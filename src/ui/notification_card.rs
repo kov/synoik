@@ -551,6 +551,11 @@ pub struct CardCache {
     context: Option<ContextId<VkTexture>>,
     cards: HashMap<(NotNan<f64>, u64), VkTexture>,
     pixels: HashMap<u64, TextureBuffer<VkTexture>>,
+    /// Uploads of images loaded *from a file* (album art), keyed by card key **and source path**.
+    /// The path is in the key on purpose: unlike `pixels`, whose bytes arrive inside the card
+    /// content, these are fetched behind the content's back, so a card whose key survived a change
+    /// of image must not be served the previous one.
+    images: crate::ui::widget::ImageUploads,
 }
 
 impl CardCache {
@@ -559,14 +564,22 @@ impl CardCache {
             context: None,
             cards: HashMap::new(),
             pixels: HashMap::new(),
+            images: HashMap::new(),
         }
     }
 
-    /// Drop every entry whose key fails `keep` (both card textures and pixel
-    /// uploads share the key space).
+    /// Drop every entry whose key fails `keep` (card textures, pixel uploads and
+    /// image uploads all share the key space).
     pub fn retain(&mut self, keep: impl Fn(u64) -> bool) {
         self.cards.retain(|(_, key), _| keep(*key));
         self.pixels.retain(|key, _| keep(*key));
+        self.images.retain(|(key, _), _| keep(*key));
+    }
+
+    /// The image-upload slots, for a card kind that composites a file-backed image
+    /// ([`crate::ui::widget::image_element`]).
+    pub fn images(&mut self) -> &mut crate::ui::widget::ImageUploads {
+        &mut self.images
     }
 
     /// Drop textures if the renderer context changed (callers building their
@@ -576,6 +589,7 @@ impl CardCache {
         if self.context.as_ref() != Some(&context) {
             self.cards.clear();
             self.pixels.clear();
+            self.images.clear();
             self.context = Some(context);
         }
     }

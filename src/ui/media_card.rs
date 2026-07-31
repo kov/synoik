@@ -9,15 +9,37 @@
 //! - **transport controls** in the body row, after the content column: prev / play-pause / next,
 //!   added through `addMediaControl` (`:605-613,778-791`), each `padding: 0 18px` with an 8px
 //!   radius and a 16px symbolic icon;
-//! - **album art** in the icon slot, rounded 8px instead of circular, falling back to
-//!   `audio-x-generic-symbolic` at 32px (`_message-list.scss:260-269`).
+//! - **album art** in the icon slot, over a rounded-square backdrop instead of the circular one,
+//!   falling back to `audio-x-generic-symbolic` at 32px (`_message-list.scss:260-269`).
 //!
 //! The card's title is the track title and its body the artists joined with `', '`
 //! (`messageList.js:825-830`). Clicking the body raises the player (`:799-804`).
 //!
-//! **Album art is not loaded yet** (recorded in `docs/fork/osd-media-port.md`): every player draws
-//! the themed fallback. The art path needs a rounded *texture* element in the message list, whose
-//! element type is `TextureRenderElement` today — a toolkit change, not a card change.
+//! ## The art slot is two different widgets
+//!
+//! `MediaMessage._update` sets `Message.icon` to a `Gio.FileIcon` when the player published
+//! `mpris:artUrl`, and a `Gio.ThemedIcon` otherwise (`messageList.js:817-824`). `Message` then
+//! toggles `.message-themed-icon` **on `notify::is-symbolic`** (`:487-492`) — so the class, and
+//! with it the backdrop fill and the 32px glyph size, exists *only while the fallback is showing*.
+//! Real art therefore draws with **no backdrop at all**: whatever the cover does not cover shows
+//! the card, not a 7% white plate.
+//!
+//! Two consequences worth stating, because both invert what the SCSS looks like it says:
+//!
+//! - The `border-radius: $base_border_radius !important` (`:262-263`) never rounds the art. St
+//!   paints a theme node's *background* rounded, but nothing in St or Clutter clips a child actor's
+//!   content to a rounded rect (no such call exists in `st-icon.c`, `st-widget.c` or
+//!   `clutter-actor.c`). What that rule actually does is reshape the fallback's backdrop from
+//!   `$forced_circular_radius` to 8px — which is why [`ART_RADIUS`] is on the fallback plate and
+//!   the art itself is drawn square-cornered.
+//! - The art is **aspect-fit and centred**, never cropped or stretched:
+//!   `st_texture_cache_load_gicon` puts the content in a square `size × size` actor with
+//!   `CLUTTER_CONTENT_GRAVITY_RESIZE_ASPECT` (`st-texture-cache.c:1017-1019`), and the loader has
+//!   already scaled the longest side to the requested size (`st-icon-theme.c:3354-3372`).
+//!   `decode_icon` produces exactly that square, so the art element is placed centred like any
+//!   other icon.
+
+use std::path::PathBuf;
 
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
@@ -103,6 +125,11 @@ pub struct MediaCardContent {
     pub playing: bool,
     pub can_go_next: bool,
     pub can_go_previous: bool,
+    /// `mpris:artUrl` resolved to a local file ([`crate::mpris::art_path`]: `file://` only), or
+    /// `None` for a player that published none — which is what puts the themed fallback up.
+    /// Whether the file *decodes* is answered at render time, so this being `Some` is not yet a
+    /// promise that art will be drawn.
+    pub art: Option<PathBuf>,
 }
 
 impl MediaCardContent {
@@ -139,6 +166,7 @@ pub fn media_card_contents(store: &crate::mpris::MprisStore) -> Vec<MediaCardCon
             playing: player.state.status.is_playing(),
             can_go_next: player.state.can_go_next,
             can_go_previous: player.state.can_go_previous,
+            art: player.state.art.clone(),
         })
         .collect()
 }
@@ -207,6 +235,12 @@ pub fn layout(width: f64) -> MediaLayout {
 
 /// Rasterize the card: rounded background, the art slot's rounded backdrop, the hovered control's
 /// wash, and all the text. Icons composite on top (see [`media_card_elements`]).
+///
+/// `art_showing` suppresses the backdrop: it is `.message-themed-icon`'s fill, and that class is
+/// only on the icon while the icon is symbolic (module docs). Pass what the caller could actually
+/// *draw*, not whether the player published a URL — art that has not decoded yet (or at all) must
+/// still get its plate.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_media_card(
     renderer: &mut VulkanRenderer,
     scale: f64,
@@ -215,6 +249,7 @@ pub fn draw_media_card(
     radius: f64,
     card_hovered: bool,
     hovered_control: Option<MediaControl>,
+    art_showing: bool,
 ) -> anyhow::Result<VkTexture> {
     let _span = tracy_client::span!("media_card::draw_media_card");
 
@@ -240,8 +275,11 @@ pub fn draw_media_card(
         p.fill_rounded(Rectangle::from_size(layout.size), radius, card_bg)?;
 
         // The art slot's backdrop is the `.message-themed-icon` fill, but rounded rather than
-        // circular. It shows through wherever the fallback glyph does not cover.
-        p.fill_rounded(layout.art, ART_RADIUS, CIRCLE_BG)?;
+        // circular. It shows through wherever the fallback glyph does not cover — and it is gone
+        // entirely once real art is up, because so is the class that carries it.
+        if !art_showing {
+            p.fill_rounded(layout.art, ART_RADIUS, CIRCLE_BG)?;
+        }
 
         // Only a hovered control has a background at all.
         if let Some(control) = hovered_control {
@@ -302,6 +340,7 @@ pub fn draw_media_card(
 pub fn media_card_elements(
     renderer: &mut VulkanRenderer,
     icons: &IconCache,
+    images: &crate::render_helpers::icon::AppIconCache,
     cache: &mut crate::ui::notification_card::CardCache,
     key: u64,
     content: &MediaCardContent,
@@ -346,19 +385,44 @@ pub fn media_card_elements(
         elements.push(elem);
     }
 
-    // The album-art fallback, at `$large_icon_size` on the slot's rounded backdrop.
-    if let Some(elem) = widget::icon_element_alpha(
-        renderer,
-        icons,
-        &["audio-x-generic-symbolic"],
-        ART_FALLBACK_ICON,
-        scale,
-        TEXT,
-        origin,
-        center_of(layout.art),
-        alpha,
-    ) {
-        elements.push(elem);
+    // The album art, or — when the player published none, or it has not decoded (or will not) —
+    // the themed fallback at `$large_icon_size` on the slot's rounded backdrop.
+    //
+    // The art decode is async, so `art_showing` is false on the frames before it lands and the
+    // fallback holds the slot; the decode arriving bumps the list revision (`note_art_decoded`),
+    // which is what re-bakes this card without its backdrop.
+    let art = content.art.as_deref().and_then(|path| {
+        widget::image_element(
+            renderer,
+            cache.images(),
+            images,
+            path,
+            key,
+            BODY_ICON,
+            scale,
+            origin,
+            center_of(layout.art),
+            alpha,
+        )
+    });
+    let art_showing = art.is_some();
+    match art {
+        Some(elem) => elements.push(elem),
+        None => {
+            if let Some(elem) = widget::icon_element_alpha(
+                renderer,
+                icons,
+                &["audio-x-generic-symbolic"],
+                ART_FALLBACK_ICON,
+                scale,
+                TEXT,
+                origin,
+                center_of(layout.art),
+                alpha,
+            ) {
+                elements.push(elem);
+            }
+        }
     }
 
     for (control, rect) in MediaControl::ALL.iter().zip(&layout.controls) {
@@ -392,6 +456,7 @@ pub fn media_card_elements(
             radius,
             card_hovered,
             hovered_control,
+            art_showing,
         ) {
             Ok(texture) => cache.insert_card(scale_key, key, texture),
             Err(err) => warn!("error rendering a media card: {err:#}"),
@@ -427,6 +492,7 @@ mod tests {
             playing: true,
             can_go_next: true,
             can_go_previous: false,
+            art: None,
         }
     }
 

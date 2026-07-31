@@ -2408,10 +2408,12 @@ fn vulkan_renders_the_calendar_popover() {
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state
-                .niri
-                .panel_popover
-                .render(vk, &state.niri.icon_cache, &output);
+            let elems = state.niri.panel_popover.render(
+                vk,
+                &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
+                &output,
+            );
             assert!(
                 !elems.is_empty(),
                 "an open popover must produce a render element"
@@ -2488,10 +2490,12 @@ fn vulkan_renders_the_message_list_card() {
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state
-                .niri
-                .panel_popover
-                .render(vk, &state.niri.icon_cache, &output);
+            let elems = state.niri.panel_popover.render(
+                vk,
+                &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
+                &output,
+            );
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
             let h = to_physical_precise_round(scale.x, 500.);
             // The element list is top-to-bottom; `render_to_vec` paints in
@@ -2612,10 +2616,12 @@ fn vulkan_hovering_a_card_close_button_lightens_it() {
             .backend
             .headless()
             .with_vulkan_renderer(|vk| {
-                let elems = state
-                    .niri
-                    .panel_popover
-                    .render(vk, &state.niri.icon_cache, &output);
+                let elems = state.niri.panel_popover.render(
+                    vk,
+                    &state.niri.icon_cache,
+                    &state.niri.app_icon_cache,
+                    &output,
+                );
                 let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
                 let at = |x: i32, y: i32| {
                     let i = ((y * w + x) * 4) as usize;
@@ -2724,10 +2730,12 @@ fn vulkan_renders_the_expanded_card_body() {
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state
-                .niri
-                .panel_popover
-                .render(vk, &state.niri.icon_cache, &output);
+            let elems = state.niri.panel_popover.render(
+                vk,
+                &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
+                &output,
+            );
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
             let h = to_physical_precise_round(scale.x, 500.);
             let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
@@ -2828,10 +2836,12 @@ fn vulkan_renders_a_grouped_stack_and_header() {
             .backend
             .headless()
             .with_vulkan_renderer(|vk| {
-                let elems = state
-                    .niri
-                    .panel_popover
-                    .render(vk, &state.niri.icon_cache, &output);
+                let elems = state.niri.panel_popover.render(
+                    vk,
+                    &state.niri.icon_cache,
+                    &state.niri.app_icon_cache,
+                    &output,
+                );
                 let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
                 pts.into_iter()
                     .map(|(x, y)| {
@@ -2975,10 +2985,12 @@ fn vulkan_renders_the_scrolled_message_list() {
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state
-                .niri
-                .panel_popover
-                .render(vk, &state.niri.icon_cache, &output);
+            let elems = state.niri.panel_popover.render(
+                vk,
+                &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
+                &output,
+            );
             let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
             let at = |x: f64, y: f64| {
                 let px = to_physical_precise_round::<i32>(scale.x, origin.x + x);
@@ -3092,10 +3104,12 @@ fn vulkan_renders_the_quick_settings_popover() {
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state
-                .niri
-                .panel_popover
-                .render(vk, &state.niri.icon_cache, &output);
+            let elems = state.niri.panel_popover.render(
+                vk,
+                &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
+                &output,
+            );
             assert!(
                 !elems.is_empty(),
                 "an open quick-settings popover must produce render elements"
@@ -3151,10 +3165,12 @@ fn vulkan_renders_the_brightness_slider() {
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state
-                .niri
-                .panel_popover
-                .render(vk, &state.niri.icon_cache, &output);
+            let elems = state.niri.panel_popover.render(
+                vk,
+                &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
+                &output,
+            );
             assert!(
                 !elems.is_empty(),
                 "the popover must produce render elements"
@@ -3208,10 +3224,12 @@ fn vulkan_renders_the_a11y_switches() {
             .backend
             .headless()
             .with_vulkan_renderer(|vk| {
-                let elems = state
-                    .niri
-                    .panel_popover
-                    .render(vk, &state.niri.icon_cache, &out);
+                let elems = state.niri.panel_popover.render(
+                    vk,
+                    &state.niri.icon_cache,
+                    &state.niri.app_icon_cache,
+                    &out,
+                );
                 assert!(!elems.is_empty(), "the a11y menu must render");
                 let w = to_physical_precise_round(scale.x, output_size(&out).w);
                 let h = to_physical_precise_round(scale.x, 600.);
@@ -10846,10 +10864,12 @@ fn vulkan_renders_the_media_card() {
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state
-                .niri
-                .panel_popover
-                .render(vk, &state.niri.icon_cache, &output);
+            let elems = state.niri.panel_popover.render(
+                vk,
+                &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
+                &output,
+            );
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
             let h = to_physical_precise_round(scale.x, 500.);
             let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
@@ -10894,4 +10914,115 @@ fn vulkan_renders_the_media_card() {
             "the play-pause glyph must composite above the card, got {ctrl_px:?}"
         );
     }
+}
+
+/// A player publishing `mpris:artUrl` draws the cover in the icon slot, and drawing it takes the
+/// themed plate away with it: `.message-themed-icon` is toggled on `notify::is-symbolic`
+/// (`js/ui/messageList.js:487-492`), so the backdrop only exists while the *fallback* is up.
+///
+/// The cover here is deliberately 2:1, which pins the other half of the rule: the art is
+/// **aspect-fit** into the square slot (`CLUTTER_CONTENT_GRAVITY_RESIZE_ASPECT`,
+/// `st-texture-cache.c:1017-1019`), so the slot's top band shows the card fill — a stretched or
+/// cover-cropped implementation paints art there and fails this. Skips with no Vulkan.
+#[test]
+fn vulkan_draws_album_art_without_the_themed_plate() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+
+    // A 2:1 solid-red cover on disk. Wide, so fitting it into the 48px square leaves bands.
+    let dir = std::env::temp_dir().join(format!("gsrs-album-art-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let art = dir.join("cover.png");
+    let cover = image::RgbaImage::from_pixel(64, 32, image::Rgba([255, 0, 0, 255]));
+    cover.save(&art).unwrap();
+
+    let bus = "org.mpris.MediaPlayer2.rhythmbox";
+    f.niri_state()
+        .on_mpris_msg(crate::mpris::MprisToNiri::PlayerUpdated {
+            bus_name: bus.to_owned(),
+            state: Box::new(crate::mpris::PlayerState {
+                identity: "Rhythmbox".into(),
+                can_play: true,
+                status: crate::mpris::PlaybackStatus::Playing,
+                title: "So What".into(),
+                artists: vec!["Miles Davis".into()],
+                art: Some(art.clone()),
+                ..crate::mpris::PlayerState::default()
+            }),
+        });
+    {
+        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.niri().gnome_settings.calendar;
+        let accent = f.niri().gnome_settings.accent_color;
+        f.niri().panel_popover.toggle_calendar(
+            output.clone(),
+            anchor,
+            cal.week_start,
+            cal.show_week_numbers,
+            accent,
+            Vec::new(),
+        );
+    }
+    f.niri().refresh_popover_media();
+    f.settle_animations();
+
+    let state = f.niri_state();
+    let origin = state.niri.panel_popover.content_location(&output);
+    let (_, card_rect, _) = state
+        .niri
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .media_card_rects()
+        .remove(0);
+    // The art slot, card-relative: the body row's 48px square (`media_card::layout`).
+    let slot = crate::ui::media_card::layout(card_rect.size.w).art;
+
+    let (band_px, art_px, card_px) = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let elems = state.niri.panel_popover.render(
+                vk,
+                &state.niri.icon_cache,
+                &state.niri.app_icon_cache,
+                &output,
+            );
+            let w = to_physical_precise_round(scale.x, output_size(&output).w);
+            let h = to_physical_precise_round(scale.x, 500.);
+            let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
+            let sample = |x: f64, y: f64| {
+                let px = to_physical_precise_round::<i32>(scale.x, origin.x + x);
+                let py = to_physical_precise_round::<i32>(scale.x, origin.y + y);
+                let i = ((py * w + px) * 4) as usize;
+                [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+            };
+            let cx = card_rect.loc.x + slot.loc.x + slot.size.w / 2.;
+            // Inside the slot, above the fitted art: 2:1 into a square leaves a 12px band, so 4px
+            // down is clear of the cover and squarely where the plate would be.
+            let band_px = sample(cx, card_rect.loc.y + slot.loc.y + 4.);
+            let art_px = sample(cx, card_rect.loc.y + slot.loc.y + slot.size.h / 2.);
+            // The card fill to compare against, well clear of the slot.
+            let card_px = sample(
+                card_rect.loc.x + card_rect.size.w / 2.,
+                card_rect.loc.y + card_rect.size.h - 4.,
+            );
+            (band_px, art_px, card_px)
+        })
+        .expect("vulkan renderer");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        art_px[0] > 200 && art_px[1] < 80 && art_px[2] < 80,
+        "the cover must be drawn in the art slot, got {art_px:?}"
+    );
+    assert_eq!(
+        band_px, card_px,
+        "the slot's letterbox band must show the plain card fill: real art removes \
+         `.message-themed-icon`, so there is no backdrop left to paint"
+    );
 }

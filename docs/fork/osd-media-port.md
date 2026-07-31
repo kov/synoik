@@ -201,11 +201,47 @@ notification, `DesktopEntry` resolves to the installed app's name, and clicking 
 reached the player over D-Bus. The cold-icon trap bit again — the first frame after the popover
 opens has no control glyphs at all; take a second shot.
 
-**Still deferred: the album art.** The model carries a validated local path
-(`PlayerState::art`), but drawing it needs a *rounded texture* element in a list whose element type
-is `TextureRenderElement`, i.e. either an element enum through the message-list render path or a
-Painter image verb. Toolkit work, not card work. Until then every player draws the
-`audio-x-generic-symbolic` fallback on the rounded slot.
+**Album art: LANDED 2026-07-31.** Players publishing a local `mpris:artUrl` draw the cover.
+
+The deferral above rested on a wrong premise, and reading the reference to its *mechanism* dissolved
+most of the work. Two findings, both inverting what the SCSS looks like it says:
+
+- **The art is not rounded.** `.media-message .message-icon { border-radius: 8px !important }`
+  (`_message-list.scss:262-263`) reads like rounded art, but St paints a theme node's *background*
+  rounded and nothing in St or Clutter clips a child actor's content to a rounded rect — there is no
+  such call in `st-icon.c`, `st-widget.c` or `clutter-actor.c`. What the rule actually does is
+  reshape the *fallback's* backdrop from `$forced_circular_radius` to 8px. So no rounded-texture
+  element and no `Painter` image verb were needed at all.
+- **Real art removes the plate.** `Message` toggles `.message-themed-icon` on
+  `notify::is-symbolic` (`messageList.js:487-492`), so the backdrop fill and the 32px glyph size
+  exist only while the fallback is up. A cover that does not fill the square shows the *card*
+  behind it, not a 7% white plate. Pinned by `vulkan_draws_album_art_without_the_themed_plate`,
+  which uses a 2:1 cover so the letterbox band must read as card fill — the same assertion also
+  fails a stretched or cover-cropped implementation, since the art is aspect-fit
+  (`CLUTTER_CONTENT_GRAVITY_RESIZE_ASPECT`, `st-texture-cache.c:1017-1019`, over a loader that has
+  already scaled the longest side, `st-icon-theme.c:3354-3372`).
+
+What the slice did add to the toolkit, since the drawing turned out to be free:
+
+- `AppIconCache::image(path, …)` — decode an arbitrary **local image file**, async, cached and
+  panic-guarded like an app icon, but with **no themed fallback**: an undecodable file returns
+  `None` so the caller can draw its own (`audio-x-generic-symbolic` here). The fallback flag is in
+  the cache *key*, so the two entry points can never serve each other's result for one path.
+- `AppIconCache::retain_images` — the eviction hook, because this is the one open-ended key space
+  either cache has: one entry per cover *played*, versus the bounded installed-app set. Driven from
+  `refresh_popover_media` with the covers still on screen.
+- `widget::image_element` — the path-addressed sibling of `app_icon_element`; upload slots keyed by
+  path as well as owner slot, so an owner reusing a slot cannot serve the previous image.
+
+The one non-obvious wiring: the decode is **async**, and the card bakes the fallback decision into
+its texture, while the message list's cache keys are positional and revision-scoped — nothing hashes
+the content. So a decode landing has to bump the list revision (`note_art_decoded`, routed from the
+`IconDecoded` handler); without it the first frame's fallback stays baked in until something
+unrelated moves the revision.
+
+**Not yet live-validated**: the async path specifically. Under test there is no decode worker, so
+`image()` answers inline and the fallback frame never happens — the revision bump is covered by a
+unit test, not by pixels.
 
 ### F — Panel volume scroll + headphone plug (optional polish)
 Scroll on the panel volume indicator steps volume and shows the OSD (`volume.js:442-464`: skip

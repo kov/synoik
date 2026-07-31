@@ -1232,10 +1232,17 @@ impl State {
                 .event_loop
                 .insert_source(icon_rx, |event, _, state| {
                     if let calloop::channel::Event::Msg(decoded) = event {
-                        if let Some((icon, logical, _)) =
+                        if let Some((icon, logical, _, _)) =
                             state.niri.app_icon_cache.apply_decoded(decoded)
                         {
                             state.niri.drop_app_icon_uploads(&icon, logical);
+                            // An image decode landing is a *content* change for the surface
+                            // showing it, not just a new texture: a media card bakes its themed
+                            // fallback into the card texture, so the list has to re-bake — and
+                            // its cache keys are revision-scoped, not content-hashed.
+                            if let crate::app_system::AppIconRef::File(path) = &icon {
+                                state.niri.panel_popover.note_art_decoded(path);
+                            }
                             state.niri.queue_redraw_all();
                         }
                     }
@@ -6549,10 +6556,12 @@ impl Niri {
             }
             // A panel popover (dateMenu calendar, quick settings, …) sits above the
             // bar; the quick-settings menu composites several elements (chrome + icons).
-            for element in self
-                .panel_popover
-                .render(ctx.renderer, &self.icon_cache, output)
-            {
+            for element in self.panel_popover.render(
+                ctx.renderer,
+                &self.icon_cache,
+                &self.app_icon_cache,
+                output,
+            ) {
                 push(element.into());
             }
             // The notification banner slides out from under the bar (pushed after
@@ -9918,6 +9927,16 @@ impl Niri {
         }
         let players = crate::ui::media_card::media_card_contents(&self.mpris);
         if self.panel_popover.set_media_players(players) {
+            // Bound the image-decode cache to the covers still on screen. Its key space is one
+            // entry per distinct art file, which for a running player is one per *track played* —
+            // the only open-ended key space either icon cache has.
+            let live: std::collections::HashSet<std::path::PathBuf> = self
+                .panel_popover
+                .date_menu()
+                .map(|dm| dm.list().art_paths().map(|p| p.to_owned()).collect())
+                .unwrap_or_default();
+            self.app_icon_cache
+                .retain_images(|path| live.contains(path));
             self.queue_redraw_all();
         }
     }

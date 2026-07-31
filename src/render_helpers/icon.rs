@@ -11,7 +11,9 @@
 //!   `g_app_info_get_icon()`): resolved through the `freedesktop-icons` crate (real theme
 //!   inheritance + size directories) and decoded **keeping their own colors** — raster (PNG/…) via
 //!   the `image` crate, SVG via `resvg`. Falls back to `application-x-executable` (GNOME's
-//!   `St.Icon` fallback).
+//!   `St.Icon` fallback). Its [`image`](AppIconCache::image) door decodes a plain **local image
+//!   file** through the same machinery with that fallback off — album art, where an executable
+//!   glyph would silently displace the caller's own themed fallback.
 //!
 //! Both return a premultiplied `Abgr8888` [`MemoryBuffer`] tagged at the output
 //! scale (never `1.` — the buffer-scale-tag trap) that the caller composites like
@@ -583,8 +585,14 @@ fn render_svg_pixmap(
     Ok(pixmap)
 }
 
-/// The cache key for a decoded app icon: descriptor + logical + physical size.
-type IconKey = (AppIconRef, u16, u32);
+/// The cache key for a decoded app icon: descriptor + logical + physical size + whether a
+/// resolve/decode failure may fall back to `application-x-executable`.
+///
+/// The fallback flag is part of the *key*, not just the request: the same file decoded for an app
+/// tile (where a failure becomes the executable glyph) and for [`AppIconCache::image`] (where a
+/// failure must stay `None`, so the caller can draw its own themed fallback) are different results,
+/// and one must never be served in place of the other.
+type IconKey = (AppIconRef, u16, u32, bool);
 
 /// A decode request handed to the worker thread — all fields are `Send`.
 pub struct IconRequest {
@@ -671,7 +679,14 @@ impl AppIconCache {
                     // panics the rasterizer must not take down the worker (it becomes
                     // a negative result instead).
                     let buffer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        render_icon(&req.theme, &req.icon, req.logical_px, req.scale, req.key.2)
+                        render_icon(
+                            &req.theme,
+                            &req.icon,
+                            req.logical_px,
+                            req.scale,
+                            req.key.2,
+                            req.key.3,
+                        )
                     }))
                     .unwrap_or(None);
                     let decoded = IconDecoded {
@@ -754,13 +769,56 @@ impl AppIconCache {
     /// Interior-mutable like [`IconCache::buffer`] so the render path and UI can
     /// rasterize from a shared `&`.
     pub fn buffer(&self, icon: &AppIconRef, logical_px: f64, scale: f64) -> Option<MemoryBuffer> {
+        self.decode(icon, logical_px, scale, true)
+    }
+
+    /// A decoded **local image file** at `logical_px` on its longest side, aspect-preserved and
+    /// centered on a transparent square (what [`decode_icon`] produces for every source), tagged at
+    /// the output `scale`. Async, cached and negative-cached exactly like [`buffer`](Self::buffer).
+    ///
+    /// The one difference is the failure mode, and it is why this is a separate entry point rather
+    /// than a `File` descriptor through `buffer`: a file that will not resolve or decode returns
+    /// `None` instead of `application-x-executable`. Album art is the first caller, and an
+    /// executable glyph stretched across an album-art slot is worse than the themed fallback it
+    /// displaced — the caller draws that itself. The file is *app-chosen content*, so the decode
+    /// runs on the worker behind the same `catch_unwind` as an app icon.
+    ///
+    /// Callers whose set of images is open-ended (one cover per track played) must bound it with
+    /// [`retain_images`](Self::retain_images) — nothing else evicts these.
+    pub fn image(&self, path: &Path, logical_px: f64, scale: f64) -> Option<MemoryBuffer> {
+        self.decode(&AppIconRef::File(path.to_owned()), logical_px, scale, false)
+    }
+
+    /// Drop the decodes of every image whose path `keep` rejects — the eviction hook for
+    /// [`image`](Self::image), whose key space grows with the content it is shown (album art is one
+    /// entry per cover seen). App-icon entries are never touched: their key space is the installed
+    /// app set, which is bounded.
+    pub fn retain_images(&mut self, keep: impl Fn(&Path) -> bool) {
+        let live = |(icon, _, _, fallback): &IconKey| match (fallback, icon) {
+            (false, AppIconRef::File(path)) => keep(path),
+            _ => true,
+        };
+        self.buffers.get_mut().retain(|key, _| live(key));
+        self.stale.get_mut().retain(|key, _| live(key));
+        // An in-flight decode is deliberately left alone: dropping its slot here would let the
+        // next miss queue the same decode again while the first is still on the worker. It lands,
+        // is inserted, and the next `retain_images` evicts it.
+    }
+
+    fn decode(
+        &self,
+        icon: &AppIconRef,
+        logical_px: f64,
+        scale: f64,
+        fallback: bool,
+    ) -> Option<MemoryBuffer> {
         // Keying on both logical and physical size avoids two different logical
         // sizes at different scales colliding on the same physical px and picking
         // a wrong-resolution theme source. Like the symbolic cache, two very close
         // fractional scales can still alias to one entry (<1px logical drift).
         let logical = (logical_px.round() as u16).max(1);
         let px = to_physical_precise_round::<i32>(scale, logical_px).max(1) as u32;
-        let key = (icon.clone(), logical, px);
+        let key = (icon.clone(), logical, px, fallback);
         if let Some(cached) = self.buffers.borrow().get(&key) {
             return cached.clone();
         }
@@ -780,7 +838,8 @@ impl AppIconCache {
                     if tx.send(req).is_err() {
                         // Worker gone: decode this one synchronously and cache it.
                         self.in_flight.borrow_mut().remove(&key);
-                        let result = render_icon(&self.theme, icon, logical_px, scale, px);
+                        let result =
+                            render_icon(&self.theme, icon, logical_px, scale, px, fallback);
                         self.stale.borrow_mut().remove(&key);
                         self.buffers.borrow_mut().insert(key, result.clone());
                         return result;
@@ -792,7 +851,7 @@ impl AppIconCache {
             }
             // No worker (tests): decode inline, caching the result (incl. negatives).
             None => {
-                let result = render_icon(&self.theme, icon, logical_px, scale, px);
+                let result = render_icon(&self.theme, icon, logical_px, scale, px, fallback);
                 self.buffers.borrow_mut().insert(key, result.clone());
                 result
             }
@@ -833,18 +892,25 @@ impl IconRequest {
 /// worker as well as inline): try the icon's own file first, and only on a
 /// resolve/decode failure fall back to `application-x-executable` (so a resolvable
 /// icon never pays for the fallback's multi-theme sweep).
+///
+/// `fallback` is what [`AppIconCache::image`] turns off: a plain image file that will not decode
+/// has no business becoming an executable glyph.
 fn render_icon(
     theme: &str,
     icon: &AppIconRef,
     logical_px: f64,
     scale: f64,
     px: u32,
+    fallback: bool,
 ) -> Option<MemoryBuffer> {
     if let Some(path) = resolve_icon(theme, icon, logical_px, scale) {
         match decode_icon(&path, px, scale) {
             Ok(buf) => return Some(buf),
             Err(err) => tracing::warn!("failed to decode app icon {}: {err:#}", path.display()),
         }
+    }
+    if !fallback {
+        return None;
     }
     let fallback = resolve_named_in_theme(theme, "application-x-executable", logical_px, scale)?;
     match decode_icon(&fallback, px, scale) {
@@ -1114,6 +1180,78 @@ mod tests {
         assert_eq!(cache.len(), 0, "clear drops the cache");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `image` is the app-content entry point, and it differs from `buffer` in exactly one way
+    /// that matters: a file that will not decode stays `None` instead of becoming GNOME's
+    /// `application-x-executable`. A media card draws its own `audio-x-generic-symbolic` fallback,
+    /// and an executable glyph in an album-art slot would silently displace it.
+    ///
+    /// The fallback flag is therefore part of the cache key, not just the request — the assertion
+    /// below is what stops the two entry points from serving each other's result for one path.
+    #[test]
+    fn an_undecodable_image_stays_none_and_does_not_share_the_icon_entry() {
+        let dir = std::env::temp_dir().join(format!("gsrs-image-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let junk = dir.join("not-an-image.png");
+        std::fs::write(&junk, b"certainly not a PNG").expect("write junk");
+
+        let cache = AppIconCache::new("Adwaita");
+        assert!(
+            cache.image(&junk, 48., 1.0).is_none(),
+            "a file that will not decode must not fall back to the executable icon"
+        );
+        // The same path through the app-icon door is allowed to fall back, so it is a *different*
+        // cached result. Whether the fallback itself resolves depends on the host's icon theme;
+        // what must hold either way is that the two do not share one entry.
+        let _ = cache.buffer(&AppIconRef::File(junk.clone()), 48., 1.0);
+        assert_eq!(
+            cache.len(),
+            2,
+            "image() and buffer() must not collide on one key for the same file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `retain_images` is the bound on the one open-ended key space either cache has: one entry per
+    /// album cover *played*, versus the installed app set. It must evict only images — app icons
+    /// are bounded already, and dropping them would re-decode the whole grid.
+    #[test]
+    fn retain_images_evicts_covers_and_leaves_app_icons_alone() {
+        let dir = std::env::temp_dir().join(format!("gsrs-image-retain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let keep = dir.join("now-playing.svg");
+        let drop = dir.join("previous-track.svg");
+        std::fs::write(&keep, RED_BLUE_SVG).expect("write svg");
+        std::fs::write(&drop, RED_BLUE_SVG).expect("write svg");
+
+        let mut cache = AppIconCache::new("Adwaita");
+        assert!(cache.image(&keep, 48., 1.0).is_some());
+        assert!(cache.image(&drop, 48., 1.0).is_some());
+        assert!(cache
+            .buffer(&AppIconRef::File(keep.clone()), 48., 1.0)
+            .is_some());
+        assert_eq!(cache.len(), 3);
+
+        cache.retain_images(|path| path == keep);
+        assert_eq!(
+            cache.len(),
+            2,
+            "only the cover that left the screen may be evicted"
+        );
+        // Proven by what still answers without a re-decode: both survivors are still cached.
+        assert!(cache.image(&keep, 48., 1.0).is_some());
+        assert!(cache
+            .buffer(&AppIconRef::File(keep.clone()), 48., 1.0)
+            .is_some());
+        assert_eq!(
+            cache.len(),
+            2,
+            "the survivors must not have been re-decoded"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A real installed app's icon resolves + decodes to visible coverage across

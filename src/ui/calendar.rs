@@ -59,7 +59,7 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform
 
 use crate::calendar_events::CalendarEventStore;
 use crate::notifications::SourceKey;
-use crate::render_helpers::icon::IconCache;
+use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -1041,6 +1041,27 @@ impl CalendarMessageList {
         true
     }
 
+    /// An album-art decode landed: bump the revision if a card is showing that file, so the list
+    /// re-bakes with the art in place of the themed fallback. Returns whether anything changed.
+    ///
+    /// The cards' cache keys are *positional* and revision-scoped — nothing in them hashes the
+    /// content — so an async decode arriving is invisible to the cache unless it says so here.
+    /// Without this the first frame's fallback (and the backdrop baked behind it) would stay up
+    /// until some unrelated change bumped the revision.
+    pub fn note_art_decoded(&mut self, path: &std::path::Path) -> bool {
+        if !self.players.iter().any(|p| p.art.as_deref() == Some(path)) {
+            return false;
+        }
+        self.revision += 1;
+        true
+    }
+
+    /// The art paths the list is currently showing — what bounds the image-decode cache, whose
+    /// key space would otherwise grow by one cover per track played.
+    pub fn art_paths(&self) -> impl Iterator<Item = &std::path::Path> {
+        self.players.iter().filter_map(|p| p.art.as_deref())
+    }
+
     /// Total notification count across every group.
     pub fn len(&self) -> usize {
         self.groups.iter().map(|g| g.cards.len()).sum()
@@ -1589,6 +1610,7 @@ impl CalendarMessageList {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
+        images: &AppIconCache,
         scale: f64,
         origin: Point<f64, Logical>,
         height: f64,
@@ -1598,7 +1620,7 @@ impl CalendarMessageList {
             // Everything fits: place the groups directly (scroll is 0, so
             // `off_y == LIST_PAD`).
             let base = origin + Point::from((0., p.off_y));
-            return self.render_groups(renderer, icons, scale, base, &p.media, &p.layouts);
+            return self.render_groups(renderer, icons, images, scale, base, &p.media, &p.layouts);
         }
 
         // Overflow: bake just the visible window (a viewport-sized texture, so
@@ -1607,7 +1629,7 @@ impl CalendarMessageList {
         // topmost). On a bake failure, draw nothing — never a lone thumb over
         // an empty column.
         let mut elements = Vec::new();
-        match self.content_texture(renderer, icons, scale, &p) {
+        match self.content_texture(renderer, icons, images, scale, &p) {
             Ok(tex) => {
                 if let Some(thumb) = self.scrollbar_thumb(renderer, scale, origin, &p) {
                     elements.push(thumb);
@@ -1636,10 +1658,12 @@ impl CalendarMessageList {
     /// Build the group render elements at `base` (a content-space origin),
     /// managing the per-card texture cache. Shared by the direct (in-place) and
     /// the baked (offscreen → clipped) render paths.
+    #[allow(clippy::too_many_arguments)]
     fn render_groups(
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
+        images: &AppIconCache,
         scale: f64,
         base: Point<f64, Logical>,
         media: &[MediaPlaced],
@@ -1663,6 +1687,7 @@ impl CalendarMessageList {
             elements.extend(media_card::media_card_elements(
                 renderer,
                 icons,
+                images,
                 &mut cache,
                 key(),
                 content,
@@ -1784,6 +1809,7 @@ impl CalendarMessageList {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
+        images: &AppIconCache,
         scale: f64,
         p: &Placed,
     ) -> anyhow::Result<VkTexture> {
@@ -1807,7 +1833,8 @@ impl CalendarMessageList {
         // Content y=scroll lands at the texture top; everything above/below the
         // window falls outside the buffer and is clipped.
         let base = Point::from((0., -p.scroll));
-        let elements = self.render_groups(renderer, icons, scale, base, &p.media, &p.layouts);
+        let elements =
+            self.render_groups(renderer, icons, images, scale, base, &p.media, &p.layouts);
         // `render_groups` returns FIRST = topmost (the compositor's convention,
         // `notification_card.rs:604`), but `render_to_texture` paints in
         // iteration order (first = backmost). Reverse so the bake matches what
@@ -2629,6 +2656,11 @@ impl DateMenu {
         self.list.set_groups(groups)
     }
 
+    /// An album-art decode landed — see [`CalendarMessageList::note_art_decoded`].
+    pub fn note_art_decoded(&mut self, path: &std::path::Path) -> bool {
+        self.list.note_art_decoded(path)
+    }
+
     /// Route a click at content-local `pos`: list hits map to notification
     /// actions; everything else goes to the calendar (all consumed — the
     /// popover stays open, like gnome-shell's grab).
@@ -3184,6 +3216,7 @@ impl DateMenu {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &IconCache,
+        images: &AppIconCache,
         scale: f64,
         origin: Point<f64, Logical>,
     ) -> Vec<TextureRenderElement<VkTexture>> {
@@ -3213,7 +3246,10 @@ impl DateMenu {
                 ));
             }
         } else {
-            elements.extend(self.list.render(renderer, icons, scale, origin, size.h));
+            elements.extend(
+                self.list
+                    .render(renderer, icons, images, scale, origin, size.h),
+            );
         }
 
         // The calendar column (its own rounded box in the same bg color, so
@@ -3469,6 +3505,54 @@ mod tests {
     use smithay::utils::Buffer as BufferCoord;
 
     use super::*;
+
+    fn player_with_art(bus: &str, art: Option<&str>) -> media_card::MediaCardContent {
+        media_card::MediaCardContent {
+            bus_name: bus.to_owned(),
+            source_title: "Rhythmbox".into(),
+            source_icon: Vec::new(),
+            title: "So What".into(),
+            body: "Miles Davis".into(),
+            playing: true,
+            can_go_next: false,
+            can_go_previous: false,
+            art: art.map(std::path::PathBuf::from),
+        }
+    }
+
+    /// An album-art decode landing has to invalidate the card that drew the fallback while it was
+    /// in flight. The list's cache keys are positional and revision-scoped — nothing hashes the
+    /// content — so the arrival is invisible unless it bumps the revision, and the first frame's
+    /// themed plate would stay baked in until some unrelated change moved it.
+    ///
+    /// It must bump for a path a card is *showing* and for nothing else: every bump re-bakes the
+    /// whole list, and app-icon decodes land on this same hook.
+    #[test]
+    fn an_album_art_decode_invalidates_only_the_list_showing_it() {
+        let mut list = CalendarMessageList::new(Vec::new());
+        assert!(list.set_players(vec![
+            player_with_art("org.mpris.MediaPlayer2.a", Some("/tmp/cover-a.png")),
+            player_with_art("org.mpris.MediaPlayer2.b", None),
+        ]));
+        let before = list.revision;
+
+        assert!(
+            !list.note_art_decoded(std::path::Path::new("/tmp/some-app-icon.png")),
+            "an unrelated decode must not re-bake the list"
+        );
+        assert_eq!(list.revision, before);
+
+        assert!(list.note_art_decoded(std::path::Path::new("/tmp/cover-a.png")));
+        assert!(
+            list.revision > before,
+            "the shown cover's decode must invalidate the cards"
+        );
+
+        // And the eviction hook sees exactly the covers on screen — the player without art
+        // contributes nothing to keep alive.
+        let live: Vec<_> = list.art_paths().collect();
+        assert_eq!(live, [std::path::Path::new("/tmp/cover-a.png")]);
+    }
 
     #[test]
     fn days_in_month_handles_leap_years() {

@@ -255,6 +255,66 @@ pub fn app_icon_element(
     ))
 }
 
+/// Uploaded textures for images loaded from a **file**, keyed by an owner-chosen slot id and the
+/// source path. See [`image_element`]; owners prune on the slot id.
+pub type ImageUploads = HashMap<(u64, std::path::PathBuf), TextureBuffer<VkTexture>>;
+
+/// Composite an image **file** (album art today) decoded by the [`AppIconCache`], centered at
+/// `center` (relative to the element `origin`), fitted into a `logical_px` square.
+///
+/// The full-color, path-addressed sibling of [`app_icon_element`]. Two differences, both because
+/// the file is content some *app* pointed us at rather than an installed asset:
+///
+/// - it goes through [`AppIconCache::image`], so a file that will not decode yields `None` instead
+///   of GNOME's executable glyph — the caller draws its own fallback (a media card's
+///   `audio-x-generic-symbolic`);
+/// - the upload slot is keyed by path as well as id, so an owner that reuses slots cannot serve the
+///   previous image for a new one.
+///
+/// The decode itself is aspect-fit and centered on a transparent square (`decode_icon`), which is
+/// what makes placing it like any other centered icon reproduce St's `RESIZE_ASPECT` gravity.
+/// `None` while an async decode is still in flight — the caller draws its fallback until it lands,
+/// so the arrival has to invalidate whatever cached it (see `media_card`).
+#[allow(clippy::too_many_arguments)]
+pub fn image_element(
+    renderer: &mut VulkanRenderer,
+    uploads: &mut ImageUploads,
+    images: &AppIconCache,
+    path: &std::path::Path,
+    slot: u64,
+    logical_px: f64,
+    scale: f64,
+    origin: Point<f64, Logical>,
+    center: Point<f64, Logical>,
+    alpha: f32,
+) -> Option<TextureRenderElement<VkTexture>> {
+    let key = (slot, path.to_owned());
+    #[allow(clippy::map_entry)]
+    if !uploads.contains_key(&key) {
+        let buffer = images.image(path, logical_px, scale)?;
+        match TextureBuffer::from_memory_buffer(renderer, &buffer) {
+            Ok(tb) => {
+                uploads.insert(key.clone(), tb);
+            }
+            Err(err) => {
+                tracing::error!("error uploading image {}: {err:#}", path.display());
+                return None;
+            }
+        }
+    }
+    let tb = uploads.get(&key)?;
+    let logical = tb.logical_size();
+    let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
+    Some(TextureRenderElement::from_texture_buffer(
+        tb.clone(),
+        loc,
+        alpha,
+        None,
+        None,
+        Kind::Unspecified,
+    ))
+}
+
 /// GNOME's `%tooltip` (`_common.scss:225-238`) — the black pill behind a short
 /// label. Shared by `.window-caption` (the overview preview title,
 /// `_window-picker.scss:24-26`), `.dash-label` (`_dash.scss:103-106`) and the
