@@ -41,6 +41,7 @@
 
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
+use crate::app_system::AppIconRef;
 use crate::image_source::ImageSource;
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -115,8 +116,11 @@ pub struct MediaCardContent {
     pub bus_name: String,
     /// The app's name, or `Identity` (`mpris.js:175`).
     pub source_title: String,
-    /// Themed icon-name candidates for the header, from the resolved app.
-    pub source_icon: Vec<String>,
+    /// The resolved app's icon for the header — the whole `GIcon`, not just its themed names:
+    /// the header resolves it exactly like a notification card's
+    /// ([`notification_card::source_icon_element`]), which needs the full descriptor to reach a
+    /// file-backed or full-colour icon.
+    pub source_icon: Option<AppIconRef>,
     /// The track title.
     pub title: String,
     /// The artists, joined `', '`.
@@ -153,13 +157,7 @@ pub fn media_card_contents(store: &crate::mpris::MprisStore) -> Vec<MediaCardCon
         .map(|player| MediaCardContent {
             bus_name: player.bus_name.clone(),
             source_title: player.source_name().to_owned(),
-            // GNOME uses the app's full-colour `GIcon` here; ours takes its themed names and
-            // falls back with the header's own fallback. A file-icon app draws that fallback
-            // until the art path lands.
-            source_icon: match player.app.as_ref().map(|app| &app.icon) {
-                Some(crate::app_system::AppIconRef::Themed(names)) => names.clone(),
-                _ => Vec::new(),
-            },
+            source_icon: player.app.as_ref().map(|app| app.icon.clone()),
             title: player.state.title.clone(),
             body: player.artists_line(),
             playing: player.state.status.is_playing(),
@@ -339,6 +337,7 @@ pub fn draw_media_card(
 pub fn media_card_elements(
     renderer: &mut VulkanRenderer,
     icons: &IconCache,
+    app_icons: &crate::render_helpers::icon::AppIconCache,
     images: &crate::render_helpers::icon::ImageCache,
     cache: &mut crate::ui::notification_card::CardCache,
     key: u64,
@@ -366,17 +365,14 @@ pub fn media_card_elements(
         Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.))
     };
 
-    // Header icon: the app's, falling back like `MessageHeader.sourceIcon`
-    // (`js/ui/messageList.js:355-359`).
-    let mut candidates: Vec<&str> = content.source_icon.iter().map(String::as_str).collect();
-    candidates.push("application-x-executable-symbolic");
-    if let Some(elem) = widget::icon_element_alpha(
+    // Header icon: the app's, resolved and drawn like every other `.message-header` source icon.
+    if let Some(elem) = crate::ui::notification_card::source_icon_element(
         renderer,
         icons,
-        &candidates,
-        SMALL_ICON,
+        app_icons,
+        &mut cache.app_icons.borrow_mut(),
+        content.source_icon.clone(),
         scale,
-        HEADER_FG,
         origin,
         center_of(layout.source_icon),
         alpha,
@@ -485,7 +481,7 @@ mod tests {
         MediaCardContent {
             bus_name: "org.mpris.MediaPlayer2.rhythmbox".into(),
             source_title: "Rhythmbox".into(),
-            source_icon: vec!["org.gnome.Rhythmbox3".into()],
+            source_icon: Some(AppIconRef::Themed(vec!["org.gnome.Rhythmbox3".into()])),
             title: "So What".into(),
             body: "Miles Davis".into(),
             playing: true,
@@ -493,6 +489,56 @@ mod tests {
             can_go_previous: false,
             art: None,
         }
+    }
+
+    /// The card carries the resolved app's **whole** `GIcon` to the header, not just its themed
+    /// names.
+    ///
+    /// It used to keep `Vec<String>` and draw them through the symbolic-only path, so a player
+    /// whose icon has no symbolic variant — `org.gnome.Rhythmbox3` has none — fell through to
+    /// `application-x-executable-symbolic` and every media card showed the generic executable
+    /// glyph. The header now resolves it exactly like a notification card's
+    /// ([`crate::ui::notification_card::source_icon_element`]), which needs the full descriptor to
+    /// reach the full-colour icon.
+    #[test]
+    fn the_card_carries_the_apps_whole_gicon() {
+        use crate::app_system::AppEntry;
+        use crate::mpris::{MprisStore, PlayerState};
+
+        let mut store = MprisStore::new();
+        let state = PlayerState {
+            can_play: true,
+            identity: "Rhythmbox".to_owned(),
+            desktop_entry: Some("org.gnome.Rhythmbox3".to_owned()),
+            ..Default::default()
+        };
+
+        let mut app = AppEntry::fake("org.gnome.Rhythmbox3.desktop", "Rhythmbox");
+        app.icon = AppIconRef::Themed(vec!["org.gnome.Rhythmbox3".to_owned()]);
+        store.update(
+            "org.mpris.MediaPlayer2.rhythmbox".to_owned(),
+            state,
+            Some(app),
+        );
+
+        let cards = media_card_contents(&store);
+        assert_eq!(cards.len(), 1, "a CanPlay player gets a card");
+        assert_eq!(
+            cards[0].source_icon,
+            Some(AppIconRef::Themed(vec!["org.gnome.Rhythmbox3".to_owned()])),
+            "the app's gicon reaches the card whole"
+        );
+
+        // A player whose DesktopEntry resolved to nothing has no icon to offer, and the header
+        // falls back the same way a notification's does.
+        let orphan = PlayerState {
+            can_play: true,
+            identity: "Mystery Player".to_owned(),
+            ..Default::default()
+        };
+        store.update("org.mpris.MediaPlayer2.mystery".to_owned(), orphan, None);
+        let cards = media_card_contents(&store);
+        assert!(cards.iter().any(|c| c.source_icon.is_none()));
     }
 
     /// The three controls are adjacent, right-aligned, and the text column ends before them —

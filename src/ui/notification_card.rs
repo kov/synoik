@@ -603,13 +603,14 @@ pub struct CardCache {
     /// content, these are fetched behind the content's back, so a card whose key survived a change
     /// of image must not be served the previous one.
     images: crate::ui::widget::ImageUploads,
-    /// Uploads of full-colour source icons.
+    /// Uploads of full-colour source icons. `pub(crate)` so the media card, which shares this
+    /// cache, can hand it to [`source_icon_element`].
     ///
     /// Deliberately *not* wired to the shell-wide [`widget::SharedAppIconUploads`], unlike the
     /// dash/grid/search: that map is keyed by size, and those draw at 64 and 96 while a header
     /// icon is 16, so there is nothing to reuse. It needs no pruning either — the key space is one
     /// entry per notification *source*, not per notification.
-    app_icons: crate::ui::widget::SharedAppIconUploads,
+    pub(crate) app_icons: crate::ui::widget::SharedAppIconUploads,
 }
 
 impl CardCache {
@@ -698,24 +699,26 @@ enum SourceIcon {
     Color(AppIconRef),
 }
 
-fn source_icon(
-    icons: &IconCache,
-    app_icons: &AppIconCache,
-    content: &CardContent,
-    scale: f64,
-) -> SourceIcon {
-    // The gicon St is handed: `app?.get_icon() ?? appIcon`
-    // (`js/ui/notificationDaemon.js:398`) — the resolved app's icon wins, and the `app_icon` call
-    // parameter is only the fallback. Both then go through the *same* symbolic-first lookup below,
-    // because the style is a property of the widget, not of where the icon came from.
-    let gicon = content.source_app_icon.clone().or_else(|| {
+/// The gicon a notification card's header shows: `app?.get_icon() ?? appIcon`
+/// (`js/ui/notificationDaemon.js:398`) — the resolved app's icon wins, and the `app_icon` call
+/// parameter is only the fallback.
+fn card_gicon(content: &CardContent) -> Option<AppIconRef> {
+    content.source_app_icon.clone().or_else(|| {
         match &content.source_icon {
             Some(NotificationIcon::Themed(name)) => Some(AppIconRef::Themed(vec![name.clone()])),
             // A file-backed `app_icon` was already decoded to pixels upstream; there is no name to
             // look up, and no themed icon to prefer.
             _ => None,
         }
-    });
+    })
+}
+
+fn source_icon(
+    icons: &IconCache,
+    app_icons: &AppIconCache,
+    gicon: Option<AppIconRef>,
+    scale: f64,
+) -> SourceIcon {
     let Some(gicon) = gicon else {
         return SourceIcon::Symbolic(SOURCE_FALLBACK.to_owned());
     };
@@ -752,6 +755,44 @@ fn source_icon(
         return SourceIcon::Color(gicon);
     }
     SourceIcon::Symbolic(SOURCE_FALLBACK.to_owned())
+}
+
+/// The header source-icon element for `gicon`, resolved and drawn the way a symbolic-styled
+/// `St.Icon` would — see [`source_icon`].
+///
+/// Shared with the MPRIS media card, whose header is the same `.message-header` widget
+/// (`js/ui/mpris.js` builds a `MessageHeader` too): it had its own symbolic-only spelling of this
+/// and so showed the executable glyph for every player.
+#[allow(clippy::too_many_arguments)]
+pub fn source_icon_element(
+    renderer: &mut VulkanRenderer,
+    icons: &IconCache,
+    app_icons: &AppIconCache,
+    uploads: &mut widget::AppIconUploads,
+    gicon: Option<AppIconRef>,
+    scale: f64,
+    origin: Point<f64, Logical>,
+    center: Point<f64, Logical>,
+    alpha: f32,
+) -> Option<TextureRenderElement<VkTexture>> {
+    match source_icon(icons, app_icons, gicon, scale) {
+        SourceIcon::Symbolic(name) => {
+            let tb = icons.texture(renderer, &name, SMALL_ICON, scale, HEADER_FG)?;
+            let logical = tb.logical_size();
+            let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
+            Some(TextureRenderElement::from_texture_buffer(
+                tb,
+                loc,
+                alpha,
+                None,
+                None,
+                Kind::Unspecified,
+            ))
+        }
+        SourceIcon::Color(icon) => widget::app_icon_element(
+            renderer, uploads, app_icons, &icon, SMALL_ICON, scale, origin, center, alpha,
+        ),
+    }
 }
 
 /// The render elements of one card at `origin`: the (cached) card texture plus
@@ -809,27 +850,18 @@ pub fn card_elements(
         layout.source_icon.loc.x + layout.source_icon.size.w / 2.,
         layout.source_icon.loc.y + layout.source_icon.size.h / 2.,
     ));
-    match source_icon(icons, app_icons, content, scale) {
-        SourceIcon::Symbolic(name) => {
-            if let Some(elem) = icon_at(renderer, &name, SMALL_ICON, HEADER_FG, source_center) {
-                elements.push(elem);
-            }
-        }
-        SourceIcon::Color(icon) => {
-            if let Some(elem) = widget::app_icon_element(
-                renderer,
-                &mut cache.app_icons.borrow_mut(),
-                app_icons,
-                &icon,
-                SMALL_ICON,
-                scale,
-                origin,
-                source_center,
-                alpha,
-            ) {
-                elements.push(elem);
-            }
-        }
+    if let Some(elem) = source_icon_element(
+        renderer,
+        icons,
+        app_icons,
+        &mut cache.app_icons.borrow_mut(),
+        card_gicon(content),
+        scale,
+        origin,
+        source_center,
+        alpha,
+    ) {
+        elements.push(elem);
     }
 
     // Close button glyph.
@@ -1264,7 +1296,7 @@ mod live_shell_tests {
                 critical: false,
                 time_text: "now".into(),
             };
-            match source_icon(&icons, &app_icons, &content, 1.) {
+            match source_icon(&icons, &app_icons, card_gicon(&content), 1.) {
                 SourceIcon::Symbolic(name) => name,
                 SourceIcon::Color(icon) => format!("color:{icon:?}"),
             }
@@ -1303,7 +1335,7 @@ mod live_shell_tests {
                 critical: false,
                 time_text: "now".into(),
             };
-            match source_icon(&icons, &app_icons, &content, 1.) {
+            match source_icon(&icons, &app_icons, card_gicon(&content), 1.) {
                 SourceIcon::Symbolic(name) => name,
                 SourceIcon::Color(icon) => format!("color:{icon:?}"),
             }

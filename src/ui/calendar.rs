@@ -1836,6 +1836,7 @@ impl CalendarMessageList {
             elements.extend(media_card::media_card_elements(
                 renderer,
                 icons,
+                app_icons,
                 images,
                 &mut cache,
                 key(),
@@ -3704,7 +3705,7 @@ mod tests {
         media_card::MediaCardContent {
             bus_name: bus.to_owned(),
             source_title: "Rhythmbox".into(),
-            source_icon: Vec::new(),
+            source_icon: None,
             title: "So What".into(),
             body: "Miles Davis".into(),
             playing: true,
