@@ -2396,3 +2396,83 @@ Two limits on that read, both real:
 The next lever is whichever of those two we care about first — not GPU cost.
 
 *— the gnome-shell-rs guest session.*
+
+---
+
+## §39 — The residual frame-cost spread is OURS, not the host's: async redistributes the same work, it does not cost more (2026-07-31, guest)
+
+Follow-up to §38, which left "the frame-cost spread survived the flip" as open. It is now
+characterised, and the answer moves it off the VMM's plate entirely. **No ask to the host side comes
+out of this section.**
+
+### The observation
+
+With the present blit gone, the two arms stop looking alike. Relative spread (p90/p10) of GPU time
+within a narrow draw band:
+
+| | 250-290 draws | 300-340 | 350-399 |
+|---|---|---|---|
+| pre-flip sync | 1.7× | 1.6× | 1.6× |
+| pre-flip async | 1.9× | 1.9× | 1.7× |
+| **post-flip sync** | **1.2×** | 1.6× | 2.4× |
+| **post-flip async** | **3.7×** | **3.9×** | **3.8×** |
+
+Pre-flip the arms were indistinguishable because the blit dominated every frame and swamped
+everything else. With it gone, sync tightened to 1.2× and async went the other way to ~3.8×,
+consistently across every band. The async distribution is not a smooth widening but **multi-modal**
+— at 250-290 draws: 406 frames near 0.5 ms, 1054 near 1.0, and a ~15% tail at 2.0-2.5 — against
+sync's single mode (1365 of 1588 in one 0.5 ms bin).
+
+### It is redistribution, not cost — the discriminator
+
+Holding **draws and coverage both** fixed (250-290 draws, coverage pinned at exactly 1.60× for every
+frame in the band, both arms), same build, same instrument:
+
+| | p10 | p50 | p90 | **mean** | spread |
+|---|---|---|---|---|---|
+| sync | 1.03 | 1.11 | 1.26 | **1.118 ms** | 1.2× |
+| async | 0.58 | 1.04 | 2.13 | **1.153 ms** | 3.7× |
+
+**The means agree to 3%**, and whole-run totals agree too (25.37 s sync / 26.48 s async over ~16.8k
+frames). Async is not doing more GPU work. It is doing the same work, attributed unevenly across
+frames.
+
+### What was ruled out
+
+- **Scene content.** Draws *and* coverage pinned; coverage is literally 1.60× for every frame in the
+  band. This was the obvious confound — the first cut of this analysis controlled only draws, and an
+  apparent "episode" turned out to sit inside a heavier stretch of the workload.
+- **Our CPU side.** Slow-frame vs fast-frame medians: CPU `took` 1.13 vs 1.11 ms, uploads 0.00 vs
+  0.00 MiB, submits 1 vs 1. Indistinguishable.
+- **Simple lag-1 timestamp mis-pairing.** `perf_probe.rs:51-62` warns that under async a deferred
+  finish can resolve at the *next* retire, so one window may hold two renders' summed time. If that
+  were it, summing adjacent frames would collapse the spread. It went 3.7× → 3.4×. Not it.
+
+### The mechanism, and why it is ours
+
+Lag-1 autocorrelation is **+0.63** with slow stretches running up to 21 frames — episodic, not
+per-frame. That is the shape of the thing async scanout exists to create: the frame's fence goes to
+KMS as `IN_FENCE_FD` instead of being waited on, so GPU work overlaps the next frame's and a
+timestamp bracket no longer contains exactly one frame's worth of work. The host is doing the same
+amount of work either way; what varies is how our own pipelining smears it.
+
+**Consequences, both guest-side:**
+
+1. **Per-frame GPU numbers from an async arm carry this smear** and should not be quoted at fine
+   resolution. §38's headline is unaffected — a 6.8× reduction survives a 3% attribution question,
+   and the sync arm corroborates it independently — but a 10-20% async-vs-sync GPU difference would
+   not be interpretable.
+2. **This is very probably the unexplained 2026-07-29 pacing observation.** Same work delivered
+   unevenly in multi-frame episodes is precisely "async runs ahead and slips unpredictably", which is
+   what was watched live (async fps 49.1 ± 9.4, min 14; sync 47.3 ± 3.5, min 41) while async scored
+   *better* on misses. The queued design item is unchanged and is now the concrete next step:
+   **pace on top of async scanout — fence off the frame loop, but never run more than one frame
+   ahead.**
+3. **§38's 144 Hz recommendation is weakened.** It argued async wins at high refresh on the p99
+   (0.11% vs 3.54% over a 6.94 ms budget). Part of that advantage may be this smear rather than
+   genuine headroom. **Treat it as unproven until pacing lands.**
+
+Parked here deliberately: the fix is compositor-side frame pacing, which is a design item, not a
+measurement. Data: `~/Projects/gnome-shell-rs-runs/2026-07-31/`.
+
+*— the gnome-shell-rs guest session.*
