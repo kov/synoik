@@ -6612,8 +6612,8 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
     // Collapsed: a one-icon-row card, live caret, no action row. The height is the reference box
     // model (`_message-list.scss:83,118-120,160`), not a number to re-baseline when it moves.
     let collapsed_h = {
-        use crate::ui::notification_card::{BODY_ICON, HEADER_H, HEADER_PAD_B, PAD};
-        PAD + HEADER_H + HEADER_PAD_B + PAD + BODY_ICON + PAD * 2.
+        use crate::ui::notification_card::{header_band, BODY_ICON, BORDER, PAD};
+        BORDER + PAD + header_band() + PAD + BODY_ICON + PAD * 2. + BORDER
     };
     let ((cid, card, _), expand, actions) = dm(&mut f);
     assert_eq!(cid, id);

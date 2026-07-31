@@ -4498,8 +4498,8 @@ mod tests {
     /// One collapsed `.message` with a body icon: the reference box model
     /// (`_message-list.scss:83,118-120,160`).
     fn lone_card_h() -> f64 {
-        use notification_card::{BODY_ICON, HEADER_H, HEADER_PAD_B, PAD};
-        PAD + HEADER_H + HEADER_PAD_B + PAD + BODY_ICON + PAD * 2.
+        use notification_card::{header_band, BODY_ICON, BORDER, PAD};
+        BORDER + PAD + header_band() + PAD + BODY_ICON + PAD * 2. + BORDER
     }
 
     /// Clicking a collapsed stack expands it into a header + vertical list;

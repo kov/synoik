@@ -35,11 +35,19 @@ pub const PAD: f64 = 6.;
 /// still reserved, since St is border-box.
 ///
 /// NOTE: this is currently only used to size the *box* (see the banner's `width_px`). The layout
-/// below still places content at `PAD` from the card edge rather than `BORDER + PAD`, so a card's
-/// content box is 2px larger than the shell's and sits 1px out. Live `.message`: a 413 box holds
-/// 399 of content; ours holds 401. Fixing that means insetting every edge-relative point here by
-/// `BORDER`, which is a separate change.
+/// still reserved, since St is border-box — every edge-relative point below is inset by it.
 pub const BORDER: f64 = 1.;
+/// `.message-close-button` `margin: $base_padding * 0.5` (`_message-list.scss:152-155`).
+pub const CLOSE_MARGIN: f64 = 3.;
+
+/// The header row's height — the tallest child's **margin box**, not `.message-header-content`.
+///
+/// That content is `HEADER_H + HEADER_PAD_B` = 30, but the close button is 28 with a 3px margin
+/// on each side, so the row is 34 and the card is 4px taller than the content alone implies.
+/// Measured on a live 50.3 shell: `.message-header` 34 inside a 108-tall banner.
+pub fn header_band() -> f64 {
+    (HEADER_H + HEADER_PAD_B).max(CLOSE_D + 2. * CLOSE_MARGIN)
+}
 /// `.message-header-content` min-height (`_message-list.scss:118`).
 pub const HEADER_H: f64 = 24.;
 /// `.message-header-content` padding-bottom (`_message-list.scss:120`). Separate from [`PAD`]
@@ -318,13 +326,16 @@ pub fn layout_clamped(
     expand_button: bool,
     max_lines: usize,
 ) -> CardLayout {
-    let header_y = PAD;
-    let body_y = header_y + HEADER_H + HEADER_PAD_B + PAD;
+    let header_y = BORDER + PAD;
+    let body_y = header_y + header_band() + PAD;
     let show_actions = expanded && !content.actions.is_empty();
     let actions_h = if show_actions { BTN_H + PAD } else { 0. };
 
     let source_icon = Rectangle::new(
-        Point::from((PAD * 2., header_y + (HEADER_H - SMALL_ICON) / 2.)),
+        Point::from((
+            BORDER + PAD * 2.,
+            header_y + (header_band() - SMALL_ICON) / 2.,
+        )),
         Size::from((SMALL_ICON, SMALL_ICON)),
     );
     // Close sits card-padding (6) + its balancing margin (3) from the right
@@ -332,8 +343,8 @@ pub fn layout_clamped(
     // `margin: $base_padding * 0.5`, `_message-list.scss:83,106-108,152-155`).
     let close = Rectangle::new(
         Point::from((
-            width - PAD - 3. - CLOSE_D,
-            header_y + (HEADER_H - CLOSE_D) / 2.,
+            width - BORDER - PAD - CLOSE_MARGIN - CLOSE_D,
+            header_y + (header_band() - CLOSE_D) / 2.,
         )),
         Size::from((CLOSE_D, CLOSE_D)),
     );
@@ -345,15 +356,15 @@ pub fn layout_clamped(
     });
     let body_icon = content.icon.is_some().then(|| {
         Rectangle::new(
-            Point::from((PAD * 2., body_y)),
+            Point::from((BORDER + PAD * 2., body_y)),
             Size::from((BODY_ICON, BODY_ICON)),
         )
     });
 
     // The body column: wrapped to the space right of the icon, minus the
     // card's edge padding.
-    let text_x = PAD * 2. + body_icon.map_or(0., |_| BODY_ICON + PAD + ICON_MARGIN);
-    let text_w = (width - text_x - PAD).max(1.);
+    let text_x = BORDER + PAD * 2. + body_icon.map_or(0., |_| BODY_ICON + PAD + ICON_MARGIN);
+    let text_w = (width - text_x - PAD - BORDER).max(1.);
     let body_lines = if content.body.is_empty() {
         Vec::new()
     } else {
@@ -387,17 +398,18 @@ pub fn layout_clamped(
     // first grows it (one line expanded == collapsed, so toggling a short
     // body only reveals the action row).
     let body_h = BODY_ICON + (body_lines.len().saturating_sub(1)) as f64 * LINE_H;
-    let h = body_y + body_h + PAD * 2. + actions_h;
+    // `.message-box`'s bottom padding, then the card's own, then the border.
+    let h = body_y + body_h + PAD * 2. + BORDER + actions_h;
 
     let mut actions = Vec::new();
     if show_actions {
         let n = content.actions.len() as f64;
-        let total_w = width - PAD * 2. - BTN_GAP * (n - 1.);
+        let total_w = width - 2. * (BORDER + PAD) - BTN_GAP * (n - 1.);
         let btn_w = total_w / n;
         let y = body_y + body_h + PAD;
         for i in 0..content.actions.len() {
             actions.push(Rectangle::new(
-                Point::from((PAD + i as f64 * (btn_w + BTN_GAP), y)),
+                Point::from((BORDER + PAD + i as f64 * (btn_w + BTN_GAP), y)),
                 Size::from((btn_w, BTN_H)),
             ));
         }
@@ -1040,5 +1052,58 @@ mod tests {
             "criticals lead within the group"
         );
         assert!(!groups[1].has_urgent);
+    }
+}
+
+#[cfg(test)]
+mod live_shell_tests {
+    use super::*;
+
+    /// A card with a 48px icon matches what a live GNOME 50.3 shell allocates: **513 x 108**.
+    ///
+    /// Decomposed from a mapped actor dump: border 1, padding 6, then header 34 and a
+    /// message-box of 60 (`6 + 48 icon + 6`), then padding 6 and border 1. Two things were wrong
+    /// and both made the card shorter: the header row was taken as `.message-header-content` (30)
+    /// rather than the close button's margin box (34), and the 1px border was never reserved.
+    ///
+    /// The earlier "`.message` is already correct at 102" reading came from an iconless
+    /// notification, where the shell's content row is text-height rather than 48. Like for like,
+    /// we were 6px short.
+    #[test]
+    fn an_iconned_card_matches_the_live_shell() {
+        assert_eq!(
+            header_band(),
+            34.,
+            "the header row is the close button's margin box"
+        );
+
+        let content = CardContent {
+            id: 1,
+            source_title: "Audit".into(),
+            source_icon: None,
+            title: "Audit probe with icon".into(),
+            body: "A body long enough to occupy the content column next to the icon.".into(),
+            icon: Some(crate::notifications::NotificationIcon::Themed(
+                "firefox".into(),
+            )),
+            actions: Vec::new(),
+            has_default_action: false,
+            critical: false,
+            time_text: "now".into(),
+        };
+        let l = layout(&content, 513., false, true);
+        assert_eq!(
+            l.size,
+            Size::from((513., 108.)),
+            "513x108 live, with a 48px icon"
+        );
+
+        // Content is inset by border+padding on every edge, not padding alone.
+        assert_eq!(l.source_icon.loc.x, BORDER + PAD * 2.);
+        assert_eq!(
+            l.close.loc.x + l.close.size.w,
+            513. - BORDER - PAD - CLOSE_MARGIN,
+            "the close button's margin box stops inside the border"
+        );
     }
 }
