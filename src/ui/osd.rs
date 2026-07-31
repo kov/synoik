@@ -784,4 +784,40 @@ mod tests {
         // `ICON_PX.max(column_h)` and the icon dominates a one-line column, so the band's height
         // only reaches the box once a level bar is stacked under it.
     }
+
+    /// The full volume OSD, box for box against a mapped dump of the 50.3 shell.
+    ///
+    /// Measured with `DumpOsd` at the default 11pt Adwaita Sans: `.osd-window` is **248x63**,
+    /// holding a 32px icon and a 166-wide column whose label band is 19 and whose level bar is
+    /// 160x6, the two 8 apart. The whole pill sits 59 above the monitor's bottom edge.
+    ///
+    /// The interesting part is where the 160 comes from: the label is *not* 160 wide of text —
+    /// "UI Dump" is a fraction of that. A vertical `StBoxLayout` allocates FILL across, so the
+    /// level's `min-width: 160` sets the column and the label is stretched to match. A model that
+    /// sized the column from the label alone would agree on every OSD wide enough to hide it.
+    #[test]
+    fn the_osd_matches_the_live_shell() {
+        let l = layout(
+            &OsdContent::icon(&["audio-volume-high-symbolic"])
+                .with_label("UI Dump")
+                .with_level(0.5, 1.),
+        );
+
+        assert_eq!((l.size.w, l.size.h), (248., 63.), "the .osd-window box");
+
+        // Positions are relative to the pill's own origin; the live abs values are the dump's
+        // minus `.osd-window`'s [1156, 1318].
+        let label = l.label.expect("a labelled OSD has a label band");
+        let level = l.level.expect("a levelled OSD has a bar");
+        assert_eq!((label.loc.x, label.loc.y), (63., 13.), "label origin");
+        assert_eq!((label.size.w, label.size.h), (160., 19.), "label band");
+        assert_eq!((level.loc.x, level.loc.y), (63., 40.), "level origin");
+        assert_eq!((level.size.w, level.size.h), (160., 6.), "level bar");
+        // The icon is `y_expand`, so it centres in the 37-tall row rather than its own 32.
+        assert_eq!(
+            (l.icon_center.x, l.icon_center.y),
+            (35., 31.5),
+            "icon centre"
+        );
+    }
 }

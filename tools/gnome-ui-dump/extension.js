@@ -101,8 +101,14 @@ const IFACE = `
 /** Depth limit, so a stray DumpAll cannot walk the shell into a stall. */
 const MAX_DEPTH = 40;
 
-/** ~1s of 50ms polls waiting for a just-opened menu to be laid out, then dump anyway and say so. */
-const MAX_ALLOCATION_POLLS = 20;
+/**
+ * ~3s of 50ms polls waiting for a just-opened surface to be laid out, then dump anyway and say so.
+ *
+ * A menu is up in one frame, but the app grid is two chained 250ms eases (overview in, then the
+ * page switch) on top of a lazily built grid — 1s was not enough for it, and the cost of waiting
+ * too long is nothing while the cost of giving up early is a plausible dump of preferred sizes.
+ */
+const MAX_ALLOCATION_POLLS = 60;
 
 function colorOf(color) {
     if (!color)
@@ -282,10 +288,22 @@ function ancestry(actor) {
  *  quick-settings dump fired a moment before the menu opened and reported a whole plausible box
  *  model for a tree that had never been laid out.) */
 function unmappedWarning(groups) {
-    const stale = groups.filter((g) => g.count > 0 && g.mapped === 0).map((g) => g.match);
-    return stale.length
-        ? `; WARNING unmapped (sizes are preferred, not allocated): ${stale.join(' ')}`
-        : '';
+    const present = groups.filter((g) => g.count > 0);
+    const stale = present.filter((g) => g.mapped === 0).map((g) => g.match);
+    // A group can be *partly* mapped, because a style class usually lives on more than one surface:
+    // a `.overview-tile` dump of the app grid also matches the dash, whose three tiles really are
+    // allocated. An all-or-nothing warning calls that dump clean while every actor you came for is
+    // unmapped — and if the grid were the only class asked for, `_whenAllocated` would have called
+    // it ready on the dash and never waited. So census the partial groups too: `3/97` is the tell.
+    const partial = present
+        .filter((g) => g.mapped > 0 && g.mapped < g.count)
+        .map((g) => `${g.match} ${g.mapped}/${g.count}`);
+    let out = '';
+    if (stale.length)
+        out += `; WARNING unmapped (sizes are preferred, not allocated): ${stale.join(' ')}`;
+    if (partial.length)
+        out += `; partly mapped (the rest report preferred sizes): ${partial.join(' ')}`;
+    return out;
 }
 
 export default class UiDumpExtension extends Extension {
@@ -434,12 +452,31 @@ export default class UiDumpExtension extends Extension {
     // The app grid is a *third* state, not a deeper overview: `Main.overview.show()` lands on the
     // windows page, where `.icon-grid` and `.page-indicator` exist but are never allocated. Dumping
     // the grid from there returns preferred sizes for exactly the actors you came for.
+    //
+    // This cannot go through `_dumpOpened`, because reaching the grid takes a different route
+    // depending on where you start. `Overview.show(state)` returns early when the overview is
+    // ALREADY shown (`overview.js:492-493`) — so `showApps()` is a silent no-op on a visible
+    // windows page, and you dump the grid unallocated with nothing having failed. The button is
+    // the documented handle (`overview.js:646-651`) and drives the state from either start, so we
+    // use both: `showApps()` to raise a hidden overview straight into the grid, the button to
+    // switch a visible one.
     DumpAppGrid(styleClasses, path) {
-        return this._dumpOpened(
-            'app grid', styleClasses, path,
-            Main.overview.visible && Main.overview.dash?.showAppsButton?.checked,
-            () => Main.overview.showApps(),
-            () => Main.overview.hide());
+        const wasVisible = Main.overview.visible;
+        const wasChecked = Main.overview.dash?.showAppsButton?.checked ?? false;
+        if (!wasVisible)
+            Main.overview.showApps();
+        Main.overview.dash.showAppsButton.checked = true;
+        this._whenAllocated(styleClasses, (ready) => {
+            const result = this.DumpClasses(styleClasses, path);
+            // Put back what we found: an overview we opened gets hidden, one that was already up
+            // keeps its page.
+            if (!wasVisible)
+                Main.overview.hide();
+            else
+                Main.overview.dash.showAppsButton.checked = wasChecked;
+            log(`[ui-dump] ${result}${ready ? '' : ' (WARNING: gave up waiting for allocation)'}`);
+        });
+        return 'opened app grid; dumping when allocated (result goes to the journal)';
     }
 
     // An OSD, raised by us. `Main.osdWindowManager.show` wants a Gio.Icon, a label and a level;
