@@ -68,6 +68,7 @@ use crate::render_helpers::{render_to_texture, NATIVE_FOURCC};
 use crate::ui::media_card;
 use crate::ui::notification_card::{self, CardCache, CardContent, CardGroup, CardLayout};
 use crate::ui::popover::PopoverAction;
+use crate::ui::theme_node::{Edges, ThemeNode};
 use crate::ui::widget::{self, Align, Painter, ShapedText, TextShaper, TextStyle};
 use crate::utils::to_physical_precise_round;
 
@@ -2182,6 +2183,27 @@ const EVENTS_MARGIN: f64 = 4.;
 const EVENTS_CARD_RADIUS: f64 = 12.;
 /// `%card` padding (`$scaled_padding * 2`).
 const EVENTS_CARD_PAD: f64 = 12.;
+
+/// The `%card` box model shared by the display-section cards (`.events-button`,
+/// `.world-clocks-button`).
+///
+/// The border is the point: `%card` is `border: 1px solid $card_shadow_border_color`, which is
+/// **transparent** in the dark theme (`_colors.scss:31`) — but St is border-box, so it still
+/// reserves its 2px. Invisible and load-bearing, which is why these cards were 2px short of the
+/// live shell (events 68 where GNOME allocates 70) while looking perfectly fine.
+///
+/// Going through [`ThemeNode::allocation_for`] instead of adding `+ 2.` is what keeps the next
+/// card from re-acquiring the same bug: the reserved pixel becomes structural rather than a
+/// constant someone has to remember. [`ThemeNode::paint`] already skips an alpha-0 border, so
+/// nothing about the drawing changes.
+fn display_card_node() -> ThemeNode {
+    ThemeNode {
+        padding: Edges::uniform(EVENTS_CARD_PAD),
+        border: Edges::uniform(1.),
+        border_radius: EVENTS_CARD_RADIUS,
+        ..ThemeNode::EMPTY
+    }
+}
 /// `.events-title` is `%heading` (11pt); `.event-summary` too; `.event-time` is
 /// `%caption` (9pt) (`_calendar.scss:161-184`, `_common.scss:266,280`).
 const EVENTS_TITLE_PT: f64 = 11.;
@@ -2520,7 +2542,9 @@ impl DateMenu {
 
     /// The events card's outer height (content + padding).
     fn events_card_h(&self) -> f64 {
-        self.events_content_h() + 2. * EVENTS_CARD_PAD
+        display_card_node()
+            .allocation_for(Size::from((0., self.events_content_h())))
+            .h
     }
 
     /// The section texture's natural height (card + its margins), clamped to the
@@ -2577,7 +2601,9 @@ impl DateMenu {
 
     /// The world-clocks card's outer height (content + padding).
     fn world_clocks_card_h(&self) -> f64 {
-        self.world_clocks_content_h() + 2. * EVENTS_CARD_PAD
+        display_card_node()
+            .allocation_for(Size::from((0., self.world_clocks_content_h())))
+            .h
     }
 
     /// The section texture's natural height (card + margins), clamped to the room
@@ -3041,8 +3067,11 @@ impl DateMenu {
             // `%card:hover` — a lighten wash over the whole card (the button state).
             widget::CardButton::paint_hover(&mut p, hovered, card, EVENTS_CARD_RADIUS)?;
 
-            let cx = card.loc.x + EVENTS_CARD_PAD;
-            let mut y = card.loc.y + EVENTS_CARD_PAD;
+            // Through `content_box`, so the text starts inside the border the card now
+            // reserves (13 in, not 12) — the same 1px the height grew by.
+            let content = display_card_node().content_box(card);
+            let cx = content.loc.x;
+            let mut y = content.loc.y;
 
             // Title (`.events-title`, muted heading), then its padding-bottom.
             p.text(
@@ -3176,9 +3205,12 @@ impl DateMenu {
             // `%card:hover` — a lighten wash over the whole card (the button state).
             widget::CardButton::paint_hover(&mut p, hovered, card, EVENTS_CARD_RADIUS)?;
 
-            let inner_left = card.loc.x + EVENTS_CARD_PAD;
-            let inner_right = card.loc.x + card.size.w - EVENTS_CARD_PAD;
-            let mut y = card.loc.y + EVENTS_CARD_PAD;
+            // Through `content_box`, so the columns start inside the border the card now
+            // reserves (see `display_card_node`).
+            let content = display_card_node().content_box(card);
+            let inner_left = content.loc.x;
+            let inner_right = content.loc.x + content.size.w;
+            let mut y = content.loc.y;
 
             // All cells are centered by their font line box (not ink), so the
             // three side-by-side columns share a baseline regardless of descenders.
@@ -4802,6 +4834,34 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// The display cards match the heights a live GNOME 50.3 shell allocates.
+    ///
+    /// Measured from a mapped actor dump at the default font: `.events-button` 321x70 with the
+    /// "No Events" placeholder, `.world-clocks-button` 321x145 with four city rows. Both are
+    /// `1 + 12 + content + 12 + 1` — the outer 1s being the `%card` border, which is
+    /// `transparent` in the dark theme and therefore reserves space without ever being drawn.
+    /// That is exactly why these were 2px short and looked right; see [`display_card_node`].
+    ///
+    /// Driven through the real height entry points rather than re-adding up the constants, so
+    /// this fails if the border stops being reserved, not merely if a literal is edited.
+    #[test]
+    fn display_cards_match_the_live_shell() {
+        let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![]);
+
+        assert_eq!(
+            dm.events_card_h(),
+            70.,
+            "the empty events card is 1 + 12 + 44 + 12 + 1"
+        );
+
+        dm.set_world_clocks(wc_model(true, 4));
+        assert_eq!(
+            dm.world_clocks_card_h(),
+            145.,
+            "four world-clock rows are 1 + 12 + 119 + 12 + 1"
+        );
     }
 
     #[test]
