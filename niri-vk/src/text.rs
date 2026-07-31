@@ -344,6 +344,86 @@ fn measure_line_width_uncached(text: &str, px: f32, bold: bool) -> f64 {
     measure_line_width_with(&mut fonts, text, px, bold)
 }
 
+/// The logical height of a single-line label box at `px` — the box a container measures its
+/// children from, which is what every card height in the UI is built out of.
+///
+/// **Pango's rule, exactly:** `ceil(ascent) + ceil(descent)`, each side rounded up
+/// *separately*. That is not a stylistic choice, it is what our layout has to match to land on
+/// the same pixel as the shell we are reimplementing. When metrics hinting is on (cairo's
+/// default, so everywhere GNOME runs), `_pango_cairo_font_private_glyph_extents_cache_init`
+/// (`pangocairo-font.c:767-810`) takes the face's typo extents and stores
+/// `y = FLOOR(-ascender)`, `height = CEIL(ascender) - FLOOR(descender)`; ClutterText then
+/// ceils again on its way to logical px (`clutter-text.c:300-324`). The line gap is *excluded*
+/// (`height = ascender - descender`), and Pango's default line spacing is 0 — so stacking `n`
+/// of these is the correct multi-line height, with no leading term.
+///
+/// The ratios come from the same swash metrics of the same resolved face that
+/// [`ShapedText::ascent`]/[`ShapedText::descent`] use, so a box sized here and a baseline
+/// centred there cannot disagree — that internal consistency matters more than matching
+/// HarfBuzz glyph-for-glyph, and is the tiebreak if the two ever diverge.
+pub fn line_box_px(px: f64) -> f64 {
+    let mut fonts = fonts();
+    line_box_px_with(&mut fonts, px)
+}
+
+/// [`line_box_px`] against a `FontSystem` the caller already holds — [`fonts`] is not
+/// reentrant, so anything inside a shape must come through here.
+pub fn line_box_px_with(fonts: &mut FontSystem, px: f64) -> f64 {
+    let (ascent, descent) = line_ratios(fonts);
+    (ascent * px).ceil() + (descent * px).ceil()
+}
+
+/// Ascent/descent as a fraction of em for the realized UI sans.
+///
+/// Cached as *ratios*, not per `(family, px)`: they are size-independent, so one entry covers
+/// every size the UI asks for and a font-size change needs no invalidation. Only a family
+/// change does — [`set_sans_family`] clears it.
+fn line_ratios(fonts: &mut FontSystem) -> (f64, f64) {
+    let mut slot = LINE_RATIOS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(ratios) = *slot {
+        return ratios;
+    }
+
+    // Resolved by *shaping a probe* rather than by querying the database: this is how we
+    // guarantee we measure the face the draw path actually picked, fallback and all, instead of
+    // the face a second lookup happens to choose.
+    const PROBE_PX: f32 = 128.;
+    let mut buffer = Buffer::new(fonts, Metrics::new(PROBE_PX, PROBE_PX));
+    {
+        let mut b = buffer.borrow_with(fonts);
+        b.set_size(None, None);
+        b.set_text("x", &sans_label_attrs(false), Shaping::Advanced, None);
+        b.shape_until_scroll(false);
+    }
+
+    let mut ratios = None;
+    'probe: for run in buffer.layout_runs() {
+        for glyph in run.glyphs {
+            let key = glyph.physical((0.0, 0.0), 1.0).cache_key;
+            if let Some(font) = fonts.get_font(key.font_id, key.font_weight) {
+                let m = font.as_swash().metrics(&[]).scale(PROBE_PX);
+                ratios = Some((
+                    f64::from(m.ascent) / f64::from(PROBE_PX),
+                    f64::from(m.descent) / f64::from(PROBE_PX),
+                ));
+                break 'probe;
+            }
+        }
+    }
+
+    // No face resolved at all (a stripped system with no fonts): fall back to the ratios the
+    // calendar used before this existed, so layout degrades to "slightly wrong" rather than
+    // collapsing every card to zero height. Not cached — the next call retries.
+    let Some(ratios) = ratios else {
+        return (1.0, 0.3);
+    };
+
+    *slot = Some(ratios);
+    ratios
+}
+
+static LINE_RATIOS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+
 /// [`measure_line_width_uncached`] against a `FontSystem` the caller already holds — the
 /// lock is not reentrant, so a wrap (which holds it for the whole wrap) must measure
 /// through this rather than through the memoized entry point.
@@ -885,6 +965,9 @@ pub fn set_sans_family(name: &str) -> bool {
         return false;
     }
     *slot = Box::leak(name.to_owned().into_boxed_str());
+    // The line box is a property of the face, so a new family invalidates it. Dropped here
+    // rather than recomputed: the next layout will ask, and asking shapes a probe.
+    *LINE_RATIOS.lock().unwrap_or_else(PoisonError::into_inner) = None;
     true
 }
 
@@ -1789,5 +1872,41 @@ mod tests {
             crate::stats::shapes() > shapes,
             "the taller wrap was not shaped"
         );
+    }
+}
+
+#[cfg(test)]
+mod line_box_tests {
+    use super::*;
+
+    /// The three label sizes the date menu uses, measured off a live GNOME 50.3 shell with a
+    /// mapped actor tree (`.world-clocks-timezone` 11.996px -> 15, `.day-label` 14.666px -> 19,
+    /// `.date-label` 20.004px -> 25). These are the numbers every card height is built from.
+    ///
+    /// Note what the spread pins: a flat factor cannot produce 15, 19 *and* 25 — the old
+    /// `px * 1.3` hits 19 and misses the other two by a pixel, because the rounding is per side.
+    ///
+    /// This asserts against Adwaita Sans specifically, so it is also a check that the UI font
+    /// resolves at all: a machine without it measures some fallback face and fails here rather
+    /// than silently laying the whole shell out to another font's metrics.
+    #[test]
+    fn line_box_matches_the_live_shell() {
+        for (px, expected) in [(11.996, 15.), (14.666, 19.), (20.004, 25.)] {
+            assert_eq!(
+                line_box_px(px),
+                expected,
+                "{px}px must give the line box the live shell measured ({expected})"
+            );
+        }
+    }
+
+    /// Multi-line bands stack without a leading term: Pango excludes the line gap from the
+    /// height it reports (`height = ascender - descender`, `pangocairo-font.c:777`) and its
+    /// default line spacing is 0, so `n` lines is exactly `n *` the single-line box. The
+    /// calendar and the quick-settings placeholder both size wrapped text that way.
+    #[test]
+    fn line_boxes_stack_without_leading() {
+        let one = line_box_px(14.666);
+        assert_eq!(one * 2., 38., "two 14.666px lines are two 19px boxes");
     }
 }

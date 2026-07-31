@@ -147,9 +147,21 @@ const WEEK_BOX_PAD_Y: f64 = 3.;
 // today. GNOME stacks two labels (`.day-label` weekday over `.date-label` full date) inside a
 // framed button. We draw one flat rounded card with the same two lines. Sizes are logical px.
 const TODAY_PAD: f64 = 9.;
-const DAY_ROW: f64 = 18.;
-const DATE_ROW: f64 = 26.;
-const TODAY_CARD_H: f64 = TODAY_PAD + DAY_ROW + DATE_ROW + TODAY_PAD; // 62
+/// The two label bands, from the realized font rather than pinned px.
+///
+/// They were 18 and 26, and the card was still the right height, because those sum to the same
+/// 44 as the shell's 19 and 25 — two errors in opposite directions cancelling in the total and
+/// leaving the *split* between the lines a pixel off. They also could not follow a font-size
+/// change. See [`crate::ui::line_height_px`].
+fn day_row() -> f64 {
+    crate::ui::line_height_px(DAY_LABEL_PT)
+}
+fn date_row() -> f64 {
+    crate::ui::line_height_px(DATE_LABEL_PT)
+}
+fn today_card_h() -> f64 {
+    TODAY_PAD + day_row() + date_row() + TODAY_PAD
+}
 /// Gap between the today card and the month-nav header below it.
 const TODAY_GAP: f64 = 6.;
 const TODAY_RADIUS: f64 = 12.;
@@ -445,7 +457,7 @@ impl Layout {
     /// The today-header card, spanning the full inner width above the month-nav header.
     fn today_button(&self) -> Rectangle<f64, Logical> {
         let w = self.bounds().size.w - 2. * PAD;
-        Rectangle::new(Point::from((PAD, PAD)), Size::from((w, TODAY_CARD_H)))
+        Rectangle::new(Point::from((PAD, PAD)), Size::from((w, today_card_h())))
     }
 
     fn prev_arrow(&self) -> Rectangle<f64, Logical> {
@@ -477,7 +489,7 @@ fn grid_left(show_week_numbers: bool) -> f64 {
 /// Top y (logical px) of the month-nav header, below the today card. Everything under the header
 /// (arrows, weekday row, day grid) is offset by this instead of the bare leading `PAD`.
 fn grid_top() -> f64 {
-    PAD + TODAY_CARD_H + TODAY_GAP
+    PAD + today_card_h() + TODAY_GAP
 }
 
 impl Calendar {
@@ -623,13 +635,13 @@ impl Calendar {
             let label_x = PAD + TODAY_PAD;
             p.text(
                 &day_label_run,
-                Point::from((label_x, PAD + TODAY_PAD + DAY_ROW / 2.)),
+                Point::from((label_x, PAD + TODAY_PAD + day_row() / 2.)),
                 Align::LEFT_MIDDLE,
                 MUTED,
             )?;
             p.text(
                 &date_label_run,
-                Point::from((label_x, PAD + TODAY_PAD + DAY_ROW + DATE_ROW / 2.)),
+                Point::from((label_x, PAD + TODAY_PAD + day_row() + date_row() / 2.)),
                 Align::LEFT_MIDDLE,
                 // GNOME's `.date-label` and `.day-label` share `$fg_color` — no per-label
                 // override (`_calendar.scss:28,33`); measured equal (~#909091) in the 50.1
@@ -3385,7 +3397,9 @@ impl DateMenu {
 /// The placeholder's vertical centers `(icon_cy, label_cy)`: the 96px icon
 /// over the label with a 12px gap, the stack centered in the column.
 fn placeholder_centers(height: f64) -> (f64, f64) {
-    let label_h = placeholder_px() * 1.3;
+    // Through the shared line box, not a second copy of the old factor: `placeholder_px` is
+    // already px, so it skips the pt conversion.
+    let label_h = niri_vk::text::line_box_px(placeholder_px());
     let total = PLACEHOLDER_ICON + PLACEHOLDER_GAP + label_h;
     let top = (height - total) / 2.;
     (
@@ -3751,7 +3765,7 @@ mod tests {
     #[test]
     fn today_button_returns_to_today_only_when_off_today() {
         // The today card adds exactly its height + gap above the grid.
-        assert_eq!(grid_top() - PAD, TODAY_CARD_H + TODAY_GAP);
+        assert_eq!(grid_top() - PAD, today_card_h() + TODAY_GAP);
         let cal = Calendar::new(0, false, [0, 0, 0]);
         assert_eq!(
             cal.logical_size().h,

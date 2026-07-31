@@ -144,12 +144,18 @@ pub fn scaled_px(px: f64) -> f64 {
 /// The logical height of one line of text at `pt` — the box a single-line label
 /// occupies, which is what a container's height is measured from.
 ///
-/// St gets this from Pango's font metrics; we approximate with the `pt * 1.3` factor
-/// the calendar has used since it was ported (its `line_h`), so a band sized here and
-/// one sized there cannot drift. It is deliberately a *typographic* line box, not the
-/// glyph ink extents — [`widget::ShapedText`] carries those for centering within it.
+/// St gets this from Pango's font metrics, and so do we now — see
+/// [`niri_vk::text::line_box_px`] for the rule and its citation. It is deliberately a
+/// *typographic* line box, not the glyph ink extents — [`widget::ShapedText`] carries those
+/// for centering within it.
+///
+/// This used to approximate with a flat `pt * 1.3`. That is right to within a rounding at
+/// 11pt and wrong by a whole pixel at 9pt (15.6 vs 15) and 15pt (26 vs 25), because no single
+/// factor can reproduce a per-side ceiling. The error was invisible for a long time because
+/// the today card's two rows were *individually* wrong in opposite directions (18+26 where the
+/// shell has 19+25) and their sum came out right.
 pub fn line_height_px(pt: f64) -> f64 {
-    pt_to_px(pt) * 1.3
+    niri_vk::text::line_box_px(pt_to_px(pt))
 }
 
 #[cfg(test)]
