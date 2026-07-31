@@ -1491,6 +1491,37 @@ impl State {
         }
     }
 
+    /// `raise()` (`mpris.js:93-100`): prefer activating the app, because a remote `Raise()` runs
+    /// into focus-stealing prevention — and for us "activating" a *running* app means focusing its
+    /// most recently used window, which is what `shell_app_activate` does. Only a player with no
+    /// resolvable app falls back to `Raise()`, and only if it says `CanRaise`.
+    pub fn raise_mpris_player(&mut self, bus_name: &str) {
+        let Some(player) = self.niri.mpris.get(bus_name) else {
+            return;
+        };
+        let can_raise = player.state.can_raise;
+
+        let Some(app) = player.app.as_ref().map(|app| app.id.clone()) else {
+            if can_raise {
+                self.mpris_control(crate::mpris::NiriToMpris::Raise(bus_name.to_owned()));
+            }
+            return;
+        };
+
+        let window = self
+            .niri
+            .app_system
+            .running_app(&app)
+            .and_then(|running| running.windows.first())
+            .map(|window| window.id);
+        match window {
+            Some(id) => self.activate_window_by_id(id),
+            None => {
+                self.launch_app(&app, crate::app_system::LaunchMode::Activate, None, "mpris");
+            }
+        }
+    }
+
     /// `shell_app_request_quit` (`shell-app.c:1210-1243`), fallback branch: close
     /// every window of the app. GNOME tries an exported `app.quit` action first; we
     /// have no action muxer, so this is the only branch — and it is the one GNOME

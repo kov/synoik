@@ -511,6 +511,12 @@ pub struct Niri {
     /// Range-request channel to the calendar-server watcher task, which owns the
     /// bus connection; `None` when the watcher isn't running.
     pub calendar_range_emit: Option<async_channel::Sender<crate::calendar_events::NiriToCalendar>>,
+    /// The media players on the session bus, behind the message list's media cards; see
+    /// [`crate::mpris`].
+    pub mpris: crate::mpris::MprisStore,
+    /// Control channel to the MPRIS watcher task, which owns the bus connection; `None` when the
+    /// watcher isn't running.
+    pub mpris_emit: Option<async_channel::Sender<crate::mpris::NiriToMpris>>,
     /// The on-screen notification banner (gnome-shell's MessageTray popup).
     pub notification_banner: crate::ui::notification_banner::NotificationBanner,
     /// The on-screen display (volume/brightness/…), one window per output.
@@ -3759,6 +3765,39 @@ impl State {
         }
     }
 
+    /// An MPRIS watcher update (see [`crate::mpris`]). Resolving `DesktopEntry` to an app is the
+    /// one part gnome-shell does inside `_updateState` (`mpris.js:167-172`) that we cannot do on
+    /// the watcher's side of the seam: the app system lives here.
+    pub fn on_mpris_msg(&mut self, msg: crate::mpris::MprisToNiri) {
+        use crate::mpris::MprisToNiri;
+
+        let changed = match msg {
+            MprisToNiri::PlayerUpdated { bus_name, state } => {
+                let app = state
+                    .desktop_entry
+                    .as_ref()
+                    .and_then(|entry| self.niri.app_system.lookup(&format!("{entry}.desktop")));
+                self.niri.mpris.update(bus_name, *state, app)
+            }
+            MprisToNiri::PlayerRemoved { bus_name } => self.niri.mpris.remove(&bus_name),
+        };
+
+        if changed {
+            // The media cards are slice E; until they exist this only keeps the store fresh.
+            self.niri.queue_redraw_all();
+        }
+    }
+
+    /// A media card's transport control (`mpris.js:73-91`). The player is addressed by bus name,
+    /// so a card whose player vanished between the click and the call is simply ignored by the
+    /// watcher, not an error here.
+    pub fn mpris_control(&mut self, command: crate::mpris::NiriToMpris) {
+        let Some(tx) = self.niri.mpris_emit.as_ref() else {
+            return;
+        };
+        let _ = tx.send_blocking(command);
+    }
+
     /// See [`Niri::apply_notification_effects`].
     pub fn apply_notification_effects(&mut self, effects: crate::notifications::Effects) {
         self.niri.apply_notification_effects(effects);
@@ -4233,6 +4272,8 @@ impl Niri {
             gtk_notifications_emit: None,
             calendar_events: crate::calendar_events::CalendarEventStore::default(),
             calendar_range_emit: None,
+            mpris: crate::mpris::MprisStore::new(),
+            mpris_emit: None,
             notification_banner,
             notification_banner_timer: None,
             osd,

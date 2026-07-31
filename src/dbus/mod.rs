@@ -16,6 +16,7 @@ pub mod gnome_shell_brightness;
 pub mod gnome_shell_introspect;
 pub mod gnome_shell_screenshot;
 pub mod gtk_notifications;
+pub mod mpris;
 pub mod mutter_display_config;
 pub mod mutter_idle_monitor;
 pub mod mutter_service_channel;
@@ -71,6 +72,9 @@ pub struct DBusServers {
     pub conn_rfkill: Option<Connection>,
     /// org.gnome.Shell.CalendarServer (session bus) — the dateMenu Events source.
     pub conn_calendar_server: Option<Connection>,
+    /// The MPRIS watcher (session bus): every `org.mpris.MediaPlayer2.*` player, plus the
+    /// connection its controls are called on.
+    pub conn_mpris: Option<Connection>,
     /// org.gnome.Shell.Brightness (session bus) — gsd-power's way in to idle dimming and the
     /// auto-brightness target. Its own well-known name, hence its own connection.
     pub conn_brightness: Option<Connection>,
@@ -348,6 +352,25 @@ impl DBusServers {
             }
             Err(err) => {
                 warn!("error starting calendar-server watcher: {err:?}");
+            }
+        }
+
+        // MPRIS media players: their state comes in, the card's controls go out.
+        let (to_niri, from_mpris) = calloop::channel::channel();
+        let (to_mpris, mpris_from_niri) = async_channel::unbounded();
+        niri.event_loop
+            .insert_source(from_mpris, move |event, _, state| match event {
+                calloop::channel::Event::Msg(msg) => state.on_mpris_msg(msg),
+                calloop::channel::Event::Closed => (),
+            })
+            .unwrap();
+        match mpris::start(to_niri, mpris_from_niri) {
+            Ok(conn) => {
+                dbus.conn_mpris = Some(conn);
+                niri.mpris_emit = Some(to_mpris);
+            }
+            Err(err) => {
+                warn!("error starting MPRIS watcher: {err:?}");
             }
         }
 

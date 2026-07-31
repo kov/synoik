@@ -12143,3 +12143,138 @@ fn osd_show_osd_without_a_resolvable_icon_draws_nothing() {
     tick(&mut f, 120);
     assert!(f.niri().osd.content(&out).is_none());
 }
+
+// ---------------------------------------------------------------------------
+// MPRIS (`js/ui/mpris.js`)
+// ---------------------------------------------------------------------------
+
+/// A player state as the watcher would hand it over.
+fn mpris_state(identity: &str, desktop_entry: Option<&str>) -> crate::mpris::PlayerState {
+    crate::mpris::PlayerState {
+        identity: identity.to_owned(),
+        desktop_entry: desktop_entry.map(str::to_owned),
+        can_play: true,
+        title: "So What".into(),
+        artists: vec!["Miles Davis".into()],
+        ..crate::mpris::PlayerState::default()
+    }
+}
+
+fn mpris_update(bus_name: &str, state: crate::mpris::PlayerState) -> crate::mpris::MprisToNiri {
+    crate::mpris::MprisToNiri::PlayerUpdated {
+        bus_name: bus_name.to_owned(),
+        state: Box::new(state),
+    }
+}
+
+/// The compositor's half of `_updateState` (`js/ui/mpris.js:167-177`): `DesktopEntry` resolves
+/// through the app system, and the card's source name is the app's name with `Identity` as the
+/// fallback. Everything else about a player is what the watcher validated.
+#[test]
+fn mpris_players_resolve_their_app() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake(
+            "org.gnome.Rhythmbox3.desktop",
+            "Rhythmbox",
+        )])),
+        Box::new(RecordingLauncher::default()),
+    );
+
+    // `DesktopEntry` is the id WITHOUT `.desktop`, which is what gnome-shell appends
+    // (`mpris.js:168`).
+    let bus = "org.mpris.MediaPlayer2.rhythmbox";
+    f.niri_state().on_mpris_msg(mpris_update(
+        bus,
+        mpris_state("Rhythmbox 3", Some("org.gnome.Rhythmbox3")),
+    ));
+    let player = f.niri().mpris.get(bus).expect("player is tracked").clone();
+    assert_eq!(
+        player.app.as_ref().map(|a| a.id.as_str()),
+        Some("org.gnome.Rhythmbox3.desktop")
+    );
+    assert_eq!(player.source_name(), "Rhythmbox", "the app's name wins");
+    assert_eq!(player.artists_line(), "Miles Davis");
+
+    // A player whose DesktopEntry matches nothing installed -- or that sends none at all -- falls
+    // back to Identity, and is still shown.
+    let other = "org.mpris.MediaPlayer2.mystery";
+    f.niri_state()
+        .on_mpris_msg(mpris_update(other, mpris_state("Mystery Player", None)));
+    let player = f.niri().mpris.get(other).unwrap().clone();
+    assert!(player.app.is_none());
+    assert_eq!(player.source_name(), "Mystery Player");
+    assert_eq!(f.niri().mpris.visible().count(), 2);
+
+    // A vanished bus name takes its player with it (`mpris.js:242-249`).
+    f.niri_state()
+        .on_mpris_msg(crate::mpris::MprisToNiri::PlayerRemoved {
+            bus_name: bus.to_owned(),
+        });
+    assert!(f.niri().mpris.get(bus).is_none());
+    assert_eq!(f.niri().mpris.visible().count(), 1);
+}
+
+/// `raise()` (`mpris.js:93-100`) prefers the app over the remote `Raise()`, because a remote raise
+/// runs into focus-stealing prevention. With no resolvable app it falls back -- but only when the
+/// player claims `CanRaise`.
+#[test]
+fn mpris_raise_prefers_the_app() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+    use crate::mpris::NiriToMpris;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let recorder = RecordingLauncher::default();
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake(
+            "org.gnome.Rhythmbox3.desktop",
+            "Rhythmbox",
+        )])),
+        Box::new(recorder.clone()),
+    );
+
+    // Stand in for the watcher's inbound half so the calls we would make are observable.
+    let (tx, rx) = async_channel::unbounded();
+    f.niri().mpris_emit = Some(tx);
+
+    // A resolvable app that is not running: activating it is a launch, and NOTHING goes on the bus.
+    let bus = "org.mpris.MediaPlayer2.rhythmbox";
+    f.niri_state().on_mpris_msg(mpris_update(
+        bus,
+        mpris_state("Rhythmbox 3", Some("org.gnome.Rhythmbox3")),
+    ));
+    f.niri_state().raise_mpris_player(bus);
+    assert_eq!(recorder.calls.borrow().len(), 1);
+    assert_eq!(
+        recorder.calls.borrow()[0].0.id,
+        "org.gnome.Rhythmbox3.desktop"
+    );
+    assert!(rx.try_recv().is_err(), "the app path never calls Raise()");
+
+    // No app, but CanRaise: the fallback goes out on the bus.
+    let other = "org.mpris.MediaPlayer2.mystery";
+    let mut state = mpris_state("Mystery Player", None);
+    state.can_raise = true;
+    f.niri_state().on_mpris_msg(mpris_update(other, state));
+    f.niri_state().raise_mpris_player(other);
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(NiriToMpris::Raise(other.to_owned()))
+    );
+
+    // No app and no CanRaise: there is nothing to do, and we must not invent a launch.
+    f.niri_state()
+        .on_mpris_msg(mpris_update(other, mpris_state("Mystery Player", None)));
+    f.niri_state().raise_mpris_player(other);
+    assert!(rx.try_recv().is_err());
+    assert_eq!(recorder.calls.borrow().len(), 1);
+
+    // A player that is not tracked at all is a no-op, not a panic -- the card can outlive it.
+    f.niri_state()
+        .raise_mpris_player("org.mpris.MediaPlayer2.gone");
+    assert!(rx.try_recv().is_err());
+}
