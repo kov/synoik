@@ -446,6 +446,15 @@ fn spawn_row(label: &str, cmd: &[&str], separator_before: bool) -> DetailRow {
 /// The live Bluetooth state a detail card renders from: the snapshot, the row order frozen when
 /// the card opened (gnome-shell reorders only at menu open, `bluetooth.js:326-331,384-393`), and
 /// the device path with a connect/disconnect in flight (its busy mark).
+/// Everything the audio device pickers resolve from. Bundled because the rows are a function of
+/// all three together: a picker row is a card *port*, matched against the sink/source lists to find
+/// the node it belongs to and whether it is the current one.
+struct AudioDetail<'a> {
+    sinks: &'a SinkList,
+    sources: &'a SourceList,
+    cards: &'a crate::audio::AudioCards,
+}
+
 struct BtDetail<'a> {
     status: &'a BluetoothStatus,
     order: &'a [String],
@@ -497,8 +506,7 @@ impl DetailOwner {
     fn rows(
         self,
         network: NetworkStatus,
-        sink_list: &SinkList,
-        source_list: &SourceList,
+        audio: AudioDetail<'_>,
         power: &PowerProfileStatus,
         bt: BtDetail<'_>,
         monitors: &[crate::brightness::MonitorView],
@@ -624,27 +632,29 @@ impl DetailOwner {
                 ));
                 rows
             }
-            // gnome-shell's output device list: one row per sink (label = description; the current
-            // default carries a trailing check; clicking sets it default via a metadata write),
-            // then a separator + a "Sound Settings" entry point (`volume.js:80-82,126-165`).
+            // gnome-shell's output device list: one row per **card port** (gvc UIDevice), labelled
+            // `description – origin` with the device's icon, the current one carrying a trailing
+            // check; then a separator + a "Sound Settings" entry point
+            // (`volume.js:80-82,126-165`). Port-level, not sink-level: one card shows "Speakers"
+            // and "Headphones" as separate rows.
             DetailOwner::Output => {
-                let mut rows: Vec<DetailRow> = sink_list
-                    .sinks
-                    .iter()
-                    .take(MAX_DEVICE_ROWS)
-                    .map(|sink| {
-                        ItemRow {
-                            label: sink.description.clone(),
-                            icons: Vec::new(),
-                            action: PopoverAction::SetDefaultSink(sink.name.clone()),
-                            separator_before: false,
-                            selected: sink_list.default_name.as_deref() == Some(sink.name.as_str()),
-                            trailing: None,
-                            placeholder: false,
-                        }
-                        .into()
-                    })
-                    .collect();
+                let mut rows: Vec<DetailRow> =
+                    crate::audio::output_devices(audio.sinks, audio.cards)
+                        .into_iter()
+                        .take(MAX_DEVICE_ROWS)
+                        .map(|device| {
+                            ItemRow {
+                                label: device.label(),
+                                icons: device.icon.clone().into_iter().collect(),
+                                selected: device.selected,
+                                action: PopoverAction::SetOutputDevice(device.key),
+                                separator_before: false,
+                                trailing: None,
+                                placeholder: false,
+                            }
+                            .into()
+                        })
+                        .collect();
                 rows.push(spawn_row(
                     "Sound Settings",
                     &["gnome-control-center", "sound"],
@@ -667,26 +677,25 @@ impl DetailOwner {
                     ]
                 })
                 .collect(),
-            // The input mirror of Output: one row per source, then "Sound Settings".
+            // The input mirror of Output: one row per input port, then "Sound Settings".
             DetailOwner::Input => {
-                let mut rows: Vec<DetailRow> = source_list
-                    .sources
-                    .iter()
-                    .take(MAX_DEVICE_ROWS)
-                    .map(|source| {
-                        ItemRow {
-                            label: source.description.clone(),
-                            icons: Vec::new(),
-                            action: PopoverAction::SetDefaultSource(source.name.clone()),
-                            separator_before: false,
-                            selected: source_list.default_name.as_deref()
-                                == Some(source.name.as_str()),
-                            trailing: None,
-                            placeholder: false,
-                        }
-                        .into()
-                    })
-                    .collect();
+                let mut rows: Vec<DetailRow> =
+                    crate::audio::input_devices(audio.sources, audio.cards)
+                        .into_iter()
+                        .take(MAX_DEVICE_ROWS)
+                        .map(|device| {
+                            ItemRow {
+                                label: device.label(),
+                                icons: device.icon.clone().into_iter().collect(),
+                                selected: device.selected,
+                                action: PopoverAction::SetInputDevice(device.key),
+                                separator_before: false,
+                                trailing: None,
+                                placeholder: false,
+                            }
+                            .into()
+                        })
+                        .collect();
                 rows.push(spawn_row(
                     "Sound Settings",
                     &["gnome-control-center", "sound"],
@@ -1202,6 +1211,9 @@ pub struct QuickSettings {
     /// The output sinks + current default, for the output slider's device picker (empty → no
     /// picker arrow).
     sink_list: SinkList,
+    /// The sound cards and their ports, which the device pickers are built from — the port-level
+    /// list is a function of these plus the sink/source lists.
+    cards: crate::audio::AudioCards,
     /// Whether the default sink is headphones, which swaps **this slider's icon only** (never the
     /// panel indicator, never the OSD — see [`crate::audio::output_slider_icon`]). Resolved by the
     /// compositor from the card/route model, since that lives outside this widget.
@@ -1261,6 +1273,7 @@ impl QuickSettings {
         battery: Option<BatteryStatus>,
         audio: Option<AudioStatus>,
         sink_list: SinkList,
+        cards: crate::audio::AudioCards,
         headphones: bool,
         mic: MicStatus,
         source_list: SourceList,
@@ -1280,6 +1293,7 @@ impl QuickSettings {
             battery,
             audio,
             sink_list,
+            cards,
             headphones,
             mic,
             source_list,
@@ -1337,8 +1351,11 @@ impl QuickSettings {
     fn detail_rows(&self, owner: DetailOwner) -> Vec<DetailRow> {
         owner.rows(
             self.network,
-            &self.sink_list,
-            &self.source_list,
+            AudioDetail {
+                sinks: &self.sink_list,
+                sources: &self.source_list,
+                cards: &self.cards,
+            },
             &self.power,
             BtDetail {
                 status: &self.bluetooth,
@@ -1514,6 +1531,17 @@ impl QuickSettings {
         let mut changed = self.sink_list != sink_list;
         if changed {
             self.sink_list = sink_list;
+            self.content_bumped();
+        }
+        changed |= self.normalize_expanded();
+        changed
+    }
+
+    /// Adopt a fresh card/route model (from the PipeWire watcher). Returns whether it changed.
+    pub fn set_audio_cards(&mut self, cards: crate::audio::AudioCards) -> bool {
+        let mut changed = self.cards != cards;
+        if changed {
+            self.cards = cards;
             self.content_bumped();
         }
         changed |= self.normalize_expanded();
@@ -3002,6 +3030,7 @@ mod tests {
                 None,
                 audio,
                 SinkList::default(),
+                crate::audio::AudioCards::default(),
                 false,
                 MicStatus::default(),
                 SourceList::default(),
@@ -3057,6 +3086,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            crate::audio::AudioCards::default(),
             false,
             MicStatus::default(),
             SourceList::default(),
@@ -3086,6 +3116,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            crate::audio::AudioCards::default(),
             false,
             MicStatus::default(),
             SourceList::default(),
@@ -3159,6 +3190,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            crate::audio::AudioCards::default(),
             false,
             MicStatus::default(),
             SourceList::default(),
@@ -3189,6 +3221,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            crate::audio::AudioCards::default(),
             false,
             MicStatus::default(),
             SourceList::default(),
@@ -3222,6 +3255,7 @@ mod tests {
             Some(battery(79.)),
             None,
             SinkList::default(),
+            crate::audio::AudioCards::default(),
             false,
             MicStatus::default(),
             SourceList::default(),
@@ -3253,6 +3287,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            crate::audio::AudioCards::default(),
             false,
             MicStatus::default(),
             SourceList::default(),
@@ -3294,6 +3329,7 @@ mod tests {
             Some(battery(79.)),
             None,
             SinkList::default(),
+            crate::audio::AudioCards::default(),
             false,
             MicStatus::default(),
             SourceList::default(),
@@ -3370,6 +3406,7 @@ mod tests {
             None,
             audio,
             SinkList::default(),
+            crate::audio::AudioCards::default(),
             false,
             MicStatus::default(),
             SourceList::default(),
@@ -3386,10 +3423,11 @@ mod tests {
                 .map(|i| crate::audio::SinkInfo {
                     name: format!("sink{i}"),
                     description: format!("Sink {i}"),
+                    card: None,
+                    form_factor: None,
                 })
                 .collect(),
             default_name: (n > 0).then(|| "sink0".to_string()),
-            bound: None,
         }
     }
 
@@ -3407,6 +3445,7 @@ mod tests {
                 .map(|i| crate::audio::SourceInfo {
                     name: format!("source{i}"),
                     description: format!("Source {i}"),
+                    card: None,
                 })
                 .collect(),
             default_name: (n > 0).then(|| "source0".to_string()),
@@ -3833,8 +3872,10 @@ mod tests {
         assert!(item(&rows[0]).selected && !item(&rows[1]).selected);
         assert_eq!(item(&rows[3]).label, "Sound Settings");
         match q.pointer_click(center(detail_row_rect(1, q.layout()).unwrap())) {
-            PopoverAction::SetDefaultSource(name) => assert_eq!(name, "source1"),
-            other => panic!("expected SetDefaultSource, got {other:?}"),
+            PopoverAction::SetInputDevice(crate::audio::AudioDeviceKey::Node(name)) => {
+                assert_eq!(name, "source1")
+            }
+            other => panic!("expected SetInputDevice, got {other:?}"),
         }
     }
 
@@ -4000,6 +4041,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            crate::audio::AudioCards::default(),
             false,
             MicStatus::default(),
             SourceList::default(),
@@ -4071,6 +4113,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            crate::audio::AudioCards::default(),
             false,
             MicStatus::default(),
             SourceList::default(),
@@ -4135,6 +4178,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            crate::audio::AudioCards::default(),
             false,
             MicStatus::default(),
             SourceList::default(),
@@ -4648,8 +4692,10 @@ mod tests {
         );
 
         match q.pointer_click(center(detail_row_rect(1, q.layout()).unwrap())) {
-            PopoverAction::SetDefaultSink(name) => assert_eq!(name, "sink1"),
-            other => panic!("expected SetDefaultSink, got {other:?}"),
+            PopoverAction::SetOutputDevice(crate::audio::AudioDeviceKey::Node(name)) => {
+                assert_eq!(name, "sink1")
+            }
+            other => panic!("expected SetOutputDevice, got {other:?}"),
         }
         match q.pointer_click(center(detail_row_rect(3, q.layout()).unwrap())) {
             PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-control-center", "sound"]),
@@ -4775,6 +4821,7 @@ mod tests {
             None,
             None,
             SinkList::default(),
+            crate::audio::AudioCards::default(),
             false,
             MicStatus::default(),
             SourceList::default(),

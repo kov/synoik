@@ -1217,11 +1217,7 @@ impl State {
             // Setting the default sink is fire-and-forget: the metadata write echoes back through
             // the watcher, which moves the picker's check and the bound-sink volume. Not applied
             // optimistically (a rejected write has no corrective echo).
-            PopoverAction::SetDefaultSink(name) => {
-                if let Some(audio) = self.niri.audio_backend.as_ref() {
-                    audio.set_default_sink(&name);
-                }
-            }
+            PopoverAction::SetOutputDevice(key) => self.activate_audio_device(key, true),
             PopoverAction::SetInputVolume(volume) => {
                 if let Some(status) = self
                     .niri
@@ -1250,12 +1246,7 @@ impl State {
             PopoverAction::SetMonitorBrightness(connector, value) => {
                 self.set_monitor_brightness(&connector, value);
             }
-            // Fire-and-forget, like SetDefaultSink.
-            PopoverAction::SetDefaultSource(name) => {
-                if let Some(audio) = self.niri.audio_backend.as_ref() {
-                    audio.set_default_source(&name);
-                }
-            }
+            PopoverAction::SetInputDevice(key) => self.activate_audio_device(key, false),
             // Airplane mode: fire-and-forget property write on gsd-rfkill's connection (never a
             // blocking Set on this thread); the tile updates when gsd echoes `PropertiesChanged`.
             #[cfg(feature = "dbus")]
@@ -1637,6 +1628,48 @@ impl State {
     ///
     /// The OSD is *this* path's job, not the audio model's: a quick-settings drag moves a slider
     /// that is already on screen and stays silent.
+    /// Activate a device-picker row — gvc's `change_output` / `change_input`
+    /// (`subprojects/gvc/gvc-mixer-control.c`), minus the profile-switching case:
+    ///
+    /// - a **portless** device (bluetooth, network, the null sink) just becomes the default;
+    /// - a **port** first has its route selected on the card, and then, if it lives on a different
+    ///   node than the current default, that node becomes the default too. Switching between two
+    ///   ports of the same node — speakers ↔ headphones, the common case — is the route write
+    ///   alone, which is exactly what gvc does.
+    ///
+    /// Both writes are fire-and-forget: a rejected one has no corrective echo, so nothing moves the
+    /// picker's check optimistically.
+    fn activate_audio_device(&mut self, key: crate::audio::AudioDeviceKey, output: bool) {
+        use crate::audio::AudioDeviceKey;
+        let Some(audio) = self.niri.audio_backend.as_ref() else {
+            return;
+        };
+        match key {
+            AudioDeviceKey::Node(name) => {
+                if output {
+                    audio.set_default_sink(&name);
+                } else {
+                    audio.set_default_source(&name);
+                }
+            }
+            AudioDeviceKey::Port {
+                card_id,
+                route_index,
+                device,
+                node,
+            } => {
+                audio.set_route(card_id, device, route_index);
+                if let Some(node) = node {
+                    if output {
+                        audio.set_default_sink(&node);
+                    } else {
+                        audio.set_default_source(&node);
+                    }
+                }
+            }
+        }
+    }
+
     fn adjust_volume_by_scroll(&mut self, steps: f64) {
         let qs_open =
             self.niri.panel_popover.open_role() == Some(crate::ui::panel::ROLE_QUICK_SETTINGS);
@@ -6017,6 +6050,7 @@ impl State {
                                 let battery = self.niri.system_status.battery.clone();
                                 let audio = self.niri.audio;
                                 let sink_list = self.niri.sink_list.clone();
+                                let audio_cards = self.niri.audio_cards.clone();
                                 // Resolved state, not a model: the menu opens showing the
                                 // headphone glyph if they are already plugged in, rather than
                                 // waiting for the next port change to correct itself.
@@ -6037,6 +6071,7 @@ impl State {
                                     battery,
                                     audio,
                                     sink_list,
+                                    audio_cards,
                                     headphones,
                                     mic,
                                     source_list,

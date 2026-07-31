@@ -3579,7 +3579,10 @@ impl State {
     /// its device list and its headphone detection from. Read-only for now: nothing renders it yet,
     /// so there is no redraw to queue.
     pub fn on_audio_cards(&mut self, cards: crate::audio::AudioCards) {
-        self.niri.audio_cards = cards;
+        self.niri.audio_cards = cards.clone();
+        if self.niri.panel_popover.set_audio_cards(cards) {
+            self.niri.queue_redraw_all();
+        }
         self.refresh_headphones();
     }
 

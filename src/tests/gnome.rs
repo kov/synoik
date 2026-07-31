@@ -12668,6 +12668,92 @@ fn a_scroll_over_the_volume_icon_steps_the_backend_and_shows_the_osd() {
     );
 }
 
+/// Activating a port row writes the route, then the default node — gvc's `change_output` case 3
+/// (`change_port` on the stream, then `set_default_sink`). A portless row writes only the default,
+/// gvc's case 2.
+#[test]
+fn picking_an_output_port_writes_the_route_then_the_default() {
+    use crate::audio::{AudioDeviceKey, AudioWrite};
+    use crate::ui::popover::PopoverAction;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let audio = f.install_stub_audio(0.5);
+
+    // Headphones on the same node as the current default: the route write is the whole switch, and
+    // re-asserting the default is harmless (gvc does the same).
+    f.niri_state()
+        .apply_popover_action(PopoverAction::SetOutputDevice(AudioDeviceKey::Port {
+            card_id: 42,
+            route_index: 1,
+            device: 0,
+            node: Some("alsa_output.pci".to_owned()),
+        }));
+    assert_eq!(
+        audio.writes(),
+        vec![
+            AudioWrite::Route {
+                card_id: 42,
+                device: 0,
+                route_index: 1
+            },
+            AudioWrite::DefaultSink("alsa_output.pci".to_owned()),
+        ],
+        "the route comes first: making a node default before selecting its port would land on the \
+         old port"
+    );
+
+    // A port with no node behind it still selects the route rather than doing nothing.
+    audio.clear_writes();
+    f.niri_state()
+        .apply_popover_action(PopoverAction::SetOutputDevice(AudioDeviceKey::Port {
+            card_id: 42,
+            route_index: 2,
+            device: 1,
+            node: None,
+        }));
+    assert_eq!(
+        audio.writes(),
+        vec![AudioWrite::Route {
+            card_id: 42,
+            device: 1,
+            route_index: 2
+        }]
+    );
+
+    // A portless device (bluetooth): default only, no route.
+    audio.clear_writes();
+    f.niri_state()
+        .apply_popover_action(PopoverAction::SetOutputDevice(AudioDeviceKey::Node(
+            "bluez_output.AA".to_owned(),
+        )));
+    assert_eq!(
+        audio.writes(),
+        vec![AudioWrite::DefaultSink("bluez_output.AA".to_owned())]
+    );
+
+    // The input side takes the same two shapes, against the source setters.
+    audio.clear_writes();
+    f.niri_state()
+        .apply_popover_action(PopoverAction::SetInputDevice(AudioDeviceKey::Port {
+            card_id: 42,
+            route_index: 3,
+            device: 0,
+            node: Some("alsa_input.pci".to_owned()),
+        }));
+    assert_eq!(
+        audio.writes(),
+        vec![
+            AudioWrite::Route {
+                card_id: 42,
+                device: 0,
+                route_index: 3
+            },
+            AudioWrite::DefaultSource("alsa_input.pci".to_owned()),
+        ]
+    );
+}
+
 /// Plugging headphones in: `OutputStreamSlider._portChanged` (`js/ui/status/volume.js:347-358`).
 ///
 /// The suppression rule is the whole point. `initializing = this._hasHeadphones === undefined` is
@@ -12676,7 +12762,7 @@ fn a_scroll_over_the_volume_icon_steps_the_backend_and_shows_the_osd() {
 /// sink to a speaker sink is a change that *does* speak up.
 #[test]
 fn a_port_change_to_headphones_shows_the_osd_but_the_first_answer_is_silent() {
-    use crate::audio::{AudioCard, AudioCards, BoundSinkInfo, PortDirection, RouteInfo, SinkCard};
+    use crate::audio::{AudioCard, AudioCards, PortDirection, RouteInfo, SinkCard, SinkInfo};
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
@@ -12690,6 +12776,7 @@ fn a_port_change_to_headphones_shows_the_osd_but_the_first_answer_is_silent() {
             description: "Built-in Audio".to_owned(),
             icon_name: Some("audio-card-analog".to_owned()),
             ports: vec![],
+            active_profile: None,
             active: vec![RouteInfo {
                 index: 0,
                 direction: Some(PortDirection::Output),
@@ -12700,15 +12787,16 @@ fn a_port_change_to_headphones_shows_the_osd_but_the_first_answer_is_silent() {
         }],
     };
     let sinks = crate::audio::SinkList {
-        sinks: vec![],
-        default_name: Some("sink".to_owned()),
-        bound: Some(BoundSinkInfo {
+        sinks: vec![SinkInfo {
+            name: "sink".to_owned(),
+            description: "Built-in Audio".to_owned(),
             card: Some(SinkCard {
                 card_id: 42,
                 device: Some(1),
             }),
             form_factor: None,
-        }),
+        }],
+        default_name: Some("sink".to_owned()),
     };
 
     // FIRST answer — speakers. The state is recorded, and NOTHING is shown.
@@ -12757,12 +12845,13 @@ fn a_port_change_to_headphones_shows_the_osd_but_the_first_answer_is_silent() {
     f.niri().osd.hide_all();
     f.settle_animations();
     f.niri_state().on_sink_list(crate::audio::SinkList {
-        sinks: vec![],
-        default_name: Some("bluez".to_owned()),
-        bound: Some(BoundSinkInfo {
+        sinks: vec![SinkInfo {
+            name: "bluez".to_owned(),
+            description: "Bluetooth Headset".to_owned(),
             card: None,
             form_factor: Some("headset".to_owned()),
-        }),
+        }],
+        default_name: Some("bluez".to_owned()),
     });
     assert_eq!(f.niri().headphones, Some(true));
     assert!(
@@ -12791,8 +12880,10 @@ fn the_quick_settings_audio_controls_reach_the_backend() {
     f.niri_state()
         .apply_popover_action(PopoverAction::ToggleMute);
     f.niri_state()
-        .apply_popover_action(PopoverAction::SetDefaultSink(
-            "alsa_output.pci-0000_00_1f.3.analog-stereo".to_owned(),
+        .apply_popover_action(PopoverAction::SetOutputDevice(
+            crate::audio::AudioDeviceKey::Node(
+                "alsa_output.pci-0000_00_1f.3.analog-stereo".to_owned(),
+            ),
         ));
     assert_eq!(
         audio.writes(),
@@ -12836,7 +12927,9 @@ fn the_quick_settings_audio_controls_reach_the_backend() {
     f.niri_state()
         .apply_popover_action(PopoverAction::ToggleInputMute);
     f.niri_state()
-        .apply_popover_action(PopoverAction::SetDefaultSource("alsa_input.usb".to_owned()));
+        .apply_popover_action(PopoverAction::SetInputDevice(
+            crate::audio::AudioDeviceKey::Node("alsa_input.usb".to_owned()),
+        ));
     assert_eq!(
         audio.writes(),
         vec![

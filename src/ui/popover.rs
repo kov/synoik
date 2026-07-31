@@ -87,10 +87,10 @@ pub enum PopoverAction {
     SetVolume(f64),
     /// Toggle the default sink's mute (clicking the slider's speaker icon).
     ToggleMute,
-    /// Set the system default output sink to this `node.name` (an output-device-picker row). The
-    /// menu stays open (gnome-shell keeps the device list up after picking); the check moves when
-    /// the write echoes back.
-    SetDefaultSink(String),
+    /// Activate an output-device-picker row: select its card port and/or make its node the
+    /// default. The menu stays open (gnome-shell keeps the device list up after picking); the
+    /// check moves when the write echoes back.
+    SetOutputDevice(crate::audio::AudioDeviceKey),
     /// Set the default source's perceptual volume `0..=1` (the QS mic slider).
     SetInputVolume(f64),
     /// Set the global brightness scale `0..=1` (the QS brightness slider). Resolved in
@@ -103,9 +103,9 @@ pub enum PopoverAction {
     SetMonitorBrightness(String, f64),
     /// Toggle the default source's mute (clicking the mic slider's icon).
     ToggleInputMute,
-    /// Set the system default input source to this `node.name` (an input-device-picker row). The
-    /// menu stays open, like [`SetDefaultSink`](Self::SetDefaultSink).
-    SetDefaultSource(String),
+    /// Activate an input-device-picker row; the input mirror of
+    /// [`SetOutputDevice`](Self::SetOutputDevice).
+    SetInputDevice(crate::audio::AudioDeviceKey),
     /// Set gsd-rfkill's airplane mode (the QS "Airplane Mode" toggle). The menu stays open; the
     /// tile updates on the gsd echo (not optimistic — a rejected/hw-blocked write has no echo).
     SetAirplaneMode(bool),
@@ -595,6 +595,7 @@ impl PanelPopover {
         battery: Option<crate::system_status::BatteryStatus>,
         audio: Option<crate::audio::AudioStatus>,
         sink_list: crate::audio::SinkList,
+        cards: crate::audio::AudioCards,
         headphones: bool,
         mic: crate::audio::MicStatus,
         source_list: crate::audio::SourceList,
@@ -620,6 +621,7 @@ impl PanelPopover {
             battery,
             audio,
             sink_list,
+            cards,
             headphones,
             mic,
             source_list,
@@ -647,6 +649,17 @@ impl PanelPopover {
         match &mut self.content {
             Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
                 qs.set_sink_list(sink_list)
+            }
+            _ => false,
+        }
+    }
+
+    /// Push a fresh card/route model to an open quick-settings popover, so the device pickers track
+    /// ports appearing/disappearing (a headphone plug is exactly that). Returns whether it changed.
+    pub fn set_audio_cards(&mut self, cards: crate::audio::AudioCards) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::QuickSettings(qs)) if self.open && !self.closing => {
+                qs.set_audio_cards(cards)
             }
             _ => false,
         }
