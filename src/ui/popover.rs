@@ -148,6 +148,15 @@ pub enum PopoverAction {
     InvokeNotificationAction { id: u32, key: String },
     /// The message list's Clear pill: close every notification.
     ClearNotifications,
+    /// A media card's transport button (`js/ui/messageList.js:778-791`). The popover stays open —
+    /// GNOME's buttons are plain `St.Button`s inside the message, not menu items.
+    MediaControl {
+        bus_name: String,
+        control: crate::ui::media_card::MediaControl,
+    },
+    /// A media card's body: raise the player and close the popover
+    /// (`MediaMessage.vfunc_clicked`, `js/ui/messageList.js:799-804`).
+    RaiseMediaPlayer(String),
     /// Switch to this input source (a layout row in the keyboard menu): set the
     /// active xkb group and record it in `mru-sources`. The menu closes, like
     /// gnome-shell's popup menu closing on item activation.
@@ -210,6 +219,8 @@ impl PopoverAction {
                 // A switch row toggles and then falls through to `super.activate`,
                 // which closes the menu — only Space keeps it open.
                 | PopoverAction::SetA11yToggle { .. }
+                // `vfunc_clicked` raises the player and calls `Main.panel.closeCalendar()`.
+                | PopoverAction::RaiseMediaPlayer(_)
         )
     }
 }
@@ -425,6 +436,20 @@ impl PanelPopover {
         match &mut self.content {
             Some(PopoverContent::Calendar(dm)) if self.open && !self.closing => {
                 dm.set_notifications(groups)
+            }
+            _ => false,
+        }
+    }
+
+    /// Push a fresh MPRIS player snapshot to an open calendar popover — the media cards above the
+    /// notification groups. Returns whether it changed anything.
+    pub fn set_media_players(
+        &mut self,
+        players: Vec<crate::ui::media_card::MediaCardContent>,
+    ) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::Calendar(dm)) if self.open && !self.closing => {
+                dm.set_media_players(players)
             }
             _ => false,
         }

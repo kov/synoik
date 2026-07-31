@@ -40,7 +40,7 @@ pub const SMALL_ICON: f64 = 16.;
 pub const CLOSE_D: f64 = SMALL_ICON + 2. * PAD;
 /// Action button height: bold 11pt + 6px paddings (`%notification_button`).
 pub const BTN_H: f64 = 28.;
-const BTN_RADIUS: f64 = 8.;
+pub(crate) const BTN_RADIUS: f64 = 8.;
 /// Gap between action buttons (`$base_margin`).
 const BTN_GAP: f64 = 4.;
 /// Body/title/source/action font size (11pt) and the header time label (9pt),
@@ -73,7 +73,7 @@ pub const STACK_HEIGHT_REDUCTION: f64 = 1.4;
 pub const GROUP_BOTTOM_MARGIN: f64 = 15.;
 
 /// `.message` bg, dark variant (`lighten($card_bg_color, 5%)` ≈ `#51515a`).
-const CARD_BG: [f32; 4] = [
+pub(crate) const CARD_BG: [f32; 4] = [
     0x51 as f32 / 255.,
     0x51 as f32 / 255.,
     0x5a as f32 / 255.,
@@ -86,22 +86,22 @@ pub const HEADER_FG: [f32; 4] = [
     0xb3 as f32 / 255.,
     1.,
 ];
-const TEXT: [f32; 4] = [1., 1., 1., 1.];
+pub(crate) const TEXT: [f32; 4] = [1., 1., 1., 1.];
 /// Close/action button bg (white@15%, `%notification_button` normal =
 /// `transparentize($fg_color, .85)`).
 const BTN_BG: [f32; 4] = [1., 1., 1., 0.15];
 /// A hovered card button lightens to white@30% (`%notification_button:hover` =
 /// `transparentize($fg_color, .7)`, `_drawing.scss:228`).
-const BTN_BG_HOVER: [f32; 4] = [1., 1., 1., 0.30];
+pub(crate) const BTN_BG_HOVER: [f32; 4] = [1., 1., 1., 0.30];
 /// `.message-themed-icon` circle bg (white@7%, `_message-list.scss:176`).
-const CIRCLE_BG: [f32; 4] = [1., 1., 1., 0.07];
-const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
+pub(crate) const CIRCLE_BG: [f32; 4] = [1., 1., 1., 0.07];
+pub(crate) const TRANSPARENT: [f32; 4] = [0., 0., 0., 0.];
 /// A hovered card body darkens slightly: `.message` extends `%card`, whose
 /// `:hover` sets the bg to `button(hover, card)` = `lighten($card_bg, 4%)`,
 /// while `.message` overrides its *normal* bg to `lighten($card_bg, 5%)`
 /// ([`CARD_BG`]) — so on the dark theme hover is ~1% darker than resting
 /// (`_common.scss:154-161`, `_drawing.scss:193`, `_message-list.scss:87`).
-const CARD_HOVER_BG: [f32; 4] = [
+pub(crate) const CARD_HOVER_BG: [f32; 4] = [
     0x4d as f32 / 255.,
     0x4d as f32 / 255.,
     0x56 as f32 / 255.,

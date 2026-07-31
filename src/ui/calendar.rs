@@ -64,6 +64,7 @@ use crate::render_helpers::renderer::OffscreenRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::render_helpers::{render_to_texture, NATIVE_FOURCC};
+use crate::ui::media_card;
 use crate::ui::notification_card::{self, CardCache, CardContent, CardGroup, CardLayout};
 use crate::ui::popover::PopoverAction;
 use crate::ui::widget::{self, Align, Painter, ShapedText, TextShaper, TextStyle};
@@ -794,6 +795,13 @@ const SCROLLBAR_MIN_H: f64 = 24.;
 const SCROLLBAR_EDGE_GAP: f64 = 4.;
 const SCROLLBAR_THUMB: [f32; 4] = [0.45, 0.45, 0.47, 1.];
 
+/// A visible media card's `(bus name, card rect, control rects)`, popover-local (test hook).
+pub type MediaCardRects = (
+    String,
+    Rectangle<f64, Logical>,
+    [Rectangle<f64, Logical>; 3],
+);
+
 /// A visible card's `(id, card rect, close-button rect)`, popover-local
 /// (introspection/test hook).
 pub type CardRects = (u32, Rectangle<f64, Logical>, Rectangle<f64, Logical>);
@@ -825,6 +833,14 @@ pub enum ListHit {
     CloseGroup(Vec<u32>),
     /// The Clear pill: close everything.
     Clear,
+    /// A media card's transport button (`js/ui/messageList.js:778-791`).
+    MediaControl {
+        bus_name: String,
+        control: media_card::MediaControl,
+    },
+    /// A media card's body: raise the player and close the popover
+    /// (`js/ui/messageList.js:799-804`).
+    MediaBody(String),
 }
 
 /// A hoverable region of the message list, for the hover highlight. A card
@@ -843,12 +859,25 @@ enum ListHover {
     GroupCollapse,
     /// The Clear pill in the controls row.
     Clear,
+    /// A media card, and the transport button under the pointer if any.
+    Media {
+        bus_name: String,
+        control: Option<media_card::MediaControl>,
+    },
 }
 
 /// A peeking lower card in a collapsed stack: `(origin, size, darkened bg)`.
 type StackPeek = (Point<f64, Logical>, Size<f64, Logical>, [f32; 4]);
 /// A visible group for introspection: `(source key, popover-local bounds, expanded?)`.
 type GroupRect = (SourceKey, Rectangle<f64, Logical>, bool);
+
+/// A media card laid out in the visible list, above every group.
+struct MediaPlaced {
+    /// Index into [`CalendarMessageList::players`].
+    player: usize,
+    origin: Point<f64, Logical>,
+    layout: media_card::MediaLayout,
+}
 
 /// A group laid out in the visible list: the y-flow is computed once and
 /// shared by the hit-test, the render, and the test hooks.
@@ -892,6 +921,8 @@ enum GroupKind {
 /// The content layout resolved against a popover height and the current scroll:
 /// content-space group layouts plus the transform into popover-local space.
 struct Placed {
+    /// Media-card layouts in content space, above every group.
+    media: Vec<MediaPlaced>,
     /// Group layouts in content space (y from 0, un-clipped).
     layouts: Vec<GroupLayout>,
     /// Total content height (all groups, no drop).
@@ -930,6 +961,10 @@ impl Placed {
 /// collapsed stack that expands into a vertical list on click.
 pub struct CalendarMessageList {
     groups: Vec<CardGroup>,
+    /// The MPRIS players, each a card **above** every notification group: gnome-shell inserts a
+    /// new player's message at index 0 of the view (`js/ui/messageList.js:1780-1784`), so this is
+    /// held newest-first and rendered in order.
+    players: Vec<media_card::MediaCardContent>,
     /// Notification ids whose card BODY is expanded (the header caret). Kept
     /// across snapshot pushes, dropped with the popover (recorded divergence).
     body_expanded: HashSet<u32>,
@@ -970,6 +1005,7 @@ impl CalendarMessageList {
     pub fn new(groups: Vec<CardGroup>) -> Self {
         Self {
             groups,
+            players: Vec::new(),
             body_expanded: HashSet::new(),
             group_expanded: None,
             hovered: None,
@@ -980,8 +1016,29 @@ impl CalendarMessageList {
         }
     }
 
+    /// Nothing at all to show — what puts the "No Notifications" placeholder up
+    /// (`MessageView.empty`, `js/ui/messageList.js:1521-1523`).
     pub fn is_empty(&self) -> bool {
-        self.groups.is_empty()
+        self.groups.is_empty() && self.players.is_empty()
+    }
+
+    /// Whether the Clear pill shows: `canClear` is "some message can close"
+    /// (`js/ui/messageList.js:1525-1527`), and a media card cannot
+    /// (`canClose() = false`, `:668-670`) — so players alone show no pill.
+    pub fn can_clear(&self) -> bool {
+        !self.groups.is_empty()
+    }
+
+    /// Replace the player snapshot (newest first). Returns whether anything changed.
+    pub fn set_players(&mut self, players: Vec<media_card::MediaCardContent>) -> bool {
+        if self.players == players {
+            return false;
+        }
+        self.players = players;
+        // Same reasoning as `set_groups`: the cards just moved, so a captured hover is stale.
+        self.hovered = None;
+        self.revision += 1;
+        true
     }
 
     /// Total notification count across every group.
@@ -1064,7 +1121,7 @@ impl CalendarMessageList {
 
     /// Height of the bottom controls row (the Clear pill), when shown.
     fn controls_h(&self) -> f64 {
-        if self.is_empty() {
+        if !self.can_clear() {
             0.
         } else {
             CONTROLS_PAD + CLEAR_H + CONTROLS_PAD_B
@@ -1120,10 +1177,27 @@ impl CalendarMessageList {
     /// Lay out every group in content space (y from 0), never dropping — the
     /// list scrolls to reach overflow (`js/ui/calendar.js:816` `St.ScrollView`).
     /// Returns the layouts and the total content height.
-    fn layout(&self) -> (Vec<GroupLayout>, f64) {
+    fn layout(&self) -> (Vec<MediaPlaced>, Vec<GroupLayout>, f64) {
         let mut out = Vec::new();
         let mut y = 0.0_f64;
         let mut content_h = 0.0_f64;
+
+        // Media cards sit above every group, in `players` order — the view holds them at index 0
+        // and each new player pushes the older ones down (`js/ui/messageList.js:1780-1784`).
+        let mut media = Vec::new();
+        for (i, _) in self.players.iter().enumerate() {
+            let origin = Point::from((LIST_PAD, y));
+            let layout = media_card::layout(card_w());
+            let h = layout.size.h;
+            media.push(MediaPlaced {
+                player: i,
+                origin,
+                layout,
+            });
+            content_h = content_h.max(y + h);
+            y += h + CARD_GAP;
+        }
+
         for (g, group) in self.groups.iter().enumerate() {
             // The store never yields an empty source (`notifications.rs:619`),
             // but `CardGroup` is public — skip rather than index-panic.
@@ -1201,7 +1275,7 @@ impl CalendarMessageList {
                 y += stack_h + CARD_GAP;
             }
         }
-        (out, content_h)
+        (media, out, content_h)
     }
 
     /// The scroll viewport height: the list top (`LIST_PAD`) down to the
@@ -1212,10 +1286,11 @@ impl CalendarMessageList {
 
     /// Lay out and resolve the scroll transform for `height` in one pass.
     fn placed(&self, height: f64) -> Placed {
-        let (layouts, content_h) = self.layout();
+        let (media, layouts, content_h) = self.layout();
         let vh = self.viewport_h(height);
         let scroll = self.scroll_y.clamp(0., (content_h - vh).max(0.));
         Placed {
+            media,
             layouts,
             content_h,
             off_y: LIST_PAD - scroll,
@@ -1240,7 +1315,7 @@ impl CalendarMessageList {
 
     /// Total content height (all groups, no drop).
     fn content_h(&self) -> f64 {
-        self.layout().1
+        self.layout().2
     }
 
     /// The list's full, un-scrolled height: top pad + group content + the
@@ -1291,7 +1366,7 @@ impl CalendarMessageList {
     /// Hit-test a click at popover-local `pos` inside the list column.
     fn hit(&self, pos: Point<f64, Logical>, height: f64) -> Option<ListHit> {
         // The Clear pill lives in the fixed controls row, below the viewport.
-        if !self.is_empty() && self.clear_rect(height).contains(pos) {
+        if self.can_clear() && self.clear_rect(height).contains(pos) {
             return Some(ListHit::Clear);
         }
         let p = self.placed(height);
@@ -1302,6 +1377,23 @@ impl CalendarMessageList {
         }
         // Map the click into content space (undo the scroll translation).
         let cpos = pos - Point::from((0., p.off_y));
+        for m in &p.media {
+            if !Rectangle::new(m.origin, m.layout.size).contains(cpos) {
+                continue;
+            }
+            let content = &self.players[m.player];
+            let bus_name = content.bus_name.clone();
+            // An insensitive skip button is `reactive = false` (`js/ui/messageList.js:836-838`),
+            // so the click passes through it to the message itself — which raises the player.
+            let control = m
+                .layout
+                .control_at(cpos - m.origin)
+                .filter(|c| content.is_sensitive(*c));
+            return Some(match control {
+                Some(control) => ListHit::MediaControl { bus_name, control },
+                None => ListHit::MediaBody(bus_name),
+            });
+        }
         for gl in &p.layouts {
             if !gl.bounds.contains(cpos) {
                 continue;
@@ -1360,7 +1452,9 @@ impl CalendarMessageList {
         let touches_cards = |h: &Option<ListHover>| {
             matches!(
                 h,
-                Some(ListHover::Card { .. }) | Some(ListHover::GroupCollapse)
+                Some(ListHover::Card { .. })
+                    | Some(ListHover::GroupCollapse)
+                    | Some(ListHover::Media { .. })
             )
         };
         if touches_cards(&self.hovered) || touches_cards(&new) {
@@ -1374,7 +1468,7 @@ impl CalendarMessageList {
     /// but only for controls that carry a visible highlight (card buttons, the
     /// group collapse button, the Clear pill — not card bodies or the stack).
     fn hover_zone(&self, pos: Point<f64, Logical>, height: f64) -> Option<ListHover> {
-        if !self.is_empty() && self.clear_rect(height).contains(pos) {
+        if self.can_clear() && self.clear_rect(height).contains(pos) {
             return Some(ListHover::Clear);
         }
         let p = self.placed(height);
@@ -1382,6 +1476,20 @@ impl CalendarMessageList {
             return None;
         }
         let cpos = pos - Point::from((0., p.off_y));
+        for m in &p.media {
+            if !Rectangle::new(m.origin, m.layout.size).contains(cpos) {
+                continue;
+            }
+            let content = &self.players[m.player];
+            return Some(ListHover::Media {
+                bus_name: content.bus_name.clone(),
+                // Only a reactive button lights up.
+                control: m
+                    .layout
+                    .control_at(cpos - m.origin)
+                    .filter(|c| content.is_sensitive(*c)),
+            });
+        }
         for gl in &p.layouts {
             if !gl.bounds.contains(cpos) {
                 continue;
@@ -1455,6 +1563,16 @@ impl CalendarMessageList {
     /// Whether the card with notification `id` is hovered (body darkens) and,
     /// if so, which of its buttons the pointer is over (that button lightens) —
     /// fed into [`notification_card::card_elements`].
+    fn media_hover_for(&self, bus_name: &str) -> (bool, Option<media_card::MediaControl>) {
+        match &self.hovered {
+            Some(ListHover::Media {
+                bus_name: hovered,
+                control,
+            }) if hovered == bus_name => (true, *control),
+            _ => (false, None),
+        }
+    }
+
     fn card_hover_for(&self, id: u32) -> (bool, Option<notification_card::CardZone>) {
         match &self.hovered {
             Some(ListHover::Card { id: hid, zone }) if *hid == id => (true, *zone),
@@ -1480,7 +1598,7 @@ impl CalendarMessageList {
             // Everything fits: place the groups directly (scroll is 0, so
             // `off_y == LIST_PAD`).
             let base = origin + Point::from((0., p.off_y));
-            return self.render_groups(renderer, icons, scale, base, &p.layouts);
+            return self.render_groups(renderer, icons, scale, base, &p.media, &p.layouts);
         }
 
         // Overflow: bake just the visible window (a viewport-sized texture, so
@@ -1524,6 +1642,7 @@ impl CalendarMessageList {
         icons: &IconCache,
         scale: f64,
         base: Point<f64, Logical>,
+        media: &[MediaPlaced],
         layouts: &[GroupLayout],
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let mut elements = Vec::new();
@@ -1538,6 +1657,24 @@ impl CalendarMessageList {
             next += 1;
             k
         };
+        for m in media {
+            let content = &self.players[m.player];
+            let (card_hovered, control) = self.media_hover_for(&content.bus_name);
+            elements.extend(media_card::media_card_elements(
+                renderer,
+                icons,
+                &mut cache,
+                key(),
+                content,
+                &m.layout,
+                CARD_RADIUS,
+                base + m.origin,
+                1.,
+                scale,
+                card_hovered,
+                control,
+            ));
+        }
         for gl in layouts {
             let group = &self.groups[gl.group];
             match &gl.kind {
@@ -1670,7 +1807,7 @@ impl CalendarMessageList {
         // Content y=scroll lands at the texture top; everything above/below the
         // window falls outside the buffer and is clipped.
         let base = Point::from((0., -p.scroll));
-        let elements = self.render_groups(renderer, icons, scale, base, &p.layouts);
+        let elements = self.render_groups(renderer, icons, scale, base, &p.media, &p.layouts);
         // `render_groups` returns FIRST = topmost (the compositor's convention,
         // `notification_card.rs:604`), but `render_to_texture` paints in
         // iteration order (first = backmost). Reverse so the bake matches what
@@ -1864,6 +2001,27 @@ impl CalendarMessageList {
     /// an EXPANDED group (a collapsed stack's top card is not here — its close
     /// closes the whole group, so it goes through the group hooks instead).
     /// `(id, popover-local origin, layout)`.
+    /// Test hook: the visible media cards `(bus name, card rect, control rects)`, popover-local.
+    fn visible_media_cards(&self, height: f64) -> Vec<MediaCardRects> {
+        let p = self.placed(height);
+        let shift = Point::from((0., p.off_y));
+        p.media
+            .iter()
+            .filter_map(|m| {
+                let rect = Rectangle::new(m.origin + shift, m.layout.size);
+                p.viewport_visible(rect).then(|| {
+                    let controls = std::array::from_fn(|i| {
+                        Rectangle::new(
+                            m.origin + shift + m.layout.controls[i].loc,
+                            m.layout.controls[i].size,
+                        )
+                    });
+                    (self.players[m.player].bus_name.clone(), rect, controls)
+                })
+            })
+            .collect()
+    }
+
     fn visible_interactive_cards(
         &self,
         height: f64,
@@ -2462,6 +2620,11 @@ impl DateMenu {
     }
 
     /// Push a fresh store snapshot into the list. Returns whether it changed.
+    /// Push a fresh player snapshot into the message list (newest first).
+    pub fn set_media_players(&mut self, players: Vec<media_card::MediaCardContent>) -> bool {
+        self.list.set_players(players)
+    }
+
     pub fn set_notifications(&mut self, groups: Vec<CardGroup>) -> bool {
         self.list.set_groups(groups)
     }
@@ -2496,6 +2659,10 @@ impl DateMenu {
                 }
                 Some(ListHit::CloseGroup(ids)) => PopoverAction::CloseNotificationGroup(ids),
                 Some(ListHit::Clear) => PopoverAction::ClearNotifications,
+                Some(ListHit::MediaControl { bus_name, control }) => {
+                    PopoverAction::MediaControl { bus_name, control }
+                }
+                Some(ListHit::MediaBody(bus_name)) => PopoverAction::RaiseMediaPlayer(bus_name),
                 None => PopoverAction::Consumed,
             };
         }
@@ -2572,6 +2739,11 @@ impl DateMenu {
             .collect()
     }
 
+    /// Test hook: the visible media cards, above the notification groups.
+    pub fn media_card_rects(&self) -> Vec<MediaCardRects> {
+        self.list.visible_media_cards(self.logical_size().h)
+    }
+
     /// Test hooks: the visible groups `(key, bounds, expanded)`, a collapsed
     /// stack's top-card close, and an expanded group's collapse button.
     pub fn group_rects(&self) -> Vec<GroupRect> {
@@ -2587,7 +2759,9 @@ impl DateMenu {
     }
 
     pub fn clear_pill_rect(&self) -> Option<Rectangle<f64, Logical>> {
-        (!self.list.is_empty()).then(|| self.list.clear_rect(self.logical_size().h))
+        self.list
+            .can_clear()
+            .then(|| self.list.clear_rect(self.logical_size().h))
     }
 
     /// Test hook: a visible card's live expand-caret rect (popover-local);
@@ -2637,7 +2811,8 @@ impl DateMenu {
         // extra cards render below the (stale, too-short) background.
         let height_key = to_physical_precise_round::<i64>(scale, self.logical_size().h).max(0);
         let revision = widget::Revision::new()
-            .of(!self.list.is_empty())
+            .of(self.list.is_empty())
+            .of(self.list.can_clear())
             .of(clear_hover)
             .of(height_key)
             .done();
@@ -2675,7 +2850,9 @@ impl DateMenu {
                 .is_empty()
                 .then(|| shaper.shape("No Notifications", TextStyle::new(PLACEHOLDER_PT).bold()))
                 .transpose()?;
-            let clear_run = (!self.list.is_empty())
+            let clear_run = self
+                .list
+                .can_clear()
                 .then(|| shaper.shape("Clear", TextStyle::new(CLEAR_PT).bold()))
                 .transpose()?;
             (placeholder_run, clear_run)

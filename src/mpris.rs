@@ -326,7 +326,7 @@ impl MprisStore {
 
     /// The players the message list shows a card for, in discovery order — the caller reverses it
     /// where GNOME's insert-at-0 would (`messageList.js:1780-1784`).
-    pub fn visible(&self) -> impl Iterator<Item = &MprisPlayer> {
+    pub fn visible(&self) -> impl DoubleEndedIterator<Item = &MprisPlayer> {
         self.players.iter().filter(|p| p.state.can_play)
     }
 

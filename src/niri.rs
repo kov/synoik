@@ -3783,8 +3783,7 @@ impl State {
         };
 
         if changed {
-            // The media cards are slice E; until they exist this only keeps the store fresh.
-            self.niri.queue_redraw_all();
+            self.niri.refresh_popover_media();
         }
     }
 
@@ -9848,6 +9847,17 @@ impl Niri {
         let now = self.clock.now_unadjusted();
         let cards = crate::ui::notification_card::message_list_groups(&self.notifications, now);
         if self.panel_popover.set_notifications(cards) {
+            self.queue_redraw_all();
+        }
+    }
+
+    /// Push a fresh MPRIS snapshot into an open calendar popover's message list, if any.
+    pub fn refresh_popover_media(&mut self) {
+        if self.panel_popover.open_role() != Some(crate::ui::panel::ROLE_DATE_MENU) {
+            return;
+        }
+        let players = crate::ui::media_card::media_card_contents(&self.mpris);
+        if self.panel_popover.set_media_players(players) {
             self.queue_redraw_all();
         }
     }

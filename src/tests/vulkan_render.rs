@@ -10779,3 +10779,115 @@ fn vulkan_renders_the_osd() {
         "value past overdrive_start must paint $destructive_color, got {over_red}px"
     );
 }
+
+/// The media card renders as a `.message`: the card fill under its own chrome, the album-art
+/// slot's `.message-themed-icon` backdrop lighter than that fill (`_message-list.scss:174-178`,
+/// rounded rather than circular for media, `:260-263`), and a control glyph compositing ON TOP of
+/// the card. Our own chrome, so a headless shot is trustworthy. Skips with no Vulkan.
+#[test]
+fn vulkan_renders_the_media_card() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+
+    // A player in the store, then the popover opened the way the panel opens it.
+    let bus = "org.mpris.MediaPlayer2.rhythmbox";
+    f.niri_state()
+        .on_mpris_msg(crate::mpris::MprisToNiri::PlayerUpdated {
+            bus_name: bus.to_owned(),
+            state: Box::new(crate::mpris::PlayerState {
+                identity: "Rhythmbox".into(),
+                can_play: true,
+                can_go_next: true,
+                status: crate::mpris::PlaybackStatus::Playing,
+                title: "So What".into(),
+                artists: vec!["Miles Davis".into()],
+                ..crate::mpris::PlayerState::default()
+            }),
+        });
+    {
+        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.niri().gnome_settings.calendar;
+        let accent = f.niri().gnome_settings.accent_color;
+        f.niri().panel_popover.toggle_calendar(
+            output.clone(),
+            anchor,
+            cal.week_start,
+            cal.show_week_numbers,
+            accent,
+            Vec::new(),
+        );
+    }
+    f.niri().refresh_popover_media();
+    f.settle_animations();
+
+    let state = f.niri_state();
+    let origin = state.niri.panel_popover.content_location(&output);
+    let (_, card_rect, controls) = state
+        .niri
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .media_card_rects()
+        .remove(0);
+    let play_icon_available = state
+        .niri
+        .icon_cache
+        .resolve("media-playback-pause-symbolic")
+        .is_some();
+
+    let (card_px, art_px, ctrl_px) = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let elems = state
+                .niri
+                .panel_popover
+                .render(vk, &state.niri.icon_cache, &output);
+            let w = to_physical_precise_round(scale.x, output_size(&output).w);
+            let h = to_physical_precise_round(scale.x, 500.);
+            let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
+            let sample = |x: f64, y: f64| {
+                let px = to_physical_precise_round::<i32>(scale.x, origin.x + x);
+                let py = to_physical_precise_round::<i32>(scale.x, origin.y + y);
+                let i = ((py * w + px) * 4) as usize;
+                [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+            };
+            // Between the art and the controls, below the text baselines: plain card fill.
+            let card_px = sample(
+                card_rect.loc.x + card_rect.size.w / 2.,
+                card_rect.loc.y + card_rect.size.h - 4.,
+            );
+            // The art slot's top-left corner area, inside its rounded backdrop but clear of the
+            // 32px fallback glyph.
+            let art_px = sample(card_rect.loc.x + 16., card_rect.loc.y + 40.);
+            // The play/pause glyph. Its dead centre is the GAP between the pause bars, so scan
+            // the row across the icon and keep the brightest pixel.
+            let cy = controls[1].loc.y + controls[1].size.h / 2.;
+            let cx = controls[1].loc.x + controls[1].size.w / 2.;
+            let ctrl_px = (-8..=8)
+                .map(|dx| sample(cx + f64::from(dx), cy))
+                .max_by_key(|px| u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2]))
+                .unwrap();
+            (card_px, art_px, ctrl_px)
+        })
+        .expect("vulkan renderer");
+
+    assert_eq!(card_px[3], 255, "the card must be opaque, got {card_px:?}");
+    assert!(
+        (0x45..=0x60).contains(&card_px[0]) && (0x50..=0x68).contains(&card_px[2]),
+        "expected the .message card bg (#51515a) under the media card, got {card_px:?}"
+    );
+    assert!(
+        art_px[0] > card_px[0] && art_px[2] > card_px[2],
+        "the art slot's white@7% backdrop must sit above the card fill, got {art_px:?} vs {card_px:?}"
+    );
+    if play_icon_available {
+        assert!(
+            ctrl_px[0] > 150 && ctrl_px[1] > 150 && ctrl_px[2] > 150,
+            "the play-pause glyph must composite above the card, got {ctrl_px:?}"
+        );
+    }
+}

@@ -1374,6 +1374,23 @@ impl State {
                 let effects = self.niri.notifications.clear_all();
                 self.niri.apply_notification_effects(effects);
             }
+            // A media card's transport buttons and its body (`js/ui/mpris.js:73-100`). The card is
+            // addressed by bus name, so a player that vanished between the click and the call is
+            // simply dropped by the watcher.
+            PopoverAction::MediaControl { bus_name, control } => {
+                use crate::mpris::NiriToMpris;
+                use crate::ui::media_card::MediaControl;
+
+                self.mpris_control(match control {
+                    MediaControl::Previous => NiriToMpris::Previous(bus_name),
+                    MediaControl::PlayPause => NiriToMpris::PlayPause(bus_name),
+                    MediaControl::Next => NiriToMpris::Next(bus_name),
+                });
+            }
+            PopoverAction::RaiseMediaPlayer(bus_name) => {
+                self.raise_mpris_player(&bus_name);
+                self.niri.layout.close_overview();
+            }
             PopoverAction::SetInputSource(idx) => self.set_input_source(idx),
 
             // The app menu's launch rows. Both leave the overview, like every
@@ -5910,6 +5927,7 @@ impl State {
                                     self.niri.sync_calendar_range();
                                     self.niri.refresh_popover_calendar_events();
                                     self.niri.refresh_popover_world_clocks();
+                                    self.niri.refresh_popover_media();
                                 }
                                 self.niri.suppressed_buttons.insert(button_code);
                                 self.niri.queue_redraw_all();

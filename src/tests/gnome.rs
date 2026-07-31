@@ -12278,3 +12278,140 @@ fn mpris_raise_prefers_the_app() {
         .raise_mpris_player("org.mpris.MediaPlayer2.gone");
     assert!(rx.try_recv().is_err());
 }
+
+/// The media card sits at the TOP of the message list, above every notification group: gnome-shell
+/// inserts each player's message at index 0 of the `MessageView` (`js/ui/messageList.js:1780-1784`,
+/// mpris set up before notifications at `:1516-1518`). It carries no close button and cannot be
+/// cleared (`canClose() = false`, `:668-670`), so a list holding only players shows neither the
+/// placeholder nor the Clear pill (`empty`/`canClear`, `:1521-1527`).
+#[test]
+fn media_cards_sit_above_the_notification_groups() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    // A player, then a notification, so their orders would disagree if the list appended.
+    let bus = "org.mpris.MediaPlayer2.rhythmbox";
+    f.niri_state()
+        .on_mpris_msg(mpris_update(bus, mpris_state("Rhythmbox", None)));
+    let nid = banner_notify(&mut f, banner_req("app-a", ":1.1"));
+    f.settle_animations();
+
+    open_calendar(&mut f);
+    let dm = f.niri().panel_popover.date_menu().unwrap();
+    let media = dm.media_card_rects();
+    let cards = dm.card_rects();
+    assert_eq!(media.len(), 1, "one card per player");
+    assert_eq!(media[0].0, bus);
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].0, nid);
+    assert!(
+        media[0].1.loc.y + media[0].1.size.h <= cards[0].1.loc.y,
+        "the media card must be entirely above the notification card"
+    );
+    // The notification is what makes the pill appear...
+    assert!(dm.clear_pill_rect().is_some());
+
+    // ... and with it gone, a list holding only the player has no pill and no placeholder.
+    f.niri_state()
+        .apply_popover_action(crate::ui::popover::PopoverAction::ClearNotifications);
+    let dm = f.niri().panel_popover.date_menu().unwrap();
+    assert!(dm.card_rects().is_empty());
+    assert_eq!(
+        dm.media_card_rects().len(),
+        1,
+        "the player card survives Clear"
+    );
+    assert!(
+        dm.clear_pill_rect().is_none(),
+        "a media card cannot be closed, so nothing can be cleared"
+    );
+    assert!(
+        !dm.list().is_empty(),
+        "the list is not empty, so no placeholder"
+    );
+
+    // A player that stops being playable takes its card with it (`mpris.js:217-223`).
+    let mut stopped = mpris_state("Rhythmbox", None);
+    stopped.can_play = false;
+    f.niri_state().on_mpris_msg(mpris_update(bus, stopped));
+    let dm = f.niri().panel_popover.date_menu().unwrap();
+    assert!(dm.media_card_rects().is_empty());
+    assert!(dm.list().is_empty(), "now the placeholder is back");
+}
+
+/// The card's controls drive the player (`js/ui/messageList.js:778-791` → `mpris.js:73-91`) and,
+/// unlike a menu item, leave the popover open. Its body raises the player and closes it
+/// (`MediaMessage.vfunc_clicked`, `:799-804`), and an insensitive skip button is `reactive = false`
+/// (`:836-838`) — so a click on it falls through to the body rather than being swallowed.
+#[test]
+fn media_card_controls_drive_the_player() {
+    use crate::mpris::NiriToMpris;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+    let (tx, rx) = async_channel::unbounded();
+    f.niri().mpris_emit = Some(tx);
+
+    // Next is allowed, Previous is not — the state the fall-through case needs.
+    let bus = "org.mpris.MediaPlayer2.rhythmbox";
+    let mut state = mpris_state("Rhythmbox", None);
+    state.can_go_next = true;
+    state.can_go_previous = false;
+    state.can_raise = true;
+    f.niri_state().on_mpris_msg(mpris_update(bus, state));
+
+    open_calendar(&mut f);
+    let output = f.niri_output(1);
+    let origin = f.niri().panel_popover.content_location(&output);
+    let (_, card, controls) = f
+        .niri()
+        .panel_popover
+        .date_menu()
+        .unwrap()
+        .media_card_rects()
+        .remove(0);
+
+    let click = |f: &mut Fixture, rect: smithay::utils::Rectangle<f64, smithay::utils::Logical>| {
+        let cx = origin.x + rect.loc.x + rect.size.w / 2.;
+        let cy = origin.y + rect.loc.y + rect.size.h / 2.;
+        pointer_motion_to(f, cx, cy);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+
+    // Play/pause and next go out on the bus, and the popover stays open.
+    click(&mut f, controls[1]);
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(NiriToMpris::PlayPause(bus.to_owned()))
+    );
+    assert!(
+        f.niri().panel_popover.is_open(),
+        "a control is not a menu item"
+    );
+    click(&mut f, controls[2]);
+    assert_eq!(rx.try_recv().ok(), Some(NiriToMpris::Next(bus.to_owned())));
+
+    // Previous is insensitive: the click reaches the message, which raises the player. With no
+    // app resolved and CanRaise set, raising is the remote `Raise()`.
+    click(&mut f, controls[0]);
+    assert_eq!(rx.try_recv().ok(), Some(NiriToMpris::Raise(bus.to_owned())));
+    // `close()` starts the fade; the popover is open until it finishes.
+    f.settle_animations();
+    assert!(
+        !f.niri().panel_popover.is_open(),
+        "raising the player closes the calendar"
+    );
+
+    // The body does the same. Re-open and click the card away from every control.
+    open_calendar(&mut f);
+    click(
+        &mut f,
+        smithay::utils::Rectangle::new(card.loc, smithay::utils::Size::from((80., card.size.h))),
+    );
+    assert_eq!(rx.try_recv().ok(), Some(NiriToMpris::Raise(bus.to_owned())));
+    f.settle_animations();
+    assert!(!f.niri().panel_popover.is_open());
+}
