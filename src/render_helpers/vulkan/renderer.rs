@@ -1747,10 +1747,15 @@ pub(super) struct GpuTimerSlot {
 }
 
 impl GpuTimer {
-    /// Timestamp pairs in the ring. Deferral keeps one or two submits
-    /// outstanding, so this is slack rather than a working limit; the cost is 16
-    /// queries in a session that asked to be measured.
+    /// Timestamp series in the ring. Deferral keeps one or two submits
+    /// outstanding, so this is slack rather than a working limit; the cost is
+    /// `SLOTS * MARKS` queries in a session that asked to be measured.
     const SLOTS: u64 = 8;
+
+    /// Timestamps per submit: one at the start, then one closing each
+    /// [`niri_vk::stats::GpuPhase`]. Consecutive deltas are the phases; first to
+    /// last is the submit's total, which is what the pair used to give.
+    const MARKS: u64 = 1 + niri_vk::stats::GpuPhase::ALL.len() as u64;
 }
 
 impl GpuTimer {
@@ -1786,7 +1791,7 @@ impl GpuTimer {
 
         let ci = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
-            .query_count(u32::try_from(Self::SLOTS * 2).expect("small"));
+            .query_count(u32::try_from(Self::SLOTS * Self::MARKS).expect("small"));
         let pool = unsafe { gpu.device.create_query_pool(&ci, None) }?;
         Ok(Some(Self {
             pool,
@@ -1798,9 +1803,9 @@ impl GpuTimer {
         }))
     }
 
-    /// The first of the two queries belonging to ring index `index`.
+    /// The first of the [`MARKS`](Self::MARKS) queries belonging to ring index `index`.
     fn query(&self, index: u64) -> u32 {
-        u32::try_from((index % Self::SLOTS) * 2).expect("small")
+        u32::try_from((index % Self::SLOTS) * Self::MARKS).expect("small")
     }
 
     /// The pool only if the session asked for GPU timing.
@@ -2179,25 +2184,43 @@ impl VulkanRenderer {
         let first = timer.query(index);
         unsafe {
             let dev = &self.gpu.device;
-            dev.cmd_reset_query_pool(cbuf, timer.pool, first, 2);
+            dev.cmd_reset_query_pool(cbuf, timer.pool, first, GpuTimer::MARKS as u32);
             dev.cmd_write_timestamp(cbuf, vk::PipelineStageFlags::TOP_OF_PIPE, timer.pool, first);
         }
         Some(slot)
     }
 
-    /// Stamp the end of `cbuf`, just before it is ended and submitted.
-    pub(super) fn gpu_timer_end(&self, cbuf: vk::CommandBuffer, slot: Option<GpuTimerSlot>) {
+    /// Close `phase` in `cbuf`. Must be called for every phase, in
+    /// [`GpuPhase::ALL`](niri_vk::stats::GpuPhase::ALL) order and at a fixed point in the
+    /// recording — a skipped mark does not "leave that phase out", it silently merges it into the
+    /// next one and moves cost between phases.
+    pub(super) fn gpu_timer_mark(
+        &self,
+        cbuf: vk::CommandBuffer,
+        slot: Option<GpuTimerSlot>,
+        phase: niri_vk::stats::GpuPhase,
+    ) {
         let (Some(timer), Some(slot)) = (self.gpu_timer.as_ref(), slot) else {
             return;
         };
+        let query = timer.query(slot.index) + 1 + phase.index() as u32;
         unsafe {
             self.gpu.device.cmd_write_timestamp(
                 cbuf,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 timer.pool,
-                timer.query(slot.index) + 1,
+                query,
             );
         }
+    }
+
+    /// Stamp the end of `cbuf`, just before it is ended and submitted. This is the mark closing
+    /// the last phase, so it doubles as the submit's end.
+    pub(super) fn gpu_timer_end(&self, cbuf: vk::CommandBuffer, slot: Option<GpuTimerSlot>) {
+        let last = *niri_vk::stats::GpuPhase::ALL
+            .last()
+            .expect("GpuPhase::ALL is never empty");
+        self.gpu_timer_mark(cbuf, slot, last);
     }
 
     /// Read back every pending pair up to and including `slot`, reporting each to
@@ -2229,7 +2252,7 @@ impl VulkanRenderer {
     }
 
     fn gpu_timer_read(&self, timer: &GpuTimer, slot: GpuTimerSlot) {
-        let mut ticks = [0u64; 2];
+        let mut ticks = [0u64; GpuTimer::MARKS as usize];
         let res = unsafe {
             self.gpu.device.get_query_pool_results(
                 timer.pool,
@@ -2244,7 +2267,11 @@ impl VulkanRenderer {
             return;
         }
 
-        match timestamp_ticks(ticks, self.gpu.timestamp_valid_bits) {
+        // The submit's total is first-to-last, which is exactly what the old
+        // begin/end pair measured — the phases are a subdivision of it, never a
+        // second opinion about it.
+        let span = [ticks[0], ticks[ticks.len() - 1]];
+        match timestamp_ticks(span, self.gpu.timestamp_valid_bits) {
             TimestampSample::Delta(delta) => {
                 timer.unwritten_run.set(0);
                 timer.ever_written.set(true);
@@ -2253,6 +2280,7 @@ impl VulkanRenderer {
                 // so it is a lost sample too, not a very slow pass.
                 if duration <= GpuTimer::SANE_LIMIT {
                     crate::frame_log::add_gpu_time(slot.seq, slot.site, duration);
+                    self.report_gpu_phases(&ticks, slot, duration);
                 } else {
                     crate::frame_log::add_gpu_lost(slot.seq, slot.site);
                 }
@@ -2281,6 +2309,48 @@ impl VulkanRenderer {
                     timer.unusable.set(true);
                 }
             }
+        }
+    }
+}
+
+impl VulkanRenderer {
+    /// Split a submit's measured total across [`GpuPhase`](niri_vk::stats::GpuPhase) from the
+    /// intermediate marks.
+    ///
+    /// Reported only when the subdivision is *consistent* with the total that was already
+    /// reported: every mark written, non-decreasing, and summing to within a tick of first-to-last.
+    /// A partially written series is a normal outcome on this stack (Venus drops timestamps in
+    /// bursts), and half a subdivision is worse than none — it would put a frame's whole cost in
+    /// whichever phase happened to get its marks, which is a *bias*, not a gap.
+    fn report_gpu_phases(&self, ticks: &[u64], slot: GpuTimerSlot, total: Duration) {
+        use niri_vk::stats::GpuPhase;
+
+        if ticks.contains(&0) {
+            return;
+        }
+        if ticks.windows(2).any(|w| w[1] < w[0]) {
+            return;
+        }
+
+        let mut phases = [Duration::ZERO; GpuPhase::ALL.len()];
+        for (i, phase) in GpuPhase::ALL.iter().enumerate() {
+            let delta =
+                match timestamp_ticks([ticks[i], ticks[i + 1]], self.gpu.timestamp_valid_bits) {
+                    TimestampSample::Delta(d) => self.gpu.timestamp_delta(d),
+                    _ => return,
+                };
+            phases[phase.index()] = delta;
+        }
+
+        // The parts must be the whole: the marks are inside the same command buffer as the span,
+        // so any disagreement means a tick wrapped or came from another clock domain.
+        let summed: Duration = phases.iter().sum();
+        if summed > total + Duration::from_micros(1) {
+            return;
+        }
+
+        for phase in GpuPhase::ALL {
+            crate::frame_log::add_gpu_phase(slot.seq, phase, phases[phase.index()]);
         }
     }
 }

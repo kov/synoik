@@ -149,6 +149,54 @@ impl SubmitSite {
     }
 }
 
+/// Where inside a single command buffer the GPU spent its time.
+///
+/// [`SubmitSite`] answers "which submit", which stopped being an answer once the submit discipline
+/// folded uploads, blur, dmabuf acquires and the present blit *into* the frame's own command
+/// buffer: everything lands in `KmsFrame` and the split reports "scanout ≈ 100%" no matter what
+/// the frame did. That is a property of the architecture, not a measurement, and it is exactly the
+/// reading that made us call the scanout pass irreducible.
+///
+/// These are the phases of one recorded frame, in the order they execute. The boundaries are fixed
+/// points in the recording, not conditional on work existing, so a frame that uploaded nothing
+/// reports a near-zero [`GpuPhase::Upload`] rather than shifting its neighbours' attribution.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GpuPhase {
+    /// Everything recorded before the render pass opens: pending texture/glyph/shm uploads,
+    /// dmabuf acquires, sampleable transitions, and the blur chains queued while collecting
+    /// elements. Named for the position rather than the work because the submit discipline keeps
+    /// moving work into it — that is the point of the discipline, and the reason this phase is
+    /// worth watching.
+    Prepass,
+    /// The render pass(es): the actual scene draws. Damage-scoped, and the only phase whose cost
+    /// the `shaded` counter describes.
+    Render,
+    /// After the render pass closes: the present blit out of the shadow into the scanout dmabuf,
+    /// plus an offscreen frame's final layout transition. The blit exists because this VM's
+    /// primary plane advertises LINEAR only, so we cannot render straight into it — full-damage,
+    /// with a channel reorder, on every damaged frame, and invisible to `shaded`.
+    Present,
+}
+
+impl GpuPhase {
+    /// Every phase, in execution order. The marks bracketing them are placed to match this.
+    pub const ALL: [GpuPhase; 3] = [GpuPhase::Prepass, GpuPhase::Render, GpuPhase::Present];
+
+    /// How it appears in the frame line.
+    pub const fn label(self) -> &'static str {
+        match self {
+            GpuPhase::Prepass => "prepass",
+            GpuPhase::Render => "render",
+            GpuPhase::Present => "present",
+        }
+    }
+
+    /// Position in [`ALL`](Self::ALL), for the per-phase arrays.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// One site's share of a frame. Times are gated on [`set_enabled`]; the count never is.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct SiteTotals {

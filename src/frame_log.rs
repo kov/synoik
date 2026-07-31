@@ -132,6 +132,14 @@ thread_local! {
     static GPU_SAMPLES: RefCell<Vec<(u64, niri_vk::stats::SubmitSite, Option<Duration>)>> =
         const { RefCell::new(Vec::new()) };
 
+    /// A frame's GPU time subdivided by where in its command buffer it went.
+    /// Separate from [`GPU_SAMPLES`] because these are a *subdivision* of samples
+    /// already promised and counted, not promises of their own: they must never
+    /// move `count` or `lost`, or a frame would park waiting for a sample that
+    /// was only ever a breakdown of another one.
+    static GPU_PHASE_SAMPLES: RefCell<Vec<(u64, niri_vk::stats::GpuPhase, Duration)>> =
+        const { RefCell::new(Vec::new()) };
+
     /// How many samples the renderer has promised for the frame being built —
     /// one per submit it stamped. [`FrameLog::end`] waits for exactly this many
     /// before emitting the line, so a frame is never reported with a partial GPU
@@ -392,6 +400,19 @@ pub fn add_gpu_lost(seq: u64, site: niri_vk::stats::SubmitSite) {
     push_gpu_sample(seq, site, None);
 }
 
+/// Report one phase's share of a submit already reported through
+/// [`add_gpu_time`]. Dropped silently outside a frame, like the sample it
+/// subdivides.
+pub fn add_gpu_phase(seq: u64, phase: niri_vk::stats::GpuPhase, duration: Duration) {
+    GPU_PHASE_SAMPLES.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.len() >= MAX_PENDING_SAMPLES {
+            s.remove(0);
+        }
+        s.push((seq, phase, duration));
+    });
+}
+
 fn push_gpu_sample(seq: u64, site: niri_vk::stats::SubmitSite, sample: Option<Duration>) {
     GPU_SAMPLES.with(|s| {
         let mut s = s.borrow_mut();
@@ -413,6 +434,13 @@ pub struct GpuSamples {
     /// which is the whole question when a frame is over budget. Indexed by
     /// `SubmitSite::index`.
     pub by_site: [Duration; niri_vk::stats::SubmitSite::ALL.len()],
+    /// The same time again, split by *where inside* the command buffer it went.
+    /// Orthogonal to `by_site`, not a refinement of it: `by_site` says which
+    /// submit, `by_phase` says prepass / render pass / present. Once the submit
+    /// discipline folded everything into the frame's own buffer, `by_site` alone
+    /// could only ever answer "scanout", so this is the split that can name what
+    /// to attack. Indexed by `GpuPhase::index`.
+    pub by_phase: [Duration; niri_vk::stats::GpuPhase::ALL.len()],
     /// Pairs that came back unusable.
     pub lost: u64,
     /// Pairs of either kind, i.e. how many of the promised samples have landed.
@@ -430,6 +458,12 @@ impl GpuSamples {
             None => self.lost += 1,
         }
     }
+
+    /// A subdivision of time already added by [`add`](Self::add) — it must not
+    /// touch `time`, `count` or `lost`.
+    fn add_phase(&mut self, phase: niri_vk::stats::GpuPhase, duration: Duration) {
+        self.by_phase[phase.index()] += duration;
+    }
 }
 
 /// Take every sample belonging to `seq`, leaving the rest.
@@ -445,6 +479,16 @@ fn take_gpu_samples_for(seq: u64) -> GpuSamples {
                 true
             }
         });
+        GPU_PHASE_SAMPLES.with(|p| {
+            p.borrow_mut().retain(|&(at, phase, d)| {
+                if at == seq {
+                    out.add_phase(phase, d);
+                    false
+                } else {
+                    true
+                }
+            })
+        });
         out
     })
 }
@@ -457,6 +501,11 @@ pub fn take_gpu_samples() -> GpuSamples {
         for (_, site, sample) in s.borrow_mut().drain(..) {
             out.add(site, sample);
         }
+        GPU_PHASE_SAMPLES.with(|p| {
+            for (_, phase, d) in p.borrow_mut().drain(..) {
+                out.add_phase(phase, d);
+            }
+        });
         out
     })
 }
@@ -663,6 +712,9 @@ struct Totals {
     gpu: Duration,
     /// `gpu`, split by the submit it was spent in. Indexed by `SubmitSite::index`.
     gpu_sites: [Duration; niri_vk::stats::SubmitSite::ALL.len()],
+    /// `gpu`, split by where inside the command buffer it went. Indexed by
+    /// `GpuPhase::index`.
+    gpu_phases: [Duration; niri_vk::stats::GpuPhase::ALL.len()],
     /// Timestamp pairs the renderer could not use. Nonzero means `gpu` is a
     /// floor, not a total. See [`GPU_LOST`].
     gpu_lost: u64,
@@ -1003,6 +1055,7 @@ impl FrameLog {
         let totals = Totals {
             gpu: samples.time,
             gpu_sites: samples.by_site,
+            gpu_phases: samples.by_phase,
             gpu_lost: samples.lost,
             bakes: bakes() - frame.bakes_at_start,
             baking: Duration::from_nanos(BAKE_NANOS.with(|c| c.replace(0))),
@@ -1054,6 +1107,14 @@ impl FrameLog {
             if parked.arrived < parked.expected {
                 let late = take_gpu_samples_for(parked.frame.seq);
                 parked.totals.gpu += late.time;
+                for (dst, add) in parked
+                    .totals
+                    .gpu_phases
+                    .iter_mut()
+                    .zip(late.by_phase.iter())
+                {
+                    *dst += *add;
+                }
                 for (dst, add) in parked.totals.gpu_sites.iter_mut().zip(late.by_site.iter()) {
                     *dst += *add;
                 }
@@ -1175,6 +1236,23 @@ impl FrameLog {
                     }
                     let _ = write!(line, "{} {}", site.label(), ms(*d));
                 }
+            }
+            // The phase split, in execution order rather than biggest-first: this
+            // one is read as a shape ("where did the frame go"), and reordering it
+            // per frame makes two lines impossible to compare by eye.
+            let by_phase: Vec<_> = niri_vk::stats::GpuPhase::ALL
+                .iter()
+                .map(|phase| (*phase, totals.gpu_phases[phase.index()]))
+                .collect();
+            if by_phase.iter().any(|(_, d)| !d.is_zero()) {
+                line.push_str(" [");
+                for (i, (phase, d)) in by_phase.iter().enumerate() {
+                    if i > 0 {
+                        line.push_str(", ");
+                    }
+                    let _ = write!(line, "{} {}", phase.label(), ms(*d));
+                }
+                line.push(']');
             }
             line.push(')');
         } else if totals.gpu_lost > 0 {

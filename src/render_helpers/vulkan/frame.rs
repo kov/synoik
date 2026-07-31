@@ -225,6 +225,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let (blur_chains, blur_targets) = renderer.record_pending_blurs(cbuf);
         acquired.extend(blur_targets);
 
+        // Everything folded in ahead of the pass is now recorded; close the prepass phase. This
+        // mark is unconditional — a frame with nothing queued reports a near-zero prepass rather
+        // than merging it into the render pass.
+        renderer.gpu_timer_mark(cbuf, gpu_slot, niri_vk::stats::GpuPhase::Prepass);
+
         {
             let dev = &renderer.gpu.device;
             // `render_pass` is the DONT_CARE base pass (callers clear explicitly) or, when
@@ -1576,6 +1581,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let dev = &self.renderer.gpu.device;
         unsafe {
             dev.cmd_end_render_pass(self.cbuf);
+            self.renderer.gpu_timer_mark(
+                self.cbuf,
+                self.gpu_slot,
+                niri_vk::stats::GpuPhase::Render,
+            );
             // Present-blit scanout (KMS planes wanting `Argb8888`/`Xrgb8888`): the render pass left
             // the R8G8B8A8 shadow in `TRANSFER_SRC_OPTIMAL` (its subpass→EXTERNAL dependency
             // already makes the writes available to a transfer read), so blit it into
@@ -2016,7 +2026,11 @@ fn normalized_src(src: Rectangle<f64, BufferCoord>, texture: &VkTexture) -> [f32
 /// function because it is needed once before the [`VulkanFrame`] exists (tagging
 /// the GPU timestamp pair at `begin`) and again from the frame itself at submit
 /// and retire — three call sites that must never disagree about what a frame is.
-fn submit_site_of(offscreen: bool, for_kms: bool) -> niri_vk::stats::SubmitSite {
+///
+/// Takes two positional `bool`s, which is exactly the shape that swaps silently:
+/// transposing them still compiles and inverts scanout/offscreen attribution for
+/// the whole session. Pinned by `submit_site_names_the_frame_not_the_target`.
+pub(super) fn submit_site_of(offscreen: bool, for_kms: bool) -> niri_vk::stats::SubmitSite {
     if offscreen {
         niri_vk::stats::SubmitSite::OffscreenFrame
     } else if for_kms {

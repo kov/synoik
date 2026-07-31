@@ -5161,3 +5161,111 @@ fn vulkan_a_deferred_acquire_outlives_the_frame_that_records_it() {
          buffer",
     );
 }
+
+/// The submit-site tag, pinned at the function the three call sites share.
+///
+/// It takes two positional `bool`s in the same order at every site, so a
+/// transposition compiles cleanly and simply relabels every frame for the rest of
+/// the session. That matters more than it looks: the frame log's per-site split is
+/// what we read to decide whether the scanout pass or the offscreen work is worth
+/// attacking, and an inverted tag answers that question backwards while looking
+/// perfectly healthy.
+#[test]
+fn submit_site_names_the_frame_not_the_target() {
+    use niri_vk::stats::SubmitSite;
+
+    use super::frame::submit_site_of;
+
+    // offscreen wins over for_kms: a bake is a bake even inside the tty bracket.
+    assert_eq!(submit_site_of(true, true), SubmitSite::OffscreenFrame);
+    assert_eq!(submit_site_of(true, false), SubmitSite::OffscreenFrame);
+    // Not offscreen: the KMS bracket is what tells a scanout frame from a
+    // screencast/screencopy render into a plain dmabuf.
+    assert_eq!(submit_site_of(false, true), SubmitSite::KmsFrame);
+    assert_eq!(submit_site_of(false, false), SubmitSite::DmabufFrame);
+}
+
+/// The intra-frame GPU phase split, through the real render path.
+///
+/// Two things are asserted, and the second is the one with teeth. First, that the
+/// phases *sum to the total the same frame reported* — the marks live in the same
+/// command buffer as the span, so any disagreement means a mark landed out of
+/// order or in the wrong slot. Second, that an **offscreen** frame's `Present` is
+/// smaller than its render pass: that phase brackets the present blit, which only
+/// a frame with a scanout target performs. Without the second check, a mark placed
+/// one statement too early or late would still sum correctly and still look
+/// plausible, while silently moving render-pass time into the phase we are using
+/// to price the blit.
+#[test]
+fn vulkan_gpu_phases_subdivide_the_frame_they_belong_to() {
+    use niri_vk::stats::GpuPhase;
+
+    let skip = |why: &str| eprintln!("skipping vulkan_gpu_phases_subdivide_...: {why}");
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => return skip(&format!("no device ({e})")),
+    };
+    if !vk.enable_gpu_timing() {
+        return skip("no timestamp support");
+    }
+    let _ = crate::frame_log::take_gpu_samples();
+
+    let elements: Vec<OutputRenderElements> = solid_scene()
+        .into_iter()
+        .map(OutputRenderElements::SolidColor)
+        .collect();
+    let mut target = vk
+        .create_buffer(Fourcc::Abgr8888, Size::from((W, H)))
+        .expect("vulkan offscreen");
+    let _ = render_elements_into(&mut vk, &mut target, &elements);
+
+    let samples = crate::frame_log::take_gpu_samples();
+    if samples.time.is_zero() {
+        return skip(&format!(
+            "the device wrote none of this frame's timestamps ({} lost)",
+            samples.lost
+        ));
+    }
+    let summed: Duration = samples.by_phase.iter().sum();
+    if summed.is_zero() {
+        // The subdivision is dropped wholesale when any mark is unwritten. That is
+        // a normal outcome on a stack that drops timestamps in bursts — but only
+        // when the device is *actually* dropping them. With zero losses the span
+        // was measured end to end, so missing marks are a missing or misplaced
+        // `gpu_timer_mark` call, i.e. ours. Skipping there would let a deleted
+        // mark pass as a green test forever.
+        if samples.lost == 0 {
+            panic!(
+                "the frame reported {:?} of GPU time with no lost samples, yet no phase \
+                 was subdivided — a gpu_timer_mark call is missing or out of order",
+                samples.time,
+            );
+        }
+        return skip("the device dropped intermediate marks");
+    }
+
+    // Equal up to the tick the two readings are quantized on. `report_gpu_phases`
+    // already refuses to report a subdivision larger than its span, so this is the
+    // other direction: phases that silently *lose* time would mean a mark landed
+    // outside the span it is supposed to subdivide.
+    let slack = Duration::from_micros(1);
+    assert!(
+        summed + slack >= samples.time && summed <= samples.time + slack,
+        "phases {:?} must sum to the frame's own total {:?}, got {summed:?}",
+        samples.by_phase,
+        samples.time,
+    );
+
+    let present = samples.by_phase[GpuPhase::Present.index()];
+    let render = samples.by_phase[GpuPhase::Render.index()];
+    assert!(
+        present < render,
+        "an offscreen frame does no present blit, so {present:?} must be smaller than \
+         the render pass {render:?} — a larger value means the mark brackets the wrong work",
+    );
+    assert!(
+        !render.is_zero(),
+        "the render pass drew {} elements and must cost something",
+        elements.len(),
+    );
+}
