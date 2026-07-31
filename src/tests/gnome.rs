@@ -12580,3 +12580,169 @@ fn a_panel_volume_change_shows_the_osd_everywhere() {
         "dragging the visible slider must not also raise an OSD"
     );
 }
+
+/// The whole panel-scroll chain end to end — pointer over the volume icon, wheel notch, a real
+/// write reaching the backend, and the OSD (`js/ui/status/volume.js:452-458`).
+///
+/// This is what the [`crate::audio::AudioBackend`] seam bought: with a concrete PipeWire handle on
+/// `Niri` the headless fixture had no backend at all, so the scroll path returned early and none of
+/// this was observable — deleting the `show_volume_osd` call left the suite green.
+#[test]
+fn a_scroll_over_the_volume_icon_steps_the_backend_and_shows_the_osd() {
+    use crate::audio::AudioWrite;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+    let audio = f.install_stub_audio(0.5);
+
+    let volume = f.niri().panel.volume_indicator_rect(1920.).unwrap();
+    let centre_x = volume.loc.x + volume.size.w / 2.;
+    pointer_motion_to(&mut f, centre_x, 10.);
+
+    // One notch down: a write of exactly one slider step, and an OSD saying so.
+    f.scroll_wheel();
+    f.niri_complete_animations();
+    assert_eq!(
+        audio.writes(),
+        vec![AudioWrite::Volume(0.5 - crate::audio::SCROLL_STEP)],
+        "a wheel notch is one SLIDER_SCROLL_STEP, written to the backend"
+    );
+    let content = f
+        .niri()
+        .osd
+        .content(&output)
+        .expect("the scroll shows an OSD");
+    assert_eq!(content.level, Some(0.5 - crate::audio::SCROLL_STEP));
+    assert_eq!(content.icon, vec!["audio-volume-medium-symbolic"]);
+    assert_eq!(
+        f.niri().audio.unwrap().volume,
+        0.5 - crate::audio::SCROLL_STEP,
+        "the model the panel icon reads follows the write, without waiting for an echo"
+    );
+
+    // At the ceiling the write still happens, but the value cannot move -- and GNOME gates the OSD
+    // on `slider.step()` having returned true (`volume.js:457`), so a scroll that changes nothing
+    // must not re-arm an OSD that says the same thing.
+    f.niri_state()
+        .apply_popover_action(crate::ui::popover::PopoverAction::SetVolume(
+            crate::audio::MAX_VOLUME,
+        ));
+    f.niri().osd.hide_all();
+    f.settle_animations();
+    audio.clear_writes();
+
+    f.scroll_wheel_up();
+    f.niri_complete_animations();
+    assert!(
+        !f.niri().osd.is_visible(),
+        "scrolling up at the ceiling must not keep re-arming the OSD"
+    );
+
+    // With the quick settings open the slider is already on screen: `mapped` short-circuits, so the
+    // scroll reports the volume and writes NOTHING (`volume.js:457`). The volume icon lives inside
+    // the quick-settings cluster, so clicking where we just scrolled is what opens it.
+    pointer_motion_to(&mut f, centre_x, 10.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle_animations();
+    assert_eq!(
+        f.niri().panel_popover.open_role(),
+        Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
+        "the volume icon is part of the quick-settings button"
+    );
+    f.niri().osd.hide_all();
+    f.settle_animations();
+    audio.clear_writes();
+
+    f.scroll_wheel();
+    f.niri_complete_animations();
+    assert_eq!(
+        audio.writes(),
+        vec![],
+        "with its slider on screen, the scroll must not change the volume"
+    );
+    assert!(
+        f.niri().osd.is_visible(),
+        "...but it still says what the volume is"
+    );
+}
+
+/// The quick-settings audio controls reach the backend: the sliders write volume, the icons toggle
+/// mute, and the device pickers set the default by `node.name`.
+///
+/// Setting a default is deliberately fire-and-forget — gvc's `change_output` has no corrective echo
+/// for a rejected write, so nothing may move the picker's check optimistically.
+#[test]
+fn the_quick_settings_audio_controls_reach_the_backend() {
+    use crate::audio::{AudioWrite, MicStatus};
+    use crate::ui::popover::PopoverAction;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let audio = f.install_stub_audio(0.5);
+
+    f.niri_state()
+        .apply_popover_action(PopoverAction::SetVolume(0.8));
+    f.niri_state()
+        .apply_popover_action(PopoverAction::ToggleMute);
+    f.niri_state()
+        .apply_popover_action(PopoverAction::SetDefaultSink(
+            "alsa_output.pci-0000_00_1f.3.analog-stereo".to_owned(),
+        ));
+    assert_eq!(
+        audio.writes(),
+        vec![
+            AudioWrite::Volume(0.8),
+            AudioWrite::Muted(true),
+            AudioWrite::DefaultSink("alsa_output.pci-0000_00_1f.3.analog-stereo".to_owned()),
+        ]
+    );
+    assert!(
+        f.niri().audio.unwrap().muted,
+        "the mute toggle updates the model the panel icon reads"
+    );
+    assert_eq!(
+        f.niri().sink_list.default_name,
+        None,
+        "the picker's check waits for the backend's echo -- a rejected write has none"
+    );
+
+    // The input side needs a bound source, exactly as the live backend does: with none, the mic
+    // controls return None and the compositor leaves its model alone.
+    audio.clear_writes();
+    f.niri_state()
+        .apply_popover_action(PopoverAction::ToggleInputMute);
+    assert_eq!(
+        audio.writes(),
+        vec![],
+        "no source bound: nothing to control, and nothing written"
+    );
+
+    let audio = f.install_stub_audio(0.5);
+    let audio = audio.with_mic(MicStatus {
+        recording: true,
+        muted: false,
+        volume: 0.4,
+        source_present: true,
+    });
+    f.niri().audio_backend = Some(Box::new(audio.clone()));
+    f.niri_state()
+        .apply_popover_action(PopoverAction::SetInputVolume(0.6));
+    f.niri_state()
+        .apply_popover_action(PopoverAction::ToggleInputMute);
+    f.niri_state()
+        .apply_popover_action(PopoverAction::SetDefaultSource("alsa_input.usb".to_owned()));
+    assert_eq!(
+        audio.writes(),
+        vec![
+            AudioWrite::InputVolume(0.6),
+            AudioWrite::InputMuted(true),
+            AudioWrite::DefaultSource("alsa_input.usb".to_owned()),
+        ]
+    );
+    assert!(
+        f.niri().mic.muted,
+        "the mic mute updates the model the privacy indicator reads"
+    );
+}

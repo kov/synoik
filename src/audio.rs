@@ -151,6 +151,185 @@ pub fn volume_icon(status: &AudioStatus) -> &'static str {
     ICONS[n.clamp(1, 3) as usize]
 }
 
+/// The compositor's view of an audio backend: everything the input/UI paths ask audio to *do*.
+///
+/// The live implementation is [`crate::pipewire_audio::PwAudio`] (feature `pipewire`), but this
+/// trait mentions no PipeWire type, so it compiles unconditionally and a test can plug in
+/// [`StubAudio`] instead. That is the point: with a concrete `Option<PwAudio>` on `Niri`, a
+/// headless fixture had no audio at all and *nothing* about the wiring was testable — deleting the
+/// OSD call out of the panel-scroll path left the whole suite green.
+///
+/// All methods take `&self`: the live backend drives its PipeWire loop on the compositor's calloop
+/// and mutates through interior mutability, and callers hold `&self.niri.audio_backend` while
+/// needing `&mut self` for the redraw that follows.
+///
+/// The control methods return the **optimistically-updated** status for immediate UI feedback,
+/// or `None` when there is nothing bound to control; the backend's echo confirms it a moment later.
+/// The two `set_default_*` are fire-and-forget: a rejected write has no corrective echo, so the
+/// caller must not move the picker's check on its own.
+pub trait AudioBackend {
+    /// The default sink's last-known state, or `None` if no sink is bound.
+    fn status(&self) -> Option<AudioStatus>;
+    /// The last-known microphone activity, or `None` before the first capture stream is seen.
+    fn mic_status(&self) -> Option<MicStatus>;
+
+    fn set_volume(&self, volume: f64) -> Option<AudioStatus>;
+    fn set_muted(&self, muted: bool) -> Option<AudioStatus>;
+    fn toggle_muted(&self) -> Option<AudioStatus>;
+
+    fn set_input_volume(&self, volume: f64) -> Option<MicStatus>;
+    fn set_input_muted(&self, muted: bool) -> Option<MicStatus>;
+    fn toggle_input_muted(&self) -> Option<MicStatus>;
+
+    fn set_default_sink(&self, node_name: &str);
+    fn set_default_source(&self, node_name: &str);
+
+    /// Nudge the volume by `delta` (e.g. ±[`SCROLL_STEP`]). Clamping is [`set_volume`]'s job.
+    fn adjust_volume(&self, delta: f64) -> Option<AudioStatus> {
+        let current = self.status()?.volume;
+        self.set_volume(current + delta)
+    }
+}
+
+/// A test double for [`AudioBackend`]: holds a status, records every write, and controls whether
+/// anything is "bound" at all (so a test can exercise the no-sink path the live backend takes when
+/// PipeWire has nothing to offer).
+///
+/// Writes are recorded rather than applied blindly — `set_volume` on a stub that is bound updates
+/// the status the way the live node echo would, so a test asserting on the *observable* state
+/// (panel icon, OSD level) exercises the same code the compositor runs.
+///
+/// Cloning shares one state, so a test can hand a clone to the compositor
+/// (`niri.audio_backend = Some(Box::new(stub.clone()))`) and keep its own handle to assert on.
+#[cfg(test)]
+#[derive(Debug, Default, Clone)]
+pub struct StubAudio {
+    inner: std::rc::Rc<std::cell::RefCell<StubAudioInner>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct StubAudioInner {
+    /// `None` = no sink bound, so every output control returns `None`.
+    status: Option<AudioStatus>,
+    /// `None` = no source bound.
+    mic: Option<MicStatus>,
+    /// Every call that reached the backend, in order, for assertions.
+    writes: Vec<AudioWrite>,
+}
+
+/// One recorded control call on [`StubAudio`].
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum AudioWrite {
+    Volume(f64),
+    Muted(bool),
+    InputVolume(f64),
+    InputMuted(bool),
+    DefaultSink(String),
+    DefaultSource(String),
+}
+
+#[cfg(test)]
+impl StubAudio {
+    /// A stub with a bound sink at this volume/mute, and no input source.
+    pub fn with_status(status: AudioStatus) -> Self {
+        let stub = Self::default();
+        stub.inner.borrow_mut().status = Some(status);
+        stub
+    }
+
+    /// Bind an input source with this status (the mic slider needs one to be controllable).
+    pub fn with_mic(self, mic: MicStatus) -> Self {
+        self.inner.borrow_mut().mic = Some(mic);
+        self
+    }
+
+    /// Everything written to the backend so far, in call order.
+    pub fn writes(&self) -> Vec<AudioWrite> {
+        self.inner.borrow().writes.clone()
+    }
+
+    /// Drop the recorded writes, so a test can assert on one interaction at a time.
+    pub fn clear_writes(&self) {
+        self.inner.borrow_mut().writes.clear();
+    }
+}
+
+#[cfg(test)]
+impl AudioBackend for StubAudio {
+    fn status(&self) -> Option<AudioStatus> {
+        self.inner.borrow().status
+    }
+
+    fn mic_status(&self) -> Option<MicStatus> {
+        self.inner.borrow().mic
+    }
+
+    fn set_volume(&self, volume: f64) -> Option<AudioStatus> {
+        let mut inner = self.inner.borrow_mut();
+        // Clamp like the live backend, so a test scrolling past the top sees the same value.
+        let volume = volume.clamp(0.0, MAX_VOLUME);
+        let status = inner.status.as_mut()?;
+        status.volume = volume;
+        let status = *status;
+        inner.writes.push(AudioWrite::Volume(volume));
+        Some(status)
+    }
+
+    fn set_muted(&self, muted: bool) -> Option<AudioStatus> {
+        let mut inner = self.inner.borrow_mut();
+        let status = inner.status.as_mut()?;
+        status.muted = muted;
+        let status = *status;
+        inner.writes.push(AudioWrite::Muted(muted));
+        Some(status)
+    }
+
+    fn toggle_muted(&self) -> Option<AudioStatus> {
+        let muted = self.status()?.muted;
+        self.set_muted(!muted)
+    }
+
+    fn set_input_volume(&self, volume: f64) -> Option<MicStatus> {
+        let mut inner = self.inner.borrow_mut();
+        let volume = volume.clamp(0.0, MAX_VOLUME);
+        let mic = inner.mic.as_mut()?;
+        mic.volume = volume;
+        let mic = *mic;
+        inner.writes.push(AudioWrite::InputVolume(volume));
+        Some(mic)
+    }
+
+    fn set_input_muted(&self, muted: bool) -> Option<MicStatus> {
+        let mut inner = self.inner.borrow_mut();
+        let mic = inner.mic.as_mut()?;
+        mic.muted = muted;
+        let mic = *mic;
+        inner.writes.push(AudioWrite::InputMuted(muted));
+        Some(mic)
+    }
+
+    fn toggle_input_muted(&self) -> Option<MicStatus> {
+        let muted = self.mic_status()?.muted;
+        self.set_input_muted(!muted)
+    }
+
+    fn set_default_sink(&self, node_name: &str) {
+        self.inner
+            .borrow_mut()
+            .writes
+            .push(AudioWrite::DefaultSink(node_name.to_owned()));
+    }
+
+    fn set_default_source(&self, node_name: &str) {
+        self.inner
+            .borrow_mut()
+            .writes
+            .push(AudioWrite::DefaultSource(node_name.to_owned()));
+    }
+}
+
 /// PipeWire node `channelVolumes` are **linear** amplitude; GNOME/PulseAudio present
 /// a **perceptual (cubic)** value — e.g. `pactl` "40%" is `0.4³ ≈ 0.064` linear
 /// (−23.88 dB). Convert a linear channel volume to the perceptual value the slider

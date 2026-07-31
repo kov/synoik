@@ -127,6 +127,27 @@ impl Fixture {
         &mut self.niri_state().niri
     }
 
+    /// Give the compositor a [`StubAudio`] backend bound at `volume` (unmuted) and return a handle
+    /// to it. Without this, `audio_backend` is `None` — the honest headless default, since there is
+    /// no PipeWire — and every audio path silently no-ops, which is exactly how the panel-scroll
+    /// OSD went unpinned for so long.
+    ///
+    /// Also seeds `niri.audio`, the model the panel icon and the OSD read: the live backend
+    /// publishes it over its calloop channel, and nothing drives that channel here.
+    pub fn install_stub_audio(&mut self, volume: f64) -> crate::audio::StubAudio {
+        let status = crate::audio::AudioStatus {
+            volume,
+            muted: false,
+        };
+        let stub = crate::audio::StubAudio::with_status(status);
+        self.niri().audio_backend = Some(Box::new(stub.clone()));
+        // Through the real entry point, not by assigning the field: `on_audio_status` is what also
+        // puts the volume icon in the panel's status cluster, and without it there is nothing to
+        // aim a scroll at.
+        self.niri_state().on_audio_status(Some(status));
+        stub
+    }
+
     pub fn niri_output(&self, n: u8) -> Output {
         let niri = &self.state.server.state.niri;
         let idx = usize::from(n - 1);
@@ -274,6 +295,18 @@ impl Fixture {
             event: SyntheticPointerAxisEvent {
                 time: self.next_input_micros(),
                 v120: 120.0,
+                finger: None,
+            },
+        };
+        self.niri_state().process_input_event(event);
+    }
+
+    /// Inject one vertical wheel notch in the *other* direction (scroll up).
+    pub fn scroll_wheel_up(&mut self) {
+        let event = InputEvent::<SyntheticInputBackend>::PointerAxis {
+            event: SyntheticPointerAxisEvent {
+                time: self.next_input_micros(),
+                v120: -120.0,
                 finger: None,
             },
         };

@@ -327,7 +327,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match niri::pipewire_audio::start(&event_loop.handle()) {
             Ok(pw) => {
                 pw.pump();
-                state.niri.pw_audio = Some(pw);
+                state.niri.audio_backend = Some(Box::new(pw));
             }
             Err(err) => warn!("error starting PipeWire audio watcher: {err:?}"),
         }

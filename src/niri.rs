@@ -545,10 +545,11 @@ pub struct Niri {
     /// Input sources + current default for the QS input-device picker; empty until the PipeWire
     /// watcher reports sources (also where the backend is absent, e.g. headless).
     pub source_list: crate::audio::SourceList,
-    /// The live PipeWire audio connection (feature `audio`); its loop is driven on
-    /// the compositor's calloop. `None` when the connection failed or is disabled.
-    #[cfg(feature = "pipewire")]
-    pub pw_audio: Option<crate::pipewire_audio::PwAudio>,
+    /// Whatever the compositor asks audio to *do* — volume, mute, default device. Live sessions
+    /// get `PwAudio` (feature `pipewire`), whose loop is driven on the compositor's calloop;
+    /// tests get `StubAudio`. `None` when the connection failed, is disabled, or the run is
+    /// headless — every caller must therefore tolerate an absent backend.
+    pub audio_backend: Option<Box<dyn crate::audio::AudioBackend>>,
     /// The decoded `org.gnome.desktop.background` picture, drawn as the
     /// workspace background in GNOME windowing mode.
     pub wallpaper: Wallpaper,
@@ -4263,8 +4264,7 @@ impl Niri {
             mic: crate::audio::MicStatus::default(),
             sink_list: crate::audio::SinkList::default(),
             source_list: crate::audio::SourceList::default(),
-            #[cfg(feature = "pipewire")]
-            pw_audio: None,
+            audio_backend: None,
             system_status: SystemStatus::default(),
             notifications: crate::notifications::NotificationStore::default(),
             notifications_emit: None,

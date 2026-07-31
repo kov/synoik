@@ -1202,47 +1202,42 @@ impl State {
                 spawn(command, None);
                 self.niri.layout.close_overview();
             }
-            #[cfg(feature = "pipewire")]
             PopoverAction::SetVolume(volume) => {
-                if let Some(pw) = self.niri.pw_audio.as_ref() {
-                    let status = pw.set_volume(volume);
+                if let Some(audio) = self.niri.audio_backend.as_ref() {
+                    let status = audio.set_volume(volume);
                     self.on_audio_status(status);
                 }
             }
-            #[cfg(feature = "pipewire")]
             PopoverAction::ToggleMute => {
-                if let Some(pw) = self.niri.pw_audio.as_ref() {
-                    let status = pw.toggle_muted();
+                if let Some(audio) = self.niri.audio_backend.as_ref() {
+                    let status = audio.toggle_muted();
                     self.on_audio_status(status);
                 }
             }
             // Setting the default sink is fire-and-forget: the metadata write echoes back through
             // the watcher, which moves the picker's check and the bound-sink volume. Not applied
             // optimistically (a rejected write has no corrective echo).
-            #[cfg(feature = "pipewire")]
             PopoverAction::SetDefaultSink(name) => {
-                if let Some(pw) = self.niri.pw_audio.as_ref() {
-                    pw.set_default_sink(&name);
+                if let Some(audio) = self.niri.audio_backend.as_ref() {
+                    audio.set_default_sink(&name);
                 }
             }
-            #[cfg(feature = "pipewire")]
             PopoverAction::SetInputVolume(volume) => {
                 if let Some(status) = self
                     .niri
-                    .pw_audio
+                    .audio_backend
                     .as_ref()
-                    .and_then(|pw| pw.set_input_volume(volume))
+                    .and_then(|audio| audio.set_input_volume(volume))
                 {
                     self.on_mic_status(status);
                 }
             }
-            #[cfg(feature = "pipewire")]
             PopoverAction::ToggleInputMute => {
                 if let Some(status) = self
                     .niri
-                    .pw_audio
+                    .audio_backend
                     .as_ref()
-                    .and_then(|pw| pw.toggle_input_muted())
+                    .and_then(|audio| audio.toggle_input_muted())
                 {
                     self.on_mic_status(status);
                 }
@@ -1256,19 +1251,11 @@ impl State {
                 self.set_monitor_brightness(&connector, value);
             }
             // Fire-and-forget, like SetDefaultSink.
-            #[cfg(feature = "pipewire")]
             PopoverAction::SetDefaultSource(name) => {
-                if let Some(pw) = self.niri.pw_audio.as_ref() {
-                    pw.set_default_source(&name);
+                if let Some(audio) = self.niri.audio_backend.as_ref() {
+                    audio.set_default_source(&name);
                 }
             }
-            #[cfg(not(feature = "pipewire"))]
-            PopoverAction::SetVolume(_)
-            | PopoverAction::ToggleMute
-            | PopoverAction::SetDefaultSink(_)
-            | PopoverAction::SetInputVolume(_)
-            | PopoverAction::ToggleInputMute
-            | PopoverAction::SetDefaultSource(_) => {}
             // Airplane mode: fire-and-forget property write on gsd-rfkill's connection (never a
             // blocking Set on this thread); the tile updates when gsd echoes `PropertiesChanged`.
             #[cfg(feature = "dbus")]
@@ -1655,40 +1642,35 @@ impl State {
             self.niri.panel_popover.open_role() == Some(crate::ui::panel::ROLE_QUICK_SETTINGS);
         let action = volume_scroll_action(qs_open, steps);
 
-        #[cfg(feature = "pipewire")]
-        {
-            let steps = match action {
-                VolumeScroll::Ignore => return,
-                // The slider is on screen: say what the volume is, change nothing.
-                VolumeScroll::OsdOnly => {
-                    if let Some(status) = self.niri.audio {
-                        self.show_volume_osd(&status);
-                    }
-                    return;
+        let steps = match action {
+            VolumeScroll::Ignore => return,
+            // The slider is on screen: say what the volume is, change nothing.
+            VolumeScroll::OsdOnly => {
+                if let Some(status) = self.niri.audio {
+                    self.show_volume_osd(&status);
                 }
-                VolumeScroll::Step(steps) => steps,
-            };
-
-            let before = self.niri.audio.map(|status| status.volume);
-            let delta = steps * crate::audio::SCROLL_STEP;
-            let Some(status) = self
-                .niri
-                .pw_audio
-                .as_ref()
-                .and_then(|pw| pw.adjust_volume(delta))
-            else {
                 return;
-            };
-            self.on_audio_status(Some(status));
-            // `slider.step()` reports whether the value moved, and the OSD is gated on it
-            // (`volume.js:457`, `slider.js:134-147`): scrolling up at 100% must not keep
-            // re-arming an OSD that says the same thing.
-            if before != Some(status.volume) {
-                self.show_volume_osd(&status);
             }
+            VolumeScroll::Step(steps) => steps,
+        };
+
+        let before = self.niri.audio.map(|status| status.volume);
+        let delta = steps * crate::audio::SCROLL_STEP;
+        let Some(status) = self
+            .niri
+            .audio_backend
+            .as_ref()
+            .and_then(|audio| audio.adjust_volume(delta))
+        else {
+            return;
+        };
+        self.on_audio_status(Some(status));
+        // `slider.step()` reports whether the value moved, and the OSD is gated on it
+        // (`volume.js:457`, `slider.js:134-147`): scrolling up at 100% must not keep
+        // re-arming an OSD that says the same thing.
+        if before != Some(status.volume) {
+            self.show_volume_osd(&status);
         }
-        #[cfg(not(feature = "pipewire"))]
-        let _ = action;
     }
 
     /// `StreamSlider.showOSD` (`js/ui/status/volume.js:284-289`): the level bar on **every**

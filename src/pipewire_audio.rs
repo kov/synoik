@@ -39,8 +39,8 @@ use pipewire::spa::sys::{
 use pipewire::types::ObjectType;
 
 use crate::audio::{
-    pw_linear_to_volume, sink_default_json, volume_to_pw_linear, AudioStatus, MicStatus, SinkInfo,
-    SinkList, SourceInfo, SourceList, MAX_VOLUME,
+    pw_linear_to_volume, sink_default_json, volume_to_pw_linear, AudioBackend, AudioStatus,
+    MicStatus, SinkInfo, SinkList, SourceInfo, SourceList, MAX_VOLUME,
 };
 use crate::niri::State;
 
@@ -289,22 +289,32 @@ pub fn start(loop_handle: &LoopHandle<'static, State>) -> anyhow::Result<PwAudio
 }
 
 impl PwAudio {
+    /// Manually pump the loop once (used at startup so the initial state lands
+    /// without waiting for the first fd wakeup).
+    pub fn pump(&self) {
+        self.main_loop.loop_().iterate(Duration::ZERO);
+    }
+}
+
+/// The live backend behind [`crate::audio::AudioBackend`]. Everything the compositor calls goes
+/// through the trait, so a headless fixture can swap in `StubAudio`.
+impl AudioBackend for PwAudio {
     /// The last-known default-sink state, or `None` if no sink is bound yet.
-    pub fn status(&self) -> Option<AudioStatus> {
+    fn status(&self) -> Option<AudioStatus> {
         let inner = self.inner.borrow();
         inner.present.then_some(inner.status)
     }
 
     /// The last-known microphone activity (recording + mute). `None` until the first capture stream
     /// is seen; the compositor treats `None` as "not recording".
-    pub fn mic_status(&self) -> Option<MicStatus> {
+    fn mic_status(&self) -> Option<MicStatus> {
         self.inner.borrow().mic_last
     }
 
     /// Set the perceptual volume (clamped to `[0, MAX_VOLUME]`) on the default sink.
     /// Returns the optimistically-updated status for immediate UI feedback (the
     /// node's echo confirms it a moment later).
-    pub fn set_volume(&self, volume: f64) -> Option<AudioStatus> {
+    fn set_volume(&self, volume: f64) -> Option<AudioStatus> {
         let volume = volume.clamp(0.0, MAX_VOLUME);
         let mut inner = self.inner.borrow_mut();
         let bound = inner.bound.as_ref()?;
@@ -319,14 +329,8 @@ impl PwAudio {
         Some(status)
     }
 
-    /// Nudge the volume by `delta` (e.g. ±[`crate::audio::SCROLL_STEP`]).
-    pub fn adjust_volume(&self, delta: f64) -> Option<AudioStatus> {
-        let current = self.status()?.volume;
-        self.set_volume(current + delta)
-    }
-
     /// Set the mute flag on the default sink.
-    pub fn set_muted(&self, muted: bool) -> Option<AudioStatus> {
+    fn set_muted(&self, muted: bool) -> Option<AudioStatus> {
         let mut inner = self.inner.borrow_mut();
         let bound = inner.bound.as_ref()?;
         set_props(&bound.node, None, Some(muted));
@@ -339,7 +343,7 @@ impl PwAudio {
     }
 
     /// Flip the mute flag.
-    pub fn toggle_muted(&self) -> Option<AudioStatus> {
+    fn toggle_muted(&self) -> Option<AudioStatus> {
         let muted = self.status()?.muted;
         self.set_muted(!muted)
     }
@@ -347,7 +351,7 @@ impl PwAudio {
     /// Set the perceptual volume on the default **source** (mic slider). Mirrors [`set_volume`]:
     /// writes `channelVolumes` to the bound source and optimistically publishes the mic status so
     /// the slider and the panel privacy tint react before the echo. No-op if no source is bound.
-    pub fn set_input_volume(&self, volume: f64) -> Option<MicStatus> {
+    fn set_input_volume(&self, volume: f64) -> Option<MicStatus> {
         let volume = volume.clamp(0.0, MAX_VOLUME);
         let mut inner = self.inner.borrow_mut();
         let bound = inner.bound_source.as_ref()?;
@@ -360,7 +364,7 @@ impl PwAudio {
     }
 
     /// Set the mute flag on the default **source**. Mirrors [`set_muted`].
-    pub fn set_input_muted(&self, muted: bool) -> Option<MicStatus> {
+    fn set_input_muted(&self, muted: bool) -> Option<MicStatus> {
         let mut inner = self.inner.borrow_mut();
         let bound = inner.bound_source.as_ref()?;
         set_props(&bound.node, None, Some(muted));
@@ -370,7 +374,7 @@ impl PwAudio {
     }
 
     /// Flip the mute flag on the default source.
-    pub fn toggle_input_muted(&self) -> Option<MicStatus> {
+    fn toggle_input_muted(&self) -> Option<MicStatus> {
         let muted = self.inner.borrow().mic_muted;
         self.set_input_muted(!muted)
     }
@@ -384,7 +388,7 @@ impl PwAudio {
     /// metadata is bound. Safe from this thread: the pipewire loop runs on the compositor's
     /// calloop, and `set_property` is a pure marshal (no synchronous callback, no `Inner`
     /// re-entrancy).
-    pub fn set_default_sink(&self, node_name: &str) {
+    fn set_default_sink(&self, node_name: &str) {
         let inner = self.inner.borrow();
         let Some((metadata, _)) = inner.metadata.as_ref() else {
             return;
@@ -403,7 +407,7 @@ impl PwAudio {
     /// persistent `default.configured.audio.source` metadata key. The input mirror of
     /// [`set_default_sink`]; WirePlumber echoes it back as `default.audio.source`, moving the
     /// picker's check. No-op if no `default` metadata is bound.
-    pub fn set_default_source(&self, node_name: &str) {
+    fn set_default_source(&self, node_name: &str) {
         let inner = self.inner.borrow();
         let Some((metadata, _)) = inner.metadata.as_ref() else {
             return;
@@ -414,12 +418,6 @@ impl PwAudio {
             Some("Spa:String:JSON"),
             Some(&sink_default_json(node_name)),
         );
-    }
-
-    /// Manually pump the loop once (used at startup so the initial state lands
-    /// without waiting for the first fd wakeup).
-    pub fn pump(&self) {
-        self.main_loop.loop_().iterate(Duration::ZERO);
     }
 }
 
