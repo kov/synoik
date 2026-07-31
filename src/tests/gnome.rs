@@ -4168,6 +4168,41 @@ fn panel_clock_is_hh_mm() {
     );
 }
 
+/// The clock label sits 24px inside its panel button, not the 16px a status icon gets.
+///
+/// GNOME gives every `.panel-button` `-natural-hpadding: $base_padding * 2` = 12
+/// (`_panel.scss:28`); what differs is what the child adds. A `.system-status-icon` adds
+/// `margin: 0 $base_margin` = 4 (`:34`), but `.clock` adds `padding-left/right:
+/// $scaled_padding * 2` = 12 (`:161-164`). Measured on a live 50.3 shell at the default
+/// font: the button spans 1183..1377 and the clock's text starts at 1207 — 24 in.
+///
+/// We had 16 for both, from reading the inset as "pill margin + breathing room". That
+/// coincidentally matches the icons (4 + 12) and is 8px short for the clock.
+///
+/// Asserted as a *difference* so it does not depend on which face the test machine
+/// resolves for the UI sans — the shaped text width cancels out.
+#[test]
+fn panel_clock_label_sits_24px_inside_its_button() {
+    let mut panel = crate::ui::panel::Panel::new(
+        crate::animation::Clock::default(),
+        std::rc::Rc::new(std::cell::RefCell::new(niri_config::Config::default())),
+    );
+    panel.update_clock_at(0);
+
+    let rect = panel.date_menu_rect(2560.);
+    let text_w = niri_vk::text::measure_line_width_weighted(
+        panel.clock_text(),
+        crate::ui::pt_to_px(11.) as f32,
+        true,
+    );
+    let pad = (rect.size.w - text_w) / 2.;
+    assert!(
+        (pad - 24.).abs() < 0.001,
+        "clock label must sit 24px inside the button (12 -natural-hpadding + 12 .clock \
+         padding), got {pad}"
+    );
+}
+
 /// Clicking the panel's Activities button toggles the overview (the mouse
 /// counterpart of the Super-tap), and the button's checked highlight tracks
 /// the overview state.

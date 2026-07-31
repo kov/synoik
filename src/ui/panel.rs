@@ -84,10 +84,18 @@ pub(crate) const DOT_DIAMETER: f64 = 8.;
 const DOT_SPACING: f64 = 5.;
 
 /// Horizontal padding from the button's hit-rect edge to its content (the dot row
-/// or the status-icon cluster), logical px: the pill's edge inset (`BTN_MARGIN_X`)
-/// plus the panel_button breathing room (`BTN_H_PADDING`), so the content sits
-/// `BTN_H_PADDING` inside the lit pill.
-const INDICATOR_H_PADDING: f64 = BTN_MARGIN_X + BTN_H_PADDING;
+/// or the status-icon cluster), logical px: the panel_button `-natural-hpadding`
+/// (`BTN_H_PADDING`) measured from the button edge, plus the icon's own
+/// `margin: 0 $base_margin` (`_panel.scss:34`).
+///
+/// This is 16 either way, but *not* via the pill: measured live, a `.system-status-icon`'s
+/// margin box starts exactly `BTN_H_PADDING` inside the button rect, so the pill's
+/// `BTN_MARGIN_X` does not enter a content offset. Reading it as "pill inset + breathing
+/// room" is what put the clock 8px short — see [`clock_h_padding`].
+const INDICATOR_H_PADDING: f64 = BTN_H_PADDING + STATUS_ICON_MARGIN_X;
+
+/// `.panel-button .system-status-icon { margin: 0 $base_margin }` (`_panel.scss:34`).
+const STATUS_ICON_MARGIN_X: f64 = 4.;
 
 /// Inactive dots are drawn at 0.75× and half-opacity (`panel.js`
 /// `INACTIVE_WORKSPACE_DOT_SCALE`, `WorkspaceDot._updateVisuals`).
@@ -95,9 +103,16 @@ const INACTIVE_DOT_SCALE: f64 = 0.75;
 const INACTIVE_DOT_OPACITY: f64 = 0.5;
 
 /// Horizontal padding from the dateMenu (clock) button's hit-rect edge to the clock
-/// label, logical px — the pill inset plus the panel_button breathing room, so the
-/// clock sits `BTN_H_PADDING` inside its lit pill, like the other buttons.
-const H_PADDING: f64 = BTN_MARGIN_X + BTN_H_PADDING;
+/// label, logical px: the panel_button `-natural-hpadding` (`BTN_H_PADDING`) plus
+/// `.clock`'s own `padding-left/right: $scaled_padding * 2` (`_panel.scss:161-164`).
+///
+/// The clock does *not* share the status icons' inset: an icon contributes a 4px margin
+/// where the clock contributes 12px of padding, so the label sits 24px in, not 16.
+/// `$scaled_padding` is `to_em(6px)`, so unlike `$base_margin` this half scales with the
+/// user's font — hence [`crate::ui::em`] rather than a literal.
+fn clock_h_padding() -> f64 {
+    BTN_H_PADDING + 2. * crate::ui::scaled_px(6.)
+}
 
 /// The dateMenu messages-indicator dot: `message-indicator-symbolic` at
 /// `$scalable_icon_size` (`_panel.scss:92-94`), sitting AFTER the clock with a
@@ -980,7 +995,7 @@ impl Panel {
     pub fn date_menu_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
         let clock_w =
             niri_vk::text::measure_line_width_weighted(&self.clock_text, font_px() as f32, true);
-        let w = clock_w + H_PADDING * 2.;
+        let w = clock_w + clock_h_padding() * 2.;
         Rectangle::new(
             Point::from(((output_width - w) / 2., 0.)),
             Size::from((w, panel_height())),

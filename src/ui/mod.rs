@@ -127,6 +127,20 @@ pub fn em(mult: f64) -> f64 {
     mult * pt_to_px(BASE_FONT_PT)
 }
 
+/// A px length the theme wrote through `to_em()` — GNOME's `$scaled_padding`
+/// (`to_em(6px)`, `_common.scss`) and friends. `to_em` converts the px length against the
+/// *default* base font, so the rule reads as px on a default desktop but scales with the
+/// user's font like any em.
+///
+/// This is the distinction [`em`]'s doc-comment warns about, from the other side: `$base_padding`
+/// (6px) is a literal that never moves, while `$scaled_padding` is *also* 6px at the default size
+/// and moves. They are indistinguishable on a default desktop, so check which one the rule used
+/// (`_panel.scss:161` `.clock` is `$scaled_padding`; `_panel.scss:28` `-natural-hpadding` is
+/// `$base_padding`) rather than matching on the number.
+pub fn scaled_px(px: f64) -> f64 {
+    px * base_font_pt() / BASE_FONT_PT
+}
+
 /// The logical height of one line of text at `pt` — the box a single-line label
 /// occupies, which is what a container's height is measured from.
 ///
