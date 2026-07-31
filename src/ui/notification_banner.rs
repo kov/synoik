@@ -53,9 +53,15 @@ use crate::utils::output_size;
 fn em() -> f64 {
     crate::ui::pt_to_px(11.)
 }
-/// `$notification_banner_width: 34em` (`_notifications.scss:2`).
+/// The banner's box width. `$notification_banner_width: 34em` (`_notifications.scss:2`) is a
+/// **content** width — St's `width` is, and `adjust_preferred_width` adds border and padding on
+/// top — so the box is 34em plus `.message`'s padding and its 1px border. Measured 513 on a live
+/// 50.3 shell against a 498.64 content width.
+///
+/// We passed the bare 34em as the box and drew a banner ~14px narrow. Same trap as
+/// `.message-list`'s 29em; see [`crate::ui::calendar`].
 fn width_px() -> f64 {
-    34. * em()
+    34. * em() + 2. * (crate::ui::notification_card::PAD + crate::ui::notification_card::BORDER)
 }
 /// `$modal_radius` (`_notifications.scss:11`).
 const RADIUS: f64 = 16.;
@@ -617,5 +623,32 @@ impl NotificationBanner {
         }
 
         elements
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The banner box matches what a live GNOME 50.3 shell allocates: **513** wide.
+    ///
+    /// `$notification_banner_width: 34em` is a *content* width — St's `width` is, and
+    /// `adjust_preferred_width` adds border and padding on top. Measured on a mapped actor dump:
+    /// the theme reports `width: 498.64` (34em) and the actor is allocated 513. Passing the bare
+    /// 34em as the box drew a banner ~14px narrow.
+    ///
+    /// Same trap as `.message-list`'s `29em`, which cost 15px on the date popover.
+    #[test]
+    fn the_banner_box_matches_the_live_shell() {
+        let content = 34. * em();
+        assert!(
+            (content - 498.64).abs() < 0.1,
+            "34em must be the shell's 498.64 content width, got {content}"
+        );
+        assert!(
+            (width_px() - 512.64).abs() < 0.1,
+            "the box adds .message's padding and border on top of 34em (513 live), got {}",
+            width_px()
+        );
     }
 }

@@ -30,6 +30,16 @@ use crate::ui::widget::{self, Align, Painter, ShapedText, TextShaper, TextStyle}
 
 /// `.message` padding = `$base_padding` (`_message-list.scss:83`).
 pub const PAD: f64 = 6.;
+
+/// `.message` `border: 1px` — `$card_shadow_border_color`, transparent in the dark theme but
+/// still reserved, since St is border-box.
+///
+/// NOTE: this is currently only used to size the *box* (see the banner's `width_px`). The layout
+/// below still places content at `PAD` from the card edge rather than `BORDER + PAD`, so a card's
+/// content box is 2px larger than the shell's and sits 1px out. Live `.message`: a 413 box holds
+/// 399 of content; ours holds 401. Fixing that means insetting every edge-relative point here by
+/// `BORDER`, which is a separate change.
+pub const BORDER: f64 = 1.;
 /// `.message-header-content` min-height (`_message-list.scss:118`).
 pub const HEADER_H: f64 = 24.;
 /// `.message-header-content` padding-bottom (`_message-list.scss:120`). Separate from [`PAD`]
