@@ -24,6 +24,7 @@ use calloop::generic::Generic;
 use calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken};
 use pipewire::context::ContextRc;
 use pipewire::core::CoreRc;
+use pipewire::device::{Device, DeviceInfoRef, DeviceListener};
 use pipewire::main_loop::MainLoopRc;
 use pipewire::metadata::{Metadata, MetadataListener};
 use pipewire::node::{Node, NodeInfoRef, NodeListener};
@@ -34,13 +35,19 @@ use pipewire::spa::pod::deserialize::PodDeserializer;
 use pipewire::spa::pod::serialize::PodSerializer;
 use pipewire::spa::pod::{Object, Pod, Property, PropertyFlags, Value, ValueArray};
 use pipewire::spa::sys::{
-    SPA_PARAM_Props, SPA_PROP_channelVolumes, SPA_PROP_mute, SPA_PROP_volume, SPA_TYPE_OBJECT_Props,
+    SPA_PARAM_AVAILABILITY_no, SPA_PARAM_AVAILABILITY_yes, SPA_PARAM_Props,
+    SPA_PARAM_ROUTE_available, SPA_PARAM_ROUTE_description, SPA_PARAM_ROUTE_device,
+    SPA_PARAM_ROUTE_devices, SPA_PARAM_ROUTE_direction, SPA_PARAM_ROUTE_index,
+    SPA_PARAM_ROUTE_name, SPA_PARAM_ROUTE_priority, SPA_PARAM_ROUTE_profiles,
+    SPA_PROP_channelVolumes, SPA_PROP_mute, SPA_PROP_volume, SPA_TYPE_OBJECT_ParamRoute,
+    SPA_TYPE_OBJECT_Props, SPA_DIRECTION_INPUT, SPA_DIRECTION_OUTPUT,
 };
 use pipewire::types::ObjectType;
 
 use crate::audio::{
-    pw_linear_to_volume, sink_default_json, volume_to_pw_linear, AudioBackend, AudioStatus,
-    MicStatus, SinkInfo, SinkList, SourceInfo, SourceList, MAX_VOLUME,
+    pw_linear_to_volume, sink_default_json, volume_to_pw_linear, AudioBackend, AudioCard,
+    AudioCards, AudioStatus, BoundSinkInfo, MicStatus, PortAvailability, PortDirection, RouteInfo,
+    SinkCard, SinkInfo, SinkList, SourceInfo, SourceList, MAX_VOLUME,
 };
 use crate::niri::State;
 
@@ -63,6 +70,14 @@ struct BoundSink {
     _listener: NodeListener,
     /// Channel count from the last `channelVolumes` read, so writes match.
     channels: usize,
+    /// The card this sink belongs to (`device.id`, copied from the registry global) and the SPA
+    /// device index within it (`card.profile.device`). The latter is **only** in the node's `info`
+    /// props, never in the registry global — reading it from the global silently yields `None`
+    /// forever, which a headless test cannot catch and a live run showed in one shot.
+    card_id: Option<u32>,
+    card_profile_device: Option<u32>,
+    /// `device.form_factor`, also info-only.
+    form_factor: Option<String>,
 }
 
 /// A bound default-source node, kept alive so its `Props` (mute + volume) events flow.
@@ -88,16 +103,48 @@ struct Capture {
     _listener: NodeListener,
 }
 
+/// A tracked `Audio/Sink` or `Audio/Source` node. Everything here is captured once, when the global
+/// appears — props are only live inside that registry callback — and never updated; node
+/// descriptions and card membership are effectively static.
+struct TrackedNode {
+    name: String,
+    description: String,
+    /// The `Audio/Device` global this node belongs to (`device.id`), absent on virtual nodes with
+    /// no card behind them (e.g. `auto_null`). This one IS in the registry global props; its
+    /// companion `card.profile.device` is not, and comes from the bound node's `info` event —
+    /// see [`BoundSink`].
+    device_id: Option<u32>,
+    /// Owned global, for binding the node later (it isn't `Clone`).
+    global: GlobalObject<PropertiesBox>,
+}
+
+/// A tracked `Audio/Device` — one sound card. Its routes are its ports, in gvc's sense.
+struct TrackedCard {
+    description: String,
+    icon_name: Option<String>,
+    /// Every route the card offers, accumulated from the `EnumRoute` param (PipeWire sends one pod
+    /// per route, so this fills over several callbacks and resets when the enumeration restarts).
+    ports: Vec<RouteInfo>,
+    /// The active route per direction, from the `Route` param, same accumulate-and-reset rule.
+    active: Vec<RouteInfo>,
+    _device: Device,
+    _listener: DeviceListener,
+}
+
 #[derive(Default)]
 struct Inner {
     /// Registry, so the metadata callback can bind a node when the default changes.
     registry: Option<RegistryRc>,
     /// `default` metadata proxy + listener (bound once).
     metadata: Option<(Metadata, MetadataListener)>,
-    /// Known `Audio/Sink` nodes: id → (node.name, node.description, owned global for late
-    /// binding). The description is captured once when the global appears (props are only live
-    /// in that callback) and never updated — sink descriptions are effectively static.
-    sinks: HashMap<u32, (String, String, GlobalObject<PropertiesBox>)>,
+    /// Known `Audio/Sink` nodes by PipeWire global id.
+    sinks: HashMap<u32, TrackedNode>,
+    /// Known `Audio/Device` cards by global id, with their routes.
+    cards: HashMap<u32, TrackedCard>,
+    /// The last card list handed to the compositor, and one it hasn't drained yet — published only
+    /// on an actual change, like every other list here.
+    cards_last: Option<AudioCards>,
+    cards_dirty: Option<AudioCards>,
     /// The default sink's `node.name`, from `default.audio.sink`.
     default_name: Option<String>,
     /// The currently-bound default sink.
@@ -112,9 +159,8 @@ struct Inner {
     sink_list_dirty: Option<SinkList>,
 
     // --- Microphone privacy indicator + input slider/picker (input side) ---
-    /// Known `Audio/Source` nodes: id → (node.name, node.description, owned global for late
-    /// binding). Description captured once at appearance (props are only live then), like sinks.
-    sources: HashMap<u32, (String, String, GlobalObject<PropertiesBox>)>,
+    /// Known `Audio/Source` nodes by PipeWire global id.
+    sources: HashMap<u32, TrackedNode>,
     /// The default source's `node.name`, from `default.audio.source`.
     default_source_name: Option<String>,
     /// The currently-bound default source (for its mute + volume).
@@ -177,10 +223,10 @@ impl Inner {
             sources: ids
                 .iter()
                 .map(|id| {
-                    let (name, description, _) = &self.sources[id];
+                    let node = &self.sources[id];
                     SourceInfo {
-                        name: name.clone(),
-                        description: description.clone(),
+                        name: node.name.clone(),
+                        description: node.description.clone(),
                     }
                 })
                 .collect(),
@@ -203,18 +249,51 @@ impl Inner {
             sinks: ids
                 .iter()
                 .map(|id| {
-                    let (name, description, _) = &self.sinks[id];
+                    let node = &self.sinks[id];
                     SinkInfo {
-                        name: name.clone(),
-                        description: description.clone(),
+                        name: node.name.clone(),
+                        description: node.description.clone(),
                     }
                 })
                 .collect(),
             default_name: self.default_name.clone(),
+            bound: self.bound.as_ref().map(|b| BoundSinkInfo {
+                card: b.card_id.map(|card_id| SinkCard {
+                    card_id,
+                    device: b.card_profile_device,
+                }),
+                form_factor: b.form_factor.clone(),
+            }),
         };
         if self.sink_list_last.as_ref() != Some(&list) {
             self.sink_list_last = Some(list.clone());
             self.sink_list_dirty = Some(list);
+        }
+    }
+
+    /// Rebuild the card/route model and flag it for the compositor only on an actual change. Sorted
+    /// by PipeWire global id, like every other list here.
+    fn publish_cards(&mut self) {
+        let mut ids: Vec<u32> = self.cards.keys().copied().collect();
+        ids.sort_unstable();
+        let cards = AudioCards {
+            cards: ids
+                .iter()
+                .map(|id| {
+                    let card = &self.cards[id];
+                    AudioCard {
+                        id: *id,
+                        description: card.description.clone(),
+                        icon_name: card.icon_name.clone(),
+                        ports: card.ports.clone(),
+                        active: card.active.clone(),
+                    }
+                })
+                .collect(),
+        };
+        if self.cards_last.as_ref() != Some(&cards) {
+            self.cards_last = Some(cards.clone());
+            self.cards_dirty = Some(cards);
         }
     }
 }
@@ -251,13 +330,14 @@ pub fn start(loop_handle: &LoopHandle<'static, State>) -> anyhow::Result<PwAudio
                 wrapper.0.loop_().iterate(Duration::ZERO);
                 // Drain all signals under one borrow, then release it before calling into State
                 // (which redraws) so nothing can re-enter a borrowed Inner.
-                let (dirty, mic_dirty, sink_list_dirty, source_list_dirty) = {
+                let (dirty, mic_dirty, sink_list_dirty, source_list_dirty, cards_dirty) = {
                     let mut inner = inner.borrow_mut();
                     (
                         inner.dirty.take(),
                         inner.mic_dirty.take(),
                         inner.sink_list_dirty.take(),
                         inner.source_list_dirty.take(),
+                        inner.cards_dirty.take(),
                     )
                 };
                 if let Some(status) = dirty {
@@ -271,6 +351,9 @@ pub fn start(loop_handle: &LoopHandle<'static, State>) -> anyhow::Result<PwAudio
                 }
                 if let Some(list) = source_list_dirty {
                     state.on_source_list(list);
+                }
+                if let Some(cards) = cards_dirty {
+                    state.on_audio_cards(cards);
                 }
                 Ok(PostAction::Continue)
             }
@@ -443,22 +526,12 @@ fn on_global(
                 return;
             };
             if class == "Audio/Sink" {
-                let Some(name) = props.get("node.name") else {
+                let Some(node) = track_node(obj, props) else {
                     return;
                 };
-                let name = name.to_string();
-                // Human label for the picker, in gvc's preference order; last-resort the machine
-                // name. Captured now — props are only live inside this callback.
-                let description = props
-                    .get("node.description")
-                    .or_else(|| props.get("node.nick"))
-                    .or_else(|| props.get("device.description"))
-                    .unwrap_or(name.as_str())
-                    .to_string();
+                let name = node.name.clone();
                 let mut inner = inner_rc.borrow_mut();
-                inner
-                    .sinks
-                    .insert(obj.id, (name.clone(), description, obj.to_owned()));
+                inner.sinks.insert(obj.id, node);
                 // If this is the default sink and nothing is bound yet, bind it now.
                 if inner.default_name.as_deref() == Some(name.as_str())
                     && inner.bound.as_ref().map(|b| b.id) != Some(obj.id)
@@ -469,21 +542,12 @@ fn on_global(
             } else if class.starts_with("Audio/Source") {
                 // Prefix, not exact: virtual/processed mics (echo-cancel, the default source on
                 // many laptops) are `Audio/Source/Virtual`.
-                let Some(name) = props.get("node.name") else {
+                let Some(node) = track_node(obj, props) else {
                     return;
                 };
-                let name = name.to_string();
-                // Human label for the picker, gvc's preference order (same as sinks).
-                let description = props
-                    .get("node.description")
-                    .or_else(|| props.get("node.nick"))
-                    .or_else(|| props.get("device.description"))
-                    .unwrap_or(name.as_str())
-                    .to_string();
+                let name = node.name.clone();
                 let mut inner = inner_rc.borrow_mut();
-                inner
-                    .sources
-                    .insert(obj.id, (name.clone(), description, obj.to_owned()));
+                inner.sources.insert(obj.id, node);
                 if inner.default_source_name.as_deref() == Some(name.as_str())
                     && inner.bound_source.as_ref().map(|b| b.id) != Some(obj.id)
                 {
@@ -494,6 +558,19 @@ fn on_global(
                 // An application recording from a mic. Bind it to watch its run-state.
                 track_capture(&inner_rc, weak, obj, props);
             }
+        }
+        // A sound card. Its routes are gvc's ports: what the device picker lists, and what the
+        // headphone detection reads (`gvc-mixer-control.c:1973-2006`).
+        ObjectType::Device => {
+            let Some(props) = obj.props else { return };
+            // Only audio cards; PipeWire also surfaces Video/Device (cameras) here.
+            if !props
+                .get("media.class")
+                .is_some_and(|c| c.starts_with("Audio/"))
+            {
+                return;
+            }
+            track_card(&inner_rc, weak, obj, props);
         }
         ObjectType::Metadata => {
             let is_default = obj.props.and_then(|p| p.get("metadata.name")) == Some("default");
@@ -533,6 +610,151 @@ fn on_global(
     }
 }
 
+/// Capture everything we need from an `Audio/Sink` / `Audio/Source` node's props, which are only
+/// live inside the registry callback. `None` when the node has no `node.name` — the key we match
+/// the default against, so a node without one is unusable.
+fn track_node(
+    obj: &GlobalObject<&pipewire::spa::utils::dict::DictRef>,
+    props: &pipewire::spa::utils::dict::DictRef,
+) -> Option<TrackedNode> {
+    let name = props.get("node.name")?.to_string();
+    // Human label for the picker, in gvc's preference order; last-resort the machine name.
+    let description = props
+        .get("node.description")
+        .or_else(|| props.get("node.nick"))
+        .or_else(|| props.get("device.description"))
+        .unwrap_or(name.as_str())
+        .to_string();
+    Some(TrackedNode {
+        name,
+        description,
+        device_id: props.get("device.id").and_then(|v| v.parse().ok()),
+        global: obj.to_owned(),
+    })
+}
+
+/// Bind a card and subscribe to its routes. `EnumRoute` gives every port the card has; `Route`
+/// gives the active one per direction.
+fn track_card(
+    inner_rc: &Rc<RefCell<Inner>>,
+    weak: &Weak<RefCell<Inner>>,
+    obj: &GlobalObject<&pipewire::spa::utils::dict::DictRef>,
+    props: &pipewire::spa::utils::dict::DictRef,
+) {
+    let id = obj.id;
+    let mut inner = inner_rc.borrow_mut();
+    if inner.cards.contains_key(&id) {
+        return;
+    }
+    let Some(registry) = inner.registry.clone() else {
+        return;
+    };
+    let device = match registry.bind::<Device, _>(obj) {
+        Ok(device) => device,
+        Err(_) => {
+            warn!("failed to bind audio device {id}");
+            return;
+        }
+    };
+    let listener = {
+        let weak = weak.clone();
+        let weak_info = weak.clone();
+        device
+            .add_listener_local()
+            .param(move |_seq, param_id, index, _next, pod| {
+                if let Some(pod) = pod {
+                    on_device_param(&weak, id, param_id, index, pod);
+                }
+            })
+            // `device.icon-name` is info-only, like the node props above — the registry global for
+            // this card carries description/nick/name but no icon.
+            .info(move |info| on_device_info(&weak_info, id, info))
+            .register()
+    };
+    device.subscribe_params(&[ParamType::EnumRoute, ParamType::Route]);
+    inner.cards.insert(
+        id,
+        TrackedCard {
+            // gvc's card name, which becomes a device row's "origin"
+            // (`gvc-mixer-control.c:1982`, `gvc_mixer_card_set_name` from `device.description`).
+            description: props
+                .get("device.description")
+                .or_else(|| props.get("device.nick"))
+                .or_else(|| props.get("device.name"))
+                .unwrap_or_default()
+                .to_string(),
+            // Filled from the `info` event below; the registry global has no icon.
+            icon_name: None,
+            ports: Vec::new(),
+            active: Vec::new(),
+            _device: device,
+            _listener: listener,
+        },
+    );
+    inner.publish_cards();
+}
+
+/// A card's `info` arrived: pick up `device.icon-name` (the picker row's icon, and the fallback for
+/// a device with no icon of its own, `gvc-mixer-ui-device.c:632-643`) and a better description if
+/// the info props carry one. Neither is in the registry global.
+fn on_device_info(weak: &Weak<RefCell<Inner>>, card_id: u32, info: &DeviceInfoRef) {
+    let Some(props) = info.props() else { return };
+    let icon_name = props.get("device.icon-name").map(str::to_string);
+    let description = props.get("device.description").map(str::to_string);
+    let Some(inner_rc) = weak.upgrade() else {
+        return;
+    };
+    let mut inner = inner_rc.borrow_mut();
+    let Some(card) = inner.cards.get_mut(&card_id) else {
+        return;
+    };
+    // Never clear a known value: `info` repeats with partial change masks.
+    if icon_name.is_some() {
+        card.icon_name = icon_name;
+    }
+    if let Some(description) = description {
+        card.description = description;
+    }
+    inner.publish_cards();
+}
+
+/// A card's route param arrived. PipeWire sends **one pod per route**, indexed from 0, so each
+/// enumeration is accumulated and an `index == 0` starts a fresh one — otherwise a re-subscribe (or
+/// a profile switch, which re-enumerates) would append duplicates forever.
+fn on_device_param(
+    weak: &Weak<RefCell<Inner>>,
+    card_id: u32,
+    param_id: ParamType,
+    index: u32,
+    pod: &Pod,
+) {
+    let is_enum = match param_id {
+        ParamType::EnumRoute => true,
+        ParamType::Route => false,
+        _ => return,
+    };
+    let Some(route) = parse_route(pod) else {
+        return;
+    };
+    let Some(inner_rc) = weak.upgrade() else {
+        return;
+    };
+    let mut inner = inner_rc.borrow_mut();
+    let Some(card) = inner.cards.get_mut(&card_id) else {
+        return;
+    };
+    let list = if is_enum {
+        &mut card.ports
+    } else {
+        &mut card.active
+    };
+    if index == 0 {
+        list.clear();
+    }
+    list.push(route);
+    inner.publish_cards();
+}
+
 /// A global went away: drop the sink and unbind if it was the default.
 fn on_global_remove(weak: &Weak<RefCell<Inner>>, id: u32) {
     let Some(inner_rc) = weak.upgrade() else {
@@ -544,6 +766,9 @@ fn on_global_remove(weak: &Weak<RefCell<Inner>>, id: u32) {
     }
     if inner.sources.remove(&id).is_some() {
         inner.publish_sources();
+    }
+    if inner.cards.remove(&id).is_some() {
+        inner.publish_cards();
     }
     if inner.bound.as_ref().map(|b| b.id) == Some(id) {
         inner.bound = None;
@@ -614,7 +839,7 @@ fn bind_default(inner: &mut Inner, weak: &Weak<RefCell<Inner>>) {
     let Some(id) = inner
         .sinks
         .iter()
-        .find(|(_, (n, _, _))| *n == name)
+        .find(|(_, node)| node.name == name)
         .map(|(id, _)| *id)
     else {
         return; // node not surfaced yet; on_global will bind it when it appears
@@ -624,7 +849,7 @@ fn bind_default(inner: &mut Inner, weak: &Weak<RefCell<Inner>>) {
     }
     // Bind from a borrow of the stored global (GlobalObject isn't Clone); the borrow
     // ends before we write `inner.bound` below.
-    let node = match registry.bind::<Node, _>(&inner.sinks[&id].2) {
+    let node = match registry.bind::<Node, _>(&inner.sinks[&id].global) {
         Ok(node) => node,
         Err(_) => {
             warn!("failed to bind default audio sink node {id}");
@@ -633,21 +858,60 @@ fn bind_default(inner: &mut Inner, weak: &Weak<RefCell<Inner>>) {
     };
     let listener = {
         let weak = weak.clone();
+        let weak_info = weak.clone();
         node.add_listener_local()
             .param(move |_seq, _id, _index, _next, pod| {
                 if let Some(pod) = pod {
                     on_node_param(&weak, pod);
                 }
             })
+            // The node's full props — `card.profile.device` and `device.form_factor` live here and
+            // nowhere else; the registry global that surfaced this node carries neither.
+            .info(move |info| on_bound_sink_info(&weak_info, info))
             .register()
     };
     node.subscribe_params(&[ParamType::Props]);
+    let card_id = inner.sinks.get(&id).and_then(|n| n.device_id);
     inner.bound = Some(BoundSink {
         id,
         node,
         _listener: listener,
         channels: 2,
+        card_id,
+        card_profile_device: None,
+        form_factor: None,
     });
+    // Publish now so a bind that never gets an `info` still reports its card.
+    inner.publish_sinks();
+}
+
+/// The bound default sink's `info` arrived: pick up the props a registry global does not carry.
+fn on_bound_sink_info(weak: &Weak<RefCell<Inner>>, info: &NodeInfoRef) {
+    let Some(props) = info.props() else { return };
+    let card_profile_device = props
+        .get("card.profile.device")
+        .and_then(|v| v.parse::<u32>().ok());
+    let form_factor = props.get("device.form_factor").map(str::to_string);
+    let device_id = props.get("device.id").and_then(|v| v.parse::<u32>().ok());
+    let Some(inner_rc) = weak.upgrade() else {
+        return;
+    };
+    let mut inner = inner_rc.borrow_mut();
+    let Some(bound) = inner.bound.as_mut() else {
+        return;
+    };
+    // `info` can repeat with only some fields changed; never overwrite a known value with nothing.
+    if card_profile_device.is_some() {
+        bound.card_profile_device = card_profile_device;
+    }
+    if form_factor.is_some() {
+        bound.form_factor = form_factor;
+    }
+    if device_id.is_some() {
+        bound.card_id = device_id;
+    }
+    // `publish_sinks` dedups, so a repeat `info` with nothing new is a no-op.
+    inner.publish_sinks();
 }
 
 /// Bind an input-capture stream and watch its run-state via `.info()`. A `Running` non-skipped
@@ -729,7 +993,7 @@ fn bind_default_source(inner: &mut Inner, weak: &Weak<RefCell<Inner>>) {
     let Some(id) = inner
         .sources
         .iter()
-        .find(|(_, (n, _, _))| *n == name)
+        .find(|(_, node)| node.name == name)
         .map(|(id, _)| *id)
     else {
         return; // node not surfaced yet; on_global will bind it when it appears
@@ -737,7 +1001,7 @@ fn bind_default_source(inner: &mut Inner, weak: &Weak<RefCell<Inner>>) {
     if inner.bound_source.as_ref().map(|b| b.id) == Some(id) {
         return;
     }
-    let node = match registry.bind::<Node, _>(&inner.sources[&id].2) {
+    let node = match registry.bind::<Node, _>(&inner.sources[&id].global) {
         Ok(node) => node,
         Err(_) => {
             warn!("failed to bind default audio source node {id}");
@@ -894,6 +1158,60 @@ fn set_props(node: &Node, channel_volumes: Option<Vec<f32>>, mute: Option<bool>)
     }
 }
 
+/// Parse a `SPA_TYPE_OBJECT_ParamRoute` pod into a [`RouteInfo`] — the one form both `EnumRoute`
+/// (every route on the card) and `Route` (the active one) arrive in.
+///
+/// Returns `None` for a pod that is not a route object at all; unknown/missing fields fall back to
+/// the [`Default`], since PipeWire is free to omit any of them and a partial route is still worth
+/// listing. Pure, so it unit-tests against hand-built pods without a PipeWire connection — which is
+/// the only way to cover multi-port cards and availability flips on a machine whose card has
+/// exactly one route.
+// The SPA property constants keep their C mixed-case names; matched as constants.
+#[allow(non_upper_case_globals)]
+fn parse_route(pod: &Pod) -> Option<RouteInfo> {
+    let (_, Value::Object(obj)) =
+        PodDeserializer::deserialize_from::<Value>(pod.as_bytes()).ok()?
+    else {
+        return None;
+    };
+    if obj.type_ != SPA_TYPE_OBJECT_ParamRoute {
+        return None;
+    }
+    let mut route = RouteInfo::default();
+    for prop in &obj.properties {
+        match (prop.key, &prop.value) {
+            (SPA_PARAM_ROUTE_index, Value::Int(v)) => route.index = *v as u32,
+            (SPA_PARAM_ROUTE_direction, Value::Id(id)) => {
+                route.direction = match id.0 {
+                    SPA_DIRECTION_INPUT => Some(PortDirection::Input),
+                    SPA_DIRECTION_OUTPUT => Some(PortDirection::Output),
+                    _ => None,
+                };
+            }
+            (SPA_PARAM_ROUTE_name, Value::String(s)) => route.name = s.clone(),
+            (SPA_PARAM_ROUTE_description, Value::String(s)) => route.description = s.clone(),
+            (SPA_PARAM_ROUTE_priority, Value::Int(v)) => route.priority = (*v).max(0) as u32,
+            (SPA_PARAM_ROUTE_available, Value::Id(id)) => {
+                route.available = match id.0 {
+                    SPA_PARAM_AVAILABILITY_no => PortAvailability::No,
+                    SPA_PARAM_AVAILABILITY_yes => PortAvailability::Yes,
+                    // Includes SPA_PARAM_AVAILABILITY_unknown, and anything new.
+                    _ => PortAvailability::Unknown,
+                };
+            }
+            (SPA_PARAM_ROUTE_device, Value::Int(v)) => route.device = Some(*v as u32),
+            (SPA_PARAM_ROUTE_devices, Value::ValueArray(ValueArray::Int(v))) => {
+                route.devices = v.iter().map(|d| *d as u32).collect();
+            }
+            (SPA_PARAM_ROUTE_profiles, Value::ValueArray(ValueArray::Int(v))) => {
+                route.profiles = v.iter().map(|p| *p as u32).collect();
+            }
+            _ => {}
+        }
+    }
+    Some(route)
+}
+
 /// Extract the sink name from a `default.audio.sink` metadata value, JSON like
 /// `{"name":"alsa_output..."}`. Minimal parse to avoid a JSON dependency.
 fn parse_metadata_name(value: &str) -> Option<String> {
@@ -907,8 +1225,217 @@ fn parse_metadata_name(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_metadata_name;
+    use pipewire::spa::utils::Id;
+
+    use super::*;
     use crate::audio::sink_default_json;
+
+    /// Serialize a route object the way PipeWire sends one, so the parser is tested against a real
+    /// pod rather than a mock. `device` present makes it the active-`Route` form; absent, the
+    /// `EnumRoute` form.
+    #[allow(clippy::too_many_arguments)]
+    fn route_pod(
+        index: i32,
+        direction: u32,
+        name: &str,
+        description: &str,
+        priority: i32,
+        available: u32,
+        devices: &[i32],
+        device: Option<i32>,
+    ) -> Vec<u8> {
+        let mut properties = vec![
+            Property {
+                key: SPA_PARAM_ROUTE_index,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(index),
+            },
+            Property {
+                key: SPA_PARAM_ROUTE_direction,
+                flags: PropertyFlags::empty(),
+                value: Value::Id(Id(direction)),
+            },
+            Property {
+                key: SPA_PARAM_ROUTE_name,
+                flags: PropertyFlags::empty(),
+                value: Value::String(name.to_owned()),
+            },
+            Property {
+                key: SPA_PARAM_ROUTE_description,
+                flags: PropertyFlags::empty(),
+                value: Value::String(description.to_owned()),
+            },
+            Property {
+                key: SPA_PARAM_ROUTE_priority,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(priority),
+            },
+            Property {
+                key: SPA_PARAM_ROUTE_available,
+                flags: PropertyFlags::empty(),
+                value: Value::Id(Id(available)),
+            },
+            Property {
+                key: SPA_PARAM_ROUTE_devices,
+                flags: PropertyFlags::empty(),
+                value: Value::ValueArray(ValueArray::Int(devices.to_vec())),
+            },
+        ];
+        if let Some(device) = device {
+            properties.push(Property {
+                key: SPA_PARAM_ROUTE_device,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(device),
+            });
+        }
+        let object = Value::Object(Object {
+            type_: SPA_TYPE_OBJECT_ParamRoute,
+            id: pipewire::spa::sys::SPA_PARAM_Route,
+            properties,
+        });
+        let mut bytes = Vec::new();
+        PodSerializer::serialize(Cursor::new(&mut bytes), &object).unwrap();
+        bytes
+    }
+
+    /// The one route this machine's card actually has, byte for byte as `pw-dump` reports it:
+    /// `index=0 direction=Output name="analog-output" description="Analog Output" priority=9900
+    /// available=unknown device=1 devices=[1]`.
+    ///
+    /// The `available` value is the point. It is `unknown`, not `yes` — so a filter written as
+    /// `== yes` would drop this card's only output from the picker. gvc's test is
+    /// `!= PA_PORT_AVAILABLE_NO` (`gvc-mixer-control.c:1973,1995`), which is what
+    /// [`PortAvailability::is_offerable`] implements.
+    #[test]
+    fn parses_the_real_cards_active_route() {
+        let bytes = route_pod(
+            0,
+            SPA_DIRECTION_OUTPUT,
+            "analog-output",
+            "Analog Output",
+            9900,
+            pipewire::spa::sys::SPA_PARAM_AVAILABILITY_unknown,
+            &[1],
+            Some(1),
+        );
+        let route = parse_route(Pod::from_bytes(&bytes).unwrap()).unwrap();
+        assert_eq!(
+            route,
+            RouteInfo {
+                index: 0,
+                direction: Some(PortDirection::Output),
+                name: "analog-output".to_owned(),
+                description: "Analog Output".to_owned(),
+                priority: 9900,
+                available: PortAvailability::Unknown,
+                devices: vec![1],
+                device: Some(1),
+                profiles: vec![],
+            }
+        );
+        assert!(
+            route.available.is_offerable(),
+            "unknown availability must still be offered, or this card loses its only output"
+        );
+    }
+
+    /// A multi-port card, which no hardware here has: speakers + headphones on one card, headphones
+    /// unplugged. Covers the shape slice 3's device list is built from, and the availability filter
+    /// that decides which rows exist at all.
+    #[test]
+    fn parses_a_multi_port_card_and_its_availability() {
+        let speakers = route_pod(
+            0,
+            SPA_DIRECTION_OUTPUT,
+            "analog-output-speaker",
+            "Speakers",
+            9000,
+            pipewire::spa::sys::SPA_PARAM_AVAILABILITY_yes,
+            &[0],
+            None,
+        );
+        let headphones = route_pod(
+            1,
+            SPA_DIRECTION_OUTPUT,
+            "analog-output-headphones",
+            "Headphones",
+            9900,
+            SPA_PARAM_AVAILABILITY_no,
+            &[0],
+            None,
+        );
+        let mic = route_pod(
+            2,
+            SPA_DIRECTION_INPUT,
+            "analog-input-internal-mic",
+            "Internal Microphone",
+            8000,
+            pipewire::spa::sys::SPA_PARAM_AVAILABILITY_unknown,
+            &[0],
+            None,
+        );
+
+        let speakers = parse_route(Pod::from_bytes(&speakers).unwrap()).unwrap();
+        let headphones = parse_route(Pod::from_bytes(&headphones).unwrap()).unwrap();
+        let mic = parse_route(Pod::from_bytes(&mic).unwrap()).unwrap();
+
+        assert_eq!(speakers.description, "Speakers");
+        assert!(speakers.available.is_offerable());
+        // Unplugged headphones are the one case gvc drops.
+        assert_eq!(headphones.available, PortAvailability::No);
+        assert!(!headphones.available.is_offerable());
+        // Direction is what splits the output picker from the input one.
+        assert_eq!(mic.direction, Some(PortDirection::Input));
+        assert_eq!(speakers.direction, Some(PortDirection::Output));
+        // The EnumRoute form carries `devices` but no single `device` — only the active Route does.
+        assert_eq!(speakers.device, None);
+        assert_eq!(speakers.devices, vec![0]);
+    }
+
+    /// A pod that is not a route at all must be rejected rather than parsed into a default-filled
+    /// route: the device listener sees every param it subscribed to, and a `Props` object would
+    /// otherwise become a nameless phantom port.
+    #[test]
+    fn a_non_route_pod_is_rejected() {
+        let object = Value::Object(Object {
+            type_: SPA_TYPE_OBJECT_Props,
+            id: SPA_PARAM_Props,
+            properties: vec![Property {
+                key: SPA_PROP_mute,
+                flags: PropertyFlags::empty(),
+                value: Value::Bool(true),
+            }],
+        });
+        let mut bytes = Vec::new();
+        PodSerializer::serialize(Cursor::new(&mut bytes), &object).unwrap();
+        assert_eq!(parse_route(Pod::from_bytes(&bytes).unwrap()), None);
+    }
+
+    /// A route with fields missing still parses — PipeWire may omit any of them, and a partial
+    /// route is worth listing. Only the object type is mandatory.
+    #[test]
+    fn a_sparse_route_falls_back_to_defaults() {
+        let object = Value::Object(Object {
+            type_: SPA_TYPE_OBJECT_ParamRoute,
+            id: pipewire::spa::sys::SPA_PARAM_Route,
+            properties: vec![Property {
+                key: SPA_PARAM_ROUTE_index,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(7),
+            }],
+        });
+        let mut bytes = Vec::new();
+        PodSerializer::serialize(Cursor::new(&mut bytes), &object).unwrap();
+        let route = parse_route(Pod::from_bytes(&bytes).unwrap()).unwrap();
+        assert_eq!(route.index, 7);
+        assert_eq!(route.direction, None);
+        assert_eq!(route.name, "");
+        assert_eq!(
+            route.available,
+            PortAvailability::Unknown,
+            "an absent availability is unknown, which is still offerable"
+        );
+    }
 
     #[test]
     fn parses_default_sink_name() {

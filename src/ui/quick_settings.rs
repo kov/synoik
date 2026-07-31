@@ -3364,6 +3364,7 @@ mod tests {
                 })
                 .collect(),
             default_name: (n > 0).then(|| "sink0".to_string()),
+            bound: None,
         }
     }
 

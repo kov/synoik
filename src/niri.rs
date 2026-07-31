@@ -545,6 +545,10 @@ pub struct Niri {
     /// Input sources + current default for the QS input-device picker; empty until the PipeWire
     /// watcher reports sources (also where the backend is absent, e.g. headless).
     pub source_list: crate::audio::SourceList,
+    /// Sound cards and their ports (PipeWire routes) — GNOME's port-level view, which the device
+    /// pickers and the headphone detection will resolve from. Empty where there is no card, or no
+    /// backend at all.
+    pub audio_cards: crate::audio::AudioCards,
     /// Whatever the compositor asks audio to *do* — volume, mute, default device. Live sessions
     /// get `PwAudio` (feature `pipewire`), whose loop is driven on the compositor's calloop;
     /// tests get `StubAudio`. `None` when the connection failed, is disabled, or the run is
@@ -3565,6 +3569,13 @@ impl State {
         }
     }
 
+    /// Adopt a fresh card/route model from the PipeWire watcher — the port-level view GNOME builds
+    /// its device list and its headphone detection from. Read-only for now: nothing renders it yet,
+    /// so there is no redraw to queue.
+    pub fn on_audio_cards(&mut self, cards: crate::audio::AudioCards) {
+        self.niri.audio_cards = cards;
+    }
+
     #[cfg(feature = "dbus")]
     pub fn on_gnome_shell_msg(&mut self, msg: crate::dbus::gnome_shell::GnomeShellToNiri) {
         use crate::dbus::gnome_shell::GnomeShellToNiri;
@@ -4264,6 +4275,7 @@ impl Niri {
             mic: crate::audio::MicStatus::default(),
             sink_list: crate::audio::SinkList::default(),
             source_list: crate::audio::SourceList::default(),
+            audio_cards: crate::audio::AudioCards::default(),
             audio_backend: None,
             system_status: SystemStatus::default(),
             notifications: crate::notifications::NotificationStore::default(),

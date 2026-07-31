@@ -96,6 +96,35 @@ pub struct SinkInfo {
     pub description: String,
 }
 
+/// A sink's place in the card/route model: the `Audio/Device` global it belongs to (`device.id`)
+/// and the SPA device index inside that card (`card.profile.device`), which is what a route's
+/// `device` field matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SinkCard {
+    pub card_id: u32,
+    /// `None` when the node does not report `card.profile.device` — a card with a single active
+    /// route per direction still resolves, since there is nothing to disambiguate.
+    pub device: Option<u32>,
+}
+
+/// What the **bound default sink** carries beyond its name — the inputs to GNOME's headphone
+/// detection (`js/ui/status/volume.js:332-345`).
+///
+/// This hangs off the bound sink rather than off every [`SinkInfo`] for a concrete reason: a
+/// PipeWire *registry global* carries only a subset of a node's props. `device.form_factor` and
+/// `card.profile.device` are **not** in it — they arrive only in the `info` event of a bound proxy.
+/// We bind exactly one sink (the default), so it is the only one that can honestly report these,
+/// and it is also the only one GNOME asks about.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BoundSinkInfo {
+    /// Which card the sink comes out of, for [`AudioCards::active_route`]. `None` for a virtual
+    /// sink with no card behind it (`auto_null`).
+    pub card: Option<SinkCard>,
+    /// `device.form_factor` ("headset" / "headphone" / …) — the first branch of `_findHeadphones`.
+    /// `None` on most cards; bluetooth headsets are where it actually shows up.
+    pub form_factor: Option<String>,
+}
+
 /// The set of output sinks + which is the current default, fed by the PipeWire watcher for the
 /// output-device picker. Sorted by PipeWire global id (stable across republishes). `default_name`
 /// is the default sink's `node.name`, so the picker can mark the selected row. [`Default`] (empty,
@@ -104,6 +133,10 @@ pub struct SinkInfo {
 pub struct SinkList {
     pub sinks: Vec<SinkInfo>,
     pub default_name: Option<String>,
+    /// The bound default sink's card membership and form factor — see [`BoundSinkInfo`] for why
+    /// these live here and not on every [`SinkInfo`]. `None` until a sink is bound and its `info`
+    /// event has arrived.
+    pub bound: Option<BoundSinkInfo>,
 }
 
 /// One audio input source, for the quick-settings input-device picker (gnome-shell's
@@ -122,6 +155,113 @@ pub struct SourceInfo {
 pub struct SourceList {
     pub sources: Vec<SourceInfo>,
     pub default_name: Option<String>,
+}
+
+/// Which way a port carries audio. PipeWire's `SPA_PARAM_ROUTE_direction` is a `spa_direction`
+/// (`SPA_DIRECTION_INPUT` = 0, `SPA_DIRECTION_OUTPUT` = 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortDirection {
+    Input,
+    Output,
+}
+
+/// Whether a port is plugged in / usable, PipeWire's `spa_param_availability`. gvc's device list is
+/// keyed off this: `create_ui_device_from_port` treats `available != PA_PORT_AVAILABLE_NO` as
+/// offerable (`gvc-mixer-control.c:1973,1995`), so **`Unknown` counts as available** — a card that
+/// cannot detect jack presence reports `Unknown` for everything and must not vanish from the
+/// picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PortAvailability {
+    #[default]
+    Unknown,
+    No,
+    Yes,
+}
+
+impl PortAvailability {
+    /// gvc's test. Deliberately *not* `== Yes`: this machine's only output route reports `Unknown`.
+    pub fn is_offerable(self) -> bool {
+        self != PortAvailability::No
+    }
+}
+
+/// One route on an audio card, parsed from a `SPA_TYPE_OBJECT_ParamRoute` pod. Both `EnumRoute`
+/// (every route the card has) and `Route` (the active one per direction) use this object type; the
+/// active form additionally carries [`device`](Self::device), the SPA device index it applies to.
+///
+/// This is gvc's card *port* — the thing GNOME builds one `GvcMixerUIDevice` per.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RouteInfo {
+    pub index: u32,
+    pub direction: Option<PortDirection>,
+    /// Machine name, e.g. `analog-output` / `analog-output-headphones`. This is what GNOME's
+    /// `_findHeadphones` substring-matches (`js/ui/status/volume.js:341-342`).
+    pub name: String,
+    /// Human label, e.g. "Analog Output" — the picker row's text (gvc's `port->human_port`).
+    pub description: String,
+    pub priority: u32,
+    pub available: PortAvailability,
+    /// SPA device indices this route applies to (`EnumRoute` form).
+    pub devices: Vec<u32>,
+    /// The SPA device index this route is currently applied to (`Route` form only). Joins to a
+    /// node's `card.profile.device`.
+    pub device: Option<u32>,
+    /// Card profile indices this route is available under (`EnumRoute` form).
+    pub profiles: Vec<u32>,
+}
+
+/// One audio card: PipeWire's `Audio/Device`, gvc's `GvcMixerCard`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioCard {
+    /// PipeWire global id, the stable key.
+    pub id: u32,
+    /// `device.description`, e.g. "Built-in Audio" — gvc's card name, which the picker shows as
+    /// the row's *origin* suffix (`volume.js:130-133`).
+    pub description: String,
+    /// `device.icon-name`, e.g. `audio-card-analog`; the fallback for a device with no icon of its
+    /// own (`gvc-mixer-ui-device.c:632-643`).
+    pub icon_name: Option<String>,
+    /// Every route the card offers, from `EnumRoute`, in PipeWire's order.
+    pub ports: Vec<RouteInfo>,
+    /// The active route per direction, from `Route` — each carries its `device`.
+    pub active: Vec<RouteInfo>,
+}
+
+/// Every audio card the watcher knows about, sorted by PipeWire global id (registry-appearance
+/// order) so republishes are stable — the same rule [`SinkList`] follows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioCards {
+    pub cards: Vec<AudioCard>,
+}
+
+impl AudioCards {
+    /// The active route on `card_id`'s SPA device `device` in `direction`, if any.
+    ///
+    /// `device` is a node's `card.profile.device` and `card_id` its `device.id` — the join
+    /// confirmed on this machine's card, where the sink node reports `device.id=42` +
+    /// `card.profile.device=1` and the active route reports `device=1`. A node that carries no
+    /// `card.profile.device` passes `None`, which falls back to the card's single active route in
+    /// that direction (there is nothing to disambiguate against).
+    pub fn active_route(
+        &self,
+        card_id: u32,
+        device: Option<u32>,
+        direction: PortDirection,
+    ) -> Option<&RouteInfo> {
+        let card = self.cards.iter().find(|c| c.id == card_id)?;
+        let mut matching = card
+            .active
+            .iter()
+            .filter(|r| r.direction == Some(direction));
+        match device {
+            Some(device) => matching.find(|r| r.device == Some(device)),
+            None => {
+                let first = matching.next()?;
+                // Ambiguous: more than one device active in this direction and no key to pick with.
+                matching.next().is_none().then_some(first)
+            }
+        }
+    }
 }
 
 /// Whether any non-skipped application is actively recording, given `(application.id, running)` for
@@ -439,6 +579,146 @@ mod tests {
             (Some("org.PulseAudio.pavucontrol"), true),
             (Some("org.mozilla.firefox"), true),
         ]));
+    }
+
+    /// The node→card→route join, on the numbers this machine's card actually reports: the sink node
+    /// carries `device.id=42` and `card.profile.device=1`, and the card's active output route
+    /// carries `device=1`.
+    #[test]
+    fn a_sink_resolves_to_its_cards_active_route() {
+        let route = |index, direction, name: &str, device| RouteInfo {
+            index,
+            direction: Some(direction),
+            name: name.to_owned(),
+            device,
+            ..RouteInfo::default()
+        };
+        let cards = AudioCards {
+            cards: vec![AudioCard {
+                id: 42,
+                description: "Built-in Audio".to_owned(),
+                icon_name: Some("audio-card-analog".to_owned()),
+                ports: vec![],
+                active: vec![
+                    route(0, PortDirection::Output, "analog-output", Some(1)),
+                    route(2, PortDirection::Input, "analog-input-mic", Some(0)),
+                ],
+            }],
+        };
+
+        let sink = SinkCard {
+            card_id: 42,
+            device: Some(1),
+        };
+        assert_eq!(
+            cards
+                .active_route(sink.card_id, sink.device, PortDirection::Output)
+                .map(|r| r.name.as_str()),
+            Some("analog-output")
+        );
+        // Direction picks the input route even though it is on a different SPA device.
+        assert_eq!(
+            cards
+                .active_route(42, Some(0), PortDirection::Input)
+                .map(|r| r.name.as_str()),
+            Some("analog-input-mic")
+        );
+        // A device index nothing is active on resolves to nothing, rather than to the wrong route.
+        assert_eq!(cards.active_route(42, Some(9), PortDirection::Output), None);
+        // Unknown card.
+        assert_eq!(cards.active_route(7, Some(1), PortDirection::Output), None);
+
+        // No `card.profile.device` on the node: fall back to the card's single active route in that
+        // direction, since there is nothing to disambiguate against.
+        assert_eq!(
+            cards
+                .active_route(42, None, PortDirection::Output)
+                .map(|r| r.name.as_str()),
+            Some("analog-output")
+        );
+
+        // ...but with TWO active output routes and no key, guessing would be wrong — a card with
+        // separate speaker and HDMI devices would silently pick whichever came first.
+        let mut ambiguous = cards.clone();
+        ambiguous.cards[0]
+            .active
+            .push(route(5, PortDirection::Output, "hdmi-output", Some(3)));
+        assert_eq!(
+            ambiguous.active_route(42, None, PortDirection::Output),
+            None,
+            "two active output routes and no device key must resolve to nothing, not to a guess"
+        );
+    }
+
+    /// The shape a live run produced, kept as a regression: the bound sink's card join and the
+    /// card's icon are populated, and they resolve to the card's active output route.
+    ///
+    /// Both of those came back `None` on the first live run, because they were being read from the
+    /// PipeWire **registry global**, whose props are only a subset — `card.profile.device`,
+    /// `device.form_factor` and `device.icon-name` exist solely in a bound proxy's `info` event.
+    /// Nothing headless could have caught that: the model was well-formed, just permanently empty.
+    #[test]
+    fn the_live_cards_shape_resolves_end_to_end() {
+        let cards = AudioCards {
+            cards: vec![AudioCard {
+                id: 42,
+                description: "Built-in Audio".to_owned(),
+                icon_name: Some("audio-card-analog".to_owned()),
+                ports: vec![RouteInfo {
+                    index: 0,
+                    direction: Some(PortDirection::Output),
+                    name: "analog-output".to_owned(),
+                    description: "Analog Output".to_owned(),
+                    priority: 9900,
+                    available: PortAvailability::Unknown,
+                    devices: vec![1],
+                    device: None,
+                    profiles: vec![1],
+                }],
+                active: vec![RouteInfo {
+                    device: Some(1),
+                    ..RouteInfo {
+                        index: 0,
+                        direction: Some(PortDirection::Output),
+                        name: "analog-output".to_owned(),
+                        description: "Analog Output".to_owned(),
+                        priority: 9900,
+                        available: PortAvailability::Unknown,
+                        devices: vec![1],
+                        device: None,
+                        profiles: vec![1],
+                    }
+                }],
+            }],
+        };
+        let sinks = SinkList {
+            sinks: vec![SinkInfo {
+                name: "alsa_output.platform-a016000.virtio_mmio.stereo-fallback".to_owned(),
+                description: "Built-in Audio Stereo".to_owned(),
+            }],
+            default_name: Some(
+                "alsa_output.platform-a016000.virtio_mmio.stereo-fallback".to_owned(),
+            ),
+            bound: Some(BoundSinkInfo {
+                card: Some(SinkCard {
+                    card_id: 42,
+                    device: Some(1),
+                }),
+                form_factor: None,
+            }),
+        };
+
+        let bound = sinks.bound.as_ref().unwrap();
+        let card = bound.card.expect("the bound sink knows its card");
+        let route = cards
+            .active_route(card.card_id, card.device, PortDirection::Output)
+            .expect("...and that card has an active output route");
+        assert_eq!(route.name, "analog-output");
+        assert!(route.available.is_offerable());
+        // What slice 2 will read: no form factor and a port name with no "headphone" in it, so this
+        // card is speakers by both of `_findHeadphones`' branches.
+        assert_eq!(bound.form_factor, None);
+        assert!(!route.name.to_lowercase().contains("headphone"));
     }
 
     #[test]
