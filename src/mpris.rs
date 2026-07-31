@@ -16,6 +16,8 @@
 //!   refuses the rest of what gvfs would happily mount (`admin://`, `sftp://`, `dav://`). Remote
 //!   art *is* fetched, as GNOME does — see that module for the address guard on it.
 //! - Every display string is newline-flattened and byte-capped, as notification text is.
+//! - **A cover survives the player dropping it mid-track** ([`carry_art_over`]) — a deliberate
+//!   divergence for a real Firefox behaviour.
 //!
 //! The spec-validation of `Metadata` is GNOME's own (`mpris.js:129-165`): players do send faulty
 //! metadata, so each field is type-checked with a fallback rather than trusted.
@@ -296,6 +298,8 @@ impl MprisStore {
 
         match self.players.iter_mut().find(|p| p.bus_name == bus_name) {
             Some(player) => {
+                let mut state = state;
+                carry_art_over(&player.state, &mut state);
                 if player.state == state && !changed_app(&player.app) {
                     return false;
                 }
@@ -323,6 +327,31 @@ impl MprisStore {
             return false;
         };
         self.players.remove(index).state.can_play
+    }
+}
+
+/// Keep the cover we already have when an update drops it *without changing the track*.
+///
+/// **A deliberate divergence, for a real player bug.** Firefox publishes art, then some time later
+/// re-emits the same track's metadata with `mpris:artUrl` gone (and deletes the file it pointed
+/// at), so a card that was showing the cover falls back to the generic glyph for no reason the user
+/// can see. GNOME reverts too; we would rather keep displaying what we already know is correct.
+///
+/// The rule is narrow on purpose:
+///
+/// - an update that *sets* art always wins, including a different cover for the same track — this
+///   only ever fills in an absence;
+/// - the track must be otherwise unchanged (title and artists), so a genuine track change with no
+///   art of its own falls back as it should, rather than showing the previous song's cover.
+///
+/// The pixels survive the file being deleted because the image cache is keyed by source and holds
+/// the *decoded* buffer, and the source stays live as long as this keeps it in the state.
+fn carry_art_over(old: &PlayerState, new: &mut PlayerState) {
+    if new.art.is_some() || old.art.is_none() {
+        return;
+    }
+    if new.title == old.title && new.artists == old.artists {
+        new.art = old.art.clone();
     }
 }
 
@@ -428,6 +457,47 @@ mod tests {
         assert_eq!(art("admin:///etc/shadow"), None);
         assert_eq!(art("sftp://host/cover.png"), None);
         assert_eq!(art("/home/u/cover.png"), None);
+    }
+
+    /// Firefox publishes cover art and then, some time later, re-emits the same track without it
+    /// (deleting the file it pointed at), which would drop a perfectly good cover back to the
+    /// generic glyph. We keep what we have — but only for the same track, and only to fill an
+    /// absence: an update that names art always wins.
+    #[test]
+    fn a_dropped_cover_is_kept_but_a_named_one_always_wins() {
+        let cover = |name: &str| {
+            Some(ImageSource::File(std::path::PathBuf::from(format!(
+                "/tmp/{name}.png"
+            ))))
+        };
+        let track = |title: &str, art: Option<ImageSource>| PlayerState {
+            identity: "Firefox".into(),
+            can_play: true,
+            title: title.into(),
+            artists: vec!["Brazilian Soul Studio".into()],
+            art,
+            ..PlayerState::default()
+        };
+
+        let mut store = MprisStore::default();
+        store.update("bus".into(), track("Beija Flor", cover("a")), None);
+
+        // Same track, art gone: keep it.
+        store.update("bus".into(), track("Beija Flor", None), None);
+        assert_eq!(
+            store.visible().next().unwrap().state.art,
+            cover("a"),
+            "a cover must survive the player dropping it mid-track"
+        );
+
+        // Same track, different art: the update wins.
+        store.update("bus".into(), track("Beija Flor", cover("b")), None);
+        assert_eq!(store.visible().next().unwrap().state.art, cover("b"));
+
+        // A genuine track change with no art of its own falls back — showing the previous song's
+        // cover would be worse than showing none.
+        store.update("bus".into(), track("So What", None), None);
+        assert_eq!(store.visible().next().unwrap().state.art, None);
     }
 
     fn state(can_play: bool, title: &str) -> PlayerState {
