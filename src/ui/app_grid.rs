@@ -557,6 +557,9 @@ pub struct AppGrid {
     /// captions, pagination, dots, arrows, icon uploads) instead of re-deriving it.
     modes: &'static [(usize, usize)],
     align: PageAlign,
+    /// Whether the chosen mode may be **scaled up** to fill a canvas with room to spare —
+    /// our divergence from GNOME's fixed page modes. See [`Self::fill_scale`].
+    fill_available: bool,
     clock: Clock,
     cache: RefCell<GridCache>,
 }
@@ -703,16 +706,63 @@ fn distribute(
 
 impl AppGrid {
     pub fn new(clock: Clock) -> Self {
-        Self::with_modes(clock, &GRID_MODES, PageAlign::Fill)
+        Self::with_modes(clock, &GRID_MODES, PageAlign::Fill, true)
     }
 
     /// A folder's inner grid — `FolderGrid` (`appDisplay.js:2066-2084`): the one 3×3
     /// mode, its cells centered as a block rather than spread to fill the page.
     pub fn folder_view(clock: Clock) -> Self {
-        Self::with_modes(clock, &FOLDER_GRID_MODES, PageAlign::Center)
+        Self::with_modes(clock, &FOLDER_GRID_MODES, PageAlign::Center, false)
     }
 
-    fn with_modes(clock: Clock, modes: &'static [(usize, usize)], align: PageAlign) -> Self {
+    /// Scale the chosen page mode up to fill a canvas with room to spare — **our divergence**
+    /// from GNOME, approved 2026-07-31.
+    ///
+    /// GNOME picks one of four fixed `(columns, rows)` shapes and stops. Whatever space is left
+    /// over becomes spacing, and spacing is capped (`max-column-spacing: $base_padding * 6`), so
+    /// past a certain canvas the remainder is simply dead margin — on a 1600x800 content box, a
+    /// 6x4 page of 96px tiles uses ~1044 of 1600 across and leaves the rest empty. GNOME can
+    /// afford that because its chrome is fixed by assumption; ours already adapts to the canvas
+    /// (`docs/fork/adaptive-overview-chrome.md`), so leaving the space empty is a choice we do
+    /// not have to make.
+    ///
+    /// Each axis is filled for what it actually has. Preserving the mode's aspect ratio was the
+    /// first cut and turned out to be a **no-op on the shapes we run on**: our 1636x848 app area
+    /// gives a 1272x760 content box, which fits 8 columns but only 4 rows at 96px (5 rows would
+    /// need 768), so the vertical binds and a ratio-locked scale can never leave 1. All the
+    /// reclaimable slack on a widescreen canvas is horizontal, so taking it means letting the
+    /// axes differ — 8x4 here, against GNOME's 6x4.
+    ///
+    /// Never shrinks: the factor is clamped at 1, so this can only ever add tiles to a page.
+    /// Icons are untouched — the ladder tops out at 96 exactly as GNOME's does, and this runs
+    /// *before* icon selection so the icon still has to fit the (larger) grid.
+    fn fill_scale(
+        &self,
+        cols: usize,
+        rows: usize,
+        content_w: f64,
+        content_h: f64,
+    ) -> (usize, usize) {
+        if !self.fill_available {
+            return (cols, rows);
+        }
+        // How many cells of the largest icon fit per axis, at base spacing.
+        let cell = ICON_SIZES[0] + TILE_EXTRA_H;
+        let fits = |avail: f64, spacing: f64| {
+            (((avail + spacing) / (cell + spacing)).floor() as usize).max(1)
+        };
+        let max_cols = fits(content_w, COL_SPACING);
+        let max_rows = fits(content_h, ROW_SPACING);
+
+        (max_cols.max(cols), max_rows.max(rows))
+    }
+
+    fn with_modes(
+        clock: Clock,
+        modes: &'static [(usize, usize)],
+        align: PageAlign,
+        fill_available: bool,
+    ) -> Self {
         Self {
             entries: Vec::new(),
             hovered: None,
@@ -735,6 +785,7 @@ impl AppGrid {
             drag_fade: None,
             modes,
             align,
+            fill_available,
             clock,
             cache: RefCell::new(GridCache::default()),
         }
@@ -1724,6 +1775,7 @@ impl AppGrid {
                 da.total_cmp(&db)
             })
             .unwrap();
+        let (cols, rows) = self.fill_scale(cols, rows, content_w, content_h);
 
         // Icon size: the largest whose square cells fit cols×rows at base spacing.
         // Horizontal fit is inclusive, vertical strict (`iconGrid.js:395`).
@@ -3131,6 +3183,61 @@ impl AppGrid {
 mod tests {
     use super::*;
 
+    /// Our approved divergence: a page mode scales up to fill a roomy canvas, keeping its
+    /// aspect ratio, instead of leaving GNOME's dead margin.
+    ///
+    /// GNOME picks one of four fixed `(cols, rows)` and turns the remainder into spacing, which
+    /// is capped — so on a large canvas the leftover is simply empty. Here a 1600x800 content box
+    /// takes 6x4 (24 tiles) in GNOME; we keep the 3:2 shape and fit more of it.
+    ///
+    /// Asserted as *properties*, not a hardcoded pair, so the test says what the rule is rather
+    /// than restating one canvas's answer: never fewer than GNOME's mode, and the result
+    /// actually fitting the box at the largest icon.
+    #[test]
+    fn a_roomy_canvas_scales_the_page_mode_up() {
+        let g = grid_n(256);
+        let area = rect(0., 0., 1600. + 2. * PAGE_PAD_H, 800. + 2. * PAGE_PAD_V);
+        let layout = g.layout(area);
+
+        assert!(
+            layout.per_page > 24,
+            "a 1600x800 content box must hold more than GNOME's fixed 6x4 = 24, got {}",
+            layout.per_page
+        );
+
+        let cols = layout.cols;
+        let rows = layout.per_page / cols;
+        assert_eq!(cols * rows, layout.per_page, "the page is a full rectangle");
+        assert!(
+            cols >= 6 && rows >= 4,
+            "never fewer than the mode GNOME would have picked, got {cols}x{rows}"
+        );
+
+        // And it genuinely fits: cells at the largest icon, at base spacing.
+        let cell = ICON_SIZES[0] + TILE_EXTRA_H;
+        assert!(
+            cell * cols as f64 + COL_SPACING * (cols as f64 - 1.) <= 1600.,
+            "{cols} columns must fit across 1600"
+        );
+    }
+
+    /// A folder never re-flows to its box (`FolderGrid`, `appDisplay.js:2077-2082`), so the fill
+    /// divergence must not reach it — the dialog is a fixed modal, not a canvas to fill.
+    #[test]
+    fn folders_keep_gnomes_fixed_3x3() {
+        let mut g = AppGrid::folder_view(Clock::with_time(Duration::ZERO));
+        g.set_entries(
+            (0..64)
+                .map(|i| entry(&format!("f{i:02}.desktop"), &format!("F {i:02}")))
+                .collect(),
+        );
+        let layout = g.layout(rect(0., 0., 1600., 800.));
+        assert_eq!(
+            layout.per_page, 9,
+            "a folder page stays 3x3 however large its box"
+        );
+    }
+
     fn entry(id: &str, name: &str) -> AppGridEntry {
         AppGridEntry {
             id: id.to_owned(),
@@ -3167,14 +3274,16 @@ mod tests {
     }
 
     #[test]
-    fn wide_band_lays_eight_columns_at_ninety_six_px() {
+    fn wide_band_lays_nine_columns_at_ninety_six_px() {
         let l = grid_n(24).layout(wide());
         assert_eq!(l.n_pages, 1);
         assert_eq!(l.tiles.len(), 24);
-        // First eight tiles share row 0; the ninth starts row 1 → 8 columns.
-        assert!((0..8).all(|i| l.tiles[i].loc.y == l.tiles[0].loc.y));
-        assert!(l.tiles[8].loc.y > l.tiles[0].loc.y);
-        // 96px icon → a 144 square tile, filling its square cell; one page, no dots.
+        // Nine, not GNOME's eight: this band fits a ninth 96px column, and the fill divergence
+        // takes it rather than turning it into margin the spacing cap cannot absorb.
+        assert_eq!(l.cols, 9);
+        assert!((0..9).all(|i| l.tiles[i].loc.y == l.tiles[0].loc.y));
+        assert!(l.tiles[9].loc.y > l.tiles[0].loc.y);
+        // Still a 96px icon → a 144 square tile: filling adds columns, never shrinks icons.
         assert_eq!(l.tiles[0].size, Size::from((144., 144.)));
         assert!(l.indicators.is_none());
     }
@@ -3185,21 +3294,28 @@ mod tests {
         let area = wide();
         assert_eq!(g.page_count(area), 2);
         // Page 0 holds a full 24; page 1 the remaining 6.
+        // Capacity comes from the layout, not a literal — the fill divergence makes it a
+        // property of the band, and what is under test here is pagination, not capacity.
+        let per_page = g.items_per_page(area);
         let l0 = g.layout(area);
-        assert_eq!((l0.first_index, l0.tiles.len()), (0, 24));
+        assert_eq!((l0.first_index, l0.tiles.len()), (0, per_page));
         assert!(g.set_page(1, area));
         let l1 = g.layout(area);
-        assert_eq!((l1.page, l1.first_index, l1.tiles.len()), (1, 24, 6));
+        assert_eq!(
+            (l1.page, l1.first_index, l1.tiles.len()),
+            (1, per_page, 30 - per_page)
+        );
     }
 
     #[test]
     fn hit_test_returns_the_absolute_index_on_a_later_page() {
         let mut g = grid_n(30);
         let area = wide();
+        let per_page = g.items_per_page(area);
         g.set_page(1, area);
-        // The first tile on page 1 is entry 24.
+        // The first tile on page 1 is the first entry that did not fit page 0.
         let c = g.tile_center(0, area).unwrap();
-        assert_eq!(g.hit_test(c, area), Some(24));
+        assert_eq!(g.hit_test(c, area), Some(per_page));
         assert_eq!(g.hit_test(Point::from((-100., -100.)), area), None);
     }
 

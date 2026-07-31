@@ -7688,19 +7688,22 @@ fn vulkan_app_grid_expands_a_long_caption_on_hover() {
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
     let t1 = f.niri().app_grid.tile_center(1, area).expect("tile 1");
     let m = TileMetrics::OVERVIEW;
-    // Tile top from its center, then the middle of the first band expansion adds.
     let tile_top = t1.y - m.size().h / 2.;
-    let line = crate::ui::widget::TILE_LABEL_LINES as f64;
-    let row_y = (tile_top + m.pad + m.icon_px + m.label_gap + m.label_h * (line + 0.5)) as i32;
     let first_x = (t1.x - m.label_w() / 2.) as i32;
 
-    // Brightest pixel across that line of tile 1.
-    let mut peak =
-        |hovered: Option<usize>| -> u8 {
-            f.niri().app_grid.set_hovered(hovered);
-            let state = f.niri_state();
-            let composited = state.backend.headless().with_vulkan_renderer(
-                |vk| -> anyhow::Result<(Vec<u8>, i32)> {
+    // How many separate lines of glyph ink the caption draws, counted as runs of rows with ink
+    // across the caption's column. Counted rather than sampled at a computed row: an expanded
+    // tile grows about its centre, so the extra line pushes the whole block *up* as well as
+    // down, and a row derived from the resting tile top misses it. The claim under test is
+    // "one more line of text", so count lines.
+    let caption_lines = |f: &mut Fixture, hovered: Option<usize>| -> usize {
+        f.niri().app_grid.set_hovered(hovered);
+        let state = f.niri_state();
+        let composited =
+            state
+                .backend
+                .headless()
+                .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
                     let niri = &mut state.niri;
                     let elements = niri.app_grid.render(
                         vk,
@@ -7722,28 +7725,37 @@ fn vulkan_app_grid_expands_a_long_caption_on_hover() {
                         elements.iter().rev(),
                     )?;
                     Ok((pixels, phys.w))
-                },
-            );
-            let (pixels, w) = composited
-                .expect("a Vulkan device")
-                .expect("compositing the app grid through Vulkan must not error");
-            (0..m.label_w() as i32)
-                .map(|dx| px(&pixels, w, first_x + dx, row_y)[3])
-                .max()
-                .unwrap_or(0)
-        };
+                });
+        let (pixels, w) = composited
+            .expect("a Vulkan device")
+            .expect("compositing the app grid through Vulkan must not error");
 
-    let at_rest = peak(None);
-    let expanded = peak(Some(1));
+        // Glyph ink only — well above the 10% hover wash (alpha ~26) that covers the whole tile.
+        let icon_bottom = (tile_top + m.pad + m.icon_px) as i32;
+        let (mut lines, mut in_line) = (0usize, false);
+        for y in icon_bottom..(icon_bottom + 120) {
+            let has_ink =
+                (0..m.label_w() as i32).any(|dx| px(&pixels, w, first_x + dx, y)[3] > 128);
+            if has_ink && !in_line {
+                lines += 1;
+            }
+            in_line = has_ink;
+        }
+        lines
+    };
+
+    let at_rest = caption_lines(&mut f, None);
+    let expanded = caption_lines(&mut f, Some(1));
     eprintln!("vulkan_app_grid caption: at_rest={at_rest} expanded={expanded}");
     assert_eq!(
-        at_rest, 0,
-        "a resting caption stops at TILE_LABEL_LINES — nothing may paint below it"
+        at_rest,
+        crate::ui::widget::TILE_LABEL_LINES,
+        "a resting caption stops at TILE_LABEL_LINES"
     );
     assert!(
-        expanded > 128,
-        "the expanded caption must wrap onto a second line of glyph ink, not just the \
-         10% hover wash (alpha ~26): {expanded}"
+        expanded > at_rest,
+        "hovering must wrap the caption onto at least one more line of glyph ink \
+         ({expanded} vs {at_rest})"
     );
 }
 
@@ -7775,18 +7787,24 @@ fn vulkan_app_grid_previews_the_next_page_while_dragging() {
     let output = f.niri_output(1);
 
     // Enough apps to paginate, so there is a next page to preview.
-    f.niri().app_grid.set_entries(
-        (0..30)
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+
+    // Two pages, whatever this band holds — the capacity is not GNOME's fixed 24 since the fill
+    // divergence scales the mode up to the canvas. Asked after seeding: an empty grid has no
+    // layout to report a capacity from.
+    let seed = |n: usize| -> Vec<AppGridEntry> {
+        (0..n)
             .map(|i| AppGridEntry {
                 id: format!("app{i:02}.desktop"),
                 name: format!("App {i:02}"),
                 icon: AppIconRef::Fallback,
                 folder: None,
             })
-            .collect(),
-    );
-
-    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+            .collect()
+    };
+    f.niri().app_grid.set_entries(seed(256));
+    let per_page = f.niri().app_grid.items_per_page(area);
+    f.niri().app_grid.set_entries(seed(per_page + 6));
     // The right band is 10% of the width, so 1728..1920. Sample the *first* row of
     // tiles: the next-page arrow lives in this band too, vertically centred, and it is
     // there whether or not anything is being dragged.
@@ -8136,22 +8154,29 @@ fn vulkan_app_grid_draws_page_indicator_dots() {
     f.add_output(1, (1920, 1080));
     let output = f.niri_output(1);
 
-    // 30 apps span two pages on a wide band → a two-dot indicator row.
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+
+    // Two pages on a wide band -> a two-dot indicator row.
+    //
+    // Two pages, whatever this band holds. The capacity is not GNOME's fixed 24 — the fill
+    // divergence scales the mode up to the canvas — so it is asked of the grid, and asked after
+    // seeding, since an empty grid has no layout to report one from.
     {
         let g = &mut f.niri().app_grid;
-        g.set_entries(
-            (0..30)
+        let seed = |n: usize| -> Vec<AppGridEntry> {
+            (0..n)
                 .map(|i| AppGridEntry {
                     id: format!("app{i:02}.desktop"),
                     name: format!("App {i:02}"),
                     icon: AppIconRef::Fallback,
                     folder: None,
                 })
-                .collect(),
-        );
+                .collect()
+        };
+        g.set_entries(seed(256));
+        let per_page = g.items_per_page(area);
+        g.set_entries(seed(per_page + 6));
     }
-
-    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
     let d0 = f.niri().app_grid.indicator_center(0, area).expect("dot 0");
     let d1 = f.niri().app_grid.indicator_center(1, area).expect("dot 1");
     let mid = Point::from(((d0.x + d1.x) / 2., d0.y));
@@ -8228,22 +8253,29 @@ fn vulkan_app_grid_draws_navigation_arrows() {
     f.add_output(1, (1920, 1080));
     let output = f.niri_output(1);
 
-    // 30 apps span two pages → page 0 shows a next arrow (and no previous one).
+    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+
+    // Two pages -> page 0 shows a next arrow (and no previous one).
+    //
+    // Two pages, whatever this band holds. The capacity is not GNOME's fixed 24 — the fill
+    // divergence scales the mode up to the canvas — so it is asked of the grid, and asked after
+    // seeding, since an empty grid has no layout to report one from.
     {
         let g = &mut f.niri().app_grid;
-        g.set_entries(
-            (0..30)
+        let seed = |n: usize| -> Vec<AppGridEntry> {
+            (0..n)
                 .map(|i| AppGridEntry {
                     id: format!("app{i:02}.desktop"),
                     name: format!("App {i:02}"),
                     icon: AppIconRef::Fallback,
                     folder: None,
                 })
-                .collect(),
-        );
+                .collect()
+        };
+        g.set_entries(seed(256));
+        let per_page = g.items_per_page(area);
+        g.set_entries(seed(per_page + 6));
     }
-
-    let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
     let center = f
         .niri()
         .app_grid
@@ -10504,18 +10536,26 @@ fn vulkan_app_grid_slides_both_pages_during_a_page_change() {
     f.add_output(1, (1920, 1080));
     let output = f.niri_output(1);
 
-    // Enough apps for two pages at this size (24 per page).
-    let entries: Vec<AppGridEntry> = (0..30)
-        .map(|i| AppGridEntry {
-            id: format!("o{i:02}.desktop"),
-            name: format!("O{i:02}"),
-            icon: AppIconRef::Fallback,
-            folder: None,
-        })
-        .collect();
-    f.niri().app_grid.set_entries(entries);
-
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+
+    // Exactly two pages, whatever this area holds. Asked of the grid rather than hardcoded: the
+    // page capacity is not GNOME's fixed 24 since the fill divergence scales the mode up to the
+    // canvas, and a stale literal here silently turns a two-page slide test into a one-page one.
+    // Seeded before asking — an empty grid has no layout to report a capacity from.
+    let seed = |n: usize| -> Vec<AppGridEntry> {
+        (0..n)
+            .map(|i| AppGridEntry {
+                id: format!("o{i:02}.desktop"),
+                name: format!("O{i:02}"),
+                icon: AppIconRef::Fallback,
+                folder: None,
+            })
+            .collect()
+    };
+    f.niri().app_grid.set_entries(seed(256));
+    let per_page = f.niri().app_grid.items_per_page(area);
+    f.niri().app_grid.set_entries(seed(per_page + 6));
+
     assert_eq!(f.niri().app_grid.page_count(area), 2, "two pages");
     let tile0 = f
         .niri()
@@ -10636,17 +10676,24 @@ fn vulkan_app_grid_dots_follow_the_page() {
     f.add_output(1, (1920, 1080));
     let output = f.niri_output(1);
 
-    let entries: Vec<AppGridEntry> = (0..30)
-        .map(|i| AppGridEntry {
-            id: format!("o{i:02}.desktop"),
-            name: format!("O{i:02}"),
-            icon: AppIconRef::Fallback,
-            folder: None,
-        })
-        .collect();
-    f.niri().app_grid.set_entries(entries);
-
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
+
+    // Two pages, whatever this band holds — the capacity is not GNOME's fixed 24 since the fill
+    // divergence scales the mode up to the canvas. Asked after seeding: an empty grid has no
+    // layout to report a capacity from.
+    let seed = |n: usize| -> Vec<AppGridEntry> {
+        (0..n)
+            .map(|i| AppGridEntry {
+                id: format!("o{i:02}.desktop"),
+                name: format!("O{i:02}"),
+                icon: AppIconRef::Fallback,
+                folder: None,
+            })
+            .collect()
+    };
+    f.niri().app_grid.set_entries(seed(256));
+    let per_page = f.niri().app_grid.items_per_page(area);
+    f.niri().app_grid.set_entries(seed(per_page + 6));
     assert_eq!(f.niri().app_grid.page_count(area), 2);
     let dots: Vec<_> = (0..2)
         .map(|p| {

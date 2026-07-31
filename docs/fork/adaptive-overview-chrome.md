@@ -171,3 +171,32 @@ Guard the ramp itself with a unit test (monotone, clamped, `r(1280×800)=1`).
   ramp could become a theme-node input so SCSS-derived paddings/radii ramp uniformly; until then
   it stays a plain factor in `overview_layout` with one call site per constant. Do not block on
   this.
+
+## Addendum: the app grid fills the canvas (approved 2026-07-31)
+
+**Status: implemented.** `AppGrid::fill_scale` (`src/ui/app_grid.rs`), pinned by
+`a_roomy_canvas_scales_the_page_mode_up` and `folders_keep_gnomes_fixed_3x3`.
+
+The ramp above only ever *shrinks* chrome, so it says nothing about a canvas with room to spare.
+The app grid had the opposite problem. GNOME picks one of four fixed `(columns, rows)` modes
+(`defaultGridModes`, `iconGrid.js:30-47`) and turns whatever is left into spacing — which is
+capped at `max-column-spacing: $base_padding * 6`. Past a certain canvas the remainder is simply
+dead margin: our 1920x550 test band takes GNOME's 8x3 and leaves room for a ninth column unused.
+
+**Decision.** Where the mode leaves a whole cell's worth of space on an axis, take it. Each axis
+is filled independently for what it actually has, at the largest icon; the icon ladder is
+untouched, so filling only ever *adds tiles*, never inflates or shrinks one. Clamped at the mode's
+own count, so this can never show fewer tiles than GNOME would.
+
+**Why not preserve the mode's aspect ratio** (the first cut, and the more conservative-looking
+option): it is a no-op on the shapes we run on. A 1636x848 app area gives a 1272x760 content box,
+which fits 8 columns but only 4 rows at 96px — 5 rows would need 768 — so the vertical axis binds
+and a ratio-locked scale can never leave 1. All the reclaimable slack on a widescreen canvas is
+horizontal, so reclaiming any of it means letting the axes differ.
+
+**Folders are exempt.** `FolderGrid` deliberately never re-flows to its box
+(`appDisplay.js:2077-2082`) and its dialog is a fixed modal, not a canvas to fill.
+
+**Consequence to know about:** a denser grid has less vertical slack between rows, so a hovered
+tile's expanded caption grows about the tile's centre rather than only downward. Tests that sampled
+a caption row computed from the *resting* tile top now miss it — count lines of ink instead.
