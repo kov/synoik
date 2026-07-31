@@ -167,7 +167,7 @@ it:
 Art decoding is deliberately **not** here: the model carries the validated local path and slice E
 loads it, so nothing is decoded for a card that is never drawn.
 
-### E — Media card in the message list
+### E — Media card in the message list ✅ (art deferred)
 Where it goes, from the construction sequence: media messages are inserted at **index 0** of the
 dateMenu's `MessageView` — above every notification group, whose indices are offset by the player
 count (`js/ui/messageList.js:1780-1784,1826-1832`; mpris is set up before notifications,
@@ -183,6 +183,30 @@ reactivity follows `CanGoPrevious`/`CanGoNext` (`:837-838`). Style: art radius 8
 `0 18px`, radius 8px (`:226-257`) — use `widget::Button` with a style variant, not bespoke paints.
 Body click raises the player and closes the popover (`:799-804`).
 
+**Landed** `f7d2063b` as `src/ui/media_card.rs`, plus the list plumbing in `src/ui/calendar.rs`.
+What the port turned up:
+- `is_empty` and `can_clear` are **different questions**. `MessageView.empty` counts messages and
+  `canClear` counts the ones that *can close* (`:1521-1527`); a media card cannot. So a list holding
+  only players shows neither the placeholder nor the Clear pill, and the list's own `is_empty` had
+  to split in two.
+- An **insensitive skip button is `reactive = false`** (`:836-838`), so a click on it passes through
+  to the message — which raises the player. Ours falls through the same way rather than swallowing
+  it. (Live: clicking a disabled Previous launched the resolved app, as `app.activate()` would.)
+- The controls are plain `St.Button`s inside the message, not menu items, so they leave the popover
+  open; only the body click closes it.
+
+**Live-validated** 2026-07-31 on an owned headless harness with a real MPRIS player on a private bus
+(a ~50-line `Gio.bus_own_name` script exporting both interfaces): the card renders above the
+notification, `DesktopEntry` resolves to the installed app's name, and clicking play-pause / next
+reached the player over D-Bus. The cold-icon trap bit again — the first frame after the popover
+opens has no control glyphs at all; take a second shot.
+
+**Still deferred: the album art.** The model carries a validated local path
+(`PlayerState::art`), but drawing it needs a *rounded texture* element in a list whose element type
+is `TextureRenderElement`, i.e. either an element enum through the message-list render path or a
+Painter image verb. Toolkit work, not card work. Until then every player draws the
+`audio-x-generic-symbolic` fallback on the rounded slot.
+
 ### F — Panel volume scroll + headphone plug (optional polish)
 Scroll on the panel volume indicator steps volume and shows the OSD (`volume.js:442-464`: skip
 pointer-emulated events, honour smooth-scroll deltas); plugging headphones shows one
@@ -192,6 +216,8 @@ grows an input seam — schedule separately.
 ---
 
 ## Order and rationale
+Done: **A → B → C → D → E** (E without album art). Left: **F**, plus the art follow-up.
+
 **A → B → C**, then **D → E**, with F last. A is prerequisite; **B is the cheapest real payoff and
 is live-verifiable today** (audio works on this machine); C completes the brightness port; D/E are
 independent and could run in parallel.
