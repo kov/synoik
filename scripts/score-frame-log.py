@@ -55,7 +55,8 @@ def read_phase(path, lo, hi):
             b = re.search(r'(\d+) bakes in', line)
             if b:
                 out['bakes'] += int(b.group(1))
-            g = re.search(r'\(gpu ([\d.]+)ms\)', line)
+            # Unanchored: the clause carries per-site and per-phase splits now.
+            g = re.search(r'\(gpu ([\d.]+)ms', line)
             if g:
                 out['gpu'].append(float(g.group(1)))
     return out

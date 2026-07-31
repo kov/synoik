@@ -33,7 +33,14 @@ import sys
 
 SUMMARY = re.compile(r'(\S+): [\d.]+ fps over .*aim ((?:\s*\S+×\d+)+)')
 FRAME = re.compile(r'frame on \S+ took ')
-GPU = re.compile(r'\(gpu ([\d.]+)ms\)')
+# Deliberately NOT anchored on the closing paren. The clause grew a per-site
+# split -- `(gpu 23.36ms: scanout 18.10ms, offscreen 5.26ms)` -- and then a
+# per-phase one -- `(gpu 9.69ms [prepass 0.4ms, render 7.1ms, present 2.2ms])`.
+# Anchoring meant every frame carrying either was silently dropped from the gpu
+# series while still counting elsewhere: a quiet bias when only some frames had
+# a split, and a total parse failure (`0 qualifying windows`) once phases made
+# it universal.
+GPU = re.compile(r'\(gpu ([\d.]+)ms')
 DRAWS = re.compile(r'(\d+) draws covering')
 ELEMENTS = re.compile(r'; (\d+) elements')
 MISS1 = 'aimed at the next cycle'
