@@ -1,7 +1,9 @@
 # Port-level audio model — scope + plan
 
-Status: **plan only, no code** (agreed 2026-07-31). This is item 3 of what was left of slice F in
-`docs/fork/osd-media-port.md`.
+Status: **slices 0–3 landed 2026-07-31** (`906cb2de`, `04a513a2`, `8e0a635f`, `3a899729`);
+card-profile switching is in the backlog (§8). This was item 3 of what was left of slice F in
+`docs/fork/osd-media-port.md`. Each slice below carries what actually landed, and where the plan was
+wrong.
 
 References read for this plan (gnome-shell 50.3 checkout, `~/Projects/gnome-shell`):
 `js/ui/status/volume.js`, `subprojects/gvc/gvc-mixer-control.c`,
@@ -119,10 +121,8 @@ which is exactly why the filter must be gvc's `!= no` rather than `== yes`, or t
 output would vanish from the list.
 
 `device.form_factor` (gvc's `sink.get_form_factor()`) rides on the node props and can be captured in
-`on_global` exactly like `node.description` is today. This card does not set it.
-
-`device.form_factor` (gvc's `sink.get_form_factor()`) rides on the node props and can be captured in
-`on_global` exactly like `node.description` is today.
+the node's **`info` event** (see slice 1 — *not* the registry global, which was this port's most
+expensive mistake). This card does not set it.
 
 ## 5. Slices
 
