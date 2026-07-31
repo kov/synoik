@@ -1664,6 +1664,9 @@ impl FrameLog {
         // the expected path is indistinguishable from a complete dump of a shorter
         // window, which is precisely the invisible-hole failure this mechanism cannot
         // tolerate. `rename` is atomic, so the reader sees the whole file or none.
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         let tmp = path.with_extension("txt.partial");
         {
             let file = std::fs::File::create(&tmp)?;
@@ -1707,8 +1710,48 @@ fn dump_path(nth: u64) -> std::path::PathBuf {
     if let Ok(path) = std::env::var("NIRI_FRAME_LOG_DUMP") {
         return std::path::PathBuf::from(path);
     }
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned());
-    std::path::PathBuf::from(dir).join(format!("niri-frame-log.{}.{nth}.txt", std::process::id()))
+    std::path::PathBuf::from(dump_dir()).join(format!("frame-log.{}.{nth}.txt", std::process::id()))
+}
+
+/// Where dumps live by default: `$XDG_STATE_HOME/niri`, i.e. `~/.local/state/niri`.
+///
+/// **Not `$XDG_RUNTIME_DIR`**, which is where this used to write. That directory is a
+/// tmpfs by design — it is for sockets and pid files, things that *should* die with the
+/// boot — and every earlier arm of this investigation tolerated that only because the
+/// frame log also wrote each line to journald, which is persistent. `ring` mode's whole
+/// purpose is that it does not, so the runtime dir was the one place a measurement must
+/// not go: a reboot between taking a run and reading it destroyed it silently. State is
+/// the XDG category for exactly this — survives restarts, not precious enough to be data.
+fn dump_dir() -> std::ffi::OsString {
+    let var = |k| std::env::var_os(k).filter(|s: &std::ffi::OsString| !s.is_empty());
+    dump_dir_from(var("XDG_STATE_HOME"), var("HOME"), var("XDG_RUNTIME_DIR"))
+}
+
+/// The choice itself, with the environment passed in.
+///
+/// Split out so it can be tested without `set_var`. That is not fastidiousness: these
+/// tests run in one process alongside everything else, and the first version of the test
+/// cleared `NIRI_FRAME_LOG_DUMP` and broke a *different* test that was mid-dump. Env
+/// mutation in a parallel test binary is a flake generator, and this file already carries
+/// scars from the same class in its counters.
+fn dump_dir_from(
+    state: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    runtime: Option<std::ffi::OsString>,
+) -> std::ffi::OsString {
+    if let Some(state) = state {
+        let mut path = std::path::PathBuf::from(state);
+        path.push("niri");
+        return path.into_os_string();
+    }
+    if let Some(home) = home {
+        let mut path = std::path::PathBuf::from(home);
+        path.extend([".local", "state", "niri"]);
+        return path.into_os_string();
+    }
+    // No home to write to (a system service, a broken environment). The runtime dir is
+    // still better than the cwd, which for a compositor is wherever it was launched.
+    runtime.unwrap_or_else(|| "/tmp".into())
 }
 
 /// How many bake sites a frame line names before it starts counting the rest.
@@ -2306,10 +2349,15 @@ mod tests {
         // dump of a shorter window.
         log.begin("out");
         log.end(Some(Duration::from_millis(16)));
-        std::env::set_var("NIRI_FRAME_LOG_DUMP", dir.join("no/such/dir/dump.txt"));
+        // A path whose parent is a regular *file*, so it fails at the directory
+        // create — a merely missing directory is no longer an error, since the
+        // state dir legitimately does not exist before the first dump.
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"").unwrap();
+        std::env::set_var("NIRI_FRAME_LOG_DUMP", blocker.join("dump.txt"));
         assert!(
             log.dump().is_err(),
-            "a dump into a missing directory must fail"
+            "a dump that cannot create its directory must fail"
         );
         assert_eq!(
             log.ring.len(),
@@ -2319,6 +2367,41 @@ mod tests {
 
         std::env::remove_var("NIRI_FRAME_LOG_DUMP");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The default dump location must survive a reboot.
+    ///
+    /// It used to be `$XDG_RUNTIME_DIR`, which is a tmpfs. That was survivable only
+    /// while the frame log also wrote every line to journald — `ring` mode removes
+    /// exactly that, so a runtime-dir dump is the only copy of a measurement in
+    /// existence and a reboot takes it. This pins the category, not the string: any
+    /// default under the runtime dir is a regression.
+    #[test]
+    fn dumps_land_somewhere_a_reboot_does_not_erase() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        let run = os("/run/user/4242");
+
+        let path = dump_dir_from(None, os("/home/someone"), run.clone());
+        assert_eq!(
+            std::path::PathBuf::from(&path),
+            std::path::PathBuf::from("/home/someone/.local/state/niri"),
+            "with no XDG_STATE_HOME, dumps belong under the home state dir"
+        );
+
+        let path = dump_dir_from(os("/home/someone/.state"), os("/home/someone"), run.clone());
+        assert_eq!(
+            std::path::PathBuf::from(&path),
+            std::path::PathBuf::from("/home/someone/.state/niri"),
+            "XDG_STATE_HOME must win over the home fallback"
+        );
+
+        // Only with nowhere durable to write does the tmpfs become acceptable.
+        let path = dump_dir_from(None, None, run);
+        assert_eq!(
+            std::path::PathBuf::from(&path),
+            std::path::PathBuf::from("/run/user/4242"),
+            "the runtime dir is the last resort, never the default"
+        );
     }
 
     /// Successive dumps must land in successive files. With one fixed name per PID

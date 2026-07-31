@@ -8,6 +8,14 @@ originally located by guessing driver timestamps out of a docstring and widening
 shape looked right. It happened to land correctly (the slice covered all five runs plus two idle
 windows) but it was luck, and the run count in the first draft of §19.1 was wrong by one.
 
+**Ring-mode runs are not in the journal, and no longer need to be.** Everything below assumes any
+arm can be recovered after the fact from journald. That holds for `NIRI_FRAME_LOG=all`, which writes
+a line per frame. `ring` mode exists precisely so the frame path never writes to journald, so a ring
+dump is the only copy that exists. It used to land in `$XDG_RUNTIME_DIR` — a tmpfs — which meant a
+reboot between taking a run and reading it destroyed it silently. Dumps now go to
+`$XDG_STATE_HOME/niri/frame-log.<pid>.<n>.txt` (`~/.local/state/niri/`), which survives.
+Older copies taken before that fix are archived in `~/Projects/gnome-shell-rs-runs/<date>/`.
+
 **The journal is persistent** (`/var/log/journal`), so every run below is still recoverable:
 
 ```
