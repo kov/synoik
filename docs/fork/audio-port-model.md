@@ -239,7 +239,7 @@ stream"*.
 **Still needs hardware.** Every test here drives the models directly; nothing has confirmed that a
 real jack produces the route change we expect. On this card the answer is `Some(false)` forever.
 
-### Slice 3 — port-level device lists
+### Slice 3 — port-level device lists — **LANDED** (`3a899729`)
 
 - Replace `SinkInfo`/`SourceInfo` with a shared `AudioDevice { key, description, origin, icon,
   available }`, keyed by `(card global id, direction, route index)` for port-backed devices and by
@@ -250,11 +250,25 @@ real jack produces the route change we expect. On this card the answer is `Some(
 - Row label `description – origin` (en dash, `volume.js:130-133`); row icon from the device icon
   falling back to the card icon (`gvc-mixer-ui-device.c:632-643`) into the existing `ItemRow.icons`.
   Closes D3.
-- Activation writes the `Route` param to select the port, then sets the default node.
-  **Explicitly out of scope: card-profile switching.** gvc will swap a card's profile to reach a
-  port (`profile_swapping_device_id`, `gvc-mixer-control.c:1590-1600`); we will select routes within
-  the current profile only, and note the gap. Choosing e.g. bluetooth HSP from HFP will not work
-  until a follow-up.
+- Activation writes the `Route` param to select the port, **then** sets the default node. The order
+  matters: making a node default before selecting its port lands you on the old port. Same as gvc's
+  `change_output` case 3.
+
+**Card-profile switching: deferred, kept in the backlog** (agreed 2026-07-31). gvc reaches a port in
+an inactive profile by swapping the card's profile first (`change_profile_on_selected_device`,
+`gvc-mixer-control.c:1590-1600`). We do not, for two reasons: it is *stateful async sequencing* —
+set profile, wait for nodes to be republished, then set route, then set default, which is what gvc
+carries `profile_swapping_device_id` across — and there is no cross-profile route on this machine to
+test it with (three profiles, but only `output:stereo-fallback` carries a route).
+
+Deferring the switch forces a choice about the *list*, because `EnumRoute` returns routes from
+inactive profiles too. Three options were on the table: implement switching now; list only
+in-profile routes; or list everything and let those rows silently fail. **We took the middle one** —
+`AudioCard::offerable_ports` filters on the active profile, so every row that exists works.
+
+**Known divergence, recorded deliberately:** GNOME lists cross-profile ports and switches for you;
+we omit them. In practice that costs the HDMI row on multi-profile cards, and bluetooth A2DP↔HSP/HFP.
+Pinned by `unavailable_and_out_of_profile_ports_are_not_offered`.
 
 ## 6. Reading the real card — you must dump as the seat user
 
@@ -307,3 +321,33 @@ real device.
    whatever the port switch did to the volume.
 3. `MAX_DEVICE_ROWS` (`src/ui/quick_settings.rs`) becomes more likely to bite once rows are
    per-port rather than per-card. Worth re-checking the cap against GNOME (which has none).
+
+## 8. Backlog
+
+- **Card-profile switching** (low priority, needs hardware). See slice 3 above for why it is out and
+  what it costs. Would restore the HDMI and bluetooth-mode rows. Wants `EnumProfile` parsed (we
+  already read the active `Profile` index), a `set_profile` on the backend, and the async
+  re-enumeration sequenced properly.
+- **`MAX_DEVICE_ROWS`** now truncates a *port* list rather than a card list, so it bites sooner.
+  GNOME has no cap. Worth revisiting.
+- **Per-port volume.** PulseAudio stores volume per port and PipeWire exposes it in
+  `SPA_PARAM_ROUTE_props`; we keep the node `Props` as the single volume authority (§7 Q2).
+
+## 9. What is live-validated, and what is not
+
+Validated on this VM's virtio-snd card (instrumented build run as gsrs against the seat's PipeWire,
+then reverted — see §6 for how):
+
+- slice 1's whole read path: card, `EnumRoute`, `Route`, `Profile`, the node→card join, the icon;
+- slice 3's list: one row, `Analog Output – Built-in Audio`, `audio-card-analog`, `selected: true`,
+  key resolving to the real sink node.
+
+**Not validated anywhere** — needs hardware with a jack or a bluetooth headset:
+
+- that plugging headphones produces a route change we see at all (slice 2's entire premise);
+- the OSD firing on a port change, and the slider icon swapping;
+- a multi-port picker (two rows on one card), the availability flip removing a row, and the
+  route write actually switching the output.
+
+All of the above are driven by hand-built models in tests. The tests pin *our* logic; they cannot
+pin the assumption that PipeWire reports what we think it does.
