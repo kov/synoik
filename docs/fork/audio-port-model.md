@@ -98,13 +98,28 @@ exists in the crates we already have (`pipewire` 0.9.2):
 So: `EnumRoute` enumerates every port on the card (gvc's port list), `Route` reports the **active**
 route per direction, and writing `Route` selects one (what `wpctl set-route` / pavucontrol do).
 
-**Join key — the one thing this plan does not know.** To attribute an active route to the default
-*sink node* we need the node→device link, which is conventionally the node props `device.id` (the
-Device global id, `PW_KEY_DEVICE_ID`, `/usr/include/pipewire-0.3/pipewire/keys.h:271`) plus
-`card.profile.device` (the SPA device index inside the card, matched against
-`SPA_PARAM_ROUTE_device`). `card.profile.device` is a WirePlumber/pipewire-pulse convention and is
-**not** in the installed spa headers, so it must be confirmed against a real card before slice 2 is
-written — see §7.
+**Join key — confirmed on live hardware** (see §6 for how to look). To attribute an active route to
+the default *sink node* we join on the node props `device.id` (the Device global id,
+`PW_KEY_DEVICE_ID`, `/usr/include/pipewire-0.3/pipewire/keys.h:271`) plus `card.profile.device` (the
+SPA device index inside the card), matched against `SPA_PARAM_ROUTE_device`. `card.profile.device`
+is a WirePlumber/pipewire-pulse convention rather than a documented spa key, but this machine's sink
+node carries both, and the value matches the active route's `device`:
+
+```
+DEVICE 42  Audio/Device  alsa_card.platform-a016000.virtio_mmio  "Built-in Audio"  icon=audio-card-analog
+ NODE 49   Audio/Sink    alsa_output...stereo-fallback  device.id=42  card.profile.device=1
+ Route     index=0 direction=Output name="analog-output" description="Analog Output"
+           available=unknown  device=1  profile=1  devices=[1]  props={mute, channelVolumes, …}
+```
+
+Two parser details visible there: an `EnumRoute` entry carries `devices: [1]` (an array of the SPA
+device indices the route applies to) while the active `Route` carries **both** `device: 1` (scalar,
+the one it is applied to) and `devices: [1]`. And `available` is `"unknown"` here, not `"yes"` —
+which is exactly why the filter must be gvc's `!= no` rather than `== yes`, or this card's only
+output would vanish from the list.
+
+`device.form_factor` (gvc's `sink.get_form_factor()`) rides on the node props and can be captured in
+`on_global` exactly like `node.description` is today. This card does not set it.
 
 `device.form_factor` (gvc's `sink.get_form_factor()`) rides on the node props and can be captured in
 `on_global` exactly like `node.description` is today.
@@ -180,28 +195,54 @@ Small and mechanical, and it is the difference between slices 2–3 landing test
   the current profile only, and note the gap. Choosing e.g. bluetooth HSP from HFP will not work
   until a follow-up.
 
-## 6. Risk: this cannot be live-validated here
+## 6. Reading the real card — you must dump as the seat user
 
-`pw-dump` on this VM lists exactly one audio node — `auto_null`, with no `device.id`, no
-`card.profile.device`, no form factor — and no `Audio/Device` object at all. There is no card to
-enumerate routes from, so:
+There **is** a real card here (`/proc/asound/cards`: `virtio-snd VirtIO SoundCard`), but a plain
+`pw-dump` as `kov` shows only `auto_null` and no `Audio/Device` at all. That is not the absence of
+hardware, it is logind device ACLs: `/dev/snd/*` is granted to the **active seat session** only,
+which is `gsrs`.
 
-- slice 1's route parsing cannot be checked against real data here;
-- slice 2 cannot be exercised end to end (nothing to plug in);
-- slice 3's list will render one fallback row, exactly as it does today.
+```
+$ getfacl -p /dev/snd/controlC0
+user::rw-
+user:gsrs:rw-        <- the seat session; kov is not on the list
+group::rw-
+```
 
-Consequences for the plan: the pod-parsing must be unit-tested against **hand-built pods** rather
-than trusted from a live read, and the whole port model goes on the pending-live-validation list to
-be run on hardware with a real card (a laptop with a headphone jack is the ideal check — it exercises
-availability flips, the OSD, and the icon in one gesture).
+So kov's own PipeWire daemon runs an ALSA monitor that finds nothing, and every audio question asked
+from a kov shell answers "no hardware". Dump from the seat session instead (read-only, safe):
+
+```
+sudo -u gsrs XDG_RUNTIME_DIR=/run/user/1002 pw-dump
+```
+
+**Trap for this whole port:** any "does PipeWire expose X" check must be run that way, or it will
+come back a confident, wrong "no". The same applies to a compositor built to test this — a headless
+niri started as kov will never see a route.
+
+What this card can and cannot validate:
+
+- **Can:** slice 1's whole read path — a real `Audio/Device`, real `EnumRoute`/`Route` objects, the
+  node→device join, the `available: unknown` case, and per-route `props`.
+- **Cannot:** the headphone behaviour. This card exposes exactly one output route, "Analog Output",
+  with no headphone port and no `device.form_factor`, so there is nothing to plug in and
+  `has_headphones` is `false` by every branch. Slice 2's OSD and icon flip still need real hardware
+  with a jack (or a bluetooth headset, which gvc's `form_factor` branch was written for) — it goes
+  on the pending-live-validation list.
+- **Cannot:** the multi-row picker. One route means slice 3 renders one row, same as today.
+
+Unit tests therefore still build **hand-made pods** for the multi-port, availability-flip and
+headphone cases; the live card is the check that the parser agrees with reality on at least one
+real device.
 
 ## 7. Open questions to settle before slice 2
 
-1. Confirm `card.profile.device` on sink nodes and its correspondence to `SPA_PARAM_ROUTE_device` on
-   a machine with a real card. If it is absent, fall back to joining on `device.id` alone and taking
-   the single active output route.
-2. Do we want per-port volume? PulseAudio stores volume per port, and PipeWire exposes it in
-   `SPA_PARAM_ROUTE_props`. Proposal: **no** — the node `Props` stay the single volume authority;
-   the node echo will report whatever the port switch did to the volume.
+1. ~~Confirm `card.profile.device`~~ — **resolved**, see §4: `device.id=42` + `card.profile.device=1`
+   on the sink node, matching `Route.device=1`. Keep the fallback anyway (join on `device.id` alone
+   and take the single active output route) for cards that omit it.
+2. Do we want per-port volume? PulseAudio stores volume per port, and PipeWire does expose it —
+   this card's active `Route.props` carries `mute` + `channelVolumes` + `volumeStep`. Proposal:
+   still **no** — the node `Props` stay the single volume authority; the node echo will report
+   whatever the port switch did to the volume.
 3. `MAX_DEVICE_ROWS` (`src/ui/quick_settings.rs`) becomes more likely to bite once rows are
    per-port rather than per-card. Worth re-checking the cap against GNOME (which has none).
