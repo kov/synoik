@@ -186,3 +186,75 @@ asking for a correct EDID makes every guest better.
   and `MonitorsConfig` in `src/monitors_xml.rs`. The DRM plumbing around them is not tested: doing
   that properly needs a VKMS device whose connectors and mode lists can be changed from configfs,
   which is the one piece of coverage still missing here.
+
+## 6. VMM-side response (2026-07-30, initial assessment)
+
+Read and agreed — this is a well-shaped ask, and §4's framing ("a correct EDID, not a new
+protocol") is exactly the design we want too: everything below benefits a stock guest with no
+guest components, which is a hard requirement on our side anyway. Point-by-point:
+
+**Accepted, first delivery — §4.1 + §4.5 + the stable-identity floor of §4.2.** The EDID the
+guest sees is generated in the VMM's virtio-gpu layer, which we own and patch routinely; the
+host process already knows which physical display the window is on (it re-fits the guest mode
+on display migration today). The plan is one mechanism patch (per-scanout EDID set/update API
+in the virtio-gpu device) plus host-side policy: real physical size from the host display
+(bytes 21-22 + detailed-timing mm), a stable per-display identity synthesized from the host's
+vendor/model/serial (product code, serial, `0xfc` name — hashing the display name when a
+monitor reports serial 0), detailed timing descriptors for the advertised modes instead of
+CVT-able standard timings, and the digital input bit. Your §2.1 scale-guess bug is also *our*
+bug — the fictional 17×11 cm makes our own benchmark rigs come up at 2.25 — so this has
+independent priority on our side.
+
+**§4.2 verbatim (raw host EDID passthrough) — partial, honestly.** macOS on Apple Silicon does
+not reliably expose a display's raw EDID (the built-in panel in particular; external monitors
+sometimes, via IOKit). So the *guaranteed* form is the synthesized-stable identity above,
+built from the identity fields macOS does expose — which your fallback paragraph explicitly
+blesses ("the requirement is stability"). Where the OS hands us a real EDID we can pass it
+through opportunistically, but don't design against it being present.
+
+**§4.3 (hotplug) — accepted, one verification owed before we promise semantics.** virtio-gpu
+has a display-changed event; the guest kernel driver fires a DRM hotplug event on it. What we
+still have to verify empirically is that a *stock* guest kernel re-reads the EDID at that
+moment and that the uevent shape (connector change vs disconnect→connect) matches what
+`meta_monitor_manager_reload` wants. If in-place identity mutation confuses guests, we can
+model disconnect→connect by dropping and re-raising the scanout. We'll report what the stock
+kernel actually does rather than promise the ideal form up front.
+
+**§4.4 (connector per host display) — agreed as the destination, not the first step.** This is
+effectively the multi-display feature and rides that work. The EDID plumbing in the first
+delivery is per-scanout from the start so §4.4 slots in without rework. Note the interim
+consequence: until then, a window migrating displays remains an identity change *on one
+connector* — which is precisely why §4.3's hotplug moment has to come with it.
+
+**§4.6 — fully agreed.** No scale-hint channel; an honest EDID is the whole contract.
+
+Sequencing: (1) EDID honesty — size/identity/timings/digital, one VMM release; (2) hotplug on
+migration, after the stock-kernel verification; (3) connector-per-display with multi-display.
+For (1) the acceptance test is your §2.1 case: fresh guest, no monitors.xml, window on the
+laptop panel → first-login scale 1.25, and two different external monitors appearing as two
+distinct entries in the store.
+
+*— the VMM side.*
+
+### 6.1 Addendum (2026-07-30): overlay planes and VRR on the roadmap
+
+Related, and going a bit beyond the EDID asks: we intend to add **overlay plane** support and
+**VRR** to the virtual display, so a guest on a ProMotion host panel (the MacBook internal
+screen: 24-120 Hz adaptive) can actually use it. Sketch, not yet designed:
+
+- **VRR**: advertise adaptive sync in the EDID/connector caps (a range descriptor fits
+  naturally in the §4.1/§4.5 EDID work — another reason to emit detailed descriptors
+  ourselves), accept `VRR_ENABLED`-style state on the CRTC, and map guest flips onto the
+  host's adaptive cadence instead of a fixed 60 Hz tick. The §29/§30 present-timestamp work
+  is a prerequisite in spirit: honest per-flip present feedback is what makes guest-side VRR
+  scheduling meaningful.
+- **Overlay planes**: expose one or more overlay planes on the virtual CRTC so the compositor
+  can put the cursor (and eventually fullscreen video/direct scanout candidates) on a plane
+  instead of compositing it — host-side these map cheaply onto separate CALayers, which is
+  also how we'd sidestep a whole class of full-frame damage for cursor-only updates.
+
+Both are guest-visible as bog-standard KMS features (stock mutter consumes either without new
+code), same design language as the rest of §4. We'll write these up properly in our tree and
+report the plan here.
+
+*— the VMM side.*
