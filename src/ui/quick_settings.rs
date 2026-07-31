@@ -61,8 +61,13 @@ const PAD: f64 = 18.;
 fn tile_w() -> f64 {
     12.0 * crate::ui::pt_to_px(11.0)
 }
-const TILE_H: f64 = 56.;
-const TILE_GAP: f64 = 8.;
+/// `.quick-toggle` is `min-height: $scalable_icon_size * 3` = 48px (`_quick-settings.scss:19`) —
+/// sized off the icon so the button scales with it, as the rule's own comment says. Measured
+/// 48.0019 on a live 50.3 shell.
+const TILE_H: f64 = 48.;
+/// `.quick-settings-grid` `spacing-rows`/`spacing-columns`: `$base_padding * 2` = 12px
+/// (`_quick-settings.scss:11-12`).
+const TILE_GAP: f64 = 12.;
 const COLS: usize = 2;
 /// Icon size inside a tile, and its inset from the tile's left edge.
 const TILE_ICON: f64 = 16.;

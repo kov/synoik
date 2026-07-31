@@ -101,4 +101,10 @@ padding (6) + `#calendarArea` padding (4) = the 10px the first card sits in from
 - Values are **logical px at the session's scale**; a fractional-scale session reports accordingly.
 - `get_theme_node()` fails on an unallocated actor, so `theme` can be `null` for something not yet
   laid out. Open the UI first.
+- **Check `mapped` before believing a size.** An unmapped actor still reports one — its *preferred*
+  size, not an allocation — so a dump that fired a moment before the menu opened comes back with a
+  complete, plausible, wrong box model. Each group carries a `mapped` count and the D-Bus reply
+  warns when a group matched nothing mapped. Theme values are unaffected: `StThemeNode` resolves
+  the cascade whether or not the actor was laid out, so padding/radius/`min-*` from an unmapped
+  dump are still good.
 - Tree walks are depth-capped (40) so a stray `DumpAll` cannot stall the shell.

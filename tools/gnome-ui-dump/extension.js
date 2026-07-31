@@ -133,6 +133,10 @@ function themeOf(actor) {
         // `spacing` is a plain theme length St feeds to the layout manager, and it is what makes
         // an icon-to-text gap differ from the icon's own margin — the two stack.
         spacing: length('spacing'),
+        // A grid sets these instead of `spacing` (`.quick-settings-grid`), and reading only
+        // `spacing` reports null — which looks like "no gap" rather than "asked the wrong name".
+        spacing_rows: length('spacing-rows'),
+        spacing_columns: length('spacing-columns'),
         min_width: length('min-width'),
         min_height: length('min-height'),
         width: length('width'),
@@ -225,6 +229,17 @@ function ancestry(actor) {
     return chain;
 }
 
+/** Say so, in the D-Bus reply, when a group matched only unmapped actors — the menu was not open
+ *  when the dump ran and its allocations are preferred sizes. (This is not hypothetical: a
+ *  quick-settings dump fired a moment before the menu opened and reported a whole plausible box
+ *  model for a tree that had never been laid out.) */
+function unmappedWarning(groups) {
+    const stale = groups.filter((g) => g.count > 0 && g.mapped === 0).map((g) => g.match);
+    return stale.length
+        ? `; WARNING unmapped (sizes are preferred, not allocated): ${stale.join(' ')}`
+        : '';
+}
+
 export default class UiDumpExtension extends Extension {
     enable() {
         this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE, this);
@@ -265,17 +280,26 @@ export default class UiDumpExtension extends Extension {
     }
 
     _dumpMatching(pred, label, path) {
-        const found = findAll(global.stage, pred, []);
-        if (found.length === 0)
+        const group = this._group(pred, label);
+        if (group.count === 0)
             return `no actor matched ${label}`;
-        return this._write(path, {
+        return `${this._write(path, group)}${unmappedWarning([group])}`;
+    }
+
+    _group(pred, label) {
+        const found = findAll(global.stage, pred, []);
+        return {
             match: label,
             count: found.length,
+            // Hoisted out of the tree so a reader cannot miss it: an unmapped actor still reports
+            // a size, but it is a *preferred* size, not an allocation. Reading a box model off
+            // one silently measures a menu that was never on screen.
+            mapped: found.filter((a) => a.mapped).length,
             matches: found.map((actor) => ({
                 ancestry: ancestry(actor),
                 actor: describe(actor, 0),
             })),
-        });
+        };
     }
 
     DumpClass(styleClass, path) {
@@ -292,23 +316,13 @@ export default class UiDumpExtension extends Extension {
     // widget is not on screen" and "I misspelled the class" are the two likeliest outcomes, and a
     // silently missing key looks like neither.
     DumpClasses(styleClasses, path) {
-        const groups = styleClasses.map((styleClass) => {
-            const found = findAll(
-                global.stage, (actor) => hasClass(actor, styleClass), []);
-            return {
-                match: `.${styleClass}`,
-                count: found.length,
-                matches: found.map((actor) => ({
-                    ancestry: ancestry(actor),
-                    actor: describe(actor, 0),
-                })),
-            };
-        });
+        const groups = styleClasses.map((styleClass) => this._group(
+            (actor) => hasClass(actor, styleClass), `.${styleClass}`));
         const missing = groups.filter((g) => g.count === 0).map((g) => g.match);
-        const written = this._write(path, {groups});
-        return missing.length
-            ? `${written}; nothing matched ${missing.join(' ')}`
-            : written;
+        let result = this._write(path, {groups});
+        if (missing.length)
+            result += `; nothing matched ${missing.join(' ')}`;
+        return result + unmappedWarning(groups);
     }
 
     _after(delaySeconds, label, run) {
