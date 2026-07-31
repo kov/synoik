@@ -202,13 +202,20 @@ seat's PipeWire, then reverted): `icon_name: Some("audio-card-analog")`, bound s
 `card: {card_id: 42, device: Some(1)}`, active route `analog-output` with `device: Some(1)` — the
 join resolves. `form_factor: None` is correct here; this card does not set one.
 
-### Slice 2 — headphones: icon + OSD (the user-visible payoff)
+### Slice 2 — headphones: icon + OSD — **LANDED** (`8e0a635f`), with a correction
 
 - `audio::has_headphones(form_factor: Option<&str>, active_port: Option<&str>) -> bool` — a direct,
   pure port of `_findHeadphones`, with its "no ports at all → false" branch.
-- `AudioStatus` gains `headphones: bool`, so `volume_icon` stays a pure function of the status and
-  both the panel and the QS slider pick it up for free. `volume_icon` returns
-  `audio-headphones-symbolic` **before** the mute check (detail 3 above).
+- ~~`AudioStatus` gains `headphones: bool`, so `volume_icon` stays a pure function of the status and
+  both the panel and the QS slider pick it up for free.~~ **WRONG — corrected while implementing.**
+  That would have put the headphone glyph on the panel indicator and the OSD, and GNOME puts it on
+  neither. `_updateIcon` sets `this.iconName`, the **quick-settings slider's own button**; the panel
+  indicator is assigned separately from `this._output.getIcon()` in the `stream-updated` handler
+  (`volume.js:484-490`), and `showOSD` builds its gicon from `this.getIcon()` (`volume.js:283-288`).
+  Both of those are the plain level icon. So the override is one function,
+  `audio::output_slider_icon`, called from `quick_settings.rs` **only** — `volume_icon` is untouched
+  and keeps feeding the panel and the OSD. (Reference-first caught this; the plan was written from
+  a reading of `_findHeadphones`/`_portChanged` without following where `iconName` actually lands.)
 - Port-change OSD with the initial-sync suppression: the watcher keeps `Option<bool>`, and emits an
   OSD request only when the previous value is `Some(_)` and differs — never reset across a
   default-sink change (detail 2). Return it as data the way `BrightnessUpdate` carries `OsdRequest`
@@ -217,6 +224,20 @@ join resolves. `form_factor: None` is correct here; this card does not set one.
 - Tests (now possible because of slice 0): plug headphones → icon flips and an OSD appears; the
   *first* sync flips the icon and shows **no** OSD; muted + headphones still shows the headphone
   glyph; default-sink swap from a headphone sink to a speaker sink shows an OSD.
+
+**As landed:** `has_headphones` is a branch-for-branch port (note the middle branch *returns* — once
+a sink has ports the answer is the port name and nothing else), `default_sink_has_headphones`
+resolves it against the models and returns `Option<bool>` where `None` is "no sink bound, no
+answer". That distinction is load-bearing: an unbound period must not spend the one-time
+suppression. `Niri::headphones: Option<bool>` is `_hasHeadphones`, and is deliberately **not** reset
+on a sink swap.
+
+Both traps are mutation-checked: dropping the `!initializing` guard fails *"the initial sync must
+not raise an OSD"*, and resetting the answer per stream fails *"`_hasHeadphones` is not reset per
+stream"*.
+
+**Still needs hardware.** Every test here drives the models directly; nothing has confirmed that a
+real jack produces the route change we expect. On this card the answer is `Some(false)` forever.
 
 ### Slice 3 — port-level device lists
 
