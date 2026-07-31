@@ -852,11 +852,21 @@ pub struct TextSpan<'a> {
     pub px: f32,
 }
 
-/// GNOME's default UI font is Cantarell (`org.gnome.desktop.interface font-name` = "Cantarell 11").
+/// **This is a known, measured divergence — we render the wrong typeface.**
+///
 /// The generic `Family::SansSerif` resolves through fontconfig to whatever `sans` maps to (Noto
-/// Sans on this system), whose glyph shapes and metrics differ from GNOME's — so name Cantarell.
-/// If it is missing, cosmic-text falls back to the fontdb default. TODO: read the `font-name`
-/// gsetting instead of hardcoding, per the fork's "GNOME's way" tenet.
+/// Sans here), whose metrics differ from GNOME's, so the family has to be named. It was named
+/// Cantarell on the belief that Cantarell 11 is GNOME's default. It is not, as of 50.3: the
+/// `org.gnome.desktop.interface font-name` schema default is **`Adwaita Sans 11`** (verified with
+/// `dconf`/`gsettings` against a live 50.3 session, and Adwaita Sans is installed there).
+///
+/// Every glyph we shape is therefore the wrong face, which moves every measured text width —
+/// wrapping, ellipsis and any centring derived from an advance.
+///
+/// The fix is not to swap one hardcoded name for another: the fork's tenet is GNOME's model, and
+/// GNOME reads the family *and* size from `font-name` (we already read the size,
+/// `crate::gnome::parse_font_size_pt`). Doing it properly means this becomes a runtime value, which
+/// re-measures every text-derived layout — hence its own slice rather than a drive-by.
 pub const SANS_FAMILY: Family<'static> = Family::Name("Cantarell");
 
 /// Sans attrs for a single-line LABEL: Cantarell, optional bold, and **tabular figures** (`tnum`).
