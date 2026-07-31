@@ -1,0 +1,8 @@
+{
+  "uuid": "ui-dump@gnome-shell-rs",
+  "name": "UI Dump (gnome-shell-rs)",
+  "description": "Dumps the live actor tree — allocations plus the resolved StThemeNode box model (padding, margin, border, radius, spacing, colors, font) — as JSON, so a port can be checked against the running shell instead of against a screenshot. Development tool for the gnome-shell-rs fork.",
+  "shell-version": ["48", "49", "50"],
+  "session-modes": ["user", "unlock-dialog"],
+  "url": "https://github.com/kov/gnome-shell-rs"
+}
