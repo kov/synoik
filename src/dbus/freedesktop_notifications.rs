@@ -278,6 +278,8 @@ impl Notifications {
             replaces_id,
             desktop_entry: hint_str(&hints, "desktop-entry").map(|s| clamp_text(s, 255)),
             source_icon: NotificationIcon::from_string(&app_icon).and_then(resolve_file_icon),
+            // Resolved by the compositor, which owns the app catalog (`on_notifications_msg`).
+            app_icon: None,
             // The summary displays verbatim in gnome-shell (escaped wholesale,
             // `js/ui/messageList.js:564-568`); only the body is markup-capable.
             title: clamp_text(flatten_text(&summary), 4096),

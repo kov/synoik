@@ -237,6 +237,12 @@ pub struct NotifyRequest {
     pub desktop_entry: Option<String>,
     /// From the `app_icon` call parameter (source-icon fallback only).
     pub source_icon: Option<NotificationIcon>,
+    /// The **resolved app's** icon, when the `desktop-entry` hint or the app name matched an
+    /// installed app (`AppSystem::app_for_notification`). Filled in by the compositor, not the
+    /// D-Bus server — resolving needs the app catalog, and the server stays a plain-data seam.
+    /// Takes precedence over `source_icon`, mirroring
+    /// `get icon() { app?.get_icon() ?? appIcon }` (`js/ui/notificationDaemon.js:398`).
+    pub app_icon: Option<crate::app_system::AppIconRef>,
     /// Sanitized (see [`sanitize_text`]).
     pub title: String,
     /// Sanitized (see [`sanitize_text`]).
@@ -314,6 +320,9 @@ pub struct Source {
     /// (`js/ui/messageList.js:396-403`).
     pub title: String,
     pub icon: Option<NotificationIcon>,
+    /// The resolved app's icon; wins over [`icon`](Self::icon) — see
+    /// [`NotifyRequest::app_icon`].
+    pub app_icon: Option<crate::app_system::AppIconRef>,
     pub notifications: Vec<Notification>,
 }
 
@@ -560,6 +569,9 @@ impl NotificationStore {
             if req.source_icon.is_some() {
                 source.icon = req.source_icon;
             }
+            if req.app_icon.is_some() {
+                source.app_icon = req.app_icon;
+            }
             id
         } else {
             let id = self.next_id;
@@ -610,6 +622,7 @@ impl NotificationStore {
                             sender: req.sender.clone(),
                             title: String::new(),
                             icon: None,
+                            app_icon: None,
                             notifications: Vec::new(),
                         },
                     );
@@ -626,6 +639,9 @@ impl NotificationStore {
             source.title = req.app_name;
             if req.source_icon.is_some() {
                 source.icon = req.source_icon;
+            }
+            if req.app_icon.is_some() {
+                source.app_icon = req.app_icon;
             }
             source.notifications.push(notification);
             id
@@ -725,6 +741,7 @@ impl NotificationStore {
                             sender: None,
                             title: String::new(),
                             icon: None,
+                            app_icon: None,
                             notifications: Vec::new(),
                         },
                     );
@@ -1099,6 +1116,7 @@ mod tests {
             replaces_id: 0,
             desktop_entry: None,
             source_icon: None,
+            app_icon: None,
             title: "title".to_owned(),
             body: "body".to_owned(),
             icon: None,

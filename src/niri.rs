@@ -3778,8 +3778,22 @@ impl State {
     pub fn on_notifications_msg(&mut self, msg: crate::notifications::NotificationsToNiri) {
         use crate::notifications::NotificationsToNiri;
         match msg {
-            NotificationsToNiri::Notify { req, reply } => {
+            NotificationsToNiri::Notify { mut req, reply } => {
                 let now = self.niri.clock.now_unadjusted();
+                // A notification's source presents as its *app* when one resolves — the app's
+                // name and icon beat the `app_name`/`app_icon` call parameters
+                // (`js/ui/notificationDaemon.js:396-399`). This is what puts the browser's own
+                // logo on a web notification, which arrives with an empty `app_icon` and only a
+                // `desktop-entry` hint. Resolved here rather than in the D-Bus server because it
+                // needs the app catalog, and the server is a plain-data seam.
+                if let Some(app) = self
+                    .niri
+                    .app_system
+                    .app_for_notification(req.desktop_entry.as_deref(), &req.app_name)
+                {
+                    req.app_name = app.name;
+                    req.app_icon = Some(app.icon);
+                }
                 // DND is the inverse of `show-banners` (the Q11 QS toggle).
                 let show_banners = !self.niri.gnome_settings.quick_toggles.do_not_disturb;
                 match self.niri.notifications.notify(req, show_banners, now) {

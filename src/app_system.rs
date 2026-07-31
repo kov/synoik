@@ -715,6 +715,42 @@ impl AppSystem {
         self.catalog.lookup(id)
     }
 
+    /// The app a notification came from — `FdoNotificationDaemon._getApp`
+    /// (`js/ui/notificationDaemon.js:74-86`), which is what gives a notification's *source* its
+    /// title and icon: `get title() { app?.get_name() ?? appName }`, `get icon() {
+    /// app?.get_icon() ?? appIcon }` (`:396-399`). The `app_icon` call parameter is only the
+    /// fallback for when no app resolves — which is why a browser's web notification, sent with an
+    /// empty `app_icon` and a `desktop-entry` hint, still shows the browser's own logo.
+    ///
+    /// **Divergence:** GNOME tries the sender's *pid* first
+    /// (`WindowTracker.get_app_from_pid`) and we have no pid→app map — ours is
+    /// [`app_for_window`](Self::app_for_window), keyed by `app_id`. So we implement GNOME's
+    /// second and third steps only: the `desktop-entry` hint, then the app name. An app that
+    /// sends neither a usable hint nor a name matching its desktop id falls back to `app_icon`
+    /// where GNOME would still have found it by pid.
+    pub fn app_for_notification(
+        &self,
+        desktop_entry: Option<&str>,
+        app_name: &str,
+    ) -> Option<AppEntry> {
+        // `lookup_app` is given `${id}.desktop`; a hint may already carry the suffix.
+        let with_suffix = |id: &str| {
+            if id.ends_with(".desktop") {
+                id.to_owned()
+            } else {
+                format!("{id}.desktop")
+            }
+        };
+        desktop_entry
+            .filter(|e| !e.is_empty())
+            .and_then(|e| self.lookup(&with_suffix(e)))
+            .or_else(|| {
+                Some(app_name)
+                    .filter(|n| !n.is_empty())
+                    .and_then(|n| self.lookup(&with_suffix(n)))
+            })
+    }
+
     /// An app folder's members, in display order — `FolderView._loadApps`
     /// (`appDisplay.js:2164-2199`).
     ///
@@ -1234,6 +1270,52 @@ mod tests {
     /// watched directory and one lands a few seconds into every session, so the
     /// reload has to check rather than trust the signal — everything it re-derives
     /// downstream is either wasted or, in the icon caches' case, destructive.
+    /// A notification's source presents as its *app*, resolved from the `desktop-entry` hint or
+    /// the app name (`_getApp`, `js/ui/notificationDaemon.js:74-86`).
+    ///
+    /// This is what a browser's web notification needs: it arrives with an **empty `app_icon`**
+    /// and identifies itself only by the hint, so without this resolution the card falls back to
+    /// the generic executable glyph — which is exactly what it did.
+    #[test]
+    fn a_notification_resolves_its_app_from_the_hint_or_the_name() {
+        let catalog = FakeCatalog::new(vec![
+            AppEntry::fake("firefox.desktop", "Firefox"),
+            AppEntry::fake("chromium-browser.desktop", "Chromium"),
+        ]);
+        let system =
+            AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
+
+        // The hint wins, and it works with or without the `.desktop` suffix.
+        let by_hint = system.app_for_notification(Some("firefox"), "");
+        assert_eq!(by_hint.map(|a| a.name), Some("Firefox".to_owned()));
+        assert_eq!(
+            system
+                .app_for_notification(Some("chromium-browser.desktop"), "")
+                .map(|a| a.name),
+            Some("Chromium".to_owned())
+        );
+
+        // No hint: fall back to the app name, GNOME's third step.
+        assert_eq!(
+            system.app_for_notification(None, "firefox").map(|a| a.name),
+            Some("Firefox".to_owned())
+        );
+
+        // An unresolvable hint must not swallow the name fallback.
+        assert_eq!(
+            system
+                .app_for_notification(Some("not-installed"), "firefox")
+                .map(|a| a.name),
+            Some("Firefox".to_owned())
+        );
+
+        // Nothing matches: the caller keeps the `app_icon` parameter it was given.
+        assert!(system
+            .app_for_notification(Some("nope"), "also-nope")
+            .is_none());
+        assert!(system.app_for_notification(None, "").is_none());
+    }
+
     #[test]
     fn refresh_reports_whether_the_catalog_actually_changed() {
         let catalog = FakeCatalog::new(vec![AppEntry::fake("a.desktop", "A")]);

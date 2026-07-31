@@ -165,6 +165,9 @@ pub struct CardContent {
     pub id: u32,
     pub source_title: String,
     pub source_icon: Option<NotificationIcon>,
+    /// The resolved app's icon, which wins over `source_icon` — see
+    /// [`crate::notifications::NotifyRequest::app_icon`].
+    pub source_app_icon: Option<AppIconRef>,
     pub title: String,
     pub body: String,
     pub icon: Option<NotificationIcon>,
@@ -187,6 +190,7 @@ pub fn card_for(source: &Source, n: &Notification, now: Duration) -> CardContent
             source.title.clone()
         },
         source_icon: source.icon.clone(),
+        source_app_icon: source.app_icon.clone(),
         title: n.title.clone(),
         body: n.body.clone(),
         icon: n.icon.clone(),
@@ -700,27 +704,54 @@ fn source_icon(
     content: &CardContent,
     scale: f64,
 ) -> SourceIcon {
-    let fallback = || SourceIcon::Symbolic(SOURCE_FALLBACK.to_owned());
-    let Some(NotificationIcon::Themed(name)) = &content.source_icon else {
-        return fallback();
+    // The gicon St is handed: `app?.get_icon() ?? appIcon`
+    // (`js/ui/notificationDaemon.js:398`) — the resolved app's icon wins, and the `app_icon` call
+    // parameter is only the fallback. Both then go through the *same* symbolic-first lookup below,
+    // because the style is a property of the widget, not of where the icon came from.
+    let gicon = content.source_app_icon.clone().or_else(|| {
+        match &content.source_icon {
+            Some(NotificationIcon::Themed(name)) => Some(AppIconRef::Themed(vec![name.clone()])),
+            // A file-backed `app_icon` was already decoded to pixels upstream; there is no name to
+            // look up, and no themed icon to prefer.
+            _ => None,
+        }
+    });
+    let Some(gicon) = gicon else {
+        return SourceIcon::Symbolic(SOURCE_FALLBACK.to_owned());
     };
-    // Both probes are `provides`, never a texture/buffer probe: a texture miss also means "queued"
+    let names: &[String] = match &gicon {
+        AppIconRef::Themed(names) => names,
+        _ => &[],
+    };
+
+    // Every probe is `provides`, never a texture/buffer probe: a texture miss also means "queued"
     // (`IconCache::provides`), and `AppIconCache::buffer` never misses at all — it substitutes its
     // own full-colour fallback, which is not the symbolic one St would use here.
-    if !name.ends_with("-symbolic") {
-        let symbolic = format!("{name}-symbolic");
-        if icons.provides(&symbolic) {
-            return SourceIcon::Symbolic(symbolic);
+    //
+    // Two passes over the whole name list, not one name tried both ways: FORCE_SYMBOLIC appends
+    // `-symbolic` to *every* name and tries all of those before *any* bare name
+    // (`st-icon-theme.c:1489-1503`).
+    for name in names {
+        if name.ends_with("-symbolic") {
+            if icons.provides(name) {
+                return SourceIcon::Symbolic(name.clone());
+            }
+        } else {
+            let symbolic = format!("{name}-symbolic");
+            if icons.provides(&symbolic) {
+                return SourceIcon::Symbolic(symbolic);
+            }
         }
     }
-    if icons.provides(name) {
-        return SourceIcon::Symbolic(name.clone());
+    for name in names {
+        if icons.provides(name) {
+            return SourceIcon::Symbolic(name.clone());
+        }
     }
-    let themed = AppIconRef::Themed(vec![name.clone()]);
-    if app_icons.provides(&themed, SMALL_ICON, scale) {
-        return SourceIcon::Color(themed);
+    if app_icons.provides(&gicon, SMALL_ICON, scale) {
+        return SourceIcon::Color(gicon);
     }
-    fallback()
+    SourceIcon::Symbolic(SOURCE_FALLBACK.to_owned())
 }
 
 /// The render elements of one card at `origin`: the (cached) card texture plus
@@ -1008,6 +1039,7 @@ mod tests {
             replaces_id: 0,
             desktop_entry: None,
             source_icon: None,
+            app_icon: None,
             title: "title".to_owned(),
             body: "body".to_owned(),
             icon: None,
@@ -1030,6 +1062,7 @@ mod tests {
             id: 1,
             source_title: "app".to_owned(),
             source_icon: None,
+            source_app_icon: None,
             title: "title".to_owned(),
             body: "short".to_owned(),
             icon: None,
@@ -1175,6 +1208,7 @@ mod live_shell_tests {
             id: 1,
             source_title: "Audit".into(),
             source_icon: None,
+            source_app_icon: None,
             title: "Audit probe with icon".into(),
             body: "A body long enough to occupy the content column next to the icon.".into(),
             icon: Some(crate::notifications::NotificationIcon::Themed(
@@ -1221,6 +1255,7 @@ mod live_shell_tests {
                 id: 1,
                 source_title: "Probe".into(),
                 source_icon: icon.map(|n| crate::notifications::NotificationIcon::Themed(n.into())),
+                source_app_icon: None,
                 title: String::new(),
                 body: String::new(),
                 icon: None,
@@ -1245,6 +1280,45 @@ mod live_shell_tests {
         // No symbolic either way, and nothing full-colour either: St's fallback.
         assert_eq!(with(Some("gnome-shell-rs-no-such-icon")), SOURCE_FALLBACK);
         assert_eq!(with(None), SOURCE_FALLBACK);
+
+        // The resolved app's icon WINS over the `app_icon` parameter, and takes the same
+        // symbolic-first rewrite — `get icon() { app?.get_icon() ?? appIcon }`
+        // (`notificationDaemon.js:398`) hands St one gicon and the widget's style decides the
+        // rest. Without the precedence a browser's web notification, whose `app_icon` is empty,
+        // never reaches its app's icon at all.
+        let with_app = |app: &[&str], param: Option<&str>| {
+            let content = CardContent {
+                id: 1,
+                source_title: "Probe".into(),
+                source_icon: param
+                    .map(|n| crate::notifications::NotificationIcon::Themed(n.into())),
+                source_app_icon: Some(AppIconRef::Themed(
+                    app.iter().map(|n| (*n).to_owned()).collect(),
+                )),
+                title: String::new(),
+                body: String::new(),
+                icon: None,
+                actions: Vec::new(),
+                has_default_action: false,
+                critical: false,
+                time_text: "now".into(),
+            };
+            match source_icon(&icons, &app_icons, &content, 1.) {
+                SourceIcon::Symbolic(name) => name,
+                SourceIcon::Color(icon) => format!("color:{icon:?}"),
+            }
+        };
+        assert_eq!(
+            with_app(&["no-notifications"], Some("message-indicator")),
+            "no-notifications-symbolic",
+            "the app's icon beats the app_icon parameter"
+        );
+        // FORCE_SYMBOLIC tries `-symbolic` for EVERY name before ANY bare name, so a later name
+        // with a symbolic variant beats an earlier one without (`st-icon-theme.c:1489-1503`).
+        assert_eq!(
+            with_app(&["gnome-shell-rs-no-such-icon", "group-collapse"], None),
+            "group-collapse-symbolic"
+        );
 
         // Not asserted: the `SourceIcon::Color` branch. Reaching it needs a name with a
         // non-symbolic file and NO symbolic one — `firefox` here — which is a property of the

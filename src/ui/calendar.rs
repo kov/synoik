@@ -4128,6 +4128,7 @@ mod tests {
             id,
             source_title: "App".to_owned(),
             source_icon: None,
+            source_app_icon: None,
             title: format!("title {id}"),
             body: "body".to_owned(),
             icon: None,

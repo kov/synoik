@@ -5471,6 +5471,89 @@ fn shell_screencast_dbus_start_and_stop() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A notification presents as its **app** when one resolves: the app's name and icon replace the
+/// `app_name`/`app_icon` call parameters (`FdoNotificationDaemonSource`,
+/// `js/ui/notificationDaemon.js:396-399`, fed by `_getApp` at `:74-86`).
+///
+/// This is the path a browser's web notification takes. Firefox and Chromium send an **empty
+/// `app_icon`** and identify themselves only through the `desktop-entry` hint, so a card built
+/// from the call parameters alone has no icon to show and falls back to the generic executable
+/// glyph — which is what the notification header did until the app resolution landed.
+///
+/// Driven through `on_notifications_msg` rather than the store, because the resolution happens in
+/// the compositor (that is where the app catalog is) and the store is a plain-data seam.
+#[test]
+fn a_notification_takes_its_source_identity_from_the_resolved_app() {
+    use crate::app_system::{AppEntry, AppIconRef, AppSystem, FakeCatalog};
+    use crate::notifications::{NotificationsToNiri, NotifyRequest, Urgency};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let mut entry = AppEntry::fake("firefox.desktop", "Firefox");
+    entry.icon = AppIconRef::Themed(vec!["firefox".to_owned()]);
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![entry])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let web_notification = |app_name: &str, hint: Option<&str>| NotifyRequest {
+        sender: Some(":1.9".to_owned()),
+        pid: 100,
+        app_name: app_name.to_owned(),
+        replaces_id: 0,
+        desktop_entry: hint.map(str::to_owned),
+        // What a browser actually sends for a web notification: nothing.
+        source_icon: None,
+        app_icon: None,
+        title: "davidwalsh.name".to_owned(),
+        body: "body".to_owned(),
+        icon: None,
+        actions: Vec::new(),
+        has_default_action: false,
+        urgency: Urgency::Normal,
+        resident: false,
+        transient: false,
+    };
+
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::Notify {
+            req: web_notification("Firefox", Some("firefox")),
+            reply,
+        });
+    assert_eq!(rx.recv_blocking().unwrap(), Ok(1));
+
+    let source = &f.niri().notifications.sources[0];
+    assert_eq!(
+        source.app_icon,
+        Some(AppIconRef::Themed(vec!["firefox".to_owned()])),
+        "the resolved app's icon reaches the source, with no app_icon parameter to fall back on"
+    );
+    assert_eq!(
+        source.title, "Firefox",
+        "and its name, which is the app's, not the caller's app_name"
+    );
+
+    // An app that does not resolve leaves the source on the call parameters — the source is then
+    // whatever the sender claimed, and the header falls back to the executable glyph.
+    let (reply, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_notifications_msg(NotificationsToNiri::Notify {
+            req: web_notification("Some Unknown App", Some("not-installed")),
+            reply,
+        });
+    assert_eq!(rx.recv_blocking().unwrap(), Ok(2));
+    let unresolved = f
+        .niri()
+        .notifications
+        .sources
+        .iter()
+        .find(|s| s.title == "Some Unknown App")
+        .expect("the unresolved source keeps the caller's app_name");
+    assert_eq!(unresolved.app_icon, None);
+}
+
 /// The `org.freedesktop.Notifications` request path (`js/ui/notificationDaemon.js`
 /// `NotifyAsync`/`CloseNotification` + the fdo proxy's per-sender id checks,
 /// `js/dbusServices/notifications/notificationDaemon.js:76-90`), driven straight
@@ -5489,6 +5572,7 @@ fn notifications_notify_replace_and_close_via_handler() {
         replaces_id: replaces,
         desktop_entry: None,
         source_icon: None,
+        app_icon: None,
         title: "title".to_owned(),
         body: "body".to_owned(),
         icon: None,
@@ -5586,6 +5670,7 @@ fn notifications_sender_vanish_via_handler() {
         replaces_id: 0,
         desktop_entry: Some("org.example.App".to_owned()),
         source_icon: None,
+        app_icon: None,
         title: "t".to_owned(),
         body: String::new(),
         icon: None,
@@ -5824,6 +5909,7 @@ fn banner_req(app: &str, sender: &str) -> crate::notifications::NotifyRequest {
         replaces_id: 0,
         desktop_entry: None,
         source_icon: None,
+        app_icon: None,
         title: "title".to_owned(),
         body: "body".to_owned(),
         icon: None,
