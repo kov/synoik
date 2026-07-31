@@ -225,6 +225,17 @@ impl IconCache {
         path
     }
 
+    /// Whether this cache can draw symbolic icon `name` at all — the theme provides it, or it is
+    /// one of our embedded ones.
+    ///
+    /// Use this, never [`texture`](Self::texture), to *choose between candidate names*. A
+    /// `texture` miss is ambiguous: with a raster worker it also means "queued, not here yet", so
+    /// picking by it makes the first paint fall through to a later candidate and swap once the
+    /// earlier one uploads. This is a synchronous, memoized path probe with no such state.
+    pub fn provides(&self, name: &str) -> bool {
+        embedded_icon(name).is_some() || self.resolve(name).is_some()
+    }
+
     /// Rasterize a recolored icon: `name` at `px` physical pixels (square), tinted to
     /// straight-RGBA `color`. `None` if the theme doesn't provide it.
     ///

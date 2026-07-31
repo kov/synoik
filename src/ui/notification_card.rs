@@ -32,10 +32,8 @@ use crate::ui::widget::{self, Align, Painter, ShapedText, TextShaper, TextStyle}
 pub const PAD: f64 = 6.;
 
 /// `.message` `border: 1px` — `$card_shadow_border_color`, transparent in the dark theme but
-/// still reserved, since St is border-box.
-///
-/// NOTE: this is currently only used to size the *box* (see the banner's `width_px`). The layout
-/// still reserved, since St is border-box — every edge-relative point below is inset by it.
+/// still reserved, since St is border-box: it sizes the box (the banner's `width_px`) *and* insets
+/// every edge-relative point in [`layout_clamped`].
 pub const BORDER: f64 = 1.;
 /// `.message-close-button` `margin: $base_padding * 0.5` (`_message-list.scss:152-155`).
 pub const CLOSE_MARGIN: f64 = 3.;
@@ -295,6 +293,18 @@ pub struct CardLayout {
     /// Empty unless expanded — the action row stays hidden until expand
     /// (`js/ui/messageList.js:598-601,620`).
     pub actions: Vec<Rectangle<f64, Logical>>,
+    /// Vertical centre of the header row — where the source title and time sit.
+    ///
+    /// These last three are here so the *painter* stops re-deriving them. It used to spell out
+    /// `PAD + HEADER_H / 2.`, `PAD * 2. + ...` and so on itself, which is duplicated arithmetic
+    /// that drifts silently: when the card grew its 1px border and the header row was resized to
+    /// the close button's margin box, `layout_clamped` learned both and the painter learned
+    /// neither, so every glyph sat a pixel left of the icons it lines up with. One owner.
+    pub header_cy: f64,
+    /// Left edge of the body text column (past the 48px icon when there is one).
+    pub text_x: f64,
+    /// Top of the body row.
+    pub body_y: f64,
 }
 
 /// Lay out a card of `width`. `expanded` grows the body to its wrapped lines
@@ -425,6 +435,9 @@ pub fn layout_clamped(
         body_icon,
         body_lines,
         actions,
+        header_cy: header_y + header_band() / 2.,
+        text_x,
+        body_y,
     }
 }
 
@@ -501,8 +514,10 @@ pub fn draw_card(
         // Header: bold source title after the icon, time right-aligned before the caret slot
         // (or the close button on the banner). The title is clipped to stop short of the time,
         // whose logical ink width sets the clip's right edge.
-        let header_cy = PAD + HEADER_H / 2.;
-        let title_x = PAD * 2. + SMALL_ICON + PAD;
+        let header_cy = layout.header_cy;
+        // The title follows the source icon the layout already placed, by `.message-header`'s
+        // spacing — deriving it from the card edge instead is how it lost the border.
+        let title_x = layout.source_icon.loc.x + SMALL_ICON + PAD;
         let time_anchor = layout.expand.map_or(layout.close.loc.x, |e| e.loc.x);
         let time_w = time_run.ink_bounds().2 as f64 / scale;
         let time_x = time_anchor - PAD - time_w;
@@ -526,16 +541,14 @@ pub fn draw_card(
 
         // Body: bold title over the pre-wrapped body lines (a single
         // ellipsized line collapsed, up to six expanded).
-        let body_y = PAD + HEADER_H + PAD;
-        let text_x = PAD * 2.
-            + if layout.body_icon.is_some() {
-                BODY_ICON + PAD
-            } else {
-                0.
-            };
+        let body_y = layout.body_y;
+        let text_x = layout.text_x;
         let text_clip = Rectangle::new(
             Point::from((text_x, 0.)),
-            Size::from(((layout.size.w - text_x - PAD).max(0.), layout.size.h)),
+            Size::from((
+                (layout.size.w - text_x - PAD - BORDER).max(0.),
+                layout.size.h,
+            )),
         );
         // Single-line body: the title vertically centers on the 48px icon row; multi-line: the
         // title sits above the first body line and each line steps down by LINE_H.
@@ -644,6 +657,46 @@ impl Default for CardCache {
     }
 }
 
+/// `MessageHeader.sourceIcon`'s `fallback_icon_name` (`js/ui/messageList.js:359`).
+const SOURCE_FALLBACK: &str = "application-x-executable-symbolic";
+
+/// Which symbolic icon the card's header shows for `content`'s source.
+///
+/// `.message-source-icon` is `-st-icon-style: symbolic` (`_message-list.scss:111-114`), and that
+/// is not decoration: it puts `ST_ICON_LOOKUP_FORCE_SYMBOLIC` on the lookup, which rewrites every
+/// non-symbolic name to `<name>-symbolic` and tries **all** of those before falling back to the
+/// bare names (`st-icon-theme.c:1489-1503`). Only if none resolve does St draw
+/// `fallback_icon_name`.
+///
+/// Missing that rewrite is why the header icon was *blank* rather than wrong: apps send
+/// `app_icon` as a plain name — `dialog-information`, `firefox` — and our resolver is
+/// symbolic-only, so it looked for `dialog-information.svg`, which Adwaita does not ship (it ships
+/// `dialog-information-symbolic.svg`). The old code then used the fallback *only* when there was
+/// no name at all, so a name that failed to resolve drew nothing and left the reserved 16px empty.
+///
+/// **Known divergence:** St's second pass — the bare, non-symbolic name — needs full-color theme
+/// lookup (real `index.theme` inheritance and size dirs, PNG decode), which is [`AppIconCache`]'s
+/// job, not this cache's. So where GNOME shows e.g. Firefox's own logo we show the generic
+/// fallback. Closing that means threading the app-icon cache into the card; the blank is fixed
+/// either way.
+fn source_icon_name(icons: &IconCache, content: &CardContent) -> String {
+    let Some(NotificationIcon::Themed(name)) = &content.source_icon else {
+        return SOURCE_FALLBACK.to_owned();
+    };
+    // `provides`, not a texture probe: see `IconCache::provides` — picking a candidate by whether
+    // its texture is ready would swap icons on the frame the first one finishes uploading.
+    if !name.ends_with("-symbolic") {
+        let symbolic = format!("{name}-symbolic");
+        if icons.provides(&symbolic) {
+            return symbolic;
+        }
+    }
+    if icons.provides(name) {
+        return name.clone();
+    }
+    SOURCE_FALLBACK.to_owned()
+}
+
 /// The render elements of one card at `origin`: the (cached) card texture plus
 /// the icons that composite on top — source icon, close glyph, and the body
 /// icon (themed symbolic on the card's circle, or the app's pixel image).
@@ -698,11 +751,7 @@ pub fn card_elements(
         layout.source_icon.loc.x + layout.source_icon.size.w / 2.,
         layout.source_icon.loc.y + layout.source_icon.size.h / 2.,
     ));
-    let source_name = match &content.source_icon {
-        Some(NotificationIcon::Themed(name)) => name.clone(),
-        // `MessageHeader.sourceIcon` fallback (`js/ui/messageList.js:355-359`).
-        _ => "application-x-executable-symbolic".to_owned(),
-    };
+    let source_name = source_icon_name(icons, content);
     if let Some(elem) = icon_at(renderer, &source_name, SMALL_ICON, HEADER_FG, source_center) {
         elements.push(elem);
     }
@@ -1105,5 +1154,47 @@ mod live_shell_tests {
             513. - BORDER - PAD - CLOSE_MARGIN,
             "the close button's margin box stops inside the border"
         );
+    }
+
+    /// The header's source icon resolves the way `-st-icon-style: symbolic` makes St resolve it:
+    /// `<name>-symbolic` first, the bare name second, `fallback_icon_name` last.
+    ///
+    /// This is the rule whose absence left the header icon **blank** on the live seat — apps send
+    /// plain names (`dialog-information`, `firefox`), our resolver is symbolic-only, and the
+    /// fallback was reached only when there was no name at all. A name that failed to resolve
+    /// drew nothing into the 16px the layout had already reserved.
+    ///
+    /// Deliberately probed with our **embedded** icons: they exist in no theme on disk
+    /// (`embedded_icon`), so this asserts the rewrite itself rather than whatever Adwaita happens
+    /// to ship on the machine running the test.
+    #[test]
+    fn the_source_icon_resolves_like_a_symbolic_styled_st_icon() {
+        let icons = IconCache::new("Adwaita");
+        let with = |icon: Option<&str>| {
+            let content = CardContent {
+                id: 1,
+                source_title: "Probe".into(),
+                source_icon: icon.map(|n| crate::notifications::NotificationIcon::Themed(n.into())),
+                title: String::new(),
+                body: String::new(),
+                icon: None,
+                actions: Vec::new(),
+                has_default_action: false,
+                critical: false,
+                time_text: "now".into(),
+            };
+            source_icon_name(&icons, &content)
+        };
+
+        // The bug: a plain name is rewritten to its symbolic variant, which is what exists.
+        assert_eq!(with(Some("no-notifications")), "no-notifications-symbolic");
+        // Already symbolic: used as-is, not double-suffixed.
+        assert_eq!(
+            with(Some("no-notifications-symbolic")),
+            "no-notifications-symbolic"
+        );
+        // Nothing resolves either way, and no name at all: both reach St's fallback.
+        assert_eq!(with(Some("gnome-shell-rs-no-such-icon")), SOURCE_FALLBACK);
+        assert_eq!(with(None), SOURCE_FALLBACK);
     }
 }
