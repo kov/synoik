@@ -116,12 +116,23 @@ sender allowlist" as an existing divergence for the accelerator API; `ShowOSD` i
 that lets a caller draw arbitrary text and icons across every monitor, so it gets the check now.
 Extending it to the accelerator methods is a follow-up, not this slice.
 
-### C — Brightness OSD (internal)
-Close the gap left by Q4. Trigger from the brightness `_sync` equivalent in `src/brightness.rs` so
+### C — Brightness OSD (internal) ✅
+Closes the gap left by Q4. Trigger from the brightness `_sync` equivalent in `src/brightness.rs` so
 both key steps and QS slider drags show it, faithfully per `brightnessManager.js:227-239`: the
 monitor-scale branch shows only the monitors that changed, the global branch shows all. Icon
 `display-brightness-symbolic`, no label, per-monitor `{level}` — **no `max_level`**, so max is 1.0
 (`brightnessManager.js:264-276`).
+
+Landed as a return value, not a callback: `_sync` reaches out to `Main.osdWindowManager` directly,
+but ours returns a `BrightnessUpdate { writes, osd }` so the compositor stays the only thing that
+touches either the device or the screen — the same shape the hardware writes already had. The
+`showOSD` flag is GNOME's own `_sync({showOSD})` parameter, false only for `_monitorsChanged`
+(`:181`). A pass that moves no scale — idle dimming, an auto-brightness target, our own write
+echoing back — asks for no OSD at all, which is *not* `hideAll`: anything already on screen expires
+on its own deadline.
+
+Live validation is hardware-gated (no backlight on this VM); headless coverage is
+`brightness_changes_show_the_osd` in `src/tests/gnome.rs`.
 
 ### D — MPRIS model (`src/mpris.rs`, no UI)
 Discovery: `ListNames` + `NameOwnerChanged`, prefix `org.mpris.MediaPlayer2.`

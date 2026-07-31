@@ -3166,7 +3166,7 @@ impl State {
         f: impl FnOnce(
             &mut crate::brightness::BrightnessManager,
             &crate::backlight::BacklightSnapshot,
-        ) -> Vec<crate::brightness::BacklightWrite>,
+        ) -> crate::brightness::BrightnessUpdate,
     ) {
         self.sync_brightness_inner(false, f);
     }
@@ -3182,7 +3182,7 @@ impl State {
         f: impl FnOnce(
             &mut crate::brightness::BrightnessManager,
             &crate::backlight::BacklightSnapshot,
-        ) -> Vec<crate::brightness::BacklightWrite>,
+        ) -> crate::brightness::BrightnessUpdate,
     ) {
         self.sync_brightness_inner(true, f);
     }
@@ -3193,11 +3193,12 @@ impl State {
         f: impl FnOnce(
             &mut crate::brightness::BrightnessManager,
             &crate::backlight::BacklightSnapshot,
-        ) -> Vec<crate::brightness::BacklightWrite>,
+        ) -> crate::brightness::BrightnessUpdate,
     ) {
         let mut manager = std::mem::take(&mut self.niri.brightness);
-        let writes = f(&mut manager, &self.niri.backlight);
+        let update = f(&mut manager, &self.niri.backlight);
         self.niri.brightness = manager;
+        let crate::brightness::BrightnessUpdate { writes, osd } = update;
 
         // gnome-shell's key handlers are `this._globalScale?.stepUp()` and
         // `this._monitorScales.get(monitor)?.stepUp()` (`brightnessManager.js:107-132`): with no
@@ -3208,6 +3209,8 @@ impl State {
         for write in writes {
             self.set_backlight_brightness(&write.connector, write.brightness);
         }
+
+        self.show_brightness_osd(&osd);
 
         // gnome-shell's `BrightnessItem._sync` off the manager's `changed`/`notify::value`.
         let view = self.niri.brightness.view();
@@ -3228,6 +3231,32 @@ impl State {
         }
         #[cfg(not(feature = "dbus"))]
         let _ = (user, moved, has_control);
+    }
+
+    /// `BrightnessManager._showOSD` (`js/misc/brightnessManager.js:264-275`): one bar per monitor
+    /// that moved, drawn with `display-brightness-symbolic` and no label. There is no `max_level`,
+    /// so the bar tops out at 1.0. An empty request is *not* `hideAll` — GNOME simply does not
+    /// call `show`, leaving any OSD already on screen to expire on its own deadline.
+    fn show_brightness_osd(&mut self, osd: &[crate::brightness::OsdRequest]) {
+        if osd.is_empty() {
+            return;
+        }
+
+        let levels: Vec<_> = osd
+            .iter()
+            .filter_map(|request| {
+                let output = self.niri.output_by_name_match(&request.connector)?.clone();
+                Some((output, crate::ui::osd::OsdLevel::new(request.level, 1.)))
+            })
+            .collect();
+        if levels.is_empty() {
+            return;
+        }
+
+        self.niri
+            .osd
+            .show(&["display-brightness-symbolic"], None, &levels);
+        self.niri.queue_redraw_all();
     }
 
     /// A call on `org.gnome.Shell.Brightness` — gsd-power asking for idle dimming or feeding an

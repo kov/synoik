@@ -4613,6 +4613,81 @@ fn brightness_keys_step_the_scales() {
     ));
 }
 
+/// Every brightness change the shell makes puts an OSD on screen (`_showOSD`,
+/// `js/misc/brightnessManager.js:227-239,264-275`): `display-brightness-symbolic`, no label, a bar
+/// that maxes out at 1.0. WHICH monitors show one is the branch `_sync` took — the global branch
+/// shows all of them, the per-monitor branch only the scales that moved, and the rest are
+/// cancelled (`osdWindow.js:172-182`). A hotplug is `_sync({showOSD: false})` (`:181`), and so is a
+/// change that moves no scale at all, like gsd-power's idle dimming.
+#[test]
+fn brightness_changes_show_the_osd() {
+    use crate::brightness::Step;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let one = f.niri_output(1);
+    let two = f.niri_output(2);
+
+    let backlight = |connector: &str, name: &str| crate::backlight::OutputBacklight {
+        connector: connector.to_owned(),
+        display_name: name.to_owned(),
+        range: crate::backlight::BacklightRange { min: 0, max: 100 },
+        brightness: 100,
+    };
+    let snapshot = crate::backlight::BacklightSnapshot {
+        outputs: vec![
+            backlight("headless-1", "Built-in display"),
+            backlight("headless-2", "Dell 24\u{2033}"),
+        ],
+    };
+    // The hotplug pass re-derives every scale, and asks for no OSD for any of them.
+    let update = f.niri().brightness.monitors_changed(&snapshot);
+    assert!(
+        update.osd.is_empty(),
+        "a monitors-changed pass must not put an OSD on screen"
+    );
+    f.niri().backlight = snapshot;
+    assert!(!f.niri().osd.is_visible());
+
+    // A plain brightness key moves the global scale, which fans out to every monitor -- so every
+    // monitor shows the bar, at its own (here identical) level.
+    f.niri_state().step_brightness(Step::Down, false);
+    let content = f.niri().osd.content(&one).expect("output 1 shows the OSD");
+    assert_eq!(content.icon, vec!["display-brightness-symbolic"]);
+    assert_eq!(content.label, None, "the brightness OSD carries no label");
+    assert_eq!(content.max_level, 1.0, "brightness tops out at 1.0");
+    assert!((content.level.unwrap() - 0.95).abs() < 1e-9);
+    assert!(f.niri().osd.content(&two).is_some());
+
+    // The `-monitor` variant moves one scale, so only that monitor shows one and the other's is
+    // cancelled -- the behavior `osdWindowManager.show`'s level map exists for.
+    pointer_motion_to(&mut f, 1920. + 100., 100.);
+    f.niri_state().step_brightness(Step::Down, true);
+    // A cancel is a fade-out, not an instant hide, so let it finish before looking.
+    tick(&mut f, 200);
+    assert!(
+        f.niri().osd.content(&one).is_none(),
+        "the monitor that did not move must have its OSD cancelled"
+    );
+    let content = f.niri().osd.content(&two).unwrap();
+    assert!((content.level.unwrap() - 0.9).abs() < 1e-9);
+
+    // The quick-settings slider is the global scale too, so it is back to both.
+    f.niri_state()
+        .apply_popover_action(crate::ui::popover::PopoverAction::SetBrightness(0.5));
+    assert!(f.niri().osd.content(&one).is_some());
+    assert!(f.niri().osd.content(&two).is_some());
+
+    // Idle dimming clamps the hardware without moving a scale, so neither branch runs: whatever is
+    // on screen is left to expire on its own deadline rather than being replaced or cancelled.
+    let before = f.niri().osd.content(&two);
+    let snapshot = f.niri().backlight.clone();
+    let update = f.niri().brightness.set_dimming(true, &snapshot);
+    assert!(update.osd.is_empty(), "dimming moves no scale");
+    assert_eq!(f.niri().osd.content(&two), before);
+}
+
 /// `org.gnome.Shell.Brightness` is gsd-power's way in (`js/ui/shellDBus.js:595-637`): idle dimming
 /// clamps the backlight without moving the scales, and the auto-brightness target biases them.
 /// `BrightnessChanged` marks changes *the user* made, so the ambient-light loop can tell its own

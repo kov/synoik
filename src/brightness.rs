@@ -18,8 +18,8 @@
 //! Divergences (also in `docs/fork/panel-status-port.md` under Q4):
 //! - **D5**: a scale is per *output*, not per logical monitor. These differ only under mirroring,
 //!   which we do not support yet; with mirroring, GNOME writes every backlight behind one scale.
-//! - **D3/D4**: the OSD and the keybindings that `_sync` would trigger are Q4d. The step/cycle
-//!   methods are ported here anyway, since they define the scale's arithmetic.
+//! - **D4**: the keybindings that `_sync` would trigger live in the compositor's action table, not
+//!   here. The step/cycle methods are ported here anyway, since they define the scale's arithmetic.
 //! - Raw brightness is **rounded** from the scale's fraction, where GJS truncates on its way into
 //!   mutter's int property. Rounding is a half-step closer to what the user asked for and keeps
 //!   `set(get(x)) == x` stable.
@@ -42,6 +42,36 @@ pub const DEFAULT_DIMMING_TARGET: f64 = 0.3;
 pub struct BacklightWrite {
     pub connector: String,
     pub brightness: i32,
+}
+
+/// One entry of `_showOSD`'s `osdMonitors` dict (`:264-275`): a monitor, and the scale value to
+/// draw on its bar. There is no `max_level` — brightness maxes out at 1.0.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OsdRequest {
+    pub connector: String,
+    pub level: f64,
+}
+
+/// What one pass of the algebra produced: the hardware writes to push, and the OSDs to show.
+///
+/// GNOME reaches out from `_sync` to `Main.osdWindowManager` directly (`:227-239,264-275`); we
+/// return the request so the compositor stays the only thing that touches either the device or the
+/// screen.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[must_use = "the writes must be pushed to the hardware, and the OSD shown"]
+pub struct BrightnessUpdate {
+    pub writes: Vec<BacklightWrite>,
+    /// The monitors whose OSD to show — empty when nothing moved, or when the caller asked for no
+    /// OSD. Non-empty means *only* these monitors show one; `osdWindowManager.show` cancels the
+    /// rest (`osdWindow.js:172-182`).
+    pub osd: Vec<OsdRequest>,
+}
+
+impl BrightnessUpdate {
+    /// No hardware write — which is also how a caller detects "no scale moved".
+    pub fn is_empty(&self) -> bool {
+        self.writes.is_empty()
+    }
 }
 
 /// What the quick-settings surfaces need from the manager, as a plain snapshot they can hold.
@@ -279,31 +309,24 @@ impl BrightnessManager {
     }
 
     /// `set dimming` (`:84-87`).
-    #[must_use = "the returned writes must be pushed to the hardware"]
-    pub fn set_dimming(
-        &mut self,
-        enable: bool,
-        snapshot: &BacklightSnapshot,
-    ) -> Vec<BacklightWrite> {
+    pub fn set_dimming(&mut self, enable: bool, snapshot: &BacklightSnapshot) -> BrightnessUpdate {
         self.dimming_enabled = enable;
-        self.sync(snapshot)
+        self.sync(snapshot, true)
     }
 
     /// `set autoBrightnessTarget` (`:93-96`).
-    #[must_use = "the returned writes must be pushed to the hardware"]
     pub fn set_auto_brightness_target(
         &mut self,
         target: f64,
         snapshot: &BacklightSnapshot,
-    ) -> Vec<BacklightWrite> {
+    ) -> BrightnessUpdate {
         self.ab_target = target;
-        self.sync(snapshot)
+        self.sync(snapshot, true)
     }
 
     /// `_monitorsChanged` (`:134-181`): rebuild the per-monitor scales from the outputs that have
     /// a backlight, creating the global scale once and keeping its value forever after.
-    #[must_use = "the returned writes must be pushed to the hardware"]
-    pub fn monitors_changed(&mut self, snapshot: &BacklightSnapshot) -> Vec<BacklightWrite> {
+    pub fn monitors_changed(&mut self, snapshot: &BacklightSnapshot) -> BrightnessUpdate {
         self.monitors = snapshot
             .outputs
             .iter()
@@ -330,72 +353,69 @@ impl BrightnessManager {
             self.global = Some(BrightnessScale::new("Brightness", 1., n_steps));
         }
 
-        self.sync(snapshot)
+        // `_sync({showOSD: false})` (`:181`): a hotplug re-derives every scale, and GNOME does not
+        // put an OSD on screen for that.
+        self.sync(snapshot, false)
     }
 
     /// The user moved the global slider (GNOME's `notify::value` on the global scale, `:172-179`).
-    #[must_use = "the returned writes must be pushed to the hardware"]
     pub fn set_global_value(
         &mut self,
         value: f64,
         snapshot: &BacklightSnapshot,
-    ) -> Vec<BacklightWrite> {
+    ) -> BrightnessUpdate {
         let Some(global) = self.global.as_mut() else {
-            return Vec::new();
+            return BrightnessUpdate::default();
         };
         global.set_value(value);
         self.global_changed = true;
-        self.sync(snapshot)
+        self.sync(snapshot, true)
     }
 
     /// The user moved one monitor's slider in the detail card (`:150-158`).
-    #[must_use = "the returned writes must be pushed to the hardware"]
     pub fn set_monitor_value(
         &mut self,
         connector: &str,
         value: f64,
         snapshot: &BacklightSnapshot,
-    ) -> Vec<BacklightWrite> {
+    ) -> BrightnessUpdate {
         let Some(scale) = self.monitors.iter_mut().find(|s| s.connector == connector) else {
-            return Vec::new();
+            return BrightnessUpdate::default();
         };
         scale.scale.set_value(value);
         scale.changed = true;
-        self.sync(snapshot)
+        self.sync(snapshot, true)
     }
 
     /// The hardware moved (GNOME's `backlights-changed`, `:151`): a firmware hotkey, another tool,
     /// or the echo of one of our own writes.
-    #[must_use = "the returned writes must be pushed to the hardware"]
-    pub fn backlights_changed(&mut self, snapshot: &BacklightSnapshot) -> Vec<BacklightWrite> {
-        self.sync(snapshot)
+    pub fn backlights_changed(&mut self, snapshot: &BacklightSnapshot) -> BrightnessUpdate {
+        self.sync(snapshot, true)
     }
 
     /// A brightness-up/down/cycle key on the global scale (`:107-132`). The per-monitor variants
     /// take the connector of the monitor the pointer is on.
-    #[must_use = "the returned writes must be pushed to the hardware"]
-    pub fn step_global(&mut self, step: Step, snapshot: &BacklightSnapshot) -> Vec<BacklightWrite> {
+    pub fn step_global(&mut self, step: Step, snapshot: &BacklightSnapshot) -> BrightnessUpdate {
         let Some(global) = self.global.as_mut() else {
-            return Vec::new();
+            return BrightnessUpdate::default();
         };
         step.apply(global);
         self.global_changed = true;
-        self.sync(snapshot)
+        self.sync(snapshot, true)
     }
 
-    #[must_use = "the returned writes must be pushed to the hardware"]
     pub fn step_monitor(
         &mut self,
         connector: &str,
         step: Step,
         snapshot: &BacklightSnapshot,
-    ) -> Vec<BacklightWrite> {
+    ) -> BrightnessUpdate {
         let Some(scale) = self.monitors.iter_mut().find(|s| s.connector == connector) else {
-            return Vec::new();
+            return BrightnessUpdate::default();
         };
         step.apply(&mut scale.scale);
         scale.changed = true;
-        self.sync(snapshot)
+        self.sync(snapshot, true)
     }
 
     /// `_sync` (`:186-262`). The phase order is load-bearing:
@@ -405,9 +425,13 @@ impl BrightnessManager {
     ///    scale to that maximum — *else* if the global scale moved, fan it back out through the
     ///    factors (never both in one pass);
     /// 3. write every monitor, applying the auto-brightness bias and the dimming clamp.
-    fn sync(&mut self, snapshot: &BacklightSnapshot) -> Vec<BacklightWrite> {
+    ///
+    /// `show_osd` is GNOME's `_sync({showOSD})` (`:186`): on it, whichever branch of phase 2 ran
+    /// also asks for the brightness OSD — the monitor branch for *only* the scales that moved,
+    /// the global branch for all of them (`:227-239`).
+    fn sync(&mut self, snapshot: &BacklightSnapshot, show_osd: bool) -> BrightnessUpdate {
         let Some(global) = self.global.as_mut() else {
-            return Vec::new();
+            return BrightnessUpdate::default();
         };
 
         // Handle changed backlights.
@@ -421,13 +445,17 @@ impl BrightnessManager {
             }
         }
 
-        // Find scales which have been changed (and reset the flag).
-        let any_scale_changed = self
+        // Find scales which have been changed (and reset the flag). GNOME keeps the *list*, not
+        // just the fact, because it is what the OSD is shown for.
+        let changed_scales: Vec<usize> = self
             .monitors
             .iter_mut()
-            .fold(false, |acc, scale| acc | std::mem::take(&mut scale.changed));
+            .enumerate()
+            .filter_map(|(i, scale)| std::mem::take(&mut scale.changed).then_some(i))
+            .collect();
 
-        if any_scale_changed {
+        let mut osd = Vec::new();
+        if !changed_scales.is_empty() {
             // Normalize everything to the maximum of all scales.
             let max = self
                 .monitors
@@ -446,6 +474,16 @@ impl BrightnessManager {
             // maximum and we want the global scale to be a factor we apply on the ratio of the
             // monitor scales.
             global.set_value(max);
+
+            if show_osd {
+                osd = changed_scales
+                    .iter()
+                    .map(|&i| OsdRequest {
+                        connector: self.monitors[i].connector.clone(),
+                        level: self.monitors[i].value(),
+                    })
+                    .collect();
+            }
         } else if self.global_changed {
             // If the global scale changed, update the monitor scales according to their
             // scaleFactor and the global scale.
@@ -453,6 +491,17 @@ impl BrightnessManager {
 
             for scale in &mut self.monitors {
                 scale.sync_with_scale(global);
+            }
+
+            if show_osd {
+                osd = self
+                    .monitors
+                    .iter()
+                    .map(|scale| OsdRequest {
+                        connector: scale.connector.clone(),
+                        level: scale.value(),
+                    })
+                    .collect();
             }
         }
 
@@ -489,7 +538,7 @@ impl BrightnessManager {
             });
         }
 
-        writes
+        BrightnessUpdate { writes, osd }
     }
 }
 
@@ -536,11 +585,11 @@ mod tests {
     }
 
     /// Apply the manager's writes back onto a snapshot, the way the hardware echo would.
-    fn apply(snapshot: &mut BacklightSnapshot, writes: Vec<BacklightWrite>) {
+    fn apply(snapshot: &mut BacklightSnapshot, update: BrightnessUpdate) {
         for BacklightWrite {
             connector,
             brightness,
-        } in writes
+        } in update.writes
         {
             let output = snapshot
                 .outputs
@@ -585,7 +634,7 @@ mod tests {
         // ... and the global scale follows the maximum, not the 1.0 it was born with.
         assert_eq!(manager.global_scale().unwrap().value(), 0.4);
         // The write is a no-op round trip of the value we just read.
-        assert_eq!(writes[0].brightness, 40);
+        assert_eq!(writes.writes[0].brightness, 40);
     }
 
     #[test]
@@ -598,7 +647,7 @@ mod tests {
         let writes = manager.set_dimming(true, &snap);
         assert!(manager.dimming());
         // Clamped to the 30% idle target, without moving the scale itself.
-        assert_eq!(writes[0].brightness, 30);
+        assert_eq!(writes.writes[0].brightness, 30);
         assert_eq!(value_of(&manager, "eDP-1"), 1.0);
         apply(&mut snap, writes);
 
@@ -607,7 +656,7 @@ mod tests {
         let writes = manager.backlights_changed(&snap);
         assert!(!manager.dimming());
         assert_eq!(value_of(&manager, "eDP-1"), 0.7);
-        assert_eq!(writes[0].brightness, 70);
+        assert_eq!(writes.writes[0].brightness, 70);
     }
 
     #[test]
@@ -625,7 +674,7 @@ mod tests {
         // cancel the dimming it just applied, and the screen would bounce back up.
         let writes = manager.backlights_changed(&snap);
         assert!(manager.dimming());
-        assert_eq!(writes[0].brightness, 30);
+        assert_eq!(writes.writes[0].brightness, 30);
         assert_eq!(value_of(&manager, "eDP-1"), 1.0);
     }
 
@@ -647,8 +696,8 @@ mod tests {
         let writes = manager.set_global_value(0.5, &snap);
         assert_eq!(value_of(&manager, "eDP-1"), 0.5);
         assert_eq!(value_of(&manager, "DP-2"), 0.25);
-        assert_eq!(writes[0].brightness, 50);
-        assert_eq!(writes[1].brightness, 25);
+        assert_eq!(writes.writes[0].brightness, 50);
+        assert_eq!(writes.writes[1].brightness, 25);
     }
 
     #[test]
@@ -666,15 +715,15 @@ mod tests {
         let writes = manager.set_monitor_value("DP-2", 1.0, &snap);
         assert_eq!(manager.global_scale().unwrap().value(), 1.0);
         assert_eq!(value_of(&manager, "eDP-1"), 1.0);
-        assert_eq!(writes[1].brightness, 100);
+        assert_eq!(writes.writes[1].brightness, 100);
         apply(&mut snap, writes);
 
         // The factors are now 1:1, so the global slider moves them together.
         let writes = manager.set_global_value(0.4, &snap);
         assert_eq!(value_of(&manager, "eDP-1"), 0.4);
         assert_eq!(value_of(&manager, "DP-2"), 0.4);
-        assert_eq!(writes[0].brightness, 40);
-        assert_eq!(writes[1].brightness, 40);
+        assert_eq!(writes.writes[0].brightness, 40);
+        assert_eq!(writes.writes[1].brightness, 40);
     }
 
     #[test]
@@ -696,11 +745,11 @@ mod tests {
             .for_each(|s| s.scale.set_value(0.5));
         manager.monitors[0].changed = true;
 
-        let writes = manager.sync(&snap);
+        let writes = manager.sync(&snap, true);
         // Normalized against the max (0.5), not fanned out from the untouched global value.
         assert_eq!(manager.global_scale().unwrap().value(), 0.5);
-        assert_eq!(writes[0].brightness, 50);
-        assert_eq!(writes[1].brightness, 50);
+        assert_eq!(writes.writes[0].brightness, 50);
+        assert_eq!(writes.writes[1].brightness, 50);
     }
 
     #[test]
@@ -730,8 +779,8 @@ mod tests {
 
         // Coming back up through the global slider fans out through those surviving factors.
         let writes = manager.set_global_value(1., &snap);
-        assert_eq!(writes[0].brightness, 0);
-        assert_eq!(writes[1].brightness, 100);
+        assert_eq!(writes.writes[0].brightness, 0);
+        assert_eq!(writes.writes[1].brightness, 100);
     }
 
     #[test]
@@ -743,17 +792,17 @@ mod tests {
 
         // With the scale at its midpoint the target is exactly the auto-brightness value.
         let writes = manager.set_auto_brightness_target(0.8, &snap);
-        assert_eq!(writes[0].brightness, 80);
+        assert_eq!(writes.writes[0].brightness, 80);
         apply(&mut snap, writes);
 
         // Above the midpoint the scale biases the target upwards, and clamps at 1.
         let writes = manager.set_monitor_value("eDP-1", 1.0, &snap);
-        assert_eq!(writes[0].brightness, 100);
+        assert_eq!(writes.writes[0].brightness, 100);
         apply(&mut snap, writes);
 
         // A negative target turns auto-brightness back off: the scale is the target again.
         let writes = manager.set_auto_brightness_target(-1., &snap);
-        assert_eq!(writes[0].brightness, 100);
+        assert_eq!(writes.writes[0].brightness, 100);
     }
 
     #[test]
@@ -849,13 +898,13 @@ mod tests {
 
         // A global step moves both monitors, through the factors.
         let writes = manager.step_global(Step::Down, &snap);
-        assert_eq!(writes[0].brightness, 95);
-        assert_eq!(writes[1].brightness, 48); // 0.475 of the range, rounded
+        assert_eq!(writes.writes[0].brightness, 95);
+        assert_eq!(writes.writes[1].brightness, 48); // 0.475 of the range, rounded
         apply(&mut snap, writes);
 
         // A per-monitor step re-normalizes, so the global scale follows the new maximum.
         let writes = manager.step_monitor("DP-2", Step::Up, &snap);
-        assert_eq!(writes[1].brightness, 53);
+        assert_eq!(writes.writes[1].brightness, 53);
         assert_eq!(manager.global_scale().unwrap().value(), 0.95);
 
         // An unknown connector is a no-op.
@@ -874,13 +923,13 @@ mod tests {
             brightness: 60,
         }]);
         let writes = manager.monitors_changed(&snap);
-        assert_eq!(writes[0].brightness, 60);
+        assert_eq!(writes.writes[0].brightness, 60);
         assert_eq!(value_of(&manager, "eDP-1"), 0.5);
 
         let writes = manager.set_global_value(0., &snap);
-        assert_eq!(writes[0].brightness, 10);
+        assert_eq!(writes.writes[0].brightness, 10);
 
         let writes = manager.set_global_value(1., &snap);
-        assert_eq!(writes[0].brightness, 110);
+        assert_eq!(writes.writes[0].brightness, 110);
     }
 }
