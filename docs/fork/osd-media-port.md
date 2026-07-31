@@ -210,8 +210,29 @@ Painter image verb. Toolkit work, not card work. Until then every player draws t
 ### F — Panel volume scroll + headphone plug (optional polish)
 Scroll on the panel volume indicator steps volume and shows the OSD (`volume.js:442-464`: skip
 pointer-emulated events, honour smooth-scroll deltas); plugging headphones shows one
-(`:347-357`, skipping the initial sync). Our panel indicator has no scroll handling today, so this
-grows an input seam — schedule separately.
+(`:347-357`, skipping the initial sync).
+
+**Correction (2026-07-31): "our panel indicator has no scroll handling" was wrong** — it has shipped
+since `a3e7c9d9`. A wheel tick over the status area already runs `pw.adjust_volume(±SCROLL_STEP)`
+(`src/input/mod.rs:6518-6546`), so there is no input seam to grow. What is actually left splits into
+three pieces of very different size:
+
+1. **The OSD on our own volume change** — small. Nothing shows one for a change *we* make;
+   `on_audio_status` (`src/niri.rs:3527`) only refreshes the panel and popover. `show_osd` is
+   reachable from the same `&mut self`, and `audio::volume_icon` already picks the icon. Follow
+   `ed26af2e` (brightness): have the audio path *return* an OSD request rather than reach into the
+   OSD manager. Note the feature gating — the audio path is `pipewire`, the OSD's caller `dbus`.
+2. **Fidelity of the scroll itself** — small. Ours is `AxisSource::Wheel` only, so a touchpad
+   two-finger scroll does nothing where GNOME honours smooth deltas; and the whole status cluster is
+   one `ROLE_QUICK_SETTINGS` rect (`src/ui/panel.rs:1158-1181`), so we scroll-adjust volume anywhere
+   on it, where GNOME's handler is on the volume indicator's own actor. Per-icon hit-testing means
+   building an icon-index test alongside `qs_indicator_icons`.
+3. **The headphone-plug OSD** — the big one, and *not* a wiring change. Our audio model is
+   **sink-level, not port-level**: `AudioStatus` is `{volume, muted}` (`src/audio.rs:26-31`) and
+   `pipewire_audio.rs` has no concept of a port at all. GNOME's is port-level (gvc UIDevices —
+   "Speakers"/"Headphones" on one card), the divergence already recorded at `src/audio.rs:92-93`.
+   This needs new PipeWire plumbing (bind `Device` params, track `Route`/`Props` per card, publish
+   an active-port change, suppress the initial sync) before there is any event to show an OSD for.
 
 ---
 
