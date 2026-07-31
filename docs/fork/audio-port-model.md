@@ -165,7 +165,7 @@ Small and mechanical, and it is the difference between slices 2–3 landing test
   call sites no longer need a cfg at all. (That build still fails on two pre-existing
   screen-recording errors unrelated to audio.)
 
-### Slice 1 — Device + route watcher (read-only)
+### Slice 1 — Device + route watcher (read-only) — **LANDED** (`04a513a2`)
 
 - Track `ObjectType::Device` globals whose `media.class` starts with `Audio/`; capture
   `device.description`, `device.icon-name`, and the id, the same way sinks are captured today.
@@ -178,6 +178,29 @@ Small and mechanical, and it is the difference between slices 2–3 landing test
 - Tests: the pod→model parse is a pure function over a serialized `Route`/`EnumRoute` object, so it
   unit-tests without PipeWire (build the pod with `PodSerializer`, same trick as
   `sink_default_json_round_trips_through_the_parser`).
+
+**A registry global's props are a SUBSET — the trap this slice hit.** The first live run produced a
+perfectly well-formed model with `icon_name: None`, `card: {card_id: 42, device: None}` and no form
+factor, i.e. permanently empty in exactly the fields slice 2 needs. `pw-dump` shows those fields, so
+the model looked wrong against reality but right against the code. The cause: PipeWire's *registry
+global* callback hands you a small dict — for this card, `device.description/nick/name`,
+`media.class`, `object.path` — and **not** `device.icon-name`; for the sink node, `device.id` but
+**not** `card.profile.device` and not `device.form_factor`. Those live only in the `info` event of a
+*bound* proxy. Fix: `.info()` listeners on the bound sink node and on the card, each refusing to
+overwrite a known value with `None` (info repeats with partial change masks).
+
+That is also why [`BoundSinkInfo`] hangs off the bound sink rather than off every `SinkInfo`: we
+bind exactly one sink (the default), so it is the only one that can honestly report these — and it
+is the only one GNOME's `_findHeadphones` asks about anyway.
+
+**Generalise it:** no headless test could have caught this. The model was structurally correct and
+silently empty. Any field sourced from a registry global needs one live read to confirm it is
+actually there.
+
+**As landed**, validated on the real card end to end (instrumented build, run as gsrs against the
+seat's PipeWire, then reverted): `icon_name: Some("audio-card-analog")`, bound sink
+`card: {card_id: 42, device: Some(1)}`, active route `analog-output` with `device: Some(1)` — the
+join resolves. `form_factor: None` is correct here; this card does not set one.
 
 ### Slice 2 — headphones: icon + OSD (the user-visible payoff)
 
