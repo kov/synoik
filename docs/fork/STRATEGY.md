@@ -546,7 +546,7 @@ does not wait on the host: multi-planar sampling (per-plane `VkImage` +
 frame ever reaches a hardware plane; non-LINEAR modifier import depends on what Venus/KosmicKrisp can
 expose on a Metal host and may stay moot here. Sequence it *before* multi-GPU, and start the
 multi-planar half ahead of the VMM landing rather than discovering it afterwards. Related: overlay
-planes for video scanout are a VMM ask, not a prerequisite — see `present-misses.md` §31.
+planes for video scanout are a VMM ask, not a prerequisite — see `present-misses.md` §33.
 
 **Accessibility is its own milestone here, tracked in `docs/fork/a11y-port.md`** — chrome
 scale ends at the toggle menu (done); behind it sit high-contrast/text-scaling in our own

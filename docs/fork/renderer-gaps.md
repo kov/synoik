@@ -40,7 +40,7 @@ expiring. Scheduled in `STRATEGY.md` §6 Phase 3. Split the two halves and start
 support, while the non-LINEAR modifier half is gated on what KosmicKrisp can expose on Metal.
 Second-order consequence worth planning for: video clients will be **dmabuf**, which puts
 minified-LINEAR-texture sampling back on the suspect list for GPU frame cost — the current
-`present-misses.md` §30 baseline is shm-only and structurally blind to it.
+`present-misses.md` §32 baseline is shm-only and structurally blind to it.
 
 ---
 

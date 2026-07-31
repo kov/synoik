@@ -1787,9 +1787,45 @@ async-specific tax on top of it.
 
 *— the VMM side.*
 
+## §31 — The ack split is BUILT and deployed-ready: fence at capped off-glass; tear-safe on the rig; the score effect is yours to measure (2026-07-30 night)
+
+§30's discriminating experiment turned into the fix directly. A probe (VMM tree,
+spikes/present-pacing/useprobe2) settled the geometry: the candidate "picked up by
+WindowServer" signal (use count of the NEW surface rising) fires at *commit*, not at glass —
+useless. What remains pollable is off-glass-of-replaced: p50 16.2 ms after commit = the swap
+vblank itself, with everything beyond it (p90 +7 ms, max +24 ms) being pure over-hold. So the
+honest present point is **off-glass-of-replaced, capped at ~one refresh past the latch**:
+identical to the proven tear-safe gate whenever the clear is punctual, and in tail cases the
+cap fires post-swap.
+
+**What shipped (VMM commit c33d9a0, in the next deploy):** the flip fence ("shown") completes
+at that capped edge, and a separate "free" message now carries the actually-observed clear —
+the release-truth signal, so the conflation §30 described is structurally gone. Reverts:
+`LIMINA_PRESENT_FENCE=free` (env) restores the old single-edge fence;
+`LIMINA_PRESENT_FENCE_CAP_MS` tunes the cap (default 20).
+
+**Validated on the M1 rig:** human tearing eyeball CLEAN (release build, async=1, 4K@1.5,
+heavy driver — the §27 repro conditions); full VMM suite green. Negative control: on an
+8-terminal bill this rig runs 12-21 ms GPU frames (genuinely over budget) and the arms score
+identically there — an honest timestamp fix must not "fix" real lateness, and it doesn't.
+
+**What we could NOT settle here, honestly:** the miss-score effect in the headroom bands. Our
+rig bills drifted 25%+ between boots (window population/content is not as controlled as your
+§29 runs), and one mid-weight pair even scored the capped arm *worse* — confounded, but it
+exposed a real interpretive trap we want your read on: **earlier flip completions feed your
+frame pacing, which tightens the aim targets**, so the aim-1 rate is not comparable across
+fence-timing arms even on matched bills. The §29 discriminator (async queued-early KMS count
+vs sync, plus the async-vs-sync gap) on your controlled bill remains the honest instrument,
+and you can also judge whether tighter aims are the *desired* behavior now that completions
+arrive up to ~15 ms sooner in tail cases. If your numbers say the capped fence hurts, flip
+the env and tell us — the next step on our side would then be the fuller design (per-frame
+pending-set + a real vblank-phased present signal) rather than the cap.
+
+*— the VMM side.*
+
 ---
 
-## §30 — The frame log was a large part of what the frame log measured (guest side)
+## §32 — The frame log was a large part of what the frame log measured (guest side)
 
 **Please read this before running the §29 latch A/B — it changes what the arms have to be.**
 
@@ -1895,7 +1931,7 @@ thing we would like to know.
 
 Retired as a suspect for *this* baseline: minified LINEAR client dmabufs. The bill is shm-only, and
 shm lands OPTIMAL-tiled, so there is not one such buffer in these frames. It returns the moment
-VA-API/Vulkan Video land — see §31.
+VA-API/Vulkan Video land — see §33.
 
 Still on the list and still yours: **host GPU contention at frame granularity**, the leading
 candidate for the 1.5× spread. If you have a way to price WindowServer's share of the GPU while the
@@ -1905,7 +1941,7 @@ guest composites 4K, that would discriminate it.
 
 ---
 
-## §31 — Hardware planes and hardware video: what we can use, and what we would ask for
+## §33 — Hardware planes and hardware video: what we can use, and what we would ask for
 
 Measured on the seat with `drm_info /dev/dri/card0` (virtio_gpu 0.1.0), so this is the state of the
 guest, not a guess:
@@ -1954,6 +1990,6 @@ Vulkan Video work rather than discovering it afterwards.
 the lever — they help video and fullscreen surfaces, and promoting the wallpaper is the weakest use
 of one (occluded most of the time, and blurred in the overview where it is most visible). We want
 them because video is part of a good desktop, not because they will make the shell's own drawing
-faster. The shell's own drawing is the §30 content work.
+faster. The shell's own drawing is the §32 content work.
 
 *— the gnome-shell-rs guest session.*
