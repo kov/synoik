@@ -175,24 +175,42 @@ Guard the ramp itself with a unit test (monotone, clamped, `r(1280×800)=1`).
 ## Addendum: the app grid fills the canvas (approved 2026-07-31)
 
 **Status: implemented.** `AppGrid::fill_scale` (`src/ui/app_grid.rs`), pinned by
-`a_roomy_canvas_scales_the_page_mode_up` and `folders_keep_gnomes_fixed_3x3`.
+`a_roomy_canvas_scales_the_page_mode_up`, `a_short_library_does_not_stretch_into_a_strip` and
+`folders_keep_gnomes_fixed_3x3`.
 
 The ramp above only ever *shrinks* chrome, so it says nothing about a canvas with room to spare.
 The app grid had the opposite problem. GNOME picks one of four fixed `(columns, rows)` modes
 (`defaultGridModes`, `iconGrid.js:30-47`) and turns whatever is left into spacing — which is
 capped at `max-column-spacing: $base_padding * 6`. Past a certain canvas the remainder is simply
-dead margin: our 1920x550 test band takes GNOME's 8x3 and leaves room for a ninth column unused.
+dead margin.
 
-**Decision.** Where the mode leaves a whole cell's worth of space on an axis, take it. Each axis
-is filled independently for what it actually has, at the largest icon; the icon ladder is
-untouched, so filling only ever *adds tiles*, never inflates or shrinks one. Clamped at the mode's
-own count, so this can never show fewer tiles than GNOME would.
+**Decision.** Scale the chosen mode up, bounded by **two** ceilings, taking the lower:
 
-**Why not preserve the mode's aspect ratio** (the first cut, and the more conservative-looking
-option): it is a no-op on the shapes we run on. A 1636x848 app area gives a 1272x760 content box,
-which fits 8 columns but only 4 rows at 96px — 5 rows would need 768 — so the vertical axis binds
-and a ratio-locked scale can never leave 1. All the reclaimable slack on a widescreen canvas is
-horizontal, so reclaiming any of it means letting the axes differ.
+1. *What the canvas allows* — one factor for both axes, so the mode keeps its shape.
+2. *What the content needs* — `sqrt(n / mode_capacity)`, square-rooted because the factor applies
+   to both axes, so capacity grows with its square.
+
+Clamped at 1, so filling only ever adds tiles. The icon ladder is untouched: filling adds tiles,
+it never inflates or shrinks one.
+
+**Both ceilings are load-bearing, and each was learned the hard way.**
+
+- **Dropping the shared factor** (filling each axis independently) maximises tile count and ruins
+  the shape. On a canvas with far more horizontal than vertical room — a 4K at scale 1 — the
+  columns run away while the rows do not.
+- **Dropping the content bound** produces the same strip from the other direction, and this is the
+  subtler one: a 4K page sized only to the canvas becomes 16x11, but a normal 34-app library fills
+  three rows of it, leaving ~1400px of dead space between the grid and the dash. *Capacity is not
+  free.* A page far larger than its contents is worse than a second page, because the layout
+  reserves the full row count and the content sits at the top of it.
+
+A corollary that looks like a bug but is the rule working: where one axis has no room for another
+cell, the factor is 1 and nothing changes. A 1920x1080 band is exactly that — it fits a ninth
+96px column but no fourth row, so it stays at GNOME's 8x3.
+
+**Watch the fit asymmetry.** Cell fitting is inclusive across and *strict* down, matching
+`iconGrid.js:395`. Getting that wrong offers a row the icon step then refuses, and the grid
+answers by shrinking every icon a rung — which reads as "the fill made my icons smaller".
 
 **Folders are exempt.** `FolderGrid` deliberately never re-flows to its box
 (`appDisplay.js:2077-2082`) and its dialog is a fixed modal, not a canvas to fill.

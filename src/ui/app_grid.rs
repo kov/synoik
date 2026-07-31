@@ -726,12 +726,19 @@ impl AppGrid {
     /// (`docs/fork/adaptive-overview-chrome.md`), so leaving the space empty is a choice we do
     /// not have to make.
     ///
-    /// Each axis is filled for what it actually has. Preserving the mode's aspect ratio was the
-    /// first cut and turned out to be a **no-op on the shapes we run on**: our 1636x848 app area
-    /// gives a 1272x760 content box, which fits 8 columns but only 4 rows at 96px (5 rows would
-    /// need 768), so the vertical binds and a ratio-locked scale can never leave 1. All the
-    /// reclaimable slack on a widescreen canvas is horizontal, so taking it means letting the
-    /// axes differ — 8x4 here, against GNOME's 6x4.
+    /// The mode's **aspect ratio is preserved**: one scale factor, the largest that fits on both
+    /// axes, applied to both. A 6x4 page becomes 12x8, never 19x4.
+    ///
+    /// Filling each axis independently was tried and is wrong. It maximises tile count but not
+    /// usability: on a canvas with far more horizontal than vertical room — a 4K at scale 1, say —
+    /// the columns run away while the rows do not, and the grid degenerates into a strip across
+    /// the top with a lake of empty space between it and the dash. Preserving the ratio is what
+    /// keeps the page the *shape* GNOME chose for this canvas, only more of it.
+    ///
+    /// A corollary worth stating, because it looks like a bug: on a canvas where one axis has no
+    /// room for another cell, the factor is 1 and nothing changes. That is the rule working. Our
+    /// own 1272x760 content box is exactly that case — 8 columns would fit but only 4 rows, so
+    /// the page stays 6x4 and the slack stays slack.
     ///
     /// Never shrinks: the factor is clamped at 1, so this can only ever add tiles to a page.
     /// Icons are untouched — the ladder tops out at 96 exactly as GNOME's does, and this runs
@@ -740,6 +747,7 @@ impl AppGrid {
         &self,
         cols: usize,
         rows: usize,
+        n: usize,
         content_w: f64,
         content_h: f64,
     ) -> (usize, usize) {
@@ -748,13 +756,30 @@ impl AppGrid {
         }
         // How many cells of the largest icon fit per axis, at base spacing.
         let cell = ICON_SIZES[0] + TILE_EXTRA_H;
-        let fits = |avail: f64, spacing: f64| {
-            (((avail + spacing) / (cell + spacing)).floor() as usize).max(1)
+        // Inclusive across, strict down — the same asymmetry the icon fit uses
+        // (`iconGrid.js:395`). Getting this wrong offers a row that the icon step then refuses,
+        // and the grid answers by shrinking every icon a rung instead.
+        let fits = |avail: f64, spacing: f64, strict: bool| {
+            let raw = (avail + spacing) / (cell + spacing);
+            let k = if strict { raw.ceil() - 1. } else { raw.floor() };
+            (k as usize).max(1)
         };
-        let max_cols = fits(content_w, COL_SPACING);
-        let max_rows = fits(content_h, ROW_SPACING);
+        let max_cols = fits(content_w, COL_SPACING, false);
+        let max_rows = fits(content_h, ROW_SPACING, true);
 
-        (max_cols.max(cols), max_rows.max(rows))
+        // Two ceilings, and the page takes the lower.
+        //
+        // What the canvas allows: one factor for both axes, so the mode keeps its shape.
+        let fit = (max_cols as f64 / cols as f64).min(max_rows as f64 / rows as f64);
+        // What the content needs: the factor that makes the mode hold `n`. Square-rooted because
+        // the factor applies to both axes, so capacity grows with its square.
+        let needed = (n as f64 / (cols * rows) as f64).sqrt();
+        let scale = needed.min(fit).max(1.);
+
+        (
+            ((cols as f64 * scale).ceil() as usize).clamp(cols, max_cols.max(cols)),
+            ((rows as f64 * scale).ceil() as usize).clamp(rows, max_rows.max(rows)),
+        )
     }
 
     fn with_modes(
@@ -1775,7 +1800,7 @@ impl AppGrid {
                 da.total_cmp(&db)
             })
             .unwrap();
-        let (cols, rows) = self.fill_scale(cols, rows, content_w, content_h);
+        let (cols, rows) = self.fill_scale(cols, rows, n, content_w, content_h);
 
         // Icon size: the largest whose square cells fit cols×rows at base spacing.
         // Horizontal fit is inclusive, vertical strict (`iconGrid.js:395`).
@@ -3183,41 +3208,58 @@ impl AppGrid {
 mod tests {
     use super::*;
 
-    /// Our approved divergence: a page mode scales up to fill a roomy canvas, keeping its
-    /// aspect ratio, instead of leaving GNOME's dead margin.
+    /// A canvas with room on **both** axes scales the page mode up, keeping its shape.
     ///
     /// GNOME picks one of four fixed `(cols, rows)` and turns the remainder into spacing, which
-    /// is capped — so on a large canvas the leftover is simply empty. Here a 1600x800 content box
-    /// takes 6x4 (24 tiles) in GNOME; we keep the 3:2 shape and fit more of it.
-    ///
-    /// Asserted as *properties*, not a hardcoded pair, so the test says what the rule is rather
-    /// than restating one canvas's answer: never fewer than GNOME's mode, and the result
-    /// actually fitting the box at the largest icon.
+    /// is capped — so past a certain canvas the leftover is dead margin. We scale the mode
+    /// instead. One factor for both axes, so a 6x4 becomes 12x8 and never 19x4.
     #[test]
     fn a_roomy_canvas_scales_the_page_mode_up() {
-        let g = grid_n(256);
-        let area = rect(0., 0., 1600. + 2. * PAGE_PAD_H, 800. + 2. * PAGE_PAD_V);
+        // Deep as well as wide — a merely wide band cannot grow, since the factor is shared.
+        let area = rect(0., 0., 3840., 1900.);
+        let g = grid_n(400);
         let layout = g.layout(area);
-
-        assert!(
-            layout.per_page > 24,
-            "a 1600x800 content box must hold more than GNOME's fixed 6x4 = 24, got {}",
-            layout.per_page
-        );
 
         let cols = layout.cols;
         let rows = layout.per_page / cols;
         assert_eq!(cols * rows, layout.per_page, "the page is a full rectangle");
         assert!(
-            cols >= 6 && rows >= 4,
-            "never fewer than the mode GNOME would have picked, got {cols}x{rows}"
+            layout.per_page > 24,
+            "a 3840x1900 canvas must hold more than GNOME's fixed modes, got {cols}x{rows}"
+        );
+        assert!(
+            cols > 6 && rows > 4,
+            "both axes grow together, got {cols}x{rows}"
+        );
+        // Tiles keep the largest icon: filling adds tiles, it never shrinks one.
+        assert_eq!(layout.tiles[0].size, Size::from((144., 144.)));
+    }
+
+    /// Growth stops at what the *content* needs, and the short page stays centred.
+    ///
+    /// This is the regression that shipped: bounded only by the canvas, a 4K page became 16x11
+    /// while a normal 34-app library filled three rows of it — a strip across the top with ~1400px
+    /// of dead space between it and the dash. Capacity is not free; a page far larger than its
+    /// contents is worse than a second page.
+    #[test]
+    fn a_short_library_does_not_stretch_into_a_strip() {
+        let area = rect(0., 0., 3840., 1900.);
+        let layout = grid_n(34).layout(area);
+
+        let cols = layout.cols;
+        let rows = layout.per_page / cols;
+        assert!(
+            rows >= 4 && cols <= 3 * rows,
+            "34 apps must not lay out as a wide strip, got {cols}x{rows}"
         );
 
-        // And it genuinely fits: cells at the largest icon, at base spacing.
-        let cell = ICON_SIZES[0] + TILE_EXTRA_H;
+        // Vertically centred: the slack above and below the tile band must match within a row.
+        let top = layout.tiles.first().unwrap().loc.y;
+        let bottom = layout.tiles.last().map(|t| t.loc.y + t.size.h).unwrap();
+        let (above, below) = (top - area.loc.y, area.loc.y + area.size.h - bottom);
         assert!(
-            cell * cols as f64 + COL_SPACING * (cols as f64 - 1.) <= 1600.,
-            "{cols} columns must fit across 1600"
+            (above - below).abs() < 144.,
+            "the band must sit centred, not pinned to the top ({above} above, {below} below)"
         );
     }
 
@@ -3274,16 +3316,16 @@ mod tests {
     }
 
     #[test]
-    fn wide_band_lays_nine_columns_at_ninety_six_px() {
+    fn wide_band_lays_eight_columns_at_ninety_six_px() {
         let l = grid_n(24).layout(wide());
         assert_eq!(l.n_pages, 1);
         assert_eq!(l.tiles.len(), 24);
-        // Nine, not GNOME's eight: this band fits a ninth 96px column, and the fill divergence
-        // takes it rather than turning it into margin the spacing cap cannot absorb.
-        assert_eq!(l.cols, 9);
-        assert!((0..9).all(|i| l.tiles[i].loc.y == l.tiles[0].loc.y));
-        assert!(l.tiles[9].loc.y > l.tiles[0].loc.y);
-        // Still a 96px icon → a 144 square tile: filling adds columns, never shrinks icons.
+        // GNOME's 8x3, unchanged: this band fits a ninth 96px column but has no room for a
+        // fourth row, and the fill rule moves both axes together or not at all.
+        assert_eq!(l.cols, 8);
+        assert!((0..8).all(|i| l.tiles[i].loc.y == l.tiles[0].loc.y));
+        assert!(l.tiles[8].loc.y > l.tiles[0].loc.y);
+        // 96px icon → a 144 square tile, filling its square cell; one page, no dots.
         assert_eq!(l.tiles[0].size, Size::from((144., 144.)));
         assert!(l.indicators.is_none());
     }
