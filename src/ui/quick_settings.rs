@@ -71,7 +71,13 @@ const TILE_GAP: f64 = 12.;
 const COLS: usize = 2;
 /// Icon size inside a tile, and its inset from the tile's left edge.
 const TILE_ICON: f64 = 16.;
-const TILE_ICON_INSET: f64 = 12.;
+/// The tile icon's inset from the tile's left edge: `.quick-toggle > StBoxLayout`'s
+/// `padding-left: $base_padding * 2.5` = 15px (`_quick-settings.scss:35`, the `:ltr` rule — the
+/// base rule's `0 $base_padding * 2` = 12 is what the RTL side and the right edge keep).
+const TILE_ICON_INSET: f64 = 15.;
+/// Gap between a tile's icon and its label: that same box's `spacing: $base_padding * 1.5` = 9px
+/// (`_quick-settings.scss:26`).
+const TILE_ICON_GAP: f64 = 9.;
 /// Tile-title / battery-percentage font size, logical px. GNOME's `.quick-toggle-title`
 /// (and the power toggle's percentage `title`) is `%heading` = **11pt, weight 700**
 /// (`gnome-shell-sass/_common.scss`), drawn bold — not regular weight, which reads too
@@ -91,14 +97,18 @@ const SUBTITLE_GAP: f64 = 9.;
 /// The system row (Settings on the left, Lock/Power on the right) sits at the
 /// **top** of the menu, above the tile grid — like gnome-shell's `SystemItem`,
 /// which `panel.js` adds first (`_addItemsBefore(this._system…)`).
-const SYS_H: f64 = 44.;
+const SYS_H: f64 = 38.;
 /// Symbolic-icon size inside a system button. gnome-shell's `.icon-button` uses
 /// `icon-size: $scalable_icon_size` = 16px (`_buttons.scss`).
 const SYS_ICON: f64 = 16.;
-/// Diameter of a system button's circular background disc, and its hit target. The
-/// `.icon-button` is the 16px icon plus `$scaled_padding * 2` = 12px padding on each
-/// side (`_buttons.scss`) → 40px.
-const SYS_HIT: f64 = 40.;
+/// Diameter of a system button's circular background disc, and its hit target: the 16px icon plus
+/// the button's padding on each side → 38px, measured on a live 50.3 shell.
+///
+/// `.icon-button`'s own padding is `$scaled_padding * 2` = 12px (`_buttons.scss:22`), which would
+/// give 40 — but inside this menu `.quick-settings .icon-button, .button` overrides it to
+/// `$base_padding * 1.75` = 10.5px (`_quick-settings.scss:5-7`). Citing only the widget's own rule
+/// and missing the container's override is how this was 40.
+const SYS_HIT: f64 = 38.;
 /// Gap between adjacent system-button discs: `$base_padding * 2` = 12px, the
 /// `.quick-settings-system-item` box spacing (`_quick-settings.scss`).
 const SYS_GAP: f64 = 12.;
@@ -108,7 +118,10 @@ const SYS_ADVANCE: f64 = SYS_HIT + SYS_GAP;
 /// the system row showing the battery icon + percentage, only when a battery is
 /// present. Clicking it opens power settings.
 const PILL_W: f64 = 96.;
-const PILL_ICON_INSET: f64 = 12.;
+/// The pill is a `.quick-toggle` like any other, so its content rides the same box: 15px in from
+/// the left and 9px from icon to label (`_quick-settings.scss:26,35`) — measured 15/9 on a live
+/// 50.3 shell, where the pill's box reports `padding: 0 12 0 15`, `spacing: 9`.
+const PILL_ICON_INSET: f64 = 15.;
 
 /// The volume slider row (gnome-shell's `.quick-slider`): a full-width row between the
 /// system row and the tile grid with a mute icon-button at the left and the slider
@@ -2541,7 +2554,7 @@ impl QuickSettings {
                 }
 
                 let fg = if on { FG_ON } else { FG_OFF };
-                let label_x = rect.loc.x + TILE_ICON_INSET + TILE_ICON + 8.;
+                let label_x = rect.loc.x + TILE_ICON_INSET + TILE_ICON + TILE_ICON_GAP;
                 let center_y = rect.loc.y + rect.size.h / 2.;
                 let run = &label_runs[i];
                 // Clip the label to the toggle-body so a long name can't run under the arrow
@@ -2585,7 +2598,7 @@ impl QuickSettings {
                 if self.hovered == Some(QsHover::Pill) {
                     p.fill_rounded(pill, pill.size.h / 2., style::HOVER_WASH)?;
                 }
-                let label_x = pill.loc.x + PILL_ICON_INSET + SYS_ICON + 8.;
+                let label_x = pill.loc.x + PILL_ICON_INSET + SYS_ICON + TILE_ICON_GAP;
                 let label_cy = pill.loc.y + pill.size.h / 2.;
                 p.text(
                     run,
