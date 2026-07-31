@@ -7340,7 +7340,7 @@ fn vulkan_search_result_caption_rests_at_the_grid_line_count() {
     };
     let (pixels, w) = result.expect("compositing the search through Vulkan must not error");
 
-    let m = TileMetrics::OVERVIEW;
+    let m = TileMetrics::overview();
     // Peak glyph ink across one caption line band of a tile. The card fill sits under it,
     // so this reads brightness, not alpha: the ink is near-white over a dark card.
     let line_ink = |t: Rectangle<f64, Logical>, line: usize| -> u8 {
@@ -7687,7 +7687,7 @@ fn vulkan_app_grid_expands_a_long_caption_on_hover() {
 
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
     let t1 = f.niri().app_grid.tile_center(1, area).expect("tile 1");
-    let m = TileMetrics::OVERVIEW;
+    let m = TileMetrics::overview();
     let tile_top = t1.y - m.size().h / 2.;
     let first_x = (t1.x - m.label_w() / 2.) as i32;
 

@@ -6503,7 +6503,7 @@ impl Niri {
                     Some(members) => {
                         let metrics = crate::ui::widget::TileMetrics {
                             icon_px: APP_DRAG_ICON_PX,
-                            ..crate::ui::widget::TileMetrics::OVERVIEW
+                            ..crate::ui::widget::TileMetrics::overview()
                         };
                         // The tile's caption space is cropped off: our drag proxy carries
                         // no name (GNOME's does), so the fill is the padded icon box, which
@@ -9614,7 +9614,7 @@ impl Niri {
             let controls = self.layout.controls_layout_for_output(output);
             let metrics = controls
                 .map(|c| self.app_grid.metrics_for(c.app_display))
-                .unwrap_or(crate::ui::widget::TileMetrics::OVERVIEW);
+                .unwrap_or(crate::ui::widget::TileMetrics::overview());
             // The dash icon is chosen from its band too, for the same reason (the
             // adaptive chrome ramp), so warming a flat 64 warms an entry a small canvas
             // never asks for.
@@ -9644,7 +9644,7 @@ impl Niri {
         // The distinct (scale, grid icon size) pairs the surfaces will draw at — each
         // combination is its own decode-cache key. The grid's icon size is **chosen from
         // the band it is given** (`AppGrid::metrics_for`), not fixed at
-        // `TileMetrics::OVERVIEW`'s 96: a 1280×800 screen renders the grid at 48. Warming
+        // `TileMetrics::overview()`'s 96: a 1280×800 screen renders the grid at 48. Warming
         // 96 there warms an entry nothing ever asks for, and every icon then decodes
         // lazily the first time its page comes up — which is exactly what a one-time blink
         // on first reaching a page looks like. A handful of outputs at most, so a linear
@@ -9660,7 +9660,7 @@ impl Niri {
             // own decode-cache key.
             let subicon_px = crate::ui::widget::TileMetrics {
                 icon_px: grid_px,
-                ..crate::ui::widget::TileMetrics::OVERVIEW
+                ..crate::ui::widget::TileMetrics::overview()
             }
             .folder_subicon_px();
             for icon in self.app_grid.folder_icon_refs() {

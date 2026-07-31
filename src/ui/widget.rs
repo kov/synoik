@@ -445,13 +445,20 @@ pub struct TileMetrics {
 impl TileMetrics {
     /// The 96 px labelled tile the app grid and search results share (`ICON_SIZE`=96,
     /// `iconGrid.js:11,83`; `.overview-tile` metrics `_app-grid.scss:24-35`).
-    pub const OVERVIEW: Self = Self {
-        icon_px: 96.,
-        pad: AppIcon::OVERVIEW_TILE_PADDING,
-        label_gap: 6.,
-        label_h: 18.,
-        radius: AppIcon::OVERVIEW_TILE_RADIUS,
-    };
+    ///
+    /// A function rather than a const because `label_h` is a *line box*, which depends on the
+    /// realized font — it was pinned at 18 while the caption draws at `LABEL_PT` (the base 11pt),
+    /// whose box is 19. That one pixel is load-bearing: a `BaseIcon` is a `SquareBin`, so the
+    /// tile's width follows its content height and the whole tile was a pixel narrow with it.
+    pub fn overview() -> Self {
+        Self {
+            icon_px: 96.,
+            pad: AppIcon::OVERVIEW_TILE_PADDING,
+            label_gap: 6.,
+            label_h: crate::ui::line_height_px(crate::ui::BASE_FONT_PT),
+            radius: AppIcon::OVERVIEW_TILE_RADIUS,
+        }
+    }
 
     /// The tile's outer size — **square**: [`Self::label_w`] plus padding on each side.
     ///
@@ -2241,8 +2248,11 @@ mod tests {
     /// A tile is `.overview-tile` padding around a `Shell.SquareBin`, so its **width**
     /// follows the *content height* — icon + spacing + one caption line
     /// (`shell-square-bin.c:14-30`, `iconGrid.js:62`). Deriving it from the icon alone
-    /// made it 120 wide against GNOME's 144. Pinned in numbers because the whole grid
+    /// made it 120 wide against GNOME's 145. Pinned in numbers because the whole grid
     /// and the search results card size off it.
+    ///
+    /// 145, not 144: the caption's line box at the base 11pt is 19 (`ceil(ascent) + ceil(descent)`
+    /// — see [`crate::ui::line_height_px`]), and `label_h` was pinned at 18.
     ///
     /// A resting caption past the first line hangs *below* the tile — the tile stays
     /// square (reserving the second line in the box would cost a rung of the icon ladder
@@ -2250,10 +2260,17 @@ mod tests {
     /// caption grows by the overhang instead.
     #[test]
     fn an_overview_tile_is_a_square_around_its_caption_box() {
-        let m = TileMetrics::OVERVIEW;
+        let m = TileMetrics::overview();
+        // The caption band is the shared line box, not a number of its own — the tile is a
+        // SquareBin, so a private copy here would resize the whole app grid behind everyone.
+        assert_eq!(
+            m.label_h,
+            crate::ui::line_height_px(crate::ui::BASE_FONT_PT),
+            "the caption band must be the shared line box at the caption's own size"
+        );
         assert_eq!(m.label_w(), m.icon_px + m.label_gap + m.label_h);
-        assert_eq!(m.label_w(), 120.);
-        assert_eq!(m.size(), Size::from((144., 144.)));
+        assert_eq!(m.label_w(), 121.);
+        assert_eq!(m.size(), Size::from((145., 145.)));
         assert_eq!(m.size().w, m.label_w() + 2. * m.pad);
 
         // One line fits the box exactly; each further line hangs below it.
@@ -2274,7 +2291,7 @@ mod tests {
     /// folder, and cell-filling instead would make the four icons touch.
     #[test]
     fn a_folder_tile_composes_four_sub_icons_centered_in_a_two_by_two() {
-        let m = TileMetrics::OVERVIEW;
+        let m = TileMetrics::overview();
         let tile = Rectangle::new(Point::from((0., 0.)), m.size());
         let sub = m.folder_subicon_px();
         assert_eq!(sub, 38., "floor(0.4 * 96)");
@@ -2315,7 +2332,7 @@ mod tests {
         // The caption box of a tile whose icon has stepped well down the ladder.
         let narrow = TileMetrics {
             icon_px: 32.,
-            ..TileMetrics::OVERVIEW
+            ..TileMetrics::overview()
         }
         .label_w();
 
@@ -2356,7 +2373,7 @@ mod tests {
     #[test]
     fn a_long_tile_caption_ellipsizes_collapsed_and_wraps_expanded() {
         let name = "Passwords and Keys";
-        let w = TileMetrics::OVERVIEW.label_w();
+        let w = TileMetrics::overview().label_w();
         let pt = crate::ui::BASE_FONT_PT;
 
         let collapsed = tile_label_lines(name, pt, w, TILE_LABEL_LINES, false);

@@ -102,11 +102,21 @@ const TILE_PAD: f64 = AppIcon::OVERVIEW_TILE_PADDING;
 /// whose preferred width is its preferred height (`shell-square-bin.c:14-30`), so it
 /// is **square**, sized by icon + `.overview-icon-with-label` spacing (`$base_padding`,
 /// `_app-grid.scss:31-35`) + one label line. A longer label ellipsizes rather than
-/// widening the tile. Kept in step with [`widget::TileMetrics::OVERVIEW`] by
+/// widening the tile. Kept in step with [`widget::TileMetrics::overview`] by
 /// `search_tiles_match_the_shared_overview_metrics`.
-const TILE_SIDE: f64 = TILE_PAD + RESULT_ICON_PX + 6. + 18. + TILE_PAD; // 144
-const TILE_W: f64 = TILE_SIDE;
-const TILE_H: f64 = TILE_SIDE;
+///
+/// Taken from the shared metrics rather than restated: the `+ 18.` this used to spell out is a
+/// caption *line box*, which rides the realized font, so a literal copy here quietly stopped
+/// agreeing with the tile the app grid draws.
+fn tile_side() -> f64 {
+    widget::TileMetrics::overview().size().w
+}
+fn tile_w() -> f64 {
+    tile_side()
+}
+fn tile_h() -> f64 {
+    tile_side()
+}
 /// How far a resting caption hangs below its tile ([`widget::TileMetrics::caption_overhang`]).
 /// The card is one bake, so it reserves this or the last line is simply not drawn.
 ///
@@ -430,18 +440,18 @@ impl OverviewSearch {
                 STATUS_CARD_W
             } else {
                 let n = self.results.len() as f64;
-                n * TILE_W + (n - 1.) * GRID_SPACING + 2. * CARD_PAD
+                n * tile_w() + (n - 1.) * GRID_SPACING + 2. * CARD_PAD
             };
-            let card_h = TILE_H + LABEL_OVERHANG + 2. * CARD_PAD;
+            let card_h = tile_h() + LABEL_OVERHANG + 2. * CARD_PAD;
             let card_x = (area.results.loc.x + (area.results.size.w - card_w) / 2.).round();
             let card_y = (area.results.loc.y + SECTION_SPACING).round();
             let card = Rectangle::new(Point::from((card_x, card_y)), Size::from((card_w, card_h)));
             let tiles = (0..self.results.len())
                 .map(|i| {
-                    let tx = card_x + CARD_PAD + i as f64 * (TILE_W + GRID_SPACING);
+                    let tx = card_x + CARD_PAD + i as f64 * (tile_w() + GRID_SPACING);
                     Rectangle::new(
                         Point::from((tx, card_y + CARD_PAD)),
-                        Size::from((TILE_W, TILE_H)),
+                        Size::from((tile_w(), tile_h())),
                     )
                 })
                 .collect();
@@ -695,7 +705,7 @@ impl OverviewSearch {
                 // with `expandTitleOnHover: false` (`appDisplay.js:1837-1841`) — so it is
                 // always the resting, end-ellipsized form, at the same line count the grid
                 // rests at (see [`LABEL_OVERHANG`], which is what makes room for it).
-                let label_w = widget::TileMetrics::OVERVIEW.label_w();
+                let label_w = widget::TileMetrics::overview().label_w();
                 let names: Vec<Vec<String>> = self
                     .results
                     .iter()
@@ -737,7 +747,7 @@ impl OverviewSearch {
                             p.labelled_tile(
                                 *rel,
                                 label,
-                                &widget::TileMetrics::OVERVIEW,
+                                &widget::TileMetrics::overview(),
                                 false,
                                 style::TEXT,
                             )?;
@@ -812,7 +822,7 @@ impl OverviewSearch {
                                 );
                                 p.fill_rounded(
                                     grown,
-                                    widget::TileMetrics::OVERVIEW.radius,
+                                    widget::TileMetrics::overview().radius,
                                     style::HOVER_WASH,
                                 )?;
                             }
@@ -1138,7 +1148,7 @@ mod tests {
         assert_eq!(RESULT_ICON_PX, 96.);
         // padding 12 + icon 96 + `.overview-icon-with-label` spacing 6 + one label
         // line 18 + padding 12 — square, because BaseIcon is a `Shell.SquareBin`.
-        assert_eq!((TILE_W, TILE_H), (144., 144.));
+        assert_eq!((tile_w(), tile_h()), (145., 145.));
         assert_eq!(TILE_PAD, AppIcon::OVERVIEW_TILE_PADDING);
         assert_ne!(
             AppIcon::OVERVIEW_TILE_RADIUS,
@@ -1157,11 +1167,11 @@ mod tests {
         assert_eq!(
             card.size,
             Size::from((
-                2. * TILE_W + GRID_SPACING + 2. * CARD_PAD,
-                TILE_H + LABEL_OVERHANG + 2. * CARD_PAD
+                2. * tile_w() + GRID_SPACING + 2. * CARD_PAD,
+                tile_h() + LABEL_OVERHANG + 2. * CARD_PAD
             ))
         );
-        assert_eq!(l.tiles[0].size, Size::from((TILE_W, TILE_H)));
+        assert_eq!(l.tiles[0].size, Size::from((tile_w(), tile_h())));
         assert_eq!(l.tiles[0].loc.x, card.loc.x + CARD_PAD);
     }
 
@@ -1171,10 +1181,10 @@ mod tests {
     /// for painting — so a change to one that misses the other shows up here.
     #[test]
     fn search_tiles_match_the_shared_overview_metrics() {
-        let m = widget::TileMetrics::OVERVIEW;
+        let m = widget::TileMetrics::overview();
         assert_eq!(RESULT_ICON_PX, m.icon_px);
         assert_eq!(TILE_PAD, m.pad);
-        assert_eq!(Size::from((TILE_W, TILE_H)), m.size());
+        assert_eq!(Size::from((tile_w(), tile_h())), m.size());
         assert_eq!(LABEL_PT, crate::ui::BASE_FONT_PT);
     }
 
@@ -1193,7 +1203,7 @@ mod tests {
             "the No-results card must fit its status text, got {}",
             card.size.w
         );
-        assert!(card.size.w > TILE_W + 2. * CARD_PAD);
+        assert!(card.size.w > tile_w() + 2. * CARD_PAD);
     }
 
     impl OverviewSearch {

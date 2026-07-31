@@ -175,7 +175,10 @@ fn layout(content: &OsdContent) -> OsdLayout {
         .label
         .as_ref()
         .map(|t| niri_vk::text::measure_line_width_weighted(t, px as f32, true) + TRAILING_MARGIN);
-    let label_h = px.ceil();
+    // The caption's line box, not a ceil of the em: ceiling the font size is a fourth private
+    // spelling of a rule that belongs in one place, and it is short — the box is
+    // `ceil(ascent) + ceil(descent)`, which at 11pt is 19 against this 15.
+    let label_h = crate::ui::line_height_px(TEXT_PT);
     let level_w = content
         .level
         .is_some()
@@ -749,5 +752,36 @@ impl OsdManager {
             w.origin(output, l.size) + rect.loc,
             rect.size,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The OSD's label band is a caption **line box**, not a ceil of the font size.
+    ///
+    /// It was `px.ceil()` — 15 at the base 11pt, where the box is 19 — so a labelled OSD was 4px
+    /// short and its text sat off-centre in the band. That was the fourth private spelling of a
+    /// rule that now lives in [`crate::ui::line_height_px`]; this pins the OSD to the shared one
+    /// so a fifth cannot appear here.
+    #[test]
+    fn a_labelled_osd_reserves_a_full_line_box() {
+        let line = crate::ui::line_height_px(TEXT_PT);
+        assert!(
+            line > crate::ui::pt_to_px(TEXT_PT).ceil(),
+            "the line box must exceed a bare ceil of the em, or this test proves nothing"
+        );
+
+        let label_only =
+            layout(&OsdContent::icon(&["audio-volume-high-symbolic"]).with_label("50%"));
+        let band = label_only
+            .label
+            .expect("a labelled OSD lays out a label band");
+        assert_eq!(band.size.h, line, "the label band is one caption line box");
+
+        // Not asserted: that the OSD box itself grows by the band. It does not — `content_h` is
+        // `ICON_PX.max(column_h)` and the icon dominates a one-line column, so the band's height
+        // only reaches the box once a level bar is stacked under it.
     }
 }

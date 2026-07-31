@@ -11236,7 +11236,7 @@ fn overview_app_icon_prewarm_uses_the_size_the_grid_will_render() {
 
         let area = overview_controls(&mut f).app_display;
         let rendered = f.niri().app_grid.metrics_for(area).icon_px;
-        let default = crate::ui::widget::TileMetrics::OVERVIEW.icon_px;
+        let default = crate::ui::widget::TileMetrics::overview().icon_px;
         assert_eq!(
             rendered == default,
             expect_default,

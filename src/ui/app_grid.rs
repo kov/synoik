@@ -120,10 +120,17 @@ const FOLDER_GRID_MODES: [(usize, usize); 1] = [(3, 3)];
 /// The icon-size ladder, largest first (`IconSize`, `iconGrid.js:16-23`); the grid
 /// shrinks the icon to the largest size whose page fits (`_findBestIconSize`).
 const ICON_SIZES: [f64; 6] = [96., 64., 48., 32., 24., 16.];
-/// A labelled `.overview-tile` is `icon + 48` **square** (padding 12, icon, gap 6,
-/// label 18, padding 12 — see [`TileMetrics::size`]), so the square cell the grid lays
-/// it in (`iconGrid.js` `_getChildrenMaxSize` = `max(w, h)`) is exactly the tile.
-const TILE_EXTRA_H: f64 = 48.;
+/// What a labelled `.overview-tile` adds to its icon: padding, the icon-to-label gap, one caption
+/// line box and padding again (see [`TileMetrics::size`]). The square cell the grid lays it in
+/// (`iconGrid.js` `_getChildrenMaxSize` = `max(w, h)`) is exactly the tile.
+///
+/// Derived rather than the 48 it used to be: the caption line box rides the realized font, so a
+/// literal here is a second copy of [`TileMetrics::overview`]'s arithmetic that silently stops
+/// agreeing with it.
+fn tile_extra_h() -> f64 {
+    let m = TileMetrics::overview();
+    2. * m.pad + m.label_gap + m.label_h
+}
 
 // Page indicator dots (`_app-grid.scss:119-131`): 10px circles, `$system_fg_color`,
 // `.page-indicator` padding `6 12 0`, `.page-indicators` margin-bottom 24.
@@ -755,7 +762,7 @@ impl AppGrid {
             return (cols, rows);
         }
         // How many cells of the largest icon fit per axis, at base spacing.
-        let cell = ICON_SIZES[0] + TILE_EXTRA_H;
+        let cell = ICON_SIZES[0] + tile_extra_h();
         // Inclusive across, strict down — the same asymmetry the icon fit uses
         // (`iconGrid.js:395`). Getting this wrong offers a row that the icon step then refuses,
         // and the grid answers by shrinking every icon a rung instead.
@@ -1754,7 +1761,7 @@ impl AppGrid {
         let empty = GridLayout {
             tiles: Vec::new(),
             block: Rectangle::from_size(Size::from((0., 0.))),
-            metrics: TileMetrics::OVERVIEW,
+            metrics: TileMetrics::overview(),
             first_index: 0,
             cols: 1,
             h_sp: 0.,
@@ -1808,7 +1815,7 @@ impl AppGrid {
             .iter()
             .copied()
             .find(|&size| {
-                let cell = size + TILE_EXTRA_H;
+                let cell = size + tile_extra_h();
                 let used_w = cell * cols as f64 + COL_SPACING * (cols as f64 - 1.);
                 let used_h = cell * rows as f64 + ROW_SPACING * (rows as f64 - 1.);
                 used_w <= content_w && used_h < content_h
@@ -1816,7 +1823,7 @@ impl AppGrid {
             .unwrap_or(16.);
         let metrics = TileMetrics {
             icon_px: icon,
-            ..TileMetrics::OVERVIEW
+            ..TileMetrics::overview()
         };
         let tile = metrics.size();
         let cell = tile.h; // the tile is square, so the `max(w, h)` cell is the tile
@@ -1970,7 +1977,7 @@ impl AppGrid {
     /// The tile metrics the grid will actually render `area` with.
     ///
     /// The icon size is **chosen from the band** — the largest of [`ICON_SIZES`] whose
-    /// cells fit the mode — so it is not [`TileMetrics::OVERVIEW`]'s 96 on every display
+    /// cells fit the mode — so it is not [`TileMetrics::overview`]'s 96 on every display
     /// (a 1280×800 screen renders at 48). The decode cache is keyed by logical px, so a
     /// prewarm at the wrong size warms an entry nothing ever asks for, and every icon
     /// still decodes lazily the first time its page is looked at.
@@ -3232,7 +3239,7 @@ mod tests {
             "both axes grow together, got {cols}x{rows}"
         );
         // Tiles keep the largest icon: filling adds tiles, it never shrinks one.
-        assert_eq!(layout.tiles[0].size, Size::from((144., 144.)));
+        assert_eq!(layout.tiles[0].size, Size::from((145., 145.)));
     }
 
     /// Growth stops at what the *content* needs, and the short page stays centred.
@@ -3325,8 +3332,8 @@ mod tests {
         assert_eq!(l.cols, 8);
         assert!((0..8).all(|i| l.tiles[i].loc.y == l.tiles[0].loc.y));
         assert!(l.tiles[8].loc.y > l.tiles[0].loc.y);
-        // 96px icon → a 144 square tile, filling its square cell; one page, no dots.
-        assert_eq!(l.tiles[0].size, Size::from((144., 144.)));
+        // 96px icon → a 145 square tile (12 + 96 + 6 + 19 caption line + 12), filling its cell.
+        assert_eq!(l.tiles[0].size, Size::from((145., 145.)));
         assert!(l.indicators.is_none());
     }
 
