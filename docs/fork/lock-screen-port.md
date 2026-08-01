@@ -106,6 +106,16 @@ On IDLE the screen is covered and a timer is armed for `max(STANDARD_FADE_TIME, 
 just an animation. Coming back cancels the timer, and that cancellation is the whole feature: a
 screensaver you dismiss must not lock you out a moment later.
 
+**The gate's window is not a screensaver.** GNOME's `lock()` sets `_isLocked` synchronously
+(`:660`); ours cannot, because the gate is a live gdm channel and opening one is a round trip. So
+between `lock` and `authenticator_ready` the shield is down with `locked` still false, and treating
+that as a screensaver would mean a lock is beaten by whoever presses a key first — suspend, walk up,
+wiggle the mouse. `is_dismissible()` is what closes it: input raises the shield only when it is
+active, not locked, *and* not waiting on an answer. The sleep inhibitor is held across the same
+window for the same reason (logind's `InhibitDelayMaxSec` bounds how long that can hold anyone up).
+A refused channel ends the wait and the shield goes back to being the screensaver it is entitled to
+be.
+
 **Sleep is not patient.** `PrepareForSleep(true)` locks immediately, no grace period — a machine
 about to suspend must not suspend unlocked. This only works because of the `delay` sleep inhibitor
 (`_syncInhibitor`, `:202-231`): holding that fd is what makes logind emit the signal and *wait* for
@@ -212,5 +222,9 @@ process. What is done about it, and what is not:
   *locking* is the same length either way — it just looks like the curtain instead of a dimming
   desktop. The fade is slice 5's, with the other animations.
 - **User-active comes from presence, not the idle monitor.** GNOME cancels the pending lock from
-  the core idle monitor's `add_user_active_watch`, which fires on the first input; ours rides
-  gnome-session's next non-idle `StatusChanged`, which is coarser. Same trigger, slightly later.
+  the core idle monitor's `add_user_active_watch` (`:282`), which fires on real input; ours rides
+  gnome-session's next `Available` status. Real input already cancels it anyway, because it raises
+  an unlocked shield through `on_shield_key`. Only `Available` counts — `Busy` and `Invisible` are
+  app- and user-set presence, not activity, and treating them as a return would un-blank an
+  unattended screen. Hanging this on our own `IdleMonitor` (which we already serve) is the proper
+  fix and is not done.

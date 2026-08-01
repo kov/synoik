@@ -151,6 +151,22 @@ impl ScreenShield {
         self.locked
     }
 
+    /// Whether a keypress or click should raise the shield.
+    ///
+    /// **Not simply `!locked`.** Between [`lock`](Self::lock) and
+    /// [`authenticator_ready`](Self::authenticator_ready) the shield is down and `locked` is still
+    /// false, because the gate is a live gdm channel and opening one is a round trip. Treating that
+    /// window as a screensaver means a lock can be dismissed by whoever gets a key in first — walk
+    /// up to a machine that just suspended, wiggle the mouse, and you are past it.
+    ///
+    /// GNOME has no such window: its `lock()` sets `_isLocked` synchronously (`:660`), so this
+    /// predicate is what keeps our asynchronous gate as strict as its synchronous one. If the
+    /// channel comes back refused the wait ends and the shield goes back to being dismissible,
+    /// which is the screensaver it was always entitled to be.
+    pub fn is_dismissible(&self) -> bool {
+        self.active && !self.locked && self.awaiting_authenticator.is_none()
+    }
+
     /// `GetActiveTime` (`shellDBus.js:558-565`): whole seconds since the shield went down, or 0.
     pub fn active_time_secs(&self, now: Duration) -> u32 {
         let Some(started) = self.activation_time else {
@@ -269,13 +285,12 @@ impl ScreenShield {
             ..Default::default()
         };
 
-        // Already covered — GNOME's "we're in the process of showing" guard (`:248-251`). Without
-        // it a second IDLE would re-arm the lock timer and push the lock further out.
-        if self.active {
-            return effects;
-        }
-
-        if self.settings.lock_enabled && !self.locked {
+        // GNOME arms whenever `lockEnabled && !isLocked` (`:258-271`) — note it does *not* check
+        // whether the shield is already down. An already-covered screensaver going idle still gets
+        // locked, and guarding on `active` here would leave `lock-enabled = true` sessions covered
+        // but permanently unlocked. Its only guard is the fade already running (`:248-251`), which
+        // for us is a lock already in flight.
+        if self.settings.lock_enabled && !self.locked && self.awaiting_authenticator.is_none() {
             effects.arm_lock_timer = Some(self.settings.lock_delay.max(STANDARD_FADE_TIME));
         }
 
@@ -290,7 +305,7 @@ impl ScreenShield {
     /// An unlocked one is a screensaver, so it goes away and takes the pending lock timer with it —
     /// that cancellation is the whole point of the grace period.
     pub fn on_user_active(&mut self) -> ShieldEffects {
-        if self.locked {
+        if !self.is_dismissible() {
             return ShieldEffects::default();
         }
         self.deactivate()
@@ -339,8 +354,13 @@ impl ScreenShield {
     /// `session_active` is logind's `Session.Active`: a session on an inactive VT must not hold up
     /// everyone else's suspend.
     pub fn wants_sleep_inhibitor(&self, session_active: bool) -> bool {
+        // `!self.active` is GNOME's condition (`:205-207`), plus the window its synchronous lock
+        // does not have: a shield that is down but still waiting on its verifier has not finished
+        // locking, and releasing the fd there lets the machine suspend mid-handshake. logind's
+        // `InhibitDelayMaxSec` bounds how long that can hold anyone up.
+        let lock_finished = self.active && self.awaiting_authenticator.is_none();
         session_active
-            && !self.active
+            && !lock_finished
             && self.settings.lock_enabled
             && !self.settings.disable_lock_screen
     }
@@ -353,10 +373,11 @@ impl ScreenShield {
         if !self.active {
             return ShieldEffects::default();
         }
-        ShieldEffects {
-            wake_up_screen: true,
-            ..Default::default()
-        }
+        // `_wakeUpScreen` runs `_onUserBecameActive` before emitting (`:499`), so waking a shield
+        // that is only a screensaver raises it rather than leaving the desktop covered.
+        let mut effects = self.on_user_active();
+        effects.wake_up_screen = true;
+        effects
     }
 
     fn set_active(&mut self, active: bool) -> ShieldEffects {
@@ -648,18 +669,89 @@ mod tests {
         assert_eq!(effects.arm_lock_timer, None);
     }
 
-    /// A second IDLE while already covered must not push the lock further out.
+    /// A screensaver that is already covering the screen still gets locked when the session goes
+    /// idle.
     ///
-    /// Without the guard, anything that re-reports idleness re-arms the timer, and a shield that
-    /// keeps being told it is idle would never reach its lock.
+    /// GNOME's only guard here is the fade already running (`:248-251`); the arming condition is
+    /// `lockEnabled && !isLocked` and says nothing about whether the shield is down (`:258`). An
+    /// `active`-based guard looks like the obvious idempotence fix and is a security hole: raise a
+    /// screensaver by hand (or lose a lock to `authenticator_lost`), walk away, and with
+    /// `lock-enabled = true` the screen stays covered and unlocked forever.
     #[test]
-    fn a_repeated_idle_does_not_re_arm_the_lock() {
+    fn an_already_covered_screensaver_still_locks_on_idle() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+        shield.activate(T0);
+
+        let effects = shield.on_session_idle(T0 + Duration::from_secs(5));
+        assert_eq!(effects.active_changed, None, "already covered");
+        assert_eq!(
+            effects.arm_lock_timer,
+            Some(STANDARD_FADE_TIME),
+            "but the lock is still owed"
+        );
+    }
+
+    /// A lock already in flight is not re-armed — that is the real analogue of GNOME's
+    /// fade-in-progress guard.
+    #[test]
+    fn idling_while_a_lock_is_in_flight_does_not_re_arm() {
         let mut shield = ScreenShield::new(ShieldSettings::default());
         shield.on_session_idle(T0);
+        // The timer fired: the shield asked gdm for a channel and is waiting on the answer.
+        shield.lock(T0, false).expect("not locked down");
 
         let again = shield.on_session_idle(T0 + Duration::from_secs(5));
         assert_eq!(again.arm_lock_timer, None);
-        assert_eq!(again.active_changed, None);
+    }
+
+    /// A shield waiting on its verifier cannot be dismissed by input.
+    ///
+    /// GNOME's `lock()` sets `_isLocked` synchronously (`:660`), so it has no such window. Ours
+    /// gates on a live gdm channel, and treating the wait as a screensaver would mean a lock is
+    /// beaten by whoever presses a key first — walk up to a machine that just suspended, wiggle
+    /// the mouse, and you are past it.
+    #[test]
+    fn a_lock_waiting_on_its_verifier_cannot_be_wiggled_away() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+        let epoch = shield
+            .lock(T0, false)
+            .expect("not locked down")
+            .request_authenticator
+            .unwrap();
+
+        assert!(!shield.is_dismissible(), "the answer has not landed yet");
+        assert_eq!(shield.on_user_active(), ShieldEffects::default());
+        assert!(shield.is_active(), "still covering the screen");
+        assert!(
+            shield.wants_sleep_inhibitor(true),
+            "and the suspend still has to wait for us"
+        );
+
+        // A refused channel ends the wait: there is nothing to authenticate against, so the shield
+        // goes back to being the screensaver it is entitled to be.
+        shield.authenticator_ready(epoch, false);
+        assert!(shield.is_dismissible());
+    }
+
+    /// Resuming raises a shield that was only a screensaver (`_wakeUpScreen` → `:499`).
+    #[test]
+    fn resuming_raises_a_screensaver_but_not_a_lock() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+        shield.activate(T0);
+
+        let effects = shield.wake_up_screen();
+        assert!(effects.wake_up_screen);
+        assert!(!shield.is_active(), "nothing to authenticate; it goes away");
+
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+        let epoch = shield
+            .lock(T0, false)
+            .expect("not locked down")
+            .request_authenticator
+            .unwrap();
+        shield.authenticator_ready(epoch, true);
+        shield.wake_up_screen();
+        assert!(shield.is_active(), "a lock survives the resume");
     }
 
     /// Coming back during the grace period takes the screensaver *and* the pending lock away.

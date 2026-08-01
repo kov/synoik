@@ -1449,6 +1449,12 @@ impl State {
                         state.niri.unlock_dialog.set_peek_locked_down(
                             state.niri.gnome_settings.shield.disable_show_password,
                         );
+                        // `lock-enabled` and `disable-lock-screen` are two of the inhibitor's
+                        // conditions, and GNOME wires both keys straight to `_syncInhibitor`
+                        // (`screenShield.js:110,113`). Without this, turning locking back on
+                        // leaves the fd unheld until the next shield event — and the next suspend
+                        // is the race the inhibitor exists to prevent.
+                        state.sync_sleep_inhibitor();
                         // Every point size in the UI is a ratio against this
                         // (`crate::ui::base_font_pt`), so publishing it re-sizes all
                         // text at once — as `st_theme_context_set_font` does.
@@ -3701,9 +3707,12 @@ impl State {
         }
         let now = crate::utils::get_monotonic_time();
 
-        if !self.niri.screen_shield.is_locked() {
+        if self.niri.screen_shield.is_dismissible() {
             // A screensaver raises on anything. Bare modifiers included: GNOME's shield is not
             // fussy, and a user pressing Shift to wake the screen expects it to wake.
+            //
+            // `is_dismissible`, not `!is_locked`: a lock still waiting on its verifier must not be
+            // typed away before the answer lands.
             let effects = self.niri.screen_shield.deactivate();
             self.apply_shield_effects(effects);
             return;
@@ -3748,7 +3757,7 @@ impl State {
         }
         let now = crate::utils::get_monotonic_time();
 
-        if self.niri.screen_shield.is_locked() {
+        if !self.niri.screen_shield.is_dismissible() {
             self.niri.lock_screen.note_activity(now);
 
             // The peek toggle, if the pointer is on it and the prompt is up.
@@ -3919,6 +3928,18 @@ impl State {
             .event_loop
             .insert_source(timer, move |_, _, state| {
                 state.niri.lock_timer = None;
+
+                // The timer outlives anything that locked in the meantime — a suspend during the
+                // grace period, or `loginctl lock-session` — because only `deactivate` cancels it
+                // (`_completeDeactivate`, `screenShield.js:575-578`). GNOME's `lock()` is benign
+                // when re-run; ours would bump the epoch and restart the gdm conversation, pulling
+                // the prompt out from under someone already typing their password.
+                // (`is_dismissible` already implies not locked and not mid-handshake, so it is the
+                // whole condition — and it is the predicate the model's tests pin.)
+                if !state.niri.screen_shield.is_dismissible() {
+                    return calloop::timer::TimeoutAction::Drop;
+                }
+
                 let now = crate::utils::get_monotonic_time();
                 match state.niri.screen_shield.lock(now, false) {
                     Ok(effects) => state.apply_shield_effects(effects),
@@ -3968,13 +3989,16 @@ impl State {
         let PresenceToNiri::StatusChanged(status) = msg;
         let now = crate::utils::get_monotonic_time();
 
-        let effects = if status == PresenceStatus::Idle {
-            self.niri.screen_shield.on_session_idle(now)
-        } else {
-            // Anything other than idle means the seat is being used again. GNOME hangs this on the
-            // idle monitor's user-active watch rather than on presence, which fires sooner; ours is
-            // coarser but arrives for the same reason and cancels the same pending lock.
-            self.niri.screen_shield.on_user_active()
+        let effects = match status {
+            PresenceStatus::Idle => self.niri.screen_shield.on_session_idle(now),
+            // Only `Available` counts as the user coming back. GNOME hangs this on the core idle
+            // monitor's user-active watch (`:282`), i.e. on real input; presence is the closest
+            // thing we subscribe to. `Busy` and `Invisible` are *not* activity — an app taking an
+            // inhibitor while the seat is idle flips the status without anyone touching the
+            // machine, and treating that as a return would un-blank the screen and cancel the
+            // pending lock on an unattended desk.
+            PresenceStatus::Available => self.niri.screen_shield.on_user_active(),
+            PresenceStatus::Busy | PresenceStatus::Invisible | PresenceStatus::Unknown(_) => return,
         };
         self.apply_shield_effects(effects);
     }

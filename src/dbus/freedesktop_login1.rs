@@ -244,12 +244,8 @@ pub fn start(
                     return;
                 }
             };
-            let session_iface = InterfaceName::try_from(SESSION_IFACE).unwrap();
-            if let Ok(mut all) = props.get_all(session_iface.clone()).await {
-                if let Some(active) = all.remove("Active").and_then(|v| bool::try_from(v).ok()) {
-                    let _ = to_niri.send(Login1ToNiri::SessionActive(active));
-                }
-            }
+            // Subscribe before reading: a VT switch landing between the two would otherwise be
+            // lost, leaving us stuck on a stale `Active` until the *next* switch.
             let mut props_changed = match props.receive_properties_changed().await {
                 Ok(stream) => stream,
                 Err(err) => {
@@ -257,6 +253,16 @@ pub fn start(
                     return;
                 }
             };
+            let session_iface = InterfaceName::try_from(SESSION_IFACE).unwrap();
+            match props.get_all(session_iface).await {
+                Ok(mut all) => {
+                    if let Some(active) = all.remove("Active").and_then(|v| bool::try_from(v).ok())
+                    {
+                        let _ = to_niri.send(Login1ToNiri::SessionActive(active));
+                    }
+                }
+                Err(err) => warn!("error reading the initial logind session Active: {err:?}"),
+            }
 
             loop {
                 let msg = futures_util::select! {
