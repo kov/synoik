@@ -138,17 +138,28 @@ pub const LIST_SHADOW: widget::DropShadowSpec = widget::DropShadowSpec {
 /// width and height the max over *both* dimensions of *all* items (`:575-590, 600-618`). So the
 /// row is N identical squares — an app with a long title cannot make its own tile wider than the
 /// rest. The thumbnail sub-list passes `false` (`altTab.js:914`) and is slice 5.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PanelLayout {
     /// The `.switcher-list` box, including its padding and hairline.
     pub panel: Rectangle<f64, Logical>,
     /// One `.item-box` per item, left to right, in the same space as [`panel`](Self::panel).
     pub items: Vec<Rectangle<f64, Logical>>,
+    /// The window switcher's single bottom label box, when there is one — see the `footer_h`
+    /// argument of [`new`](Self::new).
+    pub footer: Option<Rectangle<f64, Logical>>,
 }
 
 impl PanelLayout {
     /// Lay out `contents` (each item's *content* size, inside its `.item-box` padding) centered
-    /// on `monitor`.
+    /// on `monitor`, with `footer_h` logical px reserved for a full-width label below the row
+    /// (0 for no footer).
+    ///
+    /// The footer is `WindowSwitcher`'s title label (`altTab.js:1066-1070`), which is a child of
+    /// the *list*, not of any item: `vfunc_get_preferred_height` (`:1096-1104`) adds
+    /// `labelHeight + padding-bottom` to the row's height, and `vfunc_allocate` (`:1106-1128`)
+    /// gives the label the full content width along the panel's bottom padding edge. So the gap
+    /// between the row and the label is one [`LIST_PADDING`], and the label spans the panel
+    /// however narrow the selected item is.
     ///
     /// `monitor` is the **primary** monitor, not the focused one: `vfunc_allocate` reads
     /// `Main.layoutManager.primaryMonitor` (`switcherPopup.js:96`), so on a multi-head setup the
@@ -159,11 +170,16 @@ impl PanelLayout {
     /// two-part: the app switcher shrinks its icons down a ladder first
     /// (`AppSwitcher._setIconSize`), and only then does the `St.ScrollView` scroll
     /// ([`SCROLL_TIME`]). Both belong to the popups that have item art, so slices 2 and 3.
-    pub fn new(contents: &[Size<f64, Logical>], monitor: Rectangle<f64, Logical>) -> Self {
+    pub fn new(
+        contents: &[Size<f64, Logical>],
+        monitor: Rectangle<f64, Logical>,
+        footer_h: f64,
+    ) -> Self {
         if contents.is_empty() {
             return Self {
                 panel: Rectangle::default(),
                 items: Vec::new(),
+                footer: None,
             };
         }
 
@@ -175,9 +191,17 @@ impl PanelLayout {
         // ...and squareItems makes them all that one square.
         let n = contents.len() as f64;
 
+        // A footer costs its own height plus one `padding-bottom` of separation (`:1099-1102`).
+        let footer_h = footer_h.max(0.);
+        let footer_total = if footer_h > 0. {
+            footer_h + LIST_PADDING
+        } else {
+            0.
+        };
+
         let size = Size::<f64, Logical>::from((
             n * side + (n - 1.) * ITEM_SPACING + LIST_PADDING * 2.,
-            side + LIST_PADDING * 2.,
+            side + LIST_PADDING * 2. + footer_total,
         ));
 
         // Centered on both axes — the switcher sits in the middle of the screen, not near an
@@ -200,9 +224,21 @@ impl PanelLayout {
             })
             .collect();
 
+        // Flush with the panel's bottom padding edge, full content width (`:1122-1127`).
+        let footer = (footer_h > 0.).then(|| {
+            Rectangle::new(
+                Point::from((
+                    loc.x + LIST_PADDING,
+                    loc.y + size.h - LIST_PADDING - footer_h,
+                )),
+                Size::from(((size.w - LIST_PADDING * 2.).max(0.), footer_h)),
+            )
+        });
+
         Self {
             panel: Rectangle::new(loc, size),
             items,
+            footer,
         }
     }
 
@@ -948,7 +984,7 @@ mod tests {
             Size::from((40., 40.)),
             Size::from((60., 150.)),
         ];
-        let layout = PanelLayout::new(&contents, monitor());
+        let layout = PanelLayout::new(&contents, monitor(), 0.);
 
         // The tallest content (150) plus the item padding on both sides sets the square.
         let side = 150. + ITEM_PADDING * 2.;
@@ -967,7 +1003,7 @@ mod tests {
     /// The panel is centered on both axes, and the items sit inside its padding.
     #[test]
     fn the_panel_is_centered_on_the_monitor() {
-        let layout = PanelLayout::new(&[Size::from((96., 96.)); 4], monitor());
+        let layout = PanelLayout::new(&[Size::from((96., 96.)); 4], monitor(), 0.);
         let panel = layout.panel;
 
         assert_eq!(
@@ -990,13 +1026,53 @@ mod tests {
         );
     }
 
+    /// The window switcher's title label is a child of the *list*: it spans the whole panel below
+    /// the row, however narrow the selected item is.
+    ///
+    /// `vfunc_get_preferred_height` (`altTab.js:1096-1104`) adds `labelHeight + padding-bottom` to
+    /// the row, and `vfunc_allocate` (`:1122-1127`) gives the label the full content width along
+    /// the bottom padding edge. Putting the title inside the item instead — which is what an app
+    /// switcher does — is what makes a long title overflow its 128px slot.
+    #[test]
+    fn a_footer_takes_its_own_height_plus_one_padding_below_the_row() {
+        const LABEL_H: f64 = 18.;
+        let bare = PanelLayout::new(&[Size::from((128., 128.)); 3], monitor(), 0.);
+        let with = PanelLayout::new(&[Size::from((128., 128.)); 3], monitor(), LABEL_H);
+
+        assert!(bare.footer.is_none(), "no footer was asked for");
+        let footer = with.footer.expect("a footer was asked for");
+
+        // The row is untouched; the panel grows by the label and one separating padding.
+        assert_eq!(with.items[0].size, bare.items[0].size);
+        assert_eq!(with.panel.size.w, bare.panel.size.w);
+        assert_eq!(
+            with.panel.size.h,
+            bare.panel.size.h + LABEL_H + LIST_PADDING
+        );
+
+        // Full content width, flush with the bottom padding edge...
+        assert_eq!(footer.loc.x, with.panel.loc.x + LIST_PADDING);
+        assert_eq!(footer.size.w, with.panel.size.w - LIST_PADDING * 2.);
+        assert_eq!(
+            footer.loc.y + footer.size.h,
+            with.panel.loc.y + with.panel.size.h - LIST_PADDING
+        );
+
+        // ...and one padding clear of the row above it.
+        let row = with.items[0];
+        assert_eq!(footer.loc.y - (row.loc.y + row.size.h), LIST_PADDING);
+
+        // It is wider than any one item, which is the point: the title is not slot-width.
+        assert!(footer.size.w > row.size.w);
+    }
+
     /// The gaps between items belong to no item, so crossing one selects nothing.
     ///
     /// GNOME hangs `item-entered` off each `SwitcherButton`'s motion handler
     /// (`switcherPopup.js:487-489`) rather than dividing the row into hit zones.
     #[test]
     fn the_spacing_between_items_is_not_hoverable() {
-        let layout = PanelLayout::new(&[Size::from((96., 96.)); 3], monitor());
+        let layout = PanelLayout::new(&[Size::from((96., 96.)); 3], monitor(), 0.);
 
         let first = layout.items[0];
         let mid_y = first.loc.y + first.size.h / 2.;
@@ -1022,7 +1098,7 @@ mod tests {
     /// An empty layout is empty rather than a zero-sized panel someone might still paint.
     #[test]
     fn no_items_means_no_panel() {
-        let layout = PanelLayout::new(&[], monitor());
+        let layout = PanelLayout::new(&[], monitor(), 0.);
         assert!(layout.items.is_empty());
         assert_eq!(layout.panel.size, Size::from((0., 0.)));
     }

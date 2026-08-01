@@ -133,8 +133,27 @@ struct Open {
 }
 
 impl Open {
+    /// One item's content box. The app switcher stacks its label under the icon inside the item
+    /// (`AppIcon` adds it as a child, `altTab.js:682-686`); the window switcher does **not** — its
+    /// `WindowIcon` label is only handed to `addItem` as the accessible `label_actor`
+    /// (`switcherPopup.js:460`), and the visible title lives in the panel footer instead.
     fn content_size(&self) -> Size<f64, Logical> {
-        Size::from((self.icon_px, self.icon_px + self.label_height))
+        Size::from((self.icon_px, self.icon_px + self.item_label_height()))
+    }
+
+    fn item_label_height(&self) -> f64 {
+        match self.items {
+            Items::Apps(_) => self.label_height,
+            Items::Windows(_) => 0.,
+        }
+    }
+
+    /// The height of the panel-wide title label, or 0 for a popup that has none.
+    fn footer_height(&self) -> f64 {
+        match self.items {
+            Items::Apps(_) => 0.,
+            Items::Windows(_) => self.label_height,
+        }
     }
 }
 
@@ -188,6 +207,12 @@ impl SwitcherUi {
         self.open.as_ref()?.layout.items.get(i).copied()
     }
 
+    /// The panel-wide title label's box — the window switcher's, and `None` for the app switcher,
+    /// which labels each item instead.
+    pub fn footer_rect(&self) -> Option<Rectangle<f64, Logical>> {
+        self.open.as_ref()?.layout.footer
+    }
+
     /// The output the popup is on, so the compositor knows what to redraw.
     pub fn output(&self) -> Option<&Output> {
         self.open.as_ref().map(|o| &o.output)
@@ -236,21 +261,24 @@ impl SwitcherUi {
             ),
             Items::Windows(_) => window_switcher::WINDOW_PREVIEW_SIZE,
         };
-        // Every item is the same square: the icon or preview, with the label under it.
-        let content = Size::from((icon_px, icon_px + label_height));
-        let layout = PanelLayout::new(&vec![content; items.len()], monitor);
-
         let outcome = state.outcome();
-        self.open = Some(Open {
+        let mut open = Open {
             state,
             items,
             art,
-            layout,
+            // Measured immediately below, once `open` can answer where its labels go.
+            layout: PanelLayout::default(),
             output,
             icon_px,
             monitor,
             label_height,
-        });
+        };
+        open.layout = PanelLayout::new(
+            &vec![open.content_size(); open.items.len()],
+            monitor,
+            open.footer_height(),
+        );
+        self.open = Some(open);
 
         if outcome.is_some() {
             // Nothing was ever drawn, so there is no fade to wait out.
@@ -404,7 +432,11 @@ impl SwitcherUi {
             return;
         };
         let content = open.content_size();
-        open.layout = PanelLayout::new(&vec![content; open.items.len()], open.monitor);
+        open.layout = PanelLayout::new(
+            &vec![content; open.items.len()],
+            open.monitor,
+            open.footer_height(),
+        );
     }
 
     /// Front-to-back, like every other UI `render`.
@@ -426,6 +458,11 @@ impl SwitcherUi {
         let scale = output.current_scale().fractional_scale();
         let app_icons = &niri.app_icon_cache;
         let mut elements: Vec<TextureRenderElement<VkTexture>> = Vec::new();
+        // Collected rather than pushed as they are drawn: the app badge sits *over* the preview
+        // (`WindowIcon` adds the clone and then the icon to one `Clutter.BinLayout`,
+        // `altTab.js:1029-1037`, so the icon is the later child and paints on top), and `push` is
+        // front-to-back — so every icon must go out before any thumbnail.
+        let mut thumbnails: Vec<WindowThumbnailRenderElement> = Vec::new();
 
         // A window switcher's items are live windows; an app switcher's are just icons.
         if let Items::Windows(ids) = &open.items {
@@ -442,7 +479,7 @@ impl SwitcherUi {
                     window_switcher::preview_box(*item),
                     scale,
                     1.,
-                    &mut |elem| push(SwitcherRenderElement::Thumbnail(elem)),
+                    &mut |elem| thumbnails.push(elem),
                 );
             }
         }
@@ -502,6 +539,27 @@ impl SwitcherUi {
             .iter()
             .map(|r| Rectangle::new(r.loc - panel.loc, r.size))
             .collect();
+        // Panel-relative, like `items`.
+        let footer = open
+            .layout
+            .footer
+            .map(|r| Rectangle::new(r.loc - panel.loc, r.size));
+
+        // What actually gets shaped. A window switcher draws **one** label — the selected
+        // window's title, across the panel's bottom (`WindowSwitcher.highlight` sets the single
+        // `_label`, `altTab.js:1130-1134`) — ellipsized to the panel like every `StLabel`
+        // (`PANGO_ELLIPSIZE_END`, `st-label.c:331`). An app switcher labels every item, because
+        // there the label is a child of the item (`AppIcon`, `:682-686`).
+        let texts: Vec<String> = match footer {
+            Some(footer) => open
+                .art
+                .get(open.state.selected())
+                .map(|a| widget::ellipsized_line(&a.label, LABEL_PT, footer.size.w))
+                .filter(|line| !line.is_empty())
+                .into_iter()
+                .collect(),
+            None => open.art.iter().map(|a| a.label.clone()).collect(),
+        };
 
         let baked = widget::bake(
             &mut *ctx.renderer,
@@ -511,9 +569,9 @@ impl SwitcherUi {
             revision,
             |renderer| {
                 let mut shaper = TextShaper::new(renderer, scale);
-                open.art
+                texts
                     .iter()
-                    .map(|a| shaper.shape(&a.label, TextStyle::new(LABEL_PT)))
+                    .map(|t| shaper.shape(t, TextStyle::new(LABEL_PT)))
                     .collect::<anyhow::Result<Vec<ShapedText>>>()
             },
             |frame, phys, labels: &Vec<ShapedText>| {
@@ -528,18 +586,36 @@ impl SwitcherUi {
                     p.fill_rounded(*rect, ITEM_RADIUS, ITEM_SELECTED)?;
                 }
 
-                // The app name under each icon, centered in the strip the icon leaves free.
-                for (i, rect) in items.iter().enumerate() {
-                    if let Some(label) = labels.get(i) {
-                        p.text(
-                            label,
-                            Point::from((
-                                rect.loc.x + rect.size.w / 2.,
-                                rect.loc.y + rect.size.h - ITEM_PADDING - label_height / 2.,
-                            )),
-                            widget::Align::CENTER,
-                            LIST_FG,
-                        )?;
+                match footer {
+                    // The selected window's title, centered across the panel's bottom.
+                    Some(footer) => {
+                        if let Some(label) = labels.first() {
+                            p.text_band(
+                                label,
+                                footer.loc.x + footer.size.w / 2.,
+                                widget::HAlign::Center,
+                                footer.loc.y,
+                                footer.size.h,
+                                LIST_FG,
+                                footer,
+                            )?;
+                        }
+                    }
+                    // The app name under each icon, centered in the strip the icon leaves free.
+                    None => {
+                        for (i, rect) in items.iter().enumerate() {
+                            if let Some(label) = labels.get(i) {
+                                p.text(
+                                    label,
+                                    Point::from((
+                                        rect.loc.x + rect.size.w / 2.,
+                                        rect.loc.y + rect.size.h - ITEM_PADDING - label_height / 2.,
+                                    )),
+                                    widget::Align::CENTER,
+                                    LIST_FG,
+                                )?;
+                            }
+                        }
                     }
                 }
 
@@ -562,6 +638,7 @@ impl SwitcherUi {
             },
         );
 
+        let mut panel_element = None;
         match baked {
             Ok(texture) => {
                 let buffer = TextureBuffer::from_texture(
@@ -571,7 +648,7 @@ impl SwitcherUi {
                     Transform::Normal,
                     Vec::new(),
                 );
-                elements.push(TextureRenderElement::from_texture_buffer(
+                panel_element = Some(TextureRenderElement::from_texture_buffer(
                     buffer,
                     panel.loc,
                     1.,
@@ -583,9 +660,15 @@ impl SwitcherUi {
             Err(err) => tracing::error!("error drawing the switcher panel: {err:#}"),
         }
 
-        // Front-to-back: the icons and the panel were collected in draw order, and the panel
-        // (with its labels) must sit *behind* the icons that overlay it.
+        // Front-to-back, so this is the stacking order read topmost-first: the app icons overlay
+        // the window previews, and the panel (with its labels and arrows) is behind both.
         for element in elements {
+            push(SwitcherRenderElement::Texture(element));
+        }
+        for element in thumbnails {
+            push(SwitcherRenderElement::Thumbnail(element));
+        }
+        if let Some(element) = panel_element {
             push(SwitcherRenderElement::Texture(element));
         }
     }

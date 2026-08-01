@@ -13261,6 +13261,92 @@ fn a_quick_super_tab_switches_without_showing_the_popup() {
     );
 }
 
+/// Alt-Tab titles the *selected* window across the whole panel; Super-Tab labels every item.
+///
+/// The two popups put their label in different places. `AppIcon` adds its label as a child of the
+/// item (`altTab.js:682-686`), so an app name sits under its own icon. `WindowIcon` does **not**:
+/// its label is only handed to `addItem` as the accessible `label_actor` (`switcherPopup.js:460`),
+/// and `WindowSwitcher` owns one `St.Label` for the whole list (`altTab.js:1066-1070`) whose text
+/// follows the selection (`highlight`, `:1130-1134`).
+///
+/// This is not cosmetics. A window title is arbitrary client text, often far wider than the 128px
+/// preview it belongs to; per-item titles either overflow their slot or force every slot as wide
+/// as the longest title. Asserting the *geometry* is what pins it: the item stays square and the
+/// title band spans the panel.
+#[test]
+fn alt_tab_titles_the_selection_across_the_panel_and_super_tab_labels_each_item() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake(
+            "org.example.One.desktop",
+            "One",
+        )])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.One");
+    map_window_for_app(&mut f, client, "org.example.One");
+    f.niri_complete_animations();
+
+    const KEY_LEFTALT: u32 = 56;
+    const KEY_LEFTMETA: u32 = 125;
+
+    f.key_press(KEY_LEFTALT);
+    f.niri_state()
+        .do_action(Action::SwitchWindows { backward: false }, false);
+    let item = f.niri().switcher.item_rect(0).expect("an item");
+    let footer = f
+        .niri()
+        .switcher
+        .footer_rect()
+        .expect("the window switcher has a title band");
+    let panel = f.niri().switcher.panel_rect().expect("a panel");
+    f.key_release(KEY_LEFTALT);
+
+    // The preview slot carries no label strip of its own: it is exactly the 128px preview plus
+    // `.item-box`'s padding. A per-item title would inflate the content height and, through
+    // `squareItems`, the whole slot — so this one number fails the moment the label moves back in.
+    use crate::ui::switcher::window_switcher::WINDOW_PREVIEW_SIZE;
+    use crate::ui::switcher::ITEM_PADDING;
+    let side = WINDOW_PREVIEW_SIZE + ITEM_PADDING * 2.;
+    assert_eq!(
+        item.size,
+        smithay::utils::Size::from((side, side)),
+        "a window switcher item is the bare preview square"
+    );
+    // ...and the title band is the panel's, not the item's.
+    assert!(
+        footer.size.w > item.size.w,
+        "the title spans the panel ({}) rather than one 128px slot ({})",
+        footer.size.w,
+        item.size.w
+    );
+    assert!(
+        footer.loc.y >= item.loc.y + item.size.h,
+        "the title sits below the row, not inside it"
+    );
+    assert!(
+        footer.loc.y + footer.size.h <= panel.loc.y + panel.size.h,
+        "and inside the panel"
+    );
+
+    // The app switcher is the other arrangement: label per item, no band.
+    f.key_press(KEY_LEFTMETA);
+    f.niri_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+    let app_footer = f.niri().switcher.footer_rect();
+    f.key_release(KEY_LEFTMETA);
+
+    assert!(
+        app_footer.is_none(),
+        "an app switcher has no panel-wide title band"
+    );
+}
+
 /// Alt-Tab is workspace-local and Super-Tab is not — the two schemas' opposed defaults, driven
 /// through the real popups.
 ///

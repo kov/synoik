@@ -605,6 +605,22 @@ pub fn tile_label_lines(
     niri_vk::text::wrap_lines_weighted(name, px, false, wrap_w, max_lines.max(1), break_words)
 }
 
+/// One line of `text`, ellipsized at the end if it does not fit `max_w` logical px.
+///
+/// This is what a plain `StLabel` does with no styling at all: St puts `PANGO_ELLIPSIZE_END` on
+/// its `ClutterText` (`st-label.c:331`), so any label given less width than it wants is cut with
+/// an ellipsis rather than overflowing its allocation. Reach for this for a *single-line* label
+/// whose text is content (a window title, a device name) rather than something you control —
+/// [`tile_label_lines`] is the multi-line, app-grid-specific counterpart.
+///
+/// Break points are computed in logical px, so they do not move with the output scale.
+pub fn ellipsized_line(text: &str, pt: f64, max_w: f64) -> String {
+    let px = crate::ui::pt_to_px(pt) as f32;
+    niri_vk::text::wrap_lines_weighted(text, px, false, max_w, 1, false)
+        .pop()
+        .unwrap_or_default()
+}
+
 /// A rounded single-line text-entry chrome — the GNOME `St.Entry` used for the
 /// overview `search-entry` (`_search-entry.scss`, `overviewControls.js:325`). A
 /// **view + geometry** primitive: the caller owns the editable string (like
@@ -2281,7 +2297,7 @@ mod tests {
     use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Size};
 
     use super::{
-        bake_uncached_sized, tile_label_lines, Painter, Revision, TileMetrics,
+        bake_uncached_sized, ellipsized_line, tile_label_lines, Painter, Revision, TileMetrics,
         TILE_LABEL_EXPAND_LINES, TILE_LABEL_LINES,
     };
     use crate::render_helpers::vulkan::VulkanRenderer;
@@ -2360,6 +2376,27 @@ mod tests {
             centers[1].x - sub / 2. > centers[0].x + sub / 2.,
             "the two columns do not touch"
         );
+    }
+
+    /// A single-line label is cut with an ellipsis rather than allowed to overflow.
+    ///
+    /// Content text is not ours to bound — a window title can be a whole file path — so the label
+    /// that shows it has to end somewhere. St's answer is `PANGO_ELLIPSIZE_END` on every `StLabel`
+    /// (`st-label.c:331`), and the switcher's title band relies on it.
+    #[test]
+    fn a_content_label_ellipsizes_instead_of_overflowing() {
+        let pt = crate::ui::BASE_FONT_PT;
+        let long = "A Very Long Window Title That Nobody Would Ever Choose \
+                    But Every Editor Writes Anyway.txt";
+
+        let cut = ellipsized_line(long, pt, 200.);
+        assert!(cut.ends_with('…'), "cut at the end: {cut:?}");
+        assert!(cut.len() < long.len(), "and shorter than the input");
+        assert!(!cut.contains('\n'), "one line, never two: {cut:?}");
+
+        // A title that fits is left exactly as it is — no stray ellipsis, no reflow.
+        assert_eq!(ellipsized_line("Terminal", pt, 400.), "Terminal");
+        assert_eq!(ellipsized_line("", pt, 400.), "");
     }
 
     /// A **resting** caption never splits a word: on a narrow tile (a small canvas shrinks

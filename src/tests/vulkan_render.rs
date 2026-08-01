@@ -11139,6 +11139,142 @@ fn vulkan_draws_the_arrow_only_under_a_multi_window_app() {
     }
 }
 
+/// A single green square window that resolves to an app and carries `title`, so the switcher has
+/// a preview, an app badge *and* a title band to draw.
+///
+/// Square deliberately: a landscape window is letterboxed inside the 128px preview box and its
+/// clone never reaches the box's bottom-right corner, which is exactly where the badge goes — so
+/// a landscape fixture cannot see the two overlap at all.
+fn app_window_switcher_fixture(title: &str) -> Option<Fixture> {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return None;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake(
+            "org.example.One.desktop",
+            "One",
+        )])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.set_app_id("org.example.One");
+    window.set_title(title);
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(GREEN[0], GREEN[1], GREEN[2], GREEN[3]);
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    Some(f)
+}
+
+/// The app badge draws **over** the window preview, not under it.
+///
+/// `WindowIcon` puts the clone and the icon in one `Clutter.BinLayout` and adds the icon second
+/// (`altTab.js:1029-1037`), so the icon is the later child and paints on top. Our elements are
+/// pushed front-to-back, which makes the *order of two `push` loops* the whole behaviour — and
+/// getting it backwards leaves the badge half-buried under any preview that fills its box, which
+/// is what a square window does.
+#[test]
+fn vulkan_draws_the_app_badge_over_the_window_preview() {
+    let Some(mut f) = app_window_switcher_fixture("Green") else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    open_window_switcher(&mut f);
+
+    let item = f.niri().switcher.item_rect(0).expect("one item");
+    let preview = crate::ui::switcher::window_switcher::preview_box(item);
+    let badge = crate::ui::switcher::window_switcher::app_icon_center(preview);
+    let scale = output.current_scale().fractional_scale();
+    let at = |p: Point<f64, smithay::utils::Logical>| {
+        ((p.x * scale).round() as i32, (p.y * scale).round() as i32)
+    };
+    let (bx, by) = at(badge);
+    let (cx, cy) = at(preview.loc + Point::from((preview.size.w / 2., preview.size.h / 2.)));
+
+    let (after, w, _) = render_output_vulkan(&mut f, &output);
+
+    // The preview really is there and really is green, so "not green" below means covered.
+    let clone = px(&after, w, cx, cy);
+    assert!(
+        clone[1] > 200 && clone[0] < 80 && clone[2] < 80,
+        "the preview's middle must be the window's green, got {clone:?}"
+    );
+
+    // A 48px badge centred here: its middle is icon, whatever the icon happens to look like.
+    let over = px(&after, w, bx, by);
+    assert!(
+        !(over[1] > 200 && over[0] < 80 && over[2] < 80),
+        "the app badge must cover the preview at the corner it sits in, but that pixel is still \
+         the window's green ({over:?}) — the icons are being pushed behind the thumbnails"
+    );
+}
+
+/// The selected window's title is drawn in the panel's own bottom band.
+///
+/// `WindowSwitcher` owns one `St.Label` for the whole list (`altTab.js:1066-1070`) and
+/// `highlight` points it at the selection (`:1130-1134`). Sampling the *band* rather than any one
+/// glyph: where the text lands inside it depends on the font, but ink somewhere in an otherwise
+/// bare stretch of `%osd_panel` plate can only be the title.
+#[test]
+fn vulkan_draws_the_selected_window_title_in_the_switchers_footer() {
+    let Some(mut f) = app_window_switcher_fixture("Untitled Document") else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    open_window_switcher(&mut f);
+
+    let footer = f
+        .niri()
+        .switcher
+        .footer_rect()
+        .expect("the window switcher has a title band");
+    let scale = output.current_scale().fractional_scale();
+
+    let (after, w, _) = render_output_vulkan(&mut f, &output);
+
+    // Anything brighter than the plate ([46, 46, 51]) inside the band is glyph coverage.
+    let x0 = (footer.loc.x * scale).round() as i32;
+    let x1 = ((footer.loc.x + footer.size.w) * scale).round() as i32;
+    let y0 = (footer.loc.y * scale).round() as i32;
+    let y1 = ((footer.loc.y + footer.size.h) * scale).round() as i32;
+    let mut ink = 0;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if px(&after, w, x, y)[0] > 120 {
+                ink += 1;
+            }
+        }
+    }
+    assert!(
+        ink > 20,
+        "the title band must carry the selected window's title, but only {ink} pixels in it are \
+         brighter than the panel plate"
+    );
+}
+
 /// Count opaque green pixels — the fixture window's colour.
 fn count_green(pixels: &[u8], w: i32, h: i32) -> usize {
     let mut n = 0;

@@ -220,6 +220,16 @@ triangle primitive (`Painter::triangle` / `sdf_triangle.frag`) rather than faked
 also the verb slice 6's scroll arrows will want. Slices 4–6 and `Above_Tab`'s per-layout resolution
 are untouched.
 
+**Seat validation 2026-08-01 found two Alt-Tab divergences, both fixed.** (a) The app badge was
+pushed *behind* the window preview, so a square window buried half of it — `WindowIcon` adds the
+clone and then the icon to one `Clutter.BinLayout` (`altTab.js:1029-1037`), so the icon is the
+later child and paints on top. (b) Window titles were drawn per item, where a title longer than
+the 128 px preview overflowed its slot. They are not per-item in GNOME: `WindowIcon`'s label is
+only handed to `addItem` as the accessible `label_actor` (`switcherPopup.js:451-464`), and
+`WindowSwitcher` owns **one** `St.Label` across the whole list (`altTab.js:1066-1070`) whose text
+follows the selection (`highlight`, `:1130-1134`), ellipsized like any `StLabel`. Both are the
+same lesson as the arrow: read where the JS *adds the child*, not where the pixels look right.
+
 1. **Shared base + chrome.** `SwitcherPopup` timing/keynav/commit rules, the window list
    (`getWindows` semantics, below) that `_finish` needs to activate anything, and the
    `.switcher-list` panel. No item art. **Does not touch the `switch-*` bindings** — see the
