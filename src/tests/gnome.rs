@@ -7116,11 +7116,27 @@ fn the_screen_saver_bus_calls_drive_the_shield() {
         .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
     assert!(f.niri().screen_shield.is_active(), "Lock blanks too");
 
-    // And the snapshot the bus reads is kept in step, or `GetActive` would answer from stale
-    // state while `ActiveChanged` said otherwise.
+    // The snapshot the bus reads deliberately lags the model: `active` is not published until the
+    // curtain has landed, so the slide is not replaced by whatever gsd-power does on
+    // `ActiveChanged` (our divergence from GNOME's beat — see `lock-screen-backlog.md` item H).
+    assert!(
+        !f.niri().shield_snapshot.lock().unwrap().active,
+        "GetActive must not claim the screensaver is up while the curtain is still sliding"
+    );
+
+    f.niri().lock_screen.settle();
+    f.niri().publish_shield_active();
     assert!(
         f.niri().shield_snapshot.lock().unwrap().active,
-        "GetActive reads this, and it must not lag the model"
+        "...and must say so the moment it lands, or gsd never blanks at all"
+    );
+
+    // Raising it publishes at once — there is nothing to wait for on the way out.
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(false));
+    assert!(
+        !f.niri().shield_snapshot.lock().unwrap().active,
+        "unlocking must stop claiming the screensaver is on immediately"
     );
 }
 

@@ -259,6 +259,14 @@ process. What is done about it, and what is not:
 
 ## Known divergences
 
+- **No "beat", and no second fade to black.** GNOME dims the screen 300 ms after a manual lock
+  lands and defers `ActiveChanged` to the end of that dim, so gnome-settings-daemon does not blank
+  mid-animation (`screenShield.js:479-486`, `:316-319`, `:604-614`). We keep the reason and drop
+  the mechanism: blanking is power management's business, not the lock screen's. The published
+  `active` simply waits for the curtain to land — rises wait, falls are immediate — which is all
+  the lock screen needs to guarantee its animation is seen. Decided 2026-08-01; see
+  `lock-screen-backlog.md` item H.
+
 - **`Lock`'s reply is level-triggered, not edge-triggered.** GNOME hangs `LockAsync` on the
   `lock-screen-shown` *edge* (`shellDBus.js:538-545`), so a `Lock` at an already-covered screen
   waits forever — `_resetLockScreen` returns early unless the shield is hidden

@@ -124,28 +124,46 @@ tests for the refused lock, the already-covered lock, and the torn-down slide.
 
 ---
 
-## H. The manual fade to black, and when `ActiveChanged` fires
+## H. When `ActiveChanged` fires — **LANDED, as a divergence**
 
-**Missed by both documents until a review caught it**, and it shares a moment with B, so do them
-together.
+**Missed by both documents until a review caught it.**
 
-We built the *idle* fade (`STANDARD_FADE_TIME`, ten seconds). GNOME has a second one: every
-**manual** lock also goes black. `activate()` always passes `fadeToBlack: true`
-(`screenShield.js:603`); once the curtain lands, `_lockScreenShown` waits `MANUAL_FADE_TIME`
-(300 ms, `:35`, `:39`) and then fades the *short* lightbox in (`:479-489`). So a manual lock lands,
-holds for a beat, and dims — roughly 600 ms after it started.
+GNOME runs a *second* fade that we never ported. There are two black lightboxes
+(`screenShield.js:125-137`): the long one is the ten-second idle fade we already have, and a
+**short** one, `MANUAL_FADE_TIME = 300` (`:39`), which every manual lock also gets. `activate()`
+always passes `fadeToBlack: true` (`:601-603`), so once the curtain lands `_lockScreenShown` waits
+300 ms — the comment calls it "take a beat" — and then dims over another 300 ms (`:479-486`).
 
-The load-bearing part is not the animation. `_setActive(true)` — and therefore `ActiveChanged`, and
-therefore gsd-power blanking the display — is emitted from `_onShortLightbox` (`:316-319`),
-deliberately deferred so the monitor does not blank mid-slide; the comment at `:605-615` says so
-outright. **On the animated path `lock-screen-shown` is emitted before `active` becomes true**,
-which is exactly the ordering B's reply has to respect.
+The load-bearing part is not the dimming. `_setActive(true)`, which emits `ActiveChanged`
+(`:156-163`), fires from `_onShortLightbox` when that fade *completes* (`:316-319`) — so the signal
+is deliberately ~600 ms late, and GNOME accepts a documented window where the screen is visibly
+locked while `GetActive` answers false. Its comment (`:604-614`) says why:
 
-**Scope:** a second, short fade on the manual path, and moving the `ActiveChanged` edge to its
-completion.
+> when we emit ActiveChanged(true), gnome-settings-daemon blanks the screen, and we don't want
+> blank during the animation.
 
-**Risk:** medium — it changes when an external daemon blanks the screen, and getting it wrong either
-blanks during the slide (the bug GNOME's comment describes) or never blanks at all.
+**Our decision (Gustavo, 2026-08-01): keep the reason, drop the mechanism.** Blanking policy
+belongs to power management, not to the lock screen, and we would rather not have the two tangled
+— so we do not dim on gsd's behalf and there is no beat and no second lightbox. What the lock
+screen legitimately owes is that its animation is *seen* rather than replaced by an immediate
+blank, and that is bought entirely by **deferring the published `active` until the curtain lands**
+(250 ms, our slide) instead of until a fade we do not run.
+
+So:
+
+- the model's own `active` is unchanged and immediate — it is what input routing, `is_dismissible`
+  and the pending-`Lock` reply all read;
+- what the **session bus** sees (`GetActive` and `ActiveChanged`) waits for the curtain;
+- **rises wait, falls do not**: unlocking stops claiming the screensaver is on at once, as GNOME's
+  own `_setActive(false)` does (`:539`, `:581`);
+- the idle path is untouched — its curtain settles instantly, so it publishes immediately, exactly
+  as GNOME's non-animated branch does (`:487-490`).
+
+This also sidesteps a refactor the faithful port would have needed. GNOME keeps `_isActive`
+separate from "the shield owns the screen" (a modal grab plus `_lockScreenState`); we had collapsed
+both into `active`, across ten call sites — including `settle_lock_replies`, which reads
+`!is_active()` as "this lock will never land, answer the caller" and would have silently undone
+item B. Deferring only what is *published* leaves every internal consumer alone.
 
 ---
 
