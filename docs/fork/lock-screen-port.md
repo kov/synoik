@@ -259,10 +259,11 @@ process. What is done about it, and what is not:
 
 ## Known divergences
 
-- **`Lock` replies immediately.** GNOME defers the D-Bus reply until `lock-screen-shown`
-  (`shellDBus.js:538-546`), so a caller that locks and then suspends cannot race the shield onto
-  the screen. The curtain now exists, so there *is* something to wait for — the remaining piece is
-  a "first frame with the shield up has been presented" signal to hang the reply on. Still open.
+- **`Lock`'s reply is level-triggered, not edge-triggered.** GNOME hangs `LockAsync` on the
+  `lock-screen-shown` *edge* (`shellDBus.js:538-545`), so a `Lock` at an already-covered screen
+  waits forever — `_resetLockScreen` returns early unless the shield is hidden
+  (`screenShield.js:440-445`) and never emits again — and a lockdown-refused `Lock` never reaches
+  the emit at all. We ask "is the curtain down?" instead, which answers both immediately.
 - **The clock weight is 700, not 800.** Our rasterizer's ceiling, not a decision here — the same
   standing divergence as every other `%title_1` in the port.
 - **Touch mode is assumed off**, so the hint always reads "Click or press a key to unlock" rather

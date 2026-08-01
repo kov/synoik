@@ -508,6 +508,13 @@ pub struct Niri {
     pub lock_screen: crate::ui::lock_screen::LockScreen,
     /// The unlock prompt's state — which page is up, what has been typed, what gdm last said.
     pub unlock_dialog: crate::unlock_dialog::UnlockDialog,
+    /// Callers of `org.gnome.ScreenSaver.Lock` still waiting to hear the shield is on screen.
+    ///
+    /// A list because two can be waiting at once, and each owes its own reply. Every path that
+    /// resolves a lock — the curtain landing, a refusal, the shield going away before it lands —
+    /// must drain this, or the caller hangs until its D-Bus timeout.
+    pub lock_replies: Vec<crate::dbus::gnome_screen_saver::LockReply>,
+
     /// Caps lock, sampled from the keyboard after each key the shield saw.
     ///
     /// GNOME reads it from the keymap whenever it needs it (`shellEntry.js:192`); we have no
@@ -3680,15 +3687,23 @@ impl State {
 
         let now = crate::utils::get_monotonic_time();
         let effects = match msg {
-            ScreenSaverToNiri::Lock => {
+            ScreenSaverToNiri::Lock(reply) => {
                 // `password_mode == NONE` comes from AccountsService, which we do not read yet;
                 // `false` is the conservative answer (a user *with* a password), and it only
                 // matters once the shield can actually lock.
                 match self.niri.screen_shield.lock(now, false) {
-                    Ok(effects) => effects,
+                    Ok(effects) => {
+                        self.niri.lock_replies.extend(reply);
+                        effects
+                    }
                     Err(crate::screen_shield::LockRefused::LockedDown) => {
                         // GNOME logs and returns (`screenShield.js:638-641`).
                         debug!("screen lock is locked down, not locking");
+                        // **Divergence: a refused lock still answers.** GNOME's `LockAsync` waits
+                        // on a signal this path never emits, so a caller that locks down the
+                        // screen and then calls `Lock` blocks until the D-Bus timeout. Dropping
+                        // the reply closes its channel, which is the caller's cue to stop waiting.
+                        drop(reply);
                         return;
                     }
                 }
@@ -4014,6 +4029,10 @@ impl State {
         // The shield's own paths move the page too (`cancel_dialog`, and the `show_clock` a
         // cancelled conversation forces), so the crossfade clock is synced from here as well.
         self.sync_lock_page_and_caps();
+
+        // A `Lock` caller may be waiting on the state we just moved to — including the case where
+        // the shield is not going to land at all.
+        self.niri.settle_lock_replies();
 
         // Last, and unconditionally: the inhibitor is a function of the state we just moved to, and
         // the suspend path *depends* on it being dropped here — logind is waiting on that fd.
@@ -5273,6 +5292,7 @@ impl Niri {
                 crate::unlock_dialog::session_user(),
             ),
             caps_lock: false,
+            lock_replies: Vec::new(),
             #[cfg(feature = "dbus")]
             gdm_requests: None,
             lock_timer: None,
@@ -7157,6 +7177,30 @@ impl Niri {
         }
     }
 
+    /// Answer any `Lock` callers whose shield is now settled, one way or the other.
+    ///
+    /// **Level-triggered, deliberately.** GNOME hangs its `LockAsync` on the `lock-screen-shown`
+    /// *edge* (`shellDBus.js:538-545`), and `_resetLockScreen` returns early unless the shield is
+    /// hidden (`screenShield.js:440-445`) — so a `Lock` arriving at an already-covered screen
+    /// waits for a signal that will never come again. Asking "is the curtain down?" instead
+    /// answers that case immediately, and needs no special-casing for the idle path's instantly
+    /// settled curtain either.
+    ///
+    /// A shield that stopped being active before it landed resolves too: the caller wanted to know
+    /// the screen was covered, and the honest answer is that it is not going to be.
+    pub(crate) fn settle_lock_replies(&mut self) {
+        if self.lock_replies.is_empty() {
+            return;
+        }
+        let now = crate::utils::get_monotonic_time();
+        let landed = self.lock_screen.is_covering(now) && !self.lock_screen.is_sliding(now);
+        if landed || !self.screen_shield.is_active() {
+            for reply in self.lock_replies.drain(..) {
+                reply.answer();
+            }
+        }
+    }
+
     pub fn update_render_elements(&mut self, output: Option<&Output>) {
         self.update_xray_render_elements(output);
         self.layout.update_render_elements(output);
@@ -7165,6 +7209,7 @@ impl Niri {
         // *next* lock is told the curtain is already on its way, so it never descends.
         self.lock_screen
             .settle_curtain(crate::utils::get_monotonic_time());
+        self.settle_lock_replies();
 
         // Keep the panel's Activities highlight in sync with the overview.
         let overview_open = self.layout.is_overview_open();

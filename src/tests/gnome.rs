@@ -7112,7 +7112,8 @@ fn the_screen_saver_bus_calls_drive_the_shield() {
     assert!(!f.niri().screen_shield.is_active());
 
     // `Lock` also puts the shield down — the difference is what it takes to raise it.
-    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
     assert!(f.niri().screen_shield.is_active(), "Lock blanks too");
 
     // And the snapshot the bus reads is kept in step, or `GetActive` would answer from stale
@@ -7174,7 +7175,8 @@ fn a_lock_with_no_verifier_to_ask_stays_a_screensaver() {
     // What a build without D-Bus, or a gdm client that failed to start, actually looks like.
     f.niri_state().niri.gdm_requests = None;
 
-    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
     assert!(f.niri().screen_shield.is_active(), "the screen is covered");
     assert!(!f.niri().screen_shield.is_locked(), "but never locked");
     assert!(
@@ -7245,7 +7247,8 @@ fn lockdown_makes_the_screen_saver_lock_a_no_op() {
             ..Default::default()
         });
 
-    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
     assert!(!f.niri().screen_shield.is_active());
     assert!(!f.niri().shield_snapshot.lock().unwrap().active);
 
@@ -7348,7 +7351,8 @@ fn a_locked_shield_takes_a_password_and_gdm_decides() {
 
     // `Lock` covers the screen at once, but must NOT claim to be locked — nothing can unlock it
     // until gdm answers.
-    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
     assert!(f.niri().screen_shield.is_active(), "the screen is covered");
     assert!(
         !f.niri().screen_shield.is_locked(),
@@ -7433,7 +7437,8 @@ fn leaving_the_prompt_animates_and_survives_the_unlock() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
     f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
     f.niri_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
@@ -7481,6 +7486,68 @@ fn leaving_the_prompt_animates_and_survives_the_unlock() {
     );
 }
 
+/// `Lock` does not answer until the shield is actually on screen — and always answers.
+///
+/// GNOME defers its reply on `lock-screen-shown` (`shellDBus.js:538-545`), emitted when the
+/// curtain's slide completes (`screenShield.js:474-493`). Ours is level-triggered instead of
+/// edge-triggered, which is what makes the second and third cases here answer at all: GNOME's own
+/// `LockAsync` hangs on both, since `_resetLockScreen` returns early unless the shield is hidden
+/// (`:440-445`) and a refused lock never reaches the emit.
+#[test]
+fn lock_answers_its_caller_only_once_the_shield_is_up() {
+    use crate::dbus::gnome_screen_saver::{LockReply, ScreenSaverToNiri};
+
+    /// Poll the caller's side of the reply channel without blocking.
+    fn answered(rx: &async_channel::Receiver<()>) -> bool {
+        !matches!(rx.try_recv(), Err(async_channel::TryRecvError::Empty))
+    }
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // --- A lock from a bare screen waits for the curtain to land. ---
+    let (tx, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(Some(LockReply::for_test(tx))));
+    assert!(
+        !answered(&rx),
+        "answered while the curtain was still on its way down"
+    );
+
+    // The slide finishing is what answers. Settling stands in for the 250 ms.
+    f.niri().lock_screen.settle();
+    f.niri().settle_lock_replies();
+    assert!(
+        answered(&rx),
+        "the shield is up and the caller is still waiting"
+    );
+
+    // --- A second lock, with the screen already covered, answers at once. ---
+    let (tx2, rx2) = async_channel::bounded(1);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(Some(LockReply::for_test(tx2))));
+    assert!(
+        answered(&rx2),
+        "a lock at an already-covered screen must not wait for an edge that cannot come"
+    );
+
+    // --- A refused lock answers rather than hanging. ---
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let mut settings = f.niri().screen_shield.settings();
+    settings.disable_lock_screen = true;
+    f.niri().screen_shield.set_settings(settings);
+
+    let (tx3, rx3) = async_channel::bounded(1);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(Some(LockReply::for_test(tx3))));
+    assert!(!f.niri().screen_shield.is_active(), "lockdown refused it");
+    assert!(
+        answered(&rx3),
+        "a refused lock left its caller waiting for a screen that will never be covered"
+    );
+}
+
 /// Caps lock raises a warning on the password prompt, and only there.
 ///
 /// GNOME shows `CapsLockWarning` (`shellEntry.js:162-218`) whenever the outstanding question is a
@@ -7499,7 +7566,8 @@ fn caps_lock_warns_on_the_password_prompt_only() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
     f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
     f.niri_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
@@ -7567,7 +7635,8 @@ fn a_locked_shield_swallows_keys_instead_of_raising() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
     f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
     assert!(f.niri().screen_shield.is_locked());
 
@@ -7603,7 +7672,8 @@ fn a_locked_shield_still_lets_ctrl_alt_fn_through() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
     f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
     assert!(f.niri().screen_shield.is_locked());
 
@@ -7677,7 +7747,8 @@ fn losing_the_unlock_channel_does_not_trap_the_session() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
     f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
     assert!(f.niri().screen_shield.is_locked());
 

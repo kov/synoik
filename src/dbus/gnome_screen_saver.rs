@@ -36,11 +36,35 @@ const SHIELD_NAME: &str = "org.gnome.Shell.ScreenShield";
 const SAVER_NAME: &str = "org.gnome.ScreenSaver";
 const PATH: &str = "/org/gnome/ScreenSaver";
 
+/// A caller waiting to hear that the shield is on screen.
+///
+/// One per in-flight `Lock`, rather than a shared signal, because two callers can be waiting at
+/// once and each owes its own reply. Dropping it answers as surely as [`answer`](Self::answer)
+/// does — the receiver sees the channel close — which is what keeps a lock that never completes
+/// from hanging its caller until the D-Bus timeout.
+#[derive(Debug)]
+pub struct LockReply(async_channel::Sender<()>);
+
+impl LockReply {
+    pub fn answer(self) {
+        let _ = self.0.try_send(());
+    }
+
+    /// Build one around a caller's channel, so a test can wait exactly as the bus task does.
+    #[cfg(test)]
+    pub fn for_test(tx: async_channel::Sender<()>) -> Self {
+        Self(tx)
+    }
+}
+
 /// A call from the session into the compositor.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum ScreenSaverToNiri {
     /// `Lock` — put the shield down and require authentication (`shellDBus.js:538-546`).
-    Lock,
+    ///
+    /// Carries the waiting caller, if the call came from the bus; `None` from a test or any other
+    /// caller with nobody to answer.
+    Lock(Option<LockReply>),
     /// `SetActive(b)` — the screensaver half. GNOME activates *with* animation and deactivates
     /// *without* (`:548-553`).
     SetActive(bool),
@@ -71,15 +95,31 @@ pub struct GnomeScreenSaver {
 
 #[interface(name = "org.gnome.ScreenSaver")]
 impl GnomeScreenSaver {
-    /// `Lock`.
+    /// `Lock`, answered only once the shield is actually on screen.
     ///
-    /// GNOME does not return until the lock screen is actually shown — it defers the reply on
-    /// `lock-screen-shown` (`shellDBus.js:538-546`) — so that a caller which locks and then
-    /// suspends cannot race the shield onto the screen. We reply immediately, which is a
-    /// divergence worth closing when the shield has an on-screen state to wait for; until then
-    /// there is no such event to wait on and a deferred reply would simply never arrive.
+    /// GNOME defers the reply on `lock-screen-shown` (`shellDBus.js:538-546`) so a caller that
+    /// locks and then suspends cannot race the shield onto the display. That signal is emitted when
+    /// the curtain's slide *completes* (`screenShield.js:455-466`, `:474-493`), not when the first
+    /// frame is presented, which is a state we have.
+    ///
+    /// The reply is **level-triggered** on the compositor side: a `Lock` arriving at an
+    /// already-covered screen is answered at once. GNOME's is edge-triggered and hangs in exactly
+    /// that case, because `_resetLockScreen` returns early unless the shield is hidden
+    /// (`:440-445`) and so never emits a second time.
     async fn lock(&self) {
-        let _ = self.to_niri.send(ScreenSaverToNiri::Lock);
+        // Bounded(1) and never awaited on the sending side: the compositor answers from the event
+        // loop and must not block there.
+        let (tx, rx) = async_channel::bounded(1);
+        if self
+            .to_niri
+            .send(ScreenSaverToNiri::Lock(Some(LockReply(tx))))
+            .is_err()
+        {
+            return;
+        }
+        // `Err` is the sender being dropped — a lock that will never be shown. Returning is the
+        // right answer either way: what the caller needs is to stop waiting.
+        let _ = rx.recv().await;
     }
 
     async fn set_active(&self, active: bool) {

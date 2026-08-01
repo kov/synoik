@@ -66,7 +66,7 @@ after `input()` instead, which is what the switcher next door already does for t
 
 ---
 
-## B. `Lock` replies immediately
+## B. `Lock` replies immediately — **LANDED**
 
 **This is smaller than the divergence note claims.** The note says we need a "first frame with the
 shield up has been presented" signal. GNOME does not do that: `lock-screen-shown` is emitted from

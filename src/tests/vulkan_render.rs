@@ -11717,7 +11717,8 @@ fn vulkan_draws_the_caps_lock_warning() {
     };
     let output = f.niri_output(1);
 
-    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
     f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
     f.niri_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
@@ -11785,7 +11786,8 @@ fn vulkan_draws_the_unlock_prompt_with_a_masked_entry() {
     };
     let output = f.niri_output(1);
 
-    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
     f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
     f.niri_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
