@@ -27,6 +27,7 @@ use smithay::utils::{Logical, Point, Rectangle, Size};
 use crate::ui::widget::{self, style, Rgba};
 
 pub mod app_switcher;
+pub mod ui;
 pub mod window_list;
 
 /// `POPUP_DELAY_TIMEOUT` (`js/ui/switcherPopup.js:8`) — how long the modifier must be
