@@ -11111,3 +11111,130 @@ fn vulkan_draws_album_art_without_the_themed_plate() {
          `.message-themed-icon`, so there is no backdrop left to paint"
     );
 }
+
+/// Raise the Alt-Tab switcher and pin the clock past its open delay, so the panel is actually on
+/// screen when the frame is composited.
+///
+/// **The delay is a visibility gate, not a fade** — inside [`POPUP_DELAY`] the popup is live but
+/// draws nothing at all, so a test that opens it and renders immediately asserts against a frame
+/// the panel never appeared in. Same trap as [`settle_screenshot_ui_open`], different mechanism:
+/// there the chrome is at alpha 0, here it is not pushed at all.
+///
+/// [`POPUP_DELAY`]: crate::ui::switcher::POPUP_DELAY
+fn open_window_switcher(f: &mut Fixture) {
+    // A real held modifier, so the popup has something to commit on and does not immediately
+    // finish through the release race.
+    const KEY_LEFTALT: u32 = 56;
+    f.key_press(KEY_LEFTALT);
+
+    f.niri_state().do_action(
+        niri_config::Action::SwitchWindows { backward: false },
+        false,
+    );
+    assert!(
+        f.niri().switcher.is_open(),
+        "Alt-Tab must raise the switcher"
+    );
+
+    let mut clock = f.niri().clock.clone();
+    let now = clock.now_unadjusted();
+    clock.set_unadjusted(now + crate::ui::switcher::POPUP_DELAY * 2);
+    f.niri().advance_animations();
+
+    assert!(
+        f.niri().switcher.is_visible(),
+        "the popup must be past its open delay before the frame is taken"
+    );
+}
+
+/// The switcher panel actually reaches the screen, with `%osd_panel`'s own fill.
+///
+/// Samples the panel's *computed* location rather than scanning for "some dark pixels": the
+/// desktop backdrop is dark too, and a scan-based version of this test passed with the switcher's
+/// renderer disabled entirely. Comparing a named pixel before and after is what makes it able to
+/// fail.
+#[test]
+fn vulkan_draws_the_window_switcher_panel() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    let (before, w, _) = render_output_vulkan(&mut f, &output);
+
+    open_window_switcher(&mut f);
+
+    // Where the panel actually is, from the same layout the renderer used.
+    let panel = f
+        .niri()
+        .switcher
+        .panel_rect()
+        .expect("an open switcher has a panel");
+    let scale = output.current_scale().fractional_scale();
+    // A point inside the panel's plate but clear of the item boxes: just below its top edge,
+    // horizontally centred.
+    let sx = ((panel.loc.x + panel.size.w / 2.) * scale).round() as i32;
+    let sy = ((panel.loc.y + 3.) * scale).round() as i32;
+
+    let (after, _, _) = render_output_vulkan(&mut f, &output);
+
+    let plate = px(&after, w, sx, sy);
+    let was = px(&before, w, sx, sy);
+    assert_ne!(plate, was, "the panel must change the pixel it covers");
+
+    // `%osd_panel` is `$osd_bg_color` — [0.180, 0.180, 0.200] opaque. Allow a few levels for the
+    // rounded-rect coverage and the hairline over it.
+    let expected = [46u8, 46, 51];
+    for (i, (got, want)) in plate[..3].iter().zip(expected).enumerate() {
+        assert!(
+            got.abs_diff(want) <= 6,
+            "panel channel {i}: got {got}, want ~{want} (full pixel {plate:?})"
+        );
+    }
+    assert!(
+        plate[3] > 240,
+        "the panel plate is opaque, got alpha {}",
+        plate[3]
+    );
+}
+
+/// The live window shows up *inside* the switcher, not just the plate.
+///
+/// The preview is composited from the window's own surfaces rather than a snapshot, so a green
+/// window must put green pixels inside the panel. Without this, a panel that drew its chrome but
+/// dropped every thumbnail would pass the test above.
+#[test]
+fn vulkan_draws_the_live_window_preview_in_the_switcher() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    // Count the green the desktop shows on its own, so the preview's green is what is measured.
+    let (before, w, h) = render_output_vulkan(&mut f, &output);
+    let green_before = count_green(&before, w, h);
+
+    open_window_switcher(&mut f);
+    let (after, w, h) = render_output_vulkan(&mut f, &output);
+    let green_after = count_green(&after, w, h);
+
+    assert!(
+        green_after > green_before,
+        "the switcher must add the window's own green as a preview \
+         (before {green_before}, after {green_after})"
+    );
+}
+
+/// Count opaque green pixels — the fixture window's colour.
+fn count_green(pixels: &[u8], w: i32, h: i32) -> usize {
+    let mut n = 0;
+    for y in 0..h {
+        for x in 0..w {
+            let [r, g, b, a] = px(pixels, w, x, y);
+            if a == 255 && g > 120 && r < 90 && b < 90 {
+                n += 1;
+            }
+        }
+    }
+    n
+}

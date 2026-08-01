@@ -158,6 +158,11 @@ impl SwitcherUi {
         self.open.is_some()
     }
 
+    /// The `.switcher-list` panel's box, for tests that need to look at the pixels it covers.
+    pub fn panel_rect(&self) -> Option<Rectangle<f64, Logical>> {
+        Some(self.open.as_ref()?.layout.panel)
+    }
+
     /// The output the popup is on, so the compositor knows what to redraw.
     pub fn output(&self) -> Option<&Output> {
         self.open.as_ref().map(|o| &o.output)
