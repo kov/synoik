@@ -114,7 +114,10 @@ wayland-backend = "0.3.15"
 wayland-scanner = "0.31.10"
 wayland-server = "0.31.13"
 xcursor = "0.3.10"
-zbus = { version = "5.13.2", optional = true }
+# `p2p`: gdm hands out a peer-to-peer address for the reauthentication channel
+# (`gdm-client.c:373` connects with no MESSAGE_BUS_CONNECTION flag), so the unlock
+# dialog needs a non-bus connection. See `dbus::gdm`.
+zbus = { version = "5.13.2", optional = true, features = ["p2p"] }
 jiff = "0.2"
 tzf-rs = "1.3"
 

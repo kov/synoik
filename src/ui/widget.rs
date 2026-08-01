@@ -654,6 +654,51 @@ pub enum EntryHit {
     Field,
 }
 
+/// Which entry family to draw — the two `%…_entry` placeholders the port has reached.
+///
+/// The families differ in more than colour, which is why this is not a colour argument: the search
+/// entry reserves gutters for its find/clear glyphs and starts its text after them, while the
+/// lock screen's has no icons at all and centres what you type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryStyle {
+    /// `%system_entry` — the overview search field.
+    Search,
+    /// `%lockscreen_entry` (`_common.scss:371-379`): `entry(…, $style: lockscreen)` fills with
+    /// `transparentize($system_fg_color, .9)` over the wallpaper and takes its focus ring from
+    /// `transparentize($fg, 0.6)` (`_drawing.scss:99-105,138-142`). No icons.
+    Lockscreen,
+}
+
+impl EntryStyle {
+    fn bg(self) -> Rgba {
+        match self {
+            EntryStyle::Search => style::ENTRY_BG,
+            // `transparentize(white, .9)`.
+            EntryStyle::Lockscreen => [1., 1., 1., 0.1],
+        }
+    }
+
+    /// The focus ring's colour, when the caller says the entry has focus.
+    fn focus_ring(self) -> Option<Rgba> {
+        match self {
+            // The search entry's focus is drawn by its caller's inset-accent ring.
+            EntryStyle::Search => None,
+            // `transparentize(white, 0.6)`.
+            EntryStyle::Lockscreen => Some([1., 1., 1., 0.4]),
+        }
+    }
+
+    /// Where the text starts, and how it is aligned in the pill.
+    fn text(self, width: f64) -> (f64, HAlign) {
+        match self {
+            // After the find glyph's gutter.
+            EntryStyle::Search => (Entry::ICON_INSET * 2., HAlign::Left),
+            // Centred, as a password field with no icons is.
+            EntryStyle::Lockscreen => (width / 2., HAlign::Center),
+        }
+    }
+}
+
 impl Entry {
     /// Pill height, logical: `%entry_common` 9px padding around a ~15px line, rounded
     /// up to a comfortable pill (`.search-entry` is `$forced_circular_radius`, so the
@@ -667,7 +712,13 @@ impl Entry {
     /// Entry font (`%system_entry` inherits the 11pt base).
     const TEXT_PT: f64 = 11.;
 
+    /// The focus ring's stroke (`focus_ring` is 2px in `_drawing.scss`).
+    const FOCUS_RING: f64 = 2.;
+
     /// Lay out a pill of `width` centered horizontally on `center_x`, top edge `top_y`.
+    ///
+    /// The icon centres are only meaningful for [`EntryStyle::Search`]; a lockscreen entry has no
+    /// glyphs, and `text_x` is its centre rather than a left edge.
     pub fn layout(center_x: f64, top_y: f64, width: f64) -> EntryLayout {
         let x = (center_x - width / 2.).round();
         let pill = Rectangle::new(
@@ -708,6 +759,7 @@ impl Entry {
     /// once typing starts the text shows in full white with a caret bar. Long text is
     /// clipped at the trailing-icon inset (no horizontal scroll yet — MVP).
     #[track_caller]
+    #[allow(clippy::too_many_arguments)]
     pub fn bake(
         renderer: &mut VulkanRenderer,
         cache: &mut BakeCache,
@@ -715,6 +767,8 @@ impl Entry {
         width: f64,
         text: &str,
         placeholder: &str,
+        entry_style: EntryStyle,
+        focused: bool,
         revision: u64,
     ) -> anyhow::Result<VkTexture> {
         let size = Size::<f64, Logical>::from((width, Self::HEIGHT));
@@ -725,11 +779,18 @@ impl Entry {
         } else {
             format!("{text}\u{258f}")
         };
-        let text_x = Self::ICON_INSET * 2.;
+        let (text_x, halign) = entry_style.text(width);
+        // Text is clipped inside the pill, inset by a gutter on each side so a long string fades
+        // out at the pill's edge rather than under its rounding.
+        let gutter = match entry_style {
+            EntryStyle::Search => Self::ICON_INSET * 2.,
+            EntryStyle::Lockscreen => Self::HEIGHT / 2.,
+        };
         let clip = Rectangle::<f64, Logical>::new(
-            Point::from((text_x, 0.)),
-            Size::from((width - text_x - Self::ICON_INSET * 2., Self::HEIGHT)),
+            Point::from((gutter, 0.)),
+            Size::from(((width - gutter * 2.).max(0.), Self::HEIGHT)),
         );
+        let ring = focused.then(|| entry_style.focus_ring()).flatten();
         bake(
             renderer,
             cache,
@@ -743,9 +804,17 @@ impl Entry {
             move |frame, phys, shaped| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
-                p.fill_rounded_full(Self::HEIGHT / 2., style::ENTRY_BG)?;
+                p.fill_rounded_full(Self::HEIGHT / 2., entry_style.bg())?;
+                if let Some(ring) = ring {
+                    p.stroke_rounded(
+                        Rectangle::from_size(Size::from((width, Self::HEIGHT))),
+                        Self::HEIGHT / 2.,
+                        Self::FOCUS_RING,
+                        ring,
+                    )?;
+                }
                 let color = if empty { style::MUTED } else { style::TEXT };
-                p.text_band(shaped, text_x, HAlign::Left, 0., Self::HEIGHT, color, clip)?;
+                p.text_band(shaped, text_x, halign, 0., Self::HEIGHT, color, clip)?;
                 Ok(())
             },
         )

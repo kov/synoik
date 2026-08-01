@@ -41,6 +41,7 @@ pub mod screen_shield;
 pub mod screencasting;
 pub mod system_status;
 pub mod ui;
+pub mod unlock_dialog;
 pub mod utils;
 pub mod wallpaper;
 pub mod window;

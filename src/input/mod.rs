@@ -524,12 +524,6 @@ impl State {
             }
         }
 
-        // A key press while the shield is down raises it, and goes no further: the desktop behind
-        // the curtain must not see the keystroke that dismissed it.
-        if pressed && self.dismiss_screen_shield() {
-            return;
-        }
-
         let is_inhibiting_shortcuts = self.is_inhibiting_shortcuts();
 
         // Accessibility modifier grabs should override XKB state changes (e.g. Caps Lock), so we
@@ -604,6 +598,30 @@ impl State {
                         return FilterResult::Forward;
                     } else {
                         return FilterResult::Intercept(None);
+                    }
+                }
+
+                // The screen shield outranks every other modal surface: while it is down, nothing
+                // behind it may see a key. This lives *inside* the keyboard filter rather than
+                // ahead of `keyboard.input()` so xkb state still tracks — otherwise Shift would
+                // never register and the unlock entry could not type a capital letter.
+                if this.niri.screen_shield.is_active() {
+                    if pressed {
+                        let text = modified
+                            .key_char()
+                            .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
+                        this.on_shield_key(raw, text);
+                    }
+
+                    if pressed {
+                        this.niri.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    } else if this.niri.suppressed_keys.remove(&key_code) {
+                        return FilterResult::Intercept(None);
+                    } else {
+                        // A release of a key pressed before the shield came down. The client saw
+                        // the press, so it must see the release or it will think the key is stuck.
+                        return FilterResult::Forward;
                     }
                 }
 
@@ -5780,7 +5798,7 @@ impl State {
         // saw pressed.
         if self.niri.screen_shield.is_active() {
             if button_state == ButtonState::Pressed {
-                self.dismiss_screen_shield();
+                self.on_shield_click();
             }
             return;
         }

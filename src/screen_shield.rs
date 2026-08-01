@@ -11,14 +11,20 @@
 //! `password_mode` is NONE always gets (`lock`, `:637-661`). Collapsing them would either demand
 //! a password from someone who has none or blank without ever locking.
 //!
-//! # Safety rail — see [`ScreenShield::lock`]
+//! # The lock gate
 //!
 //! Entering `locked` with no way to authenticate is a lockout: the shield covers the screen and
-//! nothing short of a VT switch gets you back. Until the unlock dialog lands, [`lock`] refuses to
-//! set `locked` and says so. That is a real divergence and it is deliberate; the alternative is a
-//! lock that traps whoever tries it.
+//! nothing short of a VT switch gets you back. gdm being down, the reauthentication channel being
+//! denied and PAM being misconfigured all look identical from inside the compositor, and all of
+//! them are silent.
+//!
+//! So `locked` is not gated on a flag someone remembered to set. [`lock`] puts the shield **down**
+//! and asks for a verifier; only [`authenticator_ready`] — driven by a real open channel from
+//! [`crate::dbus::gdm`] — turns that into `locked`. A shield with no verifier stays a screensaver:
+//! it covers the screen and raises on any input, which is the honest thing to be.
 //!
 //! [`lock`]: ScreenShield::lock
+//! [`authenticator_ready`]: ScreenShield::authenticator_ready
 
 use std::time::Duration;
 
@@ -36,6 +42,13 @@ pub struct ShieldEffects {
     /// Lowering the shield clears the clipboard, so its contents cannot be leaked by pasting into
     /// the unlock entry and unmasking it (`lock`, `:648-651`). Both selections, as GNOME does.
     pub clear_clipboard: bool,
+    /// Open a gdm reauthentication channel for the session user, tagged with this epoch. The
+    /// shield is now *active* and waiting to hear whether it may become *locked* — see
+    /// [`ScreenShield::authenticator_ready`].
+    pub request_authenticator: Option<u64>,
+    /// Tear any conversation down: the shield was raised, so gdm's PAM worker and its channel must
+    /// not outlive it.
+    pub cancel_authenticator: bool,
 }
 
 /// The lockdown and screensaver settings [`ScreenShield`] consults.
@@ -73,8 +86,15 @@ pub struct ScreenShield {
     /// `_activationTime`, monotonic. `None` is GNOME's 0.
     activation_time: Option<Duration>,
     settings: ShieldSettings,
-    /// See the safety rail in the module docs. Cleared when the unlock dialog exists.
-    can_authenticate: bool,
+    /// The epoch a [`lock`](Self::lock) is waiting on a verifier for, if any.
+    ///
+    /// An epoch rather than a bool because opening a channel is a round trip that can outlive the
+    /// lock that asked for it: lock, dismiss, lock again, and the *first* answer would otherwise
+    /// satisfy the second lock's gate — covered-but-unlocked if it failed, or locked with no
+    /// conversation behind it if it succeeded.
+    awaiting_authenticator: Option<u64>,
+    /// Monotonically increasing; one per lock that asks for a verifier.
+    epoch: u64,
 }
 
 impl ScreenShield {
@@ -133,8 +153,10 @@ impl ScreenShield {
     /// never needed), so the caller owes that check, not this.
     pub fn deactivate(&mut self) -> ShieldEffects {
         self.activation_time = None;
+        self.awaiting_authenticator = None;
         let mut effects = self.set_active(false);
         effects.wake_up_screen = true;
+        effects.cancel_authenticator = true;
         let unlocked = self.set_locked(false);
         effects.locked_changed = unlocked.locked_changed;
         effects
@@ -145,9 +167,9 @@ impl ScreenShield {
     /// `password_mode_none` is AccountsService's `password_mode == NONE`: a user with no password
     /// is activated but never locked, because there would be nothing to authenticate with.
     ///
-    /// **Does not currently set `locked`.** See the module docs: until the unlock dialog exists,
-    /// locking would trap the session. The clipboard is still cleared and the shield still goes
-    /// down, so the observable half that is safe to ship is shipped.
+    /// **Does not set `locked` here.** See the module docs: the shield goes down immediately (a
+    /// lock must not wait on a D-Bus round trip to cover the screen) and asks for a verifier;
+    /// `locked` follows in [`authenticator_ready`](Self::authenticator_ready).
     pub fn lock(
         &mut self,
         now: Duration,
@@ -160,10 +182,47 @@ impl ScreenShield {
         let mut effects = self.activate(now);
         effects.clear_clipboard = true;
 
-        let wants_lock = !password_mode_none && self.can_authenticate;
-        let locked = self.set_locked(wants_lock);
-        effects.locked_changed = locked.locked_changed;
+        // A user with no password is activated but never locked (`:656-659`) — there would be
+        // nothing to authenticate with, so there is nothing to ask gdm for either.
+        if !password_mode_none {
+            self.epoch += 1;
+            self.awaiting_authenticator = Some(self.epoch);
+            effects.request_authenticator = Some(self.epoch);
+        }
         Ok(effects)
+    }
+
+    /// The verifier answered: `true` if a reauthentication channel is open and the conversation
+    /// has begun, `false` if it could not be had.
+    ///
+    /// This is the only path into `locked`. On `false` the shield stays merely active, so the
+    /// screen is still covered and any input raises it.
+    pub fn authenticator_ready(&mut self, epoch: u64, ready: bool) -> ShieldEffects {
+        // Ignore an answer for a lock that no longer applies: a different epoch, or a shield that
+        // has since been raised. Either way, locking now would be a lock nobody asked for.
+        if self.awaiting_authenticator != Some(epoch) || !self.active {
+            return ShieldEffects::default();
+        }
+        self.awaiting_authenticator = None;
+        if !ready {
+            return ShieldEffects::default();
+        }
+        self.set_locked(true)
+    }
+
+    /// The channel behind a locked shield died (gdm went away). There is nothing left to
+    /// authenticate against, so the lock is a trap — drop back to a plain screensaver, which the
+    /// user can at least dismiss.
+    ///
+    /// A divergence: GNOME leaves the dialog stuck. Ours is the safer failure, and it is not a
+    /// weakening — anyone who can kill gdm as root can already read the session.
+    pub fn authenticator_lost(&mut self) -> ShieldEffects {
+        self.awaiting_authenticator = None;
+        if !self.locked {
+            return ShieldEffects::default();
+        }
+        warn!("the unlock channel died; dropping the lock to a screensaver so it is not a trap");
+        self.set_locked(false)
     }
 
     /// `_wakeUpScreen` (`:495-501`) — user activity while the shield is down.
@@ -279,40 +338,150 @@ mod tests {
         assert!(shield.is_active());
     }
 
-    /// A user with no password is activated, never locked (`:656-659`).
+    /// A user with no password is activated, never locked (`:656-659`) — and no verifier is even
+    /// asked for.
     #[test]
     fn a_passwordless_user_is_never_locked() {
         let mut shield = ScreenShield::new(ShieldSettings::default());
-        shield.can_authenticate = true;
 
         let effects = shield.lock(T0, true).expect("not locked down");
         assert!(shield.is_active());
         assert!(!shield.is_locked());
         assert_eq!(effects.locked_changed, None);
+        assert!(
+            effects.request_authenticator.is_none(),
+            "there is nothing to authenticate with, so gdm is not asked"
+        );
 
-        // ...where a user who has one is.
+        // And a late `true` cannot lock them anyway: nothing was pending.
+        assert_eq!(shield.authenticator_ready(1, true).locked_changed, None);
+        assert!(!shield.is_locked());
+    }
+
+    /// **The lock gate.** `lock` puts the shield down and asks for a verifier; only a live channel
+    /// turns that into `locked`.
+    ///
+    /// The shield must cover the screen *immediately* — a lock that waited on a D-Bus round trip
+    /// would leave the desktop readable for as long as gdm took to answer. But it must not claim
+    /// to be locked before anything can unlock it, because gdm down, reauth denied and PAM
+    /// misconfigured are all silent and all identical from here.
+    #[test]
+    fn locking_covers_the_screen_first_and_locks_only_once_gdm_answers() {
         let mut shield = ScreenShield::new(ShieldSettings::default());
-        shield.can_authenticate = true;
+
         let effects = shield.lock(T0, false).expect("not locked down");
-        assert!(shield.is_locked());
+        let epoch = effects
+            .request_authenticator
+            .expect("gdm is asked for a channel");
+        assert!(shield.is_active(), "and the screen is covered right away");
+        assert!(
+            !shield.is_locked(),
+            "but not locked until something can unlock it"
+        );
+        assert_eq!(effects.locked_changed, None);
+
+        let effects = shield.authenticator_ready(epoch, true);
+        assert!(shield.is_locked(), "a live channel is what locks it");
         assert_eq!(effects.locked_changed, Some(true));
     }
 
-    /// The safety rail: with no way to authenticate, `lock` activates but refuses to lock.
-    ///
-    /// This is a deliberate divergence and the reason it is a named field rather than a comment —
-    /// when the unlock dialog lands, this test is what says where to flip it.
+    /// No channel, no lock — the shield stays a screensaver and any input still raises it.
     #[test]
-    fn locking_without_an_unlock_path_activates_but_does_not_lock() {
+    fn a_shield_with_no_verifier_never_locks() {
         let mut shield = ScreenShield::new(ShieldSettings::default());
-        assert!(!shield.can_authenticate, "no unlock dialog yet");
+        let epoch = shield
+            .lock(T0, false)
+            .expect("not locked down")
+            .request_authenticator
+            .unwrap();
 
-        let effects = shield.lock(T0, false).expect("not locked down");
-        assert!(shield.is_active(), "the shield still goes down");
+        let effects = shield.authenticator_ready(epoch, false);
+        assert!(shield.is_active(), "the screen stays covered");
         assert!(
             !shield.is_locked(),
-            "but it must not lock: there is nothing to unlock it with"
+            "a shield nothing can unlock must not lock"
         );
+        assert_eq!(effects.locked_changed, None);
+    }
+
+    /// **The epoch.** A slow channel's answer must not satisfy a *later* lock's gate.
+    ///
+    /// Opening a channel is a D-Bus round trip that can take a zbus timeout to fail, and a shield
+    /// can be dismissed and re-locked inside that window. Both crossings are bad: an old failure
+    /// answering a new lock leaves the screen covered but unlocked — any keypress lands on a live
+    /// desktop — and an old success answering a new lock locks with no conversation behind it, so
+    /// no password can ever be delivered.
+    #[test]
+    fn a_stale_verifiers_answer_cannot_satisfy_a_later_lock() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+
+        let first = shield
+            .lock(T0, false)
+            .expect("not locked down")
+            .request_authenticator
+            .unwrap();
+        shield.deactivate();
+        let second = shield
+            .lock(T0, false)
+            .expect("not locked down")
+            .request_authenticator
+            .unwrap();
+        assert_ne!(first, second, "each lock asks under its own epoch");
+
+        // The first lock's channel finally fails. It must not consume the second lock's gate.
+        assert_eq!(
+            shield.authenticator_ready(first, false).locked_changed,
+            None
+        );
+        assert!(!shield.is_locked());
+
+        // ...so the second lock's own answer still locks.
+        assert_eq!(
+            shield.authenticator_ready(second, true).locked_changed,
+            Some(true)
+        );
+        assert!(shield.is_locked());
+    }
+
+    /// If the unlock channel dies, the lock drops to a screensaver rather than becoming a trap.
+    #[test]
+    fn losing_the_channel_drops_the_lock_rather_than_trapping_the_session() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+        let epoch = shield
+            .lock(T0, false)
+            .expect("not locked down")
+            .request_authenticator
+            .unwrap();
+        shield.authenticator_ready(epoch, true);
+        assert!(shield.is_locked());
+
+        let effects = shield.authenticator_lost();
+        assert_eq!(effects.locked_changed, Some(false));
+        assert!(
+            !shield.is_locked(),
+            "nothing can unlock it, so it must not lock"
+        );
+        assert!(shield.is_active(), "but the screen stays covered");
+    }
+
+    /// A verifier that arrives after the shield was raised must not lock the running session.
+    ///
+    /// The channel opens asynchronously, so this really happens: lock, dismiss before gdm answers,
+    /// then the answer lands. Locking there would drop a lock screen over a desktop the user is
+    /// already using.
+    #[test]
+    fn a_late_verifier_does_not_lock_a_raised_shield() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+        let epoch = shield
+            .lock(T0, false)
+            .expect("not locked down")
+            .request_authenticator
+            .unwrap();
+        shield.deactivate();
+
+        let effects = shield.authenticator_ready(epoch, true);
+        assert!(!shield.is_active());
+        assert!(!shield.is_locked(), "the shield is up; nothing to lock");
         assert_eq!(effects.locked_changed, None);
     }
 }

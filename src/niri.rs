@@ -506,6 +506,13 @@ pub struct Niri {
     /// What the shield *looks* like: the curtain's clock and hint (`js/ui/unlockDialog.js`). Kept
     /// beside the model rather than inside it so the model stays renderer-free and testable.
     pub lock_screen: crate::ui::lock_screen::LockScreen,
+    /// The unlock prompt's state — which page is up, what has been typed, what gdm last said.
+    pub unlock_dialog: crate::unlock_dialog::UnlockDialog,
+    /// Drives [`crate::dbus::gdm`]. `None` before D-Bus starts, and on a build without it — in
+    /// which case the shield never gets a verifier and so never locks, which is the correct
+    /// behaviour rather than a degradation.
+    #[cfg(feature = "dbus")]
+    pub gdm_requests: Option<async_channel::Sender<crate::dbus::gdm::VerifierRequest>>,
     /// What `GetActive` / `GetActiveTime` read, mirrored out of [`Self::screen_shield`] on every
     /// change so the bus task can answer without a round trip through the event loop.
     #[cfg(feature = "dbus")]
@@ -3626,31 +3633,127 @@ impl State {
         self.apply_shield_effects(effects);
     }
 
-    /// Input arrived while the screen shield is down. Returns whether it was consumed.
+    /// A key arrived while the screen shield is down.
     ///
-    /// GNOME raises the curtain to the *prompt* here (`unlockDialog.js:570-572`'s click gesture and
-    /// `screenShield.js`'s key handler), and the prompt is what actually deactivates. We have no
-    /// prompt yet, so this deactivates directly — which is the honest behaviour while the safety
-    /// rail in [`crate::screen_shield`] holds `locked` at false anyway: there is nothing to
-    /// authenticate against, so a shield that could not be dismissed would simply trap the session.
-    /// Slice 3 replaces the body of the `is_locked` branch, not this call site.
-    pub fn dismiss_screen_shield(&mut self) -> bool {
+    /// Unlocked, any key raises the shield (the screensaver half). Locked, the key drives the
+    /// unlock dialog: it raises the prompt page and — if printable — is kept, so typing a password
+    /// blind from the clock does not eat its first letter (`unlockDialog.js:672-692`).
+    pub fn on_shield_key(
+        &mut self,
+        raw: Option<smithay::input::keyboard::Keysym>,
+        text: Option<char>,
+    ) {
+        use smithay::input::keyboard::Keysym;
+
         if !self.niri.screen_shield.is_active() {
-            return false;
+            return;
         }
-
         let now = crate::utils::get_monotonic_time();
-        if self.niri.screen_shield.is_locked() {
-            // Not reachable until slice 3 flips `can_authenticate`; when it is, this is where the
-            // prompt gets raised instead of the shield.
-            self.niri.lock_screen.note_activity(now);
-            self.niri.queue_redraw_all();
-            return true;
+
+        if !self.niri.screen_shield.is_locked() {
+            // A screensaver raises on anything. Bare modifiers included: GNOME's shield is not
+            // fussy, and a user pressing Shift to wake the screen expects it to wake.
+            let effects = self.niri.screen_shield.deactivate();
+            self.apply_shield_effects(effects);
+            return;
         }
 
-        let effects = self.niri.screen_shield.deactivate();
-        self.apply_shield_effects(effects);
-        true
+        self.niri.lock_screen.note_activity(now);
+
+        // Modifiers alone raise the prompt but must not be typed into it (`:678-682`).
+        let is_modifier = matches!(
+            raw,
+            Some(
+                Keysym::Shift_L
+                    | Keysym::Shift_R
+                    | Keysym::Shift_Lock
+                    | Keysym::Caps_Lock
+                    | Keysym::Control_L
+                    | Keysym::Control_R
+                    | Keysym::Alt_L
+                    | Keysym::Alt_R
+                    | Keysym::Super_L
+                    | Keysym::Super_R
+            )
+        );
+
+        let effects = match raw {
+            Some(Keysym::Escape) => self.niri.unlock_dialog.cancel(),
+            Some(Keysym::Return | Keysym::KP_Enter) => self.niri.unlock_dialog.submit(now),
+            Some(Keysym::BackSpace) => self.niri.unlock_dialog.backspace(now),
+            _ => match text.filter(|c| !c.is_control()).filter(|_| !is_modifier) {
+                Some(c) => self.niri.unlock_dialog.type_char(c, now),
+                None => self.niri.unlock_dialog.show_prompt(now),
+            },
+        };
+        self.apply_unlock_effects(effects);
+    }
+
+    /// A click while the shield is down: raise it, or raise the prompt page
+    /// (`unlockDialog.js:571-573`'s click gesture).
+    pub fn on_shield_click(&mut self) {
+        if !self.niri.screen_shield.is_active() {
+            return;
+        }
+        let now = crate::utils::get_monotonic_time();
+
+        if self.niri.screen_shield.is_locked() {
+            self.niri.lock_screen.note_activity(now);
+            let effects = self.niri.unlock_dialog.show_prompt(now);
+            self.apply_unlock_effects(effects);
+        } else {
+            let effects = self.niri.screen_shield.deactivate();
+            self.apply_shield_effects(effects);
+        }
+    }
+
+    /// Publish an [`UnlockEffects`](crate::unlock_dialog::UnlockEffects).
+    pub fn apply_unlock_effects(&mut self, effects: crate::unlock_dialog::UnlockEffects) {
+        if let Some(request) = effects.request {
+            #[cfg(feature = "dbus")]
+            if let Some(tx) = self.niri.gdm_requests.as_ref() {
+                let _ = tx.send_blocking(request);
+            }
+            #[cfg(not(feature = "dbus"))]
+            let _ = request;
+        }
+
+        if effects.unlock {
+            // gdm accepted. This is the only call to `deactivate` that can raise a *locked*
+            // shield, and it is reachable only from `VerifierEvent::Complete`.
+            let effects = self.niri.screen_shield.deactivate();
+            self.apply_shield_effects(effects);
+        } else if effects.redraw {
+            self.niri.queue_redraw_all();
+        }
+    }
+
+    /// A message from gdm's verifier — see [`crate::dbus::gdm`].
+    #[cfg(feature = "dbus")]
+    pub fn on_verifier_event(&mut self, event: crate::dbus::gdm::VerifierEvent) {
+        use crate::dbus::gdm::VerifierEvent;
+
+        // The shield's gate: a live channel is what makes locking safe, and its absence is what
+        // keeps a screensaver a screensaver.
+        match &event {
+            VerifierEvent::Ready(epoch) => {
+                let effects = self.niri.screen_shield.authenticator_ready(*epoch, true);
+                self.apply_shield_effects(effects);
+            }
+            VerifierEvent::Unavailable(epoch, reason) => {
+                warn!("the screen will not lock: {reason}");
+                let effects = self.niri.screen_shield.authenticator_ready(*epoch, false);
+                self.apply_shield_effects(effects);
+            }
+            VerifierEvent::Lost => {
+                let effects = self.niri.screen_shield.authenticator_lost();
+                self.apply_shield_effects(effects);
+            }
+            _ => (),
+        }
+
+        let effects = self.niri.unlock_dialog.on_verifier_event(event);
+        self.apply_unlock_effects(effects);
     }
 
     /// Publish a [`ShieldEffects`](crate::screen_shield::ShieldEffects): the shared snapshot the
@@ -3664,6 +3767,24 @@ impl State {
                 .lock_screen
                 .set_shown(now.then(crate::utils::get_monotonic_time));
             self.niri.queue_redraw_all();
+        }
+
+        #[cfg(feature = "dbus")]
+        if let Some(tx) = self.niri.gdm_requests.as_ref() {
+            if let Some(epoch) = effects.request_authenticator {
+                let username = self.niri.unlock_dialog.user().name.clone();
+                let _ =
+                    tx.send_blocking(crate::dbus::gdm::VerifierRequest::Begin { username, epoch });
+            }
+            // A raised shield ends the conversation: leaving a PAM worker and an open channel
+            // behind for a screen nobody is looking at is both a leak and a stale verifier that
+            // could answer a later lock.
+            if effects.cancel_authenticator {
+                let _ = tx.send_blocking(crate::dbus::gdm::VerifierRequest::Cancel);
+            }
+        }
+        if effects.cancel_authenticator {
+            self.niri.unlock_dialog.show_clock();
         }
 
         if effects.clear_clipboard {
@@ -4678,6 +4799,15 @@ impl Niri {
                     if state.niri.panel.update_clock() || state.niri.screen_shield.is_active() {
                         state.niri.queue_redraw_all();
                     }
+                    // ...and so does the unlock prompt's two-minute escape back to the clock.
+                    // Riding the clock tick makes that granular to a minute rather than exact,
+                    // which is the right trade for a timeout whose only job is to not leave a
+                    // half-typed password on an unattended screen.
+                    if state.niri.unlock_dialog.is_waiting_to_escape() {
+                        let now = crate::utils::get_monotonic_time();
+                        let effects = state.niri.unlock_dialog.tick(now);
+                        state.apply_unlock_effects(effects);
+                    }
                     // Refresh the open World Clocks section's live times/offsets on
                     // the same tick (gnome-shell's `WallClock notify::clock`).
                     state.niri.refresh_popover_world_clocks();
@@ -4800,6 +4930,11 @@ impl Niri {
             brightness_emit: None,
             screen_shield: crate::screen_shield::ScreenShield::new(Default::default()),
             lock_screen: Default::default(),
+            unlock_dialog: crate::unlock_dialog::UnlockDialog::new(
+                crate::unlock_dialog::session_user(),
+            ),
+            #[cfg(feature = "dbus")]
+            gdm_requests: None,
             #[cfg(feature = "dbus")]
             shield_snapshot: Default::default(),
             #[cfg(feature = "dbus")]
@@ -6915,22 +7050,50 @@ impl Niri {
             let epoch = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs() as libc::time_t);
-            let content = crate::ui::lock_screen::ClockContent::new(
-                epoch,
-                self.gnome_settings.clock,
-                // Touch mode is a seat property we do not track yet; the pointer wording is the
-                // safe default (it is also what a seat with a pointer reports).
-                false,
-            );
+            // Which page: the clock, or the unlock prompt. Only a *locked* shield has a prompt —
+            // a screensaver has nothing to authenticate, so it stays on the clock however much
+            // the dialog's page says otherwise.
+            let prompt = self.screen_shield.is_locked()
+                && self.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt;
 
-            for elem in self.lock_screen.render(
-                ctx.renderer,
-                output_scale.x,
-                Rectangle::from_size(size),
-                &content,
-                now,
-            ) {
-                push(elem.into());
+            if prompt {
+                let d = &self.unlock_dialog;
+                let content = crate::ui::lock_screen::PromptContent {
+                    display_name: d.user().display_name().to_owned(),
+                    entry: d.entry_display(),
+                    question: d.question().unwrap_or_default().to_owned(),
+                    message: d.message().map(|m| m.text.clone()),
+                    message_is_error: d
+                        .message()
+                        .is_some_and(|m| m.kind == crate::dbus::gdm::MessageKind::Error),
+                    entry_live: d.is_entry_live(),
+                };
+                for elem in self.lock_screen.render_prompt(
+                    ctx.renderer,
+                    &self.icon_cache,
+                    output_scale.x,
+                    Rectangle::from_size(size),
+                    &content,
+                ) {
+                    push(elem.into());
+                }
+            } else {
+                let content = crate::ui::lock_screen::ClockContent::new(
+                    epoch,
+                    self.gnome_settings.clock,
+                    // Touch mode is a seat property we do not track yet; the pointer wording is
+                    // the safe default (it is also what a seat with a pointer reports).
+                    false,
+                );
+                for elem in self.lock_screen.render(
+                    ctx.renderer,
+                    output_scale.x,
+                    Rectangle::from_size(size),
+                    &content,
+                    now,
+                ) {
+                    push(elem.into());
+                }
             }
 
             // The dim goes *under* the clock and over the wallpaper: `BLUR_BRIGHTNESS` darkens

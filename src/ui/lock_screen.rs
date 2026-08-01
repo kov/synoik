@@ -160,6 +160,106 @@ pub fn layout(width: f64, hint_w: f64, base_px: f64) -> ClockLayout {
     }
 }
 
+/// Where the page stack's top edge sits (`UnlockDialogLayout.vfunc_allocate`, `:478-487`):
+/// `min(height / 3, height - stackHeight)`.
+///
+/// **Not centred.** Both pages share this box — that is what makes the clock↔prompt crossfade
+/// happen in place rather than sliding — and the box is anchored a third of the way down, so the
+/// clock sits above centre. Our slice 2 centred it; this is the correction, cited.
+///
+/// The `min` is the degenerate-monitor guard: on a screen too short to hold the block, the top
+/// clamps up rather than pushing the entry off the bottom.
+pub fn stack_top(monitor: Rectangle<f64, Logical>, block_h: f64) -> f64 {
+    monitor.loc.y + (monitor.size.h / 3.).min((monitor.size.h - block_h).max(0.))
+}
+
+/// `$_gdm_dialog_width: 25em` on `.login-dialog-prompt-layout` (`_login-lock.scss:16-18`).
+const PROMPT_EM: f64 = 25.;
+/// That layout's `spacing: $base_padding * 1.5`.
+const PROMPT_SPACING: f64 = 9.;
+/// `.user-widget.vertical` `spacing: $base_padding * 4` (`:378`).
+const USER_SPACING: f64 = 24.;
+/// `.user-icon` at `icon-size: $base_icon_size * 10` in the vertical widget (`:388`).
+const AVATAR_PX: f64 = 160.;
+/// Its `StIcon { padding: $base_padding * 5 }` (`:391`) — the inset of the fallback glyph.
+const AVATAR_ICON_PAD: f64 = 30.;
+/// `.user-icon`'s fill under the lock screen: `transparentize($_gdm_fg, .87)` (`:356`).
+const AVATAR_BG: Rgba = [1., 1., 1., 0.13];
+/// `.user-widget.vertical .user-widget-label` — 20pt, weight 400 (`:380-385`).
+const NAME_PT: f64 = 20.;
+/// ...and its `margin-bottom: .75em`, where `em` is the label's own 20pt.
+const NAME_MARGIN_BOTTOM_EM: f64 = 0.75;
+/// `.login-dialog-message` `min-height: 2.75em` (`:92-95`), `em` at the base font.
+const MESSAGE_MIN_EM: f64 = 2.75;
+/// `.login-dialog-message` `color: darken($_gdm_fg, 10%)`.
+const MESSAGE_FG: Rgba = [0.9, 0.9, 0.9, 1.];
+/// A `Problem`/failure reads in the error colour rather than the muted one; GNOME distinguishes
+/// them by `MessageType` (`authPrompt.js`).
+const MESSAGE_ERROR_FG: Rgba = [1., 0.48, 0.42, 1.];
+
+/// What the prompt page shows. The entry text arrives **already masked** — this type never sees a
+/// password, which is the point (see [`crate::unlock_dialog::UnlockDialog::entry_display`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptContent {
+    pub display_name: String,
+    /// Masked or not, per the dialog. Never the raw secret.
+    pub entry: String,
+    /// gdm's prompt, shown as the entry's placeholder when nothing is typed.
+    pub question: String,
+    pub message: Option<String>,
+    pub message_is_error: bool,
+    /// Whether gdm is waiting for input — drives the entry's focus ring.
+    pub entry_live: bool,
+}
+
+/// Where the prompt page's parts sit, relative to the block's top-left.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PromptLayout {
+    pub avatar: Rectangle<f64, Logical>,
+    pub name: Rectangle<f64, Logical>,
+    pub entry: Rectangle<f64, Logical>,
+    pub message: Rectangle<f64, Logical>,
+}
+
+/// The prompt column's width — `25em` at the base font.
+pub fn prompt_width(base_px: f64) -> f64 {
+    PROMPT_EM * base_px
+}
+
+pub fn prompt_layout(base_px: f64) -> PromptLayout {
+    let width = prompt_width(base_px);
+    let name_h = crate::ui::pt_to_px(NAME_PT);
+    let message_h = MESSAGE_MIN_EM * base_px;
+
+    let mut y = 0.;
+    let centred = |y: f64, h: f64, w: f64| {
+        Rectangle::new(Point::from(((width - w) / 2., y)), Size::from((w, h)))
+    };
+
+    let avatar = centred(y, AVATAR_PX, AVATAR_PX);
+    y += AVATAR_PX + USER_SPACING;
+    let name = centred(y, name_h, width);
+    // The label's own `margin-bottom` sits *inside* the user widget, so it adds to the prompt
+    // layout's spacing rather than replacing it.
+    y += name_h + NAME_MARGIN_BOTTOM_EM * crate::ui::pt_to_px(NAME_PT) + PROMPT_SPACING;
+    let entry = centred(y, widget::Entry::HEIGHT, width);
+    y += widget::Entry::HEIGHT + PROMPT_SPACING;
+    let message = centred(y, message_h, width);
+
+    PromptLayout {
+        avatar,
+        name,
+        entry,
+        message,
+    }
+}
+
+/// The prompt block's total height.
+pub fn prompt_block_height(base_px: f64) -> f64 {
+    let l = prompt_layout(base_px);
+    l.message.loc.y + l.message.size.h
+}
+
 /// The curtain's on-screen state: when it went down, and its bake.
 #[derive(Default)]
 pub struct LockScreen {
@@ -167,6 +267,8 @@ pub struct LockScreen {
     /// fade hangs off an **idle** watch on the core idle monitor (`:395`), not off activation.
     idle_since: Option<Duration>,
     cache: RefCell<widget::BakeCache>,
+    /// The entry has its own cache: it re-bakes per keystroke, the column around it does not.
+    entry_cache: RefCell<widget::BakeCache>,
 }
 
 impl LockScreen {
@@ -202,6 +304,159 @@ impl LockScreen {
             return false;
         };
         now.saturating_sub(since) < HINT_IDLE + HINT_FADE
+    }
+
+    /// The prompt page: avatar, name, entry, message. Front-to-back like every other `render`.
+    ///
+    /// Two bakes rather than one, plus the avatar's icon element: the entry re-bakes on every
+    /// keystroke and the rest of the column does not, so folding them together would re-draw a
+    /// 160px avatar per character typed.
+    pub fn render_prompt(
+        &self,
+        renderer: &mut VulkanRenderer,
+        icons: &crate::render_helpers::icon::IconCache,
+        scale: f64,
+        monitor: Rectangle<f64, Logical>,
+        content: &PromptContent,
+    ) -> Vec<TextureRenderElement<VkTexture>> {
+        let base_px = crate::ui::pt_to_px(crate::ui::base_font_pt());
+        let width = prompt_width(base_px);
+        let block_h = prompt_block_height(base_px);
+        let l = prompt_layout(base_px);
+
+        let origin = Point::<f64, Logical>::from((
+            monitor.loc.x + (monitor.size.w - width) / 2.,
+            stack_top(monitor, block_h),
+        ))
+        .to_physical_precise_round(scale)
+        .to_logical(scale);
+
+        let mut elements = Vec::new();
+
+        // --- The entry pill, first (topmost is first). ---
+        let entry_rev = widget::Revision::new()
+            .of(&content.entry)
+            .of(&content.question)
+            .of(content.entry_live)
+            .px(width)
+            .done();
+        match widget::Entry::bake(
+            renderer,
+            &mut self.entry_cache.borrow_mut(),
+            scale,
+            width,
+            &content.entry,
+            &content.question,
+            widget::EntryStyle::Lockscreen,
+            content.entry_live,
+            entry_rev,
+        ) {
+            Ok(texture) => elements.push(Self::element(
+                renderer,
+                texture,
+                scale,
+                origin + l.entry.loc,
+            )),
+            Err(err) => tracing::error!("error drawing the unlock entry: {err:#}"),
+        }
+
+        // --- The avatar's fallback glyph, over its plate. ---
+        //
+        // AccountsService's per-user icon file is not read yet, so everyone gets the themed
+        // fallback; wiring the real picture is additive and does not move anything here.
+        if let Some(el) = widget::icon_element(
+            renderer,
+            icons,
+            &["avatar-default-symbolic"],
+            AVATAR_PX - AVATAR_ICON_PAD * 2.,
+            scale,
+            FG,
+            origin,
+            Point::from((
+                l.avatar.loc.x + l.avatar.size.w / 2.,
+                l.avatar.loc.y + l.avatar.size.h / 2.,
+            )),
+        ) {
+            elements.push(el);
+        }
+
+        // --- The rest of the column: plate, name, message. ---
+        let content_owned = content.clone();
+        let baked = widget::bake(
+            renderer,
+            &mut self.cache.borrow_mut(),
+            scale,
+            Size::from((width, block_h)),
+            widget::Revision::new()
+                .of(&content_owned.display_name)
+                .of(&content_owned.message)
+                .of(content_owned.message_is_error)
+                .px(width)
+                .done(),
+            |renderer| {
+                let mut shaper = TextShaper::new(renderer, scale);
+                Ok((
+                    shaper.shape(&content_owned.display_name, TextStyle::new(NAME_PT))?,
+                    shaper.shape(
+                        content_owned.message.as_deref().unwrap_or(""),
+                        TextStyle::new(HINT_PT),
+                    )?,
+                ))
+            },
+            |frame, phys, shaped: &(ShapedText, ShapedText)| {
+                let (name, message) = shaped;
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+
+                // `border-radius: $forced_circular_radius` on a square box is a circle.
+                p.fill_rounded(l.avatar, AVATAR_PX / 2., AVATAR_BG)?;
+
+                let cx = width / 2.;
+                p.text_band(
+                    name,
+                    cx,
+                    HAlign::Center,
+                    l.name.loc.y,
+                    l.name.size.h,
+                    FG,
+                    l.name,
+                )?;
+                if content_owned.message.is_some() {
+                    let fg = if content_owned.message_is_error {
+                        MESSAGE_ERROR_FG
+                    } else {
+                        MESSAGE_FG
+                    };
+                    p.text_band(
+                        message,
+                        cx,
+                        HAlign::Center,
+                        l.message.loc.y,
+                        l.message.size.h,
+                        fg,
+                        l.message,
+                    )?;
+                }
+                Ok(())
+            },
+        );
+        match baked {
+            Ok(texture) => elements.push(Self::element(renderer, texture, scale, origin)),
+            Err(err) => tracing::error!("error drawing the unlock prompt: {err:#}"),
+        }
+
+        elements
+    }
+
+    fn element(
+        renderer: &mut VulkanRenderer,
+        texture: VkTexture,
+        scale: f64,
+        loc: Point<f64, Logical>,
+    ) -> TextureRenderElement<VkTexture> {
+        let buffer =
+            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
+        TextureRenderElement::from_texture_buffer(buffer, loc, 1., None, None, Kind::Unspecified)
     }
 
     /// The clock block, front-to-back like every other UI `render`. The caller draws the dimmed
@@ -302,24 +557,11 @@ impl LockScreen {
             }
         };
 
-        // `UnlockDialogLayout` centres the stack on the monitor (`:433-489`).
-        let loc = Point::from((
-            monitor.loc.x,
-            monitor.loc.y + (monitor.size.h - size.h) / 2.,
-        ))
-        .to_physical_precise_round(scale)
-        .to_logical(scale);
+        let loc = Point::from((monitor.loc.x, stack_top(monitor, size.h)))
+            .to_physical_precise_round(scale)
+            .to_logical(scale);
 
-        let buffer =
-            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
-        vec![TextureRenderElement::from_texture_buffer(
-            buffer,
-            loc,
-            1.,
-            None,
-            None,
-            Kind::Unspecified,
-        )]
+        vec![Self::element(renderer, texture, scale, loc)]
     }
 }
 

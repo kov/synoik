@@ -10,6 +10,7 @@ pub mod freedesktop_locale1;
 pub mod freedesktop_login1;
 pub mod freedesktop_notifications;
 pub mod freedesktop_screensaver;
+pub mod gdm;
 pub mod gnome_screen_saver;
 pub mod gnome_session;
 pub mod gnome_shell;
@@ -53,6 +54,8 @@ pub struct DBusServers {
     pub conn_service_channel: Option<Connection>,
     pub conn_display_config: Option<Connection>,
     pub conn_screen_saver: Option<Connection>,
+    /// The system-bus connection behind the unlock dialog's verifier.
+    pub conn_gdm: Option<Connection>,
     /// org.gnome.ScreenSaver + org.gnome.Shell.ScreenShield — the *locking* screensaver
     /// interface, as opposed to `conn_screen_saver`'s inhibit-only one.
     pub conn_screen_shield: Option<Connection>,
@@ -139,6 +142,23 @@ impl DBusServers {
             if let Some(conn) = try_start(shield) {
                 dbus.conn_screen_shield = Some(conn);
                 niri.screen_saver_emit = Some(to_screen_saver);
+            }
+
+            // The verifier behind the unlock dialog. This is what decides whether the shield may
+            // lock at all — a session where it fails to start gets a screensaver, not a lock.
+            let (to_niri, from_gdm) = calloop::channel::channel();
+            niri.event_loop
+                .insert_source(from_gdm, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(msg) => state.on_verifier_event(msg),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            match gdm::start(to_niri) {
+                Ok((conn, requests)) => {
+                    dbus.conn_gdm = Some(conn);
+                    niri.gdm_requests = Some(requests);
+                }
+                Err(err) => warn!("error starting the gdm verifier client: {err:?}"),
             }
 
             // gsd-power's way in to brightness: idle dimming and the auto-brightness target.

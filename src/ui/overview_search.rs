@@ -638,6 +638,9 @@ impl OverviewSearch {
             pill_w,
             &self.query,
             PLACEHOLDER,
+            widget::EntryStyle::Search,
+            // The search entry's focus is its caller's inset-accent ring, not the pill's.
+            false,
             // The width is part of what was baked; a canvas change must re-bake it.
             widget::Revision::new()
                 .of(self.content_rev)
