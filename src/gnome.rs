@@ -78,6 +78,10 @@ pub struct GnomeSettings {
     /// `org.gnome.desktop.lockdown disable-command-line`: when set, the run
     /// dialog refuses to open (gnome-shell's `RunDialog.open`).
     pub disable_command_line: bool,
+    /// The screen shield's two keys — `disable-lock-screen` (lockdown) and
+    /// `lock-enabled` (screensaver). Kept as one struct because the shield
+    /// consults them together and they live in different schemas.
+    pub shield: crate::screen_shield::ShieldSettings,
     /// `org.gnome.desktop.wm.preferences focus-new-windows`: whether new
     /// windows may take focus on map.
     pub focus_new_windows: FocusNewWindows,
@@ -369,6 +373,7 @@ impl Default for GnomeSettings {
             favorite_apps: Vec::new(),
             switchers: SwitcherSettings::default(),
             disable_command_line: false,
+            shield: Default::default(),
             focus_new_windows: FocusNewWindows::Smart,
             edge_tiling: true,
             background: BackgroundSettings::default(),
@@ -566,6 +571,15 @@ impl GnomeSettings {
     fn load_lockdown(&mut self, lockdown: &gio::Settings) {
         if settings_has_key(lockdown, "disable-command-line") {
             self.disable_command_line = lockdown.boolean("disable-command-line");
+        }
+        if settings_has_key(lockdown, "disable-lock-screen") {
+            self.shield.disable_lock_screen = lockdown.boolean("disable-lock-screen");
+        }
+    }
+
+    fn load_screensaver(&mut self, screensaver: &gio::Settings) {
+        if settings_has_key(screensaver, "lock-enabled") {
+            self.shield.lock_enabled = screensaver.boolean("lock-enabled");
         }
     }
 
@@ -1711,6 +1725,7 @@ struct Stores {
     wm_preferences: Option<gio::Settings>,
     shell: Option<gio::Settings>,
     lockdown: Option<gio::Settings>,
+    screensaver: Option<gio::Settings>,
     background: Option<gio::Settings>,
     interface: Option<gio::Settings>,
     calendar: Option<gio::Settings>,
@@ -1766,6 +1781,7 @@ impl Stores {
             wm_preferences: gsettings("org.gnome.desktop.wm.preferences", b),
             shell: gsettings("org.gnome.shell", b),
             lockdown: gsettings("org.gnome.desktop.lockdown", b),
+            screensaver: gsettings("org.gnome.desktop.screensaver", b),
             background: gsettings("org.gnome.desktop.background", b),
             interface: gsettings("org.gnome.desktop.interface", b),
             calendar: gsettings("org.gnome.desktop.calendar", b),
@@ -1817,6 +1833,7 @@ impl Stores {
             &self.wm_preferences,
             &self.shell,
             &self.lockdown,
+            &self.screensaver,
             &self.background,
             &self.interface,
             &self.calendar,
@@ -1856,6 +1873,9 @@ impl Stores {
         settings.load_switchers(self.app_switcher.as_ref(), self.window_switcher.as_ref());
         if let Some(lockdown) = &self.lockdown {
             settings.load_lockdown(lockdown);
+        }
+        if let Some(screensaver) = &self.screensaver {
+            settings.load_screensaver(screensaver);
         }
         if let Some(background) = &self.background {
             settings.load_background(background, self.interface.as_ref());

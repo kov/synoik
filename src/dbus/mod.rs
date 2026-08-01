@@ -10,6 +10,7 @@ pub mod freedesktop_locale1;
 pub mod freedesktop_login1;
 pub mod freedesktop_notifications;
 pub mod freedesktop_screensaver;
+pub mod gnome_screen_saver;
 pub mod gnome_session;
 pub mod gnome_shell;
 pub mod gnome_shell_brightness;
@@ -33,6 +34,7 @@ use mutter_screen_cast::ScreenCast;
 use self::freedesktop_a11y::KeyboardMonitor;
 use self::freedesktop_notifications::Notifications;
 use self::freedesktop_screensaver::ScreenSaver;
+use self::gnome_screen_saver::GnomeScreenSaver;
 use self::gnome_session::EndSessionDialog;
 use self::gnome_shell::GnomeShell;
 use self::gnome_shell_brightness::Brightness;
@@ -51,6 +53,9 @@ pub struct DBusServers {
     pub conn_service_channel: Option<Connection>,
     pub conn_display_config: Option<Connection>,
     pub conn_screen_saver: Option<Connection>,
+    /// org.gnome.ScreenSaver + org.gnome.Shell.ScreenShield — the *locking* screensaver
+    /// interface, as opposed to `conn_screen_saver`'s inhibit-only one.
+    pub conn_screen_shield: Option<Connection>,
     pub conn_screen_shot: Option<Connection>,
     pub conn_introspect: Option<Connection>,
     pub conn_gnome_shell: Option<Connection>,
@@ -119,6 +124,22 @@ impl DBusServers {
 
             let screen_saver = ScreenSaver::new(niri.is_fdo_idle_inhibited.clone());
             dbus.conn_screen_saver = try_start(screen_saver);
+
+            // The lock half. A separate name and a separate object from the inhibit-only
+            // `org.freedesktop.ScreenSaver` above; see `dbus::gnome_screen_saver`.
+            let (to_niri, from_screen_saver) = calloop::channel::channel();
+            let (to_screen_saver, from_niri) = async_channel::unbounded();
+            niri.event_loop
+                .insert_source(from_screen_saver, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(msg) => state.on_screen_saver_msg(msg),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            let shield = GnomeScreenSaver::new(to_niri, from_niri, niri.shield_snapshot.clone());
+            if let Some(conn) = try_start(shield) {
+                dbus.conn_screen_shield = Some(conn);
+                niri.screen_saver_emit = Some(to_screen_saver);
+            }
 
             // gsd-power's way in to brightness: idle dimming and the auto-brightness target.
             let (to_niri, from_brightness) = calloop::channel::channel();

@@ -7081,6 +7081,76 @@ fn dash_tile_center(
         .expect("tile index in range")
 }
 
+/// `org.gnome.ScreenSaver.Lock` puts the shield down, and `SetActive(false)` raises it.
+///
+/// Driven through `State::on_screen_saver_msg` — the same entry point the bus task calls — rather
+/// than against the model, so the D-Bus plumbing is in the loop
+/// ([[test-the-code-not-a-reimplementation]]).
+///
+/// The screensaver half and the lock half are *different states*: `activate` never sets `locked`
+/// (`screenShield.js:586-616`), which is what a blanked screen with `lock-enabled = false` is.
+#[test]
+fn the_screen_saver_bus_calls_drive_the_shield() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    assert!(!f.niri().screen_shield.is_active(), "starts up");
+
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(true));
+    assert!(f.niri().screen_shield.is_active(), "SetActive(true) blanks");
+    assert!(
+        !f.niri().screen_shield.is_locked(),
+        "...but the screensaver is not a lock"
+    );
+
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(false));
+    assert!(!f.niri().screen_shield.is_active());
+
+    // `Lock` also puts the shield down — the difference is what it takes to raise it.
+    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    assert!(f.niri().screen_shield.is_active(), "Lock blanks too");
+
+    // And the snapshot the bus reads is kept in step, or `GetActive` would answer from stale
+    // state while `ActiveChanged` said otherwise.
+    assert!(
+        f.niri().shield_snapshot.lock().unwrap().active,
+        "GetActive reads this, and it must not lag the model"
+    );
+}
+
+/// `disable-lock-screen` makes `Lock` a no-op — the shield does not even go down.
+///
+/// GNOME returns *before* `activate` (`screenShield.js:638-641`), so a locked-down session does
+/// not get a blanked screen out of a `Lock` either. Getting that order wrong blanks a machine
+/// whose administrator disabled locking.
+#[test]
+fn lockdown_makes_the_screen_saver_lock_a_no_op() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri()
+        .screen_shield
+        .set_settings(crate::screen_shield::ShieldSettings {
+            disable_lock_screen: true,
+            lock_enabled: true,
+        });
+
+    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    assert!(!f.niri().screen_shield.is_active());
+    assert!(!f.niri().shield_snapshot.lock().unwrap().active);
+
+    // `SetActive` is a different call and is *not* gated by lockdown — the screensaver still
+    // blanks, it just never becomes a lock.
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(true));
+    assert!(f.niri().screen_shield.is_active());
+}
+
 /// A dash click does three different things depending on the app's state, and only one of them
 /// is a launch — `AppIcon.activate` (`appDisplay.js:3056-3071`) over `shell_app_activate_full`
 /// (`shell-app.c:497-535`).

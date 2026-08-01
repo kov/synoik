@@ -92,9 +92,13 @@ use smithay::wayland::pointer_gestures::PointerGesturesState;
 use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::security_context::SecurityContextState;
-use smithay::wayland::selection::data_device::{set_data_device_selection, DataDeviceState};
+use smithay::wayland::selection::data_device::{
+    clear_data_device_selection, set_data_device_selection, DataDeviceState,
+};
 use smithay::wayland::selection::ext_data_control::DataControlState as ExtDataControlState;
-use smithay::wayland::selection::primary_selection::PrimarySelectionState;
+use smithay::wayland::selection::primary_selection::{
+    clear_primary_selection, PrimarySelectionState,
+};
 use smithay::wayland::selection::wlr_data_control::DataControlState as WlrDataControlState;
 use smithay::wayland::session_lock::{LockSurface, SessionLockManagerState, SessionLocker};
 use smithay::wayland::shell::kde::decoration::KdeDecorationState;
@@ -489,6 +493,17 @@ pub struct Niri {
     #[cfg(feature = "dbus")]
     pub brightness_emit:
         Option<async_channel::Sender<crate::dbus::gnome_shell_brightness::NiriToBrightness>>,
+    /// The screen shield — GNOME's session lock (`ScreenShield`, `js/ui/screenShield.js`).
+    pub screen_shield: crate::screen_shield::ScreenShield,
+    /// What `GetActive` / `GetActiveTime` read, mirrored out of [`Self::screen_shield`] on every
+    /// change so the bus task can answer without a round trip through the event loop.
+    #[cfg(feature = "dbus")]
+    pub shield_snapshot:
+        std::sync::Arc<std::sync::Mutex<crate::dbus::gnome_screen_saver::ShieldSnapshot>>,
+    /// `ActiveChanged` / `WakeUpScreen`. `None` before D-Bus starts.
+    #[cfg(feature = "dbus")]
+    pub screen_saver_emit:
+        Option<async_channel::Sender<crate::dbus::gnome_screen_saver::NiriToScreenSaver>>,
     /// A clone of the login1 watcher's inbound channel, so a brightness write can report its
     /// completion back to the write serializer through the same path.
     #[cfg(feature = "dbus")]
@@ -1180,6 +1195,10 @@ impl State {
         if mode != BackendMode::HeadlessTest {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.niri.gnome_settings = initial;
+            state
+                .niri
+                .screen_shield
+                .set_settings(state.niri.gnome_settings.shield);
             // Publish the realized base font before anything measures text: every point
             // size in the UI is a ratio against it (`crate::ui::base_font_pt`), and every
             // shaped advance comes from the family.
@@ -1384,6 +1403,10 @@ impl State {
                             || state.niri.gnome_settings.base_font_family
                                 != settings.base_font_family;
                         state.niri.gnome_settings = settings;
+                        state
+                            .niri
+                            .screen_shield
+                            .set_settings(state.niri.gnome_settings.shield);
                         // Every point size in the UI is a ratio against this
                         // (`crate::ui::base_font_pt`), so publishing it re-sizes all
                         // text at once — as `st_theme_context_set_font` does.
@@ -3560,6 +3583,71 @@ impl State {
     /// A call on `org.gnome.Shell.Brightness` — gsd-power asking for idle dimming or feeding an
     /// auto-brightness target. Never `user`: these are not the user touching a slider.
     #[cfg(feature = "dbus")]
+    /// A call on `org.gnome.ScreenSaver` — see [`crate::dbus::gnome_screen_saver`].
+    #[cfg(feature = "dbus")]
+    pub fn on_screen_saver_msg(&mut self, msg: crate::dbus::gnome_screen_saver::ScreenSaverToNiri) {
+        use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+        let now = crate::utils::get_monotonic_time();
+        let effects = match msg {
+            ScreenSaverToNiri::Lock => {
+                // `password_mode == NONE` comes from AccountsService, which we do not read yet;
+                // `false` is the conservative answer (a user *with* a password), and it only
+                // matters once the shield can actually lock.
+                match self.niri.screen_shield.lock(now, false) {
+                    Ok(effects) => effects,
+                    Err(crate::screen_shield::LockRefused::LockedDown) => {
+                        // GNOME logs and returns (`screenShield.js:638-641`).
+                        debug!("screen lock is locked down, not locking");
+                        return;
+                    }
+                }
+            }
+            ScreenSaverToNiri::SetActive(true) => self.niri.screen_shield.activate(now),
+            ScreenSaverToNiri::SetActive(false) => self.niri.screen_shield.deactivate(),
+        };
+        self.apply_shield_effects(effects);
+    }
+
+    /// Publish a [`ShieldEffects`](crate::screen_shield::ShieldEffects): the shared snapshot the
+    /// bus reads, the signals it emits, logind's locked hint, and the clipboard wipe.
+    pub fn apply_shield_effects(&mut self, effects: crate::screen_shield::ShieldEffects) {
+        if effects.clear_clipboard {
+            // Both selections, as `lock` does (`screenShield.js:645-651`): the unlock entry can be
+            // unmasked, so a password sitting in the clipboard would be readable by whoever walks
+            // up. Cheap, and its absence is invisible until it matters.
+            let dh = self.niri.display_handle.clone();
+            clear_data_device_selection(&dh, &self.niri.seat);
+            clear_primary_selection(&dh, &self.niri.seat);
+        }
+
+        #[cfg(feature = "dbus")]
+        {
+            *self.niri.shield_snapshot.lock().unwrap() =
+                crate::dbus::gnome_screen_saver::ShieldSnapshot {
+                    active: self.niri.screen_shield.is_active(),
+                    activation_time: self.niri.screen_shield.activation_time(),
+                };
+
+            use crate::dbus::gnome_screen_saver::NiriToScreenSaver;
+            if let Some(tx) = self.niri.screen_saver_emit.as_ref() {
+                if let Some(active) = effects.active_changed {
+                    let _ = tx.send_blocking(NiriToScreenSaver::ActiveChanged(active));
+                }
+                if effects.wake_up_screen {
+                    let _ = tx.send_blocking(NiriToScreenSaver::WakeUpScreen);
+                }
+            }
+
+            // logind's `LockedHint` is what `loginctl` and the session tooling read.
+            if effects.locked_changed.is_some() {
+                self.niri.update_locked_hint();
+            }
+        }
+        #[cfg(not(feature = "dbus"))]
+        let _ = effects;
+    }
+
     pub fn on_brightness_msg(
         &mut self,
         msg: crate::dbus::gnome_shell_brightness::BrightnessToNiri,
@@ -4653,6 +4741,11 @@ impl Niri {
             brightness: crate::brightness::BrightnessManager::default(),
             #[cfg(feature = "dbus")]
             brightness_emit: None,
+            screen_shield: crate::screen_shield::ScreenShield::new(Default::default()),
+            #[cfg(feature = "dbus")]
+            shield_snapshot: Default::default(),
+            #[cfg(feature = "dbus")]
+            screen_saver_emit: None,
             #[cfg(feature = "dbus")]
             login1_tx: None,
             wallpaper: Wallpaper::default(),
@@ -9035,7 +9128,13 @@ impl Niri {
         // Consider only the fully locked state here. When using the locked hint with sleep
         // inhibitor tools, we want to allow sleep only after the screens are fully cleared with
         // the lock screen, which corresponds to the Locked state.
-        let locked = matches!(self.lock_state, LockState::Locked(_));
+        //
+        // Two sources, one hint: `ext-session-lock` (an external locker, niri's inherited path)
+        // and the screen shield (GNOME's own, `_setLocked` → `SetLockedHint`,
+        // `screenShield.js:173-174`). They must not each write it or they would fight over the
+        // property; whichever says locked wins.
+        let locked =
+            matches!(self.lock_state, LockState::Locked(_)) || self.screen_shield.is_locked();
 
         if self.locked_hint.is_some_and(|h| h == locked) {
             return;
