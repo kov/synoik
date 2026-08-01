@@ -25,6 +25,8 @@ use niri_config::Modifiers;
 
 use crate::ui::widget::{style, Rgba};
 
+pub mod window_list;
+
 /// `POPUP_DELAY_TIMEOUT` (`js/ui/switcherPopup.js:8`) — how long the modifier must be
 /// held before the popup is drawn at all. A tap shorter than this switches silently.
 pub const POPUP_DELAY: Duration = Duration::from_millis(150);
