@@ -424,6 +424,53 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         Ok(())
     }
 
+    /// The solid-colour half of [`render_clipped_texture`](Self::render_clipped_texture): a flat
+    /// fill masked to the same rounded geometry, for a surface whose content is a colour rather
+    /// than a texture. Same push block, same clip, no sampler.
+    fn render_clipped_solid(
+        &mut self,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        color: Color32F,
+        clip: ClipParams,
+    ) -> Result<(), VulkanError> {
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
+        let push = ClippedTexturePush {
+            origin: [dst.loc.x as f32, dst.loc.y as f32],
+            size: [dst.size.w as f32, dst.size.h as f32],
+            proj: self.proj,
+            target: self.target_dims(),
+            corner_radius: 0.0,
+            _pad0: 0.0,
+            color: color.components(),
+            // Unused by `clipped_solid.frag`; the block is shared with the texture path.
+            tex_transform: Default::default(),
+            geo_size: clip.geo_size,
+            _pad1: [0.0, 0.0],
+            clip_corner_radius: clip.corner_radius,
+            input_to_geo: clip.input_to_geo,
+            niri_scale: clip.niri_scale,
+            _pad2: [0.0, 0.0, 0.0],
+        };
+        let dev = &self.renderer.gpu.device;
+        let pipe = &self.renderer.clipped_solid_pipeline;
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            Self::draw_quad(dev, self.cbuf, &scissors);
+        }
+        Ok(())
+    }
+
     /// Draw `texture` into `dst` with its corners rounded by `corner_radius` (physical pixels) —
     /// the owned-renderer equivalent of niri's `RoundedTextureRenderElement` GLES draw. The buffer
     /// `src_transform` (rotation/flip/y-invert) and a partial `src` are baked into the sampling
@@ -1848,6 +1895,14 @@ impl Frame for VulkanFrame<'_, '_> {
         damage: &[Rectangle<i32, Physical>],
         color: Color32F,
     ) -> Result<(), VulkanError> {
+        // A `ClippedSurfaceRenderElement` armed a clip for this surface, and a surface can arrive
+        // as a solid colour as easily as a texture (a single-pixel `wl_buffer`, a blocked-out
+        // window). Honouring the clip only in `render_texture_from_to` left those square.
+
+        if let Some(clip) = self.clip_override {
+            return self.render_clipped_solid(dst, damage, color, clip);
+        }
+
         let scissors = self.damage_scissors(dst, damage);
         if scissors.is_empty() {
             return Ok(());

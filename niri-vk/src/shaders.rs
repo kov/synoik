@@ -33,6 +33,12 @@ pub const GRADIENT_FADE_FRAG: &[u8] =
 /// client surface samples correctly.
 pub const CLIPPED_TEX_FRAG: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/clipped_texture.frag.spv"));
+/// Clipped **solid** fragment stage — the same rounded-geometry mask over a flat colour instead of
+/// a sampled texture, for a surface that arrives as a solid (a single-pixel buffer, a blocked-out
+/// window). Shares the `ClippedTexturePush` block so both sides of the clip use one push struct,
+/// and binds no sampler.
+pub const CLIPPED_SOLID_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/clipped_solid.frag.spv"));
 /// Border material vertex + fragment stages (angled gradient clipped to a rounded-rect ring —
 /// niri's `BorderRenderElement`). Both stages declare the `BorderPush` block; the fragment outputs
 /// premultiplied color.

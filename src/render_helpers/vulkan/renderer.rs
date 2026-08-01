@@ -12,9 +12,10 @@ use niri_vk::render::{
     ResizePush, ShadowPush, COLOR_RANGE,
 };
 use niri_vk::shaders::{
-    BORDER_FRAG, BORDER_VERT, CLIPPED_TEX_FRAG, GRADIENT_FADE_FRAG, POSTPROCESS_FRAG,
-    POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG, SDF_FRAG,
-    SDF_TRIANGLE_FRAG, SHADOW_FRAG, SHADOW_VERT, SOLID_FRAG, TEXT_FRAG, TEXT_VERT, TEX_FRAG,
+    BORDER_FRAG, BORDER_VERT, CLIPPED_SOLID_FRAG, CLIPPED_TEX_FRAG, GRADIENT_FADE_FRAG,
+    POSTPROCESS_FRAG, POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG,
+    SDF_FRAG, SDF_TRIANGLE_FRAG, SHADOW_FRAG, SHADOW_VERT, SOLID_FRAG, TEXT_FRAG, TEXT_VERT,
+    TEX_FRAG,
 };
 use niri_vk::texture::Texture as NiriTexture;
 use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
@@ -79,6 +80,7 @@ pub struct VulkanRenderer {
     pub(super) texture_pipeline: Pipeline,
     pub(super) rounded_texture_pipeline: Pipeline,
     pub(super) clipped_texture_pipeline: Pipeline,
+    pub(super) clipped_solid_pipeline: Pipeline,
     pub(super) gradient_fade_pipeline: Pipeline,
     pub(super) border_pipeline: Pipeline,
     pub(super) shadow_pipeline: Pipeline,
@@ -448,6 +450,16 @@ impl VulkanRenderer {
             sampler,
             std::mem::size_of::<ClippedTexturePush>() as u32,
         )?;
+        // The same clip over a flat colour, for a surface that arrives as a solid. Same push
+        // block, no sampler.
+        let clipped_solid_pipeline = build_pipeline(
+            &gpu,
+            render_pass,
+            QUAD_VERT,
+            CLIPPED_SOLID_FRAG,
+            &[],
+            std::mem::size_of::<ClippedTexturePush>() as u32,
+        )?;
         let gradient_fade_pipeline = build_pipeline(
             &gpu,
             render_pass,
@@ -520,6 +532,7 @@ impl VulkanRenderer {
             texture_pipeline,
             rounded_texture_pipeline,
             clipped_texture_pipeline,
+            clipped_solid_pipeline,
             gradient_fade_pipeline,
             border_pipeline,
             shadow_pipeline,
@@ -2467,6 +2480,7 @@ impl Drop for VulkanRenderer {
             self.texture_pipeline.destroy(dev);
             self.rounded_texture_pipeline.destroy(dev);
             self.clipped_texture_pipeline.destroy(dev);
+            self.clipped_solid_pipeline.destroy(dev);
             self.gradient_fade_pipeline.destroy(dev);
             self.border_pipeline.destroy(dev);
             self.shadow_pipeline.destroy(dev);

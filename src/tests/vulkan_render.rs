@@ -11149,9 +11149,19 @@ fn app_window_switcher_fixture(title: &str) -> Option<Fixture> {
     app_window_switcher_fixture_n(title, 1)
 }
 
+/// As [`app_window_switcher_fixture_n`], but with **single-pixel solid** buffers — the surfaces
+/// that draw through `Frame::draw_solid` instead of the texture path.
+fn solid_buffer_switcher_fixture() -> Option<Fixture> {
+    app_window_switcher_fixture_inner("Solid", 2, true)
+}
+
 /// As [`app_window_switcher_fixture`], with `n` windows of the one app — so the app switcher has a
 /// window sub-list to open.
 fn app_window_switcher_fixture_n(title: &str, n: usize) -> Option<Fixture> {
+    app_window_switcher_fixture_inner(title, n, false)
+}
+
+fn app_window_switcher_fixture_inner(title: &str, n: usize, solid: bool) -> Option<Fixture> {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
 
     if let Err(e) = VulkanRenderer::new() {
@@ -11184,18 +11194,21 @@ fn app_window_switcher_fixture_n(title: &str, n: usize) -> Option<Fixture> {
         f.roundtrip(id);
 
         let window = f.client(id).window(&surface);
-        // A real `wl_shm` texture, not a single-pixel solid buffer: a solid buffer draws through
-        // `Frame::draw_solid`, which does not consult the rounded clip an outer
-        // `ClippedSurfaceRenderElement` armed — so the corners below would read as square for a
-        // reason that has nothing to do with the switcher.
-        window.attach_shm_buffer(
-            i32::from(WIN),
-            i32::from(WIN),
-            GREEN[0] as u8,
-            GREEN[1] as u8,
-            GREEN[2] as u8,
-            GREEN[3] as u8,
-        );
+        // A real `wl_shm` texture by default; `solid` picks the single-pixel buffer instead,
+        // which reaches the renderer as a colour rather than a texture and so exercises a
+        // different draw path (see `vulkan_rounds_a_solid_colour_surface_too`).
+        if solid {
+            window.attach_solid_buffer(GREEN[0], GREEN[1], GREEN[2], GREEN[3]);
+        } else {
+            window.attach_shm_buffer(
+                i32::from(WIN),
+                i32::from(WIN),
+                GREEN[0] as u8,
+                GREEN[1] as u8,
+                GREEN[2] as u8,
+                GREEN[3] as u8,
+            );
+        }
         window.set_size(WIN, WIN);
         window.ack_last_and_commit();
         f.double_roundtrip(id);
@@ -11291,6 +11304,74 @@ fn vulkan_draws_the_selected_window_title_in_the_switchers_footer() {
         ink > 20,
         "the title band must carry the selected window's title, but only {ink} pixels in it are \
          brighter than the panel plate"
+    );
+}
+
+/// A rounded clip applies to a **solid-colour** surface too, not only a textured one.
+///
+/// A surface can arrive as a flat colour — a single-pixel `wl_buffer`, a blocked-out window — and
+/// it then draws through `Frame::draw_solid` rather than `render_texture_from_to`. Only the latter
+/// consulted the clip an outer `ClippedSurfaceRenderElement` armed, so every rounded corner was
+/// silently square for exactly those surfaces. Invisible on a normal desktop, which is why it
+/// survived: it took a test fixture using `attach_solid_buffer` to surface it.
+#[test]
+fn vulkan_rounds_a_solid_colour_surface_too() {
+    let Some(mut f) = solid_buffer_switcher_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    const KEY_LEFTMETA: u32 = 125;
+    const KEY_DOWN: u32 = 108;
+    f.key_press(KEY_LEFTMETA);
+    f.niri_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+
+    let mut clock = f.niri().clock.clone();
+    clock.set_unadjusted(clock.now_unadjusted() + crate::ui::switcher::POPUP_DELAY * 2);
+    f.niri().advance_animations();
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    clock.set_unadjusted(clock.now_unadjusted() + crate::ui::switcher::thumbnails::FADE_TIME * 2);
+    f.niri().advance_animations();
+
+    let preview = f
+        .niri()
+        .switcher
+        .thumbnail_rect(0)
+        .expect("an open sub-list has a first preview");
+    let scale = output.current_scale().fractional_scale();
+    let (after, w, _) = render_output_vulkan(&mut f, &output);
+    let px_at = |x: f64, y: f64| {
+        px(
+            &after,
+            w,
+            (x * scale).round() as i32,
+            (y * scale).round() as i32,
+        )
+    };
+
+    let clone_rect = crate::render_helpers::window_thumbnail::fit_rect(
+        Size::from((f64::from(WIN), f64::from(WIN))),
+        preview,
+    );
+    let is_green = |p: [u8; 4]| p[1] > 200 && p[0] < 80 && p[2] < 80;
+
+    // The solid fill is there...
+    let middle = px_at(
+        clone_rect.loc.x + clone_rect.size.w / 2.,
+        clone_rect.loc.y + clone_rect.size.h / 2.,
+    );
+    assert!(
+        is_green(middle),
+        "the solid surface must draw, got {middle:?}"
+    );
+
+    // ...and its corner is rounded away exactly like a textured one's.
+    let corner = px_at(clone_rect.loc.x + 1., clone_rect.loc.y + 1.);
+    assert!(
+        !is_green(corner),
+        "a solid-colour surface must honour the rounded clip too, got {corner:?}"
     );
 }
 
