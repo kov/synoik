@@ -1335,6 +1335,16 @@ impl State {
                 })
                 .unwrap();
 
+            // **Warm the icons here, not on the first output.** `add_output` also asks, but on a
+            // TTY seat it runs from `backend.init` — long before this worker exists — so
+            // `prewarm_app_icons` hits its own no-worker guard and returns having warmed nothing.
+            // The grid then decoded every tile lazily on the frame it first appeared, which is
+            // what "the app grid icons sometimes flicker on first open" was; *sometimes*, because
+            // any later settings change, output resize or catalog reload would warm it first and
+            // hide the bug. The grid is populated by `sync_app_grid` above, so by here there is
+            // something to warm.
+            state.niri.prewarm_app_icons();
+
             // Images an app pointed us at (album art) get their OWN worker, not the app-icon
             // one: a remote cover can block for the whole fetch timeout, and the dash and app
             // grid must never queue behind a slow or dead cover server.
@@ -5755,9 +5765,10 @@ impl Niri {
         // Must be last since it will call queue_redraw(output) which needs things to be filled-in.
         self.reposition_outputs(Some(&output));
 
-        // Now that an output (hence a scale) exists and the worker is up, warm the
-        // dash/grid icon decodes so the first overview open doesn't rasterize them on
-        // the opening frame. Idempotent — safe to repeat as more outputs appear.
+        // A new output means a new (scale, icon size) pair to warm. This does **not** cover
+        // startup on a TTY seat: `backend.init` reaches here before the decode worker is
+        // spawned, so this call finds no worker and warms nothing. `State::new` warms again
+        // once the worker is up — see there. Idempotent, so both are safe.
         self.prewarm_app_icons();
     }
 

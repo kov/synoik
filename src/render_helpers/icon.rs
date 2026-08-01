@@ -329,6 +329,15 @@ pub struct SymbolicRequest {
     generation: u64,
 }
 
+impl SymbolicRequest {
+    /// The icon asked for, and the physical size asked for it — the two halves of the cache key a
+    /// test needs to see to know whether an animation is asking for one icon or a dozen.
+    #[cfg(test)]
+    pub(crate) fn name_and_px(&self) -> (&str, u32) {
+        (&self.name, self.key.1)
+    }
+}
+
 /// A finished rasterization on its way back to the loop, for [`IconCache::apply_rasterized`].
 /// `None` means no theme provides the icon; it is cached as a negative so the probe — up to a few
 /// hundred `stat`s across themes and categories — happens once rather than every frame.

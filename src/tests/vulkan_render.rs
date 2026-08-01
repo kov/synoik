@@ -11698,6 +11698,71 @@ fn vulkan_draws_the_screen_shield_over_the_desktop() {
     );
 }
 
+/// The crossfade asks the icon cache for the avatar **once**, not once per scale it passes through.
+///
+/// The prompt page scales from 0.3 to 1 over 300 ms. Asking for the icon at `rest_px * page_scale`
+/// makes every distinct size its own cache key, and a cold key draws *nothing* — so the first
+/// crossfade blinks the avatar in, once per size it passes through. Bucketing the scale bounds how
+/// many keys there are but not the blinking; it turns one cold miss into a dozen.
+///
+/// Uses the async miss path deliberately (`wire_test_worker`). With no worker the cache rasterizes
+/// inline and every miss draws fine, which is exactly why the seat saw this and the suite did not.
+#[test]
+fn the_crossfade_asks_for_one_avatar_not_one_per_frame() {
+    use crate::ui::lock_screen::{PageCtx, PageTransform, PromptContent};
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let requests = f.niri().icon_cache.wire_test_worker();
+
+    let content = PromptContent {
+        display_name: "Test User".to_owned(),
+        entry: "\u{25cf}".to_owned(),
+        question: "Password:".to_owned(),
+        peek: Some(false),
+        entry_live: true,
+        ..Default::default()
+    };
+
+    let state = f.niri_state();
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let niri = &mut state.niri;
+            // Walk the crossfade the way a run of frames would.
+            for step in 0..=10 {
+                let t = PageTransform::prompt(f64::from(step) / 10.);
+                let ctx = PageCtx {
+                    scale: 1.,
+                    monitor: Rectangle::from_size(Size::from((1920., 1080.))),
+                    now: Duration::ZERO,
+                };
+                let _ = niri
+                    .lock_screen
+                    .render_prompt(vk, &niri.icon_cache, ctx, &content, t);
+            }
+        })
+        .expect("headless backend must hold a Vulkan renderer");
+
+    let mut sizes: Vec<u32> = requests
+        .try_iter()
+        .filter_map(|req| {
+            let (name, px) = req.name_and_px();
+            (name == "avatar-default-symbolic").then_some(px)
+        })
+        .collect();
+    sizes.sort_unstable();
+    sizes.dedup();
+    assert_eq!(
+        sizes.len(),
+        1,
+        "the crossfade asked the cache for {} different avatar sizes: {sizes:?}",
+        sizes.len()
+    );
+}
+
 /// The caps-lock warning actually draws, and disappears again.
 ///
 /// A state test can only see `caps_alpha`; the row is a separate bake with its own element, so it

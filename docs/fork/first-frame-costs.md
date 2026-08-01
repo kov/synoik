@@ -3,6 +3,42 @@
 **Status:** plan, not built. Written 2026-07-27 out of the live session that produced
 [`present-misses.md`](./present-misses.md).
 
+## Cold icon keys, and a prewarm that ran too early
+
+Two flickers reported from the seat on 2026-08-01 — the lock screen's avatar on the first unlock
+prompt, and app-grid icons "sometimes" on first open. Same class, two unrelated mechanisms, and
+both are the shape this document predicts: **a cold icon key draws nothing at all.**
+`IconCache::texture` hands a miss to the worker and returns whatever `stale_textures` holds, which
+is empty until an icon-theme change (`render_helpers/icon.rs:287-298`), so the element is simply
+not emitted for those frames.
+
+**The avatar: bucketing turned one cold miss into twelve.** The prompt page scales 0.3 → 1 over the
+300 ms crossfade, and the avatar was requested at `rest_px * page_scale`, bucketed to sixteenths so
+the cache would not be thrashed. Bucketing bounds the *steady-state* key count and does nothing for
+the cold run: the first crossfade asked for eleven distinct sizes, each its own cold miss, each
+drawing no glyph while the plate underneath kept drawing. The fix is the one `window_preview`
+already uses for the same problem — ask at a fixed size, scale on the GPU — now a reusable
+`widget::icon_element_scaled`. Pinned by `the_crossfade_asks_for_one_avatar_not_one_per_frame`,
+which counts requests through `wire_test_worker`; with the old code it reports eleven.
+
+**The app grid: the prewarm ran before the worker existed.** `prewarm_app_icons` returns early
+without a decode worker, and its only startup caller was `add_output` — which on a TTY seat runs
+from `backend.init`, tens of lines *before* `spawn_worker`. So it warmed nothing, every tile
+decoded lazily on the frame it first appeared, and whether you saw it depended on whether some
+later settings change or catalog reload had warmed the cache first. That is the "sometimes". Now
+warmed again once the worker is up.
+
+**The general gap this leaves:** there is still no prewarm of any kind for `IconCache` (symbolic).
+Every first-ever panel, quick-settings and calendar icon has a one-frame absence today; it is
+invisible only because those surfaces are static, so the missing frame is the first frame and there
+is nothing to flicker *from*. Any new animated surface drawing a symbolic icon will hit it.
+
+**Method note.** Neither bug is visible to a test that does not ask for the async miss path: with
+no worker the cache rasterizes inline and every miss draws fine. `IconCache::wire_test_worker`
+exists for this, and the app-grid ordering bug is *still* not covered — it needs the real TTY init
+sequence, which the headless fixture does not run.
+
+
 ## The problem
 
 A cost paid **once per process, or once per surface**, is invisible to every instrument we have.

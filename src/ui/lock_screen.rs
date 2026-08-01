@@ -191,17 +191,13 @@ impl PageTransform {
     /// The buffer scale that draws a texture baked at `scale` physical px per logical px at this
     /// transform's size. Changing the *buffer* scale rather than re-baking is what keeps a 300 ms
     /// crossfade from re-rasterizing the page every frame ([[animation-per-frame-bake]]).
+    ///
+    /// Icons take the same route, through [`widget::icon_element_scaled`]. They used to ask the
+    /// cache for a bucketed *size* instead, which bounded the number of keys but made the first
+    /// run of the crossfade miss a cold key per bucket — and a cold key draws nothing, so the
+    /// avatar blinked its way in. Bucketing turned one cold miss into twelve.
     fn buffer_scale(&self, scale: f64) -> f64 {
         scale / self.scale
-    }
-
-    /// The scale to rasterize an *icon* at, bucketed.
-    ///
-    /// Icons have no buffer-scale knob — `icon_element` rasterizes at the size it is asked for —
-    /// so an unbucketed scale would re-raster the 160 px avatar on every frame of the fade.
-    /// Sixteen steps are indistinguishable in motion and populate the cache once.
-    fn icon_scale(&self) -> f64 {
-        (self.scale * 16.).round() / 16.
     }
 }
 
@@ -921,12 +917,13 @@ impl LockScreen {
             } else {
                 "view-reveal-symbolic"
             };
-            if let Some(el) = widget::icon_element_alpha(
+            if let Some(el) = widget::icon_element_scaled(
                 renderer,
                 icons,
                 &[icon],
-                widget::Entry::ICON_PX * t.icon_scale(),
+                widget::Entry::ICON_PX,
                 scale,
+                t.scale,
                 FG,
                 origin,
                 t.place(origin + entry_layout.secondary_icon.to_f64(), centre) - origin,
@@ -940,12 +937,13 @@ impl LockScreen {
         //
         // AccountsService's per-user icon file is not read yet, so everyone gets the themed
         // fallback; wiring the real picture is additive and does not move anything here.
-        if let Some(el) = widget::icon_element_alpha(
+        if let Some(el) = widget::icon_element_scaled(
             renderer,
             icons,
             &["avatar-default-symbolic"],
-            (AVATAR_PX - AVATAR_ICON_PAD * 2.) * t.icon_scale(),
+            AVATAR_PX - AVATAR_ICON_PAD * 2.,
             scale,
+            t.scale,
             FG,
             origin,
             t.place(

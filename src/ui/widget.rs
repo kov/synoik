@@ -219,6 +219,54 @@ pub fn icon_element_alpha<S: AsRef<str>>(
     ))
 }
 
+/// [`icon_element_alpha`], but drawn at `page_scale` **without changing the size asked of the
+/// cache**.
+///
+/// For an icon on a surface that animates its own scale. Asking for a different `logical_px` each
+/// frame is a different cache key each frame, and a cold key draws *nothing* — so an icon whose
+/// size rides an animation blinks its way through the first run of that animation, once per
+/// distinct size. Bucketing the size bounds how many keys there are but does not stop the cold
+/// ones being empty; it just turns one cold miss into a dozen.
+///
+/// So the size is fixed and the scaling happens on the GPU, via the buffer scale — the same trick
+/// the bakes already use, and what `window_preview` does for the overview's app icon.
+#[allow(clippy::too_many_arguments)]
+pub fn icon_element_scaled<S: AsRef<str>>(
+    renderer: &mut VulkanRenderer,
+    icons: &IconCache,
+    candidates: &[S],
+    logical_px: f64,
+    scale: f64,
+    page_scale: f64,
+    color: Rgba,
+    origin: Point<f64, Logical>,
+    center: Point<f64, Logical>,
+    alpha: f32,
+) -> Option<TextureRenderElement<VkTexture>> {
+    let tb = candidates
+        .iter()
+        .find_map(|name| icons.texture(renderer, name.as_ref(), logical_px, scale, color))?;
+    // Dividing the buffer scale is what magnifies: a buffer tagged at half the output scale
+    // covers twice the logical area.
+    let tb = TextureBuffer::from_texture(
+        renderer,
+        tb.texture().clone(),
+        scale / page_scale.max(f64::EPSILON),
+        Transform::Normal,
+        Vec::new(),
+    );
+    let logical = tb.logical_size();
+    let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
+    Some(TextureRenderElement::from_texture_buffer(
+        tb,
+        loc,
+        alpha,
+        None,
+        None,
+        Kind::Unspecified,
+    ))
+}
+
 /// Composite a **full-color application icon** ([`AppIconRef`]), resolved +
 /// decoded by the [`AppIconCache`], centered at `center` (relative to the element
 /// `origin`), sized `logical_px`. The full-color sibling of [`icon_element`]: no
