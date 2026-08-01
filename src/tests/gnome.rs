@@ -43,6 +43,7 @@ const KEY_ENTER: u32 = 28;
 const KEY_BACKSPACE: u32 = 14;
 const KEY_LEFTCTRL: u32 = 29;
 const KEY_A: u32 = 30;
+const KEY_CAPSLOCK: u32 = 58;
 const KEY_SPACE: u32 = 57;
 const KEY_RIGHT: u32 = 106;
 const KEY_LEFTSHIFT: u32 = 42;
@@ -7477,6 +7478,79 @@ fn leaving_the_prompt_animates_and_survives_the_unlock() {
         f.niri().lock_screen.page_progress(now),
         1.,
         "and it takes the prompt with it, rather than flipping to the clock mid-slide"
+    );
+}
+
+/// Caps lock raises a warning on the password prompt, and only there.
+///
+/// GNOME shows `CapsLockWarning` (`shellEntry.js:162-218`) whenever the outstanding question is a
+/// **secret** one — `this._capsLockWarningLabel.visible = secret` (`authPrompt.js:414`). A username
+/// question gets none, and neither does the clock page, where there is no entry to mangle.
+///
+/// Driven by tapping the real Caps Lock key through the input path, so the state comes from xkb
+/// exactly as it would on a seat — a test that set the flag by hand could not fail for the thing
+/// most likely to break, which is the modifier branch never reporting it
+/// ([[test-the-code-not-a-reimplementation]]).
+#[test]
+fn caps_lock_warns_on_the_password_prompt_only() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+
+    // Caps lock on the *clock* page warns about nothing: there is no entry yet.
+    tap(&mut f, KEY_CAPSLOCK);
+    f.niri().lock_screen.settle_caps();
+    let now = get_monotonic_time();
+    assert_eq!(
+        f.niri().lock_screen.caps_alpha(now),
+        0.,
+        "no warning on the clock page"
+    );
+
+    // Onto the prompt. The warning is owed the moment it appears, without another caps press —
+    // the state is already on, and GNOME reads the keymap rather than waiting for an event.
+    tap(&mut f, KEY_A);
+    assert_eq!(
+        f.niri().unlock_dialog.page(),
+        crate::unlock_dialog::Page::Prompt
+    );
+    f.niri().lock_screen.settle_caps();
+    let now = get_monotonic_time();
+    assert_eq!(
+        f.niri().lock_screen.caps_alpha(now),
+        1.,
+        "caps is on and the question is secret"
+    );
+
+    // Turning it off takes the warning with it.
+    tap(&mut f, KEY_CAPSLOCK);
+    f.niri().lock_screen.settle_caps();
+    let now = get_monotonic_time();
+    assert_eq!(f.niri().lock_screen.caps_alpha(now), 0., "caps lock is off");
+
+    // A non-secret question gets no warning even with caps on.
+    tap(&mut f, KEY_CAPSLOCK);
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Username:".to_owned(),
+            secret: false,
+        });
+    f.niri().lock_screen.settle_caps();
+    let now = get_monotonic_time();
+    assert_eq!(
+        f.niri().lock_screen.caps_alpha(now),
+        0.,
+        "a username question cannot be mangled by caps lock"
     );
 }
 

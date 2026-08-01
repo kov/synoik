@@ -293,8 +293,12 @@ process. What is done about it, and what is not:
 - **The peek toggle is in.** `view-reveal-symbolic` / `view-conceal-symbolic` at the entry's
   trailing edge (`st-password-entry.c:223-230`, `:333-346`), gated on
   `org.gnome.desktop.lockdown disable-show-password` and dropped on every fresh question.
-- **No caps-lock warning** (`authPrompt.js:414`). Worth having: it is the most common cause of the
-  wrong-password loop.
+- **The caps-lock row is always reserved.** GNOME eases the warning's *height* from 0
+  (`shellEntry.js:210-217`) and holds the line with an empty placeholder on non-secret questions
+  (`authPrompt.js:201-212`); we reserve the row always and fade only the text. Animating the height
+  would move everything below it every frame, which re-rasterises the column every frame. The cost
+  is one blank line under a password entry with caps off — the same space GNOME's own placeholder
+  reserves on a non-secret prompt.
 - **Only `gdm-password`.** Fingerprint and smartcard are separate PAM services GNOME starts in
   parallel on the same channel (`util.js:709-719`); adding them is additive — start the service and
   route by `service_name` — but GNOME also rewrites fingerprint `Info` into its own hint text

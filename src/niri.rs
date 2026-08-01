@@ -508,6 +508,13 @@ pub struct Niri {
     pub lock_screen: crate::ui::lock_screen::LockScreen,
     /// The unlock prompt's state — which page is up, what has been typed, what gdm last said.
     pub unlock_dialog: crate::unlock_dialog::UnlockDialog,
+    /// Caps lock, sampled from the keyboard after each key the shield saw.
+    ///
+    /// GNOME reads it from the keymap whenever it needs it (`shellEntry.js:192`); we have no
+    /// keymap signal, so it is remembered here. Remembered rather than passed along with the
+    /// key because a *question* arriving from gdm also changes whether a warning is owed, and
+    /// no key is involved in that at all.
+    pub caps_lock: bool,
     /// Drives [`crate::dbus::gdm`]. `None` before D-Bus starts, and on a build without it — in
     /// which case the shield never gets a verifier and so never locks, which is the correct
     /// behaviour rather than a degradation.
@@ -3722,28 +3729,28 @@ impl State {
 
         self.niri.lock_screen.note_activity(now);
 
-        // Modifiers alone raise the prompt but must not be typed into it (`:678-682`).
-        let is_modifier = matches!(
+        // **Shift and caps lock do not raise the prompt.** GNOME returns early for exactly these
+        // four and for nothing else (`unlockDialog.js:677-682`) — Ctrl, Alt and Super fall through
+        // to `_showPrompt()` like any other key. They are the keys you press *before* the one you
+        // meant: holding Shift for a capital, or setting caps lock, should leave the clock up so
+        // the letter that follows is what wakes the prompt and gets typed into it.
+        //
+        // Setting caps lock at the clock is also the case the warning has to survive — it is on
+        // before the entry exists, and must appear with the entry rather than waiting for another
+        // press.
+        let is_shift_like = matches!(
             raw,
-            Some(
-                Keysym::Shift_L
-                    | Keysym::Shift_R
-                    | Keysym::Shift_Lock
-                    | Keysym::Caps_Lock
-                    | Keysym::Control_L
-                    | Keysym::Control_R
-                    | Keysym::Alt_L
-                    | Keysym::Alt_R
-                    | Keysym::Super_L
-                    | Keysym::Super_R
-            )
+            Some(Keysym::Shift_L | Keysym::Shift_R | Keysym::Shift_Lock | Keysym::Caps_Lock)
         );
+        if is_shift_like && self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Clock {
+            return;
+        }
 
         let effects = match raw {
             Some(Keysym::Escape) => self.niri.unlock_dialog.cancel(),
             Some(Keysym::Return | Keysym::KP_Enter) => self.niri.unlock_dialog.submit(now),
             Some(Keysym::BackSpace) => self.niri.unlock_dialog.backspace(now),
-            _ => match text.filter(|c| !c.is_control()).filter(|_| !is_modifier) {
+            _ => match text.filter(|c| !c.is_control()) {
                 Some(c) => self.niri.unlock_dialog.type_char(c, now),
                 None => self.niri.unlock_dialog.show_prompt(now),
             },
@@ -3787,6 +3794,20 @@ impl State {
     }
 
     /// Publish an [`UnlockEffects`](crate::unlock_dialog::UnlockEffects).
+    /// Raise or drop the caps-lock warning.
+    ///
+    /// Only for a **secret** question (`authPrompt.js:414` sets the label's visibility straight
+    /// from `secret`) — a username prompt gets no warning — and only on the prompt page, since that
+    /// is the only place the label exists.
+    pub(crate) fn sync_caps_warning(&mut self) {
+        let warn = self.niri.caps_lock
+            && self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt
+            && self.niri.unlock_dialog.asks_for_secret();
+        self.niri
+            .lock_screen
+            .set_caps_warning(warn, crate::utils::get_monotonic_time());
+    }
+
     /// Point the curtain's crossfade at whichever page the dialog is on.
     ///
     /// Two things it deliberately does not key off `is_locked()`, which both call sites used to:
@@ -3809,6 +3830,13 @@ impl State {
             .set_page(prompt, crate::utils::get_monotonic_time());
     }
 
+    /// The page and the caps warning move together: the warning belongs to the prompt page and to
+    /// secret questions, and both of those change underneath us when gdm speaks.
+    fn sync_lock_page_and_caps(&mut self) {
+        self.sync_lock_page();
+        self.sync_caps_warning();
+    }
+
     pub fn apply_unlock_effects(&mut self, effects: crate::unlock_dialog::UnlockEffects) {
         if let Some(request) = effects.request {
             #[cfg(feature = "dbus")]
@@ -3822,7 +3850,7 @@ impl State {
         // The view's crossfade clock follows the model's page. Synced here rather than at each
         // `show_prompt`/`show_clock` call site because this is the one funnel every page change
         // already goes through, and a missed site would be a page that snaps instead of fading.
-        self.sync_lock_page();
+        self.sync_lock_page_and_caps();
 
         if effects.unlock {
             // gdm accepted. This is the only call to `deactivate` that can raise a *locked*
@@ -3985,7 +4013,7 @@ impl State {
 
         // The shield's own paths move the page too (`cancel_dialog`, and the `show_clock` a
         // cancelled conversation forces), so the crossfade clock is synced from here as well.
-        self.sync_lock_page();
+        self.sync_lock_page_and_caps();
 
         // Last, and unconditionally: the inhibitor is a function of the state we just moved to, and
         // the suspend path *depends* on it being dropped here — logind is waiting on that fd.
@@ -5244,6 +5272,7 @@ impl Niri {
             unlock_dialog: crate::unlock_dialog::UnlockDialog::new(
                 crate::unlock_dialog::session_user(),
             ),
+            caps_lock: false,
             #[cfg(feature = "dbus")]
             gdm_requests: None,
             lock_timer: None,
@@ -7388,6 +7417,12 @@ impl Niri {
             // them individually.
             let slide = -self.lock_screen.curtain_progress(now) * size.h;
 
+            let page_ctx = crate::ui::lock_screen::PageCtx {
+                scale: output_scale.x,
+                monitor: Rectangle::from_size(size),
+                now,
+            };
+
             let mut prompt_t = crate::ui::lock_screen::PageTransform::prompt(progress);
             let mut clock_t = crate::ui::lock_screen::PageTransform::clock(progress);
             prompt_t.translation_y += slide;
@@ -7409,8 +7444,7 @@ impl Niri {
                 for elem in self.lock_screen.render_prompt(
                     ctx.renderer,
                     &self.icon_cache,
-                    output_scale.x,
-                    Rectangle::from_size(size),
+                    page_ctx,
                     &content,
                     prompt_t,
                 ) {
@@ -7426,14 +7460,10 @@ impl Niri {
                     // the safe default (it is also what a seat with a pointer reports).
                     false,
                 );
-                for elem in self.lock_screen.render(
-                    ctx.renderer,
-                    output_scale.x,
-                    Rectangle::from_size(size),
-                    &content,
-                    now,
-                    clock_t,
-                ) {
+                for elem in self
+                    .lock_screen
+                    .render(ctx.renderer, page_ctx, &content, clock_t)
+                {
                     push(elem.into());
                 }
             }
@@ -8259,6 +8289,7 @@ impl Niri {
             state.unfinished_animations_remain |= self.lock_screen.page_is_animating(now);
             state.unfinished_animations_remain |= self.lock_screen.is_sliding(now);
             state.unfinished_animations_remain |= self.lock_screen.is_fading(now);
+            state.unfinished_animations_remain |= self.lock_screen.caps_is_animating(now);
 
             // Also keep redrawing if the current cursor is animated.
             state.unfinished_animations_remain |= self

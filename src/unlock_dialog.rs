@@ -186,6 +186,15 @@ impl UnlockDialog {
         self.question.as_ref().is_none_or(|(_, secret)| *secret)
     }
 
+    /// Whether gdm asked for a *secret*, regardless of whether the user is peeking at it.
+    ///
+    /// Distinct from [`is_secret`](Self::is_secret): the caps-lock warning is shown for the whole
+    /// of a password question (`authPrompt.js:414` sets it from `secret`), including while the
+    /// answer is revealed — caps lock still mangles what you type.
+    pub fn asks_for_secret(&self) -> bool {
+        self.asked_for_secret()
+    }
+
     /// Whether the entry is masked right now — a secret prompt that the user has not chosen to
     /// reveal.
     pub fn is_secret(&self) -> bool {

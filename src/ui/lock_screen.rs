@@ -319,6 +319,14 @@ const MESSAGE_FG: Rgba = [0.9, 0.9, 0.9, 1.];
 /// them by `MessageType` (`authPrompt.js`).
 const MESSAGE_ERROR_FG: Rgba = [1., 0.48, 0.42, 1.];
 
+/// `CapsLockWarning`'s text (`shellEntry.js:170`).
+pub const CAPS_TEXT: &str = "Caps lock is on";
+/// It eases in and out over 200 ms (`shellEntry.js:210-217`).
+pub const CAPS_FADE: Duration = Duration::from_millis(200);
+/// `.caps-lock-warning-label { color: $_gdm_fg }` (`_login-lock.scss:10-13`) — the dialog's own
+/// foreground, not a warning red. It is a statement of fact, not an error.
+const CAPS_FG: Rgba = FG;
+
 /// What the prompt page shows. The entry text arrives **already masked** — this type never sees a
 /// password, which is the point (see [`crate::unlock_dialog::UnlockDialog::entry_display`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -339,13 +347,34 @@ pub struct PromptContent {
     pub peek: Option<bool>,
 }
 
+/// Where a page is being drawn, and when.
+///
+/// The two pages take exactly these three between them, and both are drawn from the same place in
+/// the same frame — so they travel together rather than as three parallel parameters each.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageCtx {
+    pub scale: f64,
+    pub monitor: Rectangle<f64, Logical>,
+    /// Monotonic; the hint fade, the caps ease and the crossfade all read it.
+    pub now: Duration,
+}
+
 /// Where the prompt page's parts sit, relative to the block's top-left.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PromptLayout {
     pub avatar: Rectangle<f64, Logical>,
     pub name: Rectangle<f64, Logical>,
     pub entry: Rectangle<f64, Logical>,
+    /// The caps-lock warning's row, between the entry and the message
+    /// (`authPrompt.js:199-212` — `_initInputRow`, then the placeholder, then the warning, then
+    /// `_message`, all in the vertical `_inputWell`).
+    pub caps: Rectangle<f64, Logical>,
     pub message: Rectangle<f64, Logical>,
+}
+
+/// The caps row's height. Always reserved — see [`prompt_layout`].
+fn caps_row_height(base_px: f64) -> f64 {
+    base_px * LINE_BOX_ESTIMATE
 }
 
 /// The prompt column's width — `25em` at the base font.
@@ -379,12 +408,22 @@ pub fn prompt_layout(base_px: f64, name_h: f64, message_h: f64) -> PromptLayout 
     y += name_h + NAME_MARGIN_BOTTOM_EM * crate::ui::pt_to_px(NAME_PT) + PROMPT_SPACING;
     let entry = centred(y, widget::Entry::HEIGHT, width);
     y += widget::Entry::HEIGHT + PROMPT_SPACING;
+    // **Divergence: the row is always reserved.** GNOME eases the warning's *height* from 0
+    // (`shellEntry.js:210-217`), so the dialog grows when caps comes on, and an empty placeholder
+    // label holds the line for non-secret questions instead (`authPrompt.js:201-212`). Animating a
+    // height here would move the name and message every frame, which means re-rasterising the whole
+    // column every frame — the [[animation-per-frame-bake]] shape. Reserving the line costs one
+    // blank row under a password entry with caps off, and buys a dialog whose height never moves;
+    // it is also exactly the space GNOME's own placeholder reserves on a non-secret prompt.
+    let caps = centred(y, caps_row_height(base_px), width);
+    y += caps.size.h + PROMPT_SPACING;
     let message = centred(y, message_h, width);
 
     PromptLayout {
         avatar,
         name,
         entry,
+        caps,
         message,
     }
 }
@@ -474,9 +513,20 @@ pub struct LockScreen {
     page_since: Option<(Duration, bool)>,
     /// The page as of the last [`Self::set_page`] — what a new transition eases *from*.
     showing_prompt: bool,
+    /// Whether the caps-lock warning should be up, and when that last changed.
+    ///
+    /// `None` means settled at [`Self::caps_warning`]. Kept here rather than in
+    /// [`PromptContent`] because it is a *clock*: the content says what to draw, this says how far
+    /// through the 200 ms ease it is.
+    caps_since: Option<Duration>,
+    caps_warning: bool,
     cache: RefCell<widget::BakeCache>,
     /// The entry has its own cache: it re-bakes per keystroke, the column around it does not.
     entry_cache: RefCell<widget::BakeCache>,
+    /// ...and so does the caps warning, whose text never changes at all: keeping it out of the
+    /// column's bake is what lets its alpha animate on the *element* instead of in the bake key,
+    /// which would re-rasterise the whole column every frame ([[animation-per-frame-bake]]).
+    caps_cache: RefCell<widget::BakeCache>,
 }
 
 impl LockScreen {
@@ -595,6 +645,46 @@ impl LockScreen {
         self.page_since = Some((now, prompt));
     }
 
+    /// Raise or drop the caps-lock warning, starting its 200 ms ease.
+    ///
+    /// GNOME watches the keymap's `state-changed` (`shellEntry.js:175-188`) so the warning tracks
+    /// caps lock even with no keystroke in the entry. We have no keymap signal: the state rides in
+    /// on the key event that changed it, which is why the shield's key path must call this for
+    /// *modifier* keys too — Caps Lock itself being the one that matters most.
+    pub fn set_caps_warning(&mut self, warn: bool, now: Duration) {
+        if self.caps_warning == warn {
+            return;
+        }
+        self.caps_warning = warn;
+        self.caps_since = Some(now);
+    }
+
+    /// How opaque the caps-lock warning is: 0 hidden, 1 fully up.
+    pub fn caps_alpha(&self, now: Duration) -> f64 {
+        let target = if self.caps_warning { 1. } else { 0. };
+        let Some(since) = self.caps_since else {
+            return target;
+        };
+        let t = (now.saturating_sub(since).as_secs_f64() / CAPS_FADE.as_secs_f64()).clamp(0., 1.);
+        let eased = Curve::EaseOutQuad.y(t);
+        if self.caps_warning {
+            eased
+        } else {
+            1. - eased
+        }
+    }
+
+    /// Whether the caps warning still owes frames.
+    pub fn caps_is_animating(&self, now: Duration) -> bool {
+        self.caps_since
+            .is_some_and(|since| now.saturating_sub(since) < CAPS_FADE)
+    }
+
+    /// Finish the caps ease now, wherever it had got to.
+    pub fn settle_caps(&mut self) {
+        self.caps_since = None;
+    }
+
     /// How far through the clock→prompt crossfade we are: 0 is the clock, 1 the prompt.
     ///
     /// `EASE_OUT_QUAD` over [`CROSSFADE_TIME`] (`_showPrompt` / `_showClock`, `:786-810`).
@@ -645,6 +735,7 @@ impl LockScreen {
         // only just started.
         self.retire_curtain();
         self.settle_page();
+        self.settle_caps();
     }
 
     /// Finish the crossfade now, wherever it had got to.
@@ -695,11 +786,15 @@ impl LockScreen {
         &self,
         renderer: &mut VulkanRenderer,
         icons: &crate::render_helpers::icon::IconCache,
-        scale: f64,
-        monitor: Rectangle<f64, Logical>,
+        ctx: PageCtx,
         content: &PromptContent,
         t: PageTransform,
     ) -> Vec<TextureRenderElement<VkTexture>> {
+        let PageCtx {
+            scale,
+            monitor,
+            now,
+        } = ctx;
         let base_px = crate::ui::pt_to_px(crate::ui::base_font_pt());
         let width = prompt_width(base_px);
         let block_h = prompt_block_height(base_px);
@@ -754,6 +849,54 @@ impl LockScreen {
                 centre,
             )),
             Err(err) => tracing::error!("error drawing the unlock entry: {err:#}"),
+        }
+
+        // --- The caps-lock warning, under the entry. ---
+        //
+        // Its alpha rides the *element*, not the bake: the text is a constant, so it is
+        // rasterised once for the life of the process and the 200 ms ease costs nothing.
+        let caps_alpha = self.caps_alpha(now);
+        if caps_alpha > 0. {
+            let caps_h = caps_row_height(base_px);
+            match widget::bake(
+                renderer,
+                &mut self.caps_cache.borrow_mut(),
+                scale,
+                Size::from((width, caps_h)),
+                widget::Revision::new().px(width).done(),
+                |renderer| {
+                    let mut shaper = TextShaper::new(renderer, scale);
+                    shaper.shape(CAPS_TEXT, TextStyle::new(HINT_PT))
+                },
+                |frame, phys, text: &ShapedText| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(style::TRANSPARENT)?;
+                    p.text_band(
+                        text,
+                        width / 2.,
+                        HAlign::Center,
+                        0.,
+                        caps_h,
+                        CAPS_FG,
+                        Rectangle::from_size(Size::from((width, caps_h))),
+                    )?;
+                    Ok(())
+                },
+            ) {
+                Ok(texture) => {
+                    let mut faded = t;
+                    faded.alpha *= caps_alpha;
+                    elements.push(Self::element(
+                        renderer,
+                        texture,
+                        scale,
+                        origin + l.caps.loc,
+                        faded,
+                        centre,
+                    ));
+                }
+                Err(err) => tracing::error!("error drawing the caps-lock warning: {err:#}"),
+            }
         }
 
         // --- The peek toggle, at the entry's trailing edge. ---
@@ -930,12 +1073,15 @@ impl LockScreen {
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
-        scale: f64,
-        monitor: Rectangle<f64, Logical>,
+        ctx: PageCtx,
         content: &ClockContent,
-        now: Duration,
         t: PageTransform,
     ) -> Vec<TextureRenderElement<VkTexture>> {
+        let PageCtx {
+            scale,
+            monitor,
+            now,
+        } = ctx;
         let base_px = crate::ui::pt_to_px(crate::ui::base_font_pt());
         let size = Size::from((monitor.size.w, block_height(base_px)));
         let hint_alpha = self.hint_alpha(now);

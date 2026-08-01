@@ -11698,6 +11698,77 @@ fn vulkan_draws_the_screen_shield_over_the_desktop() {
     );
 }
 
+/// The caps-lock warning actually draws, and disappears again.
+///
+/// A state test can only see `caps_alpha`; the row is a separate bake with its own element, so it
+/// can be perfectly "visible" and still draw nothing — wrong cache, zero-sized texture, an origin
+/// off the block. Asserted as a differential rather than against fixed geometry: caps on must add
+/// bright ink, and turning it off must return the frame to exactly what it was.
+#[test]
+fn vulkan_draws_the_caps_lock_warning() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    /// `input-event-codes.h`.
+    const KEY_CAPSLOCK: u32 = 58;
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    f.niri_state().on_shield_key(None, Some('a'));
+    f.niri_state().niri.lock_screen.settle();
+
+    let is_bright = |p: [u8; 4]| p[0] > 200 && p[1] > 200 && p[2] > 200;
+    let count_bright = |pixels: &[u8], w: i32, h: i32| {
+        (0..w * h)
+            .filter(|i| is_bright(px(pixels, w, i % w, i / w)))
+            .count()
+    };
+
+    let (before, w, h) = render_output_vulkan(&mut f, &output);
+    let bright_before = count_bright(&before, w, h);
+
+    // Caps on, through the real key path — the state has to survive xkb, which is the half most
+    // likely to be wrong (the press reports the lock state it is about to change).
+    f.key_press(KEY_CAPSLOCK);
+    f.key_release(KEY_CAPSLOCK);
+    assert!(f.niri().caps_lock, "the seat reports caps lock on");
+    f.niri_state().niri.lock_screen.settle();
+
+    let (during, _, _) = render_output_vulkan(&mut f, &output);
+    let bright_during = count_bright(&during, w, h);
+    assert!(
+        bright_during > bright_before,
+        "the caps-lock warning drew no ink: {bright_before} -> {bright_during}"
+    );
+
+    // ...and off again puts the frame back exactly.
+    f.key_press(KEY_CAPSLOCK);
+    f.key_release(KEY_CAPSLOCK);
+    assert!(!f.niri().caps_lock, "and off again");
+    f.niri_state().niri.lock_screen.settle();
+
+    let (after, _, _) = render_output_vulkan(&mut f, &output);
+    let differing = before
+        .chunks_exact(4)
+        .zip(after.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        differing, 0,
+        "{differing} px still differ once caps lock is off — the warning did not go away"
+    );
+}
+
 /// The unlock prompt draws over the curtain, and the entry shows dots rather than the password.
 ///
 /// The masking assertion is the one that matters and it is the one a state test cannot make: the

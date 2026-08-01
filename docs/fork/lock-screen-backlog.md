@@ -21,7 +21,7 @@ touching them settles the animation first — see `headless-animation-clock-trap
 
 ---
 
-## A. Caps-lock warning
+## A. Caps-lock warning — **LANDED**
 
 **Why first:** smallest thing on the list, and it is the most common cause of the wrong-password
 loop — the user types the right password three times and learns nothing.
@@ -51,6 +51,18 @@ event that changes the state. The one thing to get right is that the warning mus
 **modifier-only** keys too, which is exactly the branch that currently just calls `show_prompt`.
 
 **Risk:** low. Layout-only, no new D-Bus, no new state source.
+
+**Landed**, and it turned up a divergence in the neighbouring code: our key path treated Ctrl, Alt
+and Super as "modifiers that raise the prompt without being typed", citing `:678-682`. That block is
+the list of keys that do **not** raise it, and it holds exactly four — `Shift_L`, `Shift_R`,
+`Shift_Lock`, `Caps_Lock` (`unlockDialog.js:677-682`). Everything else, Ctrl included, falls through
+to `_showPrompt()`. Shift and caps are the keys you press *before* the one you meant, and setting
+caps at the clock is precisely the case the warning has to survive: it is on before the entry
+exists. Both fixed here.
+
+The other trap was xkb. At the **press** of Caps Lock the event's modifier mask still describes the
+state the key is about to change, so a warning driven from it appears and never leaves. Sampled
+after `input()` instead, which is what the switcher next door already does for the same reason.
 
 ---
 
