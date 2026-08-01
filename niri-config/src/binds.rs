@@ -13,7 +13,6 @@ use smithay::input::keyboard::keysyms::KEY_NoSymbol;
 use smithay::input::keyboard::xkb::{keysym_from_name, KEYSYM_CASE_INSENSITIVE, KEYSYM_NO_FLAGS};
 use smithay::input::keyboard::Keysym;
 
-use crate::recent_windows::{MruDirection, MruFilter, MruScope};
 use crate::utils::{expect_only_children, MergeWith};
 
 #[derive(Debug, Default, PartialEq)]
@@ -391,12 +390,6 @@ pub enum Action {
     UnsetWindowUrgent(u64),
     #[knuffel(skip)]
     LoadConfigFile(#[knuffel(argument)] Option<String>),
-    #[knuffel(skip)]
-    MruAdvance {
-        direction: MruDirection,
-        scope: Option<MruScope>,
-        filter: Option<MruFilter>,
-    },
     /// GNOME's `switch-applications` — raise the app switcher, or advance it if it is already
     /// up. `backward` is the binding's `-backward` half (`windowManager.js:1705`).
     #[knuffel(skip)]
@@ -409,20 +402,6 @@ pub enum Action {
     SwitchWindows {
         backward: bool,
     },
-    #[knuffel(skip)]
-    MruConfirm,
-    #[knuffel(skip)]
-    MruCancel,
-    #[knuffel(skip)]
-    MruCloseCurrentWindow,
-    #[knuffel(skip)]
-    MruFirst,
-    #[knuffel(skip)]
-    MruLast,
-    #[knuffel(skip)]
-    MruSetScope(MruScope),
-    #[knuffel(skip)]
-    MruCycleScope,
 }
 
 impl From<niri_ipc::Action> for Action {

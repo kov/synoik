@@ -181,7 +181,6 @@ use crate::ui::dash::{Dash, DashEntry};
 use crate::ui::end_session_dialog::{EndSessionDialog, EndSessionDialogRenderElement};
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
-use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::overview_search::{OverviewSearch, SearchResultEntry};
 use crate::ui::panel::{Panel, PanelElement};
 use crate::ui::popover::PanelPopover;
@@ -765,10 +764,8 @@ pub struct Niri {
     /// a slow cover fetch can never queue in front of the dash's icons.
     pub image_cache: ImageCache,
 
-    pub window_mru_ui: WindowMruUi,
     /// The GNOME Alt-Tab / Super-Tab switcher (`ui::switcher`).
     pub switcher: crate::ui::switcher::ui::SwitcherUi,
-    pub pending_mru_commit: Option<PendingMruCommit>,
 
     pub pick_window: Option<async_channel::Sender<Option<MappedId>>>,
     pub pick_color: Option<async_channel::Sender<Option<niri_ipc::PickedColor>>>,
@@ -921,16 +918,23 @@ pub struct PopupGrabState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyboardFocus {
     // Layout is focused by default if there's nothing else to focus.
-    Layout { surface: Option<WlSurface> },
-    LayerShell { surface: WlSurface },
-    LockScreen { surface: Option<WlSurface> },
+    Layout {
+        surface: Option<WlSurface>,
+    },
+    LayerShell {
+        surface: WlSurface,
+    },
+    LockScreen {
+        surface: Option<WlSurface>,
+    },
     ScreenshotUi,
     ExitConfirmDialog,
     RunDialog,
     EndSessionDialog,
     Popover,
     Overview,
-    Mru,
+    /// The Alt-Tab / Super-Tab switcher holds a modal grab while it is up.
+    Switcher,
 }
 
 #[derive(Default, Clone, PartialEq)]
@@ -1050,14 +1054,6 @@ impl CastTarget {
     }
 }
 
-/// Pending update to a window's focus timestamp.
-#[derive(Debug)]
-pub struct PendingMruCommit {
-    id: MappedId,
-    token: RegistrationToken,
-    stamp: Duration,
-}
-
 impl RedrawState {
     fn queue_redraw(self) -> Self {
         match self {
@@ -1099,7 +1095,7 @@ impl KeyboardFocus {
             KeyboardFocus::EndSessionDialog => None,
             KeyboardFocus::Popover => None,
             KeyboardFocus::Overview => None,
-            KeyboardFocus::Mru => None,
+            KeyboardFocus::Switcher => None,
         }
     }
 
@@ -1114,7 +1110,7 @@ impl KeyboardFocus {
             KeyboardFocus::EndSessionDialog => None,
             KeyboardFocus::Popover => None,
             KeyboardFocus::Overview => None,
-            KeyboardFocus::Mru => None,
+            KeyboardFocus::Switcher => None,
         }
     }
 
@@ -2019,18 +2015,6 @@ impl State {
         self.focus_window(&window);
     }
 
-    pub fn confirm_mru(&mut self) {
-        if let Some(window) = self.niri.close_mru(MruCloseRequest::Confirm) {
-            // focus_window() will warp the cursor to the window only when the keyboard focus is on
-            // the layout. However, right now the keyboard focus is still on the MRU (that we had
-            // just closed) since it's only updated at the end of the event loop cycle. Force-update
-            // the keyboard focus here to make cursor warping work.
-            self.update_keyboard_focus();
-
-            self.focus_window(&window);
-        }
-    }
-
     pub fn maybe_warp_cursor_to_focus(&mut self) -> bool {
         let focused = match self.niri.config.borrow().input.warp_mouse_to_focus {
             None => return false,
@@ -2183,8 +2167,8 @@ impl State {
             }
         } else if self.niri.screenshot_ui.is_open() {
             KeyboardFocus::ScreenshotUi
-        } else if self.niri.window_mru_ui.is_open() {
-            KeyboardFocus::Mru
+        } else if self.niri.switcher.is_open() {
+            KeyboardFocus::Switcher
         } else if self.niri.panel_popover.is_open() {
             KeyboardFocus::Popover
         } else if let Some(output) = self.niri.layout.active_output() {
@@ -2312,39 +2296,15 @@ impl State {
                 if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
                     mapped.set_is_focused(true);
 
-                    // If `mapped` does not have a focus timestamp, then the window is newly
-                    // created/mapped and a timestamp is unconditionally created.
+                    // Focus *is* the user time, as in mutter (`meta_window_focus` sets it).
                     //
-                    // If `mapped` already has a timestamp only update it after the focus lock-in
-                    // period has gone by without the focus having elsewhere.
-                    let stamp = get_monotonic_time();
-
-                    let debounce = self.niri.config.borrow().recent_windows.debounce_ms;
-                    let debounce = Duration::from_millis(u64::from(debounce));
-
-                    if mapped.get_focus_timestamp().is_none() || debounce.is_zero() {
-                        mapped.set_focus_timestamp(stamp);
-                    } else {
-                        let timer = Timer::from_duration(debounce);
-
-                        let focus_token = self
-                            .niri
-                            .event_loop
-                            .insert_source(timer, move |_, _, state| {
-                                state.niri.mru_apply_keyboard_commit();
-                                TimeoutAction::Drop
-                            })
-                            .unwrap();
-                        if let Some(PendingMruCommit { token, .. }) =
-                            self.niri.pending_mru_commit.replace(PendingMruCommit {
-                                id: mapped.id(),
-                                token: focus_token,
-                                stamp,
-                            })
-                        {
-                            self.niri.event_loop.remove(token);
-                        }
-                    }
+                    // niri debounced this by `recent-windows debounce-ms` (750 by default) so
+                    // that tabbing through windows did not reorder the list underneath the
+                    // switcher. That protection is no longer needed and the knob is gone: GNOME's
+                    // switchers cache their window list when the popup opens
+                    // (`altTab.js:719-720`), and so does ours, so nothing the focus does
+                    // mid-switch can reorder the row you are looking at.
+                    mapped.set_focus_timestamp(get_monotonic_time());
                 }
             }
 
@@ -2516,7 +2476,6 @@ impl State {
         let mut layer_rules_changed = false;
         let mut shaders_changed = false;
         let mut cursor_inactivity_timeout_changed = false;
-        let mut recent_windows_changed = false;
         let mut xwls_changed = false;
         let mut old_config = self.niri.config.borrow_mut();
 
@@ -2639,10 +2598,6 @@ impl State {
             output_config_changed = true;
         }
 
-        if config.recent_windows != old_config.recent_windows {
-            recent_windows_changed = true;
-        }
-
         if config.xwayland_satellite != old_config.xwayland_satellite {
             xwls_changed = true;
         }
@@ -2719,14 +2674,6 @@ impl State {
             // Force reset due to timeout change.
             self.niri.pointer_inactivity_timer_got_reset = false;
             self.niri.reset_pointer_inactivity_timer();
-        }
-
-        if binds_changed {
-            self.niri.window_mru_ui.update_binds();
-        }
-
-        if recent_windows_changed {
-            self.niri.window_mru_ui.update_config();
         }
 
         if xwls_changed {
@@ -4338,7 +4285,6 @@ impl Niri {
         let mods_with_tablet_stylus_binds = mods_with_tablet_stylus_binds(mod_key, &config_.binds);
 
         let screenshot_ui = ScreenshotUi::new(animation_clock.clone(), config.clone());
-        let window_mru_ui = WindowMruUi::new(config.clone());
         let config_error_notification =
             ConfigErrorNotification::new(animation_clock.clone(), config.clone());
         let notification_banner = crate::ui::notification_banner::NotificationBanner::new(
@@ -4650,9 +4596,7 @@ impl Niri {
             app_icon_cache: AppIconCache::new("Adwaita"),
             image_cache: ImageCache::new(),
 
-            window_mru_ui,
             switcher: crate::ui::switcher::ui::SwitcherUi::new(),
-            pending_mru_commit: None,
 
             pick_window: None,
             pick_color: None,
@@ -5083,8 +5027,8 @@ impl Niri {
             self.queue_redraw_all();
         }
 
-        if self.window_mru_ui.output() == Some(output) {
-            self.cancel_mru();
+        if self.switcher.output() == Some(output) {
+            self.switcher.cancel();
         }
     }
 
@@ -5454,7 +5398,6 @@ impl Niri {
             || self.end_session_dialog.is_open()
             || self.is_locked()
             || self.screenshot_ui.is_open()
-            || self.window_mru_ui.is_open()
             // The window picker is faded out under the search results, so its
             // previews must not activate — gnome-shell drops `reactive` on the
             // workspaces display while searching (`overviewControls.js:636-641`).
@@ -5541,10 +5484,7 @@ impl Niri {
             return rv;
         }
 
-        if self.screenshot_ui.is_open()
-            || self.window_mru_ui.is_open()
-            || self.panel_popover.is_open()
-        {
+        if self.screenshot_ui.is_open() || self.panel_popover.is_open() {
             // A panel popover grabs input modally (clicks and motion): while it is open no
             // window under it should receive pointer focus, so the app can't keep driving the
             // cursor image (e.g. a maximized terminal's I-beam over the clock popover).
@@ -6266,7 +6206,7 @@ impl Niri {
             KeyboardFocus::EndSessionDialog => true,
             KeyboardFocus::Popover => true,
             KeyboardFocus::Overview => true,
-            KeyboardFocus::Mru => true,
+            KeyboardFocus::Switcher => true,
         };
 
         self.layout.refresh(layout_is_active);
@@ -6403,7 +6343,6 @@ impl Niri {
         self.exit_confirm_dialog.advance_animations();
         self.end_session_dialog.advance_animations();
         self.screenshot_ui.advance_animations();
-        self.window_mru_ui.advance_animations();
         self.panel_popover.advance_animations();
         self.panel.advance_animations();
 
@@ -6744,9 +6683,6 @@ impl Niri {
         // windows but below the OSD, which raises itself on show (`switcherPopup.js:178` hides
         // every OSD when the switcher becomes visible, so the two are never up together anyway).
         self.switcher
-            .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
-
-        self.window_mru_ui
             .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
 
         // The GNOME top panel sits above the windows (but below the transient
@@ -7356,7 +7292,6 @@ impl Niri {
             state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
             state.unfinished_animations_remain |= self.end_session_dialog.are_animations_ongoing();
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.panel_popover.are_animations_ongoing();
             state.unfinished_animations_remain |= self.notification_banner.are_animations_ongoing();
             state.unfinished_animations_remain |= self.osd.are_animations_ongoing();
@@ -8835,7 +8770,7 @@ impl Niri {
                 self.screenshot_ui.close();
                 self.cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());
-                self.cancel_mru();
+                self.switcher.cancel();
 
                 if self.output_state.is_empty() {
                     // There are no outputs, lock the session right away.
@@ -9145,7 +9080,7 @@ impl Niri {
             return;
         }
 
-        if self.window_mru_ui.is_open() {
+        if self.switcher.is_open() {
             return;
         }
 
@@ -10640,40 +10575,6 @@ impl Niri {
         warn!("session actions require the dbus feature");
     }
 
-    pub fn close_mru(&mut self, close_request: MruCloseRequest) -> Option<Window> {
-        if !self.window_mru_ui.is_open() {
-            return None;
-        }
-        self.queue_redraw_all();
-
-        let id = self.window_mru_ui.close(close_request)?;
-        self.find_window_by_id(id)
-    }
-
-    pub fn cancel_mru(&mut self) {
-        self.close_mru(MruCloseRequest::Cancel);
-    }
-
-    /// Apply a pending MRU commit immediately.
-    ///
-    /// Called for example on keyboard events that reach the active window, which immediately adds
-    /// it to the MRU.
-    pub fn mru_apply_keyboard_commit(&mut self) {
-        let Some(pending) = self.pending_mru_commit.take() else {
-            return;
-        };
-        self.event_loop.remove(pending.token);
-
-        if let Some(window) = self
-            .layout
-            .workspaces_mut()
-            .flat_map(|ws| ws.windows_mut())
-            .find(|w| w.id() == pending.id)
-        {
-            window.set_focus_timestamp(pending.stamp);
-        }
-    }
-
     /// The switcher's window list — `getWindows` (`altTab.js:51-61`) over our layout.
     ///
     /// DIVERGENCE: GNOME filters by the active *workspace* on the workspace manager, and places
@@ -10765,12 +10666,6 @@ impl Niri {
 
     pub fn queue_redraw_switcher_output(&mut self) {
         if let Some(output) = self.switcher.output().cloned() {
-            self.queue_redraw(&output);
-        }
-    }
-
-    pub fn queue_redraw_mru_output(&mut self) {
-        if let Some(output) = self.window_mru_ui.output().cloned() {
             self.queue_redraw(&output);
         }
     }
@@ -10877,7 +10772,6 @@ niri_render_elements! {
         SolidColor = SolidColorRenderElement,
         ScreenshotUi = ScreenshotUiRenderElement,
         CapturedTexture = CapturedTextureRenderElement,
-        WindowMruUi = WindowMruUiRenderElement,
         Switcher = crate::ui::switcher::ui::SwitcherRenderElement,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         RunDialog = RunDialogRenderElement,

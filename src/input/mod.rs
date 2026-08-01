@@ -6,8 +6,7 @@ use std::time::Duration;
 use calloop::timer::{TimeoutAction, Timer};
 use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
-    Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds, Trigger,
-    WorkspaceReference,
+    Action, Bind, Binds, Config, Key, ModKey, Modifiers, SwitchBinds, Trigger, WorkspaceReference,
 };
 use niri_ipc::LayoutSwitchTarget;
 use smithay::backend::input::{
@@ -63,7 +62,6 @@ use crate::ui::app_grid::{
 use crate::ui::dash::DashHit;
 use crate::ui::end_session_dialog::DialogOutcome;
 use crate::ui::folder_dialog::{DialogHit, POPDOWN_DIALOG_MS};
-use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::overview_search::SearchHit;
 use crate::ui::popover::PopoverSide;
 use crate::ui::run_dialog::{self, KeyOutcome};
@@ -562,7 +560,7 @@ impl State {
                 let key_code = event.key_code();
                 let modified = keysym.modified_sym();
                 let raw = keysym.raw_latin_sym_or_raw_current_sym();
-                let modifiers = modifiers_from_state(*mods);
+                let _modifiers = modifiers_from_state(*mods);
 
                 // After updating XKB state from accessibility-grabbed keys, return right away and
                 // don't handle them.
@@ -753,18 +751,6 @@ impl State {
                     }
                 }
 
-                // Check if all modifiers were released while the MRU UI was open. If so, close the
-                // UI (which will also transfer the focus to the current MRU UI selection).
-                if this.niri.window_mru_ui.is_open() && !pressed && modifiers.is_empty() {
-                    this.do_action(Action::MruConfirm, false);
-
-                    if this.niri.suppressed_keys.remove(&key_code) {
-                        return FilterResult::Intercept(None);
-                    } else {
-                        return FilterResult::Forward;
-                    }
-                }
-
                 if pressed && raw == Some(Keysym::Escape) {
                     // Cancel certain grabs on Escape.
                     let pointer = this.niri.seat.get_pointer().unwrap();
@@ -792,12 +778,10 @@ impl State {
 
                 let res = {
                     let config = this.niri.config.borrow();
-                    // "A modal switcher is up" — either the GNOME switcher or, until it is
-                    // retired, niri's MRU. Both hold a grab, so both suppress the general binds.
-                    let switcher_is_open =
-                        this.niri.window_mru_ui.is_open() || this.niri.switcher.is_open();
-                    let bindings =
-                        make_binds_iter(&config, &mut this.niri.window_mru_ui, modifiers);
+                    // The switcher holds a modal grab, so while it is up nothing but the switch
+                    // bindings resolves.
+                    let switcher_is_open = this.niri.switcher.is_open();
+                    let bindings = make_binds_iter(&config, switcher_is_open);
 
                     should_intercept_key(
                         &mut this.niri.suppressed_keys,
@@ -951,10 +935,6 @@ impl State {
                             return FilterResult::Intercept(Some(bind));
                         }
                     }
-
-                    // Interaction with the active window, immediately update the active window's
-                    // focus timestamp without waiting for a possible pending MRU lock-in delay.
-                    this.niri.mru_apply_keyboard_commit();
                 }
 
                 res
@@ -1876,7 +1856,7 @@ impl State {
             }
             Action::Screenshot(show_cursor, path) => {
                 self.open_screenshot_ui(show_cursor, path);
-                self.niri.cancel_mru();
+                self.niri.switcher.cancel();
             }
             Action::ScreenshotWindow(write_to_disk, show_pointer, path) => {
                 let focus = self.niri.layout.focus_with_output();
@@ -2008,9 +1988,6 @@ impl State {
                     .max_by_key(|win| win.get_focus_timestamp())
                     .map(|win| win.window.clone())
                 {
-                    // Commit current focus so repeated focus-window-previous works as expected.
-                    self.niri.mru_apply_keyboard_commit();
-
                     self.focus_window(&window);
                 }
             }
@@ -3506,94 +3483,6 @@ impl State {
             Action::SwitchWindows { backward } => {
                 self.switch_windows(backward);
             }
-            Action::MruConfirm => {
-                self.confirm_mru();
-            }
-            Action::MruCancel => {
-                self.niri.cancel_mru();
-            }
-            Action::MruAdvance {
-                direction,
-                scope,
-                filter,
-            } => {
-                if self.niri.window_mru_ui.is_open() {
-                    self.niri.window_mru_ui.advance(direction, filter);
-                    self.niri.queue_redraw_mru_output();
-                } else if self.niri.config.borrow().recent_windows.on {
-                    self.niri.mru_apply_keyboard_commit();
-
-                    let config = self.niri.config.borrow();
-                    let scope = scope.unwrap_or(self.niri.window_mru_ui.scope());
-
-                    let mut wmru = WindowMru::new(&self.niri);
-                    if !wmru.is_empty() {
-                        wmru.set_scope(scope);
-                        if let Some(filter) = filter {
-                            wmru.set_filter(filter);
-                        }
-
-                        if let Some(output) = self.niri.layout.active_output() {
-                            self.niri.window_mru_ui.open(
-                                self.niri.clock.clone(),
-                                wmru,
-                                output.clone(),
-                            );
-                            // The switcher becoming visible takes every OSD with it
-                            // (`js/ui/switcherPopup.js:170-178`) — otherwise a volume
-                            // pill sits under the alt-tab list for its full 1500 ms.
-                            self.niri.osd.hide_all();
-
-                            // Only select the *next* window if some window (which should be the
-                            // first one) is already focused. If nothing is focused, keep the first
-                            // window (which is logically the "previously selected" one).
-                            let keep_first = direction == MruDirection::Forward
-                                && self.niri.layout.focus().is_none();
-                            if !keep_first {
-                                self.niri.window_mru_ui.advance(direction, None);
-                            }
-
-                            drop(config);
-                            self.niri.queue_redraw_all();
-                        }
-                    }
-                }
-            }
-            Action::MruCloseCurrentWindow => {
-                if self.niri.window_mru_ui.is_open() {
-                    if let Some(id) = self.niri.window_mru_ui.current_window_id() {
-                        if let Some(w) = self.niri.find_window_by_id(id) {
-                            if let Some(tl) = w.toplevel() {
-                                tl.send_close();
-                            }
-                        }
-                    }
-                }
-            }
-            Action::MruFirst => {
-                if self.niri.window_mru_ui.is_open() {
-                    self.niri.window_mru_ui.first();
-                    self.niri.queue_redraw_mru_output();
-                }
-            }
-            Action::MruLast => {
-                if self.niri.window_mru_ui.is_open() {
-                    self.niri.window_mru_ui.last();
-                    self.niri.queue_redraw_mru_output();
-                }
-            }
-            Action::MruSetScope(scope) => {
-                if self.niri.window_mru_ui.is_open() {
-                    self.niri.window_mru_ui.set_scope(scope);
-                    self.niri.queue_redraw_mru_output();
-                }
-            }
-            Action::MruCycleScope => {
-                if self.niri.window_mru_ui.is_open() {
-                    self.niri.window_mru_ui.cycle_scope();
-                    self.niri.queue_redraw_mru_output();
-                }
-            }
         }
     }
 
@@ -3925,10 +3814,14 @@ impl State {
             self.niri.screenshot_ui.pointer_motion(point, None);
         }
 
-        if let Some(mru_output) = self.niri.window_mru_ui.output() {
+        // Hovering an item moves the switcher's selection -- but only once the pointer is live
+        // again, which it is not for DISABLE_HOVER_TIMEOUT after any keypress.
+        if let Some(switcher_output) = self.niri.switcher.output().cloned() {
             if let Some((output, pos_within_output)) = self.niri.output_under(new_pos) {
-                if mru_output == output {
-                    self.niri.window_mru_ui.pointer_motion(pos_within_output);
+                if switcher_output == *output
+                    && self.niri.switcher.pointer_motion(pos_within_output)
+                {
+                    self.niri.queue_redraw_switcher_output();
                 }
             }
         }
@@ -4074,10 +3967,12 @@ impl State {
             self.niri.screenshot_ui.pointer_motion(point, None);
         }
 
-        if let Some(mru_output) = self.niri.window_mru_ui.output() {
+        if let Some(switcher_output) = self.niri.switcher.output().cloned() {
             if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
-                if mru_output == output {
-                    self.niri.window_mru_ui.pointer_motion(pos_within_output);
+                if switcher_output == *output
+                    && self.niri.switcher.pointer_motion(pos_within_output)
+                {
+                    self.niri.queue_redraw_switcher_output();
                 }
             }
         }
@@ -5849,22 +5744,20 @@ impl State {
         let mod_down = modifiers.contains(mod_key.to_modifiers());
 
         if ButtonState::Pressed == button_state {
-            let mut is_mru_open = false;
-            if let Some(mru_output) = self.niri.window_mru_ui.output() {
-                is_mru_open = true;
+            let mut is_switcher_open = false;
+            if let Some(switcher_output) = self.niri.switcher.output().cloned() {
+                is_switcher_open = true;
                 if let Some(MouseButton::Left) = button {
                     let location = pointer.current_location();
                     let (output, pos_within_output) = self.niri.output_under(location).unwrap();
-                    if mru_output == output {
-                        let id = self.niri.window_mru_ui.pointer_motion(pos_within_output);
-                        if id.is_some() {
-                            self.confirm_mru();
-                        } else {
-                            self.niri.cancel_mru();
-                        }
+                    // A click on an item activates it; anywhere else -- including another output
+                    // -- dismisses without committing.
+                    let outcome = if switcher_output == *output {
+                        self.niri.switcher.pointer_click(pos_within_output)
                     } else {
-                        self.niri.cancel_mru();
-                    }
+                        self.niri.switcher.pointer_click(Point::from((-1., -1.)))
+                    };
+                    self.finish_switcher(outcome);
 
                     self.niri.suppressed_buttons.insert(button_code);
                     return;
@@ -6152,7 +6045,7 @@ impl State {
                 }
             }
 
-            if is_mru_open || self.niri.mods_with_mouse_binds.contains(&modifiers) {
+            if is_switcher_open || self.niri.mods_with_mouse_binds.contains(&modifiers) {
                 if let Some(bind) = match button {
                     Some(MouseButton::Left) => Some(Trigger::MouseLeft),
                     Some(MouseButton::Right) => Some(Trigger::MouseRight),
@@ -6163,8 +6056,7 @@ impl State {
                 }
                 .and_then(|trigger| {
                     let config = self.niri.config.borrow();
-                    let bindings =
-                        make_binds_iter(&config, &mut self.niri.window_mru_ui, modifiers);
+                    let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
                     find_configured_bind(bindings, mod_key, trigger, mods)
                 })
                 .filter(|bind| {
@@ -6505,7 +6397,7 @@ impl State {
             false
         };
 
-        let is_mru_open = self.niri.window_mru_ui.is_open();
+        let is_switcher_open = self.niri.switcher.is_open();
 
         // A scroll OVER an open panel popover is grabbed by it: the dateMenu
         // scrolls its message list (or pages the calendar month), gnome-shell's
@@ -6724,7 +6616,7 @@ impl State {
             let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
             let modifiers = modifiers_from_state(mods);
             let should_handle = should_handle_in_overview
-                || is_mru_open
+                || is_switcher_open
                 || self.niri.mods_with_wheel_binds.contains(&modifiers);
             if should_handle {
                 let horizontal = horizontal_amount_v120.unwrap_or(0.);
@@ -6777,8 +6669,7 @@ impl State {
                             (bind_left, bind_right)
                         } else {
                             let config = self.niri.config.borrow();
-                            let bindings =
-                                make_binds_iter(&config, &mut self.niri.window_mru_ui, modifiers);
+                            let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
                             let bind_left = find_configured_bind(
                                 bindings.clone(),
                                 mod_key,
@@ -6872,8 +6763,7 @@ impl State {
                         (bind_up, bind_down)
                     } else {
                         let config = self.niri.config.borrow();
-                        let bindings =
-                            make_binds_iter(&config, &mut self.niri.window_mru_ui, modifiers);
+                        let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
                         let bind_up = find_configured_bind(
                             bindings.clone(),
                             mod_key,
@@ -7018,15 +6908,14 @@ impl State {
                 }
             }
 
-            if is_mru_open || self.niri.mods_with_finger_scroll_binds.contains(&modifiers) {
+            if is_switcher_open || self.niri.mods_with_finger_scroll_binds.contains(&modifiers) {
                 let ticks = self
                     .niri
                     .horizontal_finger_scroll_tracker
                     .accumulate(horizontal);
                 if ticks != 0 {
                     let config = self.niri.config.borrow();
-                    let bindings =
-                        make_binds_iter(&config, &mut self.niri.window_mru_ui, modifiers);
+                    let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
                     let bind_left = find_configured_bind(
                         bindings.clone(),
                         mod_key,
@@ -7063,8 +6952,7 @@ impl State {
                     .accumulate(vertical);
                 if ticks != 0 {
                     let config = self.niri.config.borrow();
-                    let bindings =
-                        make_binds_iter(&config, &mut self.niri.window_mru_ui, modifiers);
+                    let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
                     let bind_up = find_configured_bind(
                         bindings.clone(),
                         mod_key,
@@ -7191,10 +7079,12 @@ impl State {
             self.niri.screenshot_ui.pointer_motion(point, None);
         }
 
-        if let Some(mru_output) = self.niri.window_mru_ui.output() {
+        if let Some(switcher_output) = self.niri.switcher.output().cloned() {
             if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
-                if mru_output == output {
-                    self.niri.window_mru_ui.pointer_motion(pos_within_output);
+                if switcher_output == *output
+                    && self.niri.switcher.pointer_motion(pos_within_output)
+                {
+                    self.niri.queue_redraw_switcher_output();
                 }
             }
         }
@@ -7299,18 +7189,14 @@ impl State {
                                 self.niri.queue_redraw_all();
                             }
                         }
-                    } else if let Some(mru_output) = self.niri.window_mru_ui.output() {
+                    } else if let Some(switcher_output) = self.niri.switcher.output().cloned() {
                         if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
-                            if mru_output == output {
-                                let id = self.niri.window_mru_ui.pointer_motion(pos_within_output);
-                                if id.is_some() {
-                                    self.confirm_mru();
-                                } else {
-                                    self.niri.cancel_mru();
-                                }
+                            let outcome = if switcher_output == *output {
+                                self.niri.switcher.pointer_click(pos_within_output)
                             } else {
-                                self.niri.cancel_mru();
-                            }
+                                self.niri.switcher.pointer_click(Point::from((-1., -1.)))
+                            };
+                            self.finish_switcher(outcome);
                         }
                     } else if let Some((window, _)) = under.window {
                         if let Some(output) = is_overview_open.then_some(under.output).flatten() {
@@ -7487,8 +7373,8 @@ impl State {
     }
 
     fn on_gesture_swipe_begin<I: InputBackend>(&mut self, event: I::GestureSwipeBeginEvent) {
-        if self.niri.window_mru_ui.is_open() {
-            // Don't start swipe gestures while in the MRU.
+        if self.niri.switcher.is_open() {
+            // The switcher holds a modal grab, so no gesture starts under it.
             return;
         }
 
@@ -7844,18 +7730,14 @@ impl State {
                     self.niri.queue_redraw_all();
                 }
             }
-        } else if let Some(mru_output) = self.niri.window_mru_ui.output() {
+        } else if let Some(switcher_output) = self.niri.switcher.output().cloned() {
             if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
-                if mru_output == output {
-                    let id = self.niri.window_mru_ui.pointer_motion(pos_within_output);
-                    if id.is_some() {
-                        self.confirm_mru();
-                    } else {
-                        self.niri.cancel_mru();
-                    }
+                let outcome = if switcher_output == *output {
+                    self.niri.switcher.pointer_click(pos_within_output)
                 } else {
-                    self.niri.cancel_mru();
-                }
+                    self.niri.switcher.pointer_click(Point::from((-1., -1.)))
+                };
+                self.finish_switcher(outcome);
             }
         } else if !handle.is_grabbed() {
             if self.niri.layout.is_overview_open()
@@ -8366,15 +8248,6 @@ fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         GnomeKeyAction::SwitchWindows { backward } => Action::SwitchWindows { backward },
         GnomeKeyAction::SwitchApplications { backward } => Action::SwitchApplications { backward },
     })
-}
-
-#[allow(dead_code)] // Used by the MRU actions until `mru.rs` is retired.
-fn mru_direction(backward: bool) -> MruDirection {
-    if backward {
-        MruDirection::Backward
-    } else {
-        MruDirection::Forward
-    }
 }
 
 fn find_configured_bind<'a>(
@@ -9023,27 +8896,15 @@ fn grab_allows_hot_corner(grab: &(dyn PointerGrab<State> + 'static)) -> bool {
     true
 }
 
-/// Returns an iterator over bindings.
+/// The configured binds, suppressed while a switcher holds its grab.
 ///
-/// Includes dynamically populated bindings like the MRU UI.
-fn make_binds_iter<'a>(
-    config: &'a Config,
-    mru: &'a mut WindowMruUi,
-    mods: Modifiers,
-) -> impl Iterator<Item = &'a Bind> + Clone {
-    // Figure out the binds to use depending on whether the MRU is enabled and/or open.
-    let general_binds = (!mru.is_open()).then_some(config.binds.0.iter());
-    let general_binds = general_binds.into_iter().flatten();
-
-    let mru_binds =
-        (config.recent_windows.on || mru.is_open()).then_some(config.recent_windows.binds.iter());
-    let mru_binds = mru_binds.into_iter().flatten();
-
-    let mru_open_binds = mru.is_open().then(|| mru.opened_bindings(mods));
-    let mru_open_binds = mru_open_binds.into_iter().flatten();
-
-    // General binds take precedence over the MRU binds.
-    general_binds.chain(mru_binds).chain(mru_open_binds)
+/// GNOME's `SwitcherPopup` takes a modal grab (`pushModal`, `switcherPopup.js:125`), so while it
+/// is up nothing but the switch bindings resolves — see `find_gnome_bind`.
+fn make_binds_iter(config: &Config, switcher_is_open: bool) -> impl Iterator<Item = &Bind> + Clone {
+    (!switcher_is_open)
+        .then_some(config.binds.0.iter())
+        .into_iter()
+        .flatten()
 }
 
 #[cfg(test)]

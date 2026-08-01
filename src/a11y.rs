@@ -7,19 +7,16 @@ use accesskit::{
 };
 use accesskit_unix::Adapter;
 use calloop::LoopHandle;
-use niri_config::MruScope;
 
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::{KeyboardFocus, Niri, State};
-use crate::utils::with_toplevel_role;
-use crate::window::mapped::MappedId;
 
 const ID_ROOT: NodeId = NodeId(0);
 const ID_ANNOUNCEMENT: NodeId = NodeId(1);
 const ID_SCREENSHOT_UI: NodeId = NodeId(2);
 const ID_EXIT_CONFIRM_DIALOG: NodeId = NodeId(3);
 const ID_OVERVIEW: NodeId = NodeId(4);
-const ID_MRU: NodeId = NodeId(5);
+const ID_SWITCHER: NodeId = NodeId(5);
 const ID_RUN_DIALOG: NodeId = NodeId(6);
 const ID_END_SESSION_DIALOG: NodeId = NodeId(7);
 
@@ -27,9 +24,9 @@ pub struct A11y {
     event_loop: LoopHandle<'static, State>,
     focus: NodeId,
     workspace_id: Option<WorkspaceId>,
-    mru_selection: Option<MappedId>,
-    mru_scope: Option<MruScope>,
-    last_mru_title: String,
+    /// The switcher item last announced, so a selection that has not moved is not re-read.
+    switcher_selection: Option<usize>,
+    last_switcher_label: String,
     last_announcement: String,
     to_accesskit: Option<mpsc::SyncSender<TreeUpdate>>,
 }
@@ -46,9 +43,8 @@ impl A11y {
             event_loop,
             focus: ID_ROOT,
             workspace_id: None,
-            mru_selection: None,
-            mru_scope: None,
-            last_mru_title: String::new(),
+            switcher_selection: None,
+            last_switcher_label: String::new(),
             last_announcement: String::new(),
             to_accesskit: None,
         }
@@ -141,29 +137,21 @@ impl Niri {
 
         let focus = self.a11y_focus();
 
-        // Check if the MRU selection changed.
-        let mut update_mru_selection = false;
-        if focus == ID_MRU {
-            let current = self.window_mru_ui.current_window_id();
-            if self.a11y.mru_selection != current {
-                update_mru_selection = true;
-                self.a11y.mru_selection = current;
+        // Check if the switcher's selection moved.
+        let mut update_switcher_selection = false;
+        if focus == ID_SWITCHER {
+            let current = self.switcher.selected();
+            if self.a11y.switcher_selection != current {
+                update_switcher_selection = true;
+                self.a11y.switcher_selection = current;
             }
-
-            // If there's no window title to announce, check if there's a scope change.
-            let scope = self.window_mru_ui.scope();
-            if !update_mru_selection && self.a11y.mru_scope != Some(scope) {
-                announcement = Some(self.window_mru_ui.a11y_scope_text());
-            }
-            self.a11y.mru_scope = Some(scope);
         } else {
-            self.a11y.mru_scope = None;
-            self.a11y.mru_selection = None;
+            self.a11y.switcher_selection = None;
         }
 
         let update_focus = self.a11y.focus != focus;
 
-        if !(announcement.is_some() || update_focus || update_mru_selection) {
+        if !(announcement.is_some() || update_focus || update_switcher_selection) {
             return;
         }
 
@@ -182,39 +170,28 @@ impl Niri {
             nodes.push((ID_ANNOUNCEMENT, node));
         }
 
-        if focus == ID_MRU {
-            // Ideally MRU would be a Group with a child Button for a window, but I've no idea how
-            // to make it work reliably. When I did it that way, there were two issues:
-            //
-            // 1. Alt-Tab would always start reading from "Recent windows grouping" instead of the
-            //    window title.
-            // 2. When Alt-Tab became empty (e.g. switching scope to something empty), Orca would
-            //    completely stop reading any child buttons for the remainder of the session.
-            //
-            // I've no idea what to do about these and where they even come from. So, just flip the
-            // MRU node between Group and Button, which seems to work fine.
-            if update_mru_selection {
-                if let Some(id) = self.a11y.mru_selection {
-                    if let Some((_, mapped)) = self.layout.windows().find(|(_, m)| m.id() == id) {
-                        with_toplevel_role(mapped.toplevel(), |role| {
-                            let mut title = role.title.as_deref().unwrap_or("Unknown").to_owned();
-                            // Change title on match to ensure we announce same-titled windows.
-                            if self.a11y.last_mru_title == title {
-                                title.push(' ');
-                            }
-                            self.a11y.last_mru_title = title;
-
-                            let mut mru = Node::new(Role::Button);
-                            mru.set_label(&*self.a11y.last_mru_title);
-                            nodes.push((ID_MRU, mru));
-                        });
+        if focus == ID_SWITCHER {
+            // Ideally this would be a Group with a child Button per item, but niri found two
+            // problems with that shape and neither has an explanation: Alt-Tab would always start
+            // by reading the group's own label instead of the selected item, and once the list
+            // went empty Orca stopped reading any child button for the rest of the session. So
+            // the node flips between Group and Button instead, which works.
+            if update_switcher_selection {
+                if let Some(label) = self.switcher.selected_label() {
+                    let mut label = label.to_owned();
+                    // Change the label on a match so two same-titled windows are both announced.
+                    if self.a11y.last_switcher_label == label {
+                        label.push(' ');
                     }
+                    self.a11y.last_switcher_label = label;
+
+                    let mut node = Node::new(Role::Button);
+                    node.set_label(&*self.a11y.last_switcher_label);
+                    nodes.push((ID_SWITCHER, node));
                 } else {
-                    let mut mru = Node::new(Role::Group);
-                    // Announce the current scope in the empty text to make it clear.
-                    let scope = self.window_mru_ui.a11y_scope_text();
-                    mru.set_label(format!("Recent windows empty, {scope}"));
-                    nodes.push((ID_MRU, mru));
+                    // An open switcher is never empty (the last item going away ends the
+                    // session), so this is the closing frame.
+                    nodes.push((ID_SWITCHER, Node::new(Role::Group)));
                 }
             }
         }
@@ -279,7 +256,7 @@ impl Niri {
             KeyboardFocus::RunDialog => ID_RUN_DIALOG,
             KeyboardFocus::EndSessionDialog => ID_END_SESSION_DIALOG,
             KeyboardFocus::Overview => ID_OVERVIEW,
-            KeyboardFocus::Mru => ID_MRU,
+            KeyboardFocus::Switcher => ID_SWITCHER,
             _ => ID_ROOT,
         }
     }
@@ -314,8 +291,8 @@ impl Niri {
         let mut overview = Node::new(Role::Group);
         overview.set_label("Overview");
 
-        let mut mru = Node::new(Role::Group);
-        mru.set_label("Recent windows");
+        let mut switcher_node = Node::new(Role::Group);
+        switcher_node.set_label("Window switcher");
 
         let mut root = Node::new(Role::Window);
         root.set_children(vec![
@@ -325,7 +302,7 @@ impl Niri {
             ID_RUN_DIALOG,
             ID_END_SESSION_DIALOG,
             ID_OVERVIEW,
-            ID_MRU,
+            ID_SWITCHER,
         ]);
 
         let tree = Tree {
@@ -348,7 +325,7 @@ impl Niri {
                 (ID_RUN_DIALOG, run_dialog),
                 (ID_END_SESSION_DIALOG, end_session_dialog),
                 (ID_OVERVIEW, overview),
-                (ID_MRU, mru),
+                (ID_SWITCHER, switcher_node),
             ],
             tree: Some(tree),
             tree_id: TreeId::ROOT,

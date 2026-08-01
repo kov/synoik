@@ -158,6 +158,15 @@ impl SwitcherUi {
         self.open.is_some()
     }
 
+    /// The selected item's label — its app name or window title.
+    ///
+    /// What a screen reader announces as the selection moves: `WindowIcon`/`AppIcon` give each
+    /// item an `St.Label`, and Orca reads it.
+    pub fn selected_label(&self) -> Option<&str> {
+        let open = self.open.as_ref()?;
+        Some(open.art.get(open.state.selected())?.label.as_str())
+    }
+
     /// How many items the open popup is showing, or `None` when nothing is open.
     ///
     /// Deliberately not a `len`/`is_empty` pair: an *open* switcher is never empty (the last item
@@ -308,6 +317,26 @@ impl SwitcherUi {
             return false;
         };
         open.state.pointer_entered_item(item)
+    }
+
+    /// A click — `_itemActivated` (`switcherPopup.js:250-257`) inside an item, and the
+    /// click-outside dismissal (`:71-85`) anywhere else.
+    ///
+    /// Clicking outside **cancels** rather than committing: you did not pick anything, so focus
+    /// stays where it was.
+    pub fn pointer_click(
+        &mut self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(SwitcherOutcome, Option<MappedId>)> {
+        let open = self.open.as_mut()?;
+        match open.layout.item_at(pos) {
+            Some(item) => {
+                open.state.select(item);
+                open.state.key_press(SwitcherKey::Commit, Duration::ZERO);
+            }
+            None => open.state.key_press(SwitcherKey::Dismiss, Duration::ZERO),
+        }
+        self.take_outcome()
     }
 
     /// A window went away while the popup is up (`_itemRemoved`, `switcherPopup.js:269-284`).

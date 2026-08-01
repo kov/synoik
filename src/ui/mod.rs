@@ -10,7 +10,6 @@ pub mod folder_dialog;
 pub mod hotkey_overlay;
 pub mod input_source_menu;
 pub mod media_card;
-pub mod mru;
 pub mod notification_banner;
 pub mod notification_card;
 pub mod osd;

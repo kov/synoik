@@ -20,7 +20,6 @@ pub struct Animations {
     pub panel_popover_open_close: PanelPopoverOpenCloseAnim,
     pub notification_open_close: NotificationOpenCloseAnim,
     pub overview_open_close: OverviewOpenCloseAnim,
-    pub recent_windows_close: RecentWindowsCloseAnim,
 }
 
 impl Default for Animations {
@@ -40,7 +39,6 @@ impl Default for Animations {
             panel_popover_open_close: Default::default(),
             notification_open_close: Default::default(),
             overview_open_close: Default::default(),
-            recent_windows_close: Default::default(),
         }
     }
 }
@@ -77,8 +75,6 @@ pub struct AnimationsPart {
     pub notification_open_close: Option<NotificationOpenCloseAnim>,
     #[knuffel(child)]
     pub overview_open_close: Option<OverviewOpenCloseAnim>,
-    #[knuffel(child)]
-    pub recent_windows_close: Option<RecentWindowsCloseAnim>,
 }
 
 impl MergeWith<AnimationsPart> for Animations {
@@ -106,7 +102,6 @@ impl MergeWith<AnimationsPart> for Animations {
             panel_popover_open_close,
             notification_open_close,
             overview_open_close,
-            recent_windows_close,
         );
     }
 }
@@ -354,22 +349,6 @@ impl Default for OverviewOpenCloseAnim {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct RecentWindowsCloseAnim(pub Animation);
-
-impl Default for RecentWindowsCloseAnim {
-    fn default() -> Self {
-        Self(Animation {
-            off: false,
-            kind: Kind::Spring(SpringParams {
-                damping_ratio: 1.,
-                stiffness: 800,
-                epsilon: 0.001,
-            }),
-        })
-    }
-}
-
 impl<S> knuffel::Decode<S> for WorkspaceSwitchAnim
 where
     S: knuffel::traits::ErrorSpan,
@@ -569,21 +548,6 @@ where
 }
 
 impl<S> knuffel::Decode<S> for OverviewOpenCloseAnim
-where
-    S: knuffel::traits::ErrorSpan,
-{
-    fn decode_node(
-        node: &knuffel::ast::SpannedNode<S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<Self, DecodeError<S>> {
-        let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
-    }
-}
-
-impl<S> knuffel::Decode<S> for RecentWindowsCloseAnim
 where
     S: knuffel::traits::ErrorSpan,
 {

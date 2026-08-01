@@ -866,7 +866,8 @@ impl XdgShellHandler for State {
         let active_window = self.niri.layout.focus().map(|m| &m.window);
         let was_active = active_window == Some(&window);
 
-        self.niri.window_mru_ui.remove_window(id);
+        let outcome = self.niri.switcher.window_removed(id);
+        self.finish_switcher(outcome);
         self.niri.layout.remove_window(&window, transaction.clone());
 
         let surface = surface.wl_surface();
@@ -890,7 +891,7 @@ impl XdgShellHandler for State {
 
         if let Some(output) = output {
             self.niri.queue_redraw(&output);
-            self.niri.queue_redraw_mru_output();
+            self.niri.queue_redraw_switcher_output();
         }
     }
 
