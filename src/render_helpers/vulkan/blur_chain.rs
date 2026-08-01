@@ -40,7 +40,29 @@ impl SharedBlurChain {
         source: &NiriTexture,
         passes: usize,
     ) -> Result<Arc<Self>, VulkanError> {
-        let chain = BlurChain::new(gpu, source, passes)?;
+        Self::build(gpu, source, passes, false)
+    }
+
+    /// As [`Self::new`], plus the pipelines [`Self::record_gaussian_into`] needs.
+    pub(crate) fn new_gaussian(
+        gpu: &Arc<Gpu>,
+        source: &NiriTexture,
+        passes: usize,
+    ) -> Result<Arc<Self>, VulkanError> {
+        Self::build(gpu, source, passes, true)
+    }
+
+    fn build(
+        gpu: &Arc<Gpu>,
+        source: &NiriTexture,
+        passes: usize,
+        gaussian: bool,
+    ) -> Result<Arc<Self>, VulkanError> {
+        let chain = if gaussian {
+            BlurChain::new_with_gaussian(gpu, source, passes)?
+        } else {
+            BlurChain::new(gpu, source, passes)?
+        };
         Ok(Arc::new(Self {
             gpu: gpu.clone(),
             chain,
@@ -53,6 +75,23 @@ impl SharedBlurChain {
     ///
     /// The caller must keep this `Arc` alive until that submit retires; see the module docs for
     /// what happens otherwise.
+    /// As [`Self::record_into`], but GNOME's separable gaussian: a radius in the **source
+    /// texture's** pixels, and the brightness multiply that goes with it.
+    pub(crate) fn record_gaussian_into(
+        &self,
+        cbuf: vk::CommandBuffer,
+        radius: f64,
+        brightness: f32,
+        output: vk::Image,
+        width: u32,
+        height: u32,
+    ) {
+        self.chain
+            .record_gaussian(&self.gpu, cbuf, radius, brightness);
+        self.chain
+            .copy_output_to(&self.gpu, cbuf, output, width, height);
+    }
+
     pub(crate) fn record_into(
         &self,
         cbuf: vk::CommandBuffer,

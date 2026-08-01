@@ -7367,20 +7367,38 @@ impl Niri {
                 }
             }
 
-            // The dim goes *under* the clock and over the wallpaper: `BLUR_BRIGHTNESS` darkens
-            // the picture, not the text drawn on top of it.
-            push(
-                SolidColorRenderElement::from_buffer(
-                    &state.shield_dim_buffer,
-                    (0., 0.),
-                    1.,
-                    Kind::Unspecified,
-                )
-                .into(),
-            );
+            // The backdrop: GNOME blurs the wallpaper itself and multiplies it by
+            // `BLUR_BRIGHTNESS` (`unlockDialog.js:706-713`), so the brightness rides *in* the blur
+            // rather than being a wash laid over it.
+            //
+            // `BLUR_RADIUS` is in stage pixels, which for us is output physical pixels — hence the
+            // scale, and hence `render_blurred` doing its own conversion into the wallpaper
+            // texture's resolution.
+            let radius = crate::ui::lock_screen::BLUR_RADIUS * output_scale.x;
+            let brightness = crate::ui::lock_screen::BLUR_BRIGHTNESS as f32;
+            let blurred =
+                self.wallpaper
+                    .render_blurred(ctx.renderer, size, output_scale, radius, brightness);
 
-            if let Some(elem) = self.wallpaper.render(ctx.renderer, size, 0., output_scale) {
-                push(elem.into());
+            match blurred {
+                Some(elem) => push(elem.into()),
+                None => {
+                    // No blur to be had. The dim still has to happen, or a bright wallpaper would
+                    // sit under white 72pt text — so fall back to the flat wash this used to be.
+                    push(
+                        SolidColorRenderElement::from_buffer(
+                            &state.shield_dim_buffer,
+                            (0., 0.),
+                            1.,
+                            Kind::Unspecified,
+                        )
+                        .into(),
+                    );
+                    if let Some(elem) = self.wallpaper.render(ctx.renderer, size, 0., output_scale)
+                    {
+                        push(elem.into());
+                    }
+                }
             }
             // With no wallpaper the dim alone is translucent black over nothing, which is the one
             // way this branch could leave the desktop showing. The backstop closes it.

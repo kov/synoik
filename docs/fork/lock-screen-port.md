@@ -61,9 +61,8 @@ live on this machine, so the path is available.
 5. **The look** — deferred deliberately until the shield *works*, at Gustavo's call (2026-08-01,
    after seat-validating slice 2). The clock↔prompt crossfade has **landed**
    (`PageTransform` in `src/ui/lock_screen.rs`); the blur and the shield's own slide are open:
-   - the **blur**. `BLUR_RADIUS = 90` over the wallpaper (`unlockDialog.js:35`), paired with the
-     `BLUR_BRIGHTNESS` already shipped. Wanted beyond the lock screen — a reusable blurred-backdrop
-     pass is its own toolkit verb, not a lock-screen detail, so build it as one.
+   - the **blur**: **landed** (`niri-vk/src/blur.rs`, `render_helpers/vulkan/gaussian_backdrop.rs`,
+     `Wallpaper::render_blurred`). See below.
    - the **animations**: the shield's rise and fall — `translation_y` between `-screen_height` and
      0 over `Overview.ANIMATION_TIME` (250 ms, `EASE_OUT_QUAD`; `_resetLockScreen` `:452-462`,
      `_continueDeactivate` `:551-556`) — and the idle path's 10 s fade to black.
@@ -81,6 +80,34 @@ Two traps it walked into, worth keeping:
 - A half-finished crossfade draws the incoming page at a *partial alpha*, so anything sampling the
   screen right after a page change sees a nearly-invisible prompt and reads it as "the prompt did
   not draw". That cost one Vulkan render test; `LockScreen::settle_page` is the way out.
+
+## The blurred backdrop
+
+GNOME puts a `Shell.BlurEffect` on the lock screen's *background actor* — not on the framebuffer —
+with `BLUR_RADIUS = 90` and `BLUR_BRIGHTNESS = 0.65` (`unlockDialog.js:706-713`, `:34-35`), so the
+brightness rides inside the blur rather than being a wash laid over it.
+
+Its blur is a separable gaussian with `sigma = radius / 2`, run on a downscaled copy. The renderer
+already had a blur, but it was niri's dual-Kawase, parameterised by passes and a tap offset — a
+different kernel with no way to say "90 pixels". So the gaussian went in beside it (Gustavo's call,
+2026-08-01), sharing the existing chain object's pyramid, render pass and sampler; the Kawase keeps
+driving the window background effect. Retiring the Kawase is a separate decision, and moot if that
+niri feature is ever dropped.
+
+Three things worth keeping:
+
+- **The downscale cascade is the whole trick.** Radius 90 on 1080p lands on a 240x135 buffer where
+  sigma is 5.6 and the shader runs 19 taps per direction instead of 271. GNOME cascades two
+  downscales (`ShellBlurEffect`'s, then `ClutterBlur`'s), but they collapse: the first stops once
+  `radius / f <= 12`, which is exactly `sigma <= 6`, which is the second's own threshold.
+- **`BLUR_RADIUS` is in stage pixels, and the wallpaper is not.** The picture is stored at its own
+  resolution and scaled to the screen when drawn, so blurring it with a screen-space radius makes a
+  4K picture on a 1080p output come out half as blurred as GNOME's. `render_blurred` converts by
+  the magnification the draw will apply.
+- **The blur is queued, never submitted.** It runs during element building, where no command buffer
+  is open; `VulkanRenderer::queue_gaussian_blur` hands it to the next frame's, as the Kawase path
+  already did (`docs/fork/frame-submit-discipline.md`). It also only re-runs when the wallpaper,
+  radius or brightness actually change — a lock screen redraws on every clock tick and keystroke.
 
 ## The lock gate
 

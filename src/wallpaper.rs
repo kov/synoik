@@ -39,7 +39,7 @@ use smithay::utils::{Buffer, Logical, Point, Rectangle, Scale, Size, Transform};
 use crate::gnome::{BackgroundOptions, BackgroundSettings};
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::render_helpers::vulkan::{GaussianBackdrop, VkTexture, VulkanRenderer};
 
 /// Larger pictures are downscaled to this bound before upload; it comfortably
 /// fits common GL max-texture-size limits.
@@ -71,6 +71,16 @@ pub struct Wallpaper {
     ///
     /// [`spawn_worker`]: Wallpaper::spawn_worker
     decode_tx: Option<std::sync::mpsc::Sender<DecodeRequest>>,
+    /// The blurred copy [`render_blurred`](Self::render_blurred) hands out, and the identity of
+    /// the texture it was built over.
+    ///
+    /// Keyed by image handle rather than rebuilt per frame because the chain binds its source's
+    /// view at construction: a cache kept across a wallpaper change would sample a dangling
+    /// descriptor, and one rebuilt every frame would be the per-frame `VkTexture` churn that takes
+    /// Venus down.
+    blur: RefCell<Option<(u64, GaussianBackdrop)>>,
+    /// Bumped on every upload; see [`ensure_texture`](Self::ensure_texture).
+    texture_generation: std::cell::Cell<u64>,
 }
 
 /// What the main loop asks the worker for: a picture, and the device to stage it on if there is
@@ -232,6 +242,95 @@ impl Wallpaper {
         self.render_vulkan(renderer, view_size, corner_radius, scale)
     }
 
+    /// The uploaded picture, uploading it if this is the first ask since it changed.
+    ///
+    /// Bumps [`texture_generation`](Self::texture_generation) on every *new* upload, which is what
+    /// the blur cache keys on: the blur chain binds its source's image view at construction, so
+    /// "same wallpaper, re-uploaded" has to invalidate it just as much as a different picture does.
+    /// The path is not a usable key for that — a device loss re-uploads the same file.
+    fn ensure_texture(&self, renderer: &mut VulkanRenderer) -> Option<TextureBuffer<VkTexture>> {
+        let image = self.image.as_ref()?;
+        let mut texture = self.vk_texture.borrow_mut();
+        if texture.is_none() {
+            *texture = Some(upload_vulkan(renderer, image));
+            self.texture_generation
+                .set(self.texture_generation.get().wrapping_add(1));
+        }
+        texture.as_ref()?.clone()
+    }
+
+    /// As [`render`](Self::render), but through GNOME's gaussian — the lock screen's blurred
+    /// backdrop (`unlockDialog.js:706-713`).
+    ///
+    /// `radius` and `brightness` are `BLUR_RADIUS` and `BLUR_BRIGHTNESS` (`:34-35`), with `radius`
+    /// given in **output physical pixels**, which is what GNOME's stage-space radius means.
+    ///
+    /// The conversion matters and is easy to skip: the wallpaper is stored at the picture's own
+    /// resolution and scaled to the screen when drawn, so blurring it with a radius meant for the
+    /// screen makes a 4K picture on a 1080p output come out half as blurred as GNOME's. The radius
+    /// is scaled by the same factor the draw will magnify by.
+    ///
+    /// Returns `None` if there is no wallpaper *or* if the blur could not be built — the caller
+    /// must fall back to the unblurred picture and its own dimming, since a lock screen with no
+    /// backdrop at all would show the desktop.
+    pub fn render_blurred(
+        &self,
+        renderer: &mut VulkanRenderer,
+        view_size: Size<f64, Logical>,
+        scale: Scale<f64>,
+        radius: f64,
+        brightness: f32,
+    ) -> Option<RoundedTextureRenderElement<VkTexture>> {
+        // The upload (and its device-loss handling) is `render_vulkan`'s; go through it so a
+        // blurred draw cannot diverge from a plain one about which texture is current.
+        self.render_vulkan(renderer, view_size, 0., scale)?;
+        let buffer = self.ensure_texture(renderer)?;
+        let texture = buffer.texture().clone();
+
+        // How much the draw will magnify the sampled region by, in each axis. `zoom_crop` keeps the
+        // aspect ratio, so the two agree; take the width.
+        let src = zoom_crop(buffer.logical_size(), view_size);
+        if src.size.w <= 0. {
+            return None;
+        }
+        let magnification = view_size.w * scale.x / src.size.w;
+        let texture_radius = radius / magnification.max(f64::EPSILON);
+
+        let key = self.texture_generation.get();
+        let mut cache = self.blur.borrow_mut();
+        if cache.as_ref().is_none_or(|(cached, _)| *cached != key) {
+            match GaussianBackdrop::new(renderer, &texture, texture_radius) {
+                Ok(backdrop) => *cache = Some((key, backdrop)),
+                Err(err) => {
+                    warn!("error building the wallpaper blur: {err}");
+                    return None;
+                }
+            }
+        }
+        let (_, backdrop) = cache.as_mut()?;
+        if !backdrop.is_current(texture_radius, brightness) {
+            backdrop.queue(renderer, &texture, texture_radius, brightness);
+        }
+
+        // Same geometry as the unblurred element, sampling the blurred copy instead.
+        let blurred = TextureBuffer::from_texture(
+            renderer,
+            backdrop.output().clone(),
+            1.,
+            Transform::Normal,
+            Vec::new(),
+        );
+        let elem = TextureRenderElement::from_texture_buffer(
+            blurred,
+            (0., 0.),
+            1.,
+            Some(src),
+            Some(view_size),
+            Kind::Unspecified,
+        );
+        Some(RoundedTextureRenderElement::new(elem, 0., scale))
+    }
+
     /// The Vulkan sibling of [`render`](Self::render): uploads the decoded picture to a `VkTexture`
     /// (cached across frames like the GLES texture) and returns an element the owned Vulkan
     /// renderer rounds in its own pipeline.
@@ -274,11 +373,7 @@ impl Wallpaper {
             }
         }
 
-        let mut texture = self.vk_texture.borrow_mut();
-        let buffer = texture
-            .get_or_insert_with(|| upload_vulkan(renderer, image))
-            .as_ref()?
-            .clone();
+        let buffer = self.ensure_texture(renderer)?;
 
         // Texture scale is 1, so buffer logical size == pixel size.
         let src = zoom_crop(buffer.logical_size(), view_size);

@@ -314,7 +314,17 @@ struct PendingBlur {
     /// the passes name these images, and the submit that runs them has not happened yet.
     source: VkTexture,
     output: VkTexture,
-    offset: f32,
+    kind: PendingBlurKind,
+}
+
+/// Which blur a queued entry runs — the two kernels take different parameters and there is no
+/// meaningful conversion between them.
+#[derive(Debug, Clone, Copy)]
+enum PendingBlurKind {
+    /// niri's dual-Kawase, parameterised by its tap offset.
+    Kawase { offset: f32 },
+    /// GNOME's gaussian, parameterised by a radius in the source texture's pixels.
+    Gaussian { radius: f64, brightness: f32 },
 }
 
 /// One staged texture upload waiting for a frame to record its copy, **with its destination held
@@ -2844,7 +2854,35 @@ impl VulkanRenderer {
             chain,
             source,
             output,
-            offset,
+            kind: PendingBlurKind::Kawase { offset },
+        };
+        match self
+            .pending_blurs
+            .iter_mut()
+            .find(|queued| queued.output.image() == image)
+        {
+            Some(superseded) => *superseded = entry,
+            None => self.pending_blurs.push(entry),
+        }
+    }
+
+    /// Queue GNOME's gaussian over `source` into `output`, for the next frame's command buffer.
+    ///
+    /// Same contract as [`Self::queue_blur`] — the radius is in `source`'s own pixels.
+    pub(super) fn queue_gaussian_blur(
+        &mut self,
+        chain: Arc<SharedBlurChain>,
+        source: VkTexture,
+        output: VkTexture,
+        radius: f64,
+        brightness: f32,
+    ) {
+        let image = output.image();
+        let entry = PendingBlur {
+            chain,
+            source,
+            output,
+            kind: PendingBlurKind::Gaussian { radius, brightness },
         };
         match self
             .pending_blurs
@@ -2870,8 +2908,22 @@ impl VulkanRenderer {
         let mut textures = Vec::with_capacity(queued.len() * 2);
         for blur in queued {
             let (w, h) = blur.output.extent();
-            blur.chain
-                .record_into(cbuf, blur.offset, blur.output.image(), w, h);
+            match blur.kind {
+                PendingBlurKind::Kawase { offset } => {
+                    blur.chain
+                        .record_into(cbuf, offset, blur.output.image(), w, h);
+                }
+                PendingBlurKind::Gaussian { radius, brightness } => {
+                    blur.chain.record_gaussian_into(
+                        cbuf,
+                        radius,
+                        brightness,
+                        blur.output.image(),
+                        w,
+                        h,
+                    );
+                }
+            }
             chains.push(blur.chain);
             textures.push(blur.source);
             textures.push(blur.output);
@@ -2901,8 +2953,22 @@ impl VulkanRenderer {
             |cbuf| {
                 for blur in &queued {
                     let (w, h) = blur.output.extent();
-                    blur.chain
-                        .record_into(cbuf, blur.offset, blur.output.image(), w, h);
+                    match blur.kind {
+                        PendingBlurKind::Kawase { offset } => {
+                            blur.chain
+                                .record_into(cbuf, offset, blur.output.image(), w, h);
+                        }
+                        PendingBlurKind::Gaussian { radius, brightness } => {
+                            blur.chain.record_gaussian_into(
+                                cbuf,
+                                radius,
+                                brightness,
+                                blur.output.image(),
+                                w,
+                                h,
+                            );
+                        }
+                    }
                 }
             },
         )

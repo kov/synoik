@@ -68,10 +68,13 @@ pub const HINT_FADE: Duration = Duration::from_millis(300);
 
 /// `BLUR_BRIGHTNESS` (`:34`) — the wallpaper behind the curtain is multiplied by this.
 ///
-/// The companion `BLUR_RADIUS = 90` is **not** implemented: there is no gaussian pass on this path
-/// yet, and the brightness is what makes white 72pt text legible over an arbitrary picture. The
-/// blur is cosmetic; leaving it out is visible but not a functional gap.
+/// It is not decoration: it is what makes white 72pt text legible over an arbitrary picture. The
+/// multiply rides inside the blur pass rather than being a separate wash, as GNOME's does.
 pub const BLUR_BRIGHTNESS: f64 = 0.65;
+
+/// `BLUR_RADIUS = 90` (`:35`), in **stage pixels** — so it scales with the output, and a caller
+/// converts it into whatever resolution the texture it blurs happens to be.
+pub const BLUR_RADIUS: f64 = 90.;
 
 /// What the curtain shows. Plain strings, so the caller owns formatting and this is testable
 /// without a wall clock.

@@ -20,6 +20,7 @@ mod effect_blur;
 mod error;
 mod fence;
 mod frame;
+mod gaussian_backdrop;
 mod integration;
 mod renderer;
 #[cfg(test)]
@@ -32,6 +33,7 @@ pub(crate) use effect_blur::EffectBlur;
 pub use error::VulkanError;
 pub use frame::VulkanFrame;
 pub(crate) use frame::{pack_mat3, premultiply, ClipParams};
+pub(crate) use gaussian_backdrop::GaussianBackdrop;
 pub use renderer::{dmabuf_formats, VulkanRenderer};
 pub(crate) use types::GlyphRun;
 pub use types::{VkMapping, VkTexture, NATIVE_FOURCC};
