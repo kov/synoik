@@ -7412,6 +7412,74 @@ fn a_locked_shield_takes_a_password_and_gdm_decides() {
     let _ = VerifierRequest::Cancel;
 }
 
+/// The way back from the prompt animates, and unlocking does not snap the page out from under the
+/// slide.
+///
+/// GNOME runs one `_adjustment` for the crossfade: `_showClock` eases it to 0 exactly as
+/// `_showPrompt` eases it to 1 (`unlockDialog.js:786-810`), and Escape reaches it through
+/// `cancelled` → `_fail` (`:755`, `:846`). So leaving the prompt is the same animation backwards,
+/// not a cut. Nothing calls `_showClock` on a *successful* unlock, either — the shield slides away
+/// still showing the prompt you authenticated with.
+///
+/// Both halves were broken by deriving the page from `is_locked()` at render time: `locked` is
+/// false while the clock is coming back, and false again the instant gdm accepts.
+#[test]
+fn leaving_the_prompt_animates_and_survives_the_unlock() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::unlock_dialog::Page;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+
+    // Onto the prompt, and let the crossfade finish so the return trip starts from a clean 1.
+    tap(&mut f, KEY_A);
+    assert_eq!(f.niri().unlock_dialog.page(), Page::Prompt);
+    f.niri().lock_screen.settle_page();
+    let now = crate::utils::get_monotonic_time();
+    assert_eq!(f.niri().lock_screen.page_progress(now), 1., "on the prompt");
+
+    // Escape goes back to the clock — as an animation, not a jump.
+    tap(&mut f, KEY_ESC);
+    assert_eq!(f.niri().unlock_dialog.page(), Page::Clock);
+    let now = crate::utils::get_monotonic_time();
+    assert!(
+        f.niri().lock_screen.page_is_animating(now),
+        "the way back owes frames"
+    );
+    let back = f.niri().lock_screen.page_progress(now);
+    assert!(
+        back > 0.,
+        "the clock fades in from where the prompt was, it does not cut: {back}"
+    );
+
+    // Now unlock from the prompt. The page must stay put: the curtain carries it out.
+    tap(&mut f, KEY_A);
+    assert_eq!(f.niri().unlock_dialog.page(), Page::Prompt);
+    f.niri().lock_screen.settle_page();
+    f.niri_state().on_verifier_event(VerifierEvent::Complete);
+    assert!(!f.niri().screen_shield.is_active(), "the shield is up");
+
+    let now = crate::utils::get_monotonic_time();
+    assert!(
+        f.niri().lock_screen.is_covering(now),
+        "but the curtain is still sliding away"
+    );
+    assert_eq!(
+        f.niri().lock_screen.page_progress(now),
+        1.,
+        "and it takes the prompt with it, rather than flipping to the clock mid-slide"
+    );
+}
+
 /// Keys typed at a **locked** shield must not raise it, and must not reach the desktop.
 ///
 /// The unlocked shield raises on anything (it is a screensaver). The locked one must not — and the

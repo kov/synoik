@@ -3787,6 +3787,28 @@ impl State {
     }
 
     /// Publish an [`UnlockEffects`](crate::unlock_dialog::UnlockEffects).
+    /// Point the curtain's crossfade at whichever page the dialog is on.
+    ///
+    /// Two things it deliberately does not key off `is_locked()`, which both call sites used to:
+    ///
+    /// - **A shield on its way out keeps the page it had.** `locked` drops the instant gdm accepts,
+    ///   so keying off it reset the page to the clock *during the slide-out* — while GNOME never
+    ///   calls `_showClock` on success at all, and slides the group away still showing the prompt
+    ///   you just authenticated with (`_continueDeactivate`, `:551-556`).
+    /// - **A screensaver has no prompt to move to**, which is the real content of the old check:
+    ///   `is_dismissible` is the shield that raises on any input, and it must not display a
+    ///   password entry with no conversation behind it.
+    fn sync_lock_page(&mut self) {
+        if !self.niri.screen_shield.is_active() {
+            return;
+        }
+        let prompt = self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt
+            && !self.niri.screen_shield.is_dismissible();
+        self.niri
+            .lock_screen
+            .set_page(prompt, crate::utils::get_monotonic_time());
+    }
+
     pub fn apply_unlock_effects(&mut self, effects: crate::unlock_dialog::UnlockEffects) {
         if let Some(request) = effects.request {
             #[cfg(feature = "dbus")]
@@ -3800,10 +3822,7 @@ impl State {
         // The view's crossfade clock follows the model's page. Synced here rather than at each
         // `show_prompt`/`show_clock` call site because this is the one funnel every page change
         // already goes through, and a missed site would be a page that snaps instead of fading.
-        self.niri.lock_screen.set_page(
-            self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt,
-            crate::utils::get_monotonic_time(),
-        );
+        self.sync_lock_page();
 
         if effects.unlock {
             // gdm accepted. This is the only call to `deactivate` that can raise a *locked*
@@ -3966,11 +3985,7 @@ impl State {
 
         // The shield's own paths move the page too (`cancel_dialog`, and the `show_clock` a
         // cancelled conversation forces), so the crossfade clock is synced from here as well.
-        self.niri.lock_screen.set_page(
-            self.niri.screen_shield.is_locked()
-                && self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt,
-            crate::utils::get_monotonic_time(),
-        );
+        self.sync_lock_page();
 
         // Last, and unconditionally: the inhibitor is a function of the state we just moved to, and
         // the suspend path *depends* on it being dropped here — logind is waiting on that fd.
@@ -7358,21 +7373,16 @@ impl Niri {
             let epoch = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs() as libc::time_t);
-            // Which page: the clock, or the unlock prompt. Only a *locked* shield has a prompt —
-            // a screensaver has nothing to authenticate, so it stays on the clock however much
-            // the dialog's page says otherwise.
-            let prompt = self.screen_shield.is_locked()
-                && self.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt;
-
             // Mid-crossfade both pages are on screen at once, each with its own alpha, scale and
             // offset — the pair is what reads as one page giving way to the other, so drawing only
             // the winner would be a hard cut with extra steps.
-            let progress = if prompt {
-                self.lock_screen.page_progress(now)
-            } else {
-                // A screensaver has no prompt to fade to at all.
-                0.
-            };
+            //
+            // The progress carries its own direction: `_showClock` eases the *same* adjustment back
+            // to 0 that `_showPrompt` eased to 1, so leaving the prompt is the same animation run
+            // backwards (`:786-810`). Re-deriving "are we on the prompt?" here and forcing 0 when
+            // not made Escape a hard cut — the way back has to animate too. Which page the shield
+            // is allowed to be on is `sync_lock_page`'s business, decided once when it changes.
+            let progress = self.lock_screen.page_progress(now);
             // `_lockDialogGroup.translation_y`: the whole group — backdrop, clock, prompt —
             // slides as one, so this is added to every element below rather than applied to any of
             // them individually.

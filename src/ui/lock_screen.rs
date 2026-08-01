@@ -496,8 +496,20 @@ impl LockScreen {
         };
         if !shown {
             self.fade_since = None;
-            // A raised shield settles the page instantly: the next lock must not open on the tail
-            // of the crossfade the last one was in the middle of.
+        }
+    }
+
+    /// Retire the curtain into its resting state, resetting the page once it is fully gone.
+    ///
+    /// The page reset has to wait for the *end* of the slide. Doing it when the shield stops being
+    /// active — which is where it used to live — flips the curtain back to the clock for the whole
+    /// 250 ms it spends sliding away, so unlocking snaps the prompt out from under itself. GNOME
+    /// never calls `_showClock` on a successful unlock at all: the group slides off still showing
+    /// the prompt you authenticated with. But the reset does have to happen eventually, or the next
+    /// lock opens on the tail of the crossfade this one was in the middle of.
+    fn retire_curtain(&mut self) {
+        self.curtain = self.curtain.settled();
+        if self.curtain == Curtain::Hidden {
             self.showing_prompt = false;
             self.settle_page();
         }
@@ -618,7 +630,7 @@ impl LockScreen {
         if self.is_sliding(now) {
             return;
         }
-        self.curtain = self.curtain.settled();
+        self.retire_curtain();
     }
 
     /// Finish every running animation at once — the slide *and* the crossfade.
@@ -631,7 +643,7 @@ impl LockScreen {
         self.fade_since = None;
         // Not `settle_curtain`: that one is clock-gated, and this must also finish a slide that has
         // only just started.
-        self.curtain = self.curtain.settled();
+        self.retire_curtain();
         self.settle_page();
     }
 
