@@ -213,6 +213,14 @@ use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 
+/// The screen shield's wash over the wallpaper: black at `1 - BLUR_BRIGHTNESS`, which multiplies
+/// what shows through by GNOME's `BLUR_BRIGHTNESS` (`js/ui/unlockDialog.js:34`). Premultiplied,
+/// like every other [`SolidColorBuffer`] color here.
+const SHIELD_DIM_COLOR: [f32; 4] = {
+    let a = 1. - crate::ui::lock_screen::BLUR_BRIGHTNESS as f32;
+    [0., 0., 0., a]
+};
+
 /// Every render target, in `RenderTarget as usize` order — so a `[T; RenderTarget::COUNT]` built
 /// by mapping over this can be indexed by target. A frozen screen (screenshot UI, screen
 /// transition) must be captured once per target, since block-out rules key off the target.
@@ -495,6 +503,9 @@ pub struct Niri {
         Option<async_channel::Sender<crate::dbus::gnome_shell_brightness::NiriToBrightness>>,
     /// The screen shield — GNOME's session lock (`ScreenShield`, `js/ui/screenShield.js`).
     pub screen_shield: crate::screen_shield::ScreenShield,
+    /// What the shield *looks* like: the curtain's clock and hint (`js/ui/unlockDialog.js`). Kept
+    /// beside the model rather than inside it so the model stays renderer-free and testable.
+    pub lock_screen: crate::ui::lock_screen::LockScreen,
     /// What `GetActive` / `GetActiveTime` read, mirrored out of [`Self::screen_shield`] on every
     /// change so the bus task can answer without a round trip through the event loop.
     #[cfg(feature = "dbus")]
@@ -899,6 +910,12 @@ pub struct OutputState {
     pub lock_render_state: LockRenderState,
     pub lock_surface: Option<LockSurface>,
     pub lock_color_buffer: SolidColorBuffer,
+    /// The shield's dim, laid over the wallpaper — `BLUR_BRIGHTNESS` as a black wash.
+    pub shield_dim_buffer: SolidColorBuffer,
+    /// Opaque black under it, for the case where there is no wallpaper to dim: without it the
+    /// wash is translucent black over the desktop, which is the one way the shield could fail
+    /// open.
+    pub shield_backstop_buffer: SolidColorBuffer,
     pub screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
     pub debug_damage_tracker: OutputDamageTracker,
@@ -3609,9 +3626,46 @@ impl State {
         self.apply_shield_effects(effects);
     }
 
+    /// Input arrived while the screen shield is down. Returns whether it was consumed.
+    ///
+    /// GNOME raises the curtain to the *prompt* here (`unlockDialog.js:570-572`'s click gesture and
+    /// `screenShield.js`'s key handler), and the prompt is what actually deactivates. We have no
+    /// prompt yet, so this deactivates directly — which is the honest behaviour while the safety
+    /// rail in [`crate::screen_shield`] holds `locked` at false anyway: there is nothing to
+    /// authenticate against, so a shield that could not be dismissed would simply trap the session.
+    /// Slice 3 replaces the body of the `is_locked` branch, not this call site.
+    pub fn dismiss_screen_shield(&mut self) -> bool {
+        if !self.niri.screen_shield.is_active() {
+            return false;
+        }
+
+        let now = crate::utils::get_monotonic_time();
+        if self.niri.screen_shield.is_locked() {
+            // Not reachable until slice 3 flips `can_authenticate`; when it is, this is where the
+            // prompt gets raised instead of the shield.
+            self.niri.lock_screen.note_activity(now);
+            self.niri.queue_redraw_all();
+            return true;
+        }
+
+        let effects = self.niri.screen_shield.deactivate();
+        self.apply_shield_effects(effects);
+        true
+    }
+
     /// Publish a [`ShieldEffects`](crate::screen_shield::ShieldEffects): the shared snapshot the
     /// bus reads, the signals it emits, logind's locked hint, and the clipboard wipe.
     pub fn apply_shield_effects(&mut self, effects: crate::screen_shield::ShieldEffects) {
+        // The curtain follows `active`, not `locked`: a shield down without a lock is still a
+        // shield, and it is what a `lock-enabled = false` screensaver is.
+        if effects.active_changed.is_some() {
+            let now = self.niri.screen_shield.is_active();
+            self.niri
+                .lock_screen
+                .set_shown(now.then(crate::utils::get_monotonic_time));
+            self.niri.queue_redraw_all();
+        }
+
         if effects.clear_clipboard {
             // Both selections, as `lock` does (`screenShield.js:645-651`): the unlock entry can be
             // unmasked, so a password sitting in the clipboard would be readable by whoever walks
@@ -4618,7 +4672,10 @@ impl Niri {
                     crate::ui::panel::secs_until_next_minute(),
                 )),
                 |_, _, state| {
-                    if state.niri.panel.update_clock() {
+                    // The shield's curtain shows the same clock and is the only thing on screen
+                    // while it is down, so it rides this tick too — explicitly, rather than
+                    // relying on the panel's label happening to change on the same boundary.
+                    if state.niri.panel.update_clock() || state.niri.screen_shield.is_active() {
                         state.niri.queue_redraw_all();
                     }
                     // Refresh the open World Clocks section's live times/offsets on
@@ -4742,6 +4799,7 @@ impl Niri {
             #[cfg(feature = "dbus")]
             brightness_emit: None,
             screen_shield: crate::screen_shield::ScreenShield::new(Default::default()),
+            lock_screen: Default::default(),
             #[cfg(feature = "dbus")]
             shield_snapshot: Default::default(),
             #[cfg(feature = "dbus")]
@@ -5166,6 +5224,8 @@ impl Niri {
             lock_render_state,
             lock_surface: None,
             lock_color_buffer: SolidColorBuffer::new(size, CLEAR_COLOR_LOCKED),
+            shield_dim_buffer: SolidColorBuffer::new(size, SHIELD_DIM_COLOR),
+            shield_backstop_buffer: SolidColorBuffer::new(size, [0., 0., 0., 1.]),
             screen_transition: None,
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
             last_frame_elements: 0,
@@ -5314,6 +5374,8 @@ impl Niri {
             state.backdrop_buffer.resize(output_size);
 
             state.lock_color_buffer.resize(output_size);
+            state.shield_dim_buffer.resize(output_size);
+            state.shield_backstop_buffer.resize(output_size);
             if let Some(lock_surface) = &state.lock_surface {
                 configure_lock_surface(lock_surface, output);
             }
@@ -6843,6 +6905,64 @@ impl Niri {
             return;
         }
 
+        // Next, the screen shield's curtain. Below `ext-session-lock` above — that protocol is a
+        // stronger claim on the screen and there is no sense in drawing both — but above
+        // everything else, because the whole point is that the desktop is not visible.
+        if self.screen_shield.is_active() {
+            let size = output_size(output);
+            let now = crate::utils::get_monotonic_time();
+            // `WallClock` is wall time, not the monotonic clock the fade runs on.
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as libc::time_t);
+            let content = crate::ui::lock_screen::ClockContent::new(
+                epoch,
+                self.gnome_settings.clock,
+                // Touch mode is a seat property we do not track yet; the pointer wording is the
+                // safe default (it is also what a seat with a pointer reports).
+                false,
+            );
+
+            for elem in self.lock_screen.render(
+                ctx.renderer,
+                output_scale.x,
+                Rectangle::from_size(size),
+                &content,
+                now,
+            ) {
+                push(elem.into());
+            }
+
+            // The dim goes *under* the clock and over the wallpaper: `BLUR_BRIGHTNESS` darkens
+            // the picture, not the text drawn on top of it.
+            push(
+                SolidColorRenderElement::from_buffer(
+                    &state.shield_dim_buffer,
+                    (0., 0.),
+                    1.,
+                    Kind::Unspecified,
+                )
+                .into(),
+            );
+
+            if let Some(elem) = self.wallpaper.render(ctx.renderer, size, 0., output_scale) {
+                push(elem.into());
+            }
+            // With no wallpaper the dim alone is translucent black over nothing, which is the one
+            // way this branch could leave the desktop showing. The backstop closes it.
+            push(
+                SolidColorRenderElement::from_buffer(
+                    &state.shield_backstop_buffer,
+                    (0., 0.),
+                    1.,
+                    Kind::Unspecified,
+                )
+                .into(),
+            );
+
+            return;
+        }
+
         // Prepare the background elements.
         let backdrop = SolidColorRenderElement::from_buffer(
             &state.backdrop_buffer,
@@ -7575,6 +7695,11 @@ impl Niri {
             // the results appear stuck at a partial alpha until the mouse moves.
             state.unfinished_animations_remain |= self.overview_search_fade.is_some();
             state.unfinished_animations_remain |= state.screen_transition.is_some();
+            // The shield's hint fades in four seconds after the last input, and there is by
+            // definition no input coming — nothing else would ask for those frames.
+            state.unfinished_animations_remain |= self
+                .lock_screen
+                .is_animating(crate::utils::get_monotonic_time());
 
             // Also keep redrawing if the current cursor is animated.
             state.unfinished_animations_remain |= self
@@ -11122,6 +11247,9 @@ niri_render_elements! {
         Panel = PanelElement,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<VulkanRenderer>>,
+        // The wallpaper drawn straight onto an output rather than into a workspace — the lock
+        // screen's curtain, which has no workspace geometry to be relocated into.
+        RoundedTexture = RoundedTextureRenderElement<crate::render_helpers::vulkan::VkTexture>,
         // The raised background under a dragged folder's composed icon.
         RoundedSolid = crate::render_helpers::rounded_solid::RoundedSolidRenderElement,
         // A group of elements composited at one alpha — the overview's search cross-fade.

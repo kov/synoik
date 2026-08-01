@@ -9,6 +9,7 @@ pub mod exit_confirm_dialog;
 pub mod folder_dialog;
 pub mod hotkey_overlay;
 pub mod input_source_menu;
+pub mod lock_screen;
 pub mod media_card;
 pub mod notification_banner;
 pub mod notification_card;

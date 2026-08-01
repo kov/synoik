@@ -1533,7 +1533,7 @@ pub fn secs_until_next_minute() -> u64 {
 /// The `strftime` format string for a clock label, assembled the way
 /// gnome-shell's `GnomeDesktop.WallClock` does from the interface keys: an
 /// optional weekday and date prefix, then the 12h/24h time with optional seconds.
-fn strftime_format(fmt: ClockFormat) -> &'static str {
+pub(crate) fn strftime_format(fmt: ClockFormat) -> &'static str {
     match (
         fmt.show_weekday,
         fmt.show_date,
@@ -1564,6 +1564,15 @@ fn strftime_format(fmt: ClockFormat) -> &'static str {
 /// Format epoch seconds as a local clock label per `fmt`, via locale-aware
 /// `strftime` (like GNOME's WallClock).
 fn format_clock(now: libc::time_t, fmt: ClockFormat) -> String {
+    strftime_local(now, strftime_format(fmt))
+}
+
+/// Format epoch seconds through the C library's locale-aware `strftime`.
+///
+/// Shared with the lock screen, whose date line is a `strftime` string GNOME passes through
+/// `Shell.util_translate_time_string` (`unlockDialog.js:411-415`) — same mechanism, different
+/// format, so the unsafe block lives in one place.
+pub(crate) fn strftime_local(now: libc::time_t, format: &str) -> String {
     // SAFETY: localtime returns a pointer into a static buffer; we pass it
     // straight to strftime before any other libc time call touches it.
     unsafe {
@@ -1571,7 +1580,7 @@ fn format_clock(now: libc::time_t, fmt: ClockFormat) -> String {
         if tm.is_null() {
             return String::new();
         }
-        let Ok(format) = std::ffi::CString::new(strftime_format(fmt)) else {
+        let Ok(format) = std::ffi::CString::new(format) else {
             return String::new();
         };
         let mut buf = [0u8; 128];

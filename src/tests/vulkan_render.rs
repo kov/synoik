@@ -11637,3 +11637,60 @@ fn count_green(pixels: &[u8], w: i32, h: i32) -> usize {
     }
     n
 }
+
+/// The screen shield's curtain covers the desktop, and draws its clock over it.
+///
+/// The safety property first: with the shield down, **no** window pixel may survive. A curtain
+/// that merely draws on top of a still-composited desktop is one alpha bug away from being
+/// transparent, and the failure is silent — every state assertion still passes.
+///
+/// Then the curtain itself: the clock is white text centred on the output, so a band across the
+/// vertical middle must hold bright pixels that the dimmed background does not.
+#[test]
+fn vulkan_draws_the_screen_shield_over_the_desktop() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    // Establish the oracle: the window really is on screen before the shield goes down. Without
+    // this the "no green" assertion below passes for a fixture that never had a window.
+    let (before, w, h) = render_output_vulkan(&mut f, &output);
+    assert_window_and_background(&before, w, h);
+
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(true));
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+    let green = (0..w * h)
+        .filter(|i| is_green(px(&pixels, w, i % w, i / w)))
+        .count();
+    assert_eq!(green, 0, "the desktop shows through the shield");
+
+    // Every pixel is opaque: the curtain is a cover, not a tint.
+    let transparent = (0..w * h)
+        .filter(|i| px(&pixels, w, i % w, i / w)[3] < 255)
+        .count();
+    assert_eq!(transparent, 0, "the shield left transparent pixels");
+
+    // The clock: bright, near-white pixels in the middle band, and none in the top eighth (which
+    // is background only). Both halves matter — the first says the text drew, the second says it
+    // is the text and not a washed-out frame.
+    let is_bright = |p: [u8; 4]| p[0] > 200 && p[1] > 200 && p[2] > 200;
+    let bright_in = |y0: i32, y1: i32| {
+        (y0..y1)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|(x, y)| is_bright(px(&pixels, w, *x, *y)))
+            .count()
+    };
+    let middle = bright_in(h * 3 / 8, h * 5 / 8);
+    let top = bright_in(0, h / 8);
+    assert!(middle > 0, "the lock screen clock did not draw");
+    assert!(
+        top == 0,
+        "{top} bright px in the top eighth — the curtain is not just its clock"
+    );
+}

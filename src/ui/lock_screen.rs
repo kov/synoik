@@ -1,0 +1,403 @@
+//! The lock screen curtain — `UnlockDialog`'s clock page (`js/ui/unlockDialog.js:357-428`).
+//!
+//! This is what the shield shows before you ask to unlock: the wallpaper, dimmed, with a big clock
+//! over it and a hint that fades in once you have been idle a moment. GNOME keeps it in
+//! `unlockDialog.js` rather than `screenShield.js` — it is the `_stack`'s clock page, with the
+//! password prompt as the *other* page — but it is the shield's whole appearance, so it lives on
+//! its own here and the prompt joins it in slice 3 (`docs/fork/lock-screen-port.md`).
+//!
+//! Child order comes from the JS, not the SCSS (`:381-383`): `_time`, `_date`, `_hint`, each
+//! `x_align: CENTER`, the hint starting at `opacity: 0`.
+//!
+//! Style, from `.unlock-dialog-clock` (`_login-lock.scss:238-259`): a vertical box with `2em`
+//! spacing in `$system_fg_color`, holding
+//!
+//! - `.unlock-dialog-clock-time` — `%numeric` at **72pt**, weight 800.
+//! - `.unlock-dialog-clock-date` — `%title_1` (20pt) but overridden back to weight **400**.
+//! - `.unlock-dialog-clock-hint` — bold, `margin-top: 2em`, padding `$base_padding
+//!   $base_padding*3`, radius `$base_border_radius*2`.
+//!
+//! Our rasterizer tops out at bold (700) where GNOME's `%title_1` asks for 800 — the standing
+//! divergence recorded in `gnome-style-reference.md`, not a local decision.
+
+use std::cell::RefCell;
+use std::time::Duration;
+
+use smithay::backend::renderer::element::Kind;
+use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+
+use crate::animation::Curve;
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::ui::widget::{self, style, HAlign, Painter, Rgba, ShapedText, TextShaper, TextStyle};
+
+/// `.unlock-dialog-clock-time` — `@include fontsize(72pt)`.
+const TIME_PT: f64 = 72.;
+/// `.unlock-dialog-clock-date` — `%title_1`, whose 20pt survives the weight override.
+const DATE_PT: f64 = 20.;
+/// The hint inherits the shell's body size; only its weight and chrome are set.
+const HINT_PT: f64 = 11.;
+
+/// `.unlock-dialog-clock`'s `spacing: 2em`. The box sets no font size of its own, so `em` here is
+/// the shell's base font.
+const SPACING_EM: f64 = 2.;
+
+/// `$system_fg_color` — `$_base_color_light`, i.e. white.
+const FG: Rgba = [1., 1., 1., 1.];
+/// The hint's pill, translucent white over the wallpaper.
+const HINT_BG: Rgba = [1., 1., 1., 0.12];
+
+/// `$base_padding` / `$base_padding * 3` (`_common.scss`).
+const HINT_PAD_V: f64 = 6.;
+const HINT_PAD_H: f64 = 18.;
+/// `$base_border_radius * 2`.
+const HINT_RADIUS: f64 = 16.;
+
+/// `HINT_TIMEOUT = 4` seconds (`unlockDialog.js:28`).
+pub const HINT_IDLE: Duration = Duration::from_secs(4);
+/// `CROSSFADE_TIME` (`:30`). The `ease` names no mode, so it runs at Clutter's actor default,
+/// `EASE_OUT_CUBIC` (`:396-401`).
+pub const HINT_FADE: Duration = Duration::from_millis(300);
+
+/// `BLUR_BRIGHTNESS` (`:34`) — the wallpaper behind the curtain is multiplied by this.
+///
+/// The companion `BLUR_RADIUS = 90` is **not** implemented: there is no gaussian pass on this path
+/// yet, and the brightness is what makes white 72pt text legible over an arbitrary picture. The
+/// blur is cosmetic; leaving it out is visible but not a functional gap.
+pub const BLUR_BRIGHTNESS: f64 = 0.65;
+
+/// What the curtain shows. Plain strings, so the caller owns formatting and this is testable
+/// without a wall clock.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClockContent {
+    /// `WallClock` with `time_only`, trimmed (`_updateClock`, `:409`).
+    pub time: String,
+    /// `%A %B %-d` — "Friday August 1" (`:411-415`).
+    pub date: String,
+    /// "Click or press a key to unlock", or the touch wording (`_updateHint`, `:420-425`).
+    pub hint: String,
+}
+
+impl ClockContent {
+    /// Build the curtain's text for `epoch` (local time).
+    ///
+    /// The time comes from the same interface keys the panel clock uses, with the date and weekday
+    /// forced off: GNOME's clock here is a `WallClock` constructed `{time_only: true}` (`:384`),
+    /// which is exactly that. `clock-show-seconds` is *not* forced off — a user who asked for
+    /// seconds gets them on the lock screen too, as in GNOME.
+    pub fn new(epoch: libc::time_t, clock: crate::gnome::ClockFormat, touch_mode: bool) -> Self {
+        let time_only = crate::gnome::ClockFormat {
+            show_weekday: false,
+            show_date: false,
+            ..clock
+        };
+        Self {
+            time: super::panel::strftime_local(epoch, super::panel::strftime_format(time_only)),
+            // `Shell.util_translate_time_string(N_('%A %B %-d'))` (`:411-415`).
+            date: super::panel::strftime_local(epoch, "%A %B %-d"),
+            hint: if touch_mode {
+                "Swipe up to unlock".to_owned()
+            } else {
+                "Click or press a key to unlock".to_owned()
+            },
+        }
+    }
+}
+
+/// Where each line of the curtain lands, relative to the clock block's own top-left.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClockLayout {
+    pub time: Rectangle<f64, Logical>,
+    pub date: Rectangle<f64, Logical>,
+    pub hint: Rectangle<f64, Logical>,
+    /// The pill behind the hint, wider than its text by `$base_padding * 3` a side.
+    pub hint_pill: Rectangle<f64, Logical>,
+}
+
+/// The block's height, which depends only on font sizes — so the bake can be sized before
+/// anything is shaped.
+pub fn block_height(base_px: f64) -> f64 {
+    let spacing = SPACING_EM * base_px;
+    // The hint carries `margin-top: 2em` *on top of* the box's own `spacing: 2em`
+    // (`_login-lock.scss:240,254`), so it sits twice as far below the date as the date does below
+    // the time. Folding the two into one gap is the easy misreading and it reads as a cramped hint.
+    crate::ui::pt_to_px(TIME_PT)
+        + spacing
+        + crate::ui::pt_to_px(DATE_PT)
+        + spacing * 2.
+        + crate::ui::pt_to_px(HINT_PT)
+        + HINT_PAD_V * 2.
+}
+
+/// Lay the three lines out inside a block of `width`, centred horizontally. `hint_w` is the shaped
+/// width of the hint text, which only the pill needs.
+pub fn layout(width: f64, hint_w: f64, base_px: f64) -> ClockLayout {
+    let time_h = crate::ui::pt_to_px(TIME_PT);
+    let date_h = crate::ui::pt_to_px(DATE_PT);
+    let hint_h = crate::ui::pt_to_px(HINT_PT);
+    let spacing = SPACING_EM * base_px;
+    let cx = width / 2.;
+
+    let line =
+        |y: f64, h: f64, w: f64| Rectangle::new(Point::from((cx - w / 2., y)), Size::from((w, h)));
+
+    let time = line(0., time_h, width);
+    let date = line(time_h + spacing, date_h, width);
+    let pill_y = date.loc.y + date_h + spacing * 2.;
+    ClockLayout {
+        time,
+        date,
+        hint: line(pill_y + HINT_PAD_V, hint_h, hint_w),
+        hint_pill: line(pill_y, hint_h + HINT_PAD_V * 2., hint_w + HINT_PAD_H * 2.),
+    }
+}
+
+/// The curtain's on-screen state: when it went down, and its bake.
+#[derive(Default)]
+pub struct LockScreen {
+    /// Monotonic instant the shield went down, or of the last input while it was down — the hint's
+    /// fade hangs off an **idle** watch on the core idle monitor (`:395`), not off activation.
+    idle_since: Option<Duration>,
+    cache: RefCell<widget::BakeCache>,
+}
+
+impl LockScreen {
+    /// The shield went down (or came back up, with `None`).
+    pub fn set_shown(&mut self, now: Option<Duration>) {
+        self.idle_since = now;
+    }
+
+    /// Input arrived while the shield is down: the idle watch restarts, so the hint fades back out
+    /// to nothing. (`power-save-mode-changed` slams it to 0 the same way, `:391-393`.)
+    pub fn note_activity(&mut self, now: Duration) {
+        if self.idle_since.is_some() {
+            self.idle_since = Some(now);
+        }
+    }
+
+    /// 0 until [`HINT_IDLE`] of idle, then eased to 1 over [`HINT_FADE`].
+    pub fn hint_alpha(&self, now: Duration) -> f64 {
+        let Some(since) = self.idle_since else {
+            return 0.;
+        };
+        let Some(fading) = now.saturating_sub(since).checked_sub(HINT_IDLE) else {
+            return 0.;
+        };
+        let t = (fading.as_secs_f64() / HINT_FADE.as_secs_f64()).clamp(0., 1.);
+        Curve::EaseOutCubic.y(t)
+    }
+
+    /// Whether the curtain still needs frames — the fade is time-driven, so nothing else would ask
+    /// for one and the hint would appear only when some unrelated damage happened to land.
+    pub fn is_animating(&self, now: Duration) -> bool {
+        let Some(since) = self.idle_since else {
+            return false;
+        };
+        now.saturating_sub(since) < HINT_IDLE + HINT_FADE
+    }
+
+    /// The clock block, front-to-back like every other UI `render`. The caller draws the dimmed
+    /// wallpaper behind it.
+    pub fn render(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+        monitor: Rectangle<f64, Logical>,
+        content: &ClockContent,
+        now: Duration,
+    ) -> Vec<TextureRenderElement<VkTexture>> {
+        let base_px = crate::ui::pt_to_px(crate::ui::base_font_pt());
+        let size = Size::from((monitor.size.w, block_height(base_px)));
+        let hint_alpha = self.hint_alpha(now);
+
+        // Bucketed so a 300 ms fade re-bakes ~16 times rather than once a frame. The alpha is
+        // *inside* the bake because the hint has a pill behind it; an element-level alpha would
+        // fade the clock along with it.
+        let hint_bucket = (hint_alpha * 16.).round() as i64;
+        let revision = widget::Revision::new()
+            .of(&content.time)
+            .of(&content.date)
+            .of(&content.hint)
+            .of(hint_bucket)
+            .px(size.w)
+            .done();
+
+        let content = content.clone();
+        let baked = widget::bake(
+            renderer,
+            &mut self.cache.borrow_mut(),
+            scale,
+            size,
+            revision,
+            |renderer| {
+                let mut shaper = TextShaper::new(renderer, scale);
+                Ok((
+                    // `%numeric` is `font-feature-settings: "tnum"`, and it is not decoration: a
+                    // proportional `1` is narrower than a `0`, so a centred clock would shuffle
+                    // sideways every minute.
+                    shaper.shape(&content.time, TextStyle::new(TIME_PT).bold())?,
+                    shaper.shape(&content.date, TextStyle::new(DATE_PT))?,
+                    shaper.shape(&content.hint, TextStyle::new(HINT_PT).bold())?,
+                ))
+            },
+            |frame, phys, shaped: &(ShapedText, ShapedText, ShapedText)| {
+                let (time, date, hint) = shaped;
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+
+                let (_, _, hint_iw, _) = hint.ink_bounds();
+                let l = layout(size.w, hint_iw as f64 / scale, base_px);
+                let fade = |c: Rgba| [c[0], c[1], c[2], c[3] * hint_alpha as f32];
+
+                let cx = size.w / 2.;
+                p.text_band(
+                    time,
+                    cx,
+                    HAlign::Center,
+                    l.time.loc.y,
+                    l.time.size.h,
+                    FG,
+                    l.time,
+                )?;
+                p.text_band(
+                    date,
+                    cx,
+                    HAlign::Center,
+                    l.date.loc.y,
+                    l.date.size.h,
+                    FG,
+                    l.date,
+                )?;
+
+                if hint_alpha > 0. {
+                    p.fill_rounded(l.hint_pill, HINT_RADIUS, fade(HINT_BG))?;
+                    p.text_band(
+                        hint,
+                        cx,
+                        HAlign::Center,
+                        l.hint.loc.y,
+                        l.hint.size.h,
+                        fade(FG),
+                        l.hint_pill,
+                    )?;
+                }
+                Ok(())
+            },
+        );
+
+        let texture = match baked {
+            Ok(texture) => texture,
+            Err(err) => {
+                // The caller still dims and covers the screen — a failed clock must not leave the
+                // desktop plainly readable behind a shield that is nominally down.
+                tracing::error!("error drawing the lock screen clock: {err:#}");
+                return Vec::new();
+            }
+        };
+
+        // `UnlockDialogLayout` centres the stack on the monitor (`:433-489`).
+        let loc = Point::from((
+            monitor.loc.x,
+            monitor.loc.y + (monitor.size.h - size.h) / 2.,
+        ))
+        .to_physical_precise_round(scale)
+        .to_logical(scale);
+
+        let buffer =
+            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
+        vec![TextureRenderElement::from_texture_buffer(
+            buffer,
+            loc,
+            1.,
+            None,
+            None,
+            Kind::Unspecified,
+        )]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const T0: Duration = Duration::from_secs(1_000);
+
+    /// The three lines stack in the JS's order, centred, without overlapping.
+    #[test]
+    fn the_clock_stacks_time_then_date_then_hint_centred() {
+        let l = layout(1920., 300., 16.);
+
+        assert!(l.time.loc.y < l.date.loc.y, "time above date");
+        assert!(
+            l.date.loc.y + l.date.size.h <= l.hint_pill.loc.y,
+            "date must not overlap the hint pill"
+        );
+
+        for r in [l.time, l.date, l.hint, l.hint_pill] {
+            assert_eq!(r.loc.x + r.size.w / 2., 960., "every line is centred");
+        }
+    }
+
+    /// The hint sits *twice* as far below the date as the date does below the time.
+    ///
+    /// `.unlock-dialog-clock-hint` adds `margin-top: 2em` on top of the box's own `spacing: 2em`
+    /// (`_login-lock.scss:240,254`). Folding those into one gap is the easy misreading, and it
+    /// reads on screen as a hint crowding the date.
+    #[test]
+    fn the_hint_carries_its_own_margin_on_top_of_the_box_spacing() {
+        let base = 16.;
+        let l = layout(1920., 300., base);
+
+        let time_to_date = l.date.loc.y - (l.time.loc.y + l.time.size.h);
+        let date_to_hint = l.hint_pill.loc.y - (l.date.loc.y + l.date.size.h);
+
+        assert_eq!(time_to_date, SPACING_EM * base);
+        assert_eq!(date_to_hint, SPACING_EM * base * 2.);
+    }
+
+    /// The pill pads its text on all four sides, and the block is exactly tall enough for it.
+    #[test]
+    fn the_hint_pill_pads_its_text_and_fits_the_block() {
+        let l = layout(1920., 300., 16.);
+        assert_eq!(l.hint_pill.size.w, 300. + HINT_PAD_H * 2.);
+        assert_eq!(l.hint_pill.size.h, l.hint.size.h + HINT_PAD_V * 2.);
+        assert_eq!(l.hint.loc.y - l.hint_pill.loc.y, HINT_PAD_V);
+
+        // `block_height` is what sizes the bake, so a mismatch would clip the pill away.
+        assert_eq!(l.hint_pill.loc.y + l.hint_pill.size.h, block_height(16.));
+    }
+
+    /// The hint is invisible until four seconds of idle, then fades in over 300 ms.
+    ///
+    /// The watch is on the **idle** monitor (`:395`), not on a timer started at activation — so
+    /// input while the shield is down puts the hint back to nothing rather than leaving it up.
+    #[test]
+    fn the_hint_waits_for_idle_and_restarts_on_input() {
+        let mut shield = LockScreen::default();
+        assert_eq!(shield.hint_alpha(T0), 0., "nothing while the shield is up");
+
+        shield.set_shown(Some(T0));
+        assert_eq!(shield.hint_alpha(T0 + Duration::from_secs(3)), 0.);
+        assert_eq!(
+            shield.hint_alpha(T0 + HINT_IDLE),
+            0.,
+            "the fade starts at the timeout, it has not run yet"
+        );
+        assert!(shield.hint_alpha(T0 + HINT_IDLE + Duration::from_millis(150)) > 0.);
+        assert_eq!(shield.hint_alpha(T0 + HINT_IDLE + HINT_FADE), 1.);
+        assert!(!shield.is_animating(T0 + HINT_IDLE + HINT_FADE));
+
+        // Input restarts the watch.
+        let t = T0 + Duration::from_secs(10);
+        shield.note_activity(t);
+        assert_eq!(shield.hint_alpha(t), 0., "back to nothing");
+        assert!(shield.is_animating(t));
+        assert_eq!(shield.hint_alpha(t + HINT_IDLE + HINT_FADE), 1.);
+
+        // And raising the shield stops it entirely — `note_activity` must not resurrect it.
+        shield.set_shown(None);
+        shield.note_activity(t + Duration::from_secs(60));
+        assert_eq!(shield.hint_alpha(t + Duration::from_secs(120)), 0.);
+        assert!(!shield.is_animating(t + Duration::from_secs(120)));
+    }
+}

@@ -524,6 +524,12 @@ impl State {
             }
         }
 
+        // A key press while the shield is down raises it, and goes no further: the desktop behind
+        // the curtain must not see the keystroke that dismissed it.
+        if pressed && self.dismiss_screen_shield() {
+            return;
+        }
+
         let is_inhibiting_shortcuts = self.is_inhibiting_shortcuts();
 
         // Accessibility modifier grabs should override XKB state changes (e.g. Caps Lock), so we
@@ -5768,6 +5774,16 @@ impl State {
         let button_state = event.state();
 
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
+
+        // A click while the shield is down raises it. Both edges are swallowed, not just the
+        // press: leaking the release alone would give whatever is underneath a button-up it never
+        // saw pressed.
+        if self.niri.screen_shield.is_active() {
+            if button_state == ButtonState::Pressed {
+                self.dismiss_screen_shield();
+            }
+            return;
+        }
 
         // End any quick-settings volume-slider drag on button release (the press that
         // started it is suppressed below, so handle it before that early return).

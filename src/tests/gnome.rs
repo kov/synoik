@@ -7151,6 +7151,82 @@ fn lockdown_makes_the_screen_saver_lock_a_no_op() {
     assert!(f.niri().screen_shield.is_active());
 }
 
+/// Input while the shield is down raises it, and goes no further.
+///
+/// GNOME's curtain swallows the interaction that dismisses it — the click gesture and the key
+/// handler raise the prompt rather than forwarding anything (`unlockDialog.js:570-572`). Letting
+/// it through would run the desktop's binds from behind the lock screen, so the discriminating
+/// assertion is not "the shield went up" (which a bare `deactivate` would also satisfy) but "and
+/// the Super tap did not open the overview".
+#[test]
+fn input_raises_the_shield_instead_of_reaching_the_desktop() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(true));
+    assert!(f.niri().screen_shield.is_active());
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    assert!(
+        !f.niri().screen_shield.is_active(),
+        "a key press raises the shield"
+    );
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "and the key that raised it must not also have reached the desktop's binds"
+    );
+    assert!(
+        !f.niri().shield_snapshot.lock().unwrap().active,
+        "GetActive follows the dismissal too"
+    );
+
+    // A second tap now behaves normally — the shield is not swallowing input forever.
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "with the shield up, Super works again"
+    );
+}
+
+/// A click raises the shield too, and **both** button edges are swallowed.
+///
+/// Forwarding the release alone would hand whatever is under the pointer a button-up it never saw
+/// pressed — which is how a dismissing click ends up activating a panel button behind the curtain.
+#[test]
+fn a_click_raises_the_shield_and_neither_edge_reaches_the_desktop() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Park the pointer over the panel's Activities corner, whose click opens the overview — the
+    // observable thing a leaked edge would trigger.
+    pointer_motion_to(&mut f, 10., 10.);
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(true));
+
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+
+    assert!(
+        !f.niri().screen_shield.is_active(),
+        "a click raises the shield"
+    );
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "and neither the press nor the release reached the panel behind it"
+    );
+}
+
 /// A dash click does three different things depending on the app's state, and only one of them
 /// is a launch — `AppIcon.activate` (`appDisplay.js:3056-3071`) over `shell_app_activate_full`
 /// (`shell-app.c:497-535`).
