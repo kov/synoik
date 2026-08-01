@@ -10,6 +10,11 @@ pub const QUAD_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quad.vert
 pub const SOLID_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/solid.frag.spv"));
 /// SDF rounded-rectangle fragment stage (niri's corner shader).
 pub const SDF_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sdf_rect.frag.spv"));
+/// SDF isoceles-triangle fragment stage (GNOME's `SwitcherPopup.drawArrow` — the app switcher's
+/// multi-window chevron and the switcher's scroll arrows). Reads the apex side at the shared push
+/// block's `cutoff` offset.
+pub const SDF_TRIANGLE_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/sdf_triangle.frag.spv"));
 /// Textured fragment stage (sample a bound `sampler2D`, tinted by the push-constant color).
 pub const TEX_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/texture.frag.spv"));
 /// Rounded-texture fragment stage (sample a `sampler2D`, then cut the corners with the SDF

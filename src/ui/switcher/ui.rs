@@ -22,8 +22,8 @@ use crate::render_helpers::RenderCtx;
 use crate::ui::switcher::app_switcher::{self, AppItem};
 use crate::ui::switcher::{
     window_switcher, PanelLayout, SwitcherKey, SwitcherKind, SwitcherOutcome, SwitcherPopup,
-    Visibility, ITEM_PADDING, ITEM_RADIUS, ITEM_SELECTED, LIST_BG, LIST_BORDER, LIST_BORDER_COLOR,
-    LIST_FG, LIST_RADIUS,
+    Visibility, ARROW, ARROW_HIGHLIGHTED, ITEM_PADDING, ITEM_RADIUS, ITEM_SELECTED, LIST_BG,
+    LIST_BORDER, LIST_BORDER_COLOR, LIST_FG, LIST_RADIUS,
 };
 use crate::ui::widget::{
     self, style, AppIconUploads, BakeCache, Painter, ShapedText, TextShaper, TextStyle,
@@ -179,6 +179,13 @@ impl SwitcherUi {
     /// The `.switcher-list` panel's box, for tests that need to look at the pixels it covers.
     pub fn panel_rect(&self) -> Option<Rectangle<f64, Logical>> {
         Some(self.open.as_ref()?.layout.panel)
+    }
+
+    /// Where item `i` sits, in the same layout the renderer drew from. The per-item counterpart of
+    /// [`panel_rect`](Self::panel_rect), and for the same reason: a pixel test that guessed at an
+    /// item's position would be testing its own arithmetic.
+    pub fn item_rect(&self, i: usize) -> Option<Rectangle<f64, Logical>> {
+        self.open.as_ref()?.layout.items.get(i).copied()
     }
 
     /// The output the popup is on, so the compositor knows what to redraw.
@@ -536,13 +543,21 @@ impl SwitcherUi {
                     }
                 }
 
-                // MISSING: the multi-window chevron (`.switcher-arrow`). Its geometry and
-                // visibility are modelled and tested (`app_switcher::arrow_rect`,
-                // `AppItem::has_arrow`), but GNOME draws it with cairo line segments
-                // (`switcherPopup.js:661-690`) and our Painter has no triangle verb — only
-                // rounded rects, text and hairlines. Faking it from two hairlines is exactly the
-                // "no faked chrome" smell, so the honest fix is a real polygon primitive in the
-                // Painter, which is its own change rather than a rider on this one.
+                // The multi-window chevron, under each app that has more than one window. It
+                // brightens with its item rather than appearing: an app with several windows shows
+                // a dim arrow at rest and a full-strength one when selected (`highlight`,
+                // `altTab.js:857-873`). A single-window app has none at all — its `art.arrow` is
+                // false — which is what makes the arrow mean "there is a sub-list here".
+                for (i, rect) in items.iter().enumerate() {
+                    if open.art.get(i).is_some_and(|a| a.arrow) {
+                        let color = if i == open.state.selected() {
+                            ARROW_HIGHLIGHTED
+                        } else {
+                            ARROW
+                        };
+                        p.triangle(app_switcher::arrow_rect(*rect), widget::Side::Bottom, color)?;
+                    }
+                }
                 Ok(())
             },
         );

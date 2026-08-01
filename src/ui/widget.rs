@@ -1607,6 +1607,17 @@ impl CardButton {
 /// A scale-correct drawing surface over a bound [`VulkanFrame`]. Every verb takes
 /// **logical** coordinates/sizes (and points, for text); the single `× scale`
 /// conversion lives here. Construct one inside a [`bake`] `paint` closure.
+/// An edge of a box — `St.Side` (`st-types.h`), in its order, so a port reads like the JS it came
+/// from. Today only [`Painter::triangle`] takes one, naming the edge an arrow's apex points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Side {
+    Top = 0,
+    Right = 1,
+    Bottom = 2,
+    Left = 3,
+}
+
 pub struct Painter<'a, 'frame, 'buffer> {
     frame: &'a mut VulkanFrame<'frame, 'buffer>,
     scale: f64,
@@ -1691,6 +1702,26 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         let w = (width * self.scale) as f32;
         self.frame
             .stroke_rounded_rect(color, r, w, self.rect_px(rect), &[self.full])?;
+        Ok(())
+    }
+
+    /// Fill the isoceles triangle inscribed in `rect` (logical) with `color`: its base spans one
+    /// edge, its apex the midpoint of the opposite one, `side` naming the edge it points at.
+    ///
+    /// GNOME's `SwitcherPopup.drawArrow` (`js/ui/switcherPopup.js:661-704`) — the app switcher's
+    /// multi-window chevron and the switcher list's scroll arrows. That function strokes the path
+    /// in `border-color` and then fills it in `color`; `.switcher-arrow`
+    /// (`_switcher-popup.scss:62-70`) sets both to the same value in both states, so one fill is
+    /// exact. If a caller ever needs the two to differ, this grows a stroke arm rather than the
+    /// caller painting a second triangle on top.
+    pub fn triangle(
+        &mut self,
+        rect: Rectangle<f64, Logical>,
+        side: Side,
+        color: Rgba,
+    ) -> anyhow::Result<()> {
+        self.frame
+            .render_triangle(color, side as u8, self.rect_px(rect), &[self.full])?;
         Ok(())
     }
 

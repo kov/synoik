@@ -103,6 +103,17 @@ pub const ITEM_SELECTED: Rgba = [1., 1., 1., 0.2];
 /// pointer's feedback here is the selection itself.
 pub const ITEM_HOVER: Rgba = style::TRANSPARENT;
 
+/// `.switcher-arrow { color: transparentize($osd_fg_color, 0.2) }` (`_switcher-popup.scss:62-64`)
+/// — the multi-window chevron at rest.
+///
+/// `border-color` is set to the same value, and so is the `:highlighted` pair; `drawArrow` strokes
+/// with the border and fills with the color, so the two never differ and one fill is exact.
+pub const ARROW: Rgba = [1., 1., 1., 0.8];
+
+/// `.switcher-arrow:highlighted` — full `$osd_fg_color` (`_switcher-popup.scss:66-69`). A
+/// multi-window app's arrow brightens with its item rather than appearing.
+pub const ARROW_HIGHLIGHTED: Rgba = style::OSD_FG;
+
 /// `.switcher-list` `box-shadow: 0 8px 8px 0 $shadow_color` (`_switcher-popup.scss:18`), with
 /// `$shadow_color` (dark) = `rgba(0,0,0,0.2)` (`_default-colors.scss:36`).
 ///

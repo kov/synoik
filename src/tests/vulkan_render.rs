@@ -21,6 +21,7 @@ use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::fixture::Fixture;
+use super::gnome::map_window_for_app;
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget, NATIVE_FOURCC};
@@ -11037,6 +11038,105 @@ fn vulkan_draws_the_live_window_preview_in_the_switcher() {
         "the switcher must add the window's own green as a preview \
          (before {green_before}, after {green_after})"
     );
+}
+
+/// The multi-window chevron reaches the screen, and only under the app that has two windows.
+///
+/// Both halves are the test. Asserting only that the two-window app's arrow slot brightens would
+/// pass an implementation that drew an arrow under every item, which inverts what the arrow means
+/// ("there is a window sub-list here", `altTab.js:857-873`). The slots are sampled at their
+/// *computed* positions, from the same layout the renderer drew from.
+#[test]
+fn vulkan_draws_the_arrow_only_under_a_multi_window_app() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![
+            AppEntry::fake("org.example.One.desktop", "One"),
+            AppEntry::fake("org.example.Two.desktop", "Two"),
+        ])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    // "One" gets two windows and so owes an arrow; "Two" gets one and must not have one.
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.One");
+    map_window_for_app(&mut f, client, "org.example.One");
+    map_window_for_app(&mut f, client, "org.example.Two");
+    f.niri_complete_animations();
+
+    let output = f.niri_output(1);
+    let (before, w, _) = render_output_vulkan(&mut f, &output);
+
+    const KEY_LEFTMETA: u32 = 125;
+    f.key_press(KEY_LEFTMETA);
+    f.niri_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+
+    let mut clock = f.niri().clock.clone();
+    let now = clock.now_unadjusted();
+    clock.set_unadjusted(now + crate::ui::switcher::POPUP_DELAY * 2);
+    f.niri().advance_animations();
+    assert!(f.niri().switcher.is_visible());
+
+    // Item order is the MRU tab list: "Two" was mapped last, so it leads and "One" follows.
+    let apps = f.niri().switcher.item_count();
+    assert_eq!(apps, Some(2), "two running apps, two items");
+    let one = f.niri().switcher.item_rect(1).expect("the second item");
+    let two = f.niri().switcher.item_rect(0).expect("the first item");
+
+    let scale = output.current_scale().fractional_scale();
+    // The apex: the arrow's own bottom-centre, where its coverage is lowest but nonzero, would be
+    // a fragile sample. Take the middle of the base instead — solidly inside the triangle.
+    let sample = |item| {
+        let a = crate::ui::switcher::app_switcher::arrow_rect(item);
+        (
+            ((a.loc.x + a.size.w / 2.) * scale).round() as i32,
+            ((a.loc.y + a.size.h * 0.25) * scale).round() as i32,
+        )
+    };
+    let (ox, oy) = sample(one);
+    let (tx, ty) = sample(two);
+
+    let (after, _, _) = render_output_vulkan(&mut f, &output);
+
+    // "One"'s slot carries a triangle; "Two"'s must be bare `%osd_panel` plate ([46, 46, 51], as
+    // in `vulkan_draws_the_window_switcher_panel`).
+    //
+    // The second assertion is deliberately *absolute* rather than a brightness comparison between
+    // the two slots. A relative one passed with the arrow drawn under every item: "One" is the
+    // selected app, so its arrow is `:highlighted` white while "Two"'s is the dim 0.8 variant, and
+    // the two differ by more than any sane threshold even when both are wrongly present.
+    let with_arrow = px(&after, w, ox, oy);
+    let without = px(&after, w, tx, ty);
+    assert_ne!(
+        with_arrow,
+        px(&before, w, ox, oy),
+        "the switcher must change the pixel the arrow covers"
+    );
+    assert!(
+        with_arrow[0] > 200,
+        "the multi-window app must have an arrow over its plate, got {with_arrow:?}"
+    );
+    for (i, (got, want)) in without[..3].iter().zip([46u8, 46, 51]).enumerate() {
+        assert!(
+            got.abs_diff(want) <= 6,
+            "the single-window app's slot must be bare plate; channel {i} got {got}, \
+             want ~{want} (full pixel {without:?})"
+        );
+    }
 }
 
 /// Count opaque green pixels — the fixture window's colour.

@@ -543,6 +543,49 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         )
     }
 
+    /// Fill an isoceles triangle inscribed in `dst`: its base spans one edge and its apex is the
+    /// midpoint of the opposite edge, `side` naming the edge the apex points at (`St.Side` order:
+    /// 0 TOP, 1 RIGHT, 2 BOTTOM, 3 LEFT). Analytic 1px antialiasing, like the rounded-rect SDF.
+    ///
+    /// GNOME's `SwitcherPopup.drawArrow` (`js/ui/switcherPopup.js:661-704`) — the app switcher's
+    /// multi-window chevron and the switcher list's scroll arrows. `color` is straight-alpha.
+    pub(crate) fn render_triangle(
+        &mut self,
+        color: [f32; 4],
+        side: u8,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), VulkanError> {
+        let scissors = self.damage_scissors(dst, damage);
+        if scissors.is_empty() {
+            return Ok(());
+        }
+        let push = QuadPush {
+            origin: [dst.loc.x as f32, dst.loc.y as f32],
+            size: [dst.size.w as f32, dst.size.h as f32],
+            proj: self.proj,
+            target: self.target_dims(),
+            color: premultiply(color),
+            // `sdf_triangle.frag` reads the apex side at the shared block's `cutoff` offset.
+            cutoff: [f32::from(side), 0.],
+            ..Default::default()
+        };
+        let dev = &self.renderer.gpu.device;
+        let pipe = &self.renderer.sdf_triangle_pipeline;
+        unsafe {
+            dev.cmd_bind_pipeline(self.cbuf, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
+            dev.cmd_push_constants(
+                self.cbuf,
+                pipe.layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&push),
+            );
+            Self::draw_quad(dev, self.cbuf, &scissors);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_rounded_rect_impl(
         &mut self,

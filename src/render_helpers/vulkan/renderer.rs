@@ -13,8 +13,8 @@ use niri_vk::render::{
 };
 use niri_vk::shaders::{
     BORDER_FRAG, BORDER_VERT, CLIPPED_TEX_FRAG, GRADIENT_FADE_FRAG, POSTPROCESS_FRAG,
-    POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG, SDF_FRAG, SHADOW_FRAG,
-    SHADOW_VERT, SOLID_FRAG, TEXT_FRAG, TEXT_VERT, TEX_FRAG,
+    POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG, SDF_FRAG,
+    SDF_TRIANGLE_FRAG, SHADOW_FRAG, SHADOW_VERT, SOLID_FRAG, TEXT_FRAG, TEXT_VERT, TEX_FRAG,
 };
 use niri_vk::texture::Texture as NiriTexture;
 use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
@@ -75,6 +75,7 @@ pub struct VulkanRenderer {
     pub(super) continuation_render_pass: vk::RenderPass,
     pub(super) solid_pipeline: Pipeline,
     pub(super) sdf_rect_pipeline: Pipeline,
+    pub(super) sdf_triangle_pipeline: Pipeline,
     pub(super) texture_pipeline: Pipeline,
     pub(super) rounded_texture_pipeline: Pipeline,
     pub(super) clipped_texture_pipeline: Pipeline,
@@ -418,6 +419,16 @@ impl VulkanRenderer {
         // rounded-rect primitive (tile/pill/menu backgrounds).
         let sdf_rect_pipeline =
             build_pipeline(&gpu, render_pass, QUAD_VERT, SDF_FRAG, &[], quad_push)?;
+        // Solid triangle: the `sdf_triangle.frag` material, samples nothing and shares `QuadPush`
+        // (uses only origin/size/color/cutoff) — GNOME's `drawArrow` shape.
+        let sdf_triangle_pipeline = build_pipeline(
+            &gpu,
+            render_pass,
+            QUAD_VERT,
+            SDF_TRIANGLE_FRAG,
+            &[],
+            quad_push,
+        )?;
         let texture_pipeline =
             build_pipeline(&gpu, render_pass, QUAD_VERT, TEX_FRAG, sampler, quad_push)?;
         let rounded_texture_pipeline = build_pipeline(
@@ -505,6 +516,7 @@ impl VulkanRenderer {
             continuation_render_pass,
             solid_pipeline,
             sdf_rect_pipeline,
+            sdf_triangle_pipeline,
             texture_pipeline,
             rounded_texture_pipeline,
             clipped_texture_pipeline,
@@ -2451,6 +2463,7 @@ impl Drop for VulkanRenderer {
             self.readback_staging_buffer.destroy(dev);
             self.solid_pipeline.destroy(dev);
             self.sdf_rect_pipeline.destroy(dev);
+            self.sdf_triangle_pipeline.destroy(dev);
             self.texture_pipeline.destroy(dev);
             self.rounded_texture_pipeline.destroy(dev);
             self.clipped_texture_pipeline.destroy(dev);

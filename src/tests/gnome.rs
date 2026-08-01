@@ -13156,7 +13156,7 @@ fn the_quick_settings_audio_controls_reach_the_backend() {
 }
 
 /// Map a window carrying an `app_id`, so it resolves to an app in the switcher.
-fn map_window_for_app(f: &mut Fixture, id: ClientId, app_id: &str) -> WlSurface {
+pub(super) fn map_window_for_app(f: &mut Fixture, id: ClientId, app_id: &str) -> WlSurface {
     let window = f.client(id).create_window();
     let surface = window.surface.clone();
     window.set_app_id(app_id);
