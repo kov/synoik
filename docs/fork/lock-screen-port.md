@@ -116,6 +116,14 @@ window for the same reason (logind's `InhibitDelayMaxSec` bounds how long that c
 A refused channel ends the wait and the shield goes back to being the screensaver it is entitled to
 be.
 
+Which makes *something always answering* load-bearing, because an unanswerable request is a worse
+lockout than the lock it stood in for — covered, unlockable and unraisable. Two ways it would not
+be answered, both closed: nobody to ask (no D-Bus, a gdm client that failed to start, or any
+non-session instance) is answered on the spot; a gdm that takes the request and goes quiet is
+answered by a 10 s watchdog. A dead socket already arrived as `Lost`. All three land on the same
+epoch-tagged `authenticator_ready(_, false)`, so an answer for an abandoned lock cannot refuse a
+later one.
+
 **Sleep is not patient.** `PrepareForSleep(true)` locks immediately, no grace period — a machine
 about to suspend must not suspend unlocked. This only works because of the `delay` sleep inhibitor
 (`_syncInhibitor`, `:202-231`): holding that fd is what makes logind emit the signal and *wait* for

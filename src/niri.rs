@@ -3846,17 +3846,41 @@ impl State {
             self.niri.queue_redraw_all();
         }
 
-        #[cfg(feature = "dbus")]
-        if let Some(tx) = self.niri.gdm_requests.as_ref() {
-            if let Some(epoch) = effects.request_authenticator {
+        // Asking for a verifier makes the shield undismissible until the answer lands
+        // (`is_dismissible`), so *something* must always answer. Two ways it would not:
+        //
+        // - there is nobody to ask (no D-Bus, or the gdm client failed to start). Answered here, at
+        //   once — "no channel" is precisely what the gate exists to catch.
+        // - gdm takes the request and never replies. A dead socket arrives as `Lost`, but a live
+        //   gdm that simply goes quiet has no event at all, so it needs a deadline.
+        //
+        // Without both, a shield that cannot lock also cannot be raised: a lockout, and a worse
+        // one than the lock it was standing in for.
+        if let Some(epoch) = effects.request_authenticator {
+            let mut asked = false;
+            #[cfg(feature = "dbus")]
+            if let Some(tx) = self.niri.gdm_requests.as_ref() {
                 let username = self.niri.unlock_dialog.user().name.clone();
-                let _ =
-                    tx.send_blocking(crate::dbus::gdm::VerifierRequest::Begin { username, epoch });
+                asked = tx
+                    .send_blocking(crate::dbus::gdm::VerifierRequest::Begin { username, epoch })
+                    .is_ok();
             }
-            // A raised shield ends the conversation: leaving a PAM worker and an open channel
-            // behind for a screen nobody is looking at is both a leak and a stale verifier that
-            // could answer a later lock.
-            if effects.cancel_authenticator {
+
+            if asked {
+                self.arm_authenticator_watchdog(epoch);
+            } else {
+                warn!("no way to reach gdm; the shield stays a screensaver");
+                let effects = self.niri.screen_shield.authenticator_ready(epoch, false);
+                self.apply_shield_effects(effects);
+            }
+        }
+
+        // A raised shield ends the conversation: leaving a PAM worker and an open channel behind
+        // for a screen nobody is looking at is both a leak and a stale verifier that could answer
+        // a later lock.
+        #[cfg(feature = "dbus")]
+        if effects.cancel_authenticator {
+            if let Some(tx) = self.niri.gdm_requests.as_ref() {
                 let _ = tx.send_blocking(crate::dbus::gdm::VerifierRequest::Cancel);
             }
         }
@@ -3914,6 +3938,36 @@ impl State {
         // Last, and unconditionally: the inhibitor is a function of the state we just moved to, and
         // the suspend path *depends* on it being dropped here — logind is waiting on that fd.
         self.sync_sleep_inhibitor();
+    }
+
+    /// Bound how long a lock may wait on gdm before giving up and staying a screensaver.
+    ///
+    /// Long enough that a slow PAM stack is not mistaken for a dead one, short enough that a user
+    /// facing a shield that will never lock is not stuck looking at it. Nothing is lost by being
+    /// wrong in the impatient direction: giving up produces a screensaver, which is what a shield
+    /// with no verifier was always entitled to be.
+    const AUTHENTICATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Answer the gate ourselves if gdm has not, within [`Self::AUTHENTICATOR_TIMEOUT`].
+    ///
+    /// Epoch-tagged like every other answer, so a watchdog for an abandoned lock cannot refuse a
+    /// later one; `authenticator_ready` drops it on the floor.
+    fn arm_authenticator_watchdog(&mut self, epoch: u64) {
+        let timer = calloop::timer::Timer::from_duration(Self::AUTHENTICATOR_TIMEOUT);
+        let res = self
+            .niri
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                let effects = state.niri.screen_shield.authenticator_ready(epoch, false);
+                if effects != crate::screen_shield::ShieldEffects::default() {
+                    warn!("gdm never answered; the shield stays a screensaver");
+                }
+                state.apply_shield_effects(effects);
+                calloop::timer::TimeoutAction::Drop
+            });
+        if let Err(err) = res {
+            warn!("error arming the verifier watchdog: {err:?}");
+        }
     }
 
     /// Arm the idle grace period. Any timer already pending is replaced, never stacked.

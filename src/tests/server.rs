@@ -10,6 +10,11 @@ use crate::niri::State;
 pub struct Server {
     pub event_loop: EventLoop<'static, State>,
     pub state: State,
+    /// The receiving half of the shield's gdm request channel, kept alive for the fixture's
+    /// lifetime. See [`Server::new`] — dropping it would close the channel and turn every lock
+    /// into "nobody to ask".
+    #[cfg(feature = "dbus")]
+    _gdm_requests: async_channel::Receiver<crate::dbus::gdm::VerifierRequest>,
 }
 
 impl Server {
@@ -17,7 +22,7 @@ impl Server {
         let event_loop = EventLoop::try_new().unwrap();
         let handle = event_loop.handle();
         let display = Display::new().unwrap();
-        let state = State::new(
+        let mut state = State::new(
             config,
             handle.clone(),
             event_loop.get_signal(),
@@ -28,7 +33,23 @@ impl Server {
         )
         .unwrap();
 
-        Self { event_loop, state }
+        // Stand in for the gdm client the session instance starts. Tests simulate the answers by
+        // driving `State::on_verifier_event`, and without a channel to send `Begin` down the shield
+        // would refuse to lock at all — correctly, since a lock nobody can answer is a lockout, but
+        // it would leave the whole locked-shield corpus untestable.
+        #[cfg(feature = "dbus")]
+        let (to_gdm, from_niri) = async_channel::unbounded();
+        #[cfg(feature = "dbus")]
+        {
+            state.niri.gdm_requests = Some(to_gdm);
+        }
+
+        Self {
+            event_loop,
+            state,
+            #[cfg(feature = "dbus")]
+            _gdm_requests: from_niri,
+        }
     }
 
     pub fn dispatch(&mut self) {

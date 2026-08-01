@@ -7155,6 +7155,30 @@ fn going_idle_arms_the_lock_and_coming_back_disarms_it() {
     );
 }
 
+/// A lock with nobody to ask stays a dismissible screensaver, immediately.
+///
+/// The gate makes the shield undismissible while it waits for gdm, so a request that can never be
+/// answered would be a *worse* lockout than the lock it stood in for: covered, unlockable, and
+/// unraisable. The headless fixture has no gdm client, which is the same shape as a build without
+/// D-Bus or a gdm that failed to start.
+#[test]
+fn a_lock_with_no_verifier_to_ask_stays_a_screensaver() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    // What a build without D-Bus, or a gdm client that failed to start, actually looks like.
+    f.niri_state().niri.gdm_requests = None;
+
+    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    assert!(f.niri().screen_shield.is_active(), "the screen is covered");
+    assert!(!f.niri().screen_shield.is_locked(), "but never locked");
+    assert!(
+        f.niri().screen_shield.is_dismissible(),
+        "and raising it must not wait on an answer nobody will send"
+    );
+}
+
 /// A status we do not recognise is not idleness.
 ///
 /// gnome-session can grow a new `PresenceStatus`, and mapping an unknown one onto idle would blank
