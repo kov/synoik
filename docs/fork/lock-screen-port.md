@@ -1,7 +1,8 @@
 # Session lock and lock screen — porting `ScreenShield`
 
-Status: **slices 1–3 landed 2026-08-01** (the model + the D-Bus surface; the curtain; the unlock
-dialog and gdm authentication). Slices 4–5 unstarted.
+Status: **slices 1–4 landed 2026-08-01** (the model + the D-Bus surface; the curtain; the unlock
+dialog and gdm authentication; idle and suspend). Slice 5 is part-done: the clock↔prompt crossfade
+is in, the blur and the shield's own slide are not.
 Cited against `js/ui/screenShield.js` (675 lines), `js/ui/unlockDialog.js` (972) and
 `js/ui/shellDBus.js:517-566` in the 50.3 checkout.
 
