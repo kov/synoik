@@ -75,10 +75,10 @@ A review then found two bugs in it, both fixed:
   double-tap inside 200 ms jumps to fully opaque before fading out — a flash of a warning that was
   never up. It now eases from the current alpha.
 
-**Still open here:** if the reserved row's blank line is judged too visible, GNOME's growing
-dialog is reachable without a per-frame re-bake — split the message into its own bake (its
-revision inputs are already separable) and animate the *element* offsets, which are free. Needs a
-look at the real thing first.
+**Resolved on the seat (2026-08-01):** the reserved row reads fine, so the divergence stands and
+the growing dialog is not wanted. If that is ever revisited, it is reachable without a per-frame
+re-bake — split the message into its own bake (its revision inputs are already separable) and
+animate the *element* offsets, which are free.
 
 **Toolkit-first, deferred with a reason:** GNOME hangs `CapsLockWarning` off `shellEntry`, so it is
 the password *entry's* companion rather than the lock screen's. The second password surface to
