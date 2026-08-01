@@ -11184,7 +11184,18 @@ fn app_window_switcher_fixture_n(title: &str, n: usize) -> Option<Fixture> {
         f.roundtrip(id);
 
         let window = f.client(id).window(&surface);
-        window.attach_solid_buffer(GREEN[0], GREEN[1], GREEN[2], GREEN[3]);
+        // A real `wl_shm` texture, not a single-pixel solid buffer: a solid buffer draws through
+        // `Frame::draw_solid`, which does not consult the rounded clip an outer
+        // `ClippedSurfaceRenderElement` armed — so the corners below would read as square for a
+        // reason that has nothing to do with the switcher.
+        window.attach_shm_buffer(
+            i32::from(WIN),
+            i32::from(WIN),
+            GREEN[0] as u8,
+            GREEN[1] as u8,
+            GREEN[2] as u8,
+            GREEN[3] as u8,
+        );
         window.set_size(WIN, WIN);
         window.ack_last_and_commit();
         f.double_roundtrip(id);
@@ -11368,6 +11379,29 @@ fn vulkan_draws_the_app_switchers_window_sublist() {
     assert!(
         clone[1] > 200 && clone[0] < 80 && clone[2] < 80,
         "each window's live preview must draw on the sub-list, got {clone:?}"
+    );
+
+    // `.thumbnail`'s `border-radius` rounds the preview: its very corner is cut away and the
+    // plate shows through, while a pixel a radius in is still the window. Sampled against the
+    // *clone's* box, not the bin's — the window is letterboxed inside it.
+    let is_green = |p: [u8; 4]| p[1] > 200 && p[0] < 80 && p[2] < 80;
+    let clone_rect = crate::render_helpers::window_thumbnail::fit_rect(
+        Size::from((f64::from(WIN), f64::from(WIN))),
+        preview,
+    );
+    eprintln!("PROBE preview={preview:?} clone={clone_rect:?}");
+    let corner = px_at(clone_rect.loc.x + 1., clone_rect.loc.y + 1.);
+    assert!(
+        !is_green(corner),
+        "the preview's corner must be rounded away, got {corner:?}"
+    );
+    let inside = px_at(
+        clone_rect.loc.x + crate::ui::switcher::thumbnails::THUMB_RADIUS + 2.,
+        clone_rect.loc.y + crate::ui::switcher::thumbnails::THUMB_RADIUS + 2.,
+    );
+    assert!(
+        is_green(inside),
+        "...but only the corner: a radius in is still the window, got {inside:?}"
     );
 }
 

@@ -221,12 +221,19 @@ also the verb slice 6's scroll arrows will want. Slices 4–6 and `Above_Tab`'s 
 are untouched.
 
 **Slice 5 (the window sub-list) landed 2026-08-01**, together with the popup's own key routing
-(the arrows, Escape, and the explicit-commit keys, which previously fell through to the window
-underneath). What is *not* ported from `ThumbnailSwitcher`: the 100 ms fade in/out
-(`THUMBNAIL_FADE_TIME`), `APP_ICON_HOVER_TIMEOUT`'s 200 ms delay before a hovered app swaps its
-sub-list, the `w`/`F4` close and `q` quit keys, and rounding the preview corners
-(`.thumbnail`'s `border-radius`, which needs a rounded window-thumbnail draw). Slices 4 and 6, and
-`Above_Tab`'s per-layout resolution, are still untouched.
+(the arrows, Escape, the explicit-commit keys, `w`/`F4` and `q`), the 100 ms fade, and the
+preview corner rounding. The one thing deliberately **not** ported is `APP_ICON_HOVER_TIMEOUT`'s
+200 ms delay before a hovered app swaps its sub-list: it only matters once a sub-list is already
+up, and our hover is already gated on `mouseActive` (off for 500 ms after any keypress), so it
+would be a third timer interacting with two others for a case we have not seen misbehave. Port it
+against a real complaint. Slices 4 and 6, and `Above_Tab`'s per-layout resolution, are untouched.
+
+**Renderer gap found on the way (not switcher-specific):** `Frame::draw_solid` does not consult
+the rounded clip an outer `ClippedSurfaceRenderElement` armed, where `render_texture_from_to`
+does. So a surface backed by a *single-colour* buffer keeps square corners wherever a rounded
+clip applies — invisible for ordinary clients, but it made the sub-list's rounding look broken
+against a test fixture using `attach_solid_buffer`. The fix is a clipped-solid path mirroring
+`render_clipped_texture`.
 
 **Seat validation 2026-08-01 found two Alt-Tab divergences, both fixed.** (a) The app badge was
 pushed *behind* the window preview, so a square window buried half of it — `WindowIcon` adds the

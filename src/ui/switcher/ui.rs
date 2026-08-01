@@ -945,6 +945,9 @@ impl SwitcherUi {
                     window_switcher::preview_box(*item),
                     scale,
                     1.,
+                    // `WindowIcon`'s clone has no rounding of its own — only the sub-list's
+                    // `.thumbnail` does.
+                    0.,
                     &mut |elem| thumbnails.push(elem),
                 );
             }
@@ -961,9 +964,15 @@ impl SwitcherUi {
                 let Some((_, mapped)) = niri.layout.windows().find(|(_, m)| m.id() == *id) else {
                     continue;
                 };
-                window_thumbnail::render(mapped, ctx.r(), *bin, scale, alpha, &mut |elem| {
-                    thumbnails.push(elem)
-                });
+                window_thumbnail::render(
+                    mapped,
+                    ctx.r(),
+                    *bin,
+                    scale,
+                    alpha,
+                    thumbnails::THUMB_RADIUS,
+                    &mut |elem| thumbnails.push(elem),
+                );
             }
         }
 

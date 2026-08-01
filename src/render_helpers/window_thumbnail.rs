@@ -78,12 +78,25 @@ pub fn fit_rect(
 /// Draw `mapped` live, fitted and centered inside `box_rect`.
 ///
 /// `output_scale` is the output's fractional scale; `alpha` fades the whole preview.
+///
+/// `corner_radius` rounds the preview itself, in **final** logical px — the radius you want to see
+/// on screen, not in the window's own space. It is divided by the fit scale on the way in, since
+/// the clip is applied before the rescale; a preview shrunk 5x needs a 5x radius to come out
+/// right. This is the switcher sub-list's `.thumbnail` `border-radius`
+/// (`_switcher-popup.scss:53-56`); pass 0 where the reference rounds nothing, like the window
+/// switcher's own 128px previews.
+///
+/// The window's *own* corner radius still applies — a CSD window keeps its rounded corners in a
+/// preview — so the two are combined by taking the larger. They are the same clip: rounding the
+/// preview more than the window rounds itself is what the sub-list asks for, and rounding it less
+/// would square off corners the window had already curved.
 pub fn render(
     mapped: &Mapped,
     mut ctx: RenderCtx,
     box_rect: Rectangle<f64, Logical>,
     output_scale: f64,
     alpha: f32,
+    corner_radius: f64,
     push: &mut dyn FnMut(WindowThumbnailRenderElement),
 ) {
     let _span = tracy_client::span!("window_thumbnail::render");
@@ -101,10 +114,18 @@ pub fn render(
     // spill out of the preview. A blocked-out window arrives as a solid colour instead and needs
     // the rounded shader explicitly, since its CSD corners were already rounded by the client.
     let geo = Rectangle::from_size(window_size);
-    let radius = if mapped.sizing_mode().is_normal() {
+    let own = if mapped.sizing_mode().is_normal() {
         mapped.geometry_corner_radius()
     } else {
         CornerRadius::default()
+    };
+    // In window space, so the rescale below lands it on `corner_radius`.
+    let wanted = if zoom > 0. { corner_radius / zoom } else { 0. } as f32;
+    let radius = CornerRadius {
+        top_left: own.top_left.max(wanted),
+        top_right: own.top_right.max(wanted),
+        bottom_right: own.bottom_right.max(wanted),
+        bottom_left: own.bottom_left.max(wanted),
     };
 
     let clip = move |elem| match elem {
