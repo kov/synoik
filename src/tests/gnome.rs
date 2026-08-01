@@ -13430,6 +13430,89 @@ fn the_window_sublist_closes_on_up_and_on_moving_to_another_app() {
     f.key_release(KEY_LEFTMETA);
 }
 
+/// `switch-group` opens the app switcher *inside* the current app, on its window sub-list.
+///
+/// It is the same popup and the same item list as `switch-applications` — you can still tab out
+/// to another app — but it starts at (app 0, window 1): app 0 is the app you are in, and window 1
+/// is the one you are not, so a tap-and-release swaps between an app's two windows the way
+/// tap-and-release swaps between two apps (`_initialSelection`, `altTab.js:117-137`).
+///
+/// Driven through the real `Above_Tab` key, which is a **keycode** match: mutter special-cases its
+/// fake keysym to `KEY_GRAVE + 8` before consulting any layout
+/// (`src/core/keybindings.c:385-392`), so the binding is the physical key above Tab whatever it
+/// happens to type.
+#[test]
+fn switch_group_opens_inside_the_current_app_on_its_second_window() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    const KEY_GRAVE: u32 = 41;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![
+            AppEntry::fake("org.example.One.desktop", "One"),
+            AppEntry::fake("org.example.Two.desktop", "Two"),
+        ])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let client = f.add_client();
+    // "One" gets three windows so forward's "second" and backward's "last" are distinguishable.
+    // Each maps focused, so within "One" the MRU order ends up [c, b, a].
+    map_window_for_app(&mut f, client, "org.example.Two");
+    map_window_for_app(&mut f, client, "org.example.One");
+    let a = f.niri().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.One");
+    let b = f.niri().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.One");
+    let c = f.niri().layout.focus().unwrap().id();
+    f.niri_complete_animations();
+
+    // Super + the key above Tab, held.
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_GRAVE);
+
+    assert!(f.niri().switcher.is_open(), "Above_Tab raises the switcher");
+    assert_eq!(
+        f.niri().switcher.selected(),
+        Some(0),
+        "pinned to the app you are already in, not the previous one"
+    );
+    assert!(
+        f.niri().switcher.thumbnails_open(),
+        "with its windows already up — no waiting for the popup timer"
+    );
+    assert_eq!(
+        f.niri().switcher.thumbnail_selected(),
+        Some(1),
+        "starting on the app's *second* window — the one you are not in"
+    );
+
+    // A second press walks that app's windows rather than moving to the next app.
+    tap(&mut f, KEY_GRAVE);
+    assert_eq!(f.niri().switcher.selected(), Some(0), "still the same app");
+    assert_eq!(f.niri().switcher.thumbnail_selected(), Some(2));
+
+    // And releasing commits to the window the sub-list had picked.
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    f.double_roundtrip(client);
+    let focused = f.niri().layout.focus().unwrap().id();
+    assert_eq!(focused, a, "committed to the picked window");
+    assert_ne!(focused, b);
+    assert_ne!(focused, c);
+
+    // Backward starts at the *end* of the app's windows instead (`cachedWindows.length - 1`).
+    f.key_press(KEY_LEFTSHIFT);
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_GRAVE);
+    assert_eq!(f.niri().switcher.selected(), Some(0));
+    assert_eq!(f.niri().switcher.thumbnail_selected(), Some(2));
+    f.key_release(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTSHIFT);
+}
+
 /// The window sub-list fades in rather than appearing — and keeps the compositor drawing while
 /// it does.
 ///

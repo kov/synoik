@@ -1893,7 +1893,42 @@ impl State {
         }
 
         let art = self.niri.switcher_app_art(&items);
-        self.raise_switcher(Items::Apps(items), art, backward);
+        self.raise_switcher(Items::Apps(items), art, backward, false);
+    }
+
+    /// `switch-group` — the app switcher opened *inside* the current app
+    /// (`windowManager.js:1670-1694`, `altTab.js:117-137`).
+    ///
+    /// The same popup and the same item list as `switch-applications`: what differs is where it
+    /// starts (app 0, with its window sub-list already up) and what a repeat press does — it walks
+    /// that app's windows instead of the app row.
+    pub fn switch_group(&mut self, backward: bool) {
+        if self.niri.switcher.is_open() {
+            let now = self.niri.clock.now_unadjusted();
+            let outcome = self
+                .niri
+                .switcher
+                .key_press(SwitcherKey::Group { backward }, now);
+            self.finish_switcher(outcome);
+            self.hide_osd_for_switcher();
+            self.niri.queue_redraw_switcher_output();
+            return;
+        }
+
+        // `switch-group` spans workspaces like the app switcher it is — same popup, same setting.
+        let only_here = self
+            .niri
+            .gnome_settings
+            .switchers
+            .apps_current_workspace_only;
+        let tab_list = self.niri.switcher_tab_list(only_here);
+        let items = app_items(self.niri.app_system.running(), &tab_list);
+        if items.is_empty() {
+            return;
+        }
+
+        let art = self.niri.switcher_app_art(&items);
+        self.raise_switcher(Items::Apps(items), art, backward, true);
     }
 
     /// `switch-windows` — the *window* switcher (`altTab.js:580-640`).
@@ -1917,7 +1952,7 @@ impl State {
         }
 
         let art = self.niri.switcher_window_art(&tab_list);
-        self.raise_switcher(Items::Windows(tab_list), art, backward);
+        self.raise_switcher(Items::Windows(tab_list), art, backward, false);
     }
 
     /// A key the open popup acts on — the arrows, Escape, and the explicit-commit keys.
@@ -1993,6 +2028,7 @@ impl State {
         items: Items,
         art: Vec<crate::ui::switcher::ui::ItemArt>,
         backward: bool,
+        group: bool,
     ) {
         let now = self.niri.clock.now_unadjusted();
         let Some(output) = self.niri.layout.active_output().cloned() else {
@@ -2018,6 +2054,7 @@ impl State {
                 output,
                 monitor,
                 label_height,
+                group,
             },
             now,
         );

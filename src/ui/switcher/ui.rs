@@ -131,6 +131,10 @@ pub struct OpenRequest {
     /// The **primary** monitor's logical rect — GNOME centers on it, not on the focused output.
     pub monitor: Rectangle<f64, Logical>,
     pub label_height: f64,
+    /// `switch-group`: pin the app row to item 0 — the app you are already in — and open its
+    /// window sub-list straight away (`_initialSelection`, `altTab.js:117-137`). The item list is
+    /// still every running app, so you can tab out of the group; only the starting point differs.
+    pub group: bool,
 }
 
 struct Open {
@@ -495,6 +499,7 @@ impl SwitcherUi {
             output,
             monitor,
             label_height,
+            group,
         } = req;
 
         let state = SwitcherPopup::show(items.kind(), items.len(), backward, mask, held, now)?;
@@ -533,6 +538,24 @@ impl SwitcherUi {
         // on a multi-window app is already counting down to its sub-list (`altTab.js:349-356`).
         open.close_thumbs(now, true);
         self.fading = None;
+
+        // ...except for `switch-group`, which starts *inside* app 0's windows: forward on its
+        // second window (the one you are not in), backward on its last (`altTab.js:118-127`).
+        if group {
+            open.state.select(0);
+            let windows = open.selected_windows().len();
+            if windows > 0 {
+                let window = if backward {
+                    windows - 1
+                } else if windows > 1 {
+                    1
+                } else {
+                    0
+                };
+                let fade = self.fade(0., 1.);
+                open.open_thumbs(Some(window), true, fade);
+            }
+        }
         self.open = Some(open);
 
         if outcome.is_some() {
@@ -625,6 +648,23 @@ impl SwitcherUi {
             // `forceAppFocus` is what stops the timer from putting it straight back.
             SwitcherKey::Up if focused => {
                 going = open.close_thumbs(now, false);
+                open.state.disable_hover(now);
+                open.state.show_immediately();
+            }
+            // `switch-group` while up (`altTab.js:180-186`): forward descends into the sub-list
+            // on its first press and steps through the windows after; backward always steps back.
+            SwitcherKey::Group { backward } => {
+                if !focused && !backward {
+                    open.open_thumbs(Some(0), true, fade_in);
+                } else if let Some(thumbs) = open.thumbs.as_mut() {
+                    let n = thumbs.windows.len();
+                    thumbs.selected = Some(if backward {
+                        thumbnails::previous_window(thumbs.selected, n)
+                    } else {
+                        thumbnails::next_window(thumbs.selected, n)
+                    });
+                    thumbs.focused = true;
+                }
                 open.state.disable_hover(now);
                 open.state.show_immediately();
             }

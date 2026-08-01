@@ -402,6 +402,13 @@ pub enum Action {
     SwitchWindows {
         backward: bool,
     },
+    /// GNOME's `switch-group` — the *same* popup as `switch-applications`, opened inside the
+    /// current app: the app row is pinned to item 0 and the window sub-list comes up with it
+    /// (`AppSwitcherPopup._initialSelection`, `altTab.js:117-137`).
+    #[knuffel(skip)]
+    SwitchGroup {
+        backward: bool,
+    },
 }
 
 impl From<niri_ipc::Action> for Action {

@@ -3499,6 +3499,9 @@ impl State {
             Action::SwitchApplications { backward } => {
                 self.switch_applications(backward);
             }
+            Action::SwitchGroup { backward } => {
+                self.switch_group(backward);
+            }
             Action::SwitchWindows { backward } => {
                 self.switch_windows(backward);
             }
@@ -8174,7 +8177,9 @@ fn find_gnome_bind(
     if switcher_is_open
         && !matches!(
             keybinding.action,
-            GnomeKeyAction::SwitchWindows { .. } | GnomeKeyAction::SwitchApplications { .. }
+            GnomeKeyAction::SwitchWindows { .. }
+                | GnomeKeyAction::SwitchApplications { .. }
+                | GnomeKeyAction::SwitchGroup { .. }
         )
     {
         return None;
@@ -8309,6 +8314,7 @@ fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         GnomeKeyAction::MoveToWorkspaceNext => Action::MoveWindowToWorkspaceDown(true),
         GnomeKeyAction::SwitchWindows { backward } => Action::SwitchWindows { backward },
         GnomeKeyAction::SwitchApplications { backward } => Action::SwitchApplications { backward },
+        GnomeKeyAction::SwitchGroup { backward } => Action::SwitchGroup { backward },
     })
 }
 

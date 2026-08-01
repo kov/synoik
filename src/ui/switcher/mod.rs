@@ -368,6 +368,12 @@ pub enum SwitcherKey {
     Advance {
         backward: bool,
     },
+    /// The `switch-group` binding fired while a popup is up. It walks the selected app's
+    /// *windows*, not the app row (`altTab.js:180-186`): forward opens the sub-list on window 0
+    /// the first time and steps through it after, backward steps back.
+    Group {
+        backward: bool,
+    },
     /// Left / Right — `_previous` / `_next`, spelled identically by both subclasses
     /// (`altTab.js:198-208`, `:613-620`).
     Left,
@@ -567,7 +573,7 @@ impl SwitcherPopup {
                 self.show_immediately();
             }
             // Only the app switcher's sub-list acts on these, and it has already had its say.
-            SwitcherKey::Up | SwitcherKey::Down => {}
+            SwitcherKey::Up | SwitcherKey::Down | SwitcherKey::Group { .. } => {}
             // The caller performs these against the target the popup named; all the base owes
             // them is what any handled key gets — hover off, and the popup revealed.
             SwitcherKey::CloseWindow | SwitcherKey::QuitApp => self.show_immediately(),

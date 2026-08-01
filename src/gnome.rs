@@ -862,6 +862,11 @@ pub enum GnomeKeyAction {
     /// current workspace (GNOME's window switcher is per-workspace by
     /// default).
     SwitchWindows { backward: bool },
+    /// `switch-group` / `switch-group-backward`: the app switcher again, opened
+    /// *within* the current app — the window sub-list comes up on item 0
+    /// (`altTab.js:117-137`). Its default accel is `Above_Tab`, the key
+    /// physically above Tab.
+    SwitchGroup { backward: bool },
     /// `switch-applications` / `switch-applications-backward`: GNOME's
     /// Alt-Tab. GNOME groups by application and spans workspaces; we map it
     /// onto the window MRU switcher over all workspaces (no app grouping —
@@ -1001,6 +1006,16 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
             "switch-windows-backward".to_owned(),
             SwitchWindows { backward: true },
             strs(&["<Alt><Shift>Tab"]),
+        ),
+        (
+            "switch-group".to_owned(),
+            SwitchGroup { backward: false },
+            strs(&["<Super>Above_Tab", "<Alt>Above_Tab"]),
+        ),
+        (
+            "switch-group-backward".to_owned(),
+            SwitchGroup { backward: true },
+            strs(&["<Shift><Super>Above_Tab", "<Shift><Alt>Above_Tab"]),
         ),
         (
             "switch-applications".to_owned(),
@@ -2424,7 +2439,13 @@ pub struct Accel {
 }
 
 /// `Above_Tab` resolves to the physical key above Tab: evdev `KEY_GRAVE`
-/// (0x29) plus the xkb keycode offset (mutter: `get_above_tab_keycode`).
+/// (0x29) plus the xkb keycode offset.
+///
+/// **A keycode, not a keysym, and not layout-dependent** — mutter special-cases its fake
+/// `META_KEY_ABOVE_TAB` to exactly `KEY_GRAVE + 8` and returns before consulting any layout
+/// (`add_keycodes_for_keysym`, `src/core/keybindings.c:385-392`). Matching by *position* is what
+/// makes it layout-independent: on AZERTY that key types `²`, and the binding still works because
+/// nothing ever looks at what it types.
 const ABOVE_TAB_KEYCODE: u32 = 0x29 + 8;
 
 /// A live external accelerator grab (`org.gnome.Shell` `GrabAccelerator`),

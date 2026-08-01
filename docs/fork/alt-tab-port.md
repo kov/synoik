@@ -17,8 +17,12 @@ session's defaults (read live from `org.gnome.desktop.wm.keybindings`) are:
 | `<Alt>Escape` | `cycle-windows` | `WindowCyclerPopup` | **no list** — highlights each window in place |
 | `<Alt>F6` | `cycle-group` | `GroupCyclerPopup` | ditto, within the current app |
 
-`Above_Tab` is the key above Tab — backtick on most layouts, and *not* hardcoded: mutter resolves
-it per layout.
+`Above_Tab` is the key above Tab. **Correction to an earlier reading of this doc:** mutter does
+*not* resolve it per layout. `add_keycodes_for_keysym` special-cases the fake `META_KEY_ABOVE_TAB`
+to exactly `KEY_GRAVE + 8` and returns before it consults any keymap
+(`src/core/keybindings.c:385-392`). Matching by *physical position* is what makes it
+layout-independent: on AZERTY that key types `²`, and the binding still works because nothing ever
+asks what it types. So "hardcoded backtick keycode" is the faithful port, not the shortcut.
 
 ## What we have
 
@@ -226,7 +230,17 @@ preview corner rounding. The one thing deliberately **not** ported is `APP_ICON_
 200 ms delay before a hovered app swaps its sub-list: it only matters once a sub-list is already
 up, and our hover is already gated on `mouseActive` (off for 500 ms after any keypress), so it
 would be a third timer interacting with two others for a case we have not seen misbehave. Port it
-against a real complaint. Slices 4 and 6, and `Above_Tab`'s per-layout resolution, are untouched.
+against a real complaint.
+
+**Slice 4 (`switch-group`) landed 2026-08-01.** `switch-group` / `switch-group-backward` are now
+adopted from `org.gnome.desktop.wm.keybindings` with GNOME's own defaults
+(`<Super>Above_Tab` / `<Alt>Above_Tab`, plus the `<Shift>` twins), and `Above_Tab` parses to the
+`KEY_GRAVE + 8` **keycode** — see the correction at the top of this doc; there is no per-layout
+resolution left to do. It opens the same `AppSwitcherPopup` on the same full app list — you can
+still tab out of the group — differing only in `_initialSelection`: app 0 (the app you are in)
+with its sub-list already up, on window 1 forward and the last window backward
+(`altTab.js:118-137`). While it is up, a repeat press walks that app's windows rather than the app
+row (`_keyPressHandler`, `altTab.js:180-186`). Slice 6 is what remains.
 
 **Renderer gap found on the way (not switcher-specific):** `Frame::draw_solid` does not consult
 the rounded clip an outer `ClippedSurfaceRenderElement` armed, where `render_texture_from_to`
@@ -291,8 +305,8 @@ door — [[test-the-code-not-a-reimplementation]].
 ## Open questions
 
 - ~~**Window previews at 128px**~~ — **ANSWERED 2026-07-31, see "The preview path" below.**
-- **`Above_Tab` resolution**: mutter resolves "the key above Tab" per layout — agreed we do the
-  same. Hardcoding backtick is correct on US layouts and silently wrong elsewhere, which is exactly
-  the kind of thing this machine cannot show us.
+- ~~**`Above_Tab` resolution**~~ — **CLOSED 2026-08-01 on a false premise.** The doc claimed mutter
+  resolves it per layout; it does not (see the correction at the top). We match `KEY_GRAVE + 8` by
+  keycode, exactly as mutter does, and that is already layout-independent.
 - **The cyclers** draw *on top of the windows themselves*, not in a panel — a different render path
   from everything in slices 1–5.
