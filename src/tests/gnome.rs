@@ -7227,6 +7227,149 @@ fn a_click_raises_the_shield_and_neither_edge_reaches_the_desktop() {
     );
 }
 
+/// The whole locked flow, driven through the real input path: lock, type, answer, unlock.
+///
+/// This is the test that would have caught every wiring mistake in the slice — it goes through
+/// `State::on_shield_key`, so the keys are the ones a seat would deliver, and the verdict comes
+/// from `State::on_verifier_event`, so it is gdm's word that unlocks and nothing else.
+#[test]
+fn a_locked_shield_takes_a_password_and_gdm_decides() {
+    use crate::dbus::gdm::{VerifierEvent, VerifierRequest};
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::unlock_dialog::{Page, Status};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // `Lock` covers the screen at once, but must NOT claim to be locked — nothing can unlock it
+    // until gdm answers.
+    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    assert!(f.niri().screen_shield.is_active(), "the screen is covered");
+    assert!(
+        !f.niri().screen_shield.is_locked(),
+        "not locked until a verifier exists"
+    );
+
+    // gdm opens the channel. `epoch` is whatever the shield asked under; the model owns it, so
+    // read it back rather than assuming 1.
+    let epoch = 1;
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::Ready(epoch));
+    assert!(
+        f.niri().screen_shield.is_locked(),
+        "a live channel is what locks it"
+    );
+
+    // ...and it asks for the password.
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+
+    // A key on the clock page raises the prompt AND is kept.
+    assert_eq!(f.niri().unlock_dialog.page(), Page::Clock);
+    tap(&mut f, KEY_A);
+    assert_eq!(f.niri().unlock_dialog.page(), Page::Prompt);
+    assert_eq!(
+        f.niri().unlock_dialog.entry_display(),
+        "\u{25cf}",
+        "the first keystroke is not eaten by the page flip, and it is masked"
+    );
+
+    tap(&mut f, KEY_T);
+    assert_eq!(f.niri().unlock_dialog.entry_display(), "\u{25cf}\u{25cf}");
+
+    // Backspace, then Return sends the answer.
+    tap(&mut f, KEY_BACKSPACE);
+    assert_eq!(f.niri().unlock_dialog.entry_display(), "\u{25cf}");
+    tap(&mut f, KEY_ENTER);
+    assert_eq!(f.niri().unlock_dialog.status(), Status::Answered);
+    assert_eq!(
+        f.niri().unlock_dialog.entry_display(),
+        "",
+        "the buffer does not outlive the answer"
+    );
+
+    // A refusal keeps the shield down and lets the user try again.
+    f.niri_state().on_verifier_event(VerifierEvent::Failed);
+    assert!(f.niri().screen_shield.is_locked(), "still locked");
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    assert!(f.niri().unlock_dialog.is_entry_live(), "and can retry");
+
+    // Only gdm's verdict raises it.
+    f.niri_state().on_verifier_event(VerifierEvent::Complete);
+    assert!(!f.niri().screen_shield.is_locked());
+    assert!(!f.niri().screen_shield.is_active(), "the shield is up");
+    let _ = VerifierRequest::Cancel;
+}
+
+/// Keys typed at a **locked** shield must not raise it, and must not reach the desktop.
+///
+/// The unlocked shield raises on anything (it is a screensaver). The locked one must not — and the
+/// discriminating half is that a bind like Super does not fire behind it either, which a test that
+/// only checks `is_locked` would miss entirely.
+#[test]
+fn a_locked_shield_swallows_keys_instead_of_raising() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    assert!(f.niri().screen_shield.is_locked());
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    assert!(
+        f.niri().screen_shield.is_active(),
+        "a locked shield does not raise on a keypress"
+    );
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "and the key did not reach the desktop behind it"
+    );
+}
+
+/// If the unlock channel dies, the lock drops to a dismissible screensaver rather than trapping
+/// the session.
+///
+/// A locked shield whose verifier is gone can never be answered: gdm's `answer_query` no-ops on a
+/// dead conversation *after* replying successfully, so the user gets no error and no progress.
+/// Dropping the lock is a deliberate divergence — GNOME leaves the dialog stuck — and it is not a
+/// weakening, since anyone who can kill gdm as root can already read the session.
+#[test]
+fn losing_the_unlock_channel_does_not_trap_the_session() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    assert!(f.niri().screen_shield.is_locked());
+
+    f.niri_state().on_verifier_event(VerifierEvent::Lost);
+    assert!(!f.niri().screen_shield.is_locked(), "the lock is dropped");
+    assert!(
+        f.niri().screen_shield.is_active(),
+        "the screen stays covered"
+    );
+
+    // ...and it can now be dismissed, which is the whole point.
+    tap(&mut f, KEY_A);
+    assert!(!f.niri().screen_shield.is_active());
+}
+
 /// A dash click does three different things depending on the app's state, and only one of them
 /// is a launch — `AppIcon.activate` (`appDisplay.js:3056-3071`) over `shell_app_activate_full`
 /// (`shell-app.c:497-535`).

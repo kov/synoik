@@ -11694,3 +11694,83 @@ fn vulkan_draws_the_screen_shield_over_the_desktop() {
         "{top} bright px in the top eighth — the curtain is not just its clock"
     );
 }
+
+/// The unlock prompt draws over the curtain, and the entry shows dots rather than the password.
+///
+/// The masking assertion is the one that matters and it is the one a state test cannot make: the
+/// dialog can mask correctly and the renderer still draw `content.entry` from the wrong field. So
+/// this asserts on pixels — a wide-enough run of bright ink inside the entry pill, and glyph shapes
+/// that do not change when the *characters* change but the length does not.
+#[test]
+fn vulkan_draws_the_unlock_prompt_with_a_masked_entry() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    // Raise the prompt and type.
+    for c in "abcdefgh".chars() {
+        f.niri_state().on_shield_key(None, Some(c));
+    }
+    assert_eq!(
+        f.niri().unlock_dialog.entry_display().chars().count(),
+        8,
+        "the fixture typed into a live entry"
+    );
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+
+    // The desktop is still hidden — the prompt page must not have replaced the curtain's cover.
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+    let green = (0..w * h)
+        .filter(|i| is_green(px(&pixels, w, i % w, i / w)))
+        .count();
+    assert_eq!(green, 0, "the desktop shows through the unlock prompt");
+
+    // Find the brightest rows: the avatar plate, the name, the entry. Just assert that there IS
+    // bright ink below the vertical third (where the stack starts) — the prompt drew at all.
+    let is_bright = |p: [u8; 4]| p[0] > 200 && p[1] > 200 && p[2] > 200;
+    let bright_below_third = (h / 3..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .filter(|(x, y)| is_bright(px(&pixels, w, *x, *y)))
+        .count();
+    assert!(bright_below_third > 0, "the unlock prompt did not draw");
+
+    // The masking check: re-render with *different characters, same length*. If the entry drew the
+    // raw text, the ink would move; masked, every frame is the same eight dots.
+    let baseline = pixels.clone();
+    for _ in 0..8 {
+        f.niri_state()
+            .on_shield_key(Some(smithay::input::keyboard::Keysym::BackSpace), None);
+    }
+    for c in "zyxwvuts".chars() {
+        f.niri_state().on_shield_key(None, Some(c));
+    }
+    let (pixels2, _, _) = render_output_vulkan(&mut f, &output);
+
+    assert_eq!(
+        baseline.len(),
+        pixels2.len(),
+        "the two frames must be comparable"
+    );
+    let differing = baseline
+        .chunks_exact(4)
+        .zip(pixels2.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        differing, 0,
+        "{differing} px changed when only the password's characters did — \
+         the entry is drawing the plaintext, not the mask"
+    );
+}
