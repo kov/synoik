@@ -32,6 +32,17 @@ struct BlurPush {
     _pad0: f32,
 }
 
+/// Push constants for one direction of the gaussian (matches `blur_gaussian.frag`'s `Push`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GaussianPush {
+    direction: [f32; 2],
+    /// One texel of the *sampled* texture in UV space.
+    pixel_step: f32,
+    sigma: f32,
+    brightness: f32,
+}
+
 struct Level {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -51,6 +62,10 @@ pub struct BlurChain {
     pipeline_layout: vk::PipelineLayout,
     down: vk::Pipeline,
     up: vk::Pipeline,
+    /// GNOME's separable gaussian, and the plain resample its rungs use. `None` when the chain was
+    /// built without it — the dual-Kawase path needs neither, and the scratch levels the gaussian
+    /// ping-pongs through are not worth allocating for a chain that will never run it.
+    gaussian: Option<Gaussian>,
     vert: vk::ShaderModule,
     down_frag: vk::ShaderModule,
     up_frag: vk::ShaderModule,
@@ -61,9 +76,51 @@ pub struct BlurChain {
     passes: usize,
 }
 
+/// The gaussian path's own pipelines, shaders and ping-pong targets.
+///
+/// A separable blur has to write H somewhere before reading it for V, and that somewhere must be
+/// the *same size* as the level being blurred — which no other level in a halving pyramid is.
+/// Hence a scratch twin for each shrinking level.
+struct Gaussian {
+    scale: vk::Pipeline,
+    blur: vk::Pipeline,
+    scale_frag: vk::ShaderModule,
+    blur_frag: vk::ShaderModule,
+    /// Parallel to `levels[1..]`: `scratch[i - 1]` is the same size as `levels[i]`.
+    scratch: Vec<Level>,
+}
+
 const FULLSCREEN_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fullscreen.vert.spv"));
 const DOWN_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blur_down.frag.spv"));
 const UP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blur_up.frag.spv"));
+const SCALE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blur_scale.frag.spv"));
+const GAUSSIAN_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blur_gaussian.frag.spv"));
+
+/// `MAX_RADIUS` (`shell-blur-effect.c:54`) — the radius above which the source is halved again.
+const MAX_RADIUS: f64 = 12.;
+/// `MIN_DOWNSCALE_SIZE` (`:53`) — halving stops before either side gets this small.
+const MIN_DOWNSCALE_SIZE: f64 = 256.;
+
+/// GNOME's downscale cascade: keep halving while the radius is still large *and* the texture is
+/// still big enough to spend (`calculate_downscale_factor`, `shell-blur-effect.c:289-314`, "the
+/// algorithm used by Firefox").
+///
+/// The point is that a wide blur does not need a big buffer: at radius 90 on 1920x1080 this lands
+/// on 240x135, where the remaining sigma is ~5.6 and the shader takes 19 taps per direction instead
+/// of 271. Blurring at full size would be correct and unaffordable.
+///
+/// Returns `log2` of the factor, i.e. how many pyramid rungs down to go.
+pub fn downscale_levels(width: u32, height: u32, radius: f64) -> usize {
+    let (mut w, mut h, mut r) = (f64::from(width), f64::from(height), radius);
+    let mut levels = 0;
+    while r > MAX_RADIUS && w > MIN_DOWNSCALE_SIZE && h > MIN_DOWNSCALE_SIZE {
+        levels += 1;
+        w /= 2.;
+        h /= 2.;
+        r /= 2.;
+    }
+    levels
+}
 
 /// Unwind guard for [`BlurChain::new`]: destroys every handle created so far if the build fails
 /// partway (each field starts null — `vkDestroy*` is a no-op on a null handle — and is filled as
@@ -82,7 +139,12 @@ struct NewGuard<'a> {
     vert: vk::ShaderModule,
     down_frag: vk::ShaderModule,
     up_frag: vk::ShaderModule,
+    scale: vk::Pipeline,
+    gauss: vk::Pipeline,
+    scale_frag: vk::ShaderModule,
+    gauss_frag: vk::ShaderModule,
     levels: Vec<Level>,
+    scratch: Vec<Level>,
 }
 
 impl<'a> NewGuard<'a> {
@@ -100,7 +162,12 @@ impl<'a> NewGuard<'a> {
             vert: vk::ShaderModule::null(),
             down_frag: vk::ShaderModule::null(),
             up_frag: vk::ShaderModule::null(),
+            scale: vk::Pipeline::null(),
+            gauss: vk::Pipeline::null(),
+            scale_frag: vk::ShaderModule::null(),
+            gauss_frag: vk::ShaderModule::null(),
             levels: Vec::new(),
+            scratch: Vec::new(),
         }
     }
 }
@@ -112,7 +179,7 @@ impl Drop for NewGuard<'_> {
         }
         let d = self.device;
         unsafe {
-            for level in &self.levels {
+            for level in self.levels.iter().chain(&self.scratch) {
                 d.destroy_framebuffer(level.framebuffer, None);
                 d.destroy_image_view(level.view, None);
                 d.destroy_image(level.image, None);
@@ -120,10 +187,14 @@ impl Drop for NewGuard<'_> {
             }
             d.destroy_pipeline(self.down, None);
             d.destroy_pipeline(self.up, None);
+            d.destroy_pipeline(self.scale, None);
+            d.destroy_pipeline(self.gauss, None);
             d.destroy_pipeline_layout(self.pipeline_layout, None);
             d.destroy_shader_module(self.vert, None);
             d.destroy_shader_module(self.down_frag, None);
             d.destroy_shader_module(self.up_frag, None);
+            d.destroy_shader_module(self.scale_frag, None);
+            d.destroy_shader_module(self.gauss_frag, None);
             d.destroy_descriptor_pool(self.desc_pool, None);
             d.destroy_descriptor_set_layout(self.set_layout, None);
             d.destroy_sampler(self.sampler, None);
@@ -136,6 +207,15 @@ impl BlurChain {
     /// Build the chain to blur `source` (which stays owned by the caller). `passes` is clamped to
     /// at least 1; `source` must be full-size (matches level 0).
     pub fn new(gpu: &Gpu, source: &Texture, passes: usize) -> Result<Self> {
+        Self::build(gpu, source, passes, false)
+    }
+
+    /// As [`Self::new`], plus the pipelines and scratch levels [`Self::record_gaussian`] needs.
+    pub fn new_with_gaussian(gpu: &Gpu, source: &Texture, passes: usize) -> Result<Self> {
+        Self::build(gpu, source, passes, true)
+    }
+
+    fn build(gpu: &Gpu, source: &Texture, passes: usize, gaussian: bool) -> Result<Self> {
         let _timed = crate::stats::creating();
         let device = &gpu.device;
         let passes = passes.max(1);
@@ -160,8 +240,9 @@ impl BlurChain {
 
         guard.set_layout = crate::render::sampler_set_layout(gpu)?;
 
-        // One descriptor set per level + one for the external source.
-        let count = (passes + 2) as u32;
+        // One descriptor set per level + one for the external source, doubled (less level 0) when
+        // the gaussian's scratch twins are along.
+        let count = (passes + 2 + if gaussian { passes } else { 0 }) as u32;
         let sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(count)];
@@ -175,7 +256,9 @@ impl BlurChain {
         let push = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(std::mem::size_of::<BlurPush>() as u32);
+            // Both blocks share one layout, so the range is the larger of the two: the Kawase
+            // shaders read the first 16 bytes, the gaussian the first 20.
+            .size(std::mem::size_of::<BlurPush>().max(std::mem::size_of::<GaussianPush>()) as u32);
         let layout_ci = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&guard.set_layout))
             .push_constant_ranges(std::slice::from_ref(&push));
@@ -217,6 +300,40 @@ impl BlurChain {
             h = (h / 2).max(1);
         }
 
+        if gaussian {
+            guard.scale_frag = load_module(device, SCALE_FRAG)?;
+            guard.gauss_frag = load_module(device, GAUSSIAN_FRAG)?;
+            guard.scale = build_pipeline(
+                gpu,
+                guard.render_pass,
+                guard.pipeline_layout,
+                guard.vert,
+                guard.scale_frag,
+            )?;
+            guard.gauss = build_pipeline(
+                gpu,
+                guard.render_pass,
+                guard.pipeline_layout,
+                guard.vert,
+                guard.gauss_frag,
+            )?;
+            // A twin for every shrinking level; level 0 is the full-size output and is never
+            // ping-ponged through.
+            for i in 1..=passes {
+                let (w, h) = (guard.levels[i].w, guard.levels[i].h);
+                let twin = create_level(
+                    gpu,
+                    guard.render_pass,
+                    guard.sampler,
+                    guard.set_layout,
+                    guard.desc_pool,
+                    w,
+                    h,
+                )?;
+                guard.scratch.push(twin);
+            }
+        }
+
         // Descriptor set that samples the external source (freed with `desc_pool`, no separate
         // destroy — so the guard already covers it).
         let source_set = alloc_sampler_set(
@@ -228,7 +345,15 @@ impl BlurChain {
         )?;
 
         guard.armed = false;
+        let gaussian = gaussian.then(|| Gaussian {
+            scale: guard.scale,
+            blur: guard.gauss,
+            scale_frag: guard.scale_frag,
+            blur_frag: guard.gauss_frag,
+            scratch: std::mem::take(&mut guard.scratch),
+        });
         Ok(BlurChain {
+            gaussian,
             render_pass: guard.render_pass,
             sampler: guard.sampler,
             set_layout: guard.set_layout,
@@ -279,6 +404,155 @@ impl BlurChain {
             // half_pixel = half a source pixel.
             let half_pixel = [0.5 / src.w as f32, 0.5 / src.h as f32];
             self.pass(gpu, cbuf, self.up, dst, src.set, half_pixel, offset);
+        }
+    }
+
+    /// Record GNOME's blur: `sigma = radius / 2`, evaluated separably on a downscaled copy
+    /// (`ShellBlurEffect`, `shell-blur-effect.c:425-447`; `ClutterBlur`, `clutter-blur.c:339-370`).
+    ///
+    /// GNOME cascades *two* downscales — its own, then ClutterBlur's — but they collapse: the first
+    /// stops once `radius / f <= 12`, which is exactly `sigma <= 6`, which is the second's own
+    /// threshold. So one cascade is not a simplification, it is the same arithmetic.
+    ///
+    /// `brightness` is `ShellBlurEffect`'s multiply, folded into the second direction rather than
+    /// given a pass of its own.
+    ///
+    /// Afterwards level 0 holds the result in `SHADER_READ_ONLY_OPTIMAL`, as with [`Self::record`].
+    /// Does nothing without the pipelines — build the chain with [`Self::new_with_gaussian`].
+    pub fn record_gaussian(
+        &self,
+        gpu: &Gpu,
+        cbuf: vk::CommandBuffer,
+        radius: f64,
+        brightness: f32,
+    ) {
+        let Some(g) = &self.gaussian else {
+            return;
+        };
+        let full = &self.levels[0];
+
+        // How far down the pyramid to work, capped by what this chain has — and floored at one
+        // rung, because the horizontal pass has to land in a target the same size as the level it
+        // blurs and only the shrinking levels have such a twin. That floor bites only for a radius
+        // of 12 or less, where GNOME would blur at full size with sigma <= 6; one halving with
+        // sigma <= 3 is the next step of GNOME's own cascade and is visually the same. Giving
+        // level 0 a full-size twin to be exact about it would double the chain's largest
+        // allocation to serve a radius nothing asks for.
+        let want = downscale_levels(full.w, full.h, radius);
+        let k = want.clamp(1, self.passes);
+        // The radius that survives the descent — and with it the sigma the shader runs.
+        let sigma = (radius / f64::from(1u32 << k) / 2.) as f32;
+
+        // Descend: source → L1 → … → Lk, one halving per rung.
+        for i in 1..=k {
+            let src_set = if i == 1 {
+                self.source_set
+            } else {
+                self.levels[i - 1].set
+            };
+            self.pass_gaussian(gpu, cbuf, g.scale, &self.levels[i], src_set, None);
+        }
+
+        // Blur at the working size, ping-ponging through that level's twin.
+        let (work, scratch, work_set) = (&self.levels[k], &g.scratch[k - 1], self.levels[k].set);
+
+        // Horizontal into the twin, vertical back — `pixel_step` is one texel of whatever is being
+        // sampled, which is the same size both ways.
+        let step = |w: u32| 1.0 / w as f32;
+        self.pass_gaussian(
+            gpu,
+            cbuf,
+            g.blur,
+            scratch,
+            work_set,
+            Some(GaussianPush {
+                direction: [1., 0.],
+                pixel_step: step(work.w),
+                sigma,
+                brightness: 1.,
+            }),
+        );
+        self.pass_gaussian(
+            gpu,
+            cbuf,
+            g.blur,
+            work,
+            scratch.set,
+            Some(GaussianPush {
+                direction: [0., 1.],
+                // Sampling `scratch`, which is `work`'s size by construction.
+                pixel_step: 1.0 / scratch.h as f32,
+                sigma,
+                brightness,
+            }),
+        );
+
+        // And back up to full size in one magnifying draw, which is what GNOME's compositing of the
+        // small texture over the actor's box amounts to.
+        self.pass_gaussian(gpu, cbuf, g.scale, full, self.levels[k].set, None);
+    }
+
+    /// One gaussian-path pass. `push` is `None` for the resample rungs, which read no constants.
+    fn pass_gaussian(
+        &self,
+        gpu: &Gpu,
+        cbuf: vk::CommandBuffer,
+        pipeline: vk::Pipeline,
+        dst: &Level,
+        src_set: vk::DescriptorSet,
+        push: Option<GaussianPush>,
+    ) {
+        let device = &gpu.device;
+        let extent = vk::Extent2D {
+            width: dst.w,
+            height: dst.h,
+        };
+        let begin = vk::RenderPassBeginInfo::default()
+            .render_pass(self.render_pass)
+            .framebuffer(dst.framebuffer)
+            .render_area(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent,
+            });
+        unsafe {
+            device.cmd_begin_render_pass(cbuf, &begin, vk::SubpassContents::INLINE);
+            device.cmd_bind_pipeline(cbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            let viewport = vk::Viewport {
+                x: 0.,
+                y: 0.,
+                width: dst.w as f32,
+                height: dst.h as f32,
+                min_depth: 0.,
+                max_depth: 1.,
+            };
+            device.cmd_set_viewport(cbuf, 0, &[viewport]);
+            device.cmd_set_scissor(
+                cbuf,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent,
+                }],
+            );
+            device.cmd_bind_descriptor_sets(
+                cbuf,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &[src_set],
+                &[],
+            );
+            if let Some(push) = push {
+                device.cmd_push_constants(
+                    cbuf,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    as_bytes(&push),
+                );
+            }
+            device.cmd_draw(cbuf, 3, 1, 0, 0);
+            device.cmd_end_render_pass(cbuf);
         }
     }
 
@@ -541,11 +815,18 @@ impl BlurChain {
     pub fn destroy(&self, gpu: &Gpu) {
         let d = &gpu.device;
         unsafe {
-            for level in &self.levels {
+            let scratch = self.gaussian.iter().flat_map(|g| g.scratch.iter());
+            for level in self.levels.iter().chain(scratch) {
                 d.destroy_framebuffer(level.framebuffer, None);
                 d.destroy_image_view(level.view, None);
                 d.destroy_image(level.image, None);
                 d.free_memory(level.memory, None);
+            }
+            if let Some(g) = &self.gaussian {
+                d.destroy_pipeline(g.scale, None);
+                d.destroy_pipeline(g.blur, None);
+                d.destroy_shader_module(g.scale_frag, None);
+                d.destroy_shader_module(g.blur_frag, None);
             }
             d.destroy_pipeline(self.down, None);
             d.destroy_pipeline(self.up, None);
@@ -812,6 +1093,104 @@ mod tests {
         (7680, 4320),
         (8832, 4968),
     ];
+
+    /// GNOME's downscale cascade, against the numbers it actually produces.
+    ///
+    /// Pure arithmetic, so this runs without a device — and it is worth pinning on its own, because
+    /// the cascade is what makes a radius-90 blur affordable and getting it wrong is invisible
+    /// except as a frame-time regression.
+    #[test]
+    fn the_downscale_cascade_matches_gnomes() {
+        // `BLUR_RADIUS = 90` on a 1080p output: three halvings to 240x135, where the surviving
+        // radius is 11.25 — just under the 12 that would buy a fourth.
+        assert_eq!(downscale_levels(1920, 1080, 90.), 3);
+        // A small radius needs no descent at all.
+        assert_eq!(downscale_levels(1920, 1080, 12.), 0);
+        assert_eq!(downscale_levels(1920, 1080, 13.), 1);
+        // The size guard eventually wins over the radius, however wide the blur — but it is tested
+        // *before* each halving, so a side is allowed to end up under the threshold, just not to
+        // start under it. 300 -> 150 and stop; 600 -> 300 -> 150 and stop; 256 never moves.
+        assert_eq!(downscale_levels(300, 300, 1000.), 1);
+        assert_eq!(downscale_levels(600, 600, 1000.), 2);
+        assert_eq!(downscale_levels(256, 256, 1000.), 0);
+    }
+
+    /// The gaussian spreads an edge, in proportion to its radius, and honours brightness.
+    ///
+    /// The discriminating assertions are the *comparisons*, not "it changed": a blur that ignored
+    /// sigma entirely would still smear the edge and still pass a single-radius check. What cannot
+    /// survive a wrong kernel is a wide radius spreading further than a narrow one while both leave
+    /// the far corners alone.
+    #[test]
+    fn the_gaussian_spreads_an_edge_by_its_radius() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("skipping the_gaussian_spreads_an_edge_by_its_radius: no Vulkan device");
+            return;
+        };
+        let pool_ci = vk::CommandPoolCreateInfo::default().queue_family_index(gpu.queue_family);
+        let pool = unsafe { gpu.device.create_command_pool(&pool_ci, None) }.expect("pool");
+
+        const W: u32 = 512;
+        const H: u32 = 512;
+        // A hard vertical edge: black left of centre, white right of it. Grey, so the reading does
+        // not depend on channel order.
+        let mut src = vec![0u8; (W * H * 4) as usize];
+        for y in 0..H {
+            for x in 0..W {
+                let v = if x < W / 2 { 0 } else { 255 };
+                let i = ((y * W + x) * 4) as usize;
+                src[i..i + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+
+        // Sample the middle row of the result and report how wide the transition is.
+        let spread_of = |radius: f64, brightness: f32| -> (usize, u8, u8) {
+            let source =
+                Texture::from_rgba(&gpu, pool, W, H, &src, vk::Filter::LINEAR).expect("source");
+            let chain = BlurChain::new_with_gaussian(&gpu, &source, PASSES).expect("chain");
+            gpu.run_commands(pool, crate::stats::SubmitSite::Blur, |cbuf| {
+                chain.record_gaussian(&gpu, cbuf, radius, brightness);
+            })
+            .expect("submit");
+            let out = chain.read_output(&gpu, pool).expect("read");
+            let row = H / 2;
+            let at = |x: u32| out[((row * W + x) * 4) as usize];
+            // How many pixels are neither near-black nor near-white: the edge's reach.
+            let transition = (0..W).filter(|&x| at(x) > 8 && at(x) < 200).count();
+            let result = (transition, at(0), at(W - 1));
+            chain.destroy(&gpu);
+            source.destroy(&gpu);
+            result
+        };
+
+        let (narrow, narrow_left, narrow_right) = spread_of(16., 1.);
+        let (wide, wide_left, wide_right) = spread_of(90., 1.);
+
+        assert!(narrow > 0, "a blur that does not blur");
+        assert!(
+            wide > narrow * 2,
+            "a wider radius must reach further: {narrow} vs {wide}"
+        );
+        // The far edges are untouched — a blur, not a fade to grey.
+        assert!(
+            narrow_left < 8 && wide_left < 8,
+            "the black side stayed black"
+        );
+        assert!(
+            narrow_right > 200 && wide_right > 200,
+            "the white side stayed white"
+        );
+
+        // Brightness is a plain multiply on the result (`shell-blur-effect.c:47-51`).
+        let (_, _, dim_right) = spread_of(90., 0.5);
+        let half = f32::from(wide_right) * 0.5;
+        assert!(
+            (f32::from(dim_right) - half).abs() < 12.,
+            "brightness 0.5 should halve {wide_right}, got {dim_right}"
+        );
+
+        unsafe { gpu.device.destroy_command_pool(pool, None) };
+    }
 
     /// Where the blur's cost actually goes, so the optimization is chosen from
     /// measurement rather than from the pass count.
