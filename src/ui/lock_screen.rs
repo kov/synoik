@@ -520,6 +520,12 @@ pub struct LockScreen {
     /// through the 200 ms ease it is.
     caps_since: Option<Duration>,
     caps_warning: bool,
+    /// The alpha the running ease started from.
+    ///
+    /// Not always the opposite extreme: double-tap Caps Lock inside 200 ms and the second ease
+    /// begins wherever the first had got to. Deriving the start from the *target* instead makes a
+    /// reversal jump to full opacity before fading — a flash of a warning that was never up.
+    caps_from: f64,
     cache: RefCell<widget::BakeCache>,
     /// The entry has its own cache: it re-bakes per keystroke, the column around it does not.
     entry_cache: RefCell<widget::BakeCache>,
@@ -651,12 +657,16 @@ impl LockScreen {
     /// caps lock even with no keystroke in the entry. We have no keymap signal: the state rides in
     /// on the key event that changed it, which is why the shield's key path must call this for
     /// *modifier* keys too — Caps Lock itself being the one that matters most.
-    pub fn set_caps_warning(&mut self, warn: bool, now: Duration) {
+    /// Returns whether this changed anything, so the caller knows to ask for a frame.
+    pub fn set_caps_warning(&mut self, warn: bool, now: Duration) -> bool {
         if self.caps_warning == warn {
-            return;
+            return false;
         }
+        // Sampled *before* the target flips, so a reversal continues from where it is.
+        self.caps_from = self.caps_alpha(now);
         self.caps_warning = warn;
         self.caps_since = Some(now);
+        true
     }
 
     /// How opaque the caps-lock warning is: 0 hidden, 1 fully up.
@@ -667,11 +677,7 @@ impl LockScreen {
         };
         let t = (now.saturating_sub(since).as_secs_f64() / CAPS_FADE.as_secs_f64()).clamp(0., 1.);
         let eased = Curve::EaseOutQuad.y(t);
-        if self.caps_warning {
-            eased
-        } else {
-            1. - eased
-        }
+        self.caps_from + (target - self.caps_from) * eased
     }
 
     /// Whether the caps warning still owes frames.
@@ -683,6 +689,7 @@ impl LockScreen {
     /// Finish the caps ease now, wherever it had got to.
     pub fn settle_caps(&mut self) {
         self.caps_since = None;
+        self.caps_from = if self.caps_warning { 1. } else { 0. };
     }
 
     /// How far through the clock→prompt crossfade we are: 0 is the clock, 1 the prompt.
@@ -1319,6 +1326,38 @@ mod tests {
         shield.set_shown(true, done);
         assert!(shield.is_sliding(done), "the next lock slides in afresh");
         assert_eq!(shield.curtain_progress(done + SLIDE_TIME), 0.);
+    }
+
+    /// Reversing the caps fade mid-flight continues from where it is, rather than snapping.
+    ///
+    /// Double-tap Caps Lock inside 200 ms. Deriving the ease's start from the *target* means the
+    /// second one begins at the opposite extreme — so a fade-in caught half way jumps to fully
+    /// opaque and then fades out, a flash of a warning that was never up. Invisible to any test
+    /// that settles before it looks.
+    #[test]
+    fn reversing_the_caps_fade_does_not_snap() {
+        let mut shield = LockScreen::default();
+        assert!(shield.set_caps_warning(true, T0));
+
+        let half = T0 + CAPS_FADE / 2;
+        let mid = shield.caps_alpha(half);
+        assert!(mid > 0. && mid < 1., "part-way in: {mid}");
+
+        // Reverse. The very next instant must still be ~`mid`, not 1.
+        assert!(shield.set_caps_warning(false, half));
+        let after = shield.caps_alpha(half);
+        assert!(
+            (after - mid).abs() < 1e-9,
+            "the reversal jumped from {mid} to {after}"
+        );
+        assert!(
+            shield.caps_alpha(half + CAPS_FADE / 4) < mid,
+            "and then keeps going down"
+        );
+        assert_eq!(shield.caps_alpha(half + CAPS_FADE), 0., "all the way out");
+
+        // A no-op set reports no change, so the caller does not ask for frames it does not need.
+        assert!(!shield.set_caps_warning(false, half + CAPS_FADE));
     }
 
     /// The per-frame curtain retirement must leave the *other* animations alone.

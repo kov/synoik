@@ -294,7 +294,10 @@ process. What is done about it, and what is not:
 - **The peek toggle is in.** `view-reveal-symbolic` / `view-conceal-symbolic` at the entry's
   trailing edge (`st-password-entry.c:223-230`, `:333-346`), gated on
   `org.gnome.desktop.lockdown disable-show-password` and dropped on every fresh question.
-- **The caps-lock row is always reserved.** GNOME eases the warning's *height* from 0
+- **The caps-lock row is always reserved.** Note the cost lands on the prompt everyone sees: on a
+  *secret* question with caps off GNOME reserves nothing at all (the placeholder's visibility is
+  bound inverse to the warning, and the warning's own height eases to 0), so our password prompt
+  carries one extra line box plus its spacing that GNOME's does not. GNOME eases the warning's *height* from 0
   (`shellEntry.js:210-217`) and holds the line with an empty placeholder on non-secret questions
   (`authPrompt.js:201-212`); we reserve the row always and fade only the text. Animating the height
   would move everything below it every frame, which re-rasterises the column every frame. The cost

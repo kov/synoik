@@ -7622,6 +7622,108 @@ fn caps_lock_warns_on_the_password_prompt_only() {
     );
 }
 
+/// The caps warning is right when the prompt is raised by a *click*, and across a re-lock.
+///
+/// The state is not carried in on the keystroke: GNOME reads the keymap every time it syncs
+/// (`shellEntry.js:192`). Reading a value cached from the shield's own key path instead is wrong
+/// for every other way the prompt goes up — lock with caps already on and click, and the warning
+/// is missing; lock, unlock, turn caps off, lock again and click, and it is there when it should
+/// not be.
+#[test]
+fn the_caps_warning_is_right_without_a_keystroke() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Caps lock goes on while the session is *unlocked*, so the shield never sees the key.
+    tap(&mut f, KEY_CAPSLOCK);
+
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+
+    // Raise the prompt by clicking, not typing.
+    f.niri_state()
+        .on_shield_click(smithay::utils::Point::from((960., 540.)));
+    assert_eq!(
+        f.niri().unlock_dialog.page(),
+        crate::unlock_dialog::Page::Prompt
+    );
+    f.niri().lock_screen.settle_caps();
+    let now = get_monotonic_time();
+    assert_eq!(
+        f.niri().lock_screen.caps_alpha(now),
+        1.,
+        "caps was on before the shield existed, and clicking is not a keystroke"
+    );
+
+    // Unlock, turn caps off while unlocked, lock again, and click.
+    f.niri_state().on_verifier_event(VerifierEvent::Complete);
+    assert!(!f.niri().screen_shield.is_active());
+    tap(&mut f, KEY_CAPSLOCK);
+
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(2));
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    f.niri_state()
+        .on_shield_click(smithay::utils::Point::from((960., 540.)));
+    f.niri().lock_screen.settle_caps();
+    let now = get_monotonic_time();
+    assert_eq!(
+        f.niri().lock_screen.caps_alpha(now),
+        0.,
+        "caps went off while unlocked; a warning here is a lie"
+    );
+}
+
+/// Shift and caps lock do not raise the prompt; anything else does.
+///
+/// GNOME returns early for exactly those four keysyms and lets everything else through to
+/// `_showPrompt()` (`unlockDialog.js:677-682`). They are the keys you press *before* the one you
+/// meant, so waking the prompt on them would eat the modifier of the first character.
+#[test]
+fn shift_and_caps_do_not_wake_the_prompt() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::unlock_dialog::Page;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+
+    tap(&mut f, KEY_LEFTSHIFT);
+    assert_eq!(f.niri().unlock_dialog.page(), Page::Clock, "shift waits");
+    tap(&mut f, KEY_CAPSLOCK);
+    assert_eq!(f.niri().unlock_dialog.page(), Page::Clock, "so does caps");
+
+    // Ctrl is not in GNOME's list: it raises the prompt like any other key.
+    tap(&mut f, KEY_LEFTCTRL);
+    assert_eq!(
+        f.niri().unlock_dialog.page(),
+        Page::Prompt,
+        "ctrl is not one of the four, so it wakes the prompt"
+    );
+}
+
 /// Keys typed at a **locked** shield must not raise it, and must not reach the desktop.
 ///
 /// The unlocked shield raises on anything (it is a screensaver). The locked one must not — and the

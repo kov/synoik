@@ -64,6 +64,27 @@ The other trap was xkb. At the **press** of Caps Lock the event's modifier mask 
 state the key is about to change, so a warning driven from it appears and never leaves. Sampled
 after `input()` instead, which is what the switcher next door already does for the same reason.
 
+A review then found two bugs in it, both fixed:
+
+- **A cached caps state is wrong for every path that is not a keystroke.** Clicking to raise the
+  prompt after locking with caps already on showed no warning; clicking after a
+  lock/unlock/re-lock cycle showed one that was false. GNOME reads the keymap at every sync
+  (`shellEntry.js:192`), which is why it cannot have this bug — so we read xkb live too, and the
+  field is only a redraw edge-detector.
+- **Reversing the fade mid-flight snapped.** Deriving the ease's start from its target means a
+  double-tap inside 200 ms jumps to fully opaque before fading out — a flash of a warning that was
+  never up. It now eases from the current alpha.
+
+**Still open here:** if the reserved row's blank line is judged too visible, GNOME's growing
+dialog is reachable without a per-frame re-bake — split the message into its own bake (its
+revision inputs are already separable) and animate the *element* offsets, which are free. Needs a
+look at the real thing first.
+
+**Toolkit-first, deferred with a reason:** GNOME hangs `CapsLockWarning` off `shellEntry`, so it is
+the password *entry's* companion rather than the lock screen's. The second password surface to
+land — polkit, the network agent, the keyring prompt — should lift the text, fade, cache and
+gating into `widget::` beside `widget::Entry` rather than copy them.
+
 ---
 
 ## B. `Lock` replies immediately — **LANDED**

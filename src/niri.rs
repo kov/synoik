@@ -3814,13 +3814,26 @@ impl State {
     /// Only for a **secret** question (`authPrompt.js:414` sets the label's visibility straight
     /// from `secret`) — a username prompt gets no warning — and only on the prompt page, since that
     /// is the only place the label exists.
-    pub(crate) fn sync_caps_warning(&mut self) {
+    pub(crate) fn sync_caps_warning(&mut self) -> bool {
+        // **Read live, never from a cache.** GNOME asks the keymap every time it syncs
+        // (`shellEntry.js:192`), which is why it cannot show a stale warning. xkb state is updated
+        // by every `input()` regardless of what the shield is doing, so this is always current —
+        // whereas a value sampled only on the shield's own key path is wrong for every other way
+        // the prompt goes up. Clicking to raise it after locking with caps already on showed no
+        // warning; clicking after a lock/unlock/re-lock cycle showed one that was not true.
+        self.niri.caps_lock = self
+            .niri
+            .seat
+            .get_keyboard()
+            .map(|kbd| kbd.modifier_state().caps_lock)
+            .unwrap_or(self.niri.caps_lock);
+
         let warn = self.niri.caps_lock
             && self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt
             && self.niri.unlock_dialog.asks_for_secret();
         self.niri
             .lock_screen
-            .set_caps_warning(warn, crate::utils::get_monotonic_time());
+            .set_caps_warning(warn, crate::utils::get_monotonic_time())
     }
 
     /// Point the curtain's crossfade at whichever page the dialog is on.

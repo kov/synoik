@@ -1023,19 +1023,8 @@ impl State {
         // The caps-lock warning, for the same reason and read the same way: at the *press* of
         // Caps Lock the event's mask still describes the lock state the key is about to change, so
         // trusting it means the warning never goes away again. Sampled live after `input()`.
-        if self.niri.screen_shield.is_active() {
-            let caps = self
-                .niri
-                .seat
-                .get_keyboard()
-                .unwrap()
-                .modifier_state()
-                .caps_lock;
-            if self.niri.caps_lock != caps {
-                self.niri.caps_lock = caps;
-                self.sync_caps_warning();
-                self.niri.queue_redraw_all();
-            }
+        if self.niri.screen_shield.is_active() && self.sync_caps_warning() {
+            self.niri.queue_redraw_all();
         }
 
         // The switcher commits when its *primary* modifier comes up — not when every modifier
