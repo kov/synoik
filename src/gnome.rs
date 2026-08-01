@@ -877,9 +877,13 @@ pub enum GnomeKeyAction {
     /// windows only.
     CycleGroup { backward: bool },
     /// `switch-applications` / `switch-applications-backward`: GNOME's
-    /// Alt-Tab. GNOME groups by application and spans workspaces; we map it
-    /// onto the window MRU switcher over all workspaces (no app grouping —
-    /// accepted divergence for now).
+    /// Super-Tab — `AppSwitcherPopup`, one item per application, spanning
+    /// workspaces unless `org.gnome.shell.app-switcher current-workspace-only`
+    /// says otherwise (`docs/fork/alt-tab-port.md`).
+    ///
+    /// This carried an "accepted divergence: no app grouping, mapped onto the
+    /// window MRU switcher" note long after the switcher port retired `mru.rs`
+    /// and made it false.
     SwitchApplications { backward: bool },
     /// `maximize`: maximize the focused window.
     Maximize,
