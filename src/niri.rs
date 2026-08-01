@@ -9406,44 +9406,21 @@ impl Niri {
 
     #[cfg(feature = "dbus")]
     fn update_locked_hint(&mut self) {
-        use std::sync::LazyLock;
-
         if !self.is_session_instance {
             return;
         }
 
-        static XDG_SESSION_ID: LazyLock<Option<String>> = LazyLock::new(|| {
-            let id = std::env::var("XDG_SESSION_ID").ok();
-            if id.is_none() {
-                warn!(
-                    "env var 'XDG_SESSION_ID' is unset or invalid; logind LockedHint won't be set"
-                );
-            }
-            id
-        });
-
-        let Some(session_id) = &*XDG_SESSION_ID else {
+        // One session-path resolution for the whole process, and it is not `XDG_SESSION_ID`: a
+        // GNOME session runs the shell as a user service, which need not carry that variable at
+        // all. See `freedesktop_login1::resolve_session_path`.
+        let Some(session_path) = crate::dbus::freedesktop_login1::session_path() else {
+            warn!("our logind session is unknown; LockedHint won't be set");
             return;
         };
 
-        fn call(session_id: &str, locked: bool) -> anyhow::Result<()> {
+        fn call(session_path: &zbus::zvariant::ObjectPath<'_>, locked: bool) -> anyhow::Result<()> {
             let conn = zbus::blocking::Connection::system()
                 .context("error connecting to the system bus")?;
-
-            let message = conn
-                .call_method(
-                    Some("org.freedesktop.login1"),
-                    "/org/freedesktop/login1",
-                    Some("org.freedesktop.login1.Manager"),
-                    "GetSession",
-                    &(session_id),
-                )
-                .context("failed to call GetSession")?;
-
-            let message_body = message.body();
-            let session_path: zbus::zvariant::ObjectPath = message_body
-                .deserialize()
-                .context("failed to deserialize GetSession reply")?;
 
             conn.call_method(
                 Some("org.freedesktop.login1"),
@@ -9479,7 +9456,7 @@ impl Niri {
             .spawn(move || {
                 let _span = tracy_client::span!("LockedHint");
 
-                if let Err(err) = call(session_id, locked) {
+                if let Err(err) = call(session_path, locked) {
                     warn!("failed to set logind LockedHint: {err:?}");
                 }
             });

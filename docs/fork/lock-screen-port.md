@@ -89,6 +89,33 @@ Two hazards it closes, both pinned by tests in `screen_shield.rs`:
 
 **First seat test: open a second VT before typing a wrong password.**
 
+## `.../session/auto` is not our session
+
+Getting gdm's login screen to unlock us needed logind's `Session.Unlock`, and the first attempt
+subscribed on `/org/freedesktop/login1/session/auto`. It never fired. Two separate reasons, and the
+second one had been quietly breaking things since long before the lock screen:
+
+- **Signals are not emitted on `auto`.** It is a per-caller alias logind resolves from the sender's
+  pid when a message is *addressed* to it; no object lives there. The session broadcasts from its
+  escaped concrete path — session `116` is `/org/freedesktop/login1/session/_3116`. A match rule on
+  `auto` subscribes successfully and then stays empty forever, which is the worst failure shape:
+  no error anywhere.
+- **`auto` does not resolve for us at all.** A GNOME session runs the shell as a *user service*
+  (`user@1002.service/session.slice/org.gnome.Shell@user.service`), outside the session scope, so
+  logind answers `NoSessionForPID`. Every `Session` call on `auto` from the compositor fails —
+  which is what `set_brightness` had been doing.
+
+`freedesktop_login1::resolve_session_path` now resolves it once, at startup: `GetSessionByPID` for
+our own pid (right when we *are* in a session scope, e.g. started from a TTY), falling back to the
+`Display` property of `/org/freedesktop/login1/user/_<uid>` — logind's own "this user's graphical
+session" — which is the answer for a user service. Both hand back the escaped path, so we never
+reimplement systemd's `bus_label_escape`. `SetLockedHint` was resolving separately via
+`XDG_SESSION_ID`, an env var a user service need not carry; it goes through the same path now.
+
+gdm's side is `session_unlock` in `daemon/gdm-manager.c`, which calls logind's
+`Manager.UnlockSession` — so authenticating at gdm really does arrive as this signal, and
+`loginctl unlock-session <id>` is the same thing by hand, which is how this was validated.
+
 ## The honest password exposure
 
 Authentication runs in gdm's PAM worker, not here, but the plaintext does pass through this
