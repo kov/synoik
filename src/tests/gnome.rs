@@ -13261,6 +13261,68 @@ fn a_quick_super_tab_switches_without_showing_the_popup() {
     );
 }
 
+/// The arrows walk the open switcher, Escape abandons it, and Return takes the selection.
+///
+/// These are the popup's *keysym* arms, the half of `_keyPressHandler` that does not go through a
+/// keybinding: Left is `_previous` and Right is `_next` (`altTab.js:613-620`), Escape destroys and
+/// Return finishes (`switcherPopup.js:206-217`). Driven through real key events, because the whole
+/// point is that they reach the popup at all — the switcher holds a modal grab, so nothing routes
+/// them for us.
+#[test]
+fn the_switchers_arrows_walk_it_escape_abandons_it_and_return_takes_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let _first = map_focused_window(&mut f, id);
+    let _second = map_focused_window(&mut f, id);
+    let _third = map_focused_window(&mut f, id);
+    let before = f.niri().layout.focus().unwrap().id();
+
+    // Open on item 1 (the previously used window), then walk right and back.
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_TAB);
+    assert_eq!(
+        f.niri().switcher.selected(),
+        Some(1),
+        "opens on the previous"
+    );
+
+    tap(&mut f, KEY_RIGHT);
+    assert_eq!(f.niri().switcher.selected(), Some(2), "Right is _next");
+    tap(&mut f, KEY_LEFT);
+    tap(&mut f, KEY_LEFT);
+    assert_eq!(f.niri().switcher.selected(), Some(0), "Left is _previous");
+
+    // Escape abandons: the popup goes away and focus has not moved.
+    tap(&mut f, KEY_ESC);
+    assert!(!f.niri().switcher.is_open(), "Escape destroys the popup");
+    f.key_release(KEY_LEFTALT);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.niri().layout.focus().unwrap().id(),
+        before,
+        "a cancelled switcher leaves focus where it was"
+    );
+
+    // Return commits without waiting for the modifier, which is what makes a no-modifier popup
+    // usable at all.
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_TAB);
+    assert!(f.niri().switcher.is_open());
+    tap(&mut f, KEY_ENTER);
+    assert!(!f.niri().switcher.is_open(), "Return finishes the popup");
+    f.key_release(KEY_LEFTALT);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    assert_ne!(
+        f.niri().layout.focus().unwrap().id(),
+        before,
+        "Return activated the selection"
+    );
+}
+
 /// Alt-Tab titles the *selected* window across the whole panel; Super-Tab labels every item.
 ///
 /// The two popups put their label in different places. `AppIcon` adds its label as a child of the

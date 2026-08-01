@@ -1920,6 +1920,25 @@ impl State {
         self.raise_switcher(Items::Windows(tab_list), art, backward);
     }
 
+    /// A key the open popup acts on — the arrows, Escape, and the explicit-commit keys.
+    ///
+    /// The switch binding itself does *not* come through here: it resolves as a binding and lands
+    /// in [`switch_applications`](Self::switch_applications) /
+    /// [`switch_windows`](Self::switch_windows), which is the same split GNOME has between
+    /// `_keyPressHandler`'s `action ===` arms and its `keysym ===` arms
+    /// (`switcherPopup.js:194-219`).
+    pub fn switcher_key(&mut self, key: SwitcherKey) {
+        if !self.niri.switcher.is_open() {
+            return;
+        }
+
+        let now = self.niri.clock.now_unadjusted();
+        let outcome = self.niri.switcher.key_press(key, now);
+        self.finish_switcher(outcome);
+        self.hide_osd_for_switcher();
+        self.niri.queue_redraw_switcher_output();
+    }
+
     /// A press while a popup is already up advances it rather than raising a new one — which is
     /// how holding the modifier and tapping Tab walks the row. Returns whether it handled the
     /// press.

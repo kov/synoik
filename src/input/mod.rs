@@ -66,6 +66,7 @@ use crate::ui::overview_search::SearchHit;
 use crate::ui::popover::PopoverSide;
 use crate::ui::run_dialog::{self, KeyOutcome};
 use crate::ui::screenshot_ui::ScreenshotUi;
+use crate::ui::switcher::SwitcherKey;
 use crate::ui::window_preview;
 use crate::utils::spawning::{spawn, spawn_sh};
 use crate::utils::{center, get_monotonic_time, output_size, CastSessionId, ResizeEdge};
@@ -802,6 +803,24 @@ impl State {
                 };
 
                 if matches!(res, FilterResult::Forward) {
+                    // The switcher holds a modal grab (`pushModal`, `switcherPopup.js:125`): the
+                    // switch bindings resolved above, and every *other* key now goes to the popup
+                    // and no further. `vfunc_key_press_event` (`:194-219`) returns EVENT_STOP
+                    // unconditionally, so even a key the popup does nothing with is swallowed
+                    // rather than reaching the window underneath.
+                    //
+                    // Presses only, like the overview-search arm below and for the same reason:
+                    // `should_intercept_key` already owns releases globally through
+                    // `suppressed_keys`, and the modifier release must reach the commit check
+                    // after `input()` returns.
+                    if this.niri.switcher.is_open() && pressed {
+                        if let Some(key) = raw.and_then(switcher_key_for) {
+                            this.switcher_key(key);
+                        }
+                        this.niri.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    }
+
                     // Escape cancels an item drag in flight and goes no further: the icon
                     // flows home and the grid keeps its old order (`_onEvent` →
                     // `_cancelDrag`, `dnd.js:567-573`). It is consumed rather than passed
@@ -8179,6 +8198,30 @@ fn find_gnome_bind(
         // NON_MASKABLE while the focused window inhibits shortcuts.
         allow_inhibiting: true,
         hotkey_overlay_title: None,
+    })
+}
+
+/// What an open switcher does with a plain keysym — the half of `_keyPressHandler` that matches
+/// on the key rather than on the resolved binding action.
+///
+/// The arrows are the subclasses' own (`altTab.js:198-208` for the app switcher, `:613-620` for
+/// the window switcher) and both spell them the same way: Left is `_previous`, Right is `_next`.
+/// Escape and Tab destroy the popup and space/Return/KP_Enter/ISO_Enter commit it
+/// (`switcherPopup.js:206-217`) — Tab only reaches here when it is *not* the popup's own shortcut,
+/// since that resolves as a binding first.
+///
+/// **DIVERGENCE (no RTL):** GNOME swaps Left and Right under a right-to-left text direction
+/// (`Clutter.get_default_text_direction()`), which we do not model anywhere yet. The whole shell
+/// is left-to-right for now; when a direction lands, this is one of its call sites.
+fn switcher_key_for(raw: Keysym) -> Option<SwitcherKey> {
+    Some(match raw {
+        Keysym::Left => SwitcherKey::Advance { backward: true },
+        Keysym::Right => SwitcherKey::Advance { backward: false },
+        Keysym::Escape | Keysym::Tab => SwitcherKey::Dismiss,
+        Keysym::space | Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter => {
+            SwitcherKey::Commit
+        }
+        _ => return None,
     })
 }
 
