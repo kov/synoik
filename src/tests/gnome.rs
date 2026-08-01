@@ -13430,6 +13430,66 @@ fn the_window_sublist_closes_on_up_and_on_moving_to_another_app() {
     f.key_release(KEY_LEFTMETA);
 }
 
+/// An open switcher grabs the pointer too: no window under it may keep pointer focus.
+///
+/// Same rule and same symptom as [`open_popover_suppresses_underlying_pointer_focus`] — a client
+/// that still has the pointer keeps setting the cursor image, so moving across the popup cycles
+/// through every I-beam and resize arrow of whatever is behind it. `SwitcherPopup.show` takes its
+/// modal grab **first** (`pushModal`, `switcherPopup.js:125`) and the open delay that follows only
+/// sets opacity, so the suppression starts with the popup, not with its drawing.
+#[test]
+fn an_open_switcher_suppresses_underlying_pointer_focus() {
+    use smithay::utils::{Logical, Point};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _w = map_window_sized(&mut f, id, (1800, 1000), None);
+    let _second = map_focused_window(&mut f, id);
+
+    // The pointer rests over the window, which owns it.
+    let over_window = Point::<f64, Logical>::from((900., 500.));
+    pointer_motion_to(&mut f, over_window.x, over_window.y);
+    assert!(
+        f.niri().contents_under(over_window).surface.is_some(),
+        "the window under the pointer normally receives pointer focus"
+    );
+
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_TAB);
+    assert!(f.niri().switcher.is_open());
+
+    // Still inside the popup's delay: the grab is already up, so the window is already cut off.
+    assert!(
+        !f.niri().switcher.is_visible(),
+        "sampled inside the open delay, where the popup draws nothing"
+    );
+    pointer_motion_to(&mut f, over_window.x, over_window.y);
+    assert!(
+        f.niri().contents_under(over_window).surface.is_none(),
+        "no window under an open switcher receives pointer focus"
+    );
+    assert!(
+        f.niri()
+            .seat
+            .get_pointer()
+            .unwrap()
+            .current_focus()
+            .is_none(),
+        "the seat pointer focus is cleared while the switcher holds its grab"
+    );
+
+    f.key_release(KEY_LEFTALT);
+    f.niri_complete_animations();
+
+    // ...and it comes back when the session ends.
+    pointer_motion_to(&mut f, over_window.x, over_window.y);
+    assert!(
+        f.niri().contents_under(over_window).surface.is_some(),
+        "the window takes the pointer back once the switcher is gone"
+    );
+}
+
 /// The arrows walk the open switcher, Escape abandons it, and Return takes the selection.
 ///
 /// These are the popup's *keysym* arms, the half of `_keyPressHandler` that does not go through a

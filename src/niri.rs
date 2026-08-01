@@ -5503,10 +5503,16 @@ impl Niri {
             return rv;
         }
 
-        if self.screenshot_ui.is_open() || self.panel_popover.is_open() {
-            // A panel popover grabs input modally (clicks and motion): while it is open no
-            // window under it should receive pointer focus, so the app can't keep driving the
-            // cursor image (e.g. a maximized terminal's I-beam over the clock popover).
+        if self.screenshot_ui.is_open() || self.panel_popover.is_open() || self.switcher.is_open() {
+            // These grab input modally (clicks and motion): while one is open no window under it
+            // should receive pointer focus, so the app can't keep driving the cursor image (e.g. a
+            // maximized terminal's I-beam over the clock popover).
+            //
+            // The switcher's grab starts with the popup, not with its *drawing*: `pushModal` is
+            // the first thing `show` does and the [`POPUP_DELAY`] that follows only sets opacity
+            // (`switcherPopup.js:122-168`), so this is `is_open`, not `is_visible`.
+            //
+            // [`POPUP_DELAY`]: crate::ui::switcher::POPUP_DELAY
             return rv;
         }
 
