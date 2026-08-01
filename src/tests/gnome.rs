@@ -789,12 +789,13 @@ fn gnome_keybindings_beat_niri_config_binds() {
     );
 }
 
-/// GNOME's `switch-windows` (default `<Alt>Tab`) cycles windows: holding Alt
-/// and tapping Tab opens the switcher, releasing Alt commits, and focus lands
-/// on the previously-used window. A second Alt+Tab returns to the first.
-/// (Mapped onto niri's window MRU switcher; GNOME's app-grouped
-/// `switch-applications` on `<Super>Tab` goes to the same switcher spanning
-/// all workspaces — accepted divergence: no app grouping.)
+/// GNOME's `switch-windows` (default `<Alt>Tab`) cycles windows: holding Alt and tapping Tab
+/// opens the switcher, releasing Alt commits, and focus lands on the previously-used window. A
+/// second Alt+Tab returns to the first.
+///
+/// This is the GNOME `WindowSwitcherPopup` now, not niri's MRU switcher — one item per window,
+/// with a live preview. `<Super>Tab` raises a *different* popup (`AppSwitcherPopup`, one item per
+/// app), which is the divergence this test used to carry a note about.
 #[test]
 fn alt_tab_switches_to_previous_window() {
     let mut f = Fixture::new();
@@ -808,7 +809,7 @@ fn alt_tab_switches_to_previous_window() {
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_TAB);
     assert!(
-        f.niri().window_mru_ui.is_open(),
+        f.niri().switcher.is_open(),
         "Alt+Tab must open the window switcher"
     );
     f.key_release(KEY_LEFTALT);
@@ -818,7 +819,7 @@ fn alt_tab_switches_to_previous_window() {
     f.double_roundtrip(id);
 
     assert!(
-        !f.niri().window_mru_ui.is_open(),
+        !f.niri().switcher.is_open(),
         "releasing Alt must commit and close the switcher"
     );
     let now_focused = f.niri().layout.focus().unwrap().id();
@@ -12076,11 +12077,21 @@ fn osd_hidden_by_the_window_switcher() {
     // under test.
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_TAB);
-    assert!(f.niri().window_mru_ui.is_open(), "Alt+Tab opened it");
+    assert!(f.niri().switcher.is_open(), "Alt+Tab opened it");
+
+    // The OSD goes when the popup *appears*, not when the key is pressed: `_showImmediately`
+    // calls `osdWindowManager.hideAll()` (`switcherPopup.js:178`), and that is 150 ms after the
+    // press. So the first tick reveals the popup and starts the OSD's fade, and the second lets
+    // the fade finish. (niri's MRU hid it at keypress, which is why this used to need one tick.)
+    tick(&mut f, 200);
+    assert!(
+        f.niri().switcher.is_visible(),
+        "the popup is past its delay"
+    );
     tick(&mut f, 200);
     assert!(
         !f.niri().osd.is_visible(),
-        "opening the window switcher hides the OSD"
+        "the switcher becoming visible hides the OSD"
     );
     f.key_release(KEY_LEFTALT);
 }

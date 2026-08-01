@@ -14,14 +14,16 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
 use crate::app_system::AppIconRef;
-use crate::render_helpers::icon::AppIconCache;
+use crate::niri_render_elements;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::render_helpers::vulkan::VkTexture;
+use crate::render_helpers::window_thumbnail::{self, WindowThumbnailRenderElement};
+use crate::render_helpers::RenderCtx;
 use crate::ui::switcher::app_switcher::{self, AppItem};
 use crate::ui::switcher::{
-    PanelLayout, SwitcherKey, SwitcherKind, SwitcherOutcome, SwitcherPopup, Visibility,
-    ITEM_PADDING, ITEM_RADIUS, ITEM_SELECTED, LIST_BG, LIST_BORDER, LIST_BORDER_COLOR, LIST_FG,
-    LIST_RADIUS,
+    window_switcher, PanelLayout, SwitcherKey, SwitcherKind, SwitcherOutcome, SwitcherPopup,
+    Visibility, ITEM_PADDING, ITEM_RADIUS, ITEM_SELECTED, LIST_BG, LIST_BORDER, LIST_BORDER_COLOR,
+    LIST_FG, LIST_RADIUS,
 };
 use crate::ui::widget::{
     self, style, AppIconUploads, BakeCache, Painter, ShapedText, TextShaper, TextStyle,
@@ -35,6 +37,15 @@ const LABEL_PT: f64 = 11.;
 /// The height an item's label occupies, in logical px — what the icon ladder measures against.
 pub fn label_height() -> f64 {
     crate::ui::pt_to_px(LABEL_PT)
+}
+
+niri_render_elements! {
+    SwitcherRenderElement => {
+        // The panel, its labels, and the app icons over it.
+        Texture = TextureRenderElement<VkTexture>,
+        // A window switcher's live previews.
+        Thumbnail = WindowThumbnailRenderElement,
+    }
 }
 
 /// What the switcher is cycling through.
@@ -132,6 +143,8 @@ impl Open {
 #[derive(Default)]
 pub struct SwitcherUi {
     open: Option<Open>,
+    /// Set on the `Pending` -> `Shown` edge, cleared by [`SwitcherUi::take_just_shown`].
+    just_shown: bool,
     chrome: RefCell<BakeCache>,
     icons: RefCell<AppIconUploads>,
 }
@@ -182,12 +195,18 @@ impl SwitcherUi {
 
         let state = SwitcherPopup::show(items.kind(), items.len(), backward, mask, held, now)?;
 
-        let icon_px = app_switcher::icon_size(
-            items.len(),
-            label_height,
-            app_switcher::available_width(monitor.size.w),
-        );
-        // Every item is the same square: the icon, with the label under it.
+        // The app switcher walks its icon ladder to make the row fit; the window switcher has no
+        // `_setIconSize` override, so its previews are always `WINDOW_PREVIEW_SIZE` and a row too
+        // wide for the screen simply overflows (GNOME scrolls it; see `SCROLL_TIME`).
+        let icon_px = match items {
+            Items::Apps(_) => app_switcher::icon_size(
+                items.len(),
+                label_height,
+                app_switcher::available_width(monitor.size.w),
+            ),
+            Items::Windows(_) => window_switcher::WINDOW_PREVIEW_SIZE,
+        };
+        // Every item is the same square: the icon or preview, with the label under it.
         let content = Size::from((icon_px, icon_px + label_height));
         let layout = PanelLayout::new(&vec![content; items.len()], monitor);
 
@@ -213,8 +232,30 @@ impl SwitcherUi {
     /// Drive the timers. Returns an outcome the moment the session ends.
     pub fn advance(&mut self, now: Duration) -> Option<(SwitcherOutcome, Option<MappedId>)> {
         let open = self.open.as_mut()?;
+        let was = open.state.visibility();
         open.state.poll(now);
+        self.note_shown(was);
         self.take_outcome()
+    }
+
+    /// Whether the popup became visible since this was last asked.
+    ///
+    /// `_showImmediately` hides every OSD as it raises the popup (`switcherPopup.js:178`), so the
+    /// two are never on screen together. Reported as an edge rather than done inside the state
+    /// machine because the OSD lives in the compositor, not in here.
+    pub fn take_just_shown(&mut self) -> bool {
+        std::mem::take(&mut self.just_shown)
+    }
+
+    fn note_shown(&mut self, was: Visibility) {
+        if was == Visibility::Pending
+            && self
+                .open
+                .as_ref()
+                .is_some_and(|o| o.state.visibility() == Visibility::Shown)
+        {
+            self.just_shown = true;
+        }
     }
 
     /// When [`advance`](Self::advance) next has something to do.
@@ -228,7 +269,9 @@ impl SwitcherUi {
         now: Duration,
     ) -> Option<(SwitcherOutcome, Option<MappedId>)> {
         let open = self.open.as_mut()?;
+        let was = open.state.visibility();
         open.state.key_press(key, now);
+        self.note_shown(was);
         self.take_outcome()
     }
 
@@ -315,23 +358,48 @@ impl SwitcherUi {
     }
 
     /// Front-to-back, like every other UI `render`.
-    pub fn render(
+    pub fn render_output(
         &self,
-        renderer: &mut VulkanRenderer,
-        app_icons: &AppIconCache,
+        niri: &crate::niri::Niri,
         output: &Output,
-    ) -> Vec<TextureRenderElement<VkTexture>> {
+        mut ctx: RenderCtx,
+        push: &mut dyn FnMut(SwitcherRenderElement),
+    ) {
         let Some(open) = self.open.as_ref() else {
-            return Vec::new();
+            return;
         };
         if open.output != *output || open.state.visibility() == Visibility::Pending {
-            return Vec::new();
+            return;
         }
 
+        let _span = tracy_client::span!("SwitcherUi::render_output");
         let scale = output.current_scale().fractional_scale();
-        let mut elements = Vec::new();
+        let app_icons = &niri.app_icon_cache;
+        let mut elements: Vec<TextureRenderElement<VkTexture>> = Vec::new();
 
-        // The app icons ride above the panel, one texture each.
+        // A window switcher's items are live windows; an app switcher's are just icons.
+        if let Items::Windows(ids) = &open.items {
+            for (i, id) in ids.iter().enumerate() {
+                let Some(item) = open.layout.items.get(i) else {
+                    continue;
+                };
+                let Some((_, mapped)) = niri.layout.windows().find(|(_, m)| m.id() == *id) else {
+                    continue;
+                };
+                window_thumbnail::render(
+                    mapped,
+                    ctx.r(),
+                    window_switcher::preview_box(*item),
+                    scale,
+                    1.,
+                    &mut |elem| push(SwitcherRenderElement::Thumbnail(elem)),
+                );
+            }
+        }
+
+        // The icons ride above the panel, one texture each. For an app switcher that is the app
+        // icon filling the square; for a window switcher it is the small badge in the preview's
+        // bottom-right corner.
         let mut uploads = self.icons.borrow_mut();
         for (i, art) in open.art.iter().enumerate() {
             let Some(icon) = art.icon.as_ref() else {
@@ -340,14 +408,25 @@ impl SwitcherUi {
             let Some(item) = open.layout.items.get(i) else {
                 continue;
             };
-            // The icon sits in the top of the square, with the label below it.
-            let center = Point::from((item.size.w / 2., ITEM_PADDING + open.icon_px / 2.));
+            let (icon_px, center) = match &open.items {
+                Items::Apps(_) => (
+                    open.icon_px,
+                    Point::from((item.size.w / 2., ITEM_PADDING + open.icon_px / 2.)),
+                ),
+                Items::Windows(_) => {
+                    let preview = window_switcher::preview_box(*item);
+                    (
+                        window_switcher::APP_ICON_SIZE_SMALL,
+                        window_switcher::app_icon_center(preview) - item.loc,
+                    )
+                }
+            };
             if let Some(el) = widget::app_icon_element(
-                renderer,
+                &mut *ctx.renderer,
                 &mut uploads,
                 app_icons,
                 icon,
-                open.icon_px,
+                icon_px,
                 scale,
                 item.loc,
                 center,
@@ -375,7 +454,7 @@ impl SwitcherUi {
             .collect();
 
         let baked = widget::bake(
-            renderer,
+            &mut *ctx.renderer,
             &mut self.chrome.borrow_mut(),
             scale,
             panel.size,
@@ -428,7 +507,7 @@ impl SwitcherUi {
         match baked {
             Ok(texture) => {
                 let buffer = TextureBuffer::from_texture(
-                    renderer,
+                    ctx.renderer,
                     texture,
                     scale,
                     Transform::Normal,
@@ -446,6 +525,10 @@ impl SwitcherUi {
             Err(err) => tracing::error!("error drawing the switcher panel: {err:#}"),
         }
 
-        elements
+        // Front-to-back: the icons and the panel were collected in draw order, and the panel
+        // (with its labels) must sit *behind* the icons that overlay it.
+        for element in elements {
+            push(SwitcherRenderElement::Texture(element));
+        }
     }
 }

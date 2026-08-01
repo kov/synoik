@@ -6,8 +6,8 @@ use std::time::Duration;
 use calloop::timer::{TimeoutAction, Timer};
 use input::event::gesture::GestureEventCoordinates as _;
 use niri_config::{
-    Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, MruFilter, MruScope,
-    SwitchBinds, Trigger, WorkspaceReference,
+    Action, Bind, Binds, Config, Key, ModKey, Modifiers, MruDirection, SwitchBinds, Trigger,
+    WorkspaceReference,
 };
 use niri_ipc::LayoutSwitchTarget;
 use smithay::backend::input::{
@@ -3502,6 +3502,9 @@ impl State {
             }
             Action::SwitchApplications { backward } => {
                 self.switch_applications(backward);
+            }
+            Action::SwitchWindows { backward } => {
+                self.switch_windows(backward);
             }
             Action::MruConfirm => {
                 self.confirm_mru();
@@ -8360,15 +8363,12 @@ fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         }
         GnomeKeyAction::MoveToWorkspacePrevious => Action::MoveWindowToWorkspaceUp(true),
         GnomeKeyAction::MoveToWorkspaceNext => Action::MoveWindowToWorkspaceDown(true),
-        GnomeKeyAction::SwitchWindows { backward } => Action::MruAdvance {
-            direction: mru_direction(backward),
-            scope: Some(MruScope::Workspace),
-            filter: Some(MruFilter::All),
-        },
+        GnomeKeyAction::SwitchWindows { backward } => Action::SwitchWindows { backward },
         GnomeKeyAction::SwitchApplications { backward } => Action::SwitchApplications { backward },
     })
 }
 
+#[allow(dead_code)] // Used by the MRU actions until `mru.rs` is retired.
 fn mru_direction(backward: bool) -> MruDirection {
     if backward {
         MruDirection::Backward

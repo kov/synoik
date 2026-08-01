@@ -535,6 +535,9 @@ pub struct Niri {
     pub osd_timer_at: Option<Duration>,
     pub switcher_timer: Option<RegistrationToken>,
     pub switcher_timer_at: Option<Duration>,
+    /// An outcome produced by a timer firing inside `advance_animations`, which is `Niri`-level
+    /// and so cannot activate a window itself. Drained by [`State::finish_switcher`].
+    pub pending_switcher_outcome: Option<(crate::ui::switcher::SwitcherOutcome, Option<MappedId>)>,
     /// Wake-up timer for the shown banner's expiry deadline (the pinned-clock check in
     /// `advance_animations` is the authority; this only wakes an otherwise idle loop).
     pub notification_banner_timer: Option<RegistrationToken>,
@@ -1874,38 +1877,84 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
-    /// `switch-applications` — `WindowManager._startSwitcher` for the app switcher
-    /// (`windowManager.js:1670-1712`).
-    ///
-    /// A press while the popup is already up advances it instead of raising a new one, which is
-    /// how holding the modifier and tapping Tab walks the row.
+    /// `switch-applications` — the app switcher (`windowManager.js:1670-1712`).
     pub fn switch_applications(&mut self, backward: bool) {
-        let now = self.niri.clock.now_unadjusted();
-
-        if self.niri.switcher.is_open() {
-            let outcome = self
-                .niri
-                .switcher
-                .key_press(SwitcherKey::Advance { backward }, now);
-            self.finish_switcher(outcome);
-            self.niri.queue_redraw_switcher_output();
+        if self.advance_open_switcher(backward) {
             return;
         }
 
-        let Some(output) = self.niri.layout.active_output().cloned() else {
-            return;
-        };
-
-        // `org.gnome.shell.app-switcher current-workspace-only`, default false — the app switcher
-        // spans workspaces where the *window* switcher does not.
-        let current_workspace_only = crate::ui::switcher::app_switcher::CURRENT_WORKSPACE_ONLY;
-        let tab_list = self.niri.switcher_tab_list(current_workspace_only);
+        // `org.gnome.shell.app-switcher current-workspace-only`, default **false** — the app
+        // switcher spans workspaces where the window switcher does not.
+        let tab_list = self
+            .niri
+            .switcher_tab_list(crate::ui::switcher::app_switcher::CURRENT_WORKSPACE_ONLY);
         let items = app_items(self.niri.app_system.running(), &tab_list);
         if items.is_empty() {
             return;
         }
 
         let art = self.niri.switcher_app_art(&items);
+        self.raise_switcher(Items::Apps(items), art, backward);
+    }
+
+    /// `switch-windows` — the *window* switcher (`altTab.js:580-640`).
+    ///
+    /// A different popup class from the app switcher, not the same one in another mode: its items
+    /// are windows, its previews are live, and it filters by workspace by default where the app
+    /// switcher does not.
+    pub fn switch_windows(&mut self, backward: bool) {
+        if self.advance_open_switcher(backward) {
+            return;
+        }
+
+        let tab_list = self
+            .niri
+            .switcher_tab_list(crate::ui::switcher::window_switcher::CURRENT_WORKSPACE_ONLY);
+        if tab_list.is_empty() {
+            return;
+        }
+
+        let art = self.niri.switcher_window_art(&tab_list);
+        self.raise_switcher(Items::Windows(tab_list), art, backward);
+    }
+
+    /// A press while a popup is already up advances it rather than raising a new one — which is
+    /// how holding the modifier and tapping Tab walks the row. Returns whether it handled the
+    /// press.
+    fn advance_open_switcher(&mut self, backward: bool) -> bool {
+        if !self.niri.switcher.is_open() {
+            return false;
+        }
+
+        let now = self.niri.clock.now_unadjusted();
+        let outcome = self
+            .niri
+            .switcher
+            .key_press(SwitcherKey::Advance { backward }, now);
+        self.finish_switcher(outcome);
+        self.hide_osd_for_switcher();
+        self.niri.queue_redraw_switcher_output();
+        true
+    }
+
+    /// The switcher hides every OSD as it becomes visible (`switcherPopup.js:178`), so a volume
+    /// pill and an Alt-Tab popup are never up together.
+    pub fn hide_osd_for_switcher(&mut self) {
+        if self.niri.switcher.take_just_shown() {
+            self.niri.osd.hide_all();
+        }
+    }
+
+    fn raise_switcher(
+        &mut self,
+        items: Items,
+        art: Vec<crate::ui::switcher::ui::ItemArt>,
+        backward: bool,
+    ) {
+        let now = self.niri.clock.now_unadjusted();
+        let Some(output) = self.niri.layout.active_output().cloned() else {
+            return;
+        };
         let mods = crate::input::modifiers_from_state(
             self.niri.seat.get_keyboard().unwrap().modifier_state(),
         );
@@ -1915,7 +1964,7 @@ impl State {
 
         let outcome = self.niri.switcher.open(
             OpenRequest {
-                items: Items::Apps(items),
+                items,
                 art,
                 backward,
                 // GNOME takes the mask from the binding; we take what is held at the moment the
@@ -1942,6 +1991,9 @@ impl State {
         &mut self,
         outcome: Option<(crate::ui::switcher::SwitcherOutcome, Option<MappedId>)>,
     ) {
+        // A timeout that fired inside `advance_animations` has been waiting for a caller that can
+        // actually focus a window.
+        let outcome = outcome.or_else(|| self.niri.pending_switcher_outcome.take());
         let Some((outcome, target)) = outcome else {
             return;
         };
@@ -4485,6 +4537,7 @@ impl Niri {
             osd_timer_at: None,
             switcher_timer: None,
             switcher_timer_at: None,
+            pending_switcher_outcome: None,
             last_power_profile: "power-saver".to_string(),
             #[cfg(feature = "dbus")]
             system_status_tx: None,
@@ -6314,6 +6367,17 @@ impl Niri {
         }
 
         self.osd.advance_animations();
+
+        // The switcher advances here like every other UI, not only from its event-loop timer: a
+        // frame can arrive between timer arming and firing, and a test driving
+        // `advance_animations` directly must see the same reveal a real frame would.
+        let switcher_now = self.clock.now_unadjusted();
+        if let Some(outcome) = self.switcher.advance(switcher_now) {
+            self.pending_switcher_outcome = Some(outcome);
+        }
+        if self.switcher.take_just_shown() {
+            self.osd.hide_all();
+        }
         // Unlike the banner above, this compares against what the timer is armed for
         // rather than against the pre-advance deadline: the OSD's deadline is set in
         // `show()`, which runs between frames, so a before/after diff is always equal
@@ -6673,12 +6737,8 @@ impl Niri {
         // Then, the Alt-Tab switcher. GNOME's popup is pushed into `uiGroup` on top of the
         // windows but below the OSD, which raises itself on show (`switcherPopup.js:178` hides
         // every OSD when the switcher becomes visible, so the two are never up together anyway).
-        for element in self
-            .switcher
-            .render(ctx.renderer, &self.app_icon_cache, output)
-        {
-            push(element.into());
-        }
+        self.switcher
+            .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
 
         self.window_mru_ui
             .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
@@ -10396,6 +10456,7 @@ impl Niri {
                 let now = state.niri.clock.now_unadjusted();
                 let outcome = state.niri.switcher.advance(now);
                 state.finish_switcher(outcome);
+                state.hide_osd_for_switcher();
                 state.niri.queue_redraw_all();
                 TimeoutAction::Drop
             })
@@ -10661,6 +10722,41 @@ impl Niri {
             .collect()
     }
 
+    /// Resolve each window item's badge icon and title — `WindowIcon` (`altTab.js:1002-1057`).
+    ///
+    /// The label is the *window title*, not the app name: two windows of one app are told apart
+    /// by their titles, which is the whole reason this switcher exists alongside the app one. A
+    /// window with no title falls back to its app's name, as `appMenu.js:283` does for the
+    /// equivalent row.
+    pub fn switcher_window_art(&self, ids: &[MappedId]) -> Vec<crate::ui::switcher::ui::ItemArt> {
+        use crate::utils::with_toplevel_role;
+
+        ids.iter()
+            .map(|&id| {
+                let mapped = self.layout.windows().find(|(_, m)| m.id() == id);
+                let (app_id, title) = mapped.map_or((None, None), |(_, m)| {
+                    with_toplevel_role(m.toplevel(), |role| {
+                        (role.app_id.clone(), role.title.clone())
+                    })
+                });
+                let entry = app_id
+                    .as_deref()
+                    .and_then(|id| self.app_system.app_for_window(id));
+
+                crate::ui::switcher::ui::ItemArt {
+                    icon: entry.as_ref().map(|e| e.icon.clone()),
+                    label: title
+                        .filter(|t| !t.is_empty())
+                        .or_else(|| entry.map(|e| e.name))
+                        .unwrap_or_default(),
+                    // The chevron belongs to the app switcher: a window switcher item *is* one
+                    // window, so there is never anything to descend into.
+                    arrow: false,
+                }
+            })
+            .collect()
+    }
+
     pub fn queue_redraw_switcher_output(&mut self) {
         if let Some(output) = self.switcher.output().cloned() {
             self.queue_redraw(&output);
@@ -10776,6 +10872,7 @@ niri_render_elements! {
         ScreenshotUi = ScreenshotUiRenderElement,
         CapturedTexture = CapturedTextureRenderElement,
         WindowMruUi = WindowMruUiRenderElement,
+        Switcher = crate::ui::switcher::ui::SwitcherRenderElement,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         RunDialog = RunDialogRenderElement,
         EndSessionDialog = EndSessionDialogRenderElement,

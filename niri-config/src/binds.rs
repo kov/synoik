@@ -403,6 +403,12 @@ pub enum Action {
     SwitchApplications {
         backward: bool,
     },
+    /// GNOME's `switch-windows` — the per-*window* Alt-Tab switcher, a different popup class
+    /// from the app switcher above (`windowManager.js:1670-1694`).
+    #[knuffel(skip)]
+    SwitchWindows {
+        backward: bool,
+    },
     #[knuffel(skip)]
     MruConfirm,
     #[knuffel(skip)]

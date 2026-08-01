@@ -29,6 +29,7 @@ use crate::ui::widget::{self, style, Rgba};
 pub mod app_switcher;
 pub mod ui;
 pub mod window_list;
+pub mod window_switcher;
 
 /// `POPUP_DELAY_TIMEOUT` (`js/ui/switcherPopup.js:8`) — how long the modifier must be
 /// held before the popup is drawn at all. A tap shorter than this switches silently.
