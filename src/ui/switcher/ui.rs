@@ -17,6 +17,8 @@ use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 use crate::animation::{Animation, Clock, Curve};
 use crate::app_system::AppIconRef;
 use crate::niri_render_elements;
+use crate::render_helpers::inset_ring::InsetRing;
+use crate::render_helpers::solid_color::SolidColorRenderElement;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::VkTexture;
 use crate::render_helpers::window_thumbnail::{self, WindowThumbnailRenderElement};
@@ -37,6 +39,9 @@ use crate::window::mapped::MappedId;
 /// switcher sets no font size of its own, so the item label is plain body text.
 const LABEL_PT: f64 = 11.;
 
+/// `.cycler-highlight`'s `border: 5px solid -st-accent-color` (`_switcher-popup.scss:80-82`).
+const CYCLER_HIGHLIGHT_BORDER: f64 = 5.;
+
 /// The height an item's label occupies, in logical px — what the icon ladder measures against.
 pub fn label_height() -> f64 {
     crate::ui::pt_to_px(LABEL_PT)
@@ -48,6 +53,8 @@ niri_render_elements! {
         Texture = TextureRenderElement<VkTexture>,
         // A window switcher's live previews.
         Thumbnail = WindowThumbnailRenderElement,
+        // A cycler's `.cycler-highlight` border, drawn around the window itself.
+        Solid = SolidColorRenderElement,
     }
 }
 
@@ -60,6 +67,19 @@ pub enum Items {
     Apps(Vec<AppItem>),
     /// `WindowSwitcherPopup` — slice 3.
     Windows(Vec<MappedId>),
+    /// `CyclerPopup` (`altTab.js:487-540`) — `cycle-windows` and `cycle-group`.
+    ///
+    /// Same popup machinery, no popup: `CyclerList` draws nothing, and the selection is shown by
+    /// raising the window itself and putting a `.cycler-highlight` border around it. So this
+    /// variant deliberately has no [`ItemArt`], no [`PanelLayout`] and no sub-list.
+    ///
+    /// `group` is which of the two bindings opened it, because a cycler only advances on *its
+    /// own* action: `_keyPressHandler` matches one `Meta.KeyBindingAction` and propagates
+    /// everything else (`altTab.js:544-554` for the group cycler, `:657-666` for the window one).
+    Cycler {
+        windows: Vec<MappedId>,
+        group: bool,
+    },
 }
 
 impl Items {
@@ -67,6 +87,7 @@ impl Items {
         match self {
             Items::Apps(items) => items.len(),
             Items::Windows(ids) => ids.len(),
+            Items::Cycler { windows, .. } => windows.len(),
         }
     }
 
@@ -78,6 +99,7 @@ impl Items {
         match self {
             Items::Apps(_) => SwitcherKind::Apps,
             Items::Windows(_) => SwitcherKind::Windows,
+            Items::Cycler { .. } => SwitcherKind::Cycler,
         }
     }
 
@@ -89,7 +111,7 @@ impl Items {
     fn window_at(&self, n: usize) -> Option<MappedId> {
         match self {
             Items::Apps(items) => items.get(n)?.windows.first().copied(),
-            Items::Windows(ids) => ids.get(n).copied(),
+            Items::Windows(ids) | Items::Cycler { windows: ids, .. } => ids.get(n).copied(),
         }
     }
 }
@@ -183,14 +205,14 @@ impl Open {
     fn item_label_height(&self) -> f64 {
         match self.items {
             Items::Apps(_) => self.label_height,
-            Items::Windows(_) => 0.,
+            Items::Windows(_) | Items::Cycler { .. } => 0.,
         }
     }
 
     /// The height of the panel-wide title label, or 0 for a popup that has none.
     fn footer_height(&self) -> f64 {
         match self.items {
-            Items::Apps(_) => 0.,
+            Items::Apps(_) | Items::Cycler { .. } => 0.,
             Items::Windows(_) => self.label_height,
         }
     }
@@ -201,7 +223,7 @@ impl Open {
             Items::Apps(apps) => apps
                 .get(self.state.selected())
                 .map_or(&[][..], |a| &a.windows),
-            Items::Windows(_) => &[],
+            Items::Windows(_) | Items::Cycler { .. } => &[],
         }
     }
 
@@ -310,6 +332,9 @@ pub struct SwitcherUi {
     /// app row every time a preview selection moved.
     thumb_chrome: RefCell<BakeCache>,
     icons: RefCell<AppIconUploads>,
+    /// `.cycler-highlight` — the whole visible UI of a cycler, kept across frames so a highlight
+    /// that has not moved does not re-damage its four edges.
+    cycler_ring: RefCell<InsetRing>,
 }
 
 impl SwitcherUi {
@@ -323,6 +348,7 @@ impl SwitcherUi {
             chrome: RefCell::new(BakeCache::default()),
             thumb_chrome: RefCell::new(BakeCache::default()),
             icons: RefCell::new(AppIconUploads::default()),
+            cycler_ring: RefCell::new(InsetRing::new()),
         }
     }
 
@@ -413,6 +439,8 @@ impl SwitcherUi {
         let open = self.open.as_ref()?;
         match &open.items {
             Items::Windows(ids) => ids.get(open.state.selected()).copied(),
+            // `CyclerPopup` binds no close key at all.
+            Items::Cycler { .. } => None,
             Items::Apps(_) => {
                 let thumbs = open.thumbs.as_ref().filter(|t| t.focused)?;
                 thumbs.windows.get(thumbs.selected?).copied()
@@ -426,7 +454,7 @@ impl SwitcherUi {
         let open = self.open.as_ref()?;
         match &open.items {
             Items::Apps(apps) => Some(apps.get(open.state.selected())?.app_id.as_str()),
-            Items::Windows(_) => None,
+            Items::Windows(_) | Items::Cycler { .. } => None,
         }
     }
 
@@ -471,6 +499,56 @@ impl SwitcherUi {
         self.open.as_ref().map(|o| &o.output)
     }
 
+    /// The window a running cycler is showing — `CyclerHighlight.window` (`altTab.js:433-457`).
+    ///
+    /// `None` for every other popup and when nothing is up, which is also the signal to drop the
+    /// layout's raise: no cycler, no window pinned above its neighbours.
+    pub fn cycler_window(&self) -> Option<MappedId> {
+        let open = self.open.as_ref()?;
+        let Items::Cycler { windows, .. } = &open.items else {
+            return None;
+        };
+        windows.get(open.state.selected()).copied()
+    }
+
+    /// Whether the running cycler is the *group* one, so the compositor can tell which of the two
+    /// cycle actions advances it and which is ignored (`altTab.js:544-554`, `:657-666`).
+    pub fn cycler_is_group(&self) -> Option<bool> {
+        match &self.open.as_ref()?.items {
+            Items::Cycler { group, .. } => Some(*group),
+            _ => None,
+        }
+    }
+
+    /// `.cycler-highlight`: a 5px `-st-accent-color` border around the cycled window
+    /// (`_switcher-popup.scss:80-82`), drawn inside its frame rect like any St border.
+    ///
+    /// Pushed by the compositor at the top of the window layer rather than with the rest of the
+    /// switcher, because that is where `CyclerHighlight` lives — `global.window_group`
+    /// (`altTab.js:498`), under the panel, not over it.
+    pub fn render_cycler(
+        &self,
+        rect: Rectangle<f64, Logical>,
+        accent: [u8; 3],
+        push: &mut dyn FnMut(SolidColorRenderElement),
+    ) {
+        if self.cycler_window().is_none() {
+            return;
+        }
+        let mut ring = self.cycler_ring.borrow_mut();
+        ring.update(
+            rect,
+            CYCLER_HIGHLIGHT_BORDER,
+            niri_config::Color::new_unpremul(
+                f32::from(accent[0]) / 255.,
+                f32::from(accent[1]) / 255.,
+                f32::from(accent[2]) / 255.,
+                1.,
+            ),
+        );
+        ring.render(push);
+    }
+
     pub fn selected(&self) -> Option<usize> {
         self.open.as_ref().map(|o| o.state.selected())
     }
@@ -488,7 +566,9 @@ impl SwitcherUi {
     /// An immediate finish is not an error: it is the modifier-already-released race
     /// (`switcherPopup.js:144-155`), and the caller must still activate the selection.
     pub fn open(&mut self, req: OpenRequest, now: Duration) -> Option<SwitcherOutcome> {
-        debug_assert_eq!(req.items.len(), req.art.len());
+        debug_assert!(
+            matches!(req.items, Items::Cycler { .. }) || req.items.len() == req.art.len()
+        );
 
         let OpenRequest {
             items,
@@ -514,6 +594,8 @@ impl SwitcherUi {
                 app_switcher::available_width(monitor.size.w),
             ),
             Items::Windows(_) => window_switcher::WINDOW_PREVIEW_SIZE,
+            // Nothing is drawn in a panel, so there is no icon to size.
+            Items::Cycler { .. } => 0.,
         };
         let outcome = state.outcome();
         let mut open = Open {
@@ -529,11 +611,15 @@ impl SwitcherUi {
             thumbs: None,
             thumb_deadline: None,
         };
-        open.layout = PanelLayout::new(
-            &vec![open.content_size(); open.items.len()],
-            monitor,
-            open.footer_height(),
-        );
+        // A cycler draws no panel, and must not measure one either: an empty `PanelLayout` is
+        // also what keeps the pointer from hit-testing item rects that are not on screen.
+        if !matches!(open.items, Items::Cycler { .. }) {
+            open.layout = PanelLayout::new(
+                &vec![open.content_size(); open.items.len()],
+                monitor,
+                open.footer_height(),
+            );
+        }
         // `_initialSelection` goes through `_select` like every later move, so a popup that opens
         // on a multi-window app is already counting down to its sub-list (`altTab.js:349-356`).
         open.close_thumbs(now, true);
@@ -628,6 +714,25 @@ impl SwitcherUi {
         let mut going = None;
         let open = self.open.as_mut()?;
         let was = open.state.visibility();
+
+        // `CyclerPopup` subclasses handle *only* their own cycle action and propagate everything
+        // else (`altTab.js:544-554`, `:657-666`). The base then acts on Escape and the explicit
+        // commit keys and ignores the rest — so the arrows, `w` and `q` do nothing at all here.
+        // There is no list to walk and no item to act on.
+        if matches!(open.items, Items::Cycler { .. }) {
+            match key {
+                SwitcherKey::Left
+                | SwitcherKey::Right
+                | SwitcherKey::Up
+                | SwitcherKey::Down
+                | SwitcherKey::Group { .. }
+                | SwitcherKey::CloseWindow
+                | SwitcherKey::QuitApp => {}
+                key => open.state.key_press(key, now),
+            }
+            self.note_shown(was);
+            return self.take_outcome();
+        }
 
         // `AppSwitcherPopup._keyPressHandler` (`altTab.js:190-208`) takes the arrows before the
         // base does, and what they mean depends on where the focus is: with the sub-list focused
@@ -773,7 +878,7 @@ impl SwitcherUi {
         let open = self.open.as_mut()?;
 
         let index = match &mut open.items {
-            Items::Windows(ids) => {
+            Items::Windows(ids) | Items::Cycler { windows: ids, .. } => {
                 let index = ids.iter().position(|&w| w == id)?;
                 ids.remove(index);
                 index
@@ -837,6 +942,9 @@ impl SwitcherUi {
         let Some(open) = self.open.as_mut() else {
             return;
         };
+        if matches!(open.items, Items::Cycler { .. }) {
+            return;
+        }
         let content = open.content_size();
         open.layout = PanelLayout::new(
             &vec![content; open.items.len()],
@@ -959,6 +1067,13 @@ impl SwitcherUi {
         if open.output != *output || open.state.visibility() == Visibility::Pending {
             return;
         }
+        // A cycler has no panel to draw; its highlight goes out from `render_cycler` instead,
+        // down in the window layer — and without waiting out `POPUP_DELAY`, since GNOME
+        // highlights from `_initialSelection` inside `show()` and the delay only ever touched
+        // the popup actor's opacity (`switcherPopup.js:137-160`).
+        if matches!(open.items, Items::Cycler { .. }) {
+            return;
+        }
 
         let _span = tracy_client::span!("SwitcherUi::render_output");
         let scale = output.current_scale().fractional_scale();
@@ -1032,6 +1147,8 @@ impl SwitcherUi {
                     open.icon_px,
                     Point::from((item.size.w / 2., ITEM_PADDING + open.icon_px / 2.)),
                 ),
+                // A cycler has no art, so this loop never runs for one.
+                Items::Cycler { .. } => continue,
                 Items::Windows(_) => {
                     let preview = window_switcher::preview_box(*item);
                     (

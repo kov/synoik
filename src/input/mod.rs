@@ -781,15 +781,19 @@ impl State {
                     let config = this.niri.config.borrow();
                     // The switcher holds a modal grab, so while it is up nothing but the switch
                     // bindings resolves.
-                    let switcher_is_open = this.niri.switcher.is_open();
-                    let bindings = make_binds_iter(&config, switcher_is_open);
+                    let switcher = match this.niri.switcher.cycler_is_group() {
+                        Some(group) => SwitcherGrab::Cycler { group },
+                        None if this.niri.switcher.is_open() => SwitcherGrab::Popup,
+                        None => SwitcherGrab::Closed,
+                    };
+                    let bindings = make_binds_iter(&config, switcher.is_open());
 
                     should_intercept_key(
                         &mut this.niri.suppressed_keys,
                         bindings,
                         &this.niri.gnome_settings.keybindings,
                         &this.niri.accel_grabs,
-                        switcher_is_open,
+                        switcher,
                         mod_key,
                         key_code,
                         modified,
@@ -3504,6 +3508,12 @@ impl State {
             }
             Action::SwitchWindows { backward } => {
                 self.switch_windows(backward);
+            }
+            Action::CycleWindows { backward } => {
+                self.cycle_windows(backward, false);
+            }
+            Action::CycleGroup { backward } => {
+                self.cycle_windows(backward, true);
             }
         }
     }
@@ -7961,6 +7971,49 @@ impl State {
     }
 }
 
+/// Which switcher popup holds the modal grab, and therefore which bindings still resolve.
+///
+/// A popup consumes the key only when it resolves to an action *its own* `_keyPressHandler`
+/// matches; anything else propagates to the base, which acts on Escape / Tab / the commit keys
+/// and swallows the rest (`switcherPopup.js:194-219`). So the allowlist is per popup class, not
+/// one "the switcher is up" flag — a cycler that let the *other* cycler's action through would
+/// silently eat the Escape that is supposed to abandon it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitcherGrab {
+    Closed,
+    /// `AppSwitcherPopup` / `WindowSwitcherPopup` — the popups with a list.
+    Popup,
+    /// `CyclerPopup`, which matches exactly one action: its own.
+    Cycler {
+        group: bool,
+    },
+}
+
+impl SwitcherGrab {
+    fn is_open(self) -> bool {
+        self != SwitcherGrab::Closed
+    }
+
+    /// Whether a GNOME action still resolves as a binding while this popup is up.
+    fn resolves(self, action: GnomeKeyAction) -> bool {
+        match self {
+            SwitcherGrab::Closed => true,
+            SwitcherGrab::Popup => matches!(
+                action,
+                GnomeKeyAction::SwitchWindows { .. }
+                    | GnomeKeyAction::SwitchApplications { .. }
+                    | GnomeKeyAction::SwitchGroup { .. }
+            ),
+            SwitcherGrab::Cycler { group: false } => {
+                matches!(action, GnomeKeyAction::CycleWindows { .. })
+            }
+            SwitcherGrab::Cycler { group: true } => {
+                matches!(action, GnomeKeyAction::CycleGroup { .. })
+            }
+        }
+    }
+}
+
 /// Check whether the key should be intercepted and mark intercepted
 /// pressed keys as `suppressed`, thus preventing `releases` corresponding
 /// to them from being delivered.
@@ -7970,7 +8023,7 @@ fn should_intercept_key<'a>(
     bindings: impl IntoIterator<Item = &'a Bind>,
     gnome_keybindings: &[GnomeKeybinding],
     accel_grabs: &[AccelGrab],
-    switcher_is_open: bool,
+    switcher: SwitcherGrab,
     mod_key: ModKey,
     key_code: Keycode,
     modified: Keysym,
@@ -7992,7 +8045,7 @@ fn should_intercept_key<'a>(
         bindings,
         gnome_keybindings,
         accel_grabs,
-        switcher_is_open,
+        switcher,
         mod_key,
         key_code,
         modified,
@@ -8061,7 +8114,7 @@ fn find_bind<'a>(
     bindings: impl IntoIterator<Item = &'a Bind>,
     gnome_keybindings: &[GnomeKeybinding],
     accel_grabs: &[AccelGrab],
-    switcher_is_open: bool,
+    switcher: SwitcherGrab,
     mod_key: ModKey,
     key_code: Keycode,
     modified: Keysym,
@@ -8107,14 +8160,14 @@ fn find_bind<'a>(
     // session the GSettings store is the user's keybinding config, and mutter
     // processes it before anything else sees the key. The niri config stays
     // underneath as a fallback.
-    if let Some(bind) = find_gnome_bind(gnome_keybindings, switcher_is_open, key_code, raw, mods) {
+    if let Some(bind) = find_gnome_bind(gnome_keybindings, switcher, key_code, raw, mods) {
         return Some(bind);
     }
 
     // External accelerator grabs live in the same table in mutter, after the
     // builtins (a conflicting grab is refused at grab time). They also don't
     // fire while the switcher's grab is up.
-    if !switcher_is_open {
+    if !switcher.is_open() {
         if let Some(bind) = find_accel_grab_bind(accel_grabs, key_code, raw, mods) {
             return Some(bind);
         }
@@ -8160,7 +8213,7 @@ fn find_accel_grab_bind(
 /// the equivalent niri bind.
 fn find_gnome_bind(
     keybindings: &[GnomeKeybinding],
-    switcher_is_open: bool,
+    switcher: SwitcherGrab,
     key_code: Keycode,
     raw: Option<Keysym>,
     mods: ModifiersState,
@@ -8171,17 +8224,10 @@ fn find_gnome_bind(
             .any(|accel| accel_matches(accel, key_code, raw, mods))
     })?;
 
-    // The window switcher is modal (GNOME holds a grab while it's up; niri
-    // disables the general binds): only the switch actions themselves keep
-    // resolving so further taps continue cycling.
-    if switcher_is_open
-        && !matches!(
-            keybinding.action,
-            GnomeKeyAction::SwitchWindows { .. }
-                | GnomeKeyAction::SwitchApplications { .. }
-                | GnomeKeyAction::SwitchGroup { .. }
-        )
-    {
+    // The switcher is modal (GNOME holds a grab while it's up; niri disables the general binds):
+    // only the actions the popup that is up actually matches keep resolving, so further taps
+    // continue cycling and everything else falls through to the popup's keysym handling.
+    if !switcher.resolves(keybinding.action) {
         return None;
     }
 
@@ -8315,6 +8361,8 @@ fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         GnomeKeyAction::SwitchWindows { backward } => Action::SwitchWindows { backward },
         GnomeKeyAction::SwitchApplications { backward } => Action::SwitchApplications { backward },
         GnomeKeyAction::SwitchGroup { backward } => Action::SwitchGroup { backward },
+        GnomeKeyAction::CycleWindows { backward } => Action::CycleWindows { backward },
+        GnomeKeyAction::CycleGroup { backward } => Action::CycleGroup { backward },
     })
 }
 
@@ -9015,7 +9063,7 @@ mod tests {
                 &bindings.0,
                 &[],
                 &[],
-                false,
+                SwitcherGrab::Closed,
                 comp_mod,
                 close_key_code,
                 close_keysym,
@@ -9035,7 +9083,7 @@ mod tests {
                 &bindings.0,
                 &[],
                 &[],
-                false,
+                SwitcherGrab::Closed,
                 comp_mod,
                 Keycode::from(Keysym::l.raw() + 8),
                 Keysym::l,

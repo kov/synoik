@@ -609,6 +609,11 @@ impl<W: LayoutElement> Workspace<W> {
         scrolling.chain(floating)
     }
 
+    /// See [`FloatingSpace::set_cycler_raised`].
+    pub fn set_cycler_raised(&mut self, id: Option<&W::Id>) {
+        self.floating.set_cycler_raised(id);
+    }
+
     pub fn is_floating(&self, id: &W::Id) -> bool {
         self.floating.has_window(id)
     }

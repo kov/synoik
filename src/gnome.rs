@@ -867,6 +867,15 @@ pub enum GnomeKeyAction {
     /// (`altTab.js:117-137`). Its default accel is `Above_Tab`, the key
     /// physically above Tab.
     SwitchGroup { backward: bool },
+    /// `cycle-windows` / `cycle-windows-backward`: `WindowCyclerPopup`
+    /// (`altTab.js:638-667`) — the same window list as `switch-windows` with
+    /// no popup at all; the selection is shown by raising the window and
+    /// framing it with `.cycler-highlight`.
+    CycleWindows { backward: bool },
+    /// `cycle-group` / `cycle-group-backward`: `GroupCyclerPopup`
+    /// (`altTab.js:541-580`), the same listless cycler over the focused app's
+    /// windows only.
+    CycleGroup { backward: bool },
     /// `switch-applications` / `switch-applications-backward`: GNOME's
     /// Alt-Tab. GNOME groups by application and spans workspaces; we map it
     /// onto the window MRU switcher over all workspaces (no app grouping —
@@ -1016,6 +1025,26 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
             "switch-group-backward".to_owned(),
             SwitchGroup { backward: true },
             strs(&["<Shift><Super>Above_Tab", "<Shift><Alt>Above_Tab"]),
+        ),
+        (
+            "cycle-windows".to_owned(),
+            CycleWindows { backward: false },
+            strs(&["<Alt>Escape"]),
+        ),
+        (
+            "cycle-windows-backward".to_owned(),
+            CycleWindows { backward: true },
+            strs(&["<Shift><Alt>Escape"]),
+        ),
+        (
+            "cycle-group".to_owned(),
+            CycleGroup { backward: false },
+            strs(&["<Alt>F6"]),
+        ),
+        (
+            "cycle-group-backward".to_owned(),
+            CycleGroup { backward: true },
+            strs(&["<Shift><Alt>F6"]),
         ),
         (
             "switch-applications".to_owned(),

@@ -50,6 +50,7 @@ const KEY_Z: u32 = 44;
 const KEY_LEFTALT: u32 = 56;
 const KEY_F2: u32 = 60;
 const KEY_F4: u32 = 62;
+const KEY_F6: u32 = 64;
 const KEY_UP: u32 = 103;
 const KEY_LEFT: u32 = 105;
 const KEY_DOWN: u32 = 108;
@@ -13511,6 +13512,169 @@ fn switch_group_opens_inside_the_current_app_on_its_second_window() {
     assert_eq!(f.niri().switcher.thumbnail_selected(), Some(2));
     f.key_release(KEY_LEFTMETA);
     f.key_release(KEY_LEFTSHIFT);
+}
+
+/// `cycle-windows` (`<Alt>Escape`) walks the same window list with **no popup at all**.
+///
+/// `WindowCyclerPopup` (`altTab.js:638-667`) extends `CyclerPopup`, whose `_switcherList` is a
+/// `CyclerList` that draws nothing (`:472-484`). The selection is shown by raising the window and
+/// framing it with `.cycler-highlight`, so this asserts on the highlight rather than on a panel —
+/// and the highlight is up on the *first* press, without waiting out `POPUP_DELAY`, because
+/// `_highlightItem` runs from `_initialSelection` inside `show()` and the delay only ever touched
+/// the popup actor's opacity.
+#[test]
+fn alt_escape_cycles_windows_in_place_with_no_popup() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.A");
+    let a = f.niri().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.B");
+    let b = f.niri().layout.focus().unwrap().id();
+    f.niri_complete_animations();
+
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_ESC);
+
+    assert!(f.niri().switcher.is_open(), "Alt+Escape opens a cycler");
+    assert!(
+        f.niri().switcher.item_rect(0).is_none() && f.niri().switcher.footer_rect().is_none(),
+        "...which has no list, so it measures no panel to hit-test or draw"
+    );
+    // `_initialSelection`: forward starts at 1, the window you are *not* on.
+    assert_eq!(f.niri().switcher.cycler_window(), Some(a));
+    let highlight = f.niri().cycler_highlight.expect("the window is framed");
+    assert!(
+        highlight.size.w > 0. && highlight.size.h > 0.,
+        "and framed somewhere real: {highlight:?}"
+    );
+
+    // `<Alt>F6` is the *other* cycler's binding: `_keyPressHandler` matches one action and
+    // propagates the rest, so it does not cross-drive this one.
+    tap(&mut f, KEY_F6);
+    assert_eq!(
+        f.niri().switcher.cycler_window(),
+        Some(a),
+        "the group cycler's key does not drive the window cycler"
+    );
+
+    // A second press of its own key walks on; the frame follows.
+    tap(&mut f, KEY_ESC);
+    assert_eq!(f.niri().switcher.cycler_window(), Some(b));
+    assert_ne!(f.niri().cycler_highlight, Some(highlight));
+
+    // Releasing the modifier commits, like any other switcher.
+    f.key_release(KEY_LEFTALT);
+    f.niri_complete_animations();
+    f.double_roundtrip(client);
+    assert_eq!(f.niri().layout.focus().unwrap().id(), b);
+    assert!(
+        f.niri().cycler_highlight.is_none(),
+        "and the frame goes with the session"
+    );
+}
+
+/// `cycle-group` (`<Alt>F6`) is the same listless cycler over the focused app's windows only.
+///
+/// `GroupCyclerPopup._getWindows` is `focus_app.get_windows()` (`altTab.js:557-570`), so a window
+/// of another app is never reachable from it however long you hold F6 down — which is the whole
+/// difference from `cycle-windows` and the thing a shared item list would silently lose.
+#[test]
+fn alt_f6_cycles_only_the_focused_apps_windows() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![
+            AppEntry::fake("org.example.One.desktop", "One"),
+            AppEntry::fake("org.example.Two.desktop", "Two"),
+        ])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.Two");
+    let other = f.niri().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.One");
+    let a = f.niri().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.One");
+    let b = f.niri().layout.focus().unwrap().id();
+    f.niri_complete_animations();
+
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_F6);
+    assert!(f.niri().switcher.is_open());
+    assert_eq!(f.niri().switcher.cycler_window(), Some(a));
+
+    // "One" has exactly two windows, so any number of presses stays inside them.
+    for expected in [b, a, b] {
+        tap(&mut f, KEY_F6);
+        assert_eq!(f.niri().switcher.cycler_window(), Some(expected));
+        assert_ne!(
+            f.niri().switcher.cycler_window(),
+            Some(other),
+            "the other app's window is not in this cycler at all"
+        );
+    }
+
+    f.key_release(KEY_LEFTALT);
+    f.niri_complete_animations();
+    f.double_roundtrip(client);
+    assert_eq!(f.niri().layout.focus().unwrap().id(), b);
+}
+
+/// An action the running cycler does not match falls through to the base — so `<Alt>Escape`
+/// **abandons** an `<Alt>F6` cycler instead of driving it.
+///
+/// This is the seam the JS comments out loud: "pressing one of the below keys will destroy the
+/// popup only if that key is not used by the active popup's keyboard shortcut"
+/// (`switcherPopup.js:206-210`). `GroupCyclerPopup._keyPressHandler` matches `CYCLE_GROUP` and
+/// propagates everything else (`altTab.js:571-580`), so the Escape keysym reaches the base and
+/// cancels. Get the allowlist wrong — let every switch binding resolve while any popup is up —
+/// and the key is swallowed by an action that does nothing, leaving no way out but the modifier.
+#[test]
+fn a_key_the_cycler_does_not_match_falls_through_and_abandons_it() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake(
+            "org.example.A.desktop",
+            "A",
+        )])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.A");
+    map_window_for_app(&mut f, client, "org.example.A");
+    let before = f.niri().layout.focus().unwrap().id();
+    f.niri_complete_animations();
+
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_F6);
+    assert!(f.niri().switcher.is_open(), "the group cycler is up");
+    assert_ne!(f.niri().switcher.cycler_window(), Some(before));
+
+    // Still holding Alt: `<Alt>Escape` is `cycle-windows`, which this popup does not match.
+    tap(&mut f, KEY_ESC);
+    assert!(
+        !f.niri().switcher.is_open(),
+        "it abandons rather than cycles"
+    );
+    assert!(f.niri().cycler_highlight.is_none());
+
+    f.key_release(KEY_LEFTALT);
+    f.niri_complete_animations();
+    f.double_roundtrip(client);
+    assert_eq!(
+        f.niri().layout.focus().unwrap().id(),
+        before,
+        "an abandoned cycler leaves the focus where it was"
+    );
 }
 
 /// The window sub-list fades in rather than appearing — and keeps the compositor drawing while

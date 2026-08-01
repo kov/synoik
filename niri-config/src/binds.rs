@@ -409,6 +409,19 @@ pub enum Action {
     SwitchGroup {
         backward: bool,
     },
+    /// GNOME's `cycle-windows` (`<Alt>Escape`) — `WindowCyclerPopup` (`altTab.js:638-667`). Same
+    /// window list as the window switcher, but **no popup**: the selected window is raised and
+    /// framed in place.
+    #[knuffel(skip)]
+    CycleWindows {
+        backward: bool,
+    },
+    /// GNOME's `cycle-group` (`<Alt>F6`) — `GroupCyclerPopup` (`altTab.js:541-580`), the same
+    /// listless cycler restricted to the focused app's windows.
+    #[knuffel(skip)]
+    CycleGroup {
+        backward: bool,
+    },
 }
 
 impl From<niri_ipc::Action> for Action {

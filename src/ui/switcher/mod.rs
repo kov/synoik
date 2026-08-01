@@ -284,6 +284,12 @@ pub enum SwitcherKind {
     Apps,
     /// `WindowSwitcherPopup` — `switch-windows` (`<Alt>Tab`).
     Windows,
+    /// `CyclerPopup` — `cycle-windows` (`<Alt>Escape`) and `cycle-group` (`<Alt>F6`).
+    ///
+    /// The odd one out: it has no list to draw. `CyclerList` (`altTab.js:472-484`) is a bare
+    /// `St.Widget` that only re-emits `highlight` as a signal, so the whole UI is the highlight
+    /// the popup puts around the selected window itself.
+    Cycler,
 }
 
 /// Whether the popup has become visible yet.

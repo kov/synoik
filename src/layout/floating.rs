@@ -46,6 +46,16 @@ pub struct FloatingSpace<W: LayoutElement> {
     /// This is always set to `Some()` when `tiles` isn't empty.
     active_window_id: Option<W::Id>,
 
+    /// The window a running window cycler is showing, drawn above every other tile without
+    /// touching the stacking order — `CyclerHighlight` (`altTab.js:410-472`) does the same thing
+    /// by cloning the window into `window_group` and raising the clone, so Escape leaves the
+    /// stack exactly as it found it.
+    ///
+    /// A clone is what GNOME needs and we do not: we own the render loop, so drawing the tile
+    /// out of order is both cheaper and free of the double-composite a clone over a still-visible
+    /// original would give a translucent window.
+    cycler_raised: Option<W::Id>,
+
     /// Ongoing interactive resize.
     interactive_resize: Option<InteractiveResize<W>>,
 
@@ -210,6 +220,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             tiles: Vec::new(),
             data: Vec::new(),
             active_window_id: None,
+            cycler_raised: None,
             interactive_resize: None,
             closing_windows: Vec::new(),
             view_size,
@@ -604,6 +615,12 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.bring_up_descendants_of(0);
 
         true
+    }
+
+    /// Show `id` above every other tile for as long as a cycler is up. See
+    /// [`cycler_raised`](Self::cycler_raised).
+    pub fn set_cycler_raised(&mut self, id: Option<&W::Id>) {
+        self.cycler_raised = id.cloned();
     }
 
     fn raise_window(&mut self, from_idx: usize, to_idx: usize) {
@@ -1202,14 +1219,31 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
 
         let active = self.active_window_id.clone();
-        for (tile, tile_pos) in self.tiles_with_render_positions() {
-            // For the active tile, draw the focus ring.
+        let raised = self.cycler_raised.clone();
+        // `push` is front-to-back, so the cycler's window goes out *first* to land on top, and
+        // is then skipped in its own place below.
+        let mut draw = |tile: &Tile<W>, tile_pos, ctx: &mut RenderCtx| {
             let focus_ring = focus_ring && Some(tile.window().id()) == active.as_ref();
-
             let xray_pos = xray_pos.offset(tile_pos);
             tile.render(ctx.r(), tile_pos, xray_pos, focus_ring, &mut |elem| {
                 push(elem.into())
             });
+        };
+
+        if let Some(id) = &raised {
+            if let Some((tile, tile_pos)) = self
+                .tiles_with_render_positions()
+                .find(|(tile, _)| tile.window().id() == id)
+            {
+                draw(tile, tile_pos, &mut ctx);
+            }
+        }
+
+        for (tile, tile_pos) in self.tiles_with_render_positions() {
+            if Some(tile.window().id()) == raised.as_ref() {
+                continue;
+            }
+            draw(tile, tile_pos, &mut ctx);
         }
     }
 

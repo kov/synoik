@@ -537,6 +537,9 @@ pub struct Niri {
     /// An outcome produced by a timer firing inside `advance_animations`, which is `Niri`-level
     /// and so cannot activate a window itself. Drained by [`State::finish_switcher`].
     pub pending_switcher_outcome: Option<(crate::ui::switcher::SwitcherOutcome, Option<MappedId>)>,
+    /// Where a running cycler's `.cycler-highlight` goes, on the switcher's own output. Re-derived
+    /// every frame by [`Niri::sync_cycler_highlight`]; `None` whenever no cycler is up.
+    pub cycler_highlight: Option<Rectangle<f64, Logical>>,
     /// Wake-up timer for the shown banner's expiry deadline (the pinned-clock check in
     /// `advance_animations` is the authority; this only wakes an otherwise idle loop).
     pub notification_banner_timer: Option<RegistrationToken>,
@@ -1931,6 +1934,73 @@ impl State {
         self.raise_switcher(Items::Apps(items), art, backward, true);
     }
 
+    /// `cycle-windows` (`<Alt>Escape`) and `cycle-group` (`<Alt>F6`) — the listless switchers
+    /// (`CyclerPopup`, `altTab.js:487-540`).
+    ///
+    /// Same session machinery as every other popup — the modal grab, the modifier-release commit,
+    /// Escape — with no list drawn. The selection is shown by raising the window itself and
+    /// framing it with `.cycler-highlight`, so it starts showing *immediately*: `_highlightItem`
+    /// runs from `_initialSelection` inside `show()`, and `POPUP_DELAY` only ever hid a popup
+    /// actor this popup does not have.
+    ///
+    /// A cycler advances only on **its own** action. `_keyPressHandler` matches one
+    /// `Meta.KeyBindingAction` and propagates the rest, so `<Alt>F6` while `<Alt>Escape` is up
+    /// does nothing at all rather than cross-driving the other cycler's list.
+    pub fn cycle_windows(&mut self, backward: bool, group: bool) {
+        if self.niri.switcher.is_open() {
+            // Only this cycler's own binding resolves while it is up (see `SwitcherGrab`), so
+            // getting here at all means the press was ours.
+            debug_assert_eq!(self.niri.switcher.cycler_is_group(), Some(group));
+            let now = self.niri.clock.now_unadjusted();
+            let outcome = self
+                .niri
+                .switcher
+                .key_press(SwitcherKey::Advance { backward }, now);
+            self.finish_switcher(outcome);
+            self.hide_osd_for_switcher();
+            self.niri.sync_cycler_highlight();
+            self.niri.queue_redraw_switcher_output();
+            return;
+        }
+
+        // Each cycler reads the `current-workspace-only` key of the switcher it mirrors:
+        // `WindowCyclerPopup` the window switcher's (`altTab.js:640-655`), `GroupCyclerPopup`
+        // the app switcher's (`:557-570`).
+        let settings = &self.niri.gnome_settings.switchers;
+        let only_here = if group {
+            settings.apps_current_workspace_only
+        } else {
+            settings.windows_current_workspace_only
+        };
+        let tab_list = self.niri.switcher_tab_list(only_here);
+
+        // `GroupCyclerPopup._getWindows` is `focus_app.get_windows()`, so the group cycler is
+        // over the focused app's windows in the *same* tab-list order, not over every window.
+        let windows = if group {
+            let focused = self.niri.layout.focus().map(|m| m.id());
+            let items = app_items(self.niri.app_system.running(), &tab_list);
+            let Some(item) =
+                focused.and_then(|id| items.into_iter().find(|item| item.windows.contains(&id)))
+            else {
+                return;
+            };
+            item.windows
+        } else {
+            tab_list
+        };
+        if windows.is_empty() {
+            return;
+        }
+
+        self.raise_switcher(
+            Items::Cycler { windows, group },
+            Vec::new(),
+            backward,
+            false,
+        );
+        self.niri.sync_cycler_highlight();
+    }
+
     /// `switch-windows` — the *window* switcher (`altTab.js:580-640`).
     ///
     /// A different popup class from the app switcher, not the same one in another mode: its items
@@ -2078,6 +2148,7 @@ impl State {
             return;
         };
         self.niri.queue_redraw_all();
+        self.niri.sync_cycler_highlight();
 
         if outcome != crate::ui::switcher::SwitcherOutcome::Commit {
             return;
@@ -2091,6 +2162,10 @@ impl State {
         // cursor warping does not happen.
         self.update_keyboard_focus();
         self.focus_window(&window);
+        // The popup is gone, so nothing is raised any more. Done here rather than left to the
+        // next frame because the commit *activates* the window, and a stale raise would keep a
+        // second one on top of it in between.
+        self.niri.sync_cycler_highlight();
     }
 
     pub fn maybe_warp_cursor_to_focus(&mut self) -> bool {
@@ -4570,6 +4645,7 @@ impl Niri {
             switcher_timer: None,
             switcher_timer_at: None,
             pending_switcher_outcome: None,
+            cycler_highlight: None,
             last_power_profile: "power-saver".to_string(),
             #[cfg(feature = "dbus")]
             system_status_tx: None,
@@ -6425,6 +6501,11 @@ impl Niri {
             self.reschedule_switcher_timer();
         }
 
+        // A cycler's whole UI is the window it is showing, so the raise and the border it wears
+        // are re-derived every frame: the selection moves under the keys, and the window itself
+        // can move or resize while the cycler is up.
+        self.sync_cycler_highlight();
+
         self.config_error_notification.advance_animations();
         self.exit_confirm_dialog.advance_animations();
         self.end_session_dialog.advance_animations();
@@ -6989,6 +7070,8 @@ impl Niri {
         // When rendering above the top layer, we put the regular monitor elements first.
         // Otherwise, we will render all layer-shell pop-ups and the top layer on top.
         if mon.render_above_top_layer() {
+            self.render_cycler_highlight(output, push);
+
             self.layout
                 .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
 
@@ -7038,6 +7121,8 @@ impl Niri {
         } else {
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);
+
+            self.render_cycler_highlight(output, push);
 
             self.layout
                 .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
@@ -10783,6 +10868,38 @@ impl Niri {
                 }
             })
             .collect()
+    }
+
+    /// The cycler's `.cycler-highlight`, at the top of the window layer: `CyclerHighlight` is a
+    /// child of `global.window_group` (`altTab.js:498`), so it frames the window it raised and
+    /// stays *under* the panel and the layer-shell surfaces above it.
+    fn render_cycler_highlight(&self, output: &Output, push: &mut dyn FnMut(OutputRenderElements)) {
+        if self.switcher.output() != Some(output) {
+            return;
+        }
+        let Some(rect) = self.cycler_highlight else {
+            return;
+        };
+        self.switcher
+            .render_cycler(rect, self.gnome_settings.accent_color, &mut |elem| {
+                push(crate::ui::switcher::ui::SwitcherRenderElement::Solid(elem).into())
+            });
+    }
+
+    /// Keep the layout's cycler raise and the highlight rect in step with the popup — see
+    /// [`SwitcherUi::render_cycler`](crate::ui::switcher::ui::SwitcherUi::render_cycler).
+    ///
+    /// Always runs the clearing half, even with nothing open: that is what un-pins a window when
+    /// the cycler ends.
+    pub fn sync_cycler_highlight(&mut self) {
+        let target = self
+            .switcher
+            .cycler_window()
+            .and_then(|id| self.find_window_by_id(id))
+            .zip(self.switcher.output().cloned());
+        self.cycler_highlight = self
+            .layout
+            .set_cycler_raised(target.as_ref().map(|(id, output)| (id, output)));
     }
 
     pub fn queue_redraw_switcher_output(&mut self) {

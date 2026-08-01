@@ -242,6 +242,42 @@ with its sub-list already up, on window 1 forward and the last window backward
 (`altTab.js:118-137`). While it is up, a repeat press walks that app's windows rather than the app
 row (`_keyPressHandler`, `altTab.js:180-186`). Slice 6 is what remains.
 
+**Slice 6 (the cyclers) landed 2026-08-01, closing the port.** `cycle-windows` (`<Alt>Escape`)
+and `cycle-group` (`<Alt>F6`), with their `<Shift>` twins, are adopted from
+`org.gnome.desktop.wm.keybindings`. `CyclerPopup` (`altTab.js:487-540`) is the same session
+machinery with **no list**: `CyclerList` (`:472-484`) draws nothing, so it lands as an
+`Items::Cycler` variant of the existing surface rather than a second popup type — the grab,
+the timers, the modifier-release commit and Escape are all the code that was already there.
+
+Three things are specific to it:
+
+- **It shows immediately.** `_highlightItem` runs from `_initialSelection` inside `show()`, and
+  `POPUP_DELAY` only ever set the popup actor's opacity — an actor a cycler does not have. So the
+  highlight is up on the first press, not 150 ms later.
+- **The raise.** GNOME clones the window into `global.window_group`, raises the clone and hides
+  the original (`CyclerHighlight`, `:410-472`). We own the render loop, so `FloatingSpace::render`
+  simply draws that one tile first and skips it in place — cheaper, and free of the
+  double-composite a clone over a still-visible original would give a translucent window. Nothing
+  in the stacking order changes, so Escape leaves the stack as it found it.
+- **The frame** is `.cycler-highlight`: `border: 5px solid -st-accent-color`
+  (`_switcher-popup.scss:80-82`), which St draws *inside* the widget's box. That is a new toolkit
+  verb — `render_helpers::inset_ring::InsetRing` — because `FocusRing` is the *outset* sibling and
+  a single `BorderRenderElement` fills its whole area, which would paint over the window the frame
+  exists to show.
+
+**A key routing fix rode along.** The switcher-open binding allowlist was one "is it open" flag;
+it is now `SwitcherGrab`, which knows *which* popup is up. That matters because a popup consumes a
+key only when it resolves to an action its own `_keyPressHandler` matches, and everything else
+falls through to the base's Escape / Tab / commit handling — which is precisely how `<Alt>Escape`
+abandons an `<Alt>F6` cycler instead of driving it (`switcherPopup.js:206-210` says so out loud).
+
+**Known divergence left standing:** the *popup* arm of that allowlist still lets all three switch
+actions resolve while any list popup is up. GNOME does not — `AppSwitcherPopup` ignores
+`SWITCH_WINDOWS` and `WindowSwitcherPopup` ignores `SWITCH_APPLICATIONS`, so the keysym reaches
+the base and Tab **destroys** the popup. Ours advances it instead. Left alone deliberately: it is
+pre-existing, it is the friendlier behaviour, and changing it touches the two slices most
+exercised on the seat.
+
 **Renderer gap found on the way (not switcher-specific):** `Frame::draw_solid` does not consult
 the rounded clip an outer `ClippedSurfaceRenderElement` armed, where `render_texture_from_to`
 does. So a surface backed by a *single-colour* buffer keeps square corners wherever a rounded
@@ -308,5 +344,7 @@ door — [[test-the-code-not-a-reimplementation]].
 - ~~**`Above_Tab` resolution**~~ — **CLOSED 2026-08-01 on a false premise.** The doc claimed mutter
   resolves it per layout; it does not (see the correction at the top). We match `KEY_GRAVE + 8` by
   keycode, exactly as mutter does, and that is already layout-independent.
-- **The cyclers** draw *on top of the windows themselves*, not in a panel — a different render path
-  from everything in slices 1–5.
+- ~~**The cyclers** draw on top of the windows themselves~~ — **ANSWERED 2026-08-01.** They go out
+  at the top of the window layer (`CyclerHighlight` is a child of `global.window_group`,
+  `altTab.js:498`), so they stay under the panel and the layer-shell surfaces above it. The
+  "raise" half is a draw-order skip in `FloatingSpace::render`, not a restack.

@@ -11219,6 +11219,144 @@ fn app_window_switcher_fixture_inner(title: &str, n: usize, solid: bool) -> Opti
     Some(f)
 }
 
+/// The cycled window is drawn **above** the ones covering it — the point of a cycler.
+///
+/// `CyclerHighlight` clones the window into `global.window_group` and raises the clone to the top
+/// (`_highlightItem`, `altTab.js:519-522`), hiding the original so nothing composites twice. We
+/// own the render loop, so the tile is simply drawn out of order instead; either way an obscured
+/// window has to become visible, or "cycle windows" shows you an accent frame around something
+/// you still cannot see.
+#[test]
+fn vulkan_raises_the_cycled_window_above_the_ones_over_it() {
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+
+    // Two same-sized floating windows, stacked *on top of each other*: auto-placement lays them
+    // out side by side, and a cycler is only interesting where windows overlap, so the newer one
+    // is moved onto the older explicitly.
+    const BIG: u16 = 400;
+    let id = f.add_client();
+    for colour in [[0u8, 255, 0], [255, 0, 255]] {
+        let window = f.client(id).create_window();
+        let surface = window.surface.clone();
+        window.commit();
+        f.roundtrip(id);
+
+        let window = f.client(id).window(&surface);
+        window.attach_shm_buffer(
+            i32::from(BIG),
+            i32::from(BIG),
+            colour[0],
+            colour[1],
+            colour[2],
+            255,
+        );
+        window.set_size(BIG, BIG);
+        window.ack_last_and_commit();
+        f.double_roundtrip(id);
+    }
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.niri_output(1);
+    let scale = output.current_scale().fractional_scale();
+
+    // Both at the same spot: whichever is on top is the only one visible there.
+    let ids: Vec<_> = f.niri().layout.windows().map(|(_, m)| m.id()).collect();
+    for id in ids {
+        let window = f.niri().find_window_by_id(id).unwrap();
+        f.niri().layout.move_floating_window(
+            Some(&window),
+            niri_ipc::PositionChange::SetFixed(100.),
+            niri_ipc::PositionChange::SetFixed(100.),
+            false,
+        );
+    }
+    f.niri_complete_animations();
+
+    const KEY_LEFTALT: u32 = 56;
+    f.key_press(KEY_LEFTALT);
+    f.niri_state()
+        .do_action(niri_config::Action::CycleWindows { backward: false }, false);
+    let rect = f.niri().cycler_highlight.expect("the window is framed");
+    // A point well inside the cycled window and clear of its own frame stroke.
+    let cx = ((rect.loc.x + rect.size.w / 2.) * scale).round() as i32;
+    let cy = ((rect.loc.y + rect.size.h / 2.) * scale).round() as i32;
+
+    let (after, w, _) = render_output_vulkan(&mut f, &output);
+    let middle = px(&after, w, cx, cy);
+    assert!(
+        middle[1] > 200 && middle[0] < 80 && middle[2] < 80,
+        "the cycled (older, green) window must be on top there, got {middle:?}"
+    );
+
+    // Cancel, and it drops back under the newer one — the raise is for the cycler's lifetime,
+    // not a restacking.
+    f.niri().switcher.cancel();
+    f.niri().sync_cycler_highlight();
+    let (after, w, _) = render_output_vulkan(&mut f, &output);
+    let middle = px(&after, w, cx, cy);
+    assert!(
+        middle[0] > 200 && middle[2] > 200,
+        "the newer (magenta) window must be back on top, got {middle:?}"
+    );
+}
+
+/// A cycler frames the window it is showing with `.cycler-highlight`, and does not cover it.
+///
+/// The border is `5px solid -st-accent-color` on a widget with no background
+/// (`_switcher-popup.scss:80-82`), which St draws *inside* the widget's own box — so the stroke
+/// eats the window's outer 5px and the middle stays the window. Filling the box instead (the
+/// shape a single border-shader pass gives you) would hide the very window the cycler exists to
+/// show you, and every value-based assertion about the selection would still pass.
+#[test]
+fn vulkan_frames_the_cycled_window_without_covering_it() {
+    let Some(mut f) = app_window_switcher_fixture_n("Green", 2) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = output.current_scale().fractional_scale();
+
+    const KEY_LEFTALT: u32 = 56;
+    f.key_press(KEY_LEFTALT);
+    f.niri_state()
+        .do_action(niri_config::Action::CycleWindows { backward: false }, false);
+    assert!(f.niri().switcher.is_open(), "Alt+Escape raises a cycler");
+
+    let rect = f.niri().cycler_highlight.expect("the window is framed");
+    let at = |x: f64, y: f64| ((x * scale).round() as i32, (y * scale).round() as i32);
+    // Two px into the 5px stroke on the top edge, and the middle of the window.
+    let (ex, ey) = at(rect.loc.x + rect.size.w / 2., rect.loc.y + 2.);
+    let (cx, cy) = at(rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+
+    let (after, w, _) = render_output_vulkan(&mut f, &output);
+
+    // `ACCENT_BLUE`, the default `-st-accent-color`.
+    let edge = px(&after, w, ex, ey);
+    assert!(
+        (i32::from(edge[0]) - 0x35).abs() < 24
+            && (i32::from(edge[1]) - 0x84).abs() < 24
+            && (i32::from(edge[2]) - 0xe4).abs() < 24,
+        "the frame must be the accent colour, got {edge:?}"
+    );
+
+    let middle = px(&after, w, cx, cy);
+    assert!(
+        middle[1] > 200 && middle[0] < 80 && middle[2] < 80,
+        "the window itself must still be visible inside its frame, got {middle:?}"
+    );
+}
+
 /// The app badge draws **over** the window preview, not under it.
 ///
 /// `WindowIcon` puts the clone and the icon in one `Clutter.BinLayout` and adds the icon second

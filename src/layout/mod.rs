@@ -3994,6 +3994,42 @@ impl<W: LayoutElement> Layout<W> {
         true
     }
 
+    /// Show `id` above every other window while a cycler is up, and report the rect it occupies
+    /// on `output` so the caller can put a `.cycler-highlight` border around it.
+    ///
+    /// Both halves come from one call because they must agree: the border is drawn by the shell
+    /// against the same tile position the layout just promoted. `None` clears the raise, and
+    /// clearing always runs over every workspace — a cycler that ends on another monitor must
+    /// not leave a window pinned on the one it started on.
+    pub fn set_cycler_raised(
+        &mut self,
+        target: Option<(&W::Id, &Output)>,
+    ) -> Option<Rectangle<f64, Logical>> {
+        for ws in self.workspaces_mut() {
+            ws.set_cycler_raised(target.map(|(id, _)| id));
+        }
+
+        let (id, output) = target?;
+        let (mon, (ws, ws_geo)) = self.monitors().find_map(|mon| {
+            mon.workspaces_with_render_geo()
+                .find(|(ws, _)| ws.has_window(id))
+                .map(|rv| (mon, rv))
+        })?;
+        if mon.output() != output {
+            return None;
+        }
+
+        let zoom = mon.overview_zoom();
+        let (tile, tile_offset, _visible) = ws
+            .tiles_with_render_positions()
+            .find(|(tile, _, _)| tile.window().id() == id)?;
+
+        // The window's own rect, not the tile's: the tile carries the border/shadow slack that
+        // GNOME's `get_buffer_rect` also excludes (`_onSizeChanged`, `altTab.js:465-472`).
+        let loc = ws_geo.loc + (tile_offset + tile.window_loc()).upscale(zoom);
+        Some(Rectangle::new(loc, tile.window_size().upscale(zoom)))
+    }
+
     pub fn interactive_move_begin(
         &mut self,
         window_id: W::Id,
