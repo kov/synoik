@@ -3838,7 +3838,10 @@ impl State {
         if let Some(switcher_output) = self.niri.switcher.output().cloned() {
             if let Some((output, pos_within_output)) = self.niri.output_under(new_pos) {
                 if switcher_output == *output
-                    && self.niri.switcher.pointer_motion(pos_within_output)
+                    && self
+                        .niri
+                        .switcher
+                        .pointer_motion(pos_within_output, self.niri.clock.now_unadjusted())
                 {
                     self.niri.queue_redraw_switcher_output();
                 }
@@ -3989,7 +3992,10 @@ impl State {
         if let Some(switcher_output) = self.niri.switcher.output().cloned() {
             if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
                 if switcher_output == *output
-                    && self.niri.switcher.pointer_motion(pos_within_output)
+                    && self
+                        .niri
+                        .switcher
+                        .pointer_motion(pos_within_output, self.niri.clock.now_unadjusted())
                 {
                     self.niri.queue_redraw_switcher_output();
                 }
@@ -7101,7 +7107,10 @@ impl State {
         if let Some(switcher_output) = self.niri.switcher.output().cloned() {
             if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
                 if switcher_output == *output
-                    && self.niri.switcher.pointer_motion(pos_within_output)
+                    && self
+                        .niri
+                        .switcher
+                        .pointer_motion(pos_within_output, self.niri.clock.now_unadjusted())
                 {
                     self.niri.queue_redraw_switcher_output();
                 }
@@ -8205,7 +8214,10 @@ fn find_gnome_bind(
 /// on the key rather than on the resolved binding action.
 ///
 /// The arrows are the subclasses' own (`altTab.js:198-208` for the app switcher, `:613-620` for
-/// the window switcher) and both spell them the same way: Left is `_previous`, Right is `_next`.
+/// the window switcher) and both spell Left/Right the same way — `_previous`/`_next` — until the
+/// app switcher's window sub-list has the focus, when they walk *it* instead and Up leaves it.
+/// That branch belongs to the popup, so the arrows are passed on as arrows rather than resolved
+/// to a direction here.
 /// Escape and Tab destroy the popup and space/Return/KP_Enter/ISO_Enter commit it
 /// (`switcherPopup.js:206-217`) — Tab only reaches here when it is *not* the popup's own shortcut,
 /// since that resolves as a binding first.
@@ -8215,8 +8227,11 @@ fn find_gnome_bind(
 /// is left-to-right for now; when a direction lands, this is one of its call sites.
 fn switcher_key_for(raw: Keysym) -> Option<SwitcherKey> {
     Some(match raw {
-        Keysym::Left => SwitcherKey::Advance { backward: true },
-        Keysym::Right => SwitcherKey::Advance { backward: false },
+        Keysym::Left => SwitcherKey::Left,
+        Keysym::Right => SwitcherKey::Right,
+        // Only the app switcher acts on these, to open and leave its window sub-list.
+        Keysym::Up => SwitcherKey::Up,
+        Keysym::Down => SwitcherKey::Down,
         Keysym::Escape | Keysym::Tab => SwitcherKey::Dismiss,
         Keysym::space | Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter => {
             SwitcherKey::Commit

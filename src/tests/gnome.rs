@@ -13261,6 +13261,175 @@ fn a_quick_super_tab_switches_without_showing_the_popup() {
     );
 }
 
+/// Super-Tab's window sub-list: it pops up on its own, Down descends into it, and picking a
+/// preview commits to *that* window instead of the app's most recent one.
+///
+/// The whole point of `ThumbnailSwitcher` is reaching an app's second window, so the assertion
+/// that matters is the last one: the same app item, committed twice, activating different windows
+/// depending on what the sub-list had picked.
+///
+/// The two ways it opens are deliberately both here, because they differ in a way that is easy to
+/// get wrong. The 500ms timer opens it with **nothing** picked (`_timeoutPopupThumbnails`,
+/// `altTab.js:359-364` never touches `_currentWindow`), so releasing then still activates what the
+/// app row promised; Down opens it *on* window 0 (`:206`), which changes the target.
+#[test]
+fn super_tab_pops_up_an_apps_windows_and_commits_to_the_one_it_picks() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![
+            AppEntry::fake("org.example.One.desktop", "One"),
+            AppEntry::fake("org.example.Two.desktop", "Two"),
+        ])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let client = f.add_client();
+    // "One" gets two windows, so it has a sub-list; "Two" is the app the switcher starts on.
+    // Each window maps focused, so the focus right after is that window's id.
+    map_window_for_app(&mut f, client, "org.example.One");
+    let a = f.niri().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.One");
+    let b = f.niri().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.Two");
+    f.niri_complete_animations();
+
+    // Rest on "One" (item 1) and let the popup timer run out.
+    let open_on_one = |f: &mut Fixture| {
+        f.key_press(KEY_LEFTMETA);
+        f.niri_state()
+            .do_action(Action::SwitchApplications { backward: false }, false);
+        assert_eq!(f.niri().switcher.selected(), Some(1), "opens on \"One\"");
+    };
+    let rest = |f: &mut Fixture, by: Duration| {
+        let mut clock = f.niri().clock.clone();
+        let now = clock.now_unadjusted();
+        clock.set_unadjusted(now + by);
+        f.niri().advance_animations();
+    };
+
+    open_on_one(&mut f);
+    assert!(
+        !f.niri().switcher.thumbnails_open(),
+        "the sub-list is not instant — tabbing through a multi-window app must not flash it"
+    );
+    rest(&mut f, crate::ui::switcher::thumbnails::POPUP_TIME * 2);
+    assert!(
+        f.niri().switcher.thumbnails_open(),
+        "resting on a multi-window app pops its windows up"
+    );
+    assert_eq!(
+        f.niri().switcher.thumbnail_selected(),
+        None,
+        "...with nothing picked in it"
+    );
+
+    // So the release still activates the app's most recent window.
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    f.double_roundtrip(client);
+    assert_eq!(
+        f.niri().layout.focus().unwrap().id(),
+        b,
+        "a sub-list nobody picked from commits to the app's first window"
+    );
+
+    // Now descend into it and take the *other* window.
+    open_on_one(&mut f);
+    tap(&mut f, KEY_DOWN);
+    assert!(
+        f.niri().switcher.thumbnails_open(),
+        "Down opens the sub-list at once"
+    );
+    assert_eq!(f.niri().switcher.thumbnail_selected(), Some(0));
+
+    tap(&mut f, KEY_RIGHT);
+    assert_eq!(
+        f.niri().switcher.thumbnail_selected(),
+        Some(1),
+        "Right walks the previews, not the app row"
+    );
+    assert_eq!(
+        f.niri().switcher.selected(),
+        Some(1),
+        "and the app row stays where it was"
+    );
+
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    f.double_roundtrip(client);
+    assert_eq!(
+        f.niri().layout.focus().unwrap().id(),
+        a,
+        "committing with a preview picked activates that window"
+    );
+}
+
+/// Up leaves the window sub-list, and moving to another app takes it down.
+///
+/// Both are `_select`'s doing rather than the sub-list's: `window == null` destroys it
+/// (`altTab.js:328-331`), and `forceAppFocus` — which only Up passes — is what stops the 500ms
+/// timer from putting it straight back (`:349-356`).
+#[test]
+fn the_window_sublist_closes_on_up_and_on_moving_to_another_app() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![
+            AppEntry::fake("org.example.One.desktop", "One"),
+            AppEntry::fake("org.example.Two.desktop", "Two"),
+        ])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.One");
+    map_window_for_app(&mut f, client, "org.example.One");
+    map_window_for_app(&mut f, client, "org.example.Two");
+    f.niri_complete_animations();
+
+    f.key_press(KEY_LEFTMETA);
+    f.niri_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+    tap(&mut f, KEY_DOWN);
+    assert!(f.niri().switcher.thumbnails_open());
+
+    // Up hands the arrows back to the app row and does *not* re-open the sub-list on the timer.
+    tap(&mut f, KEY_UP);
+    assert!(!f.niri().switcher.thumbnails_open(), "Up closes it");
+
+    let mut clock = f.niri().clock.clone();
+    let now = clock.now_unadjusted();
+    clock.set_unadjusted(now + crate::ui::switcher::thumbnails::POPUP_TIME * 2);
+    f.niri().advance_animations();
+    assert!(
+        !f.niri().switcher.thumbnails_open(),
+        "and it stays closed — `forceAppFocus` does not re-arm the timer"
+    );
+
+    // With the arrows back on the row, Left/Right move apps again...
+    tap(&mut f, KEY_LEFT);
+    assert_eq!(
+        f.niri().switcher.selected(),
+        Some(0),
+        "the arrows are back on the app row"
+    );
+
+    // ...and landing on the single-window app arms nothing at all.
+    clock.set_unadjusted(clock.now_unadjusted() + crate::ui::switcher::thumbnails::POPUP_TIME * 2);
+    f.niri().advance_animations();
+    assert!(
+        !f.niri().switcher.thumbnails_open(),
+        "a one-window app has no sub-list to show"
+    );
+
+    f.key_release(KEY_LEFTMETA);
+}
+
 /// The arrows walk the open switcher, Escape abandons it, and Return takes the selection.
 ///
 /// These are the popup's *keysym* arms, the half of `_keyPressHandler` that does not go through a

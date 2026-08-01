@@ -220,6 +220,14 @@ triangle primitive (`Painter::triangle` / `sdf_triangle.frag`) rather than faked
 also the verb slice 6's scroll arrows will want. Slices 4–6 and `Above_Tab`'s per-layout resolution
 are untouched.
 
+**Slice 5 (the window sub-list) landed 2026-08-01**, together with the popup's own key routing
+(the arrows, Escape, and the explicit-commit keys, which previously fell through to the window
+underneath). What is *not* ported from `ThumbnailSwitcher`: the 100 ms fade in/out
+(`THUMBNAIL_FADE_TIME`), `APP_ICON_HOVER_TIMEOUT`'s 200 ms delay before a hovered app swaps its
+sub-list, the `w`/`F4` close and `q` quit keys, and rounding the preview corners
+(`.thumbnail`'s `border-radius`, which needs a rounded window-thumbnail draw). Slices 4 and 6, and
+`Above_Tab`'s per-layout resolution, are still untouched.
+
 **Seat validation 2026-08-01 found two Alt-Tab divergences, both fixed.** (a) The app badge was
 pushed *behind* the window preview, so a square window buried half of it — `WindowIcon` adds the
 clone and then the icon to one `Clutter.BinLayout` (`altTab.js:1029-1037`), so the icon is the

@@ -27,6 +27,7 @@ use smithay::utils::{Logical, Point, Rectangle, Size};
 use crate::ui::widget::{self, style, Rgba};
 
 pub mod app_switcher;
+pub mod thumbnails;
 pub mod ui;
 pub mod window_list;
 pub mod window_switcher;
@@ -93,6 +94,17 @@ pub const LIST_FG: Rgba = style::OSD_FG;
 /// model `$contrast == 'high'` anywhere yet, so this is one more entry on that debt, not a
 /// divergence specific to the switcher.
 pub const ITEM_SELECTED: Rgba = [1., 1., 1., 0.2];
+
+/// `.item-box:highlighted` — the *outlined* state, worn by the app whose sub-list has the arrows.
+///
+/// `.item-box` overrides `:selected` (above) but not `:highlighted`, so this one comes from
+/// `tile_button` unmodified: `button(checked, flat, always_dark)` is `st-lighten($osd_bg_color,
+/// 8%)` (`_drawing.scss:184, 195, 358-359`), i.e. white at 8% over the panel.
+///
+/// It is **dimmer** than [`ITEM_SELECTED`], and that is the point: while the thumbnail sub-list
+/// holds the keyboard, the app above it is context rather than the current item
+/// (`highlight(index, justOutline)`, `switcherPopup.js:493-504`).
+pub const ITEM_HIGHLIGHTED: Rgba = [1., 1., 1., 0.08];
 
 /// `.item-box:hover { background: none }` (`_switcher-popup.scss:28-29`).
 ///
@@ -353,7 +365,18 @@ pub enum SwitcherOutcome {
 pub enum SwitcherKey {
     /// The switch binding fired again — move the selection. Subclass-handled in GNOME, so it
     /// also reveals the popup immediately (`_showImmediately`, `:201-203`).
-    Advance { backward: bool },
+    Advance {
+        backward: bool,
+    },
+    /// Left / Right — `_previous` / `_next`, spelled identically by both subclasses
+    /// (`altTab.js:198-208`, `:613-620`).
+    Left,
+    Right,
+    /// Up / Down, which mean nothing to a plain popup: they open and close the app switcher's
+    /// thumbnail sub-list (`:203-206`, `:190-193`), and [`SwitcherUi`](ui::SwitcherUi) takes them
+    /// before the base ever sees them.
+    Up,
+    Down,
     /// Escape, or Tab *not* consumed by the popup's own shortcut (`:207-209`).
     Dismiss,
     /// Space, Return, KP_Enter or ISO_Enter (`:211-217`) — an explicit "take this one", which is
@@ -527,15 +550,17 @@ impl SwitcherPopup {
         self.disable_hover(now);
 
         match key {
-            SwitcherKey::Advance { backward } => {
-                if backward {
-                    self.select_previous();
-                } else {
-                    self.select_next();
-                }
+            SwitcherKey::Advance { backward: true } | SwitcherKey::Left => {
+                self.select_previous();
                 // A handled key reveals the popup without waiting out the delay (`:201-203`).
                 self.show_immediately();
             }
+            SwitcherKey::Advance { backward: false } | SwitcherKey::Right => {
+                self.select_next();
+                self.show_immediately();
+            }
+            // Only the app switcher's sub-list acts on these, and it has already had its say.
+            SwitcherKey::Up | SwitcherKey::Down => {}
             SwitcherKey::Dismiss => self.cancel(),
             SwitcherKey::Commit => self.finish(),
         }

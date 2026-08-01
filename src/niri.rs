@@ -10643,9 +10643,38 @@ impl Niri {
                     icon: entry.as_ref().map(|e| e.icon.clone()),
                     label: entry.map_or_else(|| item.app_id.clone(), |e| e.name),
                     arrow: item.has_arrow(),
+                    // The sub-list's captions, resolved now for the same reason the icons are:
+                    // it is built half a second later, from the UI, with no way back here.
+                    window_titles: item
+                        .windows
+                        .iter()
+                        .map(|&id| self.window_title(id))
+                        .collect(),
                 }
             })
             .collect()
+    }
+
+    /// One window's title, or its app's name when it has none — the fallback `appMenu.js:283`
+    /// uses for the equivalent row.
+    fn window_title(&self, id: MappedId) -> String {
+        use crate::utils::with_toplevel_role;
+
+        let Some((_, mapped)) = self.layout.windows().find(|(_, m)| m.id() == id) else {
+            return String::new();
+        };
+        let (app_id, title) = with_toplevel_role(mapped.toplevel(), |role| {
+            (role.app_id.clone(), role.title.clone())
+        });
+        title
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                app_id
+                    .as_deref()
+                    .and_then(|id| self.app_system.app_for_window(id))
+                    .map(|e| e.name)
+            })
+            .unwrap_or_default()
     }
 
     /// Resolve each window item's badge icon and title — `WindowIcon` (`altTab.js:1002-1057`).
@@ -10676,8 +10705,10 @@ impl Niri {
                         .or_else(|| entry.map(|e| e.name))
                         .unwrap_or_default(),
                     // The chevron belongs to the app switcher: a window switcher item *is* one
-                    // window, so there is never anything to descend into.
+                    // window, so there is never anything to descend into — and with it the
+                    // sub-list, so there are no captions to resolve either.
                     arrow: false,
+                    window_titles: Vec::new(),
                 }
             })
             .collect()

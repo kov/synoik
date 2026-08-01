@@ -21,9 +21,10 @@ use crate::render_helpers::window_thumbnail::{self, WindowThumbnailRenderElement
 use crate::render_helpers::RenderCtx;
 use crate::ui::switcher::app_switcher::{self, AppItem};
 use crate::ui::switcher::{
-    window_switcher, PanelLayout, SwitcherKey, SwitcherKind, SwitcherOutcome, SwitcherPopup,
-    Visibility, ARROW, ARROW_HIGHLIGHTED, ITEM_PADDING, ITEM_RADIUS, ITEM_SELECTED, LIST_BG,
-    LIST_BORDER, LIST_BORDER_COLOR, LIST_FG, LIST_RADIUS,
+    thumbnails, window_switcher, PanelLayout, SwitcherKey, SwitcherKind, SwitcherOutcome,
+    SwitcherPopup, Visibility, ARROW, ARROW_HIGHLIGHTED, ITEM_HIGHLIGHTED, ITEM_PADDING,
+    ITEM_RADIUS, ITEM_SELECTED, LIST_BG, LIST_BORDER, LIST_BORDER_COLOR, LIST_FG, LIST_RADIUS,
+    POPUP_SPACING,
 };
 use crate::ui::widget::{
     self, style, AppIconUploads, BakeCache, Painter, ShapedText, TextShaper, TextStyle,
@@ -97,6 +98,16 @@ pub struct ItemArt {
     pub icon: Option<AppIconRef>,
     pub label: String,
     pub arrow: bool,
+    /// An app item's window titles, in the same order as [`AppItem::windows`], for the thumbnail
+    /// sub-list's captions. Empty for a window item, which has no sub-list.
+    ///
+    /// Resolved at open like everything else here, because the sub-list is built *lazily* — half a
+    /// second after the selection lands on the app — and by then the UI has no way back to the
+    /// window model. GNOME reads `window.get_title()` at that later moment
+    /// (`ThumbnailSwitcher._init`, `altTab.js:933`), so a title that changes while the popup is up
+    /// updates there and not here; the same freeze already applies to the app's window *list*,
+    /// which GNOME caches at open and says so (`:719-720`).
+    pub window_titles: Vec<String>,
 }
 
 /// Everything [`SwitcherUi::open`] needs, gathered by the caller.
@@ -130,6 +141,24 @@ struct Open {
     /// Kept so the row can be re-centered when an item disappears.
     monitor: Rectangle<f64, Logical>,
     label_height: f64,
+    /// The window sub-list, while it is up — `AppSwitcherPopup._thumbnails` (`altTab.js:66`).
+    thumbs: Option<Thumbs>,
+    /// When a resting selection pops its own sub-list (`_thumbnailTimeoutId`, `:349-356`).
+    thumb_deadline: Option<Duration>,
+}
+
+/// The app switcher's open window sub-list — see [`thumbnails`].
+struct Thumbs {
+    windows: Vec<MappedId>,
+    titles: Vec<String>,
+    layout: thumbnails::ThumbLayout,
+    /// `_currentWindow`, whose `-1` is our `None`: the list can be up with **nothing** picked in
+    /// it, which is what the popup timer produces (`_timeoutPopupThumbnails`, `:359-364` leaves it
+    /// unset). That state still commits to the app's first window, so the distinction is not
+    /// cosmetic — it is the difference between "here are the windows" and "this window".
+    selected: Option<usize>,
+    /// `_thumbnailsFocused` — whether the arrows act on the sub-list or on the app row above it.
+    focused: bool,
 }
 
 impl Open {
@@ -155,6 +184,98 @@ impl Open {
             Items::Windows(_) => self.label_height,
         }
     }
+
+    /// The selected app's windows, or empty for a window switcher (which has no sub-list).
+    fn selected_windows(&self) -> &[MappedId] {
+        match &self.items {
+            Items::Apps(apps) => apps
+                .get(self.state.selected())
+                .map_or(&[][..], |a| &a.windows),
+            Items::Windows(_) => &[],
+        }
+    }
+
+    /// Build the sub-list for the current selection — `_createThumbnails` (`altTab.js:381-408`).
+    ///
+    /// `selected`/`focused` are `_select`'s two arguments: the timer opens it with nothing picked
+    /// and the app row still holding the arrows, while Down opens it on window 0 with the arrows
+    /// moved into it.
+    fn open_thumbs(&mut self, selected: Option<usize>, focused: bool) {
+        let windows = self.selected_windows().to_vec();
+        if windows.is_empty() {
+            return;
+        }
+
+        let titles = self
+            .art
+            .get(self.state.selected())
+            .map_or_else(Vec::new, |a| a.window_titles.clone());
+
+        // `addClones` measures against the room left below the sub-list's own top edge.
+        let top = self.layout.panel.loc.y + self.layout.panel.size.h;
+        let available = self.monitor.loc.y + self.monitor.size.h - (top + POPUP_SPACING);
+        let thumb_h = thumbnails::thumb_height(available, self.label_height);
+        let anchor = self.layout.items.get(self.state.selected()).map_or(
+            self.layout.panel.loc.x + self.layout.panel.size.w / 2.,
+            |r| r.loc.x + r.size.w / 2.,
+        );
+
+        self.thumb_deadline = None;
+        self.thumbs = Some(Thumbs {
+            layout: thumbnails::layout(
+                windows.len(),
+                thumb_h,
+                self.label_height,
+                anchor,
+                top,
+                self.monitor,
+            ),
+            windows,
+            titles,
+            selected,
+            focused,
+        });
+    }
+
+    /// `ThumbnailSwitcher._removeThumbnail` (`altTab.js:978-991`) — a window closed while its
+    /// preview was on screen.
+    ///
+    /// The reselect is `mod(index, len)`, not `min(index, len - 1)`: closing the last preview
+    /// wraps to the first rather than stepping back one. And an emptied sub-list destroys itself,
+    /// which cannot strand the popup — the app it belonged to loses its item in the same pass.
+    fn thumbnail_removed(&mut self, id: MappedId) {
+        let Some(thumbs) = self.thumbs.as_mut() else {
+            return;
+        };
+        let Some(at) = thumbs.windows.iter().position(|&w| w == id) else {
+            return;
+        };
+
+        thumbs.windows.remove(at);
+        if at < thumbs.titles.len() {
+            thumbs.titles.remove(at);
+        }
+        if thumbs.windows.is_empty() {
+            self.thumbs = None;
+            return;
+        }
+
+        thumbs.selected = Some(at % thumbs.windows.len());
+        // Re-measure: the row is one preview narrower, so it re-centres on the app above it.
+        let focused = thumbs.focused;
+        let selected = thumbs.selected;
+        self.open_thumbs(selected, focused);
+    }
+
+    /// Drop the sub-list and re-arm its timer if the (possibly new) selection deserves one —
+    /// the `window == null` half of `_select` (`altTab.js:328-356`).
+    ///
+    /// `rearm` is `!forceAppFocus`: closing the list with Up must not immediately re-open it.
+    fn close_thumbs(&mut self, now: Duration, rearm: bool) {
+        self.thumbs = None;
+        self.thumb_deadline =
+            (rearm && self.selected_windows().len() > 1).then(|| now + thumbnails::POPUP_TIME);
+    }
 }
 
 /// The switcher surface — at most one is open at a time, as in GNOME (a new `_startSwitcher`
@@ -165,6 +286,10 @@ pub struct SwitcherUi {
     /// Set on the `Pending` -> `Shown` edge, cleared by [`SwitcherUi::take_just_shown`].
     just_shown: bool,
     chrome: RefCell<BakeCache>,
+    /// The sub-list's own bake. A second cache rather than a second key in the first: the two
+    /// panels are different sizes and change on different beats, so sharing one would re-bake the
+    /// app row every time a preview selection moved.
+    thumb_chrome: RefCell<BakeCache>,
     icons: RefCell<AppIconUploads>,
 }
 
@@ -205,6 +330,36 @@ impl SwitcherUi {
     /// item's position would be testing its own arithmetic.
     pub fn item_rect(&self, i: usize) -> Option<Rectangle<f64, Logical>> {
         self.open.as_ref()?.layout.items.get(i).copied()
+    }
+
+    /// Whether the app switcher's window sub-list is up.
+    pub fn thumbnails_open(&self) -> bool {
+        self.open.as_ref().is_some_and(|o| o.thumbs.is_some())
+    }
+
+    /// Which window the sub-list has picked — `None` both when there is no sub-list and when it
+    /// is up with nothing picked (`_currentWindow === -1`), which are different states with the
+    /// same answer here. Pair it with [`thumbnails_open`](Self::thumbnails_open) to tell them
+    /// apart.
+    pub fn thumbnail_selected(&self) -> Option<usize> {
+        self.open.as_ref()?.thumbs.as_ref()?.selected
+    }
+
+    /// The sub-list's panel box, for tests that need the pixels it covers.
+    pub fn thumbnail_panel_rect(&self) -> Option<Rectangle<f64, Logical>> {
+        Some(self.open.as_ref()?.thumbs.as_ref()?.layout.panel)
+    }
+
+    /// Where preview `i` is drawn, in the layout the renderer used.
+    pub fn thumbnail_rect(&self, i: usize) -> Option<Rectangle<f64, Logical>> {
+        self.open
+            .as_ref()?
+            .thumbs
+            .as_ref()?
+            .layout
+            .thumbs
+            .get(i)
+            .copied()
     }
 
     /// The panel-wide title label's box — the window switcher's, and `None` for the app switcher,
@@ -272,12 +427,17 @@ impl SwitcherUi {
             icon_px,
             monitor,
             label_height,
+            thumbs: None,
+            thumb_deadline: None,
         };
         open.layout = PanelLayout::new(
             &vec![open.content_size(); open.items.len()],
             monitor,
             open.footer_height(),
         );
+        // `_initialSelection` goes through `_select` like every later move, so a popup that opens
+        // on a multi-window app is already counting down to its sub-list (`altTab.js:349-356`).
+        open.close_thumbs(now, true);
         self.open = Some(open);
 
         if outcome.is_some() {
@@ -292,6 +452,15 @@ impl SwitcherUi {
         let open = self.open.as_mut()?;
         let was = open.state.visibility();
         open.state.poll(now);
+
+        // `_timeoutPopupThumbnails` (`altTab.js:359-364`): the sub-list appears with **nothing**
+        // picked in it and the arrows still on the app row, so resting on an app shows you its
+        // windows without changing what a release would activate.
+        if open.thumb_deadline.is_some_and(|at| now >= at) {
+            open.thumb_deadline = None;
+            open.open_thumbs(None, false);
+        }
+
         self.note_shown(was);
         self.take_outcome()
     }
@@ -318,7 +487,11 @@ impl SwitcherUi {
 
     /// When [`advance`](Self::advance) next has something to do.
     pub fn next_deadline(&self) -> Option<Duration> {
-        self.open.as_ref()?.state.next_deadline()
+        let open = self.open.as_ref()?;
+        [open.state.next_deadline(), open.thumb_deadline]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub fn key_press(
@@ -328,7 +501,46 @@ impl SwitcherUi {
     ) -> Option<(SwitcherOutcome, Option<MappedId>)> {
         let open = self.open.as_mut()?;
         let was = open.state.visibility();
-        open.state.key_press(key, now);
+
+        // `AppSwitcherPopup._keyPressHandler` (`altTab.js:190-208`) takes the arrows before the
+        // base does, and what they mean depends on where the focus is: with the sub-list focused
+        // they walk *its* windows and Up leaves it, otherwise Down descends into it.
+        let focused = open.thumbs.as_ref().is_some_and(|t| t.focused);
+        match key {
+            SwitcherKey::Left | SwitcherKey::Right if focused => {
+                let thumbs = open.thumbs.as_mut().unwrap();
+                let n = thumbs.windows.len();
+                thumbs.selected = Some(match key {
+                    SwitcherKey::Left => thumbnails::previous_window(thumbs.selected, n),
+                    _ => thumbnails::next_window(thumbs.selected, n),
+                });
+                open.state.disable_hover(now);
+                open.state.show_immediately();
+            }
+            // `_select(selectedIndex, null, true)`: window `null` destroys the list, and
+            // `forceAppFocus` is what stops the timer from putting it straight back.
+            SwitcherKey::Up if focused => {
+                open.close_thumbs(now, false);
+                open.state.disable_hover(now);
+                open.state.show_immediately();
+            }
+            // `_select(this._selectedIndex, 0)` — descend, focused, on the first window.
+            SwitcherKey::Down if !focused && open.selected_windows().len() > 1 => {
+                open.open_thumbs(Some(0), true);
+                open.state.disable_hover(now);
+                open.state.show_immediately();
+            }
+            _ => {
+                let before = open.state.selected();
+                open.state.key_press(key, now);
+                // Moving to another app tears its predecessor's sub-list down and starts the
+                // timer over (`_select`'s first branch, `:328-331`).
+                if open.state.selected() != before {
+                    open.close_thumbs(now, true);
+                }
+            }
+        }
+
         self.note_shown(was);
         self.take_outcome()
     }
@@ -343,15 +555,33 @@ impl SwitcherUi {
         self.take_outcome()
     }
 
-    /// Pointer motion over the panel. Returns whether the selection moved.
-    pub fn pointer_motion(&mut self, pos: Point<f64, Logical>) -> bool {
+    /// Pointer motion over the popup. Returns whether the selection moved.
+    pub fn pointer_motion(&mut self, pos: Point<f64, Logical>, now: Duration) -> bool {
         let Some(open) = self.open.as_mut() else {
             return false;
         };
+
+        // `_windowEntered` (`altTab.js:262-268`) — hovering a preview picks that window, gated on
+        // `mouseActive` exactly like the row above it.
+        if let Some(thumbs) = open.thumbs.as_mut() {
+            if let Some(n) = thumbs.layout.items.iter().position(|r| r.contains(pos)) {
+                if !open.state.hover_selects() || thumbs.selected == Some(n) {
+                    return false;
+                }
+                thumbs.selected = Some(n);
+                thumbs.focused = true;
+                return true;
+            }
+        }
+
         let Some(item) = open.layout.item_at(pos) else {
             return false;
         };
-        open.state.pointer_entered_item(item)
+        let moved = open.state.pointer_entered_item(item);
+        if moved {
+            open.close_thumbs(now, true);
+        }
+        moved
     }
 
     /// A click — `_itemActivated` (`switcherPopup.js:250-257`) inside an item, and the
@@ -364,11 +594,29 @@ impl SwitcherUi {
         pos: Point<f64, Logical>,
     ) -> Option<(SwitcherOutcome, Option<MappedId>)> {
         let open = self.open.as_mut()?;
+
+        // `_windowActivated` (`:255-259`): a click in the sub-list activates *that* window and
+        // ends the session, without going back through the app row.
+        if let Some(thumbs) = open.thumbs.as_mut() {
+            if let Some(n) = thumbs.layout.items.iter().position(|r| r.contains(pos)) {
+                thumbs.selected = Some(n);
+                thumbs.focused = true;
+                open.state.key_press(SwitcherKey::Commit, Duration::ZERO);
+                return self.take_outcome();
+            }
+        }
+
         match open.layout.item_at(pos) {
             Some(item) => {
                 open.state.select(item);
                 open.state.key_press(SwitcherKey::Commit, Duration::ZERO);
             }
+            // `_isActorOutside` (`:395-398`) counts the sub-list as inside the popup, so a click
+            // in its padding dismisses nothing.
+            None if open
+                .thumbs
+                .as_ref()
+                .is_some_and(|t| t.layout.panel.contains(pos)) => {}
             None => open.state.key_press(SwitcherKey::Dismiss, Duration::ZERO),
         }
         self.take_outcome()
@@ -387,10 +635,15 @@ impl SwitcherUi {
             Items::Apps(apps) => {
                 // A window closing only removes the *item* when it was the app's last one.
                 let index = apps.iter().position(|a| a.windows.contains(&id))?;
+                let at = apps[index].windows.iter().position(|&w| w == id);
                 apps[index].windows.retain(|&w| w != id);
+                if let Some(at) = at {
+                    open.art[index].window_titles.remove(at);
+                }
                 if !apps[index].windows.is_empty() {
                     // The app is still running; only its arrow may need to go.
                     open.art[index].arrow = apps[index].windows.len() > 1;
+                    open.thumbnail_removed(id);
                     return None;
                 }
                 apps.remove(index);
@@ -414,7 +667,14 @@ impl SwitcherUi {
         let open = self.open.as_ref()?;
         let outcome = open.state.outcome()?;
         let target = match outcome {
-            SwitcherOutcome::Commit => open.items.window_at(open.state.selected()),
+            // `_finish` (`altTab.js:284-292`): a picked window wins, and with nothing picked the
+            // app's first window does — which is why a sub-list that merely *popped up* still
+            // activates what the app row promised.
+            SwitcherOutcome::Commit => open
+                .thumbs
+                .as_ref()
+                .and_then(|t| Some(*t.windows.get(t.selected?)?))
+                .or_else(|| open.items.window_at(open.state.selected())),
             SwitcherOutcome::Cancel => None,
         };
         self.open = None;
@@ -437,6 +697,105 @@ impl SwitcherUi {
             open.monitor,
             open.footer_height(),
         );
+    }
+
+    /// Bake the window sub-list's own `.switcher-list` — its plate, the wash under the picked
+    /// preview and every caption. The previews themselves are live windows and ride above it.
+    ///
+    /// `None` when there is no sub-list up, or when the bake failed (already logged).
+    fn render_thumbs(
+        &self,
+        open: &Open,
+        ctx: &mut RenderCtx,
+        scale: f64,
+    ) -> Option<TextureRenderElement<VkTexture>> {
+        let thumbs = open.thumbs.as_ref()?;
+        let panel = thumbs.layout.panel;
+
+        // Panel-relative, like the row above.
+        let rel = |r: Rectangle<f64, Logical>| Rectangle::new(r.loc - panel.loc, r.size);
+        let items: Vec<_> = thumbs.layout.items.iter().copied().map(rel).collect();
+        let labels: Vec<_> = thumbs.layout.labels.iter().copied().map(rel).collect();
+        let selected = thumbs.selected;
+
+        // A caption is a window title — arbitrary client text, so it is cut to its preview rather
+        // than allowed to widen the item (`.thumbnail`'s `width: 256px` is fixed).
+        let captions: Vec<String> = thumbs
+            .titles
+            .iter()
+            .map(|t| widget::ellipsized_line(t, LABEL_PT, thumbnails::THUMBNAIL_SIZE))
+            .collect();
+
+        let revision = widget::Revision::new()
+            .of(selected)
+            .px(panel.size.w)
+            .px(panel.size.h)
+            .each(captions.iter())
+            .done();
+
+        let baked = widget::bake(
+            &mut *ctx.renderer,
+            &mut self.thumb_chrome.borrow_mut(),
+            scale,
+            panel.size,
+            revision,
+            |renderer| {
+                let mut shaper = TextShaper::new(renderer, scale);
+                captions
+                    .iter()
+                    .map(|t| shaper.shape(t, TextStyle::new(LABEL_PT)))
+                    .collect::<anyhow::Result<Vec<ShapedText>>>()
+            },
+            |frame, phys, shaped: &Vec<ShapedText>| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+                p.fill_rounded_full(LIST_RADIUS, LIST_BG)?;
+                p.stroke_rounded_full(LIST_RADIUS, LIST_BORDER, LIST_BORDER_COLOR)?;
+
+                // Nothing is washed while `_currentWindow` is unset: the list can be up purely to
+                // show you what is there.
+                if let Some(rect) = selected.and_then(|i| items.get(i)) {
+                    p.fill_rounded(*rect, ITEM_RADIUS, ITEM_SELECTED)?;
+                }
+
+                for (label, band) in shaped.iter().zip(&labels) {
+                    p.text_band(
+                        label,
+                        band.loc.x + band.size.w / 2.,
+                        widget::HAlign::Center,
+                        band.loc.y,
+                        band.size.h,
+                        LIST_FG,
+                        *band,
+                    )?;
+                }
+                Ok(())
+            },
+        );
+
+        match baked {
+            Ok(texture) => {
+                let buffer = TextureBuffer::from_texture(
+                    ctx.renderer,
+                    texture,
+                    scale,
+                    Transform::Normal,
+                    Vec::new(),
+                );
+                Some(TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    panel.loc,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ))
+            }
+            Err(err) => {
+                tracing::error!("error drawing the switcher's window sub-list: {err:#}");
+                None
+            }
+        }
     }
 
     /// Front-to-back, like every other UI `render`.
@@ -484,6 +843,22 @@ impl SwitcherUi {
             }
         }
 
+        // The window sub-list under a multi-window app: its previews are live windows too, and
+        // its panel is baked separately below.
+        if let Some(thumbs) = open.thumbs.as_ref() {
+            for (i, id) in thumbs.windows.iter().enumerate() {
+                let Some(bin) = thumbs.layout.thumbs.get(i) else {
+                    continue;
+                };
+                let Some((_, mapped)) = niri.layout.windows().find(|(_, m)| m.id() == *id) else {
+                    continue;
+                };
+                window_thumbnail::render(mapped, ctx.r(), *bin, scale, 1., &mut |elem| {
+                    thumbnails.push(elem)
+                });
+            }
+        }
+
         // The icons ride above the panel, one texture each. For an app switcher that is the app
         // icon filling the square; for a window switcher it is the small badge in the preview's
         // bottom-right corner.
@@ -525,8 +900,10 @@ impl SwitcherUi {
         drop(uploads);
 
         // ...and the panel, its selection wash and every label are one bake behind them.
+        let thumbs_focused = open.thumbs.as_ref().is_some_and(|t| t.focused);
         let revision = widget::Revision::new()
             .of(open.state.selected())
+            .of(thumbs_focused)
             .px(open.icon_px)
             .each(open.art.iter().map(|a| (a.label.clone(), a.arrow)))
             .done();
@@ -582,8 +959,17 @@ impl SwitcherUi {
 
                 // The selection wash, and nothing for hover — hovering moves the selection
                 // instead, so a second highlight would show two current items at once.
+                //
+                // `highlight(index, justOutline)` (`switcherPopup.js:493-504`): with the sub-list
+                // focused the app wears the dimmer `:highlighted` instead, so the two panels never
+                // both look current.
                 if let Some(rect) = items.get(open.state.selected()) {
-                    p.fill_rounded(*rect, ITEM_RADIUS, ITEM_SELECTED)?;
+                    let wash = if thumbs_focused {
+                        ITEM_HIGHLIGHTED
+                    } else {
+                        ITEM_SELECTED
+                    };
+                    p.fill_rounded(*rect, ITEM_RADIUS, wash)?;
                 }
 
                 match footer {
@@ -660,15 +1046,17 @@ impl SwitcherUi {
             Err(err) => tracing::error!("error drawing the switcher panel: {err:#}"),
         }
 
+        let thumb_panel = self.render_thumbs(open, &mut ctx, scale);
+
         // Front-to-back, so this is the stacking order read topmost-first: the app icons overlay
-        // the window previews, and the panel (with its labels and arrows) is behind both.
+        // the window previews, and both panels (with their labels and arrows) are behind them.
         for element in elements {
             push(SwitcherRenderElement::Texture(element));
         }
         for element in thumbnails {
             push(SwitcherRenderElement::Thumbnail(element));
         }
-        if let Some(element) = panel_element {
+        for element in panel_element.into_iter().chain(thumb_panel) {
             push(SwitcherRenderElement::Texture(element));
         }
     }

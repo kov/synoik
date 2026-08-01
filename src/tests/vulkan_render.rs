@@ -11146,6 +11146,12 @@ fn vulkan_draws_the_arrow_only_under_a_multi_window_app() {
 /// clone never reaches the box's bottom-right corner, which is exactly where the badge goes — so
 /// a landscape fixture cannot see the two overlap at all.
 fn app_window_switcher_fixture(title: &str) -> Option<Fixture> {
+    app_window_switcher_fixture_n(title, 1)
+}
+
+/// As [`app_window_switcher_fixture`], with `n` windows of the one app — so the app switcher has a
+/// window sub-list to open.
+fn app_window_switcher_fixture_n(title: &str, n: usize) -> Option<Fixture> {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
 
     if let Err(e) = VulkanRenderer::new() {
@@ -11169,18 +11175,20 @@ fn app_window_switcher_fixture(title: &str) -> Option<Fixture> {
     );
 
     let id = f.add_client();
-    let window = f.client(id).create_window();
-    let surface = window.surface.clone();
-    window.set_app_id("org.example.One");
-    window.set_title(title);
-    window.commit();
-    f.roundtrip(id);
+    for i in 0..n {
+        let window = f.client(id).create_window();
+        let surface = window.surface.clone();
+        window.set_app_id("org.example.One");
+        window.set_title(&format!("{title} {i}"));
+        window.commit();
+        f.roundtrip(id);
 
-    let window = f.client(id).window(&surface);
-    window.attach_solid_buffer(GREEN[0], GREEN[1], GREEN[2], GREEN[3]);
-    window.set_size(WIN, WIN);
-    window.ack_last_and_commit();
-    f.double_roundtrip(id);
+        let window = f.client(id).window(&surface);
+        window.attach_solid_buffer(GREEN[0], GREEN[1], GREEN[2], GREEN[3]);
+        window.set_size(WIN, WIN);
+        window.ack_last_and_commit();
+        f.double_roundtrip(id);
+    }
     f.niri_complete_animations();
     f.double_roundtrip(id);
 
@@ -11272,6 +11280,83 @@ fn vulkan_draws_the_selected_window_title_in_the_switchers_footer() {
         ink > 20,
         "the title band must carry the selected window's title, but only {ink} pixels in it are \
          brighter than the panel plate"
+    );
+}
+
+/// The app switcher's window sub-list reaches the screen: its own plate, and a live preview of
+/// each of the app's windows on it.
+///
+/// Geometry tests pin where it *would* go; only pixels catch a sub-list that is laid out and never
+/// drawn, or drawn behind its own panel. Both halves are here for that reason — the plate proves
+/// the second `.switcher-list` composited, and the green inside a preview proves the live windows
+/// went out in front of it rather than under it.
+#[test]
+fn vulkan_draws_the_app_switchers_window_sublist() {
+    let Some(mut f) = app_window_switcher_fixture_n("Green", 2) else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    const KEY_LEFTMETA: u32 = 125;
+    const KEY_DOWN: u32 = 108;
+    f.key_press(KEY_LEFTMETA);
+    f.niri_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+
+    let mut clock = f.niri().clock.clone();
+    let now = clock.now_unadjusted();
+    clock.set_unadjusted(now + crate::ui::switcher::POPUP_DELAY * 2);
+    f.niri().advance_animations();
+
+    // Down rather than the 500ms timer: the same sub-list either way, and this keeps the frame
+    // free of the clock games (see `settle_screenshot_ui_open`).
+    f.key_press(KEY_DOWN);
+    f.key_release(KEY_DOWN);
+    assert!(
+        f.niri().switcher.thumbnails_open(),
+        "Down must open the window sub-list"
+    );
+
+    let panel = f
+        .niri()
+        .switcher
+        .thumbnail_panel_rect()
+        .expect("an open sub-list has a panel");
+    let preview = f
+        .niri()
+        .switcher
+        .thumbnail_rect(0)
+        .expect("and a first preview");
+    let scale = output.current_scale().fractional_scale();
+
+    let (after, w, _) = render_output_vulkan(&mut f, &output);
+
+    // Just inside the sub-panel's top edge, clear of the previews: bare `%osd_panel` plate.
+    let px_at = |x: f64, y: f64| {
+        px(
+            &after,
+            w,
+            (x * scale).round() as i32,
+            (y * scale).round() as i32,
+        )
+    };
+    let plate = px_at(panel.loc.x + panel.size.w / 2., panel.loc.y + 3.);
+    for (i, (got, want)) in plate[..3].iter().zip([46u8, 46, 51]).enumerate() {
+        assert!(
+            got.abs_diff(want) <= 6,
+            "the sub-list's plate must reach the screen; channel {i} got {got}, want ~{want} \
+             (full pixel {plate:?})"
+        );
+    }
+
+    // ...and the preview's middle is the window's own green, drawn over that plate.
+    let clone = px_at(
+        preview.loc.x + preview.size.w / 2.,
+        preview.loc.y + preview.size.h / 2.,
+    );
+    assert!(
+        clone[1] > 200 && clone[0] < 80 && clone[2] < 80,
+        "each window's live preview must draw on the sub-list, got {clone:?}"
     );
 }
 
