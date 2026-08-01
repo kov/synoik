@@ -75,12 +75,10 @@ const LEVEL_MARGIN_BOTTOM: f64 = 4.;
 /// `margin-bottom: 4em` (`_osd.scss:14`) — em against the element's own 11pt font.
 const MARGIN_BOTTOM_EM: f64 = 4.;
 
-/// `$osd_bg_color` = `lighten(#222226, 5%)` ≈ `#2e2e33` (`_colors.scss:17`).
-const OSD_BG: widget::Rgba = [0.180, 0.180, 0.200, 1.];
-/// `$osd_fg_color` = `$light_1` #ffffff (`_colors.scss:16`).
-const OSD_FG: widget::Rgba = style::TEXT;
-/// `$osd_outer_borders_color` = `transparentize($osd_fg_color, 0.98)` (`_colors.scss:44`).
-const OSD_BORDER: widget::Rgba = [1., 1., 1., 0.02];
+/// `%osd_panel`'s colours, shared with the Alt-Tab `.switcher-list` — see [`style::OSD_BG`].
+const OSD_BG: widget::Rgba = style::OSD_BG;
+const OSD_FG: widget::Rgba = style::OSD_FG;
+const OSD_BORDER: widget::Rgba = style::OSD_BORDER;
 /// The level bar's theme colors (`_osd.scss:27-30`); the dark variant's track is
 /// `transparentize($osd_fg_color, 0.9)`, and the overdrive is `$destructive_color`.
 const LEVEL_STYLE: BarLevelStyle = BarLevelStyle {

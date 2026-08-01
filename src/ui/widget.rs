@@ -105,6 +105,16 @@ pub mod style {
     /// Icon-name fallback chain for an "active/selected" check mark.
     pub const CHECK_ICONS: &[&str] = &["object-select-symbolic", "emblem-ok-symbolic"];
 
+    /// `%osd_panel` background — `$osd_bg_color` = `lighten(#222226, 5%)` ≈ `#2e2e33`
+    /// (`_colors.scss:17`). Shared: the OSD pill and the Alt-Tab `.switcher-list` both extend
+    /// `%osd_panel` (`_common.scss:294`, `_switcher-popup.scss:11`), so they are one value.
+    pub const OSD_BG: Rgba = [0.180, 0.180, 0.200, 1.];
+    /// `%osd_panel` hairline — `$osd_outer_borders_color` =
+    /// `transparentize($osd_fg_color, 0.98)` (`_colors.scss:44`).
+    pub const OSD_BORDER: Rgba = [1., 1., 1., 0.02];
+    /// `$osd_fg_color` = `$light_1` (`_colors.scss:16`) — the foreground on an OSD panel.
+    pub const OSD_FG: Rgba = TEXT;
+
     /// Modal-dialog card background — GNOME `$bg_color` `#36363a` (`_dialogs.scss:4`,
     /// `_colors.scss:12`). Flat, borderless; corners rounded to `$alert_radius` (18px).
     pub const DIALOG_BG: Rgba = [0.212, 0.212, 0.227, 1.];
