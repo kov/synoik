@@ -6,6 +6,9 @@ the idle fade to black).
 Cited against `js/ui/screenShield.js` (675 lines), `js/ui/unlockDialog.js` (972) and
 `js/ui/shellDBus.js:517-566` in the 50.3 checkout.
 
+**What is still missing** is scoped item by item in `lock-screen-backlog.md`, with the reference
+citations for each.
+
 ## Why this came up
 
 The D-Bus audit (`dbus-surface-audit.md` §1) found the session could not lock at all. We served
