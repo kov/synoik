@@ -6,13 +6,15 @@
 //! between them, so the split lives in [`Items`] rather than in two parallel surfaces.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
-use niri_config::Modifiers;
+use niri_config::{Config, Modifiers};
 use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
+use crate::animation::{Animation, Clock, Curve};
 use crate::app_system::AppIconRef;
 use crate::niri_render_elements;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -159,6 +161,10 @@ struct Thumbs {
     selected: Option<usize>,
     /// `_thumbnailsFocused` — whether the arrows act on the sub-list or on the app row above it.
     focused: bool,
+    /// 0 -> 1 on the way in, 1 -> 0 on the way out (`THUMBNAIL_FADE_TIME`, `altTab.js:366-408`).
+    /// Element-level alpha only: it must never reach the bake key, or an animating list would
+    /// re-bake its plate and every caption each frame.
+    fade: Animation,
 }
 
 impl Open {
@@ -200,7 +206,7 @@ impl Open {
     /// `selected`/`focused` are `_select`'s two arguments: the timer opens it with nothing picked
     /// and the app row still holding the arrows, while Down opens it on window 0 with the arrows
     /// moved into it.
-    fn open_thumbs(&mut self, selected: Option<usize>, focused: bool) {
+    fn open_thumbs(&mut self, selected: Option<usize>, focused: bool, fade: Animation) {
         let windows = self.selected_windows().to_vec();
         if windows.is_empty() {
             return;
@@ -234,6 +240,7 @@ impl Open {
             titles,
             selected,
             focused,
+            fade,
         });
     }
 
@@ -261,28 +268,36 @@ impl Open {
         }
 
         thumbs.selected = Some(at % thumbs.windows.len());
-        // Re-measure: the row is one preview narrower, so it re-centres on the app above it.
+        // Re-measure: the row is one preview narrower, so it re-centres on the app above it. The
+        // fade carries over — the list did not reappear, it lost a preview.
         let focused = thumbs.focused;
         let selected = thumbs.selected;
-        self.open_thumbs(selected, focused);
+        let fade = thumbs.fade.clone();
+        self.open_thumbs(selected, focused, fade);
     }
 
     /// Drop the sub-list and re-arm its timer if the (possibly new) selection deserves one —
     /// the `window == null` half of `_select` (`altTab.js:328-356`).
     ///
     /// `rearm` is `!forceAppFocus`: closing the list with Up must not immediately re-open it.
-    fn close_thumbs(&mut self, now: Duration, rearm: bool) {
-        self.thumbs = None;
+    fn close_thumbs(&mut self, now: Duration, rearm: bool) -> Option<Thumbs> {
+        let going = self.thumbs.take();
         self.thumb_deadline =
             (rearm && self.selected_windows().len() > 1).then(|| now + thumbnails::POPUP_TIME);
+        going
     }
 }
 
 /// The switcher surface — at most one is open at a time, as in GNOME (a new `_startSwitcher`
 /// destroys any popup already up, `windowManager.js:1699-1701`).
-#[derive(Default)]
 pub struct SwitcherUi {
+    clock: Clock,
+    config: Rc<RefCell<Config>>,
     open: Option<Open>,
+    /// The sub-list on its way out, still drawn while it fades — `_destroyThumbnails` clears
+    /// `_thumbnails` immediately and lets the old actor ease itself away (`altTab.js:366-379`), so
+    /// a new list can be building while this one is still on screen.
+    fading: Option<Thumbs>,
     /// Set on the `Pending` -> `Shown` edge, cleared by [`SwitcherUi::take_just_shown`].
     just_shown: bool,
     chrome: RefCell<BakeCache>,
@@ -294,8 +309,58 @@ pub struct SwitcherUi {
 }
 
 impl SwitcherUi {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
+        Self {
+            clock,
+            config,
+            open: None,
+            fading: None,
+            just_shown: false,
+            chrome: RefCell::new(BakeCache::default()),
+            thumb_chrome: RefCell::new(BakeCache::default()),
+            icons: RefCell::new(AppIconUploads::default()),
+        }
+    }
+
+    /// `THUMBNAIL_FADE_TIME` as an animation, or an instant one when animations are off — the
+    /// only config knob any switcher timing honours, and the same treatment the OSD gives its
+    /// own fixed GNOME durations.
+    fn fade(&self, from: f64, to: f64) -> Animation {
+        let ms = if self.config.borrow().animations.off {
+            0
+        } else {
+            thumbnails::FADE_TIME.as_millis() as u64
+        };
+        Animation::ease(self.clock.clone(), from, to, 0., ms, Curve::EaseOutQuad)
+    }
+
+    /// Whether a sub-list fade is still running, so the compositor keeps drawing frames for it.
+    ///
+    /// Without this the fade only advances when something *else* forces a frame, which on a
+    /// switcher — where the next event is usually the key that ends the session — means it never
+    /// visibly runs at all.
+    pub fn are_animations_ongoing(&self) -> bool {
+        self.fading.is_some()
+            || self
+                .open
+                .as_ref()
+                .and_then(|o| o.thumbs.as_ref())
+                .is_some_and(|t| !t.fade.is_done())
+    }
+
+    /// Send a sub-list on its way out, keeping it on screen until the fade finishes. Fading from
+    /// wherever it currently is, so a list dismissed mid-appearance does not jump to opaque first.
+    fn retire_thumbs(&mut self, going: Option<Thumbs>) {
+        let Some(mut going) = going else {
+            return;
+        };
+        going.fade = self.fade(going.fade.value(), 0.);
+        self.fading = Some(going);
+    }
+
+    /// How opaque the open sub-list is right now, for tests: 1.0 once it has faded in.
+    pub fn thumbnail_alpha(&self) -> Option<f64> {
+        Some(self.open.as_ref()?.thumbs.as_ref()?.fade.value())
     }
 
     pub fn is_open(&self) -> bool {
@@ -467,6 +532,7 @@ impl SwitcherUi {
         // `_initialSelection` goes through `_select` like every later move, so a popup that opens
         // on a multi-window app is already counting down to its sub-list (`altTab.js:349-356`).
         open.close_thumbs(now, true);
+        self.fading = None;
         self.open = Some(open);
 
         if outcome.is_some() {
@@ -478,6 +544,13 @@ impl SwitcherUi {
 
     /// Drive the timers. Returns an outcome the moment the session ends.
     pub fn advance(&mut self, now: Duration) -> Option<(SwitcherOutcome, Option<MappedId>)> {
+        // Retire a list that has finished fading away. Before the early return below, so a fade
+        // that outlives its popup still ends.
+        if self.fading.as_ref().is_some_and(|t| t.fade.is_done()) {
+            self.fading = None;
+        }
+
+        let fade_in = self.fade(0., 1.);
         let open = self.open.as_mut()?;
         let was = open.state.visibility();
         open.state.poll(now);
@@ -487,7 +560,7 @@ impl SwitcherUi {
         // windows without changing what a release would activate.
         if open.thumb_deadline.is_some_and(|at| now >= at) {
             open.thumb_deadline = None;
-            open.open_thumbs(None, false);
+            open.open_thumbs(None, false, fade_in);
         }
 
         self.note_shown(was);
@@ -528,6 +601,8 @@ impl SwitcherUi {
         key: SwitcherKey,
         now: Duration,
     ) -> Option<(SwitcherOutcome, Option<MappedId>)> {
+        let fade_in = self.fade(0., 1.);
+        let mut going = None;
         let open = self.open.as_mut()?;
         let was = open.state.visibility();
 
@@ -549,13 +624,13 @@ impl SwitcherUi {
             // `_select(selectedIndex, null, true)`: window `null` destroys the list, and
             // `forceAppFocus` is what stops the timer from putting it straight back.
             SwitcherKey::Up if focused => {
-                open.close_thumbs(now, false);
+                going = open.close_thumbs(now, false);
                 open.state.disable_hover(now);
                 open.state.show_immediately();
             }
             // `_select(this._selectedIndex, 0)` — descend, focused, on the first window.
             SwitcherKey::Down if !focused && open.selected_windows().len() > 1 => {
-                open.open_thumbs(Some(0), true);
+                open.open_thumbs(Some(0), true, fade_in);
                 open.state.disable_hover(now);
                 open.state.show_immediately();
             }
@@ -565,11 +640,12 @@ impl SwitcherUi {
                 // Moving to another app tears its predecessor's sub-list down and starts the
                 // timer over (`_select`'s first branch, `:328-331`).
                 if open.state.selected() != before {
-                    open.close_thumbs(now, true);
+                    going = open.close_thumbs(now, true);
                 }
             }
         }
 
+        self.retire_thumbs(going);
         self.note_shown(was);
         self.take_outcome()
     }
@@ -608,7 +684,8 @@ impl SwitcherUi {
         };
         let moved = open.state.pointer_entered_item(item);
         if moved {
-            open.close_thumbs(now, true);
+            let going = open.close_thumbs(now, true);
+            self.retire_thumbs(going);
         }
         moved
     }
@@ -734,11 +811,10 @@ impl SwitcherUi {
     /// `None` when there is no sub-list up, or when the bake failed (already logged).
     fn render_thumbs(
         &self,
-        open: &Open,
+        thumbs: &Thumbs,
         ctx: &mut RenderCtx,
         scale: f64,
     ) -> Option<TextureRenderElement<VkTexture>> {
-        let thumbs = open.thumbs.as_ref()?;
         let panel = thumbs.layout.panel;
 
         // Panel-relative, like the row above.
@@ -814,7 +890,9 @@ impl SwitcherUi {
                 Some(TextureRenderElement::from_texture_buffer(
                     buffer,
                     panel.loc,
-                    1.,
+                    // The fade rides here rather than in the bake: an alpha in the revision would
+                    // re-bake the plate and every caption on each frame of it.
+                    thumbs.fade.value() as f32,
                     None,
                     None,
                     Kind::Unspecified,
@@ -874,7 +952,8 @@ impl SwitcherUi {
 
         // The window sub-list under a multi-window app: its previews are live windows too, and
         // its panel is baked separately below.
-        if let Some(thumbs) = open.thumbs.as_ref() {
+        for thumbs in open.thumbs.iter().chain(self.fading.as_ref()) {
+            let alpha = thumbs.fade.value() as f32;
             for (i, id) in thumbs.windows.iter().enumerate() {
                 let Some(bin) = thumbs.layout.thumbs.get(i) else {
                     continue;
@@ -882,7 +961,7 @@ impl SwitcherUi {
                 let Some((_, mapped)) = niri.layout.windows().find(|(_, m)| m.id() == *id) else {
                     continue;
                 };
-                window_thumbnail::render(mapped, ctx.r(), *bin, scale, 1., &mut |elem| {
+                window_thumbnail::render(mapped, ctx.r(), *bin, scale, alpha, &mut |elem| {
                     thumbnails.push(elem)
                 });
             }
@@ -1075,7 +1154,12 @@ impl SwitcherUi {
             Err(err) => tracing::error!("error drawing the switcher panel: {err:#}"),
         }
 
-        let thumb_panel = self.render_thumbs(open, &mut ctx, scale);
+        let thumb_panels: Vec<_> = open
+            .thumbs
+            .iter()
+            .chain(self.fading.as_ref())
+            .filter_map(|t| self.render_thumbs(t, &mut ctx, scale))
+            .collect();
 
         // Front-to-back, so this is the stacking order read topmost-first: the app icons overlay
         // the window previews, and both panels (with their labels and arrows) are behind them.
@@ -1085,7 +1169,7 @@ impl SwitcherUi {
         for element in thumbnails {
             push(SwitcherRenderElement::Thumbnail(element));
         }
-        for element in panel_element.into_iter().chain(thumb_panel) {
+        for element in panel_element.into_iter().chain(thumb_panels) {
             push(SwitcherRenderElement::Texture(element));
         }
     }

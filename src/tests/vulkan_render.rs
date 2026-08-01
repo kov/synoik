@@ -11317,6 +11317,17 @@ fn vulkan_draws_the_app_switchers_window_sublist() {
         "Down must open the window sub-list"
     );
 
+    // ...and settle its fade-in, or the frame below is sampled at the alpha it *started* at.
+    // `niri_complete_animations` does not do this (see `settle_screenshot_ui_open`): only moving
+    // the clock past the easing does.
+    clock.set_unadjusted(clock.now_unadjusted() + crate::ui::switcher::thumbnails::FADE_TIME * 2);
+    f.niri().advance_animations();
+    assert_eq!(
+        f.niri().switcher.thumbnail_alpha(),
+        Some(1.),
+        "the sub-list must be fully faded in before the frame is taken"
+    );
+
     let panel = f
         .niri()
         .switcher

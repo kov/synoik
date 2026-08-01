@@ -13430,6 +13430,62 @@ fn the_window_sublist_closes_on_up_and_on_moving_to_another_app() {
     f.key_release(KEY_LEFTMETA);
 }
 
+/// The window sub-list fades in rather than appearing — and keeps the compositor drawing while
+/// it does.
+///
+/// `_createThumbnails` eases opacity 0 -> 255 over `THUMBNAIL_FADE_TIME` (`altTab.js:381-408`).
+/// The second assertion is the one that would otherwise rot: a fade nothing is asking for frames
+/// for only advances when some *other* event forces one, and on a switcher the next event is
+/// usually the key that ends the session — so it would read as instant on the seat while every
+/// value-based assertion here still passed.
+#[test]
+fn the_window_sublist_fades_in() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake(
+            "org.example.One.desktop",
+            "One",
+        )])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.One");
+    map_window_for_app(&mut f, client, "org.example.One");
+    f.niri_complete_animations();
+
+    f.key_press(KEY_LEFTMETA);
+    f.niri_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+    tap(&mut f, KEY_DOWN);
+
+    assert!(f.niri().switcher.thumbnails_open());
+    let alpha = f
+        .niri()
+        .switcher
+        .thumbnail_alpha()
+        .expect("an open sub-list");
+    assert!(
+        alpha < 1.,
+        "the sub-list starts transparent and eases in, got {alpha}"
+    );
+    assert!(
+        f.niri().switcher.are_animations_ongoing(),
+        "and it must keep the redraw loop alive, or the fade never runs"
+    );
+
+    // Past the fade, it is fully drawn and asks for nothing more.
+    let mut clock = f.niri().clock.clone();
+    clock.set_unadjusted(clock.now_unadjusted() + crate::ui::switcher::thumbnails::FADE_TIME * 2);
+    assert_eq!(f.niri().switcher.thumbnail_alpha(), Some(1.));
+    assert!(!f.niri().switcher.are_animations_ongoing());
+
+    f.key_release(KEY_LEFTMETA);
+}
+
 /// `w` closes the window the switcher is pointing at, and `q` quits the selected app — neither
 /// ends the session.
 ///

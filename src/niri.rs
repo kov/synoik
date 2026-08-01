@@ -4333,6 +4333,8 @@ impl Niri {
             config.clone(),
         );
         let osd = crate::ui::osd::OsdManager::new(animation_clock.clone(), config.clone());
+        let switcher =
+            crate::ui::switcher::ui::SwitcherUi::new(animation_clock.clone(), config.clone());
 
         // No "Important Hotkeys" card on login: GNOME shows nothing over a fresh
         // session, and a modal cheat-sheet in front of the desktop is niri's
@@ -4637,7 +4639,7 @@ impl Niri {
             app_icon_cache: AppIconCache::new("Adwaita"),
             image_cache: ImageCache::new(),
 
-            switcher: crate::ui::switcher::ui::SwitcherUi::new(),
+            switcher,
 
             pick_window: None,
             pick_color: None,
@@ -7342,6 +7344,10 @@ impl Niri {
             state.unfinished_animations_remain |= self.panel_popover.are_animations_ongoing();
             state.unfinished_animations_remain |= self.notification_banner.are_animations_ongoing();
             state.unfinished_animations_remain |= self.osd.are_animations_ongoing();
+            // The switcher's sub-list fades in and out, and the next event on a switcher is
+            // usually the key that ends the session — so without this the fade would only
+            // advance when something else happened to force a frame.
+            state.unfinished_animations_remain |= self.switcher.are_animations_ongoing();
             state.unfinished_animations_remain |= self.panel.are_animations_ongoing();
             // The dash's drop gap eases shut after a drop, with no pointer motion left
             // to generate the frames it needs.
