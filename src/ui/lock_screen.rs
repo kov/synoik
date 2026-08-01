@@ -191,6 +191,8 @@ const NAME_PT: f64 = 20.;
 const NAME_MARGIN_BOTTOM_EM: f64 = 0.75;
 /// `.login-dialog-message` `min-height: 2.75em` (`:92-95`), `em` at the base font.
 const MESSAGE_MIN_EM: f64 = 2.75;
+/// The message keeps clear of the column's edges so a wrapped line is not flush against them.
+const MESSAGE_PAD: f64 = 9.;
 /// `.login-dialog-message` `color: darken($_gdm_fg, 10%)`.
 const MESSAGE_FG: Rgba = [0.9, 0.9, 0.9, 1.];
 /// A `Problem`/failure reads in the error colour rather than the muted one; GNOME distinguishes
@@ -226,10 +228,18 @@ pub fn prompt_width(base_px: f64) -> f64 {
     PROMPT_EM * base_px
 }
 
-pub fn prompt_layout(base_px: f64) -> PromptLayout {
+/// A text row must be as tall as its font's **line box**, not its point size, or descenders are
+/// clipped — a 20pt row is ~26.7px where the line box is nearer 32, and `g`/`y`/`p` lose their
+/// tails while everything else looks right. Callers pass the measured heights from
+/// [`widget::ShapedText::line_box_height`]; [`prompt_block_height`] uses this factor to size the
+/// bake before anything is shaped, generously, since a too-tall transparent texture costs nothing.
+const LINE_BOX_ESTIMATE: f64 = 1.6;
+
+pub fn prompt_layout(base_px: f64, name_h: f64, message_h: f64) -> PromptLayout {
     let width = prompt_width(base_px);
-    let name_h = crate::ui::pt_to_px(NAME_PT);
-    let message_h = MESSAGE_MIN_EM * base_px;
+    // GNOME's message reserves `min-height: 2.75em` whether or not there is text in it, so the
+    // entry does not jump when an error appears.
+    let message_h = message_h.max(MESSAGE_MIN_EM * base_px);
 
     let mut y = 0.;
     let centred = |y: f64, h: f64, w: f64| {
@@ -254,9 +264,13 @@ pub fn prompt_layout(base_px: f64) -> PromptLayout {
     }
 }
 
-/// The prompt block's total height.
+/// The prompt block's total height, sized before anything is shaped (see [`LINE_BOX_ESTIMATE`]).
 pub fn prompt_block_height(base_px: f64) -> f64 {
-    let l = prompt_layout(base_px);
+    let l = prompt_layout(
+        base_px,
+        crate::ui::pt_to_px(NAME_PT) * LINE_BOX_ESTIMATE,
+        MESSAGE_MIN_EM * base_px * 2.,
+    );
     l.message.loc.y + l.message.size.h
 }
 
@@ -322,7 +336,13 @@ impl LockScreen {
         let base_px = crate::ui::pt_to_px(crate::ui::base_font_pt());
         let width = prompt_width(base_px);
         let block_h = prompt_block_height(base_px);
-        let l = prompt_layout(base_px);
+        // Placement inside the block needs real font metrics, so it happens in `paint` where the
+        // runs exist. Only the entry's position is needed out here, and it does not depend on them.
+        let l = prompt_layout(
+            base_px,
+            crate::ui::pt_to_px(NAME_PT) * LINE_BOX_ESTIMATE,
+            MESSAGE_MIN_EM * base_px * 2.,
+        );
 
         let origin = Point::<f64, Logical>::from((
             monitor.loc.x + (monitor.size.w - width) / 2.,
@@ -395,18 +415,32 @@ impl LockScreen {
                 .done(),
             |renderer| {
                 let mut shaper = TextShaper::new(renderer, scale);
-                Ok((
-                    shaper.shape(&content_owned.display_name, TextStyle::new(NAME_PT))?,
-                    shaper.shape(
+                let name = shaper.shape(&content_owned.display_name, TextStyle::new(NAME_PT))?;
+                // The message **wraps** (`this._message.clutter_text.line_wrap = true`,
+                // `authPrompt.js:220`): PAM's strings are sentences, and a single clipped line
+                // loses both ends of one. Wrapped to the prompt column, minus its padding.
+                let message = shaper.paragraph(
+                    &[widget::ParagraphSpan::new(
                         content_owned.message.as_deref().unwrap_or(""),
-                        TextStyle::new(HINT_PT),
-                    )?,
-                ))
+                        HINT_PT,
+                    )],
+                    width - MESSAGE_PAD * 2.,
+                    HINT_PT,
+                )?;
+                Ok((name, message))
             },
-            |frame, phys, shaped: &(ShapedText, ShapedText)| {
+            |frame, phys, shaped: &(ShapedText, widget::ShapedParagraph)| {
                 let (name, message) = shaped;
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
+
+                // Real metrics now that the runs exist — see `LINE_BOX_ESTIMATE`.
+                let (_, _, msg_w, msg_h) = message.ink_bounds();
+                let l = prompt_layout(
+                    base_px,
+                    name.line_box_height() as f64 / scale,
+                    msg_h as f64 / scale,
+                );
 
                 // `border-radius: $forced_circular_radius` on a square box is a circle.
                 p.fill_rounded(l.avatar, AVATAR_PX / 2., AVATAR_BG)?;
@@ -427,15 +461,16 @@ impl LockScreen {
                     } else {
                         MESSAGE_FG
                     };
-                    p.text_band(
-                        message,
-                        cx,
-                        HAlign::Center,
+                    // `text-align: center` (`_login-lock.scss:90-92`) centres the *block*; the
+                    // paragraph shaper does not centre individual wrapped lines, so a two-line
+                    // message is a centred left-aligned block. Close enough to be invisible at one
+                    // line, which is every message PAM actually sends.
+                    let origin = Point::<f64, Logical>::from((
+                        cx - (msg_w as f64 / scale) / 2.,
                         l.message.loc.y,
-                        l.message.size.h,
-                        fg,
-                        l.message,
-                    )?;
+                    ))
+                    .to_physical_precise_round(scale);
+                    p.paragraph(message, origin, fg)?;
                 }
                 Ok(())
             },

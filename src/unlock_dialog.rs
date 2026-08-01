@@ -311,7 +311,7 @@ impl UnlockDialog {
             }
 
             VerifierEvent::AskQuestion { question, secret } => {
-                self.question = Some((question, secret));
+                self.question = Some((clean_question(&question), secret));
                 self.clear_entry();
                 self.status = Status::Asking;
                 UnlockEffects::redraw()
@@ -359,6 +359,26 @@ impl UnlockDialog {
             }
         }
     }
+}
+
+/// Tidy PAM's prompt for display — `authPrompt.js:429-435`, comment and all:
+///
+/// > The question string comes directly from PAM, if it's "Password:" we replace it with our own
+/// > to allow localization, if it's something else we remove the last colon and any trailing or
+/// > leading spaces.
+///
+/// So the label really is "Password" with no colon; showing PAM's raw string is the tell that this
+/// step was skipped.
+fn clean_question(question: &str) -> String {
+    if question == "Password:" || question == "Password: " {
+        return "Password".to_owned();
+    }
+    // `[:：] *$` — the ASCII colon and the fullwidth one, plus any spaces after it.
+    question
+        .trim_end()
+        .trim_end_matches([':', '：'])
+        .trim()
+        .to_owned()
 }
 
 /// The session's own user, for the prompt's avatar label.
@@ -601,6 +621,27 @@ mod tests {
         d.type_char('y', T0 + PROMPT_IDLE);
         assert!(!d.tick(T0 + PROMPT_IDLE + PROMPT_IDLE / 2).redraw);
         assert_eq!(d.page(), Page::Prompt);
+    }
+
+    /// PAM's prompt is tidied before it is shown: the colon goes, and the common case is
+    /// replaced outright (`authPrompt.js:429-435`).
+    #[test]
+    fn the_prompt_label_loses_its_colon() {
+        assert_eq!(clean_question("Password:"), "Password");
+        assert_eq!(clean_question("Password: "), "Password");
+        // The general case: strip one trailing colon and the whitespace around it.
+        assert_eq!(clean_question("Enter PIN:  "), "Enter PIN");
+        assert_eq!(clean_question("パスワード："), "パスワード");
+        // ...and a prompt that never had one is left alone.
+        assert_eq!(clean_question("Touch the sensor"), "Touch the sensor");
+
+        // It runs on the way in, so the dialog never holds the raw string.
+        let mut d = dialog();
+        d.on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+        assert_eq!(d.question(), Some("Password"));
     }
 
     /// The label under the avatar is the real name, falling back to the login name.

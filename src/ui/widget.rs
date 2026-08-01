@@ -663,11 +663,18 @@ pub enum EntryHit {
 pub enum EntryStyle {
     /// `%system_entry` — the overview search field.
     Search,
-    /// `%lockscreen_entry` (`_common.scss:371-379`): `entry(…, $style: lockscreen)` fills with
+    /// `%lockscreen_entry` (`_common.scss:370-379`): `entry(…, $style: lockscreen)` fills with
     /// `transparentize($system_fg_color, .9)` over the wallpaper and takes its focus ring from
     /// `transparentize($fg, 0.6)` (`_drawing.scss:99-105,138-142`). No icons.
+    ///
+    /// It `@extend`s `%entry_common` (`:174-180`), so it is a `$base_border_radius` box with
+    /// `$base_padding * 1.5` padding and ordinary left-aligned text — **not** a pill, and not
+    /// centred. Its placeholder is `transparentize($system_fg_color, 0.3)` (`:378`).
     Lockscreen,
 }
+
+/// `%entry_common` `padding: $base_padding * 1.5` (`_common.scss:177`).
+const ENTRY_PAD: f64 = 9.;
 
 impl EntryStyle {
     fn bg(self) -> Rgba {
@@ -688,13 +695,29 @@ impl EntryStyle {
         }
     }
 
-    /// Where the text starts, and how it is aligned in the pill.
-    fn text(self, width: f64) -> (f64, HAlign) {
+    /// Where the text starts, and how it is aligned in the box.
+    fn text(self, _width: f64) -> (f64, HAlign) {
         match self {
             // After the find glyph's gutter.
             EntryStyle::Search => (Entry::ICON_INSET * 2., HAlign::Left),
-            // Centred, as a password field with no icons is.
-            EntryStyle::Lockscreen => (width / 2., HAlign::Center),
+            EntryStyle::Lockscreen => (ENTRY_PAD, HAlign::Left),
+        }
+    }
+
+    /// `$forced_circular_radius` for the search pill; `$base_border_radius` for the plain box.
+    fn radius(self) -> f64 {
+        match self {
+            EntryStyle::Search => Entry::HEIGHT / 2.,
+            EntryStyle::Lockscreen => 8.,
+        }
+    }
+
+    /// The placeholder's colour.
+    fn placeholder(self) -> Rgba {
+        match self {
+            EntryStyle::Search => style::MUTED,
+            // `transparentize($system_fg_color, 0.3)`.
+            EntryStyle::Lockscreen => [1., 1., 1., 0.7],
         }
     }
 }
@@ -784,7 +807,7 @@ impl Entry {
         // out at the pill's edge rather than under its rounding.
         let gutter = match entry_style {
             EntryStyle::Search => Self::ICON_INSET * 2.,
-            EntryStyle::Lockscreen => Self::HEIGHT / 2.,
+            EntryStyle::Lockscreen => ENTRY_PAD,
         };
         let clip = Rectangle::<f64, Logical>::new(
             Point::from((gutter, 0.)),
@@ -804,16 +827,20 @@ impl Entry {
             move |frame, phys, shaped| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
-                p.fill_rounded_full(Self::HEIGHT / 2., entry_style.bg())?;
+                p.fill_rounded_full(entry_style.radius(), entry_style.bg())?;
                 if let Some(ring) = ring {
                     p.stroke_rounded(
                         Rectangle::from_size(Size::from((width, Self::HEIGHT))),
-                        Self::HEIGHT / 2.,
+                        entry_style.radius(),
                         Self::FOCUS_RING,
                         ring,
                     )?;
                 }
-                let color = if empty { style::MUTED } else { style::TEXT };
+                let color = if empty {
+                    entry_style.placeholder()
+                } else {
+                    style::TEXT
+                };
                 p.text_band(shaped, text_x, halign, 0., Self::HEIGHT, color, clip)?;
                 Ok(())
             },
@@ -1313,6 +1340,21 @@ impl ShapedText {
     /// Ink bounding box, physical px: `(x, y, w, h)`.
     pub fn ink_bounds(&self) -> (i32, i32, i32, i32) {
         self.run.ink_bounds()
+    }
+
+    /// The font's line-box height (ascent + descent) in **physical** px, or the ink height for a
+    /// glyph-less run.
+    ///
+    /// This is the height a text row must have. Sizing a row by its point size instead clips
+    /// descenders — a 20pt row is ~26.7px tall while the line box is nearer 32px, so `g`, `y` and
+    /// `p` lose their tails and nothing else looks wrong.
+    pub fn line_box_height(&self) -> i32 {
+        let (_, ascent, descent) = self.run.line_box();
+        if ascent + descent <= 0. {
+            let (_, _, _, ih) = self.run.ink_bounds();
+            return ih;
+        }
+        (ascent + descent).ceil() as i32
     }
 
     /// Physical-px top y at which to draw this run so its font line-box (ascent+descent about the

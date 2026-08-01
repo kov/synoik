@@ -115,7 +115,7 @@ impl Backend {
     pub fn change_vt(&mut self, vt: i32) {
         match self {
             Backend::Tty(tty) => tty.change_vt(vt),
-            Backend::Headless(_) => (),
+            Backend::Headless(headless) => headless.change_vt(vt),
         }
     }
 

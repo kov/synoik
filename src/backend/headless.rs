@@ -26,6 +26,12 @@ pub struct Headless {
     #[cfg_attr(not(test), allow(dead_code))]
     renderer: Option<crate::render_helpers::vulkan::VulkanRenderer>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
+    /// The VT a [`change_vt`](Self::change_vt) last asked for.
+    ///
+    /// Headless has no VTs, so the switch itself is a no-op — but *whether the request got here*
+    /// is exactly what a test of the lock screen's escape hatch needs to know, and the alternative
+    /// is asserting on some proxy that can agree while the real path is broken.
+    last_vt: Option<i32>,
 }
 
 impl Headless {
@@ -33,10 +39,21 @@ impl Headless {
         Self {
             renderer: None,
             ipc_outputs: Default::default(),
+            last_vt: None,
         }
     }
 
     pub fn init(&mut self, _niri: &mut Niri) {}
+
+    /// Record the request; there is no VT to switch to.
+    pub fn change_vt(&mut self, vt: i32) {
+        self.last_vt = Some(vt);
+    }
+
+    /// The VT last asked for, for tests of paths that must not swallow the switch.
+    pub fn last_vt(&self) -> Option<i32> {
+        self.last_vt
+    }
 
     pub fn add_renderer(&mut self) -> anyhow::Result<()> {
         if self.renderer.is_some() {

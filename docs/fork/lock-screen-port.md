@@ -135,8 +135,9 @@ process. What is done about it, and what is not:
   shield. This is GNOME's own behaviour (`shellDBus.js:551-552` → `screenShield.js:515-519` →
   `_setLocked(false)`, with no verification check), inherited deliberately — do not "fix" it
   without changing GNOME too.
-- **gdm's prompt text is shown raw.** `authPrompt.js:429-435` special-cases `"Password:"` to a
-  localized string and strips a trailing colon otherwise; we render what PAM sent.
+- **The message block is centred, its wrapped lines are not.** `text-align: center`
+  (`_login-lock.scss:90-92`) centres each line; our paragraph shaper centres the block and
+  left-aligns within it. Invisible at one line, which is every message PAM actually sends.
 - **No caps-lock warning** (`authPrompt.js:414`). Worth having: it is the most common cause of the
   wrong-password loop.
 - **Only `gdm-password`.** Fingerprint and smartcard are separate PAM services GNOME starts in

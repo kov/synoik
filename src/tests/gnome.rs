@@ -7339,6 +7339,54 @@ fn a_locked_shield_swallows_keys_instead_of_raising() {
     );
 }
 
+/// Ctrl+Alt+F<n> must reach the VT switch from a locked screen.
+///
+/// This is the escape hatch from a lock screen that has gone wrong, so it has to work *before*
+/// anything in the unlock dialog can fail. Swallowing it — which the first cut of the shield's key
+/// handling did — turns any compositor bug behind the curtain into an unrecoverable session, and
+/// "open a second VT first" is no help when the key that reaches it is eaten.
+///
+/// The observable is the *page*: a key the shield consumes raises the prompt (that is the whole
+/// point of `on_shield_key`), so a shield that stays on the clock is one that let the key past.
+#[test]
+fn a_locked_shield_still_lets_ctrl_alt_fn_through() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::unlock_dialog::Page;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    assert!(f.niri().screen_shield.is_locked());
+
+    f.key_press(KEY_LEFTCTRL);
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_F2);
+    f.key_release(KEY_LEFTALT);
+    f.key_release(KEY_LEFTCTRL);
+
+    assert!(
+        f.niri().screen_shield.is_locked(),
+        "still locked, of course"
+    );
+    assert_eq!(
+        f.niri_state().backend.headless().last_vt(),
+        Some(2),
+        "Ctrl+Alt+F2 must reach the VT switch from behind the curtain"
+    );
+
+    // The control: an ordinary key does NOT get through — it is typed at the shield instead.
+    // Without this the assertion above would pass for a shield that forwarded everything.
+    tap(&mut f, KEY_A);
+    assert_eq!(
+        f.niri().unlock_dialog.page(),
+        Page::Prompt,
+        "an ordinary key is still swallowed by the shield"
+    );
+}
+
 /// If the unlock channel dies, the lock drops to a dismissible screensaver rather than trapping
 /// the session.
 ///

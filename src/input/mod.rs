@@ -606,6 +606,38 @@ impl State {
                 // ahead of `keyboard.input()` so xkb state still tracks — otherwise Shift would
                 // never register and the unlock entry could not type a capital letter.
                 if this.niri.screen_shield.is_active() {
+                    // ...with the same exceptions the `ext-session-lock` path already makes.
+                    // **Ctrl+Alt+F<n> above all**: a VT switch is the escape hatch from a lock
+                    // screen that has gone wrong, and swallowing it means a compositor bug becomes
+                    // an unrecoverable session. It must work *before* anything here can fail, so
+                    // the check is a plain bind lookup ahead of the dialog, not a special case
+                    // inside it.
+                    let escape = {
+                        let config = this.niri.config.borrow();
+                        find_bind(
+                            make_binds_iter(&config, false),
+                            &this.niri.gnome_settings.keybindings,
+                            &this.niri.accel_grabs,
+                            SwitcherGrab::Closed,
+                            mod_key,
+                            key_code,
+                            modified,
+                            raw,
+                            *mods,
+                            config.input.disable_power_key_handling,
+                        )
+                        .filter(|bind| bind.allow_when_locked || allowed_when_locked(&bind.action))
+                    };
+                    if let Some(bind) = escape {
+                        if pressed {
+                            this.niri.suppressed_keys.insert(key_code);
+                            return FilterResult::Intercept(Some(bind));
+                        } else if this.niri.suppressed_keys.remove(&key_code) {
+                            return FilterResult::Intercept(None);
+                        }
+                        return FilterResult::Forward;
+                    }
+
                     if pressed {
                         let text = modified
                             .key_char()
