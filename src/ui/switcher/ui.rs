@@ -270,6 +270,28 @@ impl Open {
         });
     }
 
+    /// Point the sub-list at `window`, **creating it only if it is not already up** — the window
+    /// half of `_select` (`altTab.js:328-357`).
+    ///
+    /// `_select` destroys the thumbnails only when the app changed or the window is null
+    /// (`:329-332`); with the same app and a real window it falls straight through to
+    /// `this._thumbnails.highlight(window, ...)` on the list that is already on screen. So
+    /// descending into a list the popup timer opened must move a highlight and nothing else.
+    ///
+    /// Rebuilding instead is invisible to every value-based test — same layout, same windows,
+    /// same selection — but it hands the new list a fresh [`thumbnails::FADE_TIME`] animation, so
+    /// a list that was fully opaque blinks out and eases back in under the key that was supposed
+    /// to move a highlight.
+    fn select_thumb(&mut self, window: usize, focused: bool, fade: Animation) {
+        self.thumb_deadline = None;
+        let Some(thumbs) = self.thumbs.as_mut() else {
+            self.open_thumbs(Some(window), focused, fade);
+            return;
+        };
+        thumbs.selected = Some(window);
+        thumbs.focused = focused;
+    }
+
     /// `ThumbnailSwitcher._removeThumbnail` (`altTab.js:978-991`) — a window closed while its
     /// preview was on screen.
     ///
@@ -639,7 +661,7 @@ impl SwitcherUi {
                     0
                 };
                 let fade = self.fade(0., 1.);
-                open.open_thumbs(Some(window), true, fade);
+                open.select_thumb(window, true, fade);
             }
         }
         self.open = Some(open);
@@ -760,7 +782,7 @@ impl SwitcherUi {
             // on its first press and steps through the windows after; backward always steps back.
             SwitcherKey::Group { backward } => {
                 if !focused && !backward {
-                    open.open_thumbs(Some(0), true, fade_in);
+                    open.select_thumb(0, true, fade_in);
                 } else if let Some(thumbs) = open.thumbs.as_mut() {
                     let n = thumbs.windows.len();
                     thumbs.selected = Some(if backward {
@@ -775,7 +797,7 @@ impl SwitcherUi {
             }
             // `_select(this._selectedIndex, 0)` — descend, focused, on the first window.
             SwitcherKey::Down if !focused && open.selected_windows().len() > 1 => {
-                open.open_thumbs(Some(0), true, fade_in);
+                open.select_thumb(0, true, fade_in);
                 open.state.disable_hover(now);
                 open.state.show_immediately();
             }

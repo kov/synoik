@@ -13677,6 +13677,82 @@ fn a_key_the_cycler_does_not_match_falls_through_and_abandons_it() {
     );
 }
 
+/// Down on a sub-list the *timer* already opened only moves the highlight — it does not rebuild
+/// the list, and so does not restart its fade.
+///
+/// `_select` destroys the thumbnails only when the app changed or the window is null
+/// (`altTab.js:329-332`); with the same app and a real window it falls through to
+/// `this._thumbnails.highlight(window, ...)` on the list that is already up (`:345-349`).
+/// Rebuilding there restarts `THUMBNAIL_FADE_TIME` on a list that is fully on screen, which reads
+/// on the seat as the sub-list blinking under the key that was supposed to move a highlight.
+///
+/// The fade assertion is the one that matters: every *value* here passes either way, so a
+/// selection-only test would have shipped the blink.
+#[test]
+fn descending_into_an_open_sublist_moves_the_highlight_without_rebuilding_it() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![
+            AppEntry::fake("org.example.One.desktop", "One"),
+            AppEntry::fake("org.example.Two.desktop", "Two"),
+        ])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.One");
+    map_window_for_app(&mut f, client, "org.example.One");
+    map_window_for_app(&mut f, client, "org.example.Two");
+    f.niri_complete_animations();
+
+    let mut clock = f.niri().clock.clone();
+    let rest = |f: &mut Fixture, clock: &mut crate::animation::Clock, by: Duration| {
+        let now = clock.now_unadjusted();
+        clock.set_unadjusted(now + by);
+        f.niri().advance_animations();
+    };
+
+    // Rest on the multi-window app until its sub-list pops up on the timer, then let the fade
+    // finish so "still animating" below can only mean a *new* fade.
+    f.key_press(KEY_LEFTMETA);
+    f.niri_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+    assert_eq!(f.niri().switcher.selected(), Some(1), "opens on \"One\"");
+    rest(
+        &mut f,
+        &mut clock,
+        crate::ui::switcher::thumbnails::POPUP_TIME * 2,
+    );
+    rest(
+        &mut f,
+        &mut clock,
+        crate::ui::switcher::thumbnails::FADE_TIME * 2,
+    );
+    assert!(f.niri().switcher.thumbnails_open());
+    assert_eq!(f.niri().switcher.thumbnail_selected(), None);
+    assert!(
+        !f.niri().switcher.are_animations_ongoing(),
+        "the timer-opened list has finished fading in"
+    );
+
+    tap(&mut f, KEY_DOWN);
+
+    assert_eq!(
+        f.niri().switcher.thumbnail_selected(),
+        Some(0),
+        "Down picks the app's first window"
+    );
+    assert!(
+        !f.niri().switcher.are_animations_ongoing(),
+        "and does it in place: a list already on screen must not fade in again"
+    );
+
+    f.key_release(KEY_LEFTMETA);
+}
+
 /// The window sub-list fades in rather than appearing — and keeps the compositor drawing while
 /// it does.
 ///
