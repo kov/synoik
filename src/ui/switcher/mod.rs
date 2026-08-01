@@ -22,8 +22,9 @@
 use std::time::Duration;
 
 use niri_config::Modifiers;
+use smithay::utils::{Logical, Point, Rectangle, Size};
 
-use crate::ui::widget::{style, Rgba};
+use crate::ui::widget::{self, style, Rgba};
 
 pub mod window_list;
 
@@ -98,6 +99,116 @@ pub const ITEM_SELECTED: Rgba = [1., 1., 1., 0.2];
 /// weaker highlight under the pointer would show two "current" items at once. The
 /// pointer's feedback here is the selection itself.
 pub const ITEM_HOVER: Rgba = style::TRANSPARENT;
+
+/// `.switcher-list` `box-shadow: 0 8px 8px 0 $shadow_color` (`_switcher-popup.scss:18`), with
+/// `$shadow_color` (dark) = `rgba(0,0,0,0.2)` (`_default-colors.scss:36`).
+///
+/// The one part of the panel `%osd_panel` does *not* give us — the OSD pill has no shadow.
+///
+/// Carried at the literal spread of 0. `popover.rs` found that St's real shadow renders denser
+/// than a naive gaussian and matched its measured reference with a spread of **2** instead — but
+/// that was measured at `blur: 4`, and extrapolating someone else's fudge factor to a blur twice
+/// as wide is exactly the kind of guess this port is supposed to avoid. Check it against the seat
+/// when the panel first draws, and cite the measurement if it moves.
+pub const LIST_SHADOW: widget::DropShadowSpec = widget::DropShadowSpec {
+    blur: 8.,
+    offset: (0., 8.),
+    spread: 0.,
+    color: [0., 0., 0., 0.2],
+};
+
+/// Where the panel and its items sit, in output-logical coordinates.
+///
+/// Both Tab popups build their list with `squareItems = true` (`altTab.js:698, 1064`), which sets
+/// the item container `homogeneous` (`switcherPopup.js:448`) and makes every item's preferred
+/// width and height the max over *both* dimensions of *all* items (`:575-590, 600-618`). So the
+/// row is N identical squares — an app with a long title cannot make its own tile wider than the
+/// rest. The thumbnail sub-list passes `false` (`altTab.js:914`) and is slice 5.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PanelLayout {
+    /// The `.switcher-list` box, including its padding and hairline.
+    pub panel: Rectangle<f64, Logical>,
+    /// One `.item-box` per item, left to right, in the same space as [`panel`](Self::panel).
+    pub items: Vec<Rectangle<f64, Logical>>,
+}
+
+impl PanelLayout {
+    /// Lay out `contents` (each item's *content* size, inside its `.item-box` padding) centered
+    /// on `monitor`.
+    ///
+    /// `monitor` is the **primary** monitor, not the focused one: `vfunc_allocate` reads
+    /// `Main.layoutManager.primaryMonitor` (`switcherPopup.js:96`), so on a multi-head setup the
+    /// switcher appears on the primary head however far away you are working. That is GNOME's
+    /// behaviour, not an oversight of ours — see `docs/fork/alt-tab-port.md`.
+    ///
+    /// A row too wide for the monitor is clamped to it here. GNOME's real answer to overflow is
+    /// two-part: the app switcher shrinks its icons down a ladder first
+    /// (`AppSwitcher._setIconSize`), and only then does the `St.ScrollView` scroll
+    /// ([`SCROLL_TIME`]). Both belong to the popups that have item art, so slices 2 and 3.
+    pub fn new(contents: &[Size<f64, Logical>], monitor: Rectangle<f64, Logical>) -> Self {
+        if contents.is_empty() {
+            return Self {
+                panel: Rectangle::default(),
+                items: Vec::new(),
+            };
+        }
+
+        // Every item box is its content plus `.item-box`'s padding on all four sides...
+        let side = contents
+            .iter()
+            .map(|c| (c.w + ITEM_PADDING * 2.).max(c.h + ITEM_PADDING * 2.))
+            .fold(0f64, f64::max);
+        // ...and squareItems makes them all that one square.
+        let n = contents.len() as f64;
+
+        let size = Size::<f64, Logical>::from((
+            n * side + (n - 1.) * ITEM_SPACING + LIST_PADDING * 2.,
+            side + LIST_PADDING * 2.,
+        ));
+
+        // Centered on both axes — the switcher sits in the middle of the screen, not near an
+        // edge (`switcherPopup.js:104-109`). `floor`, like the reference.
+        let loc = Point::from((
+            (monitor.loc.x + ((monitor.size.w - size.w) / 2.).floor()).max(monitor.loc.x),
+            (monitor.loc.y + ((monitor.size.h - size.h) / 2.).floor()).max(monitor.loc.y),
+        ));
+        let size = Size::from((size.w.min(monitor.size.w), size.h.min(monitor.size.h)));
+
+        let items = (0..contents.len())
+            .map(|i| {
+                Rectangle::new(
+                    Point::from((
+                        loc.x + LIST_PADDING + i as f64 * (side + ITEM_SPACING),
+                        loc.y + LIST_PADDING,
+                    )),
+                    Size::from((side, side)),
+                )
+            })
+            .collect();
+
+        Self {
+            panel: Rectangle::new(loc, size),
+            items,
+        }
+    }
+
+    /// The item under `point`, for hover selection.
+    ///
+    /// Only the item boxes hit, not the gaps between them: GNOME's `item-entered` comes from a
+    /// motion handler on each `SwitcherButton` (`switcherPopup.js:487-489`), so the spacing
+    /// belongs to no item and the pointer crossing it selects nothing new.
+    pub fn item_at(&self, point: Point<f64, Logical>) -> Option<usize> {
+        self.items.iter().position(|r| r.contains(point))
+    }
+}
+
+// The panel's *painting* — fill, hairline, shadow, selection wash — lands with the first popup
+// that has items to draw inside it (slice 2). Everything it needs is already here: the colours,
+// the radii, `LIST_SHADOW`, and `PanelLayout` for the boxes.
+//
+// It is deliberately not written ahead of that caller. Our render tests go through a real output
+// (`src/tests/vulkan_render.rs`), so a painter with no popup behind it cannot be pixel-tested —
+// and paint code whose pixels have never been looked at reads as finished when it is not.
 
 /// Why a switcher is showing — which popup class GNOME would have raised, and therefore
 /// what the items are.
@@ -805,5 +916,100 @@ mod tests {
     #[test]
     fn an_empty_list_does_not_open() {
         assert!(SwitcherPopup::show(SwitcherKind::Windows, 0, false, ALT, ALT, T0).is_none());
+    }
+
+    fn monitor() -> Rectangle<f64, Logical> {
+        Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)))
+    }
+
+    /// Every item is the same square, however differently shaped its contents are.
+    ///
+    /// `squareItems` is true for both Tab popups (`altTab.js:698, 1064`), and the size is the max
+    /// over *both* dimensions of *all* items (`switcherPopup.js:575-590`). Without it a window
+    /// with a long title would widen its own tile and the row would look ragged.
+    #[test]
+    fn square_items_make_one_size_for_every_item() {
+        let contents = [
+            Size::from((128., 96.)),
+            Size::from((40., 40.)),
+            Size::from((60., 150.)),
+        ];
+        let layout = PanelLayout::new(&contents, monitor());
+
+        // The tallest content (150) plus the item padding on both sides sets the square.
+        let side = 150. + ITEM_PADDING * 2.;
+        for (i, item) in layout.items.iter().enumerate() {
+            assert_eq!(item.size, Size::from((side, side)), "item {i}");
+        }
+
+        // Panel = the row, plus its own padding.
+        let row_w = 3. * side + 2. * ITEM_SPACING;
+        assert_eq!(
+            layout.panel.size,
+            Size::from((row_w + LIST_PADDING * 2., side + LIST_PADDING * 2.))
+        );
+    }
+
+    /// The panel is centered on both axes, and the items sit inside its padding.
+    #[test]
+    fn the_panel_is_centered_on_the_monitor() {
+        let layout = PanelLayout::new(&[Size::from((96., 96.)); 4], monitor());
+        let panel = layout.panel;
+
+        assert_eq!(
+            panel.loc.x + panel.size.w / 2.,
+            960.,
+            "horizontally centered"
+        );
+        assert_eq!(panel.loc.y + panel.size.h / 2., 540., "vertically centered");
+
+        let first = layout.items[0];
+        assert_eq!(first.loc.x, panel.loc.x + LIST_PADDING);
+        assert_eq!(first.loc.y, panel.loc.y + LIST_PADDING);
+
+        // The last item's far edge lands on the panel's inner edge — no drift from accumulating
+        // the spacing.
+        let last = layout.items[3];
+        assert_eq!(
+            last.loc.x + last.size.w,
+            panel.loc.x + panel.size.w - LIST_PADDING
+        );
+    }
+
+    /// The gaps between items belong to no item, so crossing one selects nothing.
+    ///
+    /// GNOME hangs `item-entered` off each `SwitcherButton`'s motion handler
+    /// (`switcherPopup.js:487-489`) rather than dividing the row into hit zones.
+    #[test]
+    fn the_spacing_between_items_is_not_hoverable() {
+        let layout = PanelLayout::new(&[Size::from((96., 96.)); 3], monitor());
+
+        let first = layout.items[0];
+        let mid_y = first.loc.y + first.size.h / 2.;
+
+        assert_eq!(
+            layout.item_at(Point::from((first.loc.x + 1., mid_y))),
+            Some(0)
+        );
+
+        // A point in the gap after the first item.
+        let gap_x = first.loc.x + first.size.w + ITEM_SPACING / 2.;
+        assert_eq!(layout.item_at(Point::from((gap_x, mid_y))), None);
+
+        assert_eq!(
+            layout.item_at(Point::from((layout.items[2].loc.x + 1., mid_y))),
+            Some(2)
+        );
+
+        // Outside the panel entirely.
+        assert_eq!(layout.item_at(Point::from((0., 0.))), None);
+    }
+
+    /// An empty layout is empty rather than a zero-sized panel someone might still paint.
+    #[test]
+    fn no_items_means_no_panel() {
+        let layout = PanelLayout::new(&[], monitor());
+        assert!(layout.items.is_empty());
+        assert_eq!(layout.panel.size, Size::from((0., 0.)));
     }
 }
