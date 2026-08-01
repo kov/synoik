@@ -575,6 +575,9 @@ impl GnomeSettings {
         if settings_has_key(lockdown, "disable-lock-screen") {
             self.shield.disable_lock_screen = lockdown.boolean("disable-lock-screen");
         }
+        if settings_has_key(lockdown, "disable-show-password") {
+            self.shield.disable_show_password = lockdown.boolean("disable-show-password");
+        }
     }
 
     fn load_screensaver(&mut self, screensaver: &gio::Settings) {

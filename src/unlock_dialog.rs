@@ -106,6 +106,12 @@ pub struct UnlockDialog {
     /// clear, so there is no default — no question means no entry.
     question: Option<(String, bool)>,
     message: Option<Message>,
+    /// The peek toggle: whether the password is currently shown in the clear
+    /// (`st_password_entry_set_password_visible`, `st-password-entry.c:317-350`).
+    peek: bool,
+    /// `org.gnome.desktop.lockdown disable-show-password`. When set there is no toggle at all, and
+    /// any peek already in effect is dropped (`on_disable_show_password_changed`, `:186-199`).
+    peek_locked_down: bool,
     /// Monotonic instant of the last interaction with the prompt, for [`PROMPT_IDLE`].
     last_activity: Option<Duration>,
 }
@@ -121,6 +127,8 @@ impl UnlockDialog {
             entry: String::with_capacity(ENTRY_CAPACITY),
             question: None,
             message: None,
+            peek: false,
+            peek_locked_down: false,
             last_activity: None,
         }
     }
@@ -172,10 +180,45 @@ impl UnlockDialog {
         }
     }
 
-    /// Whether the entry must be masked. **Fails closed**: with no question outstanding this is
+    /// Whether gdm asked for a *secret*. **Fails closed**: with no question outstanding this is
     /// `true`, so a stale buffer can never be drawn in the clear.
-    pub fn is_secret(&self) -> bool {
+    fn asked_for_secret(&self) -> bool {
         self.question.as_ref().is_none_or(|(_, secret)| *secret)
+    }
+
+    /// Whether the entry is masked right now — a secret prompt that the user has not chosen to
+    /// reveal.
+    pub fn is_secret(&self) -> bool {
+        self.asked_for_secret() && !self.peek
+    }
+
+    /// The peek toggle's state, or `None` when there is none to show: a non-secret prompt has
+    /// nothing to reveal, and `disable-show-password` removes it outright.
+    pub fn peek(&self) -> Option<bool> {
+        if !self.asked_for_secret() || self.peek_locked_down {
+            return None;
+        }
+        Some(self.peek)
+    }
+
+    /// Show or hide the password (`st_password_entry_secondary_icon_clicked`, `:71-78`).
+    pub fn toggle_peek(&mut self, now: Duration) -> UnlockEffects {
+        self.last_activity = Some(now);
+        if self.peek().is_none() {
+            return UnlockEffects::default();
+        }
+        self.peek = !self.peek;
+        UnlockEffects::redraw()
+    }
+
+    /// `org.gnome.desktop.lockdown disable-show-password`. Locking it down while a password is
+    /// visible hides it again (`:191-193`) — otherwise the setting would not take effect until the
+    /// next prompt, which is the moment it least helps.
+    pub fn set_peek_locked_down(&mut self, locked_down: bool) {
+        self.peek_locked_down = locked_down;
+        if locked_down {
+            self.peek = false;
+        }
     }
 
     /// What to draw in the entry — already masked when it must be.
@@ -311,6 +354,10 @@ impl UnlockDialog {
             }
 
             VerifierEvent::AskQuestion { question, secret } => {
+                // Every fresh question re-masks: a peek is a decision about *this* answer, and
+                // carrying it into the next one would reveal a password the user never chose to
+                // show.
+                self.peek = false;
                 self.question = Some((clean_question(&question), secret));
                 self.clear_entry();
                 self.status = Status::Asking;
@@ -621,6 +668,66 @@ mod tests {
         d.type_char('y', T0 + PROMPT_IDLE);
         assert!(!d.tick(T0 + PROMPT_IDLE + PROMPT_IDLE / 2).redraw);
         assert_eq!(d.page(), Page::Prompt);
+    }
+
+    /// The peek toggle reveals the password, and every guard around it holds.
+    ///
+    /// This is the one control that is *supposed* to show a password, so the things that must stay
+    /// true around it are worth pinning: it does not exist on a non-secret prompt or under
+    /// `disable-show-password`, locking that down hides an already-visible password rather than
+    /// waiting for the next prompt, and a fresh question re-masks — a peek is a decision about the
+    /// answer being typed, not a mode.
+    #[test]
+    fn the_peek_toggle_reveals_only_what_it_should() {
+        let mut d = dialog();
+        d.show_prompt(T0);
+        d.on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+        for c in "hunter2".chars() {
+            d.type_char(c, T0);
+        }
+        assert_eq!(d.entry_display(), "●".repeat(7));
+        assert_eq!(d.peek(), Some(false), "the toggle is there, and off");
+
+        d.toggle_peek(T0);
+        assert_eq!(d.peek(), Some(true));
+        assert_eq!(d.entry_display(), "hunter2", "revealed on request");
+
+        // A new question re-masks: the peek belonged to the answer that was refused.
+        d.on_verifier_event(VerifierEvent::Failed);
+        d.on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+        assert_eq!(d.peek(), Some(false), "a fresh question is masked again");
+
+        // Lockdown removes the toggle, and takes effect immediately on a visible password.
+        d.type_char('x', T0);
+        d.toggle_peek(T0);
+        assert_eq!(d.entry_display(), "x");
+        d.set_peek_locked_down(true);
+        assert_eq!(d.peek(), None, "no toggle under disable-show-password");
+        assert_eq!(
+            d.entry_display(),
+            "●",
+            "and what was showing is hidden again"
+        );
+        d.toggle_peek(T0);
+        assert_eq!(
+            d.entry_display(),
+            "●",
+            "the toggle does nothing while locked down"
+        );
+
+        // A non-secret prompt has nothing to reveal, so it has no toggle either.
+        d.set_peek_locked_down(false);
+        d.on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Username:".to_owned(),
+            secret: false,
+        });
+        assert_eq!(d.peek(), None);
     }
 
     /// PAM's prompt is tidied before it is shown: the colon goes, and the common case is

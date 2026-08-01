@@ -5830,7 +5830,8 @@ impl State {
         // saw pressed.
         if self.niri.screen_shield.is_active() {
             if button_state == ButtonState::Pressed {
-                self.on_shield_click();
+                let pos = self.niri.seat.get_pointer().unwrap().current_location();
+                self.on_shield_click(pos);
             }
             return;
         }

@@ -428,6 +428,7 @@ impl OverviewSearch {
             area.entry.loc.x + area.entry.size.w / 2.,
             area.entry.loc.y + ENTRY_MARGIN_TOP,
             entry_width(area.ramp),
+            widget::EntryStyle::Search,
         );
 
         let active = self.is_active();
@@ -475,7 +476,7 @@ impl OverviewSearch {
     pub fn hit_test(&self, pos: Point<f64, Logical>, area: SearchArea) -> Option<SearchHit> {
         let layout = self.layout(area);
         match Entry::hit(&layout.entry, pos, self.is_active()) {
-            Some(EntryHit::Clear) => return Some(SearchHit::Clear),
+            Some(EntryHit::Trailing) => return Some(SearchHit::Clear),
             Some(EntryHit::Field) => return Some(SearchHit::Background),
             None => {}
         }
@@ -641,6 +642,7 @@ impl OverviewSearch {
             widget::EntryStyle::Search,
             // The search entry's focus is its caller's inset-accent ring, not the pill's.
             false,
+            self.is_active(),
             // The width is part of what was baked; a canvas change must re-bake it.
             widget::Revision::new()
                 .of(self.content_rev)

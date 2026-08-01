@@ -60,6 +60,9 @@ pub struct ShieldSettings {
     /// `org.gnome.desktop.screensaver lock-enabled` — whether going idle should end up locked.
     /// Consulted by the idle path, not by an explicit `Lock`.
     pub lock_enabled: bool,
+    /// `org.gnome.desktop.lockdown disable-show-password` — removes the unlock entry's peek
+    /// toggle (`st-password-entry.c:61-68`).
+    pub disable_show_password: bool,
 }
 
 impl Default for ShieldSettings {
@@ -68,6 +71,7 @@ impl Default for ShieldSettings {
         Self {
             disable_lock_screen: false,
             lock_enabled: true,
+            disable_show_password: false,
         }
     }
 }

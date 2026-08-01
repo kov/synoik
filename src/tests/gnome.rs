@@ -7137,7 +7137,7 @@ fn lockdown_makes_the_screen_saver_lock_a_no_op() {
         .screen_shield
         .set_settings(crate::screen_shield::ShieldSettings {
             disable_lock_screen: true,
-            lock_enabled: true,
+            ..Default::default()
         });
 
     f.niri_state().on_screen_saver_msg(ScreenSaverToNiri::Lock);
@@ -7385,6 +7385,35 @@ fn a_locked_shield_still_lets_ctrl_alt_fn_through() {
         Page::Prompt,
         "an ordinary key is still swallowed by the shield"
     );
+}
+
+/// logind's `Unlock` raises the shield — this is how gdm's own login screen unlocks you.
+///
+/// You switch to gdm's VT, authenticate there, gdm tells logind, and logind signals the session.
+/// Without this the VT switches back and the shield is still up, with no way to tell it what
+/// happened. `loginctl lock-session` / `unlock-session` are the same two signals by hand.
+#[test]
+fn logind_lock_and_unlock_drive_the_shield() {
+    use crate::dbus::freedesktop_login1::Login1ToNiri;
+    use crate::dbus::gdm::VerifierEvent;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state()
+        .on_login1_msg(Login1ToNiri::SessionLock(true));
+    assert!(f.niri().screen_shield.is_active(), "Lock covers the screen");
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    assert!(f.niri().screen_shield.is_locked());
+
+    // ...and gdm, having authenticated on its own VT, unlocks us.
+    f.niri_state()
+        .on_login1_msg(Login1ToNiri::SessionLock(false));
+    assert!(
+        !f.niri().screen_shield.is_locked(),
+        "Unlock must actually unlock — otherwise gdm authenticates you into a locked screen"
+    );
+    assert!(!f.niri().screen_shield.is_active(), "and raise the shield");
 }
 
 /// If the unlock channel dies, the lock drops to a dismissible screensaver rather than trapping

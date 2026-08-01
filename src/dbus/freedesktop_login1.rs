@@ -10,6 +10,14 @@ const SESSION_IFACE: &str = "org.freedesktop.login1.Session";
 
 pub enum Login1ToNiri {
     LidClosedChanged(bool),
+    /// `Session.Lock` / `Session.Unlock` — logind asking the session to raise or lower its shield.
+    ///
+    /// `Unlock` is how **gdm's own login screen unlocks you**: you switch to gdm's VT,
+    /// authenticate there, and gdm tells logind, which signals the session. Without this the
+    /// VT switches back and the shield is still up, with no way to tell it what just happened.
+    ///
+    /// `loginctl lock-session` / `unlock-session` are the same two signals by hand.
+    SessionLock(bool),
     /// A [`set_brightness`] call finished, carrying the connector it was for. Drives the
     /// per-device write serializer ([`crate::backlight::BacklightWriter::write_finished`]), which
     /// is what keeps a slider drag down to one in-flight D-Bus call.
@@ -71,7 +79,53 @@ pub fn start(
             return;
         };
 
-        while let Some(signal) = props_changed.next().await {
+        // The session's own `Lock`/`Unlock`, on a different object from the manager properties
+        // above. `.../session/auto` resolves to our own session, so there is nothing to look up.
+        let session = zbus::Proxy::new(
+            &async_conn,
+            "org.freedesktop.login1",
+            SESSION_PATH,
+            SESSION_IFACE,
+        )
+        .await;
+        let mut session_signals = match &session {
+            Ok(proxy) => match proxy.receive_all_signals().await {
+                Ok(stream) => Some(stream),
+                Err(err) => {
+                    warn!("error subscribing to logind session signals: {err:?}");
+                    None
+                }
+            },
+            Err(err) => {
+                warn!("error creating the logind session proxy: {err:?}");
+                None
+            }
+        };
+
+        loop {
+            let signal = if let Some(signals) = session_signals.as_mut() {
+                futures_util::select! {
+                    changed = props_changed.next() => changed,
+                    msg = signals.next() => {
+                        let Some(msg) = msg else { continue };
+                        let member = msg.header().member().map(|m| m.as_str().to_owned());
+                        let locked = match member.as_deref() {
+                            Some("Lock") => true,
+                            Some("Unlock") => false,
+                            _ => continue,
+                        };
+                        if let Err(err) = to_niri.send(Login1ToNiri::SessionLock(locked)) {
+                            warn!("error sending the session lock signal to niri: {err:?}");
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                props_changed.next().await
+            };
+            let Some(signal) = signal else { break };
+
             let args = match signal.args() {
                 Ok(args) => args,
                 Err(err) => {

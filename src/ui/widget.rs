@@ -648,8 +648,9 @@ pub struct EntryLayout {
 /// What a point over an [`Entry`] hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryHit {
-    /// The trailing clear (`edit-clear-symbolic`) glyph.
-    Clear,
+    /// The trailing glyph — the search entry's `edit-clear-symbolic`, or the password entry's
+    /// `view-reveal-symbolic` peek toggle.
+    Trailing,
     /// Anywhere else in the pill.
     Field,
 }
@@ -704,6 +705,15 @@ impl EntryStyle {
         }
     }
 
+    /// Distance from the near edge to a trailing glyph's centre: the search pill's icon gutter, or
+    /// `%entry_common`'s padding plus half a `$scalable_icon_size` glyph for the plain box.
+    fn icon_inset(self) -> f64 {
+        match self {
+            EntryStyle::Search => Entry::ICON_INSET,
+            EntryStyle::Lockscreen => ENTRY_PAD + Entry::ICON_PX / 2.,
+        }
+    }
+
     /// `$forced_circular_radius` for the search pill; `$base_border_radius` for the plain box.
     fn radius(self) -> f64 {
         match self {
@@ -742,18 +752,19 @@ impl Entry {
     ///
     /// The icon centres are only meaningful for [`EntryStyle::Search`]; a lockscreen entry has no
     /// glyphs, and `text_x` is its centre rather than a left edge.
-    pub fn layout(center_x: f64, top_y: f64, width: f64) -> EntryLayout {
+    pub fn layout(center_x: f64, top_y: f64, width: f64, style: EntryStyle) -> EntryLayout {
         let x = (center_x - width / 2.).round();
         let pill = Rectangle::new(
             Point::from((x, top_y.round())),
             Size::from((width, Self::HEIGHT)),
         );
         let cy = pill.loc.y + Self::HEIGHT / 2.;
+        let inset = style.icon_inset();
         EntryLayout {
             pill,
-            primary_icon: Point::from((pill.loc.x + Self::ICON_INSET, cy)),
-            secondary_icon: Point::from((pill.loc.x + width - Self::ICON_INSET, cy)),
-            text_x: pill.loc.x + Self::ICON_INSET * 2.,
+            primary_icon: Point::from((pill.loc.x + inset, cy)),
+            secondary_icon: Point::from((pill.loc.x + width - inset, cy)),
+            text_x: pill.loc.x + style.text(width).0,
         }
     }
 
@@ -762,15 +773,15 @@ impl Entry {
     pub fn hit(
         layout: &EntryLayout,
         pos: Point<f64, Logical>,
-        has_clear: bool,
+        has_trailing: bool,
     ) -> Option<EntryHit> {
         if !layout.pill.contains(pos) {
             return None;
         }
-        if has_clear {
+        if has_trailing {
             let d = pos - layout.secondary_icon;
             if d.x * d.x + d.y * d.y <= Self::ICON_PX * Self::ICON_PX {
-                return Some(EntryHit::Clear);
+                return Some(EntryHit::Trailing);
             }
         }
         Some(EntryHit::Field)
@@ -792,6 +803,9 @@ impl Entry {
         placeholder: &str,
         entry_style: EntryStyle,
         focused: bool,
+        // `has_trailing` reserves the trailing glyph's gutter, so long text stops before it
+        // instead of running underneath.
+        has_trailing: bool,
         revision: u64,
     ) -> anyhow::Result<VkTexture> {
         let size = Size::<f64, Logical>::from((width, Self::HEIGHT));
@@ -809,9 +823,14 @@ impl Entry {
             EntryStyle::Search => Self::ICON_INSET * 2.,
             EntryStyle::Lockscreen => ENTRY_PAD,
         };
+        let trailing = if has_trailing {
+            entry_style.icon_inset() * 2.
+        } else {
+            gutter
+        };
         let clip = Rectangle::<f64, Logical>::new(
             Point::from((gutter, 0.)),
-            Size::from(((width - gutter * 2.).max(0.), Self::HEIGHT)),
+            Size::from(((width - gutter - trailing).max(0.), Self::HEIGHT)),
         );
         let ring = focused.then(|| entry_style.focus_ring()).flatten();
         bake(

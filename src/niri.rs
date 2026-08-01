@@ -1223,6 +1223,10 @@ impl State {
                 .niri
                 .screen_shield
                 .set_settings(state.niri.gnome_settings.shield);
+            state
+                .niri
+                .unlock_dialog
+                .set_peek_locked_down(state.niri.gnome_settings.shield.disable_show_password);
             // Publish the realized base font before anything measures text: every point
             // size in the UI is a ratio against it (`crate::ui::base_font_pt`), and every
             // shaped advance comes from the family.
@@ -1431,6 +1435,9 @@ impl State {
                             .niri
                             .screen_shield
                             .set_settings(state.niri.gnome_settings.shield);
+                        state.niri.unlock_dialog.set_peek_locked_down(
+                            state.niri.gnome_settings.shield.disable_show_password,
+                        );
                         // Every point size in the UI is a ratio against this
                         // (`crate::ui::base_font_pt`), so publishing it re-sizes all
                         // text at once — as `st_theme_context_set_font` does.
@@ -3472,6 +3479,25 @@ impl State {
                 trace!("login1 lid {}", if is_closed { "closed" } else { "opened" });
                 self.set_lid_closed(is_closed);
             }
+            // gdm authenticated us on its own VT, or someone ran `loginctl unlock-session`.
+            // GNOME wires these straight to the shield (`screenShield.js`'s `_loginSession`
+            // handlers), and without `Unlock` a session unlocked from gdm's login screen switches
+            // VT back and sits there still locked.
+            Login1ToNiri::SessionLock(lock) => {
+                let now = crate::utils::get_monotonic_time();
+                let effects = if lock {
+                    match self.niri.screen_shield.lock(now, false) {
+                        Ok(effects) => effects,
+                        Err(crate::screen_shield::LockRefused::LockedDown) => {
+                            debug!("screen lock is locked down, ignoring logind Lock");
+                            return;
+                        }
+                    }
+                } else {
+                    self.niri.screen_shield.deactivate()
+                };
+                self.apply_shield_effects(effects);
+            }
             Login1ToNiri::BrightnessWriteDone { connector, outcome } => {
                 let Some(tty) = self.backend.tty_checked() else {
                     return;
@@ -3689,9 +3715,9 @@ impl State {
         self.apply_unlock_effects(effects);
     }
 
-    /// A click while the shield is down: raise it, or raise the prompt page
-    /// (`unlockDialog.js:571-573`'s click gesture).
-    pub fn on_shield_click(&mut self) {
+    /// A click while the shield is down: raise it, raise the prompt page
+    /// (`unlockDialog.js:571-573`'s click gesture), or hit something on the prompt.
+    pub fn on_shield_click(&mut self, pos: Point<f64, Logical>) {
         if !self.niri.screen_shield.is_active() {
             return;
         }
@@ -3699,6 +3725,23 @@ impl State {
 
         if self.niri.screen_shield.is_locked() {
             self.niri.lock_screen.note_activity(now);
+
+            // The peek toggle, if the pointer is on it and the prompt is up.
+            if self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt
+                && self.niri.unlock_dialog.peek().is_some()
+            {
+                let output = self.niri.output_under(pos).map(|(o, _)| o.clone());
+                let hit = output.and_then(|output| {
+                    let geo = self.niri.global_space.output_geometry(&output)?;
+                    crate::ui::lock_screen::peek_hit(geo.to_f64(), pos)
+                });
+                if hit == Some(crate::ui::widget::EntryHit::Trailing) {
+                    let effects = self.niri.unlock_dialog.toggle_peek(now);
+                    self.apply_unlock_effects(effects);
+                    return;
+                }
+            }
+
             let effects = self.niri.unlock_dialog.show_prompt(now);
             self.apply_unlock_effects(effects);
         } else {
@@ -7067,6 +7110,7 @@ impl Niri {
                         .message()
                         .is_some_and(|m| m.kind == crate::dbus::gdm::MessageKind::Error),
                     entry_live: d.is_entry_live(),
+                    peek: d.peek(),
                 };
                 for elem in self.lock_screen.render_prompt(
                     ctx.renderer,

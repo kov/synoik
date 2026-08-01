@@ -212,6 +212,11 @@ pub struct PromptContent {
     pub message_is_error: bool,
     /// Whether gdm is waiting for input — drives the entry's focus ring.
     pub entry_live: bool,
+    /// The peek toggle's state, or `None` when there is no toggle to draw —
+    /// `org.gnome.desktop.lockdown disable-show-password`, or a non-secret prompt
+    /// (`st-password-entry.c:174-184`). `Some(true)` means the password is currently visible, so
+    /// the glyph is `view-conceal-symbolic`.
+    pub peek: Option<bool>,
 }
 
 /// Where the prompt page's parts sit, relative to the block's top-left.
@@ -262,6 +267,35 @@ pub fn prompt_layout(base_px: f64, name_h: f64, message_h: f64) -> PromptLayout 
         entry,
         message,
     }
+}
+
+/// Hit-test a point on the prompt page against the entry, in output-global coordinates.
+///
+/// Lives here because the geometry does: the caller knows where the pointer is, not where the
+/// entry ended up.
+pub fn peek_hit(
+    monitor: Rectangle<f64, Logical>,
+    pos: Point<f64, Logical>,
+) -> Option<widget::EntryHit> {
+    let base_px = crate::ui::pt_to_px(crate::ui::base_font_pt());
+    let width = prompt_width(base_px);
+    let block_h = prompt_block_height(base_px);
+    let l = prompt_layout(
+        base_px,
+        crate::ui::pt_to_px(NAME_PT) * LINE_BOX_ESTIMATE,
+        MESSAGE_MIN_EM * base_px * 2.,
+    );
+    let origin = Point::<f64, Logical>::from((
+        monitor.loc.x + (monitor.size.w - width) / 2.,
+        stack_top(monitor, block_h),
+    ));
+    let entry = widget::Entry::layout(
+        origin.x + l.entry.loc.x + l.entry.size.w / 2.,
+        origin.y + l.entry.loc.y,
+        l.entry.size.w,
+        widget::EntryStyle::Lockscreen,
+    );
+    widget::Entry::hit(&entry, pos, true)
 }
 
 /// The prompt block's total height, sized before anything is shaped (see [`LINE_BOX_ESTIMATE`]).
@@ -369,6 +403,7 @@ impl LockScreen {
             &content.question,
             widget::EntryStyle::Lockscreen,
             content.entry_live,
+            content.peek.is_some(),
             entry_rev,
         ) {
             Ok(texture) => elements.push(Self::element(
@@ -378,6 +413,35 @@ impl LockScreen {
                 origin + l.entry.loc,
             )),
             Err(err) => tracing::error!("error drawing the unlock entry: {err:#}"),
+        }
+
+        // --- The peek toggle, at the entry's trailing edge. ---
+        if let Some(visible) = content.peek {
+            let entry_layout = widget::Entry::layout(
+                l.entry.loc.x + l.entry.size.w / 2.,
+                l.entry.loc.y,
+                l.entry.size.w,
+                widget::EntryStyle::Lockscreen,
+            );
+            // `view-reveal-symbolic` while hidden, `view-conceal-symbolic` once shown
+            // (`st-password-entry.c:333-346`).
+            let icon = if visible {
+                "view-conceal-symbolic"
+            } else {
+                "view-reveal-symbolic"
+            };
+            if let Some(el) = widget::icon_element(
+                renderer,
+                icons,
+                &[icon],
+                widget::Entry::ICON_PX,
+                scale,
+                FG,
+                origin,
+                entry_layout.secondary_icon,
+            ) {
+                elements.push(el);
+            }
         }
 
         // --- The avatar's fallback glyph, over its plate. ---
@@ -465,8 +529,12 @@ impl LockScreen {
                     // paragraph shaper does not centre individual wrapped lines, so a two-line
                     // message is a centred left-aligned block. Close enough to be invisible at one
                     // line, which is every message PAM actually sends.
+                    // Centre the *ink*, not the layout frame: the paragraph's frame is the wrap
+                    // width and its ink starts somewhere inside, so ignoring `ix` pushes the text
+                    // off-centre by that much.
+                    let (msg_ix, _, _, _) = message.ink_bounds();
                     let origin = Point::<f64, Logical>::from((
-                        cx - (msg_w as f64 / scale) / 2.,
+                        cx - (msg_ix as f64 + msg_w as f64 / 2.) / scale,
                         l.message.loc.y,
                     ))
                     .to_physical_precise_round(scale);

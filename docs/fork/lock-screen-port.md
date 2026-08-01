@@ -52,8 +52,10 @@ live on this machine, so the path is available.
 3. **The unlock dialog + gdm auth** — the password entry, the avatar and user name, error and
    retry states, `OpenReauthenticationChannel` and the `UserVerifier` conversation. **Landed**
    (`src/dbus/gdm.rs`, `src/unlock_dialog.rs`, the prompt page in `src/ui/lock_screen.rs`).
-4. **Integration** — idle → `lock-delay`, logind `Lock`/`Unlock` signals and `PrepareForSleep`,
-   `lockIfWasLocked` after a crash (`:663-674`).
+4. **Integration** — idle → `lock-delay` and `PrepareForSleep`, `lockIfWasLocked` after a crash
+   (`:663-674`). logind's session `Lock`/`Unlock` **landed early** with slice 3: without `Unlock`,
+   authenticating at gdm's own login screen switches the VT back to a session that is still
+   locked, which is a stuck session rather than a missing feature.
 5. **The look** — deferred deliberately until the shield *works*, at Gustavo's call (2026-08-01,
    after seat-validating slice 2):
    - the **blur**. `BLUR_RADIUS = 90` over the wallpaper (`unlockDialog.js:35`), paired with the
@@ -138,6 +140,9 @@ process. What is done about it, and what is not:
 - **The message block is centred, its wrapped lines are not.** `text-align: center`
   (`_login-lock.scss:90-92`) centres each line; our paragraph shaper centres the block and
   left-aligns within it. Invisible at one line, which is every message PAM actually sends.
+- **The peek toggle is in.** `view-reveal-symbolic` / `view-conceal-symbolic` at the entry's
+  trailing edge (`st-password-entry.c:223-230`, `:333-346`), gated on
+  `org.gnome.desktop.lockdown disable-show-password` and dropped on every fresh question.
 - **No caps-lock warning** (`authPrompt.js:414`). Worth having: it is the most common cause of the
   wrong-password loop.
 - **Only `gdm-password`.** Fingerprint and smartcard are separate PAM services GNOME starts in
