@@ -58,12 +58,28 @@ live on this machine, so the path is available.
    at gdm's own login screen switches the VT back to a session that is still locked, which is a
    stuck session rather than a missing feature. `lockIfWasLocked` was **dropped** — see below.
 5. **The look** — deferred deliberately until the shield *works*, at Gustavo's call (2026-08-01,
-   after seat-validating slice 2):
+   after seat-validating slice 2). The clock↔prompt crossfade has **landed**
+   (`PageTransform` in `src/ui/lock_screen.rs`); the blur and the shield's own slide are open:
    - the **blur**. `BLUR_RADIUS = 90` over the wallpaper (`unlockDialog.js:35`), paired with the
      `BLUR_BRIGHTNESS` already shipped. Wanted beyond the lock screen — a reusable blurred-backdrop
      pass is its own toolkit verb, not a lock-screen detail, so build it as one.
-   - the **animations**: the shield's rise and fall, and the clock↔prompt crossfade
-     (`CROSSFADE_TIME`, `FADE_OUT_TRANSLATION = 200`, `FADE_OUT_SCALE = 0.3`).
+   - the **animations**: the shield's rise and fall — `translation_y` between `-screen_height` and
+     0 over `Overview.ANIMATION_TIME` (250 ms, `EASE_OUT_QUAD`; `_resetLockScreen` `:452-462`,
+     `_continueDeactivate` `:551-556`) — and the idle path's 10 s fade to black.
+
+The **crossfade** is not a dissolve. The clock leaves upward while the prompt arrives from below,
+both shrinking to `FADE_OUT_SCALE` and scaling about their own centres (`pivot_point(0.5, 0.5)`,
+`:599`, `:604`); it is that opposition that reads as one page giving way to the other. Mid-fade both
+pages are on screen with their own alpha, scale and offset, so the render path draws both.
+
+Two traps it walked into, worth keeping:
+
+- The scale rides the **buffer scale**, not a re-bake — a 300 ms fade that re-rasterizes its text
+  every frame is the [[animation-per-frame-bake]] shape. Icons have no buffer-scale knob, so their
+  scale is bucketed to 16 steps that populate the cache once.
+- A half-finished crossfade draws the incoming page at a *partial alpha*, so anything sampling the
+  screen right after a page change sees a nearly-invisible prompt and reads it as "the prompt did
+  not draw". That cost one Vulkan render test; `LockScreen::settle_page` is the way out.
 
 ## The lock gate
 

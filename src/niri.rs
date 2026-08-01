@@ -3795,6 +3795,14 @@ impl State {
             let _ = request;
         }
 
+        // The view's crossfade clock follows the model's page. Synced here rather than at each
+        // `show_prompt`/`show_clock` call site because this is the one funnel every page change
+        // already goes through, and a missed site would be a page that snaps instead of fading.
+        self.niri.lock_screen.set_page(
+            self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt,
+            crate::utils::get_monotonic_time(),
+        );
+
         if effects.unlock {
             // gdm accepted. This is the only call to `deactivate` that can raise a *locked*
             // shield, and it is reachable only from `VerifierEvent::Complete`.
@@ -3934,6 +3942,14 @@ impl State {
         if let Some(delay) = effects.arm_lock_timer {
             self.arm_lock_timer(delay);
         }
+
+        // The shield's own paths move the page too (`cancel_dialog`, and the `show_clock` a
+        // cancelled conversation forces), so the crossfade clock is synced from here as well.
+        self.niri.lock_screen.set_page(
+            self.niri.screen_shield.is_locked()
+                && self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt,
+            crate::utils::get_monotonic_time(),
+        );
 
         // Last, and unconditionally: the inhibitor is a function of the state we just moved to, and
         // the suspend path *depends* on it being dropped here — logind is waiting on that fd.
@@ -7294,7 +7310,19 @@ impl Niri {
             let prompt = self.screen_shield.is_locked()
                 && self.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt;
 
-            if prompt {
+            // Mid-crossfade both pages are on screen at once, each with its own alpha, scale and
+            // offset — the pair is what reads as one page giving way to the other, so drawing only
+            // the winner would be a hard cut with extra steps.
+            let progress = if prompt {
+                self.lock_screen.page_progress(now)
+            } else {
+                // A screensaver has no prompt to fade to at all.
+                0.
+            };
+            let prompt_t = crate::ui::lock_screen::PageTransform::prompt(progress);
+            let clock_t = crate::ui::lock_screen::PageTransform::clock(progress);
+
+            if prompt_t.is_visible() {
                 let d = &self.unlock_dialog;
                 let content = crate::ui::lock_screen::PromptContent {
                     display_name: d.user().display_name().to_owned(),
@@ -7313,10 +7341,13 @@ impl Niri {
                     output_scale.x,
                     Rectangle::from_size(size),
                     &content,
+                    prompt_t,
                 ) {
                     push(elem.into());
                 }
-            } else {
+            }
+
+            if clock_t.is_visible() {
                 let content = crate::ui::lock_screen::ClockContent::new(
                     epoch,
                     self.gnome_settings.clock,
@@ -7330,6 +7361,7 @@ impl Niri {
                     Rectangle::from_size(size),
                     &content,
                     now,
+                    clock_t,
                 ) {
                     push(elem.into());
                 }
@@ -8099,9 +8131,11 @@ impl Niri {
             state.unfinished_animations_remain |= state.screen_transition.is_some();
             // The shield's hint fades in four seconds after the last input, and there is by
             // definition no input coming — nothing else would ask for those frames.
-            state.unfinished_animations_remain |= self
-                .lock_screen
-                .is_animating(crate::utils::get_monotonic_time());
+            let now = crate::utils::get_monotonic_time();
+            state.unfinished_animations_remain |= self.lock_screen.is_animating(now);
+            // The clock↔prompt crossfade is the same story: it starts on a keypress and then owes
+            // 300 ms of frames nothing else will ask for.
+            state.unfinished_animations_remain |= self.lock_screen.page_is_animating(now);
 
             // Also keep redrawing if the current cursor is animated.
             state.unfinished_animations_remain |= self

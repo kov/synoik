@@ -111,6 +111,84 @@ impl ClockContent {
     }
 }
 
+/// `CROSSFADE_TIME` (`unlockDialog.js:30`) — how long the clock↔prompt swap takes.
+pub const CROSSFADE_TIME: Duration = Duration::from_millis(300);
+/// `FADE_OUT_TRANSLATION` (`:31`) — how far the outgoing page slides, in logical px.
+const FADE_OUT_TRANSLATION: f64 = 200.;
+/// `FADE_OUT_SCALE` (`:32`) — how small a page is when fully faded out.
+const FADE_OUT_SCALE: f64 = 0.3;
+
+/// How one page is drawn part-way through the crossfade (`_setTransitionProgress`, `:815-843`).
+///
+/// The two pages move in opposite directions: at `progress = 0` the clock is at rest and the prompt
+/// is small, transparent and *below* it; at `1` they have swapped, the clock having shrunk and
+/// risen. So this is not a plain dissolve — the pair reads as one page giving way to the other.
+///
+/// Scaling is about the page's **centre**: both actors set `pivot_point(0.5, 0.5)` (`:599`,
+/// `:604`), without which a shrinking page would slide toward its own top-left corner instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageTransform {
+    pub alpha: f64,
+    pub scale: f64,
+    pub translation_y: f64,
+}
+
+impl PageTransform {
+    /// The identity — a page at rest, which is what every non-animating caller wants.
+    pub const REST: Self = Self {
+        alpha: 1.,
+        scale: 1.,
+        translation_y: 0.,
+    };
+
+    /// The clock at transition progress `p` (0 = clock showing, 1 = prompt showing).
+    pub fn clock(p: f64) -> Self {
+        Self {
+            alpha: 1. - p,
+            scale: FADE_OUT_SCALE + (1. - FADE_OUT_SCALE) * (1. - p),
+            translation_y: -FADE_OUT_TRANSLATION * p,
+        }
+    }
+
+    /// The prompt at transition progress `p`.
+    pub fn prompt(p: f64) -> Self {
+        Self {
+            alpha: p,
+            scale: FADE_OUT_SCALE + (1. - FADE_OUT_SCALE) * p,
+            translation_y: FADE_OUT_TRANSLATION * (1. - p),
+        }
+    }
+
+    /// Whether this page contributes anything — `visible = progress > 0` (`:816-817`).
+    pub fn is_visible(&self) -> bool {
+        self.alpha > 0.
+    }
+
+    /// Where a point of the page lands, scaled about `centre` and then translated.
+    fn place(&self, p: Point<f64, Logical>, centre: Point<f64, Logical>) -> Point<f64, Logical> {
+        Point::from((
+            centre.x + (p.x - centre.x) * self.scale,
+            centre.y + (p.y - centre.y) * self.scale + self.translation_y,
+        ))
+    }
+
+    /// The buffer scale that draws a texture baked at `scale` physical px per logical px at this
+    /// transform's size. Changing the *buffer* scale rather than re-baking is what keeps a 300 ms
+    /// crossfade from re-rasterizing the page every frame ([[animation-per-frame-bake]]).
+    fn buffer_scale(&self, scale: f64) -> f64 {
+        scale / self.scale
+    }
+
+    /// The scale to rasterize an *icon* at, bucketed.
+    ///
+    /// Icons have no buffer-scale knob — `icon_element` rasterizes at the size it is asked for —
+    /// so an unbucketed scale would re-raster the 160 px avatar on every frame of the fade.
+    /// Sixteen steps are indistinguishable in motion and populate the cache once.
+    fn icon_scale(&self) -> f64 {
+        (self.scale * 16.).round() / 16.
+    }
+}
+
 /// Where each line of the curtain lands, relative to the clock block's own top-left.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClockLayout {
@@ -340,6 +418,14 @@ pub struct LockScreen {
     /// Monotonic instant the shield went down, or of the last input while it was down — the hint's
     /// fade hangs off an **idle** watch on the core idle monitor (`:395`), not off activation.
     idle_since: Option<Duration>,
+    /// Which page is being eased *to*, and when the ease started. `None` means settled.
+    ///
+    /// The page a transition ends on comes from the model ([`crate::unlock_dialog::Page`]); this
+    /// is only the view's clock for it, so the crossfade stays a drawing concern and the model
+    /// keeps no notion of time.
+    page_since: Option<(Duration, bool)>,
+    /// The page as of the last [`Self::set_page`] — what a new transition eases *from*.
+    showing_prompt: bool,
     cache: RefCell<widget::BakeCache>,
     /// The entry has its own cache: it re-bakes per keystroke, the column around it does not.
     entry_cache: RefCell<widget::BakeCache>,
@@ -349,6 +435,55 @@ impl LockScreen {
     /// The shield went down (or came back up, with `None`).
     pub fn set_shown(&mut self, now: Option<Duration>) {
         self.idle_since = now;
+        // A raised shield settles instantly: the next lock must not open on the tail of the
+        // crossfade the last one was in the middle of.
+        if now.is_none() {
+            self.showing_prompt = false;
+            self.settle_page();
+        }
+    }
+
+    /// Finish the crossfade now, wherever it had got to.
+    ///
+    /// For page changes that must not animate. Note the shape of the bug it exists to avoid: a
+    /// half-finished crossfade draws the incoming page at a *partial alpha*, so anything that
+    /// samples the screen right after a page change sees a prompt that is nearly invisible and
+    /// reads it as "the prompt did not draw" ([[headless-animation-clock-trap]]).
+    pub fn settle_page(&mut self) {
+        self.page_since = None;
+    }
+
+    /// The model moved to a page. Starts the crossfade, or does nothing if we are already going
+    /// there.
+    pub fn set_page(&mut self, prompt: bool, now: Duration) {
+        if self.showing_prompt == prompt {
+            return;
+        }
+        self.showing_prompt = prompt;
+        self.page_since = Some((now, prompt));
+    }
+
+    /// How far through the clock→prompt crossfade we are: 0 is the clock, 1 the prompt.
+    ///
+    /// `EASE_OUT_QUAD` over [`CROSSFADE_TIME`] (`_showPrompt` / `_showClock`, `:786-810`).
+    pub fn page_progress(&self, now: Duration) -> f64 {
+        let Some((since, to_prompt)) = self.page_since else {
+            return if self.showing_prompt { 1. } else { 0. };
+        };
+        let t =
+            (now.saturating_sub(since).as_secs_f64() / CROSSFADE_TIME.as_secs_f64()).clamp(0., 1.);
+        let eased = Curve::EaseOutQuad.y(t);
+        if to_prompt {
+            eased
+        } else {
+            1. - eased
+        }
+    }
+
+    /// Whether the crossfade still owes frames.
+    pub fn page_is_animating(&self, now: Duration) -> bool {
+        self.page_since
+            .is_some_and(|(since, _)| now.saturating_sub(since) < CROSSFADE_TIME)
     }
 
     /// Input arrived while the shield is down: the idle watch restarts, so the hint fades back out
@@ -392,6 +527,7 @@ impl LockScreen {
         scale: f64,
         monitor: Rectangle<f64, Logical>,
         content: &PromptContent,
+        t: PageTransform,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let base_px = crate::ui::pt_to_px(crate::ui::base_font_pt());
         let width = prompt_width(base_px);
@@ -410,6 +546,12 @@ impl LockScreen {
         ))
         .to_physical_precise_round(scale)
         .to_logical(scale);
+
+        // The page scales about its own middle (`pivot_point(0.5, 0.5)`, `:599`).
+        let centre = Point::<f64, Logical>::from((
+            monitor.loc.x + monitor.size.w / 2.,
+            origin.y + block_h / 2.,
+        ));
 
         let mut elements = Vec::new();
 
@@ -437,6 +579,8 @@ impl LockScreen {
                 texture,
                 scale,
                 origin + l.entry.loc,
+                t,
+                centre,
             )),
             Err(err) => tracing::error!("error drawing the unlock entry: {err:#}"),
         }
@@ -456,15 +600,16 @@ impl LockScreen {
             } else {
                 "view-reveal-symbolic"
             };
-            if let Some(el) = widget::icon_element(
+            if let Some(el) = widget::icon_element_alpha(
                 renderer,
                 icons,
                 &[icon],
-                widget::Entry::ICON_PX,
+                widget::Entry::ICON_PX * t.icon_scale(),
                 scale,
                 FG,
                 origin,
-                entry_layout.secondary_icon,
+                t.place(origin + entry_layout.secondary_icon.to_f64(), centre) - origin,
+                t.alpha as f32,
             ) {
                 elements.push(el);
             }
@@ -474,18 +619,23 @@ impl LockScreen {
         //
         // AccountsService's per-user icon file is not read yet, so everyone gets the themed
         // fallback; wiring the real picture is additive and does not move anything here.
-        if let Some(el) = widget::icon_element(
+        if let Some(el) = widget::icon_element_alpha(
             renderer,
             icons,
             &["avatar-default-symbolic"],
-            AVATAR_PX - AVATAR_ICON_PAD * 2.,
+            (AVATAR_PX - AVATAR_ICON_PAD * 2.) * t.icon_scale(),
             scale,
             FG,
             origin,
-            Point::from((
-                l.avatar.loc.x + l.avatar.size.w / 2.,
-                l.avatar.loc.y + l.avatar.size.h / 2.,
-            )),
+            t.place(
+                origin
+                    + Point::from((
+                        l.avatar.loc.x + l.avatar.size.w / 2.,
+                        l.avatar.loc.y + l.avatar.size.h / 2.,
+                    )),
+                centre,
+            ) - origin,
+            t.alpha as f32,
         ) {
             elements.push(el);
         }
@@ -570,7 +720,9 @@ impl LockScreen {
             },
         );
         match baked {
-            Ok(texture) => elements.push(Self::element(renderer, texture, scale, origin)),
+            Ok(texture) => {
+                elements.push(Self::element(renderer, texture, scale, origin, t, centre))
+            }
             Err(err) => tracing::error!("error drawing the unlock prompt: {err:#}"),
         }
 
@@ -582,10 +734,24 @@ impl LockScreen {
         texture: VkTexture,
         scale: f64,
         loc: Point<f64, Logical>,
+        t: PageTransform,
+        centre: Point<f64, Logical>,
     ) -> TextureRenderElement<VkTexture> {
-        let buffer =
-            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
-        TextureRenderElement::from_texture_buffer(buffer, loc, 1., None, None, Kind::Unspecified)
+        let buffer = TextureBuffer::from_texture(
+            renderer,
+            texture,
+            t.buffer_scale(scale),
+            Transform::Normal,
+            Vec::new(),
+        );
+        TextureRenderElement::from_texture_buffer(
+            buffer,
+            t.place(loc, centre),
+            t.alpha as f32,
+            None,
+            None,
+            Kind::Unspecified,
+        )
     }
 
     /// The clock block, front-to-back like every other UI `render`. The caller draws the dimmed
@@ -597,6 +763,7 @@ impl LockScreen {
         monitor: Rectangle<f64, Logical>,
         content: &ClockContent,
         now: Duration,
+        t: PageTransform,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let base_px = crate::ui::pt_to_px(crate::ui::base_font_pt());
         let size = Size::from((monitor.size.w, block_height(base_px)));
@@ -695,8 +862,10 @@ impl LockScreen {
         let loc = Point::from((monitor.loc.x, stack_top(monitor, size.h)))
             .to_physical_precise_round(scale)
             .to_logical(scale);
+        // Scaled about the block's middle (`pivot_point(0.5, 0.5)`, `:604`).
+        let centre = Point::from((monitor.loc.x + monitor.size.w / 2., loc.y + size.h / 2.));
 
-        vec![Self::element(renderer, texture, scale, loc)]
+        vec![Self::element(renderer, texture, scale, loc, t, centre)]
     }
 }
 
@@ -779,6 +948,75 @@ mod tests {
             l.hint_box.loc.y + l.hint_box.size.h,
             block_height_of(measured, 16.)
         );
+    }
+
+    /// The two pages move in opposite directions and swap cleanly at the ends.
+    ///
+    /// The discriminating property is the *sign* of the translation: both pages shrinking and
+    /// fading is a dissolve, and would look right in a still frame while reading as mush in
+    /// motion. GNOME sends the clock up and the prompt down (`:826-836`), which is what makes it
+    /// read as one page giving way to the other.
+    #[test]
+    fn the_pages_cross_in_opposite_directions() {
+        let (clock0, prompt0) = (PageTransform::clock(0.), PageTransform::prompt(0.));
+        assert_eq!(clock0, PageTransform::REST, "the clock is at rest at 0");
+        assert_eq!(prompt0.alpha, 0.);
+        assert_eq!(prompt0.scale, FADE_OUT_SCALE);
+
+        let (clock1, prompt1) = (PageTransform::clock(1.), PageTransform::prompt(1.));
+        assert_eq!(prompt1, PageTransform::REST, "and the prompt at 1");
+        assert_eq!(clock1.alpha, 0.);
+        assert_eq!(clock1.scale, FADE_OUT_SCALE);
+
+        let (clock, prompt) = (PageTransform::clock(0.5), PageTransform::prompt(0.5));
+        assert!(clock.translation_y < 0., "the clock leaves upward");
+        assert!(prompt.translation_y > 0., "the prompt arrives from below");
+        assert_eq!(clock.scale, prompt.scale, "and they pass at the same size");
+    }
+
+    /// Scaling happens about the page's centre, not its corner.
+    ///
+    /// `pivot_point(0.5, 0.5)` (`:599`, `:604`). Without it a shrinking page also drifts toward
+    /// its own top-left, which reads as the text sliding off-centre rather than receding.
+    #[test]
+    fn a_page_scales_about_its_middle() {
+        let centre = Point::<f64, Logical>::from((960., 400.));
+        let t = PageTransform {
+            alpha: 1.,
+            scale: 0.5,
+            translation_y: 0.,
+        };
+        assert_eq!(
+            t.place(centre, centre),
+            centre,
+            "the centre is a fixed point"
+        );
+        // A point 100px left of centre ends up 50px left of it.
+        assert_eq!(t.place(Point::from((860., 400.)), centre).x, 910.);
+    }
+
+    /// The crossfade eases to its end and then stops asking for frames.
+    #[test]
+    fn the_crossfade_runs_once_and_settles() {
+        let mut shield = LockScreen::default();
+        shield.set_shown(Some(T0));
+        assert_eq!(shield.page_progress(T0), 0.);
+
+        shield.set_page(true, T0);
+        assert!(shield.page_is_animating(T0));
+        let mid = shield.page_progress(T0 + CROSSFADE_TIME / 2);
+        assert!(mid > 0. && mid < 1., "part-way: {mid}");
+        assert_eq!(shield.page_progress(T0 + CROSSFADE_TIME), 1.);
+        assert!(!shield.page_is_animating(T0 + CROSSFADE_TIME));
+
+        // Asking for the page we are already on does not restart it.
+        shield.set_page(true, T0 + CROSSFADE_TIME);
+        assert_eq!(shield.page_progress(T0 + CROSSFADE_TIME), 1.);
+
+        // And going back runs the other way.
+        shield.set_page(false, T0 + CROSSFADE_TIME);
+        assert_eq!(shield.page_progress(T0 + CROSSFADE_TIME), 1.);
+        assert_eq!(shield.page_progress(T0 + CROSSFADE_TIME * 2), 0.);
     }
 
     /// The hint is invisible until four seconds of idle, then fades in over 300 ms.

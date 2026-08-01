@@ -11727,6 +11727,9 @@ fn vulkan_draws_the_unlock_prompt_with_a_masked_entry() {
         8,
         "the fixture typed into a live entry"
     );
+    // The clock↔prompt crossfade runs on the wall clock, so a render taken this instant would
+    // catch the prompt at alpha ~0 and every assertion below would fail for the wrong reason.
+    f.niri_state().niri.lock_screen.settle_page();
 
     let (pixels, w, h) = render_output_vulkan(&mut f, &output);
 
