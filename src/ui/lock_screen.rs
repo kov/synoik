@@ -444,6 +444,19 @@ enum Curtain {
     Hiding(Duration),
 }
 
+impl Curtain {
+    /// Where a slide in flight ends up. Retiring the state matters because it is what a *later*
+    /// `set_shown` reads to decide whether the curtain is already on its way; a `Hiding` that never
+    /// becomes `Hidden` leaves the next lock parked off-screen.
+    fn settled(self) -> Self {
+        match self {
+            Curtain::Showing(_) => Curtain::Covering,
+            Curtain::Hiding(_) => Curtain::Hidden,
+            settled => settled,
+        }
+    }
+}
+
 /// The curtain's on-screen state: when it went down, its slide, and its bakes.
 #[derive(Default)]
 pub struct LockScreen {
@@ -597,11 +610,15 @@ impl LockScreen {
     ///
     /// Called from the render path once per frame. Without it `Hiding` stays `Hiding` forever and
     /// a later `set_shown(true)` would see "already on its way" and never restart the descent.
+    /// Retires **only the curtain**. It used to call [`settle`](Self::settle), which finishes every
+    /// running animation — and since this runs once per frame, that erased the crossfade and the
+    /// idle fade on the frame after they started. Both then drew a single frame and snapped, which
+    /// looks exactly like the animation never having been written.
     pub fn settle_curtain(&mut self, now: Duration) {
         if self.is_sliding(now) {
             return;
         }
-        self.settle();
+        self.curtain = self.curtain.settled();
     }
 
     /// Finish every running animation at once — the slide *and* the crossfade.
@@ -612,11 +629,9 @@ impl LockScreen {
     /// as "the lock screen did not draw" ([[headless-animation-clock-trap]]).
     pub fn settle(&mut self) {
         self.fade_since = None;
-        self.curtain = match self.curtain {
-            Curtain::Showing(_) => Curtain::Covering,
-            Curtain::Hiding(_) => Curtain::Hidden,
-            settled => settled,
-        };
+        // Not `settle_curtain`: that one is clock-gated, and this must also finish a slide that has
+        // only just started.
+        self.curtain = self.curtain.settled();
         self.settle_page();
     }
 
@@ -1146,6 +1161,38 @@ mod tests {
         shield.set_shown(true, done);
         assert!(shield.is_sliding(done), "the next lock slides in afresh");
         assert_eq!(shield.curtain_progress(done + SLIDE_TIME), 0.);
+    }
+
+    /// The per-frame curtain retirement must leave the *other* animations alone.
+    ///
+    /// `settle_curtain` runs once per frame from the render path, and it used to delegate to
+    /// `settle`, which finishes everything. So a crossfade or an idle fade starting while the
+    /// curtain was at rest — which is every crossfade, since you press a key at a shield that has
+    /// already landed — was erased on the very next frame. Both drew one frame and snapped, which
+    /// looks exactly like the animation never having been written.
+    #[test]
+    fn the_per_frame_retirement_does_not_settle_the_other_animations() {
+        let mut shield = LockScreen::default();
+        shield.set_shown(true, T0);
+        let landed = T0 + SLIDE_TIME;
+        shield.settle_curtain(landed);
+
+        shield.set_page(true, landed);
+        shield.light_on(landed);
+
+        // The next frame, with the curtain long since parked.
+        let next = landed + Duration::from_millis(16);
+        shield.settle_curtain(next);
+
+        assert!(
+            shield.page_is_animating(next),
+            "the crossfade still owes frames"
+        );
+        let mid = shield.page_progress(next);
+        assert!(mid > 0. && mid < 1., "and is part-way through it: {mid}");
+        assert!(shield.is_fading(next), "so does the fade");
+        let fade = shield.fade_alpha(next);
+        assert!(fade > 0. && fade < 1., "part-way to black: {fade}");
     }
 
     /// The two pages move in opposite directions and swap cleanly at the ends.
