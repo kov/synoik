@@ -397,6 +397,12 @@ pub enum Action {
         scope: Option<MruScope>,
         filter: Option<MruFilter>,
     },
+    /// GNOME's `switch-applications` — raise the app switcher, or advance it if it is already
+    /// up. `backward` is the binding's `-backward` half (`windowManager.js:1705`).
+    #[knuffel(skip)]
+    SwitchApplications {
+        backward: bool,
+    },
     #[knuffel(skip)]
     MruConfirm,
     #[knuffel(skip)]

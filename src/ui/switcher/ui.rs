@@ -32,6 +32,11 @@ use crate::window::mapped::MappedId;
 /// switcher sets no font size of its own, so the item label is plain body text.
 const LABEL_PT: f64 = 11.;
 
+/// The height an item's label occupies, in logical px — what the icon ladder measures against.
+pub fn label_height() -> f64 {
+    crate::ui::pt_to_px(LABEL_PT)
+}
+
 /// What the switcher is cycling through.
 ///
 /// The two variants are the two popup classes. An app item carries *all* of that app's windows

@@ -190,6 +190,9 @@ use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{
     OutputScreenshot, ScreenshotNeutral, ScreenshotUi, ScreenshotUiRenderElement,
 };
+use crate::ui::switcher::app_switcher::app_items;
+use crate::ui::switcher::ui::{Items, OpenRequest};
+use crate::ui::switcher::SwitcherKey;
 use crate::ui::window_preview::{PreviewChrome, PreviewOverlay};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
@@ -530,6 +533,8 @@ pub struct Niri {
     /// it — a replaced OSD would keep the *old* timer and, once that fired,
     /// re-arm nothing and hang on screen until unrelated damage.
     pub osd_timer_at: Option<Duration>,
+    pub switcher_timer: Option<RegistrationToken>,
+    pub switcher_timer_at: Option<Duration>,
     /// Wake-up timer for the shown banner's expiry deadline (the pinned-clock check in
     /// `advance_animations` is the authority; this only wakes an otherwise idle loop).
     pub notification_banner_timer: Option<RegistrationToken>,
@@ -758,6 +763,8 @@ pub struct Niri {
     pub image_cache: ImageCache,
 
     pub window_mru_ui: WindowMruUi,
+    /// The GNOME Alt-Tab / Super-Tab switcher (`ui::switcher`).
+    pub switcher: crate::ui::switcher::ui::SwitcherUi,
     pub pending_mru_commit: Option<PendingMruCommit>,
 
     pub pick_window: Option<async_channel::Sender<Option<MappedId>>>,
@@ -1865,6 +1872,93 @@ impl State {
 
         // FIXME: granular
         self.niri.queue_redraw_all();
+    }
+
+    /// `switch-applications` — `WindowManager._startSwitcher` for the app switcher
+    /// (`windowManager.js:1670-1712`).
+    ///
+    /// A press while the popup is already up advances it instead of raising a new one, which is
+    /// how holding the modifier and tapping Tab walks the row.
+    pub fn switch_applications(&mut self, backward: bool) {
+        let now = self.niri.clock.now_unadjusted();
+
+        if self.niri.switcher.is_open() {
+            let outcome = self
+                .niri
+                .switcher
+                .key_press(SwitcherKey::Advance { backward }, now);
+            self.finish_switcher(outcome);
+            self.niri.queue_redraw_switcher_output();
+            return;
+        }
+
+        let Some(output) = self.niri.layout.active_output().cloned() else {
+            return;
+        };
+
+        // `org.gnome.shell.app-switcher current-workspace-only`, default false — the app switcher
+        // spans workspaces where the *window* switcher does not.
+        let current_workspace_only = crate::ui::switcher::app_switcher::CURRENT_WORKSPACE_ONLY;
+        let tab_list = self.niri.switcher_tab_list(current_workspace_only);
+        let items = app_items(self.niri.app_system.running(), &tab_list);
+        if items.is_empty() {
+            return;
+        }
+
+        let art = self.niri.switcher_app_art(&items);
+        let mods = crate::input::modifiers_from_state(
+            self.niri.seat.get_keyboard().unwrap().modifier_state(),
+        );
+
+        let monitor = Rectangle::from_size(output_size(&output));
+        let label_height = crate::ui::switcher::ui::label_height();
+
+        let outcome = self.niri.switcher.open(
+            OpenRequest {
+                items: Items::Apps(items),
+                art,
+                backward,
+                // GNOME takes the mask from the binding; we take what is held at the moment the
+                // binding fired, which is the same set for every real switch binding and makes
+                // the no-modifier case (a bind with no modifier, or a gesture) fall out for free.
+                mask: mods,
+                held: mods,
+                output,
+                monitor,
+                label_height,
+            },
+            now,
+        );
+        self.finish_switcher(outcome.map(|outcome| {
+            // `show()` only returns an outcome for the release race, where the selection is the
+            // initial one.
+            (outcome, None)
+        }));
+        self.niri.queue_redraw_switcher_output();
+    }
+
+    /// Act on a finished switcher session: activate the selection, or leave focus alone.
+    pub fn finish_switcher(
+        &mut self,
+        outcome: Option<(crate::ui::switcher::SwitcherOutcome, Option<MappedId>)>,
+    ) {
+        let Some((outcome, target)) = outcome else {
+            return;
+        };
+        self.niri.queue_redraw_all();
+
+        if outcome != crate::ui::switcher::SwitcherOutcome::Commit {
+            return;
+        }
+        let Some(window) = target.and_then(|id| self.niri.find_window_by_id(id)) else {
+            return;
+        };
+
+        // Same ordering as `confirm_mru`: the keyboard focus still points at the popup we just
+        // closed (it is only recomputed at the end of the loop), so force it before focusing or
+        // cursor warping does not happen.
+        self.update_keyboard_focus();
+        self.focus_window(&window);
     }
 
     pub fn confirm_mru(&mut self) {
@@ -4389,6 +4483,8 @@ impl Niri {
             osd,
             osd_timer: None,
             osd_timer_at: None,
+            switcher_timer: None,
+            switcher_timer_at: None,
             last_power_profile: "power-saver".to_string(),
             #[cfg(feature = "dbus")]
             system_status_tx: None,
@@ -4496,6 +4592,7 @@ impl Niri {
             image_cache: ImageCache::new(),
 
             window_mru_ui,
+            switcher: crate::ui::switcher::ui::SwitcherUi::new(),
             pending_mru_commit: None,
 
             pick_window: None,
@@ -6225,6 +6322,13 @@ impl Niri {
             self.reschedule_osd_timer();
         }
 
+        // Same shape as the OSD's, and for the same reason: the switcher's deadlines are set
+        // between frames (by `show`, by every keypress re-arming the hover timer), so a
+        // before/after diff around `advance` would always be equal and never re-arm.
+        if self.switcher.next_deadline() != self.switcher_timer_at {
+            self.reschedule_switcher_timer();
+        }
+
         self.config_error_notification.advance_animations();
         self.exit_confirm_dialog.advance_animations();
         self.end_session_dialog.advance_animations();
@@ -6566,7 +6670,16 @@ impl Niri {
             push(element.into());
         }
 
-        // Then, the Alt-Tab switcher.
+        // Then, the Alt-Tab switcher. GNOME's popup is pushed into `uiGroup` on top of the
+        // windows but below the OSD, which raises itself on show (`switcherPopup.js:178` hides
+        // every OSD when the switcher becomes visible, so the two are never up together anyway).
+        for element in self
+            .switcher
+            .render(ctx.renderer, &self.app_icon_cache, output)
+        {
+            push(element.into());
+        }
+
         self.window_mru_ui
             .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
 
@@ -10259,6 +10372,37 @@ impl Niri {
         self.osd_timer = Some(token);
     }
 
+    /// Wake the loop at the switcher's next deadline — the open delay, the no-modifier commit,
+    /// or hover coming back on.
+    ///
+    /// Without this the popup would sit invisible for its whole session: nothing else redraws
+    /// while a modifier is merely being *held*, so the 150 ms reveal has no other event to ride.
+    pub fn reschedule_switcher_timer(&mut self) {
+        if let Some(token) = self.switcher_timer.take() {
+            self.event_loop.remove(token);
+        }
+        self.switcher_timer_at = self.switcher.next_deadline();
+        let Some(deadline) = self.switcher_timer_at else {
+            return;
+        };
+        let now = self.clock.now_unadjusted();
+        let timer = Timer::from_duration(deadline.saturating_sub(now));
+        let token = self
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.niri.switcher_timer = None;
+                state.niri.switcher_timer_at = None;
+
+                let now = state.niri.clock.now_unadjusted();
+                let outcome = state.niri.switcher.advance(now);
+                state.finish_switcher(outcome);
+                state.niri.queue_redraw_all();
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        self.switcher_timer = Some(token);
+    }
+
     /// Re-arm the single idle-watch timer to the earliest pending deadline (or cancel it if none).
     /// Idempotent; call after anything that changes the watch set or the last-activity time.
     pub fn reschedule_idle_monitor_timer(&mut self) {
@@ -10460,6 +10604,66 @@ impl Niri {
             .find(|w| w.id() == pending.id)
         {
             window.set_focus_timestamp(pending.stamp);
+        }
+    }
+
+    /// The switcher's window list — `getWindows` (`altTab.js:51-61`) over our layout.
+    ///
+    /// DIVERGENCE: GNOME filters by the active *workspace* on the workspace manager, and places
+    /// the popup on the **primary** monitor. We have no primary-monitor notion, so "the active
+    /// workspace" here means the active workspace of the active output, and the popup follows
+    /// that output. On a single head the two are the same; on several, GNOME would put the popup
+    /// on the primary head and we put it where you are working — which is arguably better but is
+    /// a divergence either way, and is recorded as one in `docs/fork/alt-tab-port.md`.
+    pub fn switcher_tab_list(&self, current_workspace_only: bool) -> Vec<MappedId> {
+        let active_output = self.layout.active_output();
+
+        let mut windows = Vec::new();
+        for (mon, ws_idx, ws) in self.layout.workspaces() {
+            let on_active_workspace = mon.is_some_and(|mon| {
+                Some(mon.output()) == active_output && mon.active_workspace_idx() == ws_idx
+            });
+
+            for mapped in ws.windows() {
+                windows.push(crate::ui::switcher::window_list::SwitcherWindow {
+                    id: mapped.id(),
+                    focus_timestamp: mapped.get_focus_timestamp(),
+                    on_active_workspace,
+                    demands_attention: mapped.is_urgent(),
+                    // Attached modal dialogs need mutter's `attach-modal-dialogs`, which is off by
+                    // default and which we do not model — see `SwitcherWindow::attached_to`.
+                    attached_to: None,
+                });
+            }
+        }
+
+        crate::ui::switcher::window_list::tab_list(&windows, current_workspace_only)
+    }
+
+    /// Resolve each app item's icon and name — `AppIcon` (`altTab.js:670-692`).
+    ///
+    /// An app the catalog cannot resolve still gets a row: it has windows, so it is switchable,
+    /// and dropping it would make those windows unreachable. It just shows its id and no icon.
+    pub fn switcher_app_art(
+        &self,
+        items: &[crate::ui::switcher::app_switcher::AppItem],
+    ) -> Vec<crate::ui::switcher::ui::ItemArt> {
+        items
+            .iter()
+            .map(|item| {
+                let entry = self.app_system.lookup(&item.app_id);
+                crate::ui::switcher::ui::ItemArt {
+                    icon: entry.as_ref().map(|e| e.icon.clone()),
+                    label: entry.map_or_else(|| item.app_id.clone(), |e| e.name),
+                    arrow: item.has_arrow(),
+                }
+            })
+            .collect()
+    }
+
+    pub fn queue_redraw_switcher_output(&mut self) {
+        if let Some(output) = self.switcher.output().cloned() {
+            self.queue_redraw(&output);
         }
     }
 

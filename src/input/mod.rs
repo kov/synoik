@@ -552,7 +552,7 @@ impl State {
         #[cfg(not(feature = "dbus"))]
         let _ = consumed_by_a11y;
 
-        let Some(Some(bind)) = self.niri.seat.get_keyboard().unwrap().input(
+        let filtered = self.niri.seat.get_keyboard().unwrap().input(
             self,
             event.key_code(),
             event.state(),
@@ -792,7 +792,10 @@ impl State {
 
                 let res = {
                     let config = this.niri.config.borrow();
-                    let mru_is_open = this.niri.window_mru_ui.is_open();
+                    // "A modal switcher is up" — either the GNOME switcher or, until it is
+                    // retired, niri's MRU. Both hold a grab, so both suppress the general binds.
+                    let switcher_is_open =
+                        this.niri.window_mru_ui.is_open() || this.niri.switcher.is_open();
                     let bindings =
                         make_binds_iter(&config, &mut this.niri.window_mru_ui, modifiers);
 
@@ -801,7 +804,7 @@ impl State {
                         bindings,
                         &this.niri.gnome_settings.keybindings,
                         &this.niri.accel_grabs,
-                        mru_is_open,
+                        switcher_is_open,
                         mod_key,
                         key_code,
                         modified,
@@ -956,7 +959,27 @@ impl State {
 
                 res
             },
-        ) else {
+        );
+
+        // The switcher commits when its *primary* modifier comes up — not when every modifier
+        // does, so <Super><Shift>Tab survives letting go of Shift. The state machine owns that
+        // rule; this only has to hand it an accurate picture of what is still held.
+        //
+        // Read *after* `input()` rather than from the event's own mask inside the filter: for the
+        // release of a modifier key the mask still lists that modifier, so the popup would never
+        // see its own modifier go up and would hang until the no-mods timeout. GNOME has the same
+        // problem and solves it the same way, by sampling live state (`global.get_pointer()`,
+        // `switcherPopup.js:223-227`) instead of trusting the event.
+        if !pressed && self.niri.switcher.is_open() {
+            let held =
+                modifiers_from_state(self.niri.seat.get_keyboard().unwrap().modifier_state());
+            let now = self.niri.clock.now_unadjusted();
+            let outcome = self.niri.switcher.key_release(held, now);
+            self.finish_switcher(outcome);
+            self.niri.queue_redraw_switcher_output();
+        }
+
+        let Some(Some(bind)) = filtered else {
             return;
         };
 
@@ -3476,6 +3499,9 @@ impl State {
                 if let Some(watcher) = &self.niri.config_file_watcher {
                     watcher.load_config(path);
                 }
+            }
+            Action::SwitchApplications { backward } => {
+                self.switch_applications(backward);
             }
             Action::MruConfirm => {
                 self.confirm_mru();
@@ -8028,7 +8054,7 @@ fn should_intercept_key<'a>(
     bindings: impl IntoIterator<Item = &'a Bind>,
     gnome_keybindings: &[GnomeKeybinding],
     accel_grabs: &[AccelGrab],
-    mru_is_open: bool,
+    switcher_is_open: bool,
     mod_key: ModKey,
     key_code: Keycode,
     modified: Keysym,
@@ -8050,7 +8076,7 @@ fn should_intercept_key<'a>(
         bindings,
         gnome_keybindings,
         accel_grabs,
-        mru_is_open,
+        switcher_is_open,
         mod_key,
         key_code,
         modified,
@@ -8119,7 +8145,7 @@ fn find_bind<'a>(
     bindings: impl IntoIterator<Item = &'a Bind>,
     gnome_keybindings: &[GnomeKeybinding],
     accel_grabs: &[AccelGrab],
-    mru_is_open: bool,
+    switcher_is_open: bool,
     mod_key: ModKey,
     key_code: Keycode,
     modified: Keysym,
@@ -8165,14 +8191,14 @@ fn find_bind<'a>(
     // session the GSettings store is the user's keybinding config, and mutter
     // processes it before anything else sees the key. The niri config stays
     // underneath as a fallback.
-    if let Some(bind) = find_gnome_bind(gnome_keybindings, mru_is_open, key_code, raw, mods) {
+    if let Some(bind) = find_gnome_bind(gnome_keybindings, switcher_is_open, key_code, raw, mods) {
         return Some(bind);
     }
 
     // External accelerator grabs live in the same table in mutter, after the
     // builtins (a conflicting grab is refused at grab time). They also don't
     // fire while the switcher's grab is up.
-    if !mru_is_open {
+    if !switcher_is_open {
         if let Some(bind) = find_accel_grab_bind(accel_grabs, key_code, raw, mods) {
             return Some(bind);
         }
@@ -8218,7 +8244,7 @@ fn find_accel_grab_bind(
 /// the equivalent niri bind.
 fn find_gnome_bind(
     keybindings: &[GnomeKeybinding],
-    mru_is_open: bool,
+    switcher_is_open: bool,
     key_code: Keycode,
     raw: Option<Keysym>,
     mods: ModifiersState,
@@ -8232,7 +8258,7 @@ fn find_gnome_bind(
     // The window switcher is modal (GNOME holds a grab while it's up; niri
     // disables the general binds): only the switch actions themselves keep
     // resolving so further taps continue cycling.
-    if mru_is_open
+    if switcher_is_open
         && !matches!(
             keybinding.action,
             GnomeKeyAction::SwitchWindows { .. } | GnomeKeyAction::SwitchApplications { .. }
@@ -8339,11 +8365,7 @@ fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
             scope: Some(MruScope::Workspace),
             filter: Some(MruFilter::All),
         },
-        GnomeKeyAction::SwitchApplications { backward } => Action::MruAdvance {
-            direction: mru_direction(backward),
-            scope: Some(MruScope::All),
-            filter: Some(MruFilter::All),
-        },
+        GnomeKeyAction::SwitchApplications { backward } => Action::SwitchApplications { backward },
     })
 }
 
@@ -8406,7 +8428,7 @@ fn find_configured_switch_action(
         .map(|switch_action| Action::Spawn(switch_action.spawn.clone()))
 }
 
-fn modifiers_from_state(mods: ModifiersState) -> Modifiers {
+pub(crate) fn modifiers_from_state(mods: ModifiersState) -> Modifiers {
     let mut modifiers = Modifiers::empty();
     if mods.ctrl {
         modifiers |= Modifiers::CTRL;

@@ -13143,3 +13143,109 @@ fn the_quick_settings_audio_controls_reach_the_backend() {
         "the mic mute updates the model the privacy indicator reads"
     );
 }
+
+/// Map a window carrying an `app_id`, so it resolves to an app in the switcher.
+fn map_window_for_app(f: &mut Fixture, id: ClientId, app_id: &str) -> WlSurface {
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.set_app_id(app_id);
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    surface
+}
+
+/// Super-Tab raises the app switcher, and it starts on the *previous* app.
+///
+/// The initial selection is the whole contract: item 0 is the app you are already in, so a
+/// forward switcher that started there would make tap-and-release do nothing at all
+/// (`_initialSelection`, `switcherPopup.js:113-120`).
+///
+/// Driven through `do_action` rather than by hand-building the popup, so the app grouping, the
+/// tab list and the state machine all run the way a keypress runs them.
+#[test]
+fn super_tab_opens_the_app_switcher_on_the_previous_app() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![
+            AppEntry::fake("org.example.One.desktop", "One"),
+            AppEntry::fake("org.example.Two.desktop", "Two"),
+        ])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.One");
+    map_window_for_app(&mut f, client, "org.example.Two");
+    f.niri_complete_animations();
+
+    f.niri_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+
+    assert!(f.niri().switcher.is_open(), "Super-Tab raises the switcher");
+    assert_eq!(
+        f.niri().switcher.selected(),
+        Some(1),
+        "a forward switcher starts on the previous app, not the current one"
+    );
+}
+
+/// A tap shorter than the open delay switches with no popup ever drawn.
+///
+/// Both halves matter and are asserted together: the switcher must have committed, *and* nothing
+/// must ever have been visible. Asserting only the commit would pass an implementation that
+/// flashes the popup for a frame, which is exactly what the 150 ms delay exists to prevent.
+#[test]
+fn a_quick_super_tab_switches_without_showing_the_popup() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![
+            AppEntry::fake("org.example.One.desktop", "One"),
+            AppEntry::fake("org.example.Two.desktop", "Two"),
+        ])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.One");
+    let first = f.niri().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.Two");
+    f.niri_complete_animations();
+
+    // Hold Super for real, so the popup gets a modifier to commit on: driving the action with
+    // nothing held makes it a *no-modifier* switcher, which commits on a timeout instead and
+    // would quietly test the wrong path.
+    const KEY_LEFTMETA: u32 = 125;
+    f.key_press(KEY_LEFTMETA);
+
+    f.niri_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+    assert!(f.niri().switcher.is_open());
+    assert!(
+        !f.niri().switcher.is_visible(),
+        "nothing is drawn inside the open delay"
+    );
+
+    // Let go well inside the delay. The popup was never drawn, and the switch happens anyway --
+    // the release reaches us because the grab was taken at open rather than at reveal.
+    f.key_release(KEY_LEFTMETA);
+
+    assert!(!f.niri().switcher.is_open(), "the release ends the session");
+    assert_eq!(
+        f.niri().layout.focus().unwrap().id(),
+        first,
+        "the tap moved focus to the previously used app's window"
+    );
+}
