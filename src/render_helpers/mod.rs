@@ -45,6 +45,7 @@ pub mod solid_color;
 pub mod surface;
 pub mod texture;
 pub mod vulkan;
+pub mod window_thumbnail;
 pub mod xray;
 
 /// A rendering context.
