@@ -516,6 +516,8 @@ pub struct Niri {
     /// The pending idle lock (`_lockTimeoutId`). Armed when the session goes idle, dropped when
     /// the user comes back — the grace period is exactly this token's lifetime.
     pub lock_timer: Option<calloop::RegistrationToken>,
+    /// The idle fade's completion, which is what actually puts the shield down.
+    pub fade_timer: Option<calloop::RegistrationToken>,
     /// logind's `Session.Active`: whether our VT is the one on screen. Assumed true until logind
     /// says otherwise, which is right for the usual case of starting on the active VT.
     pub session_active: bool,
@@ -3850,7 +3852,12 @@ impl State {
             let now = self.niri.screen_shield.is_active();
             self.niri
                 .lock_screen
-                .set_shown(now.then(crate::utils::get_monotonic_time));
+                .set_shown(now, crate::utils::get_monotonic_time());
+            if effects.curtain_instant {
+                // The idle path's shield lands on an already-black screen; sliding onto it would
+                // animate something nobody can see.
+                self.niri.lock_screen.settle();
+            }
             self.niri.queue_redraw_all();
         }
 
@@ -3933,6 +3940,20 @@ impl State {
             self.niri.unlock_dialog.cancel();
         }
 
+        if effects.stop_fade {
+            self.niri.lock_screen.light_off();
+            if let Some(token) = self.niri.fade_timer.take() {
+                self.niri.event_loop.remove(token);
+            }
+        }
+
+        if effects.start_fade {
+            let now = crate::utils::get_monotonic_time();
+            self.niri.lock_screen.light_on(now);
+            self.arm_fade_timer();
+            self.niri.queue_redraw_all();
+        }
+
         if effects.cancel_lock_timer {
             if let Some(token) = self.niri.lock_timer.take() {
                 self.niri.event_loop.remove(token);
@@ -3984,6 +4005,31 @@ impl State {
         if let Err(err) = res {
             warn!("error arming the verifier watchdog: {err:?}");
         }
+    }
+
+    /// Arm the fade's completion — the moment the screen is black and the shield goes down.
+    ///
+    /// A timer rather than "when the render says alpha is 1", because the shield must go down even
+    /// on an output that is not drawing (a blanked or unplugged monitor still has to end up
+    /// covered).
+    fn arm_fade_timer(&mut self) {
+        if let Some(token) = self.niri.fade_timer.take() {
+            self.niri.event_loop.remove(token);
+        }
+        let timer = calloop::timer::Timer::from_duration(crate::ui::lock_screen::FADE_TIME);
+        let token = self
+            .niri
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.niri.fade_timer = None;
+                let now = crate::utils::get_monotonic_time();
+                let effects = state.niri.screen_shield.fade_complete(now);
+                state.apply_shield_effects(effects);
+                calloop::timer::TimeoutAction::Drop
+            })
+            .map_err(|err| warn!("error arming the idle fade timer: {err:?}"))
+            .ok();
+        self.niri.fade_timer = token;
     }
 
     /// Arm the idle grace period. Any timer already pending is replaced, never stacked.
@@ -5186,6 +5232,7 @@ impl Niri {
             #[cfg(feature = "dbus")]
             gdm_requests: None,
             lock_timer: None,
+            fade_timer: None,
             session_active: true,
             #[cfg(feature = "dbus")]
             sleep_inhibitor: None,
@@ -7070,6 +7117,11 @@ impl Niri {
         self.update_xray_render_elements(output);
         self.layout.update_render_elements(output);
 
+        // Retire a finished curtain slide. Without this the state stays `Hiding` forever and the
+        // *next* lock is told the curtain is already on its way, so it never descends.
+        self.lock_screen
+            .settle_curtain(crate::utils::get_monotonic_time());
+
         // Keep the panel's Activities highlight in sync with the overview.
         let overview_open = self.layout.is_overview_open();
         self.panel.set_overview_open(overview_open);
@@ -7297,9 +7349,11 @@ impl Niri {
         // Next, the screen shield's curtain. Below `ext-session-lock` above — that protocol is a
         // stronger claim on the screen and there is no sense in drawing both — but above
         // everything else, because the whole point is that the desktop is not visible.
-        if self.screen_shield.is_active() {
+        let now = crate::utils::get_monotonic_time();
+        // Not `is_active`: the curtain outlives the shield by the length of its slide away, and
+        // gating the draw on the model would turn unlocking into a hard cut.
+        if self.lock_screen.is_covering(now) {
             let size = output_size(output);
-            let now = crate::utils::get_monotonic_time();
             // `WallClock` is wall time, not the monotonic clock the fade runs on.
             let epoch = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -7319,8 +7373,15 @@ impl Niri {
                 // A screensaver has no prompt to fade to at all.
                 0.
             };
-            let prompt_t = crate::ui::lock_screen::PageTransform::prompt(progress);
-            let clock_t = crate::ui::lock_screen::PageTransform::clock(progress);
+            // `_lockDialogGroup.translation_y`: the whole group — backdrop, clock, prompt —
+            // slides as one, so this is added to every element below rather than applied to any of
+            // them individually.
+            let slide = -self.lock_screen.curtain_progress(now) * size.h;
+
+            let mut prompt_t = crate::ui::lock_screen::PageTransform::prompt(progress);
+            let mut clock_t = crate::ui::lock_screen::PageTransform::clock(progress);
+            prompt_t.translation_y += slide;
+            clock_t.translation_y += slide;
 
             if prompt_t.is_visible() {
                 let d = &self.unlock_dialog;
@@ -7376,9 +7437,15 @@ impl Niri {
             // texture's resolution.
             let radius = crate::ui::lock_screen::BLUR_RADIUS * output_scale.x;
             let brightness = crate::ui::lock_screen::BLUR_BRIGHTNESS as f32;
-            let blurred =
-                self.wallpaper
-                    .render_blurred(ctx.renderer, size, output_scale, radius, brightness);
+            let origin = Point::<f64, Logical>::from((0., slide));
+            let blurred = self.wallpaper.render_blurred(
+                ctx.renderer,
+                origin,
+                size,
+                output_scale,
+                radius,
+                brightness,
+            );
 
             match blurred {
                 Some(elem) => push(elem.into()),
@@ -7388,13 +7455,15 @@ impl Niri {
                     push(
                         SolidColorRenderElement::from_buffer(
                             &state.shield_dim_buffer,
-                            (0., 0.),
+                            (0., slide),
                             1.,
                             Kind::Unspecified,
                         )
                         .into(),
                     );
-                    if let Some(elem) = self.wallpaper.render(ctx.renderer, size, 0., output_scale)
+                    if let Some(elem) =
+                        self.wallpaper
+                            .render(ctx.renderer, origin, size, 0., output_scale)
                     {
                         push(elem.into());
                     }
@@ -7405,14 +7474,33 @@ impl Niri {
             push(
                 SolidColorRenderElement::from_buffer(
                     &state.shield_backstop_buffer,
-                    (0., 0.),
+                    (0., slide),
                     1.,
                     Kind::Unspecified,
                 )
                 .into(),
             );
 
-            return;
+            // Only a curtain that is all the way down hides everything. While it slides it has
+            // vacated part of the screen, and returning here would leave that band holding whatever
+            // was in the framebuffer instead of the desktop it is uncovering.
+            if slide == 0. {
+                return;
+            }
+        }
+
+        // The idle fade to black, over the desktop and under the shield that is about to cover it.
+        let fade = self.lock_screen.fade_alpha(now);
+        if fade > 0. {
+            push(
+                SolidColorRenderElement::from_buffer(
+                    &state.shield_backstop_buffer,
+                    (0., 0.),
+                    fade as f32,
+                    Kind::Unspecified,
+                )
+                .into(),
+            );
         }
 
         // Prepare the background elements.
@@ -7768,10 +7856,13 @@ impl Niri {
                 // The GNOME wallpaper draws from an uploaded VkTexture; the solid
                 // `render_background` below still backs it.
                 if gnome_mode {
-                    if let Some(elem) =
-                        self.wallpaper
-                            .render(ctx.renderer, ws.view_size(), 0., output_scale)
-                    {
+                    if let Some(elem) = self.wallpaper.render(
+                        ctx.renderer,
+                        Default::default(),
+                        ws.view_size(),
+                        0.,
+                        output_scale,
+                    ) {
                         if let Some(elem) = scale_relocate_crop(elem, output_scale, zoom, geo) {
                             push(elem.into());
                         }
@@ -7918,6 +8009,7 @@ impl Niri {
                 if gnome_mode {
                     if let Some(elem) = self.wallpaper.render(
                         ctx.renderer,
+                        Default::default(),
                         ws.view_size(),
                         wallpaper_radius,
                         output_scale,
@@ -8152,8 +8244,11 @@ impl Niri {
             let now = crate::utils::get_monotonic_time();
             state.unfinished_animations_remain |= self.lock_screen.is_animating(now);
             // The clock↔prompt crossfade is the same story: it starts on a keypress and then owes
-            // 300 ms of frames nothing else will ask for.
+            // 300 ms of frames nothing else will ask for. So is the curtain's own slide, which
+            // additionally runs *after* the shield is gone and so has nothing else to ask at all.
             state.unfinished_animations_remain |= self.lock_screen.page_is_animating(now);
+            state.unfinished_animations_remain |= self.lock_screen.is_sliding(now);
+            state.unfinished_animations_remain |= self.lock_screen.is_fading(now);
 
             // Also keep redrawing if the current cursor is animated.
             state.unfinished_animations_remain |= self
@@ -11609,7 +11704,8 @@ fn push_gnome_wallpaper_into_xray(
 
     // Radius 0: the buffer holds the raw wallpaper; the sampling `XrayElement` does the rounded
     // clip itself.
-    let Some(elem) = wallpaper.render(renderer, buf_logical, 0., buf_scale) else {
+    let Some(elem) = wallpaper.render(renderer, Default::default(), buf_logical, 0., buf_scale)
+    else {
         return;
     };
     // Wrap into the same `CropRenderElement<Relocate<Rescale<…>>>` the on-screen path builds, but

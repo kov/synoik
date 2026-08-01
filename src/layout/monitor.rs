@@ -2873,6 +2873,7 @@ impl<W: LayoutElement> Monitor<W> {
                 let radius = self.thumbnail_corner_radius() / thumb_scale;
                 if let Some(elem) = wallpaper.render(
                     ctx.renderer,
+                    Default::default(),
                     ws.view_size(),
                     radius,
                     Scale::from(scale * thumb_scale),

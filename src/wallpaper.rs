@@ -235,11 +235,12 @@ impl Wallpaper {
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
+        origin: Point<f64, Logical>,
         view_size: Size<f64, Logical>,
         corner_radius: f64,
         scale: Scale<f64>,
     ) -> Option<RoundedTextureRenderElement<VkTexture>> {
-        self.render_vulkan(renderer, view_size, corner_radius, scale)
+        self.render_vulkan(renderer, origin, view_size, corner_radius, scale)
     }
 
     /// The uploaded picture, uploading it if this is the first ask since it changed.
@@ -276,6 +277,7 @@ impl Wallpaper {
     pub fn render_blurred(
         &self,
         renderer: &mut VulkanRenderer,
+        origin: Point<f64, Logical>,
         view_size: Size<f64, Logical>,
         scale: Scale<f64>,
         radius: f64,
@@ -283,7 +285,7 @@ impl Wallpaper {
     ) -> Option<RoundedTextureRenderElement<VkTexture>> {
         // The upload (and its device-loss handling) is `render_vulkan`'s; go through it so a
         // blurred draw cannot diverge from a plain one about which texture is current.
-        self.render_vulkan(renderer, view_size, 0., scale)?;
+        self.render_vulkan(renderer, origin, view_size, 0., scale)?;
         let buffer = self.ensure_texture(renderer)?;
         let texture = buffer.texture().clone();
 
@@ -322,7 +324,7 @@ impl Wallpaper {
         );
         let elem = TextureRenderElement::from_texture_buffer(
             blurred,
-            (0., 0.),
+            origin,
             1.,
             Some(src),
             Some(view_size),
@@ -337,6 +339,7 @@ impl Wallpaper {
     pub fn render_vulkan(
         &self,
         renderer: &mut VulkanRenderer,
+        origin: Point<f64, Logical>,
         view_size: Size<f64, Logical>,
         corner_radius: f64,
         scale: Scale<f64>,
@@ -379,7 +382,7 @@ impl Wallpaper {
         let src = zoom_crop(buffer.logical_size(), view_size);
         let elem = TextureRenderElement::from_texture_buffer(
             buffer,
-            (0., 0.),
+            origin,
             1.,
             Some(src),
             Some(view_size),
@@ -673,7 +676,13 @@ mod tests {
         // per real upload, which is the thing this test is about.
         let uploads = |_: ()| niri_vk::stats::take_creates().0;
         let render = |wp: &Wallpaper, vk: &mut VulkanRenderer| {
-            wp.render(vk, Size::from((16., 16.)), 0., Scale::from(1.))
+            wp.render(
+                vk,
+                Default::default(),
+                Size::from((16., 16.)),
+                0.,
+                Scale::from(1.),
+            )
         };
 
         // The shared staging chunk is created once per renderer and counts as a resource; warm
@@ -728,7 +737,13 @@ mod tests {
             ..Default::default()
         };
         let render = |wp: &Wallpaper, vk: &mut VulkanRenderer| {
-            wp.render(vk, Size::from((16., 16.)), 0., Scale::from(1.))
+            wp.render(
+                vk,
+                Default::default(),
+                Size::from((16., 16.)),
+                0.,
+                Scale::from(1.),
+            )
         };
 
         assert!(

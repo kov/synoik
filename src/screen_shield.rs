@@ -57,6 +57,17 @@ pub struct ShieldEffects {
     /// `_maybeCancelDialog` (`:186-191`) — put the prompt page back to the clock, so an
     /// unattended screen is not left holding a half-typed password.
     pub cancel_dialog: bool,
+    /// Start the long fade to black (`_activateFade`, `:275-283`). The shield goes down when it
+    /// finishes, not when it starts — see [`ScreenShield::fade_complete`].
+    pub start_fade: bool,
+    /// Drop the fade at once (`lightOff` with no duration, `lightbox.js:223-227`).
+    pub stop_fade: bool,
+    /// Put the curtain down *without* its slide (`activate(false)`).
+    ///
+    /// The idle path is the reason this exists: by the time the shield goes down the screen is
+    /// already black from the fade, so sliding a curtain onto it would be a second animation over
+    /// a picture nobody can see.
+    pub curtain_instant: bool,
 }
 
 /// The lockdown and screensaver settings [`ScreenShield`] consults.
@@ -164,7 +175,18 @@ impl ScreenShield {
     /// channel comes back refused the wait ends and the shield goes back to being dismissible,
     /// which is the screensaver it was always entitled to be.
     pub fn is_dismissible(&self) -> bool {
-        self.active && !self.locked && self.awaiting_authenticator.is_none()
+        self.active && !self.is_challenging()
+    }
+
+    /// Whether getting back in would take a password — either because the shield is locked, or
+    /// because it has asked for a verifier and not heard back.
+    ///
+    /// Separate from [`is_dismissible`](Self::is_dismissible) because that one also requires the
+    /// shield to be *down*, and there is a state where nothing is down yet but a lock is already
+    /// pending: the ten-second idle fade. Using the stricter predicate there leaves the armed lock
+    /// running when the user comes back, and the desktop locks under them a few seconds later.
+    fn is_challenging(&self) -> bool {
+        self.locked || self.awaiting_authenticator.is_some()
     }
 
     /// `GetActiveTime` (`shellDBus.js:558-565`): whole seconds since the shield went down, or 0.
@@ -199,6 +221,7 @@ impl ScreenShield {
         // `_completeDeactivate` drops the pending lock (`:575-578`). Leaving it armed would lock a
         // desktop the user is sitting at, seconds after they dismissed the screensaver.
         effects.cancel_lock_timer = true;
+        effects.stop_fade = true;
         let unlocked = self.set_locked(false);
         effects.locked_changed = unlocked.locked_changed;
         effects
@@ -274,11 +297,9 @@ impl ScreenShield {
     /// and tells us when it has elapsed. All we decide is what happens next — cover the screen, and
     /// arm a timer to turn that cover into a lock.
     ///
-    /// **Divergence: no fade.** GNOME raises a black lightbox over the desktop and only activates
-    /// the shield when that 10 s fade completes; we activate at once. The `max(STANDARD_FADE_TIME,
-    /// lock-delay)` grace before locking is kept, so the window in which coming back to the machine
-    /// costs nothing is the same length — it just looks like the curtain instead of a dimming
-    /// desktop. The fade belongs with the rest of the animations (slice 5).
+    /// Nothing goes down here: idle raises a black lightbox over the desktop and fades it in over
+    /// ten seconds, and only its completion activates the shield
+    /// ([`fade_complete`](Self::fade_complete)).
     pub fn on_session_idle(&mut self, now: Duration) -> ShieldEffects {
         let mut effects = ShieldEffects {
             cancel_dialog: true,
@@ -294,8 +315,34 @@ impl ScreenShield {
             effects.arm_lock_timer = Some(self.settings.lock_delay.max(STANDARD_FADE_TIME));
         }
 
-        let activated = self.activate(now);
-        effects.active_changed = activated.active_changed;
+        // The shield does **not** go down here. Going idle starts a ten-second fade to black over
+        // the desktop, and only when that finishes does `_onLongLightbox` call `activate(false)`
+        // (`:271-275`, `:311-314`). Covering the screen the moment the session is declared idle is
+        // the obvious shortcut and it is wrong twice: the user loses the gradual warning that the
+        // machine is about to blank, and the ten seconds they have to move the mouse and cancel it
+        // turn into no seconds at all.
+        //
+        // `_activationTime` is stamped here, when the session goes idle — not when the shield
+        // finally covers the screen ten seconds later (`:257-258`). `GetActiveTime` is what
+        // gnome-session and gsd read to decide how long the seat has been unattended, and starting
+        // it at the fade's *end* would under-report every idle screensaver by that fade.
+        if self.activation_time.is_none() {
+            self.activation_time = Some(now);
+        }
+
+        if !self.active {
+            effects.start_fade = true;
+        }
+        effects
+    }
+
+    /// The long fade reached black: put the shield down (`_onLongLightbox`, `:311-314`).
+    ///
+    /// Without the slide, because the screen it would slide onto is already black.
+    pub fn fade_complete(&mut self, now: Duration) -> ShieldEffects {
+        let mut effects = self.activate(now);
+        effects.curtain_instant = true;
+        effects.stop_fade = true;
         effects
     }
 
@@ -305,10 +352,17 @@ impl ScreenShield {
     /// An unlocked one is a screensaver, so it goes away and takes the pending lock timer with it —
     /// that cancellation is the whole point of the grace period.
     pub fn on_user_active(&mut self) -> ShieldEffects {
-        if !self.is_dismissible() {
-            return ShieldEffects::default();
+        if self.is_challenging() {
+            // Still drop a fade that had started: a locked shield has nothing to fade *to*, and a
+            // half-black overlay left over it would darken the unlock prompt.
+            return ShieldEffects {
+                stop_fade: true,
+                ..Default::default()
+            };
         }
-        self.deactivate()
+        let mut effects = self.deactivate();
+        effects.stop_fade = true;
+        effects
     }
 
     /// `_prepareForSleep` (`:233-241`) — logind's `PrepareForSleep`.
@@ -637,13 +691,20 @@ mod tests {
         let mut shield = ScreenShield::new(ShieldSettings::default());
 
         let effects = shield.on_session_idle(T0);
-        assert_eq!(effects.active_changed, Some(true));
-        assert!(!shield.is_locked(), "idle covers; the timer locks");
+        assert!(effects.start_fade, "idle fades first, it does not cover");
+        assert_eq!(effects.active_changed, None, "the shield is still up");
         assert_eq!(effects.arm_lock_timer, Some(STANDARD_FADE_TIME));
         assert!(
             effects.cancel_dialog,
             "no half-typed password left on screen"
         );
+
+        // The fade reaching black is what puts the shield down — and without the slide, since the
+        // screen it would slide onto is already black.
+        let done = shield.fade_complete(T0 + STANDARD_FADE_TIME);
+        assert_eq!(done.active_changed, Some(true));
+        assert!(done.curtain_instant);
+        assert!(!shield.is_locked(), "covered; the lock timer is what locks");
 
         // A longer `lock-delay` wins over the floor; a shorter one does not shrink it.
         let mut shield = ScreenShield::new(ShieldSettings {
@@ -665,8 +726,22 @@ mod tests {
         });
 
         let effects = shield.on_session_idle(T0);
-        assert_eq!(effects.active_changed, Some(true));
+        assert!(effects.start_fade);
         assert_eq!(effects.arm_lock_timer, None);
+    }
+
+    /// Going idle stamps the activation time even though the shield has not appeared yet.
+    ///
+    /// `GetActiveTime` is what gnome-session and gsd read to decide how long the seat has been
+    /// unattended (`:257-258`). Stamping it when the shield finally covers, ten seconds later,
+    /// under-reports every idle screensaver by exactly that fade.
+    #[test]
+    fn going_idle_stamps_the_activation_time_before_the_fade() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+        shield.on_session_idle(T0);
+        assert_eq!(shield.activation_time(), Some(T0));
+        assert!(!shield.is_active(), "and it is not covered yet");
+        assert_eq!(shield.active_time_secs(T0 + Duration::from_secs(30)), 30);
     }
 
     /// A screensaver that is already covering the screen still gets locked when the session goes
@@ -720,7 +795,11 @@ mod tests {
             .unwrap();
 
         assert!(!shield.is_dismissible(), "the answer has not landed yet");
-        assert_eq!(shield.on_user_active(), ShieldEffects::default());
+        assert_eq!(
+            shield.on_user_active().active_changed,
+            None,
+            "input does not raise it"
+        );
         assert!(shield.is_active(), "still covering the screen");
         assert!(
             shield.wants_sleep_inhibitor(true),
@@ -762,10 +841,12 @@ mod tests {
     fn coming_back_before_the_timer_cancels_the_lock() {
         let mut shield = ScreenShield::new(ShieldSettings::default());
         shield.on_session_idle(T0);
+        shield.fade_complete(T0 + STANDARD_FADE_TIME);
 
         let effects = shield.on_user_active();
         assert_eq!(effects.active_changed, Some(false));
         assert!(effects.cancel_lock_timer);
+        assert!(effects.stop_fade);
 
         // Once locked, activity is for the unlock dialog to handle; the shield stays put.
         let mut shield = ScreenShield::new(ShieldSettings::default());
@@ -775,8 +856,35 @@ mod tests {
             .request_authenticator
             .unwrap();
         shield.authenticator_ready(epoch, true);
-        assert_eq!(shield.on_user_active(), ShieldEffects::default());
+        let effects = shield.on_user_active();
+        assert_eq!(effects.active_changed, None, "a locked shield stays put");
         assert!(shield.is_locked());
+    }
+
+    /// Coming back *during the fade*, before anything has covered the screen, cancels the lock too.
+    ///
+    /// The nastier half of the case above, and the one worth its own test: for those ten seconds
+    /// the shield is not active, so a "is there anything to dismiss?" guard says no and returns
+    /// early — leaving the armed lock running. The user waves the mouse, the fade disappears, they
+    /// go back to work, and the machine locks under them seconds later with no warning at all.
+    #[test]
+    fn coming_back_during_the_fade_cancels_the_lock() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+        let idle = shield.on_session_idle(T0);
+        assert!(idle.start_fade);
+        assert!(idle.arm_lock_timer.is_some());
+        assert!(!shield.is_active(), "the fade has not reached black yet");
+
+        let effects = shield.on_user_active();
+        assert!(effects.stop_fade, "the fade goes away");
+        assert!(
+            effects.cancel_lock_timer,
+            "and the armed lock with it, or the desktop locks under the user"
+        );
+        assert!(
+            shield.activation_time().is_none(),
+            "the seat is attended again, so the idle clock restarts"
+        );
     }
 
     /// Suspending locks straight away — a grace period on a machine that is going to sleep would

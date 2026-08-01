@@ -7139,19 +7139,22 @@ fn going_idle_arms_the_lock_and_coming_back_disarms_it() {
 
     f.niri_state()
         .on_presence_msg(PresenceToNiri::StatusChanged(PresenceStatus::Idle));
-    assert!(f.niri().screen_shield.is_active(), "idle covers the screen");
     assert!(
-        !f.niri().screen_shield.is_locked(),
-        "but only the timer locks"
+        !f.niri().screen_shield.is_active(),
+        "idle fades to black first; it does not cover"
     );
-    assert!(f.niri().lock_timer.is_some(), "the grace period is running");
+    assert!(f.niri().fade_timer.is_some(), "the fade is running");
+    assert!(f.niri().lock_timer.is_some(), "and so is the grace period");
 
     f.niri_state()
         .on_presence_msg(PresenceToNiri::StatusChanged(PresenceStatus::Available));
-    assert!(!f.niri().screen_shield.is_active(), "coming back raises it");
+    assert!(
+        f.niri().fade_timer.is_none(),
+        "coming back drops the fade..."
+    );
     assert!(
         f.niri().lock_timer.is_none(),
-        "and takes the pending lock with it, or the desktop locks under the user"
+        "...and the pending lock with it, or the desktop locks under the user"
     );
 }
 
@@ -7194,6 +7197,7 @@ fn an_unknown_presence_status_does_not_blank_the_screen() {
         .on_presence_msg(PresenceToNiri::StatusChanged(PresenceStatus::Unknown(42)));
     assert!(!f.niri().screen_shield.is_active());
     assert!(f.niri().lock_timer.is_none());
+    assert!(f.niri().fade_timer.is_none(), "and nothing starts fading");
 }
 
 /// logind's `PrepareForSleep(true)` locks before the machine goes down, with no grace period.

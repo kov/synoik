@@ -1,8 +1,8 @@
 # Session lock and lock screen — porting `ScreenShield`
 
-Status: **slices 1–4 landed 2026-08-01** (the model + the D-Bus surface; the curtain; the unlock
-dialog and gdm authentication; idle and suspend). Slice 5 is part-done: the clock↔prompt crossfade
-is in, the blur and the shield's own slide are not.
+Status: **slices 1–5 landed 2026-08-01** — the model + the D-Bus surface; the curtain; the unlock
+dialog and gdm authentication; idle and suspend; and the look (blur, crossfade, the shield's slide,
+the idle fade to black).
 Cited against `js/ui/screenShield.js` (675 lines), `js/ui/unlockDialog.js` (972) and
 `js/ui/shellDBus.js:517-566` in the 50.3 checkout.
 
@@ -59,13 +59,12 @@ live on this machine, so the path is available.
    at gdm's own login screen switches the VT back to a session that is still locked, which is a
    stuck session rather than a missing feature. `lockIfWasLocked` was **dropped** — see below.
 5. **The look** — deferred deliberately until the shield *works*, at Gustavo's call (2026-08-01,
-   after seat-validating slice 2). The clock↔prompt crossfade has **landed**
-   (`PageTransform` in `src/ui/lock_screen.rs`); the blur and the shield's own slide are open:
-   - the **blur**: **landed** (`niri-vk/src/blur.rs`, `render_helpers/vulkan/gaussian_backdrop.rs`,
-     `Wallpaper::render_blurred`). See below.
-   - the **animations**: the shield's rise and fall — `translation_y` between `-screen_height` and
-     0 over `Overview.ANIMATION_TIME` (250 ms, `EASE_OUT_QUAD`; `_resetLockScreen` `:452-462`,
-     `_continueDeactivate` `:551-556`) — and the idle path's 10 s fade to black.
+   after seat-validating slice 2). **Landed**, in three pieces:
+   - the **blur** (`niri-vk/src/blur.rs`, `render_helpers/vulkan/gaussian_backdrop.rs`,
+     `Wallpaper::render_blurred`);
+   - the **clock↔prompt crossfade** (`PageTransform` in `src/ui/lock_screen.rs`);
+   - the **shield's own slide** and the **idle fade to black** (`Curtain` and `fade_alpha`, same
+     file).
 
 The **crossfade** is not a dissolve. The clock leaves upward while the prompt arrives from below,
 both shrinking to `FADE_OUT_SCALE` and scaling about their own centres (`pivot_point(0.5, 0.5)`,
@@ -108,6 +107,38 @@ Three things worth keeping:
   is open; `VulkanRenderer::queue_gaussian_blur` hands it to the next frame's, as the Kawase path
   already did (`docs/fork/frame-submit-discipline.md`). It also only re-runs when the wallpaper,
   radius or brightness actually change — a lock screen redraws on every clock tick and keystroke.
+
+## The slide, and the fade
+
+The shield's rise and fall is `translation_y` between `-screen_height` and 0 over
+`Overview.ANIMATION_TIME` (250 ms, `EASE_OUT_QUAD`; `_resetLockScreen` `:452-462`,
+`_continueDeactivate` `:551-556`). The idle path gets the other one: a black lightbox faded in over
+`STANDARD_FADE_TIME` (10 s, `_activateFade` `:275-283`), whose *completion* — not its start — is
+what activates the shield (`_onLongLightbox` `:311-314`).
+
+Four things worth keeping:
+
+- **Idle does not put the shield down.** `on_session_idle` starts the fade and stamps
+  `_activationTime`, and `fade_complete` is what activates. Covering the screen the moment the
+  session is declared idle is the obvious shortcut and it costs the user both the gradual warning
+  and the ten seconds they have to wave the mouse and cancel it. The stamp still goes at the
+  *start*, because `GetActiveTime` is what gnome-session and gsd read to decide how long the seat
+  has been unattended, and stamping at the fade's end under-reports every screensaver by 10 s.
+- **Coming back mid-fade has to cancel the armed lock.** For those ten seconds nothing is active
+  yet, so a "is there anything to dismiss?" guard answers *no* and returns early — leaving the lock
+  timer running, so the user goes back to work and the machine locks under them seconds later.
+  `on_user_active` therefore gates on `is_challenging()` (locked, or awaiting a verifier), not on
+  `is_dismissible()` (which also requires the shield to be down). Pinned by
+  `coming_back_during_the_fade_cancels_the_lock`.
+- **The idle path's curtain does not slide.** By the time the shield goes down the screen is
+  already black, so a slide would animate a picture nobody can see; `ShieldEffects::curtain_instant`
+  is that case. The curtain's `is_covering` is read off the `Curtain` *state*, never off its
+  progress float — at the exact instant a descent begins the float is 0, and trusting it shows one
+  frame of desktop under a locked session.
+- **A slide-out still owes the vacated band.** The shield render branch cannot `return` early once
+  it has drawn the shield: during the fall the strip it has left is its own to paint. Same shape as
+  the crossfade's trap above — and both animations start from invisible, so a Vulkan render test
+  taken right after the state change catches nothing. `LockScreen::settle()` is the way out.
 
 ## The lock gate
 
@@ -229,9 +260,6 @@ process. What is done about it, and what is not:
   (`shellDBus.js:538-546`), so a caller that locks and then suspends cannot race the shield onto
   the screen. The curtain now exists, so there *is* something to wait for — the remaining piece is
   a "first frame with the shield up has been presented" signal to hang the reply on. Still open.
-- **No blur, and no animation.** Both are slice 5 above, by decision rather than oversight; only
-  `BLUR_BRIGHTNESS = 0.65` ships, as a black wash over the wallpaper. It is the half that makes the
-  white 72pt clock legible over an arbitrary picture.
 - **The clock weight is 700, not 800.** Our rasterizer's ceiling, not a decision here — the same
   standing divergence as every other `%title_1` in the port.
 - **Touch mode is assumed off**, so the hint always reads "Click or press a key to unlock" rather
@@ -269,10 +297,6 @@ process. What is done about it, and what is not:
   route by `service_name` — but GNOME also rewrites fingerprint `Info` into its own hint text
   (`util.js:727-732`) and counts its `Problem`s against `allowed-failures` (`:745-775`), so it is
   not merely a second subscription.
-- **The idle path does not fade.** GNOME raises a black lightbox over the desktop and only puts the
-  shield down when that 10 s fade completes; we cover the screen at once. The grace period before
-  *locking* is the same length either way — it just looks like the curtain instead of a dimming
-  desktop. The fade is slice 5's, with the other animations.
 - **User-active comes from presence, not the idle monitor.** GNOME cancels the pending lock from
   the core idle monitor's `add_user_active_watch` (`:282`), which fires on real input; ours rides
   gnome-session's next `Available` status. Real input already cancels it anyway, because it raises

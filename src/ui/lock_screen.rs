@@ -114,6 +114,19 @@ impl ClockContent {
     }
 }
 
+/// `STANDARD_FADE_TIME` (`screenShield.js:39`) — the idle fade to black, before the shield.
+///
+/// The shield's lightboxes are built with `fadeFactor: 1` (`:130-137`), so this fades all the way
+/// to opaque, not to GNOME's usual 0.4 dimming.
+pub const FADE_TIME: Duration = Duration::from_secs(10);
+
+/// `Overview.ANIMATION_TIME` (`js/ui/overview.js:12`) — how long the shield takes to slide.
+///
+/// The curtain comes down from above and leaves the same way: `_lockDialogGroup.translation_y`
+/// eased between `-screen_height` and 0 (`_resetLockScreen` `:452-462`, `_continueDeactivate`
+/// `:551-556`), `EASE_OUT_QUAD` both ways.
+pub const SLIDE_TIME: Duration = Duration::from_millis(250);
+
 /// `CROSSFADE_TIME` (`unlockDialog.js:30`) — how long the clock↔prompt swap takes.
 pub const CROSSFADE_TIME: Duration = Duration::from_millis(300);
 /// `FADE_OUT_TRANSLATION` (`:31`) — how far the outgoing page slides, in logical px.
@@ -415,12 +428,31 @@ pub fn prompt_block_height(base_px: f64) -> f64 {
     l.message.loc.y + l.message.size.h
 }
 
-/// The curtain's on-screen state: when it went down, and its bake.
+/// Where the curtain is, and which way it is going.
+///
+/// The shield keeps drawing after it stops being *active*, which is the whole reason this is a
+/// state machine and not a boolean: the model raises the shield the instant it is unlocked, and the
+/// curtain still owes 250 ms of sliding away. Rendering only while `active` would make unlocking a
+/// hard cut and locking an appearance out of nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Curtain {
+    /// Off the top of the screen, drawing nothing.
+    #[default]
+    Hidden,
+    Showing(Duration),
+    Covering,
+    Hiding(Duration),
+}
+
+/// The curtain's on-screen state: when it went down, its slide, and its bakes.
 #[derive(Default)]
 pub struct LockScreen {
     /// Monotonic instant the shield went down, or of the last input while it was down — the hint's
     /// fade hangs off an **idle** watch on the core idle monitor (`:395`), not off activation.
     idle_since: Option<Duration>,
+    curtain: Curtain,
+    /// When the long fade to black started, if it is running (`_longLightbox`).
+    fade_since: Option<Duration>,
     /// Which page is being eased *to*, and when the ease started. `None` means settled.
     ///
     /// The page a transition ends on comes from the model ([`crate::unlock_dialog::Page`]); this
@@ -435,25 +467,97 @@ pub struct LockScreen {
 }
 
 impl LockScreen {
-    /// The shield went down (or came back up, with `None`).
-    pub fn set_shown(&mut self, now: Option<Duration>) {
-        self.idle_since = now;
-        // A raised shield settles instantly: the next lock must not open on the tail of the
-        // crossfade the last one was in the middle of.
-        if now.is_none() {
+    /// The shield went down (`true`) or came back up.
+    ///
+    /// Takes `now` unconditionally rather than folding it into an `Option`, because *both*
+    /// directions start an animation — the old shape could say when the curtain started coming
+    /// down but not when it started going away.
+    pub fn set_shown(&mut self, shown: bool, now: Duration) {
+        self.idle_since = shown.then_some(now);
+        self.curtain = match (shown, self.curtain) {
+            // Already there or on the way: let it finish rather than restarting it.
+            (true, Curtain::Showing(_) | Curtain::Covering) => self.curtain,
+            (true, _) => Curtain::Showing(now),
+            (false, Curtain::Hidden | Curtain::Hiding(_)) => self.curtain,
+            (false, _) => Curtain::Hiding(now),
+        };
+        if !shown {
+            self.fade_since = None;
+            // A raised shield settles the page instantly: the next lock must not open on the tail
+            // of the crossfade the last one was in the middle of.
             self.showing_prompt = false;
             self.settle_page();
         }
     }
 
-    /// Finish the crossfade now, wherever it had got to.
+    /// Start the fade to black over the desktop (`lightOn(STANDARD_FADE_TIME)`).
+    pub fn light_on(&mut self, now: Duration) {
+        if self.fade_since.is_none() {
+            self.fade_since = Some(now);
+        }
+    }
+
+    /// Drop it at once — `lightOff()` with no duration is instant (`lightbox.js:223-227`).
+    pub fn light_off(&mut self) {
+        self.fade_since = None;
+    }
+
+    /// How black the desktop is on its way to being covered: 0 to 1, `EASE_OUT_QUAD`.
+    pub fn fade_alpha(&self, now: Duration) -> f64 {
+        let Some(since) = self.fade_since else {
+            return 0.;
+        };
+        let t = (now.saturating_sub(since).as_secs_f64() / FADE_TIME.as_secs_f64()).clamp(0., 1.);
+        Curve::EaseOutQuad.y(t)
+    }
+
+    /// Whether the fade still owes frames.
+    pub fn is_fading(&self, now: Duration) -> bool {
+        self.fade_since
+            .is_some_and(|since| now.saturating_sub(since) < FADE_TIME)
+    }
+
+    /// How far the curtain is off the top of the screen: `0` fully down, `1` fully away.
     ///
-    /// For page changes that must not animate. Note the shape of the bug it exists to avoid: a
-    /// half-finished crossfade draws the incoming page at a *partial alpha*, so anything that
-    /// samples the screen right after a page change sees a prompt that is nearly invisible and
-    /// reads it as "the prompt did not draw" ([[headless-animation-clock-trap]]).
-    pub fn settle_page(&mut self) {
-        self.page_since = None;
+    /// Multiply by the monitor height for GNOME's `translation_y` (negated — the shield leaves
+    /// upward).
+    pub fn curtain_progress(&self, now: Duration) -> f64 {
+        let eased = |since: Duration| {
+            let t =
+                (now.saturating_sub(since).as_secs_f64() / SLIDE_TIME.as_secs_f64()).clamp(0., 1.);
+            Curve::EaseOutQuad.y(t)
+        };
+        match self.curtain {
+            Curtain::Hidden => 1.,
+            Curtain::Covering => 0.,
+            Curtain::Showing(since) => 1. - eased(since),
+            Curtain::Hiding(since) => eased(since),
+        }
+    }
+
+    /// Whether the curtain is on screen at all — the render path's gate.
+    ///
+    /// True through the whole slide away, which is *after* the shield stops being active. Gating
+    /// the draw on the model's `active` instead is what makes unlocking a hard cut.
+    pub fn is_covering(&self, now: Duration) -> bool {
+        match self.curtain {
+            Curtain::Hidden => false,
+            // Read off the *state*, not `curtain_progress`: at the exact instant a descent starts
+            // the progress is still 1 (fully off-screen), and a frame landing there would skip the
+            // curtain entirely — which is a locked session drawing the desktop for one frame.
+            Curtain::Showing(_) | Curtain::Covering => true,
+            Curtain::Hiding(since) => now.saturating_sub(since) < SLIDE_TIME,
+        }
+    }
+
+    /// Whether the slide still owes frames.
+    pub fn is_sliding(&self, now: Duration) -> bool {
+        match self.curtain {
+            Curtain::Hidden | Curtain::Covering => false,
+            Curtain::Showing(since) | Curtain::Hiding(since) => {
+                now.saturating_sub(since) < SLIDE_TIME
+            }
+        }
     }
 
     /// The model moved to a page. Starts the crossfade, or does nothing if we are already going
@@ -487,6 +591,43 @@ impl LockScreen {
     pub fn page_is_animating(&self, now: Duration) -> bool {
         self.page_since
             .is_some_and(|(since, _)| now.saturating_sub(since) < CROSSFADE_TIME)
+    }
+
+    /// Retire a finished slide, so the state stops being a function of the clock.
+    ///
+    /// Called from the render path once per frame. Without it `Hiding` stays `Hiding` forever and
+    /// a later `set_shown(true)` would see "already on its way" and never restart the descent.
+    pub fn settle_curtain(&mut self, now: Duration) {
+        if self.is_sliding(now) {
+            return;
+        }
+        self.settle();
+    }
+
+    /// Finish every running animation at once — the slide *and* the crossfade.
+    ///
+    /// For callers that must not animate, and for anything that samples the screen right after a
+    /// state change. Both animations start from "invisible" — the curtain fully off the top, the
+    /// incoming page at alpha zero — so a frame taken immediately shows nothing at all and reads
+    /// as "the lock screen did not draw" ([[headless-animation-clock-trap]]).
+    pub fn settle(&mut self) {
+        self.fade_since = None;
+        self.curtain = match self.curtain {
+            Curtain::Showing(_) => Curtain::Covering,
+            Curtain::Hiding(_) => Curtain::Hidden,
+            settled => settled,
+        };
+        self.settle_page();
+    }
+
+    /// Finish the crossfade now, wherever it had got to.
+    ///
+    /// For page changes that must not animate. Note the shape of the bug it exists to avoid: a
+    /// half-finished crossfade draws the incoming page at a *partial alpha*, so anything that
+    /// samples the screen right after a page change sees a prompt that is nearly invisible and
+    /// reads it as "the prompt did not draw" ([[headless-animation-clock-trap]]).
+    pub fn settle_page(&mut self) {
+        self.page_since = None;
     }
 
     /// Input arrived while the shield is down: the idle watch restarts, so the hint fades back out
@@ -953,6 +1094,60 @@ mod tests {
         );
     }
 
+    /// The curtain comes down, and keeps drawing while it goes away again.
+    ///
+    /// The second half is the point. `is_covering` must stay true after the shield stops being
+    /// active, or the render path drops the curtain the instant it is unlocked and the slide out
+    /// is a hard cut with a 250 ms animation nobody ever sees.
+    #[test]
+    fn the_curtain_slides_in_and_keeps_drawing_on_the_way_out() {
+        let mut shield = LockScreen::default();
+        assert!(!shield.is_covering(T0), "nothing before the shield");
+        assert_eq!(shield.curtain_progress(T0), 1., "parked off the top");
+
+        shield.set_shown(true, T0);
+        assert!(shield.is_covering(T0), "on screen from the first frame");
+        let mid = shield.curtain_progress(T0 + SLIDE_TIME / 2);
+        assert!(mid > 0. && mid < 1., "part-way down: {mid}");
+        assert_eq!(shield.curtain_progress(T0 + SLIDE_TIME), 0., "fully down");
+        assert!(!shield.is_sliding(T0 + SLIDE_TIME));
+
+        let settled = T0 + SLIDE_TIME;
+        shield.settle_curtain(settled);
+        shield.set_shown(false, settled);
+        assert!(
+            shield.is_covering(settled),
+            "still drawing: the shield is up but the curtain has not left"
+        );
+        assert!(
+            shield.is_sliding(settled),
+            "and it owes the frames to do it"
+        );
+        assert_eq!(shield.curtain_progress(settled + SLIDE_TIME), 1.);
+        assert!(!shield.is_covering(settled + SLIDE_TIME), "gone");
+    }
+
+    /// A finished slide is retired, so the next lock actually descends.
+    ///
+    /// Without the retirement `Hiding` never becomes `Hidden`, and the next `set_shown(true)` is
+    /// told the curtain is "already on its way" — leaving it parked off-screen with a shield that
+    /// believes it is covering the display. That is a locked session showing the desktop.
+    #[test]
+    fn a_settled_slide_lets_the_next_lock_descend() {
+        let mut shield = LockScreen::default();
+        shield.set_shown(true, T0);
+        shield.settle_curtain(T0 + SLIDE_TIME);
+        shield.set_shown(false, T0 + SLIDE_TIME);
+
+        let done = T0 + SLIDE_TIME * 2;
+        shield.settle_curtain(done);
+        assert!(!shield.is_covering(done));
+
+        shield.set_shown(true, done);
+        assert!(shield.is_sliding(done), "the next lock slides in afresh");
+        assert_eq!(shield.curtain_progress(done + SLIDE_TIME), 0.);
+    }
+
     /// The two pages move in opposite directions and swap cleanly at the ends.
     ///
     /// The discriminating property is the *sign* of the translation: both pages shrinking and
@@ -1002,7 +1197,7 @@ mod tests {
     #[test]
     fn the_crossfade_runs_once_and_settles() {
         let mut shield = LockScreen::default();
-        shield.set_shown(Some(T0));
+        shield.set_shown(true, T0);
         assert_eq!(shield.page_progress(T0), 0.);
 
         shield.set_page(true, T0);
@@ -1031,7 +1226,7 @@ mod tests {
         let mut shield = LockScreen::default();
         assert_eq!(shield.hint_alpha(T0), 0., "nothing while the shield is up");
 
-        shield.set_shown(Some(T0));
+        shield.set_shown(true, T0);
         assert_eq!(shield.hint_alpha(T0 + Duration::from_secs(3)), 0.);
         assert_eq!(
             shield.hint_alpha(T0 + HINT_IDLE),
@@ -1050,7 +1245,7 @@ mod tests {
         assert_eq!(shield.hint_alpha(t + HINT_IDLE + HINT_FADE), 1.);
 
         // And raising the shield stops it entirely — `note_activity` must not resurrect it.
-        shield.set_shown(None);
+        shield.set_shown(false, T0);
         shield.note_activity(t + Duration::from_secs(60));
         assert_eq!(shield.hint_alpha(t + Duration::from_secs(120)), 0.);
         assert!(!shield.is_animating(t + Duration::from_secs(120)));

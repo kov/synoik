@@ -11662,6 +11662,9 @@ fn vulkan_draws_the_screen_shield_over_the_desktop() {
 
     f.niri_state()
         .on_screen_saver_msg(ScreenSaverToNiri::SetActive(true));
+    // The curtain slides in from above; sampled this instant it is still entirely off-screen, and
+    // the desktop below would show through for reasons that have nothing to do with the shield.
+    f.niri_state().niri.lock_screen.settle();
     let (pixels, w, h) = render_output_vulkan(&mut f, &output);
 
     let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
@@ -11727,9 +11730,10 @@ fn vulkan_draws_the_unlock_prompt_with_a_masked_entry() {
         8,
         "the fixture typed into a live entry"
     );
-    // The clock↔prompt crossfade runs on the wall clock, so a render taken this instant would
-    // catch the prompt at alpha ~0 and every assertion below would fail for the wrong reason.
-    f.niri_state().niri.lock_screen.settle_page();
+    // The curtain's slide and the clock↔prompt crossfade both run on the wall clock, and both
+    // start from invisible, so a render taken this instant would catch the shield off the top of
+    // the screen with the prompt at alpha ~0.
+    f.niri_state().niri.lock_screen.settle();
 
     let (pixels, w, h) = render_output_vulkan(&mut f, &output);
 
