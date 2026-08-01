@@ -21,6 +21,8 @@
 
 use std::time::Duration;
 
+use niri_config::Modifiers;
+
 use crate::ui::widget::{style, Rgba};
 
 /// `POPUP_DELAY_TIMEOUT` (`js/ui/switcherPopup.js:8`) — how long the modifier must be
@@ -168,8 +170,317 @@ pub fn initial_selection(len: usize, backward: bool) -> Option<usize> {
 pub enum SwitcherOutcome {
     /// Modifier released (or [`NO_MODS_TIMEOUT`] elapsed): activate the selection.
     Commit,
-    /// Escape: leave focus where it was (`switcherPopup.js:201-217`).
+    /// Escape: leave focus where it was (`switcherPopup.js:208-209`).
     Cancel,
+}
+
+/// A key the *base* popup acts on, already classified by the caller.
+///
+/// GNOME splits this across two layers: `vfunc_key_press_event` (`switcherPopup.js:194-219`) asks
+/// the subclass's `_keyPressHandler` first and only falls through to Escape/Tab/commit if the
+/// subclass did not consume the key. The subclass matches on the **keybinding action**
+/// (`global.display.get_keybinding_action`, `:196-197`), not the keysym, which is how a rebound
+/// Alt-Tab keeps working.
+///
+/// We classify in the caller for the same reason: input already resolves a keypress to a
+/// [`GnomeKeyAction`](crate::gnome::GnomeKeyAction), so it is the layer that knows whether this
+/// key is "the switch binding again" or a plain keysym. The per-popup keys (`w`/`q`/`F4`, the
+/// arrows, the thumbnail list) belong to the subclasses and arrive in slices 2 and 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitcherKey {
+    /// The switch binding fired again — move the selection. Subclass-handled in GNOME, so it
+    /// also reveals the popup immediately (`_showImmediately`, `:201-203`).
+    Advance { backward: bool },
+    /// Escape, or Tab *not* consumed by the popup's own shortcut (`:207-209`).
+    Dismiss,
+    /// Space, Return, KP_Enter or ISO_Enter (`:211-217`) — an explicit "take this one", which is
+    /// the only way to commit a popup opened with no modifier to release.
+    Commit,
+}
+
+/// GNOME's `primaryModifier` (`switcherPopup.js:25-35`): the **highest set bit** of the binding's
+/// modifier mask.
+///
+/// Commit waits on that one modifier rather than on the whole mask, which is what makes
+/// `<Super><Shift>Tab` commit when Super comes up while Shift is still held. Note GNOME reads it
+/// from live pointer state at release time (`:223-227`) rather than tracking key events.
+fn primary_modifier(mask: Modifiers) -> Modifiers {
+    Modifiers::from_bits_truncate(if mask.is_empty() {
+        0
+    } else {
+        1 << (u8::BITS - 1 - mask.bits().leading_zeros())
+    })
+}
+
+/// The shared switcher state machine — `SwitcherPopup` (`js/ui/switcherPopup.js`) minus the item
+/// art, which is the subclasses' job.
+///
+/// It deliberately knows only how *many* items there are, never what they are: an app switcher's
+/// item is an app and a window switcher's is a window, but every rule in here — the delay, the
+/// commit, wraparound, hover suppression, reselection after a removal — is index arithmetic and
+/// timing. That is also what makes it testable before either popup exists.
+///
+/// **Timers are deadlines, not callbacks.** GNOME arms `GLib` timeouts; we store the instant each
+/// one is due and let the caller drive [`poll`](Self::poll), scheduling with
+/// [`next_deadline`](Self::next_deadline). The caller passing `now` explicitly is deliberate —
+/// see [[headless-animation-clock-trap]] for what reading a lazy clock inside a UI does to tests.
+#[derive(Debug)]
+pub struct SwitcherPopup {
+    kind: SwitcherKind,
+    len: usize,
+    selected: usize,
+    visibility: Visibility,
+    /// The modifier whose release commits. Empty for a no-modifier popup, which instead lives on
+    /// [`NO_MODS_TIMEOUT`].
+    modifier: Modifiers,
+    reveal_at: Option<Duration>,
+    no_mods_deadline: Option<Duration>,
+    /// When pointer selection comes back on — see [`DISABLE_HOVER_TIMEOUT`].
+    hover_deadline: Option<Duration>,
+    mouse_active: bool,
+    outcome: Option<SwitcherOutcome>,
+}
+
+impl SwitcherPopup {
+    /// `SwitcherPopup.show` (`switcherPopup.js:122-168`).
+    ///
+    /// Returns `None` for an empty list, where GNOME returns `false` and the binding does nothing
+    /// at all (`:123-124`) — no grab, no popup.
+    ///
+    /// `mask` is the binding's modifiers and `held` is what is *actually* down right now. When the
+    /// modifier is already up, this commits immediately and the popup never reaches
+    /// [`Visibility::Shown`]: the release-before-grab race of bgo#596695 (`:144-155`). The caller
+    /// must still treat that as a completed session and read [`outcome`](Self::outcome).
+    pub fn show(
+        kind: SwitcherKind,
+        len: usize,
+        backward: bool,
+        mask: Modifiers,
+        held: Modifiers,
+        now: Duration,
+    ) -> Option<Self> {
+        let selected = initial_selection(len, backward)?;
+
+        let modifier = primary_modifier(mask);
+        let mut popup = Self {
+            kind,
+            len,
+            selected,
+            visibility: Visibility::Pending,
+            modifier,
+            reveal_at: Some(now + POPUP_DELAY),
+            no_mods_deadline: None,
+            hover_deadline: None,
+            // GNOME leaves `mouseActive` true until something disables it, so a popup opened
+            // under a resting pointer is hover-selectable from the start.
+            mouse_active: true,
+            outcome: None,
+        };
+
+        if modifier.is_empty() {
+            // Nothing to release, so the only automatic commit is the timeout (`:156`).
+            popup.no_mods_deadline = Some(now + NO_MODS_TIMEOUT);
+        } else if !held.contains(modifier) {
+            popup.finish();
+            return Some(popup);
+        }
+
+        Some(popup)
+    }
+
+    pub fn kind(&self) -> SwitcherKind {
+        self.kind
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub fn visibility(&self) -> Visibility {
+        self.visibility
+    }
+
+    /// `Some` once the session has ended; the caller activates the selection on
+    /// [`SwitcherOutcome::Commit`] and then drops the popup after [`FADE_OUT`].
+    pub fn outcome(&self) -> Option<SwitcherOutcome> {
+        self.outcome
+    }
+
+    /// Whether pointer motion currently moves the selection (`mouseActive`).
+    pub fn hover_selects(&self) -> bool {
+        self.mouse_active
+    }
+
+    /// The earliest instant [`poll`](Self::poll) has anything to do, for the event loop to sleep
+    /// until. `None` means no timer is armed.
+    pub fn next_deadline(&self) -> Option<Duration> {
+        [self.reveal_at, self.no_mods_deadline, self.hover_deadline]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Fire whatever is due. Idempotent, and safe to call more often than the deadlines.
+    pub fn poll(&mut self, now: Duration) {
+        if self.reveal_at.is_some_and(|at| now >= at) {
+            self.show_immediately();
+        }
+
+        if self.hover_deadline.is_some_and(|at| now >= at) {
+            self.hover_deadline = None;
+            self.mouse_active = true;
+        }
+
+        if self.no_mods_deadline.is_some_and(|at| now >= at) {
+            self.no_mods_deadline = None;
+            self.finish();
+        }
+    }
+
+    /// `_showImmediately` (`:169-180`) — the delay's only effect is opacity, so this is just
+    /// "stop waiting". Does nothing once the popup is visible or already ending.
+    fn show_immediately(&mut self) {
+        if self.reveal_at.take().is_some() && self.visibility == Visibility::Pending {
+            self.visibility = Visibility::Shown;
+        }
+    }
+
+    /// `vfunc_key_press_event` (`:194-219`), with the key already classified — see
+    /// [`SwitcherKey`].
+    pub fn key_press(&mut self, key: SwitcherKey, now: Duration) {
+        if self.outcome.is_some() {
+            return;
+        }
+
+        // Every keypress suppresses hover, before the key is even dispatched (`:198`).
+        self.disable_hover(now);
+
+        match key {
+            SwitcherKey::Advance { backward } => {
+                if backward {
+                    self.select_previous();
+                } else {
+                    self.select_next();
+                }
+                // A handled key reveals the popup without waiting out the delay (`:201-203`).
+                self.show_immediately();
+            }
+            SwitcherKey::Dismiss => self.cancel(),
+            SwitcherKey::Commit => self.finish(),
+        }
+    }
+
+    /// `vfunc_key_release_event` (`:222-234`): commit when the primary modifier comes up.
+    ///
+    /// `held` is live modifier state, matching GNOME's `global.get_pointer()` sample rather than
+    /// a tally of key events. A no-modifier popup has nothing to release, so a release instead
+    /// re-arms its [`NO_MODS_TIMEOUT`] — the deadline is 1500ms from the *last* key release, not
+    /// from open.
+    pub fn key_release(&mut self, held: Modifiers, now: Duration) {
+        if self.outcome.is_some() {
+            return;
+        }
+
+        if self.modifier.is_empty() {
+            self.no_mods_deadline = Some(now + NO_MODS_TIMEOUT);
+        } else if !held.contains(self.modifier) {
+            self.finish();
+        }
+    }
+
+    /// `_itemEntered` (`:263-266`): hover moves the selection, but only while `mouseActive`.
+    ///
+    /// Returns whether the selection actually moved, so the caller can skip a redraw.
+    pub fn pointer_entered_item(&mut self, item: usize) -> bool {
+        if !self.mouse_active || self.outcome.is_some() || item == self.selected {
+            return false;
+        }
+
+        self.select(item);
+        true
+    }
+
+    /// `_disableHover` (`:290-303`) — clears the flag and (re-)arms the timer that restores it.
+    fn disable_hover(&mut self, now: Duration) {
+        self.mouse_active = false;
+        self.hover_deadline = Some(now + DISABLE_HOVER_TIMEOUT);
+    }
+
+    /// `_itemRemovedHandler` (`:269-284`) — an app stopped running, or a window was closed or
+    /// unmanaged, while the popup is up.
+    ///
+    /// Removing the last item destroys the popup, which is a **cancel**: there is nothing left to
+    /// activate, so committing would have to invent a target.
+    pub fn item_removed(&mut self, n: usize) {
+        if n >= self.len || self.outcome.is_some() {
+            return;
+        }
+
+        self.len -= 1;
+        if self.len == 0 {
+            self.cancel();
+            return;
+        }
+
+        // Below the selection everything shifts up; at it, the slot is reused unless it was the
+        // last. Above it, indices are unaffected and GNOME explicitly reselects nothing.
+        if n < self.selected {
+            self.selected -= 1;
+        } else if n == self.selected {
+            self.selected = n.min(self.len - 1);
+        }
+    }
+
+    pub fn select(&mut self, n: usize) {
+        if self.len > 0 {
+            self.selected = n.min(self.len - 1);
+        }
+    }
+
+    /// `_next` (`:181-183`), wrapping with `mod` (`:21-23`).
+    pub fn select_next(&mut self) {
+        if self.len > 0 {
+            self.selected = (self.selected + 1) % self.len;
+        }
+    }
+
+    /// `_previous` (`:185-187`).
+    pub fn select_previous(&mut self) {
+        if self.len > 0 {
+            self.selected = (self.selected + self.len - 1) % self.len;
+        }
+    }
+
+    /// `_finish` (`:335-341`): activate the selection.
+    fn finish(&mut self) {
+        self.end(SwitcherOutcome::Commit);
+    }
+
+    /// `fadeAndDestroy` reached from Escape (`:208-209`): leave focus alone.
+    fn cancel(&mut self) {
+        self.end(SwitcherOutcome::Cancel);
+    }
+
+    fn end(&mut self, outcome: SwitcherOutcome) {
+        self.outcome = Some(outcome);
+        // A popup that never became visible has nothing to fade — the quick-tap case, where the
+        // whole point is that no frame ever showed it.
+        self.visibility = match self.visibility {
+            Visibility::Pending => Visibility::Pending,
+            _ => Visibility::Fading,
+        };
+        self.reveal_at = None;
+        self.no_mods_deadline = None;
+        self.hover_deadline = None;
+    }
 }
 
 #[cfg(test)]
@@ -241,5 +552,256 @@ mod tests {
         // `show()` bails before any of this on an empty list (`switcherPopup.js:123-124`).
         assert_eq!(initial_selection(0, false), None);
         assert_eq!(initial_selection(0, true), None);
+    }
+
+    const ALT: Modifiers = Modifiers::ALT;
+    const T0: Duration = Duration::ZERO;
+
+    fn open(len: usize) -> SwitcherPopup {
+        SwitcherPopup::show(SwitcherKind::Windows, len, false, ALT, ALT, T0).unwrap()
+    }
+
+    /// The headline: tap Alt-Tab and release inside the delay, and the switch happens with no
+    /// frame ever showing the popup.
+    ///
+    /// This is the behaviour the whole delay exists for, and it is also what pins the grab
+    /// ordering — the release only reaches us because the grab was taken at `show`, long before
+    /// the popup was due to be drawn. Asserting the popup stayed [`Visibility::Pending`] *and*
+    /// committed is the pair that would fail if we ever "simplified" this into a fade-in.
+    #[test]
+    fn a_tap_shorter_than_the_delay_commits_without_ever_drawing() {
+        let mut popup = open(4);
+        assert_eq!(popup.visibility(), Visibility::Pending);
+
+        let tap = POPUP_DELAY / 2;
+        popup.poll(tap);
+        popup.key_release(Modifiers::empty(), tap);
+
+        assert_eq!(popup.outcome(), Some(SwitcherOutcome::Commit));
+        assert_eq!(
+            popup.selected(),
+            1,
+            "the tap switches to the previous window"
+        );
+        assert_eq!(
+            popup.visibility(),
+            Visibility::Pending,
+            "a popup that was never drawn has nothing to fade out"
+        );
+
+        // And it stays invisible: polling past the deadline must not resurrect a dead popup.
+        popup.poll(POPUP_DELAY * 4);
+        assert_eq!(popup.visibility(), Visibility::Pending);
+    }
+
+    /// Holding past the delay draws it; releasing then commits with a fade.
+    #[test]
+    fn holding_past_the_delay_shows_the_popup_and_then_fades_it() {
+        let mut popup = open(4);
+
+        popup.poll(POPUP_DELAY);
+        assert_eq!(popup.visibility(), Visibility::Shown);
+
+        popup.key_press(SwitcherKey::Advance { backward: false }, POPUP_DELAY);
+        assert_eq!(popup.selected(), 2);
+
+        popup.key_release(Modifiers::empty(), POPUP_DELAY);
+        assert_eq!(popup.outcome(), Some(SwitcherOutcome::Commit));
+        assert_eq!(popup.visibility(), Visibility::Fading);
+    }
+
+    /// A second Tab inside the delay reveals the popup immediately (`_showImmediately`).
+    ///
+    /// So the rule is "150ms **or** the next Tab, whichever first" — a fast double-Tab shows the
+    /// popup rather than flickering past it.
+    #[test]
+    fn a_second_tab_inside_the_delay_reveals_the_popup_at_once() {
+        let mut popup = open(4);
+        let early = POPUP_DELAY / 3;
+
+        popup.key_press(SwitcherKey::Advance { backward: false }, early);
+
+        assert_eq!(popup.visibility(), Visibility::Shown);
+        assert_eq!(popup.selected(), 2);
+    }
+
+    /// The modifier can come up before the grab lands, in which case no release is ever
+    /// delivered — so `show` samples it directly (bgo#596695, `switcherPopup.js:144-155`).
+    ///
+    /// Getting this wrong strands the popup on screen until the no-mods timeout, which is the
+    /// visible form of the bug: a switcher that ignores the key you already let go of.
+    #[test]
+    fn a_modifier_released_before_the_grab_commits_at_once() {
+        let popup =
+            SwitcherPopup::show(SwitcherKind::Windows, 4, false, ALT, Modifiers::empty(), T0)
+                .unwrap();
+
+        assert_eq!(popup.outcome(), Some(SwitcherOutcome::Commit));
+        assert_eq!(popup.selected(), 1);
+        assert_eq!(popup.visibility(), Visibility::Pending);
+    }
+
+    /// Commit waits on the mask's *highest* bit, not the whole mask.
+    ///
+    /// `primaryModifier` (`:25-35`). With `<Super><Shift>Tab`, letting go of Shift while Super is
+    /// still down must **not** commit — otherwise shift-tabbing backwards through the list ends
+    /// the session on the first release.
+    #[test]
+    fn only_the_primary_modifier_commits() {
+        let mask = Modifiers::SUPER | Modifiers::SHIFT;
+        assert_eq!(primary_modifier(mask), Modifiers::SUPER);
+        assert_eq!(primary_modifier(Modifiers::empty()), Modifiers::empty());
+
+        let mut popup = SwitcherPopup::show(SwitcherKind::Apps, 4, true, mask, mask, T0).unwrap();
+        assert_eq!(popup.selected(), 3, "backward starts at the end");
+
+        popup.key_release(Modifiers::SUPER, T0);
+        assert_eq!(
+            popup.outcome(),
+            None,
+            "Shift came up, but Super still holds it open"
+        );
+
+        popup.key_release(Modifiers::empty(), T0);
+        assert_eq!(popup.outcome(), Some(SwitcherOutcome::Commit));
+    }
+
+    /// With no modifier to release, the popup commits on a timeout that re-arms on every key
+    /// release (`:229-231`) — so it is 1500ms of *quiet*, not 1500ms from open.
+    #[test]
+    fn a_no_modifier_switcher_commits_after_a_quiet_period() {
+        let mut popup = SwitcherPopup::show(
+            SwitcherKind::Apps,
+            4,
+            false,
+            Modifiers::empty(),
+            Modifiers::empty(),
+            T0,
+        )
+        .unwrap();
+
+        let late = NO_MODS_TIMEOUT - Duration::from_millis(1);
+        popup.poll(late);
+        assert_eq!(popup.outcome(), None);
+
+        // A key release here pushes the deadline out rather than leaving it where it was.
+        popup.key_release(Modifiers::empty(), late);
+        popup.poll(NO_MODS_TIMEOUT);
+        assert_eq!(
+            popup.outcome(),
+            None,
+            "the deadline runs from the last release"
+        );
+
+        popup.poll(late + NO_MODS_TIMEOUT);
+        assert_eq!(popup.outcome(), Some(SwitcherOutcome::Commit));
+    }
+
+    /// Keyboard use parks the pointer, and it stays parked while typing continues.
+    #[test]
+    fn keyboard_use_suppresses_hover_until_things_go_quiet() {
+        let mut popup = open(5);
+        assert!(
+            popup.hover_selects(),
+            "a resting pointer selects until a key is pressed"
+        );
+
+        popup.key_press(SwitcherKey::Advance { backward: false }, T0);
+        assert!(!popup.hover_selects());
+        assert!(
+            !popup.pointer_entered_item(4),
+            "hover is ignored while suppressed"
+        );
+        assert_eq!(popup.selected(), 2);
+
+        // Held Tab keeps re-arming, so hover does not come back mid-traversal.
+        let mut t = T0;
+        for _ in 0..5 {
+            t += DISABLE_HOVER_TIMEOUT - Duration::from_millis(1);
+            popup.poll(t);
+            popup.key_press(SwitcherKey::Advance { backward: false }, t);
+            assert!(!popup.hover_selects(), "still typing at {t:?}");
+        }
+
+        popup.poll(t + DISABLE_HOVER_TIMEOUT);
+        assert!(popup.hover_selects());
+        assert!(popup.pointer_entered_item(4));
+        assert_eq!(popup.selected(), 4);
+    }
+
+    /// Escape leaves focus where it was; the caller must not activate anything.
+    #[test]
+    fn escape_cancels_rather_than_committing() {
+        let mut popup = open(4);
+        popup.poll(POPUP_DELAY);
+
+        popup.key_press(SwitcherKey::Dismiss, POPUP_DELAY);
+
+        assert_eq!(popup.outcome(), Some(SwitcherOutcome::Cancel));
+        assert_eq!(popup.visibility(), Visibility::Fading);
+
+        // A release arriving after the cancel must not turn it into a commit.
+        popup.key_release(Modifiers::empty(), POPUP_DELAY);
+        assert_eq!(popup.outcome(), Some(SwitcherOutcome::Cancel));
+    }
+
+    /// Windows vanish while the popup is up — `_itemRemovedHandler` (`:269-284`).
+    ///
+    /// Reachable in one step: F4 inside the switcher. Each branch shifts the selection
+    /// differently, and the last removal ends the session rather than leaving an empty panel.
+    #[test]
+    fn removing_an_item_reselects_by_position() {
+        // Below the selection: everything shifts up, so the selection follows.
+        let mut popup = open(5);
+        popup.select(3);
+        popup.item_removed(1);
+        assert_eq!((popup.len(), popup.selected()), (4, 2));
+
+        // Above it: indices are unaffected and GNOME reselects nothing.
+        let mut popup = open(5);
+        popup.select(1);
+        popup.item_removed(4);
+        assert_eq!((popup.len(), popup.selected()), (4, 1));
+
+        // At it: the slot is reused by whatever shifted into it.
+        let mut popup = open(5);
+        popup.select(2);
+        popup.item_removed(2);
+        assert_eq!((popup.len(), popup.selected()), (4, 2));
+
+        // At it, and it was last: clamp back onto the new end.
+        let mut popup = open(5);
+        popup.select(4);
+        popup.item_removed(4);
+        assert_eq!((popup.len(), popup.selected()), (4, 3));
+    }
+
+    /// Closing the last window ends the session — and ends it as a *cancel*, because there is
+    /// nothing left to activate and a commit would have to invent a target.
+    #[test]
+    fn removing_the_last_item_ends_the_session() {
+        let mut popup = open(1);
+        popup.item_removed(0);
+
+        assert_eq!(popup.len(), 0);
+        assert_eq!(popup.outcome(), Some(SwitcherOutcome::Cancel));
+    }
+
+    /// Traversal wraps in both directions (`mod`, `:21-23`).
+    #[test]
+    fn traversal_wraps_at_both_ends() {
+        let mut popup = open(3);
+        popup.select(2);
+        popup.select_next();
+        assert_eq!(popup.selected(), 0);
+        popup.select_previous();
+        assert_eq!(popup.selected(), 2);
+    }
+
+    /// An empty list opens nothing at all — no grab, no popup, and the binding is a no-op
+    /// (`:123-124`).
+    #[test]
+    fn an_empty_list_does_not_open() {
+        assert!(SwitcherPopup::show(SwitcherKind::Windows, 0, false, ALT, ALT, T0).is_none());
     }
 }
