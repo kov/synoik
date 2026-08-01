@@ -75,6 +75,14 @@ pub struct AppEntry {
     /// which drives the new-window launch preference *and* fills the action section
     /// of the app context menu (`AppMenu.setApp`, `appMenu.js:229-242`).
     pub actions: Vec<DesktopAction>,
+    /// The XDG `SingleMainWindow` key, or GNOME's older `X-GNOME-SingleWindow`
+    /// fallback — `Some(true)` for an app that declares it only ever has one window.
+    ///
+    /// `None` means *neither key is present*, which is not the same as `Some(false)`:
+    /// `shell_app_can_open_new_window` only consults the key when
+    /// `g_desktop_app_info_has_key` says it is there, and otherwise carries on down
+    /// the ladder (`shell-app.c:629-642`).
+    pub single_main_window: Option<bool>,
     /// `g_app_info_should_show()`. Consumers filter on this; the catalog keeps
     /// everything so favorites/launch can still resolve `NoDisplay` apps.
     pub should_show: bool,
@@ -604,20 +612,47 @@ impl AppSystem {
     }
 
     /// Whether `id` can be asked for a new window — `shell_app_can_open_new_window`
-    /// (`shell-app.c:598-670`) reduced to what we can observe.
+    /// (`shell-app.c:601-672`).
     ///
-    /// GNOME's ladder consults the app's exported action group and the
-    /// `SingleMainWindow` / `X-GNOME-SingleWindow` desktop keys. We have no action
-    /// muxer (`docs/fork/app-lifecycle-port.md` §5); the desktop keys are not in
-    /// [`AppEntry`] yet, so a running app falls through to GNOME's own
-    /// err-on-the-side-of-yes default, and the leading clause — "stopped apps can
-    /// always, starting apps never" (`:606-611`) — is exact.
+    /// The ladder, in GNOME's order:
+    ///
+    /// 1. not RUNNING → stopped yes, starting no (`:610-613`) — exact;
+    /// 2. an exported `app.new-window` GAction → yes. **Not implemented**: we have no action muxer
+    ///    (`docs/fork/app-lifecycle-port.md` §5);
+    /// 3. `SingleMainWindow`, then `X-GNOME-SingleWindow` — the *declared* answer, and the reason
+    ///    it is checked with `has_key` rather than read as a boolean;
+    /// 4. a `new-window` desktop action → yes;
+    /// 5. a unique GtkApplication with no new-window → no. **Not implemented**: it reads the
+    ///    window's GTK application object path and unique bus name, which reach mutter over
+    ///    `gtk_shell1.set_dbus_properties`, a protocol we do not serve. This is the rung that
+    ///    answers "no" for apps like System Monitor, which declare nothing and simply are
+    ///    single-window GtkApplications;
+    /// 6. otherwise yes — GNOME's own err-on-the-side-of-compatibility default (`:667-671`).
+    ///
+    /// So a missing rung 5 makes us say yes where GNOME says no, which shows up as a
+    /// "New Window" row on an app that has no such thing.
     pub fn can_open_new_window(&self, id: &str) -> bool {
         match self.app_state(id) {
-            AppState::Stopped => true,
-            AppState::Starting => false,
-            AppState::Running => true,
+            AppState::Stopped => return true,
+            AppState::Starting => return false,
+            AppState::Running => (),
         }
+
+        let Some(entry) = self.lookup(id) else {
+            // "If the app doesn't have a desktop file, then nothing is possible" (`:624-626`).
+            return false;
+        };
+        if let Some(single) = entry.single_main_window {
+            return !single;
+        }
+        if entry.actions.iter().any(|a| a.id == "new-window") {
+            return true;
+        }
+
+        // Rung 5 — the unique-GtkApplication heuristic — belongs here, and needs
+        // `gtk_shell1.set_dbus_properties`. Without it we fall straight to GNOME's own
+        // final answer, which is yes.
+        true
     }
 
     /// Open a startup sequence for `id` — mutter registering one from its launch
@@ -990,6 +1025,14 @@ fn make_entry(info: &gio::AppInfo) -> Option<AppEntry> {
                 .collect()
         })
         .unwrap_or_default();
+    // `has_key` first: an absent key must stay `None`, since a *present* `false` is a
+    // positive statement that the app can open new windows.
+    let single_main_window = info.downcast_ref::<DesktopAppInfo>().and_then(|d| {
+        ["SingleMainWindow", "X-GNOME-SingleWindow"]
+            .into_iter()
+            .find(|key| d.has_key(key))
+            .map(|key| d.boolean(key))
+    });
     let icon = icon_ref(info.icon(), &id);
     let startup_wm_class = info
         .downcast_ref::<DesktopAppInfo>()
@@ -1014,6 +1057,7 @@ fn make_entry(info: &gio::AppInfo) -> Option<AppEntry> {
         description: info.description().map(|s| s.to_string()),
         commandline: info.commandline(),
         actions,
+        single_main_window,
         should_show: info.should_show(),
         icon,
         startup_wm_class,
@@ -1249,6 +1293,7 @@ impl AppEntry {
             description: None,
             commandline: Some(PathBuf::from(format!("{} %U", name.to_lowercase()))),
             actions: Vec::new(),
+            single_main_window: None,
             should_show: true,
             icon: AppIconRef::Fallback,
             startup_wm_class: None,

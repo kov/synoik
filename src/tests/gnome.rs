@@ -7081,6 +7081,199 @@ fn dash_tile_center(
         .expect("tile index in range")
 }
 
+/// A dash click does three different things depending on the app's state, and only one of them
+/// is a launch — `AppIcon.activate` (`appDisplay.js:3056-3071`) over `shell_app_activate_full`
+/// (`shell-app.c:497-535`).
+///
+/// STOPPED launches; STARTING does nothing at all (`shell-app.c:526-527` is an empty arm);
+/// RUNNING activates the app's most recently used window. Ctrl- and middle-click ask a *running*
+/// app for a new window instead, gated on `can_open_new_window`.
+///
+/// Relaunching a running app is the bug this pins: it opens a startup sequence, which is what
+/// put a busy cursor behind every dash click on an app that was already open. It is also why
+/// dropping the Ctrl modifier *looked* fine on a terminal — whose plain activation opens a window
+/// anyway — and did nothing on Files, whose D-Bus `Activate` presents the window it already has.
+#[test]
+fn a_dash_click_launches_focuses_or_opens_a_new_window_by_state() {
+    use crate::app_system::{
+        AppEntry, AppSystem, DesktopAction, FakeCatalog, RecordingLauncher, ResolvedLaunch,
+    };
+
+    let files = AppEntry {
+        actions: vec![DesktopAction {
+            id: "new-window".to_owned(),
+            name: "New Window".to_owned(),
+        }],
+        ..AppEntry::fake("org.example.Files.desktop", "Files")
+    };
+    let calc = AppEntry::fake("org.example.Calc.desktop", "Calc");
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let recorder = RecordingLauncher::default();
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![files, calc])),
+        Box::new(recorder.clone()),
+    );
+    f.niri().app_system.set_favorites(vec![
+        "org.example.Files.desktop".to_owned(),
+        "org.example.Calc.desktop".to_owned(),
+    ]);
+    f.niri().sync_dash_favorites();
+
+    // Files runs with two windows; Calc stays stopped.
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.Files");
+    let older = f.niri().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.Files");
+    let newer = f.niri().layout.focus().unwrap().id();
+    f.niri_complete_animations();
+
+    let click = |f: &mut Fixture, i: usize| {
+        f.niri_state().do_action(Action::OpenOverview, false);
+        let c = dash_tile_center(f, i);
+        pointer_motion_to(f, c.x, c.y);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+    let verbs = |r: &RecordingLauncher| {
+        r.calls
+            .borrow()
+            .iter()
+            .map(|(entry, verb, _)| (entry.id.clone(), verb.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    // Focus the older window, so "most recently used" is a real choice and not just "the one
+    // that happens to be focused".
+    // The focus *timestamp* is what orders the tab list, and it is stamped when the seat's
+    // keyboard focus actually moves — so this needs a real focus round trip, not just a call.
+    let older_window = f.niri().find_window_by_id(older).unwrap();
+    f.niri_state().focus_window(&older_window);
+    f.niri_state().update_keyboard_focus();
+    f.double_roundtrip(client);
+    f.niri_complete_animations();
+    assert_eq!(f.niri().layout.focus().unwrap().id(), older);
+    let _ = newer;
+
+    // RUNNING, no modifier: focus its most recent window, and *do not launch*.
+    click(&mut f, 0);
+    f.niri_complete_animations();
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "a running app must not be relaunched — that is what opens the spurious startup sequence"
+    );
+    assert_eq!(
+        f.niri().layout.focus().unwrap().id(),
+        older,
+        "it activates the app's most recently used window"
+    );
+    assert_eq!(
+        f.niri().app_system.app_state("org.example.Files.desktop"),
+        crate::app_system::AppState::Running,
+        "and leaves it RUNNING, not STARTING — no busy cursor"
+    );
+
+    // RUNNING + Ctrl: the app's `new-window` desktop action.
+    f.key_press(KEY_LEFTCTRL);
+    click(&mut f, 0);
+    f.key_release(KEY_LEFTCTRL);
+    assert_eq!(
+        verbs(&recorder),
+        vec![(
+            "org.example.Files.desktop".to_owned(),
+            ResolvedLaunch::Action("new-window".to_owned())
+        )],
+        "Ctrl-click on a running app asks for a new window"
+    );
+    recorder.calls.borrow_mut().clear();
+
+    // STOPPED + Ctrl: a plain launch — launching *is* opening the window.
+    f.key_press(KEY_LEFTCTRL);
+    click(&mut f, 1);
+    f.key_release(KEY_LEFTCTRL);
+    assert_eq!(
+        verbs(&recorder),
+        vec![(
+            "org.example.Calc.desktop".to_owned(),
+            ResolvedLaunch::Default
+        )],
+        "a stopped app ignores the modifier"
+    );
+    recorder.calls.borrow_mut().clear();
+
+    // STARTING: nothing at all. Calc is mid-launch after the click above.
+    assert_eq!(
+        f.niri().app_system.app_state("org.example.Calc.desktop"),
+        crate::app_system::AppState::Starting
+    );
+    click(&mut f, 1);
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "clicking an app that is already coming up must not start it again"
+    );
+}
+
+/// `can_open_new_window` honours an app's `SingleMainWindow` / `X-GNOME-SingleWindow`
+/// declaration.
+///
+/// `shell_app_can_open_new_window` (`shell-app.c:601-672`) reaches for the key with
+/// `g_desktop_app_info_has_key` and only then reads it, so a declared `false` and an absent key
+/// are different answers: the first is a positive yes, the second carries on down the ladder.
+///
+/// **That difference is not observable yet**, and this test does not pretend otherwise — the
+/// rungs below the key currently bottom out in GNOME's own "err on the side of yes" default, so
+/// absent and `false` both end at yes. The tri-state is modelled now because the rung that will
+/// make them diverge — a unique GtkApplication with no new-window action, which is what answers
+/// *no* for apps like System Monitor — needs `gtk_shell1.set_dbus_properties`, a protocol we do
+/// not serve. Collapsing the key to a plain boolean today would be invisible and wrong later.
+#[test]
+fn a_single_window_app_cannot_be_asked_for_a_new_window() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let single = AppEntry {
+        single_main_window: Some(true),
+        ..AppEntry::fake("org.example.Single.desktop", "Single")
+    };
+    let declared_multi = AppEntry {
+        single_main_window: Some(false),
+        ..AppEntry::fake("org.example.Multi.desktop", "Multi")
+    };
+    let silent = AppEntry::fake("org.example.Silent.desktop", "Silent");
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![single, declared_multi, silent])),
+        Box::new(RecordingLauncher::default()),
+    );
+
+    let client = f.add_client();
+    for app in [
+        "org.example.Single",
+        "org.example.Multi",
+        "org.example.Silent",
+    ] {
+        map_window_for_app(&mut f, client, app);
+    }
+    f.niri_complete_animations();
+
+    let can = |f: &mut Fixture, id: &str| f.niri().app_system.can_open_new_window(id);
+    assert!(
+        !can(&mut f, "org.example.Single.desktop"),
+        "SingleMainWindow=true is a declaration that there is no new window to open"
+    );
+    assert!(
+        can(&mut f, "org.example.Multi.desktop"),
+        "a declared `false` is a positive yes"
+    );
+    assert!(
+        can(&mut f, "org.example.Silent.desktop"),
+        "and an app that declares nothing falls through to the compatibility default — which \
+         today gives the same answer, see the note above"
+    );
+}
+
 /// A left-click on a dash favorite launches it (plain `Activate` — all our apps
 /// are stopped in S3, `appDisplay.js:3060`) and closes the overview, GNOME's
 /// dash-icon behavior (`dash.js`/`appDisplay.js` `activate` → `_animateOverview`).
@@ -10945,20 +11138,21 @@ fn overview_dash_shows_running_apps_after_a_separator() {
     let run = f.niri().dash.tile_center(1, area).unwrap();
     assert!(sep.loc.x > fav.x && sep.loc.x < run.x);
 
-    // Clicking the running app's tile launches it, like any other dash tile.
+    // Clicking the running app's tile is a live target — but it *activates* rather than
+    // launching, since the app is RUNNING (`shell_app_activate_full`, `shell-app.c:528-530`).
+    // This assertion used to expect a launch, which was the bug behind the busy cursor on every
+    // dash click of an already-open app.
     pointer_motion_to(&mut f, run.x, run.y);
     assert_eq!(f.niri().dash.hovered_for_test(), Some(DashHit::App(1)));
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    assert_eq!(
-        recorder
-            .calls
-            .borrow()
-            .iter()
-            .map(|(e, _, _)| e.id.clone())
-            .collect::<Vec<_>>(),
-        ["runner.desktop"],
-        "the running tile is a live launch target"
+    assert!(
+        recorder.calls.borrow().is_empty(),
+        "a running app is activated, not relaunched"
+    );
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "and the click still took, closing the overview"
     );
 
     // Closing the window drops it back out of the dash, divider and all.

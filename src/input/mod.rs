@@ -45,7 +45,7 @@ use self::pick_window_grab::PickWindowGrab;
 use self::resize_grab::ResizeGrab;
 use self::spatial_movement_grab::SpatialMovementGrab;
 use self::thumb_grab::ThumbGrab;
-use crate::app_system::LaunchMode;
+use crate::app_system::{AppState, LaunchMode};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::gnome::{
@@ -1627,6 +1627,66 @@ impl State {
     /// one (an icon dropped on a workspace thumbnail).
     ///
     /// `origin` only labels the warning on failure.
+    /// A click on an app icon — `AppIcon.activate` (`appDisplay.js:3056-3071`) over
+    /// `shell_app_activate_full` (`shell-app.c:497-535`).
+    ///
+    /// Three states, three different things, and only one of them is a launch:
+    ///
+    /// - **STOPPED** — launch it. Ctrl and middle are ignored, because launching *is* opening the
+    ///   window they are asking for.
+    /// - **STARTING** — do nothing at all (`shell-app.c:526-527`, an empty arm). Clicking a second
+    ///   time while an app is coming up must not start it again.
+    /// - **RUNNING** — activate its most recently used window, *not* a relaunch. Ctrl-click and
+    ///   middle-click instead ask for a new window, gated on
+    ///   [`can_open_new_window`](crate::app_system::AppSystem::can_open_new_window).
+    ///
+    /// Launching a running app unconditionally is what put a startup sequence — and so the busy
+    /// cursor — behind every dash click on an app that was already open.
+    ///
+    /// Returns whether the caller should close the overview: GNOME hides it on every branch
+    /// (`appDisplay.js:3073`), including the one that does nothing.
+    fn activate_app_icon(&mut self, id: &str, button: Option<MouseButton>, origin: &str) {
+        let ctrl = self.niri.seat.get_keyboard().unwrap().modifier_state().ctrl;
+        let wants_new = ctrl || button == Some(MouseButton::Middle);
+
+        match self.niri.app_system.app_state(id) {
+            AppState::Stopped => {
+                self.launch_app(id, LaunchMode::Activate, None, origin);
+            }
+            AppState::Starting => {}
+            AppState::Running => {
+                if wants_new && self.niri.app_system.can_open_new_window(id) {
+                    self.launch_app(id, LaunchMode::NewWindow, None, origin);
+                } else if let Some(window) = self.most_recent_window_of(id) {
+                    self.update_keyboard_focus();
+                    self.focus_window(&window);
+                }
+            }
+        }
+    }
+
+    /// The app's most recently used window — `shell_app_activate_window`'s "most recently used
+    /// NORMAL window" (`shell-app.c:492-495`).
+    ///
+    /// MRU order lives in the compositor's tab list, not in the app model, so this is the
+    /// switcher's own list filtered to the app (the same pairing `app_items` does).
+    fn most_recent_window_of(&self, id: &str) -> Option<smithay::desktop::Window> {
+        let owned: Vec<_> = self
+            .niri
+            .app_system
+            .running_app(id)?
+            .windows
+            .iter()
+            .map(|w| w.id)
+            .collect();
+        let first = self
+            .niri
+            .switcher_tab_list(false)
+            .into_iter()
+            .find(|id| owned.contains(id))?;
+        self.niri.find_window_by_id(first)
+    }
+
     fn launch_app(
         &mut self,
         id: &str,
@@ -5591,12 +5651,12 @@ impl State {
                     mapped.toplevel().send_close();
                 }
             }
-            // A favorite launches and closes the overview. All our apps are stopped,
-            // so this is a plain `Activate` — GNOME's dash icon does `open_new_window`
-            // only for a *running* app (`appDisplay.js:3060`).
+            // A favorite launches and closes the overview. A dash icon is an `AppIcon`
+            // (`DashIcon`, `dash.js:130`), so Ctrl- and middle-click ask it for a new
+            // window — see [`app_click_mode`](Self::app_click_mode).
             OverviewHit::Dash(DashHit::App(i)) if launches => {
                 if let Some(id) = self.niri.dash.item_id(i).map(str::to_owned) {
-                    self.launch_app(&id, LaunchMode::Activate, None, "dash");
+                    self.activate_app_icon(&id, button, "dash");
                     self.niri.layout.close_overview();
                 }
             }
@@ -5607,7 +5667,10 @@ impl State {
             }
             OverviewHit::Search(SearchHit::Result(i)) if launches => {
                 if let Some(id) = self.niri.overview_search.result_id(i).map(str::to_owned) {
-                    self.launch_app(&id, LaunchMode::Activate, None, "search");
+                    // An app search result *is* an `AppIcon`
+                    // (`AppSearchProvider.createResultObject`, `appDisplay.js:1835-1839`),
+                    // so it takes the same two modifiers as the grid.
+                    self.activate_app_icon(&id, button, "search");
                     self.niri.overview_search.clear();
                     self.niri.layout.close_overview();
                 }
@@ -5620,7 +5683,7 @@ impl State {
             // the dialog goes down with the overview.
             OverviewHit::Folder(DialogHit::App(i)) if launches => {
                 if let Some(id) = self.niri.folder_dialog.entry_id(i).map(str::to_owned) {
-                    self.launch_app(&id, LaunchMode::Activate, None, "folder");
+                    self.activate_app_icon(&id, button, "folder");
                     // The overview is going with it, which is GNOME's source-unmapped
                     // path — no shrink to watch.
                     self.niri.folder_dialog.hide();
@@ -5669,7 +5732,7 @@ impl State {
             }
             OverviewHit::GridApp(i) if launches => {
                 if let Some(id) = self.niri.app_grid.entry_id(i).map(str::to_owned) {
-                    self.launch_app(&id, LaunchMode::Activate, None, "app grid");
+                    self.activate_app_icon(&id, button, "app grid");
                     self.niri.layout.close_overview();
                 }
             }
