@@ -109,9 +109,14 @@ pub struct DesktopAction {
 }
 
 /// How a launch was requested — the two verbs of `AppIcon.activate`
-/// (`appDisplay.js:3060`). The caller computes the mode from modifiers; the
-/// running-window branches (`open_new_window` via the app's action group,
-/// activate-existing-window) need running-app tracking and are slice S6.
+/// (`appDisplay.js:3060`). The caller computes the mode from modifiers and from
+/// the app's state; see `State::activate_app_icon`, which owns the three-way
+/// stopped/starting/running split that decides whether a launch happens at all.
+///
+/// Activating an *existing* window is deliberately not a `LaunchMode`: it never
+/// crosses the launcher seam. The one branch still missing is `open_new_window`
+/// through the app's exported action group, which needs an action muxer we do
+/// not have (`docs/fork/app-lifecycle-port.md` §5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchMode {
     /// `shell_app_activate` — for a stopped app this is just launch.
