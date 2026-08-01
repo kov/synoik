@@ -514,6 +514,15 @@ pub struct Niri {
     /// resolves a lock — the curtain landing, a refusal, the shield going away before it lands —
     /// must drain this, or the caller hangs until its D-Bus timeout.
     pub lock_replies: Vec<crate::dbus::gnome_screen_saver::LockReply>,
+    /// The session user's AccountsService account, as far as it has been read.
+    ///
+    /// Defaults are the conservative ones and stay in force until the service answers — most
+    /// importantly `PasswordMode::Regular`, so a lock that happens before the reply lands demands
+    /// a password rather than being a screensaver anyone can wave away.
+    pub user_account: crate::dbus::accounts_service::UserAccount,
+    /// Whether this machine has more than one ordinary account, for the "Other User" button.
+    pub multiple_users: bool,
+
     /// The last `active` we told the session bus about — see [`Self::publish_shield_active`].
     ///
     /// Tracked separately from the model's own `active` because the two deliberately disagree for
@@ -3703,10 +3712,12 @@ impl State {
         let now = crate::utils::get_monotonic_time();
         let effects = match msg {
             ScreenSaverToNiri::Lock(reply) => {
-                // `password_mode == NONE` comes from AccountsService, which we do not read yet;
-                // `false` is the conservative answer (a user *with* a password), and it only
-                // matters once the shield can actually lock.
-                match self.niri.screen_shield.lock(now, false) {
+                // A passwordless account gets a shield that covers the screen and never locks
+                // (`screenShield.js:656-659`). Unknown reads as "has a password" — see
+                // `accounts_service`, where that default is the whole risk of reading this
+                // asynchronously.
+                let passwordless = self.niri.user_account.password_mode.is_none();
+                match self.niri.screen_shield.lock(now, passwordless) {
                     Ok(effects) => {
                         self.niri.lock_replies.extend(reply);
                         effects
@@ -3931,6 +3942,39 @@ impl State {
 
         let effects = self.niri.unlock_dialog.on_verifier_event(event);
         self.apply_unlock_effects(effects);
+    }
+
+    /// AccountsService answered, or the account changed under us.
+    ///
+    /// Both are the same event: re-read and re-render. `PasswordMode` in particular is not
+    /// read-once — a user setting or clearing their password mid-session changes what every
+    /// *later* lock should do, and a cached value would keep locking (or not) the old way.
+    #[cfg(feature = "dbus")]
+    pub fn on_accounts_msg(&mut self, msg: crate::dbus::accounts_service::AccountsToNiri) {
+        use crate::dbus::accounts_service::AccountsToNiri;
+
+        match msg {
+            AccountsToNiri::UserChanged(account) => {
+                if self.niri.user_account == account {
+                    return;
+                }
+                // The real name is the only part the dialog itself holds; it falls back to the
+                // login name when AccountsService has nothing, which is what we did from GECOS.
+                self.niri
+                    .unlock_dialog
+                    .set_real_name(account.real_name.clone());
+                self.niri.user_account = account;
+            }
+            AccountsToNiri::MultipleUsers(multiple) => {
+                if self.niri.multiple_users == multiple {
+                    return;
+                }
+                self.niri.multiple_users = multiple;
+            }
+        }
+        if self.niri.screen_shield.is_active() {
+            self.niri.queue_redraw_all();
+        }
     }
 
     /// Publish a [`ShieldEffects`](crate::screen_shield::ShieldEffects): the shared snapshot the
@@ -5321,6 +5365,8 @@ impl Niri {
             caps_lock: false,
             lock_replies: Vec::new(),
             published_active: false,
+            user_account: Default::default(),
+            multiple_users: false,
             #[cfg(feature = "dbus")]
             gdm_requests: None,
             lock_timer: None,

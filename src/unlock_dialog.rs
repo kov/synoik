@@ -141,6 +141,16 @@ impl UnlockDialog {
         self.status
     }
 
+    /// Replace the account's real name, once AccountsService has one.
+    ///
+    /// The login name is the fallback and is already right, so this only ever *improves* the
+    /// label — an empty name from a machine with no AccountsService leaves it alone rather than
+    /// blanking it (GNOME does blank it while loading, `userWidget.js:159-166`; showing the login
+    /// name is friendlier and is what we had before this existed).
+    pub fn set_real_name(&mut self, real_name: String) {
+        self.user.real_name = real_name;
+    }
+
     pub fn user(&self) -> &UserInfo {
         &self.user
     }

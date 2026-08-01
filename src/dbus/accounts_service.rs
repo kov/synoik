@@ -1,0 +1,280 @@
+//! AccountsService — who the session's user is (`org.freedesktop.Accounts`).
+//!
+//! GNOME reaches this through libaccountsservice rather than raw D-Bus
+//! (`AccountsService.UserManager .get_default().get_user(name)`, `unlockDialog.js:589-591`,
+//! `screenShield.js:651-652`), so the protocol has to be reconstructed here: `FindUserByName` on
+//! `/org/freedesktop/Accounts` gives a `/org/freedesktop/Accounts/User<uid>` path, and the
+//! account's properties live on `org.freedesktop.Accounts.User` there.
+//!
+//! It replaces the passwd entry we used before for the real name, and adds two things passwd cannot
+//! answer: the user's avatar, and whether the account has a password at all.
+//!
+//! # Everything here fails closed
+//!
+//! The properties arrive **asynchronously**, over a service that can be absent, slow, or refuse us.
+//! Meanwhile the lock screen is a thing you can already be looking at. So every value has a safe
+//! reading for "we do not know yet", and it is never the permissive one:
+//!
+//! - `password_mode` unknown means **the account has a password**. The opposite default would make
+//!   the first lock after boot — before the reply lands — a shield that any keypress raises. See
+//!   [`crate::screen_shield::ScreenShield::lock`].
+//! - `real_name` unknown means show the login name, never a placeholder. GNOME blanks the label
+//!   entirely while `is_loaded` is false (`userWidget.js:159-166`); a login name is friendlier and
+//!   is what we already had.
+//! - `icon_file` unknown means the themed `avatar-default-symbolic`.
+
+use std::path::PathBuf;
+
+use futures_util::StreamExt;
+
+const ACCOUNTS_NAME: &str = "org.freedesktop.Accounts";
+const ACCOUNTS_PATH: &str = "/org/freedesktop/Accounts";
+const ACCOUNTS_IFACE: &str = "org.freedesktop.Accounts";
+const USER_IFACE: &str = "org.freedesktop.Accounts.User";
+
+/// `ActUserPasswordMode` (`AccountsService-1.0.gir`), as the `PasswordMode` property's `i`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PasswordMode {
+    /// Password set normally. **The default**, deliberately — see the module docs.
+    #[default]
+    Regular,
+    /// The user will choose a password at next login. Still a password as far as we are concerned.
+    SetAtLogin,
+    /// No password at all: `lock` covers the screen but must not require authentication
+    /// (`screenShield.js:656-659`).
+    None,
+}
+
+impl From<i32> for PasswordMode {
+    fn from(value: i32) -> Self {
+        match value {
+            1 => Self::SetAtLogin,
+            2 => Self::None,
+            // 0 is `REGULAR`; anything AccountsService grows later reads as "has a password",
+            // which is the fail-closed direction.
+            _ => Self::Regular,
+        }
+    }
+}
+
+impl PasswordMode {
+    /// Whether this account can be got into without authenticating.
+    pub fn is_none(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// The account, as far as the lock screen cares.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UserAccount {
+    /// `RealName`. Empty when unset — the caller falls back to the login name.
+    pub real_name: String,
+    /// `IconFile`, **already checked to exist on disk**.
+    ///
+    /// AccountsService will happily report a path that has been deleted, which is why GNOME
+    /// re-tests it before use (`userWidget.js:73-76`). Doing that here rather than at the draw
+    /// keeps the check off the render path.
+    pub icon_file: Option<PathBuf>,
+    pub password_mode: PasswordMode,
+}
+
+#[derive(Debug, Clone)]
+pub enum AccountsToNiri {
+    /// The account's properties, on first read and on every change.
+    UserChanged(UserAccount),
+    /// Whether the "Other User" button has anywhere to go: more than one non-system account exists
+    /// on this machine (`has_multiple_users`, `unlockDialog.js:922`).
+    MultipleUsers(bool),
+}
+
+/// Read the properties we care about off an already-resolved user proxy.
+async fn read_account(user: &zbus::Proxy<'_>) -> UserAccount {
+    let real_name = user
+        .get_property::<String>("RealName")
+        .await
+        .unwrap_or_default();
+
+    let icon_file = user
+        .get_property::<String>("IconFile")
+        .await
+        .ok()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        // The disk check GNOME does. A stale path here would be a permanently missing avatar,
+        // where the themed fallback at least draws something.
+        .filter(|path| path.is_file());
+
+    let password_mode = user
+        .get_property::<i32>("PasswordMode")
+        .await
+        .map_or(PasswordMode::Regular, PasswordMode::from);
+
+    UserAccount {
+        real_name,
+        icon_file,
+        password_mode,
+    }
+}
+
+/// Whether more than one ordinary account exists.
+///
+/// libaccountsservice computes `has_multiple_users` from its cached list; the wire equivalent is
+/// `ListCachedUsers`, which is already the "real people" list — system accounts are not cached.
+async fn multiple_users(conn: &zbus::Connection) -> bool {
+    let Ok(accounts) = zbus::Proxy::new(conn, ACCOUNTS_NAME, ACCOUNTS_PATH, ACCOUNTS_IFACE).await
+    else {
+        return false;
+    };
+    accounts
+        .call_method("ListCachedUsers", &())
+        .await
+        .ok()
+        .and_then(|reply| {
+            reply
+                .body()
+                .deserialize::<Vec<zbus::zvariant::OwnedObjectPath>>()
+                .ok()
+        })
+        .is_some_and(|users| users.len() > 1)
+}
+
+pub fn start(
+    username: String,
+    to_niri: calloop::channel::Sender<AccountsToNiri>,
+) -> anyhow::Result<zbus::blocking::Connection> {
+    let conn = zbus::blocking::Connection::system()?;
+
+    let async_conn = conn.inner().clone();
+    let future = async move {
+        let accounts =
+            match zbus::Proxy::new(&async_conn, ACCOUNTS_NAME, ACCOUNTS_PATH, ACCOUNTS_IFACE).await
+            {
+                Ok(proxy) => proxy,
+                Err(err) => {
+                    warn!("error creating the AccountsService proxy: {err:?}");
+                    return;
+                }
+            };
+
+        let path = match accounts
+            .call_method("FindUserByName", &(username.as_str()))
+            .await
+            .and_then(|reply| {
+                reply
+                    .body()
+                    .deserialize::<zbus::zvariant::OwnedObjectPath>()
+            }) {
+            Ok(path) => path,
+            Err(err) => {
+                // Not fatal, and not even unusual: a machine with no AccountsService, or an account
+                // it does not know about. The defaults are the conservative ones.
+                warn!("AccountsService does not know {username}: {err:?}");
+                return;
+            }
+        };
+
+        let user = match zbus::Proxy::new(&async_conn, ACCOUNTS_NAME, path, USER_IFACE).await {
+            Ok(proxy) => proxy,
+            Err(err) => {
+                warn!("error creating the AccountsService user proxy: {err:?}");
+                return;
+            }
+        };
+
+        // Subscribe before the first read, so a change landing in between is not lost — the same
+        // ordering the presence watcher needs, and for the same reason.
+        //
+        // Both signals, deliberately: the properties are `emits-change`, so
+        // `PropertiesChanged` covers the usual case, but AccountsService also emits its own
+        // argument-less `Changed` on the user object, which is what libaccountsservice listens to
+        // (`userWidget.js:122-125` connects `changed`). Either one just means "re-read".
+        let mut changed = match user.receive_signal("Changed").await {
+            Ok(stream) => stream,
+            Err(err) => {
+                warn!("error subscribing to the AccountsService user: {err:?}");
+                return;
+            }
+        };
+        // `PasswordMode` stands in for the whole property set here: any `PropertiesChanged` on
+        // this object carries it or not, and either way the reaction is to re-read everything.
+        let mut props_changed = user.receive_property_changed::<i32>("PasswordMode").await;
+
+        let _ = to_niri.send(AccountsToNiri::UserChanged(read_account(&user).await));
+        let _ = to_niri.send(AccountsToNiri::MultipleUsers(
+            multiple_users(&async_conn).await,
+        ));
+
+        loop {
+            let re_read = tokio_like_select(&mut changed, &mut props_changed).await;
+            if !re_read {
+                break;
+            }
+            if to_niri
+                .send(AccountsToNiri::UserChanged(read_account(&user).await))
+                .is_err()
+            {
+                break;
+            }
+        }
+    };
+
+    conn.inner()
+        .executor()
+        .spawn(future, "monitor AccountsService")
+        .detach();
+
+    Ok(conn)
+}
+
+/// Wait for either stream to fire; `false` once both are done.
+///
+/// Hand-rolled because there is no `select!` in the dependency set and this is the only place two
+/// signal streams feed one re-read.
+async fn tokio_like_select(
+    changed: &mut (impl StreamExt<Item = zbus::Message> + Unpin),
+    props: &mut (impl StreamExt + Unpin),
+) -> bool {
+    use futures_util::future::{select, Either};
+
+    match select(changed.next(), props.next()).await {
+        Either::Left((item, _)) => item.is_some(),
+        Either::Right((item, _)) => item.is_some(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every unknown reads as "this account has a password".
+    ///
+    /// The permissive default is the dangerous one and it is dangerous *quietly*: the shield still
+    /// covers the screen, so a lock that silently became a screensaver looks exactly like a lock
+    /// until someone taps a key and is let straight in. AccountsService being slow, absent, or not
+    /// knowing the account all land here.
+    #[test]
+    fn an_unknown_password_mode_still_takes_a_password() {
+        assert!(!PasswordMode::default().is_none(), "the default");
+        assert!(!PasswordMode::from(0).is_none(), "REGULAR");
+        assert!(
+            !PasswordMode::from(1).is_none(),
+            "SET_AT_LOGIN is still a password"
+        );
+        assert!(
+            !PasswordMode::from(7).is_none(),
+            "a value AccountsService grows later must not unlock the screen"
+        );
+        assert!(
+            !PasswordMode::from(-1).is_none(),
+            "nor must a nonsense one — the property is a signed int on the wire"
+        );
+
+        // The one value that means it.
+        assert!(PasswordMode::from(2).is_none(), "NONE");
+
+        // And an account nobody has answered for yet.
+        assert!(!UserAccount::default().password_mode.is_none());
+        assert_eq!(UserAccount::default().icon_file, None);
+        assert_eq!(UserAccount::default().real_name, "");
+    }
+}

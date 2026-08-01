@@ -3,6 +3,7 @@ use zbus::object_server::Interface;
 
 use crate::niri::State;
 
+pub mod accounts_service;
 pub mod bluez;
 pub mod calendar_server;
 pub mod freedesktop_a11y;
@@ -74,6 +75,7 @@ pub struct DBusServers {
     pub conn_login1: Option<Connection>,
     /// gnome-session's presence, the shield's idle source.
     pub conn_presence: Option<Connection>,
+    pub conn_accounts: Option<Connection>,
     pub conn_locale1: Option<Connection>,
     pub conn_keyboard_monitor: Option<Connection>,
     pub conn_system_status: Option<Connection>,
@@ -336,6 +338,18 @@ impl DBusServers {
         match gnome_session_presence::start(to_niri) {
             Ok(conn) => dbus.conn_presence = Some(conn),
             Err(err) => warn!("error starting gnome-session presence watcher: {err:?}"),
+        }
+
+        let (to_niri, from_accounts) = calloop::channel::channel();
+        niri.event_loop
+            .insert_source(from_accounts, move |event, _, state| match event {
+                calloop::channel::Event::Msg(msg) => state.on_accounts_msg(msg),
+                calloop::channel::Event::Closed => (),
+            })
+            .unwrap();
+        match accounts_service::start(niri.unlock_dialog.user().name.clone(), to_niri) {
+            Ok(conn) => dbus.conn_accounts = Some(conn),
+            Err(err) => warn!("error starting AccountsService watcher: {err:?}"),
         }
 
         let (to_niri, from_locale1) = calloop::channel::channel();
