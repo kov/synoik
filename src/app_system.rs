@@ -715,6 +715,25 @@ impl AppSystem {
         self.catalog.lookup(id)
     }
 
+    /// An app by the id apps identify themselves with — a desktop file's basename **without**
+    /// `.desktop`: the fdo `desktop-entry` hint, MPRIS's `DesktopEntry`, an app name.
+    ///
+    /// Every reference call site spells this the same way — `lookup_app(`${id}.desktop`)`
+    /// (`notificationDaemon.js:80,83`, `mpris.js:168`) — so the `.desktop` convention lives here
+    /// once instead of at each caller.
+    ///
+    /// The suffix is appended **unconditionally, like GNOME's**: an id that already ends in
+    /// `.desktop` becomes `foo.desktop.desktop` and resolves to nothing. That looks like a bug to
+    /// fix and is not one — the fdo spec defines `desktop-entry` as the name *without* the
+    /// extension, so tolerating a suffixed id would resolve apps GNOME leaves unresolved, and the
+    /// notification/media header would then diverge on exactly the inputs this exists to match.
+    pub fn lookup_desktop_id(&self, id: &str) -> Option<AppEntry> {
+        if id.is_empty() {
+            return None;
+        }
+        self.lookup(&format!("{id}.desktop"))
+    }
+
     /// The app a notification came from — `FdoNotificationDaemon._getApp`
     /// (`js/ui/notificationDaemon.js:74-86`), which is what gives a notification's *source* its
     /// title and icon: `get title() { app?.get_name() ?? appName }`, `get icon() {
@@ -722,33 +741,23 @@ impl AppSystem {
     /// fallback for when no app resolves — which is why a browser's web notification, sent with an
     /// empty `app_icon` and a `desktop-entry` hint, still shows the browser's own logo.
     ///
-    /// **Divergence:** GNOME tries the sender's *pid* first
-    /// (`WindowTracker.get_app_from_pid`) and we have no pid→app map — ours is
-    /// [`app_for_window`](Self::app_for_window), keyed by `app_id`. So we implement GNOME's
-    /// second and third steps only: the `desktop-entry` hint, then the app name. An app that
-    /// sends neither a usable hint nor a name matching its desktop id falls back to `app_icon`
-    /// where GNOME would still have found it by pid.
+    /// GNOME's steps, in order: the sender's pid, then the `desktop-entry` hint, then the app
+    /// name.
+    ///
+    /// **Divergence — the pid step is missing.** GNOME asks
+    /// `WindowTracker.get_app_from_pid(pid)` first and we have no pid→app map; ours is
+    /// [`app_for_window`](Self::app_for_window), keyed by `app_id`. So an app that sends neither a
+    /// usable hint nor a name matching its desktop id falls back to `app_icon` where GNOME would
+    /// still have found it. `NotifyRequest` already carries the pid, so this is a wiring job the
+    /// day window↔pid tracking exists, not a redesign.
     pub fn app_for_notification(
         &self,
         desktop_entry: Option<&str>,
         app_name: &str,
     ) -> Option<AppEntry> {
-        // `lookup_app` is given `${id}.desktop`; a hint may already carry the suffix.
-        let with_suffix = |id: &str| {
-            if id.ends_with(".desktop") {
-                id.to_owned()
-            } else {
-                format!("{id}.desktop")
-            }
-        };
         desktop_entry
-            .filter(|e| !e.is_empty())
-            .and_then(|e| self.lookup(&with_suffix(e)))
-            .or_else(|| {
-                Some(app_name)
-                    .filter(|n| !n.is_empty())
-                    .and_then(|n| self.lookup(&with_suffix(n)))
-            })
+            .and_then(|e| self.lookup_desktop_id(e))
+            .or_else(|| self.lookup_desktop_id(app_name))
     }
 
     /// An app folder's members, in display order — `FolderView._loadApps`
@@ -1285,15 +1294,23 @@ mod tests {
         let system =
             AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
 
-        // The hint wins, and it works with or without the `.desktop` suffix.
+        // The hint wins.
         let by_hint = system.app_for_notification(Some("firefox"), "");
         assert_eq!(by_hint.map(|a| a.name), Some("Firefox".to_owned()));
         assert_eq!(
             system
-                .app_for_notification(Some("chromium-browser.desktop"), "")
+                .app_for_notification(Some("chromium-browser"), "")
                 .map(|a| a.name),
             Some("Chromium".to_owned())
         );
+
+        // `.desktop` is appended unconditionally, exactly as the reference does
+        // (`notificationDaemon.js:80`, `mpris.js:168`), so an already-suffixed id resolves to
+        // nothing. Asserted on purpose: "tolerate the suffix" is a tempting robustness fix that
+        // would make us resolve apps GNOME does not.
+        assert!(system
+            .app_for_notification(Some("firefox.desktop"), "")
+            .is_none());
 
         // No hint: fall back to the app name, GNOME's third step.
         assert_eq!(
@@ -1314,6 +1331,15 @@ mod tests {
             .app_for_notification(Some("nope"), "also-nope")
             .is_none());
         assert!(system.app_for_notification(None, "").is_none());
+
+        // The MPRIS card's step is the same primitive with no fallbacks — `mpris.js:167-172`
+        // consults `DesktopEntry` and nothing else, so a player that publishes none stays
+        // unresolved rather than falling back to its `Identity`.
+        assert_eq!(
+            system.lookup_desktop_id("firefox").map(|a| a.name),
+            Some("Firefox".to_owned())
+        );
+        assert!(system.lookup_desktop_id("").is_none());
     }
 
     #[test]

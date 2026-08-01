@@ -3878,10 +3878,12 @@ impl State {
 
         let changed = match msg {
             MprisToNiri::PlayerUpdated { bus_name, state } => {
+                // `mpris.js:167-172`: the `DesktopEntry` property, and nothing else — no pid or
+                // identity fallback, unlike a notification's `_getApp`.
                 let app = state
                     .desktop_entry
-                    .as_ref()
-                    .and_then(|entry| self.niri.app_system.lookup(&format!("{entry}.desktop")));
+                    .as_deref()
+                    .and_then(|entry| self.niri.app_system.lookup_desktop_id(entry));
                 self.niri.mpris.update(bus_name, *state, app)
             }
             MprisToNiri::PlayerRemoved { bus_name } => self.niri.mpris.remove(&bus_name),
