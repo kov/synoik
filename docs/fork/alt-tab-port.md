@@ -214,6 +214,12 @@ what a `WindowIcon` contains; the item metrics above describe `both` only.
 
 Each is independently landable and testable against the conformance corpus.
 
+**Status 2026-07-31: slices 1–3 are landed, along with the `recent-windows`/`mru.rs` removal and
+both `current-workspace-only` settings.** The multi-window arrow landed with them, on a real
+triangle primitive (`Painter::triangle` / `sdf_triangle.frag`) rather than faked chrome — which is
+also the verb slice 6's scroll arrows will want. Slices 4–6 and `Above_Tab`'s per-layout resolution
+are untouched.
+
 1. **Shared base + chrome.** `SwitcherPopup` timing/keynav/commit rules, the window list
    (`getWindows` semantics, below) that `_finish` needs to activate anything, and the
    `.switcher-list` panel. No item art. **Does not touch the `switch-*` bindings** — see the
