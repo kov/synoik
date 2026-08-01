@@ -7122,6 +7122,82 @@ fn the_screen_saver_bus_calls_drive_the_shield() {
     );
 }
 
+/// gnome-session saying the seat went idle covers the screen and arms the delayed lock; saying it
+/// came back takes both away.
+///
+/// Driven through `State::on_presence_msg`, the entry point the presence watcher calls, so the
+/// timer plumbing is in the loop and not just the model
+/// ([[test-the-code-not-a-reimplementation]]). The observable for "a lock is pending" is
+/// `lock_timer`, because there is nothing else to look at until it fires — and a leaked timer is
+/// exactly the bug that locks a desktop the user is sitting at.
+#[test]
+fn going_idle_arms_the_lock_and_coming_back_disarms_it() {
+    use crate::dbus::gnome_session_presence::{PresenceStatus, PresenceToNiri};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state()
+        .on_presence_msg(PresenceToNiri::StatusChanged(PresenceStatus::Idle));
+    assert!(f.niri().screen_shield.is_active(), "idle covers the screen");
+    assert!(
+        !f.niri().screen_shield.is_locked(),
+        "but only the timer locks"
+    );
+    assert!(f.niri().lock_timer.is_some(), "the grace period is running");
+
+    f.niri_state()
+        .on_presence_msg(PresenceToNiri::StatusChanged(PresenceStatus::Available));
+    assert!(!f.niri().screen_shield.is_active(), "coming back raises it");
+    assert!(
+        f.niri().lock_timer.is_none(),
+        "and takes the pending lock with it, or the desktop locks under the user"
+    );
+}
+
+/// A status we do not recognise is not idleness.
+///
+/// gnome-session can grow a new `PresenceStatus`, and mapping an unknown one onto idle would blank
+/// the screen for a reason nobody chose.
+#[test]
+fn an_unknown_presence_status_does_not_blank_the_screen() {
+    use crate::dbus::gnome_session_presence::{PresenceStatus, PresenceToNiri};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state()
+        .on_presence_msg(PresenceToNiri::StatusChanged(PresenceStatus::Unknown(42)));
+    assert!(!f.niri().screen_shield.is_active());
+    assert!(f.niri().lock_timer.is_none());
+}
+
+/// logind's `PrepareForSleep(true)` locks before the machine goes down, with no grace period.
+///
+/// The delay inhibitor is what buys the time to do this at all, so the assertion that matters is
+/// that the shield is *covered and asking to lock* by the time the handler returns — anything
+/// deferred to a timer would run after the suspend.
+#[test]
+fn suspending_covers_the_screen_immediately() {
+    use crate::dbus::freedesktop_login1::Login1ToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state()
+        .on_login1_msg(Login1ToNiri::PrepareForSleep(true));
+    assert!(f.niri().screen_shield.is_active());
+    assert!(
+        f.niri().lock_timer.is_none(),
+        "a suspend has no grace period"
+    );
+
+    // Resuming wakes the screen but leaves the shield where it is.
+    f.niri_state()
+        .on_login1_msg(Login1ToNiri::PrepareForSleep(false));
+    assert!(f.niri().screen_shield.is_active());
+}
+
 /// `disable-lock-screen` makes `Lock` a no-op — the shield does not even go down.
 ///
 /// GNOME returns *before* `activate` (`screenShield.js:638-641`), so a locked-down session does

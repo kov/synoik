@@ -513,6 +513,17 @@ pub struct Niri {
     /// behaviour rather than a degradation.
     #[cfg(feature = "dbus")]
     pub gdm_requests: Option<async_channel::Sender<crate::dbus::gdm::VerifierRequest>>,
+    /// The pending idle lock (`_lockTimeoutId`). Armed when the session goes idle, dropped when
+    /// the user comes back — the grace period is exactly this token's lifetime.
+    pub lock_timer: Option<calloop::RegistrationToken>,
+    /// logind's `Session.Active`: whether our VT is the one on screen. Assumed true until logind
+    /// says otherwise, which is right for the usual case of starting on the active VT.
+    pub session_active: bool,
+    /// logind's `delay` sleep inhibitor, held while a suspend would still owe a lock. Dropping the
+    /// fd is what tells logind to go ahead and suspend, so this field's *lifetime* is the
+    /// mechanism, not a handle we happen to keep.
+    #[cfg(feature = "dbus")]
+    pub sleep_inhibitor: Option<zbus::zvariant::OwnedFd>,
     /// What `GetActive` / `GetActiveTime` read, mirrored out of [`Self::screen_shield`] on every
     /// change so the bus task can answer without a round trip through the event loop.
     #[cfg(feature = "dbus")]
@@ -3498,6 +3509,20 @@ impl State {
                 };
                 self.apply_shield_effects(effects);
             }
+            Login1ToNiri::SessionActive(active) => {
+                self.niri.session_active = active;
+                self.sync_sleep_inhibitor();
+            }
+            // The last moment before the machine goes down — logind is holding the suspend on our
+            // delay inhibitor, and `apply_shield_effects` releases it once we have locked.
+            Login1ToNiri::PrepareForSleep(about_to_suspend) => {
+                let now = crate::utils::get_monotonic_time();
+                let effects =
+                    self.niri
+                        .screen_shield
+                        .prepare_for_sleep(about_to_suspend, now, false);
+                self.apply_shield_effects(effects);
+            }
             Login1ToNiri::BrightnessWriteDone { connector, outcome } => {
                 let Some(tty) = self.backend.tty_checked() else {
                     return;
@@ -3862,8 +3887,96 @@ impl State {
                 self.niri.update_locked_hint();
             }
         }
-        #[cfg(not(feature = "dbus"))]
-        let _ = effects;
+
+        if effects.cancel_dialog {
+            self.niri.unlock_dialog.cancel();
+        }
+
+        if effects.cancel_lock_timer {
+            if let Some(token) = self.niri.lock_timer.take() {
+                self.niri.event_loop.remove(token);
+            }
+        }
+
+        if let Some(delay) = effects.arm_lock_timer {
+            self.arm_lock_timer(delay);
+        }
+
+        // Last, and unconditionally: the inhibitor is a function of the state we just moved to, and
+        // the suspend path *depends* on it being dropped here — logind is waiting on that fd.
+        self.sync_sleep_inhibitor();
+    }
+
+    /// Arm the idle grace period. Any timer already pending is replaced, never stacked.
+    fn arm_lock_timer(&mut self, delay: std::time::Duration) {
+        if let Some(token) = self.niri.lock_timer.take() {
+            self.niri.event_loop.remove(token);
+        }
+
+        let timer = calloop::timer::Timer::from_duration(delay);
+        let token = self
+            .niri
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.niri.lock_timer = None;
+                let now = crate::utils::get_monotonic_time();
+                match state.niri.screen_shield.lock(now, false) {
+                    Ok(effects) => state.apply_shield_effects(effects),
+                    Err(crate::screen_shield::LockRefused::LockedDown) => {
+                        debug!("screen lock is locked down; the idle shield stays a screensaver");
+                    }
+                }
+                calloop::timer::TimeoutAction::Drop
+            })
+            .map_err(|err| warn!("error arming the idle lock timer: {err:?}"))
+            .ok();
+        self.niri.lock_timer = token;
+    }
+
+    /// Hold or release logind's `delay` sleep inhibitor to match the shield's state
+    /// (`_syncInhibitor`, `screenShield.js:202-231`).
+    #[cfg(feature = "dbus")]
+    pub fn sync_sleep_inhibitor(&mut self) {
+        let want = self
+            .niri
+            .screen_shield
+            .wants_sleep_inhibitor(self.niri.session_active);
+        if want == self.niri.sleep_inhibitor.is_some() {
+            return;
+        }
+
+        if !want {
+            // Dropping the fd is the "go ahead" logind is blocked on.
+            self.niri.sleep_inhibitor = None;
+            return;
+        }
+
+        let Some(conn) = self.niri.dbus.as_ref().and_then(|d| d.conn_login1.as_ref()) else {
+            return;
+        };
+        self.niri.sleep_inhibitor = crate::dbus::freedesktop_login1::take_sleep_inhibitor(conn);
+    }
+
+    #[cfg(not(feature = "dbus"))]
+    pub fn sync_sleep_inhibitor(&mut self) {}
+
+    /// gnome-session's presence changed (`_onStatusChanged`, `screenShield.js:242-272`).
+    #[cfg(feature = "dbus")]
+    pub fn on_presence_msg(&mut self, msg: crate::dbus::gnome_session_presence::PresenceToNiri) {
+        use crate::dbus::gnome_session_presence::{PresenceStatus, PresenceToNiri};
+
+        let PresenceToNiri::StatusChanged(status) = msg;
+        let now = crate::utils::get_monotonic_time();
+
+        let effects = if status == PresenceStatus::Idle {
+            self.niri.screen_shield.on_session_idle(now)
+        } else {
+            // Anything other than idle means the seat is being used again. GNOME hangs this on the
+            // idle monitor's user-active watch rather than on presence, which fires sooner; ours is
+            // coarser but arrives for the same reason and cancels the same pending lock.
+            self.niri.screen_shield.on_user_active()
+        };
+        self.apply_shield_effects(effects);
     }
 
     pub fn on_brightness_msg(
@@ -4978,6 +5091,10 @@ impl Niri {
             ),
             #[cfg(feature = "dbus")]
             gdm_requests: None,
+            lock_timer: None,
+            session_active: true,
+            #[cfg(feature = "dbus")]
+            sleep_inhibitor: None,
             #[cfg(feature = "dbus")]
             shield_snapshot: Default::default(),
             #[cfg(feature = "dbus")]

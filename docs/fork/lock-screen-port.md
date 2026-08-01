@@ -52,10 +52,11 @@ live on this machine, so the path is available.
 3. **The unlock dialog + gdm auth** — the password entry, the avatar and user name, error and
    retry states, `OpenReauthenticationChannel` and the `UserVerifier` conversation. **Landed**
    (`src/dbus/gdm.rs`, `src/unlock_dialog.rs`, the prompt page in `src/ui/lock_screen.rs`).
-4. **Integration** — idle → `lock-delay` and `PrepareForSleep`, `lockIfWasLocked` after a crash
-   (`:663-674`). logind's session `Lock`/`Unlock` **landed early** with slice 3: without `Unlock`,
-   authenticating at gdm's own login screen switches the VT back to a session that is still
-   locked, which is a stuck session rather than a missing feature.
+4. **Integration** — idle → `lock-delay`, and `PrepareForSleep`. **Landed**
+   (`src/dbus/gnome_session_presence.rs`, the sleep handling in `src/dbus/freedesktop_login1.rs`).
+   logind's session `Lock`/`Unlock` **landed early** with slice 3: without `Unlock`, authenticating
+   at gdm's own login screen switches the VT back to a session that is still locked, which is a
+   stuck session rather than a missing feature. `lockIfWasLocked` was **dropped** — see below.
 5. **The look** — deferred deliberately until the shield *works*, at Gustavo's call (2026-08-01,
    after seat-validating slice 2):
    - the **blur**. `BLUR_RADIUS = 90` over the wallpaper (`unlockDialog.js:35`), paired with the
@@ -88,6 +89,35 @@ Two hazards it closes, both pinned by tests in `screen_shield.rs`:
   read the session.
 
 **First seat test: open a second VT before typing a wrong password.**
+
+## Going idle, and going to sleep
+
+Two ways in besides someone asking, and they want opposite things.
+
+**Idle is patient.** The threshold is *not ours*: `org.gnome.desktop.session idle-delay` belongs to
+gnome-session, which watches the seat through mutter's `IdleMonitor` — the one we already serve —
+and publishes its verdict on `org.gnome.SessionManager.Presence`. The shell only listens
+(`screenShield.js:78-88`). Reimplementing the threshold against our own idle monitor would be less
+machinery and worse: gsd-power, the presence indicator and everything else honouring idleness would
+go idle at a moment the screen did not, and `idle-delay = 0` would stop meaning "never".
+
+On IDLE the screen is covered and a timer is armed for `max(STANDARD_FADE_TIME, lock-delay)` —
+**ten seconds even when `lock-delay` is the default zero**, because the 10 s fade is a floor, not
+just an animation. Coming back cancels the timer, and that cancellation is the whole feature: a
+screensaver you dismiss must not lock you out a moment later.
+
+**Sleep is not patient.** `PrepareForSleep(true)` locks immediately, no grace period — a machine
+about to suspend must not suspend unlocked. This only works because of the `delay` sleep inhibitor
+(`_syncInhibitor`, `:202-231`): holding that fd is what makes logind emit the signal and *wait* for
+us. It is held exactly while a future suspend would still owe a lock — not while already covered,
+not on a background VT, not when locking is off — and dropping it is how we say "go ahead". Its
+absence is not cosmetic: it silently turns the suspend lock into a race.
+
+**`lockIfWasLocked` is deliberately not ported.** It reads a runtime-state key that nothing writes
+any more: the write was X11-only and went away with the X11 backend (`71b19fa42`, Nov 2025), whose
+own comment is the reason — *"On wayland, a crash brings down the entire session, so we don't need
+to defend against being restarted unlocked."* We are Wayland-only, so porting it would be porting
+a function that always returns early.
 
 ## `.../session/auto` is not our session
 
@@ -177,5 +207,10 @@ process. What is done about it, and what is not:
   route by `service_name` — but GNOME also rewrites fingerprint `Info` into its own hint text
   (`util.js:727-732`) and counts its `Problem`s against `allowed-failures` (`:745-775`), so it is
   not merely a second subscription.
-- **`lock-delay`** (the grace period between blanking and locking) is not modelled; it belongs
-  with slice 4's idle integration.
+- **The idle path does not fade.** GNOME raises a black lightbox over the desktop and only puts the
+  shield down when that 10 s fade completes; we cover the screen at once. The grace period before
+  *locking* is the same length either way — it just looks like the curtain instead of a dimming
+  desktop. The fade is slice 5's, with the other animations.
+- **User-active comes from presence, not the idle monitor.** GNOME cancels the pending lock from
+  the core idle monitor's `add_user_active_watch`, which fires on the first input; ours rides
+  gnome-session's next non-idle `StatusChanged`, which is coarser. Same trigger, slightly later.

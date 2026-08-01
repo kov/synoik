@@ -584,6 +584,10 @@ impl GnomeSettings {
         if settings_has_key(screensaver, "lock-enabled") {
             self.shield.lock_enabled = screensaver.boolean("lock-enabled");
         }
+        if settings_has_key(screensaver, "lock-delay") {
+            self.shield.lock_delay =
+                std::time::Duration::from_secs(u64::from(screensaver.uint("lock-delay")));
+        }
     }
 
     fn load_background(&mut self, background: &gio::Settings, interface: Option<&gio::Settings>) {

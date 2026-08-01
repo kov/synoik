@@ -13,6 +13,7 @@ pub mod freedesktop_screensaver;
 pub mod gdm;
 pub mod gnome_screen_saver;
 pub mod gnome_session;
+pub mod gnome_session_presence;
 pub mod gnome_shell;
 pub mod gnome_shell_brightness;
 pub mod gnome_shell_introspect;
@@ -71,6 +72,8 @@ pub struct DBusServers {
     pub conn_notifications: Option<Connection>,
     pub conn_gtk_notifications: Option<Connection>,
     pub conn_login1: Option<Connection>,
+    /// gnome-session's presence, the shield's idle source.
+    pub conn_presence: Option<Connection>,
     pub conn_locale1: Option<Connection>,
     pub conn_keyboard_monitor: Option<Connection>,
     pub conn_system_status: Option<Connection>,
@@ -321,6 +324,18 @@ impl DBusServers {
             Err(err) => {
                 warn!("error starting login1 watcher: {err:?}");
             }
+        }
+
+        let (to_niri, from_presence) = calloop::channel::channel();
+        niri.event_loop
+            .insert_source(from_presence, move |event, _, state| match event {
+                calloop::channel::Event::Msg(msg) => state.on_presence_msg(msg),
+                calloop::channel::Event::Closed => (),
+            })
+            .unwrap();
+        match gnome_session_presence::start(to_niri) {
+            Ok(conn) => dbus.conn_presence = Some(conn),
+            Err(err) => warn!("error starting gnome-session presence watcher: {err:?}"),
         }
 
         let (to_niri, from_locale1) = calloop::channel::channel();

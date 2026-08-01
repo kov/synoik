@@ -49,6 +49,14 @@ pub struct ShieldEffects {
     /// Tear any conversation down: the shield was raised, so gdm's PAM worker and its channel must
     /// not outlive it.
     pub cancel_authenticator: bool,
+    /// Arm a one-shot timer that calls [`ScreenShield::lock`] after this long
+    /// (`_onStatusChanged`, `:257-271`). Replaces any timer already pending.
+    pub arm_lock_timer: Option<Duration>,
+    /// Drop a pending lock timer — the shield was raised before it could fire.
+    pub cancel_lock_timer: bool,
+    /// `_maybeCancelDialog` (`:186-191`) — put the prompt page back to the clock, so an
+    /// unattended screen is not left holding a half-typed password.
+    pub cancel_dialog: bool,
 }
 
 /// The lockdown and screensaver settings [`ScreenShield`] consults.
@@ -63,7 +71,17 @@ pub struct ShieldSettings {
     /// `org.gnome.desktop.lockdown disable-show-password` — removes the unlock entry's peek
     /// toggle (`st-password-entry.c:61-68`).
     pub disable_show_password: bool,
+    /// `org.gnome.desktop.screensaver lock-delay` — the grace period between the session going
+    /// idle and the shield actually locking, so a user who comes straight back is not challenged.
+    pub lock_delay: Duration,
 }
+
+/// `STANDARD_FADE_TIME` (`:39`) — the fade GNOME runs when the session goes idle.
+///
+/// It is a floor on the lock delay, not just an animation: `_onStatusChanged` locks after
+/// `max(STANDARD_FADE_TIME, lock-delay)`, so the default `lock-delay = 0` still leaves ten seconds
+/// rather than locking the instant the session is declared idle.
+pub const STANDARD_FADE_TIME: Duration = Duration::from_secs(10);
 
 impl Default for ShieldSettings {
     fn default() -> Self {
@@ -72,6 +90,7 @@ impl Default for ShieldSettings {
             disable_lock_screen: false,
             lock_enabled: true,
             disable_show_password: false,
+            lock_delay: Duration::ZERO,
         }
     }
 }
@@ -161,6 +180,9 @@ impl ScreenShield {
         let mut effects = self.set_active(false);
         effects.wake_up_screen = true;
         effects.cancel_authenticator = true;
+        // `_completeDeactivate` drops the pending lock (`:575-578`). Leaving it armed would lock a
+        // desktop the user is sitting at, seconds after they dismissed the screensaver.
+        effects.cancel_lock_timer = true;
         let unlocked = self.set_locked(false);
         effects.locked_changed = unlocked.locked_changed;
         effects
@@ -227,6 +249,100 @@ impl ScreenShield {
         }
         warn!("the unlock channel died; dropping the lock to a screensaver so it is not a trap");
         self.set_locked(false)
+    }
+
+    /// `_onStatusChanged` with `PresenceStatus.IDLE` (`:242-272`) — gnome-session says the seat
+    /// has gone idle.
+    ///
+    /// The idle *threshold* is not ours: gnome-session owns `org.gnome.desktop.session idle-delay`
+    /// and tells us when it has elapsed. All we decide is what happens next — cover the screen, and
+    /// arm a timer to turn that cover into a lock.
+    ///
+    /// **Divergence: no fade.** GNOME raises a black lightbox over the desktop and only activates
+    /// the shield when that 10 s fade completes; we activate at once. The `max(STANDARD_FADE_TIME,
+    /// lock-delay)` grace before locking is kept, so the window in which coming back to the machine
+    /// costs nothing is the same length — it just looks like the curtain instead of a dimming
+    /// desktop. The fade belongs with the rest of the animations (slice 5).
+    pub fn on_session_idle(&mut self, now: Duration) -> ShieldEffects {
+        let mut effects = ShieldEffects {
+            cancel_dialog: true,
+            ..Default::default()
+        };
+
+        // Already covered — GNOME's "we're in the process of showing" guard (`:248-251`). Without
+        // it a second IDLE would re-arm the lock timer and push the lock further out.
+        if self.active {
+            return effects;
+        }
+
+        if self.settings.lock_enabled && !self.locked {
+            effects.arm_lock_timer = Some(self.settings.lock_delay.max(STANDARD_FADE_TIME));
+        }
+
+        let activated = self.activate(now);
+        effects.active_changed = activated.active_changed;
+        effects
+    }
+
+    /// `_onUserBecameActive` (`:285-305`) — the seat came back before the shield became a lock.
+    ///
+    /// A *locked* shield stays put; there is nothing to undo but the fade, which we do not have.
+    /// An unlocked one is a screensaver, so it goes away and takes the pending lock timer with it —
+    /// that cancellation is the whole point of the grace period.
+    pub fn on_user_active(&mut self) -> ShieldEffects {
+        if self.locked {
+            return ShieldEffects::default();
+        }
+        self.deactivate()
+    }
+
+    /// `_prepareForSleep` (`:233-241`) — logind's `PrepareForSleep`.
+    ///
+    /// `true` is the *delay* phase: the machine is about to suspend and is waiting on our inhibitor
+    /// (see [`wants_sleep_inhibitor`](Self::wants_sleep_inhibitor)), so this is the last moment at
+    /// which locking still happens before the screen contents are left on a sleeping machine.
+    /// `false` is the resume, where all that is owed is waking the screen up.
+    ///
+    /// Unlike the idle path this locks immediately: there is no grace period on a suspend.
+    pub fn prepare_for_sleep(
+        &mut self,
+        about_to_suspend: bool,
+        now: Duration,
+        password_mode_none: bool,
+    ) -> ShieldEffects {
+        if !about_to_suspend {
+            return self.wake_up_screen();
+        }
+
+        if !self.settings.lock_enabled {
+            return ShieldEffects {
+                cancel_dialog: true,
+                ..Default::default()
+            };
+        }
+
+        // A refusal (`disable-lock-screen`) is not an error here — it is the administrator's
+        // answer, and `lock` has already logged it.
+        let mut effects = self.lock(now, password_mode_none).unwrap_or_default();
+        effects.cancel_dialog = true;
+        effects
+    }
+
+    /// `_syncInhibitor` (`:202-231`) — whether logind's `delay` sleep inhibitor should be held.
+    ///
+    /// The inhibitor is what buys the handshake: holding it makes logind send `PrepareForSleep`
+    /// and *wait* for us to release it, which is the only reason [`prepare_for_sleep`] gets to lock
+    /// before the machine goes down. So it is held exactly while a future suspend would still owe a
+    /// lock — an already-active shield owes nothing, and neither does a session that has been told
+    /// not to lock.
+    ///
+    /// `session_active` is logind's `Session.Active`: a session on an inactive VT must not hold up
+    /// everyone else's suspend.
+    pub fn wants_sleep_inhibitor(&self, session_active: bool) -> bool {
+        session_active
+            && !self.active
+            && self.settings.lock_enabled
+            && !self.settings.disable_lock_screen
     }
 
     /// `_wakeUpScreen` (`:495-501`) — user activity while the shield is down.
@@ -487,5 +603,154 @@ mod tests {
         assert!(!shield.is_active());
         assert!(!shield.is_locked(), "the shield is up; nothing to lock");
         assert_eq!(effects.locked_changed, None);
+    }
+
+    /// Going idle covers the screen but does not lock it — the lock is a timer, and the timer has
+    /// a ten-second floor even when `lock-delay` is the default zero.
+    ///
+    /// Getting this wrong in the safe-looking direction (lock immediately) is the bug that makes a
+    /// desktop unusable: glance away for the idle delay and you are challenged, with no window to
+    /// come back in. `max(STANDARD_FADE_TIME, lock-delay)` is what that window is made of.
+    #[test]
+    fn going_idle_covers_the_screen_and_arms_a_delayed_lock() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+
+        let effects = shield.on_session_idle(T0);
+        assert_eq!(effects.active_changed, Some(true));
+        assert!(!shield.is_locked(), "idle covers; the timer locks");
+        assert_eq!(effects.arm_lock_timer, Some(STANDARD_FADE_TIME));
+        assert!(
+            effects.cancel_dialog,
+            "no half-typed password left on screen"
+        );
+
+        // A longer `lock-delay` wins over the floor; a shorter one does not shrink it.
+        let mut shield = ScreenShield::new(ShieldSettings {
+            lock_delay: Duration::from_secs(60),
+            ..Default::default()
+        });
+        assert_eq!(
+            shield.on_session_idle(T0).arm_lock_timer,
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    /// `lock-enabled = false` is a screensaver: idle still covers the screen, but nothing arms.
+    #[test]
+    fn going_idle_with_locking_off_never_arms_a_lock() {
+        let mut shield = ScreenShield::new(ShieldSettings {
+            lock_enabled: false,
+            ..Default::default()
+        });
+
+        let effects = shield.on_session_idle(T0);
+        assert_eq!(effects.active_changed, Some(true));
+        assert_eq!(effects.arm_lock_timer, None);
+    }
+
+    /// A second IDLE while already covered must not push the lock further out.
+    ///
+    /// Without the guard, anything that re-reports idleness re-arms the timer, and a shield that
+    /// keeps being told it is idle would never reach its lock.
+    #[test]
+    fn a_repeated_idle_does_not_re_arm_the_lock() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+        shield.on_session_idle(T0);
+
+        let again = shield.on_session_idle(T0 + Duration::from_secs(5));
+        assert_eq!(again.arm_lock_timer, None);
+        assert_eq!(again.active_changed, None);
+    }
+
+    /// Coming back during the grace period takes the screensaver *and* the pending lock away.
+    ///
+    /// If the timer survived the deactivate, the desktop would lock itself moments after the user
+    /// dismissed the screensaver and started working.
+    #[test]
+    fn coming_back_before_the_timer_cancels_the_lock() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+        shield.on_session_idle(T0);
+
+        let effects = shield.on_user_active();
+        assert_eq!(effects.active_changed, Some(false));
+        assert!(effects.cancel_lock_timer);
+
+        // Once locked, activity is for the unlock dialog to handle; the shield stays put.
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+        let epoch = shield
+            .lock(T0, false)
+            .expect("not locked down")
+            .request_authenticator
+            .unwrap();
+        shield.authenticator_ready(epoch, true);
+        assert_eq!(shield.on_user_active(), ShieldEffects::default());
+        assert!(shield.is_locked());
+    }
+
+    /// Suspending locks straight away — a grace period on a machine that is going to sleep would
+    /// be a machine that suspends unlocked.
+    #[test]
+    fn suspending_locks_without_a_grace_period() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+
+        let effects = shield.prepare_for_sleep(true, T0, false);
+        assert_eq!(effects.active_changed, Some(true));
+        assert!(effects.request_authenticator.is_some(), "asks to lock now");
+        assert_eq!(effects.arm_lock_timer, None);
+        assert!(effects.clear_clipboard);
+
+        // Resuming only wakes the screen.
+        let effects = shield.prepare_for_sleep(false, T0, false);
+        assert!(effects.wake_up_screen);
+        assert!(shield.is_active(), "resume does not raise the shield");
+    }
+
+    /// `lock-enabled = false` means suspend leaves the session as it was.
+    #[test]
+    fn suspending_with_locking_off_does_not_cover_the_screen() {
+        let mut shield = ScreenShield::new(ShieldSettings {
+            lock_enabled: false,
+            ..Default::default()
+        });
+
+        let effects = shield.prepare_for_sleep(true, T0, false);
+        assert_eq!(effects.active_changed, None);
+        assert!(!shield.is_active());
+    }
+
+    /// The sleep inhibitor is held exactly while a suspend would still owe a lock.
+    ///
+    /// Holding it forever would delay every suspend for nothing; never holding it means
+    /// `PrepareForSleep` arrives with no time to act, which is the same as not locking at all.
+    #[test]
+    fn the_sleep_inhibitor_is_held_only_while_a_suspend_would_owe_a_lock() {
+        let mut shield = ScreenShield::new(ShieldSettings::default());
+        assert!(shield.wants_sleep_inhibitor(true));
+
+        assert!(
+            !shield.wants_sleep_inhibitor(false),
+            "an inactive VT must not hold up anyone else's suspend"
+        );
+
+        shield.activate(T0);
+        assert!(
+            !shield.wants_sleep_inhibitor(true),
+            "already covered; nothing left to do before sleeping"
+        );
+
+        shield.deactivate();
+        for settings in [
+            ShieldSettings {
+                lock_enabled: false,
+                ..Default::default()
+            },
+            ShieldSettings {
+                disable_lock_screen: true,
+                ..Default::default()
+            },
+        ] {
+            shield.set_settings(settings);
+            assert!(!shield.wants_sleep_inhibitor(true));
+        }
     }
 }
