@@ -332,6 +332,35 @@ impl SwitcherUi {
         self.open.as_ref()?.layout.items.get(i).copied()
     }
 
+    /// The window `w`/`F4` closes — `_closeWindow` (`altTab.js:610-616`) for a window switcher,
+    /// `_closeAppWindow` (`:157-167`) for an app one.
+    ///
+    /// An app switcher answers **only while its sub-list has the focus**: GNOME puts the key in
+    /// the `_thumbnailsFocused` branch (`:203-208`), so `w` on the app row does nothing rather
+    /// than closing some window of it you cannot see. A sub-list that merely popped up on the
+    /// timer has nothing picked, and GNOME lands in the same place from the other direction —
+    /// `_closeAppWindow` looks up `cachedWindows[-1]` and returns on the miss (`:157-167`).
+    pub fn close_target(&self) -> Option<MappedId> {
+        let open = self.open.as_ref()?;
+        match &open.items {
+            Items::Windows(ids) => ids.get(open.state.selected()).copied(),
+            Items::Apps(_) => {
+                let thumbs = open.thumbs.as_ref().filter(|t| t.focused)?;
+                thumbs.windows.get(thumbs.selected?).copied()
+            }
+        }
+    }
+
+    /// The app `q` quits — `_quitApplication` (`altTab.js:169-175`). `None` for a window
+    /// switcher, whose items are windows and which has no `q` binding at all.
+    pub fn quit_target(&self) -> Option<&str> {
+        let open = self.open.as_ref()?;
+        match &open.items {
+            Items::Apps(apps) => Some(apps.get(open.state.selected())?.app_id.as_str()),
+            Items::Windows(_) => None,
+        }
+    }
+
     /// Whether the app switcher's window sub-list is up.
     pub fn thumbnails_open(&self) -> bool {
         self.open.as_ref().is_some_and(|o| o.thumbs.is_some())

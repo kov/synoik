@@ -1582,7 +1582,7 @@ impl State {
     ///
     /// Not running is a no-op, matching the early return at `:1216`; the menu row is
     /// hidden in that case anyway.
-    fn request_app_quit(&mut self, id: &str) {
+    pub(crate) fn request_app_quit(&mut self, id: &str) {
         let Some(app) = self.niri.app_system.running_app(id) else {
             return;
         };
@@ -8218,7 +8218,9 @@ fn find_gnome_bind(
 /// app switcher's window sub-list has the focus, when they walk *it* instead and Up leaves it.
 /// That branch belongs to the popup, so the arrows are passed on as arrows rather than resolved
 /// to a direction here.
-/// Escape and Tab destroy the popup and space/Return/KP_Enter/ISO_Enter commit it
+/// `w`/`F4` close the window being pointed at and `q` quits the selected app (`:190-191`,
+/// `:207`, `:617`); neither ends the session, so you can close several without letting the
+/// modifier up. Escape and Tab destroy the popup and space/Return/KP_Enter/ISO_Enter commit it
 /// (`switcherPopup.js:206-217`) — Tab only reaches here when it is *not* the popup's own shortcut,
 /// since that resolves as a binding first.
 ///
@@ -8232,6 +8234,8 @@ fn switcher_key_for(raw: Keysym) -> Option<SwitcherKey> {
         // Only the app switcher acts on these, to open and leave its window sub-list.
         Keysym::Up => SwitcherKey::Up,
         Keysym::Down => SwitcherKey::Down,
+        Keysym::w | Keysym::W | Keysym::F4 => SwitcherKey::CloseWindow,
+        Keysym::q | Keysym::Q => SwitcherKey::QuitApp,
         Keysym::Escape | Keysym::Tab => SwitcherKey::Dismiss,
         Keysym::space | Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter => {
             SwitcherKey::Commit

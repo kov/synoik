@@ -377,6 +377,13 @@ pub enum SwitcherKey {
     /// before the base ever sees them.
     Up,
     Down,
+    /// `w`, `W` or `F4` — close the window the popup is pointing at (`altTab.js:207`, `:617`).
+    /// It does **not** end the session: the list drops the item when the client actually goes
+    /// away, so you can close several in a row without letting the modifier up.
+    CloseWindow,
+    /// `q` or `Q` — quit the selected *app* (`:190-191`), which is the app switcher's only
+    /// letter key and has no counterpart in the window switcher.
+    QuitApp,
     /// Escape, or Tab *not* consumed by the popup's own shortcut (`:207-209`).
     Dismiss,
     /// Space, Return, KP_Enter or ISO_Enter (`:211-217`) — an explicit "take this one", which is
@@ -561,6 +568,9 @@ impl SwitcherPopup {
             }
             // Only the app switcher's sub-list acts on these, and it has already had its say.
             SwitcherKey::Up | SwitcherKey::Down => {}
+            // The caller performs these against the target the popup named; all the base owes
+            // them is what any handled key gets — hover off, and the popup revealed.
+            SwitcherKey::CloseWindow | SwitcherKey::QuitApp => self.show_immediately(),
             SwitcherKey::Dismiss => self.cancel(),
             SwitcherKey::Commit => self.finish(),
         }

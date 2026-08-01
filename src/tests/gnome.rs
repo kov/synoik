@@ -13430,6 +13430,102 @@ fn the_window_sublist_closes_on_up_and_on_moving_to_another_app() {
     f.key_release(KEY_LEFTMETA);
 }
 
+/// `w` closes the window the switcher is pointing at, and `q` quits the selected app — neither
+/// ends the session.
+///
+/// Where they apply is the part worth pinning. Alt-Tab's `w` closes the selected window (`_
+/// closeWindow`, `altTab.js:610-616`), but Super-Tab's only works **inside** the sub-list
+/// (`:203-208` puts it in the `_thumbnailsFocused` branch), so `w` on the app row does nothing
+/// rather than closing a window you cannot see. `q` is the opposite: app switcher only, and it
+/// goes through the same `shell_app_request_quit` path as the app menu's Quit row.
+#[test]
+fn the_switchers_close_and_quit_keys_act_without_ending_the_session() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    const KEY_W: u32 = 17;
+    const KEY_Q: u32 = 16;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![
+            AppEntry::fake("org.example.One.desktop", "One"),
+            AppEntry::fake("org.example.Two.desktop", "Two"),
+        ])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let client = f.add_client();
+    let one_a = map_window_for_app(&mut f, client, "org.example.One");
+    let one_b = map_window_for_app(&mut f, client, "org.example.One");
+    let two = map_window_for_app(&mut f, client, "org.example.Two");
+    f.niri_complete_animations();
+
+    // How many of "One"'s windows have been asked to close, and whether "Two" ever was.
+    let asked = |f: &mut Fixture| {
+        f.double_roundtrip(client);
+        let n = [&one_a, &one_b]
+            .iter()
+            .filter(|s| f.client(client).window(s).close_requested)
+            .count();
+        let other = f.client(client).window(&two).close_requested;
+        (n, other)
+    };
+
+    // Super-Tab, resting on the two-window app.
+    f.key_press(KEY_LEFTMETA);
+    f.niri_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+    assert_eq!(f.niri().switcher.selected(), Some(1), "opens on \"One\"");
+
+    // `w` on the app row is a no-op: nothing is picked, so there is nothing to close.
+    tap(&mut f, KEY_W);
+    assert_eq!(
+        asked(&mut f),
+        (0, false),
+        "`w` on the app row must not close anything — the key belongs to the sub-list"
+    );
+    assert!(
+        f.niri().switcher.is_open(),
+        "and it certainly must not end the session"
+    );
+
+    // Nor does it once the sub-list has merely *popped up* on its timer: it is up with nothing
+    // picked, and there is still no window the key names.
+    let mut clock = f.niri().clock.clone();
+    clock.set_unadjusted(clock.now_unadjusted() + crate::ui::switcher::thumbnails::POPUP_TIME * 2);
+    f.niri().advance_animations();
+    assert!(f.niri().switcher.thumbnails_open());
+    assert_eq!(f.niri().switcher.thumbnail_selected(), None);
+    tap(&mut f, KEY_W);
+    assert_eq!(
+        asked(&mut f),
+        (0, false),
+        "a sub-list with nothing picked names no window to close"
+    );
+
+    // Inside the sub-list it closes the picked window, and the popup stays up.
+    tap(&mut f, KEY_DOWN);
+    tap(&mut f, KEY_W);
+    assert_eq!(
+        asked(&mut f),
+        (1, false),
+        "`w` in the sub-list closes the one picked window"
+    );
+    assert!(f.niri().switcher.is_open(), "without ending the session");
+
+    // `q` quits the app: every window of it is asked to close, and no other app's.
+    tap(&mut f, KEY_Q);
+    assert_eq!(
+        asked(&mut f),
+        (2, false),
+        "`q` asks every window of the selected app to close, and only that app's"
+    );
+    assert!(f.niri().switcher.is_open(), "still without ending it");
+
+    f.key_release(KEY_LEFTMETA);
+}
+
 /// An open switcher grabs the pointer too: no window under it may keep pointer focus.
 ///
 /// Same rule and same symptom as [`open_popover_suppresses_underlying_pointer_focus`] — a client

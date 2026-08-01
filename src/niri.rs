@@ -1932,8 +1932,30 @@ impl State {
             return;
         }
 
+        // Resolved before the key is dispatched, because the popup names the target and the
+        // compositor performs it — `w` and `q` act on something outside the popup, unlike every
+        // other key here. Neither ends the session: the list loses the item when the client
+        // actually goes away, through the same `window_removed` path a client-initiated close
+        // takes (GNOME reacts to `unmanaged` too, `altTab.js:983-985`).
+        let close = matches!(key, SwitcherKey::CloseWindow)
+            .then(|| self.niri.switcher.close_target())
+            .flatten();
+        let quit = matches!(key, SwitcherKey::QuitApp)
+            .then(|| self.niri.switcher.quit_target().map(str::to_owned))
+            .flatten();
+
         let now = self.niri.clock.now_unadjusted();
         let outcome = self.niri.switcher.key_press(key, now);
+
+        if let Some(id) = close {
+            if let Some((_, mapped)) = self.niri.layout.windows().find(|(_, m)| m.id() == id) {
+                mapped.toplevel().send_close();
+            }
+        }
+        if let Some(app) = quit {
+            self.request_app_quit(&app);
+        }
+
         self.finish_switcher(outcome);
         self.hide_osd_for_switcher();
         self.niri.queue_redraw_switcher_output();
