@@ -15,7 +15,8 @@
 //! - `.unlock-dialog-clock-time` — `%numeric` at **72pt**, weight 800.
 //! - `.unlock-dialog-clock-date` — `%title_1` (20pt) but overridden back to weight **400**.
 //! - `.unlock-dialog-clock-hint` — bold, `margin-top: 2em`, padding `$base_padding
-//!   $base_padding*3`, radius `$base_border_radius*2`.
+//!   $base_padding*3`. It also carries a `border-radius` but **no `background-color`**, so nothing
+//!   is drawn behind it and the radius is inert; see [`HINT_PAD_V`].
 //!
 //! Our rasterizer tops out at bold (700) where GNOME's `%title_1` asks for 800 — the standing
 //! divergence recorded in `gnome-style-reference.md`, not a local decision.
@@ -35,7 +36,7 @@ use crate::ui::widget::{self, style, HAlign, Painter, Rgba, ShapedText, TextShap
 const TIME_PT: f64 = 72.;
 /// `.unlock-dialog-clock-date` — `%title_1`, whose 20pt survives the weight override.
 const DATE_PT: f64 = 20.;
-/// The hint inherits the shell's body size; only its weight and chrome are set.
+/// The hint inherits the shell's body size; the theme sets only its weight and spacing.
 const HINT_PT: f64 = 11.;
 
 /// `.unlock-dialog-clock`'s `spacing: 2em`. The box sets no font size of its own, so `em` here is
@@ -44,14 +45,20 @@ const SPACING_EM: f64 = 2.;
 
 /// `$system_fg_color` — `$_base_color_light`, i.e. white.
 const FG: Rgba = [1., 1., 1., 1.];
-/// The hint's pill, translucent white over the wallpaper.
-const HINT_BG: Rgba = [1., 1., 1., 0.12];
 
 /// `$base_padding` / `$base_padding * 3` (`_common.scss`).
+///
+/// `.unlock-dialog-clock-hint` sets padding and a `border-radius` but **no `background-color`**
+/// (`_login-lock.scss:253-258`), so nothing is drawn behind the text and the radius has no visible
+/// effect. The padding is kept because it is real layout: it is what separates the hint from the
+/// date beyond the box's spacing. Do not "restore" a pill here — the shipped theme has none, and a
+/// tinted plate under white text over an arbitrary wallpaper is exactly the kind of invented chrome
+/// that reads as ours rather than GNOME's.
+///
+/// (The `build/` directory in the reference checkout holds a *2021* compiled `gnome-shell.css` that
+/// disagrees — 16pt date, normal-weight hint. It is stale by four years; the SCSS is the source.)
 const HINT_PAD_V: f64 = 6.;
 const HINT_PAD_H: f64 = 18.;
-/// `$base_border_radius * 2`.
-const HINT_RADIUS: f64 = 16.;
 
 /// `HINT_TIMEOUT = 4` seconds (`unlockDialog.js:28`).
 pub const HINT_IDLE: Duration = Duration::from_secs(4);
@@ -110,8 +117,9 @@ pub struct ClockLayout {
     pub time: Rectangle<f64, Logical>,
     pub date: Rectangle<f64, Logical>,
     pub hint: Rectangle<f64, Logical>,
-    /// The pill behind the hint, wider than its text by `$base_padding * 3` a side.
-    pub hint_pill: Rectangle<f64, Logical>,
+    /// The hint's padding box — its text plus `$base_padding` / `$base_padding * 3`. Nothing is
+    /// drawn in it (the theme sets no background); it is the clip and the block's bottom edge.
+    pub hint_box: Rectangle<f64, Logical>,
 }
 
 /// The block's height, which depends only on font sizes — so the bake can be sized before
@@ -130,7 +138,7 @@ pub fn block_height(base_px: f64) -> f64 {
 }
 
 /// Lay the three lines out inside a block of `width`, centred horizontally. `hint_w` is the shaped
-/// width of the hint text, which only the pill needs.
+/// width of the hint text, which only its padding box needs.
 pub fn layout(width: f64, hint_w: f64, base_px: f64) -> ClockLayout {
     let time_h = crate::ui::pt_to_px(TIME_PT);
     let date_h = crate::ui::pt_to_px(DATE_PT);
@@ -148,7 +156,7 @@ pub fn layout(width: f64, hint_w: f64, base_px: f64) -> ClockLayout {
         time,
         date,
         hint: line(pill_y + HINT_PAD_V, hint_h, hint_w),
-        hint_pill: line(pill_y, hint_h + HINT_PAD_V * 2., hint_w + HINT_PAD_H * 2.),
+        hint_box: line(pill_y, hint_h + HINT_PAD_V * 2., hint_w + HINT_PAD_H * 2.),
     }
 }
 
@@ -211,7 +219,7 @@ impl LockScreen {
         let hint_alpha = self.hint_alpha(now);
 
         // Bucketed so a 300 ms fade re-bakes ~16 times rather than once a frame. The alpha is
-        // *inside* the bake because the hint has a pill behind it; an element-level alpha would
+        // *inside* the bake because it belongs to the hint alone; an element-level alpha would
         // fade the clock along with it.
         let hint_bucket = (hint_alpha * 16.).round() as i64;
         let revision = widget::Revision::new()
@@ -270,7 +278,6 @@ impl LockScreen {
                 )?;
 
                 if hint_alpha > 0. {
-                    p.fill_rounded(l.hint_pill, HINT_RADIUS, fade(HINT_BG))?;
                     p.text_band(
                         hint,
                         cx,
@@ -278,7 +285,7 @@ impl LockScreen {
                         l.hint.loc.y,
                         l.hint.size.h,
                         fade(FG),
-                        l.hint_pill,
+                        l.hint_box,
                     )?;
                 }
                 Ok(())
@@ -329,11 +336,11 @@ mod tests {
 
         assert!(l.time.loc.y < l.date.loc.y, "time above date");
         assert!(
-            l.date.loc.y + l.date.size.h <= l.hint_pill.loc.y,
+            l.date.loc.y + l.date.size.h <= l.hint_box.loc.y,
             "date must not overlap the hint pill"
         );
 
-        for r in [l.time, l.date, l.hint, l.hint_pill] {
+        for r in [l.time, l.date, l.hint, l.hint_box] {
             assert_eq!(r.loc.x + r.size.w / 2., 960., "every line is centred");
         }
     }
@@ -349,7 +356,7 @@ mod tests {
         let l = layout(1920., 300., base);
 
         let time_to_date = l.date.loc.y - (l.time.loc.y + l.time.size.h);
-        let date_to_hint = l.hint_pill.loc.y - (l.date.loc.y + l.date.size.h);
+        let date_to_hint = l.hint_box.loc.y - (l.date.loc.y + l.date.size.h);
 
         assert_eq!(time_to_date, SPACING_EM * base);
         assert_eq!(date_to_hint, SPACING_EM * base * 2.);
@@ -357,14 +364,14 @@ mod tests {
 
     /// The pill pads its text on all four sides, and the block is exactly tall enough for it.
     #[test]
-    fn the_hint_pill_pads_its_text_and_fits_the_block() {
+    fn the_hint_box_pads_its_text_and_fits_the_block() {
         let l = layout(1920., 300., 16.);
-        assert_eq!(l.hint_pill.size.w, 300. + HINT_PAD_H * 2.);
-        assert_eq!(l.hint_pill.size.h, l.hint.size.h + HINT_PAD_V * 2.);
-        assert_eq!(l.hint.loc.y - l.hint_pill.loc.y, HINT_PAD_V);
+        assert_eq!(l.hint_box.size.w, 300. + HINT_PAD_H * 2.);
+        assert_eq!(l.hint_box.size.h, l.hint.size.h + HINT_PAD_V * 2.);
+        assert_eq!(l.hint.loc.y - l.hint_box.loc.y, HINT_PAD_V);
 
         // `block_height` is what sizes the bake, so a mismatch would clip the pill away.
-        assert_eq!(l.hint_pill.loc.y + l.hint_pill.size.h, block_height(16.));
+        assert_eq!(l.hint_box.loc.y + l.hint_box.size.h, block_height(16.));
     }
 
     /// The hint is invisible until four seconds of idle, then fades in over 300 ms.
