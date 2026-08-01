@@ -122,27 +122,53 @@ pub struct ClockLayout {
     pub hint_box: Rectangle<f64, Logical>,
 }
 
-/// The block's height, which depends only on font sizes — so the bake can be sized before
-/// anything is shaped.
-pub fn block_height(base_px: f64) -> f64 {
+/// The height of each of the curtain's three text rows, in logical px.
+///
+/// These are **line boxes**, not point sizes. A row sized by its point size is shorter than the
+/// font's ascent+descent, so descenders are clipped and nothing else looks wrong — the `g` of
+/// "August" loses its tail. See [`widget::ShapedText::line_box_height`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClockRows {
+    pub time: f64,
+    pub date: f64,
+    pub hint: f64,
+}
+
+impl ClockRows {
+    /// The stand-in used before anything is shaped, so [`block_height`] can size the bake without
+    /// a font (see [`LINE_BOX_ESTIMATE`]). It over-estimates, which costs transparent pixels at the
+    /// bottom of the bake and never clips.
+    pub fn estimated() -> Self {
+        Self {
+            time: crate::ui::pt_to_px(TIME_PT) * LINE_BOX_ESTIMATE,
+            date: crate::ui::pt_to_px(DATE_PT) * LINE_BOX_ESTIMATE,
+            hint: crate::ui::pt_to_px(HINT_PT) * LINE_BOX_ESTIMATE,
+        }
+    }
+}
+
+/// The block's height for a given set of row heights.
+pub fn block_height_of(rows: ClockRows, base_px: f64) -> f64 {
     let spacing = SPACING_EM * base_px;
     // The hint carries `margin-top: 2em` *on top of* the box's own `spacing: 2em`
     // (`_login-lock.scss:240,254`), so it sits twice as far below the date as the date does below
     // the time. Folding the two into one gap is the easy misreading and it reads as a cramped hint.
-    crate::ui::pt_to_px(TIME_PT)
-        + spacing
-        + crate::ui::pt_to_px(DATE_PT)
-        + spacing * 2.
-        + crate::ui::pt_to_px(HINT_PT)
-        + HINT_PAD_V * 2.
+    rows.time + spacing + rows.date + spacing * 2. + rows.hint + HINT_PAD_V * 2.
+}
+
+/// The block's height as the bake must be sized — before the text exists, so on estimates.
+pub fn block_height(base_px: f64) -> f64 {
+    block_height_of(ClockRows::estimated(), base_px)
 }
 
 /// Lay the three lines out inside a block of `width`, centred horizontally. `hint_w` is the shaped
 /// width of the hint text, which only its padding box needs.
-pub fn layout(width: f64, hint_w: f64, base_px: f64) -> ClockLayout {
-    let time_h = crate::ui::pt_to_px(TIME_PT);
-    let date_h = crate::ui::pt_to_px(DATE_PT);
-    let hint_h = crate::ui::pt_to_px(HINT_PT);
+pub fn layout(width: f64, hint_w: f64, base_px: f64, rows: ClockRows) -> ClockLayout {
+    let ClockRows {
+        time: time_h,
+        date: date_h,
+        hint: hint_h,
+    } = rows;
     let spacing = SPACING_EM * base_px;
     let cx = width / 2.;
 
@@ -612,7 +638,13 @@ impl LockScreen {
                 p.clear(style::TRANSPARENT)?;
 
                 let (_, _, hint_iw, _) = hint.ink_bounds();
-                let l = layout(size.w, hint_iw as f64 / scale, base_px);
+                // Real metrics now that the runs exist — see `ClockRows`.
+                let rows = ClockRows {
+                    time: time.line_box_height() as f64 / scale,
+                    date: date.line_box_height() as f64 / scale,
+                    hint: hint.line_box_height() as f64 / scale,
+                };
+                let l = layout(size.w, hint_iw as f64 / scale, base_px, rows);
                 let fade = |c: Rgba| [c[0], c[1], c[2], c[3] * hint_alpha as f32];
 
                 let cx = size.w / 2.;
@@ -677,7 +709,7 @@ mod tests {
     /// The three lines stack in the JS's order, centred, without overlapping.
     #[test]
     fn the_clock_stacks_time_then_date_then_hint_centred() {
-        let l = layout(1920., 300., 16.);
+        let l = layout(1920., 300., 16., ClockRows::estimated());
 
         assert!(l.time.loc.y < l.date.loc.y, "time above date");
         assert!(
@@ -698,25 +730,55 @@ mod tests {
     #[test]
     fn the_hint_carries_its_own_margin_on_top_of_the_box_spacing() {
         let base = 16.;
-        let l = layout(1920., 300., base);
+        let l = layout(1920., 300., base, ClockRows::estimated());
 
         let time_to_date = l.date.loc.y - (l.time.loc.y + l.time.size.h);
         let date_to_hint = l.hint_box.loc.y - (l.date.loc.y + l.date.size.h);
 
-        assert_eq!(time_to_date, SPACING_EM * base);
-        assert_eq!(date_to_hint, SPACING_EM * base * 2.);
+        // Row heights now come from font metrics, so the sums carry float drift; the assertion
+        // is about which gap is which, not about the last ULP.
+        assert!((time_to_date - SPACING_EM * base).abs() < 1e-9);
+        assert!((date_to_hint - SPACING_EM * base * 2.).abs() < 1e-9);
     }
 
     /// The pill pads its text on all four sides, and the block is exactly tall enough for it.
     #[test]
     fn the_hint_box_pads_its_text_and_fits_the_block() {
-        let l = layout(1920., 300., 16.);
+        let l = layout(1920., 300., 16., ClockRows::estimated());
         assert_eq!(l.hint_box.size.w, 300. + HINT_PAD_H * 2.);
         assert_eq!(l.hint_box.size.h, l.hint.size.h + HINT_PAD_V * 2.);
         assert_eq!(l.hint.loc.y - l.hint_box.loc.y, HINT_PAD_V);
 
         // `block_height` is what sizes the bake, so a mismatch would clip the pill away.
-        assert_eq!(l.hint_box.loc.y + l.hint_box.size.h, block_height(16.));
+        assert!((l.hint_box.loc.y + l.hint_box.size.h - block_height(16.)).abs() < 1e-9);
+    }
+
+    /// Every row is as tall as its font's line box, not its point size.
+    ///
+    /// Sizing a row by the point size clips descenders and nothing else changes — the date's
+    /// `g` in "August" loses its tail while the layout still passes every spacing assertion above.
+    /// So pin the two things that make it wrong: the row must be taller than the point size, and
+    /// `layout` must use the height it is handed rather than deriving one.
+    #[test]
+    fn the_rows_are_line_boxes_not_point_sizes() {
+        let rows = ClockRows::estimated();
+        assert!(rows.time > crate::ui::pt_to_px(TIME_PT));
+        assert!(rows.date > crate::ui::pt_to_px(DATE_PT));
+        assert!(rows.hint > crate::ui::pt_to_px(HINT_PT));
+
+        let measured = ClockRows {
+            time: 100.,
+            date: 50.,
+            hint: 25.,
+        };
+        let l = layout(1920., 300., 16., measured);
+        assert_eq!(l.time.size.h, measured.time);
+        assert_eq!(l.date.size.h, measured.date);
+        assert_eq!(l.hint.size.h, measured.hint);
+        assert_eq!(
+            l.hint_box.loc.y + l.hint_box.size.h,
+            block_height_of(measured, 16.)
+        );
     }
 
     /// The hint is invisible until four seconds of idle, then fades in over 300 ms.
