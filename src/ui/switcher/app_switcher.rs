@@ -36,15 +36,6 @@ pub const ICON_SIZES: [f64; 5] = [96., 64., 48., 32., 22.];
 /// here with the rest of the app switcher's timing.
 pub const ICON_HOVER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// `org.gnome.shell.app-switcher current-workspace-only`
-/// (`data/org.gnome.shell.gschema.xml.in:307-318`), whose default is **false** — the app switcher
-/// spans workspaces where the window switcher does not.
-///
-/// NOT YET READ FROM GSETTINGS: we carry the default. Wiring it means adding the schema to the
-/// `GnomeSettings` model, which is a self-contained follow-up rather than part of this port —
-/// tracked in `docs/fork/alt-tab-port.md`. Until then a user who flips the key sees no change.
-pub const CURRENT_WORKSPACE_ONLY: bool = false;
-
 /// One row item: an app, and the windows of it that the switcher will cycle through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppItem {

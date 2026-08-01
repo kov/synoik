@@ -30,6 +30,29 @@ type WorldClocksCache = Option<(Vec<WorldLocation>, Vec<ResolvedLocation>)>;
 /// same store gnome-shell/mutter use — and keeps the model current afterwards.
 /// Detection code reads through this model, so updates never need to touch the
 /// input path.
+/// The Alt-Tab / Super-Tab switcher settings — `org.gnome.shell.app-switcher` and
+/// `org.gnome.shell.window-switcher` (`data/org.gnome.shell.gschema.xml.in:307-343`).
+///
+/// One struct for two schemas on purpose: they share a key *name* whose default is the
+/// **opposite** in each, so stock Super-Tab spans workspaces and stock Alt-Tab does not. Reading
+/// one where the other was meant is invisible until someone uses a second workspace.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SwitcherSettings {
+    /// `app-switcher current-workspace-only` — default **false**.
+    pub apps_current_workspace_only: bool,
+    /// `window-switcher current-workspace-only` — default **true**.
+    pub windows_current_workspace_only: bool,
+}
+
+impl Default for SwitcherSettings {
+    fn default() -> Self {
+        Self {
+            apps_current_workspace_only: false,
+            windows_current_workspace_only: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GnomeSettings {
     /// `org.gnome.mutter overlay-key`: the keys whose lone tap toggles the
@@ -49,6 +72,9 @@ pub struct GnomeSettings {
     ///
     /// [`AppSystem`]: crate::app_system::AppSystem
     pub favorite_apps: Vec<String>,
+    /// The Alt-Tab / Super-Tab switcher settings — two schemas whose same-named key has
+    /// **opposite** defaults, so they are kept as one struct to make that hard to miss.
+    pub switchers: SwitcherSettings,
     /// `org.gnome.desktop.lockdown disable-command-line`: when set, the run
     /// dialog refuses to open (gnome-shell's `RunDialog.open`).
     pub disable_command_line: bool,
@@ -341,6 +367,7 @@ impl Default for GnomeSettings {
             keybindings: default_keybindings(),
             command_history: Vec::new(),
             favorite_apps: Vec::new(),
+            switchers: SwitcherSettings::default(),
             disable_command_line: false,
             focus_new_windows: FocusNewWindows::Smart,
             edge_tiling: true,
@@ -514,6 +541,25 @@ impl GnomeSettings {
         }
         if settings_has_key(shell, "app-picker-layout") {
             self.app_picker_layout = read_app_picker_layout(&shell.value("app-picker-layout"));
+        }
+    }
+
+    /// The two switcher schemas (`data/org.gnome.shell.gschema.xml.in:307-343`).
+    ///
+    /// Each key is only read when the schema actually carries it, like every other loader here —
+    /// a system with an older gnome-shell installed keeps our defaults rather than panicking in
+    /// `gio`.
+    fn load_switchers(&mut self, app: Option<&gio::Settings>, window: Option<&gio::Settings>) {
+        if let Some(app) = app {
+            if settings_has_key(app, "current-workspace-only") {
+                self.switchers.apps_current_workspace_only = app.boolean("current-workspace-only");
+            }
+        }
+        if let Some(window) = window {
+            if settings_has_key(window, "current-workspace-only") {
+                self.switchers.windows_current_workspace_only =
+                    window.boolean("current-workspace-only");
+            }
         }
     }
 
@@ -1623,6 +1669,10 @@ struct Stores {
     notifications: Option<gio::Settings>,
     color: Option<gio::Settings>,
     input_sources: Option<gio::Settings>,
+    /// `org.gnome.shell.app-switcher` — one key, `current-workspace-only`.
+    app_switcher: Option<gio::Settings>,
+    /// `org.gnome.shell.window-switcher` — `current-workspace-only` and `app-icon-mode`.
+    window_switcher: Option<gio::Settings>,
     world_clocks: Option<gio::Settings>,
     app_folders: Option<gio::Settings>,
     /// `org.gnome.desktop.a11y` — only `always-show-universal-access-status`, the
@@ -1674,6 +1724,8 @@ impl Stores {
             notifications: gsettings("org.gnome.desktop.notifications", b),
             color: gsettings("org.gnome.settings-daemon.plugins.color", b),
             input_sources: gsettings("org.gnome.desktop.input-sources", b),
+            app_switcher: gsettings("org.gnome.shell.app-switcher", b),
+            window_switcher: gsettings("org.gnome.shell.window-switcher", b),
             world_clocks: gsettings("org.gnome.shell.world-clocks", b),
             app_folders: gsettings("org.gnome.desktop.app-folders", b),
             a11y: gsettings("org.gnome.desktop.a11y", b),
@@ -1723,6 +1775,8 @@ impl Stores {
             &self.notifications,
             &self.color,
             &self.input_sources,
+            &self.app_switcher,
+            &self.window_switcher,
             &self.world_clocks,
             &self.app_folders,
             &self.a11y,
@@ -1751,6 +1805,7 @@ impl Stores {
         if let Some(shell) = &self.shell {
             settings.load_shell(shell);
         }
+        settings.load_switchers(self.app_switcher.as_ref(), self.window_switcher.as_ref());
         if let Some(lockdown) = &self.lockdown {
             settings.load_lockdown(lockdown);
         }

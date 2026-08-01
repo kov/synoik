@@ -22,15 +22,6 @@ pub const WINDOW_PREVIEW_SIZE: f64 = 128.;
 /// `APP_ICON_SIZE_SMALL` (`altTab.js:21`) — the app badge over the preview.
 pub const APP_ICON_SIZE_SMALL: f64 = 48.;
 
-/// `org.gnome.shell.window-switcher current-workspace-only`
-/// (`data/org.gnome.shell.gschema.xml.in:337-343`), default **true**.
-///
-/// The opposite of the app switcher's default — see the module docs.
-///
-/// NOT YET READ FROM GSETTINGS: we carry the default, like the app switcher's. Wiring both means
-/// adding the two schemas to the `GnomeSettings` model.
-pub const CURRENT_WORKSPACE_ONLY: bool = true;
-
 /// The preview's box inside an item — the whole content area, since the icon overlays it rather
 /// than sitting beside it.
 ///

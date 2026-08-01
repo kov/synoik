@@ -1885,9 +1885,12 @@ impl State {
 
         // `org.gnome.shell.app-switcher current-workspace-only`, default **false** — the app
         // switcher spans workspaces where the window switcher does not.
-        let tab_list = self
+        let only_here = self
             .niri
-            .switcher_tab_list(crate::ui::switcher::app_switcher::CURRENT_WORKSPACE_ONLY);
+            .gnome_settings
+            .switchers
+            .apps_current_workspace_only;
+        let tab_list = self.niri.switcher_tab_list(only_here);
         let items = app_items(self.niri.app_system.running(), &tab_list);
         if items.is_empty() {
             return;
@@ -1907,9 +1910,12 @@ impl State {
             return;
         }
 
-        let tab_list = self
+        let only_here = self
             .niri
-            .switcher_tab_list(crate::ui::switcher::window_switcher::CURRENT_WORKSPACE_ONLY);
+            .gnome_settings
+            .switchers
+            .windows_current_workspace_only;
+        let tab_list = self.niri.switcher_tab_list(only_here);
         if tab_list.is_empty() {
             return;
         }

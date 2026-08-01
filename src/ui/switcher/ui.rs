@@ -158,6 +158,15 @@ impl SwitcherUi {
         self.open.is_some()
     }
 
+    /// How many items the open popup is showing, or `None` when nothing is open.
+    ///
+    /// Deliberately not a `len`/`is_empty` pair: an *open* switcher is never empty (the last item
+    /// going away ends the session), so "empty" and "closed" are the same state and one `Option`
+    /// says it once.
+    pub fn item_count(&self) -> Option<usize> {
+        Some(self.open.as_ref()?.items.len())
+    }
+
     /// The `.switcher-list` panel's box, for tests that need to look at the pixels it covers.
     pub fn panel_rect(&self) -> Option<Rectangle<f64, Logical>> {
         Some(self.open.as_ref()?.layout.panel)

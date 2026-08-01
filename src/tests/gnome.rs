@@ -13260,3 +13260,62 @@ fn a_quick_super_tab_switches_without_showing_the_popup() {
         "the tap moved focus to the previously used app's window"
     );
 }
+
+/// Alt-Tab is workspace-local and Super-Tab is not — the two schemas' opposed defaults, driven
+/// through the real popups.
+///
+/// `org.gnome.shell.app-switcher current-workspace-only` defaults **false** while
+/// `org.gnome.shell.window-switcher current-workspace-only` defaults **true**. Reading either
+/// from the wrong schema looks completely fine on a one-workspace machine, which is why this test
+/// puts a window on a second workspace before asking.
+#[test]
+fn alt_tab_stays_on_this_workspace_and_super_tab_does_not() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![
+            AppEntry::fake("org.example.One.desktop", "One"),
+            AppEntry::fake("org.example.Two.desktop", "Two"),
+        ])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.One");
+
+    // A second window on the next workspace down.
+    f.niri_state().do_action(Action::FocusWorkspaceDown, false);
+    map_window_for_app(&mut f, client, "org.example.Two");
+    f.niri_complete_animations();
+
+    // Sanity: the two really are on different workspaces, so the assertions below can differ.
+    assert_eq!(
+        f.niri().switcher_tab_list(false).len(),
+        2,
+        "both windows exist when nothing is filtered"
+    );
+
+    const KEY_LEFTALT: u32 = 56;
+    const KEY_LEFTMETA: u32 = 125;
+
+    f.key_press(KEY_LEFTALT);
+    f.niri_state()
+        .do_action(Action::SwitchWindows { backward: false }, false);
+    let alt_tab_items = f.niri().switcher.item_count();
+    f.key_release(KEY_LEFTALT);
+
+    f.key_press(KEY_LEFTMETA);
+    f.niri_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+    let super_tab_items = f.niri().switcher.item_count();
+    f.key_release(KEY_LEFTMETA);
+
+    assert_eq!(
+        alt_tab_items,
+        Some(1),
+        "stock Alt-Tab shows only this workspace's window"
+    );
+    assert_eq!(super_tab_items, Some(2), "stock Super-Tab spans workspaces");
+}
