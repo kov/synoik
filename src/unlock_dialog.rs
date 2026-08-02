@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use crate::dbus::gdm::{MessageKind, VerifierEvent, VerifierRequest};
+use crate::dbus::gdm::{MessageKind, MessageSource, VerifierEvent, VerifierRequest};
 
 /// Room for any password without reallocating; see [`UnlockDialog::clear_entry`].
 const ENTRY_CAPACITY: usize = 512;
@@ -70,6 +70,8 @@ pub enum Status {
 /// A line under the entry (`_onShowMessage`, `authPrompt.js`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
+    /// Which conversation said it — see [`VerifierEvent::FilterMessages`].
+    pub source: MessageSource,
     pub text: String,
     pub kind: MessageKind,
 }
@@ -249,6 +251,29 @@ impl UnlockDialog {
     fn drop_messages(&mut self) -> bool {
         self.message_queue.clear();
         self.show_message_now(None, Duration::ZERO)
+    }
+
+    /// `_filterServiceMessages(source, ERROR)` (`util.js:269-276`) — drop everything `source` said
+    /// that is quieter than an error, because its conversation has ended.
+    ///
+    /// **The read time does not protect these.** Everything else in this queue waits its turn, but
+    /// a hint from a service that has stopped is no longer merely stale, it is *wrong*: it tells
+    /// the user to place a finger on a reader the screen is no longer listening to, and leaving it
+    /// up for its full interval is leaving a false instruction up on purpose. GNOME reaches the
+    /// same place through `_queuePriorityMessage`, which clears the queue outright when the message
+    /// on screen is one of the ones being filtered out (`:313-325`).
+    ///
+    /// Errors survive, from this service and any other: `ERROR` is the threshold, not the target.
+    fn filter_messages(&mut self, source: MessageSource, now: Duration) -> bool {
+        let doomed = |m: &Message| m.source == source && m.kind < MessageKind::Error;
+        self.message_queue
+            .retain(|m| !m.as_ref().is_some_and(doomed));
+        if !self.message.as_ref().is_some_and(doomed) {
+            return false;
+        }
+        // Whatever was behind it is owed its own time from now, not from when this one went up.
+        let next = self.message_queue.pop_front().flatten();
+        self.show_message_now(next, now)
     }
 
     /// Promote the next queued message if the shown one has had its time. `true` if the screen
@@ -522,7 +547,15 @@ impl UnlockDialog {
                 UnlockEffects::redraw()
             }
 
-            VerifierEvent::ShowMessage { text, kind } => {
+            VerifierEvent::FilterMessages(source) => {
+                if self.filter_messages(source, now) {
+                    UnlockEffects::redraw()
+                } else {
+                    UnlockEffects::default()
+                }
+            }
+
+            VerifierEvent::ShowMessage { text, kind, source } => {
                 // `MessageType` is a **priority** (`util.js:58-63`), and GNOME's queue keeps the
                 // loudest message showing rather than letting a later quiet one displace it
                 // (`_queuePriorityMessage`, `:313-325`). It matters here because the two
@@ -539,7 +572,7 @@ impl UnlockDialog {
                 if self.loudest_message().is_some_and(|loudest| kind < loudest) {
                     return UnlockEffects::default();
                 }
-                if self.queue_message(Some(Message { text, kind }), now) {
+                if self.queue_message(Some(Message { text, kind, source }), now) {
                     UnlockEffects::redraw()
                 } else {
                     UnlockEffects::default()
@@ -571,6 +604,7 @@ impl UnlockDialog {
                         Some(Message {
                             text: "Authentication failed".to_owned(),
                             kind: MessageKind::Error,
+                            source: MessageSource::Password,
                         }),
                         now,
                     );
@@ -716,6 +750,7 @@ mod tests {
             VerifierEvent::ShowMessage {
                 text: "hi".to_owned(),
                 kind: MessageKind::Info,
+                source: MessageSource::Password,
             },
             VerifierEvent::Failed,
             VerifierEvent::Reset,
@@ -1002,10 +1037,12 @@ mod tests {
         let hint = || VerifierEvent::ShowMessage {
             text: "(or place finger on reader)".to_owned(),
             kind: MessageKind::Hint,
+            source: MessageSource::Fingerprint,
         };
         let error = || VerifierEvent::ShowMessage {
             text: "Sorry, that didn't work".to_owned(),
             kind: MessageKind::Error,
+            source: MessageSource::Password,
         };
 
         // Nothing showing: the hint takes the slot.
@@ -1043,6 +1080,7 @@ mod tests {
             VerifierEvent::ShowMessage {
                 text: "Sorry, that didn't work either".to_owned(),
                 kind: MessageKind::Error,
+                source: MessageSource::Password,
             },
             t,
         );
@@ -1075,6 +1113,7 @@ mod tests {
             VerifierEvent::ShowMessage {
                 text: text.to_owned(),
                 kind: MessageKind::Error,
+                source: MessageSource::Fingerprint,
             },
             T0,
         );
@@ -1102,12 +1141,118 @@ mod tests {
             VerifierEvent::ShowMessage {
                 text: text.to_owned(),
                 kind: MessageKind::Error,
+                source: MessageSource::Fingerprint,
             },
             T0,
         );
         assert_eq!(d.message_deadline(), None, "nothing is queued behind it");
         d.tick(T0 + read_time(text) * 10);
         assert_eq!(d.message().map(|m| m.text.as_str()), Some(text));
+    }
+
+    /// A reader that dies takes its own instruction off the screen with it.
+    ///
+    /// The exact sequence a reader that fails on open produces, in order: it narrates (so we show
+    /// the hint), gdm reports `ServiceUnavailable` with an **empty** message — that is not a
+    /// mistake, `PAM_AUTHINFO_UNAVAIL` sets the text to the literal empty string
+    /// (`gdm-session-worker.c:1272-1280`), which is why GNOME tests for it (`util.js:892-893`) —
+    /// and the conversation stops.
+    ///
+    /// So there is no error to put on screen, and the only honest thing left is to stop telling the
+    /// user to place a finger on a reader nothing is listening to. Leaving that hint up was the
+    /// live report: the prompt said "(or place finger on reader)" while the sensor had already been
+    /// given up on.
+    #[test]
+    fn a_reader_that_gives_up_stops_asking_for_a_finger() {
+        let mut d = dialog();
+        let hint = "(or place finger on reader)";
+
+        d.on_verifier_event(
+            VerifierEvent::ShowMessage {
+                text: hint.to_owned(),
+                kind: MessageKind::Hint,
+                source: MessageSource::Fingerprint,
+            },
+            T0,
+        );
+        assert_eq!(d.message().map(|m| m.text.as_str()), Some(hint));
+
+        // The reader's conversation ends, in the same millisecond and with nothing to say.
+        d.on_verifier_event(
+            VerifierEvent::FilterMessages(MessageSource::Fingerprint),
+            T0,
+        );
+        assert!(
+            d.message().is_none(),
+            "the prompt still asks for a finger the screen has stopped listening for"
+        );
+
+        // The password conversation is untouched by the reader's filter — it is the one way in,
+        // and its messages are not the reader's to clear.
+        let refused = "Sorry, that didn't work";
+        d.on_verifier_event(
+            VerifierEvent::ShowMessage {
+                text: refused.to_owned(),
+                kind: MessageKind::Error,
+                source: MessageSource::Password,
+            },
+            T0,
+        );
+        d.on_verifier_event(
+            VerifierEvent::FilterMessages(MessageSource::Fingerprint),
+            T0,
+        );
+        assert_eq!(d.message().map(|m| m.text.as_str()), Some(refused));
+
+        // ...and an *error* from the reader outranks the threshold, so it survives its own
+        // conversation ending. `Error` is the cut-off, not the target.
+        let mut d = dialog();
+        let problem = "Failed to match fingerprint";
+        d.on_verifier_event(
+            VerifierEvent::ShowMessage {
+                text: problem.to_owned(),
+                kind: MessageKind::Error,
+                source: MessageSource::Fingerprint,
+            },
+            T0,
+        );
+        d.on_verifier_event(
+            VerifierEvent::FilterMessages(MessageSource::Fingerprint),
+            T0,
+        );
+        assert_eq!(d.message().map(|m| m.text.as_str()), Some(problem));
+    }
+
+    /// A hint waiting *behind* another is filtered too, not just the one on screen.
+    ///
+    /// The reader narrates on every scan, so a second hint lands while the first is still being
+    /// read. If the filter only reached what is showing, the reader's conversation could end and
+    /// the instruction would be promoted afterwards — the same false instruction, arriving late and
+    /// from a service that no longer exists.
+    #[test]
+    fn a_queued_hint_dies_with_its_service() {
+        let mut d = dialog();
+        let hint = || VerifierEvent::ShowMessage {
+            text: "(or place finger on reader)".to_owned(),
+            kind: MessageKind::Hint,
+            source: MessageSource::Fingerprint,
+        };
+
+        d.on_verifier_event(hint(), T0);
+        // The reader scans again while the first is still owed its read time, so this one queues.
+        d.on_verifier_event(hint(), T0);
+        assert!(d.message_deadline().is_some(), "the second hint must queue");
+
+        d.on_verifier_event(
+            VerifierEvent::FilterMessages(MessageSource::Fingerprint),
+            T0,
+        );
+        assert!(d.message().is_none());
+        d.tick(T0 + read_time("(or place finger on reader)") * 3);
+        assert!(
+            d.message().is_none(),
+            "a hint from a dead service was promoted after the fact"
+        );
     }
 
     /// A long message is owed longer than the floor, at GNOME's 48 ms a character.

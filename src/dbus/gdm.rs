@@ -144,6 +144,21 @@ pub enum MessageKind {
     Error,
 }
 
+/// Which conversation a message came from.
+///
+/// gdm runs two at once and they talk over each other, so "whose was that?" is a question the
+/// dialog has to be able to answer: GNOME keys its queue on the service name for exactly this
+/// (`_filterServiceMessages`, `util.js:269-276`). Two variants rather than the service string
+/// because those are the only two we ever start, and a typo in a `&str` comparison would fail
+/// silently by never matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageSource {
+    /// `gdm-password`, the foreground service.
+    Password,
+    /// `gdm-fingerprint`, the background one.
+    Fingerprint,
+}
+
 /// What the verifier tells the compositor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifierEvent {
@@ -155,13 +170,22 @@ pub enum VerifierEvent {
     Unavailable(Epoch, String),
     /// gdm wants an answer. `secret` distinguishes `SecretInfoQuery` (mask the entry) from
     /// `InfoQuery` (show it) — get it backwards and a password is drawn on the lock screen.
-    AskQuestion {
-        question: String,
-        secret: bool,
-    },
+    AskQuestion { question: String, secret: bool },
+    /// Drop everything this service has said that is quieter than an error
+    /// (`_filterServiceMessages`, `util.js:269-276`), because its conversation has ended.
+    ///
+    /// The reader's hint is an *instruction* — "(or place finger on reader)" — and once the reader
+    /// is gone it is an instruction that cannot be followed, pointing at hardware the screen has
+    /// stopped listening to. gdm has nothing to put in its place: a service that fails on open
+    /// reports `PAM_AUTHINFO_UNAVAIL`, which gdm turns into `ServiceUnavailable` with a
+    /// **literally empty** message (`g_set_error_literal(..., SERVICE_UNAVAILABLE, "")`,
+    /// `gdm-session-worker.c:1276-1280`). So there is no error to show, and taking the false
+    /// instruction away is the whole of what can be done.
+    FilterMessages(MessageSource),
     ShowMessage {
         text: String,
         kind: MessageKind,
+        source: MessageSource,
     },
     /// PAM accepted. The one event that may raise a locked shield.
     Complete,
@@ -506,6 +530,17 @@ async fn pump_signals(
         }
         if member == "ConversationStopped" && service.as_deref() == Some(FINGERPRINT_SERVICE) {
             flags.running.store(false, Ordering::Relaxed);
+            // `_onConversationStopped` filters the stopped service's messages *before* it looks at
+            // anything else, including the unavailable early-return (`util.js:918-921`) — so this
+            // happens whether the reader is being retried or given up on. Sent here rather than
+            // routed because `route` answers with one event and this rides alongside whatever that
+            // is.
+            if to_niri
+                .send(VerifierEvent::FilterMessages(MessageSource::Fingerprint))
+                .is_err()
+            {
+                break;
+            }
         }
         // Both of these are owned by the shared flags, so that raising the prompt resets them from
         // the request side. Read fresh each time rather than kept in step.
@@ -690,6 +725,11 @@ fn route(
     // `serviceIsFingerprint` requires a *detected reader*, not just the name (`util.js:616-619`) —
     // without one we never started the service, so a signal bearing its name is not ours.
     let is_fingerprint = reader.is_present() && service == Some(FINGERPRINT_SERVICE);
+    let source = if is_fingerprint {
+        MessageSource::Fingerprint
+    } else {
+        MessageSource::Password
+    };
     if !is_foreground && !is_fingerprint {
         return Routed::Ignore;
     }
@@ -704,6 +744,7 @@ fn route(
             Some(hint) => Routed::Event(VerifierEvent::ShowMessage {
                 text: hint.to_owned(),
                 kind: MessageKind::Hint,
+                source,
             }),
             None => Routed::Ignore,
         },
@@ -711,6 +752,7 @@ fn route(
             Some(text) => Routed::Event(VerifierEvent::ShowMessage {
                 text,
                 kind: MessageKind::Info,
+                source,
             }),
             None => Routed::Ignore,
         },
@@ -724,6 +766,7 @@ fn route(
             Some(text) => Routed::Event(VerifierEvent::ShowMessage {
                 text,
                 kind: MessageKind::Error,
+                source,
             }),
             None => Routed::Ignore,
         },
@@ -739,10 +782,19 @@ fn route(
             } else {
                 PASSWORD_SERVICE
             },
-            event: text.map(|text| VerifierEvent::ShowMessage {
-                text,
-                kind: MessageKind::Error,
-            }),
+            // **gdm's message here is usually empty**, and GNOME checks for exactly that
+            // (`if (!errorMessage) return`, `util.js:892-893`): the `PAM_AUTHINFO_UNAVAIL` path
+            // sets the error text to the literal empty string
+            // (`gdm-session-worker.c:1272-1280`). Showing it would blank the line rather than
+            // explain anything, and it would do so *by looking like a message*, outranking the
+            // hint it replaced. So an empty one is no message at all.
+            event: text
+                .filter(|text| !text.is_empty())
+                .map(|text| VerifierEvent::ShowMessage {
+                    text,
+                    kind: MessageKind::Error,
+                    source,
+                }),
         },
 
         // Questions only ever come from the foreground service (`_onInfoQuery`, `:790-795`).
@@ -853,6 +905,7 @@ mod tests {
             Routed::Event(VerifierEvent::ShowMessage {
                 text: "(or place finger on reader)".to_owned(),
                 kind: MessageKind::Hint,
+                source: MessageSource::Fingerprint,
             })
         );
 
@@ -870,6 +923,7 @@ mod tests {
             Routed::Event(VerifierEvent::ShowMessage {
                 text: "(or swipe finger across reader)".to_owned(),
                 kind: MessageKind::Hint,
+                source: MessageSource::Fingerprint,
             })
         );
 
@@ -886,6 +940,7 @@ mod tests {
             Routed::Event(VerifierEvent::ShowMessage {
                 text: "hello".to_owned(),
                 kind: MessageKind::Info,
+                source: MessageSource::Password,
             })
         );
     }
@@ -1040,6 +1095,11 @@ mod tests {
                 Routed::Event(VerifierEvent::ShowMessage {
                     text: "no good".to_owned(),
                     kind: MessageKind::Error,
+                    source: if service == FINGERPRINT_SERVICE {
+                        MessageSource::Fingerprint
+                    } else {
+                        MessageSource::Password
+                    },
                 }),
                 "{service}'s Problem must be shown"
             );
@@ -1216,8 +1276,30 @@ mod tests {
                 event: Some(VerifierEvent::ShowMessage {
                     text: "no such device".to_owned(),
                     kind: MessageKind::Error,
+                    source: MessageSource::Fingerprint,
                 }),
             }
+        );
+
+        // **The message is usually empty, and an empty one is not a message.** The
+        // `PAM_AUTHINFO_UNAVAIL` path — a reader that will not open, which is the common way to get
+        // here — sets the error text to the literal empty string
+        // (`gdm-session-worker.c:1272-1280`), so this is the normal case rather than a corner one.
+        // Showing it would blank the line while *counting as* an error, outranking the hint it
+        // displaced and sitting there for a full read time saying nothing.
+        assert_eq!(
+            route(
+                "ServiceUnavailable",
+                Some(FINGERPRINT_SERVICE),
+                msg(""),
+                ReaderType::Press,
+                healthy(),
+            ),
+            Routed::GiveUp {
+                service: FINGERPRINT_SERVICE,
+                event: None,
+            },
+            "an empty error was shown as if it said something"
         );
 
         // ...and once marked, even a slow stop does not bring it back.

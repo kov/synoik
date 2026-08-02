@@ -363,6 +363,23 @@ that declines was restarted forever: `ServiceUnavailable` now ends that service
 counted against a small budget. The password conversation is deliberately exempt from both — it is
 the only way back in.
 
+**There is no error to show when the reader dies, and that is by construction.** The common
+failure — a reader that will not open — reaches gdm as `PAM_AUTHINFO_UNAVAIL`, and the worker turns
+that into `ServiceUnavailable` with a **literally empty** message
+(`g_set_error_literal(..., SERVICE_UNAVAILABLE, "")`, `gdm-session-worker.c:1272-1280`); GNOME
+tests for exactly that and shows nothing (`util.js:892-893`). So does this, because an empty
+message would blank the line while still *counting as* an error, outranking the hint it displaced.
+
+What is left, then, is to stop lying. The reader's hint is an instruction — "(or place finger on
+reader)" — and once the conversation has stopped it points at hardware the screen is no longer
+listening to; on the seat the prompt sat there asking for a finger from a sensor already given up
+on. `_filterServiceMessages` (`util.js:269-276`) is GNOME's answer and is now ported: when a
+conversation stops, everything it said below `Error` is dropped, from the queue as well as the
+screen, and without waiting out the read time — a message that is merely stale can wait its turn,
+one that is *wrong* cannot. Errors survive; `Error` is the threshold, not the target. Messages
+carry a `MessageSource` so the filter can tell whose they are, since the password conversation's
+messages are not the reader's to clear.
+
 The budget then needed two corrections, both from the seat the same day, and both about scope:
 
 - **"the reader did not answer", not "the attempt failed".** Stopping quickly was the first cut of
