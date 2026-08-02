@@ -776,6 +776,24 @@ pub struct Niri {
     pub exit_confirm_dialog: ExitConfirmDialog,
     pub run_dialog: RunDialog,
     pub end_session_dialog: EndSessionDialog,
+    /// The polkit "Authentication Required" dialog: what it is asking, and how it is drawn.
+    #[cfg(feature = "dbus")]
+    pub polkit_dialog: crate::polkit_dialog::PolkitDialog,
+    #[cfg(feature = "dbus")]
+    pub polkit_ui: crate::ui::polkit_dialog::PolkitDialogUi,
+    /// The agent's side of the conversation.
+    #[cfg(feature = "dbus")]
+    pub polkit_requests: Option<async_channel::Sender<crate::dbus::polkit_agent::PolkitRequest>>,
+    /// A request that arrived while the screen was locked.
+    ///
+    /// GNOME does not prompt over a lock screen: it waits for the session mode to change and
+    /// re-runs the request then (`polkitAgent.js:439-450`). Anything else would either put a
+    /// password box on top of the shield or answer polkitd without asking anyone.
+    #[cfg(feature = "dbus")]
+    pub polkit_deferred: Option<Box<crate::dbus::polkit_agent::BeginRequest>>,
+    /// The delayed entry reset — see [`crate::polkit_dialog::DELAYED_RESET`].
+    #[cfg(feature = "dbus")]
+    pub polkit_reset_timer: Option<calloop::RegistrationToken>,
     pub panel: Panel,
     pub panel_popover: PanelPopover,
     /// Whether the overview was open at the last render-elements update, to
@@ -1037,6 +1055,8 @@ pub enum KeyboardFocus {
     ExitConfirmDialog,
     RunDialog,
     EndSessionDialog,
+    /// The polkit authentication dialog, which is modal like the three above it.
+    PolkitDialog,
     Popover,
     Overview,
     /// The Alt-Tab / Super-Tab switcher holds a modal grab while it is up.
@@ -1199,6 +1219,7 @@ impl KeyboardFocus {
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::RunDialog => None,
             KeyboardFocus::EndSessionDialog => None,
+            KeyboardFocus::PolkitDialog => None,
             KeyboardFocus::Popover => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Switcher => None,
@@ -1214,6 +1235,7 @@ impl KeyboardFocus {
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::RunDialog => None,
             KeyboardFocus::EndSessionDialog => None,
+            KeyboardFocus::PolkitDialog => None,
             KeyboardFocus::Popover => None,
             KeyboardFocus::Overview => None,
             KeyboardFocus::Switcher => None,
@@ -2452,6 +2474,8 @@ impl State {
             KeyboardFocus::LockScreen {
                 surface: self.niri.lock_surface_focus(),
             }
+        } else if self.niri.polkit_is_open() {
+            KeyboardFocus::PolkitDialog
         } else if self.niri.screenshot_ui.is_open() {
             KeyboardFocus::ScreenshotUi
         } else if self.niri.switcher.is_open() {
@@ -4052,6 +4076,108 @@ impl State {
             .ok();
     }
 
+    /// A message from the polkit agent — see [`crate::dbus::polkit_agent`].
+    #[cfg(feature = "dbus")]
+    pub fn on_polkit_msg(&mut self, msg: crate::dbus::polkit_agent::PolkitToNiri) {
+        use crate::dbus::polkit_agent::PolkitToNiri;
+
+        // Not over a lock screen. GNOME holds the request and re-runs it when the session mode
+        // changes (`polkitAgent.js:439-450`); the one action it exempts is extending a
+        // parental-controls session limit, which we have no subsystem for.
+        if let PolkitToNiri::Begin(request) = &msg {
+            if self.niri.is_locked() {
+                debug!(
+                    "polkit: holding {} until the screen unlocks",
+                    request.action_id
+                );
+                self.niri.polkit_deferred = Some(request.clone());
+                return;
+            }
+        }
+        // A withdrawn request that never got on screen still has to stop being held.
+        if matches!(msg, PolkitToNiri::Cancel) {
+            self.niri.polkit_deferred = None;
+        }
+
+        let effects = self.niri.polkit_dialog.on_agent_event(msg);
+        self.apply_polkit_effects(effects);
+    }
+
+    /// The screen has unlocked: run whatever polkit asked for while it was down.
+    #[cfg(feature = "dbus")]
+    pub fn resume_deferred_polkit(&mut self) {
+        let Some(request) = self.niri.polkit_deferred.take() else {
+            return;
+        };
+        self.on_polkit_msg(crate::dbus::polkit_agent::PolkitToNiri::Begin(request));
+    }
+
+    /// The one funnel for everything the dialog decides.
+    #[cfg(feature = "dbus")]
+    pub fn apply_polkit_effects(&mut self, effects: crate::polkit_dialog::PolkitEffects) {
+        if let Some(request) = effects.request {
+            if let Some(tx) = self.niri.polkit_requests.as_ref() {
+                let _ = tx.send_blocking(request);
+            } else {
+                warn!("polkit: no agent to send to; the dialog is talking to nothing");
+            }
+        }
+
+        // Open and close ride the state machine rather than a separate flag, so there is one
+        // answer to "is it up" and the animation cannot disagree with it.
+        if self.niri.polkit_dialog.is_open() {
+            self.niri.polkit_ui.show();
+        } else {
+            self.niri.polkit_ui.hide();
+        }
+
+        if effects.wiggle {
+            self.niri
+                .polkit_ui
+                .start_wiggle(crate::utils::get_monotonic_time());
+        }
+
+        if effects.arm_reset {
+            self.arm_polkit_reset_timer();
+        }
+
+        if effects.close {
+            if let Some(token) = self.niri.polkit_reset_timer.take() {
+                self.niri.event_loop.remove(token);
+            }
+        }
+
+        if effects.redraw || effects.close || effects.wiggle {
+            // The focus chain has a `PolkitDialog` arm, so opening or closing changes who gets
+            // keys; recomputing it here is what makes the modal grab actually modal.
+            self.niri.queue_redraw_all();
+            self.refresh_and_flush_clients();
+        }
+    }
+
+    /// Hide the entry [`DELAYED_RESET`] after a conversation ends, unless another has asked by
+    /// then.
+    ///
+    /// [`DELAYED_RESET`]: crate::polkit_dialog::DELAYED_RESET
+    #[cfg(feature = "dbus")]
+    fn arm_polkit_reset_timer(&mut self) {
+        if let Some(token) = self.niri.polkit_reset_timer.take() {
+            self.niri.event_loop.remove(token);
+        }
+        let timer = calloop::timer::Timer::from_duration(crate::polkit_dialog::DELAYED_RESET);
+        self.niri.polkit_reset_timer = self
+            .niri
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.niri.polkit_reset_timer = None;
+                let effects = state.niri.polkit_dialog.on_reset_timeout();
+                state.apply_polkit_effects(effects);
+                calloop::timer::TimeoutAction::Drop
+            })
+            .map_err(|err| warn!("error arming the polkit reset timer: {err:?}"))
+            .ok();
+    }
+
     /// A message from gdm's verifier — see [`crate::dbus::gdm`].
     #[cfg(feature = "dbus")]
     pub fn on_verifier_event(&mut self, event: crate::dbus::gdm::VerifierEvent) {
@@ -4162,6 +4288,14 @@ impl State {
     /// Publish a [`ShieldEffects`](crate::screen_shield::ShieldEffects): the shared snapshot the
     /// bus reads, the signals it emits, logind's locked hint, and the clipboard wipe.
     pub fn apply_shield_effects(&mut self, effects: crate::screen_shield::ShieldEffects) {
+        // Whatever polkit asked for while the screen was down gets its turn now. Keyed off the
+        // shield going away rather than off `unlock()`, because a shield can be dismissed without
+        // ever having been locked, and a request held behind that one is just as stuck.
+        #[cfg(feature = "dbus")]
+        if effects.active_changed == Some(false) {
+            self.resume_deferred_polkit();
+        }
+
         // The curtain follows `active`, not `locked`: a shield down without a lock is still a
         // shield, and it is what a `lock-enabled = false` screensaver is.
         if effects.active_changed.is_some() {
@@ -5334,6 +5468,9 @@ impl Niri {
 
         let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone());
         let end_session_dialog = EndSessionDialog::new(animation_clock.clone(), config.clone());
+        #[cfg(feature = "dbus")]
+        let polkit_ui =
+            crate::ui::polkit_dialog::PolkitDialogUi::new(animation_clock.clone(), config.clone());
         let panel_popover = PanelPopover::new(animation_clock.clone(), config.clone());
         let panel = Panel::new(animation_clock.clone(), config.clone());
 
@@ -5633,6 +5770,16 @@ impl Niri {
             exit_confirm_dialog,
             run_dialog: RunDialog::new(),
             end_session_dialog,
+            #[cfg(feature = "dbus")]
+            polkit_dialog: crate::polkit_dialog::PolkitDialog::new(),
+            #[cfg(feature = "dbus")]
+            polkit_ui,
+            #[cfg(feature = "dbus")]
+            polkit_requests: None,
+            #[cfg(feature = "dbus")]
+            polkit_deferred: None,
+            #[cfg(feature = "dbus")]
+            polkit_reset_timer: None,
             panel,
             panel_popover,
             overview_was_open: false,
@@ -6377,6 +6524,7 @@ impl Niri {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
             || self.end_session_dialog.is_open()
+            || self.polkit_is_open()
             || self.is_locked()
             || self.screenshot_ui.is_open()
         {
@@ -6449,6 +6597,7 @@ impl Niri {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
             || self.end_session_dialog.is_open()
+            || self.polkit_is_open()
             || self.is_locked()
             || self.screenshot_ui.is_open()
             // Faded out under the search results: gnome-shell drops the strip's
@@ -6472,12 +6621,26 @@ impl Niri {
 
     /// Returns the window under the position to be activated.
     ///
+    /// Whether the polkit dialog is on screen. Always false without `dbus`, where there is no
+    /// agent to raise one.
+    pub fn polkit_is_open(&self) -> bool {
+        #[cfg(feature = "dbus")]
+        {
+            self.polkit_ui.is_open()
+        }
+        #[cfg(not(feature = "dbus"))]
+        {
+            false
+        }
+    }
+
     /// The cursor may be inside the window's activation region, but not within the window's input
     /// region.
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<&Mapped> {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
             || self.end_session_dialog.is_open()
+            || self.polkit_is_open()
             || self.is_locked()
             || self.screenshot_ui.is_open()
             // The window picker is faded out under the search results, so its
@@ -6539,6 +6702,7 @@ impl Niri {
         if self.exit_confirm_dialog.is_open()
             || self.run_dialog.is_open()
             || self.end_session_dialog.is_open()
+            || self.polkit_is_open()
         {
             return rv;
         } else if self.is_locked() {
@@ -7292,6 +7456,7 @@ impl Niri {
             KeyboardFocus::ExitConfirmDialog => true,
             KeyboardFocus::RunDialog => true,
             KeyboardFocus::EndSessionDialog => true,
+            KeyboardFocus::PolkitDialog => true,
             KeyboardFocus::Popover => true,
             KeyboardFocus::Overview => true,
             KeyboardFocus::Switcher => true,
@@ -7435,6 +7600,8 @@ impl Niri {
         self.config_error_notification.advance_animations();
         self.exit_confirm_dialog.advance_animations();
         self.end_session_dialog.advance_animations();
+        #[cfg(feature = "dbus")]
+        self.polkit_ui.advance_animations();
         self.screenshot_ui.advance_animations();
         self.panel_popover.advance_animations();
         self.panel.advance_animations();
@@ -7712,6 +7879,21 @@ impl Niri {
             ctx.renderer,
             output,
             self.gnome_settings.accent_color,
+            &mut |elem| push(elem.into()),
+        );
+
+        // Next, the polkit authentication dialog. Above the three above it and below the lock
+        // surface, which is the order it can actually be in: it defers rather than stacking on a
+        // shield.
+        #[cfg(feature = "dbus")]
+        self.polkit_ui.render(
+            ctx.renderer,
+            output,
+            &self.icon_cache,
+            &self.image_cache,
+            &self.polkit_dialog,
+            self.gnome_settings.accent_color,
+            self.clock.now_unadjusted(),
             &mut |elem| push(elem.into()),
         );
 
@@ -8646,6 +8828,12 @@ impl Niri {
                 self.config_error_notification.are_animations_ongoing();
             state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
             state.unfinished_animations_remain |= self.end_session_dialog.are_animations_ongoing();
+            #[cfg(feature = "dbus")]
+            {
+                state.unfinished_animations_remain |= self
+                    .polkit_ui
+                    .are_animations_ongoing(self.clock.now_unadjusted());
+            }
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.panel_popover.are_animations_ongoing();
             state.unfinished_animations_remain |= self.notification_banner.are_animations_ongoing();
@@ -12260,6 +12448,8 @@ niri_render_elements! {
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         RunDialog = RunDialogRenderElement,
         EndSessionDialog = EndSessionDialogRenderElement,
+        #[cfg(feature = "dbus")]
+        PolkitDialog = crate::ui::polkit_dialog::PolkitDialogRenderElement,
         FolderDialog = crate::ui::folder_dialog::FolderDialogRenderElement,
         // CPU-rendered UI (panel, notifications) uploaded through the active renderer, so it draws
         // on GLES and the owned Vulkan renderer alike (the M1 escape hatch: `TextureRenderElement`

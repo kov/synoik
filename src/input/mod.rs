@@ -202,6 +202,86 @@ impl<D: SeatHandler> PointerOrTouchStartData<D> {
 }
 
 impl State {
+    /// A key on the open polkit dialog.
+    ///
+    /// Escape cancels, Enter activates whatever has focus, Tab and the arrows move it, and
+    /// everything else is text for the entry. Nothing here reaches a client — the caller has
+    /// already decided to swallow it.
+    #[cfg(feature = "dbus")]
+    fn handle_polkit_key(&mut self, raw: Option<Keysym>, text: Option<char>, pressed: bool) {
+        use crate::polkit_dialog::Focus;
+
+        if !pressed {
+            return;
+        }
+
+        let effects = match raw {
+            Some(Keysym::Escape) => self.niri.polkit_dialog.cancel(),
+            Some(Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter) => {
+                match self.niri.polkit_dialog.focus() {
+                    Focus::Cancel => self.niri.polkit_dialog.cancel(),
+                    // Enter in the entry is the same as pressing Authenticate — GNOME connects
+                    // both to the same handler (`polkitAgent.js:101`, `:150`).
+                    Focus::Entry | Focus::Authenticate => self.niri.polkit_dialog.authenticate(),
+                }
+            }
+            Some(Keysym::Tab) => self.niri.polkit_dialog.cycle_focus(true),
+            Some(Keysym::ISO_Left_Tab) => self.niri.polkit_dialog.cycle_focus(false),
+            Some(Keysym::Down | Keysym::Right) => self.niri.polkit_dialog.cycle_focus(true),
+            Some(Keysym::Up | Keysym::Left) => self.niri.polkit_dialog.cycle_focus(false),
+            Some(Keysym::BackSpace) => self.niri.polkit_dialog.backspace(),
+            _ => match text.filter(|c| !c.is_control()) {
+                Some(c) => self.niri.polkit_dialog.type_char(c),
+                None => return,
+            },
+        };
+        self.apply_polkit_effects(effects);
+    }
+
+    /// Hovering a polkit control focuses it, the way its siblings do.
+    #[cfg(feature = "dbus")]
+    fn polkit_pointer_motion(
+        &mut self,
+        output_size: smithay::utils::Size<f64, Logical>,
+        pos: Point<f64, Logical>,
+    ) {
+        let Some(focus) = self
+            .niri
+            .polkit_ui
+            .hit(&self.niri.polkit_dialog, output_size, pos)
+        else {
+            return;
+        };
+        let effects = self.niri.polkit_dialog.set_focus(focus);
+        self.apply_polkit_effects(effects);
+    }
+
+    /// A left click on the polkit dialog.
+    #[cfg(feature = "dbus")]
+    fn polkit_pointer_click(
+        &mut self,
+        output_size: smithay::utils::Size<f64, Logical>,
+        pos: Point<f64, Logical>,
+    ) {
+        use crate::polkit_dialog::Focus;
+
+        let Some(focus) = self
+            .niri
+            .polkit_ui
+            .hit(&self.niri.polkit_dialog, output_size, pos)
+        else {
+            return;
+        };
+        let effects = match focus {
+            Focus::Cancel => self.niri.polkit_dialog.cancel(),
+            Focus::Authenticate => self.niri.polkit_dialog.authenticate(),
+            // Clicking the entry only moves focus there; there is nothing else a click in a text
+            // field does yet (no caret placement, no selection).
+            Focus::Entry => self.niri.polkit_dialog.set_focus(Focus::Entry),
+        };
+        self.apply_polkit_effects(effects);
+    }
+
     pub fn process_input_event<I: InputBackend + 'static>(&mut self, event: InputEvent<I>)
     where
         I::Device: 'static, // Needed for downcasting.
@@ -760,6 +840,28 @@ impl State {
                         DialogOutcome::Confirm => this.niri.confirm_end_session(),
                         DialogOutcome::Cancel => this.niri.cancel_end_session(),
                     }
+
+                    if pressed {
+                        this.niri.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    } else if this.niri.suppressed_keys.remove(&key_code) {
+                        return FilterResult::Intercept(None);
+                    } else {
+                        // Release of a key pressed before the dialog opened; the client saw the
+                        // press, give it the release.
+                        return FilterResult::Forward;
+                    }
+                }
+
+                // The polkit "Authentication Required" dialog is modal in the same way, and it is
+                // the one that matters most: it is a password box, so a key that leaked past it
+                // would be a character of somebody's password delivered to a window.
+                #[cfg(feature = "dbus")]
+                if this.niri.polkit_is_open() {
+                    let text = modified
+                        .key_char()
+                        .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
+                    this.handle_polkit_key(raw, text, pressed);
 
                     if pressed {
                         this.niri.suppressed_keys.insert(key_code);
@@ -4018,6 +4120,16 @@ impl State {
             }
         }
 
+        // Hovering a polkit control focuses it, so the pointer and the keyboard agree about which
+        // button Enter would press.
+        #[cfg(feature = "dbus")]
+        if self.niri.polkit_is_open() {
+            if let Some((output, pos_within_output)) = self.niri.output_under(new_pos) {
+                let output_size = output_size(output);
+                self.polkit_pointer_motion(output_size, pos_within_output);
+            }
+        }
+
         // Drag first: the dash's hover feedback is derived from the drag's unpin state,
         // so computing it the other way round would paint it one motion stale.
         self.update_app_drag(new_pos);
@@ -4169,6 +4281,16 @@ impl State {
                 {
                     self.niri.queue_redraw_all();
                 }
+            }
+        }
+
+        // Hovering a polkit control focuses it, so the pointer and the keyboard agree about which
+        // button Enter would press.
+        #[cfg(feature = "dbus")]
+        if self.niri.polkit_is_open() {
+            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+                let output_size = output_size(output);
+                self.polkit_pointer_motion(output_size, pos_within_output);
             }
         }
 
@@ -5983,6 +6105,23 @@ impl State {
                 return;
             }
 
+            // ...and so is the polkit dialog: a left click activates whatever is under the cursor,
+            // every button is swallowed, and a click on the card's background does nothing rather
+            // than dismissing it (polkit's ModalDialog has no click-outside-to-close either).
+            #[cfg(feature = "dbus")]
+            if self.niri.polkit_is_open() {
+                if button == Some(MouseButton::Left) {
+                    let location = pointer.current_location();
+                    if let Some((output, pos_within_output)) = self.niri.output_under(location) {
+                        let output_size = output_size(output);
+                        self.polkit_pointer_click(output_size, pos_within_output);
+                    }
+                }
+
+                self.niri.suppressed_buttons.insert(button_code);
+                return;
+            }
+
             // GNOME top panel + its popovers.
             if self.niri.layout.is_gnome_mode() {
                 let location = pointer.current_location();
@@ -7298,6 +7437,16 @@ impl State {
                 {
                     self.niri.queue_redraw_all();
                 }
+            }
+        }
+
+        // Hovering a polkit control focuses it, so the pointer and the keyboard agree about which
+        // button Enter would press.
+        #[cfg(feature = "dbus")]
+        if self.niri.polkit_is_open() {
+            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+                let output_size = output_size(output);
+                self.polkit_pointer_motion(output_size, pos_within_output);
             }
         }
 

@@ -82,6 +82,9 @@ pub struct DBusServers {
     pub conn_accounts: Option<Connection>,
     pub conn_fprintd: Option<Connection>,
     pub conn_smartcard: Option<Connection>,
+    /// The session's polkit authentication agent (system bus). Without it, every action needing
+    /// authentication fails with no prompt — see [`polkit_agent`].
+    pub conn_polkit: Option<Connection>,
     pub conn_locale1: Option<Connection>,
     pub conn_keyboard_monitor: Option<Connection>,
     pub conn_system_status: Option<Connection>,
@@ -170,6 +173,26 @@ impl DBusServers {
                     niri.gdm_requests = Some(requests);
                 }
                 Err(err) => warn!("error starting the gdm verifier client: {err:?}"),
+            }
+
+            // The polkit authentication agent. On the same `is_session_instance` gate as the rest:
+            // registering is per-session and polkitd allows exactly one agent per session, so a
+            // second instance would take the seat's prompt away from the real shell.
+            let (to_niri, from_polkit) = calloop::channel::channel();
+            niri.event_loop
+                .insert_source(from_polkit, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(msg) => state.on_polkit_msg(msg),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            match polkit_agent::start(to_niri) {
+                Ok((conn, requests)) => {
+                    dbus.conn_polkit = Some(conn);
+                    niri.polkit_requests = Some(requests);
+                }
+                // Loud: the failure mode is silent everywhere else. Every polkit action will fail
+                // with no prompt, and the user has no way to tell that from being denied.
+                Err(err) => warn!("no polkit authentication agent: {err:?}"),
             }
 
             // gsd-power's way in to brightness: idle dimming and the auto-brightness target.
