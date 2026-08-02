@@ -588,6 +588,43 @@ mod tests {
         );
     }
 
+    /// An info message with no question behind it opens the dialog — this is the whole fingerprint
+    /// phase.
+    ///
+    /// `pam_fprintd` sits in the `polkit-1` stack (via `system-auth`) ahead of `pam_unix`. When it
+    /// runs it sends `PAM_TEXT_INFO "Place your finger on the fingerprint reader"` and then waits
+    /// on fprintd's D-Bus signals — it never sends a prompt, because there is nothing for the
+    /// user to type. So a dialog that opened only on a question would leave the reader waiting
+    /// with nothing on screen, and appear later asking for a password. GNOME opens on info for
+    /// exactly this reason: `_onSessionShowInfo` calls `_ensureOpen` just as
+    /// `_onSessionRequest` does (`polkitAgent.js:310-317`).
+    ///
+    /// The entry must stay away while it is the reader's turn, and Authenticate with it — there is
+    /// no answer to submit.
+    #[test]
+    fn the_reader_can_speak_before_anything_is_asked() {
+        let mut dialog = PolkitDialog::new();
+        dialog.begin(request("root", false));
+
+        let effects = dialog.on_agent_event(PolkitToNiri::ShowInfo("Place your finger".to_owned()));
+
+        assert!(dialog.is_open(), "the reader's turn has to be visible");
+        assert!(effects.redraw);
+        assert_eq!(
+            dialog.message().map(Message::text),
+            Some("Place your finger")
+        );
+        assert!(!dialog.shows_entry(), "there is nothing to type yet");
+        assert!(
+            !dialog.can_authenticate(),
+            "and so nothing to submit either"
+        );
+
+        // ...and when the reader gives up, `pam_unix` asks, and the entry arrives.
+        asked(&mut dialog);
+        assert!(dialog.shows_entry());
+    }
+
     /// An info message must not be mistaken for an explanation: "Place your finger on the reader"
     /// is not a reason the password was refused, so a refusal after one still says so.
     #[test]
