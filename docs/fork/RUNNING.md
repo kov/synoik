@@ -294,8 +294,9 @@ grid, and search.
 
 In floating (GNOME) windowing mode a **top panel** is drawn in-compositor
 (`src/ui/panel.rs`) on every output: a 32px opaque bar (gnome-shell's
-`2.2em @ 11pt`) with a left **Activities** button and a centered **clock**
-(local `HH:MM`, ticking on the minute). Clicking Activities toggles the
+`2.2em @ 11pt`) with a left **Activities** button and, at the far right past the
+status indicators, the **clock** (local `HH:MM`, ticking on the minute; GNOME centres
+it — see the accepted divergence in `docs/fork/panel-status-port.md`). Clicking Activities toggles the
 overview — the mouse counterpart of the Super-tap — and highlights while the
 overview is open; the panel itself stays put in the overview (in the dark
 theme gnome-shell's `:overview` transparency is a visual no-op). It renders

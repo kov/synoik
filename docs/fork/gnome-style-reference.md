@@ -130,7 +130,7 @@ choice, and it must be Cantarell.** (Monospace spans — dialog command echoes, 
   GNOME. cosmic-text falls back to the fontdb default if Cantarell is absent (GNOME systems always
   ship it).
 - **Tabular figures.** Cantarell's default digits are *proportional* (`1` narrower than `8`), which
-  jitters the advance-centered clock every second. GNOME fixes this with `%numeric` =
+  jitters the advance-sized clock button every second. GNOME fixes this with `%numeric` =
   `font-feature-settings: "tnum"` on the panel + calendar (§1.2). We match it in `sans_label_attrs`:
   the single-line **label** shape+measure path enables `tnum` (cosmic-text 0.19
   `Attrs::font_features` + `FeatureTag::new(b"tnum")`); **body paragraphs stay proportional** (they

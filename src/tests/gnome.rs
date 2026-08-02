@@ -4416,14 +4416,23 @@ fn panel_clock_sits_right_of_the_status_indicators() {
         "the panel's right corner must open the calendar"
     );
 
-    // The calendar hugs the right edge, centred on the clock and clamped inside the
-    // output — where GNOME's would sit mid-screen.
+    // The calendar hugs the right edge — where GNOME's would sit mid-screen. Centring it
+    // on a clock this far right would overflow the output, so the clamp is what decides
+    // the position, and the assertion is on the *edge* rather than on the origin: an
+    // unclamped popover would land right of this and hang off the screen.
     let output = f.niri_output(1);
     let origin = f.niri().panel_popover.location(&output);
+    let size = f.niri().panel_popover.content_size().expect("open");
+    let margin = 6.0_f64; // POPOVER_MARGIN
     assert!(
         origin.x > 960.,
         "the calendar must follow the clock to the right half, got x={}",
         origin.x
+    );
+    assert_eq!(
+        origin.x + size.w,
+        1920. - margin,
+        "the calendar must stop a POPOVER_MARGIN short of the screen's right edge"
     );
 
     f.key_press(KEY_ESC);

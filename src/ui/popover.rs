@@ -1010,6 +1010,14 @@ impl PanelPopover {
         }
     }
 
+    /// The open popover's content size, or `None` when closed. With [`Self::location`],
+    /// enough to pin where the surface actually lands on an output — which is all this is
+    /// for, hence the gate; the render path takes the size from the content directly.
+    #[cfg(test)]
+    pub(crate) fn content_size(&self) -> Option<Size<f64, Logical>> {
+        self.content.as_ref().map(|c| c.logical_size())
+    }
+
     /// The popover's resting top-left, output-local logical: centered under the anchor,
     /// clamped into the output with a `POPOVER_MARGIN` inset from the screen edges, and
     /// sitting `POPOVER_MARGIN` below the panel (not flush); snapped to the pixel grid.

@@ -71,7 +71,7 @@ pub fn panel_height() -> f64 {
 
 /// Panel font size. The clock draws at GNOME's `panel_button` base of 11pt
 /// (`_drawing.scss`), bold. Shaping routes `FONT_PT` through [`TextShaper`]; `font_px()`
-/// is its logical px, kept for the advance-width measure that centers the clock.
+/// is its logical px, kept for the advance-width measure that sizes the clock button.
 const FONT_PT: f64 = 11.;
 fn font_px() -> f64 {
     crate::ui::pt_to_px(FONT_PT)
@@ -624,8 +624,9 @@ pub struct Panel {
     keyboard_layout: Option<String>,
     /// The dateMenu unread-messages dot (GNOME's `MessagesIndicator`): shown when
     /// `show-banners && unseen − queued > 0` (`js/ui/dateMenu.js:787-798`). The
-    /// compositor recomputes it from the notification store; a size-matched pad
-    /// keeps the clock centered whether it's shown or not.
+    /// compositor recomputes it from the notification store. It trails the clock inside
+    /// the right-anchored dateMenu box, so showing it slides the clock (and everything
+    /// left of it) over — see [`MESSAGES_INDICATOR_EXTENT`].
     messages_indicator: bool,
     /// The accessibility state driving the `a11y` right-box indicator's presence
     /// (`ATIndicator._syncMenuVisibility`, `js/ui/status/accessibility.js:90-97`).
