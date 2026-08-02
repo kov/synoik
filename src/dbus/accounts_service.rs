@@ -69,13 +69,48 @@ impl PasswordMode {
 pub struct UserAccount {
     /// `RealName`. Empty when unset — the caller falls back to the login name.
     pub real_name: String,
-    /// `IconFile`, **already checked to exist on disk**.
-    ///
-    /// AccountsService will happily report a path that has been deleted, which is why GNOME
-    /// re-tests it before use (`userWidget.js:73-76`). Doing that here rather than at the draw
-    /// keeps the check off the render path.
-    pub icon_file: Option<PathBuf>,
+    /// `IconFile`, if it is a regular file we could stat. See [`AccountIcon`].
+    pub icon_file: Option<AccountIcon>,
     pub password_mode: PasswordMode,
+}
+
+/// The account picture: the path AccountsService reported, **plus the identity of the bytes at
+/// it**.
+///
+/// Both halves are needed and neither is optional, which is why this is a type with one
+/// constructor rather than two fields on [`UserAccount`]:
+///
+/// - the **path** must be re-checked on disk, because AccountsService will happily keep reporting
+///   one that has been deleted (`userWidget.js:73-76`); doing it here keeps it off the render path.
+/// - the **stamp** is what makes a change visible at all. AccountsService reuses one path per user
+///   (`/var/lib/AccountsService/icons/<name>`), so changing your picture in Settings emits an
+///   argument-less `Changed` and a byte-identical `IconFile`. With nothing that moves, the re-read
+///   account compares equal to the one we hold, the update is dropped as a no-op, and every cache
+///   downstream — all keyed by path — serves the previous picture for the rest of the session.
+///   gnome-shell gets this from `StTextureCache`'s per-file `GFileMonitor`
+///   (`st-texture-cache.c:1087-1133`); this is the cheap equivalent.
+///
+/// [`read`](Self::read) is the only way to build one, from a single `metadata` call, so the two can
+/// neither disagree about which file they describe nor drift apart by someone adding a field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountIcon {
+    pub path: PathBuf,
+    /// Modification time and length. Private: nothing reads it, it only has to *differ*.
+    stamp: (std::time::SystemTime, u64),
+}
+
+impl AccountIcon {
+    /// `None` unless `path` is a regular file we can stat.
+    pub fn read(path: PathBuf) -> Option<Self> {
+        let meta = path.metadata().ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        Some(Self {
+            stamp: (meta.modified().ok()?, meta.len()),
+            path,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -100,9 +135,9 @@ async fn read_account(user: &zbus::Proxy<'_>) -> UserAccount {
         .ok()
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        // The disk check GNOME does. A stale path here would be a permanently missing avatar,
-        // where the themed fallback at least draws something.
-        .filter(|path| path.is_file());
+        // A path that no longer exists becomes `None` here rather than a permanently missing
+        // avatar; the themed fallback at least draws something.
+        .and_then(AccountIcon::read);
 
     let password_mode = user
         .get_property::<i32>("PasswordMode")

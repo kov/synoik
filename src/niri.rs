@@ -3963,7 +3963,16 @@ impl State {
                 self.niri
                     .unlock_dialog
                     .set_real_name(account.real_name.clone());
+                // Everything downstream is keyed by *path*, and AccountsService reuses one path
+                // per user — so a picture the user just changed has to be evicted explicitly, or
+                // the old bytes are served for the rest of the session. `icon_stamp` is what let
+                // the equality check above notice at all.
+                let stale = self.niri.avatar_source();
                 self.niri.user_account = account;
+                if let Some(stale) = stale {
+                    self.niri.image_cache.retain(|source| source != &stale);
+                    self.niri.lock_screen.forget_avatar();
+                }
                 // Decode the picture now, not on the frame that first draws it. A cold key draws
                 // *nothing* and the prompt falls back to the themed glyph, so a lazy decode means
                 // the first lock after login shows the default avatar and then swaps to the
@@ -11276,8 +11285,8 @@ impl Niri {
     pub fn avatar_source(&self) -> Option<crate::image_source::ImageSource> {
         self.user_account
             .icon_file
-            .clone()
-            .map(crate::image_source::ImageSource::File)
+            .as_ref()
+            .map(|icon| crate::image_source::ImageSource::File(icon.path.clone()))
     }
 
     /// Decode the account picture at every output's scale, at the size the unlock prompt draws it.

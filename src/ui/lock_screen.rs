@@ -562,6 +562,14 @@ impl From<TextureRenderElement<VkTexture>> for PromptElement {
 }
 
 impl LockScreen {
+    /// Drop the uploaded account picture.
+    ///
+    /// For when the *bytes* behind the path changed: everything here is keyed by path, so nothing
+    /// else would notice. See [`crate::dbus::accounts_service::UserAccount::icon_stamp`].
+    pub fn forget_avatar(&mut self) {
+        self.avatar_uploads.borrow_mut().clear();
+    }
+
     /// The shield went down (`true`) or came back up.
     ///
     /// Takes `now` unconditionally rather than folding it into an `Option`, because *both*
@@ -972,7 +980,7 @@ impl LockScreen {
         let picture = content.avatar.as_ref().and_then(|source| {
             let mut uploads = self.avatar_uploads.borrow_mut();
             // One slot, so anything else in it is a picture the user has replaced.
-            uploads.retain(|(_, s), _| s == source);
+            uploads.retain_sources(|s| s == source);
             widget::Avatar::element(
                 renderer,
                 &mut uploads,

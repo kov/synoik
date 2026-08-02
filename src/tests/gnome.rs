@@ -13408,7 +13408,7 @@ fn album_art_is_loaded_when_the_player_appears() {
 #[cfg(feature = "dbus")]
 #[test]
 fn the_account_picture_is_decoded_up_front_and_outlives_a_track_change() {
-    use crate::dbus::accounts_service::{AccountsToNiri, UserAccount};
+    use crate::dbus::accounts_service::{AccountIcon, AccountsToNiri, UserAccount};
     use crate::image_source::ImageSource;
     use crate::render_helpers::icon::ImageFit;
     use crate::ui::lock_screen::AVATAR_PX;
@@ -13430,7 +13430,7 @@ fn the_account_picture_is_decoded_up_front_and_outlives_a_track_change() {
     f.niri_state()
         .on_accounts_msg(AccountsToNiri::UserChanged(UserAccount {
             real_name: "Test User".to_owned(),
-            icon_file: Some(face.clone()),
+            icon_file: AccountIcon::read(face.clone()),
             ..Default::default()
         }));
 
@@ -13467,6 +13467,77 @@ fn the_account_picture_is_decoded_up_front_and_outlives_a_track_change() {
             .image_cache
             .is_loaded(&face_src, ImageFit::Cover, AVATAR_PX, 1.0),
         "the account picture was evicted by a track change"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Changing your picture replaces it, even though the file keeps its name.
+///
+/// AccountsService writes every user's picture to one path
+/// (`/var/lib/AccountsService/icons/<user>`) and emits an argument-less `Changed`, so the account
+/// we read back is byte-identical to the one we hold and every cache downstream is keyed on that
+/// same path. Two independent things therefore have to notice the swap, and if either does not the
+/// old picture survives until the session restarts — with nothing in the logs, because nothing
+/// failed.
+#[cfg(feature = "dbus")]
+#[test]
+fn changing_the_account_picture_in_place_replaces_it() {
+    use crate::dbus::accounts_service::{AccountIcon, AccountsToNiri, UserAccount};
+    use crate::image_source::ImageSource;
+    use crate::render_helpers::icon::ImageFit;
+    use crate::ui::lock_screen::AVATAR_PX;
+
+    let dir = std::env::temp_dir().join(format!("gsrs-avatar-swap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // The one path AccountsService will keep reporting.
+    let face = dir.join("face.png");
+
+    let write = |rgb: [u8; 3]| {
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
+            .save(&face)
+            .unwrap();
+    };
+    let announce = |f: &mut Fixture| {
+        f.niri_state()
+            .on_accounts_msg(AccountsToNiri::UserChanged(UserAccount {
+                real_name: "Test User".to_owned(),
+                icon_file: AccountIcon::read(face.clone()),
+                ..Default::default()
+            }));
+    };
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    write([200, 40, 40]);
+    announce(&mut f);
+
+    let source = ImageSource::File(face.clone());
+    let red = f
+        .niri()
+        .image_cache
+        .buffer(&source, ImageFit::Cover, AVATAR_PX, 1.0)
+        .expect("the first picture decodes");
+    assert!(
+        red.data().chunks_exact(4).all(|p| p[0] > 150 && p[1] < 90),
+        "the fixture decoded a red picture"
+    );
+
+    // The user picks a new picture. Same path, different bytes — and `modified()` has a coarse
+    // resolution on some filesystems, so the length moves too (a solid green PNG compresses
+    // differently) and the test does not depend on the clock.
+    write([40, 200, 40]);
+    announce(&mut f);
+
+    let now = f
+        .niri()
+        .image_cache
+        .buffer(&source, ImageFit::Cover, AVATAR_PX, 1.0)
+        .expect("the new picture decodes");
+    assert!(
+        now.data().chunks_exact(4).all(|p| p[1] > 150 && p[0] < 90),
+        "the lock screen is still holding the previous picture"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

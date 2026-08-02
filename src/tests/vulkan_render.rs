@@ -11784,7 +11784,7 @@ fn the_crossfade_asks_for_one_avatar_not_one_per_frame() {
 fn vulkan_draws_the_account_picture_round() {
     use std::io::Cursor;
 
-    use crate::dbus::accounts_service::{AccountsToNiri, UserAccount};
+    use crate::dbus::accounts_service::{AccountIcon, AccountsToNiri, UserAccount};
     use crate::dbus::gdm::VerifierEvent;
     use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
 
@@ -11812,7 +11812,7 @@ fn vulkan_draws_the_account_picture_round() {
     f.niri_state()
         .on_accounts_msg(AccountsToNiri::UserChanged(UserAccount {
             real_name: "Test User".to_owned(),
-            icon_file: Some(path.clone()),
+            icon_file: AccountIcon::read(path.clone()),
             ..Default::default()
         }));
 
@@ -11880,6 +11880,87 @@ fn vulkan_draws_the_account_picture_round() {
         assert!(
             !is_avatar(px(&pixels, w, cx, cy)),
             "the picture reaches its box's corner at ({cx}, {cy}) — it was not clipped to a circle"
+        );
+    }
+}
+
+/// One picture on two outputs at different scales is two uploads, not one reused at the wrong size.
+///
+/// The decode is per *physical* size, so a texture uploaded for a 1× output is half the pixels a 2×
+/// output needs. Keyed without the scale, whichever output drew first wins and the other reuses its
+/// texture — which, re-tagged at its own scale, comes out half the size and stays that way. The
+/// same key is what a scale *change* hits: `warm_avatar` decodes at the new scale and the stale
+/// entry still hits, so the fresh decode is never uploaded.
+///
+/// Asserted on the element's logical size, which is what the miss actually moves: the avatar is
+/// `AVATAR_PX` on every output, whatever the scale.
+#[test]
+fn the_account_picture_uploads_once_per_scale() {
+    use std::io::Cursor;
+
+    use smithay::backend::renderer::element::Element as _;
+
+    use crate::image_source::ImageSource;
+    use crate::ui::lock_screen::AVATAR_PX;
+    use crate::ui::widget::{Avatar, ImageUploads};
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+
+    let mut img = image::RgbaImage::new(128, 128);
+    for p in img.pixels_mut() {
+        *p = image::Rgba([255, 0, 255, 255]);
+    }
+    let mut png = Vec::new();
+    img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode png");
+    let path = std::env::temp_dir().join(format!("gsrs-avatar-scale-{}.png", std::process::id()));
+    std::fs::write(&path, &png).expect("write temp avatar");
+    let source = ImageSource::File(path.clone());
+
+    let state = f.niri_state();
+    let mut logical = Vec::new();
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let niri = &mut state.niri;
+            let mut uploads = ImageUploads::new();
+            // 1× first, so a scale-blind key hands its texture to the 2× ask.
+            for scale in [1., 2.] {
+                let el = Avatar::element(
+                    vk,
+                    &mut uploads,
+                    &niri.image_cache,
+                    &source,
+                    0,
+                    AVATAR_PX,
+                    scale,
+                    1.,
+                    Point::from((0., 0.)),
+                    Point::from((0., 0.)),
+                    1.,
+                )
+                .expect("the picture uploads");
+                // Physical geometry at this output's scale, back in logical units.
+                logical.push(f64::from(el.geometry(Scale::from(scale)).size.w) / scale);
+            }
+        })
+        .expect("headless backend must hold a Vulkan renderer");
+
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        logical.len(),
+        2,
+        "both scales must have produced an element"
+    );
+    for (i, w) in logical.iter().enumerate() {
+        assert!(
+            (w - AVATAR_PX).abs() <= 1.,
+            "at scale {} the picture drew {w} logical px, not {AVATAR_PX} — it reused the other \
+             output's upload",
+            if i == 0 { 1. } else { 2. }
         );
     }
 }

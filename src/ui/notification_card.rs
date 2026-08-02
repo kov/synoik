@@ -619,7 +619,7 @@ impl CardCache {
             context: None,
             cards: HashMap::new(),
             pixels: HashMap::new(),
-            images: HashMap::new(),
+            images: crate::ui::widget::ImageUploads::new(),
             app_icons: Default::default(),
         }
     }
@@ -629,7 +629,7 @@ impl CardCache {
     pub fn retain(&mut self, keep: impl Fn(u64) -> bool) {
         self.cards.retain(|(_, key), _| keep(*key));
         self.pixels.retain(|key, _| keep(*key));
-        self.images.retain(|(key, _), _| keep(*key));
+        self.images.retain_slots(&keep);
     }
 
     /// The image-upload slots, for a card kind that composites a file-backed image

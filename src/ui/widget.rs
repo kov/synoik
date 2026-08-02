@@ -315,9 +315,56 @@ pub fn app_icon_element(
     ))
 }
 
-/// Uploaded textures for images an app pointed us at, keyed by an owner-chosen slot id and the
-/// source. See [`image_element`]; owners prune on the slot id.
-pub type ImageUploads = HashMap<(u64, ImageSource), TextureBuffer<VkTexture>>;
+/// Uploaded textures for runtime-chosen images (album art, the account picture), keyed by output
+/// scale, an owner-chosen slot id, and the source. See [`image_element`]; owners prune on the slot
+/// id with [`retain_slots`](ImageUploads::retain_slots).
+///
+/// **The scale is in the key and must stay there.** The decode is per physical size, so one source
+/// is a different texture per output scale — without it, whichever output drew first wins and every
+/// other one reuses its texture at the wrong resolution, silently and permanently. Two outputs at
+/// different scales is the obvious way in; the quieter one is a *scale change*, where the re-warmed
+/// decode is never uploaded because the stale entry still hits. Matches [`AppIconUploads`], which
+/// has been keyed this way all along.
+///
+/// It is a type rather than a `HashMap` alias so the **renderer-context check cannot be
+/// forgotten**: [`image_element`] and [`Avatar::element`] run it themselves on every lookup, so a
+/// texture from a dead context can never be served. As an alias it was one line each owner had to
+/// remember, and the lock screen did not.
+#[derive(Default)]
+pub struct ImageUploads {
+    map: HashMap<(NotNan<f64>, u64, ImageSource), TextureBuffer<VkTexture>>,
+    context: Option<ContextId<VkTexture>>,
+}
+
+impl ImageUploads {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drop everything if the renderer context changed. Called for the owner by the element
+    /// builders; owners that mint their own textures into this map must call it too.
+    pub fn ensure_context(&mut self, renderer: &VulkanRenderer) {
+        let context = renderer.context_id();
+        if self.context.as_ref() != Some(&context) {
+            self.map.clear();
+            self.context = Some(context);
+        }
+    }
+
+    /// Drop every upload whose slot id `keep` rejects, at every scale.
+    pub fn retain_slots(&mut self, keep: impl Fn(u64) -> bool) {
+        self.map.retain(|(_, slot, _), _| keep(*slot));
+    }
+
+    /// Drop every upload whose source `keep` rejects, at every scale and slot.
+    pub fn retain_sources(&mut self, keep: impl Fn(&ImageSource) -> bool) {
+        self.map.retain(|(_, _, source), _| keep(source));
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+}
 
 /// Composite an image an app pointed us at (album art today), loaded by the [`ImageCache`],
 /// centered at `center` (relative to the element `origin`), fitted into a `logical_px` square.
@@ -347,13 +394,14 @@ pub fn image_element(
     center: Point<f64, Logical>,
     alpha: f32,
 ) -> Option<TextureRenderElement<VkTexture>> {
-    let key = (slot, source.clone());
+    uploads.ensure_context(renderer);
+    let key = (NotNan::new(scale).ok()?, slot, source.clone());
     #[allow(clippy::map_entry)]
-    if !uploads.contains_key(&key) {
+    if !uploads.map.contains_key(&key) {
         let buffer = images.buffer(source, ImageFit::Contain, logical_px, scale)?;
         match TextureBuffer::from_memory_buffer(renderer, &buffer) {
             Ok(tb) => {
-                uploads.insert(key.clone(), tb);
+                uploads.map.insert(key.clone(), tb);
             }
             Err(err) => {
                 tracing::error!("error uploading image {source:?}: {err:#}");
@@ -361,7 +409,7 @@ pub fn image_element(
             }
         }
     }
-    let tb = uploads.get(&key)?;
+    let tb = uploads.map.get(&key)?;
     let logical = tb.logical_size();
     let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
     Some(TextureRenderElement::from_texture_buffer(
@@ -424,13 +472,14 @@ impl Avatar {
         center: Point<f64, Logical>,
         alpha: f32,
     ) -> Option<RoundedTextureRenderElement<VkTexture>> {
-        let key = (slot, source.clone());
+        uploads.ensure_context(renderer);
+        let key = (NotNan::new(scale).ok()?, slot, source.clone());
         #[allow(clippy::map_entry)]
-        if !uploads.contains_key(&key) {
+        if !uploads.map.contains_key(&key) {
             let buffer = images.buffer(source, ImageFit::Cover, logical_px, scale)?;
             match TextureBuffer::from_memory_buffer(renderer, &buffer) {
                 Ok(tb) => {
-                    uploads.insert(key.clone(), tb);
+                    uploads.map.insert(key.clone(), tb);
                 }
                 Err(err) => {
                     tracing::error!("error uploading the avatar {source:?}: {err:#}");
@@ -438,7 +487,7 @@ impl Avatar {
                 }
             }
         }
-        let tb = uploads.get(&key)?;
+        let tb = uploads.map.get(&key)?;
         // Re-tag at the page's scale: dividing the buffer scale magnifies.
         let tb = TextureBuffer::from_texture(
             renderer,

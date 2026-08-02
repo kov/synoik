@@ -1336,33 +1336,40 @@ fn decode_raster(data: &[u8], px: u32, fit: ImageFit) -> anyhow::Result<Vec<u8>>
     }
 
     let (w, h) = (img.width().max(1), img.height().max(1));
-    let (sx, sy) = (px as f32 / w as f32, px as f32 / h as f32);
-    let s = match fit {
-        // Fit inside: the smaller scale, so neither axis overflows.
-        ImageFit::Contain => sx.min(sy),
-        // Fill: the larger scale, so neither axis falls short. The overflow is cropped below.
-        ImageFit::Cover => sx.max(sy),
-    };
-    let nw = ((w as f32 * s).round() as u32).max(1);
-    let nh = ((h as f32 * s).round() as u32).max(1);
-    let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::CatmullRom);
+    let filter = image::imageops::FilterType::CatmullRom;
+
+    if fit == ImageFit::Cover {
+        // **Crop first, then resample.** Cover's scale factor is the *larger* of the two, so
+        // resizing before cropping would build an intermediate as long as `w * px / h` on the long
+        // axis — bounded by nothing but the source's aspect ratio. A solid-colour 100000×2 PNG is a
+        // few KB on disk, well under `MAX_IMAGE_BYTES` (which caps *bytes*, not dimensions), and at
+        // `px = 160` it asks for a ~5 GB intermediate. That is not a decode failure the worker can
+        // absorb: an allocation failure **aborts**, and the `catch_unwind` around this catches
+        // panics. Cropping to the target's aspect on the source side is bounded by the source, and
+        // it is also less work — the resample no longer filters pixels that are about to be thrown
+        // away.
+        //
+        // The target is always square, so the crop is the largest centred square of the source.
+        let side = w.min(h);
+        let cropped =
+            image::imageops::crop_imm(&img, (w - side) / 2, (h - side) / 2, side, side).to_image();
+        // Straight to the output size: no letterbox to compose, and no off-by-one stripe from
+        // rounding the scaled length.
+        return Ok(image::imageops::resize(&cropped, px, px, filter).into_raw());
+    }
+
+    // Contain: fit inside, then centre on transparency. `min` bounds both axes at `px`.
+    let s = (px as f32 / w as f32).min(px as f32 / h as f32);
+    let nw = ((w as f32 * s).round() as u32).clamp(1, px);
+    let nh = ((h as f32 * s).round() as u32).clamp(1, px);
+    let resized = image::imageops::resize(&img, nw, nh, filter);
 
     let mut out = vec![0u8; (px * px * 4) as usize];
-    // Signed, because `cover` centres a *larger* image: the offsets go negative and the rows and
-    // columns that fall outside the square are the crop. `contain` never takes those branches.
-    let ox = (px as i64 - nw as i64) / 2;
-    let oy = (px as i64 - nh as i64) / 2;
+    let ox = (px - nw) / 2;
+    let oy = (px - nh) / 2;
     for y in 0..nh {
-        let dy = oy + y as i64;
-        if dy < 0 || dy >= px as i64 {
-            continue;
-        }
         for x in 0..nw {
-            let dx = ox + x as i64;
-            if dx < 0 || dx >= px as i64 {
-                continue;
-            }
-            let di = ((dy * px as i64 + dx) * 4) as usize;
+            let di = (((oy + y) * px + (ox + x)) * 4) as usize;
             out[di..di + 4].copy_from_slice(&resized.get_pixel(x, y).0); // premultiplied [R,G,B,A]
         }
     }
@@ -1529,6 +1536,39 @@ mod tests {
             covered(ImageFit::Cover),
             256,
             "cover must leave no transparent pixel in the square"
+        );
+    }
+
+    /// A wildly non-square source under `cover` stays bounded by the *target*, not the aspect.
+    ///
+    /// Resampling before cropping makes the intermediate `w * px / h` on the long axis, which the
+    /// file size does not bound: this 60000×2 image is under 1 KB as a PNG, and scaled-then-cropped
+    /// it would ask for a 60000·160·4 ≈ 38 GB buffer. The failure is not a decode error the worker
+    /// can turn into a negative result — an allocation failure **aborts the process**, so a
+    /// pathological account picture would take the compositor down at warm time, before anything
+    /// had drawn. The test passing at all is most of the assertion; that it finishes in
+    /// milliseconds is the rest.
+    #[test]
+    fn cover_does_not_size_its_intermediate_by_the_aspect_ratio() {
+        use std::io::Cursor;
+        let mut img = image::RgbaImage::new(60000, 2);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([0, 200, 0, 255]);
+        }
+        let mut png = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode png");
+        assert!(
+            png.len() < 100_000,
+            "the source is small on disk: {}",
+            png.len()
+        );
+
+        let out = decode_raster(&png, 160, ImageFit::Cover).expect("decode raster");
+        assert_eq!(out.len(), 160 * 160 * 4);
+        assert!(
+            out.chunks_exact(4).all(|p| p[3] > 200),
+            "cover must still fill the square"
         );
     }
 
