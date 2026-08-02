@@ -349,10 +349,26 @@ Two bugs found on the seat 2026-08-01 and fixed: the reader was armed when the *
 rather than when the prompt came up, so a screen showing only a clock demanded a fingerprint (GNOME
 never has this — it does not build the auth prompt until `_showPrompt`, `unlockDialog.js:799-800`;
 we open the channel early on purpose, so the reader has to be held back separately). And a reader
-that declines was restarted forever: `ServiceUnavailable` now ends that service for the lock
-(`util.js:888-890`, `:920-921`), and a conversation that stops faster than a person could fail is
+that declines was restarted forever: `ServiceUnavailable` now ends that service
+(`util.js:888-890`, `:920-921`), and a conversation that stops without ever having answered is
 counted against a small budget. The password conversation is deliberately exempt from both — it is
 the only way back in.
+
+The budget then needed two corrections, both from the seat the same day, and both about scope:
+
+- **"the reader did not answer", not "the attempt failed".** Stopping quickly was the first cut of
+  the test, but a wrong finger on a press sensor is exactly that: instant, and completely healthy.
+  Three of those in a row switched the reader off. The discriminator is now whether the reader said
+  *anything* during the conversation — and because `route` **throws the reader's own text away** and
+  substitutes the hint (`util.js:731-746`), the messages that prove it spoke are precisely the ones
+  that never come out of `route`. `is_fingerprint_signal` reads them on the way in, and has to agree
+  with the members `route` handles or the two halves drift.
+- **Giving up lasts for that showing of the prompt.** Escape to the clock and come back, or lock
+  again, and the reader gets another go — it may have been plugged in or woken since. The verdict
+  and the tally therefore live on the flags shared with the request side, so raising the prompt
+  clears both in one place; a fresh showing that inherited an exhausted budget would give up on its
+  first stop. This is *narrower* than GNOME, whose `_unavailableServices` is never cleared for the
+  life of the dialog — deliberately, since our shield outlives many showings and theirs does not.
 
 **Divergence: dropping back to the clock leaves the reader armed.** GNOME destroys the whole auth
 prompt after the crossfade (`_maybeDestroyAuthPrompt`, `:795`) and rebuilds it, which stops the

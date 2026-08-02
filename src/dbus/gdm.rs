@@ -259,13 +259,47 @@ async fn run(
 }
 
 /// One open reauthentication channel.
+/// The two things the request loop and the signal pump both need to know about the reader.
+///
+/// Shared rather than messaged because they are read on one side and written on the other, and both
+/// are single bits: the pump watches the conversation start and stop, while [`Session`] decides
+/// whether raising the prompt should start it again.
+#[derive(Debug, Default)]
+struct FingerprintFlags {
+    /// The conversation is running right now. gdm errors on a service that is already started, so
+    /// this is what makes re-raising the prompt safe rather than a latch that never reopens.
+    running: std::sync::atomic::AtomicBool,
+    /// The pump has stopped restarting it — see [`Routed::GiveUp`]. Cleared every time the prompt
+    /// comes up, so giving up lasts for **that showing of the prompt** and no longer.
+    given_up: std::sync::atomic::AtomicBool,
+    /// Consecutive stops where the reader never answered. Lives here rather than in the pump's own
+    /// state so that raising the prompt clears it in the same place it clears `given_up` — a fresh
+    /// showing that inherited the last one's exhausted budget would give up on its first stop.
+    silent_stops: std::sync::atomic::AtomicU32,
+}
+
+impl FingerprintFlags {
+    /// The prompt is being shown: forget whatever the last showing concluded, and claim the
+    /// conversation. `false` means one is already running and must not be started again — gdm
+    /// errors on a service that is already started.
+    ///
+    /// The clearing happens **whether or not** we go on to start anything, because a conversation
+    /// that is still running under a re-shown prompt is also a new showing as far as the budget is
+    /// concerned.
+    fn claim_for_new_showing(&self) -> bool {
+        use std::sync::atomic::Ordering;
+
+        self.given_up.store(false, Ordering::Relaxed);
+        self.silent_stops.store(0, Ordering::Relaxed);
+        !self.running.swap(true, Ordering::Relaxed)
+    }
+}
+
 struct Session {
     conn: zbus::Connection,
     username: String,
     reader: crate::dbus::fprintd::ReaderType,
-    /// Whether `gdm-fingerprint` has been begun on this channel. gdm errors on a service that is
-    /// already running, and the prompt page can be raised more than once per lock.
-    fingerprint_started: bool,
+    fingerprint: std::sync::Arc<FingerprintFlags>,
     /// The signal pump, **held rather than detached** so it can be stopped. A detached pump owns a
     /// `MessageStream`, which owns the connection — so dropping the session would neither close
     /// the socket nor stop the forwarding, and the orphan would go on emitting into the
@@ -305,8 +339,16 @@ impl Session {
         // promptly — cannot land before anything is listening.
         let stream = zbus::MessageStream::from(&conn);
 
+        let fingerprint = std::sync::Arc::new(FingerprintFlags::default());
         let pump = conn.executor().spawn(
-            pump_signals(stream, to_niri, conn.clone(), username.to_owned(), reader),
+            pump_signals(
+                stream,
+                to_niri,
+                conn.clone(),
+                username.to_owned(),
+                reader,
+                fingerprint.clone(),
+            ),
             "gdm-user-verifier-signals",
         );
 
@@ -322,23 +364,33 @@ impl Session {
             pump,
             username: username.to_owned(),
             reader,
-            fingerprint_started: false,
+            fingerprint,
         })
     }
 
-    /// Start `gdm-fingerprint`, once.
+    /// Start `gdm-fingerprint` for this showing of the prompt.
     ///
-    /// Idempotent because the page can be raised and dropped repeatedly, and gdm errors on a
-    /// service that is already running. A failure is not a failure of the lock — the password
-    /// conversation is already up, and the shield must not become unanswerable because a sensor
-    /// would not start.
+    /// **Every showing gets a fresh start**, including one after the reader was given up on. A
+    /// reader that would not answer a minute ago is worth one more try when the user deliberately
+    /// brings the prompt back up — they may have plugged it in, or woken the thing that was
+    /// ignoring it — and the alternative is a lock screen that quietly stops offering fingerprints
+    /// with no way to ask again short of a reboot.
+    ///
+    /// Skipped only while the conversation is actually running, because gdm errors on a service
+    /// that is already started. A failure is not a failure of the lock: the password conversation
+    /// is already up, and the shield must not become unanswerable because a sensor would not start.
     async fn start_fingerprint(&mut self) {
-        if !self.reader.is_present() || self.fingerprint_started {
+        use std::sync::atomic::Ordering;
+
+        if !self.reader.is_present() {
             return;
         }
-        self.fingerprint_started = true;
+        if !self.fingerprint.claim_for_new_showing() {
+            return;
+        }
         if let Err(err) = begin(&self.conn, FINGERPRINT_SERVICE, &self.username).await {
             warn!("gdm: could not start fingerprint verification: {err:?}");
+            self.fingerprint.running.store(false, Ordering::Relaxed);
         }
     }
 
@@ -398,7 +450,10 @@ async fn pump_signals(
     conn: zbus::Connection,
     username: String,
     reader: crate::dbus::fprintd::ReaderType,
+    flags: std::sync::Arc<FingerprintFlags>,
 ) {
+    use std::sync::atomic::Ordering;
+
     let mut fingerprint = FingerprintState::default();
     // When the reader's conversation last started. `None` until it has been started at all, which
     // is why an unarmed reader can never look like one that stopped immediately.
@@ -445,6 +500,23 @@ async fn pump_signals(
         // stops immediately the very first time would look like one that had never run.
         if member == "ConversationStarted" && service.as_deref() == Some(FINGERPRINT_SERVICE) {
             fingerprint_began = Some(Instant::now());
+            flags.running.store(true, Ordering::Relaxed);
+            // A fresh conversation has said nothing yet.
+            fingerprint.spoke = false;
+        }
+        if member == "ConversationStopped" && service.as_deref() == Some(FINGERPRINT_SERVICE) {
+            flags.running.store(false, Ordering::Relaxed);
+        }
+        // Both of these are owned by the shared flags, so that raising the prompt resets them from
+        // the request side. Read fresh each time rather than kept in step.
+        fingerprint.unavailable = flags.given_up.load(Ordering::Relaxed);
+        fingerprint.silent_stops = flags.silent_stops.load(Ordering::Relaxed);
+
+        // Whether the reader has said anything this conversation — `route` sees one signal at a
+        // time and cannot remember. Tracked here rather than from the routed event so that a
+        // message we chose *not* to forward still counts as the reader answering.
+        if is_fingerprint_signal(&member, service.as_deref(), reader) {
+            fingerprint.spoke = true;
         }
 
         // How long the reader's conversation lasted, which `route` cannot know: it sees one signal
@@ -459,7 +531,12 @@ async fn pump_signals(
             Routed::GiveUp { service, event } => {
                 if service == FINGERPRINT_SERVICE {
                     fingerprint.unavailable = true;
-                    debug!("gdm: not offering the fingerprint reader again for this lock");
+                    flags.given_up.store(true, Ordering::Relaxed);
+                    flags.running.store(false, Ordering::Relaxed);
+                    debug!(
+                        "gdm: the reader is not answering; not offering it again until the \
+                            prompt is raised afresh"
+                    );
                 }
                 event
             }
@@ -469,14 +546,16 @@ async fn pump_signals(
             // screen that can never be answered again.
             Routed::Restart { service, event } => {
                 if service == FINGERPRINT_SERVICE {
-                    fingerprint.immediate_stops = if fingerprint.stopped_immediately {
-                        fingerprint.immediate_stops + 1
+                    let silent = if fingerprint.stopped_immediately && !fingerprint.spoke {
+                        fingerprint.silent_stops + 1
                     } else {
-                        // A conversation that lasted long enough to be a person clears the count:
-                        // the budget is for a service that will not run, not a user having a bad
-                        // day with the sensor.
+                        // Anything else clears the count. The budget is for a reader that will not
+                        // answer, not for a user having a bad day with the sensor — and a run of
+                        // failed matches must not add up to one.
                         0
                     };
+                    flags.silent_stops.store(silent, Ordering::Relaxed);
+                    fingerprint.spoke = false;
                 }
                 if let Err(err) = begin(&conn, service, &username).await {
                     warn!("gdm: could not restart {service} after a refusal: {err:?}");
@@ -510,31 +589,52 @@ async fn pump_signals(
     let _ = to_niri.send(VerifierEvent::Lost);
 }
 
-/// How long a fingerprint conversation must survive for its ending to be a *person* failing to
-/// scan.
+/// How long a fingerprint conversation must survive for its ending to be something a person did.
 ///
-/// pam_fprintd lets the user retry several times before it gives up, so a `ConversationStopped`
-/// normally arrives many seconds in. One that comes back straight away is the service declining —
-/// the reader was cancelled, unplugged, or has no enrolled prints — and restarting it just spins,
-/// re-arming the sensor as fast as it can refuse.
+/// Only half the test — see [`FingerprintState::spoke`] for the half that matters.
 const FINGERPRINT_MIN_ALIVE: Duration = Duration::from_millis(500);
 
-/// How many immediate stops before the reader stops being offered for this lock.
+/// How many silent, immediate stops before the reader stops being offered — **for this showing of
+/// the prompt**, not for the lock and certainly not for the session.
 ///
 /// More than one because the first can be a race with the channel coming up; small because each one
 /// is a round trip and a sensor blinking at somebody who is trying to type.
-const FINGERPRINT_MAX_IMMEDIATE_STOPS: u32 = 3;
+const FINGERPRINT_MAX_SILENT_STOPS: u32 = 3;
 
 /// What the pump knows about the reader's conversation that a single signal cannot say.
 #[derive(Debug, Clone, Copy, Default)]
 struct FingerprintState {
-    /// Consecutive stops that came back faster than a person could fail.
-    immediate_stops: u32,
+    /// Consecutive stops where the reader never answered at all.
+    silent_stops: u32,
     /// It reported `ServiceUnavailable`, so it is not coming back (`_unavailableServices`,
     /// `util.js:888-890`, and the early return in `_onConversationStopped`, `:920-921`).
     unavailable: bool,
-    /// Whether the last stop was an immediate one, filled in by the pump from its own clock.
+    /// Whether this conversation stopped sooner than a person could have failed at it, from the
+    /// pump's clock.
     stopped_immediately: bool,
+    /// Whether the reader said **anything** during this conversation — narrated a scan, or
+    /// complained that a finger did not match.
+    ///
+    /// This is what separates "the finger did not match" from "the request was never answered",
+    /// and only the second is a reason to stop offering the reader. A reader that complains is
+    /// a reader that is working: the user simply has to try again, and taking the option away
+    /// from them for getting it wrong is precisely backwards.
+    spoke: bool,
+}
+
+/// Whether this signal is the reader answering — narrating a scan or complaining about one.
+///
+/// Separate from [`route`] because it must count messages the router *discards*: the reader's own
+/// `Info` narration is thrown away in favour of GNOME's hint, but a reader that narrated is
+/// unmistakably alive, and that is the whole question here.
+fn is_fingerprint_signal(
+    member: &str,
+    service: Option<&str>,
+    reader: crate::dbus::fprintd::ReaderType,
+) -> bool {
+    reader.is_present()
+        && service == Some(FINGERPRINT_SERVICE)
+        && matches!(member, "Info" | "Problem" | "InfoQuery" | "SecretInfoQuery")
 }
 
 /// What a verifier signal means, decided without touching the connection.
@@ -673,9 +773,13 @@ fn route(
         // conversation is deliberately not treated this way — it is the only way back in, so it is
         // retried whatever it does.
         "ConversationStopped" if is_fingerprint => {
+            // Silent **and** immediate. A conversation that spoke was working, whatever it said —
+            // "that finger did not match" is a reader doing its job, and the user's answer to it is
+            // to try again. A silent one that also lasted a while is a scan nobody came to make,
+            // and waiting again is exactly right. Only silent *and* instant is a refusal.
+            let refused = fingerprint.stopped_immediately && !fingerprint.spoke;
             if fingerprint.unavailable
-                || (fingerprint.stopped_immediately
-                    && fingerprint.immediate_stops + 1 >= FINGERPRINT_MAX_IMMEDIATE_STOPS)
+                || (refused && fingerprint.silent_stops + 1 >= FINGERPRINT_MAX_SILENT_STOPS)
             {
                 Routed::GiveUp {
                     service: FINGERPRINT_SERVICE,
@@ -699,6 +803,8 @@ fn route(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use crate::dbus::fprintd::ReaderType;
 
@@ -963,19 +1069,119 @@ mod tests {
             "a real failed scan must not disable the reader"
         );
 
-        // Stops that come back instantly: counted, and given up on at the budget.
+        // Stops that come back instantly *and said nothing*: counted, given up on at the budget.
         fp.stopped_immediately = true;
-        for n in 0..FINGERPRINT_MAX_IMMEDIATE_STOPS - 1 {
-            fp.immediate_stops = n;
-            assert_eq!(stop(fp), restart, "gave up after only {n} immediate stops");
+        for n in 0..FINGERPRINT_MAX_SILENT_STOPS - 1 {
+            fp.silent_stops = n;
+            assert_eq!(stop(fp), restart, "gave up after only {n} silent stops");
         }
-        fp.immediate_stops = FINGERPRINT_MAX_IMMEDIATE_STOPS - 1;
+        fp.silent_stops = FINGERPRINT_MAX_SILENT_STOPS - 1;
         assert_eq!(stop(fp), give_up, "the reader was restarted forever");
 
         // A conversation that lasted resets the count — the budget is for a service that will not
         // run, not for a person having a bad day with the sensor.
         fp.stopped_immediately = false;
         assert_eq!(stop(fp), restart);
+    }
+
+    /// A reader that **answered** never spends the budget, however fast it then stops.
+    ///
+    /// The thing being counted is "the request was not answered", not "the attempt failed". A quick
+    /// non-match — finger on the sensor, wrong finger, conversation over — is a stop that is both
+    /// immediate and completely healthy, and three of those in a row must still leave the reader
+    /// armed. Live, this was the regression: presenting the wrong finger a few times turned the
+    /// reader off for the rest of the prompt.
+    #[test]
+    fn a_reader_that_answered_keeps_its_budget() {
+        let fp = FingerprintState {
+            // Well past the budget, and stopping instantly...
+            silent_stops: FINGERPRINT_MAX_SILENT_STOPS + 5,
+            stopped_immediately: true,
+            // ...but it spoke, so none of that counts.
+            spoke: true,
+            unavailable: false,
+        };
+        assert_eq!(
+            route(
+                "ConversationStopped",
+                Some(FINGERPRINT_SERVICE),
+                None,
+                ReaderType::Press,
+                fp,
+            ),
+            Routed::Restart {
+                service: FINGERPRINT_SERVICE,
+                event: None,
+            },
+            "a failed match must not count towards giving up on the reader"
+        );
+    }
+
+    /// Giving up lasts for that showing of the prompt, not for the lock and not for the session.
+    ///
+    /// Escape back to the clock and bring the prompt up again — or lock, unlock and lock — and the
+    /// reader gets another go. Anything the pump concluded was about a moment that has passed: the
+    /// sensor may have been plugged in, or woken up, in the meantime, and there is no way to ask
+    /// again short of a reboot if the verdict sticks.
+    #[test]
+    fn a_new_showing_of_the_prompt_forgets_the_last_verdict() {
+        let flags = FingerprintFlags::default();
+        flags.given_up.store(true, Ordering::Relaxed);
+        flags
+            .silent_stops
+            .store(FINGERPRINT_MAX_SILENT_STOPS, Ordering::Relaxed);
+
+        assert!(
+            flags.claim_for_new_showing(),
+            "the reader must be started again"
+        );
+        assert!(
+            !flags.given_up.load(Ordering::Relaxed),
+            "a new showing must not inherit the last one's verdict"
+        );
+        assert_eq!(
+            flags.silent_stops.load(Ordering::Relaxed),
+            0,
+            "a new showing must not inherit the last one's exhausted budget, or it gives up on \
+             the first stop"
+        );
+        assert!(flags.running.load(Ordering::Relaxed));
+
+        // ...but a conversation already up is not started twice: gdm errors on that.
+        assert!(!flags.claim_for_new_showing());
+    }
+
+    /// A `Problem` from the reader counts as it having answered.
+    ///
+    /// `route` *discards* the reader's own text and substitutes the hint (`util.js:731-746`), so
+    /// the pump cannot learn "it spoke" from what comes out of `route` — the discarded messages
+    /// are exactly the interesting ones. That is what [`is_fingerprint_signal`] is for, and it
+    /// has to agree with the members `route` handles or the two halves drift apart.
+    #[test]
+    fn the_readers_own_messages_count_as_it_answering() {
+        for member in ["Info", "Problem", "InfoQuery", "SecretInfoQuery"] {
+            assert!(
+                is_fingerprint_signal(member, Some(FINGERPRINT_SERVICE), ReaderType::Press),
+                "{member} from the reader is the reader answering"
+            );
+            // ...but only from the reader, and only when there is one.
+            assert!(!is_fingerprint_signal(
+                member,
+                Some(PASSWORD_SERVICE),
+                ReaderType::Press
+            ));
+            assert!(!is_fingerprint_signal(
+                member,
+                Some(FINGERPRINT_SERVICE),
+                ReaderType::None
+            ));
+        }
+        // A conversation ending is not it answering — that is the whole distinction.
+        assert!(!is_fingerprint_signal(
+            "ConversationStopped",
+            Some(FINGERPRINT_SERVICE),
+            ReaderType::Press
+        ));
     }
 
     /// `ServiceUnavailable` ends that service for the lock, and its message is still shown.
@@ -1029,9 +1235,10 @@ mod tests {
     #[test]
     fn the_password_conversation_is_never_given_up_on() {
         let fp = FingerprintState {
-            immediate_stops: 99,
+            silent_stops: 99,
             stopped_immediately: true,
             unavailable: true,
+            spoke: false,
         };
         assert_eq!(
             route(
