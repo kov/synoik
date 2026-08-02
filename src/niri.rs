@@ -1673,8 +1673,11 @@ impl State {
         // like the keyboard-layout indicator below, that costs one window walk and
         // needs no invalidation bookkeeping. A change redisplays the dash
         // (GNOME's `_queueRedisplay` on `app-state-changed`, `dash.js:381`).
-        if self.niri.sync_running_apps() && self.niri.sync_dash_favorites() {
-            self.niri.queue_redraw_all();
+        if self.niri.sync_running_apps() {
+            self.niri.emit_introspect_changed();
+            if self.niri.sync_dash_favorites() {
+                self.niri.queue_redraw_all();
+            }
         }
 
         self.niri.cursor_manager.check_cursor_image_surface_alive();
@@ -3546,9 +3549,41 @@ impl State {
         to_introspect: &async_channel::Sender<NiriToIntrospect>,
         msg: IntrospectToNiri,
     ) {
+        let reply = match msg {
+            IntrospectToNiri::GetWindows => NiriToIntrospect::Windows(self.introspect_windows()),
+            IntrospectToNiri::GetRunningApplications => {
+                NiriToIntrospect::RunningApplications(self.introspect_running_applications())
+            }
+            IntrospectToNiri::GetScreenSize => {
+                // `global.screen_width/height` (`introspect.js:198-199`) is the union bounding box
+                // of every output, not one monitor's size.
+                let bounds = self
+                    .niri
+                    .global_space
+                    .outputs()
+                    .filter_map(|output| self.niri.global_space.output_geometry(output))
+                    .reduce(|acc, geo| acc.merge(geo))
+                    .unwrap_or_default();
+                NiriToIntrospect::ScreenSize(
+                    bounds.loc.x + bounds.size.w,
+                    bounds.loc.y + bounds.size.h,
+                )
+            }
+            IntrospectToNiri::GetAnimationsEnabled => {
+                NiriToIntrospect::AnimationsEnabled(self.niri.gnome_settings.enable_animations)
+            }
+        };
+
+        if let Err(err) = to_introspect.send_blocking(reply) {
+            warn!("error replying to introspect: {err:?}");
+        }
+    }
+
+    /// `GetWindows` (`introspect.js:135-182`).
+    #[cfg(feature = "dbus")]
+    fn introspect_windows(&mut self) -> HashMap<u64, gnome_shell_introspect::WindowProperties> {
         use crate::utils::with_toplevel_role;
 
-        let IntrospectToNiri::GetWindows = msg;
         let _span = tracy_client::span!("GetWindows");
 
         let mut windows = HashMap::new();
@@ -3557,34 +3592,100 @@ impl State {
         windows.insert(
             self.niri.casting.dynamic_cast_id_for_portal.get(),
             gnome_shell_introspect::WindowProperties {
-                title: String::from("niri Dynamic Cast Target"),
                 app_id: String::from("rs.bxt.niri.desktop"),
+                client_type: gnome_shell_introspect::CLIENT_TYPE_WAYLAND,
+                is_hidden: false,
+                has_focus: false,
+                width: 0,
+                height: 0,
+                title: Some(String::from("niri Dynamic Cast Target")),
+                wm_class: None,
             },
         );
 
-        self.niri.layout.with_windows(|mapped, _, _, _| {
-            let id = mapped.id().get();
-            let props = with_toplevel_role(mapped.toplevel(), |role| {
-                gnome_shell_introspect::WindowProperties {
-                    title: role.title.clone().unwrap_or_default(),
-                    app_id: role
-                        .app_id
-                        .as_ref()
-                        // We don't do proper .desktop file tracking (it's quite involved), and
-                        // Wayland windows can set any app id they want. However, this seems to
-                        // work well enough in practice.
-                        .map(|app_id| format!("{app_id}.desktop"))
-                        .unwrap_or_default(),
-                }
+        let focused = self.niri.layout.focus().map(|m| m.id());
+        // `MetaWindow::hidden` is set by `meta_window_hide` (`window.c:2669-2674`) — a window that
+        // should not be showing right now. We have no minimize, so the only such window is one on
+        // a workspace that is not its output's active one.
+        let visible: std::collections::HashSet<_> = self
+            .niri
+            .layout
+            .monitors()
+            .map(|mon| mon.active_workspace_ref().id())
+            .collect();
+        // Window -> desktop id, taken from the app system's own grouping rather than re-derived
+        // here: `app-id` must be the same resolved desktop id the dash and the switcher use, or
+        // the chooser looks up an icon nothing else agrees with.
+        let desktop_ids: HashMap<_, _> = self
+            .niri
+            .app_system
+            .running()
+            .iter()
+            .flat_map(|app| app.windows.iter().map(|w| (w.id, app.id.clone())))
+            .collect();
+
+        self.niri
+            .layout
+            .with_windows(|mapped, _, workspace, layout| {
+                let id = mapped.id();
+                let (w, h) = layout.window_size;
+                let props = with_toplevel_role(mapped.toplevel(), |role| {
+                    let app_id = role.app_id.clone();
+                    gnome_shell_introspect::WindowProperties {
+                        // The **desktop id**, resolved through the app system — the chooser looks
+                        // the icon up by it. Before the app-lifecycle port
+                        // this was `{app_id}.desktop`, which is why the
+                        // portal's window list had no icons.
+                        app_id: desktop_ids.get(&id).cloned().unwrap_or_default(),
+                        client_type: gnome_shell_introspect::CLIENT_TYPE_WAYLAND,
+                        is_hidden: workspace.is_some_and(|ws| !visible.contains(&ws)),
+                        has_focus: Some(id) == focused,
+                        width: w.max(0) as u32,
+                        height: h.max(0) as u32,
+                        title: role.title.clone().filter(|t| !t.is_empty()),
+                        wm_class: app_id,
+                    }
+                });
+
+                windows.insert(id.get(), props);
             });
 
-            windows.insert(id, props);
+        windows
+    }
+
+    /// `GetRunningApplications` (`introspect.js:73-133`).
+    ///
+    /// GNOME keys the map by desktop id and sends an *empty* dict for each app, adding
+    /// `active-on-seats` only to the focused one (`:86-95`).
+    #[cfg(feature = "dbus")]
+    fn introspect_running_applications(
+        &mut self,
+    ) -> HashMap<String, gnome_shell_introspect::AppProperties> {
+        let _span = tracy_client::span!("GetRunningApplications");
+
+        let focused = self.niri.layout.focus().map(|m| m.id());
+        let active = focused.and_then(|id| {
+            self.niri
+                .app_system
+                .running()
+                .iter()
+                .find(|app| app.windows.iter().any(|w| w.id == id))
+                .map(|app| app.id.clone())
         });
 
-        let msg = NiriToIntrospect::Windows(windows);
-        if let Err(err) = to_introspect.send_blocking(msg) {
-            warn!("error sending windows to introspect: {err:?}");
-        }
+        self.niri
+            .app_system
+            .running()
+            .iter()
+            .map(|app| {
+                let props = gnome_shell_introspect::AppProperties {
+                    active_on_seats: (Some(&app.id) == active.as_ref())
+                        // `seatName` is the literal 'seat0' upstream (`introspect.js:77`).
+                        .then(|| vec![String::from("seat0")]),
+                };
+                (app.id.clone(), props)
+            })
+            .collect()
     }
 
     #[cfg(feature = "dbus")]
@@ -10624,6 +10725,35 @@ impl Niri {
 
     #[cfg(not(feature = "dbus"))]
     pub fn emit_accelerator_signal(&self, _action: u32, _activated: bool) {}
+
+    /// Tell the portal the window/app list moved.
+    ///
+    /// GNOME emits `WindowsChanged` off `tracked-windows-changed` and
+    /// `RunningApplicationsChanged` off `app-state-changed`/`notify::focus-app`
+    /// (`introspect.js:36-47`, `:100-108`). `sync_running_apps` is the one place that already
+    /// re-snapshots both, so it is the seam — the alternative is invalidation hooks on every path
+    /// that can map, unmap or focus a window, and the ones that get forgotten are silent.
+    #[cfg(feature = "dbus")]
+    pub fn emit_introspect_changed(&self) {
+        let Some(conn) = self.dbus.as_ref().and_then(|d| d.conn_introspect.as_ref()) else {
+            return;
+        };
+        for name in ["WindowsChanged", "RunningApplicationsChanged"] {
+            let res = async_io::block_on(conn.inner().emit_signal(
+                None::<zbus::names::BusName<'_>>,
+                "/org/gnome/Shell/Introspect",
+                "org.gnome.Shell.Introspect",
+                name,
+                &(),
+            ));
+            if let Err(err) = res {
+                warn!("error emitting {name}: {err:?}");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "dbus"))]
+    pub fn emit_introspect_changed(&self) {}
 
     pub fn handle_focus_follows_mouse(&mut self, new_focus: &PointContents) {
         let Some(ffm) = self.config.borrow().input.focus_follows_mouse else {

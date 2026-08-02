@@ -15685,3 +15685,74 @@ fn a_request_that_arrives_locked_waits_for_the_unlock() {
         "and its conversation starts now"
     );
 }
+
+/// The portal's window list is built from the real window and app models, with the fields its
+/// chooser reads (`GetWindows`, `introspect.js:135-182`).
+///
+/// This drives `State::on_introspect_msg` — the entry point the bus drives — so it fails for the
+/// mistakes that matter: an `app-id` that is the raw Wayland id instead of the resolved desktop id
+/// (which is why the chooser used to have no icons), a focus flag that never moves, or a window on
+/// an inactive workspace reported as showing.
+#[cfg(feature = "dbus")]
+#[test]
+fn the_portal_window_list_carries_what_its_chooser_reads() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+    use crate::dbus::gnome_shell_introspect::{IntrospectToNiri, NiriToIntrospect};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    f.niri().app_system = AppSystem::with_parts(
+        // The desktop id deliberately is *not* `{app_id}.desktop`: that is the only shape that
+        // tells the resolved id apart from the string concatenation this used to do.
+        Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
+            "org.example.Editor.desktop",
+            "Editor",
+            "a",
+        )])),
+        Box::new(RecordingLauncher::default()),
+    );
+
+    map_window_for_app(&mut f, client, "a");
+    f.niri().sync_running_apps();
+
+    let (tx, rx) = async_channel::unbounded();
+    f.niri_state()
+        .on_introspect_msg(&tx, IntrospectToNiri::GetWindows);
+    let NiriToIntrospect::Windows(windows) = rx.try_recv().expect("a reply") else {
+        panic!("wrong reply");
+    };
+
+    // Under `xdp-gnome-screencast` the list also carries niri's "Dynamic Cast Target" pseudo-window
+    // — a niri capability, not a GNOME one; see the port doc's open questions.
+    let props = windows
+        .values()
+        .find(|p| p.wm_class.as_deref() == Some("a"))
+        .expect("the mapped window");
+    assert_eq!(
+        props.app_id, "org.example.Editor.desktop",
+        "the resolved desktop id, not the Wayland app id"
+    );
+    assert_eq!(
+        props.wm_class.as_deref(),
+        Some("a"),
+        "and the raw id beside it"
+    );
+    assert!(props.has_focus, "the only window has focus");
+    assert!(!props.is_hidden, "and it is on the active workspace");
+    assert_eq!((props.width, props.height), (100, 100));
+
+    // ...and the app list agrees about which app is active.
+    f.niri_state()
+        .on_introspect_msg(&tx, IntrospectToNiri::GetRunningApplications);
+    let NiriToIntrospect::RunningApplications(apps) = rx.try_recv().expect("a reply") else {
+        panic!("wrong reply");
+    };
+    assert_eq!(
+        apps.get("org.example.Editor.desktop")
+            .and_then(|a| a.active_on_seats.as_deref()),
+        Some(&[String::from("seat0")][..]),
+        "the focused app is active on seat0"
+    );
+}

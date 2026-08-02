@@ -115,6 +115,11 @@ pub struct GnomeSettings {
     /// icon cache and the app-icon loader resolve against. GNOME's default is
     /// `"Adwaita"`.
     pub icon_theme: String,
+
+    /// `org.gnome.desktop.interface enable-animations`. We do not gate our own animations on it
+    /// yet; it is here because `org.gnome.Shell.Introspect` publishes it and the portal reads it
+    /// to decide whether to animate its dialogs (`introspect.js:184-192`).
+    pub enable_animations: bool,
     /// `org.gnome.desktop.interface clock-*`: how the panel clock label reads.
     pub clock: ClockFormat,
     /// `org.gnome.desktop.calendar`: week start + week-number column.
@@ -376,6 +381,7 @@ impl Default for GnomeSettings {
             shield: Default::default(),
             focus_new_windows: FocusNewWindows::Smart,
             edge_tiling: true,
+            enable_animations: true,
             background: BackgroundSettings::default(),
             accent_color: ACCENT_BLUE,
             app_picker_layout: HashMap::new(),
@@ -641,6 +647,9 @@ impl GnomeSettings {
     }
 
     fn load_interface(&mut self, interface: &gio::Settings) {
+        if settings_has_key(interface, "enable-animations") {
+            self.enable_animations = interface.boolean("enable-animations");
+        }
         if settings_has_key(interface, "accent-color") {
             let value = interface.string("accent-color");
             match parse_accent_color(value.as_str()) {
