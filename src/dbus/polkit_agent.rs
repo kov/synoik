@@ -85,9 +85,16 @@ pub struct BeginRequest {
     pub action_id: String,
     /// polkit's own description of the action — the dialog's body text.
     pub message: String,
-    /// The users who could authorise this, in polkitd's order. GNOME picks one and says so in the
-    /// log rather than offering a chooser (`polkitAgent.js:51-61`).
-    pub user_names: Vec<String>,
+    /// Who we will authenticate as — see [`choose_user`].
+    pub user_name: String,
+    /// Whether the account we will authenticate as has no password at all.
+    ///
+    /// This is not cosmetic. For such an account, *starting* the PAM conversation is what performs
+    /// the authentication — so the dialog must not start one until the user has confirmed, or the
+    /// action is authorised by a prompt nobody ever saw. GNOME says exactly this
+    /// (`polkitAgent.js:373-376`) and answers it with a second mode; resolved here, off the
+    /// compositor thread, because it takes a D-Bus round trip.
+    pub passwordless: bool,
 }
 
 /// What the compositor asks of the agent.
@@ -237,10 +244,10 @@ pub fn start(
     async_channel::Sender<PolkitRequest>,
 )> {
     let (to_agent, from_niri) = async_channel::unbounded();
-    let (begin_tx, begin_rx) = async_channel::unbounded();
+    let (calls_tx, calls_rx) = async_channel::unbounded();
 
     let conn = zbus::blocking::connection::Builder::system()?
-        .serve_at(AGENT_PATH, AuthenticationAgent { begin: begin_tx })?
+        .serve_at(AGENT_PATH, AuthenticationAgent { calls: calls_tx })?
         .build()?;
 
     register(&conn)?;
@@ -249,7 +256,7 @@ pub fn start(
     conn.inner()
         .executor()
         .spawn(
-            run(begin_rx, from_niri, helper_rx, helper_tx, to_niri),
+            run(calls_rx, from_niri, helper_rx, helper_tx, to_niri),
             "polkit-agent",
         )
         .detach();
@@ -313,7 +320,13 @@ fn register(conn: &zbus::blocking::Connection) -> anyhow::Result<()> {
 /// everyone else (`/usr/share/dbus-1/system.d/org.freedesktop.PolicyKit1.conf`), which is why
 /// upstream does no caller check here either (`polkitagentlistener.c:287-289`).
 struct AuthenticationAgent {
-    begin: async_channel::Sender<Begin>,
+    calls: async_channel::Sender<AgentCall>,
+}
+
+/// What polkitd asked for, on its way to [`Agent`].
+enum AgentCall {
+    Begin(Box<Begin>),
+    Cancel { cookie: String },
 }
 
 /// A `BeginAuthentication` call in flight: what was asked, and the reply channel that finishes it.
@@ -348,26 +361,48 @@ impl AuthenticationAgent {
         _details: std::collections::HashMap<String, String>,
         cookie: String,
         identities: Vec<(String, std::collections::HashMap<String, OwnedValue>)>,
+        #[zbus(connection)] conn: &zbus::Connection,
     ) -> Result<(), PolkitError> {
-        let user_names = user_names(&identities);
-        if user_names.is_empty() {
+        let names = user_names(&identities);
+        if names.len() > 1 {
+            // Upstream's message, and upstream's behaviour: one identity is considered, and the
+            // user is not offered a chooser (`polkitAgent.js:52-54`).
+            debug!(
+                "polkit: {} identities can authenticate {action_id}; considering one",
+                names.len()
+            );
+        }
+        let Some(user_name) = choose_user(&names) else {
             // Nobody we can authenticate as. Failing is honest; a dialog with no user would be a
             // prompt that cannot succeed.
             warn!("polkit: no usable identities for {action_id}");
             return Err(PolkitError::Failed("no usable identities".to_owned()));
-        }
+        };
+
+        // Resolved here rather than in the dialog because it is a D-Bus round trip, and because
+        // getting it wrong the *other* way authorises the action with no prompt at all. An
+        // account AccountsService cannot speak for reads as having a password.
+        let passwordless = crate::dbus::accounts_service::account_for(conn, &user_name)
+            .await
+            .is_some_and(|account| account.password_mode.is_none());
 
         let (done_tx, done_rx) = async_channel::bounded(1);
         let begin = Begin {
             request: BeginRequest {
                 action_id,
                 message,
-                user_names,
+                user_name,
+                passwordless,
             },
             cookie,
             done: done_tx,
         };
-        if self.begin.send(begin).await.is_err() {
+        if self
+            .calls
+            .send(AgentCall::Begin(Box::new(begin)))
+            .await
+            .is_err()
+        {
             return Err(PolkitError::Failed("the agent is gone".to_owned()));
         }
 
@@ -384,20 +419,24 @@ impl AuthenticationAgent {
     /// polkitd withdrawing a request it made. The reply to `BeginAuthentication` is still owed;
     /// [`Agent::cancel`] sends it.
     async fn cancel_authentication(&self, cookie: String) {
-        let _ = self
-            .begin
-            .send(Begin {
-                request: BeginRequest {
-                    action_id: String::new(),
-                    message: String::new(),
-                    user_names: Vec::new(),
-                },
-                cookie,
-                // A closed channel is the marker: `Begin` with no live receiver is a cancel.
-                done: async_channel::bounded(1).0,
-            })
-            .await;
+        let _ = self.calls.send(AgentCall::Cancel { cookie }).await;
     }
+}
+
+/// Pick the account to authenticate as, from the identities polkitd offered
+/// (`polkitAgent.js:57-61`).
+///
+/// Ourselves if we are in the list, then `root`, then whoever is first. The order matters: an
+/// `auth_admin` action lists every administrator, and asking for *our own* password when we are one
+/// of them is the difference between a prompt the user can answer and one they cannot.
+fn choose_user(names: &[String]) -> Option<String> {
+    let ours = crate::unlock_dialog::session_user().name;
+    for candidate in [ours.as_str(), "root"] {
+        if names.iter().any(|name| name == candidate) {
+            return Some(candidate.to_owned());
+        }
+    }
+    names.first().cloned()
 }
 
 /// Turn polkit's `a(sa{sv})` identity list into usernames.
@@ -419,7 +458,7 @@ fn user_names(
 
 /// The agent's own loop: one dialog at a time, and one helper under it.
 async fn run(
-    begins: async_channel::Receiver<Begin>,
+    calls: async_channel::Receiver<AgentCall>,
     requests: async_channel::Receiver<PolkitRequest>,
     helper_events: async_channel::Receiver<(Epoch, HelperMessage)>,
     helper_tx: async_channel::Sender<(Epoch, HelperMessage)>,
@@ -435,21 +474,21 @@ async fn run(
     };
 
     enum Event {
-        Begin(Begin),
+        Call(AgentCall),
         Request(PolkitRequest),
         Helper(Epoch, HelperMessage),
     }
 
     // Pinned because `async_channel::Receiver` is `!Unpin` — it parks an event listener in place.
     let mut events = std::pin::pin!(futures_util::stream::select(
-        futures_util::stream::select(begins.map(Event::Begin), requests.map(Event::Request)),
+        futures_util::stream::select(calls.map(Event::Call), requests.map(Event::Request)),
         helper_events.map(|(epoch, msg)| Event::Helper(epoch, msg)),
     ));
 
     while let Some(event) = events.next().await {
         match event {
-            Event::Begin(begin) if begin.done.is_closed() => agent.cancel(&begin.cookie),
-            Event::Begin(begin) => agent.schedule(begin),
+            Event::Call(AgentCall::Begin(begin)) => agent.schedule(*begin),
+            Event::Call(AgentCall::Cancel { cookie }) => agent.cancel(&cookie),
             Event::Request(request) => agent.on_request(request),
             Event::Helper(epoch, msg) => agent.on_helper(epoch, msg),
         }
@@ -806,5 +845,38 @@ mod tests {
             ("unix-user".to_owned(), absent),
         ]);
         assert_eq!(names, vec!["root".to_owned()]);
+    }
+
+    /// The order in `choose_user` is ours-then-root-then-first, and the first arm is the one that
+    /// matters: an `auth_admin` action lists every administrator, so a list containing both us and
+    /// root must pick *us* — asking for root's password when the user has their own is a prompt
+    /// they may well not be able to answer.
+    #[test]
+    fn we_authenticate_as_ourselves_before_root() {
+        let ours = crate::unlock_dialog::session_user().name;
+        assert!(!ours.is_empty(), "the test user must resolve");
+
+        let both = vec!["root".to_owned(), ours.clone()];
+        assert_eq!(
+            choose_user(&both),
+            Some(ours.clone()),
+            "ours wins over root"
+        );
+
+        let root_only = vec!["daemon".to_owned(), "root".to_owned()];
+        assert_eq!(
+            choose_user(&root_only),
+            Some("root".to_owned()),
+            "root wins when we are not offered"
+        );
+
+        let neither = vec!["daemon".to_owned(), "bin".to_owned()];
+        assert_eq!(
+            choose_user(&neither),
+            Some("daemon".to_owned()),
+            "otherwise the first identity polkitd offered"
+        );
+
+        assert_eq!(choose_user(&[]), None, "nobody to ask");
     }
 }

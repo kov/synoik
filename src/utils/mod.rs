@@ -642,6 +642,31 @@ pub struct PasswdEntry {
     pub real_name: String,
 }
 
+/// Look up a login name in the passwd database, or `None` if there is no such user.
+///
+/// `getpwnam_r` for the same reason [`passwd_entry`] uses `getpwuid_r`.
+pub fn passwd_entry_by_name(name: &str) -> Option<PasswdEntry> {
+    let name = CString::new(name).ok()?;
+    let mut buf = [0 as libc::c_char; 4096];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = null_mut();
+
+    // SAFETY: as `passwd_entry`, plus `name` is a NUL-terminated string that outlives the call.
+    let rc = unsafe {
+        libc::getpwnam_r(
+            name.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    Some(passwd_fields(&pwd))
+}
+
 /// Look up a uid in the passwd database, or `None` if there is no such user.
 ///
 /// `getpwuid_r` rather than `getpwuid`: the plain version returns a pointer into one static buffer
@@ -671,8 +696,12 @@ pub fn passwd_entry(uid: u32) -> Option<PasswdEntry> {
     if rc != 0 || result.is_null() {
         return None;
     }
+    Some(passwd_fields(&pwd))
+}
 
-    // SAFETY: `getpwuid_r` succeeded, so these point into `buf`, which is still in scope.
+/// Copy the two strings we want out of a filled-in `passwd`.
+fn passwd_fields(pwd: &libc::passwd) -> PasswdEntry {
+    // SAFETY: the lookup succeeded, so these point into the caller's still-live buffer.
     let cstr = |p: *const libc::c_char| unsafe {
         if p.is_null() {
             String::new()
@@ -681,7 +710,7 @@ pub fn passwd_entry(uid: u32) -> Option<PasswdEntry> {
         }
     };
 
-    Some(PasswdEntry {
+    PasswdEntry {
         name: cstr(pwd.pw_name),
         // GECOS is comma-separated; the first field is the full name.
         real_name: cstr(pwd.pw_gecos)
@@ -689,7 +718,7 @@ pub fn passwd_entry(uid: u32) -> Option<PasswdEntry> {
             .next()
             .unwrap_or_default()
             .to_owned(),
-    })
+    }
 }
 
 #[inline(never)]

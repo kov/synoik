@@ -157,6 +157,31 @@ async fn read_account(user: &zbus::Proxy<'_>) -> UserAccount {
     }
 }
 
+/// Look up one account by name, for a caller that only wants a snapshot.
+///
+/// The watcher below follows *our* user forever; the polkit dialog needs whoever polkitd named,
+/// which is usually `root`, and needs it exactly once per request. `None` means AccountsService
+/// could not answer — the caller must fall back to the conservative reading, which for
+/// [`PasswordMode`] is "this account has a password".
+pub async fn account_for(conn: &zbus::Connection, username: &str) -> Option<UserAccount> {
+    let accounts = zbus::Proxy::new(conn, ACCOUNTS_NAME, ACCOUNTS_PATH, ACCOUNTS_IFACE)
+        .await
+        .ok()?;
+    let path = accounts
+        .call_method("FindUserByName", &(username))
+        .await
+        .and_then(|reply| {
+            reply
+                .body()
+                .deserialize::<zbus::zvariant::OwnedObjectPath>()
+        })
+        .ok()?;
+    let user = zbus::Proxy::new(conn, ACCOUNTS_NAME, path, USER_IFACE)
+        .await
+        .ok()?;
+    Some(read_account(&user).await)
+}
+
 /// Whether more than one ordinary account exists.
 ///
 /// libaccountsservice computes `has_multiple_users` from its cached list; the wire equivalent is

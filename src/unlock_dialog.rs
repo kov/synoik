@@ -661,7 +661,10 @@ impl UnlockDialog {
 ///
 /// So the label really is "Password" with no colon; showing PAM's raw string is the tell that this
 /// step was skipped.
-fn clean_question(question: &str) -> String {
+///
+/// Shared with the polkit dialog, which carries the same hack and the same comment
+/// (`polkitAgent.js:282-288`) — two ports of one PAM workaround, not two workarounds.
+pub fn clean_question(question: &str) -> String {
     if question == "Password:" || question == "Password: " {
         return "Password".to_owned();
     }
@@ -686,15 +689,39 @@ pub fn session_user() -> UserInfo {
     user_for_uid(uid)
 }
 
-/// The same lookup for any uid — the polkit dialog authenticates as whoever polkitd names, which
-/// is often `root` rather than us.
+/// The same lookup for any uid.
 pub fn user_for_uid(uid: u32) -> UserInfo {
-    let Some(entry) = crate::utils::passwd_entry(uid) else {
+    from_passwd(crate::utils::passwd_entry(uid))
+}
+
+/// ...and by login name — the polkit dialog authenticates as whoever polkitd named, which is
+/// usually `root` rather than us, and polkitd names accounts rather than uids.
+pub fn user_for_name(name: &str) -> UserInfo {
+    from_passwd(crate::utils::passwd_entry_by_name(name)).or_named(name)
+}
+
+fn from_passwd(entry: Option<crate::utils::PasswdEntry>) -> UserInfo {
+    let Some(entry) = entry else {
         return UserInfo::default();
     };
     UserInfo {
         name: entry.name,
         real_name: entry.real_name,
+    }
+}
+
+impl UserInfo {
+    /// Keep the login name we were given when passwd could not be read, so the dialog still says
+    /// *who* it is asking about rather than showing a blank label.
+    fn or_named(self, name: &str) -> Self {
+        if self.name.is_empty() {
+            Self {
+                name: name.to_owned(),
+                ..self
+            }
+        } else {
+            self
+        }
     }
 }
 

@@ -32,6 +32,10 @@ pub mod niri;
 pub mod notifications;
 #[cfg(feature = "pipewire")]
 pub mod pipewire_audio;
+/// The polkit dialog's state machine. Gated with `dbus` because the authentication agent it
+/// answers to is a D-Bus service: with no bus there is nothing to prompt for.
+#[cfg(feature = "dbus")]
+pub mod polkit_dialog;
 pub mod protocols;
 pub mod recording;
 pub mod render_helpers;
