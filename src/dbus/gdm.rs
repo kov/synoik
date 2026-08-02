@@ -66,6 +66,18 @@ const PASSWORD_SERVICE: &str = "gdm-password";
 /// ...and the one it runs for the reader, **beside** the password rather than instead of it
 /// (`FINGERPRINT_SERVICE_NAME`, `util.js:28`; `_maybeStartFingerprintVerification`, `:714-719`).
 const FINGERPRINT_SERVICE: &str = "gdm-fingerprint";
+/// **Divergence: GNOME says nothing here, and we say this.**
+///
+/// When the reader is given up on there is no text to show — gdm's `ServiceUnavailable` message is
+/// the literal empty string on the `PAM_AUTHINFO_UNAVAIL` path (`gdm-session-worker.c:1272-1280`),
+/// so GNOME shows nothing at all. Silent is not misleading, but it is not much help either: the
+/// hint vanishes and the user is left guessing whether the sensor is broken, whether their finger
+/// is enrolled, or whether they simply have to keep waiting. One line says which.
+///
+/// Worded as a statement about the hardware, not about the user: a reader that will not open is
+/// nothing they did, and "not recognised" would send them off re-enrolling a finger that is fine.
+const READER_UNAVAILABLE: &str = "Fingerprint reader unavailable";
+
 /// `SESSION_DBUS_PATH` (`gdm-client.c:37`) — where the verifier sits on the p2p connection.
 const SESSION_PATH: &str = "/org/gnome/DisplayManager/Session";
 const VERIFIER_IFACE: &str = "org.gnome.DisplayManager.UserVerifier";
@@ -787,9 +799,11 @@ fn route(
             // sets the error text to the literal empty string
             // (`gdm-session-worker.c:1272-1280`). Showing it would blank the line rather than
             // explain anything, and it would do so *by looking like a message*, outranking the
-            // hint it replaced. So an empty one is no message at all.
+            // hint it replaced. So an empty one is no message at all — and for the reader, our own
+            // line takes its place (see [`READER_UNAVAILABLE`]).
             event: text
                 .filter(|text| !text.is_empty())
+                .or_else(|| is_fingerprint.then(|| READER_UNAVAILABLE.to_owned()))
                 .map(|text| VerifierEvent::ShowMessage {
                     text,
                     kind: MessageKind::Error,
@@ -842,12 +856,24 @@ fn route(
             // to try again. A silent one that also lasted a while is a scan nobody came to make,
             // and waiting again is exactly right. Only silent *and* instant is a refusal.
             let refused = fingerprint.stopped_immediately && !fingerprint.spoke;
-            if fingerprint.unavailable
-                || (refused && fingerprint.silent_stops + 1 >= FINGERPRINT_MAX_SILENT_STOPS)
-            {
+            if fingerprint.unavailable {
+                // Already announced by the `ServiceUnavailable` that set the flag; saying it again
+                // would restart its read time on every stop that followed.
                 Routed::GiveUp {
                     service: FINGERPRINT_SERVICE,
                     event: None,
+                }
+            } else if refused && fingerprint.silent_stops + 1 >= FINGERPRINT_MAX_SILENT_STOPS {
+                // The other way to give up, and the one gdm never comments on at all: a reader that
+                // simply stops without a word, over and over. Same outcome for the user, so the
+                // same sentence.
+                Routed::GiveUp {
+                    service: FINGERPRINT_SERVICE,
+                    event: Some(VerifierEvent::ShowMessage {
+                        text: READER_UNAVAILABLE.to_owned(),
+                        kind: MessageKind::Error,
+                        source,
+                    }),
                 }
             } else {
                 Routed::Restart {
@@ -1128,9 +1154,14 @@ mod tests {
             service: FINGERPRINT_SERVICE,
             event: None,
         };
+        // Giving up says so — see `the_user_is_told_when_the_reader_is_given_up_on`.
         let give_up = Routed::GiveUp {
             service: FINGERPRINT_SERVICE,
-            event: None,
+            event: Some(VerifierEvent::ShowMessage {
+                text: READER_UNAVAILABLE.to_owned(),
+                kind: MessageKind::Error,
+                source: MessageSource::Fingerprint,
+            }),
         };
 
         // A stop after a conversation that lasted: somebody failed to scan. Keep offering it.
@@ -1290,13 +1321,13 @@ mod tests {
         assert_eq!(
             route(
                 "ServiceUnavailable",
-                Some(FINGERPRINT_SERVICE),
+                Some(PASSWORD_SERVICE),
                 msg(""),
                 ReaderType::Press,
                 healthy(),
             ),
             Routed::GiveUp {
-                service: FINGERPRINT_SERVICE,
+                service: PASSWORD_SERVICE,
                 event: None,
             },
             "an empty error was shown as if it said something"
@@ -1317,6 +1348,116 @@ mod tests {
             ),
             Routed::GiveUp {
                 service: FINGERPRINT_SERVICE,
+                event: None,
+            }
+        );
+    }
+
+    /// **Divergence:** the reader going away is announced, where GNOME says nothing.
+    ///
+    /// gdm has no text for this — the `PAM_AUTHINFO_UNAVAIL` path sets the message to the literal
+    /// empty string (`gdm-session-worker.c:1272-1280`) — so GNOME's `if (!errorMessage) return`
+    /// (`util.js:892-893`) leaves the prompt silent. Silent is not misleading, but the hint has
+    /// just vanished and the user is left guessing between a broken sensor, an unenrolled finger,
+    /// and having to wait longer. Both ways of giving up say the same sentence, because from where
+    /// the user is sitting they are the same thing.
+    #[test]
+    fn the_user_is_told_when_the_reader_is_given_up_on() {
+        let announced = Some(VerifierEvent::ShowMessage {
+            text: READER_UNAVAILABLE.to_owned(),
+            kind: MessageKind::Error,
+            source: MessageSource::Fingerprint,
+        });
+
+        // gdm's own empty `ServiceUnavailable`, which is the common case.
+        assert_eq!(
+            route(
+                "ServiceUnavailable",
+                Some(FINGERPRINT_SERVICE),
+                msg(""),
+                ReaderType::Press,
+                healthy(),
+            ),
+            Routed::GiveUp {
+                service: FINGERPRINT_SERVICE,
+                event: announced.clone(),
+            }
+        );
+
+        // ...and the other way in, a reader that stops without ever saying anything.
+        let fp = FingerprintState {
+            silent_stops: FINGERPRINT_MAX_SILENT_STOPS - 1,
+            stopped_immediately: true,
+            spoke: false,
+            unavailable: false,
+        };
+        assert_eq!(
+            route(
+                "ConversationStopped",
+                Some(FINGERPRINT_SERVICE),
+                None,
+                ReaderType::Press,
+                fp,
+            ),
+            Routed::GiveUp {
+                service: FINGERPRINT_SERVICE,
+                event: announced.clone(),
+            }
+        );
+
+        // But **once only**. Every later stop routes to the same give-up, and repeating the
+        // sentence would restart its read time and hold the line against anything else with
+        // something to say.
+        let fp = FingerprintState {
+            unavailable: true,
+            ..FingerprintState::default()
+        };
+        assert_eq!(
+            route(
+                "ConversationStopped",
+                Some(FINGERPRINT_SERVICE),
+                None,
+                ReaderType::Press,
+                fp,
+            ),
+            Routed::GiveUp {
+                service: FINGERPRINT_SERVICE,
+                event: None,
+            },
+            "the same sentence was repeated on every stop"
+        );
+
+        // gdm's own text, when there is any, is still preferred to ours.
+        assert_eq!(
+            route(
+                "ServiceUnavailable",
+                Some(FINGERPRINT_SERVICE),
+                msg("No fingerprints enrolled"),
+                ReaderType::Press,
+                healthy(),
+            ),
+            Routed::GiveUp {
+                service: FINGERPRINT_SERVICE,
+                event: Some(VerifierEvent::ShowMessage {
+                    text: "No fingerprints enrolled".to_owned(),
+                    kind: MessageKind::Error,
+                    source: MessageSource::Fingerprint,
+                }),
+            }
+        );
+
+        // And the password service gets none of this: it is not a thing that can be "unavailable"
+        // and worked around, it is the only way back in, so a line about hardware would be a lie.
+        assert_eq!(
+            route(
+                "ServiceUnavailable",
+                Some(PASSWORD_SERVICE),
+                msg(""),
+                ReaderType::Press,
+                healthy(),
+            ),
+            Routed::GiveUp {
+                service: PASSWORD_SERVICE,
                 event: None,
             }
         );

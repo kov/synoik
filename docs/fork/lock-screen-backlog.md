@@ -370,7 +370,18 @@ that into `ServiceUnavailable` with a **literally empty** message
 tests for exactly that and shows nothing (`util.js:892-893`). So does this, because an empty
 message would blank the line while still *counting as* an error, outranking the hint it displaced.
 
-What is left, then, is to stop lying. The reader's hint is an instruction — "(or place finger on
+**Divergence (approved 2026-08-02): we say "Fingerprint reader unavailable", GNOME says nothing.**
+Silent is not misleading, but the hint has just vanished and the user is left guessing between a
+broken sensor, an unenrolled finger, and having to wait longer. Both routes to giving up — gdm's
+empty `ServiceUnavailable`, and a reader that stops without ever answering — say the same sentence,
+because from where the user sits they are the same thing. Said **once**: repeating it on every
+later stop would restart its read time and hold the line against anything else with something to
+say. gdm's own text is preferred whenever there is any, and the password service gets none of this
+— it is not a thing that can be unavailable and worked around, so a line about hardware would be a
+lie. Worded about the hardware rather than the user for the same reason: "not recognised" would
+send someone off re-enrolling a finger that is fine.
+
+What is left, otherwise, is to stop lying. The reader's hint is an instruction — "(or place finger on
 reader)" — and once the conversation has stopped it points at hardware the screen is no longer
 listening to; on the seat the prompt sat there asking for a finger from a sensor already given up
 on. `_filterServiceMessages` (`util.js:269-276`) is GNOME's answer and is now ported: when a
