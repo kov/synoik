@@ -14,7 +14,16 @@ pub struct Screenshot {
 }
 
 pub enum ScreenshotToNiri {
-    TakeScreenshot { include_cursor: bool },
+    TakeScreenshot {
+        include_cursor: bool,
+        /// Where the caller wants the file. `None` means our own configured location.
+        path: Option<PathBuf>,
+    },
+    /// The same capture cropped to a rectangle in global logical coordinates.
+    TakeScreenshotArea {
+        area: (i32, i32, i32, i32),
+        path: Option<PathBuf>,
+    },
     PickColor(async_channel::Sender<Option<PickedColor>>),
 }
 
@@ -24,32 +33,39 @@ pub enum NiriToScreenshot {
 
 #[interface(name = "org.gnome.Shell.Screenshot")]
 impl Screenshot {
+    /// `filename` is honoured: the caller picked it, and a portal reads back exactly the path it
+    /// asked for. An empty one means "wherever you normally put them", which is what a plain
+    /// `niri msg` caller wants.
     async fn screenshot(
         &self,
         include_cursor: bool,
         _flash: bool,
-        _filename: PathBuf,
+        filename: String,
     ) -> fdo::Result<(bool, PathBuf)> {
-        if let Err(err) = self
-            .to_niri
-            .send(ScreenshotToNiri::TakeScreenshot { include_cursor })
-        {
-            warn!("error sending message to niri: {err:?}");
-            return Err(fdo::Error::Failed("internal error".to_owned()));
+        self.capture(ScreenshotToNiri::TakeScreenshot {
+            include_cursor,
+            path: wanted_path(filename),
+        })
+        .await
+    }
+
+    async fn screenshot_area(
+        &self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        _flash: bool,
+        filename: String,
+    ) -> fdo::Result<(bool, PathBuf)> {
+        if width <= 0 || height <= 0 {
+            return Err(fdo::Error::InvalidArgs("empty area".to_owned()));
         }
-
-        let filename = match self.from_niri.recv().await {
-            Ok(NiriToScreenshot::ScreenshotResult(Some(filename))) => filename,
-            Ok(NiriToScreenshot::ScreenshotResult(None)) => {
-                return Err(fdo::Error::Failed("internal error".to_owned()));
-            }
-            Err(err) => {
-                warn!("error receiving message from niri: {err:?}");
-                return Err(fdo::Error::Failed("internal error".to_owned()));
-            }
-        };
-
-        Ok((true, filename))
+        self.capture(ScreenshotToNiri::TakeScreenshotArea {
+            area: (x, y, width, height),
+            path: wanted_path(filename),
+        })
+        .await
     }
 
     async fn pick_color(&self) -> fdo::Result<HashMap<String, OwnedValue>> {
@@ -81,7 +97,33 @@ impl Screenshot {
     }
 }
 
+/// GNOME lets `filename` be an absolute path or a bare basename, and treats an empty one as "pick
+/// the usual place" (`org.gnome.Shell.Screenshot.xml`, `Screenshot`). Only the absolute case can be
+/// honoured verbatim; anything else falls back to our configured screenshot path.
+fn wanted_path(filename: String) -> Option<PathBuf> {
+    let path = PathBuf::from(filename);
+    path.is_absolute().then_some(path)
+}
+
 impl Screenshot {
+    async fn capture(&self, msg: ScreenshotToNiri) -> fdo::Result<(bool, PathBuf)> {
+        if let Err(err) = self.to_niri.send(msg) {
+            warn!("error sending message to niri: {err:?}");
+            return Err(fdo::Error::Failed("internal error".to_owned()));
+        }
+
+        match self.from_niri.recv().await {
+            Ok(NiriToScreenshot::ScreenshotResult(Some(filename))) => Ok((true, filename)),
+            Ok(NiriToScreenshot::ScreenshotResult(None)) => {
+                Err(fdo::Error::Failed("internal error".to_owned()))
+            }
+            Err(err) => {
+                warn!("error receiving message from niri: {err:?}");
+                Err(fdo::Error::Failed("internal error".to_owned()))
+            }
+        }
+    }
+
     pub fn new(
         to_niri: calloop::channel::Sender<ScreenshotToNiri>,
         from_niri: async_channel::Receiver<NiriToScreenshot>,

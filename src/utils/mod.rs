@@ -24,7 +24,7 @@ use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_to
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, DisplayHandle, Resource as _};
-use smithay::utils::{Coordinate, Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Coordinate, Logical, Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::compositor::{send_surface_state, with_states, SurfaceData};
 use smithay::wayland::fractional_scale::with_fractional_scale;
 use smithay::wayland::shell::xdg::{
@@ -317,6 +317,38 @@ pub fn write_png_rgba8(
 
     let mut writer = encoder.write_header()?;
     writer.write_image_data(pixels)
+}
+
+/// Crop a tightly-packed RGBA8 buffer to `area`, clamped to what the buffer actually holds.
+///
+/// Clamping rather than failing is what `ScreenshotArea` needs: a caller is free to ask for a
+/// rectangle that runs off the edge of the screen, and GNOME hands back the part that exists.
+/// An area that misses the buffer entirely is an error, because there is no image to return.
+pub fn crop_rgba8(
+    size: Size<i32, Physical>,
+    pixels: &[u8],
+    area: Rectangle<i32, Physical>,
+) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)> {
+    let bounds = Rectangle::from_size(size);
+    let area = area
+        .intersection(bounds)
+        .filter(|a| a.size.w > 0 && a.size.h > 0)
+        .context("the requested area is not on screen")?;
+
+    if area == bounds {
+        return Ok((size, pixels.to_vec()));
+    }
+
+    let stride = size.w as usize * 4;
+    let row = area.size.w as usize * 4;
+    let x = area.loc.x as usize * 4;
+    let mut out = Vec::with_capacity(row * area.size.h as usize);
+    for y in 0..area.size.h as usize {
+        let start = (area.loc.y as usize + y) * stride + x;
+        out.extend_from_slice(&pixels[start..start + row]);
+    }
+
+    Ok((area.size, out))
 }
 
 pub fn output_matches_name(output: &Output, target: &str) -> bool {
@@ -733,6 +765,44 @@ mod tests {
     use insta::assert_snapshot;
 
     use super::*;
+
+    /// A crop takes the requested rectangle, not the top-left corner of it.
+    ///
+    /// A stride bug here is invisible in a square test image and in any image whose crop starts at
+    /// the origin, so the fixture is deliberately non-square and the crop deliberately offset.
+    #[test]
+    fn a_crop_takes_the_rectangle_it_was_given() {
+        // 4x3, one distinct byte per pixel in the red channel: pixel (x, y) is y * 4 + x.
+        let size = Size::<i32, Physical>::from((4, 3));
+        let mut pixels = Vec::new();
+        for y in 0..3 {
+            for x in 0..4 {
+                pixels.extend_from_slice(&[(y * 4 + x) as u8, 0, 0, 255]);
+            }
+        }
+
+        let area = Rectangle::new(Point::from((1, 1)), Size::from((2, 2)));
+        let (cropped_size, cropped) = crop_rgba8(size, &pixels, area).expect("a crop");
+
+        assert_eq!(cropped_size, Size::from((2, 2)));
+        let reds: Vec<u8> = cropped.chunks_exact(4).map(|p| p[0]).collect();
+        assert_eq!(reds, vec![5, 6, 9, 10], "rows 1..3, columns 1..3");
+    }
+
+    /// An area running off the edge returns the part that exists; one entirely off it is an error,
+    /// because there is no image to hand back.
+    #[test]
+    fn a_crop_clamps_to_the_screen() {
+        let size = Size::<i32, Physical>::from((4, 3));
+        let pixels = vec![0u8; 4 * 3 * 4];
+
+        let over = Rectangle::new(Point::from((2, 2)), Size::from((10, 10)));
+        let (clamped, _) = crop_rgba8(size, &pixels, over).expect("the part on screen");
+        assert_eq!(clamped, Size::from((2, 1)));
+
+        let off = Rectangle::new(Point::from((100, 100)), Size::from((4, 4)));
+        assert!(crop_rgba8(size, &pixels, off).is_err());
+    }
 
     #[test]
     fn test_format_diagonal() {

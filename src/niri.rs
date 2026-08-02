@@ -203,9 +203,10 @@ use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
-    center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_laptop_panel,
-    is_mapped, logical_output, make_display_name, make_screenshot_path, output_matches_name,
-    output_size, panel_orientation, send_scale_transform, write_png_rgba8, xwayland,
+    center, center_f64, crop_rgba8, expand_home, get_monotonic_time, ipc_transform_to_smithay,
+    is_laptop_panel, is_mapped, logical_output, make_display_name, make_screenshot_path,
+    output_matches_name, output_size, panel_orientation, send_scale_transform, write_png_rgba8,
+    xwayland,
 };
 use crate::wallpaper::Wallpaper;
 use crate::window::mapped::MappedId;
@@ -3480,8 +3481,16 @@ impl State {
         msg: ScreenshotToNiri,
     ) {
         match msg {
-            ScreenshotToNiri::TakeScreenshot { include_cursor } => {
-                self.handle_take_screenshot(to_screenshot, include_cursor);
+            ScreenshotToNiri::TakeScreenshot {
+                include_cursor,
+                path,
+            } => {
+                self.handle_take_screenshot(to_screenshot, include_cursor, None, path);
+            }
+            ScreenshotToNiri::TakeScreenshotArea { area, path } => {
+                let (x, y, w, h) = area;
+                let area = Rectangle::new(Point::from((x, y)), Size::from((w, h)));
+                self.handle_take_screenshot(to_screenshot, false, Some(area), path);
             }
             ScreenshotToNiri::PickColor(tx) => {
                 self.handle_pick_color(tx);
@@ -3494,6 +3503,8 @@ impl State {
         &mut self,
         to_screenshot: &async_channel::Sender<NiriToScreenshot>,
         include_cursor: bool,
+        area: Option<Rectangle<i32, Logical>>,
+        path: Option<PathBuf>,
     ) {
         let _span = tracy_client::span!("TakeScreenshot");
 
@@ -3502,6 +3513,8 @@ impl State {
                 &mut self.niri,
                 renderer,
                 include_cursor,
+                area,
+                path,
                 to_screenshot,
             )
         });
@@ -3519,6 +3532,8 @@ impl State {
         niri: &mut Niri,
         renderer: &mut VulkanRenderer,
         include_cursor: bool,
+        area: Option<Rectangle<i32, Logical>>,
+        path: Option<PathBuf>,
         to_screenshot: &async_channel::Sender<NiriToScreenshot>,
     ) {
         let on_done = {
@@ -3531,7 +3546,7 @@ impl State {
             }
         };
 
-        let res = niri.screenshot_all_outputs(renderer, include_cursor, on_done);
+        let res = niri.screenshot_to_path(renderer, include_cursor, area, path, on_done);
 
         if let Err(err) = res {
             warn!("error taking a screenshot: {err:?}");
@@ -10274,7 +10289,24 @@ impl Niri {
         include_pointer: bool,
         on_done: impl FnOnce(PathBuf) + Send + 'static,
     ) -> anyhow::Result<()> {
-        let _span = tracy_client::span!("Niri::screenshot_all_outputs");
+        self.screenshot_to_path(renderer, include_pointer, None, None, on_done)
+    }
+
+    /// Capture the screen, optionally cropped to `area` (global logical coordinates), to `path`.
+    ///
+    /// This is what `org.gnome.Shell.Screenshot`'s `Screenshot` and `ScreenshotArea` are both made
+    /// of. `on_done` fires from the encoding thread *after* the file is written — the D-Bus reply
+    /// carries the filename, and a caller that gets it before the bytes are on disk is a portal
+    /// reading an empty file.
+    pub fn screenshot_to_path(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        include_pointer: bool,
+        area: Option<Rectangle<i32, Logical>>,
+        path: Option<PathBuf>,
+        on_done: impl FnOnce(PathBuf) + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let _span = tracy_client::span!("Niri::screenshot_to_path");
 
         self.update_render_elements(None);
 
@@ -10287,6 +10319,18 @@ impl Niri {
         let geom = self.global_space.output_geometry(&output).unwrap();
 
         let output_scale = output.current_scale().integer_scale();
+        // The crop, in the same output-local physical pixels the readback is in.
+        let crop = area
+            .map(|area| {
+                let local = Rectangle::new(area.loc - geom.loc, area.size);
+                let local = local.to_physical(output_scale);
+                anyhow::ensure!(
+                    local.size.w > 0 && local.size.h > 0,
+                    "empty screenshot area"
+                );
+                Ok(local)
+            })
+            .transpose()?;
         let geom = geom.to_physical(output_scale);
 
         let size = geom.size;
@@ -10309,9 +10353,15 @@ impl Niri {
             elements,
         )?;
 
-        let path = make_screenshot_path(&self.config.borrow())
-            .ok()
-            .flatten()
+        // Crop before encoding: the readback is one full output, and the requested area is a
+        // sub-rectangle of it clamped to what actually exists.
+        let (size, pixels) = match crop {
+            Some(crop) => crop_rgba8(size, &pixels, crop)?,
+            None => (size, pixels),
+        };
+
+        let path = path
+            .or_else(|| make_screenshot_path(&self.config.borrow()).ok().flatten())
             .unwrap_or_else(|| {
                 let mut path = env::temp_dir();
                 path.push("screenshot.png");
