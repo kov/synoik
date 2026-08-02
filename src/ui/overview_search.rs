@@ -673,6 +673,7 @@ impl OverviewSearch {
     /// The search render elements for `output`, faded by overview `progress` (0..1).
     /// Icons/glyphs are pushed first (topmost); chrome bakes last (below) — the dash
     /// order.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
@@ -681,6 +682,10 @@ impl OverviewSearch {
         output: &Output,
         area: SearchArea,
         fade: SearchFade,
+        // `org.gnome.desktop.interface accent-color`. The pill draws no focus ring of its own,
+        // but its **selection** is `st-transparentize(-st-accent-color, 0.7)` like every other
+        // entry's, so this is not the unused argument it used to be.
+        accent: [u8; 3],
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let SearchFade { overview, search } = fade;
         let scale = output.current_scale().fractional_scale();
@@ -834,12 +839,13 @@ impl OverviewSearch {
             // The search entry's focus is its caller's inset-accent ring, not the pill's.
             false,
             self.is_active(),
-            // Unused: this style draws no focus ring of its own (see just above).
-            widget::style::TEXT,
+            // Not a focus ring (this style has none) — the selection wash.
+            widget::style::accent_rgba(accent),
             // The width is part of what was baked; a canvas change must re-bake it.
             widget::Revision::new()
                 .of(self.content_rev)
                 .px(pill_w)
+                .of(accent)
                 .done(),
         ) {
             Ok(texture) => {

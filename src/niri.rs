@@ -8356,6 +8356,7 @@ impl Niri {
                         overview: progress,
                         search: self.overview_search_fade(),
                     },
+                    self.gnome_settings.accent_color,
                 ) {
                     push(element.into());
                 }

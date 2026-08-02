@@ -7150,6 +7150,7 @@ fn vulkan_search_result_caption_rests_at_the_grid_line_count() {
                         overview: 1.0,
                         search: 1.0,
                     },
+                    niri.gnome_settings.accent_color,
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7272,6 +7273,7 @@ fn vulkan_overview_search_draws_entry_and_selection() {
                     overview: 1.0,
                     search: 1.0,
                 },
+                niri.gnome_settings.accent_color,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());

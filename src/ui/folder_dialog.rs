@@ -1099,12 +1099,8 @@ impl FolderDialog {
             edit: TextEdit::with_text(open.name.clone()),
         });
         let size = l.name_entry.size;
-        let ring = [
-            f32::from(accent[0]) / 255.,
-            f32::from(accent[1]) / 255.,
-            f32::from(accent[2]) / 255.,
-            FOCUS_RING_ALPHA,
-        ];
+        let mut ring = widget::style::accent_rgba(accent);
+        ring[3] = FOCUS_RING_ALPHA;
         // `selection-background-color: st-transparentize(-st-accent-color, 0.7)`
         // (`_common.scss:179`).
         let selection = [ring[0], ring[1], ring[2], 0.3];

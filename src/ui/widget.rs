@@ -150,6 +150,17 @@ pub mod style {
     /// the dash and the `.search-section-content` results card. Same value the dash
     /// bakes as its pill (kept in sync via this one constant).
     pub const OVERLAY_BG: Rgba = [0.218, 0.218, 0.233, 1.];
+    /// The system accent as an [`Rgba`] — `org.gnome.desktop.interface accent-color` arrives
+    /// resolved to 8-bit RGB, and every widget that draws with it needs the float form.
+    pub fn accent_rgba(accent: [u8; 3]) -> Rgba {
+        [
+            f32::from(accent[0]) / 255.,
+            f32::from(accent[1]) / 255.,
+            f32::from(accent[2]) / 255.,
+            1.,
+        ]
+    }
+
     /// An entry's selection wash: `selection-background-color:
     /// st-transparentize(-st-accent-color, 0.7)` (`%entry_common`, `_common.scss:178`) — the
     /// live accent at 30%. Its companion `selected-color` is `$fg_color`, i.e. exactly what
