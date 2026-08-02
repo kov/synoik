@@ -175,26 +175,6 @@ impl DBusServers {
                 Err(err) => warn!("error starting the gdm verifier client: {err:?}"),
             }
 
-            // The polkit authentication agent. On the same `is_session_instance` gate as the rest:
-            // registering is per-session and polkitd allows exactly one agent per session, so a
-            // second instance would take the seat's prompt away from the real shell.
-            let (to_niri, from_polkit) = calloop::channel::channel();
-            niri.event_loop
-                .insert_source(from_polkit, move |event, _, state| match event {
-                    calloop::channel::Event::Msg(msg) => state.on_polkit_msg(msg),
-                    calloop::channel::Event::Closed => (),
-                })
-                .unwrap();
-            match polkit_agent::start(to_niri) {
-                Ok((conn, requests)) => {
-                    dbus.conn_polkit = Some(conn);
-                    niri.polkit_requests = Some(requests);
-                }
-                // Loud: the failure mode is silent everywhere else. Every polkit action will fail
-                // with no prompt, and the user has no way to tell that from being denied.
-                Err(err) => warn!("no polkit authentication agent: {err:?}"),
-            }
-
             // gsd-power's way in to brightness: idle dimming and the auto-brightness target.
             let (to_niri, from_brightness) = calloop::channel::channel();
             let (to_brightness, from_niri) = async_channel::unbounded();
@@ -354,6 +334,35 @@ impl DBusServers {
             }
             Err(err) => {
                 warn!("error starting login1 watcher: {err:?}");
+            }
+        }
+
+        // The polkit authentication agent.
+        //
+        // **After login1**, which is what resolves our session path — the subject we register for
+        // is our logind session, and there is no other way to name it. Started before that, the
+        // agent silently never registers and every polkit action in the session fails with no
+        // prompt, which is the exact bug it exists to fix.
+        //
+        // On the same `is_session_instance` gate as the rest: registration is per-session and
+        // polkitd allows one agent per session, so a second instance would take the seat's prompt
+        // away from the real shell.
+        if is_session_instance {
+            let (to_niri, from_polkit) = calloop::channel::channel();
+            niri.event_loop
+                .insert_source(from_polkit, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(msg) => state.on_polkit_msg(msg),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            match polkit_agent::start(to_niri) {
+                Ok((conn, requests)) => {
+                    dbus.conn_polkit = Some(conn);
+                    niri.polkit_requests = Some(requests);
+                }
+                // Loud: the failure mode is silent everywhere else. Every polkit action will fail
+                // with no prompt, and the user has no way to tell that from being denied.
+                Err(err) => warn!("no polkit authentication agent: {err:?}"),
             }
         }
 

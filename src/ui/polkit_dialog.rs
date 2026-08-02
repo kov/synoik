@@ -340,14 +340,9 @@ impl PolkitDialogUi {
             |r| prepare_card(r, scale, dialog, &l),
             |frame, phys, prepared| paint_card(frame, phys, prepared, &l, scale, accent_rgba),
         );
-        match card {
-            Ok(texture) => push(PolkitDialogRenderElement::Texture(scaled(
-                renderer, texture, scale, origin, clamped, value, centre,
-            ))),
-            // This dialog holds a modal grab; a failed draw must not leave an invisible trap, so
-            // the backdrop below is pushed either way.
-            Err(err) => warn!("error rendering the polkit dialog: {err:#}"),
-        }
+        // Baked now so its cache entry is warm with the rest, but pushed *last* of the card's own
+        // elements: the first element pushed is the topmost one, and the card is opaque over its
+        // whole rect, so anything queued after it would be drawn behind it and never seen.
 
         // --- The avatar, over the card's plate. ---
         let avatar_centre = l.avatar.loc + l.avatar.size.to_point().downscale(2.);
@@ -435,6 +430,16 @@ impl PolkitDialogUi {
                 }
                 Err(err) => warn!("error drawing the polkit entry: {err:#}"),
             }
+        }
+
+        // --- The card itself, under everything that sits on it. ---
+        match card {
+            Ok(texture) => push(PolkitDialogRenderElement::Texture(scaled(
+                renderer, texture, scale, origin, clamped, value, centre,
+            ))),
+            // This dialog holds a modal grab; a failed draw must not leave an invisible trap, so
+            // the backdrop below is pushed either way.
+            Err(err) => warn!("error rendering the polkit dialog: {err:#}"),
         }
 
         // --- The backdrop, dimming everything behind. ---
@@ -888,5 +893,89 @@ mod tests {
                 "the buttons overlap"
             );
         }
+    }
+
+    /// The entry and the avatar are drawn *over* the card, not under it.
+    ///
+    /// The card is one opaque texture covering the whole dialog, and the first element pushed is
+    /// the topmost one — so pushing the card first hides everything that sits on it. That is
+    /// exactly what shipped: live, the dialog came up with its title, its buttons and a blank gap
+    /// where the password entry should be, and typing produced no bullets, because the entry was
+    /// being drawn behind the card every frame.
+    ///
+    /// This drives the real `render` rather than baking the card by hand, which is why the
+    /// bake-level test above stayed green through all of it.
+    #[test]
+    fn the_entry_is_drawn_over_the_card() {
+        use std::rc::Rc;
+
+        use smithay::backend::renderer::element::Element;
+
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping the_entry_is_drawn_over_the_card: no Vulkan device ({e})");
+                return;
+            }
+        };
+
+        let output = Output::new(
+            "polkit-test".to_owned(),
+            smithay::output::PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: smithay::output::Subpixel::Unknown,
+                make: "niri".to_owned(),
+                model: "test".to_owned(),
+                serial_number: "0".to_owned(),
+            },
+        );
+        output.change_current_state(
+            Some(smithay::output::Mode {
+                size: Size::from((1920, 1080)),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            None,
+        );
+
+        let d = dialog("root", true, None, false);
+        let l = layout(&d);
+        let origin = PolkitDialogUi::origin(output_size(&output), &l);
+
+        let mut ui = PolkitDialogUi::new(
+            crate::animation::Clock::with_time(Duration::ZERO),
+            Rc::new(RefCell::new(niri_config::Config::default())),
+        );
+        ui.show();
+        ui.settle();
+
+        let icons = IconCache::new("Adwaita");
+        let images = ImageCache::new();
+        let mut elements = Vec::new();
+        ui.render(
+            &mut vk,
+            &output,
+            &icons,
+            &images,
+            &d,
+            [53, 132, 228],
+            Duration::ZERO,
+            &mut |el| elements.push(el),
+        );
+
+        let entry_at = (origin + l.entry.loc).to_physical_precise_round(1.);
+        let card_at = origin.to_physical_precise_round(1.);
+        let index = |at: Point<i32, Physical>| {
+            elements
+                .iter()
+                .position(|el| el.geometry(1.0.into()).loc == at)
+                .unwrap_or_else(|| panic!("no element drawn at {at:?}"))
+        };
+
+        assert!(
+            index(entry_at) < index(card_at),
+            "the entry must be pushed before the card, or it is drawn behind it"
+        );
     }
 }

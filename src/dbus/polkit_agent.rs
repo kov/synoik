@@ -278,7 +278,7 @@ pub fn start(
 /// already resolved gets the same answer without a second guess.
 fn subject(
     conn: &zbus::blocking::Connection,
-) -> anyhow::Result<(String, Vec<(String, OwnedValue)>)> {
+) -> anyhow::Result<(String, std::collections::HashMap<String, OwnedValue>)> {
     use anyhow::Context as _;
 
     let path = crate::dbus::freedesktop_login1::session_path()
@@ -293,7 +293,11 @@ fn subject(
         .get_property("Id")
         .context("reading the session Id")?;
 
-    let details = vec![("session-id".to_owned(), Value::from(id).try_into()?)];
+    // A **map**, not a list of pairs: polkit's subject is `(sa{sv})`, and a `Vec<(String, _)>`
+    // serialises as `a(sv)` — which polkitd rejects with `InvalidArgs` naming the whole signature,
+    // so the mistake is easy to make and unmistakable once it is live.
+    let mut details = std::collections::HashMap::new();
+    details.insert("session-id".to_owned(), Value::from(id).try_into()?);
     Ok(("unix-session".to_owned(), details))
 }
 

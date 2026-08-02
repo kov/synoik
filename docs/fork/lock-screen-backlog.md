@@ -542,20 +542,22 @@ real touch gesture is not. Last anyway, because it is the least missed.
 - **A power-save-mode change slams the hint to zero** (`unlockDialog.js:440-442`) — we have no
   power-save-mode signal wired.
 
-## Not lock screen, but found here: **no polkit authentication agent**
+## Not lock screen, but found here: **no polkit authentication agent** — DONE
 
 gnome-shell registers a `PolkitAgent.Listener` for its session (`js/ui/components/polkitAgent.js`)
-and puts up the "Authentication required" dialog. We register none, so **every polkit action that
-needs authentication fails immediately with `PermissionDenied` and no prompt** — there is nothing to
-prompt with. Found by trying to enrol a fingerprint as the test user
-(`net.reactivated.fprint.device.enroll` is `auth_self_keep`), but the blast radius is far wider:
-mounting an encrypted volume, installing updates, and every Settings panel with a lock button fail
-the same silent way. It is a blocker for dogfooding, agreed 2026-08-01 to be taken on after the lock
-screen.
+and puts up the "Authentication required" dialog. We registered none, so **every polkit action that
+needed authentication failed immediately with `PermissionDenied` and no prompt** — there was nothing
+to prompt with. Found by trying to enrol a fingerprint as the test user
+(`net.reactivated.fprint.device.enroll` is `auth_self_keep`), but the blast radius was far wider:
+mounting an encrypted volume, installing updates, and every Settings panel with a lock button failed
+the same silent way. It was a blocker for dogfooding, agreed 2026-08-01 to be taken on after the
+lock screen.
 
-Two things make it a natural sibling of the work here rather than a separate world: the dialog is a
-user widget with an avatar and a password entry, which is `widget::Avatar` plus `widget::Entry`; and
-it can authenticate by fingerprint through the same machinery E just wired up.
+Built and seat-validated 2026-08-02 — **see `docs/fork/polkit-agent-port.md`** for the shape, the
+protocols, the traps and what is deliberately not done. It landed as a natural sibling of the work
+here: the dialog is a user widget with an avatar and a password entry, which is `widget::Avatar`
+plus `widget::Entry`, and the wiggle E added for the lock screen became the shared
+`widget::Wiggle`.
 
 ---
 
