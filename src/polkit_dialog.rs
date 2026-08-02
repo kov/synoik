@@ -15,7 +15,10 @@
 
 use std::time::Duration;
 
+use smithay::input::keyboard::Keysym;
+
 use crate::dbus::polkit_agent::{BeginRequest, PolkitRequest, PolkitToNiri};
+use crate::ui::text_edit::{EditMods, EditOutcome, KeyTheme, TextEdit};
 use crate::unlock_dialog::{clean_question, UserInfo};
 
 /// Room for any password without reallocating — a `String` that grows 0→8→16 leaves the earlier
@@ -130,7 +133,7 @@ pub struct PolkitDialog {
     question: Option<(String, bool)>,
     /// What has been typed. Cleared on every verdict and every question — a password must not
     /// outlive the question it answers.
-    entry: String,
+    entry: TextEdit,
     /// False between submitting and the next question: GNOME makes the entry and the OK button
     /// insensitive so a second Enter cannot send the same password twice (`:225-226`).
     entry_live: bool,
@@ -147,7 +150,7 @@ impl PolkitDialog {
             mode: Mode::Auth,
             user: UserInfo::default(),
             question: None,
-            entry: String::with_capacity(ENTRY_CAPACITY),
+            entry: TextEdit::with_capacity(ENTRY_CAPACITY),
             entry_live: false,
             message: None,
             focus: Focus::Entry,
@@ -222,10 +225,23 @@ impl PolkitDialog {
 
     /// What to draw in the entry: the text, or one bullet per character when PAM said not to echo.
     pub fn entry_display(&self) -> String {
+        match self.entry_mask() {
+            Some(m) => m.to_string().repeat(self.entry.text().chars().count()),
+            None => self.entry.text().to_owned(),
+        }
+    }
+
+    /// The editing model behind the entry — what the view draws caret and selection from.
+    pub fn entry(&self) -> &TextEdit {
+        &self.entry
+    }
+
+    /// The mask character, or `None` when PAM said to echo. U+25CF is
+    /// `st_password_entry`'s.
+    pub fn entry_mask(&self) -> Option<char> {
         match self.question {
-            Some((_, true)) => self.entry.clone(),
-            // U+25CF, `st_password_entry`'s mask character.
-            _ => "\u{25cf}".repeat(self.entry.chars().count()),
+            Some((_, true)) => None,
+            _ => Some('\u{25cf}'),
         }
     }
 
@@ -283,8 +299,13 @@ impl PolkitDialog {
     }
 
     /// Zero the entry before dropping its contents, and keep the allocation.
+    ///
+    /// This used to be a plain `clear()` under exactly this comment: the allocation survived but
+    /// the bytes did not get overwritten, so a just-typed password stayed readable in the
+    /// dialog's heap until something else happened to reuse it. `secure_clear` is what the
+    /// comment always described (and what the lock screen's twin already did).
     fn clear_entry(&mut self) {
-        self.entry.clear();
+        self.entry.secure_clear(ENTRY_CAPACITY);
     }
 
     /// An event from the agent.
@@ -370,22 +391,35 @@ impl PolkitDialog {
         PolkitEffects::redraw()
     }
 
-    pub fn type_char(&mut self, c: char) -> PolkitEffects {
+    /// Feed a key to the entry. Returns `None` when the entry did not claim it, so the
+    /// caller can fall through to the dialog's own bindings (Tab, focus arrows, Escape).
+    ///
+    /// The whole editing surface — word motion, selection, `Ctrl-u`/`Ctrl-k`, the Emacs
+    /// theme — comes from the shared [`TextEdit`]; this only gates it on the entry being
+    /// live and focused.
+    pub fn entry_key(
+        &mut self,
+        sym: Option<Keysym>,
+        ch: Option<char>,
+        mods: EditMods,
+        theme: KeyTheme,
+    ) -> Option<PolkitEffects> {
         if !self.entry_live || self.focus != Focus::Entry {
-            return PolkitEffects::default();
+            return None;
         }
-        self.entry.push(c);
-        PolkitEffects::redraw()
+        match self.entry.handle_key(sym, ch, mods, theme) {
+            EditOutcome::Ignored => None,
+            // Enter and Escape are the dialog's, not the field's: they submit and cancel.
+            EditOutcome::Activate | EditOutcome::Cancel => None,
+            EditOutcome::Changed | EditOutcome::Moved => Some(PolkitEffects::redraw()),
+        }
     }
 
-    pub fn backspace(&mut self) -> PolkitEffects {
-        if !self.entry_live || self.focus != Focus::Entry {
-            return PolkitEffects::default();
-        }
-        if self.entry.pop().is_none() {
-            return PolkitEffects::default();
-        }
-        PolkitEffects::redraw()
+    /// Type one character into the entry — the [`Self::entry_key`] path a printable key takes,
+    /// named for what tests and callers mean by it.
+    pub fn type_char(&mut self, c: char) -> PolkitEffects {
+        self.entry_key(None, Some(c), EditMods::default(), KeyTheme::default())
+            .unwrap_or_default()
     }
 
     /// Move focus on Tab / arrows. Cancel and Authenticate are always reachable; the entry only
@@ -429,7 +463,8 @@ impl PolkitDialog {
             return PolkitEffects::default();
         }
 
-        let response = std::mem::replace(&mut self.entry, String::with_capacity(ENTRY_CAPACITY));
+        let response = self.entry.text().to_owned();
+        self.clear_entry();
         // Insensitive until the next question, so a second Enter cannot resend it.
         self.entry_live = false;
         // "When the user responds, dismiss already shown info and error texts (if any)"

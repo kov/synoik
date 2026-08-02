@@ -15,7 +15,10 @@
 
 use std::time::Duration;
 
+use smithay::input::keyboard::Keysym;
+
 use crate::dbus::gdm::{MessageKind, MessageSource, VerifierEvent, VerifierRequest};
+use crate::ui::text_edit::{EditMods, EditOutcome, KeyTheme, TextEdit};
 
 /// Room for any password without reallocating; see [`UnlockDialog::clear_entry`].
 const ENTRY_CAPACITY: usize = 512;
@@ -128,7 +131,7 @@ pub struct UnlockDialog {
     user: UserInfo,
     /// What the user has typed. Cleared on every verdict and on every reset — a password must not
     /// outlive the question it answers.
-    entry: String,
+    entry: TextEdit,
     /// gdm's prompt text, and whether to mask the entry. `secret` comes from which signal asked
     /// (`SecretInfoQuery` vs `InfoQuery`); defaulting it to `false` would draw a password in the
     /// clear, so there is no default — no question means no entry.
@@ -168,7 +171,7 @@ impl UnlockDialog {
             user,
             // Pre-sized so typing never reallocates: a `String` that grows 0→8→16 leaves the
             // earlier buffers on the heap, unzeroed, holding a prefix of the password.
-            entry: String::with_capacity(ENTRY_CAPACITY),
+            entry: TextEdit::with_capacity(ENTRY_CAPACITY),
             question: None,
             message: None,
             wiggle: false,
@@ -328,17 +331,7 @@ impl UnlockDialog {
     fn clear_entry(&mut self) {
         // SAFETY: the buffer is overwritten with ASCII zeros, which is valid UTF-8, and then
         // truncated to nothing.
-        unsafe {
-            let bytes = self.entry.as_mut_vec();
-            bytes.iter_mut().for_each(|b| {
-                // `write_volatile` so the fill is not optimised away as a dead store.
-                std::ptr::write_volatile(b, 0);
-            });
-            bytes.clear();
-        }
-        if self.entry.capacity() < ENTRY_CAPACITY {
-            self.entry.reserve(ENTRY_CAPACITY - self.entry.capacity());
-        }
+        self.entry.secure_clear(ENTRY_CAPACITY);
     }
 
     /// Whether gdm asked for a *secret*. **Fails closed**: with no question outstanding this is
@@ -393,10 +386,9 @@ impl UnlockDialog {
 
     /// What to draw in the entry — already masked when it must be.
     pub fn entry_display(&self) -> String {
-        if self.is_secret() {
-            "\u{25cf}".repeat(self.entry.chars().count())
-        } else {
-            self.entry.clone()
+        match self.entry_mask() {
+            Some(m) => m.to_string().repeat(self.entry.text().chars().count()),
+            None => self.entry.text().to_owned(),
         }
     }
 
@@ -453,21 +445,65 @@ impl UnlockDialog {
     /// (`vfunc_key_press_event`, `:672-692`): typing your password blind from the clock does not
     /// eat the first letter. Getting this wrong is invisible to a test that clicks first.
     pub fn type_char(&mut self, c: char, now: Duration) -> UnlockEffects {
-        let mut effects = self.show_prompt(now);
-        self.last_activity = Some(now);
-        if self.is_entry_live() {
-            self.entry.push(c);
-            effects.redraw = true;
-        }
-        effects
+        self.entry_key(None, Some(c), EditMods::default(), KeyTheme::default(), now)
+            .unwrap_or_else(|| self.show_prompt(now))
     }
 
-    pub fn backspace(&mut self, now: Duration) -> UnlockEffects {
+    /// Feed an editing key to the entry — arrows, word motion, selection, `Ctrl-u`/`Ctrl-k`,
+    /// the Emacs theme. Returns `None` when the entry did not claim it, so the caller falls
+    /// through to the shield's own bindings (Escape, Return).
+    ///
+    /// Like [`Self::type_char`], this raises the prompt from the clock page: an arrow key is
+    /// activity too, and getting it back to the clock mid-edit would lose what was typed.
+    pub fn entry_key(
+        &mut self,
+        sym: Option<Keysym>,
+        ch: Option<char>,
+        mods: EditMods,
+        theme: KeyTheme,
+        now: Duration,
+    ) -> Option<UnlockEffects> {
+        // Raise the prompt **before** testing whether the entry is live, because raising it is
+        // what makes it live: on the clock page the entry does not exist yet, and checking
+        // first would eat the first letter of a password typed blind — the exact thing
+        // `unlockDialog.js:672-692` goes out of its way to keep.
+        let mut effects = self.show_prompt(now);
         self.last_activity = Some(now);
-        if !self.is_entry_live() || self.entry.pop().is_none() {
-            return UnlockEffects::default();
+        if !self.is_entry_live() {
+            return None;
         }
-        UnlockEffects::redraw()
+        match self.entry.handle_key(sym, ch, mods, theme) {
+            // Return and Escape are the shield's (submit / go back), never the field's.
+            EditOutcome::Ignored | EditOutcome::Activate | EditOutcome::Cancel => None,
+            EditOutcome::Changed | EditOutcome::Moved => {
+                effects.redraw = true;
+                Some(effects)
+            }
+        }
+    }
+
+    /// The editing model behind the entry — what the view draws caret and selection from.
+    pub fn entry(&self) -> &TextEdit {
+        &self.entry
+    }
+
+    /// The mask character, or `None` when gdm's question is not a secret. U+25CF is
+    /// `st_password_entry`'s.
+    pub fn entry_mask(&self) -> Option<char> {
+        self.is_secret().then_some('\u{25cf}')
+    }
+
+    /// BackSpace on the entry — the [`Self::entry_key`] path that key takes, kept as a named
+    /// method because "backspace" is what the shield's callers and tests mean.
+    pub fn backspace(&mut self, now: Duration) -> UnlockEffects {
+        self.entry_key(
+            Some(Keysym::BackSpace),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+            now,
+        )
+        .unwrap_or_default()
     }
 
     /// Return — send the answer to gdm (`_onNext`).
@@ -479,7 +515,7 @@ impl UnlockDialog {
         // Clone, then zero ours: `mem::take` would hand the request our allocation and leave the
         // dialog with a fresh zero-capacity `String`, restarting the reallocation ladder that
         // `ENTRY_CAPACITY` exists to avoid.
-        let answer = self.entry.clone();
+        let answer = self.entry.text().to_owned();
         self.clear_entry();
         self.status = Status::Answered;
         // Queued rather than wiped: GNOME waits for pending messages before it resets or retries

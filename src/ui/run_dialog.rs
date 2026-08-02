@@ -22,6 +22,7 @@ use crate::niri_render_elements;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
+use crate::ui::text_edit::{EditMods, EditOutcome, KeyTheme, TextEdit};
 use crate::ui::widget::{self, ContentCache, Painter, ParagraphSpan, ShapedParagraph, TextShaper};
 use crate::utils::{output_size, to_physical_precise_round};
 
@@ -43,7 +44,7 @@ const HISTORY_LIMIT: usize = 512;
 
 pub struct RunDialog {
     open: bool,
-    entry: String,
+    entry: TextEdit,
     error: Option<String>,
     /// Escape must be both pressed and released on the dialog to close it
     /// (gnome-shell pairs the press and release).
@@ -78,7 +79,7 @@ impl RunDialog {
     pub fn new() -> Self {
         Self {
             open: false,
-            entry: String::new(),
+            entry: TextEdit::new(),
             error: None,
             esc_pressed: false,
             history_index: None,
@@ -107,7 +108,7 @@ impl RunDialog {
     }
 
     pub fn entry(&self) -> &str {
-        &self.entry
+        self.entry.text()
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -123,10 +124,13 @@ impl RunDialog {
 
     /// Feed a key on the open dialog. `text` is the key's character, if any;
     /// `history` is the current command history (oldest first).
+    #[allow(clippy::too_many_arguments)]
     pub fn handle_key(
         &mut self,
         raw: Option<smithay::input::keyboard::Keysym>,
         text: Option<char>,
+        mods: EditMods,
+        theme: KeyTheme,
         pressed: bool,
         history: &[String],
     ) -> KeyOutcome {
@@ -141,10 +145,9 @@ impl RunDialog {
 
         self.esc_pressed = raw == Some(Keysym::Escape);
 
+        // History recall owns Up/Down before the entry sees them: they are line motion on a
+        // one-line field, so the entry has nothing to do with them anyway.
         match raw {
-            Some(Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter) => {
-                return KeyOutcome::Run(self.entry.clone());
-            }
             Some(Keysym::Up) => {
                 let index = match self.history_index {
                     None => history.len().checked_sub(1),
@@ -166,15 +169,22 @@ impl RunDialog {
                     }
                 }
             }
-            Some(Keysym::BackSpace) => {
-                if self.entry.pop().is_some() {
-                    self.entry_edited();
-                }
-            }
             _ => {
-                if let Some(c) = text.filter(|c| !c.is_control()) {
-                    self.entry.push(c);
-                    self.entry_edited();
+                // Everything else is the shared entry's: caret motion, word deletion,
+                // selection, `Ctrl-u`/`Ctrl-k`, the Emacs theme.
+                let before = self.entry.text().to_owned();
+                match self.entry.handle_key(raw, text, mods, theme) {
+                    EditOutcome::Activate => return KeyOutcome::Run(self.entry.text().to_owned()),
+                    EditOutcome::Changed => {
+                        if self.entry.text() != before {
+                            self.entry_edited();
+                        }
+                    }
+                    // The double-Escape close is handled above via `esc_pressed`; a single
+                    // Escape must not clear the entry the way the search's does.
+                    EditOutcome::Moved | EditOutcome::Cancel | EditOutcome::Ignored => {
+                        self.revision += 1;
+                    }
                 }
             }
         }
@@ -183,7 +193,7 @@ impl RunDialog {
     }
 
     fn set_entry(&mut self, text: String) {
-        self.entry = text;
+        self.entry.set_text(text);
         self.entry_edited();
     }
 
@@ -213,7 +223,7 @@ impl RunDialog {
             // This dialog is a modal keyboard grab (`KeyboardFocus::RunDialog`); a
             // draw failure must never leave an invisible trap. On error we skip the
             // box but still draw the backdrop below, so the modal stays visible.
-            let entry = &self.entry;
+            let entry = self.entry.text();
             let error = self.error.as_deref();
             match widget::bake_content(
                 renderer,

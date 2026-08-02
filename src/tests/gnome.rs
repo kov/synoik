@@ -9857,7 +9857,14 @@ fn overview_chrome_ramps_down_on_a_small_canvas() {
             .controls_layout_for_output(&output)
             .expect("the output has a monitor");
         let icon = Dash::metrics(controls.dash).icon_px;
-        let entry = f.niri().overview_search.entry_pill(controls.into()).size.w;
+        // The ramp sizes the *open* pill; at rest the entry is a collapsed puck whose width
+        // is a fixed circle and would ramp with nothing.
+        let entry = f
+            .niri()
+            .overview_search
+            .expanded_entry_pill(controls.into())
+            .size
+            .w;
         let mon = f
             .niri()
             .layout
@@ -11052,6 +11059,69 @@ fn search_overview(groups: &[&[&str]]) -> (Fixture, crate::app_system::Recording
         "the overview must hold keyboard focus so typing engages search"
     );
     (f, recorder)
+}
+
+/// The resting entry is a puck; typing (or a click on it) grows it to GNOME's pill, and
+/// clearing puts it back. The divergence, driven through the real key path.
+#[test]
+fn overview_search_entry_rests_collapsed_and_expands_on_typing() {
+    let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
+
+    assert!(
+        !f.niri().overview_search.is_expanded(),
+        "the entry rests as a puck until something asks for it"
+    );
+    tap(&mut f, KEY_A);
+    assert!(
+        f.niri().overview_search.is_expanded(),
+        "the first keystroke grows it into the pill"
+    );
+
+    tap(&mut f, KEY_ESC);
+    assert!(
+        !f.niri().overview_search.is_expanded(),
+        "clearing collapses it again — an empty open pill is a state with no meaning"
+    );
+}
+
+/// GNOME's editing combos reach the query through the real key path — the whole point of
+/// routing entries through the shared `TextEdit`. Ctrl-BackSpace used to be refused outright
+/// (every modified key was), so this would have left the query untouched.
+#[test]
+fn overview_search_ctrl_backspace_deletes_a_word() {
+    let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
+
+    for key in [KEY_A, KEY_W, KEY_SPACE, KEY_E, KEY_R] {
+        tap(&mut f, key);
+    }
+    assert_eq!(f.niri().overview_search.query(), "aw er");
+
+    f.key_press(KEY_LEFTCTRL);
+    tap(&mut f, KEY_BACKSPACE);
+    f.key_release(KEY_LEFTCTRL);
+    assert_eq!(
+        f.niri().overview_search.query(),
+        "aw ",
+        "Ctrl-BackSpace deletes the previous word, not one character"
+    );
+}
+
+/// Home/arrows move a real caret, so typing lands mid-string instead of always appending.
+#[test]
+fn overview_search_caret_moves_and_types_mid_string() {
+    let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
+
+    for key in [KEY_A, KEY_W] {
+        tap(&mut f, key);
+    }
+    assert_eq!(f.niri().overview_search.query(), "aw");
+    tap(&mut f, KEY_HOME);
+    tap(&mut f, KEY_Z);
+    assert_eq!(
+        f.niri().overview_search.query(),
+        "zaw",
+        "Home put the caret at the start; the key typed there"
+    );
 }
 
 /// Typing a printable engages search and lists the provider's results (in group
@@ -13709,7 +13779,8 @@ fn clicking_the_switch_user_button_cancels_the_prompt() {
                 question: "Password:".to_owned(),
                 secret: true,
             });
-        f.niri_state().on_shield_key(None, Some('a'));
+        f.niri_state()
+            .on_shield_key(None, Some('a'), Default::default());
     };
     raise(&mut f);
     assert_eq!(

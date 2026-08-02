@@ -42,6 +42,7 @@ use crate::ui::app_grid::{
     AppGrid, AppGridEntry, FocusDir, GridDropTarget, PageArrow, FOCUS_RING_ALPHA, FOCUS_RING_W,
 };
 use crate::ui::panel::panel_height;
+use crate::ui::text_edit::{EditMods, EditOutcome, KeyTheme, TextEdit};
 use crate::ui::widget::{self, style, Align, Painter};
 
 /// `$app_folder_size` (`_app-grid.scss:4,60-61`) — the panel is a fixed square.
@@ -64,6 +65,8 @@ const NAME_PT: f64 = 20.;
 /// The rename entry is `%system_entry` — `%entry_common`'s `$base_border_radius` 8 and
 /// `$base_padding * 1.5` = 9px of padding around the line (`_common.scss:175-181,337`).
 const ENTRY_RADIUS: f64 = 8.;
+/// The caret bar's width — St's `caret-size` default, as [`widget::Entry`] draws it.
+const CARET_W: f64 = 1.;
 const ENTRY_PAD: f64 = 9.;
 /// `.folder-name-entry { width: 12em; }` (`_app-grid.scss:86`), the em being the entry's
 /// own `%title_1` size.
@@ -235,9 +238,11 @@ struct OpenFolder {
 /// A folder name being edited.
 #[derive(Debug, Clone)]
 struct Rename {
-    text: String,
-    /// The initial select-all: the next character typed replaces the whole name.
-    select_all: bool,
+    /// The editable name. Opens with everything selected, which is what makes typing over the
+    /// old name work — GNOME's `_showFolderEntry` does `entry.clutter_text.grab_key_focus()`
+    /// then selects all (`appDisplay.js:2643-2648`). The shared model has a real selection, so
+    /// this is no longer a bespoke `select_all` bool that only BackSpace and typing honored.
+    edit: TextEdit,
 }
 
 /// What the rename entry did with a key.
@@ -813,7 +818,7 @@ impl FolderDialog {
 
     /// The text in the rename entry, for a test to read back.
     pub fn rename_text(&self) -> Option<&str> {
-        Some(self.open.as_ref()?.rename.as_ref()?.text.as_str())
+        Some(self.open.as_ref()?.rename.as_ref()?.edit.text())
     }
 
     /// Toggle the rename entry — the edit button's `notify::checked`
@@ -827,8 +832,11 @@ impl FolderDialog {
             return None;
         };
         open.rename = Some(Rename {
-            text: open.name.clone(),
-            select_all: true,
+            edit: {
+                let mut edit = TextEdit::with_text(open.name.clone());
+                edit.select_all();
+                edit
+            },
         });
         open.edit_fade = ease_to(&self.clock, open.edit_fade.clamped_value(), 1.);
         None
@@ -842,7 +850,7 @@ impl FolderDialog {
         let open = self.open.as_mut()?;
         let rename = open.rename.take()?;
         open.edit_fade = ease_to(&clock, open.edit_fade.clamped_value(), 0.);
-        let new = rename.text.trim();
+        let new = rename.edit.text().trim();
         if new.is_empty() || new == open.name {
             return None;
         }
@@ -854,44 +862,28 @@ impl FolderDialog {
 
     /// Feed a key to the rename entry.
     ///
-    /// Divergence, shared with the search entry: the caret is at the end only, so there is
-    /// no mid-string editing and the arrow keys are left to the caller. The one selection
-    /// GNOME sets up — select-all on open — is modeled, because it is what makes typing
-    /// over the old name work.
-    pub fn rename_key(&mut self, keysym: Option<Keysym>, utf8: Option<&str>) -> RenameKey {
+    /// The whole editing surface — caret motion, word deletion, selection, `Ctrl-u`/`Ctrl-k`,
+    /// the Emacs theme — is the shared [`TextEdit`]'s. Escape stays the caller's (it pops the
+    /// folder down), and Enter commits.
+    pub fn rename_key(
+        &mut self,
+        keysym: Option<Keysym>,
+        ch: Option<char>,
+        mods: EditMods,
+        theme: KeyTheme,
+    ) -> RenameKey {
         if !self.is_renaming() {
             return RenameKey::Ignored;
         }
-        match keysym {
-            Some(Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter) => {
-                return RenameKey::Commit
-            }
-            Some(Keysym::BackSpace) => {
-                let Some(rename) = self.open.as_mut().and_then(|o| o.rename.as_mut()) else {
-                    return RenameKey::Ignored;
-                };
-                if std::mem::take(&mut rename.select_all) {
-                    rename.text.clear();
-                } else {
-                    rename.text.pop();
-                }
-                return RenameKey::Took;
-            }
-            _ => {}
-        }
-        // Anything that produced no printable text (arrows, modifiers, Escape) is not ours.
-        let text = utf8.filter(|t| !t.is_empty() && !t.chars().any(char::is_control));
-        let Some(text) = text else {
-            return RenameKey::Ignored;
-        };
         let Some(rename) = self.open.as_mut().and_then(|o| o.rename.as_mut()) else {
             return RenameKey::Ignored;
         };
-        if std::mem::take(&mut rename.select_all) {
-            rename.text.clear();
+        match rename.edit.handle_key(keysym, ch, mods, theme) {
+            EditOutcome::Activate => RenameKey::Commit,
+            EditOutcome::Changed | EditOutcome::Moved => RenameKey::Took,
+            // Escape closes the folder, so it must reach the caller unconsumed.
+            EditOutcome::Cancel | EditOutcome::Ignored => RenameKey::Ignored,
         }
-        rename.text.push_str(text);
-        RenameKey::Took
     }
 
     /// Track the pointer over the edit button. Returns whether it changed (→ redraw).
@@ -1104,8 +1096,7 @@ impl FolderDialog {
         // The entry survives the fade-out with the rename already dropped, so fall back to
         // the committed name rather than blinking to empty.
         let rename = open.rename.clone().unwrap_or_else(|| Rename {
-            text: open.name.clone(),
-            select_all: false,
+            edit: TextEdit::with_text(open.name.clone()),
         });
         let size = l.name_entry.size;
         let ring = [
@@ -1117,16 +1108,24 @@ impl FolderDialog {
         // `selection-background-color: st-transparentize(-st-accent-color, 0.7)`
         // (`_common.scss:179`).
         let selection = [ring[0], ring[1], ring[2], 0.3];
-        // The caret bar (U+258F), as the search entry draws it.
-        let display = format!("{}\u{258f}", rename.text);
-        let select_all = rename.select_all && !rename.text.is_empty();
+        let display = rename.edit.text().to_owned();
+        let caret = rename.edit.cursor();
+        let sel = rename.edit.selection();
         let revision = widget::Revision::new()
             .of(&display)
-            .of(select_all)
+            .of(caret)
+            .of(sel.clone())
             .of(accent)
             .px(size.w)
             .px(size.h)
             .done();
+        // Advances measured in the same physical px the run is shaped at, so caret and
+        // selection land on the boundaries the glyphs agree with. Bold, like the run.
+        let font_px = (crate::ui::pt_to_px(NAME_PT) * scale) as f32;
+        let advance = move |upto: usize| {
+            niri_vk::text::measure_line_width_weighted(&display[..upto], font_px, true)
+        };
+        let display_for_shape = rename.edit.text().to_owned();
         match widget::bake(
             renderer,
             &mut self.cache.borrow_mut().entry,
@@ -1135,7 +1134,7 @@ impl FolderDialog {
             revision,
             move |r| {
                 let mut shaper = widget::TextShaper::new(r, scale);
-                shaper.shape(&display, widget::TextStyle::new(NAME_PT).bold())
+                shaper.shape(&display_for_shape, widget::TextStyle::new(NAME_PT).bold())
             },
             move |frame, phys, text| {
                 let mut p = Painter::new(frame, scale, phys);
@@ -1143,16 +1142,22 @@ impl FolderDialog {
                 p.fill_rounded_full(ENTRY_RADIUS, style::ENTRY_BG)?;
                 p.stroke_rounded_full(ENTRY_RADIUS, FOCUS_RING_W, ring)?;
                 let center = Point::from((size.w / 2., size.h / 2.));
-                if select_all {
-                    let (_x, _y, w, h) = text.ink_bounds();
-                    let (w, h) = (f64::from(w) / scale, f64::from(h) / scale);
-                    let rect = Rectangle::new(
-                        Point::from((center.x - w / 2., center.y - h / 2.)),
-                        Size::from((w, h)),
-                    );
-                    p.fill_rounded(rect, 0., selection)?;
+                // `Align::CENTER` anchors the run's *ink* box on `center`; the pen origin the
+                // advances are measured from is that box's left edge less the ink's own
+                // bearing. Deriving both from it keeps caret and selection on the glyphs.
+                let (ink_x, _, ink_w, ink_h) = text.ink_bounds();
+                let pen = (center.x * scale - f64::from(ink_w) / 2.) - f64::from(ink_x);
+                let at = |adv: f64| (pen + adv) / scale;
+                let h = f64::from(ink_h) / scale;
+                let bar = |x: f64, w: f64| {
+                    Rectangle::new(Point::from((x, center.y - h / 2.)), Size::from((w, h)))
+                };
+                if let Some(sel) = &sel {
+                    let (x0, x1) = (at(advance(sel.start)), at(advance(sel.end)));
+                    p.fill_rounded(bar(x0, x1 - x0), 0., selection)?;
                 }
                 p.text(text, center, Align::CENTER, style::TEXT)?;
+                p.fill_rounded(bar(at(advance(caret)), CARET_W), 0., style::TEXT)?;
                 Ok(())
             },
         ) {

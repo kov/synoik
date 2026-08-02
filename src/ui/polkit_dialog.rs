@@ -404,6 +404,7 @@ impl PolkitDialogUi {
             let text = dialog.entry_display();
             let entry_rev = widget::Revision::new()
                 .of(&text)
+                .of(dialog.entry().cursor())
                 .of(dialog.question().unwrap_or_default())
                 .of(dialog.focus() == Focus::Entry)
                 .px(l.entry.size.w)
@@ -413,8 +414,19 @@ impl PolkitDialogUi {
                 &mut self.entry_cache.borrow_mut(),
                 scale,
                 l.entry.size.w,
-                &text,
-                dialog.question().unwrap_or_default(),
+                match dialog.entry_mask() {
+                    Some(mask) => widget::EntryContent::masked(
+                        dialog.entry(),
+                        dialog.question().unwrap_or_default(),
+                        dialog.focus() == Focus::Entry,
+                        mask,
+                    ),
+                    None => widget::EntryContent::of(
+                        dialog.entry(),
+                        dialog.question().unwrap_or_default(),
+                        dialog.focus() == Focus::Entry,
+                    ),
+                },
                 widget::EntryStyle::PromptDialog,
                 dialog.focus() == Focus::Entry,
                 false,

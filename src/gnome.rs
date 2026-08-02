@@ -111,6 +111,10 @@ pub struct GnomeSettings {
     /// `org.gnome.desktop.interface font-name`'s family — the other half of the same key,
     /// realized the same way. See [`niri_vk::text::sans_family`].
     pub base_font_family: String,
+    /// `org.gnome.desktop.interface gtk-key-theme`: which editing bindings text entries
+    /// honor. See [`crate::ui::text_edit`] — GNOME Shell itself ignores this key (it is a
+    /// GTK mechanism), and honoring it in our entries is a deliberate divergence.
+    pub key_theme: crate::ui::text_edit::KeyTheme,
     /// `org.gnome.desktop.interface icon-theme`: the icon theme both the symbolic
     /// icon cache and the app-icon loader resolve against. GNOME's default is
     /// `"Adwaita"`.
@@ -381,6 +385,7 @@ impl Default for GnomeSettings {
             app_picker_layout: HashMap::new(),
             base_font_pt: crate::ui::BASE_FONT_PT,
             base_font_family: niri_vk::text::DEFAULT_SANS_FAMILY.to_owned(),
+            key_theme: crate::ui::text_edit::KeyTheme::default(),
             icon_theme: "Adwaita".to_string(),
             clock: ClockFormat::default(),
             calendar: CalendarSettings::default(),
@@ -647,6 +652,11 @@ impl GnomeSettings {
                 Some(rgb) => self.accent_color = rgb,
                 None => warn!("ignoring unrecognized accent-color {value:?}"),
             }
+        }
+        if settings_has_key(interface, "gtk-key-theme") {
+            self.key_theme = crate::ui::text_edit::KeyTheme::from_setting(
+                interface.string("gtk-key-theme").as_str(),
+            );
         }
         if settings_has_key(interface, "icon-theme") {
             let value = interface.string("icon-theme");

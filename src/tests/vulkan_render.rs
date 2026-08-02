@@ -7104,7 +7104,7 @@ fn vulkan_search_result_caption_rests_at_the_grid_line_count() {
     // A name that needs the second line, and a short one as the control.
     {
         let s = &mut f.niri().overview_search;
-        s.handle_key(None, Some('a'), true, false);
+        s.handle_key(None, Some('a'), crate::ui::text_edit::EditMods::default());
         s.set_results(vec![
             SearchResultEntry {
                 id: "long.desktop".into(),
@@ -7225,7 +7225,7 @@ fn vulkan_overview_search_draws_entry_and_selection() {
     // Drive the model directly into an active state with two results, tile 0 selected.
     {
         let s = &mut f.niri().overview_search;
-        s.handle_key(None, Some('a'), true, false);
+        s.handle_key(None, Some('a'), crate::ui::text_edit::EditMods::default());
         s.set_results(vec![
             SearchResultEntry {
                 id: "a.desktop".into(),
@@ -11824,7 +11824,8 @@ fn vulkan_draws_the_account_picture_round() {
             question: "Password:".to_owned(),
             secret: true,
         });
-    f.niri_state().on_shield_key(None, Some('a'));
+    f.niri_state()
+        .on_shield_key(None, Some('a'), Default::default());
     f.niri_state().niri.lock_screen.settle();
 
     // Watch what the icon cache is asked for across the frame: the fallback branch must not run.
@@ -11997,7 +11998,8 @@ fn vulkan_draws_the_switch_user_button_in_its_corner() {
             question: "Password:".to_owned(),
             secret: true,
         });
-    f.niri_state().on_shield_key(None, Some('a'));
+    f.niri_state()
+        .on_shield_key(None, Some('a'), Default::default());
     f.niri_state().niri.lock_screen.settle();
     let (without, w, h) = render_output_vulkan(&mut f, &output);
 
@@ -12079,7 +12081,8 @@ fn vulkan_draws_the_caps_lock_warning() {
             question: "Password:".to_owned(),
             secret: true,
         });
-    f.niri_state().on_shield_key(None, Some('a'));
+    f.niri_state()
+        .on_shield_key(None, Some('a'), Default::default());
     f.niri_state().niri.lock_screen.settle();
 
     let is_bright = |p: [u8; 4]| p[0] > 200 && p[1] > 200 && p[2] > 200;
@@ -12150,7 +12153,8 @@ fn vulkan_draws_the_prompt_message_in_its_own_row() {
             question: "Password:".to_owned(),
             secret: true,
         });
-    f.niri_state().on_shield_key(None, Some('a'));
+    f.niri_state()
+        .on_shield_key(None, Some('a'), Default::default());
     f.niri_state().niri.lock_screen.settle();
     let (before, w, h) = render_output_vulkan(&mut f, &output);
 
@@ -12244,7 +12248,8 @@ fn vulkan_draws_the_unlock_prompt_with_a_masked_entry() {
         });
     // Raise the prompt and type.
     for c in "abcdefgh".chars() {
-        f.niri_state().on_shield_key(None, Some(c));
+        f.niri_state()
+            .on_shield_key(None, Some(c), Default::default());
     }
     assert_eq!(
         f.niri().unlock_dialog.entry_display().chars().count(),
@@ -12278,11 +12283,15 @@ fn vulkan_draws_the_unlock_prompt_with_a_masked_entry() {
     // raw text, the ink would move; masked, every frame is the same eight dots.
     let baseline = pixels.clone();
     for _ in 0..8 {
-        f.niri_state()
-            .on_shield_key(Some(smithay::input::keyboard::Keysym::BackSpace), None);
+        f.niri_state().on_shield_key(
+            Some(smithay::input::keyboard::Keysym::BackSpace),
+            None,
+            Default::default(),
+        );
     }
     for c in "zyxwvuts".chars() {
-        f.niri_state().on_shield_key(None, Some(c));
+        f.niri_state()
+            .on_shield_key(None, Some(c), Default::default());
     }
     let (pixels2, _, _) = render_output_vulkan(&mut f, &output);
 

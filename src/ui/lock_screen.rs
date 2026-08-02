@@ -346,6 +346,13 @@ pub struct PromptContent {
     pub display_name: String,
     /// Masked or not, per the dialog. Never the raw secret.
     pub entry: String,
+    /// The caret's byte offset **into `entry`** — already mapped through the mask by
+    /// [`TextEdit::masked_positions`](crate::ui::text_edit::TextEdit::masked_positions), so
+    /// this stays true to the "the view never sees the password" rule that makes `entry` a
+    /// masked `String` in the first place.
+    pub cursor: Option<usize>,
+    /// The selection, in the same masked coordinates as `cursor`.
+    pub selection: Option<std::ops::Range<usize>>,
     /// gdm's prompt, shown as the entry's placeholder when nothing is typed.
     pub question: String,
     pub message: Option<String>,
@@ -950,6 +957,8 @@ impl LockScreen {
         // --- The entry pill, first (topmost is first). ---
         let entry_rev = widget::Revision::new()
             .of(&content.entry)
+            .of(content.cursor)
+            .of(content.selection.clone())
             .of(&content.question)
             .of(content.entry_live)
             .px(width)
@@ -959,8 +968,13 @@ impl LockScreen {
             &mut self.entry_cache.borrow_mut(),
             scale,
             width,
-            &content.entry,
-            &content.question,
+            widget::EntryContent {
+                text: &content.entry,
+                placeholder: &content.question,
+                cursor: content.cursor,
+                selection: content.selection.clone(),
+                mask: None,
+            },
             widget::EntryStyle::Lockscreen,
             content.entry_live,
             content.peek.is_some(),
