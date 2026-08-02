@@ -533,9 +533,21 @@ async fn pump_signals(
                     fingerprint.unavailable = true;
                     flags.given_up.store(true, Ordering::Relaxed);
                     flags.running.store(false, Ordering::Relaxed);
+                    // Named rather than summarised, because the two reasons want opposite
+                    // responses from whoever reads this: `ServiceUnavailable` is the stack below
+                    // us saying the hardware will not do it — go and look at fprintd's own log —
+                    // while an exhausted budget is our own policy and the thing to question is the
+                    // budget. A single line saying only "gave up" sends every such report down
+                    // the wrong one.
+                    let why = if fingerprint.unavailable {
+                        "gdm reported the service unavailable"
+                    } else {
+                        "it stopped without answering too many times"
+                    };
                     debug!(
-                        "gdm: the reader is not answering; not offering it again until the \
-                            prompt is raised afresh"
+                        "gdm: not offering the reader again until the prompt is raised afresh \
+                         ({why}, on {member}, {} silent stop(s))",
+                        fingerprint.silent_stops,
                     );
                 }
                 event
