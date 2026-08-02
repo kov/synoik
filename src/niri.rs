@@ -556,6 +556,11 @@ pub struct Niri {
     pub lock_timer: Option<calloop::RegistrationToken>,
     /// The idle fade's completion, which is what actually puts the shield down.
     pub fade_timer: Option<calloop::RegistrationToken>,
+    /// Wakes the unlock dialog when the message on screen has had its read time.
+    ///
+    /// Its own timer rather than the panel's minute tick: a message is owed two seconds, and a
+    /// tick that lands up to a minute later is not a queue, it is a stall.
+    pub unlock_message_timer: Option<calloop::RegistrationToken>,
     /// logind's `Session.Active`: whether our VT is the one on screen. Assumed true until logind
     /// says otherwise, which is right for the usual case of starting on the active VT.
     pub session_active: bool,
@@ -3988,6 +3993,11 @@ impl State {
         // already goes through, and a missed site would be a page that snaps instead of fading.
         self.sync_lock_page_and_caps();
 
+        // Every path that can queue a message funnels through here, so this is the one place that
+        // has to arm the wake-up. A queued message with no timer behind it is a message that never
+        // appears.
+        self.arm_unlock_message_timer();
+
         if effects.unlock {
             // gdm accepted. This is the only call to `deactivate` that can raise a *locked*
             // shield, and it is reachable only from `VerifierEvent::Complete`.
@@ -3996,6 +4006,35 @@ impl State {
         } else if effects.redraw {
             self.niri.queue_redraw_all();
         }
+    }
+
+    /// Wake the dialog when the shown message has had its read time and something is waiting.
+    ///
+    /// Replaced rather than stacked, and dropped outright when the queue is empty — the deadline
+    /// moves every time a message is promoted, so a timer left armed from a previous message would
+    /// fire against the wrong one.
+    fn arm_unlock_message_timer(&mut self) {
+        if let Some(token) = self.niri.unlock_message_timer.take() {
+            self.niri.event_loop.remove(token);
+        }
+        let Some(deadline) = self.niri.unlock_dialog.message_deadline() else {
+            return;
+        };
+        let now = crate::utils::get_monotonic_time();
+        let timer = calloop::timer::Timer::from_duration(deadline.saturating_sub(now));
+        self.niri.unlock_message_timer = self
+            .niri
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.niri.unlock_message_timer = None;
+                let now = crate::utils::get_monotonic_time();
+                let effects = state.niri.unlock_dialog.tick(now);
+                // Re-arms through `apply_unlock_effects` if more is queued behind this one.
+                state.apply_unlock_effects(effects);
+                calloop::timer::TimeoutAction::Drop
+            })
+            .map_err(|err| warn!("error arming the unlock message timer: {err:?}"))
+            .ok();
     }
 
     /// A message from gdm's verifier — see [`crate::dbus::gdm`].
@@ -4022,7 +4061,8 @@ impl State {
             _ => (),
         }
 
-        let effects = self.niri.unlock_dialog.on_verifier_event(event);
+        let now = crate::utils::get_monotonic_time();
+        let effects = self.niri.unlock_dialog.on_verifier_event(event, now);
         self.apply_unlock_effects(effects);
     }
 
@@ -5498,6 +5538,7 @@ impl Niri {
             gdm_requests: None,
             lock_timer: None,
             fade_timer: None,
+            unlock_message_timer: None,
             session_active: true,
             #[cfg(feature = "dbus")]
             sleep_inhibitor: None,

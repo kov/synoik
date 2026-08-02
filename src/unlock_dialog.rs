@@ -24,6 +24,26 @@ const ENTRY_CAPACITY: usize = 512;
 /// (`unlockDialog.js:25`, `:667`). The shield stays down; only the page changes.
 pub const PROMPT_IDLE: Duration = Duration::from_secs(120);
 
+/// `USER_READ_TIME` / `USER_READ_TIME_MIN` (`util.js:47-49`), comment and all:
+///
+/// > Give user 48ms to read each character of a PAM message
+/// > or 2 seconds, whichever is longer
+///
+/// This is the whole reason a message queue exists rather than a single slot. gdm narrates faster
+/// than anyone can read: a reader that fails on open reports its error and stops its conversation
+/// in the same millisecond, and without a floor the error is drawn and overwritten inside one
+/// frame. Live, that was "some text flashes below the password prompt" and no way to find out what
+/// it said.
+const USER_READ_TIME: Duration = Duration::from_millis(48);
+const USER_READ_TIME_MIN: Duration = Duration::from_millis(2000);
+
+/// `_getIntervalForMessage` (`util.js:248-254`) — how long `text` is owed on screen.
+fn read_time(text: &str) -> Duration {
+    // GNOME counts JS string length; chars is the same for anything a PAM module says and is the
+    // right unit for "how long to read" regardless.
+    (USER_READ_TIME * text.chars().count() as u32).max(USER_READ_TIME_MIN)
+}
+
 /// Which page of the shield is up (`_showClock` / `_showPrompt`, `:786-830`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
@@ -112,6 +132,13 @@ pub struct UnlockDialog {
     /// clear, so there is no default — no question means no entry.
     question: Option<(String, bool)>,
     message: Option<Message>,
+    /// Earliest time [`message`](Self::message) may be replaced or cleared — `now` plus its
+    /// [`read_time`], stamped when it went up. `None` when nothing is showing.
+    message_until: Option<Duration>,
+    /// What is waiting for the shown message to have had its time. `None` in the queue is a
+    /// **clear**, which is how GNOME defers one too (`_filterServiceMessages` queues a null
+    /// message "that will lead to clearing the prompt once done", `util.js:269-276`).
+    message_queue: std::collections::VecDeque<Option<Message>>,
     /// The peek toggle: whether the password is currently shown in the clear
     /// (`st_password_entry_set_password_visible`, `st-password-entry.c:317-350`).
     peek: bool,
@@ -133,6 +160,8 @@ impl UnlockDialog {
             entry: String::with_capacity(ENTRY_CAPACITY),
             question: None,
             message: None,
+            message_until: None,
+            message_queue: std::collections::VecDeque::new(),
             peek: false,
             peek_locked_down: false,
             last_activity: None,
@@ -167,6 +196,72 @@ impl UnlockDialog {
 
     pub fn message(&self) -> Option<&Message> {
         self.message.as_ref()
+    }
+
+    /// When [`tick`](Self::tick) next has message work to do, so the caller can arm a timer.
+    ///
+    /// `None` when the queue is empty: a message with nothing behind it **stays on screen**. GNOME
+    /// is the same — draining the queue emits `no-more-messages` and never touches the label
+    /// (`finishMessageQueue`, `util.js:256-263`), so an error sits under the entry until something
+    /// replaces or clears it rather than evaporating on a timer.
+    pub fn message_deadline(&self) -> Option<Duration> {
+        self.message_queue.front()?;
+        self.message_until
+    }
+
+    /// The loudest message either on screen or already waiting.
+    ///
+    /// The queue is why this looks at both. A hint that arrives while an error is *queued* would
+    /// otherwise slip in front of it and be gone before the error was ever drawn, which is the same
+    /// bug the priority rule exists to stop, one step further along.
+    fn loudest_message(&self) -> Option<MessageKind> {
+        self.message
+            .iter()
+            .chain(self.message_queue.iter().flatten())
+            .map(|m| m.kind)
+            .max()
+    }
+
+    /// Show `message` — or clear, for `None` — once whatever is on screen has had its read time.
+    ///
+    /// Immediate when nothing is showing or its time is up, which is the common case: the queue
+    /// only builds up when gdm says two things at once.
+    fn queue_message(&mut self, message: Option<Message>, now: Duration) -> bool {
+        if self.message_until.is_some_and(|until| now < until) {
+            self.message_queue.push_back(message);
+            return false;
+        }
+        self.show_message_now(message, now)
+    }
+
+    fn show_message_now(&mut self, message: Option<Message>, now: Duration) -> bool {
+        let changed = self.message.as_ref() != message.as_ref();
+        self.message_until = message.as_ref().map(|m| now + read_time(&m.text));
+        self.message = message;
+        changed
+    }
+
+    /// Clear immediately, dropping anything queued.
+    ///
+    /// For the paths where the message is not merely superseded but *gone*: the page it belonged to
+    /// has been left, or the conversation it came from has been torn down. Nothing is owed read
+    /// time on a screen that is no longer showing it.
+    fn drop_messages(&mut self) -> bool {
+        self.message_queue.clear();
+        self.show_message_now(None, Duration::ZERO)
+    }
+
+    /// Promote the next queued message if the shown one has had its time. `true` if the screen
+    /// changed.
+    fn advance_messages(&mut self, now: Duration) -> bool {
+        let mut changed = false;
+        while self.message_until.is_none_or(|until| now >= until) {
+            let Some(next) = self.message_queue.pop_front() else {
+                return changed;
+            };
+            changed |= self.show_message_now(next, now);
+        }
+        changed
     }
 
     /// gdm's prompt text, if it has asked something.
@@ -288,8 +383,15 @@ impl UnlockDialog {
     pub fn show_clock(&mut self) -> UnlockEffects {
         self.clear_entry();
         self.last_activity = None;
+        // Not deferred: the message lives under the entry, and the entry is what we are leaving.
+        // GNOME gets here by destroying the auth prompt outright (`_maybeDestroyAuthPrompt`).
+        let cleared = self.drop_messages();
         if self.page == Page::Clock {
-            return UnlockEffects::default();
+            return if cleared {
+                UnlockEffects::redraw()
+            } else {
+                UnlockEffects::default()
+            };
         }
         self.page = Page::Clock;
         UnlockEffects::redraw()
@@ -330,7 +432,10 @@ impl UnlockDialog {
         let answer = self.entry.clone();
         self.clear_entry();
         self.status = Status::Answered;
-        self.message = None;
+        // Queued rather than wiped: GNOME waits for pending messages before it resets or retries
+        // (`await this._handlePendingMessages()`, `util.js:857-865`), so pressing Return the
+        // instant an error appears does not swallow it.
+        self.queue_message(None, now);
         UnlockEffects {
             request: Some(VerifierRequest::Answer(answer)),
             unlock: false,
@@ -344,15 +449,30 @@ impl UnlockDialog {
         self.show_clock()
     }
 
-    /// Two minutes idle on the prompt drops back to the clock (`:667`).
+    /// Everything the dialog does on a clock rather than on an event: the message queue, and the
+    /// two-minute idle escape (`:667`).
+    ///
+    /// Both live here because they are woken by different timers with very different periods — the
+    /// queue by a deadline of its own, the escape by the panel's minute tick — and either may fire
+    /// the other's work early. Draining the queue first also means a message queued *by* the escape
+    /// is not left behind by it.
     pub fn tick(&mut self, now: Duration) -> UnlockEffects {
-        let Some(last) = self.last_activity else {
-            return UnlockEffects::default();
-        };
-        if self.page != Page::Prompt || now.saturating_sub(last) < PROMPT_IDLE {
-            return UnlockEffects::default();
+        let advanced = self.advance_messages(now);
+
+        let escaping = self.page == Page::Prompt
+            && self
+                .last_activity
+                .is_some_and(|last| now.saturating_sub(last) >= PROMPT_IDLE);
+        if escaping {
+            let mut effects = self.show_clock();
+            effects.redraw |= advanced;
+            return effects;
         }
-        self.show_clock()
+        if advanced {
+            UnlockEffects::redraw()
+        } else {
+            UnlockEffects::default()
+        }
     }
 
     /// Whether a [`tick`](Self::tick) is still pending, so the caller keeps a timer armed.
@@ -361,7 +481,11 @@ impl UnlockDialog {
     }
 
     /// Drive the state machine from gdm.
-    pub fn on_verifier_event(&mut self, event: VerifierEvent) -> UnlockEffects {
+    ///
+    /// `now` is only for the message queue — every other transition here is driven by gdm and has
+    /// no clock of its own — but it has to come from the caller: a message's read time starts when
+    /// the message is *shown*, and this is where that happens.
+    pub fn on_verifier_event(&mut self, event: VerifierEvent, now: Duration) -> UnlockEffects {
         match event {
             // The channel opening changes nothing on screen; the shield uses it to decide whether
             // it may lock at all.
@@ -406,18 +530,20 @@ impl UnlockDialog {
                 // the fingerprint hint would wipe out "Sorry, that didn't work" a moment after the
                 // user's password was refused, and they would never learn why.
                 //
-                // **Divergence: no timed queue.** GNOME shows each message for an interval and then
-                // moves on, so a hint suppressed by an error reappears once the error has had its
-                // turn. We hold one message, so a hint is dropped rather than deferred; it returns
-                // on the reader's next `Info`, once the louder message has been cleared by a reset
-                // or a fresh question.
-                if let Some(current) = &self.message {
-                    if kind < current.kind {
-                        return UnlockEffects::default();
-                    }
+                // Louder-or-equal messages **queue** rather than replace, each owed its
+                // [`read_time`]; only a quieter one is dropped outright. GNOME's plain
+                // `_queueMessage` has no priority at all and would put an error behind a hint on
+                // arrival order alone; keeping the drop means the reader's narration, which arrives
+                // on every scan, cannot push the reason a password was refused off the end of a
+                // queue the user is still reading.
+                if self.loudest_message().is_some_and(|loudest| kind < loudest) {
+                    return UnlockEffects::default();
                 }
-                self.message = Some(Message { text, kind });
-                UnlockEffects::redraw()
+                if self.queue_message(Some(Message { text, kind }), now) {
+                    UnlockEffects::redraw()
+                } else {
+                    UnlockEffects::default()
+                }
             }
 
             // The one write of `Verified`.
@@ -441,10 +567,13 @@ impl UnlockDialog {
                 // live would let the user type into a conversation that is no longer listening.
                 self.question = None;
                 if self.message.is_none() {
-                    self.message = Some(Message {
-                        text: "Authentication failed".to_owned(),
-                        kind: MessageKind::Error,
-                    });
+                    self.queue_message(
+                        Some(Message {
+                            text: "Authentication failed".to_owned(),
+                            kind: MessageKind::Error,
+                        }),
+                        now,
+                    );
                 }
                 UnlockEffects::redraw()
             }
@@ -453,7 +582,12 @@ impl UnlockDialog {
                 self.status = Status::NotVerifying;
                 self.clear_entry();
                 self.question = None;
-                self.message = None;
+                // Deferred, not wiped. gdm resets the moment a conversation ends, which for a
+                // reader that fails on open is the same millisecond it reported why — and GNOME
+                // holds the reset back behind the message queue for exactly that reason
+                // (`await this._handlePendingMessages()` before `_cancelAndReset`,
+                // `util.js:857-865`).
+                self.queue_message(None, now);
                 UnlockEffects::redraw()
             }
         }
@@ -532,10 +666,13 @@ mod tests {
     fn a_successful_conversation_unlocks_and_keeps_no_copy_of_the_password() {
         let mut d = dialog();
         d.show_prompt(T0);
-        d.on_verifier_event(VerifierEvent::AskQuestion {
-            question: "Password:".to_owned(),
-            secret: true,
-        });
+        d.on_verifier_event(
+            VerifierEvent::AskQuestion {
+                question: "Password:".to_owned(),
+                secret: true,
+            },
+            T0,
+        );
         assert!(d.is_entry_live());
 
         for c in "hunter2".chars() {
@@ -556,7 +693,7 @@ mod tests {
         assert_eq!(d.status(), Status::Answered);
         assert!(!d.is_entry_live(), "a second Return must not answer twice");
 
-        let effects = d.on_verifier_event(VerifierEvent::Complete);
+        let effects = d.on_verifier_event(VerifierEvent::Complete, T0);
         assert!(effects.unlock);
         assert_eq!(d.status(), Status::Verified);
     }
@@ -586,7 +723,7 @@ mod tests {
         for event in events {
             let mut d = dialog();
             d.show_prompt(T0);
-            let effects = d.on_verifier_event(event.clone());
+            let effects = d.on_verifier_event(event.clone(), T0);
             assert!(!effects.unlock, "{event:?} must not unlock");
             assert_ne!(d.status(), Status::Verified, "{event:?} must not verify");
         }
@@ -618,10 +755,13 @@ mod tests {
 
         // gdm has already asked — which is the real ordering: the channel opens when the screen
         // locks, long before anyone walks up to it.
-        d.on_verifier_event(VerifierEvent::AskQuestion {
-            question: "Password:".to_owned(),
-            secret: true,
-        });
+        d.on_verifier_event(
+            VerifierEvent::AskQuestion {
+                question: "Password:".to_owned(),
+                secret: true,
+            },
+            T0,
+        );
 
         d.type_char('h', T0);
         assert_eq!(d.page(), Page::Prompt, "the keystroke raised the prompt");
@@ -638,24 +778,30 @@ mod tests {
         let mut d = dialog();
         assert!(d.is_secret(), "no question yet — fail closed");
 
-        d.on_verifier_event(VerifierEvent::AskQuestion {
-            question: "Username:".to_owned(),
-            secret: false,
-        });
+        d.on_verifier_event(
+            VerifierEvent::AskQuestion {
+                question: "Username:".to_owned(),
+                secret: false,
+            },
+            T0,
+        );
         d.show_prompt(T0);
         d.type_char('a', T0);
         d.type_char('b', T0);
         assert_eq!(d.entry_display(), "ab", "an InfoQuery answer is shown");
 
-        d.on_verifier_event(VerifierEvent::AskQuestion {
-            question: "Password:".to_owned(),
-            secret: true,
-        });
+        d.on_verifier_event(
+            VerifierEvent::AskQuestion {
+                question: "Password:".to_owned(),
+                secret: true,
+            },
+            T0,
+        );
         d.type_char('a', T0);
         assert_eq!(d.entry_display(), "●", "a SecretInfoQuery answer is masked");
 
         // And a verdict drops the question, so the buffer cannot be re-shown in the clear.
-        d.on_verifier_event(VerifierEvent::Failed);
+        d.on_verifier_event(VerifierEvent::Failed, T0);
         assert!(d.is_secret());
     }
 
@@ -664,14 +810,17 @@ mod tests {
     fn a_failed_attempt_clears_the_entry_and_waits_for_gdm_to_re_ask() {
         let mut d = dialog();
         d.show_prompt(T0);
-        d.on_verifier_event(VerifierEvent::AskQuestion {
-            question: "Password:".to_owned(),
-            secret: true,
-        });
+        d.on_verifier_event(
+            VerifierEvent::AskQuestion {
+                question: "Password:".to_owned(),
+                secret: true,
+            },
+            T0,
+        );
         d.type_char('x', T0);
         d.submit(T0);
 
-        d.on_verifier_event(VerifierEvent::Failed);
+        d.on_verifier_event(VerifierEvent::Failed, T0);
         assert_eq!(d.status(), Status::Failed);
         assert_eq!(d.entry_display(), "");
         assert!(
@@ -683,13 +832,22 @@ mod tests {
             "the user is told why nothing happened"
         );
 
-        // gdm resets and re-asks; the dialog comes back live.
-        d.on_verifier_event(VerifierEvent::Reset);
+        // gdm resets and re-asks; the dialog comes back live. The reset does not take the error
+        // with it on the way out — it waits for it to have been readable.
+        d.on_verifier_event(VerifierEvent::Reset, T0);
+        assert!(
+            d.message().is_some(),
+            "the reset swallowed the error before anyone could read it"
+        );
+        d.tick(T0 + Duration::from_secs(3));
         assert!(d.message().is_none(), "the reset clears the old error");
-        d.on_verifier_event(VerifierEvent::AskQuestion {
-            question: "Password:".to_owned(),
-            secret: true,
-        });
+        d.on_verifier_event(
+            VerifierEvent::AskQuestion {
+                question: "Password:".to_owned(),
+                secret: true,
+            },
+            T0,
+        );
         assert!(d.is_entry_live(), "and the user can try again");
     }
 
@@ -697,10 +855,13 @@ mod tests {
     #[test]
     fn the_prompt_escapes_to_the_clock_after_two_idle_minutes() {
         let mut d = dialog();
-        d.on_verifier_event(VerifierEvent::AskQuestion {
-            question: "Password:".to_owned(),
-            secret: true,
-        });
+        d.on_verifier_event(
+            VerifierEvent::AskQuestion {
+                question: "Password:".to_owned(),
+                secret: true,
+            },
+            T0,
+        );
         d.show_prompt(T0);
         d.type_char('x', T0);
 
@@ -733,10 +894,13 @@ mod tests {
     fn the_peek_toggle_reveals_only_what_it_should() {
         let mut d = dialog();
         d.show_prompt(T0);
-        d.on_verifier_event(VerifierEvent::AskQuestion {
-            question: "Password:".to_owned(),
-            secret: true,
-        });
+        d.on_verifier_event(
+            VerifierEvent::AskQuestion {
+                question: "Password:".to_owned(),
+                secret: true,
+            },
+            T0,
+        );
         for c in "hunter2".chars() {
             d.type_char(c, T0);
         }
@@ -748,11 +912,14 @@ mod tests {
         assert_eq!(d.entry_display(), "hunter2", "revealed on request");
 
         // A new question re-masks: the peek belonged to the answer that was refused.
-        d.on_verifier_event(VerifierEvent::Failed);
-        d.on_verifier_event(VerifierEvent::AskQuestion {
-            question: "Password:".to_owned(),
-            secret: true,
-        });
+        d.on_verifier_event(VerifierEvent::Failed, T0);
+        d.on_verifier_event(
+            VerifierEvent::AskQuestion {
+                question: "Password:".to_owned(),
+                secret: true,
+            },
+            T0,
+        );
         assert_eq!(d.peek(), Some(false), "a fresh question is masked again");
 
         // Lockdown removes the toggle, and takes effect immediately on a visible password.
@@ -775,10 +942,13 @@ mod tests {
 
         // A non-secret prompt has nothing to reveal, so it has no toggle either.
         d.set_peek_locked_down(false);
-        d.on_verifier_event(VerifierEvent::AskQuestion {
-            question: "Username:".to_owned(),
-            secret: false,
-        });
+        d.on_verifier_event(
+            VerifierEvent::AskQuestion {
+                question: "Username:".to_owned(),
+                secret: false,
+            },
+            T0,
+        );
         assert_eq!(d.peek(), None);
     }
 
@@ -796,10 +966,13 @@ mod tests {
 
         // It runs on the way in, so the dialog never holds the raw string.
         let mut d = dialog();
-        d.on_verifier_event(VerifierEvent::AskQuestion {
-            question: "Password:".to_owned(),
-            secret: true,
-        });
+        d.on_verifier_event(
+            VerifierEvent::AskQuestion {
+                question: "Password:".to_owned(),
+                secret: true,
+            },
+            T0,
+        );
         assert_eq!(d.question(), Some("Password"));
     }
 
@@ -836,18 +1009,29 @@ mod tests {
         };
 
         // Nothing showing: the hint takes the slot.
-        d.on_verifier_event(hint());
+        d.on_verifier_event(hint(), T0);
         assert_eq!(d.message().map(|m| m.kind), Some(MessageKind::Hint));
 
-        // The password is refused: the error is louder and wins.
-        d.on_verifier_event(error());
+        // The password is refused: the error is louder, so it queues rather than being dropped —
+        // and takes the screen as soon as the hint has had its read time.
+        d.on_verifier_event(error(), T0);
+
+        // The reader narrates again while the error is still *waiting its turn*. Judging the
+        // newcomer against what is on screen alone would let it in behind the error, so the error
+        // would appear and then be wiped by a hint the user never needed. It has to lose to the
+        // queue as well.
+        d.on_verifier_event(hint(), T0);
+
+        let mut t = T0 + read_time("(or place finger on reader)");
+        d.tick(t);
         assert_eq!(
             d.message().map(|m| m.text.as_str()),
             Some("Sorry, that didn't work")
         );
 
-        // The reader narrates again a moment later — and must not talk over it.
-        d.on_verifier_event(hint());
+        // ...and it is still the error a full read time later: the hint was dropped, not deferred.
+        t += read_time("Sorry, that didn't work");
+        d.tick(t);
         assert_eq!(
             d.message().map(|m| m.text.as_str()),
             Some("Sorry, that didn't work"),
@@ -855,19 +1039,87 @@ mod tests {
         );
 
         // An equally loud message does replace, so a *second* error is not swallowed.
-        d.on_verifier_event(VerifierEvent::ShowMessage {
-            text: "Sorry, that didn't work either".to_owned(),
-            kind: MessageKind::Error,
-        });
+        d.on_verifier_event(
+            VerifierEvent::ShowMessage {
+                text: "Sorry, that didn't work either".to_owned(),
+                kind: MessageKind::Error,
+            },
+            t,
+        );
         assert_eq!(
             d.message().map(|m| m.text.as_str()),
             Some("Sorry, that didn't work either")
         );
 
         // ...and once the slot is cleared, the hint is welcome again.
-        d.on_verifier_event(VerifierEvent::Reset);
-        d.on_verifier_event(hint());
+        d.on_verifier_event(VerifierEvent::Reset, t);
+        t += read_time("Sorry, that didn't work either");
+        d.tick(t);
+        d.on_verifier_event(hint(), t);
         assert_eq!(d.message().map(|m| m.kind), Some(MessageKind::Hint));
+    }
+
+    /// A message gets its read time even when gdm contradicts itself in the same millisecond.
+    ///
+    /// This is the fingerprint reader that fails on open: it reports why and its conversation stops
+    /// in the same breath, so the error and the reset that clears it arrive together. Without a
+    /// floor the label is written and blanked inside one frame — live, that was "some text flashes
+    /// below the password prompt" and no way to find out what it said. GNOME's floor is 48 ms per
+    /// character or two seconds, whichever is longer (`util.js:47-49`).
+    #[test]
+    fn a_message_is_readable_even_when_the_next_event_lands_on_top_of_it() {
+        let mut d = dialog();
+        let text = "Device reported an error during verify";
+
+        d.on_verifier_event(
+            VerifierEvent::ShowMessage {
+                text: text.to_owned(),
+                kind: MessageKind::Error,
+            },
+            T0,
+        );
+        // Same instant: the conversation that said it is torn down.
+        d.on_verifier_event(VerifierEvent::Reset, T0);
+
+        // Still up, and still up a second later.
+        assert_eq!(d.message().map(|m| m.text.as_str()), Some(text));
+        d.tick(T0 + Duration::from_millis(999));
+        assert_eq!(
+            d.message().map(|m| m.text.as_str()),
+            Some(text),
+            "the message was gone before it could be read"
+        );
+
+        // The floor is a real minimum, not a token delay.
+        assert!(read_time(text) >= USER_READ_TIME_MIN);
+        // ...and once it has been served, the clear that was waiting behind it happens.
+        d.tick(T0 + read_time(text));
+        assert!(d.message().is_none(), "the queued clear never arrived");
+
+        // A message with nothing behind it is not on a timer at all — it stays until something
+        // replaces it, exactly as GNOME's drained queue leaves the label alone.
+        d.on_verifier_event(
+            VerifierEvent::ShowMessage {
+                text: text.to_owned(),
+                kind: MessageKind::Error,
+            },
+            T0,
+        );
+        assert_eq!(d.message_deadline(), None, "nothing is queued behind it");
+        d.tick(T0 + read_time(text) * 10);
+        assert_eq!(d.message().map(|m| m.text.as_str()), Some(text));
+    }
+
+    /// A long message is owed longer than the floor, at GNOME's 48 ms a character.
+    #[test]
+    fn the_read_time_grows_with_the_message() {
+        assert_eq!(read_time(""), USER_READ_TIME_MIN);
+        // Short enough that the floor still wins.
+        assert_eq!(read_time("Sorry, that didn't work"), USER_READ_TIME_MIN);
+        // Long enough that it does not.
+        let long = "x".repeat(100);
+        assert_eq!(read_time(&long), USER_READ_TIME * 100);
+        assert!(read_time(&long) > USER_READ_TIME_MIN);
     }
 
     /// The reader is armed by the prompt coming up, and by nothing else.
@@ -884,12 +1136,18 @@ mod tests {
 
         // A conversation beginning, a question arriving, a message: none of these is the prompt
         // being shown, and none of them may arm the reader.
-        assert!(!d.on_verifier_event(VerifierEvent::Reset).start_fingerprint);
         assert!(
-            !d.on_verifier_event(VerifierEvent::AskQuestion {
-                question: "Password:".to_owned(),
-                secret: true,
-            })
+            !d.on_verifier_event(VerifierEvent::Reset, T0)
+                .start_fingerprint
+        );
+        assert!(
+            !d.on_verifier_event(
+                VerifierEvent::AskQuestion {
+                    question: "Password:".to_owned(),
+                    secret: true,
+                },
+                T0
+            )
             .start_fingerprint,
             "a question arriving while the clock is up must not arm the reader"
         );

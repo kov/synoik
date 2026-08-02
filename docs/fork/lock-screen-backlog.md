@@ -341,9 +341,18 @@ over), `gdm-fingerprint` runs beside `gdm-password` on the same channel when a r
 and the routing policy moved out of the async pump into a pure `route()` so it can be tested at all.
 
 Landed with it: `MessageKind::Hint` as an ordered priority, so the reader's narration cannot talk
-over the error explaining a refused password. **Divergence: no timed message queue.** GNOME shows
-each message for an interval and moves on, so a suppressed hint reappears; we hold one message, so
-it is dropped and returns on the reader's next `Info`.
+over the error explaining a refused password.
+
+The timed message queue landed after it, and closes what was recorded here as a divergence. Every
+message is owed **48 ms a character or two seconds, whichever is longer** (`USER_READ_TIME`,
+`util.js:47-49`), and nothing may replace or clear it before that — a clear waits in the queue as a
+null entry, which is how GNOME defers one too (`_filterServiceMessages`, `:269-276`, and the
+`await this._handlePendingMessages()` that precedes every reset and retry, `:857-865`). Without it
+a reader that fails on *open* reported its error and had its conversation torn down in the same
+millisecond, so the label was written and blanked inside one frame: on the seat that was a flash of
+text under the entry that could not be read. The priority rule is kept on top of GNOME's plain FIFO
+and now weighs the queue as well as the screen, so a hint arriving while an error is *waiting* is
+dropped rather than landing behind it.
 
 Two bugs found on the seat 2026-08-01 and fixed: the reader was armed when the *channel* opened
 rather than when the prompt came up, so a screen showing only a clock demanded a fingerprint (GNOME
