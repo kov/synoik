@@ -1923,7 +1923,6 @@ impl Painter<'_, '_, '_> {
 }
 
 /// GNOME's `.toggle-switch` (`_switches.scss:6-52`) — the pill-and-handle control a
-/// GNOME's `.toggle-switch` (`_switches.scss:6-52`) — the pill-and-handle control a
 /// `PopupSwitchMenuItem` puts at the right end of a menu row (`popupMenu.js:501-524`).
 ///
 /// A geometry-and-paint primitive, not a stateful widget: the owner holds the on/off

@@ -3649,8 +3649,8 @@ impl State {
         // its own chrome. Falling through to the panel and overview below would light up buttons
         // nobody can see, and redraw for each one.
         if self.niri.screen_shield.is_active() {
-            let on_button = self.niri.switch_user_visible()
-                && self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt
+            let now = crate::utils::get_monotonic_time();
+            let on_button = self.niri.switch_user_reactive(now)
                 && self
                     .niri
                     .output_under(pos)

@@ -3819,9 +3819,7 @@ impl State {
             // The switch-user button, which is reactive only while the prompt page is up
             // (`unlockDialog.js:811-814`) — on the clock page a click there just raises the prompt
             // like a click anywhere else.
-            if self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt
-                && self.niri.switch_user_visible()
-            {
+            if self.niri.switch_user_reactive(now) {
                 let on_button = self
                     .niri
                     .output_under(pos)
@@ -3857,11 +3855,24 @@ impl State {
         }
     }
 
-    /// Go to the login screen, and drop the authentication we were in the middle of.
+    /// Go to the login screen, dropping back to the clock with whatever was typed cleared.
     ///
-    /// `_otherUserClicked` (`unlockDialog.js:901-905`) does exactly these two, in this order. The
-    /// cancel is not tidying up: leaving a live gdm conversation behind would hold a PAM
-    /// transaction open on a session the user has walked away from.
+    /// **Divergence: the gdm conversation is kept, where GNOME cancels it.** `_otherUserClicked`
+    /// (`unlockDialog.js:901-905`) calls `authPrompt.cancel()`, which reaches
+    /// `this._userVerifier.cancel()` through `reset()` (`authPrompt.js:839-852`, `:742`). GNOME can
+    /// afford that because the prompt is an actor it *rebuilds*: `_maybeDestroyAuthPrompt` disposes
+    /// of it when the crossfade lands (`:795`) and the next `_showPrompt` calls
+    /// `_ensureAuthPrompt`, beginning a fresh conversation.
+    ///
+    /// We have no such lifecycle. `VerifierRequest::Begin` is sent from exactly one place, driven
+    /// by `ScreenShield::lock`, and a screen that is already locked never locks again — so
+    /// cancelling here would close the only channel we have and leave the shield locked with
+    /// nothing left to authenticate against. That matters because switching users does **not** end
+    /// this session: it stays running in the background and the user can VT-switch straight back to
+    /// it. The trade is a conversation that outlives the page flip, which is what Escape already
+    /// does and for the same stated reason ([`crate::unlock_dialog::UnlockDialog::show_clock`]) —
+    /// against a lock screen nobody can get past. Cancelling becomes safe once there is a re-Begin;
+    /// see `authenticator_lost`, which is the same fail-open instinct from the other direction.
     #[cfg(feature = "dbus")]
     pub fn switch_user(&mut self) {
         let now = crate::utils::get_monotonic_time();
@@ -7704,7 +7715,7 @@ impl Niri {
                 // The switch-user button is a sibling of the page stack, not part of it, so it is
                 // drawn separately — but only while the prompt is up, which is what its
                 // `progress > 0` reactivity and opacity amount to (`unlockDialog.js:811-821`).
-                if self.switch_user_visible() {
+                if self.switch_user_reactive(now) {
                     // Same alpha and scale as the prompt, but it does not slide with the page: the
                     // curtain's `translation_y` is the *group's*, so it applies, while the page's
                     // own FADE_OUT_TRANSLATION does not (`:838-842` sets no translation on it).
@@ -11385,6 +11396,19 @@ impl Niri {
             && self.multiple_users
             && settings.user_switch_enabled
             && !settings.disable_user_switching
+    }
+
+    /// Whether the switch-user button is reactive *right now* — visible, and the prompt page has
+    /// any presence at all.
+    ///
+    /// GNOME gates the button's `reactive`/`can_focus` on `progress > 0`, the same number that
+    /// drives its opacity (`unlockDialog.js:811-821`), so it is clickable exactly while it is
+    /// drawn. Gating on the model's *page* instead splits the two in both directions: through the
+    /// 300 ms fade-out the page already reads `Clock` while the button is still on screen, and for
+    /// the frame after the prompt is raised the page reads `Prompt` while the button is still at
+    /// alpha 0 — a click on something invisible.
+    pub fn switch_user_reactive(&self, now: Duration) -> bool {
+        self.switch_user_visible() && self.lock_screen.page_progress(now) > 0.
     }
 
     /// The account picture as an image source, if AccountsService gave us one that is on disk.

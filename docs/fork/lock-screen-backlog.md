@@ -207,6 +207,13 @@ gated on all four of GNOME's conditions, and `dbus::user_switching` for the acti
 one call but libgdm's algorithm (find our seat, reuse a live `gdm-launch-environment` greeter on it
 via `ActivateSessionOnSeat`, else `CreateTransientDisplay` and only on `seat0`).
 
+**Divergence: the gdm conversation survives the switch.** GNOME's `_otherUserClicked` cancels the
+verifier (`authPrompt.js:839-852` → `:742`); it can, because it destroys and rebuilds the prompt
+actor. We send `VerifierRequest::Begin` from exactly one place, driven by `ScreenShield::lock`, and
+a locked screen never locks again — so cancelling would close the only channel and leave the shield
+locked with nothing to authenticate against. Switching users does not end this session: it keeps
+running and the user can VT back to it. Revisit once there is a re-Begin path.
+
 **Divergence: no RTL mirroring.** GNOME flips the button to the leading edge under
 `Clutter.TextDirection.RTL` (`unlockDialog.js:496-499`). Nothing else in this port is
 direction-aware yet, and a lock screen that mirrors one control and not the rest is worse than a

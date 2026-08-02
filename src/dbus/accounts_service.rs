@@ -229,7 +229,7 @@ pub fn start(
         // `PropertiesChanged` covers the usual case, but AccountsService also emits its own
         // argument-less `Changed` on the user object, which is what libaccountsservice listens to
         // (`userWidget.js:122-125` connects `changed`). Either one just means "re-read".
-        let mut changed = match user.receive_signal("Changed").await {
+        let changed = match user.receive_signal("Changed").await {
             Ok(stream) => stream,
             Err(err) => {
                 warn!("error subscribing to the AccountsService user: {err:?}");
@@ -238,7 +238,15 @@ pub fn start(
         };
         // `PasswordMode` stands in for the whole property set here: any `PropertiesChanged` on
         // this object carries it or not, and either way the reaction is to re-read everything.
-        let mut props_changed = user.receive_property_changed::<i32>("PasswordMode").await;
+        let props_changed = user.receive_property_changed::<i32>("PasswordMode").await;
+
+        // The *manager's* signals, for the other half of the model: whether this machine has
+        // anybody else to log in as. GNOME re-evaluates the switch-user button on
+        // `notify::has-multiple-users` (`unlockDialog.js:640-643`), and creating a second account
+        // is precisely the event that should make that button appear — read once at startup, it
+        // never would until the next reboot.
+        let user_added = accounts.receive_signal("UserAdded").await;
+        let user_deleted = accounts.receive_signal("UserDeleted").await;
 
         let _ = to_niri.send(AccountsToNiri::UserChanged(read_account(&user).await));
         let _ = to_niri.send(AccountsToNiri::MultipleUsers(
@@ -250,15 +258,27 @@ pub fn start(
                 .is_some(),
         ));
 
-        loop {
-            let re_read = tokio_like_select(&mut changed, &mut props_changed).await;
-            if !re_read {
-                break;
+        // One stream of "something changed, and which half", so the loop is a plain `next()`
+        // rather than an N-way hand-rolled select that grows a branch per source.
+        let mut events = {
+            use futures_util::stream::{self, StreamExt as _};
+
+            let mut streams: Vec<stream::BoxStream<'_, Wake>> = vec![
+                changed.map(|_| Wake::Account).boxed(),
+                props_changed.map(|_| Wake::Account).boxed(),
+            ];
+            for signal in [user_added, user_deleted].into_iter().flatten() {
+                streams.push(signal.map(|_| Wake::Users).boxed());
             }
-            if to_niri
-                .send(AccountsToNiri::UserChanged(read_account(&user).await))
-                .is_err()
-            {
+            stream::select_all(streams)
+        };
+
+        while let Some(wake) = events.next().await {
+            let msg = match wake {
+                Wake::Account => AccountsToNiri::UserChanged(read_account(&user).await),
+                Wake::Users => AccountsToNiri::MultipleUsers(multiple_users(&async_conn).await),
+            };
+            if to_niri.send(msg).is_err() {
                 break;
             }
         }
@@ -272,20 +292,15 @@ pub fn start(
     Ok(conn)
 }
 
-/// Wait for either stream to fire; `false` once both are done.
+/// Which half of the model a signal asks us to re-read.
 ///
-/// Hand-rolled because there is no `select!` in the dependency set and this is the only place two
-/// signal streams feed one re-read.
-async fn tokio_like_select(
-    changed: &mut (impl StreamExt<Item = zbus::Message> + Unpin),
-    props: &mut (impl StreamExt + Unpin),
-) -> bool {
-    use futures_util::future::{select, Either};
-
-    match select(changed.next(), props.next()).await {
-        Either::Left((item, _)) => item.is_some(),
-        Either::Right((item, _)) => item.is_some(),
-    }
+/// Both halves are watched because both change while the lock screen is up: the user's own
+/// properties (their picture, their name, whether they have a password) and whether the machine has
+/// a second account at all.
+#[derive(Debug, Clone, Copy)]
+enum Wake {
+    Account,
+    Users,
 }
 
 #[cfg(test)]

@@ -13613,6 +13613,69 @@ fn each_condition_alone_hides_the_switch_user_button() {
     assert!(f.niri().switch_user_visible(), "and back");
 }
 
+/// The switch-user button is clickable exactly while it is on screen — both edges of that.
+///
+/// GNOME gates `reactive` on the very number that drives `opacity` (`unlockDialog.js:811-821`), so
+/// the two cannot disagree. Gating on the model's *page* instead splits them in both directions,
+/// and each half is invisible on its own: the frame after the prompt is raised the page already
+/// reads `Prompt` while the button is still at alpha 0, so a click lands on nothing anyone can see;
+/// and for the whole 300 ms fade-out the page reads `Clock` while the button is still drawn, so a
+/// click on a button plainly on screen re-raises the prompt instead.
+///
+/// The times here are picked either side of `CROSSFADE_TIME`, which is what makes this a test of
+/// the *transition* rather than of the two resting states.
+#[cfg(feature = "dbus")]
+#[test]
+fn the_switch_user_button_is_clickable_exactly_while_it_is_drawn() {
+    use std::time::Duration;
+
+    use crate::dbus::accounts_service::AccountsToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::CanSwitch(true));
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::MultipleUsers(true));
+
+    let t0 = Duration::from_secs(1_000);
+    let mid = t0 + Duration::from_millis(150);
+    let after = t0 + Duration::from_millis(400);
+
+    // Resting on the clock: nothing drawn, nothing to click.
+    f.niri().lock_screen.set_page(false, t0);
+    f.niri().lock_screen.settle();
+    assert!(
+        !f.niri().switch_user_reactive(t0),
+        "the button must not be reactive with the clock up"
+    );
+
+    // The instant the prompt starts coming up, the button is still at alpha 0.
+    f.niri().lock_screen.set_page(true, t0);
+    assert!(
+        !f.niri().switch_user_reactive(t0),
+        "a click landed on the button on the frame it was still invisible"
+    );
+    assert!(
+        f.niri().switch_user_reactive(mid),
+        "mid-crossfade the button is on screen and must take a click"
+    );
+    assert!(f.niri().switch_user_reactive(after), "and once it settles");
+
+    // Going back: the page is already the clock, but the button is still fading out.
+    f.niri().lock_screen.set_page(false, after);
+    assert!(
+        f.niri()
+            .switch_user_reactive(after + Duration::from_millis(150)),
+        "the button was still drawn but had stopped taking clicks"
+    );
+    assert!(
+        !f.niri()
+            .switch_user_reactive(after + Duration::from_millis(400)),
+        "and once it is gone it must stop"
+    );
+}
+
 /// Clicking the button cancels the authentication in flight; clicking beside it does not.
 ///
 /// `_otherUserClicked` (`unlockDialog.js:901-905`) cancels the prompt as well as leaving, and that
