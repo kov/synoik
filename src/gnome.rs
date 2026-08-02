@@ -593,6 +593,9 @@ impl GnomeSettings {
             self.shield.enable_fingerprint =
                 login_screen.boolean("enable-fingerprint-authentication");
         }
+        if settings_has_key(login_screen, "enable-smartcard-authentication") {
+            self.shield.enable_smartcard = login_screen.boolean("enable-smartcard-authentication");
+        }
     }
 
     fn load_screensaver(&mut self, screensaver: &gio::Settings) {

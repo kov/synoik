@@ -33,6 +33,7 @@ pub mod user_switching;
 pub mod gnome_shell_screencast;
 #[cfg(feature = "xdp-gnome-screencast")]
 pub mod mutter_screen_cast;
+pub mod smartcard;
 #[cfg(feature = "xdp-gnome-screencast")]
 use mutter_screen_cast::ScreenCast;
 
@@ -79,6 +80,7 @@ pub struct DBusServers {
     pub conn_presence: Option<Connection>,
     pub conn_accounts: Option<Connection>,
     pub conn_fprintd: Option<Connection>,
+    pub conn_smartcard: Option<Connection>,
     pub conn_locale1: Option<Connection>,
     pub conn_keyboard_monitor: Option<Connection>,
     pub conn_system_status: Option<Connection>,
@@ -368,6 +370,23 @@ impl DBusServers {
             match fprintd::start(to_niri) {
                 Ok(conn) => dbus.conn_fprintd = Some(conn),
                 Err(err) => warn!("error probing for a fingerprint reader: {err:?}"),
+            }
+        }
+
+        // Smartcards, gated the same way — and unlike fprintd this cannot activate anything: gsd's
+        // smartcard plugin is either running in the session or it is not.
+        {
+            let enabled = niri.gnome_settings.shield.enable_smartcard;
+            let (to_niri, from_smartcard) = calloop::channel::channel();
+            niri.event_loop
+                .insert_source(from_smartcard, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(msg) => state.on_smartcard_msg(msg),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            match smartcard::start(enabled, to_niri) {
+                Ok(conn) => dbus.conn_smartcard = Some(conn),
+                Err(err) => warn!("error watching for smartcards: {err:?}"),
             }
         }
 

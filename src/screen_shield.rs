@@ -95,6 +95,9 @@ pub struct ShieldSettings {
     /// reader (`util.js:33`, `_updateEnabledServices`, `:627-637`). Finding one is a separate
     /// question, and the one everything downstream actually gates on.
     pub enable_fingerprint: bool,
+    /// `org.gnome.login-screen enable-smartcard-authentication` — whether to watch gsd's tokens at
+    /// all. **Defaults to false**, so on most machines the whole path is inert.
+    pub enable_smartcard: bool,
 }
 
 /// `STANDARD_FADE_TIME` (`:39`) — the fade GNOME runs when the session goes idle.
@@ -115,6 +118,7 @@ impl Default for ShieldSettings {
             user_switch_enabled: true,
             disable_user_switching: false,
             enable_fingerprint: true,
+            enable_smartcard: false,
         }
     }
 }

@@ -526,6 +526,14 @@ pub struct Niri {
     /// default) is what a machine with no reader keeps forever, and it is what stops
     /// `gdm-fingerprint` from ever being started.
     pub fingerprint_reader: crate::dbus::fprintd::ReaderType,
+    /// Whether the card this session was unlocked with is in the reader
+    /// (`smartcardDetected`, `js/gdm/util.js:127`). Already reduced by the setting and by the
+    /// login-token rule — see [`crate::dbus::smartcard`].
+    ///
+    /// **Nothing acts on it yet**: GNOME would make `gdm-smartcard` preempt the password
+    /// conversation, and that restructuring is deliberately deferred until there is a card to
+    /// prove it against.
+    pub smartcard_detected: bool,
     /// Whether logind gave us a seat id — libaccountsservice's `can_switch()`, which is a seat
     /// lookup and nothing else now that `sd_seat_can_multi_session` is gone. Resolved once, off
     /// the main loop, by the same task that starts the AccountsService watch.
@@ -4081,6 +4089,13 @@ impl State {
     /// (`util.js:437-442`) — and the window is one round trip at startup against a lock screen that
     /// is not up yet.
     #[cfg(feature = "dbus")]
+    /// gsd's smartcard tokens changed.
+    #[cfg(feature = "dbus")]
+    pub fn on_smartcard_msg(&mut self, msg: crate::dbus::smartcard::SmartcardToNiri) {
+        let crate::dbus::smartcard::SmartcardToNiri::Detected(detected) = msg;
+        self.niri.smartcard_detected = detected;
+    }
+
     pub fn on_fingerprint_reader(&mut self, reader: crate::dbus::fprintd::ReaderType) {
         if self.niri.fingerprint_reader == reader {
             return;
@@ -5538,6 +5553,7 @@ impl Niri {
             published_active: false,
             user_account: Default::default(),
             fingerprint_reader: Default::default(),
+            smartcard_detected: false,
             can_switch_user: false,
             switch_user_hovered: false,
             multiple_users: false,

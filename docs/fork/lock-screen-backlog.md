@@ -441,7 +441,30 @@ Three things it needed that are worth knowing:
 `Curve::EaseInQuad` was added to the animation toolkit for the deceleration; it had only the
 `Out` variants.
 
-Still open: smartcard.
+**Smartcard: detection landed, preemption deferred (decided 2026-08-02).** gsd-smartcard owns the
+readers and exports one object per token over an `ObjectManager`; `dbus::smartcard` reads those,
+gated on `enable-smartcard-authentication` — which defaults to **false**, so on most machines the
+whole path is inert. The flag lands on `Niri::smartcard_detected` and nothing acts on it yet.
+
+Two rules in there are worth not re-deriving:
+
+- **The lock screen's question is not "is a card in".** `_checkForSmartcard` branches on
+  `_reauthOnly` (`util.js:481-486`), which `authPrompt.js:162-168` sets true for every unlock — so
+  the login screen asks `hasInsertedTokens` and the lock screen asks `hasInsertedLoginToken`. A
+  colleague's card in the second slot unlocks nobody's session; offering an authentication on the
+  strength of it would be offering one that can only fail.
+- **`UsedToLogin` is sticky.** `_updateToken` sets `_loginToken` and never unsets it; only the
+  object leaving the bus clears it (`smartcardManager.js:93-105`). Clearing it when `IsInserted`
+  went false looks right and would mean the card worked exactly once per session, because nothing
+  would recognise it on the way back in.
+
+**Still open — preemption.** In GNOME an inserted card *displaces* the password conversation:
+`_preemptingService` becomes `gdm-smartcard` and `_defaultService` makes it the foreground service
+(`util.js:487-496`, `:646-658`), card removal resets the prompt, and `_onReset` has a special case
+that refuses to reset while a smartcard verification is in flight (`authPrompt.js:470-478`). That
+restructures which conversation owns the entry, on a screen whose one hard requirement is that it
+can always be answered, and there is no card on this machine to prove it against. Deferred until
+there is.
 
 ## E (reference notes). Fingerprint and smartcard
 
