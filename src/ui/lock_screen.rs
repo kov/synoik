@@ -326,6 +326,23 @@ const MESSAGE_FG: Rgba = [0.9, 0.9, 0.9, 1.];
 /// them by `MessageType` (`authPrompt.js`).
 const MESSAGE_ERROR_FG: Rgba = [1., 0.48, 0.42, 1.];
 
+/// `wiggle` (`js/misc/animationUtils.js:87-124`), with the arguments `authPrompt.js:489` passes:
+/// **6 px, 65 ms a leg, 3 wiggles**. Only a fingerprint `ERROR` gets one (`:485-490`).
+///
+/// The shape is three eases, not one: accelerate out to `-offset`, then a *linear* triangle wave
+/// between the extremes, then decelerate back to rest. Clutter's `repeat_count` is a count of
+/// **repeats**, so `wiggleCount: 3` runs the middle leg four times, and `autoReverse` flips each
+/// run — which is what makes it a wave rather than a saw, and why it ends back at `-offset` for the
+/// deceleration to unwind. Six legs of 65 ms: 390 ms in total.
+const WIGGLE_OFFSET: f64 = 6.;
+const WIGGLE_LEG: Duration = Duration::from_millis(65);
+const WIGGLE_COUNT: u32 = 3;
+/// Legs in the middle phase — see [`WIGGLE_OFFSET`] on why it is `count + 1`.
+const WIGGLE_LEGS: u32 = WIGGLE_COUNT + 1;
+/// The whole animation: one leg out, [`WIGGLE_LEGS`] across, one leg back.
+pub const WIGGLE_TIME: Duration =
+    Duration::from_millis(WIGGLE_LEG.as_millis() as u64 * (WIGGLE_LEGS as u64 + 2));
+
 /// `CapsLockWarning`'s text (`shellEntry.js:170`).
 pub const CAPS_TEXT: &str = "Caps lock is on";
 /// It eases in and out over 200 ms (`shellEntry.js:210-217`).
@@ -569,6 +586,8 @@ pub struct LockScreen {
     /// begins wherever the first had got to. Deriving the start from the *target* instead makes a
     /// reversal jump to full opacity before fading — a flash of a warning that was never up.
     caps_from: f64,
+    /// When the message's wiggle started, or `None` when it is at rest.
+    wiggle_since: Option<Duration>,
     cache: RefCell<widget::BakeCache>,
     /// The entry has its own cache: it re-bakes per keystroke, the column around it does not.
     entry_cache: RefCell<widget::BakeCache>,
@@ -576,6 +595,12 @@ pub struct LockScreen {
     /// column's bake is what lets its alpha animate on the *element* instead of in the bake key,
     /// which would re-rasterise the whole column every frame ([[animation-per-frame-bake]]).
     caps_cache: RefCell<widget::BakeCache>,
+    /// ...and so does the message, for the same reason one step along: its wiggle is a
+    /// **translation**, and a translation folded into the bake key re-rasterises the column on
+    /// every one of the 390 ms of frames ([[animation-per-frame-bake]]). Out here it is an element
+    /// offset and costs nothing. It also matches GNOME's actor split — `wiggle` moves
+    /// `this._message` alone, not the dialog around it.
+    message_cache: RefCell<widget::BakeCache>,
     /// The avatar's inset ring — constant content, so one bake for the life of the process, and
     /// only drawn when there is a picture under it (see [`widget::Avatar`]).
     ring_cache: RefCell<widget::BakeCache>,
@@ -763,6 +788,56 @@ impl LockScreen {
             .is_some_and(|since| now.saturating_sub(since) < CAPS_FADE)
     }
 
+    /// Shake the message (`wiggle`, `animationUtils.js:87-124`). Restarts one already running.
+    ///
+    /// GNOME does this for a fingerprint **error** only (`authPrompt.js:485-490`) — the reader is
+    /// not the service the user is looking at, so its bad news has to catch the eye of somebody
+    /// whose attention is on the entry. A refused *password* does not wiggle: they are already
+    /// looking at the thing that refused them.
+    pub fn start_wiggle(&mut self, now: Duration) {
+        self.wiggle_since = Some(now);
+    }
+
+    /// How far the message is displaced, in logical pixels. 0 at rest.
+    pub fn wiggle_offset(&self, now: Duration) -> f64 {
+        let Some(since) = self.wiggle_since else {
+            return 0.;
+        };
+        let leg = WIGGLE_LEG.as_secs_f64();
+        let elapsed = now.saturating_sub(since).as_secs_f64();
+        // Which leg we are on, and how far through it.
+        let index = (elapsed / leg).floor();
+        let t = (elapsed / leg - index).clamp(0., 1.);
+        let index = index as u32;
+
+        match index {
+            // Accelerate out to `-offset`.
+            0 => -WIGGLE_OFFSET * Curve::EaseOutQuad.y(t),
+            // The wave. Even legs run `-offset` → `+offset`, odd ones back, which is what
+            // `autoReverse` does to a repeating transition.
+            i if i <= WIGGLE_LEGS => {
+                let up = (i - 1) % 2 == 0;
+                let t = if up { t } else { 1. - t };
+                -WIGGLE_OFFSET + 2. * WIGGLE_OFFSET * t
+            }
+            // Decelerate from `-offset` back to rest. The wave ends on an odd (returning) leg, so
+            // this always starts from the same side.
+            i if i == WIGGLE_LEGS + 1 => -WIGGLE_OFFSET * (1. - Curve::EaseInQuad.y(t)),
+            _ => 0.,
+        }
+    }
+
+    /// Whether the wiggle still owes frames.
+    pub fn wiggle_is_animating(&self, now: Duration) -> bool {
+        self.wiggle_since
+            .is_some_and(|since| now.saturating_sub(since) < WIGGLE_TIME)
+    }
+
+    /// Put the message back where it belongs, immediately.
+    pub fn settle_wiggle(&mut self) {
+        self.wiggle_since = None;
+    }
+
     /// Finish the caps ease now, wherever it had got to.
     pub fn settle_caps(&mut self) {
         self.caps_since = None;
@@ -820,6 +895,9 @@ impl LockScreen {
         self.retire_curtain();
         self.settle_page();
         self.settle_caps();
+        // Without this every existing lock-screen pixel test could catch a wiggle mid-swing and
+        // find the message up to 6 px from where it computed it should be.
+        self.settle_wiggle();
     }
 
     /// Finish the crossfade now, wherever it had got to.
@@ -1081,37 +1159,23 @@ impl LockScreen {
             Size::from((width, block_h)),
             widget::Revision::new()
                 .of(&content_owned.display_name)
-                .of(&content_owned.message)
-                .of(content_owned.message_is_error)
                 .px(width)
                 .done(),
             |renderer| {
                 let mut shaper = TextShaper::new(renderer, scale);
-                let name = shaper.shape(&content_owned.display_name, TextStyle::new(NAME_PT))?;
-                // The message **wraps** (`this._message.clutter_text.line_wrap = true`,
-                // `authPrompt.js:220`): PAM's strings are sentences, and a single clipped line
-                // loses both ends of one. Wrapped to the prompt column, minus its padding.
-                let message = shaper.paragraph(
-                    &[widget::ParagraphSpan::new(
-                        content_owned.message.as_deref().unwrap_or(""),
-                        HINT_PT,
-                    )],
-                    width - MESSAGE_PAD * 2.,
-                    HINT_PT,
-                )?;
-                Ok((name, message))
+                shaper.shape(&content_owned.display_name, TextStyle::new(NAME_PT))
             },
-            |frame, phys, shaped: &(ShapedText, widget::ShapedParagraph)| {
-                let (name, message) = shaped;
+            |frame, phys, name: &ShapedText| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
 
-                // Real metrics now that the runs exist — see `LINE_BOX_ESTIMATE`.
-                let (_, _, msg_w, msg_h) = message.ink_bounds();
+                // Real metrics now that the runs exist — see `LINE_BOX_ESTIMATE`. The message row
+                // is last, so its own height cannot move anything drawn here; the reserved
+                // minimum is enough to place everything above it.
                 let l = prompt_layout(
                     base_px,
                     name.line_box_height() as f64 / scale,
-                    msg_h as f64 / scale,
+                    MESSAGE_MIN_EM * base_px,
                 );
 
                 // `border-radius: $forced_circular_radius` on a square box is a circle.
@@ -1127,8 +1191,50 @@ impl LockScreen {
                     FG,
                     l.name,
                 )?;
-                if content_owned.message.is_some() {
-                    let fg = if content_owned.message_is_error {
+                Ok(())
+            },
+        );
+        match baked {
+            Ok(texture) => {
+                elements.push(Self::element(renderer, texture, scale, origin, t, centre).into())
+            }
+            Err(err) => tracing::error!("error drawing the unlock prompt: {err:#}"),
+        }
+
+        // --- The message, last in the input well and the only thing that wiggles. ---
+        //
+        // Its own bake so the wiggle can ride the *element*: see `message_cache`. Placed from the
+        // same layout as the entry and the caps row above it, which is what keeps the three in
+        // step — the column's bake refines the rows it draws with real metrics, but the message
+        // row is last and nothing below it depends on the refinement.
+        if let Some(text) = content.message.as_deref() {
+            let is_error = content.message_is_error;
+            let row = l.message.size;
+            match widget::bake(
+                renderer,
+                &mut self.message_cache.borrow_mut(),
+                scale,
+                row,
+                widget::Revision::new()
+                    .of(text)
+                    .of(is_error)
+                    .px(row.w)
+                    .done(),
+                |renderer| {
+                    let mut shaper = TextShaper::new(renderer, scale);
+                    // The message **wraps** (`this._message.clutter_text.line_wrap = true`,
+                    // `authPrompt.js:220`): PAM's strings are sentences, and a single clipped line
+                    // loses both ends of one. Wrapped to the prompt column, minus its padding.
+                    shaper.paragraph(
+                        &[widget::ParagraphSpan::new(text, HINT_PT)],
+                        row.w - MESSAGE_PAD * 2.,
+                        HINT_PT,
+                    )
+                },
+                |frame, phys, message: &widget::ShapedParagraph| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(style::TRANSPARENT)?;
+                    let fg = if is_error {
                         MESSAGE_ERROR_FG
                     } else {
                         MESSAGE_FG
@@ -1140,22 +1246,25 @@ impl LockScreen {
                     // Centre the *ink*, not the layout frame: the paragraph's frame is the wrap
                     // width and its ink starts somewhere inside, so ignoring `ix` pushes the text
                     // off-centre by that much.
-                    let (msg_ix, _, _, _) = message.ink_bounds();
-                    let origin = Point::<f64, Logical>::from((
-                        cx - (msg_ix as f64 + msg_w as f64 / 2.) / scale,
-                        l.message.loc.y,
+                    let (msg_ix, _, msg_w, _) = message.ink_bounds();
+                    let at = Point::<f64, Logical>::from((
+                        row.w / 2. - (msg_ix as f64 + msg_w as f64 / 2.) / scale,
+                        0.,
                     ))
                     .to_physical_precise_round(scale);
-                    p.paragraph(message, origin, fg)?;
+                    p.paragraph(message, at, fg)?;
+                    Ok(())
+                },
+            ) {
+                Ok(texture) => {
+                    let mut at = l.message.loc;
+                    at.x += self.wiggle_offset(now);
+                    elements.push(
+                        Self::element(renderer, texture, scale, origin + at, t, centre).into(),
+                    );
                 }
-                Ok(())
-            },
-        );
-        match baked {
-            Ok(texture) => {
-                elements.push(Self::element(renderer, texture, scale, origin, t, centre).into())
+                Err(err) => tracing::error!("error drawing the prompt message: {err:#}"),
             }
-            Err(err) => tracing::error!("error drawing the unlock prompt: {err:#}"),
         }
 
         elements
@@ -1390,6 +1499,90 @@ impl LockScreen {
 
 #[cfg(test)]
 mod tests {
+    /// The wiggle is one continuous path, and it starts and ends at rest.
+    ///
+    /// It is six separate eases stitched together, which is exactly the shape that hides a bug at
+    /// the seams: an off-by-one in the leg index, or getting `autoReverse`'s direction backwards,
+    /// leaves the curve *plausible* — still 6 px, still 390 ms — while teleporting 12 px between
+    /// two frames. That reads as a stutter rather than as a wrong animation, so it is pinned by
+    /// continuity rather than by sampled positions.
+    #[test]
+    fn the_wiggle_never_jumps() {
+        let mut ls = super::LockScreen::default();
+        let t0 = std::time::Duration::from_secs(10);
+        ls.start_wiggle(t0);
+
+        // One physical frame at 120 Hz. The largest step a *linear* leg can take is one leg's full
+        // 12 px travel over its 65 ms, so anything beyond that with room to spare is a seam.
+        let step = std::time::Duration::from_micros(8333);
+        let leg_speed = 2. * super::WIGGLE_OFFSET / super::WIGGLE_LEG.as_secs_f64();
+        let budget = leg_speed * step.as_secs_f64() * 1.5;
+
+        let mut now = t0;
+        let mut previous = ls.wiggle_offset(now);
+        assert_eq!(previous, 0., "it must start from rest");
+
+        while now < t0 + super::WIGGLE_TIME + step {
+            now += step;
+            let x = ls.wiggle_offset(now);
+            assert!(
+                (x - previous).abs() <= budget,
+                "the wiggle jumped {:.2}px at {:?}, from {previous:.2} to {x:.2}",
+                (x - previous).abs(),
+                now - t0,
+            );
+            previous = x;
+        }
+
+        // The extremes land exactly on the leg boundaries, which a frame clock will not sample —
+        // 65 ms is not a whole number of frames at any refresh rate we run at. So they are checked
+        // where they are, rather than by watching a sweep go past them.
+        let leg_end = |n: u32| ls.wiggle_offset(t0 + super::WIGGLE_LEG * n);
+        assert_eq!(leg_end(1), -super::WIGGLE_OFFSET, "the accelerate leg");
+        // ...then the wave, alternating, one boundary per leg.
+        for n in 1..=super::WIGGLE_LEGS {
+            let want = if n % 2 == 0 {
+                super::WIGGLE_OFFSET
+            } else {
+                -super::WIGGLE_OFFSET
+            };
+            assert_eq!(leg_end(n), want, "leg {n} does not alternate");
+        }
+        // The wave ends on a returning leg, so the decelerate always unwinds from the same side —
+        // get that backwards and the message ends up parked 6 px off-centre.
+        assert_eq!(
+            leg_end(super::WIGGLE_LEGS + 1),
+            -super::WIGGLE_OFFSET,
+            "the decelerate leg must start where the wave left off"
+        );
+        // ...and it is back at rest at the end, rather than parked off-centre.
+        assert_eq!(ls.wiggle_offset(t0 + super::WIGGLE_TIME), 0.);
+        assert_eq!(ls.wiggle_offset(t0 + super::WIGGLE_TIME * 2), 0.);
+        assert!(!ls.wiggle_is_animating(t0 + super::WIGGLE_TIME));
+
+        // Nothing moves when nothing asked it to.
+        let at_rest = super::LockScreen::default();
+        assert_eq!(at_rest.wiggle_offset(now), 0.);
+        assert!(!at_rest.wiggle_is_animating(now));
+    }
+
+    /// The message is displaced, and nothing else is.
+    ///
+    /// GNOME wiggles `this._message` alone (`authPrompt.js:489`). Shaking the avatar and the name
+    /// with it would read as the whole dialog rejecting the user, which is a much louder statement
+    /// than "the reader could not do it".
+    #[test]
+    fn the_wiggle_moves_the_message_and_not_the_column() {
+        // The message's own bake is what makes that possible, and it is only separate because of
+        // the wiggle — so if someone folds it back into the column, this is the test that says why
+        // they cannot.
+        let l = super::prompt_layout(16., 20., 44.);
+        assert!(
+            l.message.loc.y > l.caps.loc.y,
+            "the message is last in the input well (`authPrompt.js`'s `_inputWell` order)"
+        );
+    }
+
     use super::*;
 
     const T0: Duration = Duration::from_secs(1_000);

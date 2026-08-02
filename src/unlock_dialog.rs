@@ -134,6 +134,15 @@ pub struct UnlockDialog {
     /// clear, so there is no default — no question means no entry.
     question: Option<(String, bool)>,
     message: Option<Message>,
+    /// A fingerprint error has reached the screen and has not been acted on yet — the view picks
+    /// this up and wiggles (`authPrompt.js:485-490`).
+    ///
+    /// A flag drained by the caller rather than a field on [`UnlockEffects`] because a message can
+    /// reach the screen from three different places — an event, a tick promoting it out of the
+    /// queue, a filter dropping the one in front of it — and only one of those is a path that
+    /// builds effects from scratch. One drain point cannot miss a case; three construction sites
+    /// can.
+    wiggle: bool,
     /// Earliest time [`message`](Self::message) may be replaced or cleared — `now` plus its
     /// [`read_time`], stamped when it went up. `None` when nothing is showing.
     message_until: Option<Duration>,
@@ -162,6 +171,7 @@ impl UnlockDialog {
             entry: String::with_capacity(ENTRY_CAPACITY),
             question: None,
             message: None,
+            wiggle: false,
             message_until: None,
             message_queue: std::collections::VecDeque::new(),
             peek: false,
@@ -198,6 +208,15 @@ impl UnlockDialog {
 
     pub fn message(&self) -> Option<&Message> {
         self.message.as_ref()
+    }
+
+    /// Whether a fingerprint error has just landed, clearing the flag.
+    ///
+    /// Only the reader's errors wiggle. It is the service the user is *not* looking at — their eyes
+    /// are on the entry — so its bad news has to ask for attention; a refused password does not,
+    /// because they are already watching the thing that refused them.
+    pub fn take_wiggle(&mut self) -> bool {
+        std::mem::take(&mut self.wiggle)
     }
 
     /// When [`tick`](Self::tick) next has message work to do, so the caller can arm a timer.
@@ -238,6 +257,12 @@ impl UnlockDialog {
 
     fn show_message_now(&mut self, message: Option<Message>, now: Duration) -> bool {
         let changed = self.message.as_ref() != message.as_ref();
+        // Every route to the screen goes through here, which is the point of putting it here.
+        if changed {
+            self.wiggle |= message.as_ref().is_some_and(|m| {
+                m.kind == MessageKind::Error && m.source == MessageSource::Fingerprint
+            });
+        }
         self.message_until = message.as_ref().map(|m| now + read_time(&m.text));
         self.message = message;
         changed
@@ -1252,6 +1277,58 @@ mod tests {
         assert!(
             d.message().is_none(),
             "a hint from a dead service was promoted after the fact"
+        );
+    }
+
+    /// Only the **reader's errors** wiggle, and they wiggle however they reach the screen.
+    ///
+    /// GNOME's condition is both halves at once (`authPrompt.js:485-486`): `ERROR`, *and* from the
+    /// fingerprint service. A refused password is an error too, and shaking for it would be
+    /// shaking at somebody already looking at the thing that refused them. The hint is from the
+    /// right service and must not shake either — it is not bad news, it is an offer.
+    ///
+    /// The second half matters as much as the first: a fingerprint error rarely arrives on an idle
+    /// screen. It queues behind whatever is up, so the moment it becomes *visible* is a tick, not
+    /// an event — a wiggle raised only where the event is handled would fire while the message was
+    /// still invisible and be over before anyone saw it.
+    #[test]
+    fn only_the_readers_errors_wiggle() {
+        let show = |kind, source| VerifierEvent::ShowMessage {
+            text: "something happened".to_owned(),
+            kind,
+            source,
+        };
+
+        // A password error: no wiggle.
+        let mut d = dialog();
+        d.on_verifier_event(show(MessageKind::Error, MessageSource::Password), T0);
+        assert!(!d.take_wiggle());
+
+        // The reader's hint: no wiggle.
+        let mut d = dialog();
+        d.on_verifier_event(show(MessageKind::Hint, MessageSource::Fingerprint), T0);
+        assert!(!d.take_wiggle());
+
+        // The reader's error: wiggle, and **once** — a second drain must not shake again.
+        let mut d = dialog();
+        d.on_verifier_event(show(MessageKind::Error, MessageSource::Fingerprint), T0);
+        assert!(d.take_wiggle());
+        assert!(!d.take_wiggle(), "the wiggle was not drained");
+
+        // ...and the same error arriving *behind* another message wiggles when it is promoted, not
+        // when it was queued.
+        let mut d = dialog();
+        d.on_verifier_event(show(MessageKind::Error, MessageSource::Password), T0);
+        assert!(!d.take_wiggle());
+        d.on_verifier_event(show(MessageKind::Error, MessageSource::Fingerprint), T0);
+        assert!(
+            !d.take_wiggle(),
+            "it wiggled while the message was still queued behind another"
+        );
+        d.tick(T0 + read_time("something happened"));
+        assert!(
+            d.take_wiggle(),
+            "it never wiggled once it reached the screen"
         );
     }
 

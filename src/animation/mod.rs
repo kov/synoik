@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use keyframe::functions::{EaseOutCubic, EaseOutQuad};
+use keyframe::functions::{EaseInQuad, EaseOutCubic, EaseOutQuad};
 use keyframe::EasingFunction;
 
 mod bezier;
@@ -43,6 +43,11 @@ enum Kind {
 #[derive(Debug, Clone, Copy)]
 pub enum Curve {
     Linear,
+    /// Accelerates from rest — `Clutter.AnimationMode.EASE_IN_QUAD`.
+    ///
+    /// The mirror of [`Curve::EaseOutQuad`], and the shape of a motion that *ends* somewhere
+    /// rather than arriving from somewhere: GNOME uses it to bring a wiggle to a stop.
+    EaseInQuad,
     EaseOutQuad,
     EaseOutCubic,
     EaseOutExpo,
@@ -343,6 +348,7 @@ impl Curve {
     pub fn y(self, x: f64) -> f64 {
         match self {
             Curve::Linear => x,
+            Curve::EaseInQuad => EaseInQuad.y(x),
             Curve::EaseOutQuad => EaseOutQuad.y(x),
             Curve::EaseOutCubic => EaseOutCubic.y(x),
             Curve::EaseOutExpo => 1. - 2f64.powf(-10. * x),

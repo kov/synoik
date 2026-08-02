@@ -3998,6 +3998,13 @@ impl State {
         // appears.
         self.arm_unlock_message_timer();
 
+        // ...and the same funnel is where a fingerprint error becomes a wiggle.
+        if self.niri.unlock_dialog.take_wiggle() {
+            let now = crate::utils::get_monotonic_time();
+            self.niri.lock_screen.start_wiggle(now);
+            self.niri.queue_redraw_all();
+        }
+
         if effects.unlock {
             // gdm accepted. This is the only call to `deactivate` that can raise a *locked*
             // shield, and it is reachable only from `VerifierEvent::Complete`.
@@ -8654,6 +8661,7 @@ impl Niri {
             state.unfinished_animations_remain |= self.lock_screen.is_sliding(now);
             state.unfinished_animations_remain |= self.lock_screen.is_fading(now);
             state.unfinished_animations_remain |= self.lock_screen.caps_is_animating(now);
+            state.unfinished_animations_remain |= self.lock_screen.wiggle_is_animating(now);
 
             // Also keep redrawing if the current cursor is animated.
             state.unfinished_animations_remain |= self

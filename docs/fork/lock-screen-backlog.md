@@ -413,8 +413,35 @@ reader; the verifier interface has no per-service cancel, so matching that would
 channel and re-beginning the password conversation. Worth doing when the re-Begin path exists (see
 the switch-user divergence above, which wants the same thing).
 
-Still open: the error wiggle (`authPrompt.js:481-493`, 3 × 65 ms, ±6 px — `animationUtils.js:87`),
-and smartcard.
+The error wiggle landed too. `wiggle` (`animationUtils.js:87-124`) with `authPrompt.js:489`'s
+arguments — 6 px, 65 ms a leg, 3 wiggles — and only for a fingerprint **`ERROR`** (`:485-490`): the
+reader is the service the user is *not* looking at, so its bad news has to catch an eye that is on
+the entry, while a refused password does not, because they are already watching the thing that
+refused them.
+
+Three things it needed that are worth knowing:
+
+- **The shape is six legs, not one ease.** Accelerate out to `-6`, a *linear* triangle wave, then
+  decelerate back. Clutter's `repeat_count` counts **repeats**, so `wiggleCount: 3` runs the middle
+  leg four times, and `autoReverse` flips each run — which is what makes it a wave rather than a
+  saw, and why it always ends back at `-6` for the deceleration to unwind. 390 ms in total. Pinned
+  by *continuity* rather than sampled positions: an off-by-one in the leg index leaves the curve
+  entirely plausible while teleporting 12 px between two frames, which reads as a stutter rather
+  than as a wrong animation.
+- **The message moved into its own bake.** A translation folded into a bake key re-rasterises the
+  whole column on every frame of the animation ([[animation-per-frame-bake]]); out as its own
+  element it is an offset and costs nothing. It also matches GNOME's actor split, which wiggles
+  `this._message` alone. The row is last in the input well, so nothing above it depends on its
+  height and it can be placed from the same layout the entry and caps row already use.
+- **The trigger is drained, not pushed.** A message reaches the screen from three places — an
+  event, a tick promoting it out of the queue, a filter dropping the one in front of it — and a
+  fingerprint error usually arrives *behind* something. Raising the wiggle where the event is
+  handled would fire it while the message was still invisible.
+
+`Curve::EaseInQuad` was added to the animation toolkit for the deceleration; it had only the
+`Out` variants.
+
+Still open: smartcard.
 
 ## E (reference notes). Fingerprint and smartcard
 

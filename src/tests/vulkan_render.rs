@@ -12124,6 +12124,100 @@ fn vulkan_draws_the_caps_lock_warning() {
     );
 }
 
+/// The message under the entry actually draws, in its own row, and goes away again.
+///
+/// It has its **own bake and element** so its wiggle can ride the element rather than the bake key
+/// ([[animation-per-frame-bake]]). That split is exactly the change a state test cannot see: the
+/// dialog can hold a perfectly correct message while the renderer draws it nowhere — wrong cache,
+/// a texture sized to the wrong row, an origin taken from the column's refined layout instead of
+/// the one the entry above it uses. Asserted as a differential, and *located*, because "some ink
+/// appeared" would pass just as well if the message were drawn over the avatar.
+#[test]
+fn vulkan_draws_the_prompt_message_in_its_own_row() {
+    use crate::dbus::gdm::{MessageKind, MessageSource, VerifierEvent};
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    f.niri_state().on_shield_key(None, Some('a'));
+    f.niri_state().niri.lock_screen.settle();
+    let (before, w, h) = render_output_vulkan(&mut f, &output);
+
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::ShowMessage {
+            text: "Fingerprint reader unavailable".to_owned(),
+            kind: MessageKind::Error,
+            source: MessageSource::Fingerprint,
+        });
+    f.niri_state().niri.lock_screen.settle();
+    let (during, _, _) = render_output_vulkan(&mut f, &output);
+
+    let drawn: Vec<(i32, i32)> = (0..w * h)
+        .map(|i| (i % w, i / w))
+        .filter(|(x, y)| px(&during, w, *x, *y) != px(&before, w, *x, *y))
+        .collect();
+    assert!(!drawn.is_empty(), "the message drew no ink at all");
+
+    // Below the middle of the screen: the prompt block is centred, and the message is the last
+    // row in it, so ink from a wrong origin — the column's top-left is the usual one — lands
+    // above the middle instead. Which row it *is* is pinned by the layout test next door; this
+    // one is here for the half a layout test cannot see, that the row is drawn at all.
+    let top = drawn.iter().map(|(_, y)| *y).min().unwrap();
+    assert!(
+        top > h / 2,
+        "the message drew at y={top}, above the middle of a {h}px screen"
+    );
+    // Horizontally centred, near enough: a message drawn from the column's left edge would sit
+    // wholly in one half.
+    let (x0, x1) = (
+        drawn.iter().map(|(x, _)| *x).min().unwrap(),
+        drawn.iter().map(|(x, _)| *x).max().unwrap(),
+    );
+    let centre = f64::from(x0 + x1) / 2.;
+    assert!(
+        (centre - f64::from(w) / 2.).abs() <= f64::from(w) / 20.,
+        "the message is centred at {centre}, not near {}",
+        f64::from(w) / 2.
+    );
+
+    // ...and clearing it takes the ink away again. Compared over the pixels the message itself
+    // touched rather than the whole frame: the reset that clears it also empties the entry and
+    // drops the question, so a frame-wide diff would be measuring those instead.
+    f.niri_state().on_verifier_event(VerifierEvent::Reset);
+    // The read-time floor holds the message up past the reset; drain it the way the timer would.
+    let now = crate::utils::get_monotonic_time() + std::time::Duration::from_secs(30);
+    let effects = f.niri_state().niri.unlock_dialog.tick(now);
+    f.niri_state().apply_unlock_effects(effects);
+    assert!(
+        f.niri().unlock_dialog.message().is_none(),
+        "the message outlived the reset"
+    );
+    f.niri_state().niri.lock_screen.settle();
+
+    let (after, _, _) = render_output_vulkan(&mut f, &output);
+    let left_behind = drawn
+        .iter()
+        .filter(|(x, y)| px(&after, w, *x, *y) != px(&before, w, *x, *y))
+        .count();
+    assert_eq!(
+        left_behind,
+        0,
+        "{left_behind} of the message's {} px are still lit once it is gone",
+        drawn.len()
+    );
+}
+
 /// The unlock prompt draws over the curtain, and the entry shows dots rather than the password.
 ///
 /// The masking assertion is the one that matters and it is the one a state test cannot make: the
