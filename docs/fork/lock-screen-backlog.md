@@ -338,8 +338,15 @@ Service names are `gdm-fingerprint` and `gdm-smartcard` (`util.js:27-29`), each 
   directly (`js/misc/smartcardManager.js:6-14`), and **removing the card resets an in-progress
   prompt** (`authPrompt.js:461-479`).
 
-**Risk:** medium, and mostly untestable here — no fingerprint reader and no smartcard on this
-machine. Would land behind the probe with the no-device path as the tested one.
+**Risk:** medium, but **fully validatable on this machine** — correcting an earlier claim here
+that there was no reader. The VM has an emulated USB fingerprint device our VMM relays to the
+host's API (Touch ID on the Mac), `lsusb` shows `04f3:0c7d ELAN:Fingerprint`, and fprintd is
+installed and D-Bus-activatable. There is a FIDO device too. So this can be built and tested end
+to end rather than blind against the no-device path.
+
+**Passkeys are a related but separate question.** GNOME 50.3 has no passkey path in `util.js` at
+all — only password, fingerprint and smartcard — so that would be ours to design rather than port,
+presumably as another PAM service on the same channel. Scope it with E, decide separately.
 
 ---
 
