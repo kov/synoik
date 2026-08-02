@@ -1,6 +1,8 @@
 # The portal surface — screenshots and screen sharing
 
-Status: **scoped 2026-08-02**, no slices landed yet.
+Status: **2026-08-02.** Slice 1 landed. Slice 2 is *partly* landed — `ScreenshotArea` and
+honouring `filename` are in; `ScreenshotWindow` and `FlashArea` are not. Slice 3 (`SelectArea`) has
+not been started. Nothing here is seat-validated yet.
 
 `xdg-desktop-portal-gnome` is the path every Flatpak app, every browser screen-share and every
 in-app "take a screenshot" goes through. It is not optional for a daily-driven session, and it is
@@ -59,11 +61,17 @@ of the same bug class.
 
 Ordered by what unblocks the portal soonest, not by interface.
 
-1. **Introspect completion.** The sender allowlist first, then `GetRunningApplications` off
+1. **Introspect completion.** — **DONE** (`f7b12a1c`). Allowlist, `GetRunningApplications`, the
+   full window field set, `ScreenSize`, `AnimationsEnabled`, `version`, both change signals off the
+   `sync_running_apps` seam. Pinned by `the_portal_window_list_carries_what_its_chooser_reads`.
+   Original scope follows. The sender allowlist first, then `GetRunningApplications` off
    `AppSystem::running` + the focused app, the full `WindowProperties` field set, `ScreenSize`,
    `AnimationsEnabled`, `version`, and the two change signals. Unblocks the portal's app/window
    chooser, and closes the leak.
-2. **Screenshot, non-interactive.** `ScreenshotArea` (a crop of the existing capture),
+2. **Screenshot, non-interactive.** — **PART DONE** (`684626ae`): `ScreenshotArea` and the
+   `filename` argument. **Left: `ScreenshotWindow` and `FlashArea`.** `FlashArea` is the one with
+   real work behind it — it is a white rectangle that fades, so it needs an overlay element and an
+   animation, not just a D-Bus method. Original scope follows. `ScreenshotArea` (a crop of the existing capture),
    `ScreenshotWindow` (`Niri::screenshot_window` already exists), `FlashArea`, and **honouring the
    `filename` argument**, which `Screenshot` currently ignores in favour of its own path.
 3. **`SelectArea`.** Interactive: opens the picker and returns the rect. `ui::screenshot_ui` has
@@ -80,3 +88,11 @@ Ordered by what unblocks the portal soonest, not by interface.
   a fork that adds an escape hatch is adding a way to reopen the leak.
 - `ScreenSize` on a multi-output session is `global.screen_width/height`, i.e. the union bounding
   box, not a per-output size. Confirm against our output model before implementing.
+
+## Open question raised by slice 1
+
+Under `xdp-gnome-screencast` the window list carries a synthetic **"niri Dynamic Cast Target"**
+entry with app id `rs.bxt.niri.desktop`. It is a niri capability rather than a niri *way of doing
+a GNOME thing*, so the tenet says keep it — but it shows up in the portal's chooser as a window
+called "niri", which is a branding leak in a shell that is meant to be GNOME. Decide whether to
+rename it, hide it from `GetWindows`, or leave it.
