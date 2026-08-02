@@ -15535,3 +15535,153 @@ fn alt_tab_stays_on_this_workspace_and_super_tab_does_not() {
     );
     assert_eq!(super_tab_items, Some(2), "stock Super-Tab spans workspaces");
 }
+
+/// A polkit request goes from polkitd to a prompt, takes a real password off the keyboard, and its
+/// verdict is polkitd's alone.
+///
+/// This drives the entry points a live session drives — `State::on_polkit_msg` for the agent's
+/// side, synthetic key events for the user's — so it fails for the wiring mistakes it exists to
+/// catch: a dialog that never takes keyboard focus, keys that reach a window behind it, a password
+/// that is not what gets sent, or a cancel that reaches polkitd as a failure instead of a
+/// dismissal.
+#[test]
+fn a_polkit_request_becomes_a_prompt_and_polkitd_decides() {
+    use crate::dbus::polkit_agent::{BeginRequest, PolkitRequest, PolkitToNiri};
+    use crate::niri::KeyboardFocus;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Stand in for the agent, so what the dialog *sends* can be read back rather than assumed.
+    let (to_agent, from_dialog) = async_channel::unbounded();
+    f.niri().polkit_requests = Some(to_agent);
+    let sent = move || from_dialog.try_recv().ok();
+
+    let begin = |user: &str| {
+        PolkitToNiri::Begin(Box::new(BeginRequest {
+            action_id: "org.freedesktop.test.frobnicate".to_owned(),
+            message: "Authentication is required to frobnicate".to_owned(),
+            user_name: user.to_owned(),
+            passwordless: false,
+            avatar: None,
+        }))
+    };
+
+    // polkitd asks. Nothing is on screen yet — PAM has not said it wants anything.
+    f.niri_state().on_polkit_msg(begin("root"));
+    assert!(
+        !f.niri().polkit_is_open(),
+        "the dialog must not appear before PAM asks"
+    );
+    assert!(
+        matches!(sent(), Some(PolkitRequest::Initiate { .. })),
+        "but the conversation has been started"
+    );
+
+    // PAM asks, and now it is on screen and holds the keyboard.
+    f.niri_state().on_polkit_msg(PolkitToNiri::Request {
+        prompt: "Password:".to_owned(),
+        echo_on: false,
+    });
+    f.niri().polkit_ui.settle();
+    assert!(f.niri().polkit_is_open());
+    f.niri_state().refresh_and_flush_clients();
+    assert!(
+        matches!(f.niri().keyboard_focus, KeyboardFocus::PolkitDialog),
+        "the dialog is modal, so it owns the keyboard: {:?}",
+        f.niri().keyboard_focus,
+    );
+
+    // A real password off a real keyboard, masked on the way in.
+    tap(&mut f, KEY_A);
+    tap(&mut f, KEY_T);
+    assert_eq!(f.niri().polkit_dialog.entry_display(), "\u{25cf}\u{25cf}");
+    tap(&mut f, KEY_BACKSPACE);
+    tap(&mut f, KEY_E);
+
+    tap(&mut f, KEY_ENTER);
+    match sent() {
+        Some(PolkitRequest::Respond(response)) => {
+            assert_eq!(response, "ae", "what was typed is what is sent")
+        }
+        other => panic!("expected a response, got {other:?}"),
+    }
+    assert_eq!(
+        f.niri().polkit_dialog.entry_display(),
+        "",
+        "the buffer does not outlive the answer"
+    );
+
+    // PAM refuses. The dialog stays up and another conversation starts.
+    f.niri_state().on_polkit_msg(PolkitToNiri::Completed(false));
+    assert!(f.niri().polkit_is_open(), "a refusal is not the end");
+    assert!(matches!(sent(), Some(PolkitRequest::Initiate { .. })));
+
+    // Escape is a dismissal, which is a different answer from a failure: it tells the program that
+    // asked to stop, rather than to try again.
+    tap(&mut f, KEY_ESC);
+    assert!(
+        matches!(sent(), Some(PolkitRequest::Done { dismissed: true })),
+        "Escape must reach polkitd as a dismissal"
+    );
+    f.niri().polkit_ui.settle();
+    assert!(!f.niri().polkit_is_open());
+}
+
+/// A request that arrives while the screen is locked waits for it, rather than drawing a password
+/// box over the shield or answering polkitd without asking anyone.
+///
+/// GNOME defers it to the next session-mode change (`polkitAgent.js:439-450`). The failure this
+/// pins is not cosmetic: a prompt stacked on the lock screen is a second password entry on a locked
+/// machine, and there is no way for the person looking at it to tell which one is which.
+#[test]
+fn a_request_that_arrives_locked_waits_for_the_unlock() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::polkit_agent::{BeginRequest, PolkitRequest, PolkitToNiri};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (to_agent, from_dialog) = async_channel::unbounded();
+    f.niri().polkit_requests = Some(to_agent);
+    let sent = move || from_dialog.try_recv().ok();
+
+    // Lock, with a live verifier behind it.
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    assert!(f.niri().screen_shield.is_locked());
+
+    f.niri_state()
+        .on_polkit_msg(PolkitToNiri::Begin(Box::new(BeginRequest {
+            action_id: "org.freedesktop.test.frobnicate".to_owned(),
+            message: "Authentication is required to frobnicate".to_owned(),
+            user_name: "root".to_owned(),
+            passwordless: false,
+            avatar: None,
+        })));
+    assert!(!f.niri().polkit_is_open(), "not over a lock screen");
+    assert!(
+        sent().is_none(),
+        "and no conversation is started behind it either"
+    );
+    assert!(
+        f.niri().polkit_deferred.is_some(),
+        "the request is held, not dropped -- polkitd is still waiting on it"
+    );
+
+    // gdm accepts; the shield goes, and the held request gets its turn on the next refresh (which
+    // a live compositor runs constantly).
+    f.niri_state().on_verifier_event(VerifierEvent::Complete);
+    assert!(!f.niri().screen_shield.is_active());
+    f.niri_state().refresh_and_flush_clients();
+    assert!(
+        f.niri().polkit_deferred.is_none(),
+        "the held request has been run"
+    );
+    assert!(
+        matches!(sent(), Some(PolkitRequest::Initiate { .. })),
+        "and its conversation starts now"
+    );
+}

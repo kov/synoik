@@ -1601,6 +1601,17 @@ impl State {
     pub fn refresh_and_flush_clients(&mut self) {
         let _span = tracy_client::span!("State::refresh_and_flush_clients");
 
+        // Whatever polkit asked for while the screen was covered gets its turn once it is not.
+        //
+        // Polled here rather than driven from an unlock, because there are two ways the screen
+        // gets covered — our own shield and an `ext-session-lock` client — and only one of them
+        // has an event we own. A held request that nobody resumes is polkitd waiting forever on a
+        // dialog that will never be drawn.
+        #[cfg(feature = "dbus")]
+        if self.niri.polkit_deferred.is_some() && !self.niri.screen_is_covered() {
+            self.resume_deferred_polkit();
+        }
+
         self.refresh();
 
         // Advance animations to the current time (not target render time) before rendering outputs
@@ -4085,7 +4096,7 @@ impl State {
         // changes (`polkitAgent.js:439-450`); the one action it exempts is extending a
         // parental-controls session limit, which we have no subsystem for.
         if let PolkitToNiri::Begin(request) = &msg {
-            if self.niri.is_locked() {
+            if self.niri.screen_is_covered() {
                 debug!(
                     "polkit: holding {} until the screen unlocks",
                     request.action_id
@@ -4288,14 +4299,6 @@ impl State {
     /// Publish a [`ShieldEffects`](crate::screen_shield::ShieldEffects): the shared snapshot the
     /// bus reads, the signals it emits, logind's locked hint, and the clipboard wipe.
     pub fn apply_shield_effects(&mut self, effects: crate::screen_shield::ShieldEffects) {
-        // Whatever polkit asked for while the screen was down gets its turn now. Keyed off the
-        // shield going away rather than off `unlock()`, because a shield can be dismissed without
-        // ever having been locked, and a request held behind that one is just as stuck.
-        #[cfg(feature = "dbus")]
-        if effects.active_changed == Some(false) {
-            self.resume_deferred_polkit();
-        }
-
         // The curtain follows `active`, not `locked`: a shield down without a lock is still a
         // shield, and it is what a `lock-enabled = false` screensaver is.
         if effects.active_changed.is_some() {
@@ -6621,6 +6624,16 @@ impl Niri {
 
     /// Returns the window under the position to be activated.
     ///
+    /// Whether anything is covering the screen — our own shield, or an `ext-session-lock` client.
+    ///
+    /// GNOME's equivalent is `Main.sessionMode.isLocked`. [`Self::is_locked`] is **not** it: that
+    /// is only the Wayland lock protocol's state, so a screensaver-only shield (`lock-enabled =
+    /// false`) reads as unlocked while still covering everything. Anything that must not draw over
+    /// a covered screen wants this one.
+    pub fn screen_is_covered(&self) -> bool {
+        self.screen_shield.is_active() || self.is_locked()
+    }
+
     /// Whether the polkit dialog is on screen. Always false without `dbus`, where there is no
     /// agent to raise one.
     pub fn polkit_is_open(&self) -> bool {
