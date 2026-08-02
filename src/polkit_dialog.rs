@@ -476,6 +476,7 @@ mod tests {
             message: "Authentication is required to test".to_owned(),
             user_name: user_name.to_owned(),
             passwordless,
+            avatar: None,
         }
     }
 

@@ -95,6 +95,9 @@ pub struct BeginRequest {
     /// (`polkitAgent.js:373-376`) and answers it with a second mode; resolved here, off the
     /// compositor thread, because it takes a D-Bus round trip.
     pub passwordless: bool,
+    /// That account's picture, if AccountsService has one on disk. Usually `None`, because the
+    /// account is usually `root`; the dialog then draws the themed default.
+    pub avatar: Option<std::path::PathBuf>,
 }
 
 /// What the compositor asks of the agent.
@@ -382,9 +385,13 @@ impl AuthenticationAgent {
         // Resolved here rather than in the dialog because it is a D-Bus round trip, and because
         // getting it wrong the *other* way authorises the action with no prompt at all. An
         // account AccountsService cannot speak for reads as having a password.
-        let passwordless = crate::dbus::accounts_service::account_for(conn, &user_name)
-            .await
+        let account = crate::dbus::accounts_service::account_for(conn, &user_name).await;
+        let passwordless = account
+            .as_ref()
             .is_some_and(|account| account.password_mode.is_none());
+        let avatar = account
+            .and_then(|account| account.icon_file)
+            .map(|icon| icon.path);
 
         let (done_tx, done_rx) = async_channel::bounded(1);
         let begin = Begin {
@@ -393,6 +400,7 @@ impl AuthenticationAgent {
                 message,
                 user_name,
                 passwordless,
+                avatar,
             },
             cookie,
             done: done_tx,

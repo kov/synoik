@@ -327,21 +327,9 @@ const MESSAGE_FG: Rgba = [0.9, 0.9, 0.9, 1.];
 const MESSAGE_ERROR_FG: Rgba = [1., 0.48, 0.42, 1.];
 
 /// `wiggle` (`js/misc/animationUtils.js:87-124`), with the arguments `authPrompt.js:489` passes:
-/// **6 px, 65 ms a leg, 3 wiggles**. Only a fingerprint `ERROR` gets one (`:485-490`).
-///
-/// The shape is three eases, not one: accelerate out to `-offset`, then a *linear* triangle wave
-/// between the extremes, then decelerate back to rest. Clutter's `repeat_count` is a count of
-/// **repeats**, so `wiggleCount: 3` runs the middle leg four times, and `autoReverse` flips each
-/// run — which is what makes it a wave rather than a saw, and why it ends back at `-offset` for the
-/// deceleration to unwind. Six legs of 65 ms: 390 ms in total.
-const WIGGLE_OFFSET: f64 = 6.;
-const WIGGLE_LEG: Duration = Duration::from_millis(65);
-const WIGGLE_COUNT: u32 = 3;
-/// Legs in the middle phase — see [`WIGGLE_OFFSET`] on why it is `count + 1`.
-const WIGGLE_LEGS: u32 = WIGGLE_COUNT + 1;
-/// The whole animation: one leg out, [`WIGGLE_LEGS`] across, one leg back.
-pub const WIGGLE_TIME: Duration =
-    Duration::from_millis(WIGGLE_LEG.as_millis() as u64 * (WIGGLE_LEGS as u64 + 2));
+/// The shake, from the toolkit ([`widget::Wiggle`]). Only a fingerprint `ERROR` gets one
+/// (`authPrompt.js:485-490`).
+pub const WIGGLE_TIME: Duration = widget::Wiggle::TIME;
 
 /// `CapsLockWarning`'s text (`shellEntry.js:170`).
 pub const CAPS_TEXT: &str = "Caps lock is on";
@@ -586,8 +574,8 @@ pub struct LockScreen {
     /// begins wherever the first had got to. Deriving the start from the *target* instead makes a
     /// reversal jump to full opacity before fading — a flash of a warning that was never up.
     caps_from: f64,
-    /// When the message's wiggle started, or `None` when it is at rest.
-    wiggle_since: Option<Duration>,
+    /// The message's shake.
+    wiggle: widget::Wiggle,
     cache: RefCell<widget::BakeCache>,
     /// The entry has its own cache: it re-bakes per keystroke, the column around it does not.
     entry_cache: RefCell<widget::BakeCache>,
@@ -795,47 +783,22 @@ impl LockScreen {
     /// whose attention is on the entry. A refused *password* does not wiggle: they are already
     /// looking at the thing that refused them.
     pub fn start_wiggle(&mut self, now: Duration) {
-        self.wiggle_since = Some(now);
+        self.wiggle.start(now);
     }
 
     /// How far the message is displaced, in logical pixels. 0 at rest.
     pub fn wiggle_offset(&self, now: Duration) -> f64 {
-        let Some(since) = self.wiggle_since else {
-            return 0.;
-        };
-        let leg = WIGGLE_LEG.as_secs_f64();
-        let elapsed = now.saturating_sub(since).as_secs_f64();
-        // Which leg we are on, and how far through it.
-        let index = (elapsed / leg).floor();
-        let t = (elapsed / leg - index).clamp(0., 1.);
-        let index = index as u32;
-
-        match index {
-            // Accelerate out to `-offset`.
-            0 => -WIGGLE_OFFSET * Curve::EaseOutQuad.y(t),
-            // The wave. Even legs run `-offset` → `+offset`, odd ones back, which is what
-            // `autoReverse` does to a repeating transition.
-            i if i <= WIGGLE_LEGS => {
-                let up = (i - 1) % 2 == 0;
-                let t = if up { t } else { 1. - t };
-                -WIGGLE_OFFSET + 2. * WIGGLE_OFFSET * t
-            }
-            // Decelerate from `-offset` back to rest. The wave ends on an odd (returning) leg, so
-            // this always starts from the same side.
-            i if i == WIGGLE_LEGS + 1 => -WIGGLE_OFFSET * (1. - Curve::EaseInQuad.y(t)),
-            _ => 0.,
-        }
+        self.wiggle.offset(now)
     }
 
     /// Whether the wiggle still owes frames.
     pub fn wiggle_is_animating(&self, now: Duration) -> bool {
-        self.wiggle_since
-            .is_some_and(|since| now.saturating_sub(since) < WIGGLE_TIME)
+        self.wiggle.is_animating(now)
     }
 
     /// Put the message back where it belongs, immediately.
     pub fn settle_wiggle(&mut self) {
-        self.wiggle_since = None;
+        self.wiggle.settle();
     }
 
     /// Finish the caps ease now, wherever it had got to.
@@ -1499,73 +1462,6 @@ impl LockScreen {
 
 #[cfg(test)]
 mod tests {
-    /// The wiggle is one continuous path, and it starts and ends at rest.
-    ///
-    /// It is six separate eases stitched together, which is exactly the shape that hides a bug at
-    /// the seams: an off-by-one in the leg index, or getting `autoReverse`'s direction backwards,
-    /// leaves the curve *plausible* — still 6 px, still 390 ms — while teleporting 12 px between
-    /// two frames. That reads as a stutter rather than as a wrong animation, so it is pinned by
-    /// continuity rather than by sampled positions.
-    #[test]
-    fn the_wiggle_never_jumps() {
-        let mut ls = super::LockScreen::default();
-        let t0 = std::time::Duration::from_secs(10);
-        ls.start_wiggle(t0);
-
-        // One physical frame at 120 Hz. The largest step a *linear* leg can take is one leg's full
-        // 12 px travel over its 65 ms, so anything beyond that with room to spare is a seam.
-        let step = std::time::Duration::from_micros(8333);
-        let leg_speed = 2. * super::WIGGLE_OFFSET / super::WIGGLE_LEG.as_secs_f64();
-        let budget = leg_speed * step.as_secs_f64() * 1.5;
-
-        let mut now = t0;
-        let mut previous = ls.wiggle_offset(now);
-        assert_eq!(previous, 0., "it must start from rest");
-
-        while now < t0 + super::WIGGLE_TIME + step {
-            now += step;
-            let x = ls.wiggle_offset(now);
-            assert!(
-                (x - previous).abs() <= budget,
-                "the wiggle jumped {:.2}px at {:?}, from {previous:.2} to {x:.2}",
-                (x - previous).abs(),
-                now - t0,
-            );
-            previous = x;
-        }
-
-        // The extremes land exactly on the leg boundaries, which a frame clock will not sample —
-        // 65 ms is not a whole number of frames at any refresh rate we run at. So they are checked
-        // where they are, rather than by watching a sweep go past them.
-        let leg_end = |n: u32| ls.wiggle_offset(t0 + super::WIGGLE_LEG * n);
-        assert_eq!(leg_end(1), -super::WIGGLE_OFFSET, "the accelerate leg");
-        // ...then the wave, alternating, one boundary per leg.
-        for n in 1..=super::WIGGLE_LEGS {
-            let want = if n % 2 == 0 {
-                super::WIGGLE_OFFSET
-            } else {
-                -super::WIGGLE_OFFSET
-            };
-            assert_eq!(leg_end(n), want, "leg {n} does not alternate");
-        }
-        // The wave ends on a returning leg, so the decelerate always unwinds from the same side —
-        // get that backwards and the message ends up parked 6 px off-centre.
-        assert_eq!(
-            leg_end(super::WIGGLE_LEGS + 1),
-            -super::WIGGLE_OFFSET,
-            "the decelerate leg must start where the wave left off"
-        );
-        // ...and it is back at rest at the end, rather than parked off-centre.
-        assert_eq!(ls.wiggle_offset(t0 + super::WIGGLE_TIME), 0.);
-        assert_eq!(ls.wiggle_offset(t0 + super::WIGGLE_TIME * 2), 0.);
-        assert!(!ls.wiggle_is_animating(t0 + super::WIGGLE_TIME));
-
-        // Nothing moves when nothing asked it to.
-        let at_rest = super::LockScreen::default();
-        assert_eq!(at_rest.wiggle_offset(now), 0.);
-        assert!(!at_rest.wiggle_is_animating(now));
-    }
-
     /// The message is displaced, and nothing else is.
     ///
     /// GNOME wiggles `this._message` alone (`authPrompt.js:489`). Shaking the avatar and the name

@@ -17,6 +17,7 @@
 //! [`paragraph_spans`](Painter::paragraph_spans), [`fill_rect_px`](Painter::fill_rect_px)).
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use ordered_float::NotNan;
@@ -524,6 +525,83 @@ impl Avatar {
             logical.w / 2.,
             smithay::utils::Scale::from(scale),
         ))
+    }
+}
+
+/// GNOME's `wiggle()` (`misc/animationUtils.js:41-73`) — the shake that says "no".
+///
+/// **6 px, 65 ms a leg, 3 wiggles** at every call site so far (`authPrompt.js:489`,
+/// `polkitAgent.js:268`), so those are the defaults rather than parameters.
+///
+/// The shape is three eases, not one: accelerate out to `-offset`, then a *linear* triangle wave
+/// between the extremes, then decelerate back to rest. Clutter's `repeat_count` is a count of
+/// **repeats**, so `wiggleCount: 3` runs the middle leg four times, and `autoReverse` flips each
+/// run — which is what makes it a wave rather than a saw, and why it ends back at `-offset` for the
+/// deceleration to unwind. Six legs of 65 ms: 390 ms in total.
+///
+/// Whatever it shakes must be its **own** render element. A translation baked into a texture
+/// re-rasterises that texture every frame for the whole 390 ms; see the lock screen's message,
+/// which was moved out of its column bake for exactly this.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Wiggle {
+    /// When the current shake started. `None` is at rest.
+    since: Option<Duration>,
+}
+
+impl Wiggle {
+    pub const OFFSET: f64 = 6.;
+    pub const LEG: Duration = Duration::from_millis(65);
+    pub const COUNT: u32 = 3;
+    /// Legs in the middle phase — see the type docs on why it is `count + 1`.
+    pub const LEGS: u32 = Self::COUNT + 1;
+    /// The whole animation: one leg out, [`Self::LEGS`] across, one leg back.
+    pub const TIME: Duration =
+        Duration::from_millis(Self::LEG.as_millis() as u64 * (Self::LEGS as u64 + 2));
+
+    pub fn start(&mut self, now: Duration) {
+        self.since = Some(now);
+    }
+
+    /// Put whatever is shaking back where it belongs, immediately.
+    pub fn settle(&mut self) {
+        self.since = None;
+    }
+
+    /// Whether it still owes frames.
+    pub fn is_animating(&self, now: Duration) -> bool {
+        self.since
+            .is_some_and(|since| now.saturating_sub(since) < Self::TIME)
+    }
+
+    /// How far the element is displaced, in logical pixels. 0 at rest.
+    pub fn offset(&self, now: Duration) -> f64 {
+        let Some(since) = self.since else {
+            return 0.;
+        };
+        let leg = Self::LEG.as_secs_f64();
+        let elapsed = now.saturating_sub(since).as_secs_f64();
+        // Which leg we are on, and how far through it.
+        let index = (elapsed / leg).floor();
+        let t = (elapsed / leg - index).clamp(0., 1.);
+        let index = index as u32;
+
+        match index {
+            // Accelerate out to `-offset`.
+            0 => -Self::OFFSET * crate::animation::Curve::EaseOutQuad.y(t),
+            // The wave. Even legs run `-offset` → `+offset`, odd ones back, which is what
+            // `autoReverse` does to a repeating transition.
+            i if i <= Self::LEGS => {
+                let up = (i - 1) % 2 == 0;
+                let t = if up { t } else { 1. - t };
+                -Self::OFFSET + 2. * Self::OFFSET * t
+            }
+            // Decelerate from `-offset` back to rest. The wave ends on an odd (returning) leg, so
+            // this always starts from the same side.
+            i if i == Self::LEGS + 1 => {
+                -Self::OFFSET * (1. - crate::animation::Curve::EaseInQuad.y(t))
+            }
+            _ => 0.,
+        }
     }
 }
 
@@ -3197,6 +3275,73 @@ mod tests {
             Revision::new().of("one").of("two").done(),
             "`each` must be the same as folding the items by hand"
         );
+    }
+
+    /// The wiggle is one continuous path, and it starts and ends at rest.
+    ///
+    /// It is six separate eases stitched together, which is exactly the shape that hides a bug at
+    /// the seams: an off-by-one in the leg index, or getting `autoReverse`'s direction backwards,
+    /// leaves the curve *plausible* — still 6 px, still 390 ms — while teleporting 12 px between
+    /// two frames. That reads as a stutter rather than as a wrong animation, so it is pinned by
+    /// continuity rather than by sampled positions.
+    #[test]
+    fn the_wiggle_never_jumps() {
+        let mut w = super::Wiggle::default();
+        let t0 = std::time::Duration::from_secs(10);
+        w.start(t0);
+
+        // One physical frame at 120 Hz. The largest step a *linear* leg can take is one leg's full
+        // 12 px travel over its 65 ms, so anything beyond that with room to spare is a seam.
+        let step = std::time::Duration::from_micros(8333);
+        let leg_speed = 2. * super::Wiggle::OFFSET / super::Wiggle::LEG.as_secs_f64();
+        let budget = leg_speed * step.as_secs_f64() * 1.5;
+
+        let mut now = t0;
+        let mut previous = w.offset(now);
+        assert_eq!(previous, 0., "it must start from rest");
+
+        while now < t0 + super::Wiggle::TIME + step {
+            now += step;
+            let x = w.offset(now);
+            assert!(
+                (x - previous).abs() <= budget,
+                "the wiggle jumped {:.2}px at {:?}, from {previous:.2} to {x:.2}",
+                (x - previous).abs(),
+                now - t0,
+            );
+            previous = x;
+        }
+
+        // The extremes land exactly on the leg boundaries, which a frame clock will not sample —
+        // 65 ms is not a whole number of frames at any refresh rate we run at. So they are checked
+        // where they are, rather than by watching a sweep go past them.
+        let leg_end = |n: u32| w.offset(t0 + super::Wiggle::LEG * n);
+        assert_eq!(leg_end(1), -super::Wiggle::OFFSET, "the accelerate leg");
+        // ...then the wave, alternating, one boundary per leg.
+        for n in 1..=super::Wiggle::LEGS {
+            let want = if n % 2 == 0 {
+                super::Wiggle::OFFSET
+            } else {
+                -super::Wiggle::OFFSET
+            };
+            assert_eq!(leg_end(n), want, "leg {n} does not alternate");
+        }
+        // The wave ends on a returning leg, so the decelerate always unwinds from the same side —
+        // get that backwards and the message ends up parked 6 px off-centre.
+        assert_eq!(
+            leg_end(super::Wiggle::LEGS + 1),
+            -super::Wiggle::OFFSET,
+            "the decelerate leg must start where the wave left off"
+        );
+        // ...and it is back at rest at the end, rather than parked off-centre.
+        assert_eq!(w.offset(t0 + super::Wiggle::TIME), 0.);
+        assert_eq!(w.offset(t0 + super::Wiggle::TIME * 2), 0.);
+        assert!(!w.is_animating(t0 + super::Wiggle::TIME));
+
+        // Nothing moves when nothing asked it to.
+        let at_rest = super::Wiggle::default();
+        assert_eq!(at_rest.offset(now), 0.);
+        assert!(!at_rest.is_animating(now));
     }
 
     const ACCENT: [f32; 4] = [0.21, 0.52, 0.89, 1.];
