@@ -345,6 +345,21 @@ over the error explaining a refused password. **Divergence: no timed message que
 each message for an interval and moves on, so a suppressed hint reappears; we hold one message, so
 it is dropped and returns on the reader's next `Info`.
 
+Two bugs found on the seat 2026-08-01 and fixed: the reader was armed when the *channel* opened
+rather than when the prompt came up, so a screen showing only a clock demanded a fingerprint (GNOME
+never has this — it does not build the auth prompt until `_showPrompt`, `unlockDialog.js:799-800`;
+we open the channel early on purpose, so the reader has to be held back separately). And a reader
+that declines was restarted forever: `ServiceUnavailable` now ends that service for the lock
+(`util.js:888-890`, `:920-921`), and a conversation that stops faster than a person could fail is
+counted against a small budget. The password conversation is deliberately exempt from both — it is
+the only way back in.
+
+**Divergence: dropping back to the clock leaves the reader armed.** GNOME destroys the whole auth
+prompt after the crossfade (`_maybeDestroyAuthPrompt`, `:795`) and rebuilds it, which stops the
+reader; the verifier interface has no per-service cancel, so matching that would mean cancelling the
+channel and re-beginning the password conversation. Worth doing when the re-Begin path exists (see
+the switch-user divergence above, which wants the same thing).
+
 Still open: the error wiggle (`authPrompt.js:481-493`, 3 × 65 ms, ±6 px — `animationUtils.js:87`),
 and smartcard.
 

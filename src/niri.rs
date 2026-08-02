@@ -3972,6 +3972,17 @@ impl State {
             let _ = request;
         }
 
+        // The reader is armed by the prompt coming up, never before it (`_showPrompt` →
+        // `_ensureAuthPrompt`, `unlockDialog.js:799-800`). Sent unconditionally: whether there is a
+        // reader at all, and whether it has already been started on this channel, is the verifier
+        // task's to know — it is the one holding the conversation.
+        #[cfg(feature = "dbus")]
+        if effects.start_fingerprint {
+            if let Some(tx) = self.niri.gdm_requests.as_ref() {
+                let _ = tx.send_blocking(crate::dbus::gdm::VerifierRequest::StartFingerprint);
+            }
+        }
+
         // The view's crossfade clock follows the model's page. Synced here rather than at each
         // `show_prompt`/`show_clock` call site because this is the one funnel every page change
         // already goes through, and a missed site would be a page that snaps instead of fading.

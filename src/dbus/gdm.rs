@@ -56,6 +56,8 @@
 //! connects, and that is not among them); failure is driven off the stop. This does the same, or a
 //! single refusal would begin two conversations.
 
+use std::time::{Duration, Instant};
+
 use futures_util::StreamExt;
 use zbus::proxy;
 
@@ -99,6 +101,9 @@ pub enum VerifierRequest {
     },
     /// Answer the outstanding query. **Carries a password** — see the `Debug` impl below.
     Answer(String),
+    /// The prompt page came up: start `gdm-fingerprint` beside the password conversation, if there
+    /// is a reader and it is not already running.
+    StartFingerprint,
     /// Tear the conversation down: the shield was raised, or the user cancelled.
     Cancel,
 }
@@ -119,6 +124,7 @@ impl std::fmt::Debug for VerifierRequest {
                 .field("reader", reader)
                 .finish(),
             Self::Answer(answer) => write!(f, "Answer(<redacted, {} chars>)", answer.len()),
+            Self::StartFingerprint => write!(f, "StartFingerprint"),
             Self::Cancel => write!(f, "Cancel"),
         }
     }
@@ -224,6 +230,15 @@ async fn run(
                 }
             }
 
+            // The prompt came up. Start the reader now, not when the channel was opened: until
+            // this moment the screen was showing a clock, and an armed sensor asks for a finger.
+            VerifierRequest::StartFingerprint => {
+                let Some(open) = session.as_mut() else {
+                    continue;
+                };
+                open.start_fingerprint().await;
+            }
+
             VerifierRequest::Answer(answer) => {
                 let Some(open) = session.as_ref() else {
                     warn!("gdm: an answer arrived with no conversation open");
@@ -246,6 +261,11 @@ async fn run(
 /// One open reauthentication channel.
 struct Session {
     conn: zbus::Connection,
+    username: String,
+    reader: crate::dbus::fprintd::ReaderType,
+    /// Whether `gdm-fingerprint` has been begun on this channel. gdm errors on a service that is
+    /// already running, and the prompt page can be raised more than once per lock.
+    fingerprint_started: bool,
     /// The signal pump, **held rather than detached** so it can be stopped. A detached pump owns a
     /// `MessageStream`, which owns the connection — so dropping the session would neither close
     /// the socket nor stop the forwarding, and the orphan would go on emitting into the
@@ -294,17 +314,32 @@ impl Session {
             .await
             .context("BeginVerificationForUser")?;
 
-        // The reader runs *beside* the password, on the same channel, and only if there is one
-        // (`_beginVerification` → `_maybeStartFingerprintVerification`, `util.js:710-719`). A
-        // failure here is not a failure of the lock: the password conversation is already up, and
-        // the shield must not stay unlocked because a sensor would not start.
-        if reader.is_present() {
-            if let Err(err) = begin(&conn, FINGERPRINT_SERVICE, username).await {
-                warn!("gdm: could not start fingerprint verification: {err:?}");
-            }
-        }
+        // The reader is **not** started here. It runs beside the password conversation
+        // (`_maybeStartFingerprintVerification`, `util.js:714-719`) but only once the prompt is
+        // actually up — see [`VerifierRequest::StartFingerprint`] and `UnlockDialog::show_prompt`.
+        Ok(Self {
+            conn,
+            pump,
+            username: username.to_owned(),
+            reader,
+            fingerprint_started: false,
+        })
+    }
 
-        Ok(Self { conn, pump })
+    /// Start `gdm-fingerprint`, once.
+    ///
+    /// Idempotent because the page can be raised and dropped repeatedly, and gdm errors on a
+    /// service that is already running. A failure is not a failure of the lock — the password
+    /// conversation is already up, and the shield must not become unanswerable because a sensor
+    /// would not start.
+    async fn start_fingerprint(&mut self) {
+        if !self.reader.is_present() || self.fingerprint_started {
+            return;
+        }
+        self.fingerprint_started = true;
+        if let Err(err) = begin(&self.conn, FINGERPRINT_SERVICE, &self.username).await {
+            warn!("gdm: could not start fingerprint verification: {err:?}");
+        }
     }
 
     async fn answer(&self, answer: &str) -> zbus::Result<()> {
@@ -364,6 +399,11 @@ async fn pump_signals(
     username: String,
     reader: crate::dbus::fprintd::ReaderType,
 ) {
+    let mut fingerprint = FingerprintState::default();
+    // When the reader's conversation last started. `None` until it has been started at all, which
+    // is why an unarmed reader can never look like one that stopped immediately.
+    let mut fingerprint_began: Option<Instant> = None;
+
     while let Some(Ok(msg)) = stream.next().await {
         let header = msg.header();
         if header.message_type() != zbus::message::Type::Signal
@@ -399,14 +439,45 @@ async fn pump_signals(
             .ok()
             .map(|(_, v)| v);
 
-        let event = match route(&member, service.as_deref(), text, reader) {
+        // gdm announces each conversation starting (`_onConversationStarted`, `util.js:901`). That
+        // is the only place the reader's clock can be started from: the *first* start is issued by
+        // the session when the prompt comes up, not by this loop, so without this a reader that
+        // stops immediately the very first time would look like one that had never run.
+        if member == "ConversationStarted" && service.as_deref() == Some(FINGERPRINT_SERVICE) {
+            fingerprint_began = Some(Instant::now());
+        }
+
+        // How long the reader's conversation lasted, which `route` cannot know: it sees one signal
+        // at a time and has no clock.
+        fingerprint.stopped_immediately =
+            fingerprint_began.is_some_and(|began| began.elapsed() < FINGERPRINT_MIN_ALIVE);
+
+        let event = match route(&member, service.as_deref(), text, reader, fingerprint) {
             Routed::Ignore => continue,
             Routed::Event(event) => Some(event),
+
+            Routed::GiveUp { service, event } => {
+                if service == FINGERPRINT_SERVICE {
+                    fingerprint.unavailable = true;
+                    debug!("gdm: not offering the fingerprint reader again for this lock");
+                }
+                event
+            }
 
             // The conversation ended without accepting. gdm will not re-ask, so start another one
             // here — this is `_retry` (`util.js:866`). Without it, one wrong password leaves a lock
             // screen that can never be answered again.
             Routed::Restart { service, event } => {
+                if service == FINGERPRINT_SERVICE {
+                    fingerprint.immediate_stops = if fingerprint.stopped_immediately {
+                        fingerprint.immediate_stops + 1
+                    } else {
+                        // A conversation that lasted long enough to be a person clears the count:
+                        // the budget is for a service that will not run, not a user having a bad
+                        // day with the sensor.
+                        0
+                    };
+                }
                 if let Err(err) = begin(&conn, service, &username).await {
                     warn!("gdm: could not restart {service} after a refusal: {err:?}");
                     // Only the password service dying is fatal to the lock: without it there is no
@@ -415,7 +486,11 @@ async fn pump_signals(
                         let _ = to_niri.send(VerifierEvent::Lost);
                         break;
                     }
+                    fingerprint.unavailable = true;
                     continue;
+                }
+                if service == FINGERPRINT_SERVICE {
+                    fingerprint_began = Some(Instant::now());
                 }
                 event
             }
@@ -435,6 +510,33 @@ async fn pump_signals(
     let _ = to_niri.send(VerifierEvent::Lost);
 }
 
+/// How long a fingerprint conversation must survive for its ending to be a *person* failing to
+/// scan.
+///
+/// pam_fprintd lets the user retry several times before it gives up, so a `ConversationStopped`
+/// normally arrives many seconds in. One that comes back straight away is the service declining —
+/// the reader was cancelled, unplugged, or has no enrolled prints — and restarting it just spins,
+/// re-arming the sensor as fast as it can refuse.
+const FINGERPRINT_MIN_ALIVE: Duration = Duration::from_millis(500);
+
+/// How many immediate stops before the reader stops being offered for this lock.
+///
+/// More than one because the first can be a race with the channel coming up; small because each one
+/// is a round trip and a sensor blinking at somebody who is trying to type.
+const FINGERPRINT_MAX_IMMEDIATE_STOPS: u32 = 3;
+
+/// What the pump knows about the reader's conversation that a single signal cannot say.
+#[derive(Debug, Clone, Copy, Default)]
+struct FingerprintState {
+    /// Consecutive stops that came back faster than a person could fail.
+    immediate_stops: u32,
+    /// It reported `ServiceUnavailable`, so it is not coming back (`_unavailableServices`,
+    /// `util.js:888-890`, and the early return in `_onConversationStopped`, `:920-921`).
+    unavailable: bool,
+    /// Whether the last stop was an immediate one, filled in by the pump from its own clock.
+    stopped_immediately: bool,
+}
+
 /// What a verifier signal means, decided without touching the connection.
 ///
 /// Split out of the pump because this is where every policy decision in the port lives — which
@@ -452,6 +554,12 @@ enum Routed {
         service: &'static str,
         event: Option<VerifierEvent>,
     },
+    /// This service is finished for the rest of this lock: do **not** re-begin it. Emit `event` if
+    /// there is one.
+    GiveUp {
+        service: &'static str,
+        event: Option<VerifierEvent>,
+    },
 }
 
 fn route(
@@ -459,6 +567,7 @@ fn route(
     service: Option<&str>,
     text: Option<String>,
     reader: crate::dbus::fprintd::ReaderType,
+    fingerprint: FingerprintState,
 ) -> Routed {
     // `Reset` is the one signal that does not name a service.
     if member == "Reset" {
@@ -499,12 +608,29 @@ fn route(
         // towards `allowed-failures`, which on the unlock screen is moot — `_canRetry` is
         // unconditionally true when `_reauthOnly` (`:839-842`), and that is always our case, so the
         // fingerprint conversation is never failed from this side.
-        "Problem" | "ServiceUnavailable" => match text {
+        "Problem" => match text {
             Some(text) => Routed::Event(VerifierEvent::ShowMessage {
                 text,
                 kind: MessageKind::Error,
             }),
             None => Routed::Ignore,
+        },
+
+        // `ServiceUnavailable` is a service saying it cannot run *at all*, which is different from
+        // one refusing an attempt. GNOME remembers it and never retries that service
+        // (`_onServiceUnavailable`, `util.js:888-890`; the early return in
+        // `_onConversationStopped`, `:920-921`) — the stop that follows would otherwise restart it
+        // straight into the same refusal.
+        "ServiceUnavailable" => Routed::GiveUp {
+            service: if is_fingerprint {
+                FINGERPRINT_SERVICE
+            } else {
+                PASSWORD_SERVICE
+            },
+            event: text.map(|text| VerifierEvent::ShowMessage {
+                text,
+                kind: MessageKind::Error,
+            }),
         },
 
         // Questions only ever come from the foreground service (`_onInfoQuery`, `:790-795`).
@@ -540,10 +666,28 @@ fn route(
         // A `Failed` goes with the password stopping and not with the reader's: it clears the entry
         // and drops the question, which is right when the answer was refused and wrong when the
         // sensor timed out beside a user who is still typing.
-        "ConversationStopped" if is_fingerprint => Routed::Restart {
-            service: FINGERPRINT_SERVICE,
-            event: None,
-        },
+        //
+        // And the reader is given up on rather than restarted once it stops answering: a
+        // conversation that ends the moment it starts is not somebody failing to scan, and
+        // re-beginning it is a spin that re-arms the sensor as fast as it can decline. The password
+        // conversation is deliberately not treated this way — it is the only way back in, so it is
+        // retried whatever it does.
+        "ConversationStopped" if is_fingerprint => {
+            if fingerprint.unavailable
+                || (fingerprint.stopped_immediately
+                    && fingerprint.immediate_stops + 1 >= FINGERPRINT_MAX_IMMEDIATE_STOPS)
+            {
+                Routed::GiveUp {
+                    service: FINGERPRINT_SERVICE,
+                    event: None,
+                }
+            } else {
+                Routed::Restart {
+                    service: FINGERPRINT_SERVICE,
+                    event: None,
+                }
+            }
+        }
         "ConversationStopped" => Routed::Restart {
             service: PASSWORD_SERVICE,
             event: Some(VerifierEvent::Failed),
@@ -557,6 +701,11 @@ fn route(
 mod tests {
     use super::*;
     use crate::dbus::fprintd::ReaderType;
+
+    /// A reader that is running normally: nothing given up on, nothing stopping early.
+    fn healthy() -> FingerprintState {
+        FingerprintState::default()
+    }
 
     fn msg(text: &str) -> Option<String> {
         Some(text.to_owned())
@@ -579,6 +728,7 @@ mod tests {
             Some(FINGERPRINT_SERVICE),
             msg(narration),
             ReaderType::Press,
+            healthy(),
         );
         assert_eq!(
             press,
@@ -595,6 +745,7 @@ mod tests {
             Some(FINGERPRINT_SERVICE),
             msg(narration),
             ReaderType::Swipe,
+            healthy(),
         );
         assert_eq!(
             swipe,
@@ -611,7 +762,8 @@ mod tests {
                 "Info",
                 Some(PASSWORD_SERVICE),
                 msg("hello"),
-                ReaderType::Press
+                ReaderType::Press,
+                healthy()
             ),
             Routed::Event(VerifierEvent::ShowMessage {
                 text: "hello".to_owned(),
@@ -634,13 +786,20 @@ mod tests {
                     member,
                     Some(FINGERPRINT_SERVICE),
                     msg("?"),
-                    ReaderType::Press
+                    ReaderType::Press,
+                    healthy()
                 ),
                 Routed::Ignore,
                 "{member} from the reader must not reach the entry"
             );
             assert!(matches!(
-                route(member, Some(PASSWORD_SERVICE), msg("?"), ReaderType::Press),
+                route(
+                    member,
+                    Some(PASSWORD_SERVICE),
+                    msg("?"),
+                    ReaderType::Press,
+                    healthy()
+                ),
                 Routed::Event(VerifierEvent::AskQuestion { .. })
             ));
         }
@@ -651,7 +810,8 @@ mod tests {
                 "SecretInfoQuery",
                 Some(PASSWORD_SERVICE),
                 msg("Password:"),
-                ReaderType::None
+                ReaderType::None,
+                healthy()
             ),
             Routed::Event(VerifierEvent::AskQuestion {
                 question: "Password:".to_owned(),
@@ -679,7 +839,8 @@ mod tests {
                     member,
                     Some(FINGERPRINT_SERVICE),
                     msg("x"),
-                    ReaderType::None
+                    ReaderType::None,
+                    healthy()
                 ),
                 Routed::Ignore,
                 "{member} was acted on with no reader detected"
@@ -691,7 +852,8 @@ mod tests {
                 "VerificationComplete",
                 Some("gdm-smartcard"),
                 None,
-                ReaderType::Press
+                ReaderType::Press,
+                healthy()
             ),
             Routed::Ignore
         );
@@ -710,7 +872,8 @@ mod tests {
                 "ConversationStopped",
                 Some(PASSWORD_SERVICE),
                 None,
-                ReaderType::Press
+                ReaderType::Press,
+                healthy()
             ),
             Routed::Restart {
                 service: PASSWORD_SERVICE,
@@ -722,7 +885,8 @@ mod tests {
                 "ConversationStopped",
                 Some(FINGERPRINT_SERVICE),
                 None,
-                ReaderType::Press
+                ReaderType::Press,
+                healthy()
             ),
             Routed::Restart {
                 service: FINGERPRINT_SERVICE,
@@ -741,13 +905,20 @@ mod tests {
                     "VerificationComplete",
                     Some(service),
                     None,
-                    ReaderType::Press
+                    ReaderType::Press,
+                    healthy()
                 ),
                 Routed::Event(VerifierEvent::Complete),
                 "{service} must be able to unlock"
             );
             assert_eq!(
-                route("Problem", Some(service), msg("no good"), ReaderType::Press),
+                route(
+                    "Problem",
+                    Some(service),
+                    msg("no good"),
+                    ReaderType::Press,
+                    healthy()
+                ),
                 Routed::Event(VerifierEvent::ShowMessage {
                     text: "no good".to_owned(),
                     kind: MessageKind::Error,
@@ -755,5 +926,125 @@ mod tests {
                 "{service}'s Problem must be shown"
             );
         }
+    }
+
+    /// A reader that will not run is given up on, instead of being restarted forever.
+    ///
+    /// pam_fprintd lets a person retry several times before the conversation ends, so a stop
+    /// normally arrives seconds in. One that comes back immediately means the service is declining
+    /// — cancelled, unplugged, nothing enrolled — and restarting it re-arms the sensor as fast as
+    /// it can refuse. Live on a real reader that was a permanent loop, with the sensor asking
+    /// for a finger over and over at somebody trying to type their password.
+    #[test]
+    fn a_reader_that_keeps_declining_is_given_up_on() {
+        let stop = |fp| {
+            route(
+                "ConversationStopped",
+                Some(FINGERPRINT_SERVICE),
+                None,
+                ReaderType::Press,
+                fp,
+            )
+        };
+        let restart = Routed::Restart {
+            service: FINGERPRINT_SERVICE,
+            event: None,
+        };
+        let give_up = Routed::GiveUp {
+            service: FINGERPRINT_SERVICE,
+            event: None,
+        };
+
+        // A stop after a conversation that lasted: somebody failed to scan. Keep offering it.
+        let mut fp = FingerprintState::default();
+        assert_eq!(
+            stop(fp),
+            restart,
+            "a real failed scan must not disable the reader"
+        );
+
+        // Stops that come back instantly: counted, and given up on at the budget.
+        fp.stopped_immediately = true;
+        for n in 0..FINGERPRINT_MAX_IMMEDIATE_STOPS - 1 {
+            fp.immediate_stops = n;
+            assert_eq!(stop(fp), restart, "gave up after only {n} immediate stops");
+        }
+        fp.immediate_stops = FINGERPRINT_MAX_IMMEDIATE_STOPS - 1;
+        assert_eq!(stop(fp), give_up, "the reader was restarted forever");
+
+        // A conversation that lasted resets the count — the budget is for a service that will not
+        // run, not for a person having a bad day with the sensor.
+        fp.stopped_immediately = false;
+        assert_eq!(stop(fp), restart);
+    }
+
+    /// `ServiceUnavailable` ends that service for the lock, and its message is still shown.
+    ///
+    /// It is a service saying it cannot run at all, as opposed to refusing one attempt — GNOME
+    /// remembers it and the stop that follows is not retried (`util.js:888-890`, `:920-921`).
+    /// Restarting into the same refusal is the loop this exists to prevent.
+    #[test]
+    fn an_unavailable_service_is_not_started_again() {
+        assert_eq!(
+            route(
+                "ServiceUnavailable",
+                Some(FINGERPRINT_SERVICE),
+                msg("no such device"),
+                ReaderType::Press,
+                healthy(),
+            ),
+            Routed::GiveUp {
+                service: FINGERPRINT_SERVICE,
+                event: Some(VerifierEvent::ShowMessage {
+                    text: "no such device".to_owned(),
+                    kind: MessageKind::Error,
+                }),
+            }
+        );
+
+        // ...and once marked, even a slow stop does not bring it back.
+        let fp = FingerprintState {
+            unavailable: true,
+            ..FingerprintState::default()
+        };
+        assert_eq!(
+            route(
+                "ConversationStopped",
+                Some(FINGERPRINT_SERVICE),
+                None,
+                ReaderType::Press,
+                fp,
+            ),
+            Routed::GiveUp {
+                service: FINGERPRINT_SERVICE,
+                event: None,
+            }
+        );
+    }
+
+    /// The password conversation is retried whatever it does — it is the only way back in.
+    ///
+    /// The give-up rules are deliberately for the reader alone. A password service that stopped
+    /// immediately and was given up on would leave a lock screen with nothing left to answer.
+    #[test]
+    fn the_password_conversation_is_never_given_up_on() {
+        let fp = FingerprintState {
+            immediate_stops: 99,
+            stopped_immediately: true,
+            unavailable: true,
+        };
+        assert_eq!(
+            route(
+                "ConversationStopped",
+                Some(PASSWORD_SERVICE),
+                None,
+                ReaderType::Press,
+                fp,
+            ),
+            Routed::Restart {
+                service: PASSWORD_SERVICE,
+                event: Some(VerifierEvent::Failed),
+            }
+        );
     }
 }

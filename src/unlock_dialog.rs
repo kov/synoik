@@ -82,6 +82,12 @@ pub struct UnlockEffects {
     pub unlock: bool,
     /// Something visible changed.
     pub redraw: bool,
+    /// The prompt page has just come up, so the fingerprint reader may start listening.
+    ///
+    /// Separate from `request` because it is not a conversation the *user* drove: it rides the
+    /// page transition, and it is a transition rather than a state because starting a service
+    /// twice is an error.
+    pub start_fingerprint: bool,
 }
 
 impl UnlockEffects {
@@ -262,7 +268,15 @@ impl UnlockDialog {
             return UnlockEffects::default();
         }
         self.page = Page::Prompt;
-        UnlockEffects::redraw()
+        // **The reader only listens while the prompt is up** (`_showPrompt` → `_ensureAuthPrompt`,
+        // `unlockDialog.js:799-800`; GNOME builds the whole auth prompt here and not before). It is
+        // not merely wasted work to start it earlier: the sensor lights up and asks for a finger,
+        // so a screen showing nothing but a clock was demanding a fingerprint for a prompt the user
+        // had not asked for.
+        UnlockEffects {
+            start_fingerprint: true,
+            ..UnlockEffects::redraw()
+        }
     }
 
     /// Back to the clock (`_showClock` / `_escape`). Drops whatever was typed.
@@ -321,6 +335,7 @@ impl UnlockDialog {
             request: Some(VerifierRequest::Answer(answer)),
             unlock: false,
             redraw: true,
+            start_fingerprint: false,
         }
     }
 
@@ -414,6 +429,7 @@ impl UnlockDialog {
                     request: None,
                     unlock: true,
                     redraw: true,
+                    start_fingerprint: false,
                 }
             }
 
@@ -852,5 +868,43 @@ mod tests {
         d.on_verifier_event(VerifierEvent::Reset);
         d.on_verifier_event(hint());
         assert_eq!(d.message().map(|m| m.kind), Some(MessageKind::Hint));
+    }
+
+    /// The reader is armed by the prompt coming up, and by nothing else.
+    ///
+    /// This is not an optimisation. An armed sensor **asks for a finger** — it lights up, and on
+    /// hardware backed by a platform authenticator it puts a prompt in front of the user. Starting
+    /// it with the channel meant a screen showing nothing but a clock was demanding a fingerprint
+    /// for a prompt nobody had asked for. GNOME never has the problem because it does not build the
+    /// auth prompt at all until `_showPrompt` (`unlockDialog.js:799-800`); we open the channel
+    /// early on purpose, so the reader has to be held back separately.
+    #[test]
+    fn the_reader_is_armed_by_the_prompt_and_not_by_the_lock() {
+        let mut d = dialog();
+
+        // A conversation beginning, a question arriving, a message: none of these is the prompt
+        // being shown, and none of them may arm the reader.
+        assert!(!d.on_verifier_event(VerifierEvent::Reset).start_fingerprint);
+        assert!(
+            !d.on_verifier_event(VerifierEvent::AskQuestion {
+                question: "Password:".to_owned(),
+                secret: true,
+            })
+            .start_fingerprint,
+            "a question arriving while the clock is up must not arm the reader"
+        );
+        assert_eq!(d.page(), Page::Clock, "and none of that raised the prompt");
+
+        // Raising the prompt does.
+        assert!(d.show_prompt(T0).start_fingerprint);
+        assert_eq!(d.page(), Page::Prompt);
+
+        // Raising it again while it is already up is not a transition, so there is nothing to arm.
+        assert!(!d.show_prompt(T0).start_fingerprint);
+
+        // Back to the clock and up again: armed once more. The verifier task makes this idempotent
+        // — gdm errors on a service that is already running — but the *page* has genuinely changed.
+        d.show_clock();
+        assert!(d.show_prompt(T0).start_fingerprint);
     }
 }
