@@ -28,6 +28,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
 use crate::animation::Curve;
+use crate::image_source::ImageSource;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::widget::{self, style, HAlign, Painter, Rgba, ShapedText, TextShaper, TextStyle};
@@ -296,9 +297,11 @@ const PROMPT_SPACING: f64 = 9.;
 /// `.user-widget.vertical` `spacing: $base_padding * 4` (`:378`).
 const USER_SPACING: f64 = 24.;
 /// `.user-icon` at `icon-size: $base_icon_size * 10` in the vertical widget (`:388`).
-const AVATAR_PX: f64 = 160.;
+pub const AVATAR_PX: f64 = 160.;
 /// Its `StIcon { padding: $base_padding * 5 }` (`:391`) — the inset of the fallback glyph.
 const AVATAR_ICON_PAD: f64 = 30.;
+/// The upload slot the account picture lives in. There is only ever one avatar on this page.
+const AVATAR_SLOT: u64 = 0;
 /// `.user-icon`'s fill under the lock screen: `transparentize($_gdm_fg, .87)` (`:356`).
 const AVATAR_BG: Rgba = [1., 1., 1., 0.13];
 /// `.user-widget.vertical .user-widget-label` — 20pt, weight 400 (`:380-385`).
@@ -341,6 +344,10 @@ pub struct PromptContent {
     /// (`st-password-entry.c:174-184`). `Some(true)` means the password is currently visible, so
     /// the glyph is `view-conceal-symbolic`.
     pub peek: Option<bool>,
+    /// The account's picture, if AccountsService gave us one that is still on disk
+    /// (`UserAccount::icon_file`). `None` draws the themed `avatar-default-symbolic`, which is
+    /// also what shows while the decode is still in flight.
+    pub avatar: Option<ImageSource>,
 }
 
 /// Where a page is being drawn, and when.
@@ -529,6 +536,29 @@ pub struct LockScreen {
     /// column's bake is what lets its alpha animate on the *element* instead of in the bake key,
     /// which would re-rasterise the whole column every frame ([[animation-per-frame-bake]]).
     caps_cache: RefCell<widget::BakeCache>,
+    /// The avatar's inset ring — constant content, so one bake for the life of the process, and
+    /// only drawn when there is a picture under it (see [`widget::Avatar`]).
+    ring_cache: RefCell<widget::BakeCache>,
+    /// The uploaded avatar picture. One slot, pruned to the current source on each draw: an avatar
+    /// the user has replaced is a texture nothing will ask for again.
+    avatar_uploads: RefCell<widget::ImageUploads>,
+}
+
+/// One drawable of the prompt page.
+///
+/// The page is nearly all baked chrome, but the avatar is a *photo clipped to a circle*, which is
+/// the rounded-texture pipeline rather than a bake — so the page's elements are no longer all one
+/// type. Both variants already have a home in the output's element enum.
+#[derive(Debug)]
+pub enum PromptElement {
+    Texture(TextureRenderElement<VkTexture>),
+    Rounded(crate::render_helpers::rounded_texture::RoundedTextureRenderElement<VkTexture>),
+}
+
+impl From<TextureRenderElement<VkTexture>> for PromptElement {
+    fn from(e: TextureRenderElement<VkTexture>) -> Self {
+        Self::Texture(e)
+    }
 }
 
 impl LockScreen {
@@ -782,17 +812,18 @@ impl LockScreen {
 
     /// The prompt page: avatar, name, entry, message. Front-to-back like every other `render`.
     ///
-    /// Two bakes rather than one, plus the avatar's icon element: the entry re-bakes on every
-    /// keystroke and the rest of the column does not, so folding them together would re-draw a
-    /// 160px avatar per character typed.
+    /// Two bakes rather than one, plus the avatar: the entry re-bakes on every keystroke and the
+    /// rest of the column does not, so folding them together would re-draw a 160px avatar plate per
+    /// character typed.
     pub fn render_prompt(
         &self,
         renderer: &mut VulkanRenderer,
         icons: &crate::render_helpers::icon::IconCache,
+        images: &crate::render_helpers::icon::ImageCache,
         ctx: PageCtx,
         content: &PromptContent,
         t: PageTransform,
-    ) -> Vec<TextureRenderElement<VkTexture>> {
+    ) -> Vec<PromptElement> {
         let PageCtx {
             scale,
             monitor,
@@ -822,7 +853,7 @@ impl LockScreen {
             origin.y + block_h / 2.,
         ));
 
-        let mut elements = Vec::new();
+        let mut elements: Vec<PromptElement> = Vec::new();
 
         // --- The entry pill, first (topmost is first). ---
         let entry_rev = widget::Revision::new()
@@ -843,14 +874,9 @@ impl LockScreen {
             content.peek.is_some(),
             entry_rev,
         ) {
-            Ok(texture) => elements.push(Self::element(
-                renderer,
-                texture,
-                scale,
-                origin + l.entry.loc,
-                t,
-                centre,
-            )),
+            Ok(texture) => elements.push(
+                Self::element(renderer, texture, scale, origin + l.entry.loc, t, centre).into(),
+            ),
             Err(err) => tracing::error!("error drawing the unlock entry: {err:#}"),
         }
 
@@ -889,14 +915,10 @@ impl LockScreen {
                 Ok(texture) => {
                     let mut faded = t;
                     faded.alpha *= caps_alpha;
-                    elements.push(Self::element(
-                        renderer,
-                        texture,
-                        scale,
-                        origin + l.caps.loc,
-                        faded,
-                        centre,
-                    ));
+                    elements.push(
+                        Self::element(renderer, texture, scale, origin + l.caps.loc, faded, centre)
+                            .into(),
+                    );
                 }
                 Err(err) => tracing::error!("error drawing the caps-lock warning: {err:#}"),
             }
@@ -929,15 +951,62 @@ impl LockScreen {
                 t.place(origin + entry_layout.secondary_icon.to_f64(), centre) - origin,
                 t.alpha as f32,
             ) {
-                elements.push(el);
+                elements.push(el.into());
             }
         }
 
-        // --- The avatar's fallback glyph, over its plate. ---
+        // --- The avatar: picture + ring, or the themed glyph. ---
         //
-        // AccountsService's per-user icon file is not read yet, so everyone gets the themed
-        // fallback; wiring the real picture is additive and does not move anything here.
-        if let Some(el) = widget::icon_element_scaled(
+        // `Avatar.update()` is one branch or the other (`userWidget.js:78-92`): with a picture it
+        // sets the `background-image` and adds `.user-avatar` (hence the ring); without one it
+        // drops the style and puts an `avatar-default-symbolic` StIcon inside instead. Drawing both
+        // would be a glyph showing through a photograph.
+        let avatar_centre = t.place(
+            origin
+                + Point::from((
+                    l.avatar.loc.x + l.avatar.size.w / 2.,
+                    l.avatar.loc.y + l.avatar.size.h / 2.,
+                )),
+            centre,
+        ) - origin;
+        let picture = content.avatar.as_ref().and_then(|source| {
+            let mut uploads = self.avatar_uploads.borrow_mut();
+            // One slot, so anything else in it is a picture the user has replaced.
+            uploads.retain(|(_, s), _| s == source);
+            widget::Avatar::element(
+                renderer,
+                &mut uploads,
+                images,
+                source,
+                AVATAR_SLOT,
+                AVATAR_PX,
+                scale,
+                t.scale,
+                origin,
+                avatar_centre,
+                t.alpha as f32,
+            )
+        });
+
+        if let Some(el) = picture {
+            // The ring goes over the picture, so it is pushed first.
+            match widget::bake_card_border(
+                renderer,
+                &mut self.ring_cache.borrow_mut(),
+                scale,
+                widget::Revision::new().px(AVATAR_PX).done(),
+                Size::from((AVATAR_PX, AVATAR_PX)),
+                AVATAR_PX / 2.,
+                widget::Avatar::RING_COLOR,
+            ) {
+                Ok(texture) => elements.push(
+                    Self::element(renderer, texture, scale, origin + l.avatar.loc, t, centre)
+                        .into(),
+                ),
+                Err(err) => tracing::error!("error drawing the avatar ring: {err:#}"),
+            }
+            elements.push(PromptElement::Rounded(el));
+        } else if let Some(el) = widget::icon_element_scaled(
             renderer,
             icons,
             &["avatar-default-symbolic"],
@@ -946,17 +1015,10 @@ impl LockScreen {
             t.scale,
             FG,
             origin,
-            t.place(
-                origin
-                    + Point::from((
-                        l.avatar.loc.x + l.avatar.size.w / 2.,
-                        l.avatar.loc.y + l.avatar.size.h / 2.,
-                    )),
-                centre,
-            ) - origin,
+            avatar_centre,
             t.alpha as f32,
         ) {
-            elements.push(el);
+            elements.push(el.into());
         }
 
         // --- The rest of the column: plate, name, message. ---
@@ -1040,7 +1102,7 @@ impl LockScreen {
         );
         match baked {
             Ok(texture) => {
-                elements.push(Self::element(renderer, texture, scale, origin, t, centre))
+                elements.push(Self::element(renderer, texture, scale, origin, t, centre).into())
             }
             Err(err) => tracing::error!("error drawing the unlock prompt: {err:#}"),
         }

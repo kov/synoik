@@ -194,7 +194,14 @@ the last bug in this area lived.
 
 ---
 
-## C. AccountsService
+## C. AccountsService — **LANDED except the Other User button**
+
+`RealName`, `IconFile` and `PasswordMode` all come from AccountsService now, and the picture draws:
+`ImageFit::Cover` in the decode, `widget::Avatar` for the circular draw, a `bake_card_border` ring,
+warmed when the account answers and again on every output add/resize (the decode is keyed on the
+scale). It shares the album-art `ImageCache`, so it also had to join that cache's `retain` — its
+only bound — or a track change would evict the picture. What is left is **C3**, the Other User
+button (`unlockDialog.js:617-628`), which needs the `MultipleUsers` value C already publishes.
 
 Replaces three divergences: the user's real name and avatar come from `/etc/passwd` + GECOS today,
 and `password_mode` is assumed to be "has a password".

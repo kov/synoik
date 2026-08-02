@@ -26,7 +26,8 @@ use smithay::utils::{Buffer as BufferCoord, Logical, Physical, Point, Rectangle,
 
 use crate::app_system::AppIconRef;
 use crate::image_source::ImageSource;
-use crate::render_helpers::icon::{AppIconCache, IconCache, ImageCache};
+use crate::render_helpers::icon::{AppIconCache, IconCache, ImageCache, ImageFit};
+use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{
     premultiply, GlyphRun, VkTexture, VulkanFrame, VulkanRenderer, NATIVE_FOURCC,
@@ -349,7 +350,7 @@ pub fn image_element(
     let key = (slot, source.clone());
     #[allow(clippy::map_entry)]
     if !uploads.contains_key(&key) {
-        let buffer = images.buffer(source, logical_px, scale)?;
+        let buffer = images.buffer(source, ImageFit::Contain, logical_px, scale)?;
         match TextureBuffer::from_memory_buffer(renderer, &buffer) {
             Ok(tb) => {
                 uploads.insert(key.clone(), tb);
@@ -371,6 +372,100 @@ pub fn image_element(
         None,
         Kind::Unspecified,
     ))
+}
+
+/// GNOME's `.user-icon` (`_misc.scss:8-27`) — the circular user picture.
+///
+/// It is a widget rather than a lock-screen detail because `.user-icon` is one style class with
+/// several homes: the unlock dialog's 160px one, the login screen's user list, and the 64px
+/// `AVATAR_ICON_SIZE` default (`userWidget.js:11`) the system menu will want. The *size* is a
+/// per-home `icon-size` and so stays a parameter.
+///
+/// Three layers, and each caller owns its own placement of them:
+///
+/// 1. the plate — `background-color: transparentize($_gdm_fg, .87)` under the lock screen
+///    (`_login-lock.scss:358-360`), which shows through only when there is no picture;
+/// 2. the picture — [`Avatar::element`], `background-size: cover`, clipped to the circle;
+/// 3. the ring — `box-shadow: inset 0 0 0 1px transparentize($fg_color, 0.9)`, and **only when
+///    there is a picture**: the shadow is on `&.user-avatar` (`_misc.scss:20-21`), a class
+///    `Avatar.update()` adds in the same branch that sets the `background-image`
+///    (`userWidget.js:81-85`). Bake it with [`bake_card_border`] at a circular radius.
+///
+/// The fallback when there is no picture is not here: it is a plain themed
+/// `avatar-default-symbolic` [`icon_element_scaled`], inset by the caller's `StIcon` padding.
+#[derive(Debug, Clone, Copy)]
+pub struct Avatar;
+
+impl Avatar {
+    /// The inset ring's colour — `$fg_color` at 10%, i.e. [`style::BORDERS`]. Note it is **not**
+    /// re-tinted to `$_gdm_fg` under the lock screen: `_login-lock.scss:358` overrides the
+    /// background and colour only, so the shadow keeps `_misc.scss`'s value. Its width is the 1px
+    /// [`bake_card_border`] already strokes.
+    pub const RING_COLOR: Rgba = style::BORDERS;
+
+    /// The picture, clipped to a circle, centred at `center` (relative to `origin`) in a
+    /// `logical_px` square. `None` when there is no picture, the load has not landed yet, or it
+    /// failed — in every one of those the caller draws the themed fallback.
+    ///
+    /// `page_scale` is the surface's own animated scale, applied through the *buffer* scale exactly
+    /// as [`icon_element_scaled`] does, so a page that scales during a crossfade never asks the
+    /// cache for a new size (a cold key draws nothing — see that function).
+    #[allow(clippy::too_many_arguments)]
+    pub fn element(
+        renderer: &mut VulkanRenderer,
+        uploads: &mut ImageUploads,
+        images: &ImageCache,
+        source: &ImageSource,
+        slot: u64,
+        logical_px: f64,
+        scale: f64,
+        page_scale: f64,
+        origin: Point<f64, Logical>,
+        center: Point<f64, Logical>,
+        alpha: f32,
+    ) -> Option<RoundedTextureRenderElement<VkTexture>> {
+        let key = (slot, source.clone());
+        #[allow(clippy::map_entry)]
+        if !uploads.contains_key(&key) {
+            let buffer = images.buffer(source, ImageFit::Cover, logical_px, scale)?;
+            match TextureBuffer::from_memory_buffer(renderer, &buffer) {
+                Ok(tb) => {
+                    uploads.insert(key.clone(), tb);
+                }
+                Err(err) => {
+                    tracing::error!("error uploading the avatar {source:?}: {err:#}");
+                    return None;
+                }
+            }
+        }
+        let tb = uploads.get(&key)?;
+        // Re-tag at the page's scale: dividing the buffer scale magnifies.
+        let tb = TextureBuffer::from_texture(
+            renderer,
+            tb.texture().clone(),
+            scale / page_scale.max(f64::EPSILON),
+            Transform::Normal,
+            Vec::new(),
+        );
+        let logical = tb.logical_size();
+        let loc = origin + center - Point::from((logical.w / 2., logical.h / 2.));
+        let inner = TextureRenderElement::from_texture_buffer(
+            tb,
+            loc,
+            alpha,
+            None,
+            None,
+            Kind::Unspecified,
+        );
+        // `border-radius: $forced_circular_radius` on a square box. The radius is in the element's
+        // *logical* units, which already carry `page_scale` (the buffer scale above), so half the
+        // logical width stays a circle at every point of the crossfade.
+        Some(RoundedTextureRenderElement::new(
+            inner,
+            logical.w / 2.,
+            smithay::utils::Scale::from(scale),
+        ))
+    }
 }
 
 /// GNOME's `%tooltip` (`_common.scss:225-238`) — the black pill behind a short

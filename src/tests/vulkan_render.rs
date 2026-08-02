@@ -11739,9 +11739,14 @@ fn the_crossfade_asks_for_one_avatar_not_one_per_frame() {
                     monitor: Rectangle::from_size(Size::from((1920., 1080.))),
                     now: Duration::ZERO,
                 };
-                let _ = niri
-                    .lock_screen
-                    .render_prompt(vk, &niri.icon_cache, ctx, &content, t);
+                let _ = niri.lock_screen.render_prompt(
+                    vk,
+                    &niri.icon_cache,
+                    &niri.image_cache,
+                    ctx,
+                    &content,
+                    t,
+                );
             }
         })
         .expect("headless backend must hold a Vulkan renderer");
@@ -11761,6 +11766,122 @@ fn the_crossfade_asks_for_one_avatar_not_one_per_frame() {
         "the crossfade asked the cache for {} different avatar sizes: {sizes:?}",
         sizes.len()
     );
+}
+
+/// The account picture draws, clipped to a circle, instead of the themed glyph.
+///
+/// Three things a state test cannot see, and each has its own silent failure:
+///
+/// - the picture drew *at all* — a cold or un-uploaded key returns `None` and the page simply emits
+///   no element, which looks exactly like an account with no avatar;
+/// - it is **round** — the rounded-texture element is what clips it, and a plain texture element
+///   would draw a perfectly good square photograph that nobody would call a bug in a state test;
+/// - the fallback glyph is **gone** — GNOME's `Avatar.update()` is one branch or the other
+///   (`userWidget.js:78-92`), so drawing both would put a default avatar under the photograph and
+///   show it wherever the picture is translucent.
+#[cfg(feature = "dbus")]
+#[test]
+fn vulkan_draws_the_account_picture_round() {
+    use std::io::Cursor;
+
+    use crate::dbus::accounts_service::{AccountsToNiri, UserAccount};
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    // A solid, saturated magenta rectangle: the colour is one nothing else on the lock screen
+    // draws, so any pixel of it is the picture and no chrome can counterfeit it. The 2:1 shape is
+    // what makes the fit visible — a square source decodes identically under `cover` and
+    // `contain`, so the square test picture this started with could not tell them apart.
+    let mut img = image::RgbaImage::new(256, 128);
+    for p in img.pixels_mut() {
+        *p = image::Rgba([255, 0, 255, 255]);
+    }
+    let mut png = Vec::new();
+    img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encode png");
+    let path = std::env::temp_dir().join(format!("gsrs-avatar-{}.png", std::process::id()));
+    std::fs::write(&path, &png).expect("write temp avatar");
+
+    // Through the real AccountsService entry point, so the warm and the source both come from the
+    // code that runs on the seat rather than from the test.
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::UserChanged(UserAccount {
+            real_name: "Test User".to_owned(),
+            icon_file: Some(path.clone()),
+            ..Default::default()
+        }));
+
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    f.niri_state().on_shield_key(None, Some('a'));
+    f.niri_state().niri.lock_screen.settle();
+
+    // Watch what the icon cache is asked for across the frame: the fallback branch must not run.
+    let icon_requests = f.niri().icon_cache.wire_test_worker();
+
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+    let _ = std::fs::remove_file(&path);
+
+    let asked_for_fallback = icon_requests
+        .try_iter()
+        .any(|req| req.name_and_px().0 == "avatar-default-symbolic");
+    assert!(
+        !asked_for_fallback,
+        "the themed glyph was drawn under the account picture"
+    );
+
+    let is_avatar = |p: [u8; 4]| p[0] > 200 && p[1] < 60 && p[2] > 200 && p[3] > 200;
+    let hits: Vec<(i32, i32)> = (0..w * h)
+        .map(|i| (i % w, i / w))
+        .filter(|(x, y)| is_avatar(px(&pixels, w, *x, *y)))
+        .collect();
+    assert!(
+        hits.len() > 1000,
+        "the account picture drew {} px — the prompt fell back to the glyph",
+        hits.len()
+    );
+
+    // Its bounding box is the avatar's box, and the picture fills it: `cover`, not `contain`.
+    let (x0, x1) = (
+        hits.iter().map(|(x, _)| *x).min().unwrap(),
+        hits.iter().map(|(x, _)| *x).max().unwrap(),
+    );
+    let (y0, y1) = (
+        hits.iter().map(|(_, y)| *y).min().unwrap(),
+        hits.iter().map(|(_, y)| *y).max().unwrap(),
+    );
+    let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+    assert!(
+        (bw - bh).abs() <= 2,
+        "the picture's box is not square: {bw}x{bh}"
+    );
+
+    // Round, not square: a disc of diameter d covers π/4 ≈ 78.5% of its bounding box, and the
+    // corners of that box are bare. Both halves matter — the area alone would pass for a rounded
+    // rectangle, and the corners alone would pass for a much smaller circle.
+    let area = f64::from(hits.len() as i32) / f64::from(bw * bh);
+    assert!(
+        (0.7..0.83).contains(&area),
+        "the picture covers {:.1}% of its box — a circle covers 78.5%",
+        area * 100.
+    );
+    for (cx, cy) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+        assert!(
+            !is_avatar(px(&pixels, w, cx, cy)),
+            "the picture reaches its box's corner at ({cx}, {cy}) — it was not clipped to a circle"
+        );
+    }
 }
 
 /// The caps-lock warning actually draws, and disappears again.

@@ -13340,7 +13340,12 @@ fn album_art_is_loaded_when_the_player_appears() {
         "the point of this test is that nothing has been opened"
     );
     assert!(
-        f.niri().image_cache.is_loaded(&first_src, BODY_ICON, 1.0),
+        f.niri().image_cache.is_loaded(
+            &first_src,
+            crate::render_helpers::icon::ImageFit::Contain,
+            BODY_ICON,
+            1.0
+        ),
         "the cover must load as the player appears, not when the card is first drawn"
     );
 
@@ -13353,11 +13358,21 @@ fn album_art_is_loaded_when_the_player_appears() {
         .on_mpris_msg(mpris_update("org.mpris.MediaPlayer2.rb", next));
 
     assert!(
-        f.niri().image_cache.is_loaded(&second_src, BODY_ICON, 1.0),
+        f.niri().image_cache.is_loaded(
+            &second_src,
+            crate::render_helpers::icon::ImageFit::Contain,
+            BODY_ICON,
+            1.0
+        ),
         "the new cover must load"
     );
     assert!(
-        !f.niri().image_cache.is_loaded(&first_src, BODY_ICON, 1.0),
+        !f.niri().image_cache.is_loaded(
+            &first_src,
+            crate::render_helpers::icon::ImageFit::Contain,
+            BODY_ICON,
+            1.0
+        ),
         "the previous cover must be evicted once no player claims it"
     );
 
@@ -13367,8 +13382,91 @@ fn album_art_is_loaded_when_the_player_appears() {
             bus_name: "org.mpris.MediaPlayer2.rb".to_owned(),
         });
     assert!(
-        !f.niri().image_cache.is_loaded(&second_src, BODY_ICON, 1.0),
+        !f.niri().image_cache.is_loaded(
+            &second_src,
+            crate::render_helpers::icon::ImageFit::Contain,
+            BODY_ICON,
+            1.0
+        ),
         "a departed player's cover must be evicted"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The account picture is decoded when AccountsService answers, and a media change cannot evict it.
+///
+/// Two failures that both look like "the lock screen shows the default avatar", and neither leaves
+/// a trace:
+///
+/// - a **lazy** decode. A cold key returns `None` and the prompt emits no picture at all, so the
+///   first lock after login draws the themed glyph and only swaps to the photograph once some later
+///   frame happens to be drawn ([[cold-cost-class]]).
+/// - a **shared eviction**. The avatar lives in the same `ImageCache` as album art, whose `retain`
+///   is the cache's only bound. Built from the live players alone, it drops the avatar on every
+///   MPRIS change — which on a machine playing music is continuously.
+#[cfg(feature = "dbus")]
+#[test]
+fn the_account_picture_is_decoded_up_front_and_outlives_a_track_change() {
+    use crate::dbus::accounts_service::{AccountsToNiri, UserAccount};
+    use crate::image_source::ImageSource;
+    use crate::render_helpers::icon::ImageFit;
+    use crate::ui::lock_screen::AVATAR_PX;
+    use crate::ui::notification_card::BODY_ICON;
+
+    let dir = std::env::temp_dir().join(format!("gsrs-avatar-warm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let face = dir.join("face.png");
+    let cover = dir.join("cover.png");
+    for path in [&face, &cover] {
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([200, 40, 40, 255]))
+            .save(path)
+            .unwrap();
+    }
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::UserChanged(UserAccount {
+            real_name: "Test User".to_owned(),
+            icon_file: Some(face.clone()),
+            ..Default::default()
+        }));
+
+    let face_src = ImageSource::File(face.clone());
+    assert!(
+        f.niri()
+            .image_cache
+            .is_loaded(&face_src, ImageFit::Cover, AVATAR_PX, 1.0),
+        "the picture must decode as AccountsService answers, not on the frame that draws it"
+    );
+
+    // A player appears and then changes track: two `retain` passes over the shared cache.
+    let mut state = mpris_state("Rhythmbox", None);
+    state.art = Some(ImageSource::File(cover.clone()));
+    f.niri_state()
+        .on_mpris_msg(mpris_update("org.mpris.MediaPlayer2.rb", state));
+    let mut next = mpris_state("Rhythmbox", None);
+    next.title = "Blue in Green".into();
+    next.art = None;
+    f.niri_state()
+        .on_mpris_msg(mpris_update("org.mpris.MediaPlayer2.rb", next));
+
+    assert!(
+        !f.niri().image_cache.is_loaded(
+            &ImageSource::File(cover.clone()),
+            ImageFit::Contain,
+            BODY_ICON,
+            1.0
+        ),
+        "the cover no player claims must still be evicted — the bound has to keep working"
+    );
+    assert!(
+        f.niri()
+            .image_cache
+            .is_loaded(&face_src, ImageFit::Cover, AVATAR_PX, 1.0),
+        "the account picture was evicted by a track change"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

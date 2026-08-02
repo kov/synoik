@@ -578,6 +578,9 @@ enum SvgFit {
     /// Uniform scale + center (`min(sx, sy)`), so non-square app icons keep their
     /// aspect ratio instead of being distorted.
     Contain,
+    /// Uniform scale + center the other way (`max(sx, sy)`): the square is filled and
+    /// whatever hangs off the edges is clipped by the pixmap.
+    Cover,
 }
 
 /// Parse and render an SVG into a `px`×`px` premultiplied-RGBA pixmap. Shared by
@@ -599,8 +602,13 @@ fn render_svg_pixmap(
         SvgFit::Stretch => {
             tiny_skia::Transform::from_scale(px as f32 / size.width(), px as f32 / size.height())
         }
-        SvgFit::Contain => {
-            let s = (px as f32 / size.width()).min(px as f32 / size.height());
+        SvgFit::Contain | SvgFit::Cover => {
+            let (sx, sy) = (px as f32 / size.width(), px as f32 / size.height());
+            let s = match fit {
+                SvgFit::Cover => sx.max(sy),
+                _ => sx.min(sy),
+            };
+            // Negative for `Cover`, which is what puts the overflow off the pixmap's edges.
             let tx = (px as f32 - size.width() * s) / 2.;
             let ty = (px as f32 - size.height() * s) / 2.;
             tiny_skia::Transform::from_row(s, 0., 0., s, tx, ty)
@@ -946,8 +954,23 @@ fn resolve_named_in_theme(theme: &str, name: &str, logical_px: f64, scale: f64) 
 
 // --- images an app pointed us at -----------------------------------------------------------
 
-/// The cache key for a loaded image: source + logical + physical size.
-type ImageKey = (ImageSource, u16, u32);
+/// How an image is fitted into the square it is decoded into — CSS `background-size`.
+///
+/// It is part of the cache key, not a draw-time choice: the fit happens in the *decode*, so the
+/// same file at the same size is two different buffers depending on which one was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ImageFit {
+    /// The whole image, uniformly scaled to fit and centred on transparency (`contain`). Album art
+    /// of any aspect keeps all of itself, which is what a cover *is*.
+    #[default]
+    Contain,
+    /// Uniformly scaled to *fill* the square, overflow cropped away (`cover`). What an avatar
+    /// wants: a circular crop of a letterboxed portrait is mostly letterbox.
+    Cover,
+}
+
+/// The cache key for a loaded image: source + fit + logical + physical size.
+type ImageKey = (ImageSource, ImageFit, u16, u32);
 
 /// A load request handed to the image worker — all fields are `Send`.
 pub struct ImageRequest {
@@ -964,7 +987,8 @@ pub struct ImageLoaded {
     buffer: Option<MemoryBuffer>,
 }
 
-/// Loads images an *app* chose ([`ImageSource`]): album art today, local or remote.
+/// Loads images chosen at runtime rather than installed as assets ([`ImageSource`]): album art an
+/// app published, and the account picture AccountsService points at. Local or remote.
 ///
 /// Shares the decode core with [`AppIconCache`] and almost nothing else, which is why it is its
 /// own type:
@@ -976,7 +1000,8 @@ pub struct ImageLoaded {
 ///   worker must never queue behind it — a hung cover server would otherwise hold up the dash and
 ///   app grid, looking for all the world like a renderer stall.
 /// - **An open-ended key space.** One entry per cover *played*, versus the bounded installed-app
-///   set, so it must be evicted ([`retain`](Self::retain)).
+///   set, so it must be evicted ([`retain`](Self::retain)). Note the retain is over *every* source
+///   in here, not just album art: the account picture shares the cache and so shares its bound.
 /// - **No theme generation.** An icon-theme change does not change a cover.
 ///
 /// Without a worker (headless tests) loading is synchronous, exactly like [`AppIconCache`] — note
@@ -1005,7 +1030,7 @@ impl ImageCache {
                     // App-chosen bytes from an app-chosen server: a malformed image that panics
                     // the decoder must become a negative result, not a dead worker.
                     let buffer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        load_image(&req.source, req.key.2, req.scale)
+                        load_image(&req.source, req.key.1, req.key.3, req.scale)
                     }))
                     .unwrap_or(None);
                     if result_tx
@@ -1034,18 +1059,18 @@ impl ImageCache {
         Some(source)
     }
 
-    /// The pixels for `source` at `logical_px` on its longest side, aspect-fit and centred on a
-    /// transparent square, tagged at the output `scale`. `None` while a load is in flight, or if it
-    /// failed.
+    /// The pixels for `source` in a `logical_px` square, fitted per `fit` and tagged at the output
+    /// `scale`. `None` while a load is in flight, or if it failed.
     pub fn buffer(
         &self,
         source: &ImageSource,
+        fit: ImageFit,
         logical_px: f64,
         scale: f64,
     ) -> Option<MemoryBuffer> {
         let logical = (logical_px.round() as u16).max(1);
         let px = to_physical_precise_round::<i32>(scale, logical_px).max(1) as u32;
-        let key = (source.clone(), logical, px);
+        let key = (source.clone(), fit, logical, px);
         if let Some(cached) = self.buffers.borrow().get(&key) {
             return cached.clone();
         }
@@ -1059,7 +1084,7 @@ impl ImageCache {
                     };
                     if tx.send(req).is_err() {
                         self.in_flight.borrow_mut().remove(&key);
-                        let result = load_image(source, px, scale);
+                        let result = load_image(source, fit, px, scale);
                         self.buffers.borrow_mut().insert(key, result.clone());
                         return result;
                     }
@@ -1068,7 +1093,7 @@ impl ImageCache {
             }
             // No worker (tests): load inline, caching the result (incl. negatives).
             None => {
-                let result = load_image(source, px, scale);
+                let result = load_image(source, fit, px, scale);
                 self.buffers.borrow_mut().insert(key, result.clone());
                 result
             }
@@ -1079,8 +1104,8 @@ impl ImageCache {
     /// so resolves its icon) when the *player* appears, not when the message list is opened
     /// (`js/ui/messageList.js:1780-1784`), and on a slow link a fetch that only starts when the
     /// popover opens shows the fallback for as long as the round trip takes.
-    pub fn warm(&self, source: &ImageSource, logical_px: f64, scale: f64) {
-        let _ = self.buffer(source, logical_px, scale);
+    pub fn warm(&self, source: &ImageSource, fit: ImageFit, logical_px: f64, scale: f64) {
+        let _ = self.buffer(source, fit, logical_px, scale);
     }
 
     /// Drop every entry whose source `keep` rejects. Nothing else evicts these.
@@ -1091,17 +1116,25 @@ impl ImageCache {
     pub fn retain(&mut self, keep: impl Fn(&ImageSource) -> bool) {
         self.buffers
             .get_mut()
-            .retain(|(source, _, _), _| keep(source));
+            .retain(|(source, _, _, _), _| keep(source));
     }
 
     /// Whether `source` is already loaded at this size — a read-only probe, so a test can tell a
     /// warm that *ran* from one it would trigger itself just by asking (without a worker,
     /// [`buffer`](Self::buffer) loads inline, which makes any check through it vacuous).
-    pub fn is_loaded(&self, source: &ImageSource, logical_px: f64, scale: f64) -> bool {
+    pub fn is_loaded(
+        &self,
+        source: &ImageSource,
+        fit: ImageFit,
+        logical_px: f64,
+        scale: f64,
+    ) -> bool {
         let logical = (logical_px.round() as u16).max(1);
         let px = to_physical_precise_round::<i32>(scale, logical_px).max(1) as u32;
         matches!(
-            self.buffers.borrow().get(&(source.clone(), logical, px)),
+            self.buffers
+                .borrow()
+                .get(&(source.clone(), fit, logical, px)),
             Some(Some(_))
         )
     }
@@ -1113,7 +1146,7 @@ impl ImageCache {
 }
 
 /// Load one image: read or fetch the bytes, then decode them at `px`.
-fn load_image(source: &ImageSource, px: u32, scale: f64) -> Option<MemoryBuffer> {
+fn load_image(source: &ImageSource, fit: ImageFit, px: u32, scale: f64) -> Option<MemoryBuffer> {
     let (data, is_svg) = match source {
         ImageSource::File(path) => {
             let data = match read_capped(path) {
@@ -1139,7 +1172,7 @@ fn load_image(source: &ImageSource, px: u32, scale: f64) -> Option<MemoryBuffer>
             }
         },
     };
-    match decode_image_bytes(&data, px, scale, is_svg) {
+    match decode_image_bytes(&data, px, scale, is_svg, fit) {
         Ok(buffer) => Some(buffer),
         Err(err) => {
             tracing::warn!("could not decode image: {err:#}");
@@ -1237,11 +1270,12 @@ fn decode_icon(path: &Path, px: u32, scale: f64) -> anyhow::Result<MemoryBuffer>
     let is_svg = path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("svg"));
-    decode_image_bytes(&data, px, scale, is_svg)
+    // An app icon is always the whole icon: `contain`.
+    decode_image_bytes(&data, px, scale, is_svg, ImageFit::Contain)
 }
 
 /// The decode core, shared by [`decode_icon`] and [`ImageCache`]: bytes in, a premultiplied
-/// `Abgr8888` [`MemoryBuffer`] of `px`×`px` out, aspect-fit and centred on transparency.
+/// `Abgr8888` [`MemoryBuffer`] of `px`×`px` out, fitted per [`ImageFit`].
 ///
 /// `is_svg` is only a *hint* (a filename extension, which fetched bytes do not have); the sniff
 /// below is what actually decides when it is wrong.
@@ -1250,15 +1284,16 @@ fn decode_image_bytes(
     px: u32,
     scale: f64,
     is_svg: bool,
+    fit: ImageFit,
 ) -> anyhow::Result<MemoryBuffer> {
     let rgba = if is_svg {
-        render_app_svg(data, px)?
+        render_app_svg(data, px, fit)?
     } else {
-        match decode_raster(data, px) {
+        match decode_raster(data, px, fit) {
             Ok(rgba) => rgba,
             // Some icon files are misnamed; if the bytes sniff as SVG, try that.
             Err(err) if data.starts_with(b"<?xml") || data.starts_with(b"<svg") => {
-                render_app_svg(data, px).map_err(|_| err)?
+                render_app_svg(data, px, fit).map_err(|_| err)?
             }
             Err(err) => return Err(err),
         }
@@ -1274,14 +1309,18 @@ fn decode_image_bytes(
 
 /// Render a full-color SVG (no recolor) into premultiplied `Abgr8888` bytes.
 /// `tiny_skia` pixmaps are already premultiplied `[R,G,B,A]`, our exact contract.
-fn render_app_svg(data: &[u8], px: u32) -> anyhow::Result<Vec<u8>> {
-    let pixmap = render_svg_pixmap(data, px, SvgFit::Contain)?;
+fn render_app_svg(data: &[u8], px: u32, fit: ImageFit) -> anyhow::Result<Vec<u8>> {
+    let svg_fit = match fit {
+        ImageFit::Contain => SvgFit::Contain,
+        ImageFit::Cover => SvgFit::Cover,
+    };
+    let pixmap = render_svg_pixmap(data, px, svg_fit)?;
     Ok(pixmap.data().to_vec())
 }
 
-/// Decode a raster icon, resample (aspect-preserving) to fit `px`, and center it
-/// on a transparent square as premultiplied `Abgr8888` bytes.
-fn decode_raster(data: &[u8], px: u32) -> anyhow::Result<Vec<u8>> {
+/// Decode a raster icon, resample (aspect-preserving) per `fit`, and center it on
+/// a transparent square as premultiplied `Abgr8888` bytes.
+fn decode_raster(data: &[u8], px: u32, fit: ImageFit) -> anyhow::Result<Vec<u8>> {
     let mut img = image::load_from_memory(data)
         .context("decoding raster icon")?
         .to_rgba8();
@@ -1297,17 +1336,33 @@ fn decode_raster(data: &[u8], px: u32) -> anyhow::Result<Vec<u8>> {
     }
 
     let (w, h) = (img.width().max(1), img.height().max(1));
-    let s = (px as f32 / w as f32).min(px as f32 / h as f32);
-    let nw = ((w as f32 * s).round() as u32).clamp(1, px);
-    let nh = ((h as f32 * s).round() as u32).clamp(1, px);
+    let (sx, sy) = (px as f32 / w as f32, px as f32 / h as f32);
+    let s = match fit {
+        // Fit inside: the smaller scale, so neither axis overflows.
+        ImageFit::Contain => sx.min(sy),
+        // Fill: the larger scale, so neither axis falls short. The overflow is cropped below.
+        ImageFit::Cover => sx.max(sy),
+    };
+    let nw = ((w as f32 * s).round() as u32).max(1);
+    let nh = ((h as f32 * s).round() as u32).max(1);
     let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::CatmullRom);
 
     let mut out = vec![0u8; (px * px * 4) as usize];
-    let ox = (px - nw) / 2;
-    let oy = (px - nh) / 2;
+    // Signed, because `cover` centres a *larger* image: the offsets go negative and the rows and
+    // columns that fall outside the square are the crop. `contain` never takes those branches.
+    let ox = (px as i64 - nw as i64) / 2;
+    let oy = (px as i64 - nh as i64) / 2;
     for y in 0..nh {
+        let dy = oy + y as i64;
+        if dy < 0 || dy >= px as i64 {
+            continue;
+        }
         for x in 0..nw {
-            let di = (((oy + y) * px + (ox + x)) * 4) as usize;
+            let dx = ox + x as i64;
+            if dx < 0 || dx >= px as i64 {
+                continue;
+            }
+            let di = ((dy * px as i64 + dx) * 4) as usize;
             out[di..di + 4].copy_from_slice(&resized.get_pixel(x, y).0); // premultiplied [R,G,B,A]
         }
     }
@@ -1395,7 +1450,7 @@ mod tests {
     /// symbolic path's "everything becomes the tint color".
     #[test]
     fn app_icon_svg_keeps_its_colors() {
-        let rgba = render_app_svg(RED_BLUE_SVG, 32).expect("render app svg");
+        let rgba = render_app_svg(RED_BLUE_SVG, 32, ImageFit::Contain).expect("render app svg");
         let reddish = rgba
             .chunks_exact(4)
             .filter(|p| p[0] > 180 && p[2] < 60 && p[3] > 200)
@@ -1421,7 +1476,7 @@ mod tests {
         img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("encode png");
 
-        let rgba = decode_raster(&png, 8).expect("decode raster");
+        let rgba = decode_raster(&png, 8, ImageFit::Contain).expect("decode raster");
         // Premultiplied red = 255 * 128/255 = 128; alpha kept at 128.
         let p = rgba
             .chunks_exact(4)
@@ -1434,6 +1489,86 @@ mod tests {
         );
         assert_eq!(p[1], 0);
         assert!((110..=140).contains(&u32::from(p[3])), "alpha {}", p[3]);
+    }
+
+    /// `cover` fills the square and crops; `contain` fits the whole image and letterboxes.
+    ///
+    /// The difference only shows on a **non-square** source, which is why this uses 4:1: a square
+    /// avatar decodes identically either way, so a `cover` that silently behaved like `contain`
+    /// would pass every test taken with a square picture — and the account pictures GNOME ships
+    /// are square. A letterboxed portrait clipped to a circle is mostly letterbox.
+    #[test]
+    fn cover_fills_the_square_where_contain_letterboxes() {
+        use std::io::Cursor;
+        // 32×8 solid opaque red: four times as wide as it is tall.
+        let mut img = image::RgbaImage::new(32, 8);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([255, 0, 0, 255]);
+        }
+        let mut png = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode png");
+
+        let covered = |fit| {
+            decode_raster(&png, 16, fit)
+                .expect("decode raster")
+                .chunks_exact(4)
+                .filter(|p| p[3] > 200)
+                .count()
+        };
+
+        // Contain: the 32×8 fits as 16×4, so a quarter of the 16×16 square is covered.
+        let contain = covered(ImageFit::Contain);
+        assert!(
+            (56..=72).contains(&contain),
+            "contain should letterbox to about a quarter of 256 px, got {contain}"
+        );
+
+        // Cover: scaled to 64×16 and cropped, so every pixel of the square is opaque.
+        assert_eq!(
+            covered(ImageFit::Cover),
+            256,
+            "cover must leave no transparent pixel in the square"
+        );
+    }
+
+    /// The fit is part of the cache key, not just the decode.
+    ///
+    /// Both fits of one file at one size are two different images. Keyed without it, whichever was
+    /// asked for first would be served to the other — an avatar showing a letterboxed decode
+    /// because a media card got there first, with nothing to say why.
+    #[test]
+    fn the_fit_is_part_of_the_image_cache_key() {
+        use std::io::Cursor;
+        let mut img = image::RgbaImage::new(32, 8);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([255, 0, 0, 255]);
+        }
+        let mut png = Vec::new();
+        img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode png");
+        let path = std::env::temp_dir().join(format!("gsrs-fit-key-{}.png", std::process::id()));
+        std::fs::write(&path, &png).expect("write temp png");
+
+        let cache = ImageCache::new();
+        let source = ImageSource::File(path.clone());
+        let opaque = |fit| {
+            cache
+                .buffer(&source, fit, 16., 1.0)
+                .expect("decode")
+                .data()
+                .chunks_exact(4)
+                .filter(|p| p[3] > 200)
+                .count()
+        };
+
+        // Contain first, so a fit-blind key would hand its buffer back for the cover ask.
+        let contain = opaque(ImageFit::Contain);
+        let cover = opaque(ImageFit::Cover);
+        assert!(contain < cover, "contain {contain} vs cover {cover}");
+        assert_eq!(cover, 256, "the cover ask got the contain decode");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The full pipeline through a `File` icon: decodes, tags the buffer at the
@@ -1486,7 +1621,12 @@ mod tests {
         let cache = ImageCache::new();
         assert!(
             cache
-                .buffer(&ImageSource::File(junk.clone()), 48., 1.0)
+                .buffer(
+                    &ImageSource::File(junk.clone()),
+                    ImageFit::Contain,
+                    48.,
+                    1.0
+                )
                 .is_none(),
             "a file that will not decode must not fall back to any icon"
         );
@@ -1495,7 +1635,7 @@ mod tests {
 
         let missing = dir.join("gone.png");
         assert!(cache
-            .buffer(&ImageSource::File(missing), 48., 1.0)
+            .buffer(&ImageSource::File(missing), ImageFit::Contain, 48., 1.0)
             .is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1529,7 +1669,12 @@ mod tests {
         let cache = ImageCache::new();
         for path in [named, anonymous] {
             let buffer = cache
-                .buffer(&ImageSource::File(path.clone()), 48., 1.0)
+                .buffer(
+                    &ImageSource::File(path.clone()),
+                    ImageFit::Contain,
+                    48.,
+                    1.0,
+                )
                 .unwrap_or_else(|| panic!("{} must decode", path.display()));
             // Square, because the fit-and-centre happens in the decode: a 16:9 source becomes a
             // 48x48 buffer with transparent bands, which is what reproduces St's RESIZE_ASPECT.
@@ -1550,7 +1695,7 @@ mod tests {
 
         let zero = ImageSource::File(PathBuf::from("/dev/zero"));
         let started = std::time::Instant::now();
-        assert!(cache.buffer(&zero, 48., 1.0).is_none());
+        assert!(cache.buffer(&zero, ImageFit::Contain, 48., 1.0).is_none());
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "refusing a character device must be immediate, not an out-of-memory race"
@@ -1564,7 +1709,9 @@ mod tests {
         f.set_len(crate::image_source::MAX_IMAGE_BYTES as u64 + 1)
             .expect("grow");
         drop(f);
-        assert!(cache.buffer(&ImageSource::File(huge), 48., 1.0).is_none());
+        assert!(cache
+            .buffer(&ImageSource::File(huge), ImageFit::Contain, 48., 1.0)
+            .is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1581,7 +1728,7 @@ mod tests {
         let cache = ImageCache::new();
         // A public address, so only the switch can be what refuses this.
         let source = ImageSource::Remote("https://example.com/cover.png".to_owned());
-        assert!(cache.buffer(&source, 48., 1.0).is_none());
+        assert!(cache.buffer(&source, ImageFit::Contain, 48., 1.0).is_none());
         assert_eq!(cache.len(), 1, "the refusal is cached, not retried");
     }
 
@@ -1594,11 +1741,15 @@ mod tests {
     fn a_refused_remote_source_is_cached_as_a_negative() {
         let cache = ImageCache::new();
         let blocked = ImageSource::Remote("http://127.0.0.1:1/probe".to_owned());
-        assert!(cache.buffer(&blocked, 48., 1.0).is_none());
+        assert!(cache
+            .buffer(&blocked, ImageFit::Contain, 48., 1.0)
+            .is_none());
         // Negative-cached, so a hostile or broken cover cannot make the shell retry every frame —
         // for a remote source that would be a request per frame.
         assert_eq!(cache.len(), 1);
-        assert!(cache.buffer(&blocked, 48., 1.0).is_none());
+        assert!(cache
+            .buffer(&blocked, ImageFit::Contain, 48., 1.0)
+            .is_none());
         assert_eq!(cache.len(), 1);
     }
 
@@ -1619,7 +1770,7 @@ mod tests {
         let cache = ImageCache::new();
         let source = ImageSource::Remote("https://picsum.photos/200.jpg".to_owned());
         let buffer = cache
-            .buffer(&source, 48., 2.0)
+            .buffer(&source, ImageFit::Contain, 48., 2.0)
             .expect("fetch + decode a remote cover");
         assert_eq!(
             buffer.size().w,
@@ -1643,13 +1794,19 @@ mod tests {
         let drop_src = ImageSource::File(drop.clone());
 
         let mut cache = ImageCache::new();
-        assert!(cache.buffer(&keep_src, 48., 1.0).is_some());
-        assert!(cache.buffer(&drop_src, 48., 1.0).is_some());
+        assert!(cache
+            .buffer(&keep_src, ImageFit::Contain, 48., 1.0)
+            .is_some());
+        assert!(cache
+            .buffer(&drop_src, ImageFit::Contain, 48., 1.0)
+            .is_some());
         assert_eq!(cache.len(), 2);
 
         cache.retain(|source| source == &keep_src);
         assert_eq!(cache.len(), 1, "only the cover that left may be evicted");
-        assert!(cache.buffer(&keep_src, 48., 1.0).is_some());
+        assert!(cache
+            .buffer(&keep_src, ImageFit::Contain, 48., 1.0)
+            .is_some());
         assert_eq!(cache.len(), 1, "the survivor must not have been re-loaded");
 
         let _ = std::fs::remove_dir_all(&dir);

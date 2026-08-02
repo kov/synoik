@@ -3964,6 +3964,11 @@ impl State {
                     .unlock_dialog
                     .set_real_name(account.real_name.clone());
                 self.niri.user_account = account;
+                // Decode the picture now, not on the frame that first draws it. A cold key draws
+                // *nothing* and the prompt falls back to the themed glyph, so a lazy decode means
+                // the first lock after login shows the default avatar and then swaps to the
+                // photograph — the cold-key flicker again ([[cold-cost-class]]).
+                self.niri.warm_avatar();
             }
             AccountsToNiri::MultipleUsers(multiple) => {
                 if self.niri.multiple_users == multiple {
@@ -5816,6 +5821,10 @@ impl Niri {
         // spawned, so this call finds no worker and warms nothing. `State::new` warms again
         // once the worker is up — see there. Idempotent, so both are safe.
         self.prewarm_app_icons();
+        // ...and the same for the account picture, which is keyed on the scale too. The account
+        // usually answers before any output exists, so without this the warm at that point has
+        // nowhere to land and the first lock on the new output draws the fallback.
+        self.warm_avatar();
     }
 
     pub fn output_exists(&self, output: &Output) -> bool {
@@ -5944,6 +5953,7 @@ impl Niri {
         // the new geometry (the size also picks the grid's icon rung, so this is not just
         // the scale). Idempotent, and outputs resize rarely.
         self.prewarm_app_icons();
+        self.warm_avatar();
 
         if let Some(state) = self.output_state.get_mut(output) {
             state.backdrop_buffer.resize(output_size);
@@ -7602,15 +7612,20 @@ impl Niri {
                         .is_some_and(|m| m.kind == crate::dbus::gdm::MessageKind::Error),
                     entry_live: d.is_entry_live(),
                     peek: d.peek(),
+                    avatar: self.avatar_source(),
                 };
                 for elem in self.lock_screen.render_prompt(
                     ctx.renderer,
                     &self.icon_cache,
+                    &self.image_cache,
                     page_ctx,
                     &content,
                     prompt_t,
                 ) {
-                    push(elem.into());
+                    match elem {
+                        crate::ui::lock_screen::PromptElement::Texture(e) => push(e.into()),
+                        crate::ui::lock_screen::PromptElement::Rounded(e) => push(e.into()),
+                    }
                 }
             }
 
@@ -11231,11 +11246,15 @@ impl Niri {
     /// The retain is the cache's only bound: one entry per cover *played* is the only open-ended
     /// key space the image caches have.
     pub fn refresh_media_art(&mut self) {
-        let live: std::collections::HashSet<crate::image_source::ImageSource> = self
+        let mut live: std::collections::HashSet<crate::image_source::ImageSource> = self
             .mpris
             .visible()
             .filter_map(|player| player.state.art.clone())
             .collect();
+        // The avatar shares this cache and so shares its only bound. Leaving it out of the live
+        // set would have any MPRIS change at all evict the lock screen's picture, which is a decode
+        // that only comes back on a frame that has already drawn the fallback in its place.
+        live.extend(self.avatar_source());
         self.image_cache.retain(|source| live.contains(source));
 
         // Warm at the art slot's size for every scale a card could be drawn at, which is what the
@@ -11243,9 +11262,40 @@ impl Niri {
         for source in &live {
             for output in self.global_space.outputs() {
                 let scale = output.current_scale().fractional_scale();
-                self.image_cache
-                    .warm(source, crate::ui::notification_card::BODY_ICON, scale);
+                self.image_cache.warm(
+                    source,
+                    crate::render_helpers::icon::ImageFit::Contain,
+                    crate::ui::notification_card::BODY_ICON,
+                    scale,
+                );
             }
+        }
+    }
+
+    /// The account picture as an image source, if AccountsService gave us one that is on disk.
+    pub fn avatar_source(&self) -> Option<crate::image_source::ImageSource> {
+        self.user_account
+            .icon_file
+            .clone()
+            .map(crate::image_source::ImageSource::File)
+    }
+
+    /// Decode the account picture at every output's scale, at the size the unlock prompt draws it.
+    ///
+    /// Keyed on the scale like every other image, so warming the wrong one is a decode nobody
+    /// reads — hence per output rather than once.
+    pub fn warm_avatar(&self) {
+        let Some(source) = self.avatar_source() else {
+            return;
+        };
+        for output in self.global_space.outputs() {
+            let scale = output.current_scale().fractional_scale();
+            self.image_cache.warm(
+                &source,
+                crate::render_helpers::icon::ImageFit::Cover,
+                crate::ui::lock_screen::AVATAR_PX,
+                scale,
+            );
         }
     }
 
