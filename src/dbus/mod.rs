@@ -26,6 +26,7 @@ pub mod mutter_idle_monitor;
 pub mod mutter_service_channel;
 pub mod rfkill;
 pub mod system_status;
+pub mod user_switching;
 
 #[cfg(feature = "xdp-gnome-screencast")]
 pub mod gnome_shell_screencast;

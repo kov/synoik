@@ -578,6 +578,9 @@ impl GnomeSettings {
         if settings_has_key(lockdown, "disable-show-password") {
             self.shield.disable_show_password = lockdown.boolean("disable-show-password");
         }
+        if settings_has_key(lockdown, "disable-user-switching") {
+            self.shield.disable_user_switching = lockdown.boolean("disable-user-switching");
+        }
     }
 
     fn load_screensaver(&mut self, screensaver: &gio::Settings) {
@@ -587,6 +590,9 @@ impl GnomeSettings {
         if settings_has_key(screensaver, "lock-delay") {
             self.shield.lock_delay =
                 std::time::Duration::from_secs(u64::from(screensaver.uint("lock-delay")));
+        }
+        if settings_has_key(screensaver, "user-switch-enabled") {
+            self.shield.user_switch_enabled = screensaver.boolean("user-switch-enabled");
         }
     }
 

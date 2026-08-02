@@ -682,7 +682,7 @@ GDM login + screen-shield/lock: user list, prompt entries, auth-method list, ses
 | Prompt layout | `.login-dialog-prompt-layout` | — | fg #fff | — | width 25em; spacing 9px | _login-lock.scss:6-19 |
 | Login prompt entry (`%system_entry`) | `.login-dialog-prompt-entry` | inherit | dark entry | 8px | padding 9px | _login-lock.scss:24-26 |
 | Unlock prompt entry (`%lockscreen_entry`) | `.unlock-dialog .login-dialog-prompt-entry` | inherit | fg #fff; bg fg@10%; focus ring fg@40% | 8px | padding 9px | _login-lock.scss:216-220 |
-| Session/a11y buttons (`.icon-button`+`%system_button`) | `.login-dialog-button.*` | — | dark system button | — | padding 17.5px | _login-lock.scss:35-50 |
+| Session/a11y buttons (`.icon-button`+`%system_button`) | `.login-dialog-button.*` | — | dark system button | circular | padding `to_em(16px)` = 16px; so 48px across with a 16px glyph | _login-lock.scss:35-50 |
 | User-list item | `.login-dialog-user-list-item` | — | dark button; `:logged-in` icon border accent | 16px | padding 9px; spacing 12px | _login-lock.scss:177-209 |
 | Screen-shield backdrop | `.screen-shield-background` | — | bg black; shadow | — | | _login-lock.scss:228-231 |
 | Lock clock time (`%numeric`) | `.unlock-dialog-clock-time` | 72pt/800 | fg #fff | — | | _login-lock.scss:242-246 |

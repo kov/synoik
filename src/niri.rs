@@ -522,6 +522,12 @@ pub struct Niri {
     pub user_account: crate::dbus::accounts_service::UserAccount,
     /// Whether this machine has more than one ordinary account, for the "Other User" button.
     pub multiple_users: bool,
+    /// Whether logind gave us a seat id — libaccountsservice's `can_switch()`, which is a seat
+    /// lookup and nothing else now that `sd_seat_can_multi_session` is gone. Resolved once, off
+    /// the main loop, by the same task that starts the AccountsService watch.
+    pub can_switch_user: bool,
+    /// Whether the pointer is on the switch-user button.
+    pub switch_user_hovered: bool,
 
     /// The last `active` we told the session bus about — see [`Self::publish_shield_active`].
     ///
@@ -3810,6 +3816,23 @@ impl State {
         if !self.niri.screen_shield.is_dismissible() {
             self.niri.lock_screen.note_activity(now);
 
+            // The switch-user button, which is reactive only while the prompt page is up
+            // (`unlockDialog.js:811-814`) — on the clock page a click there just raises the prompt
+            // like a click anywhere else.
+            if self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt
+                && self.niri.switch_user_visible()
+            {
+                let on_button = self
+                    .niri
+                    .output_under(pos)
+                    .and_then(|(output, _)| self.niri.global_space.output_geometry(output))
+                    .is_some_and(|geo| crate::ui::lock_screen::switch_user_hit(geo.to_f64(), pos));
+                if on_button {
+                    self.switch_user();
+                    return;
+                }
+            }
+
             // The peek toggle, if the pointer is on it and the prompt is up.
             if self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt
                 && self.niri.unlock_dialog.peek().is_some()
@@ -3832,6 +3855,39 @@ impl State {
             let effects = self.niri.screen_shield.deactivate();
             self.apply_shield_effects(effects);
         }
+    }
+
+    /// Go to the login screen, and drop the authentication we were in the middle of.
+    ///
+    /// `_otherUserClicked` (`unlockDialog.js:901-905`) does exactly these two, in this order. The
+    /// cancel is not tidying up: leaving a live gdm conversation behind would hold a PAM
+    /// transaction open on a session the user has walked away from.
+    #[cfg(feature = "dbus")]
+    pub fn switch_user(&mut self) {
+        let now = crate::utils::get_monotonic_time();
+        let effects = self.niri.unlock_dialog.cancel();
+        self.apply_unlock_effects(effects);
+        self.niri.lock_screen.note_activity(now);
+
+        let Some(conn) = self
+            .niri
+            .dbus
+            .as_ref()
+            .and_then(|d| d.conn_accounts.as_ref())
+        else {
+            warn!("cannot switch users: no system bus connection");
+            return;
+        };
+        // Detached: this is several system-bus round trips and the event loop is also the render
+        // loop. Nothing waits for it — the outcome is a session switch, not a frame.
+        let async_conn = conn.inner().clone();
+        conn.inner()
+            .executor()
+            .spawn(
+                async move { crate::dbus::user_switching::goto_login_session(&async_conn).await },
+                "goto-login-session",
+            )
+            .detach();
     }
 
     /// Publish an [`UnlockEffects`](crate::unlock_dialog::UnlockEffects).
@@ -3984,6 +4040,12 @@ impl State {
                     return;
                 }
                 self.niri.multiple_users = multiple;
+            }
+            AccountsToNiri::CanSwitch(can) => {
+                if self.niri.can_switch_user == can {
+                    return;
+                }
+                self.niri.can_switch_user = can;
             }
         }
         if self.niri.screen_shield.is_active() {
@@ -5380,6 +5442,8 @@ impl Niri {
             lock_replies: Vec::new(),
             published_active: false,
             user_account: Default::default(),
+            can_switch_user: false,
+            switch_user_hovered: false,
             multiple_users: false,
             #[cfg(feature = "dbus")]
             gdm_requests: None,
@@ -7634,6 +7698,30 @@ impl Niri {
                     match elem {
                         crate::ui::lock_screen::PromptElement::Texture(e) => push(e.into()),
                         crate::ui::lock_screen::PromptElement::Rounded(e) => push(e.into()),
+                    }
+                }
+
+                // The switch-user button is a sibling of the page stack, not part of it, so it is
+                // drawn separately — but only while the prompt is up, which is what its
+                // `progress > 0` reactivity and opacity amount to (`unlockDialog.js:811-821`).
+                if self.switch_user_visible() {
+                    // Same alpha and scale as the prompt, but it does not slide with the page: the
+                    // curtain's `translation_y` is the *group's*, so it applies, while the page's
+                    // own FADE_OUT_TRANSLATION does not (`:838-842` sets no translation on it).
+                    let mut switch_t = crate::ui::lock_screen::PageTransform::prompt(progress);
+                    switch_t.translation_y = slide;
+                    for elem in self.lock_screen.render_switch_user(
+                        ctx.renderer,
+                        &self.icon_cache,
+                        page_ctx,
+                        self.switch_user_hovered,
+                        self.gnome_settings.accent_color,
+                        switch_t,
+                    ) {
+                        match elem {
+                            crate::ui::lock_screen::PromptElement::Texture(e) => push(e.into()),
+                            crate::ui::lock_screen::PromptElement::Rounded(e) => push(e.into()),
+                        }
                     }
                 }
             }
@@ -11279,6 +11367,24 @@ impl Niri {
                 );
             }
         }
+    }
+
+    /// Whether the unlock dialog shows the "Log in as another user" button.
+    ///
+    /// All four of GNOME's conditions (`unlockDialog.js:921-926`), and every one of them can veto:
+    /// the seat must be able to host another session, the machine must have somebody else to log in
+    /// as, the user must not have turned it off, and the administrator must not have locked it
+    /// down. A button that appears when any of these is false is a button that does nothing, on the
+    /// one screen where a control that does nothing is alarming.
+    pub fn switch_user_visible(&self) -> bool {
+        // Through the shield's own copy, not `gnome_settings`: that is the one kept current at
+        // runtime (`set_settings` on every settings change), and reading the other would make the
+        // button ignore a lockdown that took effect after startup.
+        let settings = self.screen_shield.settings();
+        self.can_switch_user
+            && self.multiple_users
+            && settings.user_switch_enabled
+            && !settings.disable_user_switching
     }
 
     /// The account picture as an image source, if AccountsService gave us one that is on disk.

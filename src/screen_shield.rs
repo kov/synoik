@@ -85,6 +85,12 @@ pub struct ShieldSettings {
     /// `org.gnome.desktop.screensaver lock-delay` — the grace period between the session going
     /// idle and the shield actually locking, so a user who comes straight back is not challenged.
     pub lock_delay: Duration,
+    /// `org.gnome.desktop.screensaver user-switch-enabled` — whether the unlock dialog offers to
+    /// log in as somebody else (`unlockDialog.js:922-925`).
+    pub user_switch_enabled: bool,
+    /// `org.gnome.desktop.lockdown disable-user-switching` — the administrator's veto over the
+    /// same button. Both are consulted, and either one being against it wins.
+    pub disable_user_switching: bool,
 }
 
 /// `STANDARD_FADE_TIME` (`:39`) — the fade GNOME runs when the session goes idle.
@@ -102,6 +108,8 @@ impl Default for ShieldSettings {
             lock_enabled: true,
             disable_show_password: false,
             lock_delay: Duration::ZERO,
+            user_switch_enabled: true,
+            disable_user_switching: false,
         }
     }
 }

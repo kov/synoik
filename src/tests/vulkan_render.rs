@@ -11965,6 +11965,93 @@ fn the_account_picture_uploads_once_per_scale() {
     }
 }
 
+/// The switch-user button draws, in the corner GNOME puts it, and only when it should.
+///
+/// The layout rule is `x1 = box.x2 - natWidth * 2`, `y1 = box.y2 - natHeight * 2`
+/// (`unlockDialog.js:496-501`) — inset by its **own size**, not by a padding constant, which is the
+/// kind of rule that is easy to read as "one padding from the edge" and land twice as close as it
+/// should. And because it is a sibling of the page stack rather than part of it, nothing about the
+/// crossfade would stop it drawing over the clock: its `progress > 0` gate is its own.
+#[cfg(feature = "dbus")]
+#[test]
+fn vulkan_draws_the_switch_user_button_in_its_corner() {
+    use crate::dbus::accounts_service::AccountsToNiri;
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    // The seat can switch, but there is nobody to switch *to* yet — so the button is hidden and
+    // everything else on the page is identical. Differencing against this isolates the button,
+    // where differencing the clock page against the prompt page would just show the crossfade.
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::CanSwitch(true));
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
+    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.niri_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    f.niri_state().on_shield_key(None, Some('a'));
+    f.niri_state().niri.lock_screen.settle();
+    let (without, w, h) = render_output_vulkan(&mut f, &output);
+
+    // --- A second account appears: the button, and nothing else, must change. ---
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::MultipleUsers(true));
+    f.niri_state().niri.lock_screen.settle();
+    let (with, _, _) = render_output_vulkan(&mut f, &output);
+
+    let drawn: Vec<(i32, i32)> = (0..w * h)
+        .map(|i| (i % w, i / w))
+        .filter(|(x, y)| px(&with, w, *x, *y) != px(&without, w, *x, *y))
+        .collect();
+    assert!(
+        !drawn.is_empty(),
+        "the button did not draw when the last condition became true"
+    );
+    let clock_page = without;
+
+    // Where GNOME's rule says it is, spelled out here rather than taken from `switch_user_rect`:
+    // an expectation computed by the function under test cannot fail when that function is wrong.
+    // Only the *size* is borrowed, since that is a measured constant rather than the rule.
+    let size = crate::ui::lock_screen::switch_user_size();
+    let expected = Rectangle::<f64, smithay::utils::Logical>::new(
+        Point::from((f64::from(w) - size * 2., f64::from(h) - size * 2.)),
+        Size::from((size, size)),
+    );
+    let (x0, x1) = (
+        drawn.iter().map(|(x, _)| *x).min().unwrap(),
+        drawn.iter().map(|(x, _)| *x).max().unwrap(),
+    );
+    let (y0, y1) = (
+        drawn.iter().map(|(_, y)| *y).min().unwrap(),
+        drawn.iter().map(|(_, y)| *y).max().unwrap(),
+    );
+    let near = |got: i32, want: f64| (f64::from(got) - want).abs() <= 2.;
+    assert!(
+        near(x0, expected.loc.x)
+            && near(y0, expected.loc.y)
+            && near(x1, expected.loc.x + expected.size.w - 1.)
+            && near(y1, expected.loc.y + expected.size.h - 1.),
+        "the button drew at ({x0},{y0})-({x1},{y1}), not at {expected:?}"
+    );
+
+    // It is a circle: its corners are untouched, exactly like the avatar's.
+    for (cx, cy) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+        assert_eq!(
+            px(&with, w, cx, cy),
+            px(&clock_page, w, cx, cy),
+            "the button painted the corner of its box at ({cx}, {cy}) — it is not circular"
+        );
+    }
+}
+
 /// The caps-lock warning actually draws, and disappears again.
 ///
 /// A state test can only see `caps_alpha`; the row is a separate bake with its own element, so it

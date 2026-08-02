@@ -120,6 +120,12 @@ pub enum AccountsToNiri {
     /// Whether the "Other User" button has anywhere to go: more than one non-system account exists
     /// on this machine (`has_multiple_users`, `unlockDialog.js:922`).
     MultipleUsers(bool),
+    /// `can_switch()` (`unlockDialog.js:922`) — see
+    /// [`crate::dbus::user_switching::seat_id`] for why this reduces to "we have a seat".
+    ///
+    /// It rides this channel rather than logind's because it is one of the same button's four
+    /// gates and is resolved once at startup, not watched: a session does not change seats.
+    CanSwitch(bool),
 }
 
 /// Read the properties we care about off an already-resolved user proxy.
@@ -237,6 +243,11 @@ pub fn start(
         let _ = to_niri.send(AccountsToNiri::UserChanged(read_account(&user).await));
         let _ = to_niri.send(AccountsToNiri::MultipleUsers(
             multiple_users(&async_conn).await,
+        ));
+        let _ = to_niri.send(AccountsToNiri::CanSwitch(
+            crate::dbus::user_switching::seat_id(&async_conn)
+                .await
+                .is_some(),
         ));
 
         loop {

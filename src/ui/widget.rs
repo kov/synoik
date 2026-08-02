@@ -163,6 +163,16 @@ pub mod style {
     /// a resting background.
     pub const FOLDER_BG: Rgba = [0.210, 0.210, 0.224, 1.];
 
+    /// `%system_button`'s normal fill — `button(normal, $tc: $system_fg_color, $c:
+    /// $system_bg_color)`, i.e. `st-mix(#fafafb, lighten(#222226, 5%), 9%)` (`_common.scss:348`,
+    /// `_drawing.scss:171`, `_colors.scss:20-21,47`).
+    ///
+    /// Numerically the same as [`ENTRY_BG`] — the `entry()` and `button()` mixins compute the
+    /// resting fill the same way from the same pair — but a separate constant because they are
+    /// separate rules: an entry and a button on a system surface are free to diverge, and one of
+    /// them changing must not silently move the other.
+    pub const SYSTEM_BUTTON_BG: Rgba = [0.252, 0.252, 0.267, 1.];
+
     /// Modal-dialog corner radius, logical px — GNOME `$alert_radius` (`_common.scss:43`,
     /// applied at `_dialogs.scss:6`). Note this is 18px, not `$modal_radius` (16px).
     pub const DIALOG_RADIUS: f64 = 18.;
@@ -1820,6 +1830,99 @@ impl Button {
     }
 }
 
+/// GNOME's `.icon-button` (`_buttons.scss:18-38`) — a **circular** button whose whole content is
+/// one symbolic glyph.
+///
+/// Distinct from [`Button`], which is a rounded rect with a text label: this one has
+/// `border-radius: $forced_circular_radius`, so it is a circle, and its size is derived rather than
+/// laid out — icon plus padding on every side. GNOME uses it for the login screen's a11y, cancel,
+/// session-list and switch-user buttons (`_login-lock.scss:35-50`), the app-folder rename pencil,
+/// and the notification close buttons, which is why it is a widget: those want one hover wash, one
+/// focus ring and one geometry rule between them.
+///
+/// The fill is a [`ButtonStyle`] like any other button; the *shape* is what this type fixes.
+#[derive(Debug, Clone, Copy)]
+pub struct IconButton {
+    pub rect: Rectangle<f64, Logical>,
+    pub icon_px: f64,
+    pub bg: Rgba,
+    pub hovered: bool,
+    pub focused: bool,
+}
+
+impl IconButton {
+    /// `$scalable_icon_size` (`_common.scss:60`) — the glyph inside, at the default font.
+    pub const ICON_PX: f64 = 16.;
+
+    /// The button's diameter for a glyph of `icon_px` with `pad` on every side.
+    ///
+    /// `.icon-button`'s own padding is `$scaled_padding * 2` (12px); rules that extend it routinely
+    /// override that, so it is a parameter rather than a constant — the lock screen's is
+    /// `to_em(16px)` (`_login-lock.scss:44`).
+    pub fn diameter(icon_px: f64, pad: f64) -> f64 {
+        icon_px + pad * 2.
+    }
+
+    pub fn new(rect: Rectangle<f64, Logical>, icon_px: f64, bg: Rgba) -> Self {
+        Self {
+            rect,
+            icon_px,
+            bg,
+            hovered: false,
+            focused: false,
+        }
+    }
+
+    pub fn hovered(mut self, hovered: bool) -> Self {
+        self.hovered = hovered;
+        self
+    }
+
+    pub fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+
+    /// The glyph's centre, in the same space as `rect`.
+    pub fn icon_centre(&self) -> Point<f64, Logical> {
+        Point::from((
+            self.rect.loc.x + self.rect.size.w / 2.,
+            self.rect.loc.y + self.rect.size.h / 2.,
+        ))
+    }
+
+    /// Hit-test a point in the button's own logical space — **round**, not the bounding box.
+    ///
+    /// A circle inscribed in its box leaves a quarter of that box outside it, and a click landing
+    /// in a corner an inch from any drawn pixel reads as a misfire, not as a generous target.
+    pub fn contains(&self, p: Point<f64, Logical>) -> bool {
+        let c = self.icon_centre();
+        let r = self.rect.size.w.min(self.rect.size.h) / 2.;
+        let (dx, dy) = (p.x - c.x, p.y - c.y);
+        dx * dx + dy * dy <= r * r
+    }
+}
+
+impl Painter<'_, '_, '_> {
+    /// Paint an [`IconButton`]'s chrome — the circle, its hover wash and its focus ring. The glyph
+    /// itself is composited by the caller (icons are textures, not paint ops); use
+    /// [`IconButton::icon_centre`] to place it.
+    pub fn icon_button(&mut self, b: &IconButton, accent: Rgba) -> anyhow::Result<()> {
+        // `border-radius: $forced_circular_radius` on a square box.
+        let radius = b.rect.size.w.min(b.rect.size.h) / 2.;
+        self.fill_rounded(b.rect, radius, b.bg)?;
+        if b.hovered {
+            self.fill_rounded(b.rect, radius, style::HOVER_WASH)?;
+        }
+        if b.focused {
+            let ring_color = [accent[0], accent[1], accent[2], 0.8];
+            self.stroke_rounded(b.rect, radius, 2., ring_color)?;
+        }
+        Ok(())
+    }
+}
+
+/// GNOME's `.toggle-switch` (`_switches.scss:6-52`) — the pill-and-handle control a
 /// GNOME's `.toggle-switch` (`_switches.scss:6-52`) — the pill-and-handle control a
 /// `PopupSwitchMenuItem` puts at the right end of a menu row (`popupMenu.js:501-524`).
 ///

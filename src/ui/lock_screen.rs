@@ -300,6 +300,14 @@ const USER_SPACING: f64 = 24.;
 pub const AVATAR_PX: f64 = 160.;
 /// Its `StIcon { padding: $base_padding * 5 }` (`:391`) — the inset of the fallback glyph.
 const AVATAR_ICON_PAD: f64 = 30.;
+/// `.login-dialog-button.switch-user-button` — an `.icon-button` whose `.icon-button` padding is
+/// overridden to `to_em(16px)` (`_login-lock.scss:39-45`). `to_em` divides by a 16px reference and
+/// multiplies by 1.091, which is exactly `16/11pt`, so it reads as 16px at the default font and
+/// scales with the user's.
+const SWITCH_PAD_PX: f64 = 16.;
+/// `system-users-symbolic` (`unlockDialog.js:626`).
+const SWITCH_ICON: &str = "system-users-symbolic";
+
 /// The upload slot the account picture lives in. There is only ever one avatar on this page.
 const AVATAR_SLOT: u64 = 0;
 /// `.user-icon`'s fill under the lock screen: `transparentize($_gdm_fg, .87)` (`:356`).
@@ -460,6 +468,38 @@ pub fn peek_hit(
     widget::Entry::hit(&entry, pos, true)
 }
 
+/// The "Log in as another user" button's box, in output-global coordinates.
+///
+/// `UnlockDialogLayout.allocate` (`unlockDialog.js:491-506`) puts it a **button-width in from the
+/// right edge and a button-height up from the bottom** — `x1 = box.x2 - natWidth * 2`,
+/// `y1 = box.y2 - natHeight * 2` — so the inset is its own size rather than a padding constant.
+/// RTL mirrors it to `box.x1 + natWidth`, which we do not do yet: nothing else in this port is
+/// direction-aware, and a half-mirrored lock screen is worse than a consistently LTR one.
+pub fn switch_user_rect(monitor: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+    let size = switch_user_size();
+    Rectangle::new(
+        Point::from((
+            monitor.loc.x + monitor.size.w - size * 2.,
+            monitor.loc.y + monitor.size.h - size * 2.,
+        )),
+        Size::from((size, size)),
+    )
+}
+
+/// The button's diameter: the glyph plus its padding on both sides.
+pub fn switch_user_size() -> f64 {
+    widget::IconButton::diameter(
+        crate::ui::scaled_px(widget::IconButton::ICON_PX),
+        crate::ui::scaled_px(SWITCH_PAD_PX),
+    )
+}
+
+/// Whether `pos` is on the button — **round**, see [`widget::IconButton::contains`].
+pub fn switch_user_hit(monitor: Rectangle<f64, Logical>, pos: Point<f64, Logical>) -> bool {
+    let rect = switch_user_rect(monitor);
+    widget::IconButton::new(rect, 0., style::TRANSPARENT).contains(pos)
+}
+
 /// The prompt block's total height, sized before anything is shaped (see [`LINE_BOX_ESTIMATE`]).
 pub fn prompt_block_height(base_px: f64) -> f64 {
     let l = prompt_layout(
@@ -542,6 +582,9 @@ pub struct LockScreen {
     /// The uploaded avatar picture. One slot, pruned to the current source on each draw: an avatar
     /// the user has replaced is a texture nothing will ask for again.
     avatar_uploads: RefCell<widget::ImageUploads>,
+    /// The switch-user button's circle. Its own cache because its revision moves on *hover*, which
+    /// nothing else on the page cares about.
+    switch_cache: RefCell<widget::BakeCache>,
 }
 
 /// One drawable of the prompt page.
@@ -1113,6 +1156,90 @@ impl LockScreen {
                 elements.push(Self::element(renderer, texture, scale, origin, t, centre).into())
             }
             Err(err) => tracing::error!("error drawing the unlock prompt: {err:#}"),
+        }
+
+        elements
+    }
+
+    /// The "Log in as another user" button, bottom-right.
+    ///
+    /// A sibling of the page stack rather than part of it (`mainBox.add_child`,
+    /// `unlockDialog.js:659`), so it is drawn separately — but it rides the same crossfade the
+    /// prompt does, at the same alpha and scale (`:817-821`, `:838-842`). Two differences from a
+    /// page, both from that code: **no `translation_y`**, and it scales about **its own** centre
+    /// (`set_pivot_point(0.5, 0.5)`, `:627`) rather than the stack's, which is why `t` arrives here
+    /// with the page's alpha and scale but this passes the button's own centre as the pivot.
+    pub fn render_switch_user(
+        &self,
+        renderer: &mut VulkanRenderer,
+        icons: &crate::render_helpers::icon::IconCache,
+        ctx: PageCtx,
+        hovered: bool,
+        accent: [u8; 3],
+        t: PageTransform,
+    ) -> Vec<PromptElement> {
+        let PageCtx { scale, monitor, .. } = ctx;
+        let rect = switch_user_rect(monitor);
+        let size = rect.size.w;
+        let icon_px = crate::ui::scaled_px(widget::IconButton::ICON_PX);
+        let mut elements: Vec<PromptElement> = Vec::new();
+
+        // It scales about its own middle, so that is the pivot for both layers.
+        let centre = Point::from((rect.loc.x + size / 2., rect.loc.y + size / 2.));
+
+        // The glyph, over its circle.
+        if let Some(el) = widget::icon_element_scaled(
+            renderer,
+            icons,
+            &[SWITCH_ICON],
+            icon_px,
+            scale,
+            t.scale,
+            FG,
+            rect.loc,
+            t.place(centre, centre) - rect.loc,
+            t.alpha as f32,
+        ) {
+            elements.push(el.into());
+        }
+
+        // The circle itself. Baked in its own local space (origin at the rect's top-left) so the
+        // texture is position-independent and the cache key is just its size.
+        let button = widget::IconButton::new(
+            Rectangle::from_size(Size::from((size, size))),
+            icon_px,
+            style::SYSTEM_BUTTON_BG,
+        )
+        .hovered(hovered);
+        let accent_rgb = accent;
+        let accent: Rgba = [
+            f32::from(accent[0]) / 255.,
+            f32::from(accent[1]) / 255.,
+            f32::from(accent[2]) / 255.,
+            1.,
+        ];
+        match widget::bake(
+            renderer,
+            &mut self.switch_cache.borrow_mut(),
+            scale,
+            Size::from((size, size)),
+            widget::Revision::new()
+                .of(hovered)
+                .of(accent_rgb)
+                .px(size)
+                .done(),
+            |_| Ok(()),
+            |frame, phys, ()| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(style::TRANSPARENT)?;
+                p.icon_button(&button, accent)?;
+                Ok(())
+            },
+        ) {
+            Ok(texture) => {
+                elements.push(Self::element(renderer, texture, scale, rect.loc, t, centre).into())
+            }
+            Err(err) => tracing::error!("error drawing the switch-user button: {err:#}"),
         }
 
         elements

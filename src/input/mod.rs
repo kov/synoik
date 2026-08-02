@@ -3645,6 +3645,27 @@ impl State {
     /// `pos` is the global-space pointer location. Off any button — or outside GNOME
     /// mode — clears the hover. Redraws only when the hovered button actually changed.
     fn update_panel_hover(&mut self, pos: Point<f64, Logical>) {
+        // The shield is over everything, so while it is down the only thing that tracks `:hover` is
+        // its own chrome. Falling through to the panel and overview below would light up buttons
+        // nobody can see, and redraw for each one.
+        if self.niri.screen_shield.is_active() {
+            let on_button = self.niri.switch_user_visible()
+                && self.niri.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt
+                && self
+                    .niri
+                    .output_under(pos)
+                    .and_then(|(output, _)| self.niri.global_space.output_geometry(output))
+                    .is_some_and(|geo| crate::ui::lock_screen::switch_user_hit(geo.to_f64(), pos));
+            if self.niri.switch_user_hovered != on_button {
+                self.niri.switch_user_hovered = on_button;
+                self.niri.queue_redraw_all();
+            }
+            return;
+        }
+        if self.niri.switch_user_hovered {
+            self.niri.switch_user_hovered = false;
+        }
+
         let role = if self.niri.layout.is_gnome_mode() {
             self.niri.output_under(pos).and_then(|(output, p)| {
                 let ws = self.niri.workspace_state_for(output);

@@ -194,14 +194,23 @@ the last bug in this area lived.
 
 ---
 
-## C. AccountsService — **LANDED except the Other User button**
+## C. AccountsService — **LANDED**
 
 `RealName`, `IconFile` and `PasswordMode` all come from AccountsService now, and the picture draws:
 `ImageFit::Cover` in the decode, `widget::Avatar` for the circular draw, a `bake_card_border` ring,
 warmed when the account answers and again on every output add/resize (the decode is keyed on the
 scale). It shares the album-art `ImageCache`, so it also had to join that cache's `retain` — its
-only bound — or a track change would evict the picture. What is left is **C3**, the Other User
-button (`unlockDialog.js:617-628`), which needs the `MultipleUsers` value C already publishes.
+only bound — or a track change would evict the picture.
+
+The Other User button landed with it: `widget::IconButton` for the circular `.icon-button` shape,
+gated on all four of GNOME's conditions, and `dbus::user_switching` for the action — which is not
+one call but libgdm's algorithm (find our seat, reuse a live `gdm-launch-environment` greeter on it
+via `ActivateSessionOnSeat`, else `CreateTransientDisplay` and only on `seat0`).
+
+**Divergence: no RTL mirroring.** GNOME flips the button to the leading edge under
+`Clutter.TextDirection.RTL` (`unlockDialog.js:496-499`). Nothing else in this port is
+direction-aware yet, and a lock screen that mirrors one control and not the rest is worse than a
+consistently LTR one; it goes in when text direction does, as a whole.
 
 Replaces three divergences: the user's real name and avatar come from `/etc/passwd` + GECOS today,
 and `password_mode` is assumed to be "has a password".

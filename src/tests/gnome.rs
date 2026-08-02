@@ -13543,6 +13543,143 @@ fn changing_the_account_picture_in_place_replaces_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Every one of the four conditions can hide the "Log in as another user" button, on its own.
+///
+/// `_updateUserSwitchVisibility` (`unlockDialog.js:921-926`) ANDs four independent sources — a seat
+/// that can host another session, another account to switch to, the user's preference, and the
+/// administrator's lockdown. Missing one is not a visual nit: a button that appears when switching
+/// is impossible does nothing when pressed, and one that appears under `disable-user-switching`
+/// hands out a route past a policy somebody set deliberately. Each is asserted from a state where
+/// everything *else* is satisfied, so a gate that is wired to the wrong field cannot hide behind
+/// another gate that happens to be false too.
+#[cfg(feature = "dbus")]
+#[test]
+fn each_condition_alone_hides_the_switch_user_button() {
+    use crate::dbus::accounts_service::AccountsToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Nothing has answered yet: the fail-closed direction is hidden, since a button offering a
+    // switch we have not established is possible is the one that does nothing.
+    assert!(
+        !f.niri().switch_user_visible(),
+        "the button must not appear before anything has said it can work"
+    );
+
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::CanSwitch(true));
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::MultipleUsers(true));
+    assert!(
+        f.niri().switch_user_visible(),
+        "with a seat, another user, and default settings, the button shows"
+    );
+
+    // ...and each condition, alone, takes it away again.
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::CanSwitch(false));
+    assert!(
+        !f.niri().switch_user_visible(),
+        "a seat that cannot host another session"
+    );
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::CanSwitch(true));
+
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::MultipleUsers(false));
+    assert!(!f.niri().switch_user_visible(), "nobody else to log in as");
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::MultipleUsers(true));
+
+    let base = f.niri().screen_shield.settings();
+    let mut settings = base;
+    settings.user_switch_enabled = false;
+    f.niri().screen_shield.set_settings(settings);
+    assert!(
+        !f.niri().switch_user_visible(),
+        "org.gnome.desktop.screensaver user-switch-enabled = false"
+    );
+
+    let mut settings = base;
+    settings.disable_user_switching = true;
+    f.niri().screen_shield.set_settings(settings);
+    assert!(
+        !f.niri().switch_user_visible(),
+        "org.gnome.desktop.lockdown disable-user-switching = true"
+    );
+
+    f.niri().screen_shield.set_settings(base);
+    assert!(f.niri().switch_user_visible(), "and back");
+}
+
+/// Clicking the button cancels the authentication in flight; clicking beside it does not.
+///
+/// `_otherUserClicked` (`unlockDialog.js:901-905`) cancels the prompt as well as leaving, and that
+/// half is the one worth pinning: a conversation left running holds a PAM transaction open on a
+/// session whose user has gone to the login screen. The switch itself is a system-bus round trip
+/// with no observable state here, so what this asserts is the compositor's half — including that a
+/// click a few pixels outside the circle still just raises the prompt, since the button is round
+/// and its bounding box is a quarter larger than it is.
+#[cfg(feature = "dbus")]
+#[test]
+fn clicking_the_switch_user_button_cancels_the_prompt() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use crate::dbus::accounts_service::AccountsToNiri;
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::CanSwitch(true));
+    f.niri_state()
+        .on_accounts_msg(AccountsToNiri::MultipleUsers(true));
+
+    let raise = |f: &mut Fixture| {
+        f.niri_state()
+            .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
+        f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
+        f.niri_state()
+            .on_verifier_event(VerifierEvent::AskQuestion {
+                question: "Password:".to_owned(),
+                secret: true,
+            });
+        f.niri_state().on_shield_key(None, Some('a'));
+    };
+    raise(&mut f);
+    assert_eq!(
+        f.niri().unlock_dialog.page(),
+        crate::unlock_dialog::Page::Prompt,
+        "the fixture is on the prompt page"
+    );
+
+    let monitor = Rectangle::from_size(Size::from((1920., 1080.)));
+    let rect = crate::ui::lock_screen::switch_user_rect(monitor);
+    let centre = Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.));
+
+    // A click just outside the circle but inside its box: the corner of the bounding square.
+    f.niri_state().on_shield_click(rect.loc);
+    assert_eq!(
+        f.niri().unlock_dialog.page(),
+        crate::unlock_dialog::Page::Prompt,
+        "a click in the button's corner must not have counted as the button"
+    );
+
+    // ...and one on the button itself drops back to the clock, the prompt cancelled.
+    f.niri_state().on_shield_click(centre);
+    assert_eq!(
+        f.niri().unlock_dialog.page(),
+        crate::unlock_dialog::Page::Clock,
+        "the click did not cancel the authentication in flight"
+    );
+    assert!(
+        f.niri().screen_shield.is_active(),
+        "and it must certainly not have unlocked the screen"
+    );
+}
+
 /// The compositor's half of `_updateState` (`js/ui/mpris.js:167-177`): `DesktopEntry` resolves
 /// through the app system, and the card's source name is the app's name with `Identity` as the
 /// fallback. Everything else about a player is what the watcher validated.
