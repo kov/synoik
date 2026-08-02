@@ -583,6 +583,18 @@ impl GnomeSettings {
         }
     }
 
+    /// `org.gnome.login-screen` — which authentication services the shell is allowed to offer
+    /// (`util.js:32-35`).
+    ///
+    /// Only whether to *look* for a reader; a machine with the key on and no hardware still shows
+    /// nothing, because everything downstream gates on a reader having been found.
+    fn load_login_screen(&mut self, login_screen: &gio::Settings) {
+        if settings_has_key(login_screen, "enable-fingerprint-authentication") {
+            self.shield.enable_fingerprint =
+                login_screen.boolean("enable-fingerprint-authentication");
+        }
+    }
+
     fn load_screensaver(&mut self, screensaver: &gio::Settings) {
         if settings_has_key(screensaver, "lock-enabled") {
             self.shield.lock_enabled = screensaver.boolean("lock-enabled");
@@ -1739,6 +1751,7 @@ struct Stores {
     shell: Option<gio::Settings>,
     lockdown: Option<gio::Settings>,
     screensaver: Option<gio::Settings>,
+    login_screen: Option<gio::Settings>,
     background: Option<gio::Settings>,
     interface: Option<gio::Settings>,
     calendar: Option<gio::Settings>,
@@ -1795,6 +1808,7 @@ impl Stores {
             shell: gsettings("org.gnome.shell", b),
             lockdown: gsettings("org.gnome.desktop.lockdown", b),
             screensaver: gsettings("org.gnome.desktop.screensaver", b),
+            login_screen: gsettings("org.gnome.login-screen", b),
             background: gsettings("org.gnome.desktop.background", b),
             interface: gsettings("org.gnome.desktop.interface", b),
             calendar: gsettings("org.gnome.desktop.calendar", b),
@@ -1847,6 +1861,7 @@ impl Stores {
             &self.shell,
             &self.lockdown,
             &self.screensaver,
+            &self.login_screen,
             &self.background,
             &self.interface,
             &self.calendar,
@@ -1889,6 +1904,9 @@ impl Stores {
         }
         if let Some(screensaver) = &self.screensaver {
             settings.load_screensaver(screensaver);
+        }
+        if let Some(login_screen) = &self.login_screen {
+            settings.load_login_screen(login_screen);
         }
         if let Some(background) = &self.background {
             settings.load_background(background, self.interface.as_ref());

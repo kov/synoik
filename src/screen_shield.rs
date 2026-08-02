@@ -91,6 +91,10 @@ pub struct ShieldSettings {
     /// `org.gnome.desktop.lockdown disable-user-switching` — the administrator's veto over the
     /// same button. Both are consulted, and either one being against it wins.
     pub disable_user_switching: bool,
+    /// `org.gnome.login-screen enable-fingerprint-authentication` — whether to go *looking* for a
+    /// reader (`util.js:33`, `_updateEnabledServices`, `:627-637`). Finding one is a separate
+    /// question, and the one everything downstream actually gates on.
+    pub enable_fingerprint: bool,
 }
 
 /// `STANDARD_FADE_TIME` (`:39`) — the fade GNOME runs when the session goes idle.
@@ -110,6 +114,7 @@ impl Default for ShieldSettings {
             lock_delay: Duration::ZERO,
             user_switch_enabled: true,
             disable_user_switching: false,
+            enable_fingerprint: true,
         }
     }
 }

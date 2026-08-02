@@ -522,6 +522,10 @@ pub struct Niri {
     pub user_account: crate::dbus::accounts_service::UserAccount,
     /// Whether this machine has more than one ordinary account, for the "Other User" button.
     pub multiple_users: bool,
+    /// What the fprintd probe found, if anything — see [`crate::dbus::fprintd`]. `None` (the
+    /// default) is what a machine with no reader keeps forever, and it is what stops
+    /// `gdm-fingerprint` from ever being started.
+    pub fingerprint_reader: crate::dbus::fprintd::ReaderType,
     /// Whether logind gave us a seat id — libaccountsservice's `can_switch()`, which is a seat
     /// lookup and nothing else now that `sd_seat_can_multi_session` is gone. Resolved once, off
     /// the main loop, by the same task that starts the AccountsService watch.
@@ -4011,6 +4015,24 @@ impl State {
         self.apply_unlock_effects(effects);
     }
 
+    /// fprintd answered the startup probe.
+    ///
+    /// Only matters for the *next* lock: the conversation reads the reader type when it begins, so
+    /// a probe landing after a lock is already up leaves that one without a reader. That matches
+    /// GNOME closely enough — it re-runs `_maybeStartFingerprintVerification` on a late detection
+    /// (`util.js:437-442`) — and the window is one round trip at startup against a lock screen that
+    /// is not up yet.
+    #[cfg(feature = "dbus")]
+    pub fn on_fingerprint_reader(&mut self, reader: crate::dbus::fprintd::ReaderType) {
+        if self.niri.fingerprint_reader == reader {
+            return;
+        }
+        if reader.is_present() {
+            debug!("fingerprint reader detected: {reader:?}");
+        }
+        self.niri.fingerprint_reader = reader;
+    }
+
     /// AccountsService answered, or the account changed under us.
     ///
     /// Both are the same event: re-read and re-render. `PasswordMode` in particular is not
@@ -4098,7 +4120,11 @@ impl State {
             if let Some(tx) = self.niri.gdm_requests.as_ref() {
                 let username = self.niri.unlock_dialog.user().name.clone();
                 asked = tx
-                    .send_blocking(crate::dbus::gdm::VerifierRequest::Begin { username, epoch })
+                    .send_blocking(crate::dbus::gdm::VerifierRequest::Begin {
+                        username,
+                        epoch,
+                        reader: self.niri.fingerprint_reader,
+                    })
                     .is_ok();
             }
 
@@ -5453,6 +5479,7 @@ impl Niri {
             lock_replies: Vec::new(),
             published_active: false,
             user_account: Default::default(),
+            fingerprint_reader: Default::default(),
             can_switch_user: false,
             switch_user_hovered: false,
             multiple_users: false,

@@ -6,6 +6,7 @@ use crate::niri::State;
 pub mod accounts_service;
 pub mod bluez;
 pub mod calendar_server;
+pub mod fprintd;
 pub mod freedesktop_a11y;
 pub mod freedesktop_locale1;
 pub mod freedesktop_login1;
@@ -77,6 +78,7 @@ pub struct DBusServers {
     /// gnome-session's presence, the shield's idle source.
     pub conn_presence: Option<Connection>,
     pub conn_accounts: Option<Connection>,
+    pub conn_fprintd: Option<Connection>,
     pub conn_locale1: Option<Connection>,
     pub conn_keyboard_monitor: Option<Connection>,
     pub conn_system_status: Option<Connection>,
@@ -351,6 +353,22 @@ impl DBusServers {
         match accounts_service::start(niri.unlock_dialog.user().name.clone(), to_niri) {
             Ok(conn) => dbus.conn_accounts = Some(conn),
             Err(err) => warn!("error starting AccountsService watcher: {err:?}"),
+        }
+
+        // Only if the user has not turned fingerprint authentication off — the probe can activate
+        // fprintd, and activating a service the user has declined is not ours to do.
+        if niri.gnome_settings.shield.enable_fingerprint {
+            let (to_niri, from_fprintd) = calloop::channel::channel();
+            niri.event_loop
+                .insert_source(from_fprintd, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(reader) => state.on_fingerprint_reader(reader),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            match fprintd::start(to_niri) {
+                Ok(conn) => dbus.conn_fprintd = Some(conn),
+                Err(err) => warn!("error probing for a fingerprint reader: {err:?}"),
+            }
         }
 
         let (to_niri, from_locale1) = calloop::channel::channel();

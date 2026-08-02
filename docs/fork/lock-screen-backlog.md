@@ -333,7 +333,22 @@ message list already has rather than growing a second one.
 
 ---
 
-## E. Fingerprint and smartcard
+## E. Fingerprint and smartcard — **fingerprint LANDED, smartcard open**
+
+The reader half is in: `dbus::fprintd` probes `GetDefaultDevice` + `scan-type` once at startup
+(gated on `enable-fingerprint-authentication`, silent on the two no-reader errors GNOME passes
+over), `gdm-fingerprint` runs beside `gdm-password` on the same channel when a reader was found,
+and the routing policy moved out of the async pump into a pure `route()` so it can be tested at all.
+
+Landed with it: `MessageKind::Hint` as an ordered priority, so the reader's narration cannot talk
+over the error explaining a refused password. **Divergence: no timed message queue.** GNOME shows
+each message for an interval and moves on, so a suppressed hint reappears; we hold one message, so
+it is dropped and returns on the reader's next `Info`.
+
+Still open: the error wiggle (`authPrompt.js:481-493`, 3 × 65 ms, ±6 px — `animationUtils.js:87`),
+and smartcard.
+
+## E (reference notes). Fingerprint and smartcard
 
 Additive to the gdm conversation, but not merely "start a second PAM service".
 

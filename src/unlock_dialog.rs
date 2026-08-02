@@ -384,6 +384,23 @@ impl UnlockDialog {
             }
 
             VerifierEvent::ShowMessage { text, kind } => {
+                // `MessageType` is a **priority** (`util.js:58-63`), and GNOME's queue keeps the
+                // loudest message showing rather than letting a later quiet one displace it
+                // (`_queuePriorityMessage`, `:313-325`). It matters here because the two
+                // conversations talk at once: pam_fprintd narrates on every scan, so without this
+                // the fingerprint hint would wipe out "Sorry, that didn't work" a moment after the
+                // user's password was refused, and they would never learn why.
+                //
+                // **Divergence: no timed queue.** GNOME shows each message for an interval and then
+                // moves on, so a hint suppressed by an error reappears once the error has had its
+                // turn. We hold one message, so a hint is dropped rather than deferred; it returns
+                // on the reader's next `Info`, once the louder message has been cleared by a reset
+                // or a fresh question.
+                if let Some(current) = &self.message {
+                    if kind < current.kind {
+                        return UnlockEffects::default();
+                    }
+                }
                 self.message = Some(Message { text, kind });
                 UnlockEffects::redraw()
             }
@@ -780,5 +797,60 @@ mod tests {
         assert_eq!(user.display_name(), "Test User");
         user.real_name.clear();
         assert_eq!(user.display_name(), "gsrs");
+    }
+
+    /// The fingerprint hint must not wipe out the error that says why the password was refused.
+    ///
+    /// The two conversations talk at the same time, and pam_fprintd narrates on *every* scan — so
+    /// without a priority the sequence "password refused, finger brushed the sensor" ends with the
+    /// user looking at "(or place finger on reader)" and no idea what went wrong. GNOME's
+    /// `MessageType` is ordered for exactly this and its queue keeps the loudest message showing
+    /// (`util.js:58-63`, `_queuePriorityMessage`, `:313-325`).
+    #[test]
+    fn a_hint_never_displaces_a_louder_message() {
+        let mut d = dialog();
+
+        let hint = || VerifierEvent::ShowMessage {
+            text: "(or place finger on reader)".to_owned(),
+            kind: MessageKind::Hint,
+        };
+        let error = || VerifierEvent::ShowMessage {
+            text: "Sorry, that didn't work".to_owned(),
+            kind: MessageKind::Error,
+        };
+
+        // Nothing showing: the hint takes the slot.
+        d.on_verifier_event(hint());
+        assert_eq!(d.message().map(|m| m.kind), Some(MessageKind::Hint));
+
+        // The password is refused: the error is louder and wins.
+        d.on_verifier_event(error());
+        assert_eq!(
+            d.message().map(|m| m.text.as_str()),
+            Some("Sorry, that didn't work")
+        );
+
+        // The reader narrates again a moment later — and must not talk over it.
+        d.on_verifier_event(hint());
+        assert_eq!(
+            d.message().map(|m| m.text.as_str()),
+            Some("Sorry, that didn't work"),
+            "the hint erased the reason the unlock failed"
+        );
+
+        // An equally loud message does replace, so a *second* error is not swallowed.
+        d.on_verifier_event(VerifierEvent::ShowMessage {
+            text: "Sorry, that didn't work either".to_owned(),
+            kind: MessageKind::Error,
+        });
+        assert_eq!(
+            d.message().map(|m| m.text.as_str()),
+            Some("Sorry, that didn't work either")
+        );
+
+        // ...and once the slot is cleared, the hint is welcome again.
+        d.on_verifier_event(VerifierEvent::Reset);
+        d.on_verifier_event(hint());
+        assert_eq!(d.message().map(|m| m.kind), Some(MessageKind::Hint));
     }
 }
