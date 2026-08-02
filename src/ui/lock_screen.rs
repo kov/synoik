@@ -964,6 +964,9 @@ impl LockScreen {
             widget::EntryStyle::Lockscreen,
             content.entry_live,
             content.peek.is_some(),
+            // Unused: the lock screen's focus ring is white, not the accent — there is a wallpaper
+            // behind it, so an accent ring would compete with whatever happens to be there.
+            widget::style::TEXT,
             entry_rev,
         ) {
             Ok(texture) => elements.push(

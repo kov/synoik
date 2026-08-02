@@ -952,6 +952,11 @@ pub enum EntryStyle {
     /// `$base_padding * 1.5` padding and ordinary left-aligned text — **not** a pill, and not
     /// centred. Its placeholder is `transparentize($system_fg_color, 0.3)` (`:378`).
     Lockscreen,
+    /// `.prompt-dialog-password-entry` (`_dialogs.scss:119-122`) — the polkit dialog's password
+    /// box. An ordinary `%entry` on a *dialog* rather than over the wallpaper, so it takes
+    /// `_entries.scss`'s normal fill (`mix($fg_color, $bg_color, 9%)`, i.e. [`style::ENTRY_BG`])
+    /// rather than the lock screen's translucent one, and its focus ring is the accent.
+    PromptDialog,
 }
 
 /// `%entry_common` `padding: $base_padding * 1.5` (`_common.scss:177`).
@@ -963,16 +968,20 @@ impl EntryStyle {
             EntryStyle::Search => style::ENTRY_BG,
             // `transparentize(white, .9)`.
             EntryStyle::Lockscreen => [1., 1., 1., 0.1],
+            EntryStyle::PromptDialog => style::ENTRY_BG,
         }
     }
 
     /// The focus ring's colour, when the caller says the entry has focus.
-    fn focus_ring(self) -> Option<Rgba> {
+    fn focus_ring(self, accent: Rgba) -> Option<Rgba> {
         match self {
             // The search entry's focus is drawn by its caller's inset-accent ring.
             EntryStyle::Search => None,
             // `transparentize(white, 0.6)`.
             EntryStyle::Lockscreen => Some([1., 1., 1., 0.4]),
+            // An ordinary entry on a dialog takes `focus_ring()`'s accent (`_drawing.scss:99-105`),
+            // not the lock screen's white — that one exists because there is a wallpaper behind it.
+            EntryStyle::PromptDialog => Some(accent),
         }
     }
 
@@ -981,7 +990,7 @@ impl EntryStyle {
         match self {
             // After the find glyph's gutter.
             EntryStyle::Search => (Entry::ICON_INSET * 2., HAlign::Left),
-            EntryStyle::Lockscreen => (ENTRY_PAD, HAlign::Left),
+            EntryStyle::Lockscreen | EntryStyle::PromptDialog => (ENTRY_PAD, HAlign::Left),
         }
     }
 
@@ -990,7 +999,7 @@ impl EntryStyle {
     fn icon_inset(self) -> f64 {
         match self {
             EntryStyle::Search => Entry::ICON_INSET,
-            EntryStyle::Lockscreen => ENTRY_PAD + Entry::ICON_PX / 2.,
+            EntryStyle::Lockscreen | EntryStyle::PromptDialog => ENTRY_PAD + Entry::ICON_PX / 2.,
         }
     }
 
@@ -998,7 +1007,7 @@ impl EntryStyle {
     fn radius(self) -> f64 {
         match self {
             EntryStyle::Search => Entry::HEIGHT / 2.,
-            EntryStyle::Lockscreen => 8.,
+            EntryStyle::Lockscreen | EntryStyle::PromptDialog => 8.,
         }
     }
 
@@ -1008,6 +1017,8 @@ impl EntryStyle {
             EntryStyle::Search => style::MUTED,
             // `transparentize($system_fg_color, 0.3)`.
             EntryStyle::Lockscreen => [1., 1., 1., 0.7],
+            // `$fg_color` at 70% — `%entry`'s placeholder (`_entries.scss:3`).
+            EntryStyle::PromptDialog => [1., 1., 1., 0.7],
         }
     }
 }
@@ -1086,6 +1097,8 @@ impl Entry {
         // `has_trailing` reserves the trailing glyph's gutter, so long text stops before it
         // instead of running underneath.
         has_trailing: bool,
+        // The system accent, for the styles whose focus ring is `focus_ring()`.
+        accent: Rgba,
         revision: u64,
     ) -> anyhow::Result<VkTexture> {
         let size = Size::<f64, Logical>::from((width, Self::HEIGHT));
@@ -1101,7 +1114,7 @@ impl Entry {
         // out at the pill's edge rather than under its rounding.
         let gutter = match entry_style {
             EntryStyle::Search => Self::ICON_INSET * 2.,
-            EntryStyle::Lockscreen => ENTRY_PAD,
+            EntryStyle::Lockscreen | EntryStyle::PromptDialog => ENTRY_PAD,
         };
         let trailing = if has_trailing {
             entry_style.icon_inset() * 2.
@@ -1112,7 +1125,7 @@ impl Entry {
             Point::from((gutter, 0.)),
             Size::from(((width - gutter - trailing).max(0.), Self::HEIGHT)),
         );
-        let ring = focused.then(|| entry_style.focus_ring()).flatten();
+        let ring = focused.then(|| entry_style.focus_ring(accent)).flatten();
         bake(
             renderer,
             cache,

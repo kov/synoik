@@ -17,6 +17,9 @@ pub mod osd;
 pub mod overview_layout;
 pub mod overview_search;
 pub mod panel;
+/// Gated with `dbus` like the state machine it draws — see [`crate::polkit_dialog`].
+#[cfg(feature = "dbus")]
+pub mod polkit_dialog;
 pub mod popover;
 pub mod quick_settings;
 pub mod run_dialog;

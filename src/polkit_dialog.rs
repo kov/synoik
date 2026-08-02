@@ -182,6 +182,11 @@ impl PolkitDialog {
         }
     }
 
+    /// The account's picture, if AccountsService had one on disk.
+    pub fn avatar(&self) -> Option<&std::path::PathBuf> {
+        self.request.as_ref()?.avatar.as_ref()
+    }
+
     /// polkit's description of the action — the dialog's body text.
     pub fn action_message(&self) -> &str {
         self.request.as_ref().map_or("", |r| r.message.as_str())
