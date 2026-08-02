@@ -681,29 +681,20 @@ fn clean_question(question: &str) -> String {
 /// account whose real name was changed through AccountsService without touching GECOS; wiring
 /// `org.freedesktop.Accounts` closes that and changes nothing else here.
 pub fn session_user() -> UserInfo {
-    // SAFETY: `getpwuid` returns a pointer into a static buffer. We copy both strings out before
-    // returning, and make no other libc call that could reuse the buffer in between.
-    unsafe {
-        let uid = libc::getuid();
-        let pw = libc::getpwuid(uid);
-        if pw.is_null() {
-            return UserInfo::default();
-        }
-        let cstr = |p: *const libc::c_char| {
-            if p.is_null() {
-                String::new()
-            } else {
-                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
-            }
-        };
-        let name = cstr((*pw).pw_name);
-        // GECOS is comma-separated; the first field is the full name.
-        let real_name = cstr((*pw).pw_gecos)
-            .split(',')
-            .next()
-            .unwrap_or_default()
-            .to_owned();
-        UserInfo { name, real_name }
+    // SAFETY: `getuid` is always successful and touches no memory.
+    let uid = unsafe { libc::getuid() };
+    user_for_uid(uid)
+}
+
+/// The same lookup for any uid — the polkit dialog authenticates as whoever polkitd names, which
+/// is often `root` rather than us.
+pub fn user_for_uid(uid: u32) -> UserInfo {
+    let Some(entry) = crate::utils::passwd_entry(uid) else {
+        return UserInfo::default();
+    };
+    UserInfo {
+        name: entry.name,
+        real_name: entry.real_name,
     }
 }
 

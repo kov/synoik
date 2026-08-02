@@ -633,6 +633,65 @@ pub fn show_screenshot_notification(image_path: Option<&Path>) -> anyhow::Result
     Ok(())
 }
 
+/// A user's login name and real name, as the passwd database has them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswdEntry {
+    pub name: String,
+    /// The first GECOS field, which is what AccountsService itself seeds `real-name` from. Empty
+    /// when the account has none.
+    pub real_name: String,
+}
+
+/// Look up a uid in the passwd database, or `None` if there is no such user.
+///
+/// `getpwuid_r` rather than `getpwuid`: the plain version returns a pointer into one static buffer
+/// shared by the whole process, so two threads asking at once hand each other's answers back. That
+/// is not hypothetical here — the polkit agent resolves identities on a D-Bus executor thread while
+/// the compositor thread is free to ask about its own user. glibc's own callers use the `_r` form
+/// for the same reason (`shell-polkit-authentication-agent.c:225`).
+pub fn passwd_entry(uid: u32) -> Option<PasswdEntry> {
+    // 4096 is what gnome-shell allocates for the same call. `getpwuid_r` reports ERANGE if a
+    // record needs more, and we treat that as "no answer" rather than growing: a passwd entry
+    // that large is malformed, not merely long.
+    let mut buf = [0 as libc::c_char; 4096];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = null_mut();
+
+    // SAFETY: `pwd`, `buf` and `result` are live for the call and sized as `getpwuid_r` requires.
+    // The strings it writes point into `buf`, and we copy them out before returning.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid as libc::uid_t,
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+
+    // SAFETY: `getpwuid_r` succeeded, so these point into `buf`, which is still in scope.
+    let cstr = |p: *const libc::c_char| unsafe {
+        if p.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    };
+
+    Some(PasswdEntry {
+        name: cstr(pwd.pw_name),
+        // GECOS is comma-separated; the first field is the full name.
+        real_name: cstr(pwd.pw_gecos)
+            .split(',')
+            .next()
+            .unwrap_or_default()
+            .to_owned(),
+    })
+}
+
 #[inline(never)]
 pub fn cause_panic() {
     let a = Duration::from_secs(1);
