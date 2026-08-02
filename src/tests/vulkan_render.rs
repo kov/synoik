@@ -1970,8 +1970,10 @@ fn vulkan_renders_the_top_panel() {
     );
 }
 
-/// The dateMenu messages-indicator dot composites right of the clock when shown,
-/// and nothing does there when it's hidden (`js/ui/dateMenu.js:871-886`). A
+/// The dateMenu messages-indicator dot composites into the clock button's trailing
+/// padding when shown, and nothing does there when it's hidden (`js/ui/dateMenu.js:871-886`).
+/// The differential doubles as the check that the padding really is empty in the hidden
+/// state — if the clock label ever grew into it, the "off" count would stop being zero. A
 /// differential over the same panel proves it's the dot — bundled from
 /// `message-indicator-symbolic` through the embedded-icon fallback — not a stray
 /// clock glyph, and that the bundled SVG rasterizes at all.
@@ -1986,9 +1988,10 @@ fn vulkan_renders_the_messages_indicator_dot() {
     let width = to_physical_precise_round(scale.x, ow);
     let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::panel_height());
 
-    // The dot's center, in physical pixels. Asked of the panel with the dot ON: showing it
-    // widens the right-anchored dateMenu box, which slides the clock left, so a center
-    // derived from the clock's *hidden-state* rect would probe 14px off the mark.
+    // The dot's center, in physical pixels — asked of the panel rather than derived from
+    // the clock rect, so this probe keeps pointing at the dot if its placement inside the
+    // button's padding is ever retuned. Toggling to read it is safe precisely because the
+    // dot costs no layout (`the_messages_dot_moves_nothing`).
     let dot = {
         let panel = &mut f.niri().panel;
         panel.set_messages_indicator(true);

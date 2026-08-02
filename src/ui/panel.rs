@@ -116,25 +116,19 @@ fn clock_h_padding() -> f64 {
 }
 
 /// The dateMenu messages-indicator dot: `message-indicator-symbolic` at
-/// `$scalable_icon_size` (`_panel.scss:92-94`). `MESSAGES_INDICATOR_SPACING` is the
-/// `.clock-display-box` spacing between the box children (`_panel.scss:159-160`).
+/// `$scalable_icon_size` (`_panel.scss:92-94`).
 ///
-/// The dot keeps GNOME's child order — it sits AFTER the clock, at the same offset from
-/// the lit `.clock` pill (`js/ui/dateMenu.js:880-883`). What GNOME's *leading* pad bought,
-/// though, was the clock staying centered in the panel (`dateMenu.js:871-879`), and with
-/// the clock right-anchored (see [`RIGHT_BOX_ORDER`]) there is nothing left to center. So
-/// the pad is dropped and the dot takes the corner: the whole dateMenu box is
-/// right-anchored, which pushes the clock label left by [`MESSAGES_INDICATOR_EXTENT`]
-/// whenever the dot appears.
+/// **Divergence, following the clock's** (see [`RIGHT_BOX_ORDER`]). GNOME hangs the dot off
+/// the clock as a sibling in the `.clock-display-box`, with a size-matched *leading* pad so
+/// the pair stays centred in the panel (`js/ui/dateMenu.js:871-883`). That pad also happens
+/// to keep the clock still as the dot comes and goes — and with the clock right-anchored,
+/// stillness is the only part worth keeping. Rather than reserve a slot for the dot, we put
+/// it where there is already room: the clock button's own trailing `clock_h_padding()`,
+/// empty by construction. So the dot costs no layout at all, the button never changes size,
+/// and an arriving or dismissed notification cannot shove the clock — or every status
+/// indicator left of it — sideways. It draws over the button's pill rather than beside it,
+/// which GNOME never does; it reads as a trailing badge on the button.
 const MESSAGES_INDICATOR_ICON: f64 = 16.;
-const MESSAGES_INDICATOR_SPACING: f64 = 2.;
-
-/// How far past the clock button's own rect the shown dot reaches: it starts
-/// `MESSAGES_INDICATOR_SPACING` right of the *pill*, which is already `BTN_MARGIN_X` in
-/// from the button rect's right edge. This is what the dateMenu box grows by when the dot
-/// appears — see [`Panel::messages_indicator_rect`].
-const MESSAGES_INDICATOR_EXTENT: f64 =
-    MESSAGES_INDICATOR_SPACING + MESSAGES_INDICATOR_ICON - BTN_MARGIN_X;
 
 /// Bar background (opaque black — GNOME's dark panel `$panel_bg_color` = `$dark_5`
 /// `#000000`, `_colors.scss:24` / `_palette.scss:46`), straight RGBA.
@@ -802,19 +796,15 @@ impl Panel {
 
     /// Show/hide the dateMenu unread-messages dot (the compositor computes
     /// `show-banners && unseen − queued > 0`). Returns whether it changed so the
-    /// caller can queue a redraw.
-    ///
-    /// The dot itself composites on top of the bar (from the icon cache), but it is part
-    /// of the right-anchored dateMenu box, so showing it shifts the clock label — and
-    /// every right-box indicator left of it — by [`MESSAGES_INDICATOR_EXTENT`]. The bar
-    /// texture carries those labels, hence the invalidation. (While the clock was
-    /// centered this was a pure composite and skipped it.)
+    /// caller can queue a redraw. The dot composites on top of the bar (from the icon
+    /// cache) into a slot the dateMenu box reserves for it either way
+    /// ([`MESSAGES_INDICATOR_EXTENT`]), so nothing in the bar texture moves and this
+    /// doesn't invalidate it.
     pub fn set_messages_indicator(&mut self, visible: bool) -> bool {
         if visible == self.messages_indicator {
             return false;
         }
         self.messages_indicator = visible;
-        self.cache.borrow_mut().clear();
         true
     }
 
@@ -1023,44 +1013,30 @@ impl Panel {
         )
     }
 
-    /// Logical width of the clock button alone: the shaped label plus a padding on each
-    /// side. The dot is not in here — see [`Self::date_menu_width`].
-    fn clock_button_width(&self) -> f64 {
+    /// Logical width of the dateMenu button: the shaped clock label plus a padding on
+    /// each side. The messages dot costs nothing here — it draws *inside* the trailing
+    /// padding (see [`Self::messages_indicator_rect`]), which is what keeps the button a
+    /// fixed size whether or not there is anything unread.
+    fn date_menu_width(&self) -> f64 {
         let clock_w =
             niri_vk::text::measure_line_width_weighted(&self.clock_text, font_px() as f32, true);
         clock_w + clock_h_padding() * 2.
     }
 
-    /// Logical width of the whole dateMenu box (GNOME's `clock-display-box`): the clock
-    /// button plus, when shown, the trailing messages dot. Its right-box slot, so a
-    /// dot appearing widens the box leftward and the clock label moves with it.
-    fn date_menu_width(&self) -> f64 {
-        let dot = if self.messages_indicator {
-            MESSAGES_INDICATOR_EXTENT
-        } else {
-            0.
-        };
-        self.clock_button_width() + dot
-    }
-
-    /// The dateMenu (clock) button rect: the shaped label plus a padding on each side,
-    /// sitting at the LEFT of the dateMenu box so the dot (when shown) trails it.
+    /// The dateMenu (clock) button rect — its right-box slot ([`RIGHT_BOX_ORDER`]), so the
+    /// same fold that places quickSettings places the clock. This is the whole button:
+    /// what it draws, what wears the pill, and what a click hits, dot or no dot.
     /// `output_width` is the output's logical width.
     pub fn date_menu_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
-        let r#box = self.date_menu_hit_rect(output_width);
-        Rectangle::new(
-            r#box.loc,
-            Size::from((self.clock_button_width(), panel_height())),
-        )
+        self.right_box_rect(ROLE_DATE_MENU, output_width)
+            .expect("the dateMenu is always present in the right box")
     }
 
-    /// The messages-indicator dot's rect (logical), or `None` when hidden: the
-    /// 16px icon sitting `MESSAGES_INDICATOR_SPACING` right of the CLOCK PILL —
-    /// GNOME measures the `.clock-display-box` spacing from the `.clock`
-    /// element's edge, and the lit pill is the `.clock` background
-    /// (`js/ui/dateMenu.js:880-883`, `_panel.scss:81-86,159-160`). The pill is
-    /// `date_menu_rect` inset by `BTN_MARGIN_X` (see [`container_rect`]), which is
-    /// exactly what makes the overhang [`MESSAGES_INDICATOR_EXTENT`].
+    /// The messages-indicator dot's rect (logical), or `None` when hidden: the 16px icon
+    /// centred in the clock button's TRAILING PADDING — the `clock_h_padding()` of empty
+    /// space that already exists between the label and the button's right edge. That is
+    /// the divergence (see [`MESSAGES_INDICATOR_ICON`]): the dot costs no layout, so it
+    /// can appear and disappear without moving the clock.
     pub(crate) fn messages_indicator_rect(
         &self,
         output_width: f64,
@@ -1069,23 +1045,14 @@ impl Panel {
             return None;
         }
         let clock = self.date_menu_rect(output_width);
-        let pill_right = clock.loc.x + clock.size.w - BTN_MARGIN_X;
+        let right = clock.loc.x + clock.size.w;
         Some(Rectangle::new(
             Point::from((
-                pill_right + MESSAGES_INDICATOR_SPACING,
+                right - (clock_h_padding() + MESSAGES_INDICATOR_ICON) / 2.,
                 (panel_height() - MESSAGES_INDICATOR_ICON) / 2.,
             )),
             Size::from((MESSAGES_INDICATOR_ICON, MESSAGES_INDICATOR_ICON)),
         ))
-    }
-
-    /// The dateMenu's full clickable extent — GNOME's whole `clock-display-box` is the
-    /// button, with the pill only on the clock (`js/ui/dateMenu.js:871-886`). Now that the
-    /// box is a right-box slot ([`RIGHT_BOX_ORDER`]) this is just that slot, so the same
-    /// fold that places quickSettings places the clock.
-    fn date_menu_hit_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
-        self.right_box_rect(ROLE_DATE_MENU, output_width)
-            .expect("the dateMenu is always present in the right box")
     }
 
     /// The quick-settings status indicator rect: the icon cluster plus a padding
@@ -2283,24 +2250,29 @@ mod tests {
     }
 
     /// The dateMenu messages-indicator dot (`js/ui/dateMenu.js:871-886`): the setter is a
-    /// no-op-detecting toggle; the dot sits right of the clock; the whole box stays
-    /// anchored to the output's right edge, so showing the dot pushes the clock left
-    /// rather than growing past the screen; and clicking the dot opens the calendar.
+    /// no-op-detecting toggle, and the dot draws inside the clock button's own trailing
+    /// padding.
+    ///
+    /// **The invariant is that the dot costs no layout.** GNOME can afford a dot that
+    /// occupies width because its clock is centred and a mirrored pad absorbs it; ours is
+    /// right-anchored, so any width the dot took would be width the clock — and every
+    /// status indicator left of it — gave back the moment a notification arrived or was
+    /// read. Asserted as strict rect equality across the toggle, not a tolerance.
     /// Structural, no GPU.
     #[test]
-    fn messages_indicator_trails_a_right_anchored_clock() {
+    fn the_messages_dot_moves_nothing() {
         let ow = 1920.;
         let mut panel = test_panel();
 
-        // Hidden by default: no dot rect, hit rect == the bare clock rect, right-anchored.
+        // Hidden by default: no dot rect, and the button owns the output's right corner.
         assert!(!panel.messages_indicator_visible());
         assert!(panel.messages_indicator_rect(ow).is_none());
         let clock = panel.date_menu_rect(ow);
-        assert_eq!(panel.date_menu_hit_rect(ow), clock);
+        let qs = panel.quick_settings_rect(ow);
         assert_eq!(
             clock.loc.x + clock.size.w,
             ow,
-            "with no dot the clock button itself owns the right corner"
+            "the clock button owns the output's right corner"
         );
 
         // Show it: the setter reports the change once, then no-ops.
@@ -2308,29 +2280,39 @@ mod tests {
         assert!(!panel.set_messages_indicator(true), "no-op re-set");
         assert!(panel.messages_indicator_visible());
 
-        // The box, not the clock, keeps the corner: the clock is pushed left by exactly
-        // the dot's overhang, and its width is untouched.
-        let shifted = panel.date_menu_rect(ow);
-        assert_eq!(shifted.size.w, clock.size.w);
-        assert_eq!(shifted.loc.x, clock.loc.x - MESSAGES_INDICATOR_EXTENT);
+        // Nothing moved — not the button, not the cluster left of it.
+        assert_eq!(
+            panel.date_menu_rect(ow),
+            clock,
+            "the clock button must not move"
+        );
+        assert_eq!(
+            panel.quick_settings_rect(ow),
+            qs,
+            "the status cluster must not move either"
+        );
 
-        // The dot is a 16px square 2px right of the CLOCK PILL edge (the pill is
-        // the clock rect inset by BTN_MARGIN_X), matching GNOME's box spacing.
+        // The dot is a 16px square centred in the button's trailing padding, so it clears
+        // the label and stays inside the button.
         let dot = panel.messages_indicator_rect(ow).unwrap();
         assert_eq!(dot.size.w, MESSAGES_INDICATOR_ICON);
-        assert_eq!(
+        let label_right = clock.loc.x + clock.size.w - clock_h_padding();
+        assert!(
+            dot.loc.x >= label_right,
+            "the dot must not overlap the clock label ({} vs {label_right})",
             dot.loc.x,
-            shifted.loc.x + shifted.size.w - BTN_MARGIN_X + MESSAGES_INDICATOR_SPACING
+        );
+        assert!(
+            dot.loc.x + dot.size.w <= clock.loc.x + clock.size.w,
+            "the dot must stay inside the button it badges"
         );
         assert_eq!(
-            dot.loc.x + dot.size.w,
-            ow,
-            "the dot now takes the corner the clock had"
+            dot.loc.x - label_right,
+            clock.loc.x + clock.size.w - (dot.loc.x + dot.size.w),
+            "centred in the padding: equal gaps to the label and to the button edge"
         );
 
-        // The hit rect is the whole box, so a click on the dot opens the calendar.
-        let hit = panel.date_menu_hit_rect(ow);
-        assert!(hit.contains(Point::from((dot.loc.x + 8., 10.))));
+        // And it is the same button, so clicking the dot opens the calendar.
         let ws = WorkspaceState {
             count: 3,
             active: 1,
