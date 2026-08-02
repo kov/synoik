@@ -4,7 +4,8 @@
 //! session is in GNOME (floating) windowing mode. It draws the bar chrome, a
 //! left-hand **workspace indicator** (the graphical dots that replaced GNOME's
 //! old "Activities" text button — click toggles the overview, scroll switches
-//! workspace) and a centered clock; the panel also reserves a top strut so
+//! workspace) and, at the far right past the status indicators, the clock
+//! (a divergence — see `RIGHT_BOX_ORDER`); the panel also reserves a top strut so
 //! windows never sit under it (see `layout::workspace::compute_working_area`).
 //!
 //! The bar is drawn entirely on the GPU through the owned Vulkan renderer: an
@@ -115,12 +116,25 @@ fn clock_h_padding() -> f64 {
 }
 
 /// The dateMenu messages-indicator dot: `message-indicator-symbolic` at
-/// `$scalable_icon_size` (`_panel.scss:92-94`), sitting AFTER the clock with a
-/// size-matched invisible pad BEFORE it, so the clock stays centered
-/// (`js/ui/dateMenu.js:871-883`). `MESSAGES_INDICATOR_SPACING` is the
+/// `$scalable_icon_size` (`_panel.scss:92-94`). `MESSAGES_INDICATOR_SPACING` is the
 /// `.clock-display-box` spacing between the box children (`_panel.scss:159-160`).
+///
+/// The dot keeps GNOME's child order — it sits AFTER the clock, at the same offset from
+/// the lit `.clock` pill (`js/ui/dateMenu.js:880-883`). What GNOME's *leading* pad bought,
+/// though, was the clock staying centered in the panel (`dateMenu.js:871-879`), and with
+/// the clock right-anchored (see [`RIGHT_BOX_ORDER`]) there is nothing left to center. So
+/// the pad is dropped and the dot takes the corner: the whole dateMenu box is
+/// right-anchored, which pushes the clock label left by [`MESSAGES_INDICATOR_EXTENT`]
+/// whenever the dot appears.
 const MESSAGES_INDICATOR_ICON: f64 = 16.;
 const MESSAGES_INDICATOR_SPACING: f64 = 2.;
+
+/// How far past the clock button's own rect the shown dot reaches: it starts
+/// `MESSAGES_INDICATOR_SPACING` right of the *pill*, which is already `BTN_MARGIN_X` in
+/// from the button rect's right edge. This is what the dateMenu box grows by when the dot
+/// appears — see [`Panel::messages_indicator_rect`].
+const MESSAGES_INDICATOR_EXTENT: f64 =
+    MESSAGES_INDICATOR_SPACING + MESSAGES_INDICATOR_ICON - BTN_MARGIN_X;
 
 /// Bar background (opaque black — GNOME's dark panel `$panel_bg_color` = `$dark_5`
 /// `#000000`, `_colors.scss:24` / `_palette.scss:46`), straight RGBA.
@@ -218,7 +232,8 @@ const TEXT: [f32; 4] = [1., 1., 1., 1.];
 
 /// Role of the left-hand workspace indicator (GNOME's `activities` panel role).
 pub const ROLE_ACTIVITIES: &str = "activities";
-/// Role of the centered clock (GNOME's `dateMenu` panel role).
+/// Role of the clock (GNOME's `dateMenu` panel role). GNOME centres it; we put it at the
+/// right end of the panel — see [`RIGHT_BOX_ORDER`].
 pub const ROLE_DATE_MENU: &str = "dateMenu";
 /// Role of the right-hand status area that opens quick settings (GNOME's
 /// `quickSettings`).
@@ -237,14 +252,23 @@ pub const ROLE_A11Y: &str = "a11y";
 
 /// Right-box role order, mirroring `js/ui/sessionMode.js:99`. The remaining unbuilt
 /// standalone indicators are commented out; adding one is a new entry here plus a
-/// presence/width case in [`Panel::right_box_role_width`]. quickSettings anchors the
+/// presence/width case in [`Panel::right_box_role_width`]. The last entry anchors the
 /// right edge; earlier roles stack to its left in this order.
+///
+/// **Divergence — the clock lives at the right end.** GNOME puts `dateMenu` alone in the
+/// panel's *center* box (`js/ui/panel.js` `_centerBox`, `sessionMode.js:98`); we move it
+/// into the right box, past `quickSettings`, so it anchors the screen's right corner and
+/// the status cluster sits to its left. Nothing else about the button changes — same pill,
+/// same padding, same calendar popover (which re-centers on the button and is clamped to
+/// the screen edge by [`crate::ui::popover::PanelPopover::location`]). The center box is
+/// consequently empty, so [`PanelBox::Center`] no longer has an occupant.
 const RIGHT_BOX_ORDER: &[&str] = &[
     ROLE_SCREEN_RECORDING,
     // screenSharing, dwellClick,
     ROLE_A11Y,
     ROLE_KEYBOARD,
     ROLE_QUICK_SETTINGS,
+    ROLE_DATE_MENU,
 ];
 
 /// Right-box status-indicator icon size, logical px (`$scalable_icon_size`).
@@ -777,13 +801,19 @@ impl Panel {
 
     /// Show/hide the dateMenu unread-messages dot (the compositor computes
     /// `show-banners && unseen − queued > 0`). Returns whether it changed so the
-    /// caller can queue a redraw. The dot composites on top of the bar (from the
-    /// icon cache), so this doesn't invalidate the bar texture.
+    /// caller can queue a redraw.
+    ///
+    /// The dot itself composites on top of the bar (from the icon cache), but it is part
+    /// of the right-anchored dateMenu box, so showing it shifts the clock label — and
+    /// every right-box indicator left of it — by [`MESSAGES_INDICATOR_EXTENT`]. The bar
+    /// texture carries those labels, hence the invalidation. (While the clock was
+    /// centered this was a pure composite and skipped it.)
     pub fn set_messages_indicator(&mut self, visible: bool) -> bool {
         if visible == self.messages_indicator {
             return false;
         }
         self.messages_indicator = visible;
+        self.cache.borrow_mut().clear();
         true
     }
 
@@ -940,6 +970,8 @@ impl Panel {
     ) -> Option<Rectangle<f64, Logical>> {
         match role {
             ROLE_ACTIVITIES => Some(self.activities_rect(ws)),
+            // The dateMenu's right-box slot spans the messages dot too, but only the
+            // `.clock` wears the pill (`js/ui/dateMenu.js:880-886`).
             ROLE_DATE_MENU => Some(self.date_menu_rect(output_width)),
             // quickSettings (always present) and keyboard (present with >1 layout) both
             // live in the right box, so their geometry comes from the same folder.
@@ -990,15 +1022,34 @@ impl Panel {
         )
     }
 
-    /// The dateMenu (clock) button rect: the shaped label plus a padding on each
-    /// side, centered on the output. `output_width` is the output's logical width.
-    pub fn date_menu_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
+    /// Logical width of the clock button alone: the shaped label plus a padding on each
+    /// side. The dot is not in here — see [`Self::date_menu_width`].
+    fn clock_button_width(&self) -> f64 {
         let clock_w =
             niri_vk::text::measure_line_width_weighted(&self.clock_text, font_px() as f32, true);
-        let w = clock_w + clock_h_padding() * 2.;
+        clock_w + clock_h_padding() * 2.
+    }
+
+    /// Logical width of the whole dateMenu box (GNOME's `clock-display-box`): the clock
+    /// button plus, when shown, the trailing messages dot. Its right-box slot, so a
+    /// dot appearing widens the box leftward and the clock label moves with it.
+    fn date_menu_width(&self) -> f64 {
+        let dot = if self.messages_indicator {
+            MESSAGES_INDICATOR_EXTENT
+        } else {
+            0.
+        };
+        self.clock_button_width() + dot
+    }
+
+    /// The dateMenu (clock) button rect: the shaped label plus a padding on each side,
+    /// sitting at the LEFT of the dateMenu box so the dot (when shown) trails it.
+    /// `output_width` is the output's logical width.
+    pub fn date_menu_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
+        let r#box = self.date_menu_hit_rect(output_width);
         Rectangle::new(
-            Point::from(((output_width - w) / 2., 0.)),
-            Size::from((w, panel_height())),
+            r#box.loc,
+            Size::from((self.clock_button_width(), panel_height())),
         )
     }
 
@@ -1007,8 +1058,12 @@ impl Panel {
     /// GNOME measures the `.clock-display-box` spacing from the `.clock`
     /// element's edge, and the lit pill is the `.clock` background
     /// (`js/ui/dateMenu.js:880-883`, `_panel.scss:81-86,159-160`). The pill is
-    /// `date_menu_rect` inset by `BTN_MARGIN_X` (see [`container_rect`]).
-    fn messages_indicator_rect(&self, output_width: f64) -> Option<Rectangle<f64, Logical>> {
+    /// `date_menu_rect` inset by `BTN_MARGIN_X` (see [`container_rect`]), which is
+    /// exactly what makes the overhang [`MESSAGES_INDICATOR_EXTENT`].
+    pub(crate) fn messages_indicator_rect(
+        &self,
+        output_width: f64,
+    ) -> Option<Rectangle<f64, Logical>> {
         if !self.messages_indicator {
             return None;
         }
@@ -1023,24 +1078,13 @@ impl Panel {
         ))
     }
 
-    /// The dateMenu's full clickable extent: the clock button, plus the
-    /// messages-indicator dot and its size-matched leading pad when the dot is
-    /// shown (GNOME's whole `clock-display-box` is the button, with the pill only
-    /// on the clock — `js/ui/dateMenu.js:871-886`). The clock stays centered
-    /// because the pad mirrors the dot, so only this hit rect widens.
+    /// The dateMenu's full clickable extent — GNOME's whole `clock-display-box` is the
+    /// button, with the pill only on the clock (`js/ui/dateMenu.js:871-886`). Now that the
+    /// box is a right-box slot ([`RIGHT_BOX_ORDER`]) this is just that slot, so the same
+    /// fold that places quickSettings places the clock.
     fn date_menu_hit_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
-        let clock = self.date_menu_rect(output_width);
-        if !self.messages_indicator {
-            return clock;
-        }
-        // Extend to cover the dot (which sits past the clock's right edge), and
-        // mirror that on the left so the clickable box stays centered.
-        let dot = self.messages_indicator_rect(output_width).unwrap();
-        let ext = (dot.loc.x + dot.size.w) - (clock.loc.x + clock.size.w);
-        Rectangle::new(
-            Point::from((clock.loc.x - ext, clock.loc.y)),
-            Size::from((clock.size.w + 2. * ext, clock.size.h)),
-        )
+        self.right_box_rect(ROLE_DATE_MENU, output_width)
+            .expect("the dateMenu is always present in the right box")
     }
 
     /// The quick-settings status indicator rect: the icon cluster plus a padding
@@ -1105,6 +1149,7 @@ impl Panel {
             ROLE_SCREEN_RECORDING => self.recording_width(),
             ROLE_KEYBOARD => self.keyboard_width(),
             ROLE_A11Y => self.a11y_width(),
+            ROLE_DATE_MENU => self.date_menu_width(),
             _ => 0.,
         }
     }
@@ -1158,23 +1203,17 @@ impl Panel {
 
     /// The panel's items with their current rectangles, for introspection and the
     /// (deferred) extension host. `output_width` is the output's logical width, used
-    /// to place the centered clock and the right-anchored quick-settings indicator.
+    /// to place the right-anchored box (the status indicators and, past them, the clock).
     pub fn items(&self, output_width: f64, ws: WorkspaceState) -> Vec<PanelItem> {
-        let mut items = vec![
-            PanelItem {
-                role: ROLE_ACTIVITIES,
-                r#box: PanelBox::Left,
-                rect: self.activities_rect(ws),
-            },
-            PanelItem {
-                role: ROLE_DATE_MENU,
-                r#box: PanelBox::Center,
-                rect: self.date_menu_rect(output_width),
-            },
-        ];
-        // The right box, in `sessionMode.js:99` order — each role present only when it
-        // has a rect (screenRecording comes and goes with the recording, like GNOME
-        // hiding the actor).
+        let mut items = vec![PanelItem {
+            role: ROLE_ACTIVITIES,
+            r#box: PanelBox::Left,
+            rect: self.activities_rect(ws),
+        }];
+        // The right box, in `sessionMode.js:99` order plus our trailing dateMenu — each
+        // role present only when it has a rect (screenRecording comes and goes with the
+        // recording, like GNOME hiding the actor). A role's rect is its whole slot, so
+        // the dateMenu's covers the messages dot as well as the clock button.
         for &role in RIGHT_BOX_ORDER {
             if let Some(rect) = self.right_box_rect(role, output_width) {
                 items.push(PanelItem {
@@ -1210,8 +1249,8 @@ impl Panel {
     }
 
     /// Which panel *role*, if any, sits at an output-local logical position.
-    /// `output_width` is needed to place the centered dateMenu and the
-    /// right-anchored quick-settings indicator.
+    /// `output_width` is needed to place the right-anchored box (the status indicators
+    /// and, past them, the dateMenu).
     pub fn hit_test(
         &self,
         pos: Point<f64, Logical>,
@@ -1220,15 +1259,14 @@ impl Panel {
     ) -> Option<&'static str> {
         if self.activities_rect(ws).contains(pos) {
             Some(ROLE_ACTIVITIES)
-        } else if let Some(role) = RIGHT_BOX_ORDER.iter().copied().find(|&role| {
-            self.right_box_rect(role, output_width)
-                .is_some_and(|rect| rect.contains(pos))
-        }) {
-            Some(role)
-        } else if self.date_menu_hit_rect(output_width).contains(pos) {
-            Some(ROLE_DATE_MENU)
         } else {
-            None
+            // Every role's slot is its clickable extent, the dateMenu's included: its
+            // slot is the whole `clock-display-box`, so the messages dot opens the
+            // calendar like the clock does.
+            RIGHT_BOX_ORDER.iter().copied().find(|&role| {
+                self.right_box_rect(role, output_width)
+                    .is_some_and(|rect| rect.contains(pos))
+            })
         }
     }
 
@@ -1387,6 +1425,7 @@ impl Panel {
                 scale,
                 width_px,
                 &self.clock_text,
+                self.date_menu_rect(width).loc.x + clock_h_padding(),
                 recording_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
                 keyboard_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
             ) {
@@ -1655,8 +1694,9 @@ fn workspace_dots(count: usize, position: f64) -> Vec<(Rectangle<f64, Logical>, 
     dots
 }
 
-/// Draw the bar chrome into an offscreen [`VkTexture`]: the centered clock glyph run and
-/// the recording/keyboard labels, over a **transparent** background. The hover/active
+/// Draw the bar chrome into an offscreen [`VkTexture`]: the clock glyph run (at `clock_x`,
+/// its button's padded left edge) and the recording/keyboard labels, over a
+/// **transparent** background. The hover/active
 /// button containers and the workspace dots are not here — they animate, and each is its
 /// own element. The returned texture is `SHADER_READ_ONLY`
 /// (sampleable) so the caller can composite it directly. The right-box status icons
@@ -1747,6 +1787,7 @@ fn draw_bar_texture(
     scale: f64,
     width_px: i32,
     clock: &str,
+    clock_x: f64,
     recording_label: Option<(&str, f64)>,
     keyboard_label: Option<(&str, f64)>,
 ) -> anyhow::Result<VkTexture> {
@@ -1755,7 +1796,6 @@ fn draw_bar_texture(
     let width_px = width_px.max(1);
     let height_px: i32 = to_physical_precise_round(scale, panel_height());
     let height_px = height_px.max(1);
-    let px = (font_px() * scale) as f32;
 
     // Shape every run up front (needs `&mut renderer`, before the bake frame opens). `TextShaper`
     // owns the pt → physical-px multiply; the clock draws bold, like GNOME's `panel_button`.
@@ -1782,17 +1822,18 @@ fn draw_bar_texture(
         (clock_run, recording, keyboard)
     };
 
-    // Center the clock horizontally by its *advance* box, not its ink. gnome-shell's
+    // The clock label sits at its button's own padding, like the recording/keyboard
+    // labels — `clock_x` is that padded left edge, and the button's width came from the
+    // same *advance* measurement (`clock_button_width`), not the ink. gnome-shell's
     // WallClock uses tabular figures, so the advance width is constant as the seconds
-    // tick and the label never shifts; centering on the ink (whose left edge/width
-    // wobble per digit) makes the whole run jitter left/right each second. Our
-    // Cantarell digits are tabular too, so an advance-centered origin is rock-steady.
+    // tick and the label never shifts; sizing on the ink (whose left edge/width wobble
+    // per digit) would make the whole run jitter left/right each second. Our Cantarell
+    // digits are tabular too, so an advance-derived origin is rock-steady.
     // Vertical centers on the font line-box (ascent+descent about the baseline), as
     // St/Pango do — reserving descent space so the caps sit a hair higher than ink
     // centering would put them (GNOME's clock reads visually higher in the bar).
-    let advance_w = niri_vk::text::measure_line_width_weighted(clock, px, true).round() as i32;
     let c_origin = Point::<i32, Physical>::from((
-        (width_px - advance_w) / 2,
+        to_physical_precise_round(scale, clock_x),
         clock_run.line_box_centered_y(height_px),
     ));
 
@@ -2240,32 +2281,37 @@ mod tests {
         assert!(!panel.set_mic(MicStatus::default()), "no-op re-set");
     }
 
-    /// The dateMenu messages-indicator dot (`js/ui/dateMenu.js:871-886`): the
-    /// setter is a no-op-detecting toggle; the dot sits right of the clock; the
-    /// clock stays centered whether or not the dot shows (the pad mirrors it);
-    /// and clicking the dot still opens the calendar (the button's hit rect
-    /// widens to include it). Structural, no GPU.
+    /// The dateMenu messages-indicator dot (`js/ui/dateMenu.js:871-886`): the setter is a
+    /// no-op-detecting toggle; the dot sits right of the clock; the whole box stays
+    /// anchored to the output's right edge, so showing the dot pushes the clock left
+    /// rather than growing past the screen; and clicking the dot opens the calendar.
+    /// Structural, no GPU.
     #[test]
-    fn messages_indicator_sits_right_of_a_centered_clock() {
+    fn messages_indicator_trails_a_right_anchored_clock() {
         let ow = 1920.;
         let mut panel = test_panel();
 
-        // Hidden by default: no dot rect, hit rect == the bare clock rect.
+        // Hidden by default: no dot rect, hit rect == the bare clock rect, right-anchored.
         assert!(!panel.messages_indicator_visible());
         assert!(panel.messages_indicator_rect(ow).is_none());
         let clock = panel.date_menu_rect(ow);
         assert_eq!(panel.date_menu_hit_rect(ow), clock);
+        assert_eq!(
+            clock.loc.x + clock.size.w,
+            ow,
+            "with no dot the clock button itself owns the right corner"
+        );
 
         // Show it: the setter reports the change once, then no-ops.
         assert!(panel.set_messages_indicator(true));
         assert!(!panel.set_messages_indicator(true), "no-op re-set");
         assert!(panel.messages_indicator_visible());
 
-        // The clock rect is UNCHANGED — the dot doesn't push the clock off
-        // center (the invisible leading pad mirrors it).
-        assert_eq!(panel.date_menu_rect(ow), clock);
-        let center = clock.loc.x + clock.size.w / 2.;
-        assert!((center - ow / 2.).abs() < 1., "clock stays centered");
+        // The box, not the clock, keeps the corner: the clock is pushed left by exactly
+        // the dot's overhang, and its width is untouched.
+        let shifted = panel.date_menu_rect(ow);
+        assert_eq!(shifted.size.w, clock.size.w);
+        assert_eq!(shifted.loc.x, clock.loc.x - MESSAGES_INDICATOR_EXTENT);
 
         // The dot is a 16px square 2px right of the CLOCK PILL edge (the pill is
         // the clock rect inset by BTN_MARGIN_X), matching GNOME's box spacing.
@@ -2273,11 +2319,15 @@ mod tests {
         assert_eq!(dot.size.w, MESSAGES_INDICATOR_ICON);
         assert_eq!(
             dot.loc.x,
-            clock.loc.x + clock.size.w - BTN_MARGIN_X + MESSAGES_INDICATOR_SPACING
+            shifted.loc.x + shifted.size.w - BTN_MARGIN_X + MESSAGES_INDICATOR_SPACING
+        );
+        assert_eq!(
+            dot.loc.x + dot.size.w,
+            ow,
+            "the dot now takes the corner the clock had"
         );
 
-        // The hit rect grew symmetrically to cover the dot (and its leading
-        // pad), so a click on the dot opens the calendar.
+        // The hit rect is the whole box, so a click on the dot opens the calendar.
         let hit = panel.date_menu_hit_rect(ow);
         assert!(hit.contains(Point::from((dot.loc.x + 8., 10.))));
         let ws = WorkspaceState {
@@ -2292,11 +2342,15 @@ mod tests {
     }
 
     /// The panel exposes both roles in their boxes (extension-representable model).
+    ///
+    /// Our divergence lives here: the dateMenu is in the RIGHT box, past quickSettings,
+    /// not alone in GNOME's centre box ([`RIGHT_BOX_ORDER`]).
     #[test]
     fn items_expose_roles_and_boxes() {
         let panel = test_panel();
+        let ow = 1920.;
         let items = panel.items(
-            1920.,
+            ow,
             WorkspaceState {
                 count: 3,
                 active: 1,
@@ -2304,11 +2358,20 @@ mod tests {
         );
         let activities = items.iter().find(|i| i.role == ROLE_ACTIVITIES).unwrap();
         let date = items.iter().find(|i| i.role == ROLE_DATE_MENU).unwrap();
+        let qs = items
+            .iter()
+            .find(|i| i.role == ROLE_QUICK_SETTINGS)
+            .unwrap();
         assert_eq!(activities.r#box, PanelBox::Left);
-        assert_eq!(date.r#box, PanelBox::Center);
-        // The clock is roughly centered on the output.
-        let center = date.rect.loc.x + date.rect.size.w / 2.;
-        assert!((center - 960.).abs() < 1.);
+        assert_eq!(date.r#box, PanelBox::Right);
+        assert!(
+            !items.iter().any(|i| i.r#box == PanelBox::Center),
+            "the centre box is empty now that the clock moved right"
+        );
+        // The clock owns the output's right corner…
+        assert_eq!(date.rect.loc.x + date.rect.size.w, ow);
+        // …and the status indicators are to its left, not the other way round.
+        assert_eq!(qs.rect.loc.x + qs.rect.size.w, date.rect.loc.x);
     }
 
     /// The dots are [`RoundedSolidRenderElement`]s now, one per workspace: the active one
@@ -2422,11 +2485,13 @@ mod tests {
         );
     }
 
-    /// The clock is centered on its advance box (see `draw_bar_texture`), which is
-    /// constant across ticks only because the panel font's digits are tabular — that's
-    /// what keeps the label from jittering left/right as the seconds change. Pins that
-    /// invariant: if SansSerif ever resolves to a font with proportional digits this
-    /// fails, flagging that advance-centering alone would no longer be steady.
+    /// The clock button is sized from its advance box (see `clock_button_width`), which
+    /// is constant across ticks only because the panel font's digits are tabular — that's
+    /// what keeps the label from jittering left/right as the seconds change. It matters
+    /// more now that the button is right-anchored: a wobbling advance would drag the
+    /// label's left edge every second. Pins that invariant: if SansSerif ever resolves to
+    /// a font with proportional digits this fails, flagging that the advance alone would
+    /// no longer be steady.
     #[test]
     fn clock_advance_width_is_stable_across_seconds() {
         let px = font_px() as f32;
@@ -2573,8 +2638,12 @@ mod tests {
             "the open overview must light the Activities pill, or the assertion below \
              that the bake does not contain it proves nothing",
         );
-        let mut tex =
-            draw_bar_texture(&mut vk, 1., width_px, "12:34", None, None).expect("bar texture");
+        // Where the right-anchored clock button puts its label on a 400px-wide bar.
+        let clock_w = niri_vk::text::measure_line_width_weighted("12:34", font_px() as f32, true)
+            + clock_h_padding() * 2.;
+        let clock_x = width_px as f64 - clock_w + clock_h_padding();
+        let mut tex = draw_bar_texture(&mut vk, 1., width_px, "12:34", clock_x, None, None)
+            .expect("bar texture");
 
         let fb = vk.bind(&mut tex).expect("bind for readback");
         let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((width_px, height_px)));
@@ -2588,9 +2657,9 @@ mod tests {
             [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
         };
 
-        // A pixel deep in the right half (away from any text) is where the background
-        // would be. The chrome must not paint it at all.
-        let bg = px_at(width_px - 4, height_px / 2);
+        // A pixel mid-bar (past the Activities button, before the right-anchored clock)
+        // is where the background would be. The chrome must not paint it at all.
+        let bg = px_at(width_px / 2, height_px / 2);
         assert_eq!(
             bg[3], 0,
             "the chrome bake must be transparent where the background element goes, got {bg:?}",
@@ -3065,6 +3134,9 @@ mod tests {
             scale,
             width_px,
             "12:34",
+            // Park the clock at the far left; this test scans the 300–390 band for the
+            // recording label's ink, and the clock's would be indistinguishable there.
+            0.,
             Some(("0:05", 306.)),
             None,
         )

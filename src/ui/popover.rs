@@ -1013,7 +1013,7 @@ impl PanelPopover {
     /// The popover's resting top-left, output-local logical: centered under the anchor,
     /// clamped into the output with a `POPOVER_MARGIN` inset from the screen edges, and
     /// sitting `POPOVER_MARGIN` below the panel (not flush); snapped to the pixel grid.
-    fn location(&self, output: &Output) -> Point<f64, Logical> {
+    pub(crate) fn location(&self, output: &Output) -> Point<f64, Logical> {
         let scale = output.current_scale().fractional_scale();
         let os = output_size(output);
         let size = self

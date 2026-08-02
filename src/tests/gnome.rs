@@ -3507,6 +3507,33 @@ fn pointer_motion_to(f: &mut Fixture, x: f64, y: f64) {
     f.pointer_motion(x - cur.x, y - cur.y);
 }
 
+/// Horizontal centre of the dateMenu's clock button on an `output_w`-wide output — asked
+/// of the panel, never hardcoded. Our clock is anchored to the output's right corner past
+/// the status indicators (a divergence from GNOME's centre box), and its x further depends
+/// on the label's width and on whether the messages dot is showing, so a literal
+/// screen-centre would just click the wallpaper.
+fn clock_center_x(f: &mut Fixture, output_w: f64) -> f64 {
+    let rect = f.niri().panel.date_menu_rect(output_w);
+    rect.loc.x + rect.size.w / 2.
+}
+
+/// Horizontal centre of the quick-settings indicator — likewise asked of the panel. It no
+/// longer owns the top-right corner: the dateMenu was moved past it (see
+/// [`crate::ui::panel`]), so the cluster starts wherever the clock's box ends.
+fn qs_center_x(f: &mut Fixture, output_w: f64) -> f64 {
+    let rect = f.niri().panel.quick_settings_rect(output_w);
+    rect.loc.x + rect.size.w / 2.
+}
+
+/// The open panel popover's actual top-left — asked of the popover rather than
+/// recomputed from its anchor. The anchor is frozen when the menu opens, while the
+/// indicator it hangs off keeps moving (showing the messages dot widens the dateMenu box,
+/// sliding every right-box role left of it), so a hand-rolled origin goes stale mid-test.
+fn popover_origin(f: &mut Fixture) -> smithay::utils::Point<f64, smithay::utils::Logical> {
+    let output = f.niri_output(1);
+    f.niri().panel_popover.location(&output)
+}
+
 /// The center of the given strip thumbnail, for pointer input.
 fn thumbnail_center(f: &mut Fixture, idx: usize) -> (f64, f64) {
     let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
@@ -4309,9 +4336,10 @@ fn panel_date_menu_click_opens_and_dismisses_calendar() {
     f.add_output(1, (1920, 1080));
     assert!(!f.niri().panel_popover.is_open());
 
-    // The clock is centered; click it.
+    // Click the clock, wherever the panel put it.
     let open = |f: &mut Fixture| {
-        pointer_motion_to(f, 960., 10.);
+        let x = clock_center_x(f, 1920.);
+        pointer_motion_to(f, x, 10.);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
     };
@@ -4345,6 +4373,80 @@ fn panel_date_menu_click_opens_and_dismisses_calendar() {
     );
 }
 
+/// **Divergence — the clock lives in the top-RIGHT corner**, not GNOME's centre box
+/// (`js/ui/panel.js` `_centerBox`, `sessionMode.js:98-99`). Driven through real pointer
+/// input, because the whole point is where a click lands:
+///
+/// - the panel's right corner opens the calendar (GNOME would find nothing there);
+/// - the centre of the panel opens nothing (GNOME's clock is exactly there);
+/// - the status indicators are still *left* of the clock, and clicking them still opens quick
+///   settings — the clock moved past the cluster, it did not displace it.
+///
+/// The popover follows its button: it is centred on the clock and clamped a
+/// `POPOVER_MARGIN` in from the screen edge, so it hugs the right side.
+#[test]
+fn panel_clock_sits_right_of_the_status_indicators() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().update_render_elements(None);
+
+    let clock = f.niri().panel.date_menu_rect(1920.);
+    let qs = f.niri().panel.quick_settings_rect(1920.);
+    assert_eq!(
+        clock.loc.x + clock.size.w,
+        1920.,
+        "the clock button must own the output's right corner"
+    );
+    assert!(
+        qs.loc.x + qs.size.w <= clock.loc.x,
+        "the quick-settings cluster must sit left of the clock ({qs:?} vs {clock:?})"
+    );
+
+    let click = |f: &mut Fixture, x: f64| {
+        pointer_motion_to(f, x, 10.);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+    };
+
+    // The right corner is the clock.
+    click(&mut f, 1919.);
+    assert_eq!(
+        f.niri().panel_popover.open_role(),
+        Some(crate::ui::panel::ROLE_DATE_MENU),
+        "the panel's right corner must open the calendar"
+    );
+
+    // The calendar hugs the right edge, centred on the clock and clamped inside the
+    // output — where GNOME's would sit mid-screen.
+    let output = f.niri_output(1);
+    let origin = f.niri().panel_popover.location(&output);
+    assert!(
+        origin.x > 960.,
+        "the calendar must follow the clock to the right half, got x={}",
+        origin.x
+    );
+
+    f.key_press(KEY_ESC);
+    f.key_release(KEY_ESC);
+    f.settle_animations();
+
+    // The centre of the panel — GNOME's clock — is now bare bar.
+    click(&mut f, 960.);
+    assert!(
+        !f.niri().panel_popover.is_open(),
+        "nothing lives in the centre box any more"
+    );
+
+    // The cluster the clock moved past still works.
+    let x = qs_center_x(&mut f, 1920.);
+    click(&mut f, x);
+    assert_eq!(
+        f.niri().panel_popover.open_role(),
+        Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
+        "the status cluster must still open quick settings from its new place"
+    );
+}
+
 /// Panel menus work inside the overview: a popover opened while the overview is
 /// up pushes its own grab on top of the overview's modal and stays open
 /// (`js/ui/popupMenu.js:1520`) — it must not be dismissed on the next frame.
@@ -4358,7 +4460,8 @@ fn panel_popover_stays_open_in_overview() {
     assert!(f.niri().layout.is_overview_open());
 
     // Click the clock: the calendar popover opens.
-    pointer_motion_to(&mut f, 960., 10.);
+    let x = clock_center_x(&mut f, 1920.);
+    pointer_motion_to(&mut f, x, 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert!(
@@ -4390,7 +4493,8 @@ fn overview_open_dismisses_open_panel_popover() {
     f.add_output(1, (1920, 1080));
     f.niri().update_render_elements(None);
 
-    pointer_motion_to(&mut f, 960., 10.);
+    let x = clock_center_x(&mut f, 1920.);
+    pointer_motion_to(&mut f, x, 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert!(f.niri().panel_popover.is_open());
@@ -4414,10 +4518,11 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
     f.add_output(1, (1920, 1080));
     assert!(!f.niri().panel_popover.is_open());
 
-    // The indicator is right-anchored; with the default toggles it's a single
-    // anchor icon in the top-right corner. Click it.
+    // The indicator sits at the right end of the status cluster, just left of the clock;
+    // with the default toggles it's a single anchor icon. Click it.
     let open = |f: &mut Fixture| {
-        pointer_motion_to(f, 1906., 10.);
+        let x = qs_center_x(f, 1920.);
+        pointer_motion_to(f, x, 10.);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
     };
@@ -4429,22 +4534,13 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
     );
 
     // A click on the Do Not Disturb tile flips the local state and keeps the menu
-    // open. The menu is centered under the indicator, clamped into the output. The
-    // grid is [Network, Dark Style, Do Not Disturb, Night Light] row-major over two
-    // columns, so DND is the bottom-left tile (row 1, col 0).
-    let output_w = 1920.0_f64;
-    let anchor = f.niri().panel.quick_settings_rect(output_w);
-    // Recompute the popover origin the way the popover does (centered, clamped with a
-    // POPOVER_MARGIN inset from the screen edges).
-    let menu_w = 332.0_f64; // PAD*2 + 2*TILE_W + TILE_GAP
-    let margin = 6.0_f64; // POPOVER_MARGIN
-    let center_x = anchor.loc.x + anchor.size.w / 2.;
-    let origin_x = (center_x - menu_w / 2.).clamp(margin, (output_w - menu_w - margin).max(margin));
+    // open. The grid is [Network, Dark Style, Do Not Disturb, Night Light] row-major over
+    // two columns, so DND is the bottom-left tile (row 1, col 0).
+    let origin = popover_origin(&mut f);
     // DND tile center (row 1, col 0), menu-local: x = PAD + TILE_W/2; y = PAD + SYS_H
-    // + TILE_GAP + (TILE_H + TILE_GAP) [second row] + TILE_H/2. Plus the popover
-    // origin (menu y = panel_height() + margin).
-    let tile_x = origin_x + 12. + 75.;
-    let tile_y = (32. + margin) + (12. + 44. + 8.) + (56. + 8.) + 28.;
+    // + TILE_GAP + (TILE_H + TILE_GAP) [second row] + TILE_H/2.
+    let tile_x = origin.x + 12. + 75.;
+    let tile_y = origin.y + (12. + 44. + 8.) + (56. + 8.) + 28.;
     pointer_motion_to(&mut f, tile_x, tile_y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
@@ -4495,22 +4591,22 @@ fn messages_indicator_toggles_with_dnd_tile() {
     banner_notify(&mut f, low);
     assert!(f.niri().panel.messages_indicator_visible());
 
-    // The DND tile center, computed the way `panel_quick_settings_*` does.
-    let output_w = 1920.0_f64;
-    let anchor = f.niri().panel.quick_settings_rect(output_w);
-    let menu_w = 332.0_f64;
-    let margin = 6.0_f64;
-    let center_x = anchor.loc.x + anchor.size.w / 2.;
-    let origin_x = (center_x - menu_w / 2.).clamp(margin, (output_w - menu_w - margin).max(margin));
-    let tile_x = origin_x + 12. + 75.;
-    let tile_y = (32. + margin) + (12. + 44. + 8.) + (56. + 8.) + 28.;
+    // The DND tile center, computed the way `panel_quick_settings_*` does — and
+    // re-derived per click, because toggling DND toggles the messages dot, which moves
+    // the quick-settings indicator (and so the menu the next open hangs off it).
     let open_qs = |f: &mut Fixture| {
-        pointer_motion_to(f, 1906., 10.);
+        let x = qs_center_x(f, 1920.);
+        pointer_motion_to(f, x, 10.);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
     };
     let click_dnd = |f: &mut Fixture| {
-        pointer_motion_to(f, tile_x, tile_y);
+        let origin = popover_origin(f);
+        pointer_motion_to(
+            f,
+            origin.x + 12. + 75.,
+            origin.y + (12. + 44. + 8.) + (56. + 8.) + 28.,
+        );
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
     };
@@ -4889,8 +4985,9 @@ fn panel_popover_open_and_close_are_animated() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    // Open the calendar (click the centered clock).
-    pointer_motion_to(&mut f, 960., 10.);
+    // Open the calendar (click the clock).
+    let x = clock_center_x(&mut f, 1920.);
+    pointer_motion_to(&mut f, x, 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert!(f.niri().panel_popover.is_open());
@@ -6186,7 +6283,8 @@ fn notification_banner_blocked_by_open_popover() {
     assert!(f.niri().notification_banner.is_visible());
 
     // Open the calendar via a clock click (panel y < banner y: no overlap).
-    pointer_motion_to(&mut f, 960., 10.);
+    let x = clock_center_x(&mut f, 1920.);
+    pointer_motion_to(&mut f, x, 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert!(f.niri().panel_popover.is_open());
@@ -6260,7 +6358,8 @@ fn notification_banner_activity_during_show_arms_short_timeout() {
 
 /// Open the calendar popover with a clock click.
 fn open_calendar(f: &mut Fixture) {
-    pointer_motion_to(f, 960., 10.);
+    let x = clock_center_x(f, 1920.);
+    pointer_motion_to(f, x, 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert!(f.niri().panel_popover.is_open());
