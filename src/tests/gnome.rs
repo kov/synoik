@@ -5527,6 +5527,27 @@ fn end_session_dialog_open_confirm_and_cancel() {
     );
 }
 
+/// Tear a client's window down the way an app does on its way out.
+fn destroy_window(f: &mut Fixture, id: ClientId, surface: &WlSurface) {
+    let window = f.client(id).window(surface);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+}
+
+/// Push the clock past the drain's settle and poll, so the drain reaches its verdict.
+///
+/// The settle is deliberate — unmap is not "done", see `end_session::DRAIN_SETTLE` — so a test that
+/// only destroys the window is looking at a drain that is still correctly waiting.
+fn settle_session_drain(f: &mut Fixture) {
+    let now = f.niri().clock.now_unadjusted();
+    f.niri()
+        .clock
+        .set_unadjusted(now + crate::end_session::DRAIN_SETTLE);
+    f.niri().poll_session_drain();
+}
+
 /// Ending the session waits for client windows instead of pulling the socket out from under them.
 ///
 /// This is the fix for the `Broken pipe` aborts in `docs/fork/overview-port.md`: at logout systemd
@@ -5551,17 +5572,18 @@ fn session_drain_waits_for_client_windows() {
         "a mapped client window must hold the session open",
     );
 
-    // The app finishes shutting down and its window goes away.
-    let window = f.client(id).window(&surface);
-    window.xdg_toplevel.destroy();
-    window.xdg_surface.destroy();
-    window.surface.destroy();
-    f.double_roundtrip(id);
+    // The app unmaps its window part-way through shutting down.
+    destroy_window(&mut f, id, &surface);
     f.niri().poll_session_drain();
+    assert!(
+        f.niri().session_drain.is_some(),
+        "unmapping is not finishing: the settle must still hold the session open",
+    );
 
+    settle_session_drain(&mut f);
     assert!(
         f.niri().session_drain.is_none(),
-        "the last window closing must end the drain",
+        "the settle elapsing after the last window must end the drain",
     );
 }
 
@@ -5605,12 +5627,8 @@ fn end_session_confirm_drains_before_answering_gnome_session() {
         "gnome-session drives the teardown from its answer; we do not stop ourselves here",
     );
 
-    let window = f.client(id).window(&surface);
-    window.xdg_toplevel.destroy();
-    window.xdg_surface.destroy();
-    window.surface.destroy();
-    f.double_roundtrip(id);
-    f.niri().poll_session_drain();
+    destroy_window(&mut f, id, &surface);
+    settle_session_drain(&mut f);
 
     assert!(f.niri().session_drain.is_none());
     assert_eq!(

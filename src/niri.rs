@@ -13526,8 +13526,39 @@ impl Niri {
     /// one would put save-changes dialogs in the way of a logout that has already been confirmed.
     /// What we add over GNOME is only the waiting.
     pub fn begin_session_drain(&mut self) {
+        let was_stopping = self.session_drain_stop;
         self.session_drain_stop = true;
+
+        // Announce it here rather than in `start_session_drain`, because this is the only place
+        // that means it. `STOPPING=1` puts the unit into deactivating and arms its
+        // `TimeoutStopSec`, so sending it on the dialog path — where we deliberately keep running
+        // and let gnome-session drive — would have systemd kill us mid-session if that teardown
+        // ever stalled. Also runs when a SIGTERM folds into a confirm drain already in flight,
+        // which is the ordinary sequence rather than an edge case.
+        if !was_stopping && self.is_session_instance {
+            self.notify_systemd_stopping();
+        }
+
         self.start_session_drain();
+    }
+
+    /// Tell systemd we heard it, so our unit's `TimeoutStopSec` stops counting against the reply
+    /// and starts counting against the extension instead. Slack on top of the budget: the extension
+    /// has to cover the poll that *notices* the deadline, not just the deadline.
+    fn notify_systemd_stopping(&self) {
+        if !crate::utils::IS_SYSTEMD_SERVICE.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let extend = (DRAIN_TIMEOUT + Duration::from_secs(1)).as_micros() as u32;
+        let res = sd_notify::notify(&[
+            sd_notify::NotifyState::Stopping,
+            sd_notify::NotifyState::ExtendTimeoutUsec(extend),
+            sd_notify::NotifyState::Status("waiting for applications to exit"),
+        ]);
+        if let Err(err) = res {
+            warn!("error notifying systemd that we are stopping: {err:?}");
+        }
     }
 
     /// The end-session dialog was confirmed: drain first, then answer gnome-session.
@@ -13568,45 +13599,42 @@ impl Niri {
         // the call joins the stop jobs it queued; on the `Quit` and end-session-dialog paths it is
         // the only thing that asks them at all, and without it the drain would wait out its whole
         // budget for apps nobody had told to leave.
+        //
+        // Synchronous, unlike every other systemd call here: the very next thing we do is poll,
+        // and on an empty desktop that poll can take us all the way to process exit — which would
+        // kill a background thread before it had finished connecting to the bus, so the stops
+        // would never go out at all. A D-Bus round trip on the way out costs nothing that matters.
         crate::utils::spawning::stop_app_scopes();
-
-        // Tell systemd we heard it, so it stops counting our unit's `TimeoutStopSec` against the
-        // reply and starts counting it against the extension instead. Slack on top of the budget:
-        // the extension has to cover the poll that *notices* the deadline, not just the deadline.
-        if crate::utils::IS_SYSTEMD_SERVICE.load(Ordering::Relaxed) {
-            let extend = (DRAIN_TIMEOUT + Duration::from_secs(1)).as_micros() as u32;
-            let res = sd_notify::notify(&[
-                sd_notify::NotifyState::Stopping,
-                sd_notify::NotifyState::ExtendTimeoutUsec(extend),
-                sd_notify::NotifyState::Status("waiting for applications to exit"),
-            ]);
-            if let Err(err) = res {
-                warn!("error notifying systemd that we are stopping: {err:?}");
-            }
-        }
 
         let now = self.clock.now_unadjusted();
         self.session_drain = Some(SessionDrain::new(now));
         info!("session ending, waiting for clients to exit");
 
-        // Arm the give-up timer before the first poll: if the poll ends the drain the timer is
-        // removed there, and if it doesn't we need the wakeup even on an idle desktop, where
-        // nothing else would run the poll again.
-        let timer = Timer::from_duration(DRAIN_TIMEOUT);
+        self.poll_session_drain();
+    }
+
+    /// (Re-)arm the single drain timer for the drain's next decision point.
+    ///
+    /// Re-armed rather than set once because the settle after the last window moves that point
+    /// nearer than the deadline. Without it an idle desktop — nothing rendering, no client traffic
+    /// — would have nothing to run the poll again.
+    fn arm_session_drain_timer(&mut self, after: Duration) {
+        if let Some(token) = self.session_drain_timer.take() {
+            self.event_loop.remove(token);
+        }
+
         let token = self
             .event_loop
-            .insert_source(timer, move |_, _, state| {
+            .insert_source(Timer::from_duration(after), move |_, _, state| {
                 // Forget the token before polling: returning `Drop` is what removes this source,
-                // and `poll_session_drain` would otherwise also try to remove it — from inside its
-                // own callback, while calloop holds it borrowed for the dispatch.
+                // and a re-arm from inside `poll_session_drain` would otherwise try to remove it
+                // here too, while calloop holds it borrowed for this dispatch.
                 state.niri.session_drain_timer = None;
                 state.niri.poll_session_drain();
                 TimeoutAction::Drop
             })
             .unwrap();
         self.session_drain_timer = Some(token);
-
-        self.poll_session_drain();
     }
 
     /// Do whatever the drain was for: answer gnome-session, stop, or both.
@@ -13626,15 +13654,19 @@ impl Niri {
     /// `State::refresh_and_flush_clients`), so the last window closing ends it without waiting for
     /// the deadline.
     pub fn poll_session_drain(&mut self) {
-        let Some(drain) = &self.session_drain else {
+        if self.session_drain.is_none() {
             return;
-        };
+        }
 
         let mut windows_left = 0;
         self.layout.with_windows(|_, _, _, _| windows_left += 1);
 
         let now = self.clock.now_unadjusted();
+        let drain = self.session_drain.as_mut().unwrap();
         let Some(outcome) = drain.poll(now, windows_left) else {
+            // Not done: re-arm for whichever comes first, the settle or the deadline.
+            let next = drain.next_wakeup(now);
+            self.arm_session_drain_timer(next);
             return;
         };
 

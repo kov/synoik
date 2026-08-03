@@ -237,8 +237,11 @@ pub fn start_app_scope(_app_id: &str, _pid: u32) {}
 /// cannot drift out of date, cannot grow without bound over a long session, and picks up scopes
 /// started for us by anything else that uses the same prefix.
 ///
-/// Fire-and-forget on its own thread — the caller is the compositor thread, and nothing reads the
-/// result. The drain's oracle is the window count, not this call.
+/// Blocking, unlike the other systemd calls here, which are deliberately off-thread. The caller is
+/// about to start polling for the drain to finish, and on an empty desktop that can reach process
+/// exit within the same call — which would kill a background thread before it had finished even
+/// connecting to the bus, so the stops would never be sent. A D-Bus round trip on the way out of
+/// the session costs nothing that matters.
 ///
 /// A no-op without the `systemd` feature, and without being a systemd service ourselves.
 #[cfg(feature = "systemd")]
@@ -632,15 +635,10 @@ mod systemd {
             return;
         }
 
-        let spawned = thread::Builder::new()
-            .name("stop app scopes".to_owned())
-            .spawn(|| {
-                if let Err(err) = stop_scopes_matching(APP_SCOPE_PATTERNS) {
-                    warn!("error stopping the app scopes: {err:?}");
-                }
-            });
-        if let Err(err) = spawned {
-            warn!("error spawning the app scope thread: {err:?}");
+        let _span = tracy_client::span!();
+
+        if let Err(err) = stop_scopes_matching(APP_SCOPE_PATTERNS) {
+            warn!("error stopping the app scopes: {err:?}");
         }
     }
 

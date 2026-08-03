@@ -156,6 +156,22 @@ impl EndSession {
 /// budget matches it; we buy room against the second with `EXTEND_TIMEOUT_USEC`.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the last window being gone has to hold before we believe the clients are done.
+///
+/// The window count is an approximation of "the app has finished", and it is early: a toolkit that
+/// handles SIGTERM destroys its toplevels near the *start* of shutdown and then keeps talking to
+/// the socket — tearing down GL contexts, dmabuf feedback, the registry — until it disconnects.
+/// Leaving at unmap would reopen the same `Broken pipe` on a shorter fuse, and precisely for the
+/// apps that shut down gracefully rather than dying where they stand. (An app killed outright never
+/// unmaps at all: the compositor sees the disconnect, so window-gone and client-gone coincide.)
+///
+/// This is a settle, not a poll interval — it restarts if a window reappears, and the overall
+/// [`DRAIN_TIMEOUT`] still bounds it. A stricter oracle would count live client connections, but it
+/// needs an allowlist for the clients that are *ours* (xwayland-satellite holds a connection for as
+/// long as it runs, whether or not any X window is left), which is a bigger change than the risk
+/// justifies. Noted in `docs/fork/session-end.md`.
+pub const DRAIN_SETTLE: Duration = Duration::from_millis(500);
+
 /// Why the drain ended, for the log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrainOutcome {
@@ -182,6 +198,9 @@ pub enum DrainOutcome {
 #[derive(Debug)]
 pub struct SessionDrain {
     deadline: Duration,
+    /// When the window count last reached zero, i.e. when the [`DRAIN_SETTLE`] wait started.
+    /// Cleared if a window comes back, so the settle always covers the most recent one.
+    empty_since: Option<Duration>,
 }
 
 impl SessionDrain {
@@ -189,26 +208,39 @@ impl SessionDrain {
     pub fn new(now: Duration) -> Self {
         Self {
             deadline: now + DRAIN_TIMEOUT,
+            empty_since: None,
         }
     }
 
-    /// The monotonic time [`Self::poll`] gives up at, so the caller can arm one timer.
+    /// The monotonic time this drain gives up at, whatever the clients are doing.
     pub fn deadline(&self) -> Duration {
         self.deadline
     }
 
     /// Is the drain over? `windows_left` is the number of client toplevels still mapped.
     ///
-    /// The zero check comes first, so a drain that finishes in the same poll as its deadline
-    /// reports the good outcome rather than a spurious timeout.
-    pub fn poll(&self, now: Duration, windows_left: usize) -> Option<DrainOutcome> {
-        if windows_left == 0 {
-            Some(DrainOutcome::ClientsGone)
-        } else if now >= self.deadline {
-            Some(DrainOutcome::TimedOut)
-        } else {
-            None
+    /// Reaching zero windows starts the [`DRAIN_SETTLE`] wait rather than ending the drain; see
+    /// that constant for why unmap is not the same as done. Hitting the deadline while settling
+    /// still reports [`DrainOutcome::ClientsGone`] — the windows *are* gone, and warning about
+    /// clients that overstayed would point at the wrong thing.
+    pub fn poll(&mut self, now: Duration, windows_left: usize) -> Option<DrainOutcome> {
+        if windows_left > 0 {
+            self.empty_since = None;
+            return (now >= self.deadline).then_some(DrainOutcome::TimedOut);
         }
+
+        let settled_at = *self.empty_since.get_or_insert(now) + DRAIN_SETTLE;
+        (now >= settled_at || now >= self.deadline).then_some(DrainOutcome::ClientsGone)
+    }
+
+    /// How long until [`Self::poll`] could next change its answer, so the caller can arm one timer.
+    /// Zero when that moment has passed.
+    pub fn next_wakeup(&self, now: Duration) -> Duration {
+        let mut next = self.deadline;
+        if let Some(empty_since) = self.empty_since {
+            next = next.min(empty_since + DRAIN_SETTLE);
+        }
+        next.saturating_sub(now)
     }
 }
 
@@ -329,17 +361,45 @@ mod tests {
         assert!(!e.close());
     }
 
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
     #[test]
-    fn drain_waits_for_windows_then_ends_on_the_last_one() {
-        let drain = SessionDrain::new(s(0));
+    fn drain_waits_for_windows_then_settles_after_the_last_one() {
+        let mut drain = SessionDrain::new(s(0));
         assert_eq!(drain.poll(s(0), 2), None);
         assert_eq!(drain.poll(s(1), 1), None);
-        assert_eq!(drain.poll(s(2), 0), Some(DrainOutcome::ClientsGone));
+        // The last window unmapping starts the settle, it does not end the drain.
+        assert_eq!(drain.poll(s(2), 0), None);
+        assert_eq!(drain.poll(s(2) + DRAIN_SETTLE - ms(1), 0), None);
+        assert_eq!(
+            drain.poll(s(2) + DRAIN_SETTLE, 0),
+            Some(DrainOutcome::ClientsGone)
+        );
+    }
+
+    /// The settle exists because unmap is not "done" — a toolkit that handles SIGTERM destroys its
+    /// toplevels early and keeps using the socket afterwards. Leaving at unmap would reopen the
+    /// `Broken pipe` for exactly the apps that shut down gracefully.
+    #[test]
+    fn a_window_reappearing_restarts_the_settle() {
+        let mut drain = SessionDrain::new(s(0));
+        assert_eq!(drain.poll(ms(0), 0), None);
+        // Something mapped again part-way through the settle.
+        assert_eq!(drain.poll(ms(200), 1), None);
+        // The old settle must not carry over and fire early.
+        assert_eq!(drain.poll(ms(400), 0), None);
+        assert_eq!(drain.poll(ms(400) + DRAIN_SETTLE - ms(1), 0), None);
+        assert_eq!(
+            drain.poll(ms(400) + DRAIN_SETTLE, 0),
+            Some(DrainOutcome::ClientsGone)
+        );
     }
 
     #[test]
     fn drain_gives_up_at_the_deadline() {
-        let drain = SessionDrain::new(s(0));
+        let mut drain = SessionDrain::new(s(0));
         assert_eq!(drain.deadline(), DRAIN_TIMEOUT);
         assert_eq!(drain.poll(drain.deadline() - s(1), 1), None);
         assert_eq!(
@@ -348,12 +408,13 @@ mod tests {
         );
     }
 
-    /// The last window going away *at* the deadline is a clean drain, not a timeout: an app that
-    /// used its whole budget still exited on its own terms, and logging it as a timeout would send
-    /// anyone reading the journal after the real failure mode.
+    /// The deadline landing mid-settle reports a clean drain: the windows *are* gone, and warning
+    /// about clients that overstayed would send anyone reading the journal after the wrong thing.
     #[test]
-    fn drain_finishing_on_the_deadline_is_not_a_timeout() {
-        let drain = SessionDrain::new(s(0));
+    fn the_deadline_during_a_settle_is_not_a_timeout() {
+        let mut drain = SessionDrain::new(s(0));
+        let just_before = drain.deadline() - ms(1);
+        assert_eq!(drain.poll(just_before, 0), None, "settle has not elapsed");
         assert_eq!(
             drain.poll(drain.deadline(), 0),
             Some(DrainOutcome::ClientsGone)
@@ -361,10 +422,29 @@ mod tests {
     }
 
     /// Nothing open when the stop arrives — the drain must not hold the session up for five
-    /// seconds on an empty desktop.
+    /// seconds on an empty desktop. It still pays the settle, which is bounded and small.
     #[test]
-    fn drain_with_no_windows_is_over_immediately() {
-        let drain = SessionDrain::new(s(0));
-        assert_eq!(drain.poll(s(0), 0), Some(DrainOutcome::ClientsGone));
+    fn drain_with_no_windows_is_over_after_the_settle() {
+        let mut drain = SessionDrain::new(s(0));
+        assert_eq!(drain.poll(s(0), 0), None);
+        assert_eq!(drain.poll(DRAIN_SETTLE, 0), Some(DrainOutcome::ClientsGone));
+    }
+
+    /// The caller arms one timer off this, so it must shorten to the settle and never overshoot the
+    /// deadline — an overshoot is a compositor that sits there after its clients have gone.
+    #[test]
+    fn next_wakeup_is_the_earlier_of_settle_and_deadline() {
+        let mut drain = SessionDrain::new(s(0));
+        assert_eq!(drain.next_wakeup(s(0)), DRAIN_TIMEOUT);
+
+        drain.poll(s(1), 1);
+        assert_eq!(drain.next_wakeup(s(1)), DRAIN_TIMEOUT - s(1));
+
+        // Windows gone: the settle is now the nearer wakeup.
+        drain.poll(s(1), 0);
+        assert_eq!(drain.next_wakeup(s(1)), DRAIN_SETTLE);
+
+        // And it never runs backwards once everything has passed.
+        assert_eq!(drain.next_wakeup(s(600)), Duration::ZERO);
     }
 }

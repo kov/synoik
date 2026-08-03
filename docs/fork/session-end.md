@@ -99,14 +99,27 @@ Every path that ends the compositor now goes through **`Niri::begin_session_drai
 unwinding, we stay in the event loop — still dispatching, still rendering, still flushing — until
 the last client window is gone or `DRAIN_TIMEOUT` (5 s) expires.
 
-- **The oracle is the window count**, `layout.with_windows`. An app that has finished is an app with
-  no windows; waiting on client *connections* would instead wait on session components (portals,
-  gsd) that are being torn down alongside us.
+- **The oracle is the window count**, `layout.with_windows` — plus a settle. Zero windows starts a
+  500 ms `DRAIN_SETTLE` rather than ending the drain, because unmap is not "done": a toolkit that
+  *handles* SIGTERM destroys its toplevels near the start of shutdown and keeps using the socket
+  afterwards (GL contexts, dmabuf feedback, the registry). Leaving at unmap would reopen the same
+  `Broken pipe` on a shorter fuse, and precisely for the apps that shut down gracefully rather than
+  dying where they stand. An app killed outright never unmaps at all — the compositor sees the
+  disconnect, so the two coincide. The settle restarts if a window reappears and `DRAIN_TIMEOUT`
+  still bounds the whole thing.
+
+  The strictly correct oracle is live client *connections*, but it needs an allowlist for the
+  clients that are ours: xwayland-satellite holds a connection for as long as it runs, so waiting
+  on it would push every logout with an X app to the full timeout. Not worth the machinery for the
+  residual risk; noted here so the option is on record.
 - **The poll runs after `flush_clients`** in `refresh_and_flush_clients`, plus once on a deadline
   timer. The first point is what makes the drain end the instant the last window goes; the timer is
   what wakes an otherwise idle desktop to give up.
 - **`sd_notify(STOPPING=1, EXTEND_TIMEOUT_USEC=…)`** buys the budget against our own unit's
-  `TimeoutStopSec=5`, which would otherwise be counting the whole time.
+  `TimeoutStopSec`, which would otherwise be counting the whole time. Sent **only on the stopping
+  path**, never on the dialog drain: `STOPPING=1` moves the unit into deactivating and arms that
+  timeout, so declaring it while we intend to keep running would have systemd kill us mid-session
+  if gnome-session's teardown ever stalled. A SIGTERM folding into a confirm drain sends it then.
 - **Timing out is a warning that names the apps.** Which client ignored a five-second SIGTERM is
   the only thing worth knowing from that line.
 
@@ -117,7 +130,10 @@ front of a logout the user has already confirmed. GNOME's answer to unsaved work
 protocol, not a close sweep. What we add over GNOME is only the waiting.
 
 On an externally driven logout, `stop_app_scopes` joins stop jobs systemd has already queued and is
-a no-op. On the `Quit` and dialog paths it is the only thing that asks the apps at all.
+a no-op. On the `Quit` and dialog paths it is the only thing that asks the apps at all — which is
+why it is the one systemd call here that blocks. The rest are fire-and-forget on a thread; this one
+is followed immediately by a poll that can reach process exit within the same call, and a detached
+thread would be killed before it had finished connecting to the bus.
 
 ### 2.3 The end-session dialog answers late
 
@@ -144,13 +160,23 @@ tests in `src/tests/gnome.rs` set the flag by hand.
 
 ## 3. Known gaps
 
-- **Clients with no scope are still unprotected.** D-Bus-activated apps
-  (`dbus-:1.x-org.foo@N.service`) and anything spawned from a terminal never get an
-  `app-gnome-*`/`app-niri-*` scope, so `stop_app_scopes` cannot reach them and nothing SIGTERMs
-  them at logout. The drain still waits for their windows, so they are no *worse* off than under
-  GNOME — which has the identical hole — but they are only asked to leave when the socket dies.
+- **Clients with no scope are still unprotected, and cost the full budget.** A `DBusActivatable`
+  app is launched by the bus, so `app_system.rs` skips scope creation for it (`pid == 0`) and its
+  unit is `dbus-:1.x-org.foo@N.service` — matching neither `APP_SCOPE_PATTERN`. Same for anything
+  spawned from a terminal. On the `Quit` and dialog paths nothing SIGTERMs them, so the drain waits
+  its whole 5 s and then exits over them anyway: the original bug, preserved for this app class,
+  plus a constant tax on those logouts. GNOME has the identical hole (its `dbus-.service.d` drop-in
+  sets only `Slice=`, no `PartOf=`), and on an *externally* driven logout they are equally exposed
+  under both. Closing it means either widening the patterns — dangerous, `dbus-*` covers services
+  we still need — or `xdg_toplevel.close` as a fallback for windows whose client we could not
+  reach, which is the divergence deliberately not taken here.
 - **`--session` under a non-systemd init** (dinit) drains with no way to stop the scopes, so a
-  `Quit` there waits out the full budget before the warning. Nobody runs that configuration today.
+  `Quit` there waits out the full budget before the warning: the drain is gated on
+  `is_session_instance` while `stop_app_scopes` is gated on `IS_SYSTEMD_SERVICE`. Nobody runs that
+  configuration today.
+- **A stuck app can cost two budgets.** If a confirm drain times out on it, gnome-session's
+  subsequent SIGTERM starts a fresh drain that gives the same app another 5 s — worst case a ~10 s
+  logout. Carrying the deadline across would fix it; not worth the state until it is seen.
 - **Inhibitors are still parsed and discarded.** `EndSessionDialog.Open` takes a list of inhibitor
   object paths (`src/dbus/gnome_session.rs:59`) and the dialog does not show them, so an app with
   unsaved work has no way to say so. This is the piece that would let apps push back on a logout,
