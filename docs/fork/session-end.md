@@ -194,12 +194,24 @@ tests in `src/tests/gnome.rs` set the flag by hand.
 
 ## 3. Known gaps
 
+- **An app that ignores SIGTERM cannot be drained, and OBS is one.** Measured 2026-08-03 across
+  three logouts: OBS is asked to stop, logs **nothing at all** for its full five seconds, and is
+  SIGKILLed. The contrast is in the same journal — quit from its own menu, it prints
+  `==== Shutting down ====` … `Number of memory leaks: 0` in ~130 ms. So it never *begins* shutting
+  down: waiting longer only postpones the SIGKILL, and holding its Wayland socket open (which we
+  did, for the whole five seconds) does not prompt it either. That is why it still reports "Crash
+  or unclean shutdown detected" on the next start, and why nothing on the compositor side fixes it.
+  Stock GNOME uses the same scope, the same drop-in and the same five seconds, so it should nag
+  identically there — worth a real-GNOME control run before anyone spends time on it. The one thing
+  that *would* reach it is an `xdg_toplevel.close` sweep, which §2.2 rejects on purpose; if that
+  trade is ever revisited, this is the case that argues for it.
 - **Terminal-spawned clients have no scope**, so `stop_app_scopes` cannot reach them and nothing
   SIGTERMs them at logout. The drain still waits for their windows; they are only asked to leave
   when the socket dies, as under GNOME. (A flatpak app started from a terminal is the exception —
   `flatpak run` makes it a scope regardless of who launched it, so `app-flatpak-*` now reaches it.)
-- **`DBusActivatable` apps are handled by GNOME restarting the bus** — see §4; that covers us too
-  on every path except a bare `Quit`.
+- **`DBusActivatable` apps are unreachable from the drain** — see §4. The bus restart that ends
+  them is triggered by our own exit, so waiting moves it out of reach rather than into it. Measured
+  with a keyring prompt open: 10 s of drain, then `Broken pipe` anyway.
 - **`--session` under a non-systemd init** (dinit) drains with no way to stop the scopes, so a
   `Quit` there waits out the full budget before the warning: the drain is gated on
   `is_session_instance` while `stop_app_scopes` is gated on `IS_SYSTEMD_SERVICE`. Nobody runs that
@@ -220,6 +232,12 @@ tests in `src/tests/gnome.rs` set the flag by hand.
   app in drain 2 was OBS, and OBS was in it because nothing had asked it to quit yet — the flatpak
   scope fix above is what that logout actually needed. Carrying the deadline across is still the
   fix for the general case; it is not obviously the fix for the case we have.
+
+  With the fix in, measured again 2026-08-03: one logout took **5.6 s and ended on
+  `clients are gone`** — the first clean drain we have recorded — and the next took the full 10 s on
+  `gcr-prompter`, which is the D-Bus-activated case above and would not have been helped by either
+  budget. So the second budget is now only ever spent on clients the drain cannot influence, which
+  is an argument for capping the *total* rather than for carrying the deadline.
 - **Inhibitors are still parsed and discarded.** `EndSessionDialog.Open` takes a list of inhibitor
   object paths (`src/dbus/gnome_session.rs:59`) and the dialog does not show them, so an app with
   unsaved work has no way to say so. This is the piece that would let apps push back on a logout,
@@ -271,19 +289,36 @@ The bus restart lands **after** the compositor has been told to stop. So under s
 D-Bus-activated app is *more* exposed than a scoped one, not less: a scoped app at least gets a
 341 ms head start, while this one is not asked to leave until 425 ms after the shell was.
 
-**The drain covers it anyway**, which is the part worth noticing — and it is why this is a footnote
-and not a gap:
+**The drain does *not* cover it, and the reason is worth keeping.** An earlier revision of this
+section argued that it did — the drain keeps us serving Wayland for 5 s, the bus restart lands
+~425 ms after we are told to stop, so the app gets to close its own socket. That reasoning has a
+hole in it: the restart is not at a fixed offset from our *SIGTERM*, it is downstream of our
+*exit*. `gnome-session-restart-dbus.service` is pulled in by `gnome-session-shutdown.target`, which
+`org.gnome.Shell@user.service` triggers through `OnSuccess=`. **Every second the drain waits pushes
+the bus restart back by the same second**, so it can never arrive during the drain — the deadline
+moves with us.
 
-- **External logout** (systemd SIGTERMs us): the drain starts at `16.179` and runs for up to 5 s, so
-  we are still serving Wayland at `16.604` when the bus goes and the app exits. It closes our socket
-  itself instead of having it yanked. This is a case GNOME loses and we win, for free.
-- **Dialog confirm**: we drain, emit `Confirmed*`, and keep running while gnome-session drives the
-  teardown — so we are alive across the bus restart for the same reason.
-- **Bare `Quit`**: the only exposed path. We exit, and only then does our unit's
-  `OnSuccess=gnome-session-shutdown.target` fire the bus restart, with nobody left to serve the app.
-  A developer keybind, on a session that is ending regardless.
+Measured 2026-08-03, a logout with a keyring password prompt open (`gcr-prompter`, in
+`dbus-:1.2-org.gnome.keyring.SystemPrompter@0.service`):
 
-The corollary is that `stop_app_scopes` not matching `dbus-:1.x-*` is correct rather than a
-shortfall: those units are not ours to stop, and stopping them by pattern would take out session
-services we still need. Nothing to fix here — but do not read "the app has no scope" as "the app is
-unprotected", which is the wrong conclusion this section exists to prevent.
+```
+16:26:51.495  drain 2 starts (after drain 1 timed out on it)
+16:26:56.501  clients did not exit within 5s: gcr-prompter
+16:26:56.598  gcr-prompter: Error reading events from display: Broken pipe   ← the yank
+16:26:56.641  Stopped org.gnome.Shell@user.service
+16:26:56.645  Started gnome-session-restart-dbus.service                      ← 47 ms too late
+```
+
+Ten seconds of drain, both budgets spent, and the client still went out on `Broken pipe` — the
+exact failure the drain exists to prevent, in the one class of client it cannot help. So this is a
+**gap, not a footnote**: a D-Bus-activated client that only exits when the bus goes is unreachable
+from here on *every* path, `Quit` included, because we are what the bus restart is waiting for.
+
+What would actually fix it is asking gnome-session to restart the bus before we exit rather than
+after, or stopping the `dbus-:1.x-*` unit for a client whose window is holding the drain. The
+second is tempting and wrong as stated — those units are not ours, and a blanket pattern would take
+out session services we still need — but a *targeted* stop, of a unit we can tie to a window that
+is holding the drain open, is a different proposition and has not been explored.
+
+Do not read "the app has no scope" as "the app is unprotected"; read it as "the drain has no
+lever on this one", which is the conclusion this section now exists to record.
