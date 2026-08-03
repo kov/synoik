@@ -64,8 +64,16 @@ recovery key could arm the very thing it exists to undo.
 
 `org.gnome.mutter` — `overlay-key` (the Super tap, with mutter's arm/disarm state machine).
 
-`org.gnome.shell.keybindings` — `show-screenshot-ui`, `screenshot`, `screenshot-window`,
-`show-screen-recording-ui`, `screen-brightness-{up,down,cycle}[-monitor]`.
+`org.gnome.shell.keybindings` — `toggle-overview`, `toggle-application-view`,
+`toggle-message-tray`, `toggle-quick-settings`, `show-screenshot-ui`, `screenshot`,
+`screenshot-window`, `show-screen-recording-ui`,
+`screen-brightness-{up,down,cycle}[-monitor]`.
+
+`toggle-message-tray` and `toggle-quick-settings` are registered by gnome-shell with
+`ShellActionMode.POPUP` (`windowManager.js:747-760`), so they keep resolving while a panel menu
+holds its modal grab. Our popover grab swallowed every key but Escape and the VT chord, which
+made the menus one-way — the key that opened one could not close it. `allowed_during_popup`
+is the allowlist that fixes it, in the same shape as `allowed_when_locked`.
 
 ### The fallback defaults are the session's defaults
 
@@ -76,11 +84,14 @@ while silently defining what the conformance tests assert. A *deliberate* differ
 but it must be labelled at the key and carried into the `.gschema.override` we install, so the
 table, the override and the seat all agree.
 
-Two divergences from upstream have been found:
+Three divergences from upstream have been found:
 
 - `switch-to-workspace-1..4` claimed `<Super>1..4`. Accidental, and wrong: `<Super>N` is
   `switch-to-application-N` (`gnome-shell/data/org.gnome.shell.gschema.xml.in:193+`).
   `switch-to-workspace-1` is `<Super>Home`, 2..12 are `[]`. **Fixed.**
+- `show-screenshot-ui` and `screenshot` had their accelerators swapped: we claimed
+  `<Shift>Print` opens the picker and plain `Print` writes a file, where GNOME does the
+  reverse (`org.gnome.shell.gschema.xml.in`). Accidental. **Fixed.**
 - `switch-windows = ['<Alt>Tab']` with `switch-applications = ['<Super>Tab']`, where upstream
   leaves `switch-windows` empty and gives Alt+Tab to `switch-applications`. Arrived by
   accident, **kept deliberately**: Alt+Tab is our window switcher, Super+Tab our application
@@ -143,7 +154,7 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 |---|---|---|
 | S1 | Fix the invented fallback defaults for `switch-to-workspace-N` | **done** |
 | S2 | `non_maskable` flag + `restore-shortcuts` + `switch-to-session-N` | **done** |
-| S3 | Shell UI toggles: overview, app grid, quick settings, message tray | |
+| S3 | Shell UI toggles: overview, app grid, quick settings, message tray | **done** |
 | S4 | wm/mutter window + monitor keys: `toggle-maximized`, `move-to-monitor-*`, `*-workspace-last`, `switch-input-source` | |
 | S5 | `switch-to-application-N` + `open-new-window-application-N`, on a real focus-or-launch path | |
 | S6 | Our own schema for the niri actions, plus its packaging | |

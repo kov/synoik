@@ -971,6 +971,16 @@ pub enum GnomeKeyAction {
     /// the focused window to the given half of the work area, or untile it if
     /// already tiled there.
     ToggleTiled(TileSide),
+    /// `toggle-overview` (`org.gnome.shell.keybindings`): the overview. Unbound by
+    /// default — GNOME opens the overview with the overlay key.
+    ToggleOverview,
+    /// `toggle-application-view` (`<Super>a`): the app grid.
+    ToggleApplicationView,
+    /// `toggle-message-tray` (`<Super>v` / `<Super>m`): the date menu — calendar
+    /// and message list.
+    ToggleMessageTray,
+    /// `toggle-quick-settings` (`<Super>s`): the quick settings menu.
+    ToggleQuickSettings,
     /// `restore-shortcuts` (`org.gnome.mutter.wayland.keybindings`, `<Super>Escape`):
     /// hand the shortcuts back to the compositor while a client is inhibiting them.
     RestoreShortcuts,
@@ -1729,14 +1739,35 @@ fn adopted_shell_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
 
     vec![
         (
+            "toggle-overview".to_owned(),
+            GnomeKeyAction::ToggleOverview,
+            Vec::new(),
+        ),
+        (
+            "toggle-application-view".to_owned(),
+            GnomeKeyAction::ToggleApplicationView,
+            vec!["<Super>a".to_owned()],
+        ),
+        (
+            "toggle-message-tray".to_owned(),
+            GnomeKeyAction::ToggleMessageTray,
+            vec!["<Super>v".to_owned(), "<Super>m".to_owned()],
+        ),
+        (
+            "toggle-quick-settings".to_owned(),
+            GnomeKeyAction::ToggleQuickSettings,
+            vec!["<Super>s".to_owned()],
+        ),
+        // Print opens the picker; Shift+Print is the one that goes straight to a file.
+        (
             "show-screenshot-ui".to_owned(),
             GnomeKeyAction::ShowScreenshotUi,
-            vec!["<Shift>Print".to_owned()],
+            vec!["Print".to_owned()],
         ),
         (
             "screenshot".to_owned(),
             GnomeKeyAction::Screenshot,
-            vec!["Print".to_owned()],
+            vec!["<Shift>Print".to_owned()],
         ),
         (
             "screenshot-window".to_owned(),

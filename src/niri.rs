@@ -1967,6 +1967,89 @@ impl State {
         self.ipc_refresh_keyboard_layout_index();
     }
 
+    /// Toggle the date menu (calendar + message list) on `output`'s panel —
+    /// gnome-shell's `Panel.toggleCalendar` (`js/ui/panel.js:603`), reached both
+    /// by clicking the clock and by `toggle-message-tray`.
+    ///
+    /// Opening acknowledges every notification in the store, exactly once per
+    /// open and never on close (`js/ui/messageList.js:1193-1199`).
+    pub fn toggle_date_menu(&mut self, output: Output) {
+        let output_w = output_size(&output).w;
+        let anchor = self.niri.panel.date_menu_rect(output_w);
+        let cal = self.niri.gnome_settings.calendar;
+        let accent = self.niri.gnome_settings.accent_color;
+        let now = self.niri.clock.now_unadjusted();
+        let cards =
+            crate::ui::notification_card::message_list_groups(&self.niri.notifications, now);
+        let opened = self.niri.panel_popover.toggle_calendar(
+            output,
+            anchor,
+            cal.week_start,
+            cal.show_week_numbers,
+            accent,
+            cards,
+        );
+        if opened {
+            let effects = self.niri.notifications.acknowledge_all();
+            self.niri.apply_notification_effects(effects);
+            // Load events for the now-open calendar's grid (`open-state-changed` →
+            // today, `js/ui/dateMenu.js:907-915`) and populate the section from
+            // what's cached.
+            self.niri.sync_calendar_range();
+            self.niri.refresh_popover_calendar_events();
+            self.niri.refresh_popover_world_clocks();
+            self.niri.refresh_popover_media();
+        }
+        self.niri.queue_redraw_all();
+    }
+
+    /// Toggle the quick settings menu on `output`'s panel — gnome-shell's
+    /// `Panel.toggleQuickSettings` (`js/ui/panel.js:607`), reached both by
+    /// clicking the indicators and by `toggle-quick-settings`.
+    ///
+    /// The snapshot it opens on is resolved state rather than a model: the menu
+    /// shows the headphone glyph if they are already plugged in, instead of
+    /// waiting for the next port change to correct itself.
+    pub fn toggle_quick_settings_menu(&mut self, output: Output) {
+        let output_w = output_size(&output).w;
+        let toggles = self.niri.gnome_settings.quick_toggles;
+        let anchor = self.niri.panel.quick_settings_rect(output_w);
+        let network = self.niri.system_status.network;
+        let airplane = self.niri.system_status.airplane;
+        let power = self.niri.system_status.power.clone();
+        let bluetooth = self.niri.system_status.bluetooth.clone();
+        let bluetooth_rfkill = self.niri.system_status.bluetooth_rfkill;
+        let battery = self.niri.system_status.battery.clone();
+        let audio = self.niri.audio;
+        let sink_list = self.niri.sink_list.clone();
+        let audio_cards = self.niri.audio_cards.clone();
+        let headphones = self.niri.headphones.unwrap_or(false);
+        let mic = self.niri.mic;
+        let source_list = self.niri.source_list.clone();
+        let brightness = self.niri.brightness.view();
+        let accent = self.niri.gnome_settings.accent_color;
+        self.niri.panel_popover.toggle_quick_settings(
+            output,
+            anchor,
+            toggles,
+            network,
+            airplane,
+            power,
+            bluetooth,
+            bluetooth_rfkill,
+            battery,
+            audio,
+            sink_list,
+            audio_cards,
+            headphones,
+            mic,
+            source_list,
+            brightness,
+            accent,
+        );
+        self.niri.queue_redraw_all();
+    }
+
     /// The input-source popover's items (a display name + short label per layout,
     /// in xkb/source order) and the active index — read from the live xkb state
     /// (which reflects GNOME's input-sources) so it matches the panel indicator.

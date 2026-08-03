@@ -382,6 +382,16 @@ pub enum Action {
     #[knuffel(skip)]
     StopCast(u64),
     ToggleOverview,
+    /// GNOME's `toggle-application-view` (`<Super>a`): from the window picker it
+    /// flips to the app grid and back, and from a closed overview it opens
+    /// straight into the grid (`overviewControls.js:660-667`).
+    ToggleApplicationView,
+    /// GNOME's `toggle-message-tray` (`<Super>v` / `<Super>m`): the date menu —
+    /// calendar and message list (`Panel.toggleCalendar`, `js/ui/panel.js:603`).
+    ToggleMessageTray,
+    /// GNOME's `toggle-quick-settings` (`<Super>s`): the quick settings menu
+    /// (`Panel.toggleQuickSettings`, `js/ui/panel.js:607`).
+    ToggleQuickSettings,
     ToggleScreenRecord,
     OpenOverview,
     CloseOverview,

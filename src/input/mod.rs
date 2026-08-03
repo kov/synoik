@@ -925,6 +925,37 @@ impl State {
                         }
                     }
 
+                    // ...and the menu keys themselves keep resolving, so the key that
+                    // opened a menu also closes it. gnome-shell registers both with
+                    // `ShellActionMode.POPUP` for exactly this
+                    // (`windowManager.js:747-760`).
+                    let popup_bind = {
+                        let config = this.niri.config.borrow();
+                        find_bind(
+                            make_binds_iter(&config, false),
+                            &this.niri.gnome_settings.keybindings,
+                            &this.niri.accel_grabs,
+                            SwitcherGrab::Closed,
+                            mod_key,
+                            key_code,
+                            modified,
+                            raw,
+                            *mods,
+                            config.input.disable_power_key_handling,
+                        )
+                        .filter(|bind| allowed_during_popup(&bind.action))
+                    };
+                    if let Some(bind) = popup_bind {
+                        if pressed {
+                            this.niri.suppressed_keys.insert(key_code);
+                            return FilterResult::Intercept(Some(bind));
+                        } else if this.niri.suppressed_keys.remove(&key_code) {
+                            return FilterResult::Intercept(None);
+                        } else {
+                            return FilterResult::Forward;
+                        }
+                    }
+
                     this.niri.panel_popover.handle_key(raw, pressed);
                     this.niri.queue_redraw_all();
 
@@ -3730,6 +3761,29 @@ impl State {
                 self.niri.layout.toggle_overview();
                 self.niri.queue_redraw_all();
             }
+            Action::ToggleApplicationView => {
+                // `_toggleAppsPage` (`overviewControls.js:660-667`): with the overview
+                // up this is the show-apps button, flipping between the window picker
+                // and the grid; with it down it opens the overview *at* the grid rather
+                // than at the picker.
+                if self.niri.layout.is_overview_open() {
+                    self.niri.layout.toggle_app_grid();
+                } else {
+                    self.niri.layout.open_overview();
+                    self.niri.layout.open_app_grid();
+                }
+                self.niri.queue_redraw_all();
+            }
+            Action::ToggleMessageTray => {
+                if let Some(output) = self.niri.layout.active_output().cloned() {
+                    self.toggle_date_menu(output);
+                }
+            }
+            Action::ToggleQuickSettings => {
+                if let Some(output) = self.niri.layout.active_output().cloned() {
+                    self.toggle_quick_settings_menu(output);
+                }
+            }
             #[cfg(feature = "xdp-gnome-screencast")]
             Action::ToggleScreenRecord => {
                 self.toggle_screen_record();
@@ -6376,81 +6430,13 @@ impl State {
                                 return;
                             }
                             Some(crate::ui::panel::ROLE_DATE_MENU) => {
-                                let anchor = self.niri.panel.date_menu_rect(output_w);
-                                let cal = self.niri.gnome_settings.calendar;
-                                let accent = self.niri.gnome_settings.accent_color;
-                                let now = self.niri.clock.now_unadjusted();
-                                let cards = crate::ui::notification_card::message_list_groups(
-                                    &self.niri.notifications,
-                                    now,
-                                );
-                                let opened = self.niri.panel_popover.toggle_calendar(
-                                    output,
-                                    anchor,
-                                    cal.week_start,
-                                    cal.show_week_numbers,
-                                    accent,
-                                    cards,
-                                );
-                                // Opening the message list acknowledges everything
-                                // in the store, exactly once per open — never on
-                                // close (`js/ui/messageList.js:1193-1199`).
-                                if opened {
-                                    let effects = self.niri.notifications.acknowledge_all();
-                                    self.niri.apply_notification_effects(effects);
-                                    // Load events for the now-open calendar's grid
-                                    // (`open-state-changed` → today, `js/ui/dateMenu.js:907-915`)
-                                    // and populate the section from what's cached.
-                                    self.niri.sync_calendar_range();
-                                    self.niri.refresh_popover_calendar_events();
-                                    self.niri.refresh_popover_world_clocks();
-                                    self.niri.refresh_popover_media();
-                                }
+                                self.toggle_date_menu(output);
                                 self.niri.suppressed_buttons.insert(button_code);
-                                self.niri.queue_redraw_all();
                                 return;
                             }
                             Some(crate::ui::panel::ROLE_QUICK_SETTINGS) => {
-                                let toggles = self.niri.gnome_settings.quick_toggles;
-                                let anchor = self.niri.panel.quick_settings_rect(output_w);
-                                let network = self.niri.system_status.network;
-                                let airplane = self.niri.system_status.airplane;
-                                let power = self.niri.system_status.power.clone();
-                                let bluetooth = self.niri.system_status.bluetooth.clone();
-                                let bluetooth_rfkill = self.niri.system_status.bluetooth_rfkill;
-                                let battery = self.niri.system_status.battery.clone();
-                                let audio = self.niri.audio;
-                                let sink_list = self.niri.sink_list.clone();
-                                let audio_cards = self.niri.audio_cards.clone();
-                                // Resolved state, not a model: the menu opens showing the
-                                // headphone glyph if they are already plugged in, rather than
-                                // waiting for the next port change to correct itself.
-                                let headphones = self.niri.headphones.unwrap_or(false);
-                                let mic = self.niri.mic;
-                                let source_list = self.niri.source_list.clone();
-                                let brightness = self.niri.brightness.view();
-                                let accent = self.niri.gnome_settings.accent_color;
-                                self.niri.panel_popover.toggle_quick_settings(
-                                    output,
-                                    anchor,
-                                    toggles,
-                                    network,
-                                    airplane,
-                                    power,
-                                    bluetooth,
-                                    bluetooth_rfkill,
-                                    battery,
-                                    audio,
-                                    sink_list,
-                                    audio_cards,
-                                    headphones,
-                                    mic,
-                                    source_list,
-                                    brightness,
-                                    accent,
-                                );
+                                self.toggle_quick_settings_menu(output);
                                 self.niri.suppressed_buttons.insert(button_code);
-                                self.niri.queue_redraw_all();
                                 return;
                             }
                             Some(crate::ui::panel::ROLE_SCREEN_RECORDING) => {
@@ -8749,6 +8735,10 @@ fn accel_matches(
 pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
     Some(match action {
         GnomeKeyAction::PanelRunDialog => Action::ShowRunDialog,
+        GnomeKeyAction::ToggleOverview => Action::ToggleOverview,
+        GnomeKeyAction::ToggleApplicationView => Action::ToggleApplicationView,
+        GnomeKeyAction::ToggleMessageTray => Action::ToggleMessageTray,
+        GnomeKeyAction::ToggleQuickSettings => Action::ToggleQuickSettings,
         GnomeKeyAction::RestoreShortcuts => Action::RestoreKeyboardShortcuts,
         GnomeKeyAction::SwitchToSession(n) => Action::ChangeVt(i32::from(n)),
         GnomeKeyAction::Maximize => Action::Maximize,
@@ -8970,6 +8960,19 @@ pub(crate) fn allowed_when_locked(action: &Action) -> bool {
             | Action::ScreenBrightnessUp(_)
             | Action::ScreenBrightnessDown(_)
             | Action::ScreenBrightnessCycle(_)
+    )
+}
+
+/// The actions that keep resolving while a panel popover holds its modal grab —
+/// gnome-shell's `ShellActionMode.POPUP`, which `toggle-message-tray` and
+/// `toggle-quick-settings` are both registered with (`windowManager.js:747-760`).
+///
+/// Without this the menus would be one-way: the grab swallows the key that opened
+/// them, so the *toggle* half of a toggle never arrives.
+pub(crate) fn allowed_during_popup(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::ToggleMessageTray | Action::ToggleQuickSettings
     )
 }
 

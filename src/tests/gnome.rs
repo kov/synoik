@@ -60,6 +60,8 @@ const KEY_HOME: u32 = 102;
 const KEY_END: u32 = 107;
 const KEY_PAGEDOWN: u32 = 109;
 const KEY_O: u32 = 24;
+const KEY_S: u32 = 31;
+const KEY_V: u32 = 47;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
 pub(super) const BTN_LEFT: u32 = 0x110;
@@ -292,14 +294,18 @@ fn right_super_tap_toggles_overview_by_default() {
 
 /// Using Super as a modifier (Super+key) must *not* trigger the overlay key:
 /// once another key participates, the press is no longer a lone tap.
+///
+/// The second key has to be one nothing binds, or this stops measuring the
+/// overlay key: `<Super>a` used to stand in for "any Super+key" until it became
+/// `toggle-application-view`, whose whole job is to open the overview.
 #[test]
 fn super_plus_key_does_not_toggle_overview() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
     f.key_press(KEY_LEFTMETA);
-    f.key_press(KEY_A);
-    f.key_release(KEY_A);
+    f.key_press(KEY_Z);
+    f.key_release(KEY_Z);
     f.key_release(KEY_LEFTMETA);
     f.niri_complete_animations();
 
@@ -349,18 +355,19 @@ fn overlay_key_firing_release_is_not_sent_to_the_client() {
     f.roundtrip(id);
     let _ = f.client(id).take_key_events();
 
-    // A canceled tap (Super+A): the client sees all four key events.
+    // A canceled tap (Super+Z — a chord nothing binds, so the events reach the
+    // client instead of being eaten by the binding): all four key events arrive.
     f.key_press(KEY_LEFTMETA);
-    f.key_press(KEY_A);
-    f.key_release(KEY_A);
+    f.key_press(KEY_Z);
+    f.key_release(KEY_Z);
     f.key_release(KEY_LEFTMETA);
     f.double_roundtrip(id);
     assert_eq!(
         f.client(id).take_key_events(),
         vec![
             (KEY_LEFTMETA, WlKeyState::Pressed),
-            (KEY_A, WlKeyState::Pressed),
-            (KEY_A, WlKeyState::Released),
+            (KEY_Z, WlKeyState::Pressed),
+            (KEY_Z, WlKeyState::Released),
             (KEY_LEFTMETA, WlKeyState::Released),
         ],
         "a canceled tap must deliver both Super key events to the client"
@@ -791,6 +798,76 @@ fn shortcuts_inhibit_masks_gnome_keybindings() {
     assert!(
         f.client(id).window(&surface).close_requested,
         "releasing the inhibitor must restore the keybinding"
+    );
+}
+
+/// `toggle-application-view` (`<Super>a`) is the show-apps button as a key:
+/// from a closed overview it opens straight into the app grid, and with the
+/// overview already up it flips between the window picker and the grid
+/// (`_toggleAppsPage`, `overviewControls.js:660-667`).
+#[test]
+fn super_a_toggles_the_app_grid() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_A);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert!(
+        f.niri().layout.is_app_grid_open(),
+        "from closed, <Super>a must open the overview at the app grid"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_A);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert!(
+        !f.niri().layout.is_app_grid_open(),
+        "pressing it again must fall back to the window picker"
+    );
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "...without leaving the overview — that is what the show-apps button does"
+    );
+}
+
+/// `toggle-message-tray` (`<Super>v`, and `<Super>m` as its second accelerator)
+/// and `toggle-quick-settings` (`<Super>s`) open the panel menus, the same
+/// `Panel.toggleCalendar` / `toggleQuickSettings` the pointer reaches by
+/// clicking the clock and the indicators (`js/ui/panel.js:603-609`).
+#[test]
+fn super_v_and_super_s_open_the_panel_menus() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_V);
+    f.key_release(KEY_LEFTMETA);
+    assert_eq!(
+        f.niri().panel_popover.open_role(),
+        Some(crate::ui::panel::ROLE_DATE_MENU),
+        "<Super>v must open the date menu"
+    );
+
+    // Toggling: the same key closes it again.
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_V);
+    f.key_release(KEY_LEFTMETA);
+    assert_eq!(
+        f.niri().panel_popover.open_role(),
+        None,
+        "<Super>v must toggle the date menu back closed"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_S);
+    f.key_release(KEY_LEFTMETA);
+    assert_eq!(
+        f.niri().panel_popover.open_role(),
+        Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
+        "<Super>s must open quick settings"
     );
 }
 
@@ -17407,7 +17484,10 @@ fn the_screenshot_keys_come_from_gnome_settings() {
         .find(|kb| kb.action == GnomeKeyAction::Screenshot)
         .map(|kb| kb.accels.len())
         .expect("adopted");
-    assert_eq!(screenshot_accels, 1, "Print, from GNOME's own default");
+    assert_eq!(
+        screenshot_accels, 1,
+        "<Shift>Print, from GNOME's own default — plain Print opens the picker"
+    );
 
     use crate::input::action_for_gnome;
     assert!(matches!(
