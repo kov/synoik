@@ -6,6 +6,7 @@ pub mod config_error_notification;
 pub mod dash;
 pub mod end_session_dialog;
 pub mod exit_confirm_dialog;
+pub mod flashspot;
 pub mod folder_dialog;
 pub mod hotkey_overlay;
 pub mod input_source_menu;

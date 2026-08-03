@@ -242,6 +242,37 @@ const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995
 /// rate limit. See [`Niri::queue_app_catalog_reload`].
 const APP_CATALOG_RELOAD_DEBOUNCE: Duration = Duration::from_secs(5);
 
+/// Encode RGBA8 to PNG and write it, off the compositor thread.
+///
+/// `on_done` fires **after** the bytes are on disk. A D-Bus reply that carried the filename before
+/// the write finished would hand a portal an empty file to read.
+fn write_png_in_thread(
+    size: Size<i32, Physical>,
+    pixels: Vec<u8>,
+    path: PathBuf,
+    on_done: impl FnOnce(PathBuf) + Send + 'static,
+) {
+    debug!("saving screenshot to {path:?}");
+
+    thread::spawn(move || {
+        let file = match std::fs::File::create(&path) {
+            Ok(file) => file,
+            Err(err) => {
+                warn!("error creating file: {err:?}");
+                return;
+            }
+        };
+
+        let w = std::io::BufWriter::new(file);
+        if let Err(err) = write_png_rgba8(w, size.w as u32, size.h as u32, &pixels) {
+            warn!("error encoding screenshot image: {err:?}");
+            return;
+        }
+
+        on_done(path);
+    });
+}
+
 /// What the portal's share picker calls the dynamic-cast pseudo-window.
 ///
 /// User-visible, and deliberately says what it *does* rather than who made it — it sits in a list
@@ -786,6 +817,8 @@ pub struct Niri {
     pub end_session_dialog: EndSessionDialog,
     /// The polkit "Authentication Required" dialog: what it is asking, and how it is drawn.
     #[cfg(feature = "dbus")]
+    /// The screenshot flash (`org.gnome.Shell.Screenshot.FlashArea`).
+    pub flashspot: crate::ui::flashspot::FlashSpot,
     pub polkit_dialog: crate::polkit_dialog::PolkitDialog,
     #[cfg(feature = "dbus")]
     pub polkit_ui: crate::ui::polkit_dialog::PolkitDialogUi,
@@ -3499,6 +3532,20 @@ impl State {
                 let area = Rectangle::new(Point::from((x, y)), Size::from((w, h)));
                 self.handle_take_screenshot(to_screenshot, false, Some(area), path);
             }
+            ScreenshotToNiri::TakeScreenshotWindow {
+                include_cursor,
+                path,
+            } => {
+                self.handle_take_screenshot_window(to_screenshot, include_cursor, path);
+            }
+            ScreenshotToNiri::FlashArea { area } => {
+                let (x, y, w, h) = area;
+                let area = Rectangle::new(Point::from((x, y)), Size::from((w, h)));
+                self.niri
+                    .flashspot
+                    .fire(area, self.niri.clock.now_unadjusted());
+                self.niri.queue_redraw_all();
+            }
             ScreenshotToNiri::PickColor(tx) => {
                 self.handle_pick_color(tx);
             }
@@ -3527,6 +3574,70 @@ impl State {
         });
 
         if rv.is_none() {
+            let msg = NiriToScreenshot::ScreenshotResult(None);
+            if let Err(err) = to_screenshot.send_blocking(msg) {
+                warn!("error sending None to screenshot: {err:?}");
+            }
+        }
+    }
+
+    /// `ScreenshotWindow` captures the *focused* window, like GNOME's.
+    #[cfg(feature = "dbus")]
+    fn handle_take_screenshot_window(
+        &mut self,
+        to_screenshot: &async_channel::Sender<NiriToScreenshot>,
+        include_cursor: bool,
+        path: Option<PathBuf>,
+    ) {
+        let _span = tracy_client::span!("TakeScreenshotWindow");
+
+        let target = self
+            .niri
+            .layout
+            .focus()
+            .map(|mapped| mapped.id())
+            .and_then(|id| {
+                let output = self.niri.layout.active_output().cloned()?;
+                Some((id, output))
+            });
+
+        let rv = target.and_then(|(id, output)| {
+            let to_screenshot = to_screenshot.clone();
+            let on_done = move |path| {
+                let msg = NiriToScreenshot::ScreenshotResult(Some(path));
+                if let Err(err) = to_screenshot.send_blocking(msg) {
+                    warn!("error sending path to screenshot: {err:?}");
+                }
+            };
+
+            self.backend.with_vulkan_renderer(|renderer| {
+                let Some(mapped) = self
+                    .niri
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id() == id)
+                    .map(|(_, m)| m)
+                else {
+                    return false;
+                };
+                match self.niri.screenshot_window_to_path(
+                    renderer,
+                    &output,
+                    mapped,
+                    include_cursor,
+                    path,
+                    on_done,
+                ) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!("error taking a window screenshot: {err:?}");
+                        false
+                    }
+                }
+            })
+        });
+
+        if rv != Some(true) {
             let msg = NiriToScreenshot::ScreenshotResult(None);
             if let Err(err) = to_screenshot.send_blocking(msg) {
                 warn!("error sending None to screenshot: {err:?}");
@@ -5905,6 +6016,7 @@ impl Niri {
             run_dialog: RunDialog::new(),
             end_session_dialog,
             #[cfg(feature = "dbus")]
+            flashspot: crate::ui::flashspot::FlashSpot::new(),
             polkit_dialog: crate::polkit_dialog::PolkitDialog::new(),
             #[cfg(feature = "dbus")]
             polkit_ui,
@@ -7746,6 +7858,7 @@ impl Niri {
         self.end_session_dialog.advance_animations();
         #[cfg(feature = "dbus")]
         self.polkit_ui.advance_animations();
+        self.flashspot.advance(self.clock.now_unadjusted());
         self.screenshot_ui.advance_animations();
         self.panel_popover.advance_animations();
         self.panel.advance_animations();
@@ -8000,6 +8113,14 @@ impl Niri {
         if include_pointer && self.pointer_visibility.is_visible() {
             self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
         }
+
+        // Next, the screenshot flash: over everything the capture could have contained.
+        self.flashspot.render(
+            output,
+            output.current_location(),
+            self.clock.now_unadjusted(),
+            &mut |elem| push(elem.into()),
+        );
 
         // Next, the screen transition texture.
         {
@@ -8978,6 +9099,11 @@ impl Niri {
                     .polkit_ui
                     .are_animations_ongoing(self.clock.now_unadjusted());
             }
+            // The flash is fired from a D-Bus call and is usually the only thing on screen that
+            // is moving, so without this it would freeze at full white until something else asked
+            // for a frame.
+            state.unfinished_animations_remain |=
+                self.flashspot.is_animating(self.clock.now_unadjusted());
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.panel_popover.are_animations_ongoing();
             state.unfinished_animations_remain |= self.notification_banner.are_animations_ongoing();
@@ -10131,6 +10257,44 @@ impl Niri {
         show_pointer: bool,
         path: Option<String>,
     ) -> anyhow::Result<()> {
+        let (size, pixels) =
+            self.render_window_to_pixels(renderer, output, mapped, show_pointer)?;
+        self.save_screenshot(size, pixels, write_to_disk, path)
+            .context("error saving screenshot")
+    }
+
+    /// `ScreenshotWindow` — writes the file and nothing else.
+    ///
+    /// Deliberately *not* built on `save_screenshot`, which also puts the image on the clipboard
+    /// and raises a notification. Those belong to the user pressing a key, not to a portal call the
+    /// user never sees; a screenshot API that silently replaced the clipboard would be a surprise
+    /// with a privacy edge to it.
+    #[cfg(feature = "dbus")]
+    pub fn screenshot_window_to_path(
+        &self,
+        renderer: &mut VulkanRenderer,
+        output: &Output,
+        mapped: &Mapped,
+        show_pointer: bool,
+        path: Option<PathBuf>,
+        on_done: impl FnOnce(PathBuf) + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let (size, pixels) =
+            self.render_window_to_pixels(renderer, output, mapped, show_pointer)?;
+        let path = path
+            .or_else(|| make_screenshot_path(&self.config.borrow()).ok().flatten())
+            .context("no path to save the screenshot to")?;
+        write_png_in_thread(size, pixels, path, on_done);
+        Ok(())
+    }
+
+    fn render_window_to_pixels(
+        &self,
+        renderer: &mut VulkanRenderer,
+        output: &Output,
+        mapped: &Mapped,
+        show_pointer: bool,
+    ) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)> {
         let _span = tracy_client::span!("Niri::screenshot_window");
 
         let scale = Scale::from(output.current_scale().fractional_scale());
@@ -10186,8 +10350,7 @@ impl Niri {
             elements,
         )?;
 
-        self.save_screenshot(geo.size, pixels, write_to_disk, path)
-            .context("error saving screenshot")
+        Ok((geo.size, pixels))
     }
 
     pub fn save_screenshot(
@@ -10382,25 +10545,7 @@ impl Niri {
                 path.push("screenshot.png");
                 path
             });
-        debug!("saving screenshot to {path:?}");
-
-        thread::spawn(move || {
-            let file = match std::fs::File::create(&path) {
-                Ok(file) => file,
-                Err(err) => {
-                    warn!("error creating file: {err:?}");
-                    return;
-                }
-            };
-
-            let w = std::io::BufWriter::new(file);
-            if let Err(err) = write_png_rgba8(w, size.w as u32, size.h as u32, &pixels) {
-                warn!("error encoding screenshot image: {err:?}");
-                return;
-            }
-
-            on_done(path);
-        });
+        write_png_in_thread(size, pixels, path, on_done);
 
         Ok(())
     }

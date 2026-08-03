@@ -24,6 +24,16 @@ pub enum ScreenshotToNiri {
         area: (i32, i32, i32, i32),
         path: Option<PathBuf>,
     },
+    /// The focused window, which is what GNOME captures (`screenshot.js`'s `ScreenshotWindow`
+    /// takes `global.display.focus_window`).
+    TakeScreenshotWindow {
+        include_cursor: bool,
+        path: Option<PathBuf>,
+    },
+    /// A flash over a rectangle in global logical coordinates — visual only, no reply.
+    FlashArea {
+        area: (i32, i32, i32, i32),
+    },
     PickColor(async_channel::Sender<Option<PickedColor>>),
 }
 
@@ -47,6 +57,37 @@ impl Screenshot {
             path: wanted_path(filename),
         })
         .await
+    }
+
+    /// `include_frame` is accepted and ignored: our windows have no server-side frame to include
+    /// or omit, so both values mean the same capture.
+    async fn screenshot_window(
+        &self,
+        _include_frame: bool,
+        include_cursor: bool,
+        _flash: bool,
+        filename: String,
+    ) -> fdo::Result<(bool, PathBuf)> {
+        self.capture(ScreenshotToNiri::TakeScreenshotWindow {
+            include_cursor,
+            path: wanted_path(filename),
+        })
+        .await
+    }
+
+    /// Fire-and-forget: GNOME's `FlashArea` returns as soon as the effect is started
+    /// (`screenshot.js`), and the caller does not wait for it to finish.
+    async fn flash_area(&self, x: i32, y: i32, width: i32, height: i32) -> fdo::Result<()> {
+        if width <= 0 || height <= 0 {
+            return Err(fdo::Error::InvalidArgs("empty area".to_owned()));
+        }
+        if let Err(err) = self.to_niri.send(ScreenshotToNiri::FlashArea {
+            area: (x, y, width, height),
+        }) {
+            warn!("error sending message to niri: {err:?}");
+            return Err(fdo::Error::Failed("internal error".to_owned()));
+        }
+        Ok(())
     }
 
     async fn screenshot_area(
