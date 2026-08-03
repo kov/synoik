@@ -1258,9 +1258,8 @@ impl Cast {
                         let chunk = (*(*spa_buffer).datas).chunk;
                         (*chunk).offset = 0;
                         (*chunk).stride = stride as i32;
-                        (*chunk).size = dst_len as u32;
 
-                        mark_buffer_as_good(pw_buffer, &mut self.sequence_counter);
+                        mark_buffer_as_good(pw_buffer, &mut self.sequence_counter, dst_len as u32);
                         trace!("queueing memory buffer with seq={}", self.sequence_counter);
                         pw_stream_queue_buffer(self.stream.as_raw_ptr(), pw_buffer.as_ptr());
                         true
@@ -1280,7 +1279,7 @@ impl Cast {
 
             match res {
                 Ok(sync_point) => {
-                    mark_buffer_as_good(pw_buffer, &mut self.sequence_counter);
+                    mark_buffer_as_good(pw_buffer, &mut self.sequence_counter, DMABUF_CHUNK_SIZE);
                     trace!("queueing buffer with seq={}", self.sequence_counter);
                     self.queue_after_sync(pw_buffer, sync_point);
                     true
@@ -1333,9 +1332,8 @@ impl Cast {
                 let chunk = (*(*spa_buffer).datas).chunk;
                 (*chunk).offset = 0;
                 (*chunk).stride = mapping.stride as i32;
-                (*chunk).size = mapping.len as u32;
 
-                mark_buffer_as_good(pw_buffer, &mut self.sequence_counter);
+                mark_buffer_as_good(pw_buffer, &mut self.sequence_counter, mapping.len as u32);
                 trace!(
                     "queueing cleared memory buffer with seq={}",
                     self.sequence_counter
@@ -1348,7 +1346,7 @@ impl Cast {
 
             match clear_dmabuf(renderer, dmabuf) {
                 Ok(sync_point) => {
-                    mark_buffer_as_good(pw_buffer, &mut self.sequence_counter);
+                    mark_buffer_as_good(pw_buffer, &mut self.sequence_counter, DMABUF_CHUNK_SIZE);
                     trace!("queueing clear buffer with seq={}", self.sequence_counter);
                     self.queue_after_sync(pw_buffer, sync_point);
                     true
@@ -1790,19 +1788,27 @@ unsafe fn return_unused_buffer(stream: &Stream, pw_buffer: NonNull<pw_buffer>) {
     pw_stream_queue_buffer(stream.as_raw_ptr(), pw_buffer);
 }
 
-unsafe fn mark_buffer_as_good(pw_buffer: NonNull<pw_buffer>, sequence: &mut u64) {
+/// The `chunk.size` a **dmabuf** frame carries.
+///
+/// With DMA-BUFs consumers should ignore the size field and producers may set it to 0
+/// (<https://docs.pipewire.org/page_dma_buf.html>), but OBS checks `size != 0` as a workaround for
+/// old compositor versions, so it has to be non-zero.
+const DMABUF_CHUNK_SIZE: u32 = 1;
+
+/// Hand a filled buffer to the consumer.
+///
+/// `chunk_size` is **not** optional and has no sensible default, which is the point: for a dmabuf
+/// it is the meaningless [`DMABUF_CHUNK_SIZE`] sentinel, but for a memory buffer it is the number
+/// of valid bytes and the consumer believes it. This function used to hardcode the dmabuf
+/// sentinel; when the memory sink landed it silently overwrote the real length that
+/// `dequeue_buffer_and_render` had just written, so every 10MB frame announced one valid byte and
+/// OBS kept showing its last good frame while our buffers were perfectly correct.
+unsafe fn mark_buffer_as_good(pw_buffer: NonNull<pw_buffer>, sequence: &mut u64, chunk_size: u32) {
     let pw_buffer = pw_buffer.as_ptr();
     let spa_buffer = (*pw_buffer).buffer;
     let chunk = (*(*spa_buffer).datas).chunk;
 
-    // With DMA-BUFs, consumers should ignore the size field, and producers are allowed
-    // to set it to 0.
-    //
-    // https://docs.pipewire.org/page_dma_buf.html
-    //
-    // However, OBS checks for size != 0 as a workaround for old compositor versions,
-    // so we set it to 1.
-    (*chunk).size = 1;
+    (*chunk).size = chunk_size;
     // Clear the corrupted flag we may have set before.
     (*chunk).flags = SPA_CHUNK_FLAG_NONE as i32;
 
