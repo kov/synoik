@@ -938,6 +938,13 @@ impl State {
                     }
                 }
 
+                // A delayed capture counts down with the picker gone, so Escape has no bind to
+                // reach: it needs its own route, or an armed capture could only be waited out.
+                if pressed && raw == Some(Keysym::Escape) && this.cancel_pending_capture() {
+                    this.niri.suppressed_keys.insert(key_code);
+                    return FilterResult::Intercept(None);
+                }
+
                 if pressed && raw == Some(Keysym::Escape) {
                     // Cancel certain grabs on Escape.
                     let pointer = this.niri.seat.get_pointer().unwrap();
@@ -2155,6 +2162,8 @@ impl State {
                             write_to_disk,
                             show_pointer,
                             path,
+                            #[cfg(feature = "dbus")]
+                            None,
                         )
                     });
                     match res {
@@ -2182,6 +2191,8 @@ impl State {
                             write_to_disk,
                             show_pointer,
                             path,
+                            #[cfg(feature = "dbus")]
+                            None,
                         )
                     });
                     match res {

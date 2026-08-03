@@ -1,9 +1,9 @@
 # The screenshot UI — porting GNOME's control panel
 
-Status: **2026-08-03, slices 1, 2 and 5 landed and checked on the headless harness.** The help text
-is gone; the panel is GNOME's control panel — type row, shot pill, capture button, show-pointer
-toggle, close button and tooltips — and all three capture types work. Slices 3 (delayed capture)
-and 4 (cast mode) are open.
+Status: **2026-08-03, slices 1, 2, 3 and 5 landed and checked on the headless harness.** The help
+text is gone; the panel is GNOME's control panel — type row, shot pill, capture button,
+show-pointer toggle, close button and tooltips — all three capture types work, and the delay is
+armed from a fourth round button beside show-pointer. Slice 4 (cast mode) is open.
 
 Reference: `js/ui/screenshot.js` (50.3) and `_screenshot.scss`. The visual spec is already cached
 and cited in `docs/fork/gnome-style-reference.md` §screenshot (every class, colour, radius and
@@ -76,8 +76,23 @@ Two things the panel's shape now fixes in place, worth knowing before touching i
    frame rect its slot was sized from (shadows, CSD margins), so the thumbnail scales by the
    slot/frame ratio and is centred on the slot — anchoring at the slot corner offsets every window
    by its own shadow.
-3. **Delayed capture.** Our divergence — see below. After slice 1 because it needs the panel, but
-   its *foundation* is slice 1's problem, not this slice's.
+3. **DONE.** Delayed capture — our divergence, see below. The button cycles off → 3s → 10s and
+   reads as `:checked` when armed, carrying its own baked number in place of `alarm-symbolic`.
+   Arming lifts the whole capture out of the picker into `Niri::pending_capture` and dismisses the
+   picker, because the delay only means anything with the shell out of the way; the shot is then
+   taken from the **live** screen by `screenshot_area`/`screenshot_window`.
+
+   All six design points below are handled. The two worth restating: the D-Bus reply is **taken**
+   out of `Niri` as the capture arms, so `close_screenshot_ui`'s unconditional `None` cannot tell a
+   still-waiting caller it was cancelled; and the countdown card refuses every `RenderTarget` but
+   `Output` inside `Countdown::element`, so there is no way to draw it into a shot, a cast or a
+   portal capture. A one-second timer drives it, but the *clock* decides when it fires — a
+   coalesced wakeup shortens the last tick rather than the delay.
+
+   Two calls this slice made, both deliberate: a `SelectArea` caller is answered immediately and
+   the delay is ignored, because it wants coordinates and already has them; and the countdown is
+   pushed *after* the lock branch's early return, so a lock that lands between two ticks cannot get
+   a countdown drawn over its surface even for the one frame before the tick cancels.
 4. **Cast mode.** The shot/cast segmented control wired to our recorder, plus the capture button's
    `:cast` state (inner circle goes `$red_4`). This is the real trigger GNOME uses for the panel's
    recording indicator — see `docs/fork/panel-status-port.md` R1, which is currently driven by a
@@ -173,7 +188,20 @@ the Vulkan tests in `src/tests/vulkan_render.rs` are where this is pinned —
 `vulkan_screenshot_ui_draws_the_help_panel` (`:413`) is the test that has to change shape first,
 since the help panel it asserts on is what slice 1 deletes.
 
-The delay slice needs cover the renderer cannot give: that arming *does not* answer the D-Bus
-caller, that firing does, and that a lock or an output change cancels instead of capturing. Those
-are `Niri`-level state transitions, so they belong in the headless corpus (`src/tests/gnome.rs`)
-beside the existing `select_area_always_answers_its_caller`.
+The delay slice's cover ended up in `vulkan_render.rs` after all, not the headless corpus: every
+one of its transitions starts at a picker that only opens with a renderer, so a corpus test would
+have had to fabricate the armed state instead of driving the real one.
+
+- `vulkan_screenshot_ui_delay_arms_the_capture_without_answering_its_caller` — the cycle through
+  the three stops, and the D-Bus contract on both sides: arming stays silent, cancelling answers.
+- `vulkan_screenshot_ui_a_delayed_capture_shoots_the_live_screen` — the window is recoloured during
+  the countdown and the saved PNG must not contain a pixel of the old colour. This is the whole
+  divergence in one assertion.
+- `vulkan_screenshot_ui_a_lock_mid_countdown_cancels_the_capture` — with a tick *before* the lock
+  asserted to keep counting, so it cannot pass for the wrong reason.
+- `vulkan_screenshot_ui_countdown_cannot_reach_a_capture` — the same pixel rendered at `Output` and
+  at `ScreenCapture`, against a reference capture taken before any of it.
+
+One trap for anything else that wants to read a screenshot back in a test: `save_screenshot`
+answers its D-Bus reply from an **event-loop source**, so `recv_blocking` on that channel deadlocks
+the loop that would answer it. Pass an explicit path and wait for the file instead.

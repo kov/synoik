@@ -192,7 +192,8 @@ use crate::ui::popover::PanelPopover;
 use crate::ui::run_dialog::{RunDialog, RunDialogRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{
-    OutputScreenshot, PointerUp, ScreenshotNeutral, ScreenshotUi, ScreenshotUiRenderElement,
+    OutputScreenshot, PendingTarget, PointerUp, ScreenshotNeutral, ScreenshotUi,
+    ScreenshotUiRenderElement,
 };
 use crate::ui::switcher::app_switcher::app_items;
 use crate::ui::switcher::ui::{Items, OpenRequest};
@@ -830,6 +831,16 @@ pub struct Niri {
     #[cfg(feature = "dbus")]
     pub interactive_screenshot_reply: Option<crate::dbus::gnome_shell_screenshot::InteractiveReply>,
 
+    /// A capture armed to fire after the picker's delay has run out. **Our divergence** — GNOME's
+    /// shell screenshot UI has no delay (`docs/fork/screenshot-ui-port.md`).
+    ///
+    /// It lives here rather than in `ScreenshotUi::Open` because it *outlives* it: arming
+    /// dismisses the picker so the delay can do its job, and the shot is taken from the live
+    /// screen afterwards.
+    pub pending_capture: Option<PendingCapture>,
+    /// The countdown card the pending capture draws — Output target only, never in a capture.
+    pub capture_countdown: crate::ui::screenshot_ui::Countdown,
+
     /// The screenshot flash (`org.gnome.Shell.Screenshot.FlashArea`).
     pub flashspot: crate::ui::flashspot::FlashSpot,
     pub polkit_dialog: crate::polkit_dialog::PolkitDialog,
@@ -989,6 +1000,32 @@ pub struct Niri {
 
     #[cfg(feature = "xdp-gnome-screencast")]
     pub casting: Screencasting,
+}
+
+/// A capture armed to fire once its delay has run out. See [`State::arm_delayed_capture`].
+///
+/// Deliberately *not* a field of `ScreenshotUi::Open`: arming closes the picker, so this outlives
+/// it. The output is held weakly so an unplug during the countdown cancels rather than resurrects.
+pub struct PendingCapture {
+    output: WeakOutput,
+    target: PendingTarget,
+    show_pointer: bool,
+    write_to_disk: bool,
+    path: Option<String>,
+    /// The `InteractiveScreenshot` caller still waiting, lifted out of `Niri` as this armed so the
+    /// close would not answer it with a dismissal.
+    #[cfg(feature = "dbus")]
+    reply: Option<crate::dbus::gnome_shell_screenshot::InteractiveReply>,
+    /// Monotonic; the countdown reads it, and it — not the tick count — decides when to fire.
+    fires_at: Duration,
+    token: RegistrationToken,
+}
+
+impl PendingCapture {
+    /// Whole seconds still to wait, rounded up: the number the countdown card shows.
+    pub fn seconds_left(&self, now: Duration) -> u64 {
+        self.fires_at.saturating_sub(now).as_secs_f64().ceil() as u64
+    }
 }
 
 /// A scale/transform override applied live this session (see
@@ -3479,6 +3516,201 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    /// Arm a delayed capture and dismiss the picker.
+    ///
+    /// The delay only means anything with the shell out of the way, so the picker goes now and the
+    /// shot is taken from the **live** screen when the timer runs out. That is why every scrap of
+    /// context the capture will need — the output, the target, the reply channel, the path — is
+    /// lifted out here: none of it survives `close_screenshot_ui`.
+    fn arm_delayed_capture(&mut self, delay: Duration, write_to_disk: bool, path: Option<String>) {
+        let Some((output, target)) = self.niri.screenshot_ui.pending_target() else {
+            warn!("nothing to capture; not arming the delay");
+            self.cancel_screenshot();
+            return;
+        };
+        let show_pointer = self.niri.screenshot_ui.show_pointer();
+
+        // Taken *before* the close, which answers whatever is still pending with `None`. An armed
+        // capture has not failed, so its caller must keep waiting for the real answer.
+        #[cfg(feature = "dbus")]
+        let reply = self.niri.interactive_screenshot_reply.take();
+
+        self.niri.close_screenshot_ui();
+        self.niri
+            .cursor_manager
+            .set_cursor_image(CursorImageStatus::default_named());
+
+        // Replaces anything already armed rather than stacking: two countdowns on screen at once
+        // would be two shots the user asked for once.
+        self.cancel_pending_capture();
+
+        let fires_at = self.niri.clock.now_unadjusted() + delay;
+        // Ticks every second so the countdown can redraw; the fire condition is the clock, not the
+        // tick count, so a late or coalesced wakeup shortens the last tick instead of the delay.
+        let timer = calloop::timer::Timer::from_duration(Duration::from_secs(1));
+        let token = self
+            .niri
+            .event_loop
+            .insert_source(timer, move |_, _, state| state.tick_pending_capture())
+            .map_err(|err| warn!("error arming the delayed capture: {err:?}"))
+            .ok();
+        let Some(token) = token else {
+            #[cfg(feature = "dbus")]
+            if let Some(tx) = reply {
+                let _ = tx.send_blocking(None);
+            }
+            return;
+        };
+
+        self.niri.pending_capture = Some(PendingCapture {
+            output: output.downgrade(),
+            target,
+            show_pointer,
+            write_to_disk,
+            path,
+            #[cfg(feature = "dbus")]
+            reply,
+            fires_at,
+            token,
+        });
+        self.niri.queue_redraw_all();
+    }
+
+    /// One second of the countdown. Fires the capture when the clock says so.
+    ///
+    /// `pub(crate)` for the corpus: the cancellation rules live here, and the alternative is a test
+    /// that reimplements them.
+    pub(crate) fn tick_pending_capture(&mut self) -> calloop::timer::TimeoutAction {
+        let Some(pending) = &self.niri.pending_capture else {
+            return calloop::timer::TimeoutAction::Drop;
+        };
+
+        // A lock arriving mid-countdown cancels: the delay was armed against a screen the user
+        // could see, and firing into a lock screen would capture what the lock exists to hide.
+        if self.niri.is_locked() || self.niri.screen_shield.is_active() {
+            debug!("screen locked mid-countdown; dropping the delayed capture");
+            self.cancel_pending_capture();
+            return calloop::timer::TimeoutAction::Drop;
+        }
+
+        // The output is held weakly, so unplugging it mid-countdown lands here.
+        if pending.output.upgrade().is_none() {
+            debug!("the delayed capture's output is gone; dropping it");
+            self.cancel_pending_capture();
+            return calloop::timer::TimeoutAction::Drop;
+        }
+
+        if self.niri.clock.now_unadjusted() < pending.fires_at {
+            self.niri.queue_redraw_all();
+            return calloop::timer::TimeoutAction::ToDuration(Duration::from_secs(1));
+        }
+
+        self.fire_pending_capture();
+        calloop::timer::TimeoutAction::Drop
+    }
+
+    /// Take the shot the delay was armed for, from the live screen.
+    fn fire_pending_capture(&mut self) {
+        let Some(pending) = self.niri.pending_capture.take() else {
+            return;
+        };
+        // The timer that got us here is about to be dropped by its own return value; removing it
+        // as well would be a double removal.
+        let PendingCapture {
+            output,
+            target,
+            show_pointer,
+            write_to_disk,
+            path,
+            #[cfg(feature = "dbus")]
+            reply,
+            ..
+        } = pending;
+        let Some(output) = output.upgrade() else {
+            #[cfg(feature = "dbus")]
+            if let Some(tx) = reply {
+                let _ = tx.send_blocking(None);
+            }
+            return;
+        };
+
+        // The countdown card is gone by the time anything is rendered for the shot (it reads
+        // `pending_capture`, which is now `None`), but this is also the redraw that clears it.
+        self.niri.queue_redraw_all();
+
+        // The reply travels into `save_screenshot`, which answers it once the PNG lands. The spare
+        // is for the paths that never get that far — the channel is used once, so whichever sends
+        // first is the answer.
+        #[cfg(feature = "dbus")]
+        let spare = reply.clone();
+        let res = self.backend.with_vulkan_renderer(|renderer| match target {
+            PendingTarget::Window(id) => {
+                let found = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let Some((_, mapped)) = found else {
+                    return Err(anyhow::anyhow!("the window is gone"));
+                };
+                self.niri.screenshot_window(
+                    renderer,
+                    &output,
+                    mapped,
+                    write_to_disk,
+                    show_pointer,
+                    path,
+                    #[cfg(feature = "dbus")]
+                    reply,
+                )
+            }
+            PendingTarget::Area(rect) => self.niri.screenshot_area(
+                renderer,
+                &output,
+                rect,
+                write_to_disk,
+                show_pointer,
+                path,
+                #[cfg(feature = "dbus")]
+                reply,
+            ),
+        });
+
+        match res {
+            Some(Ok(())) => {}
+            Some(Err(err)) => {
+                warn!("error taking the delayed screenshot: {err:?}");
+                #[cfg(feature = "dbus")]
+                if let Some(tx) = spare {
+                    let _ = tx.send_blocking(None);
+                }
+                return;
+            }
+            None => {
+                warn!("renderer unavailable for the delayed screenshot");
+                #[cfg(feature = "dbus")]
+                if let Some(tx) = spare {
+                    let _ = tx.send_blocking(None);
+                }
+                return;
+            }
+        }
+
+        // `save_screenshot` owns the reply from here; it is answered when the PNG lands.
+        #[cfg(feature = "dbus")]
+        drop(spare);
+    }
+
+    /// Disarm whatever is counting down, answering its caller with a dismissal.
+    pub fn cancel_pending_capture(&mut self) -> bool {
+        let Some(pending) = self.niri.pending_capture.take() else {
+            return false;
+        };
+        self.niri.event_loop.remove(pending.token);
+        #[cfg(feature = "dbus")]
+        if let Some(tx) = pending.reply {
+            let _ = tx.send_blocking(None);
+        }
+        self.niri.queue_redraw_all();
+        true
+    }
+
     pub fn confirm_screenshot(&mut self, write_to_disk: bool) {
         let ScreenshotUi::Open { path, .. } = &mut self.niri.screenshot_ui else {
             return;
@@ -3492,8 +3724,13 @@ impl State {
         #[cfg(not(feature = "dbus"))]
         let selecting = false;
         if selecting {
+            // A delay has nothing to apply to here: the caller wants coordinates, and it already
+            // has them.
             let rect = self.niri.screenshot_ui.selection_rect_global();
             self.niri.answer_select_area(rect);
+        } else if let Some(delay) = self.niri.screenshot_ui.delay() {
+            self.arm_delayed_capture(delay, write_to_disk, path);
+            return;
         } else {
             // Save from the frozen-screen neutral CPU buffer: a pure crop + pointer composite, no
             // render or readback. The neutral is captured when the UI opens, so a missing one means
@@ -6191,7 +6428,8 @@ impl Niri {
             exit_confirm_dialog,
             run_dialog: RunDialog::new(),
             end_session_dialog,
-            #[cfg(feature = "dbus")]
+            pending_capture: None,
+            capture_countdown: Default::default(),
             #[cfg(feature = "dbus")]
             select_area_reply: None,
             #[cfg(feature = "dbus")]
@@ -8389,6 +8627,21 @@ impl Niri {
             return;
         }
 
+        // The delayed-capture countdown. Below the pointer and the dialogs, and — because it sits
+        // *after* the lock branch's early return — never over a lock surface: the tick cancels a
+        // capture the lock caught, but not before the frame that locked. `element` refuses any
+        // target but `Output`, so the countdown can never reach a shot, a cast or a portal capture,
+        // which is the entire point of a delay.
+        if let Some(pending) = &self.pending_capture {
+            let seconds = pending.seconds_left(self.clock.now_unadjusted());
+            if let Some(elem) =
+                self.capture_countdown
+                    .element(ctx.renderer, ctx.target, output, seconds)
+            {
+                push(elem.into());
+            }
+        }
+
         // Next, the screen shield's curtain. Below `ext-session-lock` above — that protocol is a
         // stronger claim on the screen and there is no sense in drawing both — but above
         // everything else, because the whole point is that the desktop is not visible.
@@ -10537,6 +10790,70 @@ impl Niri {
         .context("error saving screenshot")
     }
 
+    #[allow(clippy::too_many_arguments)]
+    /// Capture an output-local **physical** rect of the live screen, saving it the way a keybind
+    /// screenshot is saved (clipboard + notification + any waiting D-Bus caller).
+    ///
+    /// The whole output is rendered and then cropped on the CPU rather than rendered scissored: the
+    /// crop is a memcpy over pixels we already have, and it keeps this on exactly the same
+    /// block-out path as [`Self::screenshot`].
+    pub fn screenshot_area(
+        &mut self,
+        renderer: &mut VulkanRenderer,
+        output: &Output,
+        rect: Rectangle<i32, Physical>,
+        write_to_disk: bool,
+        include_pointer: bool,
+        path: Option<String>,
+        #[cfg(feature = "dbus")] reply: Option<
+            crate::dbus::gnome_shell_screenshot::InteractiveReply,
+        >,
+    ) -> anyhow::Result<()> {
+        let _span = tracy_client::span!("Niri::screenshot_area");
+
+        self.update_render_elements(Some(output));
+
+        let size = output.current_mode().unwrap().size;
+        let transform = output.current_transform();
+        let size = transform.transform_size(size);
+
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        let ctx = RenderCtx {
+            renderer,
+            target: RenderTarget::ScreenCapture,
+            xray: None,
+        };
+        let elements = self.render_to_vec(ctx, output, include_pointer);
+        let elements = elements.iter().rev();
+        let pixels = render_to_vec(
+            renderer,
+            size,
+            scale,
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            elements,
+        )?;
+
+        // Clamped, not trusted: the rect was chosen against the frozen screen, and a mode change
+        // during the delay can leave it hanging off the edge.
+        let rect = rect
+            .intersection(Rectangle::from_size(size))
+            .context("the capture area is off-screen")?;
+        let pixels =
+            crate::ui::screenshot_ui::crop_rgba(Size::from((size.w, size.h)), &pixels, rect);
+
+        self.save_screenshot(
+            rect.size,
+            pixels,
+            write_to_disk,
+            path,
+            #[cfg(feature = "dbus")]
+            reply,
+        )
+        .context("error saving screenshot")
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn screenshot_window(
         &self,
         renderer: &mut VulkanRenderer,
@@ -10545,6 +10862,9 @@ impl Niri {
         write_to_disk: bool,
         show_pointer: bool,
         path: Option<String>,
+        #[cfg(feature = "dbus")] reply: Option<
+            crate::dbus::gnome_shell_screenshot::InteractiveReply,
+        >,
     ) -> anyhow::Result<()> {
         let (size, pixels) =
             self.render_window_to_pixels(renderer, output, mapped, show_pointer)?;
@@ -10554,7 +10874,7 @@ impl Niri {
             write_to_disk,
             path,
             #[cfg(feature = "dbus")]
-            None,
+            reply,
         )
         .context("error saving screenshot")
     }

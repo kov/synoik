@@ -472,6 +472,284 @@ fn vulkan_screenshot_ui_draws_the_control_panel() {
 /// at to the geometry [`PanelLayout::control_at`] answers with. One shared [`PanelLayout`] is what
 /// keeps them together, and this is the test that would fail if the bake and the hit test ever
 /// stopped reading the same one.
+/// Click a control on the open picker's panel, by the rect the bake published for it.
+fn click_control(f: &mut Fixture, output: &Output, rect: Rectangle<f64, Logical>) -> PointerUp {
+    let panel = f
+        .niri()
+        .screenshot_ui
+        .panel_rect(output)
+        .expect("the open screenshot UI must have a control panel");
+    let scale = output.current_scale().fractional_scale();
+    let point =
+        Point::<f64, Logical>::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.))
+            .to_physical(scale)
+            .to_i32_round::<i32>()
+            + panel.loc;
+
+    let ui = &mut f.niri_state().niri.screenshot_ui;
+    ui.pointer_motion(point, None);
+    assert!(ui.pointer_down(output.clone(), point, None, false));
+    ui.pointer_up(None)
+        .expect("the release must land on a control")
+}
+
+/// **Our divergence** — GNOME's screenshot UI has no delay. Arming one hands the *whole* capture
+/// over to a timer, so the two things that must not happen at that moment are answering the D-Bus
+/// caller (it has not been given anything yet) and losing the capture when the picker closes.
+#[test]
+fn vulkan_screenshot_ui_delay_arms_the_capture_without_answering_its_caller() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    let (tx, rx) = async_channel::bounded(1);
+    f.niri().interactive_screenshot_reply = Some(tx);
+    f.niri_state().open_screenshot_ui(false, None);
+    settle_screenshot_ui_open(&mut f);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    assert_eq!(f.niri().screenshot_ui.delay(), None, "the delay starts off");
+
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    assert_eq!(
+        click_control(&mut f, &output, layout.delay),
+        PointerUp::Redraw
+    );
+    assert_eq!(
+        f.niri().screenshot_ui.delay(),
+        Some(Duration::from_secs(3)),
+        "one click must arm the first stop"
+    );
+
+    // Re-bake so the second click hits the layout the *armed* panel published: the number replaces
+    // an icon, and a control the bake moved is a control the pointer would miss.
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.delay);
+    assert_eq!(
+        f.niri().screenshot_ui.delay(),
+        Some(Duration::from_secs(10))
+    );
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.delay);
+    assert_eq!(
+        f.niri().screenshot_ui.delay(),
+        None,
+        "the third click must wrap back to off"
+    );
+
+    // Back to 3s, then fire the shutter.
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.delay);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    assert_eq!(
+        click_control(&mut f, &output, layout.capture),
+        PointerUp::Capture
+    );
+    f.niri_state()
+        .handle_screenshot_ui_pointer_up(PointerUp::Capture);
+
+    assert!(
+        !f.niri().screenshot_ui.is_open(),
+        "arming must dismiss the picker — the delay exists to get the shell out of the shot"
+    );
+    assert!(
+        f.niri().pending_capture.is_some(),
+        "the capture must survive the picker that armed it"
+    );
+    assert_eq!(
+        rx.try_recv(),
+        Err(async_channel::TryRecvError::Empty),
+        "an armed capture has not failed; answering `None` here would tell the portal it was \
+         cancelled while a shot is still coming"
+    );
+
+    // Escape has no bind to reach with the picker gone, so `cancel_pending_capture` is its route —
+    // and cancelling *is* the dismissal the caller was spared above.
+    assert!(f.niri_state().cancel_pending_capture());
+    assert!(f.niri().pending_capture.is_none());
+    assert_eq!(
+        rx.try_recv(),
+        Ok(None),
+        "a cancelled countdown must answer the caller it was holding"
+    );
+}
+
+/// The point of the whole divergence: the shot is of the screen as it is when the timer runs out,
+/// not the frozen one the picker was showing.
+#[test]
+fn vulkan_screenshot_ui_a_delayed_capture_shoots_the_live_screen() {
+    let Some((mut f, client, surface)) = window_fixture_with_client(GREEN, true, None) else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    // An explicit path, so the shot can be read back without going through the D-Bus reply — that
+    // is answered from an event-loop source, and a test that blocks on it deadlocks the loop that
+    // would answer it.
+    let path = std::env::temp_dir().join("gsrs-delayed-capture-test.png");
+    std::fs::remove_file(&path).ok();
+    f.niri_state()
+        .open_screenshot_ui(false, Some(path.to_string_lossy().into_owned()));
+    settle_screenshot_ui_open(&mut f);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    // Screen mode, so the crop is the whole output and the centre pixel is the window's.
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.type_buttons[1]);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.delay);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.capture);
+    f.niri_state()
+        .handle_screenshot_ui_pointer_up(PointerUp::Capture);
+    assert!(f.niri().pending_capture.is_some());
+
+    // The screen changes during the countdown. A capture from the picker's frozen neutral would
+    // still be green.
+    recolor_window(&mut f, client, &surface, [0, 0, u32::MAX, u32::MAX]);
+
+    let mut clock = f.niri().clock.clone();
+    let now = clock.now_unadjusted();
+    clock.set_unadjusted(now + Duration::from_secs(4));
+    assert!(matches!(
+        f.niri_state().tick_pending_capture(),
+        calloop::timer::TimeoutAction::Drop
+    ));
+    assert!(f.niri().pending_capture.is_none());
+
+    // The PNG is encoded off-thread; bounded work, so this waits rather than polls forever.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let img = loop {
+        if let Some(img) = image::ImageReader::open(&path)
+            .ok()
+            .and_then(|r| r.decode().ok())
+        {
+            break img.to_rgba8();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the delayed capture never wrote {path:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    std::fs::remove_file(&path).ok();
+
+    assert_eq!(
+        (img.width(), img.height()),
+        (u32::from(OUT_W), u32::from(OUT_H)),
+        "Screen mode captures the whole output"
+    );
+    let count = |want: [u8; 4]| img.pixels().filter(|p| p.0 == want).count();
+    assert!(
+        count([0, 0, 255, 255]) > 0,
+        "the recoloured window is missing from the delayed shot"
+    );
+    assert_eq!(
+        count([0, 255, 0, 255]),
+        0,
+        "the delayed shot still has the green window in it — it was taken from the picker's frozen \
+         screen instead of the live one, which is the entire thing a delay is for"
+    );
+}
+
+/// A lock landing mid-countdown must take the capture with it. The delay was armed against a
+/// screen the user could see; firing into a lock screen would capture what the lock exists to hide.
+#[test]
+fn vulkan_screenshot_ui_a_lock_mid_countdown_cancels_the_capture() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    let (tx, rx) = async_channel::bounded(1);
+    f.niri().interactive_screenshot_reply = Some(tx);
+    f.niri_state().open_screenshot_ui(false, None);
+    settle_screenshot_ui_open(&mut f);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.delay);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.capture);
+    f.niri_state()
+        .handle_screenshot_ui_pointer_up(PointerUp::Capture);
+    assert!(f.niri().pending_capture.is_some());
+
+    // A tick before the lock keeps counting — otherwise this would pass for the wrong reason.
+    assert!(matches!(
+        f.niri_state().tick_pending_capture(),
+        calloop::timer::TimeoutAction::ToDuration(_)
+    ));
+    assert!(f.niri().pending_capture.is_some());
+
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
+    assert!(matches!(
+        f.niri_state().tick_pending_capture(),
+        calloop::timer::TimeoutAction::Drop
+    ));
+    assert!(
+        f.niri().pending_capture.is_none(),
+        "the locked screen must not be shot"
+    );
+    assert_eq!(
+        rx.try_recv(),
+        Ok(None),
+        "and its caller must be told, not left waiting"
+    );
+}
+
+/// The fail-closed rule the countdown exists under: it may never appear in anything captured.
+#[test]
+fn vulkan_screenshot_ui_countdown_cannot_reach_a_capture() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    let centre = (i32::from(OUT_W) / 2, i32::from(OUT_H) / 2);
+    // What a capture of this desktop looks like before any of this — the shot the delay promises.
+    let (pixels, w, _) = render_output_vulkan_target(&mut f, &output, RenderTarget::ScreenCapture);
+    let undisturbed = px(&pixels, w, centre.0, centre.1);
+
+    f.niri_state().open_screenshot_ui(false, None);
+    settle_screenshot_ui_open(&mut f);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.delay);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.capture);
+    f.niri_state()
+        .handle_screenshot_ui_pointer_up(PointerUp::Capture);
+    assert!(f.niri().pending_capture.is_some());
+
+    let (pixels, w, _) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let on_screen = px(&pixels, w, centre.0, centre.1);
+
+    let (pixels, w, _) = render_output_vulkan_target(&mut f, &output, RenderTarget::ScreenCapture);
+    let captured = px(&pixels, w, centre.0, centre.1);
+
+    assert_ne!(
+        on_screen, captured,
+        "the countdown must be visible on the output — otherwise this test proves nothing"
+    );
+    assert_eq!(
+        captured, undisturbed,
+        "a capture taken mid-countdown got the countdown card in it; the whole point of a delay is \
+         a shot with the shell out of the way"
+    );
+}
+
 #[test]
 fn vulkan_screenshot_ui_type_buttons_take_clicks_where_they_are_drawn() {
     let Some(mut f) = green_window_fixture() else {
@@ -3766,7 +4044,16 @@ fn vulkan_screenshots_a_window_through_vulkan() {
     let ran = state.backend.headless().with_vulkan_renderer(|vk| {
         state
             .niri
-            .screenshot_window(vk, &output, mapped, false, false, None)
+            .screenshot_window(
+                vk,
+                &output,
+                mapped,
+                false,
+                false,
+                None,
+                #[cfg(feature = "dbus")]
+                None,
+            )
             .expect("screenshot_window must succeed on the Vulkan renderer");
     });
     assert!(

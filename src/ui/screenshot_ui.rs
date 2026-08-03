@@ -99,6 +99,9 @@ pub enum ScreenshotUi {
         output_data: HashMap<Output, OutputData>,
         button: Button,
         show_pointer: bool,
+        /// Seconds to wait before the capture fires, cycling through [`DELAYS`]. Our divergence:
+        /// GNOME's shell UI has no delay, only gnome-screenshot did.
+        delay: u8,
         capture_type: CaptureType,
         /// The window the selector has picked, as `(output, window id)`.
         ///
@@ -127,6 +130,11 @@ pub enum ScreenshotUi {
 /// GNOME's tooltip appears 300ms after the pointer settles, then fades in over 150ms
 /// (`Tooltip.open`, `js/ui/screenshot.js:95-119`). The delay is what keeps a pointer crossing the
 /// panel from strobing seven tips on its way past.
+/// The delays the button cycles through, in seconds. `0` is off. gnome-screenshot's own delay
+/// spinner was free-form; a three-stop cycle is the most a single round button can carry, and
+/// 3s/10s are the two stops its UI defaulted to.
+const DELAYS: [u8; 3] = [0, 3, 10];
+
 const TOOLTIP_DELAY: Duration = Duration::from_millis(300);
 const TOOLTIP_FADE_MS: u64 = 150;
 /// `.screenshot-ui-tooltip { -y-offset: $base_margin * 6 }` (`_screenshot.scss:202`) — how far
@@ -199,6 +207,15 @@ pub struct OutputData {
     tooltip_cache: RefCell<widget::BakeCache>,
 }
 
+/// What an armed delayed capture will shoot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingTarget {
+    /// An output-local **physical** crop; the whole output in Screen mode.
+    Area(Rectangle<i32, Physical>),
+    /// A window by id, re-found at fire time so it can have moved meanwhile.
+    Window(u64),
+}
+
 /// The panel state the bake depends on. Anything else — the selection, the animation, the pointer
 /// wandering over the screenshot — leaves the texture alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +225,7 @@ struct PanelState {
     /// there is nothing to pick (`_syncWindowButtonSensitivity`, `js/ui/screenshot.js:1529-1536`).
     window_enabled: bool,
     show_pointer: bool,
+    delay: u8,
     hover: Option<Control>,
     /// The control currently held down, for the `:active` fills.
     active: Option<Control>,
@@ -530,6 +548,7 @@ impl ScreenshotUi {
             output_data,
             button: Button::Up,
             show_pointer,
+            delay: 0,
             capture_type: CaptureType::default(),
             selected_window,
             hovered_window: None,
@@ -574,6 +593,22 @@ impl ScreenshotUi {
     pub fn toggle_pointer(&mut self) {
         if let Self::Open { show_pointer, .. } = self {
             *show_pointer = !*show_pointer;
+        }
+    }
+
+    /// Step to the next delay in [`DELAYS`], wrapping back to off.
+    fn cycle_delay(&mut self) {
+        if let Self::Open { delay, .. } = self {
+            let next = DELAYS.iter().position(|d| d == delay).map_or(0, |i| i + 1);
+            *delay = DELAYS[next % DELAYS.len()];
+        }
+    }
+
+    /// How long the capture should wait before it fires, or `None` for right now.
+    pub fn delay(&self) -> Option<Duration> {
+        match self {
+            Self::Open { delay: 0, .. } | Self::Closed { .. } => None,
+            Self::Open { delay, .. } => Some(Duration::from_secs(u64::from(*delay))),
         }
     }
 
@@ -643,6 +678,44 @@ impl ScreenshotUi {
                 selected_window, ..
             } => selected_window.as_ref().map(|(o, id)| (o, *id)),
             Self::Closed { .. } => None,
+        }
+    }
+
+    /// What a delayed capture should shoot when its timer runs out, as `(output, target)`.
+    ///
+    /// Resolved *while the picker is still up*, because arming dismisses it: nothing about the
+    /// selection survives the close. Window mode hands over an id rather than a rect — the window
+    /// is free to move during the delay, and shooting where it *was* is not what was asked for.
+    pub fn pending_target(&self) -> Option<(Output, PendingTarget)> {
+        let Self::Open {
+            selection,
+            output_data,
+            capture_type,
+            ..
+        } = self
+        else {
+            return None;
+        };
+
+        if *capture_type == CaptureType::Window {
+            let (output, id) = self.selected_window()?;
+            return Some((output.clone(), PendingTarget::Window(id)));
+        }
+
+        // Screen mode has already widened the selection to the whole output, so both modes are the
+        // same crop here.
+        let (output, a, b) = selection;
+        output_data.get(output)?;
+        Some((
+            output.clone(),
+            PendingTarget::Area(rect_from_corner_points(*a, *b)),
+        ))
+    }
+
+    pub fn show_pointer(&self) -> bool {
+        match self {
+            Self::Open { show_pointer, .. } => *show_pointer,
+            Self::Closed { .. } => false,
         }
     }
 
@@ -1105,6 +1178,7 @@ impl ScreenshotUi {
             selection,
             output_data,
             show_pointer,
+            delay,
             capture_type,
             selected_window,
             hovered_window,
@@ -1132,6 +1206,7 @@ impl ScreenshotUi {
             capture_type: *capture_type,
             window_enabled: self.any_windows(),
             show_pointer: *show_pointer,
+            delay: *delay,
             hover,
             // `:active` only while the pointer is still on the control the press armed — a press
             // dragged off a button must let go of it, as it does anywhere else.
@@ -1686,6 +1761,10 @@ impl ScreenshotUi {
                 self.toggle_pointer();
                 PointerUp::Redraw
             }
+            Control::Delay => {
+                self.cycle_delay();
+                PointerUp::Redraw
+            }
             // Only the shot segment exists until slice 4, and it is already checked.
             Control::ShotCast(_) => PointerUp::Redraw,
         }
@@ -1933,6 +2012,7 @@ impl OutputData {
             Control::ShotCast(i) => widget::Segmented::segment_rect(layout.shot_cast, i),
             Control::Capture => layout.capture,
             Control::ShowPointer => layout.show_pointer,
+            Control::Delay => layout.delay,
             Control::Close => unreachable!("handled above"),
         };
         Some(Rectangle::new(panel.loc + local.loc, local.size))
@@ -2136,6 +2216,17 @@ impl OutputData {
             centre(layout.show_pointer),
         );
 
+        // Armed, the button carries its own baked number instead — no glyph.
+        if state.delay == 0 {
+            icon(
+                "alarm-symbolic",
+                widget::IconButton::ICON_PX,
+                style::OSD_FG,
+                origin,
+                centre(layout.delay),
+            );
+        }
+
         if let Some(panel) = self.panel_rect_logical() {
             let close = close_rect(panel);
             icon(
@@ -2205,21 +2296,18 @@ pub fn rect_from_corner_points(
     Rectangle::from_extremities((x1, y1), (x2 + 1, y2 + 1))
 }
 
-/// Crop `rect` out of the frozen-screen `neutral` buffer (tightly-packed `Abgr8888`, origin at the
-/// output's top-left) and, if `pointer` is given, composite that premultiplied buffer on top at its
-/// physical origin. Pure CPU — the owned-Vulkan save-to-disk path, so it never reads back through
-/// GLES. Returns `rect.size.w * rect.size.h * 4` bytes; out-of-bounds source pixels stay zero.
-pub(crate) fn crop_screenshot_neutral(
-    neutral: &MemoryBuffer,
+/// Copy an out-of-bounds-tolerant `rect` out of a tightly packed RGBA buffer. Anything outside
+/// `size` comes back transparent rather than clamped or wrapped.
+pub(crate) fn crop_rgba(
+    size: Size<i32, Buffer>,
+    src: &[u8],
     rect: Rectangle<i32, Physical>,
-    pointer: Option<(&MemoryBuffer, Point<i32, Physical>)>,
 ) -> Vec<u8> {
-    let (fw, fh) = (neutral.size().w, neutral.size().h);
+    let (fw, fh) = (size.w, size.h);
     let (rw, rh) = (rect.size.w.max(0), rect.size.h.max(0));
-    let src = neutral.data();
     let mut out = vec![0u8; (rw * rh * 4) as usize];
 
-    // Crop: copy the in-bounds horizontal span of each row wholesale.
+    // Copy the in-bounds horizontal span of each row wholesale.
     for y in 0..rh {
         let sy = rect.loc.y + y;
         if sy < 0 || sy >= fh {
@@ -2235,6 +2323,21 @@ pub(crate) fn crop_screenshot_neutral(
         let n = ((sx1 - sx0) * 4) as usize;
         out[dst_off..dst_off + n].copy_from_slice(&src[src_off..src_off + n]);
     }
+
+    out
+}
+
+/// Crop `rect` out of the frozen-screen `neutral` buffer (tightly-packed `Abgr8888`, origin at the
+/// output's top-left) and, if `pointer` is given, composite that premultiplied buffer on top at its
+/// physical origin. Pure CPU — the owned-Vulkan save-to-disk path, so it never reads back through
+/// GLES. Returns `rect.size.w * rect.size.h * 4` bytes; out-of-bounds source pixels stay zero.
+pub(crate) fn crop_screenshot_neutral(
+    neutral: &MemoryBuffer,
+    rect: Rectangle<i32, Physical>,
+    pointer: Option<(&MemoryBuffer, Point<i32, Physical>)>,
+) -> Vec<u8> {
+    let mut out = crop_rgba(neutral.size(), neutral.data(), rect);
+    let (rw, rh) = (rect.size.w.max(0), rect.size.h.max(0));
 
     // Composite the pointer on top: premultiplied `Abgr8888` "over" (out = src + dst·(255−a)/255).
     if let Some((ptr, ptr_origin)) = pointer {
@@ -2319,6 +2422,9 @@ pub enum Control {
     ShotCast(usize),
     Capture,
     ShowPointer,
+    /// **Our divergence**: arm the capture to fire after a delay. See
+    /// `docs/fork/screenshot-ui-port.md`.
+    Delay,
     Close,
 }
 
@@ -2337,6 +2443,7 @@ impl Control {
             Control::ShotCast(_) => return None,
             Control::Capture => "Capture",
             Control::ShowPointer => "Show Pointer",
+            Control::Delay => "Delay",
             // GNOME's close button carries no tooltip.
             Control::Close => return None,
         })
@@ -2357,6 +2464,9 @@ pub struct PanelLayout {
     pub shot_cast: Rectangle<f64, Logical>,
     pub capture: Rectangle<f64, Logical>,
     pub show_pointer: Rectangle<f64, Logical>,
+    /// Our delay button, left of the show-pointer toggle. Both are persistent capture *options*,
+    /// which is why they share the end of the bottom row rather than joining the type row.
+    pub delay: Rectangle<f64, Logical>,
 }
 
 impl PanelLayout {
@@ -2401,8 +2511,11 @@ impl PanelLayout {
         // The bottom row must fit its three children side by side even though they are stacked in
         // a bin — otherwise the pill and the toggle would overlap the capture button on a narrow
         // panel.
-        let bottom_min_w =
-            shot_cast_size.w + Self::CAPTURE_DIAMETER + show_pointer_d + Self::ROW_SPACING * 2.;
+        let bottom_min_w = shot_cast_size.w
+            + Self::CAPTURE_DIAMETER
+            + show_pointer_d * 2.
+            + Self::TYPE_SPACING
+            + Self::ROW_SPACING * 2.;
         let content_w = type_row_w.max(bottom_min_w);
 
         let size = Size::from((
@@ -2438,6 +2551,11 @@ impl PanelLayout {
             show_pointer_d,
             size.w - Self::PAD - show_pointer_d,
         );
+        let delay = centred(
+            show_pointer_d,
+            show_pointer_d,
+            show_pointer.loc.x - Self::TYPE_SPACING - show_pointer_d,
+        );
 
         Self {
             size,
@@ -2445,6 +2563,7 @@ impl PanelLayout {
             shot_cast,
             capture,
             show_pointer,
+            delay,
         }
     }
 
@@ -2467,6 +2586,9 @@ impl PanelLayout {
         }
         if in_circle(self.show_pointer) {
             return Some(Control::ShowPointer);
+        }
+        if in_circle(self.delay) {
+            return Some(Control::Delay);
         }
         for (i, ty) in CaptureType::ROW.iter().enumerate() {
             if self.type_buttons[i].contains(p) {
@@ -2685,6 +2807,17 @@ fn generate_panel(
         .unwrap_or(0);
     let label_h = f64::from(label_h) / scale;
 
+    // The armed delay renders as its own number inside the button; off renders as an alarm glyph.
+    let delay_label = (state.delay != 0)
+        .then(|| {
+            let mut shaper = TextShaper::new(renderer, scale);
+            shaper.shape(
+                &state.delay.to_string(),
+                TextStyle::new(widget::IconLabelButton::LABEL_PT),
+            )
+        })
+        .transpose()?;
+
     let layout = PanelLayout::new(label_w, label_h);
     let size = widget::physical_size(scale, layout.size);
 
@@ -2744,6 +2877,25 @@ fn generate_panel(
             accent,
         )?;
 
+        // The delay button shares the show-pointer cascade: an armed delay reads as `:checked`.
+        let delay_control = Control::Delay;
+        let delay_bg = if state.active == Some(delay_control) {
+            style::OSD_FLAT_ACTIVE
+        } else if state.delay != 0 {
+            style::OSD_FLAT_CHECKED
+        } else if state.hover == Some(delay_control) {
+            style::OSD_FLAT_HOVER
+        } else {
+            style::OSD_BG
+        };
+        p.icon_button(
+            &widget::IconButton::new(layout.delay, widget::IconButton::ICON_PX, delay_bg),
+            accent,
+        )?;
+        if let Some(label) = &delay_label {
+            p.text(label, centre(layout.delay), Align::CENTER, style::OSD_FG)?;
+        }
+
         // The capture button: a real 4px ring, a transparent gap, then the inner circle.
         let cap = layout.capture;
         p.stroke_rounded(cap, cap.size.w / 2., CAPTURE_BORDER, style::OSD_FG)?;
@@ -2765,6 +2917,117 @@ fn generate_panel(
     })?;
 
     Ok((texture, layout))
+}
+
+// === Delayed-capture countdown =================================================================
+
+/// The card's side and corner radius, and the point size of the number inside it.
+const COUNTDOWN_SIDE: f64 = 108.;
+const COUNTDOWN_RADIUS: f64 = 24.;
+const COUNTDOWN_PT: f64 = 48.;
+
+/// The on-screen countdown for a delayed capture.
+///
+/// **Drawn only on [`RenderTarget::Output`]** — see [`Countdown::element`]. A delay exists so the
+/// shot can be taken with the shell out of the way; a countdown that could reach a screenshot, a
+/// screencast or a portal capture would defeat exactly that.
+#[derive(Default)]
+pub struct Countdown {
+    cache: RefCell<CountdownCache>,
+}
+
+#[derive(Default)]
+struct CountdownCache {
+    seconds: u64,
+    scale: f64,
+    context: Option<ContextId<VkTexture>>,
+    texture: Option<VkTexture>,
+}
+
+impl Countdown {
+    /// The countdown card for `output`, centred, or `None` when there is nothing to count down,
+    /// the target is not the screen, or the bake failed.
+    pub fn element(
+        &self,
+        renderer: &mut VulkanRenderer,
+        target: RenderTarget,
+        output: &Output,
+        seconds: u64,
+    ) -> Option<CapturedTextureRenderElement> {
+        // The fail-closed rule this whole overlay exists under.
+        if target != RenderTarget::Output || seconds == 0 {
+            return None;
+        }
+
+        let scale = output.current_scale().fractional_scale();
+        let context = renderer.context_id();
+        {
+            let cache = self.cache.borrow();
+            if cache.texture.is_none()
+                || cache.seconds != seconds
+                || cache.scale != scale
+                || cache.context.as_ref() != Some(&context)
+            {
+                drop(cache);
+                let texture = generate_countdown(renderer, scale, seconds)
+                    .map_err(|err| warn!("error rendering the capture countdown: {err:?}"))
+                    .ok();
+                *self.cache.borrow_mut() = CountdownCache {
+                    seconds,
+                    scale,
+                    context: Some(context),
+                    texture,
+                };
+            }
+        }
+
+        let texture = self.cache.borrow().texture.clone()?;
+        let size = crate::utils::output_size(output);
+        let location = Point::from((
+            (size.w - COUNTDOWN_SIDE) / 2.,
+            (size.h - COUNTDOWN_SIDE) / 2.,
+        ));
+
+        let buffer =
+            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
+        Some(CapturedTextureRenderElement(
+            TextureRenderElement::from_texture_buffer(
+                buffer,
+                location,
+                1.,
+                None,
+                None,
+                Kind::Unspecified,
+            ),
+        ))
+    }
+}
+
+fn generate_countdown(
+    renderer: &mut VulkanRenderer,
+    scale: f64,
+    seconds: u64,
+) -> anyhow::Result<VkTexture> {
+    let label = {
+        let mut shaper = TextShaper::new(renderer, scale);
+        shaper.shape(&seconds.to_string(), TextStyle::new(COUNTDOWN_PT))?
+    };
+
+    let logical = Size::from((COUNTDOWN_SIDE, COUNTDOWN_SIDE));
+    let size = widget::physical_size(scale, logical);
+    widget::bake_uncached_sized(renderer, size, |frame| {
+        let mut p = Painter::new(frame, scale, size);
+        p.clear(style::TRANSPARENT)?;
+        p.fill_rounded_full(COUNTDOWN_RADIUS, style::OSD_BG)?;
+        p.stroke_rounded_full(COUNTDOWN_RADIUS, 1., PANEL_BORDER_COLOR)?;
+        p.text(
+            &label,
+            Point::from((COUNTDOWN_SIDE / 2., COUNTDOWN_SIDE / 2.)),
+            Align::CENTER,
+            style::OSD_FG,
+        )?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -2816,6 +3079,10 @@ mod tests {
 
     // `homogeneous: true` (`screenshot.js:1300`): every type button takes the width of the widest,
     // so the row does not jitter as the captions change with translation.
+    fn mid_y(r: Rectangle<f64, Logical>) -> f64 {
+        r.loc.y + r.size.h / 2.
+    }
+
     #[test]
     fn the_type_buttons_are_homogeneous_and_evenly_spaced() {
         let l = layout();
@@ -2860,6 +3127,31 @@ mod tests {
         let corner = Point::from((l.capture.loc.x + 1., l.capture.loc.y + 1.));
         assert!(l.capture.contains(corner));
         assert_ne!(l.control_at(corner), Some(Control::Capture));
+    }
+
+    // The delay button is ours, and it shares the bottom row's right end with show-pointer: both
+    // are persistent capture *options*, as against the type row's "what to capture".
+    #[test]
+    fn the_delay_button_sits_beside_show_pointer_and_takes_clicks() {
+        let l = layout();
+
+        assert_eq!(l.control_at(centre(l.delay)), Some(Control::Delay));
+        assert_eq!(
+            l.delay.size, l.show_pointer.size,
+            "the two round toggles must match"
+        );
+        assert!(
+            (mid_y(l.delay) - mid_y(l.show_pointer)).abs() < 0.001,
+            "they share a row, so they share a centreline"
+        );
+        assert!(
+            l.delay.loc.x + l.delay.size.w <= l.show_pointer.loc.x,
+            "delay goes to the left of show-pointer, and they must not overlap"
+        );
+        assert!(
+            l.capture.loc.x + l.capture.size.w <= l.delay.loc.x,
+            "the capture button must still clear both of them"
+        );
     }
 
     // Every type button is hit-testable, Window included: GNOME keeps it visible and greys it
