@@ -202,6 +202,10 @@ have had to fabricate the armed state instead of driving the real one.
 - `vulkan_screenshot_ui_countdown_cannot_reach_a_capture` — the same pixel rendered at `Output` and
   at `ScreenCapture`, against a reference capture taken before any of it.
 
+The countdown card is the one thing the headless harness cannot photograph: `grim` goes through
+wlr-screencopy, which is `RenderTarget::ScreenCapture`, and the card refuses that target on purpose.
+Seeing nothing there is the rule working, not a missing draw — judge the card from the Vulkan test.
+
 One trap for anything else that wants to read a screenshot back in a test: `save_screenshot`
 answers its D-Bus reply from an **event-loop source**, so `recv_blocking` on that channel deadlocks
 the loop that would answer it. Pass an explicit path and wait for the file instead.
