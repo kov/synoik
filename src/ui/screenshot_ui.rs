@@ -825,6 +825,36 @@ impl ScreenshotUi {
         action(raw, mods)
     }
 
+    /// The current selection as a rectangle in **global logical** coordinates.
+    ///
+    /// This is what `org.gnome.Shell.Screenshot.SelectArea` hands back, so it has to be in the same
+    /// space its caller then passes to `ScreenshotArea` — output-local physical is what the UI
+    /// works in and is not it.
+    pub fn selection_rect_global(&self) -> Option<Rectangle<i32, Logical>> {
+        let Self::Open {
+            selection,
+            output_data,
+            ..
+        } = self
+        else {
+            return None;
+        };
+
+        let (output, a, b) = selection;
+        let rect = rect_from_corner_points(*a, *b);
+        let scale = output_data.get(output)?.scale;
+        let logical = rect.to_f64().to_logical(scale);
+        let loc = output.current_location();
+
+        Some(Rectangle::new(
+            Point::from((
+                loc.x + logical.loc.x.round() as i32,
+                loc.y + logical.loc.y.round() as i32,
+            )),
+            Size::from((logical.size.w.round() as i32, logical.size.h.round() as i32)),
+        ))
+    }
+
     pub fn selection_output(&self) -> Option<&Output> {
         if let Self::Open {
             selection: (output, _, _),

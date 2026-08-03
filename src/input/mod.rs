@@ -2092,7 +2092,7 @@ impl State {
                     return;
                 }
 
-                self.niri.screenshot_ui.close();
+                self.niri.close_screenshot_ui();
                 self.niri
                     .cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());

@@ -1,8 +1,7 @@
 # The portal surface — screenshots and screen sharing
 
-Status: **2026-08-02.** Slice 1 landed. Slice 2 is *partly* landed — `ScreenshotArea` and
-honouring `filename` are in; `ScreenshotWindow` and `FlashArea` are not. Slice 3 (`SelectArea`) has
-not been started. Nothing here is seat-validated yet.
+Status: **2026-08-02.** Slices 1-3 landed; 4-6 not started. Not yet seat-validated — that is the
+next step, and is what slices 1-3 were sequenced to make possible.
 
 `xdg-desktop-portal-gnome` is the path every Flatpak app, every browser screen-share and every
 in-app "take a screenshot" goes through. It is not optional for a daily-driven session, and it is
@@ -68,14 +67,17 @@ Ordered by what unblocks the portal soonest, not by interface.
    `AppSystem::running` + the focused app, the full `WindowProperties` field set, `ScreenSize`,
    `AnimationsEnabled`, `version`, and the two change signals. Unblocks the portal's app/window
    chooser, and closes the leak.
-2. **Screenshot, non-interactive.** — **PART DONE** (`684626ae`): `ScreenshotArea` and the
-   `filename` argument. **Left: `ScreenshotWindow` and `FlashArea`.** `FlashArea` is the one with
-   real work behind it — it is a white rectangle that fades, so it needs an overlay element and an
-   animation, not just a D-Bus method. Original scope follows. `ScreenshotArea` (a crop of the existing capture),
-   `ScreenshotWindow` (`Niri::screenshot_window` already exists), `FlashArea`, and **honouring the
-   `filename` argument**, which `Screenshot` currently ignores in favour of its own path.
-3. **`SelectArea`.** Interactive: opens the picker and returns the rect. `ui::screenshot_ui` has
-   the selection machinery but no "select only, hand back coordinates" mode.
+2. **Screenshot, non-interactive.** — **DONE** (`684626ae`, `8e583d9d`). `ScreenshotArea` as a
+   crop of the existing capture, `ScreenshotWindow` on the focused window, `FlashArea` as
+   `ui::flashspot`, and the `filename` argument honoured. `ScreenshotWindow` deliberately bypasses
+   `save_screenshot`, which also replaces the clipboard and raises a notification — those belong to
+   a keypress, not to a portal call the user never sees.
+3. **`SelectArea`.** — **DONE**. The picker opens with `Niri::select_area_reply` armed; confirming
+   answers with the rect in global logical coordinates and saves nothing, and **every** close
+   answers, because a D-Bus caller that is not answered hangs until its timeout rather than
+   failing. That is why all the `ScreenshotUi::close` call sites now route through
+   `Niri::close_screenshot_ui`, and why it answers unconditionally rather than only when the picker
+   was open. Pinned by `select_area_always_answers_its_caller`.
 4. **ScreenCast completion.** `Stream.Start`/`Stop`, then `RecordVirtual`.
 5. **`org.gnome.Mutter.RemoteDesktop`.** The whole name — screen sharing *with input*, and
    `EnableClipboard`. Largest, and the only one that needs new input-injection plumbing.
@@ -106,3 +108,11 @@ than who built it, since it sits beside the user's real windows in a shell prese
 GNOME. The **app id is still `rs.bxt.niri.desktop`**, which resolves to nothing and so draws with no
 icon; that waits on the wider naming decision (neither "niri" nor "gnome-shell-rs" is the intended
 product name). Fix the app id, the desktop file and the icon together when that lands.
+
+## Note for the seat validation
+
+The picker cannot open in the headless corpus — it has to freeze the screen through the renderer
+first — so the conformance test covers the *refusal* and *dismissal* exits only. The happy path,
+where a real selection comes back as a rectangle, has no automated cover and is exactly what the
+seat run has to exercise: open a browser's screen-share or a Flatpak screenshot and check the
+returned area matches what was dragged.

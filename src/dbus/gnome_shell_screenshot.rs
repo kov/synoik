@@ -13,6 +13,12 @@ pub struct Screenshot {
     from_niri: async_channel::Receiver<NiriToScreenshot>,
 }
 
+/// The rectangle `SelectArea` hands back: x, y, width, height in global logical coordinates.
+pub type SelectedArea = (i32, i32, i32, i32);
+
+/// Where a `SelectArea` result goes. `None` means the user dismissed the picker.
+pub type SelectAreaReply = async_channel::Sender<Option<SelectedArea>>;
+
 pub enum ScreenshotToNiri {
     TakeScreenshot {
         include_cursor: bool,
@@ -34,6 +40,9 @@ pub enum ScreenshotToNiri {
     FlashArea {
         area: (i32, i32, i32, i32),
     },
+    /// Open the picker for `SelectArea`; the reply carries the chosen rectangle, or `None` if the
+    /// user dismissed it.
+    SelectArea(SelectAreaReply),
     PickColor(async_channel::Sender<Option<PickedColor>>),
 }
 
@@ -88,6 +97,28 @@ impl Screenshot {
             return Err(fdo::Error::Failed("internal error".to_owned()));
         }
         Ok(())
+    }
+
+    /// Interactive: puts the picker up and blocks until the user picks or dismisses.
+    ///
+    /// A dismissal is `Cancelled`, not a zero-sized rectangle — the caller has to be able to tell
+    /// "the user said no" from "the user selected nothing", and the portal treats the two
+    /// differently.
+    async fn select_area(&self) -> fdo::Result<(i32, i32, i32, i32)> {
+        let (tx, rx) = async_channel::bounded(1);
+        if let Err(err) = self.to_niri.send(ScreenshotToNiri::SelectArea(tx)) {
+            warn!("error sending message to niri: {err:?}");
+            return Err(fdo::Error::Failed("internal error".to_owned()));
+        }
+
+        match rx.recv().await {
+            Ok(Some(area)) => Ok(area),
+            Ok(None) => Err(fdo::Error::Failed("cancelled".to_owned())),
+            Err(err) => {
+                warn!("error receiving message from niri: {err:?}");
+                Err(fdo::Error::Failed("internal error".to_owned()))
+            }
+        }
     }
 
     async fn screenshot_area(

@@ -817,6 +817,12 @@ pub struct Niri {
     pub end_session_dialog: EndSessionDialog,
     /// The polkit "Authentication Required" dialog: what it is asking, and how it is drawn.
     #[cfg(feature = "dbus")]
+    /// Set while the picker is up on behalf of `org.gnome.Shell.Screenshot.SelectArea`: the
+    /// caller wants coordinates, not a file. Answered on confirm *and* on every close, because a
+    /// D-Bus caller left unanswered blocks until its timeout.
+    #[cfg(feature = "dbus")]
+    pub select_area_reply: Option<crate::dbus::gnome_shell_screenshot::SelectAreaReply>,
+
     /// The screenshot flash (`org.gnome.Shell.Screenshot.FlashArea`).
     pub flashspot: crate::ui::flashspot::FlashSpot,
     pub polkit_dialog: crate::polkit_dialog::PolkitDialog,
@@ -3447,19 +3453,30 @@ impl State {
         };
         let path = path.take();
 
-        // Save from the frozen-screen neutral CPU buffer: a pure crop + pointer composite, no
-        // render or readback. The neutral is captured when the UI opens, so a missing one means
-        // that capture failed (warned there) — fail closed rather than save a wrong screenshot.
-        match self.niri.screenshot_ui.capture_from_neutral() {
-            Some((size, pixels)) => {
-                if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
-                    warn!("error saving screenshot: {err:?}");
+        // A `SelectArea` caller wanted coordinates, not a picture: hand them over and save
+        // nothing. Answered before the close, which would otherwise answer `None`.
+        #[cfg(feature = "dbus")]
+        let selecting = self.niri.select_area_reply.is_some();
+        #[cfg(not(feature = "dbus"))]
+        let selecting = false;
+        if selecting {
+            let rect = self.niri.screenshot_ui.selection_rect_global();
+            self.niri.answer_select_area(rect);
+        } else {
+            // Save from the frozen-screen neutral CPU buffer: a pure crop + pointer composite, no
+            // render or readback. The neutral is captured when the UI opens, so a missing one means
+            // that capture failed (warned there) — fail closed rather than save a wrong screenshot.
+            match self.niri.screenshot_ui.capture_from_neutral() {
+                Some((size, pixels)) => {
+                    if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
+                        warn!("error saving screenshot: {err:?}");
+                    }
                 }
+                None => warn!("no frozen-screen capture to save the screenshot from"),
             }
-            None => warn!("no frozen-screen capture to save the screenshot from"),
         }
 
-        self.niri.screenshot_ui.close();
+        self.niri.close_screenshot_ui();
         self.niri
             .cursor_manager
             .set_cursor_image(CursorImageStatus::default_named());
@@ -3538,6 +3555,9 @@ impl State {
             } => {
                 self.handle_take_screenshot_window(to_screenshot, include_cursor, path);
             }
+            ScreenshotToNiri::SelectArea(tx) => {
+                self.handle_select_area(tx);
+            }
             ScreenshotToNiri::FlashArea { area } => {
                 let (x, y, w, h) = area;
                 let area = Rectangle::new(Point::from((x, y)), Size::from((w, h)));
@@ -3578,6 +3598,20 @@ impl State {
             if let Err(err) = to_screenshot.send_blocking(msg) {
                 warn!("error sending None to screenshot: {err:?}");
             }
+        }
+    }
+
+    /// `SelectArea` — the picker, opened to hand back coordinates rather than save a file.
+    #[cfg(feature = "dbus")]
+    fn handle_select_area(&mut self, tx: crate::dbus::gnome_shell_screenshot::SelectAreaReply) {
+        self.niri.select_area_reply = Some(tx);
+        self.open_screenshot_ui(false, None);
+
+        // The picker refuses to open when the screen is locked or it is already up. Answering now
+        // is the difference between a caller that gets an error and one that hangs until its
+        // D-Bus timeout.
+        if !self.niri.screenshot_ui.is_open() {
+            self.niri.answer_select_area(None);
         }
     }
 
@@ -6016,6 +6050,8 @@ impl Niri {
             run_dialog: RunDialog::new(),
             end_session_dialog,
             #[cfg(feature = "dbus")]
+            #[cfg(feature = "dbus")]
+            select_area_reply: None,
             flashspot: crate::ui::flashspot::FlashSpot::new(),
             polkit_dialog: crate::polkit_dialog::PolkitDialog::new(),
             #[cfg(feature = "dbus")]
@@ -6493,7 +6529,7 @@ impl Niri {
             }
         }
 
-        if self.screenshot_ui.close() {
+        if self.close_screenshot_ui() {
             self.cursor_manager
                 .set_cursor_image(CursorImageStatus::default_named());
             self.queue_redraw_all();
@@ -6554,7 +6590,7 @@ impl Niri {
             // I haven't quite figured out how to draw the screenshot textures in
             // physical coordinates.
             if old_size != size || old_scale != scale || old_transform != transform {
-                self.screenshot_ui.close();
+                self.close_screenshot_ui();
                 self.cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());
                 self.queue_redraw_all();
@@ -10550,6 +10586,31 @@ impl Niri {
         Ok(())
     }
 
+    /// Close the picker, answering any pending `SelectArea` caller.
+    ///
+    /// Every close goes through here rather than through `ScreenshotUi::close` directly: the
+    /// picker can be dismissed from a keybind, a lock, an output change or a session end, and a
+    /// `SelectArea` caller that is not answered on *all* of those blocks until its D-Bus timeout.
+    pub fn close_screenshot_ui(&mut self) -> bool {
+        let was_open = self.screenshot_ui.close();
+        // Unconditional, not gated on `was_open`: a pending reply with no picker on screen is
+        // precisely the stuck state this exists to prevent, so closing always resolves it.
+        self.answer_select_area(None);
+        was_open
+    }
+
+    /// Hand a `SelectArea` caller its result, once.
+    #[cfg(feature = "dbus")]
+    pub fn answer_select_area(&mut self, rect: Option<Rectangle<i32, Logical>>) {
+        if let Some(tx) = self.select_area_reply.take() {
+            // The channel is bounded(1) and used once, so this cannot block.
+            let _ = tx.send_blocking(rect.map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h)));
+        }
+    }
+
+    #[cfg(not(feature = "dbus"))]
+    pub fn answer_select_area(&mut self, _rect: Option<Rectangle<i32, Logical>>) {}
+
     pub fn is_locked(&self) -> bool {
         match self.lock_state {
             LockState::Unlocked | LockState::WaitingForSurfaces { .. } => false,
@@ -10590,7 +10651,7 @@ impl Niri {
 
         if self.output_state.is_empty() {
             // There are no outputs, lock the session right away.
-            self.screenshot_ui.close();
+            self.close_screenshot_ui();
             self.cursor_manager
                 .set_cursor_image(CursorImageStatus::default_named());
 
@@ -10650,7 +10711,7 @@ impl Niri {
             } => {
                 self.event_loop.remove(deadline_token);
 
-                self.screenshot_ui.close();
+                self.close_screenshot_ui();
                 self.cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());
                 self.switcher.cancel();

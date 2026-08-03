@@ -15773,3 +15773,46 @@ fn the_portal_window_list_carries_what_its_chooser_reads() {
         "the focused app is active on seat0"
     );
 }
+
+/// `SelectArea` answers its caller on every exit, not just the happy one.
+///
+/// A D-Bus caller that is not answered does not fail — it *hangs* until its timeout, with the
+/// compositor looking perfectly healthy. Two exits are not the happy one: the picker refusing to
+/// open (locked screen, or already up), and the user dismissing it.
+///
+/// The headless corpus has no renderer, so the picker cannot freeze the screen and open here —
+/// which makes this fixture exactly the refusal case, driven through the real
+/// `State::on_screen_shot_msg`. The dismissal is driven through `Niri::close_screenshot_ui`, the
+/// one seam every dismissal path goes through.
+#[cfg(feature = "dbus")]
+#[test]
+fn select_area_always_answers_its_caller() {
+    use crate::dbus::gnome_shell_screenshot::ScreenshotToNiri;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (to_screenshot, _from_niri) = async_channel::unbounded();
+
+    // The picker never opens: the caller is answered anyway rather than left pending.
+    let (tx, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_screen_shot_msg(&to_screenshot, ScreenshotToNiri::SelectArea(tx));
+    assert!(
+        !f.niri().screenshot_ui.is_open(),
+        "no renderer here, so the picker cannot open"
+    );
+    // `try_recv`, not a blocking wait: the answer is synchronous, and a test that *hangs* when
+    // this regresses is a test nobody can read the output of.
+    assert_eq!(
+        rx.try_recv(),
+        Ok(None),
+        "a picker that never opened must still answer"
+    );
+
+    // A dismissal reaches the caller too.
+    let (tx, rx) = async_channel::bounded(1);
+    f.niri().select_area_reply = Some(tx);
+    f.niri().close_screenshot_ui();
+    assert_eq!(rx.try_recv(), Ok(None), "a dismissal must reach the caller");
+}
