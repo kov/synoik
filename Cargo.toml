@@ -223,6 +223,21 @@ opt-level = 3
 debug-assertions = false
 overflow-checks = false
 
+# ...except the log crates, which read `debug_assertions` to decide whether they are a *release*
+# build. `tracing`'s STATIC_MAX_LEVEL is `cfg!(all(not(debug_assertions), feature =
+# "release_max_level_debug"))` (`tracing/src/level_filters.rs:68-78`), and both crates carry
+# `release_max_level_debug` above, so the override two lines up made them strip every `trace!`
+# from our *dev* builds — statically, at the call site. The symptom is silent and expensive:
+# `RUST_LOG=...=trace` is accepted, the filter is installed, the process has the env var, and not
+# one TRACE line is ever emitted, because the call sites were compiled away. That cost a live seat
+# relog to discover while diagnosing the screencast negotiation. These two crates are not the hot
+# decoders the override exists for, so exempting them is free.
+[profile.dev.package.tracing]
+debug-assertions = true
+
+[profile.dev.package.log]
+debug-assertions = true
+
 [package.metadata.generate-rpm]
 version = "26.04"
 assets = [
