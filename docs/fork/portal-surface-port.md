@@ -4,8 +4,8 @@ Status: **2026-08-02.** Slices 1-3 and 6 landed; slice 4 is *partly* landed (`St
 in, `RecordVirtual` not); slice 5 not started. Screenshots are seat-validated — wayshot captures
 through the portal.
 
-**Open: we advertise dmabuf-only formats, so any consumer without dmabuf import cannot start.**
-Diagnosed 2026-08-03 from the gsrs journal; fix not yet written.
+**Fixed in `f7a629da`, awaiting seat validation: we advertised dmabuf-only formats, so any
+consumer without dmabuf import could not start.** Diagnosed 2026-08-03 from the gsrs journal.
 
 The reported symptom was "OBS shows stale content", but OBS's stream *never starts*: it goes
 `connecting -> paused -> error` in the same second, every session, with
@@ -23,10 +23,24 @@ SHM/MemPtr fallback. `push_format_object` only attaches the modifier when `n_mod
 rejecting anything else (`:750`). A consumer that cannot import our modifiers is left with
 nothing to accept.
 
-Fixing it properly means implementing the memfd/SHM capture path, not just widening the offer:
-today `dequeue_buffer_and_render` reads `(*(*spa_buffer).datas).fd` and looks it up in
-`inner.dmabufs`, so an accepted SHM format would have no renderer behind it. Mutter also offers
-`VideoSize` as a `CHOICE_RANGE` where we send a fixed rectangle — worth matching at the same time.
+The fix needed the memfd path as well as the wider offer, because widening alone would have
+turned a negotiation failure into a crash — `dequeue_buffer_and_render` looks the block's fd up in
+`inner.dmabufs` and `add_buffer` asserted DmaBuf. What landed:
+
+- `make_video_params` takes `with_modifier`; `false` omits the property entirely and returns
+  `None` when a dmabuf offer would have no modifiers to name (mutter's `:1526-1531` early return).
+- The offer is built in mutter's order — all formats with modifiers, then all without.
+- A `Sink` enum records which world the stream settled on, so the block count, the data type, the
+  allocation and the render path cannot disagree. `SPA_PARAM_BUFFERS_dataType` follows it.
+- `attach_memfd` allocates/seals/maps the storage exactly as mutter does (`:2318-2358`).
+- Rendering goes through `render_and_copy_to_memory`, extracted from `render_to_shm` so the
+  Wayland shm path and the PipeWire path share one readback.
+
+Memory frames are queued directly rather than through `queue_after_sync`: the readback has
+already synchronized with the GPU, so there is no fence left to wait on.
+
+Still divergent, deliberately: mutter offers `VideoSize` as a `CHOICE_RANGE` where we send a fixed
+rectangle. Worth matching, but it is not what broke negotiation.
 
 An earlier theory was *falsified* and should not be re-derived: it is not partial-damage
 under-painting.
