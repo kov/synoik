@@ -493,11 +493,12 @@ fn click_control(f: &mut Fixture, output: &Output, rect: Rectangle<f64, Logical>
         .expect("the release must land on a control")
 }
 
-/// The cast segment is not just a mode flag: it drops the frozen screen, greys out Window, and
-/// turns the capture button red. All three come from `_onCastButtonToggled`
-/// (`js/ui/screenshot.js:1880-1906`).
+/// Cast mode drops the frozen screen, and only a pixel can tell that from "the still happens to
+/// match": the live window is recoloured *after* the switch and the new colour must reach the
+/// frame. The mode's state-machine half (Window mode greyed out, the fall back to Selection) is
+/// device-free and lives in the corpus as `cast_mode_refuses_window_capture`.
 #[test]
-fn vulkan_screenshot_ui_cast_mode_drops_the_frozen_screen_and_window_mode() {
+fn vulkan_screenshot_ui_cast_mode_drops_the_frozen_screen() {
     let Some((mut f, client, surface)) = window_fixture_with_client(GREEN, true, None) else {
         return;
     };
@@ -507,46 +508,17 @@ fn vulkan_screenshot_ui_cast_mode_drops_the_frozen_screen_and_window_mode() {
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
-    assert_eq!(
-        f.niri().screenshot_ui.mode(),
-        crate::ui::screenshot_ui::CaptureMode::Shot
-    );
-    assert!(
-        f.niri().screenshot_ui.window_enabled(),
-        "there is a window, so Window mode is available in Shot mode"
-    );
-
-    // Park in Window mode first, so the switch has something to take away.
     let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
-    click_control(&mut f, &output, layout.type_buttons[2]);
-    assert_eq!(
-        f.niri().screenshot_ui.capture_type(),
-        CaptureType::Window,
-        "the click must land on the Window button"
+    click_control(
+        &mut f,
+        &output,
+        crate::ui::widget::Segmented::segment_rect(layout.shot_cast, 1),
     );
-
-    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
-    let cast = crate::ui::widget::Segmented::segment_rect(layout.shot_cast, 1);
-    click_control(&mut f, &output, cast);
-
     assert_eq!(
         f.niri().screenshot_ui.mode(),
         crate::ui::screenshot_ui::CaptureMode::Cast
     );
-    assert_eq!(
-        f.niri().screenshot_ui.capture_type(),
-        CaptureType::Selection,
-        "recording a single window is not a thing, so cast mode must move off Window rather than \
-         leave a mode whose capture button does nothing"
-    );
-    assert!(
-        !f.niri().screenshot_ui.window_enabled(),
-        "and it must stay unavailable while cast is checked, window or no window"
-    );
 
-    // The frozen screen is gone: recolouring the live window now shows through the picker, which it
-    // could not do while a still of the moment it opened was drawn on top.
     recolor_window(&mut f, client, &surface, [0, 0, u32::MAX, u32::MAX]);
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
     // Not an exact match: the picker's shade dims everything outside the selection, so the live
@@ -561,20 +533,12 @@ fn vulkan_screenshot_ui_cast_mode_drops_the_frozen_screen_and_window_mode() {
         "cast mode still draws the frozen screen — the picker is showing a still of the past while \
          claiming to record the present"
     );
-
-    // Back to shot, and the button is live again.
-    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
-    let shot = crate::ui::widget::Segmented::segment_rect(layout.shot_cast, 0);
-    click_control(&mut f, &output, shot);
-    assert_eq!(
-        f.niri().screenshot_ui.mode(),
-        crate::ui::screenshot_ui::CaptureMode::Shot
-    );
-    assert!(f.niri().screenshot_ui.window_enabled());
 }
 
 /// The capture button clicked in cast mode starts a recording instead of taking a picture.
+///
+/// Here rather than in the corpus despite having no pixel claim: starting the recorder spawns a
+/// real ffmpeg, and the corpus should not need an external process to run.
 #[test]
 fn vulkan_screenshot_ui_cast_mode_capture_starts_a_recording() {
     let Some(mut f) = green_window_fixture() else {
@@ -630,92 +594,6 @@ fn vulkan_screenshot_ui_cast_mode_capture_starts_a_recording() {
         notif.actions.len(),
         1,
         "the notification carries a way into Files"
-    );
-}
-
-/// **Our divergence** — GNOME's screenshot UI has no delay. Arming one hands the *whole* capture
-/// over to a timer, so the two things that must not happen at that moment are answering the D-Bus
-/// caller (it has not been given anything yet) and losing the capture when the picker closes.
-#[test]
-fn vulkan_screenshot_ui_delay_arms_the_capture_without_answering_its_caller() {
-    let Some(mut f) = green_window_fixture() else {
-        return;
-    };
-    let output = f.niri_output(1);
-
-    let (tx, rx) = async_channel::bounded(1);
-    f.niri().interactive_screenshot_reply = Some(tx);
-    f.niri_state().open_screenshot_ui(false, None);
-    settle_screenshot_ui_open(&mut f);
-    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-
-    assert_eq!(f.niri().screenshot_ui.delay(), None, "the delay starts off");
-
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
-    assert_eq!(
-        click_control(&mut f, &output, layout.delay),
-        PointerUp::Redraw
-    );
-    assert_eq!(
-        f.niri().screenshot_ui.delay(),
-        Some(Duration::from_secs(3)),
-        "one click must arm the first stop"
-    );
-
-    // Re-bake so the second click hits the layout the *armed* panel published: the number replaces
-    // an icon, and a control the bake moved is a control the pointer would miss.
-    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
-    click_control(&mut f, &output, layout.delay);
-    assert_eq!(
-        f.niri().screenshot_ui.delay(),
-        Some(Duration::from_secs(10))
-    );
-    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
-    click_control(&mut f, &output, layout.delay);
-    assert_eq!(
-        f.niri().screenshot_ui.delay(),
-        None,
-        "the third click must wrap back to off"
-    );
-
-    // Back to 3s, then fire the shutter.
-    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
-    click_control(&mut f, &output, layout.delay);
-    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
-    assert_eq!(
-        click_control(&mut f, &output, layout.capture),
-        PointerUp::Capture
-    );
-    f.niri_state()
-        .handle_screenshot_ui_pointer_up(PointerUp::Capture);
-
-    assert!(
-        !f.niri().screenshot_ui.is_open(),
-        "arming must dismiss the picker — the delay exists to get the shell out of the shot"
-    );
-    assert!(
-        f.niri().pending_capture.is_some(),
-        "the capture must survive the picker that armed it"
-    );
-    assert_eq!(
-        rx.try_recv(),
-        Err(async_channel::TryRecvError::Empty),
-        "an armed capture has not failed; answering `None` here would tell the portal it was \
-         cancelled while a shot is still coming"
-    );
-
-    // Escape has no bind to reach with the picker gone, so `cancel_pending_capture` is its route —
-    // and cancelling *is* the dismissal the caller was spared above.
-    assert!(f.niri_state().cancel_pending_capture());
-    assert!(f.niri().pending_capture.is_none());
-    assert_eq!(
-        rx.try_recv(),
-        Ok(None),
-        "a cancelled countdown must answer the caller it was holding"
     );
 }
 
@@ -796,55 +674,6 @@ fn vulkan_screenshot_ui_a_delayed_capture_shoots_the_live_screen() {
         0,
         "the delayed shot still has the green window in it — it was taken from the picker's frozen \
          screen instead of the live one, which is the entire thing a delay is for"
-    );
-}
-
-/// A lock landing mid-countdown must take the capture with it. The delay was armed against a
-/// screen the user could see; firing into a lock screen would capture what the lock exists to hide.
-#[test]
-fn vulkan_screenshot_ui_a_lock_mid_countdown_cancels_the_capture() {
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
-
-    let Some(mut f) = green_window_fixture() else {
-        return;
-    };
-    let output = f.niri_output(1);
-
-    let (tx, rx) = async_channel::bounded(1);
-    f.niri().interactive_screenshot_reply = Some(tx);
-    f.niri_state().open_screenshot_ui(false, None);
-    settle_screenshot_ui_open(&mut f);
-    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
-    click_control(&mut f, &output, layout.delay);
-    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
-    click_control(&mut f, &output, layout.capture);
-    f.niri_state()
-        .handle_screenshot_ui_pointer_up(PointerUp::Capture);
-    assert!(f.niri().pending_capture.is_some());
-
-    // A tick before the lock keeps counting — otherwise this would pass for the wrong reason.
-    assert!(matches!(
-        f.niri_state().tick_pending_capture(),
-        calloop::timer::TimeoutAction::ToDuration(_)
-    ));
-    assert!(f.niri().pending_capture.is_some());
-
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    assert!(matches!(
-        f.niri_state().tick_pending_capture(),
-        calloop::timer::TimeoutAction::Drop
-    ));
-    assert!(
-        f.niri().pending_capture.is_none(),
-        "the locked screen must not be shot"
-    );
-    assert_eq!(
-        rx.try_recv(),
-        Ok(None),
-        "and its caller must be told, not left waiting"
     );
 }
 

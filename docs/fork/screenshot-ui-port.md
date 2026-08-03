@@ -207,42 +207,45 @@ the Vulkan tests in `src/tests/vulkan_render.rs` are where this is pinned —
 `vulkan_screenshot_ui_draws_the_help_panel` (`:413`) is the test that has to change shape first,
 since the help panel it asserts on is what slice 1 deletes.
 
-The delay slice's cover ended up in `vulkan_render.rs`, not the headless corpus. Not because the
-corpus *cannot* do it — `overview_dash_inert_behind_screenshot_ui` (`src/tests/gnome.rs:11360`)
-already opens the picker there with `headless().add_renderer()` behind a no-device skip guard, and
-these tests would work the same way. It is that doing so buys nothing: the guard means they would
-**skip** on a machine without a Vulkan device rather than run, and a skipped test is silent, whereas
-in `vulkan_render.rs` skipping is the whole file's stated contract.
+The picker's cover is split by what actually needs a device, not by which file was convenient.
 
-What would be worth having is cover that runs with **no device at all**, and the blocker for that is
-not opening the picker (`open_screenshot_ui` already tolerates a missing renderer — the neutrals are
-`unwrap_or_default()`) but **clicking** it: `PanelLayout` is produced by the bake, because the panel
-is content-sized and the captions need a `TextShaper`. No renderer → no layout → `control_at`
-returns `None` → no control can be driven. Giving the layout a shaper-free path (measured captions
-injected, or a metrics trait) is the seam that would move the D-Bus and cancellation assertions into
-the device-free corpus. It has not been built.
+**The corpus drives real controls with no Vulkan device.** Two things used to require one, and
+neither had to. A `ScreenshotNeutral` is plain `MemoryBuffer` pixels, so `open_screenshot_ui` was
+split at exactly the renderer boundary — `open_screenshot_ui_with` takes neutrals that have already
+been captured, and the corpus hand-builds them. And `PanelLayout` is arithmetic over measured
+captions, so the measuring was lifted out of the bake into `CaptionMetrics` and
+`ScreenshotUi::lay_out_panels` installs a layout without one. `open_picker_headless` in
+`src/tests/gnome.rs` does both; everything downstream — the hit test, `activate`, the D-Bus
+contract, the cancellation rules — is the production path. What the corpus does *not* get is pixels:
+with no texture the panel draws nothing, so any claim about how something **looks** belongs in
+`vulkan_render.rs`.
 
-- `vulkan_screenshot_ui_delay_arms_the_capture_without_answering_its_caller` — the cycle through
-  the three stops, and the D-Bus contract on both sides: arming stays silent, cancelling answers.
+A related redundancy went with it: `PanelCache::size` read the panel's physical size back off the
+*texture*, when `generate_panel` sizes that texture as exactly `physical_size(scale, layout.size)`.
+Two sources for one number, one of which does not exist until a renderer has baked. It now comes
+from the layout.
+
+In the corpus (`src/tests/gnome.rs`), device-free, beside `select_area_always_answers_its_caller`:
+
+- `arming_a_delayed_capture_does_not_answer_its_caller` — the cycle through the three stops, and the
+  D-Bus contract on both sides: arming stays silent, cancelling answers.
+- `a_lock_mid_countdown_cancels_the_delayed_capture` — with a tick *before* the lock asserted to
+  keep counting, so it cannot pass for the wrong reason.
+- `cast_mode_refuses_window_capture` — cast takes Window mode away, refuses a click that reaches the
+  insensitive button anyway, and gives it back on the way out.
+
+In `src/tests/vulkan_render.rs`, where skipping without a device is the file's stated contract:
+
 - `vulkan_screenshot_ui_a_delayed_capture_shoots_the_live_screen` — the window is recoloured during
   the countdown and the saved PNG must not contain a pixel of the old colour. This is the whole
   divergence in one assertion.
-- `vulkan_screenshot_ui_a_lock_mid_countdown_cancels_the_capture` — with a tick *before* the lock
-  asserted to keep counting, so it cannot pass for the wrong reason.
 - `vulkan_screenshot_ui_countdown_cannot_reach_a_capture` — the same pixel rendered at `Output` and
   at `ScreenCapture`, against a reference capture taken before any of it.
-
-Cast mode's two:
-
-- `vulkan_screenshot_ui_cast_mode_drops_the_frozen_screen_and_window_mode` — recolours the live
-  window *after* switching to cast and asserts the new colour reaches the frame, which is the only
-  way to tell "the still is gone" from "the still happens to match".
-- `vulkan_screenshot_ui_cast_mode_capture_starts_a_recording` — the capture button starts the
-  recorder, the picker closes instantly, and stopping notifies.
-
-The countdown card is the one thing the headless harness cannot photograph: `grim` goes through
-wlr-screencopy, which is `RenderTarget::ScreenCapture`, and the card refuses that target on purpose.
-Seeing nothing there is the rule working, not a missing draw — judge the card from the Vulkan test.
+- `vulkan_screenshot_ui_cast_mode_drops_the_frozen_screen` — recolours the live window *after*
+  switching to cast, which is the only way to tell "the still is gone" from "the still happens to
+  match".
+- `vulkan_screenshot_ui_cast_mode_capture_starts_a_recording` — here despite having no pixel claim,
+  because starting the recorder spawns a real ffmpeg and the corpus should not need one.
 
 One trap for anything else that wants to read a screenshot back in a test: `save_screenshot`
 answers its D-Bus reply from an **event-loop source**, so `recv_blocking` on that channel deadlocks

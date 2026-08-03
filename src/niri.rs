@@ -3476,6 +3476,36 @@ impl State {
             return;
         }
 
+        self.niri.update_render_elements(None);
+
+        // Capture the Output-target neutrals through the owned renderer first.
+        let vk_neutrals = self
+            .backend
+            .with_vulkan_renderer(|vk| self.niri.capture_screenshot_neutrals(vk))
+            .unwrap_or_default();
+        // Every window on every active workspace, frozen the same way — Window mode picks from
+        // these, not from live windows.
+        let window_shots = self
+            .backend
+            .with_vulkan_renderer(|vk| self.niri.capture_screenshot_window_neutrals(vk))
+            .unwrap_or_default();
+
+        self.open_screenshot_ui_with(vk_neutrals, window_shots, show_pointer, path);
+    }
+
+    /// Open the picker around neutrals that have **already been captured**.
+    ///
+    /// Split from [`Self::open_screenshot_ui`] at exactly the renderer boundary: everything above
+    /// needs a Vulkan device, everything from here down is CPU. A `ScreenshotNeutral` is plain
+    /// `MemoryBuffer` pixels, so the headless corpus can hand-build a frozen screen and drive the
+    /// real picker with no device at all (see `screenshot_ui_fixture` in `src/tests/gnome.rs`).
+    pub fn open_screenshot_ui_with(
+        &mut self,
+        vk_neutrals: std::collections::HashMap<Output, [ScreenshotNeutral; RenderTarget::COUNT]>,
+        window_shots: std::collections::HashMap<Output, Vec<crate::ui::screenshot_ui::WindowShot>>,
+        show_pointer: bool,
+        path: Option<String>,
+    ) {
         let default_output = self
             .niri
             .output_under_cursor()
@@ -3484,22 +3514,9 @@ impl State {
             return;
         };
 
-        self.niri.update_render_elements(None);
-
-        // Capture the Output-target neutrals through the owned renderer first.
-        let vk_neutrals = self
-            .backend
-            .with_vulkan_renderer(|vk| self.niri.capture_screenshot_neutrals(vk))
-            .unwrap_or_default();
         // The captures are already taken, so opening the UI must not depend on a renderer being
         // available here, or it would silently never open.
         let screenshots = self.niri.capture_screenshots(vk_neutrals).collect();
-        // Every window on every active workspace, frozen the same way — Window mode picks from
-        // these, not from live windows.
-        let window_shots = self
-            .backend
-            .with_vulkan_renderer(|vk| self.niri.capture_screenshot_window_neutrals(vk))
-            .unwrap_or_default();
 
         // Now that we captured the screenshots, clear grabs like drag-and-drop, etc.
         self.niri.seat.get_pointer().unwrap().unset_grab(

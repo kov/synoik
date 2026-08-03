@@ -215,6 +215,32 @@ pub struct OutputData {
     tooltip_cache: RefCell<widget::BakeCache>,
 }
 
+/// The caption metrics a content-sized panel must have before it can be laid out: each type
+/// button's caption width and the shared line height, in logical px.
+///
+/// Split out of the bake because measuring means shaping and shaping means a renderer — which was
+/// the one thing standing between the headless corpus and driving a real panel control. The corpus
+/// supplies these directly through [`ScreenshotUi::lay_out_panels`]; everything downstream of the
+/// layout is the production path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptionMetrics {
+    pub label_w: [f64; 3],
+    pub label_h: f64,
+}
+
+#[cfg(test)]
+impl CaptionMetrics {
+    /// Plausible metrics at scale 1, for tests that have no shaper.
+    ///
+    /// The three widths differ, which is what makes the homogeneous rule observable, and the
+    /// **widest is Window** — the button most likely to be insensitive — so a layout that sized the
+    /// row from only the sensitive captions fails rather than passing by luck.
+    pub const TEST: Self = Self {
+        label_w: [58., 42., 66.],
+        label_h: 13.,
+    };
+}
+
 /// Shot or cast: the two halves of the panel's segmented control (`screenshot.js:1360-1391`).
 ///
 /// This is *how* the capture is taken, as against [`CaptureType`]'s *what* — the same area can be
@@ -321,10 +347,17 @@ fn type_fg(enabled: bool) -> Rgba {
 }
 
 impl PanelCache {
-    /// The panel's physical size, or `None` before the first draw.
+    /// The panel's physical size, or `None` before it has been laid out.
+    ///
+    /// Derived from the **layout**, not from the texture: `generate_panel` sizes the texture as
+    /// exactly `physical_size(scale, layout.size)`, so reading it back off the texture was a second
+    /// source for a number the layout already holds — and one that does not exist until a renderer
+    /// has baked. Going through the layout is what lets a panel be placed and hit-tested without
+    /// one (see [`ScreenshotUi::lay_out_panels`]).
     fn size(&self) -> Option<Size<i32, Buffer>> {
-        let t = self.texture.as_ref()?;
-        Some(Size::from((t.width() as i32, t.height() as i32)))
+        let logical = self.layout?.size;
+        let size = widget::physical_size(self.scale, logical);
+        Some(Size::from((size.w, size.h)))
     }
 }
 
@@ -706,6 +739,30 @@ impl ScreenshotUi {
         let state = tooltip.as_ref()?;
         state.fade.as_ref()?;
         state.control.tooltip()
+    }
+
+    /// Lay every open output's panel out from supplied caption metrics, with no renderer.
+    ///
+    /// The panel is content-sized, so its `PanelLayout` normally falls out of the bake — and the
+    /// bake needs a `TextShaper`, hence a Vulkan device. That is the only reason driving a panel
+    /// control ever required one: `control_at` reads the cached layout, and without it every
+    /// button is unreachable. This installs the layout and nothing else, so the hit test, the
+    /// activation and every state transition downstream stay the production path.
+    ///
+    /// Nothing is drawn: with no texture, `panel_element` yields nothing and the panel simply does
+    /// not appear. A later render with a real renderer re-bakes over this.
+    ///
+    /// For the headless corpus (`src/tests/gnome.rs`), which has no device.
+    #[cfg(test)]
+    pub fn lay_out_panels(&mut self, metrics: CaptionMetrics) {
+        let Self::Open { output_data, .. } = self else {
+            return;
+        };
+        for data in output_data.values() {
+            let mut cache = data.panel.borrow_mut();
+            cache.scale = data.scale;
+            cache.layout = Some(PanelLayout::new(metrics));
+        }
     }
 
     /// Whether any output has a window to pick — what makes the Window button sensitive.
@@ -2591,13 +2648,14 @@ impl PanelLayout {
     /// `$scaled_padding * 2` (`_buttons.scss:18-38`).
     const SHOW_POINTER_PAD: f64 = 12.;
 
-    /// Lay the panel out around captions of `label_w` (one per type button) and `label_h`.
+    /// Lay the panel out around the measured captions.
     ///
     /// The bottom row is a **BinLayout** in GNOME (`screenshot.js:1350`): the shot/cast pill, the
     /// capture button and the show-pointer button all occupy the same band, aligned start, centre
     /// and end. Laying them out in sequence instead would push the capture button off-centre,
     /// which is the mistake this arithmetic exists to prevent.
-    pub fn new(label_w: [f64; 3], label_h: f64) -> Self {
+    pub fn new(metrics: CaptionMetrics) -> Self {
+        let CaptionMetrics { label_w, label_h } = metrics;
         let type_sizes = label_w.map(|w| widget::IconLabelButton::size(w, label_h));
 
         // `homogeneous: true` (`screenshot.js:1300`) — every type button is as wide as the widest.
@@ -2911,7 +2969,10 @@ fn generate_panel(
         .map(|r| r.line_box_height())
         .max()
         .unwrap_or(0);
-    let label_h = f64::from(label_h) / scale;
+    let metrics = CaptionMetrics {
+        label_w,
+        label_h: f64::from(label_h) / scale,
+    };
 
     // The armed delay renders as its own number inside the button; off renders as an alarm glyph.
     let delay_label = (state.delay != 0)
@@ -2924,7 +2985,7 @@ fn generate_panel(
         })
         .transpose()?;
 
-    let layout = PanelLayout::new(label_w, label_h);
+    let layout = PanelLayout::new(metrics);
     let size = widget::physical_size(scale, layout.size);
 
     let texture = widget::bake_uncached_sized(renderer, size, |frame| {
@@ -2948,7 +3009,7 @@ fn generate_panel(
             p.icon_label_button(&button, accent)?;
             p.text(
                 &captions[i],
-                button.label_centre(label_h),
+                button.label_centre(metrics.label_h),
                 Align::CENTER,
                 type_fg(state.enables(*ty)),
             )?;
@@ -3150,14 +3211,11 @@ fn generate_countdown(
 mod tests {
     use super::*;
 
-    // Plausible caption metrics at scale 1 — the three labels differ in width, which is what makes
-    // the homogeneous rule observable. The *widest* is deliberately the hidden Window button, so a
-    // layout that sized the row from only the visible captions fails rather than passes by luck.
-    const LABEL_W: [f64; 3] = [58., 42., 66.];
-    const LABEL_H: f64 = 13.;
+    const LABEL_W: [f64; 3] = CaptionMetrics::TEST.label_w;
+    const LABEL_H: f64 = CaptionMetrics::TEST.label_h;
 
     fn layout() -> PanelLayout {
-        PanelLayout::new(LABEL_W, LABEL_H)
+        PanelLayout::new(CaptionMetrics::TEST)
     }
 
     // GNOME's bottom row is a BinLayout (`screenshot.js:1350`), so the capture button is centred on

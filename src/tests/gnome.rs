@@ -16246,6 +16246,288 @@ fn the_portal_window_list_carries_what_its_chooser_reads() {
 /// compositor looking perfectly healthy. Two exits are not the happy one: the picker refusing to
 /// open (locked screen, or already up), and the user dismissing it.
 ///
+/// Open the screenshot picker with **no Vulkan device**, laid out and clickable.
+///
+/// The two things that normally need a renderer are a frozen screen and a panel layout, and neither
+/// has to: a `ScreenshotNeutral` is plain `MemoryBuffer` pixels, and `PanelLayout` is arithmetic
+/// over measured captions. So this hand-builds a neutral per output, hands it to the real
+/// `State::open_screenshot_ui_with`, and installs the layout the bake would otherwise produce.
+/// Everything the tests then drive — the hit test, `activate`, the D-Bus contract, the cancellation
+/// rules — is the production path.
+///
+/// What it does *not* get is pixels: with no texture the panel draws nothing. Any claim about how
+/// something **looks** belongs in `src/tests/vulkan_render.rs`.
+fn open_picker_headless(f: &mut Fixture) {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::utils::{Size, Transform};
+
+    use crate::render_helpers::memory::MemoryBuffer;
+    use crate::render_helpers::RenderTarget;
+    use crate::ui::screenshot_ui::{CaptionMetrics, ScreenshotNeutral};
+
+    let outputs: Vec<_> = f.niri().global_space.outputs().cloned().collect();
+    let neutrals = outputs
+        .into_iter()
+        .map(|output| {
+            let mode = output.current_mode().unwrap();
+            let size = output.current_transform().transform_size(mode.size);
+            let scale = output.current_scale().fractional_scale();
+            let pixels = vec![0u8; (size.w * size.h * 4) as usize];
+            let neutrals = std::array::from_fn(|_| ScreenshotNeutral {
+                screen: Some(MemoryBuffer::new(
+                    pixels.clone(),
+                    Fourcc::Abgr8888,
+                    Size::from((size.w, size.h)),
+                    scale,
+                    Transform::Normal,
+                )),
+                pointer: None,
+            });
+            let _: [ScreenshotNeutral; RenderTarget::COUNT] = neutrals;
+            (output, neutrals)
+        })
+        .collect();
+
+    // Window mode picks from frozen per-window copies, which are `MemoryBuffer` pixels too, so the
+    // corpus can supply those as well rather than leave the Window button permanently insensitive.
+    let outputs: Vec<_> = f.niri().global_space.outputs().cloned().collect();
+    let window_shots = outputs
+        .into_iter()
+        .map(|output| {
+            let scale = output.current_scale().fractional_scale();
+            let shots = f
+                .niri()
+                .layout
+                .active_workspace_windows_for_output(&output)
+                .into_iter()
+                .map(|(mapped, rect)| {
+                    let size: Size<i32, smithay::utils::Physical> =
+                        rect.size.to_physical_precise_round(scale);
+                    let (w, h) = (size.w.max(1), size.h.max(1));
+                    let neutral = MemoryBuffer::new(
+                        vec![0u8; (w * h * 4) as usize],
+                        Fourcc::Abgr8888,
+                        Size::from((w, h)),
+                        scale,
+                        Transform::Normal,
+                    );
+                    crate::ui::screenshot_ui::WindowShot::new(mapped.id().get(), rect, neutral)
+                })
+                .collect::<Vec<_>>();
+            (output, shots)
+        })
+        .collect();
+
+    f.niri_state()
+        .open_screenshot_ui_with(neutrals, window_shots, false, None);
+    assert!(
+        f.niri().screenshot_ui.is_open(),
+        "the picker must open from hand-built neutrals; a renderer is not what opens it"
+    );
+    f.niri().screenshot_ui.lay_out_panels(CaptionMetrics::TEST);
+}
+
+/// Click a panel control by the rect the layout published for it, on output 1.
+fn click_picker_control(
+    f: &mut Fixture,
+    rect: smithay::utils::Rectangle<f64, smithay::utils::Logical>,
+) -> crate::ui::screenshot_ui::PointerUp {
+    use smithay::utils::{Logical, Point};
+
+    let output = f.niri_output(1);
+    let panel = f
+        .niri()
+        .screenshot_ui
+        .panel_rect(&output)
+        .expect("an open, laid-out picker has a panel rect");
+    let scale = output.current_scale().fractional_scale();
+    let point =
+        Point::<f64, Logical>::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.))
+            .to_physical(scale)
+            .to_i32_round::<i32>()
+            + panel.loc;
+
+    let ui = &mut f.niri_state().niri.screenshot_ui;
+    ui.pointer_motion(point, None);
+    assert!(ui.pointer_down(output, point, None, false));
+    ui.pointer_up(None)
+        .expect("the release must land on a control")
+}
+
+/// **Our divergence, the delay.** Arming hands the whole capture to a timer and closes the picker,
+/// so the two things that must not happen at that moment are answering the D-Bus caller — it has
+/// been given nothing yet — and losing the capture with the picker that armed it.
+#[cfg(feature = "dbus")]
+#[test]
+fn arming_a_delayed_capture_does_not_answer_its_caller() {
+    use crate::ui::screenshot_ui::PointerUp;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (tx, rx) = async_channel::bounded(1);
+    f.niri().interactive_screenshot_reply = Some(tx);
+    open_picker_headless(&mut f);
+
+    let output = f.niri_output(1);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    assert_eq!(f.niri().screenshot_ui.delay(), None, "the delay starts off");
+
+    // Off -> 3s -> 10s -> off. The layout does not move as it cycles (the number replaces a glyph
+    // inside the same circle), so one read of it is enough.
+    click_picker_control(&mut f, layout.delay);
+    assert_eq!(
+        f.niri().screenshot_ui.delay(),
+        Some(Duration::from_secs(3)),
+        "one click must arm the first stop"
+    );
+    click_picker_control(&mut f, layout.delay);
+    assert_eq!(
+        f.niri().screenshot_ui.delay(),
+        Some(Duration::from_secs(10))
+    );
+    click_picker_control(&mut f, layout.delay);
+    assert_eq!(
+        f.niri().screenshot_ui.delay(),
+        None,
+        "the third click must wrap back to off"
+    );
+
+    // Back to 3s, then fire the shutter.
+    click_picker_control(&mut f, layout.delay);
+    assert_eq!(
+        click_picker_control(&mut f, layout.capture),
+        PointerUp::Capture
+    );
+    f.niri_state()
+        .handle_screenshot_ui_pointer_up(PointerUp::Capture);
+
+    assert!(
+        !f.niri().screenshot_ui.is_open(),
+        "arming must dismiss the picker — the delay exists to get the shell out of the shot"
+    );
+    assert!(
+        f.niri().pending_capture.is_some(),
+        "the capture must survive the picker that armed it"
+    );
+    assert_eq!(
+        rx.try_recv(),
+        Err(async_channel::TryRecvError::Empty),
+        "an armed capture has not failed; answering `None` here would tell the portal it was \
+         cancelled while a shot is still coming"
+    );
+
+    // Escape has no bind to reach with the picker gone, so `cancel_pending_capture` is its route —
+    // and cancelling *is* the dismissal the caller was spared above.
+    assert!(f.niri_state().cancel_pending_capture());
+    assert!(f.niri().pending_capture.is_none());
+    assert_eq!(
+        rx.try_recv(),
+        Ok(None),
+        "a cancelled countdown must answer the caller it was holding"
+    );
+}
+
+/// A lock landing mid-countdown must take the capture with it: the delay was armed against a screen
+/// the user could see, and firing into a lock screen would capture what the lock exists to hide.
+#[cfg(feature = "dbus")]
+#[test]
+fn a_lock_mid_countdown_cancels_the_delayed_capture() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::ui::screenshot_ui::PointerUp;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (tx, rx) = async_channel::bounded(1);
+    f.niri().interactive_screenshot_reply = Some(tx);
+    open_picker_headless(&mut f);
+
+    let output = f.niri_output(1);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_picker_control(&mut f, layout.delay);
+    click_picker_control(&mut f, layout.capture);
+    f.niri_state()
+        .handle_screenshot_ui_pointer_up(PointerUp::Capture);
+    assert!(f.niri().pending_capture.is_some());
+
+    // A tick before the lock keeps counting — otherwise this would pass for the wrong reason.
+    assert!(matches!(
+        f.niri_state().tick_pending_capture(),
+        calloop::timer::TimeoutAction::ToDuration(_)
+    ));
+    assert!(f.niri().pending_capture.is_some());
+
+    f.niri_state()
+        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
+    assert!(matches!(
+        f.niri_state().tick_pending_capture(),
+        calloop::timer::TimeoutAction::Drop
+    ));
+    assert!(
+        f.niri().pending_capture.is_none(),
+        "the locked screen must not be shot"
+    );
+    assert_eq!(
+        rx.try_recv(),
+        Ok(None),
+        "and its caller must be told, not left waiting"
+    );
+}
+
+/// Cast mode takes Window mode with it, and gives it back. Recording a single window is not
+/// something the recorder does, so GNOME greys the button rather than leaving a mode whose capture
+/// button would silently do nothing (`_onCastButtonToggled`, `js/ui/screenshot.js:1880-1906`).
+#[test]
+fn cast_mode_refuses_window_capture() {
+    use crate::ui::screenshot_ui::{CaptureMode, CaptureType};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    map_focused_window(&mut f, id);
+
+    open_picker_headless(&mut f);
+    assert_eq!(f.niri().screenshot_ui.mode(), CaptureMode::Shot);
+    assert!(
+        f.niri().screenshot_ui.window_enabled(),
+        "there is a window, so Window mode is available in Shot mode"
+    );
+
+    let output = f.niri_output(1);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_picker_control(&mut f, layout.type_buttons[2]);
+    assert_eq!(f.niri().screenshot_ui.capture_type(), CaptureType::Window);
+
+    let cast = crate::ui::widget::Segmented::segment_rect(layout.shot_cast, 1);
+    click_picker_control(&mut f, cast);
+    assert_eq!(f.niri().screenshot_ui.mode(), CaptureMode::Cast);
+    assert_eq!(
+        f.niri().screenshot_ui.capture_type(),
+        CaptureType::Selection,
+        "cast mode must move off Window rather than leave a mode it will not act on"
+    );
+    assert!(
+        !f.niri().screenshot_ui.window_enabled(),
+        "and it must stay unavailable while cast is checked, window or no window"
+    );
+
+    // A click that reaches the insensitive button anyway must still be refused.
+    click_picker_control(&mut f, layout.type_buttons[2]);
+    assert_eq!(
+        f.niri().screenshot_ui.capture_type(),
+        CaptureType::Selection
+    );
+
+    let shot = crate::ui::widget::Segmented::segment_rect(layout.shot_cast, 0);
+    click_picker_control(&mut f, shot);
+    assert_eq!(f.niri().screenshot_ui.mode(), CaptureMode::Shot);
+    assert!(
+        f.niri().screenshot_ui.window_enabled(),
+        "and switching back must give it up again"
+    );
+}
+
 /// The headless corpus has no renderer, so the picker cannot freeze the screen and open here —
 /// which makes this fixture exactly the refusal case, driven through the real
 /// `State::on_screen_shot_msg`. The dismissal is driven through `Niri::close_screenshot_ui`, the
