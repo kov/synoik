@@ -1319,6 +1319,27 @@ impl Cast {
             }
 
             let fd = (*(*spa_buffer).datas).fd;
+
+            // A memory sink has nothing in `dmabufs`, and indexing it would take the compositor
+            // down the first time a cast target disappeared. Zero the mapping instead — that *is*
+            // the clear for this sink, and it needs no GPU work or fence.
+            if let Some(mapping) = self.inner.borrow().memory_buffers.get(&fd) {
+                ptr::write_bytes(mapping.ptr.as_ptr(), 0, mapping.len);
+
+                let chunk = (*(*spa_buffer).datas).chunk;
+                (*chunk).offset = 0;
+                (*chunk).stride = mapping.stride as i32;
+                (*chunk).size = mapping.len as u32;
+
+                mark_buffer_as_good(pw_buffer, &mut self.sequence_counter);
+                trace!(
+                    "queueing cleared memory buffer with seq={}",
+                    self.sequence_counter
+                );
+                pw_stream_queue_buffer(self.stream.as_raw_ptr(), pw_buffer.as_ptr());
+                return true;
+            }
+
             let dmabuf = self.inner.borrow().dmabufs[&fd].clone();
 
             match clear_dmabuf(renderer, dmabuf) {
