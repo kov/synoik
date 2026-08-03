@@ -4,8 +4,32 @@ Status: **2026-08-02.** Slices 1-3 and 6 landed; slice 4 is *partly* landed (`St
 in, `RecordVirtual` not); slice 5 not started. Screenshots are seat-validated — wayshot captures
 through the portal.
 
-**Open: OBS shows stale screencast content** (Firefox's `getUserMedia` is fine on the same
-build). Not diagnosed. One theory has been *falsified*: it is not partial-damage under-painting.
+**Open: we advertise dmabuf-only formats, so any consumer without dmabuf import cannot start.**
+Diagnosed 2026-08-03 from the gsrs journal; fix not yet written.
+
+The reported symptom was "OBS shows stale content", but OBS's stream *never starts*: it goes
+`connecting -> paused -> error` in the same second, every session, with
+`res=-32 (Broken pipe): no more input formats`. The stuck preview is OBS's own last texture, not
+a frame we sent. `gnome-software` fails identically, so this is not an OBS quirk — Firefox is the
+outlier that happens to do dmabuf well.
+
+Cause, read on both sides. Mutter offers each format **twice** — `build_format_params`
+(`meta-screen-cast-stream-src.c:1576-1592`) loops all formats with `with_modifiers=TRUE`, then
+again with `FALSE`, and the second pass calls `push_format_object(..., NULL, 0, ...)`
+(`:1543-1553`), emitting a format param with **no modifier property at all**. That is the
+SHM/MemPtr fallback. `push_format_object` only attaches the modifier when `n_modifiers > 0`
+(`:297`). We offer one param per format and *always* attach a `MANDATORY` modifier
+(`pw_utils.rs:1300-1310`), and advertise `DataType::DmaBuf` alone (`:656-657`) with an `assert!`
+rejecting anything else (`:750`). A consumer that cannot import our modifiers is left with
+nothing to accept.
+
+Fixing it properly means implementing the memfd/SHM capture path, not just widening the offer:
+today `dequeue_buffer_and_render` reads `(*(*spa_buffer).datas).fd` and looks it up in
+`inner.dmabufs`, so an accepted SHM format would have no renderer behind it. Mutter also offers
+`VideoSize` as a `CHOICE_RANGE` where we send a fixed rectangle — worth matching at the same time.
+
+An earlier theory was *falsified* and should not be re-derived: it is not partial-damage
+under-painting.
 `render_to_dmabuf` (`src/render_helpers/mod.rs`) hardcodes age `0` into
 `render_output_with_states`, and Smithay treats age 0 as "damage everything"
 (`damage/mod.rs:747`), so **every cast frame that renders at all is already a full repaint**. A
