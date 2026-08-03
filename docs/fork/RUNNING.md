@@ -329,6 +329,11 @@ changes are picked up **live** by a change subscription
 calloop). Note dconf is shared with your real GNOME session, so a change
 affects both.
 
+Keys resolve in four tiers: the hardcoded VT/power keys, then everything GNOME itself names,
+then external accelerator grabs (gnome-settings-daemon's lock, logout and media keys), and
+last the scrolling-layout keys only we have. That last tier yields to gsd on purpose — see
+`docs/fork/keybindings-port.md`.
+
 Keybindings live **only** in GSettings — the config file's `binds{}` block is
 gone. GNOME's own schemas own everything GNOME names; the scrolling-layout
 actions it has no name for are in ours, `org.gnome.shell-rs.keybindings`, which

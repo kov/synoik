@@ -8604,24 +8604,63 @@ fn find_bind(
         });
     }
 
-    // GNOME keybindings resolve before niri's configured binds: in a GNOME
-    // session the GSettings store is the user's keybinding config, and mutter
-    // processes it before anything else sees the key. The niri config stays
-    // underneath as a fallback.
-    if let Some(bind) = find_gnome_bind(gnome_keybindings, switcher, key_code, raw, mods) {
+    // The keys GNOME itself names come first: in a GNOME session the GSettings store *is*
+    // the keybinding config, and mutter resolves it before anything else sees the key.
+    if let Some(bind) = find_gnome_bind(
+        gnome_keybindings,
+        KeybindingSource::Gnome,
+        switcher,
+        key_code,
+        raw,
+        mods,
+    ) {
         return Some(bind);
     }
 
-    // External accelerator grabs live in the same table in mutter, after the
-    // builtins (a conflicting grab is refused at grab time). They also don't
-    // fire while the switcher's grab is up.
+    // Then external accelerator grabs — gnome-settings-daemon's media, lock and logout
+    // keys, the GlobalShortcuts portal, Settings' custom shortcuts. In mutter these share
+    // one table with the builtins and a conflicting grab is refused at grab time
+    // (`meta_display_grab_accelerator`, keybindings.c:1297). They don't fire while the
+    // switcher holds its grab.
     if !switcher.is_open() {
         if let Some(bind) = find_accel_grab_bind(accel_grabs, key_code, raw, mods) {
             return Some(bind);
         }
     }
 
-    None
+    // Last: the scrolling-layout actions GNOME has no key for, from our own schema. These
+    // are inherited-from-niri *extra* capability, so they yield to everything GNOME
+    // defines — a session component must never lose a key to one of ours. Mutter has no
+    // equivalent tier, because it has no keys of this kind.
+    find_gnome_bind(
+        gnome_keybindings,
+        KeybindingSource::Niri,
+        switcher,
+        key_code,
+        raw,
+        mods,
+    )
+}
+
+/// Which tier of the keybinding model a lookup is asking about.
+///
+/// One `Vec<GnomeKeybinding>` holds both, but they resolve at different priorities: see
+/// [`find_bind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeybindingSource {
+    /// Keys GNOME itself names, from its own schemas.
+    Gnome,
+    /// Keys only we have, from `org.gnome.shell-rs.keybindings`.
+    Niri,
+}
+
+impl KeybindingSource {
+    fn matches(self, action: &KeybindingAction) -> bool {
+        match self {
+            Self::Gnome => matches!(action, KeybindingAction::Gnome(_)),
+            Self::Niri => matches!(action, KeybindingAction::Niri(_)),
+        }
+    }
 }
 
 /// Match an `org.gnome.Shell` accelerator grab (gsd-media-keys et al.),
@@ -8659,15 +8698,18 @@ fn find_accel_grab_bind(
 /// the equivalent niri bind.
 fn find_gnome_bind(
     keybindings: &[GnomeKeybinding],
+    source: KeybindingSource,
     switcher: SwitcherGrab,
     key_code: Keycode,
     raw: Option<Keysym>,
     mods: ModifiersState,
 ) -> Option<ResolvedBind> {
     let keybinding = keybindings.iter().find(|kb| {
-        kb.accels
-            .iter()
-            .any(|accel| accel_matches(accel, key_code, raw, mods))
+        source.matches(&kb.action)
+            && kb
+                .accels
+                .iter()
+                .any(|accel| accel_matches(accel, key_code, raw, mods))
     })?;
 
     // The switcher is modal (GNOME holds a grab while it's up; niri disables the general binds):

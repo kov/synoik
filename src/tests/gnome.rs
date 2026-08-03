@@ -921,6 +921,67 @@ fn our_own_keybindings_resolve_too() {
     let _ = right_surface;
 }
 
+/// A gnome-settings-daemon grab outranks a key that only *we* have, at the keypress and
+/// not merely at grab time.
+///
+/// gsd owns lock, logout and the media keys, and it cannot connect to D-Bus until after our
+/// keybindings exist — so "first grabber wins", ported straight from mutter, would hand it
+/// every contest against us. Keys GNOME itself names still outrank a grab, as in mutter;
+/// only the scrolling-layout extras yield. `<Super>l` was `focus-column-right` until it
+/// turned out to be gsd's `screensaver`, which is the shape of bug this pins.
+#[test]
+fn a_grab_outranks_our_own_keybinding() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let left = f.add_client();
+    let _left_surface = map_focused_window(&mut f, left);
+    let right = f.add_client();
+    let _right_surface = map_focused_window(&mut f, right);
+
+    // Point one of our own keys at a free chord, then let a "gsd" grab take the same one.
+    let binding = f
+        .niri()
+        .gnome_settings
+        .keybindings
+        .iter_mut()
+        .find(|kb| kb.action == KeybindingAction::Niri(Action::FocusWindowUp))
+        .expect("our schema's keys are in the model");
+    binding.accels = vec![Accel {
+        trigger: AccelTrigger::Keysym(Keysym::z),
+        mods: AccelMods::SUPER,
+    }];
+
+    let action = f
+        .niri_state()
+        .grab_accelerator("<Super>z", 1, 0, ":1.10".to_owned());
+    assert_ne!(action, 0, "ours must not block the grab");
+
+    let newest = f.niri().layout.focus().map(|m| m.id());
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_Z);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    assert_eq!(
+        f.niri().layout.focus().map(|m| m.id()),
+        newest,
+        "the grab wins the keypress, so our focus-window-up must not have run"
+    );
+
+    // And with the grab gone, our key works again — the chord was yielded, not lost.
+    assert!(f.niri_state().ungrab_accelerator(action, ":1.10"));
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_Z);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert_ne!(
+        f.niri().layout.focus().map(|m| m.id()),
+        newest,
+        "after the ungrab our key resolves again"
+    );
+}
+
 /// `<Super>N` is `switch-to-application-N`: it activates the Nth *dash favourite*
 /// — not workspace N, which GNOME leaves unbound. A stopped app launches, and the
 /// overview closes on the way, since `_switchToApplication` calls
@@ -1621,6 +1682,16 @@ fn accelerator_grabs_intercept_conflict_and_ungrab() {
             .grab_accelerator("<Alt>F4", 1, 0, ":1.11".to_owned()),
         0,
         "a combo held by a GNOME keybinding must be refused"
+    );
+    // But a key only *we* have does not refuse a grab. The grabber is a session component
+    // — gnome-settings-daemon owns lock, logout and the media keys — and our keybindings
+    // always exist before anything can connect to D-Bus, so first-come-first-served would
+    // hand every contest to us. Inherited-from-niri capability yields instead.
+    assert_ne!(
+        f.niri_state()
+            .grab_accelerator("<Super><Alt>l", 1, 0, ":1.11".to_owned()),
+        0,
+        "a combo held only by our own schema must not block a grab"
     );
     assert_eq!(
         f.niri_state()

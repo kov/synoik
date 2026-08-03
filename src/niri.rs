@@ -6253,16 +6253,55 @@ impl State {
             return 0;
         };
 
-        let keybinding_accels = self
+        // Mutter keeps builtins and external grabs in one table and refuses a grab whose
+        // combo already resolves (`meta_display_grab_accelerator`, keybindings.c:1297).
+        // That is first-come-first-served, and our keybindings always exist before anything
+        // can connect to D-Bus — so a naive port would let *any* key of ours outrank a
+        // session component. Keys GNOME itself names may do that, as in mutter. Keys only
+        // we have may not: they are inherited-from-niri extra capability, and
+        // gnome-settings-daemon owns lock, logout and the media keys. So the grab is
+        // refused only by GNOME's own keys and by earlier grabs; ours yield, here and in
+        // `find_bind`.
+        let conflict = self
             .niri
             .gnome_settings
             .keybindings
             .iter()
-            .flat_map(|kb| &kb.accels);
-        let grab_accels = self.niri.accel_grabs.iter().map(|g| &g.accel);
-        if keybinding_accels.chain(grab_accels).any(|e| *e == accel) {
-            debug!("refusing conflicting accelerator grab {accelerator:?} for {sender}");
+            .find(|kb| {
+                matches!(kb.action, crate::gnome::KeybindingAction::Gnome(_))
+                    && kb.accels.contains(&accel)
+            })
+            .map(|kb| format!("GNOME's own {:?}", kb.action))
+            .or_else(|| {
+                self.niri
+                    .accel_grabs
+                    .iter()
+                    .find(|g| g.accel == accel)
+                    .map(|g| format!("a grab held by {}", g.owner))
+            });
+        if let Some(conflict) = conflict {
+            warn!(
+                "refusing {sender}'s grab of {accelerator:?}: already taken by {conflict}. \
+                 That key will not reach {sender}."
+            );
             return 0;
+        }
+
+        // Ours lose the chord rather than the grabber. Still worth saying: the settings key
+        // is now dead, which is what `niri_accels_do_not_collide_with_anything_gnome_ships`
+        // exists to keep from shipping.
+        if let Some(ours) = self
+            .niri
+            .gnome_settings
+            .keybindings
+            .iter()
+            .find(|kb| kb.accels.contains(&accel))
+        {
+            warn!(
+                "{sender} grabbed {accelerator:?}, which our own {:?} also wants; \
+                 ours yields and that key of ours now does nothing",
+                ours.action
+            );
         }
 
         let action = self.niri.next_accel_grab_action;

@@ -22,8 +22,22 @@ where niri and GNOME merely do the same thing differently, GNOME wins.
 2. `find_gnome_bind` — the GSettings keybindings.
 3. `find_accel_grab_bind` — external `org.gnome.Shell` `GrabAccelerator` grabs
    (gnome-settings-daemon's media keys, the GlobalShortcuts portal, Settings' custom shortcuts).
+4. The keys only *we* have, from `org.gnome.shell-rs.keybindings`.
 
-There is no fourth step: the KDL `binds{}` block is gone. What a match produces is an
+**Steps 2 and 4 are one `Vec<GnomeKeybinding>` split by tier** (`KeybindingSource`), and the
+split is deliberate — a **divergence from mutter**, which has no keys of this kind. Mutter
+keeps builtins and external grabs in one table and refuses a conflicting grab at grab time
+(`meta_display_grab_accelerator`, `keybindings.c:1297`), i.e. first-come-first-served. Ported
+naively that hands *every* contest to us: our keybindings exist before anything can connect to
+D-Bus. So keys GNOME itself names still outrank a grab, as in mutter, but keys inherited from
+niri yield — gnome-settings-daemon owns lock, logout and the media keys, and a session
+component must never lose one to an extra of ours. `grab_accelerator` refuses on the same
+rule, and warns when a grab takes a chord one of ours wanted.
+
+`a_grab_outranks_our_own_keybinding` pins the dispatch half; it was checked by reverting the
+order and watching it fail.
+
+There is no fifth step: the KDL `binds{}` block is gone. What a match produces is an
 `input::ResolvedBind` — action plus the policy for running it — which the hardcoded binds,
 the accelerator grabs and the screenshot UI's own keys all synthesize too.
 
