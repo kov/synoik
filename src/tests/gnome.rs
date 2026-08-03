@@ -536,10 +536,12 @@ fn alt_f4_requests_close_on_the_focused_window() {
     );
 }
 
-/// The numbered workspace switches (`switch-to-workspace-N`, default
-/// `<Super>N` in the GNOME session) focus that workspace.
+/// The numbered workspace switches (`switch-to-workspace-N`) focus that
+/// workspace. Only workspace 1 has an accelerator out of the box, `<Super>Home`
+/// — `<Super>N` belongs to `switch-to-application-N`, so 2..12 start unbound
+/// and only work once the user binds them.
 #[test]
-fn super_number_switches_workspaces() {
+fn numbered_workspace_switches_follow_the_settings() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
@@ -567,8 +569,35 @@ fn super_number_switches_workspaces() {
             .active_monitor_ref()
             .unwrap()
             .active_workspace_idx(),
+        0,
+        "<Super>2 is unbound by default and must not switch workspaces"
+    );
+
+    let switch_2 = f
+        .niri()
+        .gnome_settings
+        .keybindings
+        .iter_mut()
+        .find(|kb| kb.action == GnomeKeyAction::SwitchToWorkspace(2))
+        .unwrap();
+    switch_2.accels = vec![Accel {
+        trigger: AccelTrigger::Keysym(Keysym::_2),
+        mods: AccelMods::SUPER,
+    }];
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_2);
+    f.key_release(KEY_2);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert_eq!(
+        f.niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx(),
         1,
-        "<Super>2 must focus the second workspace"
+        "the bound <Super>2 must focus the second workspace"
     );
     assert!(
         !f.niri().layout.is_overview_open(),
@@ -586,8 +615,23 @@ fn super_number_switches_workspaces() {
             .active_monitor_ref()
             .unwrap()
             .active_workspace_idx(),
+        1,
+        "<Super>1 belongs to switch-to-application-1, not workspace 1"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_HOME);
+    f.key_release(KEY_HOME);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert_eq!(
+        f.niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx(),
         0,
-        "<Super>1 must focus the first workspace again"
+        "<Super>Home must focus the first workspace again"
     );
 }
 

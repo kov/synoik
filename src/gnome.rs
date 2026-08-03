@@ -998,10 +998,12 @@ pub enum EdgeTileTarget {
 pub const SHAKE_THRESHOLD: f64 = 48.;
 
 /// The `org.gnome.desktop.wm.keybindings` keys we honor, with GNOME's default
-/// accelerators for each. The defaults are the GNOME session's effective ones
-/// (gnome-shell overrides some upstream schema defaults, e.g. `<Super>N` for
-/// workspace switching); they only matter where the schema isn't installed,
-/// since a live read replaces them wholesale.
+/// accelerators for each.
+///
+/// The defaults must be the schema's own, verbatim — they are what we run on
+/// where the schema isn't installed, and a live read replaces them wholesale,
+/// so any invention here is a divergence that only shows up off a GNOME
+/// system (and in the test corpus, which runs on these).
 fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
     use GnomeKeyAction::*;
 
@@ -1136,8 +1138,12 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
     ];
 
     for n in 1..=12u8 {
-        let defaults = if n <= 4 {
-            vec![format!("<Super>{n}")]
+        // Only workspace 1 is bound out of the box, to `<Super>Home`. `<Super>N` is *not*
+        // workspace N in GNOME — it is `switch-to-application-N` from
+        // `org.gnome.shell.keybindings` (gnome-shell's schema, `switch-to-application-1`
+        // = `<Super>1`), i.e. the Nth dash favorite.
+        let defaults = if n == 1 {
+            strs(&["<Super>Home"])
         } else {
             Vec::new()
         };
@@ -3448,12 +3454,17 @@ mod tests {
             "panel-run-dialog defaults to <Alt>F2"
         );
         assert_eq!(
-            accels_of(GnomeKeyAction::SwitchToWorkspace(2)),
+            accels_of(GnomeKeyAction::SwitchToWorkspace(1)),
             vec![Accel {
-                trigger: AccelTrigger::Keysym(Keysym::_2),
+                trigger: AccelTrigger::Keysym(Keysym::Home),
                 mods: AccelMods::SUPER,
             }],
-            "switch-to-workspace-2 defaults to <Super>2"
+            "switch-to-workspace-1 defaults to <Super>Home"
+        );
+        assert_eq!(
+            accels_of(GnomeKeyAction::SwitchToWorkspace(2)),
+            vec![],
+            "switch-to-workspace-2 starts unbound — <Super>2 is switch-to-application-2"
         );
         // Both directional axes funnel into previous/next.
         assert_eq!(
