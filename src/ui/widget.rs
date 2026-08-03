@@ -2295,10 +2295,13 @@ impl Painter<'_, '_, '_> {
     /// The base fill is [`style::OSD_BG`], not transparent: see [`style::OSD_FLAT_HOVER`] for why
     /// a "flat" OSD button is the panel's own colour rather than a hole in it.
     pub fn icon_label_button(&mut self, b: &IconLabelButton, accent: Rgba) -> anyhow::Result<()> {
-        let bg = match (b.checked, b.hovered) {
-            (true, _) => style::OSD_FLAT_CHECKED,
-            (false, true) => style::OSD_FLAT_HOVER,
-            (false, false) => style::OSD_BG,
+        // `:active` outranks `:checked` outranks `:hover` — a press must read as a press even on
+        // the button that is already selected.
+        let bg = match (b.active, b.checked, b.hovered) {
+            (true, _, _) => style::OSD_FLAT_ACTIVE,
+            (false, true, _) => style::OSD_FLAT_CHECKED,
+            (false, false, true) => style::OSD_FLAT_HOVER,
+            (false, false, false) => style::OSD_BG,
         };
         self.fill_rounded(b.rect, IconLabelButton::RADIUS, bg)?;
         if b.focused {
@@ -2371,6 +2374,9 @@ pub struct IconLabelButton {
     pub rect: Rectangle<f64, Logical>,
     pub hovered: bool,
     pub checked: bool,
+    /// Held down — `%osd_button_flat`'s `:active` step (`_drawing.scss:182`), a lighter fill than
+    /// hover. Distinct from `checked`: this one lasts only as long as the press.
+    pub active: bool,
     pub focused: bool,
 }
 
@@ -2407,6 +2413,7 @@ impl IconLabelButton {
             rect,
             hovered: false,
             checked: false,
+            active: false,
             focused: false,
         }
     }
@@ -2418,6 +2425,11 @@ impl IconLabelButton {
 
     pub fn checked(mut self, checked: bool) -> Self {
         self.checked = checked;
+        self
+    }
+
+    pub fn active(mut self, active: bool) -> Self {
+        self.active = active;
         self
     }
 

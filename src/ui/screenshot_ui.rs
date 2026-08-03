@@ -6,7 +6,6 @@ use std::rc::Rc;
 
 use niri_config::{Action, Config};
 use niri_ipc::SizeChange;
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer, Texture};
@@ -18,12 +17,14 @@ use crate::animation::{Animation, Clock};
 use crate::layout::floating::DIRECTIONAL_MOVE_PX;
 use crate::niri_render_elements;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
+use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::render_helpers::RenderTarget;
-use crate::ui::widget::{self, Painter, ParagraphSpan, TextShaper};
+use crate::ui::widget::{self, style, Align, Painter, Rgba, ShapedText, TextShaper, TextStyle};
+use crate::ui::window_preview::{CLOSE_BG, CLOSE_BG_HOVER};
 use crate::utils::to_physical_precise_round;
 
 /// Per-element cache of a neutral CPU buffer uploaded once to a `VkTexture` (see
@@ -32,25 +33,46 @@ type VkCache = RefCell<Option<TextureBuffer<VkTexture>>>;
 
 const SELECTION_BORDER: i32 = 2;
 
-const PADDING: i32 = 8;
-const RADIUS: i32 = 16;
-/// Help-line font size, GNOME points; shaping routes it through [`ParagraphSpan`].
-/// `font_px()` is its logical px, used only for the keycap-patch padding geometry.
-const FONT_PT: f64 = 11.;
-fn font_px() -> f64 {
-    crate::ui::pt_to_px(FONT_PT)
-}
+/// The stage's default font, GNOME points — the reference for the panel's `em` margin.
+const BASE_FONT_PT: f64 = 11.;
 /// Panel corner radius, logical px — GNOME `.screenshot-ui-panel` `$modal_radius * 2`
 /// (`_screenshot.scss:9`). The whole panel is one rounded `%osd_panel` card.
 const PANEL_RADIUS: f64 = 32.;
 
-/// Dark `%osd_panel` background and the grey keycap patch (`#2C2C2C`). `PANEL_BORDER_COLOR`
-/// is GNOME's `$osd_outer_borders_color` = white@2% (`_colors.scss:44`), a 1px inset stroke;
-/// the panel reads against the screenshot via its drop shadow, not a heavy border.
-const PANEL_BG: [f32; 4] = [0.1, 0.1, 0.1, 1.];
+/// `.screenshot-ui-panel { margin-bottom: 4em }` (`_screenshot.scss:13`), logical px. `em` is the
+/// element's own font size, which the panel inherits from the stage — so this is a font-relative
+/// gap, not a fixed one, and it must not be hardcoded in px.
+fn panel_margin_bottom() -> f64 {
+    4. * crate::ui::pt_to_px(BASE_FONT_PT)
+}
+
+/// `%osd_panel`'s 1px inset border — GNOME's `$osd_outer_borders_color` = white@2%
+/// (`_colors.scss:44`). The panel reads against the screenshot via its drop shadow, not a heavy
+/// border. Its *fill* is [`style::OSD_BG`], which is also what makes the flat type buttons work:
+/// a `%osd_button_flat` base is the container's own colour, not a hole in it.
 const PANEL_BORDER_COLOR: [f32; 4] = [1., 1., 1., 0.02];
-const KEYCAP_BG: [f32; 4] = [0.172, 0.172, 0.172, 1.];
-const TEXT_COLOR: [f32; 4] = [1., 1., 1., 1.];
+
+/// `.screenshot-ui-capture-button { border: 4px $osd_fg_color; padding: $base_margin }`
+/// (`_screenshot.scss:44-45`) — a real ring with a transparent gap inside it, then the
+/// `$large_icon_size` inner circle.
+const CAPTURE_BORDER: f64 = 4.;
+const CAPTURE_GAP: f64 = 4.;
+const CAPTURE_INNER: f64 = 32.;
+
+/// `.screenshot-ui-capture-button-circle` (`_screenshot.scss:48-64`): `$osd_fg_color` (white),
+/// `darken(…, 20%)` on hover/focus, `darken(…, 50%)` while pressed.
+const CAPTURE_CIRCLE: [f32; 4] = [1., 1., 1., 1.];
+const CAPTURE_CIRCLE_HOVER: [f32; 4] = [0.8, 0.8, 0.8, 1.];
+const CAPTURE_CIRCLE_ACTIVE: [f32; 4] = [0.5, 0.5, 0.5, 1.];
+
+/// `.screenshot-ui-close-button` extends `.window-close` but overrides its padding to
+/// `$base_padding` (`_screenshot.scss:19`), so the box grows to fit the `$medium_icon_size` glyph
+/// plus 6px a side rather than staying at `.window-close`'s 32px.
+const CLOSE_SIZE: f64 = CLOSE_ICON_PX + 6. * 2.;
+const CLOSE_ICON_PX: f64 = 24.;
+/// `.left`/`.right { margin-*: $base_margin * 3 }` and `margin-top: $base_margin * 3`
+/// (`_screenshot.scss:20-23`), logical px.
+const CLOSE_MARGIN: f64 = 12.;
 
 /// Drop shadow — GNOME `.screenshot-ui-panel` `box-shadow: 0 2px 4px 0 $shadow_color`
 /// (`_screenshot.scss:21`); `$shadow_color` (dark) is `rgba(0,0,0,0.2)`. Logical px.
@@ -75,6 +97,14 @@ pub enum ScreenshotUi {
         output_data: HashMap<Output, OutputData>,
         button: Button,
         show_pointer: bool,
+        capture_type: CaptureType,
+        /// The control under the pointer, on the **selection output's** panel.
+        ///
+        /// Motion only ever reaches us in the selection output's coordinate space (every call site
+        /// in `input/mod.rs` computes it from `selection_output()`), so that is the one panel
+        /// whose hover we can honestly track. Clicking a control on another output's panel
+        /// still works — it just does not light up first.
+        hover: Option<Control>,
         open_anim: Animation,
         clock: Clock,
         config: Rc<RefCell<Config>>,
@@ -95,10 +125,26 @@ pub enum Button {
     Up,
     Down {
         touch_slot: Option<TouchSlot>,
-        on_capture_button: bool,
+        /// The panel control the press landed on, if any. A press that lands on a control acts on
+        /// *release over the same control*, the way a button does everywhere else — so this is
+        /// what the press is armed on, not merely "was it the capture button".
+        on_control: Option<Control>,
         last_pos: (Output, Point<i32, Physical>),
         move_state: Option<MoveState>,
     },
+}
+
+/// What a release did, for the caller to act on. Everything the panel can settle by itself (a mode
+/// change, a toggle) it settles inside [`ScreenshotUi::pointer_up`] and reports as `Redraw`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerUp {
+    /// The capture button fired.
+    Capture,
+    /// The close button was clicked — the caller must go through `Niri::close_screenshot_ui`,
+    /// which is also what answers a waiting D-Bus caller.
+    Close,
+    /// Something changed on screen and nothing else.
+    Redraw,
 }
 
 pub struct OutputData {
@@ -109,35 +155,47 @@ pub struct OutputData {
     screenshot: [OutputScreenshot; 3],
     buffers: [SolidColorBuffer; 8],
     locations: [Point<i32, Physical>; 8],
-    /// The help panel, drawn straight into `VkTexture`s by the owned renderer and cached across
-    /// frames. Built lazily on the first render (no renderer is available at open time); the
-    /// capture button's hit test reads its size, so the button isn't clickable until one frame
-    /// has drawn.
+    /// The control panel, drawn straight into `VkTexture`s by the owned renderer and cached across
+    /// frames. Built lazily on the first render (no renderer is available at open time); the hit
+    /// test reads its layout, so no control is clickable until one frame has drawn.
     panel: RefCell<PanelCache>,
 }
 
-/// The two help-panel variants (show/hide-pointer), rebuilt on a scale or renderer-context change.
+/// The panel state the bake depends on. Anything else — the selection, the animation, the pointer
+/// wandering over the screenshot — leaves the texture alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PanelState {
+    capture_type: CaptureType,
+    show_pointer: bool,
+    hover: Option<Control>,
+    /// The control currently held down, for the `:active` fills.
+    active: Option<Control>,
+}
+
+/// The baked panel, rebuilt on a [`PanelState`], scale or renderer-context change.
 #[derive(Default)]
 struct PanelCache {
     scale: f64,
     context: Option<ContextId<VkTexture>>,
-    /// "…to show the pointer." — shown while the pointer is hidden.
-    show: Option<VkTexture>,
-    /// "…to hide the pointer." — shown while the pointer is visible.
-    hide: Option<VkTexture>,
-    /// The panel's drop shadow, baked once into its own transparent texture and composited
-    /// *behind* the panel (both variants share the panel size, so one shadow serves both).
+    /// What [`texture`](Self::texture) was baked for; `None` before the first bake.
+    state: Option<PanelState>,
+    texture: Option<VkTexture>,
+    /// Where every control sits inside `texture`, in panel-local logical px. Produced by the bake
+    /// because it is content-sized (the captions need a shaper), and it is the *only* hit-test
+    /// authority — a control cannot be drawn somewhere the pointer will not find it.
+    layout: Option<PanelLayout>,
+    /// The panel's drop shadow, baked into its own transparent texture and composited *behind* the
+    /// panel.
     shadow: Option<VkTexture>,
-    /// The CPU-composed capture-button bitmap (composited over the panel as a separate element),
-    /// and its once-per-context Vulkan upload.
-    button: Option<MemoryBuffer>,
-    button_vk: VkCache,
+    /// The close button, which is a sibling of the panel rather than a child of it (it straddles a
+    /// panel corner), so it is its own texture placed by [`close_rect`].
+    close: Option<VkTexture>,
 }
 
 impl PanelCache {
-    /// The panel's physical size (both variants share it), or `None` before the first draw.
+    /// The panel's physical size, or `None` before the first draw.
     fn size(&self) -> Option<Size<i32, Buffer>> {
-        let t = self.show.as_ref().or(self.hide.as_ref())?;
+        let t = self.texture.as_ref()?;
         Some(Size::from((t.width() as i32, t.height() as i32)))
     }
 }
@@ -180,10 +238,18 @@ impl Button {
         matches!(
             self,
             Self::Down {
-                on_capture_button: false,
+                on_control: None,
                 ..
             }
         )
+    }
+
+    /// The control the press is armed on, if any.
+    fn on_control(&self) -> Option<Control> {
+        match self {
+            Self::Up => None,
+            Self::Down { on_control, .. } => *on_control,
+        }
     }
 }
 
@@ -288,6 +354,8 @@ impl ScreenshotUi {
             output_data,
             button: Button::Up,
             show_pointer,
+            capture_type: CaptureType::default(),
+            hover: None,
             open_anim,
             clock: clock.clone(),
             config: config.clone(),
@@ -330,6 +398,42 @@ impl ScreenshotUi {
         }
     }
 
+    /// Switch what the capture button will act on.
+    ///
+    /// `Screen` takes the whole output as the selection, so the shade collapses and the ordinary
+    /// capture path needs no special case — the rect it crops is simply the full frame.
+    pub fn set_capture_type(&mut self, ty: CaptureType) {
+        let Self::Open {
+            capture_type,
+            selection,
+            output_data,
+            ..
+        } = self
+        else {
+            return;
+        };
+
+        if *capture_type == ty || !ty.is_available() {
+            return;
+        }
+        *capture_type = ty;
+
+        if ty == CaptureType::Screen {
+            let size = output_data[&selection.0].size;
+            selection.1 = Point::from((0, 0));
+            selection.2 = Point::from((size.w - 1, size.h - 1));
+        }
+
+        self.update_buffers();
+    }
+
+    pub fn capture_type(&self) -> CaptureType {
+        match self {
+            Self::Open { capture_type, .. } => *capture_type,
+            Self::Closed { .. } => CaptureType::default(),
+        }
+    }
+
     pub fn is_open(&self) -> bool {
         matches!(self, ScreenshotUi::Open { .. })
     }
@@ -369,6 +473,9 @@ impl ScreenshotUi {
         let Self::Open {
             selection: (output, a, b),
             output_data,
+            // Screen mode's selection *is* the output; nudging or resizing it would silently
+            // make the panel lie about what the capture button will take.
+            capture_type: CaptureType::Selection,
             ..
         } = self
         else {
@@ -389,6 +496,9 @@ impl ScreenshotUi {
         let Self::Open {
             selection: (output, a, b),
             output_data,
+            // Screen mode's selection *is* the output; nudging or resizing it would silently
+            // make the panel lie about what the capture button will take.
+            capture_type: CaptureType::Selection,
             ..
         } = self
         else {
@@ -409,6 +519,9 @@ impl ScreenshotUi {
         let Self::Open {
             selection: (output, a, b),
             output_data,
+            // Screen mode's selection *is* the output; nudging or resizing it would silently
+            // make the panel lie about what the capture button will take.
+            capture_type: CaptureType::Selection,
             ..
         } = self
         else {
@@ -429,6 +542,9 @@ impl ScreenshotUi {
         let Self::Open {
             selection: (output, a, b),
             output_data,
+            // Screen mode's selection *is* the output; nudging or resizing it would silently
+            // make the panel lie about what the capture button will take.
+            capture_type: CaptureType::Selection,
             ..
         } = self
         else {
@@ -455,6 +571,7 @@ impl ScreenshotUi {
         let Self::Open {
             selection,
             output_data,
+            capture_type,
             ..
         } = self
         else {
@@ -470,6 +587,19 @@ impl ScreenshotUi {
         let Some(target_data) = output_data.get(&new_output) else {
             return;
         };
+
+        // Screen mode selects the whole output, so moving means taking all of the new one — not
+        // carrying a proportional rect across.
+        if *capture_type == CaptureType::Screen {
+            let size = target_data.size;
+            *selection = (
+                new_output,
+                Point::from((0, 0)),
+                Point::from((size.w - 1, size.h - 1)),
+            );
+            self.update_buffers();
+            return;
+        }
 
         let current_data = &output_data[current_output];
 
@@ -518,6 +648,9 @@ impl ScreenshotUi {
         let Self::Open {
             selection: (output, a, b),
             output_data,
+            // Screen mode's selection *is* the output; nudging or resizing it would silently
+            // make the panel lie about what the capture button will take.
+            capture_type: CaptureType::Selection,
             ..
         } = self
         else {
@@ -556,6 +689,9 @@ impl ScreenshotUi {
         let Self::Open {
             selection: (output, a, b),
             output_data,
+            // Screen mode's selection *is* the output; nudging or resizing it would silently
+            // make the panel lie about what the capture button will take.
+            capture_type: CaptureType::Selection,
             ..
         } = self
         else {
@@ -673,13 +809,13 @@ impl ScreenshotUi {
         }
     }
 
-    /// The help panel's on-screen rect on `output`, or `None` if it has no panel.
+    /// The control panel's on-screen rect on `output`, or `None` if it has no panel.
     ///
-    /// Test-only. The panel is drawn from real text, so its size depends on the font the machine
-    /// actually has — a test cannot hardcode this rect. Measuring *inside* it is also the only way
-    /// to tell the panel apart from the UI's other chrome: the four selection-border buffers alone
-    /// score thousands of white pixels with the panel entirely absent. Returns `None` until the
-    /// panel has drawn at least once (it is built lazily at render time).
+    /// Test-only. The panel is content-sized around real captions, so its size depends on the font
+    /// the machine actually has — a test cannot hardcode this rect. Measuring *inside* it is also
+    /// the only way to tell the panel apart from the UI's other chrome: the four selection-border
+    /// buffers alone score thousands of white pixels with the panel entirely absent. Returns `None`
+    /// until the panel has drawn at least once (it is built lazily at render time).
     #[cfg(test)]
     pub fn panel_rect(&self, output: &Output) -> Option<Rectangle<i32, Physical>> {
         let Self::Open { output_data, .. } = self else {
@@ -695,9 +831,23 @@ impl ScreenshotUi {
         ))
     }
 
+    /// The panel's control geometry on `output`, panel-local and logical. Test-only, and the same
+    /// value the bake and the hit test both read — a test that guessed its own coordinates would
+    /// prove nothing about whether those two agree.
+    #[cfg(test)]
+    pub fn panel_layout(&self, output: &Output) -> Option<PanelLayout> {
+        let Self::Open { output_data, .. } = self else {
+            return None;
+        };
+        output_data.get(output)?.panel.borrow().layout
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn render_output(
         &self,
         renderer: &mut VulkanRenderer,
+        icons: &IconCache,
+        accent: Rgba,
         output: &Output,
         target: RenderTarget,
         push: &mut dyn FnMut(ScreenshotUiRenderElement),
@@ -705,8 +855,11 @@ impl ScreenshotUi {
         let _span = tracy_client::span!("ScreenshotUi::render_output");
 
         let Self::Open {
+            selection,
             output_data,
             show_pointer,
+            capture_type,
+            hover,
             button,
             open_anim,
             ..
@@ -722,29 +875,39 @@ impl ScreenshotUi {
         let scale = output_data.scale;
         let progress = open_anim.clamped_value().clamp(0., 1.) as f32;
 
-        // The help panel goes on top. Built lazily here (no renderer exists at open time), so this
-        // is also what first populates the size the capture-button hit test reads.
-        output_data.ensure_panel(renderer);
+        // Hover only ever tracks the selection output (see the `hover` field), so a second output's
+        // panel draws at rest.
+        let hover = if output == &selection.0 { *hover } else { None };
+        let state = PanelState {
+            capture_type: *capture_type,
+            show_pointer: *show_pointer,
+            hover,
+            // `:active` only while the pointer is still on the control the press armed — a press
+            // dragged off a button must let go of it, as it does anywhere else.
+            active: button.on_control().filter(|c| hover == Some(*c)),
+        };
+
+        // The panel goes on top. Built lazily here (no renderer exists at open time), so this is
+        // also what first populates the layout the hit test reads.
+        output_data.ensure_panel(renderer, accent, state);
         if let Some(size) = output_data.panel.borrow().size() {
             let alpha = if button.is_dragging_selection() {
                 0.3
             } else {
                 0.9
-            };
+            } * progress;
             let location = panel_location(output_data, size).to_f64().to_logical(scale);
 
-            // Earlier-pushed elements are composited on top (the screenshot goes last), so push the
-            // capture button before the panel to keep it above the panel background.
-            if let Some(elem) = output_data.button_element(renderer, size, alpha * progress) {
+            // Earlier-pushed elements are composited on top (the screenshot goes last), so the
+            // glyphs are pushed before the panel they sit on, and the shadow after it.
+            output_data.push_icons(renderer, icons, location, alpha, push);
+            if let Some(elem) = output_data.close_element(renderer, alpha) {
                 push(ScreenshotUiRenderElement::Screenshot(elem));
             }
-            if let Some(elem) =
-                output_data.panel_element(renderer, *show_pointer, location, alpha * progress)
-            {
+            if let Some(elem) = output_data.panel_element(renderer, location, alpha) {
                 push(ScreenshotUiRenderElement::Screenshot(elem));
             }
-            // The drop shadow is pushed after the panel so it composites beneath it.
-            if let Some(elem) = output_data.shadow_element(renderer, alpha * progress) {
+            if let Some(elem) = output_data.shadow_element(renderer, alpha) {
                 push(ScreenshotUiRenderElement::Screenshot(elem));
             }
         }
@@ -878,32 +1041,37 @@ impl ScreenshotUi {
 
     /// The pointer has moved to `point` relative to the current selection output.
     ///
-    /// The point may be outside output bounds.
-    pub fn pointer_motion(&mut self, point: Point<i32, Physical>, slot: Option<TouchSlot>) {
+    /// The point may be outside output bounds. Returns whether anything on screen changed.
+    pub fn pointer_motion(&mut self, point: Point<i32, Physical>, slot: Option<TouchSlot>) -> bool {
+        // Hover first: it tracks even with no button down, which is the whole point of it.
+        let hover_changed = self.update_hover(point);
+
         let Self::Open {
             selection,
             output_data,
+            capture_type,
             button:
                 Button::Down {
                     touch_slot,
-                    on_capture_button,
+                    on_control,
                     last_pos,
                     move_state,
                 },
             ..
         } = self
         else {
-            return;
+            return hover_changed;
         };
 
         if *touch_slot != slot {
-            return;
+            return hover_changed;
         }
 
         last_pos.1 = point;
 
-        if *on_capture_button {
-            return;
+        // A press that landed on a control drags nothing, and Screen mode has no selection to drag.
+        if on_control.is_some() || *capture_type != CaptureType::Selection {
+            return hover_changed;
         }
 
         if let Some(move_state) = move_state {
@@ -923,6 +1091,30 @@ impl ScreenshotUi {
         }
 
         self.update_buffers();
+        true
+    }
+
+    /// Recompute which control the pointer is over, on the selection output. Returns whether it
+    /// changed — a rebake and a redraw only happen when it does.
+    fn update_hover(&mut self, point: Point<i32, Physical>) -> bool {
+        let Self::Open {
+            selection,
+            output_data,
+            hover,
+            ..
+        } = self
+        else {
+            return false;
+        };
+
+        let new = output_data
+            .get(&selection.0)
+            .and_then(|data| data.control_at(point));
+        if *hover == new {
+            return false;
+        }
+        *hover = new;
+        true
     }
 
     pub fn pointer_down(
@@ -935,6 +1127,7 @@ impl ScreenshotUi {
         let Self::Open {
             selection,
             output_data,
+            capture_type,
             button,
             ..
         } = self
@@ -945,7 +1138,7 @@ impl ScreenshotUi {
         // Check if this is a second touch (different slot) while already dragging.
         if let Some(new_slot) = slot {
             if let Button::Down {
-                on_capture_button: false,
+                on_control: None,
                 move_state,
                 last_pos,
                 ..
@@ -965,13 +1158,13 @@ impl ScreenshotUi {
         }
 
         if move_existing {
-            if output != selection.0 {
+            if output != selection.0 || *capture_type != CaptureType::Selection {
                 return false;
             }
 
             *button = Button::Down {
                 touch_slot: slot,
-                on_capture_button: false,
+                on_control: None,
                 last_pos: (output, point),
                 move_state: Some(MoveState {
                     pointer_offset: point - selection.1,
@@ -985,26 +1178,29 @@ impl ScreenshotUi {
             return false;
         };
 
-        if let Some(panel_size) = output_data.panel.borrow().size() {
-            let location = panel_location(output_data, panel_size);
-
-            if is_within_capture_button(output_data.scale, panel_size, point - location) {
-                *button = Button::Down {
-                    touch_slot: slot,
-                    on_capture_button: true,
-                    last_pos: (output, point),
-                    move_state: None,
-                };
-                return false;
-            }
+        if let Some(control) = output_data.control_at(point) {
+            *button = Button::Down {
+                touch_slot: slot,
+                on_control: Some(control),
+                last_pos: (output, point),
+                move_state: None,
+            };
+            // A control lights up while held, so the caller still owes a redraw.
+            return true;
         }
 
         *button = Button::Down {
             touch_slot: slot,
-            on_capture_button: false,
+            on_control: None,
             last_pos: (output.clone(), point),
             move_state: None,
         };
+
+        // In Screen mode the selection is the output; a press on the frozen screen must not start
+        // dragging a rectangle out of it.
+        if *capture_type != CaptureType::Selection {
+            return false;
+        }
 
         let point = Point::new(
             point.x.clamp(0, output_data.size.w - 1),
@@ -1017,7 +1213,7 @@ impl ScreenshotUi {
         true
     }
 
-    pub fn pointer_up(&mut self, slot: Option<TouchSlot>) -> Option<bool> {
+    pub fn pointer_up(&mut self, slot: Option<TouchSlot>) -> Option<PointerUp> {
         let Self::Open {
             selection,
             output_data,
@@ -1030,7 +1226,7 @@ impl ScreenshotUi {
 
         let Button::Down {
             touch_slot,
-            on_capture_button,
+            on_control,
             ref last_pos,
             ref mut move_state,
             ..
@@ -1053,22 +1249,14 @@ impl ScreenshotUi {
         let last_pos = last_pos.clone();
         *button = Button::Up;
 
-        // Check if we released still on the capture button.
-        if on_capture_button {
+        // A press armed on a control acts only if the release lands on that same control.
+        if let Some(control) = on_control {
             let (output, point) = last_pos;
-
-            #[allow(clippy::question_mark)]
-            let Some(output_data) = output_data.get(&output) else {
-                return None;
-            };
-
-            if let Some(panel_size) = output_data.panel.borrow().size() {
-                let location = panel_location(output_data, panel_size);
-
-                if is_within_capture_button(output_data.scale, panel_size, point - location) {
-                    return Some(true);
-                }
+            let released_on = output_data.get(&output).and_then(|d| d.control_at(point));
+            if released_on != Some(control) {
+                return Some(PointerUp::Redraw);
             }
+            return Some(self.activate(control));
         }
 
         // Check if the resulting selection is zero-sized, and try to come up with a small
@@ -1089,7 +1277,26 @@ impl ScreenshotUi {
 
         self.update_buffers();
 
-        Some(false)
+        Some(PointerUp::Redraw)
+    }
+
+    /// Act on a clicked control. Everything the panel owns it settles here; only the two that need
+    /// the compositor (firing the shutter, closing the UI) travel back out.
+    fn activate(&mut self, control: Control) -> PointerUp {
+        match control {
+            Control::Capture => PointerUp::Capture,
+            Control::Close => PointerUp::Close,
+            Control::Type(ty) => {
+                self.set_capture_type(ty);
+                PointerUp::Redraw
+            }
+            Control::ShowPointer => {
+                self.toggle_pointer();
+                PointerUp::Redraw
+            }
+            // Only the shot segment exists until slice 4, and it is already checked.
+            Control::ShotCast(_) => PointerUp::Redraw,
+        }
     }
 }
 
@@ -1160,79 +1367,78 @@ impl OutputScreenshot {
 }
 
 impl OutputData {
-    /// Build both help-panel variants into `VkTexture`s if missing or stale (scale / renderer
-    /// context change). Failures leave the variant `None` — the panel just doesn't draw.
-    fn ensure_panel(&self, renderer: &mut VulkanRenderer) {
+    /// Build the panel (and its shadow and close button) into `VkTexture`s if missing or stale —
+    /// a [`PanelState`], scale or renderer-context change. Failures leave the texture `None`, so
+    /// the panel just doesn't draw.
+    fn ensure_panel(&self, renderer: &mut VulkanRenderer, accent: Rgba, state: PanelState) {
         let scale = self.scale;
         let context = renderer.context_id();
         {
             let cache = self.panel.borrow();
-            if cache.show.is_some()
+            if cache.texture.is_some()
                 && cache.scale == scale
                 && cache.context.as_ref() == Some(&context)
+                && cache.state == Some(state)
             {
                 return;
             }
         }
 
-        let show = generate_panel(renderer, scale, "show")
-            .map_err(|err| warn!("error rendering help panel: {err:?}"))
+        let built = generate_panel(renderer, scale, accent, state)
+            .map_err(|err| warn!("error rendering the screenshot panel: {err:?}"))
             .ok();
-        let hide = generate_panel(renderer, scale, "hide")
-            .map_err(|err| warn!("error rendering help panel: {err:?}"))
-            .ok();
-        // The shadow only needs the panel footprint (both variants share it).
-        let shadow = show
+        let (texture, layout) = match built {
+            Some((texture, layout)) => (Some(texture), Some(layout)),
+            None => (None, None),
+        };
+        let shadow = texture
             .as_ref()
-            .or(hide.as_ref())
             .map(|t| Size::<i32, Physical>::from((t.width() as i32, t.height() as i32)))
             .and_then(|panel_size| {
                 generate_panel_shadow(renderer, scale, panel_size)
-                    .map_err(|err| warn!("error rendering help-panel shadow: {err:?}"))
+                    .map_err(|err| warn!("error rendering the screenshot panel's shadow: {err:?}"))
                     .ok()
             });
+        let close = generate_close_button(renderer, scale, state.hover == Some(Control::Close))
+            .map_err(|err| warn!("error rendering the screenshot close button: {err:?}"))
+            .ok();
+
         *self.panel.borrow_mut() = PanelCache {
             scale,
             context: Some(context),
-            show,
-            hide,
+            state: Some(state),
+            texture,
+            layout,
             shadow,
-            button: Some(button_bitmap(scale)),
-            button_vk: RefCell::new(None),
+            close,
         };
     }
 
-    /// The capture-button element, positioned at the panel's left-centre. `None` if the button
-    /// bitmap or its upload is missing.
-    fn button_element(
-        &self,
-        renderer: &mut VulkanRenderer,
-        panel_size: Size<i32, Buffer>,
-        alpha: f32,
-    ) -> Option<CapturedTextureRenderElement> {
-        let scale = self.scale;
-        let padding: i32 = to_physical_precise_round(scale, PADDING);
-        let radius: i32 = to_physical_precise_round(scale, RADIUS);
-
+    /// The panel's on-screen rect in output-logical px, or `None` before the first bake.
+    fn panel_rect_logical(&self) -> Option<Rectangle<f64, Logical>> {
         let cache = self.panel.borrow();
-        let buffer = cache.button.as_ref()?;
-        let tb = upload_cached(renderer, buffer, &cache.button_vk)?;
+        let layout = cache.layout?;
+        let size = cache.size()?;
+        let loc = panel_location(self, size).to_f64().to_logical(self.scale);
+        Some(Rectangle::new(loc, layout.size))
+    }
 
-        // Panel-local physical offset of the button's top-left, then into output-logical space.
-        let loc =
-            panel_location(self, panel_size) + Point::from((padding, panel_size.h / 2 - radius));
-        let location = loc.to_f64().to_logical(scale);
+    /// The control at an output-local **physical** point, or `None`.
+    ///
+    /// Everything but the close button lives inside the panel, so this is one coordinate shift plus
+    /// [`PanelLayout::control_at`]; the close button is a sibling and is tested against its own
+    /// circle.
+    fn control_at(&self, point: Point<i32, Physical>) -> Option<Control> {
+        let panel = self.panel_rect_logical()?;
+        let p = point.to_f64().to_logical(self.scale);
 
-        Some(CapturedTextureRenderElement(
-            TextureRenderElement::from_texture_buffer(
-                tb,
-                location,
-                alpha,
-                None,
-                None,
-                Kind::Unspecified,
-            ),
-        ))
+        let close = widget::IconButton::new(close_rect(panel), CLOSE_ICON_PX, style::TRANSPARENT);
+        if close.contains(p) {
+            return Some(Control::Close);
+        }
+
+        let layout = self.panel.borrow().layout?;
+        layout.control_at(p - panel.loc)
     }
 
     /// The panel's drop-shadow element, placed so its baked panel-footprint aligns with the panel
@@ -1266,22 +1472,35 @@ impl OutputData {
         ))
     }
 
-    /// The help-panel element (show/hide variant chosen by `show_pointer`), or `None` if the panel
-    /// hasn't been built (see [`Self::ensure_panel`]).
+    /// The panel element, or `None` if it hasn't been built (see [`Self::ensure_panel`]).
     fn panel_element(
         &self,
         renderer: &mut VulkanRenderer,
-        show_pointer: bool,
         location: Point<f64, Logical>,
         alpha: f32,
     ) -> Option<CapturedTextureRenderElement> {
-        let cache = self.panel.borrow();
-        let texture = if show_pointer {
-            &cache.hide
-        } else {
-            &cache.show
-        };
-        let texture = texture.clone()?;
+        let texture = self.panel.borrow().texture.clone()?;
+        Some(self.texture_element(renderer, texture, location, alpha))
+    }
+
+    /// The close-button element, straddling the panel's top corner.
+    fn close_element(
+        &self,
+        renderer: &mut VulkanRenderer,
+        alpha: f32,
+    ) -> Option<CapturedTextureRenderElement> {
+        let texture = self.panel.borrow().close.clone()?;
+        let loc = close_rect(self.panel_rect_logical()?).loc;
+        Some(self.texture_element(renderer, texture, loc, alpha))
+    }
+
+    fn texture_element(
+        &self,
+        renderer: &mut VulkanRenderer,
+        texture: VkTexture,
+        location: Point<f64, Logical>,
+        alpha: f32,
+    ) -> CapturedTextureRenderElement {
         let buffer = TextureBuffer::from_texture(
             renderer,
             texture,
@@ -1289,16 +1508,95 @@ impl OutputData {
             Transform::Normal,
             Vec::new(),
         );
-        Some(CapturedTextureRenderElement(
-            TextureRenderElement::from_texture_buffer(
-                buffer,
-                location,
-                alpha,
-                None,
-                None,
-                Kind::Unspecified,
-            ),
+        CapturedTextureRenderElement(TextureRenderElement::from_texture_buffer(
+            buffer,
+            location,
+            alpha,
+            None,
+            None,
+            Kind::Unspecified,
         ))
+    }
+
+    /// Composite every glyph on the panel.
+    ///
+    /// Icons are render elements, not paint verbs, so they cannot go into the bake — they ride on
+    /// top of it and must fade with it, hence `alpha` rather than `1.`. `origin` is the panel's
+    /// on-screen top-left; the layout's centres are panel-local.
+    fn push_icons(
+        &self,
+        renderer: &mut VulkanRenderer,
+        icons: &IconCache,
+        origin: Point<f64, Logical>,
+        alpha: f32,
+        push: &mut dyn FnMut(ScreenshotUiRenderElement),
+    ) {
+        let Some(layout) = self.panel.borrow().layout else {
+            return;
+        };
+        let scale = self.scale;
+
+        let mut icon = |name: &str, px: f64, color: Rgba, origin, center| {
+            if let Some(elem) = widget::icon_element_alpha(
+                renderer,
+                icons,
+                &[name],
+                px,
+                scale,
+                color,
+                origin,
+                center,
+                alpha,
+            ) {
+                push(ScreenshotUiRenderElement::Screenshot(
+                    CapturedTextureRenderElement(elem),
+                ));
+            }
+        };
+
+        for (i, ty) in CaptureType::ROW.iter().enumerate() {
+            if !ty.is_available() {
+                continue;
+            }
+            let button = widget::IconLabelButton::new(layout.type_buttons[i]);
+            icon(
+                ty.icon(),
+                widget::IconLabelButton::ICON_PX,
+                style::OSD_FG,
+                origin,
+                button.icon_centre(),
+            );
+        }
+
+        // The checked segment is a solid white pill, so its glyph inverts to the panel colour
+        // (`_screenshot.scss:108`). Only the shot segment exists until slice 4, and it is checked.
+        let shot = widget::Segmented::segment_rect(layout.shot_cast, 0);
+        icon(
+            "camera-photo-symbolic",
+            widget::Segmented::ICON_PX,
+            style::OSD_BG,
+            origin,
+            centre(shot),
+        );
+
+        icon(
+            "screenshot-ui-show-pointer-symbolic",
+            widget::IconButton::ICON_PX,
+            style::OSD_FG,
+            origin,
+            centre(layout.show_pointer),
+        );
+
+        if let Some(panel) = self.panel_rect_logical() {
+            let close = close_rect(panel);
+            icon(
+                "preview-close-symbolic",
+                CLOSE_ICON_PX,
+                style::TEXT,
+                close.loc,
+                centre(close) - close.loc,
+            );
+        }
     }
 }
 
@@ -1527,9 +1825,14 @@ impl PanelLayout {
         let type_sizes = label_w.map(|w| widget::IconLabelButton::size(w, label_h));
 
         // `homogeneous: true` (`screenshot.js:1300`) — every type button is as wide as the widest.
+        // Homogeneous over *all three* labels, including the one Window mode is not offering yet:
+        // the row must not resize when slice 2 unhides that button.
         let type_w = type_sizes.iter().fold(0f64, |acc, s| acc.max(s.w));
         let type_h = type_sizes.iter().fold(0f64, |acc, s| acc.max(s.h));
-        let type_row_w = type_w * 3. + Self::TYPE_SPACING * 2.;
+        // A hidden button takes no space, so the row is as wide as what is actually drawn — a
+        // reserved empty slot would leave the panel visibly lopsided while Window is out.
+        let shown = CaptureType::ROW.iter().filter(|t| t.is_available()).count();
+        let type_row_w = type_w * shown as f64 + Self::TYPE_SPACING * (shown as f64 - 1.).max(0.);
 
         let shot_cast_size = widget::Segmented::size(1);
         let show_pointer_d =
@@ -1551,13 +1854,17 @@ impl PanelLayout {
         ));
 
         let type_y = Self::PAD;
-        let type_x0 = Self::PAD + (content_w - type_row_w) / 2.;
-        let type_buttons = [0usize, 1, 2].map(|i| {
-            Rectangle::new(
-                Point::from((type_x0 + (type_w + Self::TYPE_SPACING) * i as f64, type_y)),
-                Size::from((type_w, type_h)),
-            )
-        });
+        let mut type_x = Self::PAD + (content_w - type_row_w) / 2.;
+        let mut type_buttons = [Rectangle::default(); 3];
+        for (i, ty) in CaptureType::ROW.iter().enumerate() {
+            if !ty.is_available() {
+                // A zero rect, so it draws nothing and `contains` can never match it.
+                continue;
+            }
+            type_buttons[i] =
+                Rectangle::new(Point::from((type_x, type_y)), Size::from((type_w, type_h)));
+            type_x += type_w + Self::TYPE_SPACING;
+        }
 
         let bottom_y = Self::PAD + type_h + Self::ROW_SPACING;
         // Centre each child on the band, then align it start / centre / end.
@@ -1623,76 +1930,62 @@ impl PanelLayout {
     }
 }
 
+/// The centre of a rect.
+fn centre(r: Rectangle<f64, Logical>) -> Point<f64, Logical> {
+    Point::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
+}
+
 fn panel_location(output_data: &OutputData, panel_size: Size<i32, Buffer>) -> Point<i32, Physical> {
     let scale = output_data.scale;
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
+    let margin: i32 = to_physical_precise_round(scale, panel_margin_bottom());
     let x = max(0, (output_data.size.w - panel_size.w) / 2);
-    let y = max(0, output_data.size.h - panel_size.h - padding * 2);
+    let y = max(0, output_data.size.h - panel_size.h - margin);
     Point::from((x, y))
 }
 
-fn is_within_capture_button(
-    scale: f64,
-    panel_size: Size<i32, Buffer>,
-    pos_within_panel: Point<i32, Physical>,
-) -> bool {
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
-    let radius = to_physical_precise_round::<i32>(scale, RADIUS) - 2;
-
-    let xc = padding + radius;
-    let yc = panel_size.h / 2;
-    let pos = pos_within_panel;
-
-    (pos.x - xc) * (pos.x - xc) + (pos.y - yc) * (pos.y - yc) <= radius * radius
+/// The close button's rect for a panel drawn at `panel`, in the same space.
+///
+/// GNOME binds the button's *centre* to a panel corner with the same `AlignConstraint` pair the
+/// overview's preview close button uses (`screenshot.js:1252-1266`), then insets it by
+/// `margin-top`/`margin-right`. Clutter applies a margin by shrinking the allocation the constraint
+/// positioned, which moves the painted box by half the margin — hence `CLOSE_MARGIN / 2.` rather
+/// than the whole of it.
+///
+/// DIVERGENCE: `Meta.prefs_get_button_layout()` can put the close button on the left, and GNOME
+/// flips the constraint's factor to match (`_refreshButtonLayout`, `screenshot.js:1533-1546`). We
+/// always draw it on the right — the same divergence, for the same reason, as
+/// `window_preview::close_rect`.
+fn close_rect(panel: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+    let centre = Point::from((
+        panel.loc.x + panel.size.w - CLOSE_MARGIN / 2.,
+        panel.loc.y + CLOSE_MARGIN / 2.,
+    ));
+    Rectangle::new(
+        centre - Point::from((CLOSE_SIZE / 2., CLOSE_SIZE / 2.)),
+        Size::from((CLOSE_SIZE, CLOSE_SIZE)),
+    )
 }
 
-/// Compose the concentric capture-button bitmap: a white centre disk and a white outer ring with a
-/// transparent gap between them (and outside), so it composites over the dark panel like the old
-/// cairo shutter icon. A pure CPU distance test (no cairo); tagged at `scale` so it draws at the
-/// same logical size regardless of the output scale.
-fn button_bitmap(scale: f64) -> MemoryBuffer {
-    let radius: i32 = to_physical_precise_round(scale, RADIUS);
-    let stroke: i32 = to_physical_precise_round::<i32>(scale, 2).max(1);
-    let side = (radius * 2).max(1);
-    let d = side as usize;
-    let c = f64::from(radius); // centre, since side == 2·radius
-    let r = f64::from(radius);
-    let ring_inner = f64::from((radius - stroke).max(0));
-    let disk_outer = f64::from((radius - stroke * 2).max(0));
-
-    // 1 below `edge`, 0 above, ~1px transition.
-    let below = |dist: f64, edge: f64| (edge - dist + 0.5).clamp(0., 1.);
-    // 1 within [inner, outer], 0 outside.
-    let band = |dist: f64, inner: f64, outer: f64| {
-        f64::min((dist - inner + 0.5).clamp(0., 1.), below(dist, outer))
-    };
-
-    let mut data = vec![0u8; d * d * 4];
-    for y in 0..d {
-        for x in 0..d {
-            let dx = x as f64 + 0.5 - c;
-            let dy = y as f64 + 0.5 - c;
-            let dist = (dx * dx + dy * dy).sqrt();
-            let cov = f64::max(below(dist, disk_outer), band(dist, ring_inner, r));
-            // Premultiplied opaque white × coverage → all four channels equal.
-            let v = (cov * 255.).round().clamp(0., 255.) as u8;
-            let i = (y * d + x) * 4;
-            data[i] = v;
-            data[i + 1] = v;
-            data[i + 2] = v;
-            data[i + 3] = v;
-        }
-    }
-
-    // The pixels are physical-sized (`radius` is already scaled), so tag the buffer at the output
-    // scale — matching the panel texture — or it composites `scale`× too big on a HiDPI output.
-    MemoryBuffer::new(
-        data,
-        Fourcc::Argb8888,
-        Size::from((side, side)),
-        Scale::from(scale),
-        Transform::Normal,
-    )
+/// Bake the close button's disc — `.window-close`'s fill, which `.screenshot-ui-close-button`
+/// inherits wholesale (`_screenshot.scss:18`), so the colours come from `window_preview` rather
+/// than a second copy. Its glyph is composited on top by [`OutputData::push_icons`].
+///
+/// Its `box-shadow` (`_screenshot.scss:21`) is not drawn: the shadow would need bleed room outside
+/// this tightly-sized buffer, and the overview's identical button has never drawn one either.
+fn generate_close_button(
+    renderer: &mut VulkanRenderer,
+    scale: f64,
+    hovered: bool,
+) -> anyhow::Result<VkTexture> {
+    let size = widget::physical_size(scale, Size::from((CLOSE_SIZE, CLOSE_SIZE)));
+    widget::bake_uncached_sized(renderer, size, |frame| {
+        let mut p = Painter::new(frame, scale, size);
+        p.clear(style::TRANSPARENT)?;
+        let bg = if hovered { CLOSE_BG_HOVER } else { CLOSE_BG };
+        // `border-radius: $forced_circular_radius` — a full circle.
+        p.fill_rounded_full(CLOSE_SIZE / 2., bg)?;
+        Ok(())
+    })
 }
 
 /// Draw the screenshot help panel straight into a `VkTexture`: a dark box with a grey border, the
@@ -1744,92 +2037,127 @@ fn generate_panel_shadow(
     })
 }
 
+/// Bake GNOME's control panel: the `%osd_panel` card, the three type buttons with their captions,
+/// the shot/cast pill, the show-pointer toggle and the capture button.
+///
+/// Returns the [`PanelLayout`] it drew against, because that same layout is what places the glyphs
+/// and answers the hit test — the panel is one texture, so nothing else knows where its controls
+/// are. The captions are measured here (the panel is content-sized), which is why the layout cannot
+/// be computed before a renderer exists.
 fn generate_panel(
     renderer: &mut VulkanRenderer,
     scale: f64,
-    verb: &str,
-) -> anyhow::Result<VkTexture> {
+    accent: Rgba,
+    state: PanelState,
+) -> anyhow::Result<(VkTexture, PanelLayout)> {
     let _span = tracy_client::span!("screenshot_ui::generate_panel");
 
-    let px = (font_px() * scale) as f32;
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
-    let radius: i32 = to_physical_precise_round(scale, RADIUS);
-    // 2 px between the two lines, matching the old cairo line spacing.
-    let line_gap: i32 = to_physical_precise_round(scale, 2);
-    // Breathing room around the grey keycap patches.
-    let kpad_x = (px * 0.28).round() as i32;
-    let kpad_y = (px * 0.12).round() as i32;
-
-    // Each line is its own single-line run so the two share a left edge (the paragraph builder
-    // center-aligns; we strip that per line via its ink-x). The keycap is span index 1.
-    // `TextShaper` owns the pt → physical-px multiply — no `* scale` on the shaping path.
-    let pointer_line = format!(" to {verb} the pointer.");
-    const WRAP: f64 = 100_000.;
-    let lines = [
-        vec![
-            ParagraphSpan::new("Press ", FONT_PT),
-            ParagraphSpan::new(" Space ", FONT_PT).mono(),
-            ParagraphSpan::new(" to save the screenshot.", FONT_PT),
-        ],
-        vec![
-            ParagraphSpan::new("Press ", FONT_PT),
-            ParagraphSpan::new(" P ", FONT_PT).mono(),
-            ParagraphSpan::new(&pointer_line, FONT_PT),
-        ],
-    ];
-    let runs = {
+    let captions: Vec<ShapedText> = {
         let mut shaper = TextShaper::new(renderer, scale);
-        lines
+        CaptureType::ROW
             .iter()
-            .map(|spans| shaper.paragraph(spans, WRAP, FONT_PT))
-            .collect::<Result<Vec<_>, _>>()?
+            .map(|ty| {
+                shaper.shape(
+                    ty.label(),
+                    TextStyle::new(widget::IconLabelButton::LABEL_PT),
+                )
+            })
+            .collect::<anyhow::Result<_>>()?
     };
-    let ink: Vec<(i32, i32, i32, i32)> = runs.iter().map(|r| r.ink_bounds()).collect();
 
-    let text_w = ink.iter().map(|b| b.2).max().unwrap_or(0);
-    let line_bottom = ink.iter().map(|b| b.1 + b.3).max().unwrap_or(0);
-    let row_advance = line_bottom + line_gap;
-    let text_h = row_advance * (lines.len() as i32 - 1) + line_bottom;
+    // Ink is physical; the layout is logical.
+    let mut label_w = [0f64; 3];
+    for (i, run) in captions.iter().enumerate() {
+        label_w[i] = f64::from(run.ink_bounds().2) / scale;
+    }
+    let label_h = captions
+        .iter()
+        .map(|r| r.line_box_height())
+        .max()
+        .unwrap_or(0);
+    let label_h = f64::from(label_h) / scale;
 
-    let width = text_w + radius * 2 + padding * 3;
-    let height = max(text_h, radius * 2) + padding * 2;
-    let text_x = radius * 2 + padding * 2;
+    let layout = PanelLayout::new(label_w, label_h);
+    let size = widget::physical_size(scale, layout.size);
 
-    let size = Size::<i32, Physical>::from((width, height));
-    let full = Rectangle::from_size(size);
-
-    // A rounded `%osd_panel` card: transparent-cleared, filled to `PANEL_RADIUS`, then a 1px
-    // white@2% inset border stroke. The capture button and the drop shadow are composited as
-    // separate elements over/under it (see `OutputData::button_element` and the `Shadow` element
-    // in `render_output`), so the buffer stays exactly panel-sized.
-    widget::bake_uncached_sized(renderer, size, |frame| {
+    let texture = widget::bake_uncached_sized(renderer, size, |frame| {
         let mut p = Painter::new(frame, scale, size);
-        p.clear([0., 0., 0., 0.])?;
-        p.fill_rounded_full(PANEL_RADIUS, PANEL_BG)?;
+        p.clear(style::TRANSPARENT)?;
+
+        // A rounded `%osd_panel` card: the fill, then its 1px white@2% inset border. The drop
+        // shadow is a separate element composited under it (see `OutputData::shadow_element`), so
+        // this buffer stays exactly panel-sized.
+        p.fill_rounded_full(PANEL_RADIUS, style::OSD_BG)?;
         p.stroke_rounded_full(PANEL_RADIUS, 1., PANEL_BORDER_COLOR)?;
 
-        // Two help lines, left-aligned at `text_x`.
-        for (i, run) in runs.iter().enumerate() {
-            let (ix, _, _, _) = ink[i];
-            let y_line = padding + i as i32 * row_advance;
-            let origin = Point::<i32, Physical>::from((text_x - ix, y_line));
-
-            // Grey keycap patch behind span 1 (" Space " / " P ").
-            let (sx, sy, sw, sh) = run.span_ink_bounds(1);
-            if sw > 0 && sh > 0 {
-                let patch = Rectangle::new(
-                    Point::from((origin.x + sx - kpad_x, origin.y + sy - kpad_y)),
-                    Size::from((sw + kpad_x * 2, sh + kpad_y * 2)),
-                );
-                if let Some(patch) = patch.intersection(full) {
-                    p.fill_rect_px(patch, KEYCAP_BG)?;
-                }
+        for (i, ty) in CaptureType::ROW.iter().enumerate() {
+            if !ty.is_available() {
+                continue;
             }
-            p.paragraph(run, origin, TEXT_COLOR)?;
+            let control = Control::Type(*ty);
+            let button = widget::IconLabelButton::new(layout.type_buttons[i])
+                .checked(state.capture_type == *ty)
+                .hovered(state.hover == Some(control))
+                .active(state.active == Some(control));
+            p.icon_label_button(&button, accent)?;
+            p.text(
+                &captions[i],
+                button.label_centre(label_h),
+                Align::CENTER,
+                style::OSD_FG,
+            )?;
         }
 
+        // Only the shot segment exists until slice 4, and it is what is checked.
+        p.segmented(
+            layout.shot_cast,
+            1,
+            0,
+            match state.hover {
+                Some(Control::ShotCast(i)) => Some(i),
+                _ => None,
+            },
+        )?;
+
+        // `%osd_button_flat` + `.icon-button`: a circle whose *fill* already encodes hover and
+        // checked (see `style::OSD_FLAT_HOVER`), so `IconButton`'s generic hover wash would double
+        // it — the flat cascade is resolved here instead.
+        let pointer_control = Control::ShowPointer;
+        let pointer_bg = if state.active == Some(pointer_control) {
+            style::OSD_FLAT_ACTIVE
+        } else if state.show_pointer {
+            style::OSD_FLAT_CHECKED
+        } else if state.hover == Some(pointer_control) {
+            style::OSD_FLAT_HOVER
+        } else {
+            style::OSD_BG
+        };
+        p.icon_button(
+            &widget::IconButton::new(layout.show_pointer, widget::IconButton::ICON_PX, pointer_bg),
+            accent,
+        )?;
+
+        // The capture button: a real 4px ring, a transparent gap, then the inner circle.
+        let cap = layout.capture;
+        p.stroke_rounded(cap, cap.size.w / 2., CAPTURE_BORDER, style::OSD_FG)?;
+        let inset = CAPTURE_BORDER + CAPTURE_GAP;
+        let inner = Rectangle::new(
+            cap.loc + Point::from((inset, inset)),
+            Size::from((CAPTURE_INNER, CAPTURE_INNER)),
+        );
+        let circle = if state.active == Some(Control::Capture) {
+            CAPTURE_CIRCLE_ACTIVE
+        } else if state.hover == Some(Control::Capture) {
+            CAPTURE_CIRCLE_HOVER
+        } else {
+            CAPTURE_CIRCLE
+        };
+        p.fill_rounded(inner, CAPTURE_INNER / 2., circle)?;
+
         Ok(())
-    })
+    })?;
+
+    Ok((texture, layout))
 }
 
 #[cfg(test)]
@@ -1837,8 +2165,9 @@ mod tests {
     use super::*;
 
     // Plausible caption metrics at scale 1 — the three labels differ in width, which is what makes
-    // the homogeneous rule observable.
-    const LABEL_W: [f64; 3] = [58., 42., 48.];
+    // the homogeneous rule observable. The *widest* is deliberately the hidden Window button, so a
+    // layout that sized the row from only the visible captions fails rather than passes by luck.
+    const LABEL_W: [f64; 3] = [58., 42., 66.];
     const LABEL_H: f64 = 13.;
 
     fn layout() -> PanelLayout {
@@ -1884,22 +2213,53 @@ mod tests {
     fn the_type_buttons_are_homogeneous_and_evenly_spaced() {
         let l = layout();
 
-        let w = l.type_buttons[0].size.w;
-        for b in &l.type_buttons {
+        let shown: Vec<_> = CaptureType::ROW
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| ty.is_available())
+            .map(|(i, _)| l.type_buttons[i])
+            .collect();
+        assert!(shown.len() >= 2, "the row needs two buttons to be a row");
+
+        let w = shown[0].size.w;
+        for b in &shown {
             assert_eq!(b.size.w, w);
-            assert_eq!(b.size.h, l.type_buttons[0].size.h);
+            assert_eq!(b.size.h, shown[0].size.h);
             assert_eq!(b.loc.y, PanelLayout::PAD);
         }
-        for i in 1..3 {
-            assert_eq!(
-                l.type_buttons[i].loc.x - l.type_buttons[i - 1].loc.x,
-                w + PanelLayout::TYPE_SPACING
-            );
+        for pair in shown.windows(2) {
+            assert_eq!(pair[1].loc.x - pair[0].loc.x, w + PanelLayout::TYPE_SPACING);
         }
 
-        // The widest caption sets the width, not the first one.
+        // The widest caption sets the width — including Window's, which is *not* drawn yet. Sizing
+        // the row from only the visible captions would make it jump the day slice 2 unhides that
+        // button, which is exactly the jitter `homogeneous: true` exists to prevent.
         let widest = LABEL_W.iter().cloned().fold(0f64, f64::max);
         assert_eq!(w, widget::IconLabelButton::size(widest, LABEL_H).w);
+        assert_eq!(
+            widest, LABEL_W[2],
+            "this assertion is only meaningful while Window has the widest caption"
+        );
+    }
+
+    // A hidden button must take no space, or the panel sits visibly lopsided around a gap nobody
+    // can see. (It must also take no clicks — that is
+    // `the_unavailable_window_button_does_not_take_clicks`.)
+    #[test]
+    fn the_hidden_window_button_occupies_no_room() {
+        let l = layout();
+
+        let window = l.type_buttons[2];
+        assert_eq!(window.size, Size::from((0., 0.)));
+
+        // The row is exactly the two drawn buttons plus one gap, centred on the panel.
+        let drawn = l.type_buttons[1].loc.x + l.type_buttons[1].size.w - l.type_buttons[0].loc.x;
+        let left = l.type_buttons[0].loc.x;
+        let right = l.size.w - (l.type_buttons[1].loc.x + l.type_buttons[1].size.w);
+        assert!(
+            (left - right).abs() < 0.001,
+            "type row is off-centre: {left} left, {right} right (row {drawn})"
+        );
     }
 
     // A click in the corner of a circular button's bounding box is an inch from any drawn pixel.
@@ -1909,9 +2269,6 @@ mod tests {
     fn the_round_controls_are_hit_tested_as_circles() {
         let l = layout();
 
-        let centre = |r: Rectangle<f64, Logical>| {
-            Point::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
-        };
         assert_eq!(l.control_at(centre(l.capture)), Some(Control::Capture));
         assert_eq!(
             l.control_at(centre(l.show_pointer)),
@@ -1930,10 +2287,7 @@ mod tests {
     fn the_unavailable_window_button_does_not_take_clicks() {
         let l = layout();
 
-        let centre_of = |i: usize| {
-            let r = l.type_buttons[i];
-            Point::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
-        };
+        let centre_of = |i: usize| centre(l.type_buttons[i]);
         assert_eq!(
             l.control_at(centre_of(0)),
             Some(Control::Type(CaptureType::Selection))

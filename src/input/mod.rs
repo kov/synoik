@@ -2125,15 +2125,7 @@ impl State {
                 self.confirm_screenshot(write_to_disk);
             }
             Action::CancelScreenshot => {
-                if !self.niri.screenshot_ui.is_open() {
-                    return;
-                }
-
-                self.niri.close_screenshot_ui();
-                self.niri
-                    .cursor_manager
-                    .set_cursor_image(CursorImageStatus::default_named());
-                self.niri.queue_redraw_all();
+                self.cancel_screenshot();
             }
             Action::ScreenshotTogglePointer => {
                 self.niri.screenshot_ui.toggle_pointer();
@@ -4142,7 +4134,9 @@ impl State {
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
-            self.niri.screenshot_ui.pointer_motion(point, None);
+            if self.niri.screenshot_ui.pointer_motion(point, None) {
+                self.niri.queue_redraw_all();
+            }
         }
 
         // Hovering an item moves the switcher's selection -- but only once the pointer is live
@@ -4308,7 +4302,9 @@ impl State {
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
-            self.niri.screenshot_ui.pointer_motion(point, None);
+            if self.niri.screenshot_ui.pointer_motion(point, None) {
+                self.niri.queue_redraw_all();
+            }
         }
 
         if let Some(switcher_output) = self.niri.switcher.output().cloned() {
@@ -6741,12 +6737,8 @@ impl State {
                         self.niri.queue_redraw_all();
                     }
                 }
-            } else if let Some(capture) = self.niri.screenshot_ui.pointer_up(None) {
-                if capture {
-                    self.confirm_screenshot(true);
-                } else {
-                    self.niri.queue_redraw_all();
-                }
+            } else if let Some(up) = self.niri.screenshot_ui.pointer_up(None) {
+                self.handle_screenshot_ui_pointer_up(up);
             }
         }
 
@@ -7484,7 +7476,9 @@ impl State {
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
-            self.niri.screenshot_ui.pointer_motion(point, None);
+            if self.niri.screenshot_ui.pointer_motion(point, None) {
+                self.niri.queue_redraw_all();
+            }
         }
 
         if let Some(switcher_output) = self.niri.switcher.output().cloned() {
@@ -7675,12 +7669,8 @@ impl State {
                 }
             }
             TabletToolTipState::Up => {
-                if let Some(capture) = self.niri.screenshot_ui.pointer_up(None) {
-                    if capture {
-                        self.confirm_screenshot(true);
-                    } else {
-                        self.niri.queue_redraw_all();
-                    }
+                if let Some(up) = self.niri.screenshot_ui.pointer_up(None) {
+                    self.handle_screenshot_ui_pointer_up(up);
                 }
 
                 tool.tip_up(event.time_msec());
@@ -8244,12 +8234,8 @@ impl State {
         };
         let slot = evt.slot();
 
-        if let Some(capture) = self.niri.screenshot_ui.pointer_up(Some(slot)) {
-            if capture {
-                self.confirm_screenshot(true);
-            } else {
-                self.niri.queue_redraw_all();
-            }
+        if let Some(up) = self.niri.screenshot_ui.pointer_up(Some(slot)) {
+            self.handle_screenshot_ui_pointer_up(up);
         }
 
         let serial = SERIAL_COUNTER.next_serial();
@@ -8277,8 +8263,9 @@ impl State {
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
-            self.niri.screenshot_ui.pointer_motion(point, Some(slot));
-            self.niri.queue_redraw(&output);
+            if self.niri.screenshot_ui.pointer_motion(point, Some(slot)) {
+                self.niri.queue_redraw(&output);
+            }
         }
 
         let under = self.niri.contents_under(pos);

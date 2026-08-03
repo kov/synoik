@@ -191,7 +191,7 @@ use crate::ui::popover::PanelPopover;
 use crate::ui::run_dialog::{RunDialog, RunDialogRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{
-    OutputScreenshot, ScreenshotNeutral, ScreenshotUi, ScreenshotUiRenderElement,
+    OutputScreenshot, PointerUp, ScreenshotNeutral, ScreenshotUi, ScreenshotUiRenderElement,
 };
 use crate::ui::switcher::app_switcher::app_items;
 use crate::ui::switcher::ui::{Items, OpenRequest};
@@ -3509,6 +3509,32 @@ impl State {
             .cursor_manager
             .set_cursor_image(CursorImageStatus::default_named());
         self.niri.queue_redraw_all();
+    }
+
+    /// Dismiss the screenshot UI without capturing anything.
+    ///
+    /// Shared by Escape and the panel's close button — both must go through
+    /// `close_screenshot_ui`, which is what answers a `SelectArea`/`InteractiveScreenshot` caller
+    /// that would otherwise wait for its timeout.
+    pub fn cancel_screenshot(&mut self) {
+        if !self.niri.screenshot_ui.is_open() {
+            return;
+        }
+
+        self.niri.close_screenshot_ui();
+        self.niri
+            .cursor_manager
+            .set_cursor_image(CursorImageStatus::default_named());
+        self.niri.queue_redraw_all();
+    }
+
+    /// Act on a release over the screenshot UI's control panel.
+    pub fn handle_screenshot_ui_pointer_up(&mut self, up: PointerUp) {
+        match up {
+            PointerUp::Capture => self.confirm_screenshot(true),
+            PointerUp::Close => self.cancel_screenshot(),
+            PointerUp::Redraw => self.niri.queue_redraw_all(),
+        }
     }
 
     pub fn store_unmap_snapshot(&mut self, window: &Window, output: Option<&Output>) {
@@ -8506,10 +8532,15 @@ impl Niri {
 
         // If the screenshot UI is open, draw it.
         if self.screenshot_ui.is_open() {
-            self.screenshot_ui
-                .render_output(ctx.renderer, output, ctx.target, &mut |elem| {
-                    push(elem.into())
-                });
+            let accent = crate::ui::widget::style::accent_rgba(self.gnome_settings.accent_color);
+            self.screenshot_ui.render_output(
+                ctx.renderer,
+                &self.icon_cache,
+                accent,
+                output,
+                ctx.target,
+                &mut |elem| push(elem.into()),
+            );
 
             // Add the backdrop for outputs that were connected while the screenshot UI was open.
             push(backdrop);

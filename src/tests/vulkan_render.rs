@@ -15,7 +15,9 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Element, RenderElement};
 use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Renderer};
 use smithay::output::Output;
-use smithay::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{
+    Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
+};
 use wayland_client::protocol::wl_shm;
 use wayland_client::protocol::wl_surface::WlSurface;
 
@@ -25,6 +27,7 @@ use super::gnome::map_window_for_app;
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget, NATIVE_FOURCC};
+use crate::ui::screenshot_ui::{CaptureType, PointerUp};
 use crate::utils::{output_size, to_physical_precise_round};
 
 const OUT_W: u16 = 1280;
@@ -402,15 +405,18 @@ fn vulkan_screenshot_ui_draws_the_frozen_screen() {
     );
 }
 
-/// The screenshot UI's help panel must actually draw.
+/// The screenshot UI's control panel must actually draw.
 ///
 /// The panel is the UI's most fragile element: drawn into an offscreen, gated on the open
 /// animation's progress — chances to end up invisible while the frozen screenshot (which is *not*
 /// progress-gated) still draws and makes the frame look right. Measure inside
 /// [`ScreenshotUi::panel_rect`]: whole-frame white does not discriminate the panel, since the four
 /// selection-border buffers alone score thousands of white px without it.
+///
+/// Also the only cover for the icons, which are render *elements* composited over the bake rather
+/// than paint ops inside it — the one part of the panel that a successful bake does not prove.
 #[test]
-fn vulkan_screenshot_ui_draws_the_help_panel() {
+fn vulkan_screenshot_ui_draws_the_control_panel() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
@@ -426,34 +432,106 @@ fn vulkan_screenshot_ui_draws_the_help_panel() {
         .niri()
         .screenshot_ui
         .panel_rect(&output)
-        .expect("the open screenshot UI must have a help panel");
+        .expect("the open screenshot UI must have a control panel");
 
-    // `generate_panel` fills the panel with rgb(0.1) — 26/255 — and writes the help text in white.
+    // `%osd_panel`'s fill is `style::OSD_BG` — rgb(46, 46, 51) — and the capture button's ring,
+    // the captions and the type-button glyphs are all white.
     let mut background = 0;
-    let mut text = 0;
+    let mut white = 0;
     for y in rect.loc.y..(rect.loc.y + rect.size.h).min(h) {
         for x in rect.loc.x..(rect.loc.x + rect.size.w).min(w) {
             let p = px(&pixels, w, x, y);
-            if p[0] < 40 && p[1] < 40 && p[2] < 40 {
+            if (35..60).contains(&p[0]) && (35..60).contains(&p[1]) && (35..65).contains(&p[2]) {
                 background += 1;
             }
             if p[0] > 200 && p[1] > 200 && p[2] > 200 {
-                text += 1;
+                white += 1;
             }
         }
     }
     eprintln!(
-        "vulkan_screenshot_ui_draws_the_help_panel: {background} panel-bg px, {text} text px in \
-         {rect:?}"
+        "vulkan_screenshot_ui_draws_the_control_panel: {background} panel-bg px, {white} white px \
+         in {rect:?}"
     );
     assert!(
         background > 1000,
-        "the help panel's background did not draw ({background} px in {rect:?})"
+        "the control panel's background did not draw ({background} px in {rect:?})"
     );
+    // The capture button's 32px inner circle alone is ~800 px, so this cannot pass on chrome.
     assert!(
-        text > 100,
-        "the help panel drew no text or capture button ({text} white px in {rect:?})"
+        white > 900,
+        "the control panel drew no capture button or captions ({white} white px in {rect:?})"
     );
+}
+
+/// The type buttons must be where the hit test says they are, and clicking one must change what the
+/// capture button will take.
+///
+/// The panel is a single baked texture: nothing structural connects the pixels a control is drawn
+/// at to the geometry [`PanelLayout::control_at`] answers with. One shared [`PanelLayout`] is what
+/// keeps them together, and this is the test that would fail if the bake and the hit test ever
+/// stopped reading the same one.
+#[test]
+fn vulkan_screenshot_ui_type_buttons_take_clicks_where_they_are_drawn() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    f.niri_state().open_screenshot_ui(false, None);
+    settle_screenshot_ui_open(&mut f);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    let rect = f
+        .niri()
+        .screenshot_ui
+        .panel_rect(&output)
+        .expect("the open screenshot UI must have a control panel");
+    let scale = output.current_scale().fractional_scale();
+
+    assert_eq!(
+        f.niri().screenshot_ui.capture_type(),
+        CaptureType::Selection,
+        "the picker must open on Selection, the mode niri's picker always had"
+    );
+
+    // Screen is the middle button of the three, so its centre is the panel's horizontal centre at
+    // the type row's height — derived from the layout, not from a pixel guess.
+    let layout = f
+        .niri()
+        .screenshot_ui
+        .panel_layout(&output)
+        .expect("the panel must publish its layout once baked");
+    let screen = layout.type_buttons[1];
+    let point = Point::<f64, Logical>::from((
+        screen.loc.x + screen.size.w / 2.,
+        screen.loc.y + screen.size.h / 2.,
+    ))
+    .to_physical(scale)
+    .to_i32_round::<i32>()
+        + rect.loc;
+
+    let ui = &mut f.niri_state().niri.screenshot_ui;
+    ui.pointer_motion(point, None);
+    assert!(ui.pointer_down(output.clone(), point, None, false));
+    assert_eq!(ui.pointer_up(None), Some(PointerUp::Redraw));
+
+    assert_eq!(
+        ui.capture_type(),
+        CaptureType::Screen,
+        "clicking the Screen button did not switch modes — the bake and the hit test disagree"
+    );
+
+    // Screen mode takes the whole output, so the selection must now be the full frame.
+    let sel = ui.selection_rect_global().unwrap();
+    let logical = output
+        .current_mode()
+        .unwrap()
+        .size
+        .to_f64()
+        .to_logical(scale);
+    assert_eq!(sel.size.w, logical.w.round() as i32);
+    assert_eq!(sel.size.h, logical.h.round() as i32);
 }
 
 /// Build a Vulkan fixture whose single output is configured at `scale` (through config, by
@@ -524,28 +602,30 @@ fn vulkan_screenshot_ui_button_is_scale_correct() {
         .niri()
         .screenshot_ui
         .panel_rect(&output)
-        .expect("the open screenshot UI must have a help panel");
+        .expect("the open screenshot UI must have a control panel");
+    let layout = f
+        .niri()
+        .screenshot_ui
+        .panel_layout(&output)
+        .expect("the panel must publish its layout once baked");
 
-    // The button sits at the panel's left: centre x = left + PADDING + RADIUS (both logical, in
-    // screenshot_ui.rs: PADDING = 8, RADIUS = 16). Scan that column across the whole output and
-    // measure the vertical extent of the white shutter ring/disk.
-    let radius_phys = to_physical_precise_round::<i32>(scale, 16.);
-    let padding_phys = to_physical_precise_round::<i32>(scale, 8.);
-    // The button occupies the panel's left column: x in [left+PADDING, left+PADDING+2·RADIUS].
-    // Bound the scan to the left of the help text (text_x ≈ PADDING + 2·RADIUS + PADDING) so
-    // only the white shutter — not the white glyphs — is measured. Scan only WITHIN the panel
-    // box vertically (the selection-rectangle chrome above the panel is white too). The button
-    // is the only white here; measure its bounding-box height: a correct button is 2·RADIUS
-    // (64px at 2×); the bug's 2× button clips to the ~106px panel, well outside tolerance
-    // either way.
-    let left = rect.loc.x;
-    let text_x = left + 2 * radius_phys + padding_phys;
+    // Measure the capture button, which is drawn *inside* the panel bake: if the panel texture is
+    // tagged at the wrong scale the whole card composites at the wrong size, and the button is the
+    // one element whose logical size is a fixed constant rather than content-derived. Scan only
+    // within its own rect, so the white captions and glyphs elsewhere on the panel cannot be
+    // mistaken for it.
+    let button = layout.capture;
+    let x0 = rect.loc.x + to_physical_precise_round::<i32>(scale, button.loc.x);
+    let x1 = x0 + to_physical_precise_round::<i32>(scale, button.size.w);
+    let y0 = rect.loc.y + to_physical_precise_round::<i32>(scale, button.loc.y);
+    let y1 = y0 + to_physical_precise_round::<i32>(scale, button.size.h);
+
     let mut top: Option<i32> = None;
     let mut bot = 0;
-    for y in rect.loc.y..(rect.loc.y + rect.size.h).min(h) {
-        for x in (left + padding_phys)..text_x.min(w) {
+    for y in y0..y1.min(h) {
+        for x in x0..x1.min(w) {
             let p = px(&pixels, w, x, y);
-            // Pure white shutter over the rgb(26) panel — a mid threshold catches the AA edge too.
+            // Pure white ring/disc over the panel — a mid threshold catches the AA edge too.
             if p[0] > 128 && p[1] > 128 && p[2] > 128 {
                 top.get_or_insert(y);
                 bot = y;
@@ -553,17 +633,18 @@ fn vulkan_screenshot_ui_button_is_scale_correct() {
             }
         }
     }
-    let top = top.expect("no capture-button pixels found in the panel's left column");
+    let top = top.expect("no capture-button pixels found where the layout puts the button");
     let extent = bot - top + 1;
-    let expected = 2 * radius_phys; // 2·RADIUS logical, expressed at the output scale
+    let expected = to_physical_precise_round::<i32>(scale, button.size.h);
     eprintln!(
         "button vertical extent {extent}px at scale {scale} (expected ~{expected}); panel {rect:?}"
     );
-    // The bug doubled the button (~4·RADIUS·scale, clipped by the panel). Allow AA slack but
-    // reject.
+    // A texture tagged at scale 1 on a scale-2 output composites at twice the size, so the button's
+    // ring would run off its own rect entirely — the scan would saturate at the rect height rather
+    // than land on the diameter.
     assert!(
         (expected - 8..=expected + 8).contains(&extent),
-        "capture-button vertical extent {extent}px != expected ~{expected}px — button tagged at \
+        "capture-button vertical extent {extent}px != expected ~{expected}px — panel tagged at \
          the wrong scale? (the physical-vs-scale buffer-tag trap)"
     );
 }

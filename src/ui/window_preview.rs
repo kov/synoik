@@ -52,11 +52,11 @@ const CLOSE_ICON_PX: f64 = 24.;
 /// `$window_close_button_color` = `transparentize(lighten($system_bg_color, 7%),
 /// .02)` (`_window-picker.scss:2`), with `$system_bg_color` =
 /// `lighten($system_base_color, 5%)` (`_colors.scss:47`) — `#3f3f46` at 98%.
-const CLOSE_BG: Rgba = [0.2471, 0.2471, 0.2745, 0.98];
+pub const CLOSE_BG: Rgba = [0.2471, 0.2471, 0.2745, 0.98];
 
 /// `.window-close:hover` — the same color lightened 7% (`_window-picker.scss:47`).
 /// Note this widget lightens on hover, but the direction is read, never assumed.
-const CLOSE_BG_HOVER: Rgba = [0.3137, 0.3137, 0.349, 0.98];
+pub const CLOSE_BG_HOVER: Rgba = [0.3137, 0.3137, 0.349, 0.98];
 
 /// The close button of a preview drawn at `preview`: a `CLOSE_SIZE` box centered
 /// on the preview's top-right corner. gnome-shell aligns the button's own center

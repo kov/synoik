@@ -1,9 +1,8 @@
 # The screenshot UI — porting GNOME's control panel
 
-Status: **2026-08-03, scoping (reviewed).** What we have is niri's area picker wearing GNOME's OSD
-chrome: the shade, the selection rectangle, a capture button, and a panel that says *"Press Space to
-save the screenshot"*. GNOME's panel is a row of real controls, and per the fork tenet its way
-replaces niri's — the help text goes.
+Status: **2026-08-03, slice 1 landed and seat-checked on the headless harness.** The help text is
+gone; the panel is GNOME's control panel — type row, shot pill, capture button, show-pointer toggle
+and close button — with Selection and Screen both working. Slices 2-5 below are open.
 
 Reference: `js/ui/screenshot.js` (50.3) and `_screenshot.scss`. The visual spec is already cached
 and cited in `docs/fork/gnome-style-reference.md` §screenshot (every class, colour, radius and
@@ -36,21 +35,33 @@ constraint GNOME flips as the selection moves (`_closeButtonXAlignConstraint`,
 
 ## What we have today
 
-`src/ui/screenshot_ui.rs` (~1630 lines). Area selection on a single output, drag/move/resize by
-pointer and by keyboard, the shade and selection chrome, a CPU-composed capture button, and
-`generate_panel` — the two help lines with keycap patches. `P` toggles the pointer; `Space` saves.
-No type buttons, no shot/cast control, no close button, no tooltips, no window selector.
+`src/ui/screenshot_ui.rs`. Area selection on a single output, drag/move/resize by pointer and by
+keyboard, the shade and selection chrome, and GNOME's control panel: the three type buttons
+(Window built but not offered), the shot segment, the capture button, the show-pointer toggle and
+the close button, all hover/checked/active-styled and hit-tested off one shared `PanelLayout`. `P`
+still toggles the pointer and `Space` still saves. No cast control, no tooltips, no window selector.
+
+Two things the panel's shape now fixes in place, worth knowing before touching it:
+
+- **One `PanelLayout` feeds the bake, the glyph placement and the hit test.** The panel is a single
+  baked texture, so nothing structural ties a control's pixels to its clickable rect — that layout
+  is the only thing that does, and `vulkan_screenshot_ui_type_buttons_take_clicks_where_they_are_drawn`
+  is the test that fails if they ever drift apart.
+- **Icons are render elements, not paint verbs**, so they ride *on top* of the bake and fade with
+  it. They also arrive a frame late (the symbolic worker rasterizes off-thread and queues a redraw
+  on arrival), which is why a first-frame capture of the panel can be glyphless and mean nothing.
 
 ## Slices
 
-1. **The panel becomes GNOME's, with Selection and Screen.** Replace the help lines with the type
-   row and the bottom row. `Selection` is what we already do; `Screen` selects the whole output.
-   The show-pointer state becomes a real button (keeping `P` as its accelerator), and the close
-   button lands. `Window` is built but hidden — **our scaffolding, not GNOME's practice**: GNOME
-   never hides `_windowButton`. (It does hide `_castButton`, but on a runtime capability —
-   `visible = this._screencastSupported`, `screenshot.js:1524` — which is the parallel to slice 3,
-   not to this.) The hidden Window button is a debt to pay in slice 2, and should be labelled as
-   such in the code.
+1. **DONE.** The panel became GNOME's, with Selection and Screen. `Window` is built but hidden —
+   **our scaffolding, not GNOME's practice**: GNOME never hides `_windowButton`. (It does hide
+   `_castButton`, but on a runtime capability — `visible = this._screencastSupported`,
+   `screenshot.js:1524` — which is the parallel to slice 4, not to this.) `CaptureType::is_available`
+   is that debt, labelled as such; the row still sizes itself homogeneously over Window's caption so
+   unhiding it does not resize the panel. Two divergences taken deliberately: the close button is
+   always on the right (`Meta.prefs_get_button_layout()` is unported, as in `window_preview`), and
+   in Screen mode the keyboard selection actions are inert rather than silently breaking the
+   whole-output invariant.
 2. **Window mode.** Bigger than it looks, and *not* "selection UI over an existing capture": GNOME
    freezes **every** window's content at open and captures the chosen one from that snapshot
    (`screenshot.js:1638-1639`), while our `ScreenshotWindow` renders the **focused** window
