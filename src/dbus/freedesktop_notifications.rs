@@ -29,7 +29,7 @@ use zbus::{interface, zvariant};
 
 use super::Start;
 use crate::notifications::{
-    clamp_text, flatten_text, sanitize_text, NiriToNotifications, NotificationIcon,
+    bounded_pixels, clamp_text, flatten_text, sanitize_text, NiriToNotifications, NotificationIcon,
     NotificationsToNiri, NotifyRequest, PixelIcon, Urgency,
 };
 
@@ -101,35 +101,6 @@ fn hint_bool(hints: &Hints, key: &str) -> Option<bool> {
 fn hint_str(hints: &Hints, key: &str) -> Option<String> {
     let v = hints.get(key)?.try_clone().ok()?;
     String::try_from(v).ok()
-}
-
-/// Nothing renders a notification icon above 48 logical px; retaining
-/// untrusted images any larger than 2x that is pure memory exposure.
-const MAX_ICON_PX: u32 = 96;
-
-/// Downscale an ingested pixel icon to [`MAX_ICON_PX`] on the long side
-/// (aspect preserved) so a hostile client can't park megapixel buffers in the
-/// compositor for the lifetime of a notification.
-pub(crate) fn bounded_pixels(pix: PixelIcon) -> Arc<PixelIcon> {
-    let long = pix.width.max(pix.height);
-    if long <= MAX_ICON_PX {
-        return Arc::new(pix);
-    }
-    let w = (pix.width * MAX_ICON_PX / long).max(1);
-    let h = (pix.height * MAX_ICON_PX / long).max(1);
-    let Some(img) = image::RgbaImage::from_raw(pix.width, pix.height, pix.rgba) else {
-        return Arc::new(PixelIcon {
-            width: 0,
-            height: 0,
-            rgba: Vec::new(),
-        });
-    };
-    let resized = image::imageops::thumbnail(&img, w, h);
-    Arc::new(PixelIcon {
-        width: w,
-        height: h,
-        rgba: resized.into_raw(),
-    })
 }
 
 /// Decode an `image-data`-style hint: the `(iiibiiay)` pixbuf tuple, converted

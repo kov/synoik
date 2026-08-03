@@ -81,6 +81,35 @@ impl CloseReason {
     }
 }
 
+/// Nothing renders a notification icon above 48 logical px; retaining
+/// untrusted images any larger than 2x that is pure memory exposure.
+const MAX_ICON_PX: u32 = 96;
+
+/// Downscale an ingested pixel icon to [`MAX_ICON_PX`] on the long side
+/// (aspect preserved) so a hostile client can't park megapixel buffers in the
+/// compositor for the lifetime of a notification.
+pub fn bounded_pixels(pix: PixelIcon) -> Arc<PixelIcon> {
+    let long = pix.width.max(pix.height);
+    if long <= MAX_ICON_PX {
+        return Arc::new(pix);
+    }
+    let w = (pix.width * MAX_ICON_PX / long).max(1);
+    let h = (pix.height * MAX_ICON_PX / long).max(1);
+    let Some(img) = image::RgbaImage::from_raw(pix.width, pix.height, pix.rgba) else {
+        return Arc::new(PixelIcon {
+            width: 0,
+            height: 0,
+            rgba: Vec::new(),
+        });
+    };
+    let resized = image::imageops::thumbnail(&img, w, h);
+    Arc::new(PixelIcon {
+        width: w,
+        height: h,
+        rgba: resized.into_raw(),
+    })
+}
+
 /// A decoded, tightly-packed RGBA8 image from the `image-data` hint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PixelIcon {
@@ -204,6 +233,30 @@ pub enum SourceKey {
     DesktopEntry(String),
     PidName(u32, String),
     GtkApp(String),
+    /// The shell's own notifications. gnome-shell gives each a dedicated `Source` it caches and
+    /// reuses (`getScreenshotNotificationSource`, `js/ui/screenshot.js:2255-2270`); `name` is that
+    /// source's identity, so screenshots group together and not with screencasts.
+    Shell(&'static str),
+}
+
+/// The screenshot source's identity — gnome-shell caches one `Source` for every capture
+/// (`getScreenshotNotificationSource`, `js/ui/screenshot.js:2255-2270`).
+pub const SHELL_SOURCE_SCREENSHOT: &str = "screenshot";
+
+/// What the shell itself does when one of its own notifications is activated.
+///
+/// gnome-shell attaches in-process closures (`js/ui/screenshot.js:2400-2418`). We have a
+/// plain-data seam between the notification store and the compositor, so the intent travels as
+/// data and the compositor runs it — see `State::run_shell_notification_action`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellAction {
+    /// Open the file with its default handler — GNOME's body-click
+    /// (`Gio.app_info_launch_default_for_uri`, `js/ui/screenshot.js:2413`).
+    OpenFile(PathBuf),
+    /// Hand the file to the file manager — GNOME's "Show in Files" button, which launches the
+    /// default `inode/directory` handler with the file as its argument
+    /// (`js/ui/screenshot.js:2401-2411`).
+    ShowInFiles(PathBuf),
 }
 
 /// Which D-Bus front-end created a notification. Signals route by origin: fdo
@@ -214,6 +267,14 @@ pub enum SourceKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifKind {
     Fdo,
+    /// One of the shell's own. Nothing to signal — the actions are ours to run, so they are
+    /// carried here rather than routed to a bus name.
+    Shell {
+        /// Action key → what it does, parallel to [`Notification::actions`].
+        actions: Vec<(String, ShellAction)>,
+        /// What a body click does, if anything.
+        default_action: Option<ShellAction>,
+    },
     Gtk {
         app_id: String,
         gtk_id: String,
@@ -283,6 +344,54 @@ pub struct GtkNotifyRequest {
     /// The `default-action` key (body click), if any.
     pub default_action: Option<String>,
     pub urgency: Urgency,
+}
+
+/// One of the shell's own notifications. No bus name, no numeric id to hand back, and its buttons
+/// carry [`ShellAction`]s rather than keys to signal at somebody.
+/// The [`ShellAction`] a click resolves to, or `None` if the key names nothing.
+///
+/// Split out from running it so the resolution — which key maps to which action, and the `default`
+/// body-click pseudo-key — is testable without launching a file manager.
+pub fn shell_action_for(kind: &NotifKind, action: &str) -> Option<ShellAction> {
+    let NotifKind::Shell {
+        actions,
+        default_action,
+    } = kind
+    else {
+        return None;
+    };
+    if action == "default" {
+        return default_action.clone();
+    }
+    actions
+        .iter()
+        .find(|(key, _)| key == action)
+        .map(|(_, a)| a.clone())
+}
+
+/// The synthetic action key for the shell's own notification buttons. The UI and the banner both
+/// key buttons by string, but a shell action has no app-supplied key to use — so index it, and
+/// keep [`Notification::actions`] and `NotifKind::Shell::actions` in the same order.
+fn shell_action_key(i: usize) -> String {
+    format!("shell-{i}")
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShellNotifyRequest {
+    /// The source's stable identity — see [`SourceKey::Shell`].
+    pub source: &'static str,
+    /// The source's display name ("Screenshot", `js/ui/screenshot.js:2262`).
+    pub source_title: String,
+    pub source_icon: Option<NotificationIcon>,
+    pub title: String,
+    pub body: String,
+    /// The notification's image — for a screenshot, the shot itself.
+    pub icon: Option<NotificationIcon>,
+    /// (label, action) buttons, in display order.
+    pub actions: Vec<(String, ShellAction)>,
+    pub default_action: Option<ShellAction>,
+    pub urgency: Urgency,
+    pub transient: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -767,6 +876,101 @@ impl NotificationStore {
             });
         }
         effects
+    }
+
+    /// Post one of the shell's own notifications (the screenshot-captured banner).
+    ///
+    /// Always a fresh id — gnome-shell constructs a new `Notification` per capture and lets the
+    /// source hold several (`js/ui/screenshot.js:2386-2420`), so there is no replace key here.
+    /// The source is reused across captures, which is what makes repeated screenshots group
+    /// under one heading rather than stacking separate sources.
+    pub fn add_shell(
+        &mut self,
+        req: ShellNotifyRequest,
+        show_banners: bool,
+        now: Duration,
+    ) -> (u32, Effects) {
+        let mut effects = Effects::default();
+        let key = SourceKey::Shell(req.source);
+        let kind = NotifKind::Shell {
+            actions: req
+                .actions
+                .iter()
+                .enumerate()
+                .map(|(i, (_, action))| (shell_action_key(i), action.clone()))
+                .collect(),
+            default_action: req.default_action.clone(),
+        };
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let notification = Notification {
+            id,
+            sender: None,
+            title: req.title,
+            body: req.body,
+            icon: req.icon,
+            actions: req
+                .actions
+                .into_iter()
+                .enumerate()
+                .map(|(i, (label, _))| (shell_action_key(i), label))
+                .collect(),
+            has_default_action: req.default_action.is_some(),
+            urgency: req.urgency,
+            resident: false,
+            transient: req.transient,
+            acknowledged: false,
+            timestamp: now,
+            kind,
+        };
+
+        let idx = match self.sources.iter().position(|s| s.key == key) {
+            Some(idx) => idx,
+            None => {
+                self.sources.insert(
+                    0,
+                    Source {
+                        key: key.clone(),
+                        sender: None,
+                        title: String::new(),
+                        icon: None,
+                        app_icon: None,
+                        notifications: Vec::new(),
+                    },
+                );
+                0
+            }
+        };
+        // Evict oldest-first past the per-source cap BEFORE pushing, as the other two do.
+        let excess = (self.sources[idx].notifications.len() + 1)
+            .saturating_sub(MAX_NOTIFICATIONS_PER_SOURCE);
+        let evict: Vec<u32> = self.sources[idx].notifications[..excess]
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        for evicted in evict {
+            merge(&mut effects, self.close(evicted, CloseReason::Expired));
+        }
+
+        let idx = self.sources.iter().position(|s| s.key == key).unwrap();
+        let source = self.sources.remove(idx);
+        self.sources.insert(0, source);
+        let source = &mut self.sources[0];
+        source.title = req.source_title;
+        source.icon = req.source_icon;
+        source.notifications.push(notification);
+
+        if let Some(banner) = self.request_banner(id, show_banners) {
+            effects.banner = Some(match effects.banner {
+                Some(BannerEffect::HideCurrent) if banner != BannerEffect::RefreshCurrent => {
+                    BannerEffect::HideCurrent
+                }
+                _ => banner,
+            });
+        }
+        (id, effects)
     }
 
     /// `org.gtk.Notifications` `RemoveNotification(app_id, id)`: destroy the

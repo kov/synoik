@@ -613,56 +613,45 @@ pub fn baba_is_float_offset(now: Duration, view_height: f64) -> f64 {
     amplitude * ((f64::consts::TAU * now / 3.6).sin() - 1.)
 }
 
-#[cfg(feature = "dbus")]
-pub fn show_screenshot_notification(image_path: Option<&Path>) -> anyhow::Result<()> {
-    use std::collections::HashMap;
+/// Run one of the shell's own notification actions.
+///
+/// gnome-shell attaches these as in-process closures; ours arrive as data across the
+/// notification store's plain-data seam. Both end up in the same two GIO calls
+/// (`js/ui/screenshot.js:2400-2418`).
+pub fn run_shell_notification_action(action: &crate::notifications::ShellAction) {
+    use gio::prelude::AppInfoExt as _;
 
-    use gio::glib;
-    use zbus::zvariant;
+    use crate::notifications::ShellAction;
 
-    let conn = zbus::blocking::Connection::session()?;
-
-    // Try to add the screenshot as an image if possible.
-    let mut image_url = None;
-    if let Some(path) = image_path {
-        match path.canonicalize() {
-            Ok(path) => match glib::filename_to_uri(path, None) {
-                Ok(url) => {
-                    image_url = Some(url);
-                }
+    match action {
+        ShellAction::OpenFile(path) => {
+            let uri = match gio::glib::filename_to_uri(path, None) {
+                Ok(uri) => uri,
                 Err(err) => {
-                    warn!("error converting screenshot path to file url: {err:?}");
+                    warn!("error making a uri for {path:?}: {err:?}");
+                    return;
                 }
-            },
-            Err(err) => {
-                warn!("error canonicalizing screenshot path: {err:?}");
+            };
+            if let Err(err) =
+                gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE)
+            {
+                warn!("error opening {uri}: {err:?}");
+            }
+        }
+        ShellAction::ShowInFiles(path) => {
+            // GNOME hands the *file* to the directory handler, which is what makes Nautilus open
+            // the containing folder with it selected rather than trying to display the PNG.
+            let Some(app) = gio::AppInfo::default_for_type("inode/directory", false) else {
+                // Null e.g. in a toolbox without nautilus — gnome-shell logs and gives up too.
+                warn!("no default app for inode/directory; not showing the file");
+                return;
+            };
+            let file = gio::File::for_path(path);
+            if let Err(err) = app.launch(&[file], gio::AppLaunchContext::NONE) {
+                warn!("error showing {path:?} in the file manager: {err:?}");
             }
         }
     }
-
-    let actions: &[&str] = &[];
-
-    conn.call_method(
-        Some("org.freedesktop.Notifications"),
-        "/org/freedesktop/Notifications",
-        Some("org.freedesktop.Notifications"),
-        "Notify",
-        &(
-            "niri",
-            0u32,
-            image_url.as_ref().map(|url| url.as_str()).unwrap_or(""),
-            "Screenshot captured",
-            "You can paste the image from the clipboard.",
-            actions,
-            HashMap::from([
-                ("transient", zvariant::Value::Bool(true)),
-                ("urgency", zvariant::Value::U8(1)),
-            ]),
-            -1,
-        ),
-    )?;
-
-    Ok(())
 }
 
 /// A user's login name and real name, as the passwd database has them.

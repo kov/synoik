@@ -154,6 +154,7 @@ use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
 };
 use crate::niri_render_elements;
+use crate::notifications::{bounded_pixels, PixelIcon};
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
 use crate::protocols::foreign_toplevel::{self, ForeignToplevelManagerState};
 use crate::protocols::gamma_control::GammaControlManagerState;
@@ -3509,6 +3510,51 @@ impl State {
             .cursor_manager
             .set_cursor_image(CursorImageStatus::default_named());
         self.niri.queue_redraw_all();
+    }
+
+    /// The "Screenshot captured" notification (`js/ui/screenshot.js:2386-2420`).
+    ///
+    /// Carries the shot itself as its image, and — when it went to disk — a **Show in Files**
+    /// button plus a body click that opens it. `None` means the capture went to the clipboard
+    /// only, and GNOME drops both of those with it (`disableSaveToDisk`, `:2400`).
+    pub fn show_screenshot_notification(
+        &mut self,
+        path: Option<PathBuf>,
+        thumbnail: Option<Arc<PixelIcon>>,
+    ) {
+        use crate::notifications::{NotificationIcon, ShellAction, ShellNotifyRequest, Urgency};
+
+        let mut actions = Vec::new();
+        let mut default_action = None;
+        if let Some(path) = &path {
+            actions.push((
+                String::from("Show in Files"),
+                ShellAction::ShowInFiles(path.clone()),
+            ));
+            default_action = Some(ShellAction::OpenFile(path.clone()));
+        }
+
+        let req = ShellNotifyRequest {
+            source: crate::notifications::SHELL_SOURCE_SCREENSHOT,
+            source_title: String::from("Screenshot"),
+            source_icon: Some(NotificationIcon::Themed(String::from(
+                "applets-screenshooter-symbolic",
+            ))),
+            title: String::from("Screenshot captured"),
+            body: String::from("You can paste the image from the clipboard"),
+            // The shot itself, downscaled on the encoding thread. A clipboard-only capture still
+            // gets one — there is no file, but there is very much an image.
+            icon: thumbnail.map(NotificationIcon::Pixels),
+            actions,
+            default_action,
+            urgency: Urgency::Normal,
+            transient: true,
+        };
+
+        let now = self.niri.clock.now_unadjusted();
+        let show_banners = !self.niri.gnome_settings.quick_toggles.do_not_disturb;
+        let (_, effects) = self.niri.notifications.add_shell(req, show_banners, now);
+        self.apply_notification_effects(effects);
     }
 
     /// Dismiss the screenshot UI without capturing anything.
@@ -10591,14 +10637,28 @@ impl Niri {
         // Prepare to send screenshot completion event back to main thread.
         #[cfg(feature = "dbus")]
         let mut interactive_reply = interactive_reply;
-        let (event_tx, event_rx) = calloop::channel::sync_channel::<Option<String>>(1);
+        // The path plus the shot itself, already downscaled to a notification icon. Built on the
+        // encoding thread, which is holding the raw pixels anyway: making the main loop re-read and
+        // re-decode the PNG it just wrote would be a full-screen image decode on the frame path.
+        let (event_tx, event_rx) =
+            calloop::channel::sync_channel::<(Option<String>, Option<Arc<PixelIcon>>)>(1);
         self.event_loop
             .insert_source(event_rx, move |event, _, state| match event {
-                calloop::channel::Event::Msg(path) => {
+                calloop::channel::Event::Msg((path, thumbnail)) => {
                     #[cfg(feature = "dbus")]
                     if let Some(tx) = interactive_reply.take() {
                         let _ = tx.send_blocking(path.as_deref().map(|p| format!("file://{p}")));
                     }
+                    // Posted here rather than from the encoding thread, and straight into the
+                    // store rather than back through `org.freedesktop.Notifications`: we ARE the
+                    // notification server, and a notification we send ourselves over the bus comes
+                    // back owned by a connection that is already gone — so its buttons would have
+                    // nowhere to route to. gnome-shell builds this one in-process for the same
+                    // reason (`js/ui/screenshot.js:2386-2420`).
+                    state.show_screenshot_notification(
+                        path.as_deref().map(PathBuf::from),
+                        thumbnail,
+                    );
                     state.ipc_screenshot_taken(path);
                 }
                 calloop::channel::Event::Closed => (),
@@ -10617,6 +10677,14 @@ impl Niri {
 
             let buf: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
             let _ = tx.send(buf.clone());
+
+            // The notification's image. `pixels` is the capture in RGBA already, so this is a
+            // downscale and nothing else — no second decode of the PNG above.
+            let thumbnail = Some(bounded_pixels(PixelIcon {
+                width: size.w.max(0) as u32,
+                height: size.h.max(0) as u32,
+                rgba: pixels,
+            }));
 
             let mut image_path = None;
 
@@ -10646,17 +10714,12 @@ impl Niri {
                 debug!("not saving screenshot to disk");
             }
 
-            #[cfg(feature = "dbus")]
-            if let Err(err) = crate::utils::show_screenshot_notification(image_path.as_deref()) {
-                warn!("error showing screenshot notification: {err:?}");
-            }
-
             // Send screenshot completion event.
             let path_string = image_path
                 .as_ref()
                 .and_then(|p| p.to_str())
                 .map(|s| s.to_owned());
-            let _ = event_tx.send(path_string);
+            let _ = event_tx.send((path_string, thumbnail));
         });
 
         Ok(())
@@ -12478,6 +12541,18 @@ impl Niri {
                     });
                 }
                 false
+            }
+            // Ours: there is no bus name to signal at, so the action runs here.
+            kind @ NotifKind::Shell { .. } => {
+                let Some(resolved) = crate::notifications::shell_action_for(&kind, &action) else {
+                    return false;
+                };
+                crate::utils::run_shell_notification_action(&resolved);
+                // The shell just raised an app, which is the case gnome-shell leaves the overview
+                // for (`GtkNotificationDaemonAppSource.activateAction`,
+                // `js/ui/notificationDaemon.js:512-519`) — the fdo path, which only signals, does
+                // not.
+                true
             }
             NotifKind::Gtk {
                 app_id,

@@ -16370,3 +16370,112 @@ fn the_screenshot_keys_come_from_gnome_settings() {
         "the interim mapping, to be replaced when the recording UI lands"
     );
 }
+
+/// The "Screenshot captured" notification carries the shot and a way into the file manager.
+///
+/// GNOME's has the image as its icon, a **Show in Files** button, and a body click that opens the
+/// file (`js/ui/screenshot.js:2386-2420`). Ours used to be posted over
+/// `org.freedesktop.Notifications` from the encoding thread — which made it a notification we sent
+/// *to ourselves* from a connection that was dropped a moment later, so its buttons had nowhere to
+/// route to and it carried the image in the `app_icon` slot (a small source badge) rather than as
+/// the notification image.
+#[test]
+fn a_saved_screenshot_notifies_with_the_image_and_a_show_in_files_button() {
+    use crate::notifications::{shell_action_for, NotificationIcon, ShellAction};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let path = std::path::PathBuf::from("/tmp/does-not-need-to-exist.png");
+    // A real capture always has pixels; the icon is built from them on the encoding thread.
+    let thumbnail = std::sync::Arc::new(crate::notifications::PixelIcon {
+        width: 2,
+        height: 2,
+        rgba: vec![255; 16],
+    });
+    f.niri_state()
+        .show_screenshot_notification(Some(path.clone()), Some(thumbnail.clone()));
+
+    let store = &f.niri().notifications;
+    let source = store
+        .sources
+        .iter()
+        .find(|s| {
+            s.key
+                == crate::notifications::SourceKey::Shell(
+                    crate::notifications::SHELL_SOURCE_SCREENSHOT,
+                )
+        })
+        .expect("the screenshot notification must have its own source");
+    assert_eq!(source.title, "Screenshot");
+
+    let n = source
+        .notifications
+        .last()
+        .expect("the source must hold the notification");
+    assert_eq!(n.title, "Screenshot captured");
+    assert_eq!(
+        n.icon,
+        Some(NotificationIcon::Pixels(thumbnail)),
+        "the shot itself is the notification's image, not a themed badge"
+    );
+
+    // One button, and it resolves to the file manager.
+    assert_eq!(n.actions.len(), 1);
+    assert_eq!(n.actions[0].1, "Show in Files");
+    assert_eq!(
+        shell_action_for(&n.kind, &n.actions[0].0),
+        Some(ShellAction::ShowInFiles(path.clone())),
+        "the Show in Files button must resolve to the file manager"
+    );
+
+    // ...and a body click opens the file.
+    assert!(n.has_default_action);
+    assert_eq!(
+        shell_action_for(&n.kind, "default"),
+        Some(ShellAction::OpenFile(path))
+    );
+}
+
+/// A clipboard-only capture keeps its image but loses the file buttons.
+///
+/// GNOME sets the notification's image unconditionally and gates only the "Show in Files" button
+/// and the body click on `disableSaveToDisk` (`js/ui/screenshot.js:2397-2418`). Offering either for
+/// a file that was never written is the failure this pins.
+#[test]
+fn a_clipboard_only_screenshot_notifies_without_a_file_button() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Clipboard-only still has pixels — GNOME sets the notification's image unconditionally and
+    // gates only the button and the body click on `disableSaveToDisk` (`screenshot.js:2397-2400`).
+    let thumbnail = std::sync::Arc::new(crate::notifications::PixelIcon {
+        width: 2,
+        height: 2,
+        rgba: vec![255; 16],
+    });
+    f.niri_state()
+        .show_screenshot_notification(None, Some(thumbnail));
+
+    let n = f
+        .niri()
+        .notifications
+        .sources
+        .iter()
+        .find(|s| {
+            s.key
+                == crate::notifications::SourceKey::Shell(
+                    crate::notifications::SHELL_SOURCE_SCREENSHOT,
+                )
+        })
+        .and_then(|s| s.notifications.last())
+        .expect("the notification must still be posted");
+
+    assert_eq!(n.title, "Screenshot captured");
+    assert!(
+        n.icon.is_some(),
+        "a clipboard-only capture still has an image — it just has no file"
+    );
+    assert!(n.actions.is_empty(), "nothing to open in the file manager");
+    assert!(!n.has_default_action);
+}
