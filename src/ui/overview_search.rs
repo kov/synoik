@@ -52,8 +52,10 @@ use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::overview_layout::ControlsLayout;
+use crate::ui::text_edit::{EditMods, EditOutcome, KeyTheme, TextEdit};
 use crate::ui::widget::{
-    self, AppIcon, Entry, EntryHit, EntryLayout, Painter, SharedAppIconUploads,
+    self, AppIcon, Entry, EntryContent, EntryHit, EntryLayout, HAlign, Painter,
+    SharedAppIconUploads,
 };
 
 /// The built-in `AppSearchProvider` result cap (`this.maxResults = 6`,
@@ -77,6 +79,20 @@ const PLACEHOLDER: &str = "Type to search";
 /// so the pill keeps the *share* of the screen GNOME gives it. Its **height** does not
 /// ramp — that is the entry's text plus padding, and text is exempt.
 const ENTRY_WIDTH: f64 = 352.;
+/// The resting pill's width — [`Entry::HEIGHT`], so `$forced_circular_radius` makes it a
+/// **circle** holding nothing but the find glyph.
+///
+/// **Divergence (approved).** GNOME shows the full 24em pill at rest with a "Type to search"
+/// hint inside it (`overviewControls.js:324-331`). We rest as a puck at the right end of the
+/// same footprint, with the hint on its own line beneath, and grow to GNOME's pill on click or
+/// on the first keystroke. Everything about the expanded entry — width, radius, fill, icon
+/// insets, font — is still GNOME's; only the resting state and the transition are ours.
+const COLLAPSED_W: f64 = Entry::HEIGHT;
+/// Gap between the resting puck and the hint line under it.
+const HINT_GAP: f64 = 6.;
+/// The hint line's point size — deliberately smaller than the entry's own 11pt, since it is
+/// now a label beside the control rather than text inside it.
+const HINT_PT: f64 = 9.;
 /// `.search-entry` `margin-top: $base_padding*2` (`_search-entry.scss:4`).
 const ENTRY_MARGIN_TOP: f64 = 12.;
 /// `.search-entry` `margin-bottom: $base_padding` (`_search-entry.scss:5`).
@@ -86,6 +102,11 @@ const ENTRY_MARGIN_BOTTOM: f64 = 6.;
 /// its margins, which is what gnome-shell's `searchEntryBin` reports as its
 /// preferred height (`overviewControls.js:165`).
 pub const PREFERRED_ENTRY_HEIGHT: f64 = ENTRY_MARGIN_TOP + Entry::HEIGHT + ENTRY_MARGIN_BOTTOM;
+
+/// How far the hint line's baseline band sits below the pill, and how tall it is — the strip
+/// the resting hint occupies under the puck. It hangs *below* the entry's own box (into the
+/// results strip, which is empty at rest), so it does not widen the band the layout reserves.
+const HINT_BAND: f64 = 18.;
 
 /// Full-color app-icon side in a result tile, logical: `GridSearchResult` builds a
 /// default `IconGrid.BaseIcon` (`search.js:144-146`), whose size is `ICON_SIZE`
@@ -157,6 +178,9 @@ pub enum SearchHit {
     Clear,
     /// Result tile at index `.0`.
     Result(usize),
+    /// The entry's body — clicking it focuses (and so expands) the entry, the way
+    /// gnome-shell's `searchEntryBin` click grabs key focus.
+    Field,
     /// The results card background (padding/gaps) — consumes the click, no action.
     Background,
 }
@@ -186,6 +210,9 @@ pub enum SearchOutcome {
 struct SearchCache {
     context: Option<ContextId<VkTexture>>,
     entry_bake: widget::BakeCache,
+    /// The resting hint line under the puck. Its text never changes, so this re-bakes only
+    /// on a scale change.
+    hint_bake: widget::BakeCache,
     /// The card background + selection/hover wash + "No results" status (below the
     /// labels). Re-bakes on a highlight change, but only rounded fills — no re-shape.
     bg_bake: widget::BakeCache,
@@ -198,7 +225,15 @@ struct SearchCache {
 
 /// The overview search model. Owned on `Niri`; fed results by `sync_overview_search`.
 pub struct OverviewSearch {
-    query: String,
+    /// The editable query — caret, selection and all (see [`crate::ui::text_edit`]).
+    edit: TextEdit,
+    /// Whether the entry is grown to GNOME's pill. Distinct from [`Self::is_active`]: you can
+    /// be expanded with an empty query (you clicked the puck and have not typed yet).
+    expanded: bool,
+    /// The expand animation's progress, 0 = puck, 1 = pill. Pushed each frame by
+    /// `Niri::update_overview_search_expand`, so hit-testing follows the animating pill
+    /// instead of snapping to its destination.
+    expand: f64,
     results: Vec<SearchResultEntry>,
     /// Keyboard-selected (default) result index; meaningful only when `!results.empty()`.
     selected: usize,
@@ -225,7 +260,9 @@ pub fn tokenize(query: &str) -> Vec<&str> {
 impl OverviewSearch {
     pub fn new() -> Self {
         Self {
-            query: String::new(),
+            edit: TextEdit::new(),
+            expanded: false,
+            expand: 0.,
             results: Vec::new(),
             selected: 0,
             hovered: None,
@@ -237,11 +274,26 @@ impl OverviewSearch {
     /// Whether a search is active (`terms.length > 0`, `_setSearchActive`). Derived
     /// from the query, like GNOME's cached `_searchActive`.
     pub fn is_active(&self) -> bool {
-        self.query.split_whitespace().next().is_some()
+        self.edit.text().split_whitespace().next().is_some()
     }
 
     pub fn query(&self) -> &str {
-        &self.query
+        self.edit.text()
+    }
+
+    /// Whether the entry is (or is becoming) the full pill rather than the resting puck.
+    pub fn is_expanded(&self) -> bool {
+        self.expanded
+    }
+
+    /// Grow to the pill — a click on the entry, or the first keystroke. Idempotent.
+    pub fn expand(&mut self) {
+        self.expanded = true;
+    }
+
+    /// The animated expand progress Niri pushes in, 0 = puck, 1 = pill.
+    pub fn set_expand(&mut self, progress: f64) {
+        self.expand = progress.clamp(0., 1.);
     }
 
     /// The selected result's id, if any (what Enter activates).
@@ -272,22 +324,48 @@ impl OverviewSearch {
         &mut self,
         raw: Option<Keysym>,
         text: Option<char>,
-        plain: bool,
-        shift: bool,
+        mods: EditMods,
+        // `org.gnome.desktop.interface gtk-key-theme`, read live at the call site — the same
+        // way the other four entries take it. It used to be a field with a setter nothing
+        // called, so this entry was the one that silently ignored the setting.
+        theme: KeyTheme,
     ) -> SearchOutcome {
-        if !plain {
-            return SearchOutcome::Ignored;
-        }
-        match raw {
-            Some(Keysym::Escape) => {
-                if self.is_active() {
-                    self.clear();
-                    SearchOutcome::Cleared
+        // --- Result navigation comes first, because these keys mean navigation to the
+        // *results view*, not to the caret (`searchController.js:274-311`).
+        //
+        // Tab / Shift-Tab always navigate. Down/Up always navigate — they are line motion
+        // on a one-line entry, so the caret has nothing to do with them. Right navigates
+        // only when the caret is already at the end with nothing selected, which is
+        // gnome-shell's `cursor_position === -1` guard; otherwise it moves the caret.
+        // Left is *not* a navigation key in gnome-shell at all, and is now a caret move
+        // here too — a divergence from our own MVP, which mapped it to select-prev
+        // because there was no caret to move.
+        if mods.is_plain() {
+            let at_end =
+                self.edit.cursor() == self.edit.text().len() && self.edit.selection().is_none();
+            let nav = match raw {
+                Some(Keysym::Tab) => Some(!mods.shift),
+                Some(Keysym::ISO_Left_Tab) => Some(false),
+                Some(Keysym::Up | Keysym::KP_Up) => Some(false),
+                Some(Keysym::Down | Keysym::KP_Down) => Some(true),
+                Some(Keysym::Right | Keysym::KP_Right) if at_end => Some(true),
+                _ => None,
+            };
+            if let Some(forward) = nav {
+                if forward {
+                    self.select_next();
                 } else {
-                    SearchOutcome::Close
+                    self.select_prev();
                 }
+                return SearchOutcome::Handled;
             }
-            Some(Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter) => {
+        }
+
+        // --- Everything else is the entry's. The shared model owns the bindings; this
+        // only maps its outcome onto the search's own policy.
+        let was = self.edit.text().to_owned();
+        match self.edit.handle_key(raw, text, mods, theme) {
+            EditOutcome::Activate => {
                 // activateDefault: launch the selected result, else consume (must NOT
                 // fall through, or the hardcoded Return bind would toggle the overview).
                 match self.selected_id() {
@@ -295,44 +373,32 @@ impl OverviewSearch {
                     _ => SearchOutcome::Handled,
                 }
             }
-            // Shift+Tab is `ISO_Left_Tab` only as a *modified* keysym; what reaches us is
-            // the raw sym, which is a plain `Tab` — so the shift state is what actually
-            // decides the direction, and matching `ISO_Left_Tab` alone stepped forward.
-            // Shift+Tab is `ISO_Left_Tab` only as a *modified* keysym; what reaches us is
-            // the raw sym, which is a plain `Tab` — so the shift state is what actually
-            // decides the direction, and matching `ISO_Left_Tab` alone stepped forward.
-            Some(Keysym::Tab) if shift => {
-                self.select_prev();
-                SearchOutcome::Handled
+            EditOutcome::Cancel => {
+                // Escape tier 1: a live search clears but stays open. With nothing to
+                // clear the entry collapses and the caller closes the next tier down.
+                if self.is_active() || self.expanded {
+                    let was_active = self.is_active();
+                    self.clear();
+                    if was_active {
+                        return SearchOutcome::Cleared;
+                    }
+                    return SearchOutcome::Handled;
+                }
+                SearchOutcome::Close
             }
-            Some(
-                Keysym::Left | Keysym::Up | Keysym::KP_Left | Keysym::KP_Up | Keysym::ISO_Left_Tab,
-            ) => {
-                self.select_prev();
-                SearchOutcome::Handled
-            }
-            Some(
-                Keysym::Right | Keysym::Down | Keysym::KP_Right | Keysym::KP_Down | Keysym::Tab,
-            ) => {
-                self.select_next();
-                SearchOutcome::Handled
-            }
-            Some(Keysym::BackSpace) => {
-                self.query.pop();
-                self.on_query_changed();
-                SearchOutcome::QueryChanged
-            }
-            _ => {
-                if let Some(c) = text.filter(|c| !c.is_control()) {
-                    self.query.push(c);
+            EditOutcome::Changed => {
+                // Typing is what grows the puck into the pill.
+                self.expanded = true;
+                if self.edit.text() != was {
                     self.on_query_changed();
                     SearchOutcome::QueryChanged
                 } else {
-                    // A key the search doesn't handle (bare modifier, F-key, …) — do
-                    // not consume it.
-                    SearchOutcome::Ignored
+                    SearchOutcome::Handled
                 }
             }
+            EditOutcome::Moved => SearchOutcome::Handled,
+            // A key the search doesn't handle (bare modifier, F-key, …) — do not consume it.
+            EditOutcome::Ignored => SearchOutcome::Ignored,
         }
     }
 
@@ -373,10 +439,17 @@ impl OverviewSearch {
 
     /// Clear the query and results (overview enter/reset, Escape-while-active).
     pub fn clear(&mut self) {
-        if self.query.is_empty() && self.results.is_empty() && self.hovered.is_none() {
+        if self.edit.is_empty()
+            && self.results.is_empty()
+            && self.hovered.is_none()
+            && !self.expanded
+        {
             return;
         }
-        self.query.clear();
+        // Clearing puts the entry back to its resting puck: there is nothing left to hold it
+        // open, and leaving an empty pill up would be a third state with no meaning.
+        self.expanded = false;
+        self.edit.clear();
         self.results.clear();
         self.selected = 0;
         self.hovered = None;
@@ -424,11 +497,36 @@ impl OverviewSearch {
     /// boxes [`crate::ui::overview_layout`] allocated: the entry bin at the top of
     /// the work area, the results strip spanning everything between it and the dash.
     fn layout(&self, area: SearchArea) -> SearchLayout {
+        // The pill grows leftward out of the puck: its **right** edge is pinned to the
+        // right edge of the box the controls layout allocated, so nothing else has to move
+        // as it opens.
+        let full_w = entry_width(area.ramp);
+        let e = self.expand;
+        let pill_w = COLLAPSED_W + (full_w - COLLAPSED_W) * e;
+        let right = area.entry.loc.x + area.entry.size.w;
         let entry = Entry::layout(
-            area.entry.loc.x + area.entry.size.w / 2.,
+            right - pill_w / 2.,
             area.entry.loc.y + ENTRY_MARGIN_TOP,
-            entry_width(area.ramp),
+            pill_w,
             widget::EntryStyle::Search,
+        );
+        // The find glyph rides from the puck's centre to the pill's leading gutter. It has
+        // to be lerped rather than read off `EntryLayout`, whose `primary_icon` is only the
+        // *expanded* position — at puck width the two happen to be a pixel apart, and
+        // taking the layout's would make the icon jump at the start of the animation
+        // instead of sliding.
+        let find_icon = Point::from((
+            entry.pill.loc.x + (pill_w / 2.) + (Entry::ICON_INSET - pill_w / 2.) * e,
+            entry.primary_icon.y,
+        ));
+        // The resting hint: its own line under the puck, its run **ending** at the pill's
+        // right edge. It hangs below the entry box into the (empty at rest) results strip.
+        let hint = Rectangle::new(
+            Point::from((
+                area.entry.loc.x,
+                entry.pill.loc.y + Entry::HEIGHT + HINT_GAP,
+            )),
+            Size::from((area.entry.size.w, HINT_BAND)),
         );
 
         let active = self.is_active();
@@ -459,7 +557,14 @@ impl OverviewSearch {
             (Some(card), tiles)
         };
 
-        SearchLayout { entry, card, tiles }
+        SearchLayout {
+            entry,
+            find_icon,
+            hint,
+            pill_w,
+            card,
+            tiles,
+        }
     }
 
     /// Which interactive element is under `pos` (logical, output coords).
@@ -475,9 +580,20 @@ impl OverviewSearch {
     /// overview regardless.
     pub fn hit_test(&self, pos: Point<f64, Logical>, area: SearchArea) -> Option<SearchHit> {
         let layout = self.layout(area);
-        match Entry::hit(&layout.entry, pos, self.is_active()) {
+        // The clear glyph is hittable only once the pill is fully open. Its hit disc is a
+        // generous 32px across (a 16px glyph deserves a bigger target), which is fine inside
+        // a 352px pill and catastrophic inside the 40px puck: the disc covers the whole puck,
+        // so any click on a resting-but-active entry would land on Clear and wipe the query.
+        // It is also exactly when the glyph finishes fading in, so what you can hit is what
+        // you can see.
+        let clear_live = self.is_active() && self.expand >= 1.;
+        match Entry::hit(&layout.entry, pos, clear_live) {
             Some(EntryHit::Trailing) => return Some(SearchHit::Clear),
-            Some(EntryHit::Field) => return Some(SearchHit::Background),
+            // The body is a focusable control, resting puck or open pill alike: clicking it
+            // grows the entry, the way clicking gnome-shell's `searchEntryBin` grabs key
+            // focus. It still consumes when already open, so a click inside the pill never
+            // falls through to the picker behind it and leaves the overview.
+            Some(EntryHit::Field) => return Some(SearchHit::Field),
             None => {}
         }
         if let Some(card) = layout.card {
@@ -504,10 +620,21 @@ impl OverviewSearch {
         None
     }
 
-    /// The entry pill box — a geometry probe for the render test.
+    /// The entry pill box **as currently drawn** — a geometry probe for the render test.
+    /// At rest this is the collapsed puck; use [`Self::expanded_entry_pill`] for the open
+    /// pill's dimensions, which is what the adaptive-chrome ramp is about.
     #[cfg(test)]
     pub fn entry_pill(&self, area: SearchArea) -> Rectangle<f64, Logical> {
         self.layout(area).entry.pill
+    }
+
+    /// The pill at full expansion, whatever the entry is doing right now — the box the
+    /// chrome ramp sizes.
+    #[cfg(test)]
+    pub fn expanded_entry_pill(&self, area: SearchArea) -> Rectangle<f64, Logical> {
+        let mut open = OverviewSearch::new();
+        open.expand = 1.;
+        open.layout(area).entry.pill
     }
 
     /// The label-bake revision — a test probe for the invariant that a highlight change
@@ -542,6 +669,7 @@ impl OverviewSearch {
     /// The search render elements for `output`, faded by overview `progress` (0..1).
     /// Icons/glyphs are pushed first (topmost); chrome bakes last (below) — the dash
     /// order.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
@@ -550,6 +678,10 @@ impl OverviewSearch {
         output: &Output,
         area: SearchArea,
         fade: SearchFade,
+        // `org.gnome.desktop.interface accent-color`. The pill draws no focus ring of its own,
+        // but its **selection** is `st-transparentize(-st-accent-color, 0.7)` like every other
+        // entry's, so this is not the unused argument it used to be.
+        accent: [u8; 3],
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let SearchFade { overview, search } = fade;
         let scale = output.current_scale().fractional_scale();
@@ -574,21 +706,26 @@ impl OverviewSearch {
         // the fade into the tint instead would miss the `IconCache` key
         // (`(name, px, color)`) on every animation frame — re-rasterizing the SVG *and*
         // re-uploading it, and accreting a cached entry per alpha step.
-        for (name, color, center, want) in [
+        // The clear glyph fades in with the pill it lives in — at puck width there is no
+        // room for it, and it would sit on top of the find glyph.
+        let expand = self.expand as f32;
+        for (name, color, center, want, glyph_alpha) in [
             (
                 "edit-find-symbolic",
                 style::MUTED,
-                layout.entry.primary_icon,
+                layout.find_icon,
                 true,
+                1.,
             ),
             (
                 "edit-clear-symbolic",
                 style::TEXT,
                 layout.entry.secondary_icon,
                 active,
+                expand,
             ),
         ] {
-            if !want {
+            if !want || glyph_alpha <= 0. {
                 continue;
             }
             let Some(tb) = sym_icons.texture(renderer, name, Entry::ICON_PX, scale, color) else {
@@ -599,11 +736,65 @@ impl OverviewSearch {
             elements.push(TextureRenderElement::from_texture_buffer(
                 tb,
                 loc,
-                alpha,
+                alpha * glyph_alpha,
                 None,
                 None,
                 Kind::Unspecified,
             ));
+        }
+
+        // --- The resting hint line, on its own row under the puck, right-aligned to the
+        //     pill's right edge and fading out as the pill takes over. ---
+        if expand < 1. {
+            let hint = layout.hint;
+            match widget::bake(
+                renderer,
+                &mut cache.hint_bake,
+                scale,
+                hint.size,
+                widget::Revision::new()
+                    .of(PLACEHOLDER)
+                    .px(hint.size.w)
+                    .done(),
+                |r| {
+                    let mut shaper = widget::TextShaper::new(r, scale);
+                    shaper.shape(PLACEHOLDER, widget::TextStyle::new(HINT_PT))
+                },
+                move |frame, phys, shaped| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(style::TRANSPARENT)?;
+                    // Right-aligned: the *end* of the run lands on the band's right edge,
+                    // which is the pill's right edge.
+                    p.text_band(
+                        shaped,
+                        hint.size.w,
+                        HAlign::Right,
+                        0.,
+                        hint.size.h,
+                        style::MUTED,
+                        Rectangle::from_size(hint.size),
+                    )
+                },
+            ) {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        vec![],
+                    );
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        hint.loc,
+                        alpha * (1. - expand),
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ));
+                }
+                Err(err) => tracing::error!("error baking the search hint: {err:#}"),
+            }
         }
 
         // --- Result app icons (topmost, over their tiles). ---
@@ -631,24 +822,26 @@ impl OverviewSearch {
         // --- The entry pill chrome (text/placeholder + caret), baked. ---
         // The pill's own width — the bake is the chrome, so it has to be the width the
         // layout placed, ramp included, or the two disagree by the ramp.
-        let pill_w = entry_width(area.ramp);
+        let pill_w = layout.pill_w;
         match Entry::bake(
             renderer,
             &mut cache.entry_bake,
             scale,
             pill_w,
-            &self.query,
-            PLACEHOLDER,
+            // No placeholder inside the pill: the hint is the line underneath, and once the
+            // pill is open the user has already been told what it is for.
+            EntryContent::of(&self.edit, "", self.expanded),
             widget::EntryStyle::Search,
             // The search entry's focus is its caller's inset-accent ring, not the pill's.
             false,
             self.is_active(),
-            // Unused: this style draws no focus ring of its own (see just above).
-            widget::style::TEXT,
+            // Not a focus ring (this style has none) — the selection wash.
+            widget::style::accent_rgba(accent),
             // The width is part of what was baked; a canvas change must re-bake it.
             widget::Revision::new()
                 .of(self.content_rev)
-                .of(pill_w.to_bits())
+                .px(pill_w)
+                .of(accent)
                 .done(),
         ) {
             Ok(texture) => {
@@ -896,6 +1089,12 @@ impl From<ControlsLayout> for SearchArea {
 
 struct SearchLayout {
     entry: EntryLayout,
+    /// The find glyph's centre, lerped between the puck's middle and the pill's gutter.
+    find_icon: Point<f64, Logical>,
+    /// The resting hint line's band; its text is right-aligned to the band's right edge.
+    hint: Rectangle<f64, Logical>,
+    /// The pill's current width — what the chrome is baked at.
+    pill_w: f64,
     /// The results card (`None` when search inactive).
     card: Option<Rectangle<f64, Logical>>,
     /// Result-tile boxes (empty unless active with results).
@@ -929,21 +1128,26 @@ mod tests {
         // stutter that bites once providers make the result set large). Query/result
         // changes, which DO change the labels, still bump it.
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true, false);
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
         let rev = s.content_rev();
         assert!(
             s.set_hovered(Some(SearchHit::Result(1))),
             "a new hover reports a change"
         );
-        s.handle_key(Some(Keysym::Down), None, true, false); // move the keyboard selection
+        s.handle_key(
+            Some(Keysym::Down),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        ); // move the keyboard selection
         assert_eq!(
             s.content_rev(),
             rev,
             "hover + selection must not invalidate the label bake"
         );
         // A query change re-shapes (the labels differ).
-        s.handle_key(None, Some('b'), true, false);
+        s.handle_key(None, Some('b'), EditMods::default(), KeyTheme::default());
         assert_ne!(s.content_rev(), rev, "a query change re-bakes");
     }
 
@@ -952,11 +1156,11 @@ mod tests {
         let mut s = OverviewSearch::new();
         assert!(!s.is_active());
         assert_eq!(
-            s.handle_key(None, Some('f'), true, false),
+            s.handle_key(None, Some('f'), EditMods::default(), KeyTheme::default()),
             SearchOutcome::QueryChanged
         );
         assert_eq!(
-            s.handle_key(None, Some('i'), true, false),
+            s.handle_key(None, Some('i'), EditMods::default(), KeyTheme::default()),
             SearchOutcome::QueryChanged
         );
         assert!(s.is_active());
@@ -964,38 +1168,211 @@ mod tests {
 
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
         assert_eq!(
-            s.handle_key(Some(Keysym::Return), None, true, false),
+            s.handle_key(
+                Some(Keysym::Return),
+                None,
+                EditMods::default(),
+                KeyTheme::default()
+            ),
             SearchOutcome::Activate("a.desktop".to_owned())
         );
     }
 
+    /// Down/Up always navigate the results; Right only does so with the caret already at
+    /// the end (gnome-shell's `cursor_position === -1` guard, `searchController.js:274-311`).
     #[test]
     fn arrow_moves_selection_and_clamps() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true, false);
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
-        // Right → index 1, then clamp at the last.
-        s.handle_key(Some(Keysym::Right), None, true, false);
+        // Right at the end of the text → index 1, then clamp at the last.
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
         assert_eq!(s.selected_id(), Some("b.desktop"));
-        s.handle_key(Some(Keysym::Right), None, true, false);
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
         assert_eq!(s.selected_id(), Some("b.desktop"));
-        // Left back to 0, saturating.
-        s.handle_key(Some(Keysym::Left), None, true, false);
-        s.handle_key(Some(Keysym::Left), None, true, false);
+        // Up back to 0, saturating.
+        s.handle_key(
+            Some(Keysym::Up),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
+        s.handle_key(
+            Some(Keysym::Up),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
         assert_eq!(s.selected_id(), Some("a.desktop"));
+    }
+
+    /// Left is caret motion, never navigation — gnome-shell does not bind it in the entry at
+    /// all, and once the caret has left the end of the text Right stops navigating too.
+    #[test]
+    fn left_moves_the_caret_and_parks_right_navigation() {
+        let mut s = OverviewSearch::new();
+        for c in "ab".chars() {
+            s.handle_key(None, Some(c), EditMods::default(), KeyTheme::default());
+        }
+        s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
+        s.handle_key(
+            Some(Keysym::Left),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
+        assert_eq!(
+            s.selected_id(),
+            Some("a.desktop"),
+            "Left must not have stepped the selection"
+        );
+        // Typing now lands mid-string, which the old end-only caret could not do.
+        s.handle_key(None, Some('x'), EditMods::default(), KeyTheme::default());
+        assert_eq!(s.query(), "axb");
+        // The caret is no longer at the end, so Right moves it rather than navigating.
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
+        assert_eq!(s.selected_id(), Some("a.desktop"));
+        // Back at the end, Right navigates again.
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
+        assert_eq!(s.selected_id(), Some("b.desktop"));
+    }
+
+    /// An emptied-but-open entry still shows its caret. Backspacing the last character leaves
+    /// a focused pill with no text and (for this entry) no placeholder either — gating the
+    /// caret on "has text" made it draw literally nothing, which reads as a dead control.
+    #[test]
+    fn an_emptied_entry_still_has_a_caret() {
+        let mut s = OverviewSearch::new();
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
+        s.handle_key(
+            Some(Keysym::BackSpace),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
+        assert_eq!(s.query(), "");
+        assert!(
+            s.is_expanded(),
+            "backspacing to empty leaves the pill open — only Escape/clear collapses it"
+        );
+        let content = widget::EntryContent::of(&s.edit, "", s.is_expanded());
+        assert_eq!(
+            content.cursor,
+            Some(0),
+            "the caret must survive an empty entry, or the open pill draws nothing at all"
+        );
+    }
+
+    /// The key theme reaches the entry. It used to be a field with a setter nothing called, so
+    /// this entry — the one this whole change is about — silently ignored the setting while the
+    /// other four honored it.
+    #[test]
+    fn the_entry_honors_the_key_theme() {
+        let mut s = OverviewSearch::new();
+        for c in "one two".chars() {
+            s.handle_key(None, Some(c), EditMods::default(), KeyTheme::Emacs);
+        }
+        // Ctrl-w is Emacs-only: in the default theme it falls through unconsumed.
+        assert_eq!(
+            s.handle_key(Some(Keysym::w), None, EditMods::ctrl(), KeyTheme::Default),
+            SearchOutcome::Ignored
+        );
+        assert_eq!(s.query(), "one two");
+        assert_eq!(
+            s.handle_key(Some(Keysym::w), None, EditMods::ctrl(), KeyTheme::Emacs),
+            SearchOutcome::QueryChanged
+        );
+        assert_eq!(s.query(), "one ");
+    }
+
+    /// The GNOME editing combos reach the query, which the old `push`/`pop` model could not
+    /// express at all: a modified key was refused outright.
+    #[test]
+    fn gnome_editing_combos_reach_the_query() {
+        let mut s = OverviewSearch::new();
+        for c in "one two".chars() {
+            s.handle_key(None, Some(c), EditMods::default(), KeyTheme::default());
+        }
+        assert_eq!(
+            s.handle_key(
+                Some(Keysym::BackSpace),
+                None,
+                EditMods::ctrl(),
+                KeyTheme::default()
+            ),
+            SearchOutcome::QueryChanged
+        );
+        assert_eq!(
+            s.query(),
+            "one ",
+            "Ctrl-BackSpace deletes the previous word"
+        );
+        s.handle_key(
+            Some(Keysym::Home),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::ctrl_shift(),
+            KeyTheme::default(),
+        );
+        s.handle_key(None, Some('t'), EditMods::default(), KeyTheme::default());
+        assert_eq!(
+            s.query(),
+            "t ",
+            "Ctrl-Shift-Right selected a word; typing replaced it"
+        );
     }
 
     #[test]
     fn selection_never_underflows_on_empty() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('z'), true, false);
+        s.handle_key(None, Some('z'), EditMods::default(), KeyTheme::default());
         // No results seeded.
-        s.handle_key(Some(Keysym::Right), None, true, false);
-        s.handle_key(Some(Keysym::Left), None, true, false);
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
+        s.handle_key(
+            Some(Keysym::Left),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
         assert_eq!(s.selected_id(), None);
         // Enter with no results is consumed, not an activate.
         assert_eq!(
-            s.handle_key(Some(Keysym::Return), None, true, false),
+            s.handle_key(
+                Some(Keysym::Return),
+                None,
+                EditMods::default(),
+                KeyTheme::default()
+            ),
             SearchOutcome::Handled
         );
     }
@@ -1005,15 +1382,25 @@ mod tests {
         let mut s = OverviewSearch::new();
         // Inactive Escape → Close (normally unreachable via the input gate).
         assert_eq!(
-            s.handle_key(Some(Keysym::Escape), None, true, false),
+            s.handle_key(
+                Some(Keysym::Escape),
+                None,
+                EditMods::default(),
+                KeyTheme::default()
+            ),
             SearchOutcome::Close
         );
 
-        s.handle_key(None, Some('x'), true, false);
+        s.handle_key(None, Some('x'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A")]);
         assert!(s.is_active());
         assert_eq!(
-            s.handle_key(Some(Keysym::Escape), None, true, false),
+            s.handle_key(
+                Some(Keysym::Escape),
+                None,
+                EditMods::default(),
+                KeyTheme::default()
+            ),
             SearchOutcome::Cleared
         );
         assert!(!s.is_active());
@@ -1024,10 +1411,15 @@ mod tests {
     #[test]
     fn backspace_empties_and_deactivates() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true, false);
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         assert!(s.is_active());
         assert_eq!(
-            s.handle_key(Some(Keysym::BackSpace), None, true, false),
+            s.handle_key(
+                Some(Keysym::BackSpace),
+                None,
+                EditMods::default(),
+                KeyTheme::default()
+            ),
             SearchOutcome::QueryChanged
         );
         assert!(!s.is_active());
@@ -1036,22 +1428,32 @@ mod tests {
     #[test]
     fn query_change_resets_selection_to_first() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true, false);
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
-        s.handle_key(Some(Keysym::Right), None, true, false);
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
         assert_eq!(s.selected_id(), Some("b.desktop"));
         // Typing another char resets selection to the first.
-        s.handle_key(None, Some('b'), true, false);
+        s.handle_key(None, Some('b'), EditMods::default(), KeyTheme::default());
         assert_eq!(s.selected(), 0);
     }
 
     #[test]
     fn unhandled_key_is_ignored_not_consumed() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true, false); // active
-                                                    // F5 (no text, not a nav key) must be Ignored so the caller doesn't eat it.
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default()); // active
+                                                                                 // F5 (no text, not a nav key) must be Ignored so the caller doesn't eat it.
         assert_eq!(
-            s.handle_key(Some(Keysym::F5), None, true, false),
+            s.handle_key(
+                Some(Keysym::F5),
+                None,
+                EditMods::default(),
+                KeyTheme::default()
+            ),
             SearchOutcome::Ignored
         );
     }
@@ -1084,29 +1486,45 @@ mod tests {
         let mut s = OverviewSearch::new();
         let area = area_1080();
         let layout = s.layout(area);
+        // The *current* pill, not the expanded one: at rest this is the 40px puck, and
+        // hit-testing has to follow the box that is actually drawn.
         let entry_center = Point::from((
-            layout.entry.pill.loc.x + entry_width(area.ramp) / 2.,
+            layout.entry.pill.loc.x + layout.entry.pill.size.w / 2.,
             layout.entry.pill.loc.y + Entry::HEIGHT / 2.,
         ));
         assert_eq!(
             s.hit_test(entry_center, area),
-            Some(SearchHit::Background),
-            "the idle entry pill must consume rather than fall through"
+            Some(SearchHit::Field),
+            "the idle entry puck must consume rather than fall through"
         );
         // No query yet, so there is nothing to clear: that glyph is not live.
         assert_eq!(
             s.hit_test(layout.entry.secondary_icon, area),
-            Some(SearchHit::Background)
+            Some(SearchHit::Field)
         );
         // Well away from the entry: no hit at all.
         assert_eq!(s.hit_test(Point::from((10., 600.)), area), None);
 
-        s.handle_key(None, Some('a'), true, false);
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
+        // Mid-grow the clear glyph is not hittable yet: its 32px disc would cover the whole
+        // 40px puck, so a click meant for the field would wipe the query.
+        s.set_expand(0.5);
+        let half = s.layout(area);
+        assert_eq!(
+            s.hit_test(half.entry.secondary_icon, area),
+            Some(SearchHit::Field),
+            "the clear glyph must not be hittable before the pill is open"
+        );
+        s.set_expand(1.);
         let layout = s.layout(area);
+        let entry_center = Point::from((
+            layout.entry.pill.loc.x + layout.entry.pill.size.w / 2.,
+            layout.entry.pill.loc.y + Entry::HEIGHT / 2.,
+        ));
         assert_eq!(
             s.hit_test(entry_center, area),
-            Some(SearchHit::Background),
+            Some(SearchHit::Field),
             "an active (opaque) entry body must consume its own clicks"
         );
         assert_eq!(
@@ -1118,25 +1536,107 @@ mod tests {
         assert_eq!(s.hit_test(tc, area), Some(SearchHit::Result(0)));
     }
 
-    /// A modified key (Ctrl/Alt/Super held) must never act as its bare self: Ctrl+Escape
-    /// must not clear, Alt+arrow must not move the selection, Super+Enter must not launch.
+    /// The resting entry is a puck at the right end of its footprint; expanding grows it
+    /// leftward to GNOME's 24em pill with the right edge pinned. This is the divergence, so
+    /// it is pinned by geometry rather than by eye.
+    #[test]
+    fn the_entry_rests_as_a_puck_and_grows_leftward() {
+        let mut s = OverviewSearch::new();
+        let area = area_1080();
+        let right = area.entry.loc.x + area.entry.size.w;
+
+        let puck = s.layout(area).entry.pill;
+        assert_eq!(puck.size.w, COLLAPSED_W, "at rest it is a circle");
+        assert_eq!(puck.size.h, Entry::HEIGHT, "as tall as the open entry");
+        assert_eq!(puck.loc.x + puck.size.w, right, "parked at the right edge");
+        // The find glyph is centred in the puck, not sitting in a leading gutter.
+        assert_eq!(s.layout(area).find_icon.x, puck.loc.x + COLLAPSED_W / 2.);
+
+        // Typing expands it; the animation progress is pushed in by Niri, so drive it here.
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
+        assert!(s.is_expanded());
+        s.set_expand(1.);
+        let pill = s.layout(area).entry.pill;
+        assert_eq!(pill.size.w, entry_width(area.ramp), "grown to 24em");
+        assert_eq!(
+            pill.loc.x + pill.size.w,
+            right,
+            "the right edge never moved — the pill grew leftward"
+        );
+        assert_eq!(
+            s.layout(area).find_icon.x,
+            pill.loc.x + Entry::ICON_INSET,
+            "and the glyph has slid into the leading gutter"
+        );
+
+        // Halfway through, both the box and the glyph are between the two — an endpoint-only
+        // check would pass on a pill that teleported.
+        s.set_expand(0.5);
+        let mid = s.layout(area);
+        assert!(mid.entry.pill.size.w > COLLAPSED_W && mid.entry.pill.size.w < pill.size.w);
+        assert!(mid.find_icon.x > pill.loc.x + Entry::ICON_INSET);
+        assert_eq!(mid.entry.pill.loc.x + mid.entry.pill.size.w, right);
+
+        // Clearing puts it back to the puck.
+        s.clear();
+        assert!(!s.is_expanded());
+    }
+
+    /// The hint is its own line under the puck, its run ending on the pill's right edge.
+    #[test]
+    fn the_resting_hint_sits_under_the_puck_and_ends_at_its_right_edge() {
+        let s = OverviewSearch::new();
+        let area = area_1080();
+        let l = s.layout(area);
+        assert_eq!(
+            l.hint.loc.x + l.hint.size.w,
+            l.entry.pill.loc.x + l.entry.pill.size.w,
+            "right-aligned to the pill's right edge"
+        );
+        assert!(
+            l.hint.loc.y >= l.entry.pill.loc.y + Entry::HEIGHT,
+            "on its own line, below the puck — never overlapping it"
+        );
+        const {
+            assert!(
+                HINT_PT < 11.,
+                "the hint is in a smaller font than the entry's own"
+            )
+        };
+    }
+
+    /// A modified key (Alt/Super held) must never act as its bare self.
     #[test]
     fn modified_keys_are_ignored_while_active() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true, false);
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
 
-        for raw in [
-            Keysym::Escape,
-            Keysym::Return,
-            Keysym::Right,
-            Keysym::BackSpace,
-        ] {
-            assert_eq!(
-                s.handle_key(Some(raw), None, false, false),
-                SearchOutcome::Ignored,
-                "{raw:?} with a modifier held must be ignored, not acted on"
-            );
+        // Super is never an entry's, and Alt is bound to nothing here — both must fall
+        // through unconsumed. Ctrl is deliberately NOT in this list any more: Ctrl-BackSpace
+        // and friends are real editing bindings now, covered by
+        // `gnome_editing_combos_reach_the_query`.
+        let logo = EditMods {
+            logo: true,
+            ..EditMods::default()
+        };
+        let alt = EditMods {
+            alt: true,
+            ..EditMods::default()
+        };
+        for mods in [logo, alt] {
+            for raw in [
+                Keysym::Escape,
+                Keysym::Return,
+                Keysym::Right,
+                Keysym::BackSpace,
+            ] {
+                assert_eq!(
+                    s.handle_key(Some(raw), None, mods, KeyTheme::default()),
+                    SearchOutcome::Ignored,
+                    "{raw:?} with {mods:?} held must be ignored, not acted on"
+                );
+            }
         }
         // Untouched by all of the above.
         assert!(s.is_active());
@@ -1167,7 +1667,7 @@ mod tests {
         // The card grows with the bigger tiles, and still centers them — plus the room a
         // resting caption needs below its tile box ([`LABEL_OVERHANG`]).
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), true, false);
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
         let l = s.layout(area_1080());
         let card = l.card.expect("an active search has a card");
@@ -1200,7 +1700,7 @@ mod tests {
     #[test]
     fn empty_results_card_is_wide_enough_for_the_status_text() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('z'), true, false);
+        s.handle_key(None, Some('z'), EditMods::default(), KeyTheme::default());
         let card = s
             .layout(area_1080())
             .card

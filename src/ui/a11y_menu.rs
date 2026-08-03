@@ -84,12 +84,7 @@ impl A11yMenu {
             settings,
             hovered: None,
             revision: 0,
-            accent: [
-                f32::from(accent[0]) / 255.,
-                f32::from(accent[1]) / 255.,
-                f32::from(accent[2]) / 255.,
-                1.,
-            ],
+            accent: widget::style::accent_rgba(accent),
             bg_cache: RefCell::new(BakeCache::new()),
         }
     }

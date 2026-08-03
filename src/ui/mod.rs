@@ -27,6 +27,7 @@ pub mod run_dialog;
 pub mod screen_transition;
 pub mod screenshot_ui;
 pub mod switcher;
+pub mod text_edit;
 pub mod theme_node;
 pub mod widget;
 pub mod window_preview;

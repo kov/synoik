@@ -17,6 +17,7 @@
 //! [`paragraph_spans`](Painter::paragraph_spans), [`fill_rect_px`](Painter::fill_rect_px)).
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -33,6 +34,7 @@ use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{
     premultiply, GlyphRun, VkTexture, VulkanFrame, VulkanRenderer, NATIVE_FOURCC,
 };
+use crate::ui::text_edit::TextEdit;
 use crate::utils::to_physical_precise_round;
 
 /// The upload cache for full-color app icons, keyed by
@@ -148,6 +150,24 @@ pub mod style {
     /// the dash and the `.search-section-content` results card. Same value the dash
     /// bakes as its pill (kept in sync via this one constant).
     pub const OVERLAY_BG: Rgba = [0.218, 0.218, 0.233, 1.];
+    /// The system accent as an [`Rgba`] — `org.gnome.desktop.interface accent-color` arrives
+    /// resolved to 8-bit RGB, and every widget that draws with it needs the float form.
+    pub fn accent_rgba(accent: [u8; 3]) -> Rgba {
+        [
+            f32::from(accent[0]) / 255.,
+            f32::from(accent[1]) / 255.,
+            f32::from(accent[2]) / 255.,
+            1.,
+        ]
+    }
+
+    /// An entry's selection wash: `selection-background-color:
+    /// st-transparentize(-st-accent-color, 0.7)` (`%entry_common`, `_common.scss:178`) — the
+    /// live accent at 30%. Its companion `selected-color` is `$fg_color`, i.e. exactly what
+    /// unselected text already draws in, so selected glyphs need no second pass.
+    pub fn selection_bg(accent: Rgba) -> Rgba {
+        [accent[0], accent[1], accent[2], 0.3]
+    }
     /// A `.button` / `.icon-button` sitting **on** [`OVERLAY_BG`] — `button(normal)`'s
     /// `st-mix($system_fg_color, $system_overlay_bg_color, 9%)` (`_drawing.scss:171`,
     /// `$background_mix_factor` 9%), i.e. 9% of #fafafb over the overlay surface ≈ `#49494d`.
@@ -925,6 +945,78 @@ pub struct EntryLayout {
     pub text_x: f64,
 }
 
+/// What an [`Entry`] shows — the string plus where the caret and selection are.
+///
+/// Bundled rather than passed as five more arguments to [`Entry::bake`], and built from a
+/// [`TextEdit`](crate::ui::text_edit::TextEdit) by [`EntryContent::of`] so the offsets a
+/// caller draws can't drift from the ones it edits.
+#[derive(Debug, Clone, Default)]
+pub struct EntryContent<'a> {
+    /// The text as typed — **unmasked**, so `cursor`/`selection` index it directly.
+    pub text: &'a str,
+    /// Shown instead, muted and caret-less, while `text` is empty.
+    pub placeholder: &'a str,
+    /// Caret byte offset into `text`. `None` draws no caret — an unfocused field, or one
+    /// whose caller has no caret model yet.
+    pub cursor: Option<usize>,
+    /// Selected byte range of `text`, drawn behind the glyphs in
+    /// `selection-background-color` (`%entry_common`, `_common.scss:178`).
+    pub selection: Option<Range<usize>>,
+    /// Draw every character as this glyph instead — a password field. Offsets still index
+    /// `text`; [`Entry::bake`] remaps them onto the mask, so a caller never has to.
+    pub mask: Option<char>,
+}
+
+impl<'a> EntryContent<'a> {
+    /// Plain read-only text with no caret — a field whose caller has no editing model.
+    pub fn plain(text: &'a str, placeholder: &'a str) -> Self {
+        Self {
+            text,
+            placeholder,
+            ..Self::default()
+        }
+    }
+
+    /// The live view of an editing model. `focused` gates the caret only: an unfocused
+    /// entry still shows its text, it just doesn't blink at you.
+    pub fn of(edit: &'a TextEdit, placeholder: &'a str, focused: bool) -> Self {
+        Self {
+            text: edit.text(),
+            placeholder,
+            cursor: focused.then(|| edit.cursor()),
+            selection: focused.then(|| edit.selection()).flatten(),
+            mask: None,
+        }
+    }
+
+    /// [`Self::of`], masked — a password entry.
+    pub fn masked(edit: &'a TextEdit, placeholder: &'a str, focused: bool, mask: char) -> Self {
+        Self {
+            mask: Some(mask),
+            ..Self::of(edit, placeholder, focused)
+        }
+    }
+
+    /// The string actually drawn, and a byte-offset mapper onto it.
+    ///
+    /// Masking is per **character**, so an offset maps by counting characters before it and
+    /// multiplying by the mask's own encoded length — not by reusing the byte offset, which
+    /// would land mid-glyph for any non-ASCII password.
+    fn display(&self) -> (String, impl Fn(usize) -> usize + '_) {
+        let mask = self.mask;
+        let text = self.text;
+        let shown = match mask {
+            Some(m) => m.to_string().repeat(text.chars().count()),
+            None => text.to_owned(),
+        };
+        let map = move |at: usize| match mask {
+            Some(m) => text[..at.min(text.len())].chars().count() * m.len_utf8(),
+            None => at.min(text.len()),
+        };
+        (shown, map)
+    }
+}
+
 /// What a point over an [`Entry`] hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryHit {
@@ -985,22 +1077,21 @@ impl EntryStyle {
         }
     }
 
-    /// Where the text starts, and how it is aligned in the box.
-    fn text(self, _width: f64) -> (f64, HAlign) {
-        match self {
-            // After the find glyph's gutter.
-            EntryStyle::Search => (Entry::ICON_INSET * 2., HAlign::Left),
-            EntryStyle::Lockscreen | EntryStyle::PromptDialog => (ENTRY_PAD, HAlign::Left),
-        }
+    /// Whether this family reserves a **leading** icon gutter. Only the search entry has a
+    /// primary icon (`searchController.js:72-75`); the password entries put their one glyph
+    /// on the trailing side.
+    fn has_primary_icon(self) -> bool {
+        matches!(self, EntryStyle::Search)
     }
 
-    /// Distance from the near edge to a trailing glyph's centre: the search pill's icon gutter, or
-    /// `%entry_common`'s padding plus half a `$scalable_icon_size` glyph for the plain box.
-    fn icon_inset(self) -> f64 {
-        match self {
-            EntryStyle::Search => Entry::ICON_INSET,
-            EntryStyle::Lockscreen | EntryStyle::PromptDialog => ENTRY_PAD + Entry::ICON_PX / 2.,
-        }
+    /// Where the text starts, and how it is aligned in the box.
+    fn text(self, _width: f64) -> (f64, HAlign) {
+        let x = if self.has_primary_icon() {
+            Entry::ICON_GUTTER
+        } else {
+            ENTRY_PAD
+        };
+        (x, HAlign::Left)
     }
 
     /// `$forced_circular_radius` for the search pill; `$base_border_radius` for the plain box.
@@ -1031,10 +1122,30 @@ impl Entry {
     /// The find/clear symbolic glyph side (`.search-entry-icon` `$scalable_icon_size`
     /// = 16px, `_search-entry.scss:10`).
     pub const ICON_PX: f64 = 16.;
-    /// Icon center inset from the pill's near edge (icon half + `padding 0 $base_margin`).
-    const ICON_INSET: f64 = 16.;
+    /// An entry icon's own horizontal padding: `.search-entry-icon { padding: 0 $base_margin }`
+    /// (`_search-entry.scss:13`), and identically `StIcon.peek-password`/`.capslock-warning`
+    /// (`_entries.scss:9,14`). So every entry glyph, in every family, has the same 4px each side.
+    const ICON_PAD: f64 = 4.;
+    /// The gap between an icon box and the text — `priv->spacing`, **hardcoded** `6.0f` in
+    /// `st_entry_init` (`st-entry.c:1025`). It is not a CSS property and has no setter, so it
+    /// is a fixed 6 logical px whatever the theme does.
+    const ICON_SPACING: f64 = 6.;
+    /// Icon centre inset from the pill's near edge: `st_entry_allocate` puts the icon box flush
+    /// with the **content** box (`st-entry.c:452-467`, zero extra offset), so it is the entry's
+    /// 9px padding, plus the icon's own 4px padding, plus half the 16px glyph — **21px**.
+    ///
+    /// This was 16 before, which is why both glyphs sat visibly too near the pill's ends.
+    pub const ICON_INSET: f64 = ENTRY_PAD + Self::ICON_PAD + Self::ICON_PX / 2.;
+    /// `.search-entry-icon { margin-top: 2px }` (`_search-entry.scss:12`) — an explicit
+    /// optical-centering nudge on top of the vertical centering `st_entry_allocate` already does.
+    pub const ICON_NUDGE_Y: f64 = 2.;
+    /// Distance from an edge to the text beside an icon: content box + the whole icon box
+    /// (`4 + 16 + 4`) + [`ICON_SPACING`](Self::ICON_SPACING) — **39px**.
+    const ICON_GUTTER: f64 = ENTRY_PAD + Self::ICON_PAD * 2. + Self::ICON_PX + Self::ICON_SPACING;
     /// Entry font (`%system_entry` inherits the 11pt base).
     const TEXT_PT: f64 = 11.;
+    /// The caret bar's width. St's `caret-size` defaults to 1px.
+    const CARET_W: f64 = 1.;
 
     /// The focus ring's stroke (`focus_ring` is 2px in `_drawing.scss`).
     const FOCUS_RING: f64 = 2.;
@@ -1049,8 +1160,16 @@ impl Entry {
             Point::from((x, top_y.round())),
             Size::from((width, Self::HEIGHT)),
         );
-        let cy = pill.loc.y + Self::HEIGHT / 2.;
-        let inset = style.icon_inset();
+        // `.search-entry-icon`'s 2px `margin-top` rides on the centre, for every family: the
+        // plain entries' glyphs get no such nudge in the theme, so only Search takes it.
+        let cy = pill.loc.y
+            + Self::HEIGHT / 2.
+            + if style.has_primary_icon() {
+                Self::ICON_NUDGE_Y
+            } else {
+                0.
+            };
+        let inset = Self::ICON_INSET;
         EntryLayout {
             pill,
             primary_icon: Point::from((pill.loc.x + inset, cy)),
@@ -1078,11 +1197,22 @@ impl Entry {
         Some(EntryHit::Field)
     }
 
-    /// Bake the pill + text/placeholder + trailing caret into a pill-sized texture
-    /// (composited by the caller at `layout.pill.loc`, the two glyphs on top). When
-    /// `text` is empty the `placeholder` shows muted with no caret (an unfocused hint);
-    /// once typing starts the text shows in full white with a caret bar. Long text is
-    /// clipped at the trailing-icon inset (no horizontal scroll yet — MVP).
+    /// Bake the pill + selection wash + text/placeholder + caret into a pill-sized texture
+    /// (composited by the caller at `layout.pill.loc`, the two glyphs on top).
+    ///
+    /// While `content.text` is empty the `placeholder` shows muted (a hint, never selected or
+    /// caret-bearing); once there is text it shows in full white, with the selection painted
+    /// behind it and a 1px caret bar at `content.cursor`.
+    ///
+    /// Text longer than the field **scrolls**: the run is offset so the caret stays inside the
+    /// clip, pinned to the trailing edge once it would run past it, exactly far enough and no
+    /// further. That replaces the MVP's hard clip, which simply hid whatever you typed past the
+    /// pill's width.
+    ///
+    /// Caret and selection are placed by re-measuring the text before them
+    /// ([`niri_vk::text::measure_line_width_weighted`], memoized) and adding it to the run's own
+    /// pen origin, so they land on advance boundaries the drawn glyphs agree with rather than on
+    /// an ink-box estimate.
     #[track_caller]
     #[allow(clippy::too_many_arguments)]
     pub fn bake(
@@ -1090,8 +1220,7 @@ impl Entry {
         cache: &mut BakeCache,
         scale: f64,
         width: f64,
-        text: &str,
-        placeholder: &str,
+        content: EntryContent<'_>,
         entry_style: EntryStyle,
         focused: bool,
         // `has_trailing` reserves the trailing glyph's gutter, so long text stops before it
@@ -1102,39 +1231,87 @@ impl Entry {
         revision: u64,
     ) -> anyhow::Result<VkTexture> {
         let size = Size::<f64, Logical>::from((width, Self::HEIGHT));
-        let empty = text.is_empty();
-        // The caret bar (U+258F), like run_dialog, only while typing.
+        let (shown, map) = content.display();
+        let empty = shown.is_empty();
         let display = if empty {
-            placeholder.to_owned()
+            content.placeholder.to_owned()
         } else {
-            format!("{text}\u{258f}")
+            shown.clone()
         };
+        // The caret is gated on **focus**, not on there being text: an empty focused entry is
+        // exactly where the caret is the only thing left to see, and a field showing neither
+        // text nor caret reads as dead. (GNOME draws the hint label beside a ClutterText that
+        // still carries its cursor.) A *selection*, on the other hand, needs something to
+        // select, and never spans a placeholder — that is a hint, not a value.
+        let cursor = content.cursor.map(&map);
+        let selection = (!empty)
+            .then(|| content.selection.clone().map(|s| map(s.start)..map(s.end)))
+            .flatten()
+            .filter(|s| s.start < s.end);
+
         let (text_x, halign) = entry_style.text(width);
-        // Text is clipped inside the pill, inset by a gutter on each side so a long string fades
-        // out at the pill's edge rather than under its rounding.
-        let gutter = match entry_style {
-            EntryStyle::Search => Self::ICON_INSET * 2.,
-            EntryStyle::Lockscreen | EntryStyle::PromptDialog => ENTRY_PAD,
-        };
+        // The text area: the entry's own gutter on the leading side (after the primary icon, if
+        // this family has one), and the trailing glyph's gutter on the other when one is shown.
+        let leading = text_x;
         let trailing = if has_trailing {
-            entry_style.icon_inset() * 2.
+            Self::ICON_GUTTER
         } else {
-            gutter
+            ENTRY_PAD
         };
+        let avail = (width - leading - trailing).max(0.);
         let clip = Rectangle::<f64, Logical>::new(
-            Point::from((gutter, 0.)),
-            Size::from(((width - gutter - trailing).max(0.), Self::HEIGHT)),
+            Point::from((leading, 0.)),
+            Size::from((avail, Self::HEIGHT)),
         );
         let ring = focused.then(|| entry_style.focus_ring(accent)).flatten();
+
+        // Measurement happens in the same physical px the run is shaped at, so the advances
+        // agree with the glyphs to the pixel.
+        let font_px = (crate::ui::pt_to_px(Self::TEXT_PT) * scale) as f32;
+        let advance = |upto: usize| {
+            niri_vk::text::measure_line_width_weighted(&display[..upto], font_px, false)
+        };
+
+        // Scroll just enough to keep the caret in view, and never past the end of the text —
+        // so a short string never shifts, and a long one parks its tail at the trailing edge.
+        //
+        // Deliberately stateless (derived from the caret alone), which costs one nicety: with
+        // overflowing text, walking Left from the end holds the caret against the clip's
+        // trailing edge and slides the text under it, where GNOME would hold the viewport and
+        // move the caret inside it. Fixing that means the *view* owning a scroll offset across
+        // frames, which is state this bake does not have and does not want; the current
+        // behavior is at least monotonic and never hides the caret.
+        let avail_px = avail * scale;
+        let total_px = advance(display.len());
+        let scroll_px = match cursor {
+            Some(at) if total_px > avail_px => {
+                (advance(at) + Self::CARET_W * scale - avail_px).clamp(0., total_px - avail_px)
+            }
+            _ => 0.,
+        };
+
+        // Fold the caret and selection into the caller's revision here rather than asking every
+        // caller to remember them: they change what is drawn without changing the text, so a
+        // text-keyed revision would leave the caret frozen where it was baked.
+        let revision = Revision::new()
+            .of(revision)
+            .of(cursor)
+            .of(selection.clone())
+            .px(scroll_px)
+            .done();
+
         bake(
             renderer,
             cache,
             scale,
             size,
             revision,
-            |r| {
-                let mut shaper = TextShaper::new(r, scale);
-                shaper.shape(&display, TextStyle::new(Self::TEXT_PT))
+            {
+                let display = display.clone();
+                move |r: &mut VulkanRenderer| {
+                    let mut shaper = TextShaper::new(r, scale);
+                    shaper.shape(&display, TextStyle::new(Self::TEXT_PT))
+                }
             },
             move |frame, phys, shaped| {
                 let mut p = Painter::new(frame, scale, phys);
@@ -1148,15 +1325,107 @@ impl Entry {
                         ring,
                     )?;
                 }
+
+                let anchor = leading - scroll_px / scale;
+                let m = CaretMetrics::new(shaped, anchor, halign, scale, Self::TEXT_PT, false);
+                // A fixed band, not the ink's height: an empty entry has no ink at all, and a
+                // caret whose height came from the glyphs would vanish exactly when it is the
+                // only thing left to see.
+                let band = Rectangle::<f64, Logical>::new(
+                    Point::from((0., ENTRY_PAD)),
+                    Size::from((width, Self::HEIGHT - ENTRY_PAD * 2.)),
+                );
+
+                // Selection goes *behind* the glyphs. `selected-color` is `$fg_color`
+                // (`_common.scss:180`), which is what unselected text already draws in, so the
+                // run needs no second, differently-tinted pass.
+                if let Some(sel) = &selection {
+                    p.selection(
+                        m.x_at(&display, sel.start),
+                        m.x_at(&display, sel.end),
+                        band,
+                        style::selection_bg(accent),
+                        Some(clip),
+                    )?;
+                }
+
                 let color = if empty {
                     entry_style.placeholder()
                 } else {
                     style::TEXT
                 };
-                p.text_band(shaped, text_x, halign, 0., Self::HEIGHT, color, clip)?;
+                p.text_band(shaped, anchor, halign, 0., Self::HEIGHT, color, clip)?;
+
+                if let Some(at_byte) = cursor {
+                    p.caret(m.x_at(&display, at_byte), band, style::TEXT, Some(clip))?;
+                }
                 Ok(())
             },
         )
+    }
+}
+
+/// Where a caret and a selection land inside a drawn run.
+///
+/// Both entry surfaces — the pill ([`Entry::bake`]) and the folder-rename box, which is
+/// centred and bold and so cannot simply *be* an [`Entry`] — need the same three steps: recover
+/// the run's pen origin from where its ink was anchored, measure the advance of the text before
+/// an offset, and turn that into a bar. Doing it twice is how the two drift, so it lives here.
+///
+/// The pen origin matters: [`Painter::text`] and [`Painter::text_band`] anchor a run's **ink**,
+/// and the glyph advances a caret rides are measured from the pen. Deriving the caret from the
+/// ink box instead puts it off by the first glyph's left side bearing — invisible on `n`,
+/// obvious on `j` or a leading space.
+///
+/// **Known limitation — RTL.** Offsets are turned into x by re-measuring `text[..offset]`, which
+/// assumes logical order matches visual order. For a right-to-left or bidi run the glyphs are
+/// laid out in visual order, so the caret lands at the LTR-prefix width rather than at the
+/// insertion point and a selection washes the wrong glyphs. Fixing it needs an index→x mapping
+/// out of the shaper (cosmic-text has the per-glyph byte ranges; `niri_vk::text::ShapedRun`
+/// does not expose them yet), not a change here. LTR runs are exact apart from kerning across
+/// the caret boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct CaretMetrics {
+    /// Run-local pen origin, physical px.
+    pen: f64,
+    scale: f64,
+    font_px: f32,
+    bold: bool,
+}
+
+impl CaretMetrics {
+    /// Recover the metrics for a run whose **ink** was anchored at logical `anchor_x` per
+    /// `halign`. `pt` and `bold` must be the ones the run was shaped with, or the advances
+    /// will not be the drawn glyphs'.
+    pub fn new(
+        shaped: &ShapedText,
+        anchor_x: f64,
+        halign: HAlign,
+        scale: f64,
+        pt: f64,
+        bold: bool,
+    ) -> Self {
+        let (ink_x, _, ink_w, _) = shaped.ink_bounds();
+        let anchor = anchor_x * scale;
+        let ink_left = match halign {
+            HAlign::Left => anchor,
+            HAlign::Center => anchor - f64::from(ink_w) / 2.,
+            HAlign::Right => anchor - f64::from(ink_w),
+        };
+        Self {
+            pen: ink_left - f64::from(ink_x),
+            scale,
+            font_px: (crate::ui::pt_to_px(pt) * scale) as f32,
+            bold,
+        }
+    }
+
+    /// The logical x of byte offset `at` in `text` (which must be the string that was shaped).
+    pub fn x_at(&self, text: &str, at: usize) -> f64 {
+        let at = at.min(text.len());
+        let advance =
+            niri_vk::text::measure_line_width_weighted(&text[..at], self.font_px, self.bold);
+        (self.pen + advance) / self.scale
     }
 }
 
@@ -2529,6 +2798,46 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         self.frame
             .clear(Color32F::from(premultiply(color)), &[rect])?;
         Ok(())
+    }
+
+    /// A caret bar of `Entry::CARET_W` at logical `x`, filling `band` vertically, clipped to
+    /// `clip`. Blends (an SDF fill), unlike [`fill_rect_px`](Self::fill_rect_px)'s clear — a
+    /// caret sits *on* the entry's fill, and clearing would punch a hole in it.
+    pub fn caret(
+        &mut self,
+        x: f64,
+        band: Rectangle<f64, Logical>,
+        color: Rgba,
+        clip: Option<Rectangle<f64, Logical>>,
+    ) -> anyhow::Result<()> {
+        self.selection(x, x + Entry::CARET_W, band, color, clip)
+    }
+
+    /// The selection wash between logical `x0` and `x1`, filling `band` vertically, clipped to
+    /// `clip`. A zero-or-negative span draws nothing.
+    pub fn selection(
+        &mut self,
+        x0: f64,
+        x1: f64,
+        band: Rectangle<f64, Logical>,
+        color: Rgba,
+        clip: Option<Rectangle<f64, Logical>>,
+    ) -> anyhow::Result<()> {
+        if x1 <= x0 {
+            return Ok(());
+        }
+        let rect = Rectangle::new(
+            Point::from((x0, band.loc.y)),
+            Size::from((x1 - x0, band.size.h)),
+        );
+        let rect = match clip {
+            Some(clip) => match rect.intersection(clip) {
+                Some(rect) => rect,
+                None => return Ok(()),
+            },
+            None => rect,
+        };
+        self.fill_rounded(rect, 0., color)
     }
 
     /// A crisp separator hairline filling the logical `rect` (one dimension is its 1px thickness).

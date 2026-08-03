@@ -201,6 +201,17 @@ impl<D: SeatHandler> PointerOrTouchStartData<D> {
     }
 }
 
+/// The seat's modifier state as [`EditMods`](crate::ui::text_edit::EditMods) — the plain-data
+/// mirror every entry's key handler takes, so no UI module depends on smithay's type.
+fn edit_mods(mods: &ModifiersState) -> crate::ui::text_edit::EditMods {
+    crate::ui::text_edit::EditMods {
+        ctrl: mods.ctrl,
+        shift: mods.shift,
+        alt: mods.alt,
+        logo: mods.logo,
+    }
+}
+
 impl State {
     /// A key on the open polkit dialog.
     ///
@@ -208,13 +219,24 @@ impl State {
     /// everything else is text for the entry. Nothing here reaches a client — the caller has
     /// already decided to swallow it.
     #[cfg(feature = "dbus")]
-    fn handle_polkit_key(&mut self, raw: Option<Keysym>, text: Option<char>, pressed: bool) {
+    fn handle_polkit_key(
+        &mut self,
+        raw: Option<Keysym>,
+        text: Option<char>,
+        mods: crate::ui::text_edit::EditMods,
+        theme: crate::ui::text_edit::KeyTheme,
+        pressed: bool,
+    ) {
         use crate::polkit_dialog::Focus;
 
         if !pressed {
             return;
         }
 
+        // Focus keys first, then the entry, then the *horizontal* focus keys as a fallback.
+        // Tab and Up/Down always move focus; Left/Right only do so when the entry does not
+        // have focus, because inside a focused entry they are caret motion — which is what
+        // GNOME's real StEntry does with them.
         let effects = match raw {
             Some(Keysym::Escape) => self.niri.polkit_dialog.cancel(),
             Some(Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter) => {
@@ -227,12 +249,15 @@ impl State {
             }
             Some(Keysym::Tab) => self.niri.polkit_dialog.cycle_focus(true),
             Some(Keysym::ISO_Left_Tab) => self.niri.polkit_dialog.cycle_focus(false),
-            Some(Keysym::Down | Keysym::Right) => self.niri.polkit_dialog.cycle_focus(true),
-            Some(Keysym::Up | Keysym::Left) => self.niri.polkit_dialog.cycle_focus(false),
-            Some(Keysym::BackSpace) => self.niri.polkit_dialog.backspace(),
-            _ => match text.filter(|c| !c.is_control()) {
-                Some(c) => self.niri.polkit_dialog.type_char(c),
-                None => return,
+            Some(Keysym::Down) => self.niri.polkit_dialog.cycle_focus(true),
+            Some(Keysym::Up) => self.niri.polkit_dialog.cycle_focus(false),
+            _ => match self.niri.polkit_dialog.entry_key(raw, text, mods, theme) {
+                Some(effects) => effects,
+                None => match raw {
+                    Some(Keysym::Right) => self.niri.polkit_dialog.cycle_focus(true),
+                    Some(Keysym::Left) => self.niri.polkit_dialog.cycle_focus(false),
+                    _ => return,
+                },
             },
         };
         self.apply_polkit_effects(effects);
@@ -722,7 +747,7 @@ impl State {
                         let text = modified
                             .key_char()
                             .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
-                        this.on_shield_key(raw, text);
+                        this.on_shield_key(raw, text, edit_mods(mods));
                     }
 
                     if pressed {
@@ -810,6 +835,8 @@ impl State {
                     let outcome = this.niri.run_dialog.handle_key(
                         raw,
                         text,
+                        edit_mods(mods),
+                        this.niri.gnome_settings.key_theme,
                         pressed,
                         &this.niri.gnome_settings.command_history,
                     );
@@ -861,7 +888,8 @@ impl State {
                     let text = modified
                         .key_char()
                         .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
-                    this.handle_polkit_key(raw, text, pressed);
+                    let theme = this.niri.gnome_settings.key_theme;
+                    this.handle_polkit_key(raw, text, edit_mods(mods), theme, pressed);
 
                     if pressed {
                         this.niri.suppressed_keys.insert(key_code);
@@ -1015,8 +1043,13 @@ impl State {
                         // (`_showFolderEntry`'s `grab_key_focus`, `appDisplay.js:2643-2648`).
                         if this.niri.folder_dialog.is_renaming() {
                             use crate::ui::folder_dialog::RenameKey;
-                            let typed = text.map(String::from);
-                            match this.niri.folder_dialog.rename_key(raw, typed.as_deref()) {
+                            let theme = this.niri.gnome_settings.key_theme;
+                            match this.niri.folder_dialog.rename_key(
+                                raw,
+                                text,
+                                edit_mods(mods),
+                                theme,
+                            ) {
                                 RenameKey::Ignored => {}
                                 RenameKey::Took => {
                                     this.niri.suppressed_keys.insert(key_code);
@@ -1036,17 +1069,21 @@ impl State {
                             }
                         }
                         let active = this.niri.overview_search.is_active();
-                        // A non-whitespace printable starts a search; once active, every key
-                        // routes to the entry (Backspace/nav/Escape). Modifiers/Tab/arrows while
-                        // inactive fall through to the overview binds below.
+                        // A non-whitespace printable starts a search; once active — or once the
+                        // entry has been clicked open with no query yet — every key routes to
+                        // the entry (editing/nav/Escape). Modifiers/Tab/arrows while the entry
+                        // is closed and empty fall through to the overview binds below.
+                        let expanded = this.niri.overview_search.is_expanded();
                         let starts = text.is_some_and(|c| !c.is_whitespace() && !c.is_control());
-                        if active || starts {
+                        if active || expanded || starts {
                             use crate::ui::overview_search::SearchOutcome;
-                            let plain = !mods.ctrl && !mods.alt && !mods.logo;
-                            let outcome = this
-                                .niri
-                                .overview_search
-                                .handle_key(raw, text, plain, mods.shift);
+                            let theme = this.niri.gnome_settings.key_theme;
+                            let outcome = this.niri.overview_search.handle_key(
+                                raw,
+                                text,
+                                edit_mods(mods),
+                                theme,
+                            );
                             // Ignored = a key the search doesn't handle (bare modifier, F-key);
                             // let it fall through to the hardcoded overview binds, unconsumed.
                             if !matches!(outcome, SearchOutcome::Ignored) {
@@ -5884,6 +5921,12 @@ impl State {
             OverviewHit::Search(SearchHit::Clear) if primary => {
                 self.niri.overview_search.clear();
                 self.niri.sync_overview_search();
+            }
+            // Clicking the entry focuses it, which is what grows the resting puck into
+            // GNOME's pill. Already-open is a no-op (but still consumes, so the click never
+            // reaches the picker behind it).
+            OverviewHit::Search(SearchHit::Field) if primary => {
+                self.niri.overview_search.expand();
             }
             // An app inside an open folder launches exactly like a top-level one, and
             // the dialog goes down with the overview.

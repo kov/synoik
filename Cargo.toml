@@ -120,6 +120,7 @@ xcursor = "0.3.10"
 zbus = { version = "5.13.2", optional = true, features = ["p2p"] }
 jiff = "0.2"
 tzf-rs = "1.3"
+unicode-segmentation = "1.13.3"
 
 [dependencies.smithay]
 workspace = true

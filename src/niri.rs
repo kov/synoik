@@ -912,6 +912,12 @@ pub struct Niri {
     overview_search_fade: Option<Animation>,
     /// The settled target of [`Self::overview_search_fade`], for edge detection.
     overview_search_fade_target: bool,
+    /// The search entry's grow/shrink between its resting puck and GNOME's full pill.
+    /// Separate from the cross-fade above, which is about the *results* covering the
+    /// picker: the entry opens on a click with no query at all.
+    overview_search_expand: Option<Animation>,
+    /// The settled target of [`Self::overview_search_expand`], for edge detection.
+    overview_search_expand_target: bool,
     /// Offscreens for the cross-fade. The picker and the thumbnails are each faded
     /// as a *group*: a per-element alpha would double-darken wherever previews
     /// overlap, which the group composite avoids.
@@ -4083,6 +4089,7 @@ impl State {
         &mut self,
         raw: Option<smithay::input::keyboard::Keysym>,
         text: Option<char>,
+        mods: crate::ui::text_edit::EditMods,
     ) {
         use smithay::input::keyboard::Keysym;
 
@@ -4121,14 +4128,24 @@ impl State {
             return;
         }
 
+        // The entry gets first refusal on everything but the shield's own two keys, so the
+        // password field has the same editing surface as every other entry in the shell.
+        let theme = self.niri.gnome_settings.key_theme;
         let effects = match raw {
             Some(Keysym::Escape) => self.niri.unlock_dialog.cancel(),
             Some(Keysym::Return | Keysym::KP_Enter) => self.niri.unlock_dialog.submit(now),
-            Some(Keysym::BackSpace) => self.niri.unlock_dialog.backspace(now),
-            _ => match text.filter(|c| !c.is_control()) {
-                Some(c) => self.niri.unlock_dialog.type_char(c, now),
-                None => self.niri.unlock_dialog.show_prompt(now),
-            },
+            _ => {
+                let entry = self
+                    .niri
+                    .unlock_dialog
+                    .entry_key(raw, text, mods, theme, now);
+                match entry {
+                    Some(effects) => effects,
+                    // Not an editing key (and not text): still activity, so the clock page
+                    // raises the prompt — `type_char` used to be the only path that did.
+                    None => self.niri.unlock_dialog.show_prompt(now),
+                }
+            }
         };
         self.apply_unlock_effects(effects);
     }
@@ -6090,6 +6107,8 @@ impl Niri {
             overview_search_was_visible: false,
             overview_search_fade: None,
             overview_search_fade_target: false,
+            overview_search_expand: None,
+            overview_search_expand_target: false,
             picker_offscreen: OffscreenBuffer::default(),
             thumbnails_offscreen: OffscreenBuffer::default(),
             icon_cache: IconCache::new("Adwaita"),
@@ -7821,6 +7840,7 @@ impl Niri {
 
         self.layout.advance_animations();
         self.update_overview_search_fade();
+        self.update_overview_search_expand();
 
         // Banners are blocked while a panel popover is open; syncing here (once per
         // frame) covers every open/close path with a single site. The drain check
@@ -8271,9 +8291,17 @@ impl Niri {
 
             if prompt_t.is_visible() {
                 let d = &self.unlock_dialog;
+                let (caret, selection) = match d.entry_mask() {
+                    Some(mask) => d.entry().masked_positions(mask, d.is_entry_live()),
+                    None if d.is_entry_live() => (Some(d.entry().cursor()), d.entry().selection()),
+                    None => (None, None),
+                };
                 let content = crate::ui::lock_screen::PromptContent {
                     display_name: d.user().display_name().to_owned(),
                     entry: d.entry_display(),
+                    // The caret in *masked* coordinates: `d.entry()` never leaves the model.
+                    cursor: caret,
+                    selection,
                     question: d.question().unwrap_or_default().to_owned(),
                     message: d.message().map(|m| m.text.clone()),
                     message_is_error: d
@@ -8616,6 +8644,7 @@ impl Niri {
                         overview: progress,
                         search: self.overview_search_fade(),
                     },
+                    self.gnome_settings.accent_color,
                 ) {
                     push(element.into());
                 }
@@ -9159,6 +9188,7 @@ impl Niri {
             // advances when another event (e.g. pointer motion) forces a frame, and
             // the results appear stuck at a partial alpha until the mouse moves.
             state.unfinished_animations_remain |= self.overview_search_fade.is_some();
+            state.unfinished_animations_remain |= self.overview_search_expand.is_some();
             state.unfinished_animations_remain |= state.screen_transition.is_some();
             // The shield's hint fades in four seconds after the last input, and there is by
             // definition no input coming — nothing else would ask for those frames.
@@ -11904,6 +11934,58 @@ impl Niri {
                 }
             }
         }
+    }
+
+    /// How far the entry has grown from its resting puck to GNOME's pill: 0 = puck, 1 = pill.
+    pub fn overview_search_expand(&self) -> f64 {
+        match &self.overview_search_expand {
+            Some(anim) => anim.clamped_value().clamp(0., 1.),
+            None => {
+                if self.overview_search_expand_target {
+                    1.
+                } else {
+                    0.
+                }
+            }
+        }
+    }
+
+    /// Arms (or retires) the grow/shrink, and pushes the current progress into the search
+    /// model so hit-testing follows the animating pill rather than snapping to its target.
+    fn update_overview_search_expand(&mut self) {
+        let target = self.overview_search.is_expanded();
+        if target != self.overview_search_expand_target {
+            let from = self.overview_search_expand();
+            self.overview_search_expand_target = target;
+            // The same fixed `SIDE_CONTROLS_ANIMATION_TIME` ease the cross-fade uses; only
+            // whether animations run at all comes from the config.
+            let config = niri_config::Animation {
+                off: self.config.borrow().animations.off,
+                kind: niri_config::animations::Kind::Easing(
+                    niri_config::animations::EasingParams {
+                        duration_ms: 250,
+                        curve: niri_config::animations::Curve::EaseOutQuad,
+                    },
+                ),
+            };
+            self.overview_search_expand = Some(Animation::new(
+                self.clock.clone(),
+                from,
+                if target { 1. } else { 0. },
+                0.,
+                config,
+            ));
+        }
+
+        if self
+            .overview_search_expand
+            .as_ref()
+            .is_some_and(|a| a.is_done())
+        {
+            self.overview_search_expand = None;
+        }
+        let progress = self.overview_search_expand();
+        self.overview_search.set_expand(progress);
     }
 
     /// Arms (or retires) the cross-fade when the search engages or clears.

@@ -1266,6 +1266,104 @@ keeps a folder from forming every time a drag crosses an icon.
   dialog's grab does). A checked edit button draws like a hovered one: `.icon-button` inside
   `.app-folder-dialog` restyles only normal/hover/active.
 
+## 11b. The collapsing search entry + the shared editing model (landed 2026-08-02)
+
+**Divergence, approved.** GNOME rests the entry as the full 24em pill with `hint_text: _('Type
+to search')` inside it (`overviewControls.js:324-331`). We rest as a **puck** — a circle of
+`Entry::HEIGHT`, so `$forced_circular_radius` makes it round — parked at the right end of the
+same footprint, holding only `edit-find-symbolic`. The hint moves to **its own line beneath**,
+in a smaller font (9pt vs the entry's 11pt), its run ending on the pill's right edge. Clicking
+the puck or typing grows it leftward to GNOME's pill with the **right edge pinned**, the find
+glyph sliding from the puck's centre into the leading gutter and the hint fading out; the
+in-pill placeholder is gone (once it is open you have already been told what it is for).
+Escape/clear collapses it again. Everything about the *expanded* entry — width, radius, fill,
+insets, font — is still GNOME's. Animated by `Niri::overview_search_expand`, a twin of the
+existing `overview_search_fade`, whose progress is pushed into the model so **hit-testing
+follows the animating pill** rather than snapping to its destination.
+
+**Icon insets were wrong and are now cited.** `Entry::ICON_INSET` was 16. `st_entry_allocate`
+puts an icon box flush with the **content** box, at zero extra offset (`st-entry.c:452-467`),
+so the glyph centre is `9` (`%entry_common` padding, `_common.scss:177`) + `4`
+(`.search-entry-icon { padding: 0 $base_margin }`, `_search-entry.scss:13`) + `8` (half a 16px
+glyph) = **21**. Text starts one whole icon box plus `priv->spacing` further in — and that
+spacing is **hardcoded** `6.0f` in `st_entry_init` (`st-entry.c:1025`), not a CSS property and
+with no setter — so `9 + (4+16+4) + 6` = **39**. The `.search-entry-icon { margin-top: 2px }`
+optical nudge (`_search-entry.scss:12`) rides on top.
+
+**`ui::text_edit::TextEdit` — the shared editing model.** Every entry hand-rolled
+`push`/`pop`, so all five shared one ceiling: caret at the end, no selection, and any modified
+key refused outright. `TextEdit` owns the string, caret and selection bound and implements
+GNOME's bindings, which live in two files: `clutter-text.c:4338-4430` (motion, Ctrl word
+motion, Home/End, `Ctrl-a` = **select all** and *not* beginning-of-line, `Ctrl-BackSpace` /
+`Ctrl-Delete`, Return = activate) and `st-entry.c:743-762` (`Ctrl-u`/`Ctrl-k`, the two Emacs
+bindings GNOME ships unconditionally). Shift-selection is `clutter_text_add_move_binding`
+(`:3545-3577`) — every motion registered four ways, each handler collapsing the selection only
+when Shift is absent. Word boundaries come from `unicode-segmentation`, the UAX #29 annex
+Pango's `is_word_start`/`is_word_end` log attrs implement.
+
+Adopted by **all five** entries: overview search, polkit password, lock screen, run dialog,
+folder rename. `widget::Entry` grew a measured caret, a selection wash
+(`selection-background-color`, the accent at 30%) and horizontal scroll, replacing the U+258F
+glyph that used to be appended to the string.
+
+**Divergence — the Emacs key theme.** `org.gnome.desktop.interface gtk-key-theme` is a pure
+GTK mechanism; greps for `key-theme` over `gnome-shell/src`+`js` and all of mutter return
+nothing, so shell entries ignore it. We honor it: a user who set that key means it for every
+field on their desktop. Off by default, so shipped behavior is still GNOME's; `KeyTheme::Emacs`
+only adds bindings, with one deliberate override (`Ctrl-a` becomes beginning-of-line).
+
+**Not ported:** the `Ctrl-c`/`Ctrl-v`/`Ctrl-x` clipboard set (`st-entry.c:672-739`) — it needs
+the Wayland selection, so it belongs to a caller, not to a plain-data model.
+
+**Traps this turned up.**
+* **The clear glyph's hit disc covers the whole puck.** `Entry::hit` gives the 16px glyph a
+  generous 32px target, which is right inside a 352px pill and catastrophic inside a 40px one:
+  any click on a resting-but-active entry landed on Clear and wiped the query. It is now
+  hittable only at full expansion — which is also exactly when it finishes fading in, so what
+  you can hit is what you can see.
+* **The lock screen's first keystroke.** `type_char` raised the prompt **before** testing
+  whether the entry was live, because raising it is what makes it live — typing a password
+  blind from the clock page must not eat its first letter (`unlockDialog.js:672-692`). Routing
+  through `entry_key` reintroduced the bug until the order was restored; the corpus caught it.
+* **`polkit_dialog::clear_entry` promised zeroing it never did** — a plain `clear()` under a
+  comment saying it overwrote the bytes first. Both password entries now use
+  `TextEdit::secure_clear`, which carries the volatile zero + preallocation over.
+* **The caret must ride the pen origin, not the ink box.** `text_band` anchors a run's *ink*;
+  caret and selection are measured from the pen origin (`anchor * scale - ink_x`), or they
+  drift by the first glyph's left bearing.
+* **A caret is not in a text-keyed revision.** `Entry::bake` folds cursor/selection/scroll into
+  the caller's revision itself rather than trusting every caller to remember — moving the caret
+  changes what is drawn without changing the text.
+* **A caret sized from the ink box vanishes exactly when it matters.** Both entry surfaces first
+  derived the caret's height (and, in the search entry, its existence) from the drawn glyphs —
+  so an emptied field drew *nothing at all*, which reads as a dead control. The caret is gated
+  on **focus**, never on there being text, and its band is a fixed inset (or the run's line box),
+  never the ink.
+* **A kill buffer is a second copy of the password.** `Ctrl-u`/`Ctrl-k` are *default-theme*
+  bindings and reach both password entries. GNOME discards what they delete (`st-entry.c:743-762`
+  calls `clutter_text_delete_text` and nothing else) and has no `Ctrl-y` to paste it back, so
+  remembering it there bought nothing and cost a full unzeroed copy of the secret, surviving
+  `secure_clear`. `TextEdit::kill` is now written only under `KeyTheme::Emacs`, zeroed by
+  `secure_clear`, and zeroed before every overwrite.
+* **A setter nothing calls is a feature nothing has.** `OverviewSearch` held its own `key_theme`
+  field with a `set_key_theme` that was never wired, so four entries honored `gtk-key-theme` and
+  the flagship one silently did not. The theme is now a `handle_key` argument read live at the
+  call site, like the other four — there is no field to forget to feed.
+* **`TextEdit`'s Activate arm is plain-only, so a caller that owns Return must claim it first.**
+  Ctrl+Enter belongs to whoever owns the field (GNOME's open-in-new-window), so the model refuses
+  it — which silently broke the run dialog, where `CONTROL_MASK` on the activate event means "run
+  in a terminal" (`runDialog.js:113-114`, `_run(input, inTerminal)` `:204,218`), and the folder
+  rename, which committed on Return with any modifier.
+
+**Known limitations, deliberate.** The caret maps an offset to an x by re-measuring
+`text[..offset]`, which assumes logical order is visual order — wrong for **RTL/bidi** runs, where
+the caret lands at the LTR-prefix width. Fixing it needs an index→x mapping out of the shaper
+(cosmic-text has the per-glyph byte ranges; `niri_vk::text::ShapedRun` does not expose them), not
+a change in the widget. And `Entry::bake`'s horizontal scroll is derived from the caret alone
+rather than held as view state, so walking Left through overflowing text holds the caret at the
+trailing edge and slides the text under it where GNOME would hold the viewport — monotonic, and
+it never hides the caret, but it is not GNOME's.
+
 ## 12. Chrome divergences on the thumbnail strip (landed 2026-07-28)
 
 Approved as one batch; the first three landed in `66953ae5` + `d2e5bae9`.
