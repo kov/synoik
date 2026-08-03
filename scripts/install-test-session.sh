@@ -19,12 +19,14 @@
 #   sudo scripts/install-test-session.sh        # install/update
 #   sudo scripts/install-test-session.sh --uninstall
 #
-# It also installs our own GSettings schema (the keybindings for the
-# scrolling-window-manager actions GNOME has no key for) into a *private*
-# schema dir and points the session at it with GSETTINGS_SCHEMA_DIR. Private,
-# not /usr/share/glib-2.0/schemas: two files declaring one schema id in a single
-# directory means glib-compile-schemas drops one of them and still exits 0, and
-# this machine has the real gnome-shell installed alongside.
+# It also installs our GSettings schemas into a *private* schema dir and points
+# the session at it with GSETTINGS_SCHEMA_DIR: our own keybindings (the
+# scrolling-window-manager actions GNOME has no key for), our copies of the
+# mutter and gnome-shell schemas, and the override carrying the defaults we
+# knowingly differ on. Private, not /usr/share/glib-2.0/schemas: two files
+# declaring one schema id in a single directory means glib-compile-schemas drops
+# one of them and still exits 0, and this machine has the real gnome-shell
+# installed alongside.
 #
 # Env knobs:
 #   TEST_USER=gsrs      test account to create/configure (default: gsrs)
@@ -85,12 +87,15 @@ if ! runuser -u "$user" -- test -x "$bin"; then
     exit 1
 fi
 
-# Our schema, compiled into its own directory. GSETTINGS_SCHEMA_DIR is searched
-# ahead of the system one, so this coexists with the real GNOME on this machine
-# instead of fighting it.
+# Our schemas, compiled into their own directory. GSETTINGS_SCHEMA_DIR is
+# searched ahead of the system one, so this coexists with the real GNOME on this
+# machine instead of fighting it -- and the override only tunes the copies in
+# here, never the system's.
 mkdir -p "$schema_dir"
-install -m644 "$repo/resources/org.gnome.shell-rs.keybindings.gschema.xml" "$schema_dir/"
-glib-compile-schemas "$schema_dir"
+rm -f "$schema_dir"/*.gschema.xml "$schema_dir"/*.gschema.override
+install -m644 "$repo"/resources/schemas/*.gschema.xml "$schema_dir/"
+install -m644 "$repo"/resources/schemas/*.gschema.override "$schema_dir/"
+glib-compile-schemas --strict "$schema_dir"
 
 mkdir -p "$dropin_dir"
 cat > "$dropin_dir/override.conf" <<EOF
@@ -120,8 +125,9 @@ echo
 echo "To iterate: rebuild, then log '$user' out and back in — the session"
 echo "always runs whatever is currently at $bin."
 echo
-echo "Our keybinding schema is installed at:"
+echo "Our schemas are installed at:"
 echo "  $schema_dir"
-echo "The session gets it via GSETTINGS_SCHEMA_DIR. To read or write those keys"
+echo "The session gets them via GSETTINGS_SCHEMA_DIR. To read or write those keys"
 echo "from a shell, set it there too:"
 echo "  GSETTINGS_SCHEMA_DIR=$schema_dir gsettings list-recursively org.gnome.shell-rs.keybindings"
+echo "  GSETTINGS_SCHEMA_DIR=$schema_dir gsettings get org.gnome.desktop.wm.keybindings switch-windows"

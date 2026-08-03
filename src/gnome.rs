@@ -2034,7 +2034,7 @@ pub(crate) fn key_for_accel(accel: &Accel) -> Option<niri_config::Key> {
 /// Our own schema, `org.gnome.shell-rs.keybindings`: the scrolling-window-manager
 /// behaviors GNOME has no equivalent for.
 ///
-/// Mirrors `resources/org.gnome.shell-rs.keybindings.gschema.xml` key for key —
+/// Mirrors `resources/schemas/org.gnome.shell-rs.keybindings.gschema.xml` key for key —
 /// `our_schema_matches_the_table` fails if the two drift apart. Nothing here may
 /// take a chord we adopt from GNOME; `niri_accels_do_not_collide_with_gnome`
 /// checks that, so the fork tenet is enforced rather than remembered.
@@ -3570,7 +3570,7 @@ mod tests {
     /// out not to be read, so it is checked rather than trusted.
     #[test]
     fn our_schema_matches_the_table() {
-        let xml = include_str!("../resources/org.gnome.shell-rs.keybindings.gschema.xml");
+        let xml = include_str!("../resources/schemas/org.gnome.shell-rs.keybindings.gschema.xml");
 
         // A deliberately dumb reader: enough of the file's shape to compare, and no
         // XML dependency for one test.
@@ -3599,9 +3599,120 @@ mod tests {
 
         assert_eq!(
             in_file, in_table,
-            "resources/org.gnome.shell-rs.keybindings.gschema.xml and \
+            "resources/schemas/org.gnome.shell-rs.keybindings.gschema.xml and \
              adopted_niri_keybindings() have drifted apart"
         );
+    }
+
+    /// The vendored GNOME schemas must be byte-identical to the installed originals.
+    ///
+    /// We ship copies of the mutter and gnome-shell schemas so the session still has
+    /// *editable* keybindings once those packages are replaced — without them `gsettings
+    /// set` fails, dconf-editor shows nothing, and the Keyboard panel cannot enumerate a
+    /// shortcut. A copy is only worth having if it is the same file, and the way it stops
+    /// being the same file is a GNOME upgrade, which changes nothing here and so says
+    /// nothing.
+    ///
+    /// Skipped where the originals are not installed: the copies exist precisely for that
+    /// case, and there is nothing to compare against.
+    #[test]
+    fn vendored_schemas_match_the_installed_ones() {
+        let vendored = [
+            (
+                "org.gnome.mutter.gschema.xml",
+                include_str!("../resources/schemas/org.gnome.mutter.gschema.xml"),
+            ),
+            (
+                "org.gnome.mutter.wayland.gschema.xml",
+                include_str!("../resources/schemas/org.gnome.mutter.wayland.gschema.xml"),
+            ),
+            (
+                "org.gnome.shell.gschema.xml",
+                include_str!("../resources/schemas/org.gnome.shell.gschema.xml"),
+            ),
+            (
+                "org.gnome.desktop.wm.keybindings.gschema.xml",
+                include_str!("../resources/schemas/org.gnome.desktop.wm.keybindings.gschema.xml"),
+            ),
+        ];
+
+        let mut compared = 0;
+        for (name, ours) in vendored {
+            let path = std::path::Path::new("/usr/share/glib-2.0/schemas").join(name);
+            let Ok(theirs) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            assert_eq!(
+                ours,
+                theirs,
+                "resources/schemas/{name} has drifted from {}; re-copy it and re-check the \
+                 keys we read out of it",
+                path.display(),
+            );
+            compared += 1;
+        }
+
+        if compared == 0 {
+            eprintln!("no GNOME schemas installed; nothing to compare the vendored copies to");
+        }
+    }
+
+    /// Every key in the shipped `.gschema.override` must match the fallback table.
+    ///
+    /// The override is what a *session* gets — it tunes the vendored GNOME schemas in our
+    /// own schema directory. The tables are what the compositor runs on when there are no
+    /// schemas at all, which is also what the conformance corpus asserts against. A
+    /// divergence written in one and not the other is a session that behaves differently
+    /// from every test.
+    ///
+    /// Only the `org.gnome.desktop.wm.keybindings` group is checked: the `org.gnome.mutter`
+    /// group carries settings we do not read as keybindings.
+    #[test]
+    fn override_matches_the_tables() {
+        let text = include_str!("../resources/schemas/gnome-shell-rs.gschema.override");
+
+        let mut group = "";
+        let mut checked = 0;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                group = match name {
+                    "org.gnome.desktop.wm.keybindings" => name,
+                    _ => "",
+                };
+                continue;
+            }
+            if group.is_empty() {
+                continue;
+            }
+
+            let (key, value) = line.split_once('=').expect("a key line is key=value");
+            let want: Vec<String> = value
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .map(|s| s.trim().trim_matches('\'').to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let got = adopted_wm_keybindings()
+                .into_iter()
+                .find(|(name, ..)| name == key)
+                .unwrap_or_else(|| panic!("the override sets {key}, which no table names"))
+                .2;
+
+            assert_eq!(
+                got, want,
+                "{group} {key} differs between the override and the table"
+            );
+            checked += 1;
+        }
+
+        assert!(checked > 0, "the override parser matched nothing at all");
     }
 
     /// The brightness keys come from `org.gnome.shell.keybindings`, which we had never read

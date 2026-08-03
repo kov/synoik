@@ -124,7 +124,7 @@ Three divergences from upstream have been found:
 ## Our own schema
 
 `org.gnome.shell-rs.keybindings`, path `/org/gnome/shell-rs/keybindings/`, source in
-`resources/org.gnome.shell-rs.keybindings.gschema.xml` — the scrolling-window-manager actions
+`resources/schemas/org.gnome.shell-rs.keybindings.gschema.xml` — the scrolling-window-manager actions
 GNOME has no key for: column focus and movement, monitor focus, consume/expel, the preset
 width and height cycles, centring, tabbed display, floating, and the session keys.
 
@@ -183,7 +183,8 @@ from a `binds{}` block.
 
 ### Packaging
 
-The schema installs to a **private** directory, never `/usr/share/glib-2.0/schemas`:
+Everything in `resources/schemas/` installs to a **private** directory, never
+`/usr/share/glib-2.0/schemas`:
 `%{_datadir}/gnome-shell-rs/glib-2.0/schemas` from the RPM,
 `/usr/local/share/gnome-shell-rs/glib-2.0/schemas` from `scripts/install-test-session.sh`. The
 session finds it through `GSETTINGS_SCHEMA_DIR` (`resources/niri.service`, and the systemd
@@ -199,8 +200,9 @@ GSETTINGS_SCHEMA_DIR=/usr/local/share/gnome-shell-rs/glib-2.0/schemas \
 
 ## Schemas: who ships what, and what a replacement costs
 
-We ship our own schema and **no override yet** — everything GNOME names is read from what the
-system has installed, falling back to the tables above.
+We ship our own schema, **copies of the ones mutter and gnome-shell own**, and an override
+carrying the defaults we knowingly differ on — all in the private directory, all compiled
+together.
 
 | Schema | Shipped by | Survives replacing mutter + gnome-shell? |
 |---|---|---|
@@ -225,7 +227,50 @@ Three glib behaviours, all verified with `glib-compile-schemas`, that constrain 
 If the mutter/shell schemas are absent altogether, the compositor still runs — on the fallback
 tables — but there is no *editable* keybinding config at all: `gsettings set` fails,
 dconf-editor shows nothing, and gnome-control-center's Keyboard panel cannot enumerate
-shortcuts. That is the cost that S10 buys back.
+shortcuts. That is the cost S10 bought back.
+
+### What is vendored, and why each one
+
+| File | Shipped by | Why we carry a copy |
+|---|---|---|
+| `org.gnome.mutter.gschema.xml` | mutter 50.3 | `org.gnome.mutter` + `org.gnome.mutter.keybindings`, both of which we read |
+| `org.gnome.mutter.wayland.gschema.xml` | mutter 50.3 | `org.gnome.mutter.wayland.keybindings` — `restore-shortcuts`, `switch-to-session-N` |
+| `org.gnome.shell.gschema.xml` | gnome-shell 50.3 | `org.gnome.shell` and its `.keybindings`, `.app-switcher`, `.window-switcher`, `.world-clocks` children |
+| `org.gnome.desktop.wm.keybindings.gschema.xml` | gsettings-desktop-schemas 50.1 | *not* at risk of going away — vendored because an override only tunes a schema in its **own directory**, and this is where Alt+Tab lives |
+
+The copies are byte-identical to the installed originals;
+`vendored_schemas_match_the_installed_ones` compares them against
+`/usr/share/glib-2.0/schemas` and skips itself where GNOME is not installed. A GNOME upgrade
+is the way they stop being copies, and an upgrade touches nothing here, so it is checked
+rather than trusted.
+
+`org.gnome.login-screen` (gdm) and the `org.gnome.desktop.*` / `org.gnome.settings-daemon.*`
+schemas are not vendored: they come from packages we are not replacing.
+
+### The override
+
+`resources/schemas/gnome-shell-rs.gschema.override` carries our shipped defaults. It is the
+same mechanism GNOME uses on itself — gnome-shell's `00_org.gnome.shell.gschema.override` sets
+the mutter defaults a GNOME session wants, and **GNOME Classic's**
+`00_org.gnome.shell.extensions.classic.gschema.override` gives `<Alt>Tab` to `switch-windows`,
+which is precisely our divergence. Ours lands in our own directory rather than the shared one,
+so a real GNOME session on the same machine is untouched.
+
+Two groups:
+
+- `org.gnome.desktop.wm.keybindings` — the Alt+Tab divergence. Upstream leaves `switch-windows`
+  empty and gives `<Alt>Tab` to `switch-applications`, so a stock GNOME Alt+Tab is the
+  *application* switcher; we ship Alt+Tab as the *window* switcher and leave `<Super>Tab` to
+  the applications. `override_matches_the_tables` checks every key in this group against
+  `adopted_wm_keybindings()`, because the tables are what the conformance corpus runs on: a
+  divergence written in one and not the other is a session that behaves unlike every test.
+- `org.gnome.mutter` — *not* a divergence. These five are what gnome-shell's own override sets
+  for a GNOME session, and shadowing `org.gnome.mutter` with our copy would otherwise drop
+  them back to mutter's raw defaults.
+
+Verified with `glib-compile-schemas --strict` into a scratch dir: with our directory on
+`GSETTINGS_SCHEMA_DIR`, `switch-windows` reads `['<Alt>Tab']` and `switch-applications`
+`['<Super>Tab']`, against the system's `@as []` and `['<Super>Tab', '<Alt>Tab']`.
 
 ## Deferred, with reasons
 
@@ -260,7 +305,7 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 | S7 | Route the non-keyboard triggers (mouse, wheel, touchpad, tablet) through the model | **done** |
 | S8 | Prune and then delete the KDL `binds{}` | **done** |
 | S9 | Re-source the hotkey overlay from the settings model | **done** |
-| S10 | Vendor `org.gnome.shell.*` / `org.gnome.mutter.*` into our private schema dir, plus the `.gschema.override` for our differing defaults | after S6 |
+| S10 | Vendor `org.gnome.shell.*` / `org.gnome.mutter.*` into our private schema dir, plus the `.gschema.override` for our differing defaults | **done** |
 
 ### What the prune removed, and what replaced it
 
@@ -327,15 +372,6 @@ gnome-session. The unobserved hop is gsd firing those two handlers specifically.
 - **Silent fallback drift.** Closed by S6, which shipped the packaging in the same slice: code
   without it would leave the session on compiled-in defaults while the user believed they were
   editing settings.
-
-### S10 vendoring
-
-Depends on S6, which has to build the plumbing anyway: a private schema dir,
-`glib-compile-schemas` at install time, and `GSETTINGS_SCHEMA_DIR` in the session environment.
-Once that exists, vendoring is incremental — drop our copies of the mutter and gnome-shell
-schemas beside our own, and the `.gschema.override` carrying every default where we knowingly
-differ from upstream (starting with Alt+Tab). Never into the shared system dir: see hazard 2
-above.
 
 ### S6 schema design
 

@@ -1,0 +1,35 @@
+# Every default where we knowingly differ from a stock GNOME session.
+#
+# This is the same mechanism GNOME itself uses to reshape a session without
+# forking a schema: gnome-shell ships 00_org.gnome.shell.gschema.override to set
+# the mutter defaults a GNOME session wants, and GNOME Classic ships
+# 00_org.gnome.shell.extensions.classic.gschema.override to give Alt+Tab to
+# switch-windows. Ours lands in our own schema directory rather than the shared
+# one, so a real GNOME session on the same machine is untouched.
+#
+# An override only tunes a schema installed in the *same directory*, which is
+# why the schemas it names are vendored beside it. Keep every key here in sync
+# with the fallback tables in src/gnome.rs — `override_matches_the_tables`
+# checks that, because the tables are what a session with no schemas at all
+# runs on.
+
+# DIVERGENCE (deliberate). Upstream leaves switch-windows empty and gives
+# <Alt>Tab to switch-applications, so a stock GNOME Alt+Tab is the *application*
+# switcher. We ship Alt+Tab as the *window* switcher and leave Super+Tab to the
+# applications — GNOME Classic's choice, and the one a scrolling layout wants,
+# since "the other window" is the common case and it is rarely another app's.
+[org.gnome.desktop.wm.keybindings]
+switch-applications=['<Super>Tab']
+switch-applications-backward=['<Shift><Super>Tab']
+switch-windows=['<Alt>Tab']
+switch-windows-backward=['<Alt><Shift>Tab']
+
+# Not a divergence: these are the defaults gnome-shell's own override sets for a
+# GNOME session, which we would otherwise lose by shadowing org.gnome.mutter
+# with our vendored copy. Kept verbatim from 00_org.gnome.shell.gschema.override.
+[org.gnome.mutter]
+attach-modal-dialogs=true
+edge-tiling=true
+dynamic-workspaces=true
+workspaces-only-on-primary=true
+focus-change-on-pointer-rest=true
