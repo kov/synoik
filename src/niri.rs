@@ -1449,12 +1449,7 @@ impl State {
         if mode != BackendMode::HeadlessTest {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.niri.gnome_settings = initial;
-            {
-                let config = state.niri.config.clone();
-                let config = config.borrow();
-                let mod_key = state.backend.mod_key(&config);
-                state.niri.refresh_keybinding_state(mod_key, &config.binds);
-            }
+            state.niri.refresh_keybinding_state();
             state
                 .niri
                 .screen_shield
@@ -1679,12 +1674,7 @@ impl State {
                         state.niri.gnome_settings = settings;
                         // The scroll bindings live in this model, and the pointer
                         // handlers gate on a set derived from it.
-                        {
-                            let config = state.niri.config.clone();
-                            let config = config.borrow();
-                            let mod_key = state.backend.mod_key(&config);
-                            state.niri.refresh_keybinding_state(mod_key, &config.binds);
-                        }
+                        state.niri.refresh_keybinding_state();
                         state
                             .niri
                             .screen_shield
@@ -3103,14 +3093,14 @@ impl State {
             preserved_output_config = Some(mem::take(&mut old_config.outputs));
         }
 
-        let binds_changed = config.binds != old_config.binds;
+        // Only the mod key still comes from the config; the bindings themselves are in
+        // GSettings and change through their own watch.
         let new_mod_key = self.backend.mod_key(&config);
-        if new_mod_key != self.backend.mod_key(&old_config) || binds_changed {
+        if new_mod_key != self.backend.mod_key(&old_config) {
             self.niri
                 .hotkey_overlay
                 .on_hotkey_config_updated(new_mod_key);
-            self.niri
-                .refresh_keybinding_state(new_mod_key, &config.binds);
+            self.niri.refresh_keybinding_state();
         }
 
         if config.window_rules != old_config.window_rules {
@@ -6490,12 +6480,10 @@ impl Niri {
         // exactly this one, so the fast-path sets have to be built from it here.
         let gnome_settings = GnomeSettings::default();
         let keybindings = &gnome_settings.keybindings;
-        let mods_with_mouse_binds = mods_with_mouse_binds(mod_key, &config_.binds, keybindings);
-        let mods_with_wheel_binds = mods_with_wheel_binds(mod_key, &config_.binds, keybindings);
-        let mods_with_finger_scroll_binds =
-            mods_with_finger_scroll_binds(mod_key, &config_.binds, keybindings);
-        let mods_with_tablet_stylus_binds =
-            mods_with_tablet_stylus_binds(mod_key, &config_.binds, keybindings);
+        let mods_with_mouse_binds = mods_with_mouse_binds(keybindings);
+        let mods_with_wheel_binds = mods_with_wheel_binds(keybindings);
+        let mods_with_finger_scroll_binds = mods_with_finger_scroll_binds(keybindings);
+        let mods_with_tablet_stylus_binds = mods_with_tablet_stylus_binds(keybindings);
 
         let screenshot_ui = ScreenshotUi::new(animation_clock.clone(), config.clone());
         let config_error_notification =
@@ -8190,18 +8178,12 @@ impl Niri {
     /// model — so this runs whenever either changes. A stale set does not make a
     /// binding slow, it makes it *invisible*: the handlers never look it up, and the
     /// overlay never re-bakes.
-    pub fn refresh_keybinding_state(
-        &mut self,
-        mod_key: niri_config::ModKey,
-        binds: &niri_config::Binds,
-    ) {
+    pub fn refresh_keybinding_state(&mut self) {
         let keybindings = &self.gnome_settings.keybindings;
-        self.mods_with_mouse_binds = mods_with_mouse_binds(mod_key, binds, keybindings);
-        self.mods_with_wheel_binds = mods_with_wheel_binds(mod_key, binds, keybindings);
-        self.mods_with_tablet_stylus_binds =
-            mods_with_tablet_stylus_binds(mod_key, binds, keybindings);
-        self.mods_with_finger_scroll_binds =
-            mods_with_finger_scroll_binds(mod_key, binds, keybindings);
+        self.mods_with_mouse_binds = mods_with_mouse_binds(keybindings);
+        self.mods_with_wheel_binds = mods_with_wheel_binds(keybindings);
+        self.mods_with_tablet_stylus_binds = mods_with_tablet_stylus_binds(keybindings);
+        self.mods_with_finger_scroll_binds = mods_with_finger_scroll_binds(keybindings);
         self.hotkey_overlay.set_keybindings(keybindings);
     }
 

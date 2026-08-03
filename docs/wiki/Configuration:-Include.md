@@ -200,27 +200,6 @@ include "laptop.kdl"
 // End result: both DP-2 and eDP-1 settings.
 ```
 
-#### Binds
-
-`binds` will override previously-defined conflicting keys:
-
-```kdl
-// binds.kdl
-binds {
-    Mod+T { spawn "alacritty"; }
-}
-```
-
-```kdl,must-fail
-// config.kdl
-include "binds.kdl"
-
-binds {
-    // Overrides Mod+T from binds.kdl.
-    Mod+T { spawn "foot"; }
-}
-```
-
 #### Flags
 
 Most flags can be disabled with `false`:

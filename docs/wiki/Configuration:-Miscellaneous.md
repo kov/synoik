@@ -69,8 +69,6 @@ Add lines like this to spawn processes at niri startup.
 
 `spawn-at-startup` accepts a path to the program binary as the first argument, followed by arguments to the program.
 
-This option works the same way as the [`spawn` key binding action](./Configuration:-Key-Bindings.md#spawn), so please read about all its subtleties there.
-
 ```kdl
 spawn-at-startup "waybar"
 spawn-at-startup "alacritty"
@@ -87,8 +85,6 @@ Add lines like this to run shell commands at niri startup.
 
 The argument is a single string that is passed verbatim to `sh`.
 You can use shell variables, pipelines, `~` expansion and everything else as expected.
-
-See detailed description in the docs for the [`spawn-sh` key binding action](./Configuration:-Key-Bindings.md#spawn-sh).
 
 ```kdl
 // Pass all arguments in the same string.
@@ -303,8 +299,6 @@ hotkey-overlay {
     hide-not-bound
 }
 ```
-
-You can customize which binds the hotkey overlay shows using the [`hotkey-overlay-title` property](./Configuration:-Key-Bindings.md#custom-hotkey-overlay-titles).
 
 ### `config-notification`
 

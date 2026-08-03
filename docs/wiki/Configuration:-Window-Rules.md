@@ -606,7 +606,7 @@ Opacity is applied to every surface of the window individually, so subsurfaces a
 
 Also, focus ring and border with background will show through semitransparent windows (see `prefer-no-csd` and the `draw-border-with-background` window rule below).
 
-Opacity can be toggled on or off for a window using the [`toggle-window-rule-opacity`](./Configuration:-Key-Bindings.md#toggle-window-rule-opacity) action.
+Opacity can be toggled on or off for a window using the `toggle-window-rule-opacity` action (`niri msg action toggle-window-rule-opacity`).
 
 ```kdl
 // Make inactive windows semitransparent.

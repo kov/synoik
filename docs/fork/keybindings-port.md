@@ -22,7 +22,10 @@ where niri and GNOME merely do the same thing differently, GNOME wins.
 2. `find_gnome_bind` — the GSettings keybindings.
 3. `find_accel_grab_bind` — external `org.gnome.Shell` `GrabAccelerator` grabs
    (gnome-settings-daemon's media keys, the GlobalShortcuts portal, Settings' custom shortcuts).
-4. `find_configured_bind` — the KDL binds, on their way out.
+
+There is no fourth step: the KDL `binds{}` block is gone. What a match produces is an
+`input::ResolvedBind` — action plus the policy for running it — which the hardcoded binds,
+the accelerator grabs and the screenshot UI's own keys all synthesize too.
 
 An adopted key with no mapping would return `None` and **fall through** — benign while the KDL
 layer caught it, but after the prune it means the key reaches the client instead. The audit is
@@ -255,7 +258,7 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 | S5 | `switch-to-application-N` + `open-new-window-application-N` | **done** |
 | S6 | Our own schema for the niri actions, plus its packaging | **done** |
 | S7 | Route the non-keyboard triggers (mouse, wheel, touchpad, tablet) through the model | **done** |
-| S8 | Prune and then delete the KDL `binds{}` | (a) **done**, (b) needs the seat check |
+| S8 | Prune and then delete the KDL `binds{}` | **done** |
 | S9 | Re-source the hotkey overlay from the settings model | **done** |
 | S10 | Vendor `org.gnome.shell.*` / `org.gnome.mutter.*` into our private schema dir, plus the `.gschema.override` for our differing defaults | after S6 |
 
@@ -276,10 +279,30 @@ home now:
 | `Mod+Shift+F` (`fullscreen-window`) | `toggle-fullscreen`, which **GNOME ships unbound**. Following that default is the tenet; bind it in Settings if you want it back |
 | `Ctrl+Alt+Delete { quit; }` | gsd's `logout`, pending the seat check that gates S8(b) |
 
-The block still parses and still wins nothing — `find_bind` consults it last — so it remains
-the escape hatch for the two things the schema cannot express: an action with an argument, and
-spawning a command. It ships empty on purpose, because a default here would silently shadow
-what the user edits in Settings.
+Then the block itself went, along with `find_configured_bind`, the `Bind`/`Binds` config
+types, the `Mod+Key` accelerator syntax and the per-bind properties (`repeat`, `cooldown-ms`,
+`allow-when-locked`, `allow-inhibiting`, `hotkey-overlay-title`). `niri-config` keeps `Key`,
+`Trigger` and `Modifiers`, which is what a GSettings accelerator parses into, and `Trigger`
+keeps `from_name` for the trigger tokens our schema spells.
+
+An action that takes an argument now reaches the compositor over IPC (`niri msg action
+set-column-width 25%`); spawning a command is Settings → Keyboard → Custom Shortcuts, which
+arrives through `GrabAccelerator` with no code of ours involved.
+
+`mod-key` survives, but it no longer names a modifier for bindings — its one remaining job is
+the pointer-gesture modifier for the screenshot UI's selection. The hotkey overlay still
+renders a `Mod` prefix, which is now unreachable: `modifiers_from_accel` never sets
+`Modifiers::COMPOSITOR`, because an accelerator names its modifiers outright.
+
+### The escape hatches, verified on the seat
+
+Deleting `Ctrl+Alt+Delete { quit; }` and the `Super+Alt+L` locker bind means gsd owns both.
+Checked in a live session (read-only; no keypress, since firing these logs the seat out):
+gsd-media-keys has grabbed `<Super>l` and `<Control><Alt>Delete` through our
+`GrabAccelerator`; delivery works end to end in that same session (gsd launched a terminal
+from a grabbed key, and reached its volume handler from another); and both interfaces its
+handlers call are up, `org.gnome.ScreenSaver` owned by *us* and `org.gnome.SessionManager` by
+gnome-session. The unobserved hop is gsd firing those two handlers specifically.
 
 ### Ordering hazards
 

@@ -359,7 +359,6 @@ window-rule {
 //     gsettings set org.gnome.desktop.wm.keybindings close "['<Super>q']"
 //     gsettings range org.gnome.shell-rs.keybindings focus-column-left
 //
-// A `binds {}` block here still works and wins over the settings model, for
-// actions that take an argument (set-column-width "25%") or spawn a command.
-// It ships empty on purpose: a default here would silently shadow the settings
-// the user edits in Settings.
+// There is no `binds {}` block any more, in this file or any other. Actions
+// that take an argument are reachable over IPC (`niri msg action
+// set-column-width 25%`).

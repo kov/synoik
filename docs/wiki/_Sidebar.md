@@ -26,7 +26,6 @@
 * [Introduction](./Configuration:-Introduction.md)
 * [Input](./Configuration:-Input.md)
 * [Outputs](./Configuration:-Outputs.md)
-* [Key Bindings](./Configuration:-Key-Bindings.md)
 * [Switch Events](./Configuration:-Switch-Events.md)
 * [Layout](./Configuration:-Layout.md)
 * [Named Workspaces](./Configuration:-Named-Workspaces.md)

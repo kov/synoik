@@ -125,13 +125,11 @@ This is not always convenient, for example if you have an ultrawide monitor, or 
 The `toggle-windowed-fullscreen` bind helps with this.
 It tells the app that it went fullscreen, while in reality leaving it as a normal window that you can resize and put wherever you want.
 
-```kdl
-binds {
-    Mod+Ctrl+Shift+F { toggle-windowed-fullscreen; }
-}
+```
+niri msg action toggle-windowed-fullscreen
 ```
 
-Keep in mind that not all apps react to fullscreening, so it may sometimes look as if the bind did nothing.
+Keep in mind that not all apps react to fullscreening, so it may sometimes look as if it did nothing.
 
 Here's an example showing a windowed-fullscreen Google Slides [presentation](https://youtu.be/Kmz8ODolnDg), along with the presenter view and a meeting app:
 
@@ -142,12 +140,11 @@ Here's an example showing a windowed-fullscreen Google Slides [presentation](htt
 For presentations it can be useful to mirror an output to another.
 Currently, niri doesn't have built-in output mirroring, but you can use a third-party tool [`wl-mirror`](https://github.com/Ferdi265/wl-mirror) that mirrors an output to a window.
 Note that the command below requires [`jq`](https://jqlang.org/download/) to be installed.
-```kdl
-binds {
-    Mod+P repeat=false { spawn-sh "wl-mirror $(niri msg --json focused-output | jq -r .name)"; }
-}
 ```
-Focus the output you want to mirror, press <kbd>Mod</kbd><kbd>P</kbd> and move the `wl-mirror` window to the target output.
-Finally, fullscreen the `wl-mirror` window (by default, <kbd>Mod</kbd><kbd>Shift</kbd><kbd>F</kbd>).
+sh -c 'wl-mirror $(niri msg --json focused-output | jq -r .name)'
+```
+Add that as a custom shortcut in Settings → Keyboard.
+Focus the output you want to mirror, press it, and move the `wl-mirror` window to the target output.
+Finally, fullscreen the `wl-mirror` window.
 
 [OBS]: https://obsproject.com/

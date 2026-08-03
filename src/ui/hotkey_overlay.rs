@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::rc::Rc;
 
-use niri_config::{Action, Bind, Config, Key, ModKey, Modifiers, Trigger};
+use niri_config::{Action, Config, Key, ModKey, Modifiers, Trigger};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::Texture;
 use smithay::input::keyboard::xkb::keysym_get_name;
@@ -194,10 +194,7 @@ impl HotkeyOverlay {
         writeln!(&mut buf, "{TITLE}").unwrap();
 
         for action in actions {
-            let Some((key, label)) = format_bind(&config.binds.0, &self.keybindings, &action)
-            else {
-                continue;
-            };
+            let (key, label) = format_bind(&self.keybindings, &action);
 
             let key = key.map(|key| key_name(true, self.mod_key, &key));
             let key = key.as_deref().unwrap_or("not bound");
@@ -211,62 +208,10 @@ impl HotkeyOverlay {
     }
 }
 
-/// The key shown for `action`, and its label.
-///
-/// The settings model supplies the key when it has one, because that is the order
-/// `find_bind` resolves in — GNOME wins a conflict, so printing the config bind first could
-/// name a chord that does something else entirely. The config still supplies the *title*,
-/// which is the only place a custom one can come from.
-///
-/// `None` means the action should not be listed at all — a bind with a null
-/// `hotkey-overlay-title` hides it explicitly.
-fn format_bind(
-    binds: &[Bind],
-    keybindings: &[GnomeKeybinding],
-    action: &Action,
-) -> Option<(Option<Key>, Label)> {
-    let mut bind_with_non_null = None;
-    let mut bind_with_custom_title = None;
-    let mut found_null_title = false;
-
-    for bind in binds {
-        if bind.action != *action {
-            continue;
-        }
-
-        match &bind.hotkey_overlay_title {
-            Some(Some(_)) => {
-                bind_with_custom_title.get_or_insert(bind);
-            }
-            Some(None) => {
-                found_null_title = true;
-            }
-            None => {
-                bind_with_non_null.get_or_insert(bind);
-            }
-        }
-    }
-
-    if bind_with_custom_title.is_none() && found_null_title {
-        return None;
-    }
-
-    let mut custom_title = None;
-    let config_key = bind_with_custom_title.or(bind_with_non_null).map(|bind| {
-        if let Some(Some(custom)) = &bind.hotkey_overlay_title {
-            custom_title = Some(custom.clone());
-        }
-
-        bind.key
-    });
-    let key = keybinding_key(keybindings, action).or(config_key);
-    // A custom title is user text: render it plain (any pango markup it carries is stripped).
-    let label = match custom_title {
-        Some(title) => vec![LabelSpan::plain(strip_markup(&title))],
-        None => action_label(action),
-    };
-
-    Some((key, label))
+/// The key shown for `action`, and its label. `None` for the key means the action is not
+/// bound to anything showable.
+fn format_bind(keybindings: &[GnomeKeybinding], action: &Action) -> (Option<Key>, Label) {
+    (keybinding_key(keybindings, action), action_label(action))
 }
 
 /// The first showable accelerator bound to `action` in the settings model.
@@ -304,45 +249,16 @@ fn spawn_label(command: &str) -> Label {
     ]
 }
 
-/// Drop pango-markup tags and unescape the basic entities, so a user-supplied title renders as
-/// clean plain text without a markup parser.
-fn strip_markup(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    out.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-}
-
-/// Every action bound by either source: the settings model, plus whatever the config binds
-/// layer on top. Actions bound to nothing at all are left out, so "is this bound?" has one
-/// answer regardless of which model the binding came from.
-fn bound_actions(binds: &[Bind], keybindings: &[GnomeKeybinding]) -> Vec<Action> {
-    binds
+fn bound_actions(keybindings: &[GnomeKeybinding]) -> Vec<Action> {
+    keybindings
         .iter()
-        .map(|bind| bind.action.clone())
-        .chain(
-            keybindings
-                .iter()
-                .filter(|kb| !kb.accels.is_empty())
-                .filter_map(|kb| action_for_keybinding(&kb.action)),
-        )
+        .filter(|kb| !kb.accels.is_empty())
+        .filter_map(|kb| action_for_keybinding(&kb.action))
         .collect()
 }
 
 fn collect_actions(config: &Config, keybindings: &[GnomeKeybinding]) -> Vec<Action> {
-    let binds = &config.binds.0;
-    let bound = bound_actions(binds, keybindings);
+    let bound = bound_actions(keybindings);
 
     // Collect actions that we want to show.
     let mut actions = vec![Action::ShowHotkeyOverlay];
@@ -415,32 +331,6 @@ fn collect_actions(config: &Config, keybindings: &[GnomeKeybinding]) -> Vec<Acti
         actions.push(action.clone());
     }
 
-    // Add actions with a custom hotkey-overlay-title. Only config binds can carry one.
-    for bind in binds {
-        if matches!(bind.hotkey_overlay_title, Some(Some(_))) {
-            // Avoid duplicate actions.
-            if !actions.contains(&bind.action) {
-                actions.push(bind.action.clone());
-            }
-        }
-    }
-
-    // Add the spawn actions. These are config-only too: spawning is not in our schema, it
-    // reaches us through gsd's custom shortcuts instead.
-    for bind in binds.iter().filter(|bind| {
-        matches!(bind.action, Action::Spawn(_) | Action::SpawnSh(_))
-            // Only show binds with Mod or Super to filter out stuff like volume up/down.
-            && (bind.key.modifiers.contains(Modifiers::COMPOSITOR)
-                || bind.key.modifiers.contains(Modifiers::SUPER))
-            // Also filter out wheel and touchpad scroll binds.
-            && matches!(bind.key.trigger, Trigger::Keysym(_))
-    }) {
-        // We only show one bind for each action, so we need to deduplicate the Spawn actions.
-        if !actions.contains(&bind.action) {
-            actions.push(bind.action.clone());
-        }
-    }
-
     if config.hotkey_overlay.hide_not_bound {
         // Only keep actions that have been bound
         actions.retain(|action| bound.contains(action));
@@ -494,7 +384,7 @@ fn prepare(
 
     let rows: Vec<(String, Label)> = collect_actions(config, keybindings)
         .into_iter()
-        .filter_map(|action| format_bind(&config.binds.0, keybindings, &action))
+        .map(|action| format_bind(keybindings, &action))
         .map(|(key, label)| {
             let key = key.map(|key| key_name(false, mod_key, &key));
             let key = key.as_deref().unwrap_or("(not bound)").to_string();
@@ -806,157 +696,41 @@ mod tests {
 
     use super::*;
 
-    /// The config-only case: no settings model, so the KDL binds are the whole story.
     #[track_caller]
-    fn check(config: &str, action: Action) -> String {
-        check_with(config, &[], action)
+    fn check(keybindings: &[GnomeKeybinding], action: Action) -> String {
+        let (key, label) = format_bind(keybindings, &action);
+        let key = key.map(|key| key_name(false, ModKey::Super, &key));
+        let key = key.as_deref().unwrap_or("(not bound)");
+        let title: String = label.iter().map(|s| s.text.as_str()).collect();
+        format!(" {key} : {title}")
     }
 
-    #[track_caller]
-    fn check_with(config: &str, keybindings: &[GnomeKeybinding], action: Action) -> String {
-        let config = Config::parse_mem(config).unwrap();
-        if let Some((key, label)) = format_bind(&config.binds.0, keybindings, &action) {
-            let key = key.map(|key| key_name(false, ModKey::Super, &key));
-            let key = key.as_deref().unwrap_or("(not bound)");
-            let title: String = label.iter().map(|s| s.text.as_str()).collect();
-            format!(" {key} : {title}")
-        } else {
-            String::from("None")
-        }
-    }
-
-    #[test]
-    fn test_format_bind() {
-        // Not bound.
-        assert_snapshot!(check("", Action::Screenshot(true, None)), @" (not bound) : Take a Screenshot");
-
-        // Bound with a default title.
-        assert_snapshot!(
-            check(
-                r#"binds {
-                    Mod+P { screenshot; }
-                }"#,
-                Action::Screenshot(true, None),
-            ),
-            @" Super + P : Take a Screenshot"
-        );
-
-        // Custom title.
-        assert_snapshot!(
-            check(
-                r#"binds {
-                    Mod+P hotkey-overlay-title="Hello" { screenshot; }
-                }"#,
-                Action::Screenshot(true, None),
-            ),
-            @" Super + P : Hello"
-        );
-
-        // Prefer first bind.
-        assert_snapshot!(
-            check(
-                r#"binds {
-                    Mod+P { screenshot; }
-                    Print { screenshot; }
-                }"#,
-                Action::Screenshot(true, None),
-            ),
-            @" Super + P : Take a Screenshot"
-        );
-
-        // Prefer bind with custom title.
-        assert_snapshot!(
-            check(
-                r#"binds {
-                    Mod+P { screenshot; }
-                    Print hotkey-overlay-title="My Cool Bind" { screenshot; }
-                }"#,
-                Action::Screenshot(true, None),
-            ),
-            @" PrtSc : My Cool Bind"
-        );
-
-        // Prefer first bind with custom title.
-        assert_snapshot!(
-            check(
-                r#"binds {
-                    Mod+P hotkey-overlay-title="First" { screenshot; }
-                    Print hotkey-overlay-title="My Cool Bind" { screenshot; }
-                }"#,
-                Action::Screenshot(true, None),
-            ),
-            @" Super + P : First"
-        );
-
-        // Any bind with null title hides it.
-        assert_snapshot!(
-            check(
-                r#"binds {
-                    Mod+P { screenshot; }
-                    Print hotkey-overlay-title=null { screenshot; }
-                }"#,
-                Action::Screenshot(true, None),
-            ),
-            @"None"
-        );
-
-        // Custom title takes preference over null.
-        assert_snapshot!(
-            check(
-                r#"binds {
-                    Mod+P hotkey-overlay-title="Hello" { screenshot; }
-                    Print hotkey-overlay-title=null { screenshot; }
-                }"#,
-                Action::Screenshot(true, None),
-            ),
-            @" Super + P : Hello"
-        );
-    }
-
-    /// Most bindings live in GSettings now, so the overlay has to read them from
-    /// there — with no config binds at all it would otherwise print "not bound" for
-    /// nearly everything.
+    /// Bindings live in GSettings and nowhere else, so this is the whole of what the
+    /// overlay can show.
     #[test]
     fn keybindings_come_from_the_settings_model() {
         let keybindings = crate::gnome::GnomeSettings::default().keybindings;
 
         assert_snapshot!(
-            check_with("", &keybindings, Action::CloseWindow),
+            check(&keybindings, Action::CloseWindow),
             @" Alt + F4 : Close Focused Window"
         );
         assert_snapshot!(
-            check_with("", &keybindings, Action::FocusColumnLeft),
+            check(&keybindings, Action::FocusColumnLeft),
             @" Super + H : Focus Column to the Left"
         );
 
-        // A config bind loses to the model, because that is what `find_bind` does: a
-        // conflicting chord goes to GNOME, so naming the config one would be a lie.
+        // An action nothing binds still gets a row, marked as such. `toggle-overview` is the
+        // real case: GNOME ships it unbound, reachable by the overlay key instead.
         assert_snapshot!(
-            check_with(
-                r#"binds {
-                    Mod+Shift+K { close-window; }
-                }"#,
-                &keybindings,
-                Action::CloseWindow,
-            ),
-            @" Alt + F4 : Close Focused Window"
+            check(&keybindings, Action::ToggleOverview),
+            @" (not bound) : Open the Overview"
         );
-
-        // The title still comes from the config — it is the only source of one.
-        assert_snapshot!(
-            check_with(
-                r#"binds {
-                    Mod+Shift+K hotkey-overlay-title="Go Away" { close-window; }
-                }"#,
-                &keybindings,
-                Action::CloseWindow,
-            ),
-            @" Alt + F4 : Go Away"
-        );
+        assert_snapshot!(check(&[], Action::CloseWindow), @" (not bound) : Close Focused Window");
     }
 
-    /// `hide-not-bound` drops actions nothing binds. With the settings model as the
-    /// only source, that must not empty the overlay out.
+    /// `hide-not-bound` drops actions nothing binds. With the settings model as the only
+    /// source, that must not empty the overlay out.
     #[test]
     fn hide_not_bound_still_sees_the_settings_model() {
         let keybindings = crate::gnome::GnomeSettings::default().keybindings;

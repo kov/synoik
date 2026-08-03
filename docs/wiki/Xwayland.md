@@ -70,14 +70,7 @@ For textual data you can do it manually using [wl-clipboard](https://github.com/
 - `env DISPLAY=:0 xsel -ob | wl-copy` to copy from Xwayland to niri clipboard
 - `wl-paste -n | env DISPLAY=:0 xsel -ib` to copy from niri to Xwayland clipboard
 
-You can also bind these to hotkeys if you want:
-
-```
-binds {
-    Mod+Shift+C { spawn "sh" "-c" "env DISPLAY=:0 xsel -ob | wl-copy"; }
-    Mod+Shift+V { spawn "sh" "-c" "wl-paste -n | env DISPLAY=:0 xsel -ib"; }
-}
-```
+You can also bind these to hotkeys, in Settings → Keyboard → Custom Shortcuts.
 
 ## Using xwayland-run to run Xwayland
 

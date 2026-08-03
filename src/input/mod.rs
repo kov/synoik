@@ -5,9 +5,7 @@ use std::time::Duration;
 
 use calloop::timer::{TimeoutAction, Timer};
 use input::event::gesture::GestureEventCoordinates as _;
-use niri_config::{
-    Action, Bind, Binds, Config, Key, ModKey, Modifiers, SwitchBinds, Trigger, WorkspaceReference,
-};
+use niri_config::{Action, Key, Modifiers, SwitchBinds, Trigger, WorkspaceReference};
 use niri_ipc::LayoutSwitchTarget;
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
@@ -609,8 +607,6 @@ impl State {
         event: I::KeyboardKeyEvent,
         consumed_by_a11y: &mut bool,
     ) {
-        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
-
         let serial = SERIAL_COUNTER.next_serial();
         let time = Event::time_msec(&event);
         let pressed = event.state() == KeyState::Pressed;
@@ -732,11 +728,9 @@ impl State {
                     let escape = {
                         let config = this.niri.config.borrow();
                         find_bind(
-                            make_binds_iter(&config, false),
                             &this.niri.gnome_settings.keybindings,
                             &this.niri.accel_grabs,
                             SwitcherGrab::Closed,
-                            mod_key,
                             key_code,
                             modified,
                             raw,
@@ -944,11 +938,9 @@ impl State {
                     let popup_bind = {
                         let config = this.niri.config.borrow();
                         find_bind(
-                            make_binds_iter(&config, false),
                             &this.niri.gnome_settings.keybindings,
                             &this.niri.accel_grabs,
                             SwitcherGrab::Closed,
-                            mod_key,
                             key_code,
                             modified,
                             raw,
@@ -1014,7 +1006,6 @@ impl State {
                 }
 
                 let res = {
-                    let config = this.niri.config.borrow();
                     // The switcher holds a modal grab, so while it is up nothing but the switch
                     // bindings resolves.
                     let switcher = match this.niri.switcher.cycler_is_group() {
@@ -1022,15 +1013,12 @@ impl State {
                         None if this.niri.switcher.is_open() => SwitcherGrab::Popup,
                         None => SwitcherGrab::Closed,
                     };
-                    let bindings = make_binds_iter(&config, switcher.is_open());
 
                     should_intercept_key(
                         &mut this.niri.suppressed_keys,
-                        bindings,
                         &this.niri.gnome_settings.keybindings,
                         &this.niri.accel_grabs,
                         switcher,
-                        mod_key,
                         key_code,
                         modified,
                         raw,
@@ -1256,7 +1244,7 @@ impl State {
         self.start_key_repeat(bind);
     }
 
-    fn start_key_repeat(&mut self, bind: Bind) {
+    fn start_key_repeat(&mut self, bind: ResolvedBind) {
         if !bind.repeat {
             return;
         }
@@ -1312,7 +1300,7 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
-    pub fn handle_bind(&mut self, bind: Bind) {
+    pub fn handle_bind(&mut self, bind: ResolvedBind) {
         let Some(cooldown) = bind.cooldown else {
             self.do_action(bind.action, bind.allow_when_locked);
             return;
@@ -6201,6 +6189,7 @@ impl State {
     }
 
     fn on_pointer_button<I: InputBackend>(&mut self, event: I::PointerButtonEvent) {
+        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
         let pointer = self.niri.seat.get_pointer().unwrap();
 
         let serial = SERIAL_COUNTER.next_serial();
@@ -6210,8 +6199,6 @@ impl State {
         let button_code = event.button_code();
 
         let button_state = event.state();
-
-        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
 
         // A click while the shield is down raises it. Both edges are swallowed, not just the
         // press: leaking the release alone would give whatever is underneath a button-up it never
@@ -6560,15 +6547,7 @@ impl State {
                     _ => None,
                 }
                 .and_then(|trigger| {
-                    let config = self.niri.config.borrow();
-                    let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
-                    find_trigger_bind(
-                        bindings,
-                        &self.niri.gnome_settings.keybindings,
-                        mod_key,
-                        trigger,
-                        mods,
-                    )
+                    find_trigger_bind(&self.niri.gnome_settings.keybindings, trigger, mods)
                 })
                 .filter(|bind| {
                     !self.niri.screenshot_ui.is_open() || allowed_during_screenshot(&bind.action)
@@ -6879,8 +6858,6 @@ impl State {
 
         let source = event.source();
 
-        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
-
         // We received an event for the regular pointer, so show it now. This is also needed for
         // update_pointer_contents() below to return the real contents, necessary for the pointer
         // axis event to reach the window.
@@ -7159,7 +7136,7 @@ impl State {
                                     None,
                                 )
                             };
-                            let bind_left = Some(Bind {
+                            let bind_left = Some(ResolvedBind {
                                 key: Key {
                                     trigger: Trigger::WheelScrollLeft,
                                     modifiers: Modifiers::empty(),
@@ -7169,9 +7146,8 @@ impl State {
                                 cooldown,
                                 allow_when_locked: false,
                                 allow_inhibiting: false,
-                                hotkey_overlay_title: None,
                             });
-                            let bind_right = Some(Bind {
+                            let bind_right = Some(ResolvedBind {
                                 key: Key {
                                     trigger: Trigger::WheelScrollRight,
                                     modifiers: Modifiers::empty(),
@@ -7181,16 +7157,11 @@ impl State {
                                 cooldown,
                                 allow_when_locked: false,
                                 allow_inhibiting: false,
-                                hotkey_overlay_title: None,
                             });
                             (bind_left, bind_right)
                         } else {
-                            let config = self.niri.config.borrow();
-                            let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
                             let bind_left = find_trigger_bind(
-                                bindings.clone(),
                                 &self.niri.gnome_settings.keybindings,
-                                mod_key,
                                 Trigger::WheelScrollLeft,
                                 mods,
                             )
@@ -7199,9 +7170,7 @@ impl State {
                                     || allowed_during_screenshot(&bind.action)
                             });
                             let bind_right = find_trigger_bind(
-                                bindings,
                                 &self.niri.gnome_settings.keybindings,
-                                mod_key,
                                 Trigger::WheelScrollRight,
                                 mods,
                             )
@@ -7229,7 +7198,7 @@ impl State {
                 if ticks != 0 {
                     let (bind_up, bind_down) = if should_handle_in_overview && modifiers.is_empty()
                     {
-                        let bind_up = Some(Bind {
+                        let bind_up = Some(ResolvedBind {
                             key: Key {
                                 trigger: Trigger::WheelScrollUp,
                                 modifiers: Modifiers::empty(),
@@ -7239,9 +7208,8 @@ impl State {
                             cooldown: Some(Duration::from_millis(50)),
                             allow_when_locked: false,
                             allow_inhibiting: false,
-                            hotkey_overlay_title: None,
                         });
-                        let bind_down = Some(Bind {
+                        let bind_down = Some(ResolvedBind {
                             key: Key {
                                 trigger: Trigger::WheelScrollDown,
                                 modifiers: Modifiers::empty(),
@@ -7251,11 +7219,10 @@ impl State {
                             cooldown: Some(Duration::from_millis(50)),
                             allow_when_locked: false,
                             allow_inhibiting: false,
-                            hotkey_overlay_title: None,
                         });
                         (bind_up, bind_down)
                     } else if should_handle_in_overview && modifiers == Modifiers::SHIFT {
-                        let bind_up = Some(Bind {
+                        let bind_up = Some(ResolvedBind {
                             key: Key {
                                 trigger: Trigger::WheelScrollUp,
                                 modifiers: Modifiers::empty(),
@@ -7265,9 +7232,8 @@ impl State {
                             cooldown: Some(Duration::from_millis(50)),
                             allow_when_locked: false,
                             allow_inhibiting: false,
-                            hotkey_overlay_title: None,
                         });
-                        let bind_down = Some(Bind {
+                        let bind_down = Some(ResolvedBind {
                             key: Key {
                                 trigger: Trigger::WheelScrollDown,
                                 modifiers: Modifiers::empty(),
@@ -7277,16 +7243,11 @@ impl State {
                             cooldown: Some(Duration::from_millis(50)),
                             allow_when_locked: false,
                             allow_inhibiting: false,
-                            hotkey_overlay_title: None,
                         });
                         (bind_up, bind_down)
                     } else {
-                        let config = self.niri.config.borrow();
-                        let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
                         let bind_up = find_trigger_bind(
-                            bindings.clone(),
                             &self.niri.gnome_settings.keybindings,
-                            mod_key,
                             Trigger::WheelScrollUp,
                             mods,
                         )
@@ -7295,9 +7256,7 @@ impl State {
                                 || allowed_during_screenshot(&bind.action)
                         });
                         let bind_down = find_trigger_bind(
-                            bindings,
                             &self.niri.gnome_settings.keybindings,
-                            mod_key,
                             Trigger::WheelScrollDown,
                             mods,
                         )
@@ -7439,12 +7398,8 @@ impl State {
                     .horizontal_finger_scroll_tracker
                     .accumulate(horizontal);
                 if ticks != 0 {
-                    let config = self.niri.config.borrow();
-                    let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
                     let bind_left = find_trigger_bind(
-                        bindings.clone(),
                         &self.niri.gnome_settings.keybindings,
-                        mod_key,
                         Trigger::TouchpadScrollLeft,
                         mods,
                     )
@@ -7453,9 +7408,7 @@ impl State {
                             || allowed_during_screenshot(&bind.action)
                     });
                     let bind_right = find_trigger_bind(
-                        bindings,
                         &self.niri.gnome_settings.keybindings,
-                        mod_key,
                         Trigger::TouchpadScrollRight,
                         mods,
                     )
@@ -7463,7 +7416,6 @@ impl State {
                         !self.niri.screenshot_ui.is_open()
                             || allowed_during_screenshot(&bind.action)
                     });
-                    drop(config);
 
                     if let Some(right) = bind_right {
                         for _ in 0..ticks {
@@ -7482,12 +7434,8 @@ impl State {
                     .vertical_finger_scroll_tracker
                     .accumulate(vertical);
                 if ticks != 0 {
-                    let config = self.niri.config.borrow();
-                    let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
                     let bind_up = find_trigger_bind(
-                        bindings.clone(),
                         &self.niri.gnome_settings.keybindings,
-                        mod_key,
                         Trigger::TouchpadScrollUp,
                         mods,
                     )
@@ -7496,9 +7444,7 @@ impl State {
                             || allowed_during_screenshot(&bind.action)
                     });
                     let bind_down = find_trigger_bind(
-                        bindings,
                         &self.niri.gnome_settings.keybindings,
-                        mod_key,
                         Trigger::TouchpadScrollDown,
                         mods,
                     )
@@ -7506,7 +7452,6 @@ impl State {
                         !self.niri.screenshot_ui.is_open()
                             || allowed_during_screenshot(&bind.action)
                     });
-                    drop(config);
 
                     if let Some(down) = bind_down {
                         for _ in 0..ticks {
@@ -7704,6 +7649,7 @@ impl State {
         };
         let tip_state = event.tip_state();
 
+        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
         let is_overview_open = self.niri.layout.is_overview_open();
 
         match tip_state {
@@ -7715,7 +7661,6 @@ impl State {
                     let under = self.niri.contents_under(pos);
 
                     if self.niri.screenshot_ui.is_open() {
-                        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
                         let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
                         let modifiers = modifiers_from_state(mods);
                         let mod_down = modifiers.contains(mod_key.to_modifiers());
@@ -7885,26 +7830,16 @@ impl State {
 
             if let Some(trigger) = trigger {
                 if event.button_state() == ButtonState::Pressed {
-                    let mod_key = self.backend.mod_key(&self.niri.config.borrow());
                     let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
                     let modifiers = modifiers_from_state(mods);
 
                     if self.niri.mods_with_tablet_stylus_binds.contains(&modifiers) {
-                        let bind = {
-                            let config = self.niri.config.borrow();
-                            let bindings = config.binds.0.iter();
-                            find_trigger_bind(
-                                bindings,
-                                &self.niri.gnome_settings.keybindings,
-                                mod_key,
-                                trigger,
-                                mods,
-                            )
-                        }
-                        .filter(|bind| {
-                            !self.niri.screenshot_ui.is_open()
-                                || allowed_during_screenshot(&bind.action)
-                        });
+                        let bind =
+                            find_trigger_bind(&self.niri.gnome_settings.keybindings, trigger, mods)
+                                .filter(|bind| {
+                                    !self.niri.screenshot_ui.is_open()
+                                        || allowed_during_screenshot(&bind.action)
+                                });
                         if let Some(bind) = bind {
                             self.niri.suppressed_buttons.insert(button);
                             self.handle_bind(bind.clone());
@@ -8242,6 +8177,7 @@ impl State {
     }
 
     fn on_touch_down<I: InputBackend>(&mut self, evt: I::TouchDownEvent) {
+        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
         let Some(handle) = self.niri.seat.get_touch() else {
             return;
         };
@@ -8254,7 +8190,6 @@ impl State {
 
         let under = self.niri.contents_under(pos);
 
-        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
         let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
         let mods = modifiers_from_state(mods);
         let mod_down = mods.contains(mod_key.to_modifiers());
@@ -8521,13 +8456,11 @@ impl SwitcherGrab {
 /// pressed keys as `suppressed`, thus preventing `releases` corresponding
 /// to them from being delivered.
 #[allow(clippy::too_many_arguments)]
-fn should_intercept_key<'a>(
+fn should_intercept_key(
     suppressed_keys: &mut HashSet<Keycode>,
-    bindings: impl IntoIterator<Item = &'a Bind>,
     gnome_keybindings: &[GnomeKeybinding],
     accel_grabs: &[AccelGrab],
     switcher: SwitcherGrab,
-    mod_key: ModKey,
     key_code: Keycode,
     modified: Keysym,
     raw: Option<Keysym>,
@@ -8536,7 +8469,7 @@ fn should_intercept_key<'a>(
     screenshot_ui: &ScreenshotUi,
     disable_power_key_handling: bool,
     is_inhibiting_shortcuts: bool,
-) -> FilterResult<Option<Bind>> {
+) -> FilterResult<Option<ResolvedBind>> {
     // Actions are only triggered on presses, release of the key
     // shouldn't try to intercept anything unless we have marked
     // the key to suppress.
@@ -8545,11 +8478,9 @@ fn should_intercept_key<'a>(
     }
 
     let mut final_bind = find_bind(
-        bindings,
         gnome_keybindings,
         accel_grabs,
         switcher,
-        mod_key,
         key_code,
         modified,
         raw,
@@ -8570,7 +8501,7 @@ fn should_intercept_key<'a>(
 
         if use_screenshot_ui_action {
             if let Some(raw) = raw {
-                final_bind = screenshot_ui.action(raw, mods).map(|action| Bind {
+                final_bind = screenshot_ui.action(raw, mods).map(|action| ResolvedBind {
                     key: Key {
                         trigger: Trigger::Keysym(raw),
                         // Not entirely correct but it doesn't matter in how we currently use it.
@@ -8584,7 +8515,6 @@ fn should_intercept_key<'a>(
                     // But logically, nothing can inhibit its actions. Only opening it can be
                     // inhibited.
                     allow_inhibiting: false,
-                    hotkey_overlay_title: None,
                 });
             }
         }
@@ -8612,19 +8542,35 @@ fn should_intercept_key<'a>(
     }
 }
 
+/// A binding resolved for one key or trigger event: what to run, and the policy for
+/// running it.
+///
+/// Bindings themselves live in GSettings — this is only what one becomes once it has
+/// matched, shared with the hardcoded VT/power-key binds, external accelerator grabs
+/// and the screenshot UI's own keys, none of which come from settings either.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedBind {
+    /// Identifies the binding for the cooldown timers. Synthesized bindings fill in
+    /// whatever key matched, which is enough to tell them apart.
+    pub key: Key,
+    pub action: Action,
+    pub repeat: bool,
+    pub cooldown: Option<Duration>,
+    pub allow_when_locked: bool,
+    pub allow_inhibiting: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn find_bind<'a>(
-    bindings: impl IntoIterator<Item = &'a Bind>,
+fn find_bind(
     gnome_keybindings: &[GnomeKeybinding],
     accel_grabs: &[AccelGrab],
     switcher: SwitcherGrab,
-    mod_key: ModKey,
     key_code: Keycode,
     modified: Keysym,
     raw: Option<Keysym>,
     mods: ModifiersState,
     disable_power_key_handling: bool,
-) -> Option<Bind> {
+) -> Option<ResolvedBind> {
     use keysyms::*;
 
     // Handle hardcoded binds.
@@ -8639,7 +8585,7 @@ fn find_bind<'a>(
     };
 
     if let Some(action) = hardcoded_action {
-        return Some(Bind {
+        return Some(ResolvedBind {
             key: Key {
                 // Not entirely correct but it doesn't matter in how we currently use it.
                 trigger: Trigger::Keysym(modified),
@@ -8655,7 +8601,6 @@ fn find_bind<'a>(
             // It also makes no sense to inhibit the default power key handling.
             // Hardcoded binds must never be inhibited.
             allow_inhibiting: false,
-            hotkey_overlay_title: None,
         });
     }
 
@@ -8676,8 +8621,7 @@ fn find_bind<'a>(
         }
     }
 
-    let trigger = Trigger::Keysym(raw?);
-    find_configured_bind(bindings, mod_key, trigger, mods)
+    None
 }
 
 /// Match an `org.gnome.Shell` accelerator grab (gsd-media-keys et al.),
@@ -8687,12 +8631,12 @@ fn find_accel_grab_bind(
     key_code: Keycode,
     raw: Option<Keysym>,
     mods: ModifiersState,
-) -> Option<Bind> {
+) -> Option<ResolvedBind> {
     let grab = accel_grabs
         .iter()
         .find(|g| accel_matches(&g.accel, key_code, raw, mods))?;
 
-    Some(Bind {
+    Some(ResolvedBind {
         key: Key {
             // Not entirely correct but it doesn't matter in how we currently use it.
             trigger: Trigger::Keysym(raw.unwrap_or(Keysym::NoSymbol)),
@@ -8707,7 +8651,6 @@ fn find_accel_grab_bind(
             & (AccelGrab::MODE_LOCK_SCREEN | AccelGrab::MODE_UNLOCK_SCREEN)
             != 0,
         allow_inhibiting: grab.grab_flags & AccelGrab::FLAG_NON_MASKABLE == 0,
-        hotkey_overlay_title: None,
     })
 }
 
@@ -8720,7 +8663,7 @@ fn find_gnome_bind(
     key_code: Keycode,
     raw: Option<Keysym>,
     mods: ModifiersState,
-) -> Option<Bind> {
+) -> Option<ResolvedBind> {
     let keybinding = keybindings.iter().find(|kb| {
         kb.accels
             .iter()
@@ -8753,7 +8696,7 @@ fn find_gnome_bind(
         )
     );
 
-    Some(Bind {
+    Some(ResolvedBind {
         key: Key {
             // Not entirely correct but it doesn't matter in how we currently use it.
             trigger: Trigger::Keysym(raw.unwrap_or(Keysym::NoSymbol)),
@@ -8766,34 +8709,19 @@ fn find_gnome_bind(
         // mutter suppresses every binding not flagged NON_MASKABLE while the focused
         // window inhibits shortcuts — which is all of them bar the recovery keys.
         allow_inhibiting: !gnome.is_some_and(GnomeKeyAction::is_non_maskable),
-        hotkey_overlay_title: None,
     })
 }
 
 /// Find a binding for a non-keyboard trigger — a mouse button, a scroll
-/// direction, a tablet stylus button — in the keybinding model, then in the
-/// config binds.
+/// direction, a tablet stylus button — in the keybinding model.
 ///
-/// The GSettings half only ever matches our own schema: mutter's accelerators
-/// are keys, so nothing GNOME names can be on a trigger.
-fn find_trigger_bind<'a>(
-    bindings: impl IntoIterator<Item = &'a Bind>,
-    keybindings: &[GnomeKeybinding],
-    mod_key: ModKey,
-    trigger: Trigger,
-    mods: ModifiersState,
-) -> Option<Bind> {
-    if let Some(bind) = find_gnome_trigger_bind(keybindings, trigger, mods) {
-        return Some(bind);
-    }
-    find_configured_bind(bindings, mod_key, trigger, mods)
-}
-
-fn find_gnome_trigger_bind(
+/// Only ever matches our own schema: mutter's accelerators are keys, so nothing
+/// GNOME names can be on a trigger.
+fn find_trigger_bind(
     keybindings: &[GnomeKeybinding],
     trigger: Trigger,
     mods: ModifiersState,
-) -> Option<Bind> {
+) -> Option<ResolvedBind> {
     let keybinding = keybindings.iter().find(|kb| {
         kb.accels.iter().any(|accel| {
             accel.trigger == AccelTrigger::Device(trigger) && accel_mods_match(accel.mods, mods)
@@ -8801,7 +8729,7 @@ fn find_gnome_trigger_bind(
     })?;
 
     let action = action_for_keybinding(&keybinding.action)?;
-    Some(Bind {
+    Some(ResolvedBind {
         key: Key {
             trigger,
             modifiers: Modifiers::empty(),
@@ -8813,7 +8741,6 @@ fn find_gnome_trigger_bind(
         cooldown: keybinding.cooldown,
         allow_when_locked: false,
         allow_inhibiting: true,
-        hotkey_overlay_title: None,
     })
 }
 
@@ -8971,40 +8898,6 @@ pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         GnomeKeyAction::CycleWindows { backward } => Action::CycleWindows { backward },
         GnomeKeyAction::CycleGroup { backward } => Action::CycleGroup { backward },
     })
-}
-
-fn find_configured_bind<'a>(
-    bindings: impl IntoIterator<Item = &'a Bind>,
-    mod_key: ModKey,
-    trigger: Trigger,
-    mods: ModifiersState,
-) -> Option<Bind> {
-    // Handle configured binds.
-    let mut modifiers = modifiers_from_state(mods);
-
-    let mod_down = modifiers_from_state(mods).contains(mod_key.to_modifiers());
-    if mod_down {
-        modifiers |= Modifiers::COMPOSITOR;
-    }
-
-    for bind in bindings {
-        if bind.key.trigger != trigger {
-            continue;
-        }
-
-        let mut bind_modifiers = bind.key.modifiers;
-        if bind_modifiers.contains(Modifiers::COMPOSITOR) {
-            bind_modifiers |= mod_key.to_modifiers();
-        } else if bind_modifiers.contains(mod_key.to_modifiers()) {
-            bind_modifiers |= Modifiers::COMPOSITOR;
-        }
-
-        if bind_modifiers == modifiers {
-            return Some(bind.clone());
-        }
-    }
-
-    None
 }
 
 fn find_configured_switch_action(
@@ -9212,7 +9105,7 @@ pub(crate) fn allowed_during_screenshot(action: &Action) -> bool {
     )
 }
 
-fn hardcoded_overview_bind(raw: Keysym, mods: ModifiersState) -> Option<Bind> {
+fn hardcoded_overview_bind(raw: Keysym, mods: ModifiersState) -> Option<ResolvedBind> {
     let mods = modifiers_from_state(mods);
     if !mods.is_empty() {
         return None;
@@ -9233,7 +9126,7 @@ fn hardcoded_overview_bind(raw: Keysym, mods: ModifiersState) -> Option<Bind> {
         }
     };
 
-    Some(Bind {
+    Some(ResolvedBind {
         key: Key {
             trigger: Trigger::Keysym(raw),
             modifiers: Modifiers::empty(),
@@ -9243,7 +9136,6 @@ fn hardcoded_overview_bind(raw: Keysym, mods: ModifiersState) -> Option<Bind> {
         cooldown: None,
         allow_when_locked: false,
         allow_inhibiting: false,
-        hotkey_overlay_title: None,
     })
 }
 
@@ -9542,29 +9434,13 @@ pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::
 /// A fast path: the pointer, wheel, touchpad and stylus handlers consult it
 /// before doing any lookup, so an unmodified scroll costs nothing. That makes it
 /// a **trap** — a binding whose modifiers are missing here is not merely slow to
-/// find, it is never found at all. Both sources of bindings have to be in it, and
-/// it has to be recomputed when either changes ([`Niri::refresh_keybinding_state`]).
+/// find, it is never found at all. It has to be recomputed whenever the keybindings
+/// change ([`Niri::refresh_keybinding_state`]).
 pub fn mods_with_binds(
-    mod_key: ModKey,
-    binds: &Binds,
     keybindings: &[GnomeKeybinding],
     triggers: &[Trigger],
 ) -> HashSet<Modifiers> {
     let mut rv = HashSet::new();
-    for bind in &binds.0 {
-        if !triggers.contains(&bind.key.trigger) {
-            continue;
-        }
-
-        let mut mods = bind.key.modifiers;
-        if mods.contains(Modifiers::COMPOSITOR) {
-            mods.remove(Modifiers::COMPOSITOR);
-            mods.insert(mod_key.to_modifiers());
-        }
-
-        rv.insert(mods);
-    }
-
     for keybinding in keybindings {
         for accel in &keybinding.accels {
             let AccelTrigger::Device(trigger) = accel.trigger else {
@@ -9579,14 +9455,8 @@ pub fn mods_with_binds(
     rv
 }
 
-pub fn mods_with_mouse_binds(
-    mod_key: ModKey,
-    binds: &Binds,
-    keybindings: &[GnomeKeybinding],
-) -> HashSet<Modifiers> {
+pub fn mods_with_mouse_binds(keybindings: &[GnomeKeybinding]) -> HashSet<Modifiers> {
     mods_with_binds(
-        mod_key,
-        binds,
         keybindings,
         &[
             Trigger::MouseLeft,
@@ -9598,14 +9468,8 @@ pub fn mods_with_mouse_binds(
     )
 }
 
-pub fn mods_with_wheel_binds(
-    mod_key: ModKey,
-    binds: &Binds,
-    keybindings: &[GnomeKeybinding],
-) -> HashSet<Modifiers> {
+pub fn mods_with_wheel_binds(keybindings: &[GnomeKeybinding]) -> HashSet<Modifiers> {
     mods_with_binds(
-        mod_key,
-        binds,
         keybindings,
         &[
             Trigger::WheelScrollUp,
@@ -9616,14 +9480,8 @@ pub fn mods_with_wheel_binds(
     )
 }
 
-pub fn mods_with_finger_scroll_binds(
-    mod_key: ModKey,
-    binds: &Binds,
-    keybindings: &[GnomeKeybinding],
-) -> HashSet<Modifiers> {
+pub fn mods_with_finger_scroll_binds(keybindings: &[GnomeKeybinding]) -> HashSet<Modifiers> {
     mods_with_binds(
-        mod_key,
-        binds,
         keybindings,
         &[
             Trigger::TouchpadScrollUp,
@@ -9634,14 +9492,8 @@ pub fn mods_with_finger_scroll_binds(
     )
 }
 
-pub fn mods_with_tablet_stylus_binds(
-    mod_key: ModKey,
-    binds: &Binds,
-    keybindings: &[GnomeKeybinding],
-) -> HashSet<Modifiers> {
+pub fn mods_with_tablet_stylus_binds(keybindings: &[GnomeKeybinding]) -> HashSet<Modifiers> {
     mods_with_binds(
-        mod_key,
-        binds,
         keybindings,
         &[
             Trigger::TabletStylusButton1,
@@ -9676,17 +9528,6 @@ fn grab_allows_hot_corner(grab: &(dyn PointerGrab<State> + 'static)) -> bool {
     true
 }
 
-/// The configured binds, suppressed while a switcher holds its grab.
-///
-/// GNOME's `SwitcherPopup` takes a modal grab (`pushModal`, `switcherPopup.js:125`), so while it
-/// is up nothing but the switch bindings resolves — see `find_gnome_bind`.
-fn make_binds_iter(config: &Config, switcher_is_open: bool) -> impl Iterator<Item = &Bind> + Clone {
-    (!switcher_is_open)
-        .then_some(config.binds.0.iter())
-        .into_iter()
-        .flatten()
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -9697,20 +9538,15 @@ mod tests {
     #[test]
     fn bindings_suppress_keys() {
         let close_keysym = Keysym::q;
-        let bindings = Binds(vec![Bind {
-            key: Key {
-                trigger: Trigger::Keysym(close_keysym),
-                modifiers: Modifiers::COMPOSITOR | Modifiers::CTRL,
-            },
-            action: Action::CloseWindow,
-            repeat: true,
+        let keybindings = vec![GnomeKeybinding {
+            action: GnomeKeyAction::Close.into(),
+            accels: vec![Accel {
+                trigger: AccelTrigger::Keysym(close_keysym),
+                mods: AccelMods::CONTROL | AccelMods::SUPER,
+            }],
             cooldown: None,
-            allow_when_locked: false,
-            allow_inhibiting: true,
-            hotkey_overlay_title: None,
-        }]);
+        }];
 
-        let comp_mod = ModKey::Super;
         let mut suppressed_keys = HashSet::new();
 
         let screenshot_ui = ScreenshotUi::new(Clock::default(), Default::default());
@@ -9724,11 +9560,9 @@ mod tests {
         let close_key_event = |suppr: &mut HashSet<Keycode>, mods: ModifiersState, pressed| {
             should_intercept_key(
                 suppr,
-                &bindings.0,
-                &[],
+                &keybindings,
                 &[],
                 SwitcherGrab::Closed,
-                comp_mod,
                 close_key_code,
                 close_keysym,
                 Some(close_keysym),
@@ -9744,11 +9578,9 @@ mod tests {
         let none_key_event = |suppr: &mut HashSet<Keycode>, mods: ModifiersState, pressed| {
             should_intercept_key(
                 suppr,
-                &bindings.0,
-                &[],
+                &keybindings,
                 &[],
                 SwitcherGrab::Closed,
-                comp_mod,
                 Keycode::from(Keysym::l.raw() + 8),
                 Keysym::l,
                 Some(Keysym::l),
@@ -9771,7 +9603,7 @@ mod tests {
         let filter = close_key_event(&mut suppressed_keys, mods, true);
         assert!(matches!(
             filter,
-            FilterResult::Intercept(Some(Bind {
+            FilterResult::Intercept(Some(ResolvedBind {
                 action: Action::CloseWindow,
                 ..
             }))
@@ -9805,7 +9637,7 @@ mod tests {
         let filter = close_key_event(&mut suppressed_keys, mods, true);
         assert!(matches!(
             filter,
-            FilterResult::Intercept(Some(Bind {
+            FilterResult::Intercept(Some(ResolvedBind {
                 action: Action::CloseWindow,
                 ..
             }))
@@ -9825,7 +9657,7 @@ mod tests {
         let filter = close_key_event(&mut suppressed_keys, mods, true);
         assert!(matches!(
             filter,
-            FilterResult::Intercept(Some(Bind {
+            FilterResult::Intercept(Some(ResolvedBind {
                 action: Action::CloseWindow,
                 ..
             }))
@@ -9872,7 +9704,7 @@ mod tests {
         let filter = close_key_event(&mut suppressed_keys, mods, true);
         assert!(matches!(
             filter,
-            FilterResult::Intercept(Some(Bind {
+            FilterResult::Intercept(Some(ResolvedBind {
                 action: Action::CloseWindow,
                 ..
             }))
@@ -9884,190 +9716,5 @@ mod tests {
         let filter = close_key_event(&mut suppressed_keys, mods, false);
         assert!(matches!(filter, FilterResult::Intercept(None)));
         assert!(suppressed_keys.is_empty());
-    }
-
-    #[test]
-    fn comp_mod_handling() {
-        let bindings = Binds(vec![
-            Bind {
-                key: Key {
-                    trigger: Trigger::Keysym(Keysym::q),
-                    modifiers: Modifiers::COMPOSITOR,
-                },
-                action: Action::CloseWindow,
-                repeat: true,
-                cooldown: None,
-                allow_when_locked: false,
-                allow_inhibiting: true,
-                hotkey_overlay_title: None,
-            },
-            Bind {
-                key: Key {
-                    trigger: Trigger::Keysym(Keysym::h),
-                    modifiers: Modifiers::SUPER,
-                },
-                action: Action::FocusColumnLeft,
-                repeat: true,
-                cooldown: None,
-                allow_when_locked: false,
-                allow_inhibiting: true,
-                hotkey_overlay_title: None,
-            },
-            Bind {
-                key: Key {
-                    trigger: Trigger::Keysym(Keysym::j),
-                    modifiers: Modifiers::empty(),
-                },
-                action: Action::FocusWindowDown,
-                repeat: true,
-                cooldown: None,
-                allow_when_locked: false,
-                allow_inhibiting: true,
-                hotkey_overlay_title: None,
-            },
-            Bind {
-                key: Key {
-                    trigger: Trigger::Keysym(Keysym::k),
-                    modifiers: Modifiers::COMPOSITOR | Modifiers::SUPER,
-                },
-                action: Action::FocusWindowUp,
-                repeat: true,
-                cooldown: None,
-                allow_when_locked: false,
-                allow_inhibiting: true,
-                hotkey_overlay_title: None,
-            },
-            Bind {
-                key: Key {
-                    trigger: Trigger::Keysym(Keysym::l),
-                    modifiers: Modifiers::SUPER | Modifiers::ALT,
-                },
-                action: Action::FocusColumnRight,
-                repeat: true,
-                cooldown: None,
-                allow_when_locked: false,
-                allow_inhibiting: true,
-                hotkey_overlay_title: None,
-            },
-        ]);
-
-        assert_eq!(
-            find_configured_bind(
-                &bindings.0,
-                ModKey::Super,
-                Trigger::Keysym(Keysym::q),
-                ModifiersState {
-                    logo: true,
-                    ..Default::default()
-                }
-            )
-            .as_ref(),
-            Some(&bindings.0[0])
-        );
-        assert_eq!(
-            find_configured_bind(
-                &bindings.0,
-                ModKey::Super,
-                Trigger::Keysym(Keysym::q),
-                ModifiersState::default(),
-            ),
-            None,
-        );
-
-        assert_eq!(
-            find_configured_bind(
-                &bindings.0,
-                ModKey::Super,
-                Trigger::Keysym(Keysym::h),
-                ModifiersState {
-                    logo: true,
-                    ..Default::default()
-                }
-            )
-            .as_ref(),
-            Some(&bindings.0[1])
-        );
-        assert_eq!(
-            find_configured_bind(
-                &bindings.0,
-                ModKey::Super,
-                Trigger::Keysym(Keysym::h),
-                ModifiersState::default(),
-            ),
-            None,
-        );
-
-        assert_eq!(
-            find_configured_bind(
-                &bindings.0,
-                ModKey::Super,
-                Trigger::Keysym(Keysym::j),
-                ModifiersState {
-                    logo: true,
-                    ..Default::default()
-                }
-            ),
-            None,
-        );
-        assert_eq!(
-            find_configured_bind(
-                &bindings.0,
-                ModKey::Super,
-                Trigger::Keysym(Keysym::j),
-                ModifiersState::default(),
-            )
-            .as_ref(),
-            Some(&bindings.0[2])
-        );
-
-        assert_eq!(
-            find_configured_bind(
-                &bindings.0,
-                ModKey::Super,
-                Trigger::Keysym(Keysym::k),
-                ModifiersState {
-                    logo: true,
-                    ..Default::default()
-                }
-            )
-            .as_ref(),
-            Some(&bindings.0[3])
-        );
-        assert_eq!(
-            find_configured_bind(
-                &bindings.0,
-                ModKey::Super,
-                Trigger::Keysym(Keysym::k),
-                ModifiersState::default(),
-            ),
-            None,
-        );
-
-        assert_eq!(
-            find_configured_bind(
-                &bindings.0,
-                ModKey::Super,
-                Trigger::Keysym(Keysym::l),
-                ModifiersState {
-                    logo: true,
-                    alt: true,
-                    ..Default::default()
-                }
-            )
-            .as_ref(),
-            Some(&bindings.0[4])
-        );
-        assert_eq!(
-            find_configured_bind(
-                &bindings.0,
-                ModKey::Super,
-                Trigger::Keysym(Keysym::l),
-                ModifiersState {
-                    logo: true,
-                    ..Default::default()
-                },
-            ),
-            None,
-        );
     }
 }

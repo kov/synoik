@@ -1324,21 +1324,8 @@ fn switch_to_session_beats_the_inhibitor() {
 /// the GSettings store is the keybinding config of a GNOME session, so a
 /// conflicting config bind must lose.
 #[test]
-fn gnome_keybindings_beat_niri_config_binds() {
-    let mut config = Config::default();
-    config.binds.0.push(niri_config::Bind {
-        key: niri_config::Key {
-            trigger: niri_config::Trigger::Keysym(Keysym::F4),
-            modifiers: niri_config::Modifiers::ALT,
-        },
-        action: Action::ToggleOverview,
-        repeat: true,
-        cooldown: None,
-        allow_when_locked: false,
-        allow_inhibiting: true,
-        hotkey_overlay_title: None,
-    });
-    let mut f = Fixture::with_config(config);
+fn gnome_keybindings_are_the_only_keybindings() {
+    let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
     let id = f.add_client();
@@ -1353,11 +1340,7 @@ fn gnome_keybindings_beat_niri_config_binds() {
 
     assert!(
         f.client(id).window(&surface).close_requested,
-        "the GNOME close binding must win the conflict"
-    );
-    assert!(
-        !f.niri().layout.is_overview_open(),
-        "the conflicting niri config bind must not have fired"
+        "<Alt>F4 is GNOME's `close` default and there is no other source of bindings"
     );
 }
 
@@ -15260,30 +15243,30 @@ fn media_card_controls_drive_the_player() {
 /// wants it — here, a plain wheel bind.
 #[test]
 fn only_the_volume_icon_consumes_a_panel_scroll() {
-    use niri_config::binds::{Bind, Binds, Key, Modifiers, Trigger};
+    use niri_config::Trigger;
 
-    let mut config = Config::default();
-    // A no-modifier wheel bind, so "was the event consumed?" is observable without PipeWire.
-    let bind = |trigger, action| Bind {
-        key: Key {
-            trigger,
-            modifiers: Modifiers::empty(),
-        },
-        action,
-        repeat: true,
+    use crate::gnome::GnomeKeybinding;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // No-modifier scroll bindings, so "was the event consumed?" is observable without PipeWire.
+    let bind = |trigger, action| GnomeKeybinding {
+        action: KeybindingAction::Niri(action),
+        accels: vec![Accel {
+            trigger: AccelTrigger::Device(trigger),
+            mods: AccelMods::empty(),
+        }],
         cooldown: None,
-        allow_when_locked: false,
-        allow_inhibiting: true,
-        hotkey_overlay_title: None,
     };
-    config.binds = Binds(vec![
+    f.niri().gnome_settings.keybindings = vec![
         bind(Trigger::WheelScrollDown, Action::FocusWorkspaceDown),
         // Up, so it is observable from where the wheel bind leaves us: with one window there are
         // only two workspaces, and workspace 1 is the last.
         bind(Trigger::TouchpadScrollDown, Action::FocusWorkspaceUp),
-    ]);
-    let mut f = Fixture::with_config(config);
-    f.add_output(1, (1920, 1080));
+    ];
+    // Without this the modifier fast path never lets the lookup happen at all.
+    f.niri().refresh_keybinding_state();
 
     // Two workspaces to move between, and a volume icon in the cluster to aim at.
     let id = f.add_client();

@@ -7,13 +7,8 @@ All tabs in a column have the same window size, so this is useful to get more ve
 
 ![Terminal with a tab indicator on the left.](https://github.com/user-attachments/assets/0e94ac0d-796d-4f85-a264-c105ef41c13f)
 
-Use this bind to toggle a column between normal and tabbed display:
-
-```kdl
-binds {
-   Mod+W { toggle-column-tabbed-display; }
-}
-```
+<kbd>Super</kbd><kbd>W</kbd> toggles a column between normal and tabbed display
+(`toggle-column-tabbed-display` in `org.gnome.shell-rs.keybindings`).
 
 All other binds remain the same: switch tabs with `focus-window-down/up`, add or remove windows with `consume-window-into-column`/`expel-window-from-column`, and so on.
 

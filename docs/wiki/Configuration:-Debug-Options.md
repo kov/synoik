@@ -33,12 +33,14 @@ debug {
     skip-cursor-only-updates-during-vrr
     deactivate-unfocused-windows
 }
+```
 
-binds {
-    Mod+Shift+Ctrl+T { toggle-debug-tint; }
-    Mod+Shift+Ctrl+O { debug-toggle-opaque-regions; }
-    Mod+Shift+Ctrl+D { debug-toggle-damage; }
-}
+The debug render modes are not keybindings; run them over IPC:
+
+```
+niri msg action toggle-debug-tint
+niri msg action debug-toggle-opaque-regions
+niri msg action debug-toggle-damage
 ```
 
 ### `preview-render`
@@ -319,10 +321,8 @@ Tints all surfaces green, unless they are being directly scanned out.
 
 Useful to check if direct scanout is working.
 
-```kdl
-binds {
-    Mod+Shift+Ctrl+T { toggle-debug-tint; }
-}
+```
+niri msg action toggle-debug-tint
 ```
 
 #### `debug-toggle-opaque-regions`
@@ -333,10 +333,8 @@ Tints regions marked as opaque with blue and the rest of the render elements wit
 
 Useful to check how Wayland surfaces and internal render elements mark their parts as opaque, which is a rendering performance optimization.
 
-```kdl
-binds {
-    Mod+Shift+Ctrl+O { debug-toggle-opaque-regions; }
-}
+```
+niri msg action debug-toggle-opaque-regions
 ```
 
 #### `debug-toggle-damage`
@@ -345,8 +343,6 @@ binds {
 
 Tints damaged regions with red.
 
-```kdl
-binds {
-    Mod+Shift+Ctrl+D { debug-toggle-damage; }
-}
+```
+niri msg action debug-toggle-damage
 ```

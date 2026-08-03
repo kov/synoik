@@ -380,7 +380,7 @@ input {
 
 <sup>Since: 25.05</sup>
 
-Customize the `Mod` key for [key bindings](./Configuration:-Key-Bindings.md).
+Customize the `Mod` key.
 Only valid modifiers are allowed, e.g. `Super`, `Alt`, `Mod3`, `Mod5`, `Ctrl`, `Shift`.
 
 By default, `Mod` is equal to `Super` when running niri on a TTY, and to `Alt` when running niri as a nested winit window.

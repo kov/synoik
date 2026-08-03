@@ -120,12 +120,6 @@ This is niri's locked session background.
 You can recover from this by spawning a new screen locker.
 One way is to switch to a different TTY (with a shortcut like <kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>F3</kbd>) and spawning a screen locker to niri's Wayland display, e.g. `WAYLAND_DISPLAY=wayland-1 swaylock`.
 
-Another way is to set `allow-when-locked=true` on your screen locker bind, then you can press it on the red screen to get a fresh screen locker.
-```kdl
-binds {
-    Super+Alt+L allow-when-locked=true { spawn "swaylock"; }
-}
-```
 
 ### How do I change output configuration based on connected monitors?
 

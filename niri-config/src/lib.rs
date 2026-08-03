@@ -8,12 +8,12 @@
 //! Then, parsing will update the values with those parsed from the config.
 //!
 //! The `Default` values match those from `default-config.kdl` in almost all cases, with a notable
-//! exception of `binds {}` and some window rules.
+//! exception of some window rules.
 
 #[macro_use]
 extern crate tracing;
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -84,7 +84,6 @@ pub struct Config {
     pub xwayland_satellite: XwaylandSatellite,
     pub window_rules: Vec<WindowRule>,
     pub layer_rules: Vec<LayerRule>,
-    pub binds: Binds,
     pub switch_events: SwitchBinds,
     pub debug: Debug,
     pub workspaces: Vec<Workspace>,
@@ -121,7 +120,6 @@ struct IncludeErrors(Vec<knuffel::Error>);
 //
 // We don't *need* it because we have a recursion limit, but it makes for nicer error messages.
 struct IncludeStack(HashSet<PathBuf>);
-struct SawMruBinds(Rc<Cell<bool>>);
 
 // Rather than listing all fields and deriving knuffel::Decode, we implement
 // knuffel::DecodeChildren by hand, since we need custom logic for every field anyway: we want to
@@ -144,7 +142,6 @@ where
         let includes = ctx.get::<Rc<RefCell<Includes>>>().unwrap().clone();
         let include_errors = ctx.get::<Rc<RefCell<IncludeErrors>>>().unwrap().clone();
         let recursion = ctx.get::<Recursion>().unwrap().0;
-        let saw_mru_binds = ctx.get::<SawMruBinds>().unwrap().0.clone();
 
         let mut seen = HashSet::new();
 
@@ -212,19 +209,6 @@ where
                 "workspace" => m_push!(workspaces),
 
                 // Single-part sections.
-                "binds" => {
-                    let part = Binds::decode_node(node, ctx)?;
-
-                    // We replace conflicting binds, rather than error, to support the use-case
-                    // where you import some preconfigured-dots.kdl, then override some binds with
-                    // your own.
-                    let mut config = config.borrow_mut();
-                    let binds = &mut config.binds.0;
-                    // Remove existing binds matching any new bind.
-                    binds.retain(|bind| !part.0.iter().any(|new| new.key == bind.key));
-                    // Add all new binds.
-                    binds.extend(part.0);
-                }
                 "environment" => {
                     let part = Environment::decode_node(node, ctx)?;
                     config.borrow_mut().environment.0.extend(part.0);
@@ -395,7 +379,6 @@ where
                                 ctx.set(includes.clone());
                                 ctx.set(include_errors.clone());
                                 ctx.set(IncludeStack(include_stack));
-                                ctx.set(SawMruBinds(saw_mru_binds.clone()));
                                 ctx.set(config.clone());
                             });
 
@@ -495,7 +478,6 @@ impl Config {
                 ctx.set(includes.clone());
                 ctx.set(include_errors.clone());
                 ctx.set(IncludeStack(include_stack));
-                ctx.set(SawMruBinds(Rc::new(Cell::new(false))));
                 ctx.set(config.clone());
             },
         );
@@ -883,24 +865,6 @@ mod tests {
             layer-rule {
                 match namespace="^notifications$"
                 block-out-from "screencast"
-            }
-
-            binds {
-                Mod+Escape hotkey-overlay-title="Inhibit" { toggle-keyboard-shortcuts-inhibit; }
-                Mod+Shift+Escape allow-inhibiting=true { toggle-keyboard-shortcuts-inhibit; }
-                Mod+T allow-when-locked=true { spawn "alacritty"; }
-                Mod+Q hotkey-overlay-title=null { close-window; }
-                Mod+Shift+H { focus-monitor-left; }
-                Mod+Shift+O { focus-monitor "eDP-1"; }
-                Mod+Ctrl+Shift+L { move-window-to-monitor-right; }
-                Mod+Ctrl+Alt+O { move-window-to-monitor "eDP-1"; }
-                Mod+Ctrl+Alt+P { move-column-to-monitor "DP-1"; }
-                Mod+Comma { consume-window-into-column; }
-                Mod+1 { focus-workspace 1; }
-                Mod+Shift+1 { focus-workspace "workspace-1"; }
-                Mod+Shift+E allow-inhibiting=false { quit skip-confirmation=true; }
-                Mod+WheelScrollDown cooldown-ms=150 { focus-workspace-down; }
-                Super+Alt+S allow-when-locked=true { spawn-sh "pkill orca || exec orca"; }
             }
 
             switch-events {
@@ -1914,278 +1878,6 @@ mod tests {
                     },
                 },
             ],
-            binds: Binds(
-                [
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_Escape,
-                            ),
-                            modifiers: Modifiers(
-                                COMPOSITOR,
-                            ),
-                        },
-                        action: ToggleKeyboardShortcutsInhibit,
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: false,
-                        allow_inhibiting: false,
-                        hotkey_overlay_title: Some(
-                            Some(
-                                "Inhibit",
-                            ),
-                        ),
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_Escape,
-                            ),
-                            modifiers: Modifiers(
-                                SHIFT | COMPOSITOR,
-                            ),
-                        },
-                        action: ToggleKeyboardShortcutsInhibit,
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: false,
-                        allow_inhibiting: false,
-                        hotkey_overlay_title: None,
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_t,
-                            ),
-                            modifiers: Modifiers(
-                                COMPOSITOR,
-                            ),
-                        },
-                        action: Spawn(
-                            [
-                                "alacritty",
-                            ],
-                        ),
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: true,
-                        allow_inhibiting: true,
-                        hotkey_overlay_title: None,
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_q,
-                            ),
-                            modifiers: Modifiers(
-                                COMPOSITOR,
-                            ),
-                        },
-                        action: CloseWindow,
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: false,
-                        allow_inhibiting: true,
-                        hotkey_overlay_title: Some(
-                            None,
-                        ),
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_h,
-                            ),
-                            modifiers: Modifiers(
-                                SHIFT | COMPOSITOR,
-                            ),
-                        },
-                        action: FocusMonitorLeft,
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: false,
-                        allow_inhibiting: true,
-                        hotkey_overlay_title: None,
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_o,
-                            ),
-                            modifiers: Modifiers(
-                                SHIFT | COMPOSITOR,
-                            ),
-                        },
-                        action: FocusMonitor(
-                            "eDP-1",
-                        ),
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: false,
-                        allow_inhibiting: true,
-                        hotkey_overlay_title: None,
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_l,
-                            ),
-                            modifiers: Modifiers(
-                                CTRL | SHIFT | COMPOSITOR,
-                            ),
-                        },
-                        action: MoveWindowToMonitorRight,
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: false,
-                        allow_inhibiting: true,
-                        hotkey_overlay_title: None,
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_o,
-                            ),
-                            modifiers: Modifiers(
-                                CTRL | ALT | COMPOSITOR,
-                            ),
-                        },
-                        action: MoveWindowToMonitor(
-                            "eDP-1",
-                        ),
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: false,
-                        allow_inhibiting: true,
-                        hotkey_overlay_title: None,
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_p,
-                            ),
-                            modifiers: Modifiers(
-                                CTRL | ALT | COMPOSITOR,
-                            ),
-                        },
-                        action: MoveColumnToMonitor(
-                            "DP-1",
-                        ),
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: false,
-                        allow_inhibiting: true,
-                        hotkey_overlay_title: None,
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_comma,
-                            ),
-                            modifiers: Modifiers(
-                                COMPOSITOR,
-                            ),
-                        },
-                        action: ConsumeWindowIntoColumn,
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: false,
-                        allow_inhibiting: true,
-                        hotkey_overlay_title: None,
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_1,
-                            ),
-                            modifiers: Modifiers(
-                                COMPOSITOR,
-                            ),
-                        },
-                        action: FocusWorkspace(
-                            Index(
-                                1,
-                            ),
-                        ),
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: false,
-                        allow_inhibiting: true,
-                        hotkey_overlay_title: None,
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_1,
-                            ),
-                            modifiers: Modifiers(
-                                SHIFT | COMPOSITOR,
-                            ),
-                        },
-                        action: FocusWorkspace(
-                            Name(
-                                "workspace-1",
-                            ),
-                        ),
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: false,
-                        allow_inhibiting: true,
-                        hotkey_overlay_title: None,
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_e,
-                            ),
-                            modifiers: Modifiers(
-                                SHIFT | COMPOSITOR,
-                            ),
-                        },
-                        action: Quit(
-                            true,
-                        ),
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: false,
-                        allow_inhibiting: false,
-                        hotkey_overlay_title: None,
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: WheelScrollDown,
-                            modifiers: Modifiers(
-                                COMPOSITOR,
-                            ),
-                        },
-                        action: FocusWorkspaceDown,
-                        repeat: true,
-                        cooldown: Some(
-                            150ms,
-                        ),
-                        allow_when_locked: false,
-                        allow_inhibiting: true,
-                        hotkey_overlay_title: None,
-                    },
-                    Bind {
-                        key: Key {
-                            trigger: Keysym(
-                                XK_s,
-                            ),
-                            modifiers: Modifiers(
-                                ALT | SUPER,
-                            ),
-                        },
-                        action: SpawnSh(
-                            "pkill orca || exec orca",
-                        ),
-                        repeat: true,
-                        cooldown: None,
-                        allow_when_locked: true,
-                        allow_inhibiting: true,
-                        hotkey_overlay_title: None,
-                    },
-                ],
-            ),
             switch_events: SwitchBinds {
                 lid_open: None,
                 lid_close: None,
@@ -2304,10 +1996,9 @@ mod tests {
         let mut default_config = Config::load_default();
         let empty_config = Config::parse_mem("").unwrap();
 
-        // Some notable omissions: the default config has some window rules, and an empty config
-        // will not have any binds. Clear them out so they don't spam the diff.
+        // Notable omission: the default config has some window rules. Clear them out so they
+        // don't spam the diff.
         default_config.window_rules.clear();
-        default_config.binds.0.clear();
 
         assert_snapshot!(
             diff_lines(

@@ -329,11 +329,11 @@ changes are picked up **live** by a change subscription
 calloop). Note dconf is shared with your real GNOME session, so a change
 affects both.
 
-GNOME keybindings (`org.gnome.desktop.wm.keybindings`: close, workspace
-switch/move, panel-run-dialog, …) resolve **before** binds from the niri
-config file — in a GNOME session, GSettings *is* the keybinding config; the
-niri config stays underneath as a fallback. The adopted subset lives in
-`gnome::adopted_wm_keybindings`.
+Keybindings live **only** in GSettings — the config file's `binds{}` block is
+gone. GNOME's own schemas own everything GNOME names; the scrolling-layout
+actions it has no name for are in ours, `org.gnome.shell-rs.keybindings`, which
+installs to a private schema dir (see `docs/fork/keybindings-port.md` for the
+adopted tables, the divergences and how to read the keys from a shell).
 
 ## The run dialog (Alt+F2)
 
