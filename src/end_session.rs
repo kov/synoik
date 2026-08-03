@@ -148,6 +148,70 @@ impl EndSession {
     }
 }
 
+/// How long the compositor stays up after being told to stop, waiting for clients to finish.
+///
+/// The two clocks this sits between are both 5 s: the app scopes' `TimeoutStopSec` (gnome-session's
+/// `app-gnome-.scope.d/override.conf`, after which systemd SIGKILLs the app) and our own unit's
+/// `TimeoutStopSec` (`org.gnome.Shell@.service:30`). Outliving the first is the whole point, so the
+/// budget matches it; we buy room against the second with `EXTEND_TIMEOUT_USEC`.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why the drain ended, for the log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// Every client window went away on its own — the good case.
+    ClientsGone,
+    /// The budget ran out with windows still up. They lose their socket when we exit, which is the
+    /// behaviour this whole mechanism exists to avoid, so it is worth a warning.
+    TimedOut,
+}
+
+/// The compositor is stopping and is staying alive until its clients are gone.
+///
+/// Nothing in GNOME does this. mutter's `meta_context_terminate` is a bare `g_main_loop_quit`
+/// (`meta-context.c:519-530`), and `meta_wayland_compositor_prepare_shutdown` then calls
+/// `wl_display_destroy_clients` (`meta-wayland.c:822`) — a hard disconnect, not a wait. GNOME
+/// survives that because the app scopes are SIGTERMed a few inert target-job hops before the shell
+/// is, and apps usually win the race. Measured on our own session (journal, 2026-08-03 14:10:15)
+/// the head start is 341 ms and Epiphany needed 903 ms: the app finished 562 ms *after* the
+/// compositor had been told to stop. That margin is luck, and losing it is the `Broken pipe` abort
+/// recorded in `docs/fork/overview-port.md`. So we keep serving Wayland until the windows are gone.
+///
+/// Pure and time-in/outcome-out like [`EndSession`]: `now` is monotonic and the caller supplies the
+/// window count, so the policy is testable without a compositor.
+#[derive(Debug)]
+pub struct SessionDrain {
+    deadline: Duration,
+}
+
+impl SessionDrain {
+    /// Start draining at `now`, giving clients [`DRAIN_TIMEOUT`].
+    pub fn new(now: Duration) -> Self {
+        Self {
+            deadline: now + DRAIN_TIMEOUT,
+        }
+    }
+
+    /// The monotonic time [`Self::poll`] gives up at, so the caller can arm one timer.
+    pub fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
+    /// Is the drain over? `windows_left` is the number of client toplevels still mapped.
+    ///
+    /// The zero check comes first, so a drain that finishes in the same poll as its deadline
+    /// reports the good outcome rather than a spurious timeout.
+    pub fn poll(&self, now: Duration, windows_left: usize) -> Option<DrainOutcome> {
+        if windows_left == 0 {
+            Some(DrainOutcome::ClientsGone)
+        } else if now >= self.deadline {
+            Some(DrainOutcome::TimedOut)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +327,44 @@ mod tests {
         assert!(e.close());
         assert!(!e.is_open());
         assert!(!e.close());
+    }
+
+    #[test]
+    fn drain_waits_for_windows_then_ends_on_the_last_one() {
+        let drain = SessionDrain::new(s(0));
+        assert_eq!(drain.poll(s(0), 2), None);
+        assert_eq!(drain.poll(s(1), 1), None);
+        assert_eq!(drain.poll(s(2), 0), Some(DrainOutcome::ClientsGone));
+    }
+
+    #[test]
+    fn drain_gives_up_at_the_deadline() {
+        let drain = SessionDrain::new(s(0));
+        assert_eq!(drain.deadline(), DRAIN_TIMEOUT);
+        assert_eq!(drain.poll(drain.deadline() - s(1), 1), None);
+        assert_eq!(
+            drain.poll(drain.deadline(), 1),
+            Some(DrainOutcome::TimedOut)
+        );
+    }
+
+    /// The last window going away *at* the deadline is a clean drain, not a timeout: an app that
+    /// used its whole budget still exited on its own terms, and logging it as a timeout would send
+    /// anyone reading the journal after the real failure mode.
+    #[test]
+    fn drain_finishing_on_the_deadline_is_not_a_timeout() {
+        let drain = SessionDrain::new(s(0));
+        assert_eq!(
+            drain.poll(drain.deadline(), 0),
+            Some(DrainOutcome::ClientsGone)
+        );
+    }
+
+    /// Nothing open when the stop arrives — the drain must not hold the session up for five
+    /// seconds on an empty desktop.
+    #[test]
+    fn drain_with_no_windows_is_over_immediately() {
+        let drain = SessionDrain::new(s(0));
+        assert_eq!(drain.poll(s(0), 0), Some(DrainOutcome::ClientsGone));
     }
 }

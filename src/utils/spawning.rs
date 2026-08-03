@@ -225,6 +225,30 @@ pub fn start_app_scope(app_id: &str, pid: u32) {
 #[cfg(not(feature = "systemd"))]
 pub fn start_app_scope(_app_id: &str, _pid: u32) {}
 
+/// Ask systemd to stop every app scope we started, which SIGTERMs the apps inside them.
+///
+/// This is what makes a session end *begin*, on the paths where nothing else has asked the apps to
+/// go: the `Quit` action, and confirming the end-session dialog before we answer gnome-session. At
+/// a logout driven from outside (systemd SIGTERMs us and the scopes in one transaction) it is
+/// redundant, and issuing a stop for a unit that already has a stop job is a no-op — so the drain
+/// calls it unconditionally rather than keeping two paths.
+///
+/// The scopes are found by unit-name pattern instead of a registry of what we launched: the pattern
+/// cannot drift out of date, cannot grow without bound over a long session, and picks up scopes
+/// started for us by anything else that uses the same prefix.
+///
+/// Fire-and-forget on its own thread — the caller is the compositor thread, and nothing reads the
+/// result. The drain's oracle is the window count, not this call.
+///
+/// A no-op without the `systemd` feature, and without being a systemd service ourselves.
+#[cfg(feature = "systemd")]
+pub fn stop_app_scopes() {
+    systemd::stop_app_scopes();
+}
+
+#[cfg(not(feature = "systemd"))]
+pub fn stop_app_scopes() {}
+
 #[cfg(feature = "systemd")]
 mod systemd {
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -447,7 +471,12 @@ mod systemd {
 
         // Wait for the job: the intermediate child must not exit before the scope exists, or the
         // scope is created around a PID that is already gone.
-        start_transient_scope(&scope_name, &[intermediate_pid, child_pid], true)
+        start_transient_scope(
+            &scope_name,
+            SCOPE_DESCRIPTION,
+            &[intermediate_pid, child_pid],
+            true,
+        )
     }
 
     /// Escape a name for use inside a systemd unit name, similarly to libgnome-desktop, which says
@@ -466,12 +495,17 @@ mod systemd {
         escaped
     }
 
+    /// What `systemctl` shows for a scope we started, matching the shape of GNOME's
+    /// `"Application launched by %s"` (libgnome-desktop's `gnome_start_systemd_scope`).
+    const SCOPE_DESCRIPTION: &str = "Application launched by niri";
+
     /// Ask systemd to put `pids` into a new transient scope called `scope_name`.
     ///
     /// `wait_for_job` blocks until systemd reports the unit started; callers that have nothing
     /// waiting on the scope's existence should pass `false` and not pay the round trip.
     fn start_transient_scope(
         scope_name: &str,
+        description: &str,
         pids: &[u32],
         wait_for_job: bool,
     ) -> anyhow::Result<()> {
@@ -501,9 +535,20 @@ mod systemd {
             .transpose()
             .context("error creating a signal iterator")?;
 
+        // `PartOf=graphical-session.target` is the property that gets the app a SIGTERM when the
+        // session ends, instead of being a stray in a stopping unit. GNOME gets it from a drop-in
+        // gnome-session ships for the `app-gnome-` unit-name prefix
+        // (`/usr/lib/systemd/user/app-gnome-.scope.d/override.conf`), which our `app-gnome-*`
+        // scopes do inherit — verified live, `DropInPaths` names that file. We set it here anyway:
+        // it also covers the `app-niri-*` prefix, which matches no drop-in, and it does not leave
+        // the property that makes logout work resting on a file from the package we intend to
+        // replace. `TimeoutStopSec` matches that drop-in's 5s.
         let properties: &[_] = &[
+            ("Description", Value::new(description)),
             ("PIDs", Value::new(pids)),
             ("CollectMode", Value::new("inactive-or-failed")),
+            ("PartOf", Value::new(vec!["graphical-session.target"])),
+            ("TimeoutStopUSec", Value::new(5_000_000u64)),
         ];
         let aux: &[(&str, &[(&str, Value)])] = &[];
 
@@ -530,6 +575,75 @@ mod systemd {
         Ok(())
     }
 
+    /// The unit-name patterns covering every scope we start: `app-gnome-*` from
+    /// [`start_app_scope`] (GNOME's prefix, which we match on purpose) and `app-niri-*` from
+    /// [`start_systemd_scope`] (the `spawn` path).
+    const APP_SCOPE_PATTERNS: &[&str] = &["app-gnome-*.scope", "app-niri-*.scope"];
+
+    fn stop_scopes_matching(patterns: &[&str]) -> anyhow::Result<()> {
+        use anyhow::Context;
+        use zbus::zvariant::OwnedObjectPath;
+
+        let conn = zbus::blocking::Connection::session().context("error connecting to the bus")?;
+        let proxy = zbus::blocking::Proxy::new(
+            &conn,
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+        )
+        .context("error creating a Proxy")?;
+
+        // `ListUnitsByPatterns(states, patterns)`; an empty `states` means "any". Only the unit
+        // name (field 0) is used, but the reply shape is systemd's full unit tuple.
+        type Unit = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            OwnedObjectPath,
+            u32,
+            String,
+            OwnedObjectPath,
+        );
+        let units: Vec<Unit> = proxy
+            .call("ListUnitsByPatterns", &(&[] as &[&str], patterns))
+            .context("error calling ListUnitsByPatterns")?;
+
+        for unit in &units {
+            let name = &unit.0;
+            // "replace": if the unit already has a stop job (the logout case) this simply joins it.
+            let res: zbus::Result<OwnedObjectPath> = proxy.call("StopUnit", &(name, "replace"));
+            match res {
+                Ok(_) => debug!("asked systemd to stop {name}"),
+                // An app that exited between the listing and here is normal, not a problem.
+                Err(err) => trace!("error stopping {name}: {err:?}"),
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn stop_app_scopes() {
+        use crate::utils::IS_SYSTEMD_SERVICE;
+
+        if !IS_SYSTEMD_SERVICE.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let spawned = thread::Builder::new()
+            .name("stop app scopes".to_owned())
+            .spawn(|| {
+                if let Err(err) = stop_scopes_matching(APP_SCOPE_PATTERNS) {
+                    warn!("error stopping the app scopes: {err:?}");
+                }
+            });
+        if let Err(err) = spawned {
+            warn!("error spawning the app scope thread: {err:?}");
+        }
+    }
+
     pub fn start_app_scope(app_id: &str, pid: u32) {
         use crate::utils::IS_SYSTEMD_SERVICE;
 
@@ -549,7 +663,9 @@ mod systemd {
         let spawned = thread::Builder::new()
             .name("app scope".to_owned())
             .spawn(move || {
-                if let Err(err) = start_transient_scope(&scope_name, &[pid], false) {
+                if let Err(err) =
+                    start_transient_scope(&scope_name, SCOPE_DESCRIPTION, &[pid], false)
+                {
                     // Losing the race against a process that exits immediately is normal.
                     trace!("error starting the app scope: {err:?}");
                 }

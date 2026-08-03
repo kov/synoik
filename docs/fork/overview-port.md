@@ -206,6 +206,10 @@ toolkit, per the CLAUDE.md "toolkit-first, no faked chrome" tenet.
   Faithful systemd-scope wrapping (`app-<id>.scope`) and startup-notification/focus-stealing timestamps
   are a follow-up refinement, not MVP.
 
+  **RESOLVED 2026-08-03 — see `docs/fork/session-end.md`.** Both gaps below are closed and the
+  ordering fix they pointed at is implemented. Kept for the diagnosis, which is still the clearest
+  statement of the failure; do not act on the "two gaps" as open work.
+
   **This deferral has a live consequence: apps we launch die badly on logout.** Observed 2026-07-27 —
   Firefox aborts every logout, and the core says why:
 
@@ -244,6 +248,15 @@ toolkit, per the CLAUDE.md "toolkit-first, no faked chrome" tenet.
   — the compositor outliving its clients** (gnome-session's EndSession phases run before any target
   stops), which is its own piece of work and wants the session-manager integration designed first.
   Do not file (1)+(2) as "fixes the Firefox crash".
+
+  **Outcome.** (1) was fixed by `start_app_scope`, and (2) turned out to be fixed with it: our
+  `app-gnome-*` scopes inherit gnome-session's `app-gnome-.scope.d/override.conf`, so they do carry
+  `PartOf=graphical-session.target` — verified live, `DropInPaths` names that file. The prediction
+  in the last paragraph held: they did not fix the crash, and the ordering did. One correction to
+  the mechanism assumed above — gnome-session's EndSession phases do **not** run before the targets
+  stop in any way that helps, because in a GNOME 50 session no app is a registered session client
+  (GTK4 dropped `RegisterClient` entirely). What actually stops apps is systemd, in the same job
+  transaction that stops the shell. `docs/fork/session-end.md` has the measured timeline.
 
 ---
 

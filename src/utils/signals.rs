@@ -50,7 +50,11 @@ mod platform {
                 Signals::new(&[Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP]).unwrap(),
                 |event, _, state| {
                     info!("quitting due to receiving signal {:?}", event.signal());
-                    state.niri.stop_signal.stop();
+                    // Not `stop_signal.stop()`: at logout systemd SIGTERMs us and the apps in the
+                    // same transaction, so quitting here takes the socket away from clients that
+                    // are still shutting down. `begin_session_drain` keeps us serving until they
+                    // are gone.
+                    state.niri.begin_session_drain();
                 },
             )
             .unwrap();

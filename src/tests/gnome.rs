@@ -5527,6 +5527,144 @@ fn end_session_dialog_open_confirm_and_cancel() {
     );
 }
 
+/// Ending the session waits for client windows instead of pulling the socket out from under them.
+///
+/// This is the fix for the `Broken pipe` aborts in `docs/fork/overview-port.md`: at logout systemd
+/// stops the app scopes and our unit in one transaction with no ordering between them, so quitting
+/// the moment the signal lands can leave an app mid-shutdown with a dead display. Drive the real
+/// entry point (`begin_session_drain`, what `utils::signals` calls) and assert we stay up while a
+/// window is mapped and leave when it is gone.
+#[test]
+fn session_drain_waits_for_client_windows() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    // The drain is for real sessions; a headless fixture is not one, and would otherwise take the
+    // quit-at-once path this test exists to bypass.
+    f.niri().is_session_instance = true;
+
+    let id = f.add_client();
+    let surface = map_window_for_app(&mut f, id, "org.gnome.Epiphany.desktop");
+
+    f.niri().begin_session_drain();
+    assert!(
+        f.niri().session_drain.is_some(),
+        "a mapped client window must hold the session open",
+    );
+
+    // The app finishes shutting down and its window goes away.
+    let window = f.client(id).window(&surface);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+    f.niri().poll_session_drain();
+
+    assert!(
+        f.niri().session_drain.is_none(),
+        "the last window closing must end the drain",
+    );
+}
+
+/// Confirming the end-session dialog drains *before* answering gnome-session.
+///
+/// The answer is what starts the teardown that SIGTERMs us, so emitting it while apps are still up
+/// hands the ordering back to systemd's job graph. Draining first means gnome-session's phases only
+/// ever run on a desktop with no app windows left. Note the drain here does **not** stop us:
+/// gnome-session still drives the teardown, its SIGTERM just lands on an empty session.
+#[cfg(feature = "dbus")]
+#[test]
+fn end_session_confirm_drains_before_answering_gnome_session() {
+    use crate::dbus::gnome_session::EndSessionDialogToNiri;
+    use crate::end_session::EndSessionType;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().is_session_instance = true;
+
+    let id = f.add_client();
+    let surface = map_window_for_app(&mut f, id, "org.gnome.Epiphany.desktop");
+
+    f.niri_state()
+        .on_end_session_msg(EndSessionDialogToNiri::Open {
+            kind: 0,
+            seconds: 60,
+        });
+    f.niri().confirm_end_session();
+
+    assert!(
+        f.niri().session_drain.is_some(),
+        "confirming with a window up must drain, not answer straight away",
+    );
+    assert_eq!(
+        f.niri().session_drain_confirm,
+        Some(EndSessionType::Logout),
+        "the answer owed to gnome-session must be held until the drain ends",
+    );
+    assert!(
+        !f.niri().session_drain_stop,
+        "gnome-session drives the teardown from its answer; we do not stop ourselves here",
+    );
+
+    let window = f.client(id).window(&surface);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(id);
+    f.niri().poll_session_drain();
+
+    assert!(f.niri().session_drain.is_none());
+    assert_eq!(
+        f.niri().session_drain_confirm,
+        None,
+        "ConfirmedLogout goes out when the drain ends",
+    );
+}
+
+/// A stop request arriving during a confirm drain folds into it rather than restarting it.
+///
+/// gnome-session answers a `Confirmed*` by tearing the session down, which SIGTERMs us — so this
+/// is the ordinary sequence, not an edge case. Restarting the clock would give apps a second full
+/// budget, and dropping the request would leave the drain with nothing to do at the end but answer
+/// a session manager that has already gone.
+#[cfg(feature = "dbus")]
+#[test]
+fn a_stop_during_a_confirm_drain_folds_into_it() {
+    use crate::dbus::gnome_session::EndSessionDialogToNiri;
+    use crate::end_session::EndSessionType;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.niri().is_session_instance = true;
+
+    let id = f.add_client();
+    map_window_for_app(&mut f, id, "org.gnome.Epiphany.desktop");
+
+    f.niri_state()
+        .on_end_session_msg(EndSessionDialogToNiri::Open {
+            kind: 0,
+            seconds: 60,
+        });
+    f.niri().confirm_end_session();
+    let deadline = f.niri().session_drain.as_ref().unwrap().deadline();
+
+    f.niri().begin_session_drain();
+
+    assert_eq!(
+        f.niri().session_drain.as_ref().unwrap().deadline(),
+        deadline,
+        "the SIGTERM must not restart the drain's clock",
+    );
+    assert!(
+        f.niri().session_drain_stop,
+        "the SIGTERM must still be honoured when the drain ends",
+    );
+    assert_eq!(
+        f.niri().session_drain_confirm,
+        Some(EndSessionType::Logout),
+        "and it must not lose the answer owed to gnome-session",
+    );
+}
+
 // RecordArea screencast: an area is recorded from a single output (the one it overlaps most),
 // cropped to the recorded rectangle. See docs/fork/panel-status-port.md (slice 1, Half A).
 
