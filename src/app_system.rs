@@ -1165,10 +1165,15 @@ fn launch_default(desktop: &DesktopAppInfo, context: &gio::AppLaunchContext) -> 
         .launch_uris_as_manager_with_fds(
             &[],
             Some(context),
-            // GIO's own flags for this path. `DO_NOT_REAP_CHILD` is load-bearing: without it glib
-            // spawns through an intermediate fork and reports *its* pid, which has already exited
-            // by the time we would put it in a scope.
-            glib::SpawnFlags::SEARCH_PATH | glib::SpawnFlags::DO_NOT_REAP_CHILD,
+            // **Not** `DO_NOT_REAP_CHILD`, which is the tempting mistake here: it makes the app
+            // our direct child, and nothing in the compositor ever reaps one — we run
+            // calloop, so the child watch GIO hangs on the thread-default
+            // `GMainContext` is never iterated, and every app the user launches would
+            // leave a zombie behind when it quits. Without it glib spawns through an
+            // intermediate fork, so the app is reparented to init and reaped
+            // there. The `launched` signal still reports the **app's** pid either way — verified,
+            // it is the grandchild's, not the intermediate's — so the scope gets a live process.
+            glib::SpawnFlags::SEARCH_PATH,
             Some(Box::new(|| {
                 // In the child, after fork, before exec. Failure here would hand the app the same
                 // deaf mask, so say so — but there is no way to report it except the log.
@@ -1518,18 +1523,28 @@ Actions=newwin;\n\n\
             let pid = pid.get();
             assert_ne!(pid, 0, "the launch reported no pid");
             let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
-            let blk = status
-                .lines()
-                .find_map(|line| line.strip_prefix("SigBlk:"))
-                .unwrap()
-                .trim()
-                .to_owned();
+            let field = |name: &str| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name))
+                    .unwrap()
+                    .trim()
+                    .to_owned()
+            };
+            let blk = field("SigBlk:");
+            let ppid: i32 = field("PPid:").parse().unwrap();
 
-            // Reap before asserting, so a failure does not also leak a process for 30 seconds.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, std::ptr::null_mut(), 0);
-            }
+            // Nothing here reaps: the compositor runs calloop, so GIO's child watch never gets
+            // iterated. The app must therefore not be our direct child, or it zombies on quit.
+            assert_ne!(
+                ppid,
+                std::process::id() as i32,
+                "the app was launched as our own child; it would zombie when it exits"
+            );
+
+            // Not ours to wait for, so kill and move on rather than blocking on a `waitpid` that
+            // would only return `ECHILD`.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
             u64::from_str_radix(&blk, 16).unwrap()
         };
 

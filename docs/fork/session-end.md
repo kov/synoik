@@ -222,9 +222,20 @@ choice are load-bearing:
   activation entirely.
 - **`pid_callback` is deliberately unused.** `as_manager` still emits `launched` on the context, so
   `scoped_launch_context` stays the single place a scope is started rather than becoming one of two.
-- **`DO_NOT_REAP_CHILD` is not optional.** Without it glib spawns through an intermediate fork and
-  reports *its* pid, which has already exited by the time we would put it in a scope. It is what
-  GIO's own launch path passes.
+- **`DO_NOT_REAP_CHILD` must stay off**, which is the opposite of what it looks like. Setting it
+  makes the app our direct child — and nothing here reaps one, because the child watch GIO hangs on
+  the thread-default `GMainContext` is never iterated by a compositor running calloop, so every app
+  the user launched would leave a zombie on quit. It went in on the assumption that the flag was
+  needed for a usable pid; measured, it is not. Without it glib spawns through an intermediate fork,
+  the app is reparented to init and reaped there, and the `launched` signal still reports the
+  **app's** pid rather than the intermediate's, so the scope still gets a live process:
+
+  ```
+  as_manager + DO_NOT_REAP_CHILD   pid=…  comm='sleep'  our child: yes   after exit: Z
+  as_manager, no DO_NOT_REAP       pid=…  comm='sleep'  our child: no    after exit: reaped
+  ```
+
+  The test asserts the launched pid is *not* our child, so this cannot quietly come back.
 
 **Desktop actions come in by a different door**, and were left deaf for one commit longer.
 `g_desktop_app_info_launch_action` has no `as_manager` variant either, so `launch_action` rebuilds
