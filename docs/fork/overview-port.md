@@ -1269,17 +1269,29 @@ keeps a folder from forming every time a drag crosses an icon.
 ## 11b. The collapsing search entry + the shared editing model (landed 2026-08-02)
 
 **Divergence, approved.** GNOME rests the entry as the full 24em pill with `hint_text: _('Type
-to search')` inside it (`overviewControls.js:324-331`). We rest as a **puck** — a circle of
-`Entry::HEIGHT`, so `$forced_circular_radius` makes it round — parked at the right end of the
-same footprint, holding only `edit-find-symbolic`. The hint moves to **its own line beneath**,
-in a smaller font (9pt vs the entry's 11pt), its run ending on the pill's right edge. Clicking
-the puck or typing grows it leftward to GNOME's pill with the **right edge pinned**, the find
-glyph sliding from the puck's centre into the leading gutter and the hint fading out; the
-in-pill placeholder is gone (once it is open you have already been told what it is for).
-Escape/clear collapses it again. Everything about the *expanded* entry — width, radius, fill,
-insets, font — is still GNOME's. Animated by `Niri::overview_search_expand`, a twin of the
-existing `overview_search_fade`, whose progress is pushed into the model so **hit-testing
-follows the animating pill** rather than snapping to its destination.
+to search')` inside it (`overviewControls.js:324-331`). We rest as a **puck** — a `PUCK_D` = 56px
+circle, so `$forced_circular_radius` makes it round — parked at the right end of the same
+footprint, holding only `edit-find-symbolic`. **No hint text at all**, in the pill or beside it:
+at rest this is a *button*, sized as one (a touch under the dash's 64px icon, the biggest round
+target on the overview) rather than as a shrunken text field. Clicking the puck or typing grows
+it leftward to GNOME's pill with the **right edge pinned**, the find glyph sliding from the
+puck's centre into the leading gutter. Escape/clear collapses it again. Everything about the
+*expanded* entry — width, height, radius, fill, insets, font — is still GNOME's. Animated by
+`Niri::overview_search_expand`, a twin of the existing `overview_search_fade`, whose progress is
+pushed into the model so **hit-testing follows the animating pill** rather than snapping to its
+destination.
+
+Two consequences of the puck being *bigger* than the pill:
+* The pill's **height** is now a parameter of `Entry::layout`/`Entry::bake` (and of
+  `EntryStyle::radius`, or the shrinking puck would square off its corners), lerped from
+  `PUCK_D` to `Entry::HEIGHT` about a **fixed centre** so the control opens symmetrically.
+* `PREFERRED_ENTRY_HEIGHT` reserves the **puck's** footprint, not the pill's, so the resting
+  button does not overhang the thumbnail strip. The open pill therefore centres in that band
+  instead of sitting on GNOME's literal `margin-top` — the price of the divergence.
+* The find glyph exists at two fixed sizes — `PUCK_ICON_PX` = 24 and `Entry::ICON_PX` = 16 —
+  **cross-faded**, never a px lerped with the expansion: `IconCache` is keyed `(name, px,
+  color)`, so a per-frame size re-rasterizes the SVG every frame and accretes a cache entry per
+  step (the same trap the alpha-in-the-tint note above describes).
 
 **Icon insets were wrong and are now cited.** `Entry::ICON_INSET` was 16. `st_entry_allocate`
 puts an icon box flush with the **content** box, at zero extra offset (`st-entry.c:452-467`),
@@ -1317,7 +1329,7 @@ the Wayland selection, so it belongs to a caller, not to a plain-data model.
 
 **Traps this turned up.**
 * **The clear glyph's hit disc covers the whole puck.** `Entry::hit` gives the 16px glyph a
-  generous 32px target, which is right inside a 352px pill and catastrophic inside a 40px one:
+  generous 32px target, which is right inside a 352px pill and catastrophic inside a 56px one:
   any click on a resting-but-active entry landed on Clear and wiped the query. It is now
   hittable only at full expansion — which is also exactly when it finishes fading in, so what
   you can hit is what you can see.

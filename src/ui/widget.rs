@@ -1095,9 +1095,12 @@ impl EntryStyle {
     }
 
     /// `$forced_circular_radius` for the search pill; `$base_border_radius` for the plain box.
-    fn radius(self) -> f64 {
+    ///
+    /// Circular takes the drawn `height`, not [`Entry::HEIGHT`]: the search entry rests as a
+    /// puck taller than the open pill, and a fixed radius would square off its corners.
+    fn radius(self, height: f64) -> f64 {
         match self {
-            EntryStyle::Search => Entry::HEIGHT / 2.,
+            EntryStyle::Search => height / 2.,
             EntryStyle::Lockscreen | EntryStyle::PromptDialog => 8.,
         }
     }
@@ -1150,20 +1153,25 @@ impl Entry {
     /// The focus ring's stroke (`focus_ring` is 2px in `_drawing.scss`).
     const FOCUS_RING: f64 = 2.;
 
-    /// Lay out a pill of `width` centered horizontally on `center_x`, top edge `top_y`.
+    /// Lay out a pill of `width` x `height` centered horizontally on `center_x`, top edge
+    /// `top_y`. `height` is a parameter rather than [`Self::HEIGHT`] because the search entry
+    /// rests as a puck bigger than the pill it opens into.
     ///
     /// The icon centres are only meaningful for [`EntryStyle::Search`]; a lockscreen entry has no
     /// glyphs, and `text_x` is its centre rather than a left edge.
-    pub fn layout(center_x: f64, top_y: f64, width: f64, style: EntryStyle) -> EntryLayout {
+    pub fn layout(
+        center_x: f64,
+        top_y: f64,
+        width: f64,
+        height: f64,
+        style: EntryStyle,
+    ) -> EntryLayout {
         let x = (center_x - width / 2.).round();
-        let pill = Rectangle::new(
-            Point::from((x, top_y.round())),
-            Size::from((width, Self::HEIGHT)),
-        );
+        let pill = Rectangle::new(Point::from((x, top_y.round())), Size::from((width, height)));
         // `.search-entry-icon`'s 2px `margin-top` rides on the centre, for every family: the
         // plain entries' glyphs get no such nudge in the theme, so only Search takes it.
         let cy = pill.loc.y
-            + Self::HEIGHT / 2.
+            + height / 2.
             + if style.has_primary_icon() {
                 Self::ICON_NUDGE_Y
             } else {
@@ -1220,6 +1228,7 @@ impl Entry {
         cache: &mut BakeCache,
         scale: f64,
         width: f64,
+        height: f64,
         content: EntryContent<'_>,
         entry_style: EntryStyle,
         focused: bool,
@@ -1230,7 +1239,7 @@ impl Entry {
         accent: Rgba,
         revision: u64,
     ) -> anyhow::Result<VkTexture> {
-        let size = Size::<f64, Logical>::from((width, Self::HEIGHT));
+        let size = Size::<f64, Logical>::from((width, height));
         let (shown, map) = content.display();
         let empty = shown.is_empty();
         let display = if empty {
@@ -1259,10 +1268,8 @@ impl Entry {
             ENTRY_PAD
         };
         let avail = (width - leading - trailing).max(0.);
-        let clip = Rectangle::<f64, Logical>::new(
-            Point::from((leading, 0.)),
-            Size::from((avail, Self::HEIGHT)),
-        );
+        let clip =
+            Rectangle::<f64, Logical>::new(Point::from((leading, 0.)), Size::from((avail, height)));
         let ring = focused.then(|| entry_style.focus_ring(accent)).flatten();
 
         // Measurement happens in the same physical px the run is shaped at, so the advances
@@ -1316,11 +1323,11 @@ impl Entry {
             move |frame, phys, shaped| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(style::TRANSPARENT)?;
-                p.fill_rounded_full(entry_style.radius(), entry_style.bg())?;
+                p.fill_rounded_full(entry_style.radius(height), entry_style.bg())?;
                 if let Some(ring) = ring {
                     p.stroke_rounded(
-                        Rectangle::from_size(Size::from((width, Self::HEIGHT))),
-                        entry_style.radius(),
+                        Rectangle::from_size(Size::from((width, height))),
+                        entry_style.radius(height),
                         Self::FOCUS_RING,
                         ring,
                     )?;
@@ -1333,7 +1340,7 @@ impl Entry {
                 // only thing left to see.
                 let band = Rectangle::<f64, Logical>::new(
                     Point::from((0., ENTRY_PAD)),
-                    Size::from((width, Self::HEIGHT - ENTRY_PAD * 2.)),
+                    Size::from((width, height - ENTRY_PAD * 2.)),
                 );
 
                 // Selection goes *behind* the glyphs. `selected-color` is `$fg_color`
@@ -1354,7 +1361,7 @@ impl Entry {
                 } else {
                     style::TEXT
                 };
-                p.text_band(shaped, anchor, halign, 0., Self::HEIGHT, color, clip)?;
+                p.text_band(shaped, anchor, halign, 0., height, color, clip)?;
 
                 if let Some(at_byte) = cursor {
                     p.caret(m.x_at(&display, at_byte), band, style::TEXT, Some(clip))?;

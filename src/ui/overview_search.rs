@@ -54,8 +54,7 @@ use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::overview_layout::ControlsLayout;
 use crate::ui::text_edit::{EditMods, EditOutcome, KeyTheme, TextEdit};
 use crate::ui::widget::{
-    self, AppIcon, Entry, EntryContent, EntryHit, EntryLayout, HAlign, Painter,
-    SharedAppIconUploads,
+    self, AppIcon, Entry, EntryContent, EntryHit, EntryLayout, Painter, SharedAppIconUploads,
 };
 
 /// The built-in `AppSearchProvider` result cap (`this.maxResults = 6`,
@@ -69,9 +68,6 @@ pub fn entry_width(ramp: f64) -> f64 {
     (ENTRY_WIDTH * ramp).round()
 }
 
-/// The hint shown in the empty entry (`hint_text: _('Type to search')`,
-/// `overviewControls.js:330`).
-const PLACEHOLDER: &str = "Type to search";
 /// Entry pill width, logical (`.search-entry` `width: 24em`; em = 11pt·4/3 ≈ 14.67px).
 ///
 /// **Adaptive chrome, rule 2 — ramped** (`docs/fork/adaptive-overview-chrome.md`): this is
@@ -79,34 +75,42 @@ const PLACEHOLDER: &str = "Type to search";
 /// so the pill keeps the *share* of the screen GNOME gives it. Its **height** does not
 /// ramp — that is the entry's text plus padding, and text is exempt.
 const ENTRY_WIDTH: f64 = 352.;
-/// The resting pill's width — [`Entry::HEIGHT`], so `$forced_circular_radius` makes it a
-/// **circle** holding nothing but the find glyph.
+/// The resting puck's diameter — square, so `$forced_circular_radius` makes it a **circle**
+/// holding nothing but the find glyph.
+///
+/// Sized as a *button* rather than as a collapsed text field: it reads a touch smaller than a
+/// dash icon ([`crate::ui::dash::ICON_PX`] = 64), the biggest round-ish target on the overview,
+/// so it looks deliberate beside it instead of like a shrunken entry. It does **not** ramp with
+/// the chrome — like the pill's height, this is the size of a hand target, not a share of the
+/// canvas.
 ///
 /// **Divergence (approved).** GNOME shows the full 24em pill at rest with a "Type to search"
 /// hint inside it (`overviewControls.js:324-331`). We rest as a puck at the right end of the
-/// same footprint, with the hint on its own line beneath, and grow to GNOME's pill on click or
-/// on the first keystroke. Everything about the expanded entry — width, radius, fill, icon
-/// insets, font — is still GNOME's; only the resting state and the transition are ours.
-const COLLAPSED_W: f64 = Entry::HEIGHT;
-/// Gap between the resting puck and the hint line under it.
-const HINT_GAP: f64 = 6.;
-/// The hint line's point size — deliberately smaller than the entry's own 11pt, since it is
-/// now a label beside the control rather than text inside it.
-const HINT_PT: f64 = 9.;
+/// same footprint and grow to GNOME's pill on click or on the first keystroke. Everything about
+/// the expanded entry — width, height, radius, fill, icon insets, font — is still GNOME's; only
+/// the resting state and the transition are ours.
+const PUCK_D: f64 = 56.;
+/// The find glyph's size inside the resting puck. Bigger than [`Entry::ICON_PX`], which is the
+/// glyph *in the pill* — a 16px magnifier in a 56px disc reads as a mis-drawn icon.
+///
+/// Two fixed sizes cross-faded, never a size lerped with `expand`: [`IconCache`] is keyed on
+/// `(name, px, color)`, so a per-frame px would re-rasterize the SVG every animation frame and
+/// accrete a cache entry per step.
+const PUCK_ICON_PX: f64 = 24.;
 /// `.search-entry` `margin-top: $base_padding*2` (`_search-entry.scss:4`).
 const ENTRY_MARGIN_TOP: f64 = 12.;
 /// `.search-entry` `margin-bottom: $base_padding` (`_search-entry.scss:5`).
 const ENTRY_MARGIN_BOTTOM: f64 = 6.;
 
-/// What the search entry asks [`crate::ui::overview_layout`] for: the pill plus
-/// its margins, which is what gnome-shell's `searchEntryBin` reports as its
-/// preferred height (`overviewControls.js:165`).
-pub const PREFERRED_ENTRY_HEIGHT: f64 = ENTRY_MARGIN_TOP + Entry::HEIGHT + ENTRY_MARGIN_BOTTOM;
-
-/// How far the hint line's baseline band sits below the pill, and how tall it is — the strip
-/// the resting hint occupies under the puck. It hangs *below* the entry's own box (into the
-/// results strip, which is empty at rest), so it does not widen the band the layout reserves.
-const HINT_BAND: f64 = 18.;
+/// What the search entry asks [`crate::ui::overview_layout`] for: the control plus its margins,
+/// which is what gnome-shell's `searchEntryBin` reports as its preferred height
+/// (`overviewControls.js:165`).
+///
+/// The control here is the **puck**, not the pill: it is the taller of the two states, and a
+/// band sized for the pill would leave the resting button overhanging the thumbnail strip. The
+/// pill then centres inside the puck's footprint rather than sitting on GNOME's literal
+/// `margin-top`, which is the price of [`PUCK_D`]'s divergence.
+pub const PREFERRED_ENTRY_HEIGHT: f64 = ENTRY_MARGIN_TOP + PUCK_D + ENTRY_MARGIN_BOTTOM;
 
 /// Full-color app-icon side in a result tile, logical: `GridSearchResult` builds a
 /// default `IconGrid.BaseIcon` (`search.js:144-146`), whose size is `ICON_SIZE`
@@ -210,9 +214,6 @@ pub enum SearchOutcome {
 struct SearchCache {
     context: Option<ContextId<VkTexture>>,
     entry_bake: widget::BakeCache,
-    /// The resting hint line under the puck. Its text never changes, so this re-bakes only
-    /// on a scale change.
-    hint_bake: widget::BakeCache,
     /// The card background + selection/hover wash + "No results" status (below the
     /// labels). Re-bakes on a highlight change, but only rounded fills — no re-shape.
     bg_bake: widget::BakeCache,
@@ -502,12 +503,18 @@ impl OverviewSearch {
         // as it opens.
         let full_w = entry_width(area.ramp);
         let e = self.expand;
-        let pill_w = COLLAPSED_W + (full_w - COLLAPSED_W) * e;
+        let pill_w = PUCK_D + (full_w - PUCK_D) * e;
+        // The puck shrinks to the pill's height about a **fixed centre**, so the control opens
+        // symmetrically instead of hinging on one edge. That centre is the puck's own, since the
+        // band is reserved for the puck (see `PREFERRED_ENTRY_HEIGHT`).
+        let pill_h = PUCK_D + (Entry::HEIGHT - PUCK_D) * e;
+        let center_y = area.entry.loc.y + ENTRY_MARGIN_TOP + PUCK_D / 2.;
         let right = area.entry.loc.x + area.entry.size.w;
         let entry = Entry::layout(
             right - pill_w / 2.,
-            area.entry.loc.y + ENTRY_MARGIN_TOP,
+            center_y - pill_h / 2.,
             pill_w,
+            pill_h,
             widget::EntryStyle::Search,
         );
         // The find glyph rides from the puck's centre to the pill's leading gutter. It has
@@ -519,16 +526,6 @@ impl OverviewSearch {
             entry.pill.loc.x + (pill_w / 2.) + (Entry::ICON_INSET - pill_w / 2.) * e,
             entry.primary_icon.y,
         ));
-        // The resting hint: its own line under the puck, its run **ending** at the pill's
-        // right edge. It hangs below the entry box into the (empty at rest) results strip.
-        let hint = Rectangle::new(
-            Point::from((
-                area.entry.loc.x,
-                entry.pill.loc.y + Entry::HEIGHT + HINT_GAP,
-            )),
-            Size::from((area.entry.size.w, HINT_BAND)),
-        );
-
         let active = self.is_active();
         let (card, tiles) = if !active {
             (None, Vec::new())
@@ -560,8 +557,8 @@ impl OverviewSearch {
         SearchLayout {
             entry,
             find_icon,
-            hint,
             pill_w,
+            pill_h,
             card,
             tiles,
         }
@@ -582,7 +579,7 @@ impl OverviewSearch {
         let layout = self.layout(area);
         // The clear glyph is hittable only once the pill is fully open. Its hit disc is a
         // generous 32px across (a 16px glyph deserves a bigger target), which is fine inside
-        // a 352px pill and catastrophic inside the 40px puck: the disc covers the whole puck,
+        // a 352px pill and catastrophic inside the 56px puck: the disc covers most of the puck,
         // so any click on a resting-but-active entry would land on Clear and wipe the query.
         // It is also exactly when the glyph finishes fading in, so what you can hit is what
         // you can see.
@@ -708,17 +705,30 @@ impl OverviewSearch {
         // re-uploading it, and accreting a cached entry per alpha step.
         // The clear glyph fades in with the pill it lives in — at puck width there is no
         // room for it, and it would sit on top of the find glyph.
+        // The find glyph exists at two fixed sizes — the puck's and the pill's — cross-faded on
+        // the same centre, for the reason `PUCK_ICON_PX` gives: a lerped px would re-rasterize
+        // per frame.
         let expand = self.expand as f32;
-        for (name, color, center, want, glyph_alpha) in [
+        for (name, px, color, center, want, glyph_alpha) in [
             (
                 "edit-find-symbolic",
+                PUCK_ICON_PX,
                 style::MUTED,
                 layout.find_icon,
                 true,
-                1.,
+                1. - expand,
+            ),
+            (
+                "edit-find-symbolic",
+                Entry::ICON_PX,
+                style::MUTED,
+                layout.find_icon,
+                true,
+                expand,
             ),
             (
                 "edit-clear-symbolic",
+                Entry::ICON_PX,
                 style::TEXT,
                 layout.entry.secondary_icon,
                 active,
@@ -728,7 +738,7 @@ impl OverviewSearch {
             if !want || glyph_alpha <= 0. {
                 continue;
             }
-            let Some(tb) = sym_icons.texture(renderer, name, Entry::ICON_PX, scale, color) else {
+            let Some(tb) = sym_icons.texture(renderer, name, px, scale, color) else {
                 continue;
             };
             let logical = tb.logical_size();
@@ -741,60 +751,6 @@ impl OverviewSearch {
                 None,
                 Kind::Unspecified,
             ));
-        }
-
-        // --- The resting hint line, on its own row under the puck, right-aligned to the
-        //     pill's right edge and fading out as the pill takes over. ---
-        if expand < 1. {
-            let hint = layout.hint;
-            match widget::bake(
-                renderer,
-                &mut cache.hint_bake,
-                scale,
-                hint.size,
-                widget::Revision::new()
-                    .of(PLACEHOLDER)
-                    .px(hint.size.w)
-                    .done(),
-                |r| {
-                    let mut shaper = widget::TextShaper::new(r, scale);
-                    shaper.shape(PLACEHOLDER, widget::TextStyle::new(HINT_PT))
-                },
-                move |frame, phys, shaped| {
-                    let mut p = Painter::new(frame, scale, phys);
-                    p.clear(style::TRANSPARENT)?;
-                    // Right-aligned: the *end* of the run lands on the band's right edge,
-                    // which is the pill's right edge.
-                    p.text_band(
-                        shaped,
-                        hint.size.w,
-                        HAlign::Right,
-                        0.,
-                        hint.size.h,
-                        style::MUTED,
-                        Rectangle::from_size(hint.size),
-                    )
-                },
-            ) {
-                Ok(texture) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        vec![],
-                    );
-                    elements.push(TextureRenderElement::from_texture_buffer(
-                        buffer,
-                        hint.loc,
-                        alpha * (1. - expand),
-                        None,
-                        None,
-                        Kind::Unspecified,
-                    ));
-                }
-                Err(err) => tracing::error!("error baking the search hint: {err:#}"),
-            }
         }
 
         // --- Result app icons (topmost, over their tiles). ---
@@ -820,16 +776,18 @@ impl OverviewSearch {
         }
 
         // --- The entry pill chrome (text/placeholder + caret), baked. ---
-        // The pill's own width — the bake is the chrome, so it has to be the width the
-        // layout placed, ramp included, or the two disagree by the ramp.
+        // The pill's own size — the bake is the chrome, so it has to be what the layout
+        // placed, ramp and expansion included, or the two disagree.
         let pill_w = layout.pill_w;
+        let pill_h = layout.pill_h;
         match Entry::bake(
             renderer,
             &mut cache.entry_bake,
             scale,
             pill_w,
-            // No placeholder inside the pill: the hint is the line underneath, and once the
-            // pill is open the user has already been told what it is for.
+            pill_h,
+            // No placeholder inside the pill: at rest the control is a labelled-by-shape
+            // button, and once the pill is open the caret is the invitation.
             EntryContent::of(&self.edit, "", self.expanded),
             widget::EntryStyle::Search,
             // The search entry's focus is its caller's inset-accent ring, not the pill's.
@@ -837,10 +795,12 @@ impl OverviewSearch {
             self.is_active(),
             // Not a focus ring (this style has none) — the selection wash.
             widget::style::accent_rgba(accent),
-            // The width is part of what was baked; a canvas change must re-bake it.
+            // The size is part of what was baked; a canvas change or a step of the expansion
+            // must re-bake it.
             widget::Revision::new()
                 .of(self.content_rev)
                 .px(pill_w)
+                .px(pill_h)
                 .of(accent)
                 .done(),
         ) {
@@ -1091,10 +1051,9 @@ struct SearchLayout {
     entry: EntryLayout,
     /// The find glyph's centre, lerped between the puck's middle and the pill's gutter.
     find_icon: Point<f64, Logical>,
-    /// The resting hint line's band; its text is right-aligned to the band's right edge.
-    hint: Rectangle<f64, Logical>,
-    /// The pill's current width — what the chrome is baked at.
+    /// The pill's current size — what the chrome is baked at.
     pill_w: f64,
+    pill_h: f64,
     /// The results card (`None` when search inactive).
     card: Option<Rectangle<f64, Logical>>,
     /// Result-tile boxes (empty unless active with results).
@@ -1486,11 +1445,11 @@ mod tests {
         let mut s = OverviewSearch::new();
         let area = area_1080();
         let layout = s.layout(area);
-        // The *current* pill, not the expanded one: at rest this is the 40px puck, and
+        // The *current* pill, not the expanded one: at rest this is the puck, and
         // hit-testing has to follow the box that is actually drawn.
         let entry_center = Point::from((
             layout.entry.pill.loc.x + layout.entry.pill.size.w / 2.,
-            layout.entry.pill.loc.y + Entry::HEIGHT / 2.,
+            layout.entry.pill.loc.y + layout.entry.pill.size.h / 2.,
         ));
         assert_eq!(
             s.hit_test(entry_center, area),
@@ -1507,8 +1466,8 @@ mod tests {
 
         s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
-        // Mid-grow the clear glyph is not hittable yet: its 32px disc would cover the whole
-        // 40px puck, so a click meant for the field would wipe the query.
+        // Mid-grow the clear glyph is not hittable yet: its 32px disc would cover most of the
+        // puck, so a click meant for the field would wipe the query.
         s.set_expand(0.5);
         let half = s.layout(area);
         assert_eq!(
@@ -1546,11 +1505,24 @@ mod tests {
         let right = area.entry.loc.x + area.entry.size.w;
 
         let puck = s.layout(area).entry.pill;
-        assert_eq!(puck.size.w, COLLAPSED_W, "at rest it is a circle");
-        assert_eq!(puck.size.h, Entry::HEIGHT, "as tall as the open entry");
+        assert_eq!(puck.size.w, PUCK_D, "at rest it is a circle");
+        assert_eq!(
+            puck.size.h, PUCK_D,
+            "…square, so the radius rounds it fully"
+        );
+        assert!(
+            puck.size.h > Entry::HEIGHT,
+            "and it is a button, bigger than the pill it opens into"
+        );
+        const {
+            assert!(
+                PUCK_D < crate::ui::dash::ICON_PX,
+                "but still smaller than a dash icon"
+            )
+        };
         assert_eq!(puck.loc.x + puck.size.w, right, "parked at the right edge");
         // The find glyph is centred in the puck, not sitting in a leading gutter.
-        assert_eq!(s.layout(area).find_icon.x, puck.loc.x + COLLAPSED_W / 2.);
+        assert_eq!(s.layout(area).find_icon.x, puck.loc.x + PUCK_D / 2.);
 
         // Typing expands it; the animation progress is pushed in by Niri, so drive it here.
         s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
@@ -1558,6 +1530,7 @@ mod tests {
         s.set_expand(1.);
         let pill = s.layout(area).entry.pill;
         assert_eq!(pill.size.w, entry_width(area.ramp), "grown to 24em");
+        assert_eq!(pill.size.h, Entry::HEIGHT, "and back to GNOME's own height");
         assert_eq!(
             pill.loc.x + pill.size.w,
             right,
@@ -1573,36 +1546,32 @@ mod tests {
         // check would pass on a pill that teleported.
         s.set_expand(0.5);
         let mid = s.layout(area);
-        assert!(mid.entry.pill.size.w > COLLAPSED_W && mid.entry.pill.size.w < pill.size.w);
+        assert!(mid.entry.pill.size.w > PUCK_D && mid.entry.pill.size.w < pill.size.w);
+        assert!(mid.entry.pill.size.h < PUCK_D && mid.entry.pill.size.h > Entry::HEIGHT);
         assert!(mid.find_icon.x > pill.loc.x + Entry::ICON_INSET);
         assert_eq!(mid.entry.pill.loc.x + mid.entry.pill.size.w, right);
+        // The height shrinks about a fixed centre, so the control does not hinge on an edge.
+        let mid_c = mid.entry.pill.loc.y + mid.entry.pill.size.h / 2.;
+        assert_eq!(mid_c, puck.loc.y + puck.size.h / 2.);
+        assert_eq!(mid_c, pill.loc.y + pill.size.h / 2.);
 
         // Clearing puts it back to the puck.
         s.clear();
         assert!(!s.is_expanded());
     }
 
-    /// The hint is its own line under the puck, its run ending on the pill's right edge.
+    /// The reserved band is the *puck's*, so the resting button never overhangs the strip
+    /// below it — the band used to be sized for the 40px pill, which the 56px puck outgrows.
     #[test]
-    fn the_resting_hint_sits_under_the_puck_and_ends_at_its_right_edge() {
+    fn the_resting_puck_fits_inside_the_band_the_layout_reserves() {
         let s = OverviewSearch::new();
         let area = area_1080();
-        let l = s.layout(area);
-        assert_eq!(
-            l.hint.loc.x + l.hint.size.w,
-            l.entry.pill.loc.x + l.entry.pill.size.w,
-            "right-aligned to the pill's right edge"
-        );
+        let puck = s.layout(area).entry.pill;
+        assert!(puck.loc.y >= area.entry.loc.y, "clear of the band's top");
         assert!(
-            l.hint.loc.y >= l.entry.pill.loc.y + Entry::HEIGHT,
-            "on its own line, below the puck — never overlapping it"
+            puck.loc.y + puck.size.h <= area.entry.loc.y + area.entry.size.h,
+            "and of its bottom"
         );
-        const {
-            assert!(
-                HINT_PT < 11.,
-                "the hint is in a smaller font than the entry's own"
-            )
-        };
     }
 
     /// A modified key (Alt/Super held) must never act as its bare self.

@@ -409,6 +409,7 @@ impl PolkitDialogUi {
                 &mut self.entry_cache.borrow_mut(),
                 scale,
                 l.entry.size.w,
+                l.entry.size.h,
                 match dialog.entry_mask() {
                     Some(mask) => widget::EntryContent::masked(
                         dialog.entry(),

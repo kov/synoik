@@ -475,6 +475,7 @@ pub fn peek_hit(
         origin.x + l.entry.loc.x + l.entry.size.w / 2.,
         origin.y + l.entry.loc.y,
         l.entry.size.w,
+        l.entry.size.h,
         widget::EntryStyle::Lockscreen,
     );
     widget::Entry::hit(&entry, pos, true)
@@ -968,6 +969,7 @@ impl LockScreen {
             &mut self.entry_cache.borrow_mut(),
             scale,
             width,
+            widget::Entry::HEIGHT,
             widget::EntryContent {
                 text: &content.entry,
                 placeholder: &content.question,
@@ -1039,6 +1041,7 @@ impl LockScreen {
                 l.entry.loc.x + l.entry.size.w / 2.,
                 l.entry.loc.y,
                 l.entry.size.w,
+                l.entry.size.h,
                 widget::EntryStyle::Lockscreen,
             );
             // `view-reveal-symbolic` while hidden, `view-conceal-symbolic` once shown
