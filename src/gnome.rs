@@ -830,6 +830,7 @@ impl GnomeSettings {
         wm: Option<&gio::Settings>,
         mutter_keybindings: Option<&gio::Settings>,
         shell_keybindings: Option<&gio::Settings>,
+        wayland_keybindings: Option<&gio::Settings>,
     ) {
         let mut keybindings = read_keybinding_table(wm, adopted_wm_keybindings());
         keybindings.extend(read_keybinding_table(
@@ -839,6 +840,10 @@ impl GnomeSettings {
         keybindings.extend(read_keybinding_table(
             shell_keybindings,
             adopted_shell_keybindings(),
+        ));
+        keybindings.extend(read_keybinding_table(
+            wayland_keybindings,
+            adopted_wayland_keybindings(),
         ));
         self.keybindings = keybindings;
     }
@@ -966,6 +971,13 @@ pub enum GnomeKeyAction {
     /// the focused window to the given half of the work area, or untile it if
     /// already tiled there.
     ToggleTiled(TileSide),
+    /// `restore-shortcuts` (`org.gnome.mutter.wayland.keybindings`, `<Super>Escape`):
+    /// hand the shortcuts back to the compositor while a client is inhibiting them.
+    RestoreShortcuts,
+    /// `switch-to-session-N` (`org.gnome.mutter.wayland.keybindings`, 1-based): change
+    /// to VT N. Registered by mutter only on the native backend
+    /// (`NATIVE_KEYBINDINGS`, `keybindings.c`).
+    SwitchToSession(u8),
     /// `screen-brightness-{up,down,cycle}[-monitor]` (`org.gnome.shell.keybindings`): step the
     /// brightness scales. The `-monitor` variants act on the monitor under the pointer, which is
     /// gnome-shell's `get_current_logical_monitor()` (`brightnessManager.js:107-132`).
@@ -973,6 +985,21 @@ pub enum GnomeKeyAction {
         step: crate::brightness::Step,
         current_monitor: bool,
     },
+}
+
+impl GnomeKeyAction {
+    /// Whether this binding survives a client's keyboard-shortcuts inhibitor —
+    /// mutter's `META_KEY_BINDING_NON_MASKABLE`, which `process_event` checks
+    /// before consulting `meta_window_shortcuts_inhibited`.
+    ///
+    /// Only the recovery keys carry it, and for a reason worth stating: an
+    /// inhibiting client that could also swallow these would leave the user with
+    /// no way to take the keyboard back or to change VT. Deriving it from the
+    /// action rather than storing it per keybinding keeps it from drifting out
+    /// of sync with what the action actually does.
+    pub(crate) fn is_non_maskable(self) -> bool {
+        matches!(self, Self::RestoreShortcuts | Self::SwitchToSession(_))
+    }
 }
 
 /// Which half of the work area a window is tiled to.
@@ -1184,6 +1211,7 @@ fn default_keybindings() -> Vec<GnomeKeybinding> {
     let mut keybindings = read_keybinding_table(None, adopted_wm_keybindings());
     keybindings.extend(read_keybinding_table(None, adopted_mutter_keybindings()));
     keybindings.extend(read_keybinding_table(None, adopted_shell_keybindings()));
+    keybindings.extend(read_keybinding_table(None, adopted_wayland_keybindings()));
     keybindings
 }
 
@@ -1759,6 +1787,36 @@ fn adopted_shell_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
     ]
 }
 
+/// The `org.gnome.mutter.wayland.keybindings` keys we honor — mutter's two
+/// recovery bindings, both `META_KEY_BINDING_NON_MASKABLE`.
+///
+/// `switch-to-session-N` overlaps the hardcoded `XF86Switch_VT_N` path in
+/// `find_bind` rather than replacing it, and deliberately: that path reads the
+/// keysym the keymap produces on a real VT and so needs no settings at all,
+/// which is what makes it a hatch you cannot lock yourself out of. This table
+/// covers the other case, where `<Ctrl><Alt>Fn` arrives as a plain function key
+/// because the keymap has no VT-switch mapping.
+///
+/// `xwayland-grab-access-rules` lives in the same schema but is not a
+/// keybinding.
+fn adopted_wayland_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
+    let mut keys = vec![(
+        "restore-shortcuts".to_owned(),
+        GnomeKeyAction::RestoreShortcuts,
+        vec!["<Super>Escape".to_owned()],
+    )];
+
+    for n in 1..=12u8 {
+        keys.push((
+            format!("switch-to-session-{n}"),
+            GnomeKeyAction::SwitchToSession(n),
+            vec![format!("<Primary><Alt>F{n}")],
+        ));
+    }
+
+    keys
+}
+
 fn adopted_mutter_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
     vec![
         (
@@ -1825,6 +1883,8 @@ struct Stores {
     backend: Option<gio::SettingsBackend>,
     mutter: Option<gio::Settings>,
     mutter_keybindings: Option<gio::Settings>,
+    /// `org.gnome.mutter.wayland.keybindings` — the two recovery bindings.
+    wayland_keybindings: Option<gio::Settings>,
     shell_keybindings: Option<gio::Settings>,
     wm_keybindings: Option<gio::Settings>,
     wm_preferences: Option<gio::Settings>,
@@ -1882,6 +1942,7 @@ impl Stores {
             backend: backend.clone(),
             mutter: gsettings("org.gnome.mutter", b),
             mutter_keybindings: gsettings("org.gnome.mutter.keybindings", b),
+            wayland_keybindings: gsettings("org.gnome.mutter.wayland.keybindings", b),
             shell_keybindings: gsettings("org.gnome.shell.keybindings", b),
             wm_keybindings: gsettings("org.gnome.desktop.wm.keybindings", b),
             wm_preferences: gsettings("org.gnome.desktop.wm.preferences", b),
@@ -1935,6 +1996,7 @@ impl Stores {
         [
             &self.mutter,
             &self.mutter_keybindings,
+            &self.wayland_keybindings,
             &self.shell_keybindings,
             &self.wm_keybindings,
             &self.wm_preferences,
@@ -1971,6 +2033,7 @@ impl Stores {
             self.wm_keybindings.as_ref(),
             self.mutter_keybindings.as_ref(),
             self.shell_keybindings.as_ref(),
+            self.wayland_keybindings.as_ref(),
         );
         if let Some(wm) = &self.wm_preferences {
             settings.load_wm_preferences(wm);

@@ -160,6 +160,13 @@ pub enum Action {
         path: Option<String>,
     },
     ToggleKeyboardShortcutsInhibit,
+    /// Give the keyboard shortcuts back unconditionally, the way GNOME's
+    /// `restore-shortcuts` does (mutter `handle_restore_shortcuts`,
+    /// `keybindings.c:2503` → `meta_wayland_compositor_restore_shortcuts`,
+    /// `meta-wayland.c:1155`): a no-op when nothing is inhibiting, and never
+    /// the reverse. That asymmetry is the point — this is a recovery key, so
+    /// it must not be able to *start* inhibiting the way a toggle would.
+    RestoreKeyboardShortcuts,
     CloseWindow,
     #[knuffel(skip)]
     CloseWindowById(u64),

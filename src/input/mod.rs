@@ -2227,6 +2227,20 @@ impl State {
                     }
                 }
             }
+            Action::RestoreKeyboardShortcuts => {
+                // Only ever restores. mutter bails when the focus isn't inhibiting
+                // (`meta_wayland_compositor_restore_shortcuts`), and so must we: this is
+                // the key that gets you *out*, so it can never put you in.
+                if let Some(inhibitor) = self.niri.keyboard_focus.surface().and_then(|surface| {
+                    self.niri
+                        .keyboard_shortcuts_inhibiting_surfaces
+                        .get(surface)
+                }) {
+                    if inhibitor.is_active() {
+                        inhibitor.inactivate();
+                    }
+                }
+            }
             Action::CloseWindow => {
                 if let Some(mapped) = self.niri.layout.focus() {
                     mapped.toplevel().send_close();
@@ -8655,9 +8669,9 @@ fn find_gnome_bind(
         repeat,
         cooldown: None,
         allow_when_locked: false,
-        // GNOME bindings are maskable: mutter suppresses everything not
-        // NON_MASKABLE while the focused window inhibits shortcuts.
-        allow_inhibiting: true,
+        // mutter suppresses every binding not flagged NON_MASKABLE while the focused
+        // window inhibits shortcuts — which is all of them bar the recovery keys.
+        allow_inhibiting: !keybinding.action.is_non_maskable(),
         hotkey_overlay_title: None,
     })
 }
@@ -8735,6 +8749,8 @@ fn accel_matches(
 pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
     Some(match action {
         GnomeKeyAction::PanelRunDialog => Action::ShowRunDialog,
+        GnomeKeyAction::RestoreShortcuts => Action::RestoreKeyboardShortcuts,
+        GnomeKeyAction::SwitchToSession(n) => Action::ChangeVt(i32::from(n)),
         GnomeKeyAction::Maximize => Action::Maximize,
         GnomeKeyAction::Unmaximize => Action::Unmaximize,
         GnomeKeyAction::ToggleTiled(TileSide::Left) => Action::ToggleTiledLeft,
@@ -8947,6 +8963,7 @@ pub(crate) fn allowed_when_locked(action: &Action) -> bool {
             | Action::Reboot
             | Action::SwitchLayout(_)
             | Action::ToggleKeyboardShortcutsInhibit
+            | Action::RestoreKeyboardShortcuts
             // gnome-shell registers the brightness keys with `Shell.ActionMode.ALL`
             // (`brightnessManager.js:35-76`), so they work on the lock screen — which is exactly
             // when you need them, since gsd-power has usually dimmed the panel by then.

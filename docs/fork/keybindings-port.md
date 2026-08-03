@@ -52,6 +52,16 @@ gsd media keys.
 `switch-applications(-backward)`.
 
 `org.gnome.mutter.keybindings` — `toggle-tiled-left`, `toggle-tiled-right`.
+
+`org.gnome.mutter.wayland.keybindings` — `restore-shortcuts`, `switch-to-session-1..12`. Both
+are `META_KEY_BINDING_NON_MASKABLE`: they resolve *through* a client's shortcuts inhibitor,
+because they are the keys that get you back out of one. `GnomeKeyAction::is_non_maskable`
+derives that from the action rather than storing it per keybinding, so it cannot drift from
+what the action does. `restore-shortcuts` maps to `Action::RestoreKeyboardShortcuts`, which
+only ever restores — mutter's handler bails when nothing is inhibiting
+(`meta_wayland_compositor_restore_shortcuts`, `meta-wayland.c:1155`), and a *toggle* on a
+recovery key could arm the very thing it exists to undo.
+
 `org.gnome.mutter` — `overlay-key` (the Super tap, with mutter's arm/disarm state machine).
 
 `org.gnome.shell.keybindings` — `show-screenshot-ui`, `screenshot`, `screenshot-window`,
@@ -132,7 +142,7 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 | # | Slice | Status |
 |---|---|---|
 | S1 | Fix the invented fallback defaults for `switch-to-workspace-N` | **done** |
-| S2 | `non_maskable` flag + `restore-shortcuts` + `switch-to-session-N` | |
+| S2 | `non_maskable` flag + `restore-shortcuts` + `switch-to-session-N` | **done** |
 | S3 | Shell UI toggles: overview, app grid, quick settings, message tray | |
 | S4 | wm/mutter window + monitor keys: `toggle-maximized`, `move-to-monitor-*`, `*-workspace-last`, `switch-input-source` | |
 | S5 | `switch-to-application-N` + `open-new-window-application-N`, on a real focus-or-launch path | |
@@ -144,10 +154,13 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 
 ### Ordering hazards
 
-- **Jailing.** `restore-shortcuts` / `switch-to-session-N` are `META_KEY_BINDING_NON_MASKABLE`
-  in mutter, but `find_gnome_bind` hardcodes `allow_inhibiting: true`. Adopting them before S2
-  hands an inhibiting client the power to lock the user out of both un-inhibiting and VT
-  switching. The hardcoded VT path is what makes this survivable — never remove it.
+- **Jailing.** Handled in S2: `find_gnome_bind` used to hardcode `allow_inhibiting: true`, so
+  adopting the two NON_MASKABLE keys before that would have handed an inhibiting client the
+  power to lock the user out of both un-inhibiting and VT switching. Both new tests were run
+  against a disabled flag to confirm they fail without it. The hardcoded `XF86Switch_VT` path
+  stays regardless — on a normal keymap `<Ctrl><Alt>Fn` arrives as `XF86Switch_VT_n` and never
+  reaches the settings at all, which is precisely why it is the hatch that cannot be
+  misconfigured.
 - **Escape-hatch loss.** S8 before S2 removes the only never-inhibited un-inhibit key
   (`Mod+Escape`). S8 before seat-verifying that gsd delivers `logout` (`<Ctrl><Alt>Delete`)
   and `screensaver` (`<Super>l`) removes quit and lock outright.

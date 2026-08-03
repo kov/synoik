@@ -794,6 +794,113 @@ fn shortcuts_inhibit_masks_gnome_keybindings() {
     );
 }
 
+/// `restore-shortcuts` (`<Super>Escape`) is one of mutter's two NON_MASKABLE
+/// bindings, so it resolves *through* an inhibitor — otherwise a client that
+/// grabbed the keyboard could keep it — and hands the shortcuts back.
+///
+/// It restores and only restores: mutter's handler bails when the focus isn't
+/// inhibiting (`meta_wayland_compositor_restore_shortcuts`), so pressing it
+/// again must not toggle inhibition back on.
+#[test]
+fn restore_shortcuts_beats_the_inhibitor_and_never_arms_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+
+    f.client(id).inhibit_shortcuts(&surface);
+    f.roundtrip(id);
+
+    f.key_press(KEY_LEFTALT);
+    f.key_press(KEY_F4);
+    f.key_release(KEY_F4);
+    f.key_release(KEY_LEFTALT);
+    f.double_roundtrip(id);
+    assert!(
+        !f.client(id).window(&surface).close_requested,
+        "the inhibitor must mask <Alt>F4 to begin with"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_ESC);
+    f.key_release(KEY_ESC);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+
+    f.key_press(KEY_LEFTALT);
+    f.key_press(KEY_F4);
+    f.key_release(KEY_F4);
+    f.key_release(KEY_LEFTALT);
+    f.double_roundtrip(id);
+    assert!(
+        f.client(id).window(&surface).close_requested,
+        "<Super>Escape must resolve despite the inhibitor and give the shortcuts back"
+    );
+
+    // A second press has nothing to restore. A toggle would re-arm the inhibitor
+    // here, which is exactly what a recovery key must never do.
+    f.client(id).window(&surface).close_requested = false;
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_ESC);
+    f.key_release(KEY_ESC);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+
+    f.key_press(KEY_LEFTALT);
+    f.key_press(KEY_F4);
+    f.key_release(KEY_F4);
+    f.key_release(KEY_LEFTALT);
+    f.double_roundtrip(id);
+    assert!(
+        f.client(id).window(&surface).close_requested,
+        "pressing it again must not put the inhibitor back on"
+    );
+}
+
+/// `switch-to-session-N` is mutter's other NON_MASKABLE binding, so it changes
+/// VT even while a client is inhibiting the shortcuts.
+///
+/// It is bound here rather than driven through its default `<Ctrl><Alt>F3`:
+/// on this keymap that chord already arrives as `XF86Switch_VT_3` and is caught
+/// by the hardcoded path in `find_bind` before any settings are consulted (see
+/// `vt_switch_works_from_the_lock_screen`). This exercises the settings path
+/// itself, which is what covers keymaps carrying no VT-switch mapping.
+#[test]
+fn switch_to_session_beats_the_inhibitor() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+
+    let session_3 = f
+        .niri()
+        .gnome_settings
+        .keybindings
+        .iter_mut()
+        .find(|kb| kb.action == GnomeKeyAction::SwitchToSession(3))
+        .expect("the wayland keybindings table must be loaded");
+    session_3.accels = vec![Accel {
+        trigger: AccelTrigger::Keysym(Keysym::F6),
+        mods: AccelMods::SUPER,
+    }];
+
+    f.client(id).inhibit_shortcuts(&surface);
+    f.roundtrip(id);
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_F6);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.niri_state().backend.headless().last_vt(),
+        Some(3),
+        "an inhibitor must not be able to swallow the VT switch"
+    );
+}
+
 /// GNOME keybindings take precedence over binds from the niri config file:
 /// the GSettings store is the keybinding config of a GNOME session, so a
 /// conflicting config bind must lose.
