@@ -1,8 +1,8 @@
 # The screenshot UI — porting GNOME's control panel
 
-Status: **2026-08-03, slice 1 landed and seat-checked on the headless harness.** The help text is
+Status: **2026-08-03, slices 1-2 landed and checked on the headless harness.** The help text is
 gone; the panel is GNOME's control panel — type row, shot pill, capture button, show-pointer toggle
-and close button — with Selection and Screen both working. Slices 2-5 below are open.
+and close button — and all three capture types work. Slices 3-5 below are open.
 
 Reference: `js/ui/screenshot.js` (50.3) and `_screenshot.scss`. The visual spec is already cached
 and cited in `docs/fork/gnome-style-reference.md` §screenshot (every class, colour, radius and
@@ -62,12 +62,19 @@ Two things the panel's shape now fixes in place, worth knowing before touching i
    always on the right (`Meta.prefs_get_button_layout()` is unported, as in `window_preview`), and
    in Screen mode the keyboard selection actions are inert rather than silently breaking the
    whole-output invariant.
-2. **Window mode.** Bigger than it looks, and *not* "selection UI over an existing capture": GNOME
-   freezes **every** window's content at open and captures the chosen one from that snapshot
-   (`screenshot.js:1638-1639`), while our `ScreenshotWindow` renders the **focused** window
-   **live** (`screenshot_window` → `render_window_to_pixels`, `src/niri.rs:10359-10369`). So this
-   slice owes per-window neutrals captured at open, plus the selector chrome: per-window borders
-   with hover and checked states (`.screenshot-ui-window-selector-window-border`, accent-tinted).
+2. **DONE.** Window mode. Every window on every output's active workspace is frozen at open
+   (`capture_screenshot_window_neutrals`) and the selector picks from those copies, not from live
+   windows — the difference `screenshot_window` does not make. Slots come from the same exposé
+   layout the overview picker uses (`UIWindowSelectorLayout extends WorkspaceLayout`), over the
+   monitor less GNOME's 100px margin and 200px at the bottom. The Window button is now
+   **insensitive, not hidden**, which is what GNOME does — `CaptureType::is_available` is gone.
+
+   Two things to know before touching it. The per-window capture takes **no pointer**: it is
+   composited at save time from the output's own pointer neutral, so the show-pointer toggle still
+   works after the freeze rather than being baked in. And a window's *buffer* is bigger than the
+   frame rect its slot was sized from (shadows, CSD margins), so the thumbnail scales by the
+   slot/frame ratio and is centred on the slot — anchoring at the slot corner offsets every window
+   by its own shadow.
 3. **Delayed capture.** Our divergence — see below. After slice 1 because it needs the panel, but
    its *foundation* is slice 1's problem, not this slice's.
 4. **Cast mode.** The shot/cast segmented control wired to our recorder, plus the capture button's

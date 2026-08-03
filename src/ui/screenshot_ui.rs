@@ -14,6 +14,7 @@ use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::animation::{Animation, Clock};
+use crate::layout::expose;
 use crate::layout::floating::DIRECTIONAL_MOVE_PX;
 use crate::niri_render_elements;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
@@ -98,6 +99,14 @@ pub enum ScreenshotUi {
         button: Button,
         show_pointer: bool,
         capture_type: CaptureType,
+        /// The window the selector has picked, as `(output, window id)`.
+        ///
+        /// Held by id rather than by index so it survives anything that reorders the list, and
+        /// global rather than per-output because GNOME lets exactly one window be checked across
+        /// every monitor (`screenshot.js:1643-1658` unchecks the others).
+        selected_window: Option<(Output, u64)>,
+        /// The window under the pointer, for the hover border.
+        hovered_window: Option<(Output, u64)>,
         /// The control under the pointer, on the **selection output's** panel.
         ///
         /// Motion only ever reaches us in the selection output's coordinate space (every call site
@@ -159,6 +168,11 @@ pub struct OutputData {
     /// frames. Built lazily on the first render (no renderer is available at open time); the hit
     /// test reads its layout, so no control is clickable until one frame has drawn.
     panel: RefCell<PanelCache>,
+    /// This output's windows, frozen when the picker opened, and where each is drawn in the
+    /// Window-mode selector. Parallel vectors, indexed together; empty on an output with no
+    /// windows on its active workspace.
+    windows: Vec<WindowShot>,
+    slots: Vec<Rectangle<f64, Logical>>,
 }
 
 /// The panel state the bake depends on. Anything else — the selection, the animation, the pointer
@@ -166,6 +180,9 @@ pub struct OutputData {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PanelState {
     capture_type: CaptureType,
+    /// Whether the Window button is sensitive — GNOME keeps it *visible* and greys it out when
+    /// there is nothing to pick (`_syncWindowButtonSensitivity`, `js/ui/screenshot.js:1529-1536`).
+    window_enabled: bool,
     show_pointer: bool,
     hover: Option<Control>,
     /// The control currently held down, for the `:active` fills.
@@ -192,6 +209,29 @@ struct PanelCache {
     close: Option<VkTexture>,
 }
 
+impl PanelState {
+    /// Whether `ty` can be picked right now. Only Window is ever refused, and only for want of a
+    /// window to pick.
+    fn enables(self, ty: CaptureType) -> bool {
+        ty != CaptureType::Window || self.window_enabled
+    }
+}
+
+/// A type button's glyph + caption colour. `%osd_button_flat:insensitive` halves the foreground
+/// and leaves the fill alone (`_drawing.scss:296-300`, `$tc` = `$osd_fg_color`).
+fn type_fg(enabled: bool) -> Rgba {
+    if enabled {
+        style::OSD_FG
+    } else {
+        [
+            style::OSD_FG[0],
+            style::OSD_FG[1],
+            style::OSD_FG[2],
+            style::OSD_FG[3] * 0.5,
+        ]
+    }
+}
+
 impl PanelCache {
     /// The panel's physical size, or `None` before the first draw.
     fn size(&self) -> Option<Size<i32, Buffer>> {
@@ -210,6 +250,79 @@ impl PanelCache {
 pub struct ScreenshotNeutral {
     pub screen: Option<MemoryBuffer>,
     pub pointer: Option<(MemoryBuffer, Point<f64, Logical>)>,
+}
+
+/// One window, frozen at picker-open time, for the Window-mode selector.
+///
+/// GNOME's `UIWindowSelectorWindowContent` (`js/ui/screenshot.js:829-975`) holds the same three
+/// things: the captured content, the frame rect it was captured at (`boundingBox`, which drives
+/// both the layout and the aspect ratio the thumbnail is drawn at), and the identity to hand back.
+pub struct WindowShot {
+    /// The window id, so a selection survives the list being rebuilt.
+    id: u64,
+    /// The window's output-local logical rect when the picker opened — the layout's input, and
+    /// the aspect the thumbnail keeps.
+    rect: Rectangle<f64, Logical>,
+    neutral: MemoryBuffer,
+    neutral_vk: VkCache,
+}
+
+impl WindowShot {
+    pub fn new(id: u64, rect: Rectangle<f64, Logical>, neutral: MemoryBuffer) -> Self {
+        Self {
+            id,
+            rect,
+            neutral,
+            neutral_vk: RefCell::new(None),
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The thumbnail, scaled to fill `slot`.
+    ///
+    /// The capture is the window's *buffer*, which can be larger than the frame rect the slot was
+    /// sized from (shadows, CSD margins). GNOME allocates the actor at `bufferRect` scaled by the
+    /// slot/boundingBox ratio and lets it overhang (`vfunc_allocate`,
+    /// `js/ui/screenshot.js:911-928`); the same ratio is what this applies.
+    fn element(
+        &self,
+        renderer: &mut VulkanRenderer,
+        slot: Rectangle<f64, Logical>,
+        alpha: f32,
+    ) -> Option<CapturedTextureRenderElement> {
+        let tb = upload_cached(renderer, &self.neutral, &self.neutral_vk)?;
+        let natural = tb.logical_size();
+        if natural.w <= 0. || natural.h <= 0. || self.rect.size.w <= 0. || self.rect.size.h <= 0. {
+            return None;
+        }
+
+        // One uniform ratio, from the frame rect the slot was computed for.
+        let ratio = f64::min(
+            slot.size.w / self.rect.size.w,
+            slot.size.h / self.rect.size.h,
+        );
+        let drawn = Size::from((natural.w * ratio, natural.h * ratio));
+        // Centre the buffer on the slot: the frame rect sits inside the buffer, so anchoring at
+        // the slot's corner would push the visible window off by the shadow margin.
+        let loc = Point::from((
+            slot.loc.x + (slot.size.w - drawn.w) / 2.,
+            slot.loc.y + (slot.size.h - drawn.h) / 2.,
+        ));
+
+        let mut elem = TextureRenderElement::from_texture_buffer(
+            tb,
+            loc,
+            alpha,
+            None,
+            None,
+            Kind::Unspecified,
+        );
+        elem.set_size(drawn);
+        Some(CapturedTextureRenderElement(elem))
+    }
 }
 
 /// One output's frozen screen (and pointer + its logical location), as renderer-neutral CPU
@@ -262,12 +375,15 @@ impl ScreenshotUi {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         &mut self,
         // Output, screencast, screen capture.
         screenshots: HashMap<Output, [OutputScreenshot; 3]>,
+        mut window_shots: HashMap<Output, Vec<WindowShot>>,
         default_output: Output,
         show_pointer: bool,
+        focused_window: Option<u64>,
         path: Option<String>,
     ) -> bool {
         if screenshots.is_empty() {
@@ -312,7 +428,7 @@ impl ScreenshotUi {
             selection.1.loc + selection.1.size - Size::from((1, 1)),
         );
 
-        let output_data = screenshots
+        let output_data: HashMap<Output, OutputData> = screenshots
             .into_iter()
             .map(|(output, screenshot)| {
                 let transform = output.current_transform();
@@ -331,6 +447,16 @@ impl ScreenshotUi {
                 ];
                 let locations = [Default::default(); 8];
 
+                let windows = window_shots.remove(&output).unwrap_or_default();
+                // The selector's slots come from the same layout strategy the overview picker
+                // uses (`UIWindowSelectorLayout extends WorkspaceLayout`,
+                // `js/ui/screenshot.js:764`), over the area GNOME leaves it — the full monitor
+                // less a 100px margin, and 200px at the bottom on the monitor holding the panel
+                // (`_screenshot.scss:142-151`).
+                let area = window_selector_area(size.to_f64().to_logical(scale));
+                let rects: Vec<_> = windows.iter().map(|w| w.rect).collect();
+                let slots = expose::compute_slots(f64::from(size.h) / scale, area, &rects);
+
                 let data = OutputData {
                     size,
                     scale,
@@ -339,10 +465,35 @@ impl ScreenshotUi {
                     buffers,
                     locations,
                     panel: RefCell::new(PanelCache::default()),
+                    windows,
+                    slots,
                 };
                 (output, data)
             })
             .collect();
+
+        // GNOME checks the focused window up front and takes it out of toggle mode, so the
+        // selector opens on something rather than on nothing (`screenshot.js:1088-1091`). Falling
+        // back to the first window on the default output keeps that true when focus is elsewhere
+        // (a layer surface, or nothing at all).
+        let selected_window = focused_window
+            .filter(|id| {
+                output_data
+                    .values()
+                    .any(|d: &OutputData| d.windows.iter().any(|w| w.id == *id))
+            })
+            .and_then(|id| {
+                output_data
+                    .iter()
+                    .find(|(_, d)| d.windows.iter().any(|w| w.id == id))
+                    .map(|(output, _)| (output.clone(), id))
+            })
+            .or_else(|| {
+                output_data
+                    .iter()
+                    .find(|(_, d)| !d.windows.is_empty())
+                    .map(|(output, d)| (output.clone(), d.windows[0].id))
+            });
 
         let open_anim = {
             let c = config.borrow();
@@ -355,6 +506,8 @@ impl ScreenshotUi {
             button: Button::Up,
             show_pointer,
             capture_type: CaptureType::default(),
+            selected_window,
+            hovered_window: None,
             hover: None,
             open_anim,
             clock: clock.clone(),
@@ -413,7 +566,11 @@ impl ScreenshotUi {
             return;
         };
 
-        if *capture_type == ty || !ty.is_available() {
+        if *capture_type == ty {
+            return;
+        }
+        // An insensitive button must not switch modes even if a click somehow reaches it.
+        if ty == CaptureType::Window && output_data.values().all(|d| d.windows.is_empty()) {
             return;
         }
         *capture_type = ty;
@@ -425,6 +582,27 @@ impl ScreenshotUi {
         }
 
         self.update_buffers();
+    }
+
+    /// Whether any output has a window to pick — what makes the Window button sensitive.
+    ///
+    /// GNOME asks the same question of every selector at once (`_syncWindowButtonSensitivity`,
+    /// `js/ui/screenshot.js:1529-1536`), so a second monitor's windows keep the button live.
+    pub fn any_windows(&self) -> bool {
+        match self {
+            Self::Open { output_data, .. } => output_data.values().any(|d| !d.windows.is_empty()),
+            Self::Closed { .. } => false,
+        }
+    }
+
+    /// The window the selector has picked, as `(output, id)`.
+    pub fn selected_window(&self) -> Option<(&Output, u64)> {
+        match self {
+            Self::Open {
+                selected_window, ..
+            } => selected_window.as_ref().map(|(o, id)| (o, *id)),
+            Self::Closed { .. } => None,
+        }
     }
 
     pub fn capture_type(&self) -> CaptureType {
@@ -859,6 +1037,8 @@ impl ScreenshotUi {
             output_data,
             show_pointer,
             capture_type,
+            selected_window,
+            hovered_window,
             hover,
             button,
             open_anim,
@@ -880,6 +1060,7 @@ impl ScreenshotUi {
         let hover = if output == &selection.0 { *hover } else { None };
         let state = PanelState {
             capture_type: *capture_type,
+            window_enabled: self.any_windows(),
             show_pointer: *show_pointer,
             hover,
             // `:active` only while the pointer is still on the control the press armed — a press
@@ -900,7 +1081,7 @@ impl ScreenshotUi {
 
             // Earlier-pushed elements are composited on top (the screenshot goes last), so the
             // glyphs are pushed before the panel they sit on, and the shadow after it.
-            output_data.push_icons(renderer, icons, location, alpha, push);
+            output_data.push_icons(renderer, icons, location, alpha, state, push);
             if let Some(elem) = output_data.close_element(renderer, alpha) {
                 push(ScreenshotUiRenderElement::Screenshot(elem));
             }
@@ -912,14 +1093,28 @@ impl ScreenshotUi {
             }
         }
 
-        for (buffer, loc) in zip(&output_data.buffers, &output_data.locations) {
-            let elem = SolidColorRenderElement::from_buffer(
-                buffer,
-                loc.to_f64().to_logical(scale),
-                progress,
-                Kind::Unspecified,
-            );
-            push(elem.into());
+        if *capture_type == CaptureType::Window {
+            // The selector replaces the selection chrome entirely: window thumbnails over an
+            // opaque backdrop, no shade and no rectangle.
+            let selected = selected_window
+                .as_ref()
+                .filter(|(o, _)| o == output)
+                .map(|(_, id)| *id);
+            let hovered = hovered_window
+                .as_ref()
+                .filter(|(o, _)| o == output)
+                .map(|(_, id)| *id);
+            output_data.push_window_selector(renderer, accent, progress, selected, hovered, push);
+        } else {
+            for (buffer, loc) in zip(&output_data.buffers, &output_data.locations) {
+                let elem = SolidColorRenderElement::from_buffer(
+                    buffer,
+                    loc.to_f64().to_logical(scale),
+                    progress,
+                    Kind::Unspecified,
+                );
+                push(elem.into());
+            }
         }
 
         // The screenshot itself goes last.
@@ -947,11 +1142,16 @@ impl ScreenshotUi {
             selection,
             output_data,
             show_pointer,
+            capture_type,
             ..
         } = self
         else {
             panic!("screenshot UI must be open to capture");
         };
+
+        if *capture_type == CaptureType::Window {
+            return self.capture_window_from_neutral();
+        }
 
         let data = &output_data[&selection.0];
         let OutputScreenshot {
@@ -973,6 +1173,47 @@ impl ScreenshotUi {
             });
 
         Some((rect.size, crop_screenshot_neutral(screen, rect, pointer)))
+    }
+
+    /// The selected window's frozen content, with the pointer composited on top if it was over
+    /// that window when the picker opened.
+    ///
+    /// Goes through [`crop_screenshot_neutral`] like the screen path, with the whole buffer as the
+    /// "crop": one composite routine, so the pointer blends the same way in both modes.
+    fn capture_window_from_neutral(&self) -> Option<(Size<i32, Physical>, Vec<u8>)> {
+        let Self::Open {
+            output_data,
+            show_pointer,
+            selected_window,
+            ..
+        } = self
+        else {
+            return None;
+        };
+
+        let (output, id) = selected_window.as_ref()?;
+        let data = output_data.get(output)?;
+        let shot = data.windows.iter().find(|w| w.id == *id)?;
+
+        let size = shot.neutral.size();
+        let rect = Rectangle::from_size(Size::<i32, Physical>::from((size.w, size.h)));
+
+        // The pointer neutral's location is output-local logical; the window buffer's origin is
+        // the window's own. `rect` is the whole buffer, so shift the pointer into buffer space by
+        // the window's on-screen origin.
+        let scale = Scale::from(data.scale);
+        let pointer = show_pointer
+            .then(|| data.screenshot[0].pointer.as_ref())
+            .flatten()
+            .map(|(ptr, loc)| {
+                let loc = (*loc - shot.rect.loc).to_physical_precise_round(scale);
+                (ptr, loc)
+            });
+
+        Some((
+            rect.size,
+            crop_screenshot_neutral(&shot.neutral, rect, pointer),
+        ))
     }
 
     pub fn action(&self, raw: Keysym, mods: ModifiersState) -> Option<Action> {
@@ -1100,20 +1341,29 @@ impl ScreenshotUi {
         let Self::Open {
             selection,
             output_data,
+            capture_type,
             hover,
+            hovered_window,
             ..
         } = self
         else {
             return false;
         };
 
-        let new = output_data
-            .get(&selection.0)
-            .and_then(|data| data.control_at(point));
-        if *hover == new {
+        let data = output_data.get(&selection.0);
+        let new = data.and_then(|data| data.control_at(point));
+        // The panel sits above the selector, so a control under the pointer wins the hover — the
+        // window behind it must not light up too.
+        let new_window = (*capture_type == CaptureType::Window && new.is_none())
+            .then(|| data.and_then(|data| data.window_at(point)))
+            .flatten()
+            .map(|id| (selection.0.clone(), id));
+
+        if *hover == new && *hovered_window == new_window {
             return false;
         }
         *hover = new;
+        *hovered_window = new_window;
         true
     }
 
@@ -1128,6 +1378,7 @@ impl ScreenshotUi {
             selection,
             output_data,
             capture_type,
+            selected_window,
             button,
             ..
         } = self
@@ -1187,6 +1438,25 @@ impl ScreenshotUi {
             };
             // A control lights up while held, so the caller still owes a redraw.
             return true;
+        }
+
+        // In Window mode a press outside the panel is a window pick, not a drag.
+        if *capture_type == CaptureType::Window {
+            let picked = output_data.window_at(point);
+            *button = Button::Down {
+                touch_slot: slot,
+                on_control: None,
+                last_pos: (output.clone(), point),
+                move_state: None,
+            };
+            if let Some(id) = picked {
+                // GNOME checks on release, but it also unchecks every other window at once — the
+                // selection is single-valued, so assigning it is the whole operation
+                // (`screenshot.js:1643-1658`).
+                *selected_window = Some((output, id));
+                return true;
+            }
+            return false;
         }
 
         *button = Button::Down {
@@ -1414,6 +1684,18 @@ impl OutputData {
         };
     }
 
+    /// The window whose selector slot contains an output-local **physical** point.
+    ///
+    /// Slots do not overlap (the layout packs them into rows), so first-hit is unambiguous. Tested
+    /// against the slot rather than the thumbnail: a window with a large shadow margin draws
+    /// smaller than its slot, and GNOME's button — which is what is reactive — is the slot.
+    fn window_at(&self, point: Point<i32, Physical>) -> Option<u64> {
+        let p = point.to_f64().to_logical(self.scale);
+        zip(&self.windows, &self.slots)
+            .find(|(_, slot)| slot.contains(p))
+            .map(|(shot, _)| shot.id)
+    }
+
     /// The panel's on-screen rect in output-logical px, or `None` before the first bake.
     fn panel_rect_logical(&self) -> Option<Rectangle<f64, Logical>> {
         let cache = self.panel.borrow();
@@ -1470,6 +1752,91 @@ impl OutputData {
                 Kind::Unspecified,
             ),
         ))
+    }
+
+    /// The Window-mode selector: an opaque backdrop, then every frozen window at its slot with a
+    /// border that tints on hover and on selection.
+    ///
+    /// Elements are pushed front-to-back (the first pushed composites on top), so each window's
+    /// border goes before its thumbnail and the backdrop goes last.
+    fn push_window_selector(
+        &self,
+        renderer: &mut VulkanRenderer,
+        accent: Rgba,
+        alpha: f32,
+        selected: Option<u64>,
+        hovered: Option<u64>,
+        push: &mut dyn FnMut(ScreenshotUiRenderElement),
+    ) {
+        for (shot, slot) in zip(&self.windows, &self.slots) {
+            // The thumbnail keeps the window's aspect: `compute_slots` already sized the slot from
+            // that rect, so filling the slot is right — but a zero-sized window would divide by
+            // zero on the way there.
+            if slot.size.w <= 0. || slot.size.h <= 0. {
+                continue;
+            }
+
+            if let Some(elem) = shot.element(renderer, *slot, alpha) {
+                push(ScreenshotUiRenderElement::Screenshot(elem));
+            }
+
+            let state = if selected == Some(shot.id) {
+                SelectorBorder::Checked
+            } else if hovered == Some(shot.id) {
+                SelectorBorder::Hovered
+            } else {
+                continue;
+            };
+            if let Some(elem) = self.selector_border_element(renderer, *slot, state, accent, alpha)
+            {
+                push(ScreenshotUiRenderElement::Screenshot(elem));
+            }
+        }
+
+        // The backdrop, over the frozen screen and under everything above.
+        let size = self.size.to_f64().to_logical(self.scale);
+        let buffer = SolidColorBuffer::new(size, SELECTOR_BG);
+        push(
+            SolidColorRenderElement::from_buffer(&buffer, (0., 0.), alpha, Kind::Unspecified)
+                .into(),
+        );
+    }
+
+    /// One window's selection border, baked at the slot's size. Not cached: a slot size is
+    /// per-window and only changes when the picker reopens, and the two tints differ per window.
+    fn selector_border_element(
+        &self,
+        renderer: &mut VulkanRenderer,
+        slot: Rectangle<f64, Logical>,
+        state: SelectorBorder,
+        accent: Rgba,
+        alpha: f32,
+    ) -> Option<CapturedTextureRenderElement> {
+        let scale = self.scale;
+        // The border sits *outside* the thumbnail, as GNOME's does (`vfunc_allocate` grows the
+        // border box by the border width on every side, `js/ui/screenshot.js:902-909`).
+        let outer = Rectangle::new(
+            slot.loc - Point::from((SELECTOR_BORDER, SELECTOR_BORDER)),
+            Size::from((
+                slot.size.w + SELECTOR_BORDER * 2.,
+                slot.size.h + SELECTOR_BORDER * 2.,
+            )),
+        );
+        let size = widget::physical_size(scale, outer.size);
+        let texture = widget::bake_uncached_sized(renderer, size, |frame| {
+            let mut p = Painter::new(frame, scale, size);
+            p.clear(style::TRANSPARENT)?;
+            let (border, fill) = state.colors(accent);
+            if let Some(fill) = fill {
+                p.fill_rounded_full(SELECTOR_RADIUS + SELECTOR_BORDER, fill)?;
+            }
+            p.stroke_rounded_full(SELECTOR_RADIUS + SELECTOR_BORDER, SELECTOR_BORDER, border)?;
+            Ok(())
+        })
+        .map_err(|err| warn!("error rendering the window selector border: {err:?}"))
+        .ok()?;
+
+        Some(self.texture_element(renderer, texture, outer.loc, alpha))
     }
 
     /// The panel element, or `None` if it hasn't been built (see [`Self::ensure_panel`]).
@@ -1529,6 +1896,7 @@ impl OutputData {
         icons: &IconCache,
         origin: Point<f64, Logical>,
         alpha: f32,
+        state: PanelState,
         push: &mut dyn FnMut(ScreenshotUiRenderElement),
     ) {
         let Some(layout) = self.panel.borrow().layout else {
@@ -1555,14 +1923,11 @@ impl OutputData {
         };
 
         for (i, ty) in CaptureType::ROW.iter().enumerate() {
-            if !ty.is_available() {
-                continue;
-            }
             let button = widget::IconLabelButton::new(layout.type_buttons[i]);
             icon(
                 ty.icon(),
                 widget::IconLabelButton::ICON_PX,
-                style::OSD_FG,
+                type_fg(state.enables(*ty)),
                 origin,
                 button.icon_centre(),
             );
@@ -1759,14 +2124,6 @@ impl CaptureType {
             CaptureType::Window => "Window",
         }
     }
-
-    /// Whether the mode is offered yet. `Window` is built and laid out but not drawn — **our**
-    /// scaffolding, not GNOME's practice: GNOME never hides `_windowButton` (it hides the *cast*
-    /// button, and on a runtime capability, `screenshot.js:1524`). Delete this the moment slice 2
-    /// lands rather than growing more callers.
-    pub fn is_available(self) -> bool {
-        self != CaptureType::Window
-    }
 }
 
 /// A clickable control in the panel. The panel is one baked texture, so hit-testing is geometry
@@ -1825,14 +2182,9 @@ impl PanelLayout {
         let type_sizes = label_w.map(|w| widget::IconLabelButton::size(w, label_h));
 
         // `homogeneous: true` (`screenshot.js:1300`) — every type button is as wide as the widest.
-        // Homogeneous over *all three* labels, including the one Window mode is not offering yet:
-        // the row must not resize when slice 2 unhides that button.
         let type_w = type_sizes.iter().fold(0f64, |acc, s| acc.max(s.w));
         let type_h = type_sizes.iter().fold(0f64, |acc, s| acc.max(s.h));
-        // A hidden button takes no space, so the row is as wide as what is actually drawn — a
-        // reserved empty slot would leave the panel visibly lopsided while Window is out.
-        let shown = CaptureType::ROW.iter().filter(|t| t.is_available()).count();
-        let type_row_w = type_w * shown as f64 + Self::TYPE_SPACING * (shown as f64 - 1.).max(0.);
+        let type_row_w = type_w * 3. + Self::TYPE_SPACING * 2.;
 
         let shot_cast_size = widget::Segmented::size(1);
         let show_pointer_d =
@@ -1854,17 +2206,13 @@ impl PanelLayout {
         ));
 
         let type_y = Self::PAD;
-        let mut type_x = Self::PAD + (content_w - type_row_w) / 2.;
-        let mut type_buttons = [Rectangle::default(); 3];
-        for (i, ty) in CaptureType::ROW.iter().enumerate() {
-            if !ty.is_available() {
-                // A zero rect, so it draws nothing and `contains` can never match it.
-                continue;
-            }
-            type_buttons[i] =
-                Rectangle::new(Point::from((type_x, type_y)), Size::from((type_w, type_h)));
-            type_x += type_w + Self::TYPE_SPACING;
-        }
+        let type_x0 = Self::PAD + (content_w - type_row_w) / 2.;
+        let type_buttons = [0usize, 1, 2].map(|i| {
+            Rectangle::new(
+                Point::from((type_x0 + (type_w + Self::TYPE_SPACING) * i as f64, type_y)),
+                Size::from((type_w, type_h)),
+            )
+        });
 
         let bottom_y = Self::PAD + type_h + Self::ROW_SPACING;
         // Centre each child on the band, then align it start / centre / end.
@@ -1916,7 +2264,7 @@ impl PanelLayout {
             return Some(Control::ShowPointer);
         }
         for (i, ty) in CaptureType::ROW.iter().enumerate() {
-            if ty.is_available() && self.type_buttons[i].contains(p) {
+            if self.type_buttons[i].contains(p) {
                 return Some(Control::Type(*ty));
             }
         }
@@ -1927,6 +2275,61 @@ impl PanelLayout {
             }
         }
         None
+    }
+}
+
+/// `.screenshot-ui-window-selector-window-container { margin: 100px }`, with `margin-bottom:
+/// 200px` on the monitor carrying the panel — "make some room for the panel" (`_screenshot.scss:
+/// 142-151`). We draw the panel on every output, so every output gets the taller bottom margin.
+const SELECTOR_MARGIN: f64 = 100.;
+const SELECTOR_MARGIN_BOTTOM: f64 = 200.;
+
+/// The area the Window-mode selector may lay windows out in, given the output's logical size.
+fn window_selector_area(output: Size<f64, Logical>) -> Rectangle<f64, Logical> {
+    Rectangle::new(
+        Point::from((SELECTOR_MARGIN, SELECTOR_MARGIN)),
+        Size::from((
+            f64::max(output.w - SELECTOR_MARGIN * 2., 1.),
+            f64::max(output.h - SELECTOR_MARGIN - SELECTOR_MARGIN_BOTTOM, 1.),
+        )),
+    )
+}
+
+/// `.screenshot-ui-window-selector { background-color: $system_base_color }`
+/// (`_screenshot.scss:140`) — `$system_base_color` is `#26262a` (`_colors.scss:46`). Window mode
+/// hides the frozen screen behind an opaque backdrop rather than shading it, so a window that is
+/// not offered cannot be read off the wallpaper behind the selector.
+const SELECTOR_BG: [f32; 4] = [0.149, 0.149, 0.165, 1.];
+
+/// `.screenshot-ui-window-selector-window-border { border: 6px transparent; border-radius:
+/// $modal_radius }` (`_screenshot.scss:154-158`), tinted on hover/checked by
+/// `_screenshot.scss:168-184`.
+const SELECTOR_BORDER: f64 = 6.;
+const SELECTOR_RADIUS: f64 = 16.;
+
+/// A window-selector border's state (`_screenshot.scss:168-184`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectorBorder {
+    /// `:hover` — `st-darken(-st-accent-color, 15%)`, border only.
+    Hovered,
+    /// `:checked` — the accent border plus an accent wash at 20%.
+    Checked,
+}
+
+impl SelectorBorder {
+    /// `(border, fill)` for this state.
+    fn colors(self, accent: Rgba) -> (Rgba, Option<Rgba>) {
+        match self {
+            Self::Hovered => (
+                [accent[0] * 0.85, accent[1] * 0.85, accent[2] * 0.85, 1.],
+                None,
+            ),
+            Self::Checked => (
+                accent,
+                // `background-color: st-transparentize(-st-accent-color, 0.8)`.
+                Some([accent[0], accent[1], accent[2], 0.2]),
+            ),
+        }
     }
 }
 
@@ -2091,20 +2494,18 @@ fn generate_panel(
         p.stroke_rounded_full(PANEL_RADIUS, 1., PANEL_BORDER_COLOR)?;
 
         for (i, ty) in CaptureType::ROW.iter().enumerate() {
-            if !ty.is_available() {
-                continue;
-            }
             let control = Control::Type(*ty);
+            let enabled = state.enables(*ty);
             let button = widget::IconLabelButton::new(layout.type_buttons[i])
                 .checked(state.capture_type == *ty)
-                .hovered(state.hover == Some(control))
-                .active(state.active == Some(control));
+                .hovered(enabled && state.hover == Some(control))
+                .active(enabled && state.active == Some(control));
             p.icon_label_button(&button, accent)?;
             p.text(
                 &captions[i],
                 button.label_centre(label_h),
                 Align::CENTER,
-                style::OSD_FG,
+                type_fg(enabled),
             )?;
         }
 
@@ -2213,52 +2614,26 @@ mod tests {
     fn the_type_buttons_are_homogeneous_and_evenly_spaced() {
         let l = layout();
 
-        let shown: Vec<_> = CaptureType::ROW
-            .iter()
-            .enumerate()
-            .filter(|(_, ty)| ty.is_available())
-            .map(|(i, _)| l.type_buttons[i])
-            .collect();
-        assert!(shown.len() >= 2, "the row needs two buttons to be a row");
-
-        let w = shown[0].size.w;
-        for b in &shown {
+        let w = l.type_buttons[0].size.w;
+        for b in &l.type_buttons {
             assert_eq!(b.size.w, w);
-            assert_eq!(b.size.h, shown[0].size.h);
+            assert_eq!(b.size.h, l.type_buttons[0].size.h);
             assert_eq!(b.loc.y, PanelLayout::PAD);
         }
-        for pair in shown.windows(2) {
+        for pair in l.type_buttons.windows(2) {
             assert_eq!(pair[1].loc.x - pair[0].loc.x, w + PanelLayout::TYPE_SPACING);
         }
 
-        // The widest caption sets the width — including Window's, which is *not* drawn yet. Sizing
-        // the row from only the visible captions would make it jump the day slice 2 unhides that
-        // button, which is exactly the jitter `homogeneous: true` exists to prevent.
+        // The widest caption sets the width, not the first one.
         let widest = LABEL_W.iter().cloned().fold(0f64, f64::max);
         assert_eq!(w, widget::IconLabelButton::size(widest, LABEL_H).w);
-        assert_eq!(
-            widest, LABEL_W[2],
-            "this assertion is only meaningful while Window has the widest caption"
-        );
-    }
 
-    // A hidden button must take no space, or the panel sits visibly lopsided around a gap nobody
-    // can see. (It must also take no clicks — that is
-    // `the_unavailable_window_button_does_not_take_clicks`.)
-    #[test]
-    fn the_hidden_window_button_occupies_no_room() {
-        let l = layout();
-
-        let window = l.type_buttons[2];
-        assert_eq!(window.size, Size::from((0., 0.)));
-
-        // The row is exactly the two drawn buttons plus one gap, centred on the panel.
-        let drawn = l.type_buttons[1].loc.x + l.type_buttons[1].size.w - l.type_buttons[0].loc.x;
+        // The row is centred on the panel.
         let left = l.type_buttons[0].loc.x;
-        let right = l.size.w - (l.type_buttons[1].loc.x + l.type_buttons[1].size.w);
+        let right = l.size.w - (l.type_buttons[2].loc.x + l.type_buttons[2].size.w);
         assert!(
             (left - right).abs() < 0.001,
-            "type row is off-centre: {left} left, {right} right (row {drawn})"
+            "type row is off-centre: {left} left, {right} right"
         );
     }
 
@@ -2281,21 +2656,19 @@ mod tests {
         assert_ne!(l.control_at(corner), Some(Control::Capture));
     }
 
-    // Window mode is laid out but not offered yet, and a button nobody can see must not be
-    // clickable — an invisible hit region that silently switches modes is worse than no button.
+    // Every type button is hit-testable, Window included: GNOME keeps it visible and greys it
+    // out when there is nothing to pick, rather than removing it. Whether the click *does*
+    // anything is `ScreenshotUi::set_capture_type`'s call, not the layout's — see
+    // `the_window_button_is_inert_without_windows` in the corpus.
     #[test]
-    fn the_unavailable_window_button_does_not_take_clicks() {
+    fn every_type_button_takes_clicks_at_its_own_centre() {
         let l = layout();
 
-        let centre_of = |i: usize| centre(l.type_buttons[i]);
-        assert_eq!(
-            l.control_at(centre_of(0)),
-            Some(Control::Type(CaptureType::Selection))
-        );
-        assert_eq!(
-            l.control_at(centre_of(1)),
-            Some(Control::Type(CaptureType::Screen))
-        );
-        assert_eq!(l.control_at(centre_of(2)), None);
+        for (i, ty) in CaptureType::ROW.iter().enumerate() {
+            assert_eq!(
+                l.control_at(centre(l.type_buttons[i])),
+                Some(Control::Type(*ty))
+            );
+        }
     }
 }

@@ -12526,3 +12526,132 @@ fn vulkan_screenshot_from_quick_settings_does_not_freeze_the_menu_into_the_shot(
         "the quick-settings menu is in the frozen screen ({menu_px} of {area} px in {menu:?})"
     );
 }
+
+/// Window mode picks from windows frozen at open, and the selector draws them where it says they
+/// are.
+///
+/// Two things this pins that nothing else does. First, the picker's Window mode captures each
+/// window **at open** (`UIWindowSelector.capture`, `js/ui/screenshot.js:1062-1094`) — so it never
+/// depends on the window still being there, or still showing what it showed. Second, the selector
+/// slots come from the exposé layout while the hit test reads the same slots: one shared vector,
+/// like the panel's `PanelLayout`, and this is what fails if they ever part ways.
+#[test]
+fn vulkan_screenshot_ui_window_mode_picks_a_frozen_window() {
+    let Some((mut f, id, surface)) = window_fixture_with_client(GREEN, true, None) else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = output.current_scale().fractional_scale();
+
+    f.niri_state().open_screenshot_ui(false, None);
+    // Recolour the live window red *after* the picker froze it. Every green pixel below therefore
+    // came from the frozen capture, and any red would mean Window mode read the live window —
+    // which is the whole difference between this and `screenshot_window`.
+    recolor_window(&mut f, id, &surface, RED);
+    settle_screenshot_ui_open(&mut f);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    assert!(
+        f.niri().screenshot_ui.any_windows(),
+        "the fixture's window must reach the selector, or the Window button stays insensitive"
+    );
+
+    // The focused window is picked up front, so the selector opens on something.
+    let (_, selected) = f
+        .niri()
+        .screenshot_ui
+        .selected_window()
+        .expect("the selector must open with the focused window checked");
+
+    // Switch to Window mode by clicking its type button, at the coordinates the layout publishes.
+    let panel = f.niri().screenshot_ui.panel_rect(&output).unwrap();
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let window_button = layout.type_buttons[2];
+    let point = Point::<f64, Logical>::from((
+        window_button.loc.x + window_button.size.w / 2.,
+        window_button.loc.y + window_button.size.h / 2.,
+    ))
+    .to_physical(scale)
+    .to_i32_round::<i32>()
+        + panel.loc;
+
+    {
+        let ui = &mut f.niri_state().niri.screenshot_ui;
+        ui.pointer_motion(point, None);
+        ui.pointer_down(output.clone(), point, None, false);
+        assert_eq!(ui.pointer_up(None), Some(PointerUp::Redraw));
+        assert_eq!(
+            ui.capture_type(),
+            CaptureType::Window,
+            "the Window button must switch modes now that there is a window to pick"
+        );
+    }
+
+    let (size, pixels) = f
+        .niri()
+        .screenshot_ui
+        .capture_from_neutral()
+        .expect("Window mode must capture the selected window");
+    assert!(size.w > 0 && size.h > 0, "empty window capture: {size:?}");
+
+    let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
+    let is_red = |p: [u8; 4]| p[0] > 200 && p[1] < 40 && p[2] < 40;
+    let count = |pred: &dyn Fn([u8; 4]) -> bool| {
+        (0..size.w * size.h)
+            .filter(|i| pred(px(&pixels, size.w, i % size.w, i / size.w)))
+            .count()
+    };
+    let (green, red) = (count(&is_green), count(&is_red));
+    eprintln!(
+        "vulkan_screenshot_ui_window_mode_picks_a_frozen_window: window {selected}, \
+         {size:?}, {green} green px, {red} red px"
+    );
+    assert!(
+        green > 1000,
+        "the window capture is not the green window ({green} green px in {size:?})"
+    );
+    assert!(
+        red < 100,
+        "Window mode captured the live (recoloured) window, not the one frozen at open \
+         ({red} red px)"
+    );
+}
+
+/// With no windows, the Window button must not switch modes.
+///
+/// GNOME keeps the button *visible* and drops its `reactive` (`_syncWindowButtonSensitivity`,
+/// `js/ui/screenshot.js:1529-1536`), so it still occupies the row — a button that vanished would
+/// reflow the panel every time the last window closed. What must not happen is a mode with nothing
+/// in it: Window mode with an empty selector captures nothing at all.
+#[test]
+fn vulkan_screenshot_ui_window_button_is_inert_without_windows() {
+    if VulkanRenderer::new().is_err() {
+        eprintln!("skipping: no Vulkan device");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.niri_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (OUT_W, OUT_H));
+    f.niri().update_render_elements(None);
+
+    let output = f.niri_output(1);
+    f.niri_state().open_screenshot_ui(false, None);
+    settle_screenshot_ui_open(&mut f);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    assert!(!f.niri().screenshot_ui.any_windows());
+    assert!(f.niri().screenshot_ui.selected_window().is_none());
+
+    let ui = &mut f.niri_state().niri.screenshot_ui;
+    ui.set_capture_type(CaptureType::Window);
+    assert_eq!(
+        ui.capture_type(),
+        CaptureType::Selection,
+        "Window mode must refuse to engage with nothing to select"
+    );
+}

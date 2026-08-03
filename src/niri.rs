@@ -3430,6 +3430,12 @@ impl State {
         // The captures are already taken, so opening the UI must not depend on a renderer being
         // available here, or it would silently never open.
         let screenshots = self.niri.capture_screenshots(vk_neutrals).collect();
+        // Every window on every active workspace, frozen the same way — Window mode picks from
+        // these, not from live windows.
+        let window_shots = self
+            .backend
+            .with_vulkan_renderer(|vk| self.niri.capture_screenshot_window_neutrals(vk))
+            .unwrap_or_default();
 
         // Now that we captured the screenshots, clear grabs like drag-and-drop, etc.
         self.niri.seat.get_pointer().unwrap().unset_grab(
@@ -3441,9 +3447,15 @@ impl State {
             touch.unset_grab(self);
         }
 
-        self.niri
-            .screenshot_ui
-            .open(screenshots, default_output, show_pointer, path);
+        let focused_window = self.niri.layout.focus().map(|mapped| mapped.id().get());
+        self.niri.screenshot_ui.open(
+            screenshots,
+            window_shots,
+            default_output,
+            show_pointer,
+            focused_window,
+            path,
+        );
 
         self.niri
             .cursor_manager
@@ -10291,6 +10303,55 @@ impl Niri {
                 });
 
                 (output, neutrals)
+            })
+            .collect()
+    }
+
+    /// Freeze every window on every output's active workspace, for the picker's Window mode.
+    ///
+    /// GNOME captures each window's content **at open** and selects from those frozen copies
+    /// (`UIWindowSelector.capture`, `js/ui/screenshot.js:1062-1094`) — so what you pick is what you
+    /// saw when you opened the picker, not whatever the window has drawn since. Captured through
+    /// `RenderTarget::ScreenCapture`, which is what applies the block-out rules: a window that must
+    /// not be captured must not become visible in a selector either.
+    pub fn capture_screenshot_window_neutrals(
+        &self,
+        renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
+    ) -> std::collections::HashMap<Output, Vec<crate::ui::screenshot_ui::WindowShot>> {
+        let _span = tracy_client::span!("Niri::capture_screenshot_window_neutrals");
+
+        self.global_space
+            .outputs()
+            .cloned()
+            .map(|output| {
+                let scale = output.current_scale().fractional_scale();
+                let shots = self
+                    .layout
+                    .active_workspace_windows_for_output(&output)
+                    .into_iter()
+                    .filter_map(|(mapped, rect)| {
+                        let id = mapped.id().get();
+                        // No pointer in the capture: it is composited at save time from the
+                        // output's own pointer neutral, so the show-pointer toggle keeps working
+                        // after the freeze instead of being baked in here.
+                        let (size, pixels) = self
+                            .render_window_to_pixels(renderer, &output, mapped, false)
+                            .map_err(|err| {
+                                warn!("error capturing window {id} for the picker: {err:?}")
+                            })
+                            .ok()?;
+                        let neutral = MemoryBuffer::new(
+                            pixels,
+                            Fourcc::Abgr8888,
+                            Size::from((size.w, size.h)),
+                            Scale::from(scale),
+                            Transform::Normal,
+                        );
+                        Some(crate::ui::screenshot_ui::WindowShot::new(id, rect, neutral))
+                    })
+                    .collect();
+
+                (output, shots)
             })
             .collect()
     }

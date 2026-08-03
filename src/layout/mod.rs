@@ -1678,6 +1678,29 @@ impl<W: LayoutElement> Layout<W> {
         Some(&mut mon.workspaces[mon.active_workspace_idx])
     }
 
+    /// Every window on `output`'s **active** workspace with its output-local logical rect, front
+    /// to back.
+    ///
+    /// The screenshot UI's window selector. GNOME filters the same three ways — not
+    /// override-redirect, on the active workspace, on this monitor (`UIWindowSelector.capture`,
+    /// `js/ui/screenshot.js:1063-1071`) — and feeds the rects to the same layout strategy the
+    /// overview uses, which is [`expose::compute_slots`] here too.
+    ///
+    /// Distinct from [`Self::windows_for_output`], which spans *every* workspace on the monitor:
+    /// a selector offering windows from a workspace you cannot see would be a menu of surprises.
+    pub fn active_workspace_windows_for_output(
+        &self,
+        output: &Output,
+    ) -> Vec<(&W, Rectangle<f64, Logical>)> {
+        let Some(mon) = self.monitor_for_output(output) else {
+            return Vec::new();
+        };
+        let ws = &mon.workspaces[mon.active_workspace_idx];
+        ws.tiles_with_render_positions()
+            .map(|(tile, pos, _)| (tile.window(), Rectangle::new(pos, tile.tile_size())))
+            .collect()
+    }
+
     pub fn windows_for_output(&self, output: &Output) -> impl Iterator<Item = &W> + '_ {
         let MonitorSet::Normal { monitors, .. } = &self.monitor_set else {
             panic!()
