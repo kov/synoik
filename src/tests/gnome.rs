@@ -2496,29 +2496,31 @@ fn overview_workspace_fills_its_allocated_picker_box() {
     tap(&mut f, KEY_LEFTMETA);
     f.niri_complete_animations();
 
-    // Two workspaces (active + trailing empty) is at the strip threshold, so no
-    // thumbnails band is reserved. Work area 1048 tall ⇒ spacing round(20.96) = 21,
-    // round(21·0.6) = 13 above the (zero-height) band. The search entry floats
-    // (approved divergence), so it costs the picker nothing:
-    //   y = 32 + 13                            = 45
-    //   h = 1048 − 112(dash) − 21 − 13        = 902
+    // The thumbnails band is always reserved (divergence, see
+    // `docs/fork/dynamic-workspaces-divergence.md`), and one thumbnail is the app-grid
+    // row's workspace height. Work area 1048 tall ⇒ spacing round(20.96) = 21,
+    // round(21·0.6) = 13 above the band, thumbs round(1048·0.15) = 157,
+    // round(21·1.2) = 25 below it. The search entry floats (approved divergence), so it
+    // costs the picker nothing:
+    //   y = 32 + 13 + 157 + 25                     = 227
+    //   h = 1048 − 112(dash) − 21 − 13 − 157 − 25 = 720
     let controls = overview_controls(&mut f);
-    assert_eq!(controls.workspaces.loc.y, 45.);
-    assert_eq!(controls.workspaces.size.h, 902.);
+    assert_eq!(controls.workspaces.loc.y, 227.);
+    assert_eq!(controls.workspaces.size.h, 720.);
 
     // The row is fit by height into that box, and centered on what width is left.
-    let zoom: f64 = 902. / 1080.;
-    let ws_w = (1920. * zoom).ceil(); // 1599
-    let offset_x = ((1920. - ws_w) / 2.).round(); // 161
+    let zoom: f64 = 720. / 1080.;
+    let ws_w = (1920. * zoom).ceil();
+    let offset_x = ((1920. - ws_w) / 2.).round();
 
     // Workspace-local slot (see expose::tests): 760 × 570 centered in the picker's area,
     // which is the work area symmetrized about the view — the 32px panel strut is applied
     // at both edges, giving 1920×1016 at y = 32, so the slot sits at
-    // (580, 32 + (1016−570)/2) = (580, 255), scaled into the picker box at y = 45.
+    // (580, 32 + (1016−570)/2) = (580, 255), scaled into the picker box at y = 227.
     let rect = f.niri().layout.expose_target_rect(&win).unwrap();
     assert_pos_eq(
         (rect.loc.x, rect.loc.y),
-        (offset_x + 580. * zoom, 45. + 255. * zoom),
+        (offset_x + 580. * zoom, 227. + 255. * zoom),
         "picker slot must sit in the allocated window-picker box",
     );
     assert!(
@@ -2895,12 +2897,14 @@ fn overview_thumbnail_strip_fills_its_allocated_band() {
     );
 }
 
-/// The collapse direction eases too, and the strip stays drawn until the band is
-/// actually gone: emptying the second desktop takes the workspace count back
-/// under the threshold, and the picker must grow into the band continuously
-/// rather than snapping the zoom out from under the previews.
+/// The thumbnails band is reserved whatever the workspace count (divergence, see
+/// `docs/fork/dynamic-workspaces-divergence.md`), so the picker box — and the workspace
+/// zoom derived from it — no longer moves when a second desktop is populated or emptied.
+/// gnome-shell instead crosses `NUM_WORKSPACES_THRESHOLD` here and eases
+/// `ThumbnailsBox.expandFraction` (`overviewControls.js:358-366`); there is nothing left
+/// to ease, and this pins that the box really is unmoved rather than merely un-animated.
 #[test]
-fn overview_picker_grows_smoothly_when_the_strip_collapses() {
+fn overview_picker_box_does_not_move_with_the_workspace_count() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
@@ -2911,91 +2915,39 @@ fn overview_picker_grows_smoothly_when_the_strip_collapses() {
     tap(&mut f, KEY_LEFTMETA);
     f.settle_animations();
 
-    // Populate a second desktop and let the band settle in. The ease is armed on
-    // the frame after the count changes, so advance once before settling.
+    // One populated desktop plus the trailing empty: the band is already there.
+    let one = overview_controls(&mut f).workspaces;
+    assert_eq!((one.loc.y, one.size.h), (227., 720.));
+
+    // Populate a second desktop. Sample mid-transition too: an eased band would be
+    // caught here, and a popped one would show a different box on the next frame.
     f.niri().layout.move_to_workspace_down(true);
     f.niri().advance_animations();
-    f.settle_animations();
-    let expanded = overview_controls(&mut f).workspaces;
-    assert_eq!((expanded.loc.y, expanded.size.h), (227., 720.));
+    {
+        let niri = f.niri();
+        let now = niri.clock.now_unadjusted();
+        niri.clock.set_unadjusted(now + Duration::from_millis(60));
+        niri.advance_animations();
+    }
+    let mid = overview_controls(&mut f).workspaces;
+    assert_eq!((mid.loc.y, mid.size.h), (227., 720.));
 
-    // Back to one populated desktop: the emptied workspace is only reaped once the
-    // switch settles, and the collapse ease arms on that frame.
+    f.settle_animations();
+    let two = overview_controls(&mut f).workspaces;
+    assert_eq!((two.loc.y, two.size.h), (227., 720.));
+
+    // …and back. The emptied desktop is not reaped, so this is now three workspaces.
     f.niri().layout.move_to_workspace_up(true);
     f.settle_animations();
-    {
-        let niri = f.niri();
-        let now = niri.clock.now_unadjusted();
-        niri.clock.set_unadjusted(now + Duration::from_millis(60));
-        niri.advance_animations();
-    }
+    let back = overview_controls(&mut f).workspaces;
+    assert_eq!((back.loc.y, back.size.h), (227., 720.));
 
-    let mid = overview_controls(&mut f).workspaces;
-    assert!(
-        mid.size.h > expanded.size.h && mid.size.h < 899.,
-        "mid-collapse picker height must be between the two rest states, got {}",
-        mid.size.h
-    );
-    // The strip is still drawn while the band is shrinking — dropping it the
-    // instant the count changes would leave a hole over the still-reserved band.
     let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let mon = mon.expect("workspaces must be on a monitor");
     assert!(
-        mon.expect("workspaces must be on a monitor")
-            .thumbnails_visible(),
-        "the strip must stay visible until the expand fraction reaches zero"
+        mon.thumbnails_visible(),
+        "the strip is shown at every count while the overview is open"
     );
-
-    f.settle_animations();
-    let collapsed = overview_controls(&mut f).workspaces;
-    assert_eq!((collapsed.loc.y, collapsed.size.h), (45., 902.));
-    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
-    assert!(!mon.unwrap().thumbnails_visible());
-}
-
-/// The picker box contains the thumbnails band, so the workspace zoom depends on
-/// whether the strip is showing. Crossing the strip threshold happens *inside*
-/// the overview (drag a window onto the trailing empty desktop), so gnome-shell
-/// eases `ThumbnailsBox.expandFraction` (`overviewControls.js:358-366`) and the
-/// picker follows continuously instead of popping.
-#[test]
-fn overview_picker_shrinks_smoothly_when_the_strip_expands() {
-    let mut f = Fixture::new();
-    f.add_output(1, (1920, 1080));
-    let id = f.add_client();
-    let _w = map_window_sized(&mut f, id, (800, 600), None);
-
-    tap(&mut f, KEY_LEFTMETA);
-    f.settle_animations();
-
-    // Two workspaces: no band, so the picker has the whole space.
-    let collapsed = overview_controls(&mut f).workspaces;
-    assert_eq!(collapsed.size.h, 902.);
-
-    // Populate a second desktop, which brings the strip in. The ease starts on
-    // the next frame, so advance once to arm it and once more to sample it.
-    f.niri().layout.move_to_workspace_down(true);
-    f.niri().advance_animations();
-
-    // Mid-expand the picker must be strictly between the two resting boxes —
-    // never at either end, which is what a popped (un-eased) flip would give.
-    {
-        let niri = f.niri();
-        let now = niri.clock.now_unadjusted();
-        niri.clock.set_unadjusted(now + Duration::from_millis(60));
-        niri.advance_animations();
-    }
-    let mid = overview_controls(&mut f).workspaces;
-    assert!(
-        mid.size.h < collapsed.size.h && mid.size.h > 779.,
-        "mid-expand picker height must be between the two rest states, got {}",
-        mid.size.h
-    );
-    assert!(mid.loc.y > collapsed.loc.y && mid.loc.y < 168.);
-
-    // Settled: the band is fully reserved (54 tall, plus round(21 × 0.4) = 8 below).
-    f.settle_animations();
-    let expanded = overview_controls(&mut f).workspaces;
-    assert_eq!((expanded.loc.y, expanded.size.h), (227., 720.));
 }
 
 /// GNOME overview click semantics (gnome-shell Workspace click): clicking a
@@ -3686,35 +3638,46 @@ fn overview_a_short_thumbnail_press_still_activates_the_workspace() {
     );
 }
 
-/// gnome-shell's ThumbnailsBox visibility rule with dynamic workspaces: the
-/// strip appears only once there are more than two workspaces, i.e. once a
-/// second desktop is populated.
+/// **Divergence** (`docs/fork/dynamic-workspaces-divergence.md`): the strip is shown at
+/// every workspace count. gnome-shell's `ThumbnailsBox._updateShouldShow`
+/// (`workspaceThumbnail.js:697-706`) hides it at or below `NUM_WORKSPACES_THRESHOLD`, so
+/// with dynamic workspaces it only appears once a second desktop is populated. The strip
+/// is the desktop switcher; one that comes and goes is not one you can aim at.
 #[test]
-fn thumbnail_strip_appears_once_second_desktop_is_populated() {
+fn thumbnail_strip_is_shown_at_every_workspace_count() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
-
-    let _a = map_window_sized(&mut f, id, (800, 600), None);
-    tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
 
     let visible = |f: &mut Fixture| {
         let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
         mon.unwrap().thumbnails_visible()
     };
+    let count = |f: &mut Fixture| {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        mon.unwrap().workspace_count()
+    };
+
+    // A bare session: MIN_NUM_WORKSPACES empties, and the strip already showing.
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert_eq!(count(&mut f), 2, "a fresh monitor shows two desktops");
+    assert!(visible(&mut f), "an empty session must show the strip");
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    let _a = map_window_sized(&mut f, id, (800, 600), None);
+    tap(&mut f, KEY_LEFTMETA);
+    f.niri_complete_animations();
     assert!(
-        !visible(&mut f),
-        "one populated desktop must not show the thumbnails strip"
+        visible(&mut f),
+        "one populated desktop must show the strip too"
     );
     tap(&mut f, KEY_LEFTMETA);
     f.niri_complete_animations();
 
     let (_a, _b) = setup_two_desktops_in_overview(&mut f, id);
-    assert!(
-        visible(&mut f),
-        "a second populated desktop must bring up the thumbnails strip"
-    );
+    assert!(visible(&mut f), "…and so must two");
 }
 
 /// Clicking a strip thumbnail follows gnome-shell's
@@ -10030,22 +9993,20 @@ fn overview_chrome_ramps_down_on_a_small_canvas() {
         s_gap < 80.,
         "the gap is no longer pegged at the un-ramped maximum: {s_gap}"
     );
-    // The corner does *not* ramp here any more: since the search entry floats (approved
-    // divergence) the picker got its 58px row back, so the preview on this canvas is
-    // taller than the 520px the flat 30 is written for. The rule is unchanged — it just
-    // bites lower down now.
-    // Compared with a tolerance: `radius` is a ratio of the canvas, so it is exact only when
-    // the panel strut divides evenly — at the default font it lands on 30.000000000000004.
+    // The corner ramps here: the always-shown thumbnails band (divergence, see
+    // `docs/fork/dynamic-workspaces-divergence.md`) takes its share of this canvas, so the
+    // preview is under the 520px the flat 30 is written for. The rule is unchanged; what
+    // moved is the canvas at which it starts biting.
     assert!(
-        (s_radius - radius).abs() < 1e-9,
-        "the preview is big enough to keep GNOME's corner: {s_radius} vs {radius}"
+        s_radius < radius && s_radius >= 8.,
+        "the corner follows the preview down but stays a corner: {s_radius} vs {radius}"
     );
 
-    // 900x600, where the preview finally is smaller than that reference.
+    // 900x600, and it keeps following rather than stepping once and stopping.
     let (_, _, t_radius, _) = measure((900, 600));
     assert!(
-        t_radius < radius && t_radius >= 8.,
-        "the corner follows the preview down but stays a corner: {t_radius}"
+        t_radius < s_radius && t_radius >= 8.,
+        "the corner keeps following the preview: {t_radius} after {s_radius}"
     );
     // …and it keeps following, rather than stepping once and stopping.
     let (_, _, u_radius, _) = measure((800, 500));

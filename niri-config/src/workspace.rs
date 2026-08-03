@@ -28,11 +28,10 @@ impl<S: knuffel::traits::ErrorSpan> knuffel::Decode<S> for WorkspaceLayoutPart {
 
             // Check for disallowed properties.
             //
-            // - empty-workspace-above-first is a monitor-level concept.
-            // - insert-hint customization could make sense for workspaces, however currently it is
-            //   also handled at the monitor level (since insert hints in-between workspaces are a
-            //   monitor-level concept), so for now this config option would do nothing.
-            if matches!(name, "empty-workspace-above-first" | "insert-hint") {
+            // insert-hint customization could make sense for workspaces, however currently it is
+            // also handled at the monitor level (since insert hints in-between workspaces are a
+            // monitor-level concept), so for now this config option would do nothing.
+            if matches!(name, "insert-hint") {
                 ctx.emit_error(DecodeError::unexpected(
                     child,
                     "node",

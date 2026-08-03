@@ -39,6 +39,11 @@ use crate::utils::{
 };
 use crate::wallpaper::Wallpaper;
 
+/// The fewest workspaces a monitor ever has, gnome-shell's `MIN_NUM_WORKSPACES`
+/// (`js/ui/windowManager.js:42`, enforced at `:273-276` and `:286`): a fresh session
+/// shows two desktops in the overview, not one.
+pub const MIN_NUM_WORKSPACES: usize = 2;
+
 /// Amount of touchpad movement to scroll the height of one workspace.
 const WORKSPACE_GESTURE_MOVEMENT: f64 = 300.;
 
@@ -157,17 +162,11 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
     overview_progress: Option<OverviewProgress>,
-    /// gnome-shell's `ThumbnailsBox.expandFraction` (`overviewControls.js:358-366`):
-    /// eased 0↔1 when the strip's `should-show` flips, so the picker box grows
-    /// into the thumbnails band (and back) instead of jumping.
-    thumbnails_expand: Option<Animation>,
-    /// The settled target of [`Self::thumbnails_expand`], for edge detection.
-    thumbnails_shown: bool,
     /// gnome-shell's `ControlsState` show-apps fraction (0 = window picker, 1 = app
     /// grid): eased when the show-apps state flips, shrinking the picker box and
     /// sliding the app grid up (`overviewControls.js` state adjustment). The target.
     app_grid_shown: bool,
-    /// The ease driving [`Self::app_grid_shown`], mirroring [`Self::thumbnails_expand`].
+    /// The ease driving [`Self::app_grid_shown`].
     app_grid_expand: Option<Animation>,
     /// Clock for driving animations.
     pub(super) clock: Clock,
@@ -451,7 +450,7 @@ impl<W: LayoutElement> Monitor<W> {
         let view_size = output_size(&output);
         let working_area = compute_working_area(&output, &options);
 
-        // Prepare the workspaces: set output, empty first, empty last.
+        // Prepare the workspaces: set output, empty last, at least MIN_NUM_WORKSPACES.
         let mut active_workspace_idx = 0;
 
         for (idx, ws) in workspaces.iter_mut().enumerate() {
@@ -465,15 +464,19 @@ impl<W: LayoutElement> Monitor<W> {
             }
         }
 
-        if options.layout.empty_workspace_above_first && !workspaces.is_empty() {
-            let ws = Workspace::new(output.clone(), clock.clone(), options.clone());
-            workspaces.insert(0, ws);
-            active_workspace_idx += 1;
+        // The trailing empty workspace, then gnome-shell's minimum on top of it, in that
+        // order: a fresh monitor comes up showing two desktops
+        // (`windowManager.js:267-276`).
+        let new_workspace = || Workspace::new(output.clone(), clock.clone(), options.clone());
+        if workspaces
+            .last()
+            .is_none_or(|ws: &Workspace<W>| ws.has_windows_or_name())
+        {
+            workspaces.push(new_workspace());
         }
-
-        let ws = Workspace::new(output.clone(), clock.clone(), options.clone());
-        workspaces.push(ws);
-        let workspaces_len = workspaces.len();
+        while workspaces.len() < MIN_NUM_WORKSPACES {
+            workspaces.push(new_workspace());
+        }
 
         Self {
             output_name: output.name(),
@@ -497,10 +500,8 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
-            thumbnails_expand: None,
             app_grid_shown: false,
             app_grid_expand: None,
-            thumbnails_shown: workspaces_len > thumbnails::NUM_WORKSPACES_THRESHOLD,
             workspace_switch: None,
             clock,
             base_options,
@@ -706,7 +707,7 @@ impl<W: LayoutElement> Monitor<W> {
         );
     }
 
-    pub fn add_column(&mut self, mut workspace_idx: usize, column: Column<W>, activate: bool) {
+    pub fn add_column(&mut self, workspace_idx: usize, column: Column<W>, activate: bool) {
         let workspace = &mut self.workspaces[workspace_idx];
 
         workspace.add_column(column, activate);
@@ -719,11 +720,6 @@ impl<W: LayoutElement> Monitor<W> {
         if workspace_idx == self.workspaces.len() - 1 {
             self.add_workspace_bottom();
         }
-        if self.options.layout.empty_workspace_above_first && workspace_idx == 0 {
-            self.add_workspace_top();
-            workspace_idx += 1;
-        }
-
         if activate {
             self.activate_workspace(workspace_idx);
         }
@@ -741,7 +737,7 @@ impl<W: LayoutElement> Monitor<W> {
         is_full_width: bool,
         is_floating: bool,
     ) {
-        let (mut workspace_idx, target) = self.resolve_add_window_target(target);
+        let (workspace_idx, target) = self.resolve_add_window_target(target);
 
         let workspace = &mut self.workspaces[workspace_idx];
 
@@ -755,11 +751,6 @@ impl<W: LayoutElement> Monitor<W> {
         if workspace_idx == self.workspaces.len() - 1 {
             // Insert a new empty workspace.
             self.add_workspace_bottom();
-        }
-
-        if self.options.layout.empty_workspace_above_first && workspace_idx == 0 {
-            self.add_workspace_top();
-            workspace_idx += 1;
         }
 
         if allow_to_activate_workspace && activate.map_smart(|| false) {
@@ -794,35 +785,41 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    /// Restores the workspace-list invariants: the last workspace is empty and unnamed,
+    /// and there are at least [`MIN_NUM_WORKSPACES`] of them.
+    ///
+    /// **Divergence (approved 2026-08-03).** gnome-shell's `_checkWorkspaces`
+    /// (`js/ui/windowManager.js:278-291`) also *reaps* every empty non-active workspace
+    /// but the last, so emptying a desktop makes it vanish under you. We keep empties
+    /// around and let you dismiss them by hand, macOS-style — see
+    /// [`Self::workspace_is_closable`] and `docs/fork/dynamic-workspaces-divergence.md`.
+    /// Everything the reaper *maintained* still holds; only the reaping is gone.
     pub fn clean_up_workspaces(&mut self) {
         assert!(self.workspace_switch.is_none());
 
-        let range_start = if self.options.layout.empty_workspace_above_first {
-            1
-        } else {
-            0
-        };
-        for idx in (range_start..self.workspaces.len() - 1).rev() {
-            if self.active_workspace_idx == idx {
-                continue;
-            }
-
-            if !self.workspaces[idx].has_windows_or_name() {
-                self.workspaces.remove(idx);
-                if self.active_workspace_idx > idx {
-                    self.active_workspace_idx -= 1;
-                }
-            }
+        // "If we don't have an empty workspace at the end, add one", then "enforce minimum
+        // number of workspaces" (`windowManager.js:267-276`).
+        if self.workspaces.last().unwrap().has_windows_or_name() {
+            self.add_workspace_bottom();
         }
-
-        // Special case handling when empty_workspace_above_first is set and all workspaces
-        // are empty.
-        if self.options.layout.empty_workspace_above_first && self.workspaces.len() == 2 {
-            assert!(!self.workspaces[0].has_windows_or_name());
-            assert!(!self.workspaces[1].has_windows_or_name());
-            self.workspaces.remove(1);
-            self.active_workspace_idx = 0;
+        while self.workspaces.len() < MIN_NUM_WORKSPACES {
+            self.add_workspace_bottom();
         }
+    }
+
+    /// How many workspaces this monitor has, never fewer than [`MIN_NUM_WORKSPACES`].
+    pub fn workspace_count(&self) -> usize {
+        self.workspaces.len()
+    }
+
+    /// Whether this workspace may be closed from its thumbnail: it has to be windowless
+    /// (naming one means you want it kept), it can't be the trailing empty one — closing
+    /// that would just re-append it — and closing it can't take us below
+    /// [`MIN_NUM_WORKSPACES`].
+    pub fn workspace_is_closable(&self, idx: usize) -> bool {
+        idx + 1 < self.workspaces.len()
+            && self.workspaces.len() > MIN_NUM_WORKSPACES
+            && !self.workspaces[idx].has_windows_or_name()
     }
 
     pub fn unname_workspace(&mut self, id: WorkspaceId) -> bool {
@@ -839,13 +836,9 @@ impl<W: LayoutElement> Monitor<W> {
         true
     }
 
-    pub fn remove_workspace_by_idx(&mut self, mut idx: usize) -> Workspace<W> {
+    pub fn remove_workspace_by_idx(&mut self, idx: usize) -> Workspace<W> {
         if idx == self.workspaces.len() - 1 {
             self.add_workspace_bottom();
-        }
-        if self.options.layout.empty_workspace_above_first && idx == 0 {
-            self.add_workspace_top();
-            idx += 1;
         }
 
         let mut ws = self.workspaces.remove(idx);
@@ -871,11 +864,6 @@ impl<W: LayoutElement> Monitor<W> {
         // Don't insert past the last empty workspace.
         if idx == self.workspaces.len() {
             idx -= 1;
-        }
-        if idx == 0 && self.options.layout.empty_workspace_above_first {
-            // Insert a new empty workspace on top to prepare for insertion of new workspace.
-            self.add_workspace_top();
-            idx += 1;
         }
 
         self.workspaces.insert(idx, ws);
@@ -910,14 +898,6 @@ impl<W: LayoutElement> Monitor<W> {
         let empty = self.workspaces.remove(self.workspaces.len() - 1);
         self.workspaces.extend(workspaces);
         self.workspaces.push(empty);
-
-        // If empty_workspace_above_first is set and the first workspace is now no longer empty,
-        // add a new empty workspace on top.
-        if self.options.layout.empty_workspace_above_first
-            && self.workspaces[0].has_windows_or_name()
-        {
-            self.add_workspace_top();
-        }
 
         // If the empty workspace was focused on the primary monitor, keep it focused.
         if empty_was_focused {
@@ -1245,27 +1225,19 @@ impl<W: LayoutElement> Monitor<W> {
             ws.advance_animations();
         }
 
-        // After `clean_up_workspaces` above, so the strip's `should-show` is
-        // evaluated against this frame's workspace count rather than lagging it.
-        self.update_thumbnails_expand();
+        self.update_app_grid_expand();
     }
 
     pub(super) fn are_animations_ongoing(&self) -> bool {
         self.workspace_switch
             .as_ref()
             .is_some_and(|s| s.is_animation_ongoing())
-            || self.thumbnails_expand.is_some()
-            || self.thumbnails_should_show() != self.thumbnails_shown
             || self.app_grid_expand.is_some()
             || self.workspaces.iter().any(|ws| ws.are_animations_ongoing())
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
         self.workspace_switch.is_some()
-            // The expand only moves anything while the overview is in play — with
-            // it closed the zoom is 1 regardless, so counting it would defer
-            // pointer-focus refresh for a quarter second over a still screen.
-            || (self.thumbnails_expand.is_some() && self.overview_progress.is_some())
             || self.app_grid_expand.is_some()
             || self
                 .workspaces
@@ -1475,18 +1447,6 @@ impl<W: LayoutElement> Monitor<W> {
         let options =
             Rc::new(Options::clone(&base_options).with_merged_layout(self.layout_config.as_ref()));
 
-        if self.options.layout.empty_workspace_above_first
-            != options.layout.empty_workspace_above_first
-            && self.workspaces.len() > 1
-        {
-            if options.layout.empty_workspace_above_first {
-                self.add_workspace_top();
-            } else if self.workspace_switch.is_none() && self.active_workspace_idx != 0 {
-                self.workspaces.remove(0);
-                self.active_workspace_idx = self.active_workspace_idx.saturating_sub(1);
-            }
-        }
-
         for ws in &mut self.workspaces {
             ws.update_config(options.clone());
         }
@@ -1528,7 +1488,7 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn move_workspace_down(&mut self) {
-        let mut new_idx = min(self.active_workspace_idx + 1, self.workspaces.len() - 1);
+        let new_idx = min(self.active_workspace_idx + 1, self.workspaces.len() - 1);
         if new_idx == self.active_workspace_idx {
             return;
         }
@@ -1540,11 +1500,6 @@ impl<W: LayoutElement> Monitor<W> {
             self.add_workspace_bottom();
         }
 
-        if self.options.layout.empty_workspace_above_first && self.active_workspace_idx == 0 {
-            self.add_workspace_top();
-            new_idx += 1;
-        }
-
         let previous_workspace_id = self.previous_workspace_id;
         self.activate_workspace(new_idx);
         self.workspace_switch = None;
@@ -1554,7 +1509,7 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn move_workspace_up(&mut self) {
-        let mut new_idx = self.active_workspace_idx.saturating_sub(1);
+        let new_idx = self.active_workspace_idx.saturating_sub(1);
         if new_idx == self.active_workspace_idx {
             return;
         }
@@ -1564,11 +1519,6 @@ impl<W: LayoutElement> Monitor<W> {
         if self.active_workspace_idx == self.workspaces.len() - 1 {
             // Insert a new empty workspace.
             self.add_workspace_bottom();
-        }
-
-        if self.options.layout.empty_workspace_above_first && new_idx == 0 {
-            self.add_workspace_top();
-            new_idx += 1;
         }
 
         let previous_workspace_id = self.previous_workspace_id;
@@ -1584,7 +1534,7 @@ impl<W: LayoutElement> Monitor<W> {
             return;
         }
 
-        let mut new_idx = new_idx.clamp(0, self.workspaces.len() - 1);
+        let new_idx = new_idx.clamp(0, self.workspaces.len() - 1);
         if old_idx == new_idx {
             return;
         }
@@ -1592,26 +1542,11 @@ impl<W: LayoutElement> Monitor<W> {
         let ws = self.workspaces.remove(old_idx);
         self.workspaces.insert(new_idx, ws);
 
-        if new_idx > old_idx {
-            if new_idx == self.workspaces.len() - 1 {
-                // Insert a new empty workspace.
-                self.add_workspace_bottom();
-            }
-
-            if self.options.layout.empty_workspace_above_first && old_idx == 0 {
-                self.add_workspace_top();
-                new_idx += 1;
-            }
-        } else {
-            if old_idx == self.workspaces.len() - 1 {
-                // Insert a new empty workspace.
-                self.add_workspace_bottom();
-            }
-
-            if self.options.layout.empty_workspace_above_first && new_idx == 0 {
-                self.add_workspace_top();
-                new_idx += 1;
-            }
+        // Whichever index ended up last, the trailing workspace must stay empty.
+        let moved_into_last = if new_idx > old_idx { new_idx } else { old_idx };
+        if moved_into_last == self.workspaces.len() - 1 {
+            // Insert a new empty workspace.
+            self.add_workspace_bottom();
         }
 
         // Only refocus the workspace if it was already focused
@@ -1946,61 +1881,21 @@ impl<W: LayoutElement> Monitor<W> {
         self.controls_layout_at(state).workspaces.size.h / self.view_size.h
     }
 
-    /// Whether the strip *wants* to be shown: gnome-shell's
-    /// `ThumbnailsBox.shouldShow`, which with dynamic workspaces is purely a
-    /// workspace count (it is not gated on the overview — that's the slide).
-    fn thumbnails_should_show(&self) -> bool {
-        self.workspaces.len() > thumbnails::NUM_WORKSPACES_THRESHOLD
-    }
-
+    /// `ThumbnailsBox.expandFraction` — always fully expanded.
+    ///
+    /// **Divergence (approved 2026-08-03).** gnome-shell hides the strip below
+    /// `NUM_WORKSPACES_THRESHOLD + 1` workspaces (`workspaceThumbnail.js:697-706`) and eases
+    /// this fraction when the count crosses it. We always show it, so there is nothing to
+    /// ease: the strip is the desktop switcher, and one that appears and disappears under
+    /// you is not one you can aim at. See `docs/fork/dynamic-workspaces-divergence.md`.
+    /// The band allocator keeps its `expand_fraction` parameter — it is the ported
+    /// `ControlsManagerLayout` signature — and we hand it the constant.
     fn thumbnails_expand_fraction(&self) -> f64 {
-        match &self.thumbnails_expand {
-            Some(anim) => anim.clamped_value().clamp(0., 1.),
-            None => {
-                if self.thumbnails_shown {
-                    1.
-                } else {
-                    0.
-                }
-            }
-        }
+        1.
     }
 
-    /// Starts (or retires) the expand ease when the strip's `should-show`
-    /// flips — dragging a window onto the trailing empty workspace crosses the
-    /// threshold *while the overview is open*, and the picker box depends on
-    /// the band, so an instant flip would pop the workspace zoom.
-    fn update_thumbnails_expand(&mut self) {
-        let should_show = self.thumbnails_should_show();
-        if should_show != self.thumbnails_shown {
-            let from = self.thumbnails_expand_fraction();
-            self.thumbnails_shown = should_show;
-            // gnome-shell eases this one with `SIDE_CONTROLS_ANIMATION_TIME`
-            // (250ms, EASE_OUT_QUAD, `overviewControls.js:360-366`) — a fixed
-            // duration, not the configurable overview open/close animation. Only
-            // whether animations run at all is inherited from the config.
-            let config = niri_config::Animation {
-                off: self.options.animations.overview_open_close.0.off,
-                kind: niri_config::animations::Kind::Easing(
-                    niri_config::animations::EasingParams {
-                        duration_ms: 250,
-                        curve: niri_config::animations::Curve::EaseOutQuad,
-                    },
-                ),
-            };
-            self.thumbnails_expand = Some(Animation::new(
-                self.clock.clone(),
-                from,
-                if should_show { 1. } else { 0. },
-                0.,
-                config,
-            ));
-        }
-
-        if self.thumbnails_expand.as_ref().is_some_and(|a| a.is_done()) {
-            self.thumbnails_expand = None;
-        }
-
+    /// Retires the show-apps ease when it lands.
+    fn update_app_grid_expand(&mut self) {
         if self.app_grid_expand.as_ref().is_some_and(|a| a.is_done()) {
             self.app_grid_expand = None;
         }
@@ -2024,7 +1919,7 @@ impl<W: LayoutElement> Monitor<W> {
     /// adjustment with `EASE_OUT_SINE` over `SIDE_CONTROLS_ANIMATION_TIME` (250ms,
     /// `overviewControls.js:654-657`); our `Curve` has no sine, so the equivalent
     /// cubic-bézier reproduces it. Only whether animations run is inherited from the
-    /// config (like [`Self::update_thumbnails_expand`]).
+    /// config (like [`Self::update_app_grid_expand`]).
     pub(super) fn set_app_grid(&mut self, shown: bool) {
         if shown == self.app_grid_shown {
             return;
@@ -3439,8 +3334,8 @@ impl<W: LayoutElement> Monitor<W> {
         assert_eq!(&*self.options, &options);
 
         assert!(
-            !self.workspaces.is_empty(),
-            "monitor must have at least one workspace"
+            self.workspaces.len() >= MIN_NUM_WORKSPACES,
+            "monitor must have at least {MIN_NUM_WORKSPACES} workspaces"
         );
         assert!(self.active_workspace_idx < self.workspaces.len());
 
@@ -3456,57 +3351,14 @@ impl<W: LayoutElement> Monitor<W> {
             !self.workspaces.last().unwrap().has_windows(),
             "monitor must have an empty workspace in the end"
         );
-        if self.options.layout.empty_workspace_above_first {
-            assert!(
-                !self.workspaces.first().unwrap().has_windows(),
-                "first workspace must be empty when empty_workspace_above_first is set"
-            )
-        }
 
         assert!(
             self.workspaces.last().unwrap().name.is_none(),
             "monitor must have an unnamed workspace in the end"
         );
-        if self.options.layout.empty_workspace_above_first {
-            assert!(
-                self.workspaces.first().unwrap().name.is_none(),
-                "first workspace must be unnamed when empty_workspace_above_first is set"
-            )
-        }
-
-        if self.options.layout.empty_workspace_above_first {
-            assert!(
-                self.workspaces.len() != 2,
-                "if empty_workspace_above_first is set there must be just 1 or 3+ workspaces"
-            )
-        }
-
-        // If there's no workspace switch in progress, there can't be any non-last non-active
-        // empty workspaces. If empty_workspace_above_first is set then the first workspace
-        // will be empty too.
-        let pre_skip = if self.options.layout.empty_workspace_above_first {
-            1
-        } else {
-            0
-        };
-        if self.workspace_switch.is_none() {
-            for (idx, ws) in self
-                .workspaces
-                .iter()
-                .enumerate()
-                .skip(pre_skip)
-                .rev()
-                // skip last
-                .skip(1)
-            {
-                if idx != self.active_workspace_idx {
-                    assert!(
-                        ws.has_windows_or_name(),
-                        "non-active workspace can't be empty and unnamed except the last one"
-                    );
-                }
-            }
-        }
+        // NOTE: empty non-last non-active workspaces are legal here — they are the whole
+        // point of the manual-close divergence (see `clean_up_workspaces`). What is *not*
+        // legal is a monitor with no trailing empty, which the two asserts above pin.
 
         for workspace in &self.workspaces {
             assert_eq!(self.clock, workspace.clock);

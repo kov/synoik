@@ -5694,9 +5694,20 @@ fn vulkan_clips_a_window_through_the_overview_wrapper() {
     // pixel where green clearly leads red/blue is the (dimmed) window content vs the gray backdrop.
     let is_green =
         |p: [u8; 4]| p[1] as i32 > p[0] as i32 + 15 && p[1] as i32 > p[2] as i32 + 15 && p[1] > 45;
+    // Only the window-picker box: the thumbnail strip above it draws the same window as a
+    // miniature (it is now always shown — `docs/fork/dynamic-workspaces-divergence.md`), and
+    // a bbox spanning both would measure the strip rather than the wrapped picker render.
+    let picker_top = f
+        .niri()
+        .layout
+        .controls_layout_for_output(&output)
+        .expect("output 1 has a monitor")
+        .workspaces
+        .loc
+        .y as i32;
     let (mut x0, mut y0, mut x1, mut y1) = (w, h, -1, -1);
     let green = (0..w * h)
-        .filter(|i| is_green(px(&pixels, w, i % w, i / w)))
+        .filter(|i| i / w >= picker_top && is_green(px(&pixels, w, i % w, i / w)))
         .inspect(|i| {
             let (x, y) = (i % w, i / w);
             x0 = x0.min(x);

@@ -857,20 +857,7 @@ impl<W: LayoutElement> Layout<W> {
                             workspaces.push(ws);
                         }
 
-                        if i <= primary.active_workspace_idx
-                            // Generally when moving the currently active workspace, we want to
-                            // fall back to the workspace above, so as not to end up on the last
-                            // empty workspace. However, with empty workspace above first, when
-                            // moving the workspace at index 1 (first non-empty), we want to stay
-                            // at index 1, so as once again not to end up on an empty workspace.
-                            //
-                            // This comes into play at compositor startup when having named
-                            // workspaces set up across multiple monitors. Without this check, the
-                            // first monitor to connect can end up with the first empty workspace
-                            // focused instead of the first named workspace.
-                            && !(primary.options.layout.empty_workspace_above_first
-                                && primary.active_workspace_idx == 1)
-                        {
+                        if i <= primary.active_workspace_idx {
                             primary.active_workspace_idx =
                                 primary.active_workspace_idx.saturating_sub(1);
                         }
@@ -878,14 +865,7 @@ impl<W: LayoutElement> Layout<W> {
                 }
 
                 // If we stopped a workspace switch, then we might need to clean up workspaces.
-                // Also if empty_workspace_above_first is set and there are only 2 workspaces left,
-                // both will be empty and one of them needs to be removed. clean_up_workspaces
-                // takes care of this.
-
-                if stopped_primary_ws_switch
-                    || (primary.options.layout.empty_workspace_above_first
-                        && primary.workspaces.len() == 2)
-                {
+                if stopped_primary_ws_switch {
                     primary.clean_up_workspaces();
                 }
 
@@ -1249,35 +1229,12 @@ impl<W: LayoutElement> Layout<W> {
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
-                    for (idx, ws) in mon.workspaces.iter_mut().enumerate() {
+                    for ws in mon.workspaces.iter_mut() {
                         if ws.has_window(window) {
-                            let removed = ws.remove_tile(window, transaction);
-
-                            // Clean up empty workspaces that are not active and not last.
-                            if !ws.has_windows_or_name()
-                                && idx != mon.active_workspace_idx
-                                && idx != mon.workspaces.len() - 1
-                                && mon.workspace_switch.is_none()
-                            {
-                                mon.workspaces.remove(idx);
-
-                                if idx < mon.active_workspace_idx {
-                                    mon.active_workspace_idx -= 1;
-                                }
-                            }
-
-                            // Special case handling when empty_workspace_above_first is set and all
-                            // workspaces are empty.
-                            if mon.options.layout.empty_workspace_above_first
-                                && mon.workspaces.len() == 2
-                                && mon.workspace_switch.is_none()
-                            {
-                                assert!(!mon.workspaces[0].has_windows_or_name());
-                                assert!(!mon.workspaces[1].has_windows_or_name());
-                                mon.workspaces.remove(1);
-                                mon.active_workspace_idx = 0;
-                            }
-                            return Some(removed);
+                            // Emptying a workspace no longer reaps it: it stays put and
+                            // grows a close button in the overview instead (see
+                            // `Monitor::clean_up_workspaces`).
+                            return Some(ws.remove_tile(window, transaction));
                         }
                     }
                 }
@@ -4569,10 +4526,7 @@ impl<W: LayoutElement> Layout<W> {
                         .position(|ws| ws.id() == ws_id)
                         .unwrap(),
                     InsertWorkspace::NewAt(ws_idx) => {
-                        if mon.options.layout.empty_workspace_above_first && ws_idx == 0 {
-                            // Reuse the top empty workspace.
-                            0
-                        } else if mon.workspaces.len() - 1 <= ws_idx {
+                        if mon.workspaces.len() - 1 <= ws_idx {
                             // Reuse the bottom empty workspace.
                             mon.workspaces.len() - 1
                         } else {
@@ -4700,7 +4654,7 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 }
 
-                // needed because empty_workspace_above_first could have modified the idx
+                // The insert above can shift the workspace index, so re-find the tile.
                 let (tile, tile_offset, ws_geo) = mon
                     .workspaces_with_render_geo_mut(false)
                     .find_map(|(ws, geo)| {
@@ -4928,11 +4882,8 @@ impl<W: LayoutElement> Layout<W> {
 
         let wsid = ws.id();
 
-        // if `empty_workspace_above_first` is set and `ws` is the first
-        // workspace on a monitor, another empty workspace needs to
-        // be added before.
-        // Conversely, if `ws` was the last workspace on a monitor, an
-        // empty workspace needs to be added after.
+        // If `ws` was the last workspace on a monitor, an empty workspace needs to be
+        // added after.
 
         if let MonitorSet::Normal {
             monitors,
@@ -4941,14 +4892,6 @@ impl<W: LayoutElement> Layout<W> {
         } = &mut self.monitor_set
         {
             let monitor = &mut monitors[*active_monitor_idx];
-            if monitor.options.layout.empty_workspace_above_first
-                && monitor
-                    .workspaces
-                    .first()
-                    .is_some_and(|first| first.id() == wsid)
-            {
-                monitor.add_workspace_top();
-            }
             if monitor
                 .workspaces
                 .last()

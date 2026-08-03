@@ -77,7 +77,6 @@ workspace "aesthetic" {
 
 It accepts all the same options as [the top-level `layout {}` block](./Configuration:-Layout.md), except:
 
-- `empty-workspace-above-first`: this is an output-level setting, doesn't make sense on a workspace.
 - `insert-hint`: currently we always draw these at the output level, so it's not customizable per-workspace.
 
 In order to unset a flag, write it with `false`, e.g.:

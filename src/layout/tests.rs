@@ -1999,13 +1999,18 @@ fn removing_output_must_keep_empty_focus_on_primary() {
         unreachable!()
     };
 
-    // The workspace from the removed output was inserted at position 0, so the active workspace
-    // must change to 1 to keep the focus on the empty workspace.
-    assert_eq!(monitors[0].active_workspace_idx, 1);
+    // The primary starts with MIN_NUM_WORKSPACES empties and the removed output's
+    // workspace is spliced in before the last one, so the empty workspace the user was on
+    // keeps both its index and the focus.
+    assert_eq!(monitors[0].active_workspace_idx, 0);
+    assert!(!monitors[0].workspaces[0].has_windows());
 }
 
+/// Moving the last window off a workspace used to reap it. It stays now — that is the
+/// manual-close divergence (`docs/fork/dynamic-workspaces-divergence.md`) — and what the
+/// move must still get right is that the window lands where it was aimed.
 #[test]
-fn move_to_workspace_by_idx_does_not_leave_empty_workspaces() {
+fn move_to_workspace_by_idx_leaves_the_emptied_workspace_in_place() {
     let ops = [
         Op::AddOutput(1),
         Op::AddWindow {
@@ -2029,7 +2034,16 @@ fn move_to_workspace_by_idx_does_not_leave_empty_workspaces() {
         unreachable!()
     };
 
-    assert!(monitors[0].workspaces[1].has_windows());
+    let mon = &monitors[0];
+    // [output2's own window, the migrated workspace, the move target, trailing empty].
+    assert_eq!(mon.workspaces.len(), 4);
+    assert!(
+        mon.workspaces[2].has_windows(),
+        "the window must land on the index it was sent to"
+    );
+    // …and the workspace it left is still there, empty, closable by hand.
+    assert!(!mon.workspaces[1].has_windows());
+    assert!(mon.workspace_is_closable(1));
 }
 
 #[test]
@@ -2093,7 +2107,9 @@ fn workspaces_update_original_output_on_moving_to_same_output() {
         },
         Op::AddOutput(2),
         Op::RemoveOutput(1),
-        Op::FocusWorkspaceUp,
+        // The named workspace is spliced in below output2's own empties, so focus down
+        // onto it.
+        Op::FocusWorkspaceDown,
         Op::MoveWorkspaceToOutput(2),
         Op::AddOutput(1),
     ];
@@ -2267,11 +2283,14 @@ fn move_workspace_to_output() {
     };
 
     assert_eq!(active_monitor_idx, 1);
-    assert_eq!(monitors[0].workspaces.len(), 1);
+    // The source monitor is left with nothing but its MIN_NUM_WORKSPACES empties.
+    assert_eq!(monitors[0].workspaces.len(), 2);
     assert!(!monitors[0].workspaces[0].has_windows());
-    assert_eq!(monitors[1].active_workspace_idx, 0);
-    assert_eq!(monitors[1].workspaces.len(), 2);
-    assert!(monitors[1].workspaces[0].has_windows());
+    // The target already had its own two empties; the moved workspace is spliced in
+    // before the trailing one, and the focus follows it there.
+    assert_eq!(monitors[1].workspaces.len(), 3);
+    assert!(monitors[1].workspaces[1].has_windows());
+    assert_eq!(monitors[1].active_workspace_idx, 1);
 }
 
 #[test]
@@ -2304,49 +2323,6 @@ fn open_right_of_on_different_workspace() {
     );
     assert_eq!(
         mon.workspaces[0].scrolling().active_column_idx(),
-        1,
-        "the new window must become active"
-    );
-}
-
-#[test]
-// empty_workspace_above_first = true
-fn open_right_of_on_different_workspace_ewaf() {
-    let ops = [
-        Op::AddOutput(1),
-        Op::AddWindow {
-            params: TestWindowParams::new(1),
-        },
-        Op::FocusWorkspaceDown,
-        Op::AddWindow {
-            params: TestWindowParams::new(2),
-        },
-        Op::AddWindowNextTo {
-            params: TestWindowParams::new(3),
-            next_to_id: 1,
-        },
-    ];
-
-    let options = Options {
-        layout: niri_config::Layout {
-            empty_workspace_above_first: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let layout = check_ops_with_options(options, ops);
-
-    let MonitorSet::Normal { monitors, .. } = layout.monitor_set else {
-        unreachable!()
-    };
-
-    let mon = monitors.into_iter().next().unwrap();
-    assert_eq!(
-        mon.active_workspace_idx, 2,
-        "the second workspace must remain active"
-    );
-    assert_eq!(
-        mon.workspaces[1].scrolling().active_column_idx(),
         1,
         "the new window must become active"
     );
@@ -2574,41 +2550,6 @@ fn interactive_move_onto_empty_output() {
 }
 
 #[test]
-fn interactive_move_onto_empty_output_ewaf() {
-    let ops = [
-        Op::AddOutput(1),
-        Op::AddWindow {
-            params: TestWindowParams::new(0),
-        },
-        Op::InteractiveMoveBegin {
-            window: 0,
-            output_idx: 1,
-            px: 0.,
-            py: 0.,
-        },
-        Op::AddOutput(2),
-        Op::InteractiveMoveUpdate {
-            window: 0,
-            dx: 1000.,
-            dy: 0.,
-            output_idx: 2,
-            px: 0.,
-            py: 0.,
-        },
-        Op::InteractiveMoveEnd { window: 0 },
-    ];
-
-    let options = Options {
-        layout: niri_config::Layout {
-            empty_workspace_above_first: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    check_ops_with_options(options, ops);
-}
-
-#[test]
 fn interactive_move_onto_last_workspace() {
     let ops = [
         Op::AddOutput(1),
@@ -2638,38 +2579,29 @@ fn interactive_move_onto_last_workspace() {
 }
 
 #[test]
-fn interactive_move_onto_first_empty_workspace() {
+fn move_window_to_different_output() {
     let ops = [
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::MoveWorkspaceToOutput(2),
+    ];
+    check_ops(ops);
+}
+
+#[test]
+fn add_and_remove_output() {
+    let ops = [
+        Op::AddOutput(2),
         Op::AddOutput(1),
         Op::AddWindow {
             params: TestWindowParams::new(1),
         },
-        Op::InteractiveMoveBegin {
-            window: 1,
-            output_idx: 1,
-            px: 0.,
-            py: 0.,
-        },
-        Op::InteractiveMoveUpdate {
-            window: 1,
-            dx: 1000.,
-            dy: 0.,
-            output_idx: 1,
-            px: 0.,
-            py: 0.,
-        },
-        Op::FocusWorkspaceUp,
-        Op::AdvanceAnimations { msec_delta: 1000 },
-        Op::InteractiveMoveEnd { window: 1 },
+        Op::RemoveOutput(2),
     ];
-    let options = Options {
-        layout: niri_config::Layout {
-            empty_workspace_above_first: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    check_ops_with_options(options, ops);
+    check_ops(ops);
 }
 
 #[test]
@@ -2734,150 +2666,6 @@ fn named_workspace_to_output() {
         Op::FocusWorkspaceUp,
     ];
     check_ops(ops);
-}
-
-#[test]
-// empty_workspace_above_first = true
-fn named_workspace_to_output_ewaf() {
-    let ops = [
-        Op::AddNamedWorkspace {
-            ws_name: 1,
-            output_name: Some(2),
-            layout_config: None,
-        },
-        Op::AddOutput(1),
-        Op::AddOutput(2),
-    ];
-    let options = Options {
-        layout: niri_config::Layout {
-            empty_workspace_above_first: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    check_ops_with_options(options, ops);
-}
-
-#[test]
-fn move_window_to_empty_workspace_above_first() {
-    let ops = [
-        Op::AddOutput(1),
-        Op::AddWindow {
-            params: TestWindowParams::new(1),
-        },
-        Op::MoveWorkspaceUp,
-        Op::MoveWorkspaceDown,
-        Op::FocusWorkspaceUp,
-        Op::MoveWorkspaceDown,
-    ];
-    let options = Options {
-        layout: niri_config::Layout {
-            empty_workspace_above_first: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    check_ops_with_options(options, ops);
-}
-
-#[test]
-fn move_window_to_different_output() {
-    let ops = [
-        Op::AddWindow {
-            params: TestWindowParams::new(1),
-        },
-        Op::AddOutput(1),
-        Op::AddOutput(2),
-        Op::MoveWorkspaceToOutput(2),
-    ];
-    let options = Options {
-        layout: niri_config::Layout {
-            empty_workspace_above_first: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    check_ops_with_options(options, ops);
-}
-
-#[test]
-fn close_window_empty_ws_above_first() {
-    let ops = [
-        Op::AddWindow {
-            params: TestWindowParams::new(1),
-        },
-        Op::AddOutput(1),
-        Op::CloseWindow(1),
-    ];
-    let options = Options {
-        layout: niri_config::Layout {
-            empty_workspace_above_first: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    check_ops_with_options(options, ops);
-}
-
-#[test]
-fn add_and_remove_output() {
-    let ops = [
-        Op::AddOutput(2),
-        Op::AddOutput(1),
-        Op::AddWindow {
-            params: TestWindowParams::new(1),
-        },
-        Op::RemoveOutput(2),
-    ];
-    let options = Options {
-        layout: niri_config::Layout {
-            empty_workspace_above_first: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    check_ops_with_options(options, ops);
-}
-
-#[test]
-fn switch_ewaf_on() {
-    let ops = [
-        Op::AddOutput(1),
-        Op::AddWindow {
-            params: TestWindowParams::new(1),
-        },
-    ];
-
-    let mut layout = check_ops(ops);
-    layout.update_options(Options {
-        layout: niri_config::Layout {
-            empty_workspace_above_first: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    });
-    layout.verify_invariants();
-}
-
-#[test]
-fn switch_ewaf_off() {
-    let ops = [
-        Op::AddOutput(1),
-        Op::AddWindow {
-            params: TestWindowParams::new(1),
-        },
-    ];
-
-    let options = Options {
-        layout: niri_config::Layout {
-            empty_workspace_above_first: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut layout = check_ops_with_options(options, ops);
-    layout.update_options(Options::default());
-    layout.verify_invariants();
 }
 
 #[test]
@@ -3237,26 +3025,6 @@ fn set_first_workspace_name() {
     ];
 
     check_ops(ops);
-}
-
-#[test]
-fn set_first_workspace_name_ewaf() {
-    let ops = [
-        Op::AddOutput(0),
-        Op::SetWorkspaceName {
-            new_ws_name: 0,
-            ws_name: None,
-        },
-    ];
-
-    let options = Options {
-        layout: niri_config::Layout {
-            empty_workspace_above_first: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    check_ops_with_options(options, ops);
 }
 
 #[test]
@@ -3886,14 +3654,12 @@ prop_compose! {
         tab_indicator in prop::option::of(arbitrary_tab_indicator()),
         center_focused_column in prop::option::of(arbitrary_center_focused_column()),
         always_center_single_column in prop::option::of(any::<bool>().prop_map(Flag)),
-        empty_workspace_above_first in prop::option::of(any::<bool>().prop_map(Flag)),
     ) -> niri_config::LayoutPart {
         niri_config::LayoutPart {
             gaps,
             struts,
             center_focused_column,
             always_center_single_column,
-            empty_workspace_above_first,
             focus_ring,
             border,
             shadow,
