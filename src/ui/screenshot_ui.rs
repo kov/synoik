@@ -122,6 +122,14 @@ pub enum ScreenshotUi {
         hovered_window: Option<(Output, u64)>,
         /// What the pointer should look like where it currently is. See [`Self::cursor_icon`].
         cursor: CursorIcon,
+        /// The area rectangle put aside while another capture type borrows `selection`.
+        ///
+        /// Screen mode widens `selection` to the whole output so the capture path needs no special
+        /// case, which would otherwise *destroy* the rectangle the user dragged. In GNOME nothing
+        /// can: `_areaSelector` keeps its own geometry and Screen mode draws a different widget
+        /// entirely (`_screenSelectors`), so a trip through Screen and back leaves the area
+        /// exactly where it was.
+        saved_area: Option<(Point<i32, Physical>, Point<i32, Physical>)>,
         /// The pending or showing tooltip, if the pointer has settled on a control.
         tooltip: Option<TooltipState>,
         /// The control under the pointer, on the **selection output's** panel.
@@ -162,12 +170,185 @@ pub struct TooltipState {
 }
 
 /// State for moving the selection (as opposed to just drawing).
+/// `.screenshot-ui-area-selector-handle` (`_screenshot.scss:131-137`): a `$medium_icon_size`
+/// white circle with `box-shadow: 0 1px 3px 2px $shadow_color`, centred on each corner of the
+/// selection. Logical px.
+const HANDLE_PX: f64 = 24.;
+const HANDLE_SHADOW_BLUR: f64 = 3.;
+const HANDLE_SHADOW_SPREAD: f64 = 2.;
+const HANDLE_SHADOW_OFFSET_Y: f64 = 1.;
+
+/// How far outside an edge still grabs it: `10 * scaleFactor` (`js/ui/screenshot.js:375-376`).
+/// Logical px.
+const EDGE_GRAB_PX: f64 = 10.;
+
+/// Which side of the selection one axis of a grab moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// Left, or top.
+    Low,
+    /// Right, or bottom.
+    High,
+}
+
+/// What part of the selection a point is on.
+///
+/// GNOME's `_computeCursorType` (`js/ui/screenshot.js:354-398`) is one function answering two
+/// questions at once — what the cursor should be, and what a press there would grab — so this is
+/// one type feeding both. Keeping them together is the point: a cursor that promises a drag the
+/// press does not start is the bug this replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AreaTarget {
+    /// Past the selection and its grab bands. A press drags a new rectangle out.
+    Outside,
+    /// Inside. A press moves the whole rectangle.
+    Move,
+    /// On an edge or a corner: which sides the pointer will drive. Never both `None`.
+    Resize { x: Option<Side>, y: Option<Side> },
+}
+
+impl AreaTarget {
+    /// The cursor that advertises this grab.
+    pub fn cursor(self) -> CursorIcon {
+        use Side::{High, Low};
+        match self {
+            Self::Outside => CursorIcon::Crosshair,
+            Self::Move => CursorIcon::Move,
+            Self::Resize { x, y } => match (x, y) {
+                (Some(Low), Some(Low)) => CursorIcon::NwResize,
+                (Some(High), Some(Low)) => CursorIcon::NeResize,
+                (Some(Low), Some(High)) => CursorIcon::SwResize,
+                (Some(High), Some(High)) => CursorIcon::SeResize,
+                (Some(Low), None) => CursorIcon::WResize,
+                (Some(High), None) => CursorIcon::EResize,
+                (None, Some(Low)) => CursorIcon::NResize,
+                (None, Some(High)) => CursorIcon::SResize,
+                // `Resize` is only ever built with at least one side.
+                (None, None) => CursorIcon::Move,
+            },
+        }
+    }
+}
+
+/// Which side the moving edge is now on, given the stationary one.
+fn side_of(moving: i32, stationary: i32) -> Side {
+    if moving > stationary {
+        Side::High
+    } else {
+        Side::Low
+    }
+}
+
+/// Which part of `rect` the output-local **physical** `point` is on. `scale` carries GNOME's
+/// logical thresholds into the same space.
+pub fn area_target(
+    rect: Rectangle<i32, Physical>,
+    point: Point<i32, Physical>,
+    scale: f64,
+) -> AreaTarget {
+    use Side::{High, Low};
+
+    let (left, top) = (rect.loc.x, rect.loc.y);
+    let (right, bottom) = (left + rect.size.w - 1, top + rect.size.h - 1);
+    let (x, y) = (point.x, point.y);
+
+    // The corner handles win, and they are hit-tested as **circles** of their own radius
+    // (`:359-373`) — the corners of their bounding boxes are not grabs.
+    let limit = (HANDLE_PX / 2. * scale).powi(2);
+    let on_handle = |cx: i32, cy: i32| {
+        let (dx, dy) = (f64::from(cx - x), f64::from(cy - y));
+        dx * dx + dy * dy <= limit
+    };
+    for (cx, cy, sx, sy) in [
+        (left, top, Low, Low),
+        (right, top, High, Low),
+        (left, bottom, Low, High),
+        (right, bottom, High, High),
+    ] {
+        if on_handle(cx, cy) {
+            return AreaTarget::Resize {
+                x: Some(sx),
+                y: Some(sy),
+            };
+        }
+    }
+
+    // Then the edge bands. Note they sit **outside** the rect: `leftX - x >= 0` means the pointer
+    // is at or past the left edge going out (`:378`). Inside is strictly between the two.
+    let threshold = (EDGE_GRAB_PX * scale).round() as i32;
+    // `None` = not in any band on this axis, which is what makes the whole point `Outside`.
+    let band = |low: i32, high: i32, v: i32| -> Option<Option<Side>> {
+        if (0..=threshold).contains(&(low - v)) {
+            Some(Some(Low))
+        } else if (0..=threshold).contains(&(v - high)) {
+            Some(Some(High))
+        } else if low - v < 0 && v - high < 0 {
+            Some(None)
+        } else {
+            None
+        }
+    };
+
+    match (band(left, right, x), band(top, bottom, y)) {
+        (Some(None), Some(None)) => AreaTarget::Move,
+        (Some(x), Some(y)) => AreaTarget::Resize { x, y },
+        _ => AreaTarget::Outside,
+    }
+}
+
 pub struct MoveState {
-    // Cursor offset from selection.1 when starting the move.
+    // Cursor offset from the selection's top-left when starting the move.
     pointer_offset: Point<i32, Physical>,
     // If the move is initiated by a touch, this is the slot. If `None`, the move was initiated by
     // holding Space.
     touch_slot: Option<TouchSlot>,
+}
+
+/// What a press on the area selector took hold of, mirroring GNOME's `_dragCursor`
+/// (`js/ui/screenshot.js:456-537`).
+pub enum Grab {
+    /// Dragging a new rectangle out: `selection.2` follows the pointer.
+    New,
+    /// Moving the whole rectangle, size intact.
+    ///
+    /// Reachable two extra ways that are ours, not GNOME's, and kept as capabilities rather than
+    /// as "niri's way of moving": holding Space, or a second touch, upgrades a `New` drag into a
+    /// move mid-gesture. GNOME's own route — pressing *inside* the selection — now exists too.
+    Move(MoveState),
+    /// Resizing. `selection.1` holds the stationary sides and `selection.2` the moving ones, so
+    /// these say only *which* of them the pointer drives; `None` means that axis is pinned.
+    ///
+    /// Not stored as a cursor the way GNOME stores it: the cursor is derived from where the moving
+    /// corner currently is (see [`ScreenshotUi::drag_cursor`]), which is the same answer its
+    /// `_onMotion` reaches by rewriting `_dragCursor` on every flip (`:672-709`) — without the
+    /// chance of the two disagreeing.
+    Resize { x: Option<Side>, y: Option<Side> },
+}
+
+impl Grab {
+    /// The cursor this grab shows while it is held.
+    ///
+    /// For a resize it is *derived* from where the moving corner now is relative to the stationary
+    /// one, so dragging a handle past the opposite side re-labels it — GNOME reaches the same
+    /// place by rewriting `_dragCursor` on every motion (`js/ui/screenshot.js:672-709`).
+    fn cursor(&self, start: Point<i32, Physical>, last: Point<i32, Physical>) -> CursorIcon {
+        match self {
+            Self::New => CursorIcon::Crosshair,
+            Self::Move(_) => CursorIcon::Move,
+            Self::Resize { x, y } => AreaTarget::Resize {
+                x: x.map(|_| side_of(last.x, start.x)),
+                y: y.map(|_| side_of(last.y, start.y)),
+            }
+            .cursor(),
+        }
+    }
+
+    fn move_state(&self) -> Option<&MoveState> {
+        match self {
+            Self::Move(state) => Some(state),
+            _ => None,
+        }
+    }
 }
 
 pub enum Button {
@@ -179,8 +360,22 @@ pub enum Button {
         /// what the press is armed on, not merely "was it the capture button".
         on_control: Option<Control>,
         last_pos: (Output, Point<i32, Physical>),
-        move_state: Option<MoveState>,
+        grab: Grab,
     },
+}
+
+/// What a press wants from the compositor beyond a redraw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerDown {
+    /// Redraw and nothing else.
+    Redraw,
+    /// Warp the pointer to this output-local **physical** point — the edge or corner the press
+    /// grabbed.
+    ///
+    /// GNOME warps too (`warp_pointer`, `js/ui/screenshot.js:519`), and it is not cosmetic: an
+    /// edge can be grabbed from up to 10px outside it, so without the warp every later delta
+    /// would be measured from a pointer sitting beside the thing it is dragging.
+    WarpTo(Point<i32, Physical>),
 }
 
 /// What a release did, for the caller to act on. Everything the panel can settle by itself (a mode
@@ -324,6 +519,9 @@ struct PanelCache {
     /// The close button, which is a sibling of the panel rather than a child of it (it straddles a
     /// panel corner), so it is its own texture placed by [`close_rect`].
     close: Option<VkTexture>,
+    /// One selection corner handle. All four are identical, so this is baked once and drawn four
+    /// times — it depends on the scale alone, never on [`PanelState`].
+    handle: Option<VkTexture>,
 }
 
 impl PanelState {
@@ -636,6 +834,7 @@ impl ScreenshotUi {
             selected_window,
             hovered_window: None,
             cursor: CursorIcon::Crosshair,
+            saved_area: None,
             tooltip: None,
             hover: None,
             open_anim,
@@ -706,6 +905,7 @@ impl ScreenshotUi {
             capture_type,
             selection,
             output_data,
+            saved_area,
             ..
         } = self
         else {
@@ -718,6 +918,16 @@ impl ScreenshotUi {
         // An insensitive button must not switch modes even if a click somehow reaches it.
         if ty == CaptureType::Window && !window_enabled {
             return;
+        }
+
+        // Leaving Selection puts the area aside; returning brings it back.
+        if *capture_type == CaptureType::Selection {
+            *saved_area = Some((selection.1, selection.2));
+        } else if ty == CaptureType::Selection {
+            if let Some((a, b)) = saved_area.take() {
+                selection.1 = a;
+                selection.2 = b;
+            }
         }
         *capture_type = ty;
 
@@ -891,30 +1101,28 @@ impl ScreenshotUi {
     pub fn set_space_down(&mut self, down: bool) {
         if let Self::Open {
             selection,
-            button:
-                Button::Down {
-                    move_state,
-                    last_pos,
-                    ..
-                },
+            button: Button::Down { grab, last_pos, .. },
             ..
         } = self
         {
             if down {
-                if move_state.is_none() {
-                    *move_state = Some(MoveState {
+                // Only a new-rectangle drag is upgraded. A resize already has hold of a side, and
+                // turning that into a move mid-gesture would abandon it silently.
+                if matches!(grab, Grab::New) {
+                    *grab = Grab::Move(MoveState {
                         pointer_offset: last_pos.1 - selection.1,
                         touch_slot: None,
                     });
                 }
-            } else {
-                // Only clear if moving with Space.
-                if let Some(MoveState {
-                    touch_slot: None, ..
-                }) = move_state
-                {
-                    *move_state = None;
-                }
+            } else if matches!(
+                grab,
+                Grab::Move(MoveState {
+                    touch_slot: None,
+                    ..
+                })
+            ) {
+                // Only give it back if the move was Space's doing.
+                *grab = Grab::New;
             }
         }
     }
@@ -1425,6 +1633,14 @@ impl ScreenshotUi {
                 .map(|(_, id)| *id);
             output_data.push_window_selector(renderer, accent, progress, selected, hovered, push);
         } else {
+            // The four corner handles ride above the border, and only on the output that owns the
+            // selection — the others draw the shade alone. Screen mode has no handles: the
+            // selection is the whole output, and nothing about it is draggable.
+            if output == &selection.0 && *capture_type == CaptureType::Selection {
+                let rect = rect_from_corner_points(selection.1, selection.2);
+                output_data.push_handles(renderer, rect, progress, push);
+            }
+
             for (buffer, loc) in zip(&output_data.buffers, &output_data.locations) {
                 let elem = SolidColorRenderElement::from_buffer(
                     buffer,
@@ -1617,12 +1833,13 @@ impl ScreenshotUi {
             selection,
             output_data,
             capture_type,
+            cursor,
             button:
                 Button::Down {
                     touch_slot,
                     on_control,
                     last_pos,
-                    move_state,
+                    grab,
                 },
             ..
         } = self
@@ -1634,6 +1851,7 @@ impl ScreenshotUi {
             return hover_changed;
         }
 
+        let previous = last_pos.1;
         last_pos.1 = point;
 
         // A press that landed on a control drags nothing, and Screen mode has no selection to drag.
@@ -1641,21 +1859,48 @@ impl ScreenshotUi {
             return hover_changed;
         }
 
-        if let Some(move_state) = move_state {
-            // The cursor offset is relative to selection.1.
-            let delta = point - (selection.1 + move_state.pointer_offset);
+        let size = output_data[&selection.0].size;
+        match grab {
+            Grab::New => {
+                selection.2 =
+                    Point::new(point.x.clamp(0, size.w - 1), point.y.clamp(0, size.h - 1));
+            }
+            Grab::Move(state) => {
+                // The offset model *is* GNOME's rubberbanding (`:610-640`): it tracks the pointer's
+                // absolute position, so pushing into an edge clamps and coming back off it moves
+                // again immediately, which is what its overshoot bookkeeping buys with deltas.
+                let delta = point - (selection.1 + state.pointer_offset);
 
-            let desired = rect_from_corner_points(selection.1 + delta, selection.2 + delta);
-            let bounds = Rectangle::from_size(output_data[&selection.0].size - desired.size);
-            let clamped_loc = desired.loc.constrain(bounds);
+                let desired = rect_from_corner_points(selection.1 + delta, selection.2 + delta);
+                let bounds = Rectangle::from_size(size - desired.size);
+                let clamped_loc = desired.loc.constrain(bounds);
 
-            let delta = clamped_loc - rect_from_corner_points(selection.1, selection.2).loc;
-            selection.1 += delta;
-            selection.2 += delta;
-        } else {
-            let size = output_data[&selection.0].size;
-            selection.2 = Point::new(point.x.clamp(0, size.w - 1), point.y.clamp(0, size.h - 1));
+                let delta = clamped_loc - rect_from_corner_points(selection.1, selection.2).loc;
+                selection.1 += delta;
+                selection.2 += delta;
+            }
+            Grab::Resize { x, y } => {
+                // Only the grabbed axes move: a pure edge drag pins the other one (`:645-650`).
+                // Deltas rather than the absolute position, because `selection.2` is the moving
+                // corner and the pointer sits on it only after the press-time warp.
+                let mut delta = point - previous;
+                if x.is_none() {
+                    delta.x = 0;
+                }
+                if y.is_none() {
+                    delta.y = 0;
+                }
+                selection.2 = Point::new(
+                    (selection.2.x + delta.x).clamp(0, size.w - 1),
+                    (selection.2.y + delta.y).clamp(0, size.h - 1),
+                );
+            }
         }
+
+        // After the drag, not before: `update_hover` ran at the top against the geometry this
+        // motion was about to change, so a handle dragged past the far side would keep advertising
+        // the corner it used to be for one motion longer.
+        *cursor = grab.cursor(selection.1, selection.2);
 
         self.update_buffers();
         true
@@ -1672,6 +1917,7 @@ impl ScreenshotUi {
             hover,
             hovered_window,
             cursor,
+            button,
             ..
         } = self
         else {
@@ -1685,12 +1931,28 @@ impl ScreenshotUi {
         // are siblings that inherit the default, and leaving Selection mode resets it outright
         // (`:1792`). A crosshair over a button says "click to select an area" about a surface that
         // does nothing of the kind.
-        let new_cursor = if *capture_type != CaptureType::Selection
-            || data.is_some_and(|data| data.over_chrome(point))
-        {
-            CursorIcon::Default
-        } else {
-            CursorIcon::Crosshair
+        let new_cursor = match button {
+            // A held drag keeps its own cursor wherever the pointer wanders, including over the
+            // panel: GNOME holds a stage grab for the duration, so nothing else can claim it.
+            Button::Down {
+                on_control: None,
+                grab,
+                ..
+            } if *capture_type == CaptureType::Selection => grab.cursor(selection.1, selection.2),
+            _ if *capture_type != CaptureType::Selection
+                || data.is_some_and(|data| data.over_chrome(point)) =>
+            {
+                CursorIcon::Default
+            }
+            // Free pointer over the selectable area: whatever a press here would grab.
+            _ => data.map_or(CursorIcon::Crosshair, |data| {
+                area_target(
+                    rect_from_corner_points(selection.1, selection.2),
+                    point,
+                    data.scale,
+                )
+                .cursor()
+            }),
         };
         let cursor_changed = *cursor != new_cursor;
         *cursor = new_cursor;
@@ -1753,30 +2015,31 @@ impl ScreenshotUi {
         point: Point<i32, Physical>,
         slot: Option<TouchSlot>,
         move_existing: bool,
-    ) -> bool {
+    ) -> Option<PointerDown> {
         let Self::Open {
             selection,
             output_data,
             capture_type,
             selected_window,
             button,
+            cursor,
             ..
         } = self
         else {
-            return false;
+            return None;
         };
 
         // Check if this is a second touch (different slot) while already dragging.
         if let Some(new_slot) = slot {
             if let Button::Down {
                 on_control: None,
-                move_state,
+                grab,
                 last_pos,
                 ..
             } = button
             {
-                if move_state.is_none() {
-                    *move_state = Some(MoveState {
+                if matches!(grab, Grab::New) {
+                    *grab = Grab::Move(MoveState {
                         pointer_offset: last_pos.1 - selection.1,
                         touch_slot: Some(new_slot),
                     });
@@ -1785,39 +2048,37 @@ impl ScreenshotUi {
         }
 
         if button.is_down() {
-            return false;
+            return None;
         }
 
         if move_existing {
             if output != selection.0 || *capture_type != CaptureType::Selection {
-                return false;
+                return None;
             }
 
             *button = Button::Down {
                 touch_slot: slot,
                 on_control: None,
                 last_pos: (output, point),
-                move_state: Some(MoveState {
+                grab: Grab::Move(MoveState {
                     pointer_offset: point - selection.1,
                     touch_slot: slot,
                 }),
             };
-            return true;
+            return Some(PointerDown::Redraw);
         }
 
-        let Some(output_data) = output_data.get(&output) else {
-            return false;
-        };
+        let output_data = output_data.get(&output)?;
 
         if let Some(control) = output_data.control_at(point) {
             *button = Button::Down {
                 touch_slot: slot,
                 on_control: Some(control),
                 last_pos: (output, point),
-                move_state: None,
+                grab: Grab::New,
             };
             // A control lights up while held, so the caller still owes a redraw.
-            return true;
+            return Some(PointerDown::Redraw);
         }
 
         // In Window mode a press outside the panel is a window pick, not a drag.
@@ -1827,40 +2088,109 @@ impl ScreenshotUi {
                 touch_slot: slot,
                 on_control: None,
                 last_pos: (output.clone(), point),
-                move_state: None,
+                grab: Grab::New,
             };
             if let Some(id) = picked {
                 // GNOME checks on release, but it also unchecks every other window at once — the
                 // selection is single-valued, so assigning it is the whole operation
                 // (`screenshot.js:1643-1658`).
                 *selected_window = Some((output, id));
-                return true;
+                return Some(PointerDown::Redraw);
             }
-            return false;
+            return None;
         }
-
-        *button = Button::Down {
-            touch_slot: slot,
-            on_control: None,
-            last_pos: (output.clone(), point),
-            move_state: None,
-        };
 
         // In Screen mode the selection is the output; a press on the frozen screen must not start
         // dragging a rectangle out of it.
         if *capture_type != CaptureType::Selection {
-            return false;
+            *button = Button::Down {
+                touch_slot: slot,
+                on_control: None,
+                last_pos: (output, point),
+                grab: Grab::New,
+            };
+            return None;
         }
 
-        let point = Point::new(
-            point.x.clamp(0, output_data.size.w - 1),
-            point.y.clamp(0, output_data.size.h - 1),
-        );
-        *selection = (output, point, point);
+        // What the press grabbed. Only a press on the *selection output's* own rectangle can grab
+        // it — a second monitor has its own panel but not this selection.
+        let target = if output == selection.0 {
+            area_target(
+                rect_from_corner_points(selection.1, selection.2),
+                point,
+                output_data.scale,
+            )
+        } else {
+            AreaTarget::Outside
+        };
+
+        let size = output_data.size;
+        let clamp = |p: Point<i32, Physical>| {
+            Point::new(p.x.clamp(0, size.w - 1), p.y.clamp(0, size.h - 1))
+        };
+
+        let (grab, warp) = match target {
+            AreaTarget::Outside => {
+                let point = clamp(point);
+                *selection = (output.clone(), point, point);
+                (Grab::New, None)
+            }
+            AreaTarget::Move => (
+                Grab::Move(MoveState {
+                    pointer_offset: point - rect_from_corner_points(selection.1, selection.2).loc,
+                    touch_slot: slot,
+                }),
+                None,
+            ),
+            AreaTarget::Resize { x, y } => {
+                // `selection.1` becomes the stationary corner and `selection.2` the moving one, so
+                // the rest of the drag is "move `.2`" no matter which handle was taken
+                // (`js/ui/screenshot.js:524-537`).
+                let rect = rect_from_corner_points(selection.1, selection.2);
+                let (left, top) = (rect.loc.x, rect.loc.y);
+                let (right, bottom) = (left + rect.size.w - 1, top + rect.size.h - 1);
+
+                let (stay_x, move_x) = match x {
+                    Some(Side::Low) => (right, left),
+                    Some(Side::High) => (left, right),
+                    None => (selection.1.x, selection.2.x),
+                };
+                let (stay_y, move_y) = match y {
+                    Some(Side::Low) => (bottom, top),
+                    Some(Side::High) => (top, bottom),
+                    None => (selection.1.y, selection.2.y),
+                };
+                *selection = (
+                    output.clone(),
+                    Point::new(stay_x, stay_y),
+                    Point::new(move_x, move_y),
+                );
+
+                // Snap the pointer onto the side it grabbed; an edge is grabbable from outside it,
+                // so without this the drag would run from beside the thing it moves.
+                let warp = Point::new(
+                    if x.is_some() { move_x } else { point.x },
+                    if y.is_some() { move_y } else { point.y },
+                );
+                (Grab::Resize { x, y }, Some(warp))
+            }
+        };
+
+        // GNOME sets the cursor inside `_onPress` (`js/ui/screenshot.js:465`, `:519`), and it has
+        // to: taking hold of a handle is a cursor change with no motion behind it.
+        *cursor = grab.cursor(selection.1, selection.2);
+
+        *button = Button::Down {
+            touch_slot: slot,
+            on_control: None,
+            // The warp lands here next, and a resize measures deltas from it.
+            last_pos: (output, warp.unwrap_or(point)),
+            grab,
+        };
 
         self.update_buffers();
 
-        true
+        Some(warp.map_or(PointerDown::Redraw, PointerDown::WarpTo))
     }
 
     pub fn pointer_up(&mut self, slot: Option<TouchSlot>) -> Option<PointerUp> {
@@ -1878,7 +2208,7 @@ impl ScreenshotUi {
             touch_slot,
             on_control,
             ref last_pos,
-            ref mut move_state,
+            ref mut grab,
             ..
         } = *button
         else {
@@ -1887,11 +2217,11 @@ impl ScreenshotUi {
 
         if touch_slot != slot {
             // This is not our main touch, but it might be the move touch. If so, stop the move.
-            if let Some(state) = move_state {
+            if let Some(state) = grab.move_state() {
                 if state.touch_slot.is_some_and(|m_slot| Some(m_slot) == slot) {
-                    *move_state = None;
+                    *grab = Grab::New;
                 }
-            };
+            }
 
             return None;
         }
@@ -1926,6 +2256,11 @@ impl ScreenshotUi {
         }
 
         self.update_buffers();
+
+        // "We might have finished creating a new selection, so we need to update the cursor"
+        // (`_onRelease`, `js/ui/screenshot.js:578-581`): the rectangle under the pointer is not the
+        // one that was there when the drag began, so what a press would grab has changed.
+        self.update_hover(last_pos.1);
 
         Some(PointerUp::Redraw)
     }
@@ -2058,6 +2393,9 @@ impl OutputData {
         let close = generate_close_button(renderer, scale, state.hover == Some(Control::Close))
             .map_err(|err| warn!("error rendering the screenshot close button: {err:?}"))
             .ok();
+        let handle = generate_handle(renderer, scale)
+            .map_err(|err| warn!("error rendering a selection handle: {err:?}"))
+            .ok();
 
         *self.panel.borrow_mut() = PanelCache {
             scale,
@@ -2067,6 +2405,7 @@ impl OutputData {
             layout,
             shadow,
             close,
+            handle,
         };
     }
 
@@ -2346,6 +2685,37 @@ impl OutputData {
             None,
             Kind::Unspecified,
         ))
+    }
+
+    /// The four selection corner handles, centred on the corners of `rect` (output-local physical).
+    ///
+    /// `_updateSelectionRect` places each one at `corner - handleSize / 2`
+    /// (`js/ui/screenshot.js:346-352`), so they straddle the corner rather than sit inside it —
+    /// which is also why the hit test in [`area_target`] reaches outside the rectangle.
+    fn push_handles(
+        &self,
+        renderer: &mut VulkanRenderer,
+        rect: Rectangle<i32, Physical>,
+        alpha: f32,
+        push: &mut dyn FnMut(ScreenshotUiRenderElement),
+    ) {
+        let Some(texture) = self.panel.borrow().handle.clone() else {
+            return;
+        };
+        let (side, margin) = handle_pad(self.scale);
+        // The texture is the circle plus its shadow margin, so the top-left of the *circle* is
+        // `margin` in from the buffer's own top-left.
+        let offset = f64::from(side) / 2. + f64::from(margin);
+
+        let (left, top) = (rect.loc.x, rect.loc.y);
+        let (right, bottom) = (left + rect.size.w - 1, top + rect.size.h - 1);
+        for (cx, cy) in [(left, top), (right, top), (left, bottom), (right, bottom)] {
+            let loc =
+                Point::<f64, Physical>::from((f64::from(cx) - offset, f64::from(cy) - offset))
+                    .to_logical(self.scale);
+            let elem = self.texture_element(renderer, texture.clone(), loc, alpha);
+            push(ScreenshotUiRenderElement::Screenshot(elem));
+        }
     }
 
     /// Composite every glyph on the panel.
@@ -2977,6 +3347,49 @@ fn generate_panel_shadow(
     })
 }
 
+/// The handle texture's physical size, and the shadow margin inside it. The circle sits at
+/// `(margin, margin)`; the buffer is larger so the shadow has room to spread and blur.
+fn handle_pad(scale: f64) -> (i32, i32) {
+    let sigma = HANDLE_SHADOW_BLUR * scale / 2.;
+    let spread = HANDLE_SHADOW_SPREAD * scale;
+    let offset = HANDLE_SHADOW_OFFSET_Y * scale;
+    let margin = (sigma * 3. + spread + offset).ceil() as i32;
+    let side = (HANDLE_PX * scale).round() as i32;
+    (side, margin)
+}
+
+/// Bake one `.screenshot-ui-area-selector-handle`: a white circle over its own drop shadow.
+fn generate_handle(renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
+    let (side, margin) = handle_pad(scale);
+    let size = Size::<i32, Physical>::from((side + margin * 2, side + margin * 2));
+
+    widget::bake_uncached_sized(renderer, size, |frame| {
+        let mut p = Painter::new(frame, scale, size);
+        p.clear(style::TRANSPARENT)?;
+
+        let logical = f64::from(margin) / scale;
+        let circle = Rectangle::new(
+            Point::from((logical, logical)),
+            Size::from((HANDLE_PX, HANDLE_PX)),
+        );
+        // `box-shadow: 0 1px 3px 2px` — the 2px spread is the box grown before blurring, which is
+        // what a spread *is*; our `drop_shadow` verb has blur and offset but no spread term.
+        let spread = Rectangle::new(
+            circle.loc - Point::from((HANDLE_SHADOW_SPREAD, HANDLE_SHADOW_SPREAD)),
+            circle.size + Size::from((HANDLE_SHADOW_SPREAD * 2., HANDLE_SHADOW_SPREAD * 2.)),
+        );
+        p.drop_shadow(
+            spread,
+            spread.size.h / 2.,
+            HANDLE_SHADOW_BLUR,
+            (0., HANDLE_SHADOW_OFFSET_Y),
+            SHADOW_COLOR,
+        )?;
+        p.fill_rounded(circle, HANDLE_PX / 2., [1., 1., 1., 1.])?;
+        Ok(())
+    })
+}
+
 /// Bake GNOME's control panel: the `%osd_panel` card, the three type buttons with their captions,
 /// the shot/cast pill, the show-pointer toggle and the capture button.
 ///
@@ -3347,6 +3760,99 @@ mod tests {
         let corner = Point::from((l.capture.loc.x + 1., l.capture.loc.y + 1.));
         assert!(l.capture.contains(corner));
         assert_ne!(l.control_at(corner), Some(Control::Capture));
+    }
+
+    // GNOME's `_computeCursorType` in one table. The rect is 100x100 at (100, 100) so every band
+    // is reachable, and scale 1 keeps the thresholds at their logical values (handle radius 12,
+    // edge band 10).
+    #[test]
+    fn the_selection_grabs_edges_corners_and_its_middle() {
+        use Side::{High, Low};
+
+        let rect = Rectangle::<i32, Physical>::new(Point::from((100, 100)), Size::from((100, 100)));
+        let at = |x, y| area_target(rect, Point::from((x, y)), 1.);
+        let resize = |x, y| AreaTarget::Resize { x, y };
+
+        // Corners, on the handle.
+        assert_eq!(at(100, 100), resize(Some(Low), Some(Low)));
+        assert_eq!(at(199, 100), resize(Some(High), Some(Low)));
+        assert_eq!(at(100, 199), resize(Some(Low), Some(High)));
+        assert_eq!(at(199, 199), resize(Some(High), Some(High)));
+
+        // The handle is a circle, so its bounding-box corner is not a grab: (11, 11) out is
+        // outside a radius-12 disc even though each axis alone is within 12. It is past the 10px
+        // edge bands too, so nothing is grabbed there at all.
+        assert_eq!(at(89, 89), AreaTarget::Outside);
+        // ...while straight up from the same corner, still on the disc, is.
+        assert_eq!(at(100, 89), resize(Some(Low), Some(Low)));
+
+        // Edges, from just outside — that is where the bands live.
+        assert_eq!(at(95, 150), resize(Some(Low), None), "left edge");
+        assert_eq!(at(204, 150), resize(Some(High), None), "right edge");
+        assert_eq!(at(150, 95), resize(None, Some(Low)), "top edge");
+        assert_eq!(at(150, 204), resize(None, Some(High)), "bottom edge");
+
+        // The middle moves.
+        assert_eq!(at(150, 150), AreaTarget::Move);
+
+        // Past the bands, nothing is grabbed and a press starts a new rectangle.
+        assert_eq!(at(150, 89), AreaTarget::Outside, "11px above the top edge");
+        assert_eq!(
+            at(89, 150),
+            AreaTarget::Outside,
+            "11px left of the left edge"
+        );
+        assert_eq!(at(50, 50), AreaTarget::Outside);
+        assert_eq!(
+            at(89, 250),
+            AreaTarget::Outside,
+            "in the left band on x but nowhere near on y"
+        );
+    }
+
+    // The scale is not decoration: the bands and handles are logical px, so at scale 2 a point
+    // that was outside is inside. A hit test that forgot it would be wrong by half on HiDPI.
+    #[test]
+    fn the_grab_bands_scale() {
+        let rect = Rectangle::<i32, Physical>::new(Point::from((100, 100)), Size::from((100, 100)));
+        let p = Point::from((85, 150));
+        assert_eq!(area_target(rect, p, 1.), AreaTarget::Outside);
+        assert_eq!(
+            area_target(rect, p, 2.),
+            AreaTarget::Resize {
+                x: Some(Side::Low),
+                y: None
+            },
+            "at scale 2 the 10px band is 20 physical px, and 15 away is inside it"
+        );
+    }
+
+    // Every grab must advertise itself, and the eight resize cursors must not collide — a table
+    // this regular is exactly where a copy-paste slip hides.
+    #[test]
+    fn every_grab_has_its_own_cursor() {
+        use Side::{High, Low};
+
+        let mut seen = Vec::new();
+        for x in [Some(Low), Some(High), None] {
+            for y in [Some(Low), Some(High), None] {
+                if x.is_none() && y.is_none() {
+                    continue;
+                }
+                seen.push(AreaTarget::Resize { x, y }.cursor());
+            }
+        }
+        let mut sorted = seen.clone();
+        sorted.sort_by_key(|c| format!("{c:?}"));
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            seen.len(),
+            "two grabs share a cursor: {seen:?}"
+        );
+
+        assert_eq!(AreaTarget::Outside.cursor(), CursorIcon::Crosshair);
+        assert_eq!(AreaTarget::Move.cursor(), CursorIcon::Move);
     }
 
     // The delay button is ours, and it shares the bottom row's right end with show-pointer: both

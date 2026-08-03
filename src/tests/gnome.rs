@@ -16349,7 +16349,7 @@ fn click_picker_control(
 
     let ui = &mut f.niri_state().niri.screenshot_ui;
     ui.pointer_motion(point, None);
-    assert!(ui.pointer_down(output, point, None, false));
+    assert!(ui.pointer_down(output, point, None, false).is_some());
     ui.pointer_up(None)
         .expect("the release must land on a control")
 }
@@ -16472,6 +16472,194 @@ fn a_lock_mid_countdown_cancels_the_delayed_capture() {
         rx.try_recv(),
         Ok(None),
         "and its caller must be told, not left waiting"
+    );
+}
+
+/// Drive a press/drag/release on the area selector, in output-local physical coords.
+fn drag_selection(f: &mut Fixture, from: (i32, i32), to: (i32, i32)) {
+    use smithay::utils::{Physical, Point};
+
+    let output = f.niri_output(1);
+    let from = Point::<i32, Physical>::from(from);
+    f.niri_state()
+        .handle_screenshot_ui_pointer_down(output, from, None, false);
+    // From wherever the press left the pointer — a resize warps it onto the side it grabbed.
+    f.niri_state()
+        .handle_screenshot_ui_motion(Point::from(to), None);
+    f.niri_state().niri.screenshot_ui.pointer_up(None);
+}
+
+fn selection_of(f: &mut Fixture) -> smithay::utils::Rectangle<i32, smithay::utils::Logical> {
+    f.niri()
+        .screenshot_ui
+        .selection_rect_global()
+        .expect("an open picker in Selection mode has a selection")
+}
+
+/// A press on a corner handle resizes from it, holding the opposite corner still.
+#[test]
+fn dragging_a_handle_resizes_from_the_opposite_corner() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    open_picker_headless(&mut f);
+
+    // A known rectangle to grab: 400x400 at (400, 400).
+    drag_selection(&mut f, (400, 400), (799, 799));
+    assert_eq!(
+        selection_of(&mut f),
+        Rectangle::new(Point::from((400, 400)), Size::from((400, 400)))
+    );
+
+    // Grab the top-left handle and pull it out to (200, 200). The bottom-right must not move.
+    drag_selection(&mut f, (400, 400), (200, 200));
+    assert_eq!(
+        selection_of(&mut f),
+        Rectangle::new(Point::from((200, 200)), Size::from((600, 600))),
+        "the corner opposite the one dragged is the one that must stay put"
+    );
+
+    // Grab the bottom edge from just outside it — an edge is grabbable from up to 10px out — and
+    // pull down. Only the height changes: a pure edge drag pins the other axis.
+    drag_selection(&mut f, (500, 805), (500, 900));
+    assert_eq!(
+        selection_of(&mut f),
+        Rectangle::new(Point::from((200, 200)), Size::from((600, 701))),
+        "an edge drag must not move the axis it did not grab"
+    );
+}
+
+/// Dragging a handle past the opposite side flips which handle it is, rather than collapsing the
+/// rectangle or inverting it (`js/ui/screenshot.js:672-709`).
+#[test]
+fn a_handle_dragged_past_the_far_side_flips() {
+    use smithay::input::pointer::CursorIcon;
+    use smithay::utils::{Point, Rectangle, Size};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    open_picker_headless(&mut f);
+    drag_selection(&mut f, (400, 400), (599, 599));
+
+    let output = f.niri_output(1);
+    // The pointer arrives on the handle before it presses, as a real one does.
+    f.niri_state()
+        .handle_screenshot_ui_motion(Point::from((400, 400)), None);
+    assert_eq!(
+        f.niri().screenshot_ui.cursor_icon(),
+        CursorIcon::NwResize,
+        "hovering the handle already advertises the grab"
+    );
+    // Grab it...
+    f.niri_state()
+        .handle_screenshot_ui_pointer_down(output, Point::from((400, 400)), None, false);
+    assert_eq!(
+        f.niri().screenshot_ui.cursor_icon(),
+        CursorIcon::NwResize,
+        "and holding it keeps it, with no motion in between"
+    );
+
+    // ...and drag it beyond the bottom-right one.
+    f.niri_state()
+        .handle_screenshot_ui_motion(Point::from((800, 800)), None);
+    assert_eq!(
+        f.niri().screenshot_ui.cursor_icon(),
+        CursorIcon::SeResize,
+        "past the far corner it is the south-east handle now, not a north-west one dragging \
+         backwards"
+    );
+    f.niri_state().niri.screenshot_ui.pointer_up(None);
+
+    assert_eq!(
+        selection_of(&mut f),
+        Rectangle::new(Point::from((599, 599)), Size::from((202, 202))),
+        "the rectangle stays a rectangle, hinged on the corner that was standing still"
+    );
+}
+
+/// A press inside the selection moves the whole thing, and it cannot be pushed off the output.
+#[test]
+fn dragging_inside_the_selection_moves_it() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    open_picker_headless(&mut f);
+    drag_selection(&mut f, (400, 400), (599, 599));
+
+    drag_selection(&mut f, (500, 500), (700, 500));
+    assert_eq!(
+        selection_of(&mut f),
+        Rectangle::new(Point::from((600, 400)), Size::from((200, 200))),
+        "moving keeps the size and follows the pointer"
+    );
+
+    // Shove it hard into the left edge: it stops there with its size intact.
+    drag_selection(&mut f, (700, 500), (-5000, 500));
+    assert_eq!(
+        selection_of(&mut f),
+        Rectangle::new(Point::from((0, 400)), Size::from((200, 200))),
+        "a move clamps to the output rather than sliding off it"
+    );
+}
+
+/// A press outside the selection still drags a new one — the behaviour the handles must not eat.
+#[test]
+fn pressing_outside_the_selection_still_starts_a_new_one() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    open_picker_headless(&mut f);
+    drag_selection(&mut f, (400, 400), (599, 599));
+
+    // Well clear of the rectangle and its grab bands.
+    drag_selection(&mut f, (1000, 1000), (1199, 1039));
+    assert_eq!(
+        selection_of(&mut f),
+        Rectangle::new(Point::from((1000, 1000)), Size::from((200, 40)))
+    );
+}
+
+/// A trip through Screen mode must not destroy the rectangle you dragged.
+///
+/// Ours reuses `selection` for Screen mode — it widens it to the whole output so the capture path
+/// needs no special case — which quietly overwrote the area. Nothing can do that in GNOME:
+/// `_areaSelector` keeps its own geometry and Screen mode draws `_screenSelectors`, a different
+/// widget entirely (`js/ui/screenshot.js:1780-1800`).
+#[test]
+fn the_area_selection_survives_a_trip_through_screen_mode() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use crate::ui::screenshot_ui::CaptureType;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    open_picker_headless(&mut f);
+
+    drag_selection(&mut f, (300, 300), (699, 599));
+    let area = Rectangle::new(Point::from((300, 300)), Size::from((400, 300)));
+    assert_eq!(selection_of(&mut f), area);
+
+    f.niri_state()
+        .niri
+        .screenshot_ui
+        .set_capture_type(CaptureType::Screen);
+    assert_eq!(
+        selection_of(&mut f),
+        Rectangle::new(Point::from((0, 0)), Size::from((1920, 1080))),
+        "Screen mode still captures the whole output"
+    );
+
+    f.niri_state()
+        .niri
+        .screenshot_ui
+        .set_capture_type(CaptureType::Selection);
+    assert_eq!(
+        selection_of(&mut f),
+        area,
+        "and coming back hands the rectangle back, rather than leaving the whole screen selected"
     );
 }
 

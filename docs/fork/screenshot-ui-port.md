@@ -185,14 +185,37 @@ fixed the same day. It is now derived in `update_hover` (same hit test as the ho
 through `State::handle_screenshot_ui_motion`, one funnel for all four motion call sites, plus a
 re-sync on click so switching to Screen mode drops the crosshair without the pointer moving.
 
-**Still missing, and it needs an interaction first.** GNOME's `_computeCursorType`
-(`js/ui/screenshot.js:354-398`) also returns `MOVE` inside the selection and eight resize variants
-near its edges and corner handles. We have none of those cursors because we have none of that
-interaction: our press either starts a fresh selection or moves the existing one, and *moving*
-requires a held modifier (`mod_down` at the three `pointer_down` call sites in `src/input/mod.rs`)
-rather than being a function of where the pointer is. Edge/corner resize does not exist at all.
-Porting the cursors without the interaction would be a cursor that promises a drag nothing
-implements, so this is one gap, not two: **selection resize handles**, with their cursors.
+**The rest of `_computeCursorType` landed 2026-08-03**, with the interaction it needs. Ported whole
+(`js/ui/screenshot.js:354-398`): four corner handles hit-tested as **circles** of their own radius,
+then edge bands `10 * scale` wide that sit *outside* the rectangle, then `MOVE` for anything
+strictly inside. `area_target` answers both questions at once — what the cursor is and what a press
+would grab — because a cursor promising a drag the press does not start is the bug this replaced.
+
+Three things worth keeping:
+
+- **The grab is stored as axes, not as a cursor.** GNOME keeps `_dragCursor` and *rewrites* it on
+  every motion when a handle crosses the far side (`:672-709`). We store which sides the pointer
+  drives and derive the cursor from where the moving corner currently is, so the two cannot
+  disagree. The flip falls out for free.
+- **The press warps the pointer**, as GNOME's does (`:519`), through `State::move_cursor` — the same
+  path `warp-mouse-to-focus` uses. Not cosmetic: an edge is grabbable from 10px outside it, so
+  without the warp every later delta would be measured from a pointer sitting beside the thing it
+  drags. `pointer_down` therefore returns `PointerDown`, and `State::handle_screenshot_ui_pointer_down`
+  is the one funnel that performs it — the same shape motion and release already had.
+- **The cursor is set at three moments, and all three are needed.** On press (taking a handle is a
+  cursor change with no motion behind it, `:465`), *after* applying a motion (before it, and a
+  flipped handle advertises its old corner one motion too long), and on release (`:578-581` — the
+  rectangle under the pointer is no longer the one the drag began on).
+
+**Found while doing it, and fixed:** a trip Selection → Screen → Selection destroyed the area. Ours
+reuses `selection` for Screen mode, widening it to the whole output so the capture path needs no
+special case; that overwrote the rectangle. It is now put aside on the way out and handed back on
+the way in. Nothing can lose it in GNOME — Screen mode draws a different widget.
+
+**Still not ported:** the click-without-dragging fallback expands by `20 * scale` in GNOME
+(`stopDrag`, `:412-441`) where ours expands by a flat 16px, and only when the result is empty or
+1×1 rather than when the pointer never moved. Both produce "a larger selection to reduce confusion";
+the constants differ.
 
 ## Toolkit first
 

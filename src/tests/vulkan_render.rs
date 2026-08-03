@@ -488,7 +488,9 @@ fn click_control(f: &mut Fixture, output: &Output, rect: Rectangle<f64, Logical>
 
     let ui = &mut f.niri_state().niri.screenshot_ui;
     ui.pointer_motion(point, None);
-    assert!(ui.pointer_down(output.clone(), point, None, false));
+    assert!(ui
+        .pointer_down(output.clone(), point, None, false)
+        .is_some());
     ui.pointer_up(None)
         .expect("the release must land on a control")
 }
@@ -761,7 +763,9 @@ fn vulkan_screenshot_ui_type_buttons_take_clicks_where_they_are_drawn() {
 
     let ui = &mut f.niri_state().niri.screenshot_ui;
     ui.pointer_motion(point, None);
-    assert!(ui.pointer_down(output.clone(), point, None, false));
+    assert!(ui
+        .pointer_down(output.clone(), point, None, false)
+        .is_some());
     assert_eq!(ui.pointer_up(None), Some(PointerUp::Redraw));
 
     assert_eq!(

@@ -192,8 +192,8 @@ use crate::ui::popover::PanelPopover;
 use crate::ui::run_dialog::{RunDialog, RunDialogRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{
-    CaptureMode, CaptureType, OutputScreenshot, PendingTarget, PointerUp, ScreenshotNeutral,
-    ScreenshotUi, ScreenshotUiRenderElement,
+    CaptureMode, CaptureType, OutputScreenshot, PendingTarget, PointerDown, PointerUp,
+    ScreenshotNeutral, ScreenshotUi, ScreenshotUiRenderElement,
 };
 use crate::ui::switcher::app_switcher::app_items;
 use crate::ui::switcher::ui::{Items, OpenRequest};
@@ -3999,6 +3999,37 @@ impl State {
         let changed = self.niri.screenshot_ui.pointer_motion(point, slot);
         self.sync_screenshot_ui_cursor();
         changed
+    }
+
+    /// Feed the picker a press, and perform whatever it asks for.
+    ///
+    /// Returns whether the caller owes a redraw. The warp goes through `move_cursor` — the same
+    /// path `warp-mouse-to-focus` uses — so the pointer really moves rather than the picker merely
+    /// pretending it did.
+    pub fn handle_screenshot_ui_pointer_down(
+        &mut self,
+        output: Output,
+        point: Point<i32, Physical>,
+        slot: Option<smithay::backend::input::TouchSlot>,
+        move_existing: bool,
+    ) -> bool {
+        let Some(down) =
+            self.niri
+                .screenshot_ui
+                .pointer_down(output.clone(), point, slot, move_existing)
+        else {
+            return false;
+        };
+
+        if let PointerDown::WarpTo(target) = down {
+            if let Some(geo) = self.niri.global_space.output_geometry(&output) {
+                let scale = output.current_scale().fractional_scale();
+                let global = target.to_f64().to_logical(scale) + geo.loc.to_f64();
+                self.move_cursor(global);
+            }
+        }
+        self.sync_screenshot_ui_cursor();
+        true
     }
 
     /// Apply the picker's current cursor. Also the way a *click* that changes mode gets a fresh
