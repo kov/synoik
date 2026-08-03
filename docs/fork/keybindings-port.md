@@ -24,9 +24,12 @@ where niri and GNOME merely do the same thing differently, GNOME wins.
    (gnome-settings-daemon's media keys, the GlobalShortcuts portal, Settings' custom shortcuts).
 4. `find_configured_bind` — the KDL binds, on their way out.
 
-An adopted key with no `action_for_gnome` mapping returns `None` and **falls through**. Benign
-while the KDL layer catches it; after the prune it means the key reaches the client. The prune
-slice must audit that every adopted entry maps to `Some`.
+An adopted key with no mapping would return `None` and **fall through** — benign while the KDL
+layer caught it, but after the prune it means the key reaches the client instead. The audit is
+now structural rather than a checklist: `action_for_gnome` is `Some(match action { … })` over
+`GnomeKeyAction` with **no wildcard arm**, so a variant without a mapping does not compile, and
+our own schema speaks niri actions directly (`KeybindingAction::Niri(a) => Some(a)`), which
+cannot fail to map at all.
 
 ## Ownership split (GNOME 50.3)
 
@@ -161,9 +164,19 @@ workspaces.
 `mods_with_*_binds` — sets of the modifier combinations any binding uses — before doing any
 lookup, so an unmodified scroll costs nothing. They were built from `config.binds` alone, which
 means a binding in the settings model was not merely slow to find but *never found at all*.
-`Niri::refresh_mods_with_binds` now rebuilds them from both sources, and runs wherever either
+`Niri::refresh_keybinding_state` now rebuilds them from both sources, and runs wherever either
 changes: config reload, the initial settings read, and every live settings change. Construction
 builds them from the compiled-in model, which is what the headless tests run on.
+
+### Sizes without an argument
+
+`set-column-width`/`set-window-height` take an amount, and a keybinding key is a list of
+accelerators with nowhere to put one. Rather than drop the capability with the KDL defaults,
+the four `<Super>`+`minus`/`equal` binds got keys with the step **compiled in** at niri's
+default 10% of the working area: `grow-column-width`, `shrink-column-width`,
+`grow-window-height`, `shrink-window-height`. The accelerators are configurable, the step is
+not; an arbitrary size is still reachable over IPC (`niri msg action set-column-width 25%`) or
+from a `binds{}` block.
 
 ### Packaging
 
@@ -242,9 +255,31 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 | S5 | `switch-to-application-N` + `open-new-window-application-N` | **done** |
 | S6 | Our own schema for the niri actions, plus its packaging | **done** |
 | S7 | Route the non-keyboard triggers (mouse, wheel, touchpad, tablet) through the model | **done** |
-| S8 | Prune and then delete the KDL `binds{}` | |
+| S8 | Prune and then delete the KDL `binds{}` | (a) **done**, (b) needs the seat check |
 | S9 | Re-source the hotkey overlay from the settings model | **done** |
 | S10 | Vendor `org.gnome.shell.*` / `org.gnome.mutter.*` into our private schema dir, plus the `.gschema.override` for our differing defaults | after S6 |
+
+### What the prune removed, and what replaced it
+
+`resources/default-config.kdl` ships **no** `binds{}` block. Every default it carried has a
+home now:
+
+| Was | Now |
+|---|---|
+| `Mod+Left/Right/Up/Down`, `Mod+H/J/K/L` and the Ctrl/Shift families | ours (hjkl) and GNOME's tiling/maximize arrows |
+| `Mod+1..9`, `Mod+Ctrl+1..9` | GNOME's `switch-to-application-N`; workspace-by-number ships unbound, as in a stock session |
+| `Mod+Q`, `Print`/`Ctrl+Print`/`Alt+Print`, `Mod+O`, `Mod+M` | `close`, the shell screenshot keys, `toggle-overview`, `toggle-maximized` |
+| `Mod+Escape` (`allow-inhibiting=false`) | `restore-shortcuts` (`<Super>Escape`), NON_MASKABLE |
+| `Mod+Minus`/`Mod+Equal` and the Shift pair | `grow-`/`shrink-column-width`, `grow-`/`shrink-window-height` |
+| `Mod+T` alacritty, `Mod+D` fuzzel, `Super+Alt+L` swaylock, `Super+Alt+S` orca | gnome-settings-daemon's launcher/screensaver/a11y keys and Settings → Keyboard custom shortcuts |
+| the `XF86Audio*` / `XF86MonBrightness*` `spawn-sh` examples | gsd's media-key plugin, which grabs them over `GrabAccelerator`. These were worse than redundant: they would have double-handled every volume press |
+| `Mod+Shift+F` (`fullscreen-window`) | `toggle-fullscreen`, which **GNOME ships unbound**. Following that default is the tenet; bind it in Settings if you want it back |
+| `Ctrl+Alt+Delete { quit; }` | gsd's `logout`, pending the seat check that gates S8(b) |
+
+The block still parses and still wins nothing — `find_bind` consults it last — so it remains
+the escape hatch for the two things the schema cannot express: an action with an argument, and
+spawning a command. It ships empty on purpose, because a default here would silently shadow
+what the user edits in Settings.
 
 ### Ordering hazards
 

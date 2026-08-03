@@ -16,6 +16,7 @@ use gio::glib;
 use gio::glib::prelude::ObjectExt;
 use gio::prelude::{DBusProxyExt, SettingsExt, SettingsExtManual};
 use niri_config::{Action, Modifiers};
+use niri_ipc::SizeChange;
 use smithay::input::keyboard::{xkb, Keysym};
 
 use crate::world_clocks::{ResolvedLocation, WorldLocation};
@@ -2148,6 +2149,29 @@ fn adopted_niri_keybindings() -> Vec<(String, Action, Vec<String>, Option<Durati
             "reset-window-height",
             ResetWindowHeight,
             "<Super><Control>r",
+        ),
+        // The step is compiled in rather than a settings key: mutter's keybinding
+        // schema is accelerators only, and an `as` key has nowhere to put the amount.
+        // Arbitrary sizes stay available over IPC (`niri msg action set-column-width`).
+        key(
+            "grow-column-width",
+            SetColumnWidth(SizeChange::AdjustProportion(10.)),
+            "<Super>equal",
+        ),
+        key(
+            "shrink-column-width",
+            SetColumnWidth(SizeChange::AdjustProportion(-10.)),
+            "<Super>minus",
+        ),
+        key(
+            "grow-window-height",
+            SetWindowHeight(SizeChange::AdjustProportion(10.)),
+            "<Super><Shift>equal",
+        ),
+        key(
+            "shrink-window-height",
+            SetWindowHeight(SizeChange::AdjustProportion(-10.)),
+            "<Super><Shift>minus",
         ),
         key("maximize-column", MaximizeColumn, "<Super>f"),
         key(

@@ -157,6 +157,25 @@
       <default>['&lt;Super&gt;&lt;Control&gt;r']</default>
       <summary>Reset the window height</summary>
     </key>
+    <!-- Finer size adjustments. The step (10% of the working area) is compiled in:
+         a keybinding key is a list of accelerators and has nowhere to put an amount.
+         Arbitrary sizes are still reachable over IPC. -->
+    <key name="grow-column-width" type="as">
+      <default>['&lt;Super&gt;equal']</default>
+      <summary>Widen the column</summary>
+    </key>
+    <key name="shrink-column-width" type="as">
+      <default>['&lt;Super&gt;minus']</default>
+      <summary>Narrow the column</summary>
+    </key>
+    <key name="grow-window-height" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;equal']</default>
+      <summary>Make the window taller</summary>
+    </key>
+    <key name="shrink-window-height" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;minus']</default>
+      <summary>Make the window shorter</summary>
+    </key>
     <key name="maximize-column" type="as">
       <default>['&lt;Super&gt;f']</default>
       <summary>Maximize the column</summary>

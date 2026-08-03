@@ -213,7 +213,11 @@ impl HotkeyOverlay {
 
 /// The key shown for `action`, and its label.
 ///
-/// A config bind wins over the settings model: the config is what the user layered on top.
+/// The settings model supplies the key when it has one, because that is the order
+/// `find_bind` resolves in — GNOME wins a conflict, so printing the config bind first could
+/// name a chord that does something else entirely. The config still supplies the *title*,
+/// which is the only place a custom one can come from.
+///
 /// `None` means the action should not be listed at all — a bind with a null
 /// `hotkey-overlay-title` hides it explicitly.
 fn format_bind(
@@ -248,15 +252,14 @@ fn format_bind(
     }
 
     let mut custom_title = None;
-    let key = if let Some(bind) = bind_with_custom_title.or(bind_with_non_null) {
+    let config_key = bind_with_custom_title.or(bind_with_non_null).map(|bind| {
         if let Some(Some(custom)) = &bind.hotkey_overlay_title {
             custom_title = Some(custom.clone());
         }
 
-        Some(bind.key)
-    } else {
-        keybinding_key(keybindings, action)
-    };
+        bind.key
+    });
+    let key = keybinding_key(keybindings, action).or(config_key);
     // A custom title is user text: render it plain (any pango markup it carries is stripped).
     let label = match custom_title {
         Some(title) => vec![LabelSpan::plain(strip_markup(&title))],
@@ -926,7 +929,8 @@ mod tests {
             @" Super + H : Focus Column to the Left"
         );
 
-        // A config bind is the user's override, so it wins over the model.
+        // A config bind loses to the model, because that is what `find_bind` does: a
+        // conflicting chord goes to GNOME, so naming the config one would be a lie.
         assert_snapshot!(
             check_with(
                 r#"binds {
@@ -935,7 +939,19 @@ mod tests {
                 &keybindings,
                 Action::CloseWindow,
             ),
-            @" Super + Shift + K : Close Focused Window"
+            @" Alt + F4 : Close Focused Window"
+        );
+
+        // The title still comes from the config — it is the only source of one.
+        assert_snapshot!(
+            check_with(
+                r#"binds {
+                    Mod+Shift+K hotkey-overlay-title="Go Away" { close-window; }
+                }"#,
+                &keybindings,
+                Action::CloseWindow,
+            ),
+            @" Alt + F4 : Go Away"
         );
     }
 
