@@ -3567,6 +3567,110 @@ fn generate_panel(
 
 // === Delayed-capture countdown =================================================================
 
+/// `.screenshot-ui-area-indicator-shade`, `_screenshot.scss:117-119`. Note this is the *base* rule,
+/// not the 50% one: that one is nested under `.screenshot-ui-area-selector`, so it applies while
+/// the picker is up and not to the standalone indicator below.
+const CAST_SHADE: [f32; 4] = [0., 0., 0., 0.3];
+
+/// The shade GNOME leaves over everything *outside* an area recording for as long as it runs
+/// (`_screencastAreaIndicator`, `js/ui/screenshot.js:1192-1207`, geometry set in `_startScreencast`
+/// at `:2022-2032`). It is the only sign on screen of *what* is being recorded, so it outlives the
+/// picker that started it.
+///
+/// **Drawn only on [`RenderTarget::Output`].** GNOME can afford to put its copy straight on the
+/// stage because the shade is by construction outside the recorded rect and so never in frame; we
+/// fail closed instead and keep it off every capture target, which also spares a screenshot taken
+/// mid-recording from inheriting it.
+#[derive(Default)]
+pub struct CastAreaIndicator {
+    /// The output and its recorded rect in that output's physical pixels, while one is running.
+    area: Option<(Output, Rectangle<i32, Physical>)>,
+    shades: RefCell<[SolidColorBuffer; 4]>,
+}
+
+impl CastAreaIndicator {
+    /// Start marking `rect` on `output`. A full-output rect collapses every shade to nothing, which
+    /// is exactly what GNOME's Screen mode draws.
+    pub fn set(&mut self, output: Output, rect: Rectangle<i32, Physical>) {
+        *self.shades.borrow_mut() =
+            std::array::from_fn(|_| SolidColorBuffer::new((0., 0.), CAST_SHADE));
+        self.area = Some((output, rect));
+    }
+
+    pub fn clear(&mut self) {
+        self.area = None;
+    }
+
+    /// Drop the mark only if it belongs to `output` — another output's recording is still running.
+    pub fn clear_for_output(&mut self, output: &Output) {
+        if self.area.as_ref().is_some_and(|(o, _)| o == output) {
+            self.area = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn area(&self) -> Option<(&Output, Rectangle<i32, Physical>)> {
+        self.area.as_ref().map(|(o, r)| (o, *r))
+    }
+
+    /// Push the four shade rects for `output`, top / bottom / left / right, as in `UIAreaIndicator`
+    /// (`js/ui/screenshot.js:145-245`): the horizontal pair spans the full width, the vertical pair
+    /// fills only the band beside the selection.
+    pub fn push(
+        &self,
+        target: RenderTarget,
+        output: &Output,
+        mut push: impl FnMut(SolidColorRenderElement),
+    ) {
+        if target != RenderTarget::Output {
+            return;
+        }
+        let Some((recorded, rect)) = &self.area else {
+            return;
+        };
+        if recorded != output {
+            return;
+        }
+
+        let scale = output.current_scale().fractional_scale();
+        let mode = output.current_mode().expect("a recorded output has a mode");
+        let size = output.current_transform().transform_size(mode.size);
+
+        // Clamp so a stale rect — an output that shrank under a running recording — can only shrink
+        // the shades, never hand a negative size to a buffer.
+        let rect = rect
+            .intersection(Rectangle::from_size(size))
+            .unwrap_or_default();
+        let geo: [(Point<i32, Physical>, Size<i32, Physical>); 4] = [
+            (Point::from((0, 0)), Size::from((size.w, rect.loc.y))),
+            (
+                Point::from((0, rect.loc.y + rect.size.h)),
+                Size::from((size.w, size.h - rect.loc.y - rect.size.h)),
+            ),
+            (
+                Point::from((0, rect.loc.y)),
+                Size::from((rect.loc.x, rect.size.h)),
+            ),
+            (
+                Point::from((rect.loc.x + rect.size.w, rect.loc.y)),
+                Size::from((size.w - rect.loc.x - rect.size.w, rect.size.h)),
+            ),
+        ];
+
+        let mut shades = self.shades.borrow_mut();
+        for (buffer, (loc, size)) in zip(shades.iter_mut(), geo) {
+            let size = Size::<i32, Physical>::from((size.w.max(0), size.h.max(0)));
+            buffer.resize(size.to_f64().to_logical(scale));
+            push(SolidColorRenderElement::from_buffer(
+                buffer,
+                loc.to_f64().to_logical(scale),
+                1.,
+                Kind::Unspecified,
+            ));
+        }
+    }
+}
+
 /// The card's side and corner radius, and the point size of the number inside it.
 const COUNTDOWN_SIDE: f64 = 108.;
 const COUNTDOWN_RADIUS: f64 = 24.;

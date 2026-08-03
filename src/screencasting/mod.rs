@@ -1170,6 +1170,8 @@ impl Niri {
     /// a client that is doing its own reporting.
     pub fn stop_screen_recordings(&mut self) -> Vec<std::path::PathBuf> {
         let mut finished = Vec::new();
+        // Nothing is being recorded after this, so nothing should still be marked as recorded.
+        self.cast_area_indicator.clear();
         let ids: Vec<_> = self
             .casting
             .recordings
@@ -1209,6 +1211,7 @@ impl Niri {
     /// matches the stored weak.
     pub fn stop_native_recordings_for_output(&mut self, output: &Output) {
         let weak = output.downgrade();
+        self.cast_area_indicator.clear_for_output(output);
         let mut changed = false;
         let mut i = 0;
         while i < self.casting.recordings.len() {

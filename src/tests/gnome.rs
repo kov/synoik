@@ -16881,6 +16881,71 @@ fn cast_mode_refuses_window_capture() {
     );
 }
 
+/// While an area recording runs, the rest of the screen is shaded so the user can see what is
+/// being recorded (`_screencastAreaIndicator`, `js/ui/screenshot.js:1192-1207`). The shade covers
+/// exactly the complement of the recorded rect, and — our fail-closed rule — never appears on a
+/// capture target, so it cannot end up inside the very recording it describes.
+#[test]
+fn a_running_area_recording_shades_what_it_leaves_out() {
+    use smithay::backend::renderer::element::Element as _;
+    use smithay::utils::{Physical, Rectangle};
+
+    use crate::render_helpers::RenderTarget;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.niri_output(1);
+
+    let recorded = Rectangle::<i32, Physical>::new((100, 200).into(), (800, 600).into());
+    f.niri().cast_area_indicator.set(output.clone(), recorded);
+
+    let shades = |f: &mut Fixture, target| {
+        let mut geo = Vec::new();
+        f.niri()
+            .cast_area_indicator
+            .push(target, &output, |elem| geo.push(elem.geometry(1.0.into())));
+        geo
+    };
+
+    for target in [RenderTarget::Screencast, RenderTarget::ScreenCapture] {
+        assert!(
+            shades(&mut f, target).is_empty(),
+            "the shade must not reach {target:?}"
+        );
+    }
+
+    let geo = shades(&mut f, RenderTarget::Output);
+    assert_eq!(geo.len(), 4);
+    for shade in &geo {
+        assert!(
+            shade.intersection(recorded).is_none(),
+            "{shade:?} covers part of what is being recorded"
+        );
+    }
+    // Every pixel outside the recorded rect belongs to one of the four.
+    let outside = |x, y| {
+        let point = Rectangle::<i32, Physical>::new((x, y).into(), (1, 1).into());
+        geo.iter().any(|shade| shade.contains_rect(point))
+    };
+    for (x, y) in [
+        (0, 0),
+        (1919, 0),
+        (0, 1079),
+        (1919, 1079),
+        (500, 100),
+        (50, 500),
+    ] {
+        assert!(
+            outside(x, y),
+            "({x}, {y}) is outside the recording, unshaded"
+        );
+    }
+
+    // And it stops the moment the recording does.
+    f.niri().cast_area_indicator.clear();
+    assert!(shades(&mut f, RenderTarget::Output).is_empty());
+}
+
 /// Single keys drive the type row and the shot/cast pill, so the picker is usable without the
 /// pointer (`vfunc_key_press_event`, `js/ui/screenshot.js:2207-2233`). The insensitive Window
 /// button still refuses its key, as its click already does.

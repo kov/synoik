@@ -38,10 +38,11 @@ constraint GNOME flips as the selection moves (`_closeButtonXAlignConstraint`,
 ## What we have today
 
 `src/ui/screenshot_ui.rs`. Area selection on a single output, drag/move/resize by pointer and by
-keyboard, the shade and selection chrome, and GNOME's control panel: the three type buttons
-(Window built but not offered), the shot segment, the capture button, the show-pointer toggle and
-the close button, all hover/checked/active-styled and hit-tested off one shared `PanelLayout`. `P`
-still toggles the pointer and `Space` still saves. No cast control, no tooltips, no window selector.
+keyboard, the shade, the selection chrome and its four corner handles, the window selector, and
+GNOME's control panel: the three type buttons, the shot/cast pill, the capture button, the
+show-pointer and delay toggles, the close button and tooltips, all hover/checked/active-styled and
+hit-tested off one shared `PanelLayout`. The keyboard reaches all of it: `s`/`c`/`w` pick the
+capture type, `v` flips shot/cast, `p` toggles the pointer, `Space` saves and `Ctrl+C` copies.
 
 Two things the panel's shape now fixes in place, worth knowing before touching it:
 
@@ -217,6 +218,40 @@ the way in. Nothing can lose it in GNOME — Screen mode draws a different widge
 1×1 rather than when the pointer never moved. Both produce "a larger selection to reduce confusion";
 the constants differ.
 
+**Nothing else may take the cursor while a grab holds it.** Two places did. `update_panel_hover`
+runs on every motion and forced the default whenever a notification banner was under the pointer or
+a panel popover was open, which reset a *window* resize mid-drag — user-reported, and nothing to do
+with the picker (`a_resize_grab_keeps_its_cursor_under_a_banner`). And `SeatHandler::cursor_image`
+rewrote every request to `Crosshair` while the picker was open, which was fine when the picker had
+one cursor and wrong the moment it had five; it now defers to `screenshot_ui.cursor_icon()`. Both
+are the same shape: a second writer to a single-valued piece of shared state, with no rule about
+who wins.
+
+## After the slices
+
+- **The type row and the pill answer to single keys.** `s`/`c`/`w` and `v`, from
+  `vfunc_key_press_event` (`js/ui/screenshot.js:2207-2233`). An insensitive control still swallows
+  its key without acting — GNOME gates on `reactive` and returns `EVENT_STOP` either way, and
+  `set_capture_type` already refused the switch, so the gate needs no second home. Ours does not
+  accept the shifted keysym: `raw` is the unshifted symbol, so `s` works with or without Shift on
+  the way in, and the picker's existing `alt`/`shift` rejection stays as it was.
+- **A running area recording shades what it leaves out** (`_screencastAreaIndicator`,
+  `js/ui/screenshot.js:1192-1207`). `CastAreaIndicator` outlives the picker — it is set as the
+  recorder starts and cleared by both ledger-removal paths in `screencasting` — and draws the same
+  four rects `UIAreaIndicator` does, in the **base** `.screenshot-ui-area-indicator-shade` colour
+  (30% black; the 50% rule is nested under `.screenshot-ui-area-selector` and does not reach here).
+  A Screen-mode recording collapses all four to nothing, which is what GNOME draws too.
+
+  One divergence, deliberate: GNOME parents its copy to `global.stage`, which is safe only because
+  the shade is by construction outside the recorded rect and so never in frame. We fail closed
+  instead and refuse every `RenderTarget` but `Output`, as the countdown does — which also keeps it
+  out of a screenshot taken while a recording runs.
+
+**Left, and agreed as a later pass:** arrow-key navigation of the window selector
+(`navigate_focus`, `:2236-2262`), `_screenSelectors` — Screen mode picking *which* monitor on a
+multi-monitor setup, which is also the last thing keeping the panel on one output — and the
+click-without-drag constant above.
+
 ## Toolkit first
 
 Checked against `src/ui/widget.rs` rather than assumed:
@@ -275,6 +310,10 @@ In the corpus (`src/tests/gnome.rs`), device-free, beside `select_area_always_an
   keep counting, so it cannot pass for the wrong reason.
 - `cast_mode_refuses_window_capture` — cast takes Window mode away, refuses a click that reaches the
   insensitive button anyway, and gives it back on the way out.
+- `single_keys_pick_the_capture_type_and_mode` — through `Fixture::key_press`, so the real xkb
+  keymap and the real bind filter are in the path, not `action()` called directly.
+- `a_running_area_recording_shades_what_it_leaves_out` — the four rects tile the complement of the
+  recorded rect and none of them touches it, and the whole thing is absent on both capture targets.
 
 In `src/tests/vulkan_render.rs`, where skipping without a device is the file's stated contract:
 

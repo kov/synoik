@@ -192,8 +192,8 @@ use crate::ui::popover::PanelPopover;
 use crate::ui::run_dialog::{RunDialog, RunDialogRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{
-    CaptureMode, CaptureType, OutputScreenshot, PendingTarget, PointerDown, PointerUp,
-    ScreenshotNeutral, ScreenshotUi, ScreenshotUiRenderElement,
+    CaptureMode, CaptureType, CastAreaIndicator, OutputScreenshot, PendingTarget, PointerDown,
+    PointerUp, ScreenshotNeutral, ScreenshotUi, ScreenshotUiRenderElement,
 };
 use crate::ui::switcher::app_switcher::app_items;
 use crate::ui::switcher::ui::{Items, OpenRequest};
@@ -840,6 +840,8 @@ pub struct Niri {
     pub pending_capture: Option<PendingCapture>,
     /// The countdown card the pending capture draws — Output target only, never in a capture.
     pub capture_countdown: crate::ui::screenshot_ui::Countdown,
+    /// The shade marking the area a picker-started recording is capturing, while it runs.
+    pub cast_area_indicator: CastAreaIndicator,
 
     /// The screenshot flash (`org.gnome.Shell.Screenshot.FlashArea`).
     pub flashspot: crate::ui::flashspot::FlashSpot,
@@ -3692,6 +3694,21 @@ impl State {
             warn!("could not start the recorder: {err:?}");
             return;
         }
+
+        // Mark what is being recorded, for as long as it is (`_startScreencast`,
+        // `js/ui/screenshot.js:2022-2032`). No crop means the whole output, which GNOME marks with
+        // the monitor's own rect — the shades then have nothing to cover.
+        let scale = output.current_scale().fractional_scale();
+        let rect = match crop {
+            Some(crop) => {
+                let local = Rectangle::new(crop.loc - output.current_location(), crop.size);
+                local.to_f64().to_physical_precise_round(scale)
+            }
+            None => Rectangle::from_size(crate::utils::output_size(&output))
+                .to_physical_precise_round(scale),
+        };
+        self.niri.cast_area_indicator.set(output, rect);
+
         self.niri.queue_redraw_all();
     }
 
@@ -6682,6 +6699,7 @@ impl Niri {
             end_session_dialog,
             pending_capture: None,
             capture_countdown: Default::default(),
+            cast_area_indicator: Default::default(),
             #[cfg(feature = "dbus")]
             select_area_reply: None,
             #[cfg(feature = "dbus")]
@@ -8893,6 +8911,12 @@ impl Niri {
                 push(elem.into());
             }
         }
+
+        // The shade marking a running area recording. GNOME parents its copy directly to the stage
+        // "so that it's above popup menus" (`js/ui/screenshot.js:1205-1206`), so this goes above
+        // everything the shell draws below — and, like the countdown, only on the screen itself.
+        self.cast_area_indicator
+            .push(ctx.target, output, |elem| push(elem.into()));
 
         // Next, the screen shield's curtain. Below `ext-session-lock` above — that protocol is a
         // stronger claim on the screen and there is no sense in drawing both — but above
