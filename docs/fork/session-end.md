@@ -160,16 +160,11 @@ tests in `src/tests/gnome.rs` set the flag by hand.
 
 ## 3. Known gaps
 
-- **Clients with no scope are still unprotected, and cost the full budget.** A `DBusActivatable`
-  app is launched by the bus, so `app_system.rs` skips scope creation for it (`pid == 0`) and its
-  unit is `dbus-:1.x-org.foo@N.service` — matching neither `APP_SCOPE_PATTERN`. Same for anything
-  spawned from a terminal. On the `Quit` and dialog paths nothing SIGTERMs them, so the drain waits
-  its whole 5 s and then exits over them anyway: the original bug, preserved for this app class,
-  plus a constant tax on those logouts. GNOME has the identical hole (its `dbus-.service.d` drop-in
-  sets only `Slice=`, no `PartOf=`), and on an *externally* driven logout they are equally exposed
-  under both. Closing it means either widening the patterns — dangerous, `dbus-*` covers services
-  we still need — or `xdg_toplevel.close` as a fallback for windows whose client we could not
-  reach, which is the divergence deliberately not taken here.
+- **Terminal-spawned clients have no scope**, so `stop_app_scopes` cannot reach them and nothing
+  SIGTERMs them at logout. The drain still waits for their windows; they are only asked to leave
+  when the socket dies, as under GNOME.
+- **`DBusActivatable` apps are handled by GNOME restarting the bus** — see §4; that covers us too
+  on every path except a bare `Quit`.
 - **`--session` under a non-systemd init** (dinit) drains with no way to stop the scopes, so a
   `Quit` there waits out the full budget before the warning: the drain is gated on
   `is_session_instance` while `stop_app_scopes` is gated on `IS_SYSTEMD_SERVICE`. Nobody runs that
@@ -186,3 +181,61 @@ tests in `src/tests/gnome.rs` set the flag by hand.
   gnome-shell. Since GTK4 dropped registration this protocol is dead for apps too, so there is
   nothing to gain until something starts speaking it again — the new `xx_session_v1` toplevel
   session protocol is about *restoring* windows, not quitting them.
+
+---
+
+## 4. D-Bus-activated apps: GNOME restarts the bus
+
+A `DBusActivatable=true` app is launched by the message bus, not by us, so the shell never sees a
+pid to put in a scope — `shell-global.c:1194-1196` bails out with "it's already in its own unit",
+and `app_system.rs` does the same. dbus-broker puts it in a transient
+`dbus-:1.x-org.foo@N.service`, and on this machine that unit's only drop-in is uresourced's
+`dbus-.service.d/00-uresourced.conf`, which sets `Slice=app.slice` and nothing else. Checked live:
+`PartOf=`, `BindsTo=`, `Requisite=` are all empty. The `graphical-session.target` stop does not
+touch these units at all.
+
+What actually kills them is at the bottom of `gnome-session-shutdown.target`, and GNOME says what it
+is in the file:
+
+```
+# We trigger a restart of DBus after reaching the shutdown target this
+# is a workaround so that DBus services that do not connect to the
+# display server are shut down after log-out.
+# This should be removed when the relevant services add a
+# PartOf=graphical-session.target
+# Historic bug: https://bugzilla.gnome.org/show_bug.cgi?id=764029
+Wants=gnome-session-restart-dbus.service
+Before=gnome-session-restart-dbus.service
+```
+
+`gnome-session-ctl --restart-dbus` bounces `dbus-broker.service`; every activated service loses its
+bus connection and exits. A self-described workaround, aimed at *services*, that takes GUI apps with
+it as a side effect.
+
+**Its timing is bad for exactly the case it covers.** From the same logout:
+
+```
+14:10:16.179  Stopping org.gnome.Shell@user.service...      compositor SIGTERM
+14:10:16.604  Stopping dbus-broker.service...               bus restart, +425 ms
+```
+
+The bus restart lands **after** the compositor has been told to stop. So under stock GNOME a
+D-Bus-activated app is *more* exposed than a scoped one, not less: a scoped app at least gets a
+341 ms head start, while this one is not asked to leave until 425 ms after the shell was.
+
+**The drain covers it anyway**, which is the part worth noticing — and it is why this is a footnote
+and not a gap:
+
+- **External logout** (systemd SIGTERMs us): the drain starts at `16.179` and runs for up to 5 s, so
+  we are still serving Wayland at `16.604` when the bus goes and the app exits. It closes our socket
+  itself instead of having it yanked. This is a case GNOME loses and we win, for free.
+- **Dialog confirm**: we drain, emit `Confirmed*`, and keep running while gnome-session drives the
+  teardown — so we are alive across the bus restart for the same reason.
+- **Bare `Quit`**: the only exposed path. We exit, and only then does our unit's
+  `OnSuccess=gnome-session-shutdown.target` fire the bus restart, with nobody left to serve the app.
+  A developer keybind, on a session that is ending regardless.
+
+The corollary is that `stop_app_scopes` not matching `dbus-:1.x-*` is correct rather than a
+shortfall: those units are not ours to stop, and stopping them by pattern would take out session
+services we still need. Nothing to fix here — but do not read "the app has no scope" as "the app is
+unprotected", which is the wrong conclusion this section exists to prevent.
