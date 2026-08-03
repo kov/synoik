@@ -128,18 +128,20 @@ fn clock_h_padding() -> f64 {
 /// and an arriving or dismissed notification cannot shove the clock — or every status
 /// indicator left of it — sideways. It draws over the button's pill rather than beside it,
 /// which GNOME never does; it reads as a trailing badge on the button.
-const MESSAGES_INDICATOR_ICON: f64 = 16.;
+/// **Ours, not GNOME's** (`$scalable_icon_size` is 16): the dot shares the clock button's
+/// trailing padding with the label rather than having a box of its own, and at 16 it filled
+/// that space wall to wall. 12 leaves [`MESSAGES_INDICATOR_GAP`] of air on both sides.
+const MESSAGES_INDICATOR_ICON: f64 = 12.;
 
 /// How far the dot's trailing edge sits in from the lit pill's, logical px — its only
 /// placement rule, since the pill's rounded end is what it would otherwise collide with.
 ///
-/// The room is tight and worth stating: after the clock label's advance box there is just
-/// `clock_h_padding() - BTN_MARGIN_X` (20px) of pill interior for a 16px dot, so this gap
-/// and the one left of the dot trade off directly. 4px reads balanced because the label's
-/// last glyph carries a few px of right side bearing, putting the dot ~4px off the *ink*
-/// even where it touches the advance box. Wanting more air on both sides means shrinking
-/// [`MESSAGES_INDICATOR_ICON`] — that is the knob, not this.
-const MESSAGES_INDICATOR_GAP: f64 = 4.;
+/// This gap and the one left of the dot trade off directly: the pill has just
+/// `clock_h_padding() - BTN_MARGIN_X` (20px) of interior after the clock label's advance
+/// box, which the dot and its two margins have to share. At GNOME's 16px icon there was
+/// nothing left to distribute — the dot sat flush in the pill's rounded end — so the icon
+/// shrank to [`MESSAGES_INDICATOR_ICON`] and both sides get this.
+const MESSAGES_INDICATOR_GAP: f64 = 6.;
 
 /// Bar background (opaque black — GNOME's dark panel `$panel_bg_color` = `$dark_5`
 /// `#000000`, `_colors.scss:24` / `_palette.scss:46`), straight RGBA.
