@@ -1238,10 +1238,12 @@ impl Entry {
         } else {
             shown.clone()
         };
-        // Caret/selection are only meaningful over real text — a placeholder is a hint, not a
-        // value, so neither is drawn over it (`st_entry` shows the hint *instead of* the
-        // ClutterText).
-        let cursor = (!empty).then(|| content.cursor.map(&map)).flatten();
+        // The caret is gated on **focus**, not on there being text: an empty focused entry is
+        // exactly where the caret is the only thing left to see, and a field showing neither
+        // text nor caret reads as dead. (GNOME draws the hint label beside a ClutterText that
+        // still carries its cursor.) A *selection*, on the other hand, needs something to
+        // select, and never spans a placeholder — that is a hint, not a value.
+        let cursor = content.cursor.map(&map);
         let selection = (!empty)
             .then(|| content.selection.clone().map(|s| map(s.start)..map(s.end)))
             .flatten()
@@ -1272,6 +1274,13 @@ impl Entry {
 
         // Scroll just enough to keep the caret in view, and never past the end of the text —
         // so a short string never shifts, and a long one parks its tail at the trailing edge.
+        //
+        // Deliberately stateless (derived from the caret alone), which costs one nicety: with
+        // overflowing text, walking Left from the end holds the caret against the clip's
+        // trailing edge and slides the text under it, where GNOME would hold the viewport and
+        // move the caret inside it. Fixing that means the *view* owning a scroll offset across
+        // frames, which is state this bake does not have and does not want; the current
+        // behavior is at least monotonic and never hides the caret.
         let avail_px = avail * scale;
         let total_px = advance(display.len());
         let scroll_px = match cursor {
@@ -1297,9 +1306,12 @@ impl Entry {
             scale,
             size,
             revision,
-            |r| {
-                let mut shaper = TextShaper::new(r, scale);
-                shaper.shape(&display, TextStyle::new(Self::TEXT_PT))
+            {
+                let display = display.clone();
+                move |r: &mut VulkanRenderer| {
+                    let mut shaper = TextShaper::new(r, scale);
+                    shaper.shape(&display, TextStyle::new(Self::TEXT_PT))
+                }
             },
             move |frame, phys, shaped| {
                 let mut p = Painter::new(frame, scale, phys);
@@ -1314,32 +1326,27 @@ impl Entry {
                     )?;
                 }
 
-                // `text_band` anchors the run's **ink** at `x`; the pen origin the glyph
-                // advances are measured from is that anchor less the ink's own left bearing.
-                // Caret and selection ride the pen origin, so they cannot drift from the glyphs
-                // the way an ink-relative estimate would on a leading `j` or a space.
                 let anchor = leading - scroll_px / scale;
-                let (ink_x, ..) = shaped.ink_bounds();
-                let pen = anchor * scale - ink_x as f64;
-                // Everything below is placed in physical px and handed back as logical, so the
-                // rects land on the same grid as the glyphs.
-                let at = |adv: f64| (pen + adv) / scale;
-                let bar = |x: f64, w: f64| {
-                    Rectangle::<f64, Logical>::new(
-                        Point::from((x, ENTRY_PAD)),
-                        Size::from((w, Self::HEIGHT - ENTRY_PAD * 2.)),
-                    )
-                };
+                let m = CaretMetrics::new(shaped, anchor, halign, scale, Self::TEXT_PT, false);
+                // A fixed band, not the ink's height: an empty entry has no ink at all, and a
+                // caret whose height came from the glyphs would vanish exactly when it is the
+                // only thing left to see.
+                let band = Rectangle::<f64, Logical>::new(
+                    Point::from((0., ENTRY_PAD)),
+                    Size::from((width, Self::HEIGHT - ENTRY_PAD * 2.)),
+                );
 
                 // Selection goes *behind* the glyphs. `selected-color` is `$fg_color`
                 // (`_common.scss:180`), which is what unselected text already draws in, so the
                 // run needs no second, differently-tinted pass.
                 if let Some(sel) = &selection {
-                    let (x0, x1) = (at(advance(sel.start)), at(advance(sel.end)));
-                    let rect = bar(x0, x1 - x0).intersection(clip);
-                    if let Some(rect) = rect {
-                        p.fill_rounded(rect, 0., style::selection_bg(accent))?;
-                    }
+                    p.selection(
+                        m.x_at(&display, sel.start),
+                        m.x_at(&display, sel.end),
+                        band,
+                        style::selection_bg(accent),
+                        Some(clip),
+                    )?;
                 }
 
                 let color = if empty {
@@ -1350,14 +1357,75 @@ impl Entry {
                 p.text_band(shaped, anchor, halign, 0., Self::HEIGHT, color, clip)?;
 
                 if let Some(at_byte) = cursor {
-                    let x = at(advance(at_byte));
-                    if let Some(rect) = bar(x, Self::CARET_W).intersection(clip) {
-                        p.fill_rounded(rect, 0., style::TEXT)?;
-                    }
+                    p.caret(m.x_at(&display, at_byte), band, style::TEXT, Some(clip))?;
                 }
                 Ok(())
             },
         )
+    }
+}
+
+/// Where a caret and a selection land inside a drawn run.
+///
+/// Both entry surfaces — the pill ([`Entry::bake`]) and the folder-rename box, which is
+/// centred and bold and so cannot simply *be* an [`Entry`] — need the same three steps: recover
+/// the run's pen origin from where its ink was anchored, measure the advance of the text before
+/// an offset, and turn that into a bar. Doing it twice is how the two drift, so it lives here.
+///
+/// The pen origin matters: [`Painter::text`] and [`Painter::text_band`] anchor a run's **ink**,
+/// and the glyph advances a caret rides are measured from the pen. Deriving the caret from the
+/// ink box instead puts it off by the first glyph's left side bearing — invisible on `n`,
+/// obvious on `j` or a leading space.
+///
+/// **Known limitation — RTL.** Offsets are turned into x by re-measuring `text[..offset]`, which
+/// assumes logical order matches visual order. For a right-to-left or bidi run the glyphs are
+/// laid out in visual order, so the caret lands at the LTR-prefix width rather than at the
+/// insertion point and a selection washes the wrong glyphs. Fixing it needs an index→x mapping
+/// out of the shaper (cosmic-text has the per-glyph byte ranges; `niri_vk::text::ShapedRun`
+/// does not expose them yet), not a change here. LTR runs are exact apart from kerning across
+/// the caret boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct CaretMetrics {
+    /// Run-local pen origin, physical px.
+    pen: f64,
+    scale: f64,
+    font_px: f32,
+    bold: bool,
+}
+
+impl CaretMetrics {
+    /// Recover the metrics for a run whose **ink** was anchored at logical `anchor_x` per
+    /// `halign`. `pt` and `bold` must be the ones the run was shaped with, or the advances
+    /// will not be the drawn glyphs'.
+    pub fn new(
+        shaped: &ShapedText,
+        anchor_x: f64,
+        halign: HAlign,
+        scale: f64,
+        pt: f64,
+        bold: bool,
+    ) -> Self {
+        let (ink_x, _, ink_w, _) = shaped.ink_bounds();
+        let anchor = anchor_x * scale;
+        let ink_left = match halign {
+            HAlign::Left => anchor,
+            HAlign::Center => anchor - f64::from(ink_w) / 2.,
+            HAlign::Right => anchor - f64::from(ink_w),
+        };
+        Self {
+            pen: ink_left - f64::from(ink_x),
+            scale,
+            font_px: (crate::ui::pt_to_px(pt) * scale) as f32,
+            bold,
+        }
+    }
+
+    /// The logical x of byte offset `at` in `text` (which must be the string that was shaped).
+    pub fn x_at(&self, text: &str, at: usize) -> f64 {
+        let at = at.min(text.len());
+        let advance =
+            niri_vk::text::measure_line_width_weighted(&text[..at], self.font_px, self.bold);
+        (self.pen + advance) / self.scale
     }
 }
 
@@ -2729,6 +2797,46 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         self.frame
             .clear(Color32F::from(premultiply(color)), &[rect])?;
         Ok(())
+    }
+
+    /// A caret bar of `Entry::CARET_W` at logical `x`, filling `band` vertically, clipped to
+    /// `clip`. Blends (an SDF fill), unlike [`fill_rect_px`](Self::fill_rect_px)'s clear — a
+    /// caret sits *on* the entry's fill, and clearing would punch a hole in it.
+    pub fn caret(
+        &mut self,
+        x: f64,
+        band: Rectangle<f64, Logical>,
+        color: Rgba,
+        clip: Option<Rectangle<f64, Logical>>,
+    ) -> anyhow::Result<()> {
+        self.selection(x, x + Entry::CARET_W, band, color, clip)
+    }
+
+    /// The selection wash between logical `x0` and `x1`, filling `band` vertically, clipped to
+    /// `clip`. A zero-or-negative span draws nothing.
+    pub fn selection(
+        &mut self,
+        x0: f64,
+        x1: f64,
+        band: Rectangle<f64, Logical>,
+        color: Rgba,
+        clip: Option<Rectangle<f64, Logical>>,
+    ) -> anyhow::Result<()> {
+        if x1 <= x0 {
+            return Ok(());
+        }
+        let rect = Rectangle::new(
+            Point::from((x0, band.loc.y)),
+            Size::from((x1 - x0, band.size.h)),
+        );
+        let rect = match clip {
+            Some(clip) => match rect.intersection(clip) {
+                Some(rect) => rect,
+                None => return Ok(()),
+            },
+            None => rect,
+        };
+        self.fill_rounded(rect, 0., color)
     }
 
     /// A crisp separator hairline filling the logical `rect` (one dimension is its 1px thickness).

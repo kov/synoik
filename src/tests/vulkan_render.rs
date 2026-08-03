@@ -7104,7 +7104,12 @@ fn vulkan_search_result_caption_rests_at_the_grid_line_count() {
     // A name that needs the second line, and a short one as the control.
     {
         let s = &mut f.niri().overview_search;
-        s.handle_key(None, Some('a'), crate::ui::text_edit::EditMods::default());
+        s.handle_key(
+            None,
+            Some('a'),
+            crate::ui::text_edit::EditMods::default(),
+            crate::ui::text_edit::KeyTheme::default(),
+        );
         s.set_results(vec![
             SearchResultEntry {
                 id: "long.desktop".into(),
@@ -7226,7 +7231,12 @@ fn vulkan_overview_search_draws_entry_and_selection() {
     // Drive the model directly into an active state with two results, tile 0 selected.
     {
         let s = &mut f.niri().overview_search;
-        s.handle_key(None, Some('a'), crate::ui::text_edit::EditMods::default());
+        s.handle_key(
+            None,
+            Some('a'),
+            crate::ui::text_edit::EditMods::default(),
+            crate::ui::text_edit::KeyTheme::default(),
+        );
         s.set_results(vec![
             SearchResultEntry {
                 id: "a.desktop".into(),

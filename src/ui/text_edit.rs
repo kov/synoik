@@ -162,11 +162,21 @@ pub struct TextEdit {
     cursor: usize,
     /// The other end of the selection. Equal to `cursor` when nothing is selected.
     anchor: usize,
-    /// The Emacs kill buffer that `Ctrl-k`/`Ctrl-u`/`Ctrl-w` fill and `Ctrl-y` yanks.
+    /// The Emacs kill buffer that `Ctrl-k`/`Ctrl-w` fill and `Ctrl-y` yanks.
     ///
-    /// Not a clipboard: GNOME's `Ctrl-k`/`Ctrl-u` discard what they delete
-    /// (`st-entry.c:743-762` just call `clutter_text_delete_text`), and a real kill ring
-    /// would need the Wayland selection. This is per-entry and dies with it.
+    /// Not a clipboard: a real kill ring would need the Wayland selection. This is per-entry
+    /// and dies with it.
+    ///
+    /// **Only ever written under [`KeyTheme::Emacs`].** In the default theme GNOME's
+    /// `Ctrl-u`/`Ctrl-k` simply *discard* what they delete (`st_entry_key_press_event` calls
+    /// `clutter_text_delete_text` and nothing else, `st-entry.c:743-762`) and there is no
+    /// `Ctrl-y` to paste it back — so filling this would buy nothing and cost everything: it
+    /// is a second heap copy of whatever was deleted, and both password entries route
+    /// `Ctrl-u` here. Typing a password and hitting `Ctrl-u` to start over would have left
+    /// the whole secret sitting in this buffer for the life of the dialog.
+    ///
+    /// It is zeroed by [`Self::secure_clear`] and before every overwrite, for the same
+    /// reason: a `String` that is merely reassigned drops its old allocation unzeroed.
     kill: String,
 }
 
@@ -239,19 +249,13 @@ impl TextEdit {
     pub fn secure_clear(&mut self, capacity: usize) {
         // SAFETY: every byte is overwritten with 0 and the vec is then truncated to nothing,
         // so no invalid UTF-8 is ever observable.
-        unsafe {
-            let bytes = self.text.as_mut_vec();
-            bytes
-                .iter_mut()
-                .for_each(|b| std::ptr::write_volatile(b, 0));
-            bytes.clear();
-        }
+        zero(&mut self.text);
         if self.text.capacity() < capacity {
             self.text.reserve(capacity - self.text.capacity());
         }
         self.cursor = 0;
         self.anchor = 0;
-        self.kill.clear();
+        zero(&mut self.kill);
     }
 
     /// This edit's caret and selection **mapped onto a masked rendering** of it — the offsets
@@ -362,8 +366,11 @@ impl TextEdit {
                 };
                 Some(to)
             }
-            // Single-line: Up/Down and Home/End all land on the two ends
-            // (`clutter_text_move_line_start/end`, `clutter-text.c:2288,2323`).
+            // Home/End land on the two ends (`clutter_text_move_line_start/end`,
+            // `clutter-text.c:2288,2323`). **Up/Down are deliberately absent**: on line 0 of a
+            // one-line entry `clutter_text_real_move_up` returns FALSE (`:3258-3259`), so the
+            // binding is unhandled in GNOME too and the key falls through to whatever is
+            // above. The overview search relies on exactly that to steer its results.
             Keysym::Home | Keysym::KP_Home | Keysym::Begin if !mods.alt => Some(0),
             Keysym::End | Keysym::KP_End if !mods.alt => Some(self.text.len()),
             // Emacs motion, only when the theme is on.
@@ -388,6 +395,13 @@ impl TextEdit {
         // --- Deletion.
         let deleted = match sym {
             // BackSpace and Shift-BackSpace are the same binding (`:4406-4413`).
+            //
+            // Divergence: with a selection up, the Ctrl arms below delete the *selection*
+            // rather than a word. GNOME's `clutter_text_real_del_word_prev/next`
+            // (`:3419-3452`, `:3490-3534`) do not — only the unmodified variants clear the
+            // selection first. Deleting visibly-selected text is what every other toolkit
+            // (and GTK) does, and "Ctrl-BackSpace ate a word *next to* what I had selected"
+            // is a surprise with no upside.
             Keysym::BackSpace if !mods.alt => {
                 if self.delete_selection() {
                     true
@@ -411,8 +425,10 @@ impl TextEdit {
             // St's two unconditional Emacs bindings (`st-entry.c:743-762`). They kill to
             // the line end/start regardless of the selection, which is what St does — it
             // calls `clutter_text_delete_text` with explicit positions.
-            Keysym::k | Keysym::K if mods.ctrl => self.kill_range(self.cursor..self.text.len()),
-            Keysym::u | Keysym::U if mods.ctrl => self.kill_range(0..self.cursor),
+            Keysym::k | Keysym::K if mods.ctrl => {
+                self.kill_range(self.cursor..self.text.len(), emacs)
+            }
+            Keysym::u | Keysym::U if mods.ctrl => self.kill_range(0..self.cursor, emacs),
             // Emacs-only deletions.
             Keysym::d | Keysym::D if emacs && mods.ctrl => {
                 if self.delete_selection() {
@@ -426,7 +442,7 @@ impl TextEdit {
                     Some(sel) => sel,
                     None => self.word_start_before(self.cursor)..self.cursor,
                 };
-                self.kill_range(range)
+                self.kill_range(range, true)
             }
             _ => return self.handle_emacs_tail(sym, mods, emacs),
         };
@@ -495,12 +511,19 @@ impl TextEdit {
         true
     }
 
-    /// [`Self::delete_range`], but the removed text lands in the kill buffer for `Ctrl-y`.
-    fn kill_range(&mut self, range: Range<usize>) -> bool {
+    /// [`Self::delete_range`], but when `remember` the removed text lands in the kill buffer
+    /// for `Ctrl-y`. See [`Self::kill`] for why `remember` is false in the default theme.
+    fn kill_range(&mut self, range: Range<usize>, remember: bool) -> bool {
         if range.start >= range.end {
             return false;
         }
-        self.kill = self.text[range.clone()].to_owned();
+        if remember {
+            // Overwrite the previous kill in place where it fits, so a reassignment cannot
+            // drop an allocation still holding the last thing that was deleted.
+            let text = self.text[range.clone()].to_owned();
+            zero(&mut self.kill);
+            self.kill.push_str(&text);
+        }
         self.delete_range(range)
     }
 
@@ -557,6 +580,20 @@ impl TextEdit {
     fn debug_check(&self) {
         debug_assert!(self.text.is_char_boundary(self.cursor));
         debug_assert!(self.text.is_char_boundary(self.anchor));
+    }
+}
+
+/// Overwrite a string's bytes and empty it, keeping the allocation — the password path's
+/// `write_volatile` fill, so the compiler cannot drop it as a store nothing reads back.
+fn zero(s: &mut String) {
+    // SAFETY: every byte is overwritten with 0 and the vec is then truncated to nothing, so no
+    // invalid UTF-8 is ever observable.
+    unsafe {
+        let bytes = s.as_mut_vec();
+        bytes
+            .iter_mut()
+            .for_each(|b| std::ptr::write_volatile(b, 0));
+        bytes.clear();
     }
 }
 
@@ -831,6 +868,40 @@ mod tests {
             EditOutcome::Ignored,
             "Ctrl-w is Emacs-only"
         );
+    }
+
+    /// The kill buffer is an Emacs-only affordance, and a *password* copy anywhere else.
+    /// `Ctrl-u` reaches both password entries in the default theme, where GNOME simply
+    /// discards; remembering it there would leave the whole secret in a second allocation.
+    #[test]
+    fn the_default_theme_never_fills_the_kill_buffer() {
+        let mut e = TextEdit::with_text("hunter2");
+        press(&mut e, Keysym::u, EditMods::ctrl());
+        assert_eq!(e.text(), "");
+        // Nothing to yank back, because nothing was kept. (`Ctrl-y` is Emacs-only, so ask in
+        // that theme — if the default theme had filled the buffer, this would paste.)
+        press_emacs(&mut e, Keysym::y, EditMods::ctrl());
+        assert_eq!(
+            e.text(),
+            "",
+            "the default theme's Ctrl-u must not have kept a copy"
+        );
+        assert!(e.kill.is_empty());
+    }
+
+    /// `secure_clear` zeroes the kill buffer too — otherwise an Emacs user's `Ctrl-k` leaves
+    /// the password behind after the dialog has "cleared" itself.
+    #[test]
+    fn secure_clear_zeroes_the_kill_buffer_as_well() {
+        let mut e = TextEdit::with_capacity(512);
+        e.insert_str("hunter2");
+        press_emacs(&mut e, Keysym::a, EditMods::ctrl());
+        press_emacs(&mut e, Keysym::k, EditMods::ctrl());
+        assert_eq!(e.kill, "hunter2", "the Emacs theme does keep it");
+        e.secure_clear(512);
+        assert!(e.kill.is_empty(), "and secure_clear takes it with the text");
+        press_emacs(&mut e, Keysym::y, EditMods::ctrl());
+        assert_eq!(e.text(), "", "nothing survives to be yanked back");
     }
 
     #[test]

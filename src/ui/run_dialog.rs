@@ -145,9 +145,21 @@ impl RunDialog {
 
         self.esc_pressed = raw == Some(Keysym::Escape);
 
-        // History recall owns Up/Down before the entry sees them: they are line motion on a
-        // one-line field, so the entry has nothing to do with them anyway.
+        // Return and history recall come before the entry.
+        //
+        // Return is the dialog's whatever the modifiers are: gnome-shell reads the activate
+        // event's `CONTROL_MASK` to decide whether to run *in a terminal*
+        // (`runDialog.js:113-114`, `_run(input, inTerminal)` `:204,218`), so Ctrl+Enter is a
+        // run, not a no-op. Leaving it to `TextEdit` — whose Activate arm is plain-only,
+        // because Ctrl+Enter belongs to whoever owns the field — silently swallowed it.
+        // (We still always run plainly; the in-terminal half is a separate divergence.)
+        //
+        // Up/Down are history recall: they are line motion on a one-line field, so the entry
+        // has nothing to do with them anyway.
         match raw {
+            Some(Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter) => {
+                return KeyOutcome::Run(self.entry.text().to_owned());
+            }
             Some(Keysym::Up) => {
                 let index = match self.history_index {
                     None => history.len().checked_sub(1),
@@ -174,15 +186,18 @@ impl RunDialog {
                 // selection, `Ctrl-u`/`Ctrl-k`, the Emacs theme.
                 let before = self.entry.text().to_owned();
                 match self.entry.handle_key(raw, text, mods, theme) {
-                    EditOutcome::Activate => return KeyOutcome::Run(self.entry.text().to_owned()),
                     EditOutcome::Changed => {
                         if self.entry.text() != before {
                             self.entry_edited();
                         }
                     }
-                    // The double-Escape close is handled above via `esc_pressed`; a single
-                    // Escape must not clear the entry the way the search's does.
-                    EditOutcome::Moved | EditOutcome::Cancel | EditOutcome::Ignored => {
+                    // Return never reaches here (claimed above). The double-Escape close is
+                    // handled via `esc_pressed`; a single Escape must not clear the entry the
+                    // way the search's does.
+                    EditOutcome::Activate
+                    | EditOutcome::Moved
+                    | EditOutcome::Cancel
+                    | EditOutcome::Ignored => {
                         self.revision += 1;
                     }
                 }

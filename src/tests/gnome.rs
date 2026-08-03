@@ -898,6 +898,29 @@ fn run_dialog_escape_closes() {
     );
 }
 
+/// Ctrl+Enter runs, like plain Enter. gnome-shell reads `CONTROL_MASK` off the activate event
+/// to decide whether to run *in a terminal* (`runDialog.js:113-114`, `_run(input, inTerminal)`
+/// `:204,218`) — so it is a run either way, and letting the shared entry's plain-only Activate
+/// arm swallow it made Ctrl+Enter silently do nothing.
+#[test]
+fn run_dialog_ctrl_enter_still_runs() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.niri_state().do_action(Action::ShowRunDialog, false);
+    tap(&mut f, KEY_Z);
+    tap(&mut f, KEY_Z);
+    f.key_press(KEY_LEFTCTRL);
+    tap(&mut f, KEY_ENTER);
+    f.key_release(KEY_LEFTCTRL);
+
+    assert_eq!(
+        f.niri().run_dialog.error(),
+        Some("Command not found"),
+        "Ctrl+Enter must have attempted the run, not been eaten by the entry"
+    );
+}
+
 /// An unknown command shows "Command not found" in-dialog and keeps the
 /// dialog open with the entry intact — and still enters the history
 /// (gnome-shell's `_run` records the attempt before trying it).

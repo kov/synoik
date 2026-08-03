@@ -65,8 +65,6 @@ const NAME_PT: f64 = 20.;
 /// The rename entry is `%system_entry` — `%entry_common`'s `$base_border_radius` 8 and
 /// `$base_padding * 1.5` = 9px of padding around the line (`_common.scss:175-181,337`).
 const ENTRY_RADIUS: f64 = 8.;
-/// The caret bar's width — St's `caret-size` default, as [`widget::Entry`] draws it.
-const CARET_W: f64 = 1.;
 const ENTRY_PAD: f64 = 9.;
 /// `.folder-name-entry { width: 12em; }` (`_app-grid.scss:86`), the em being the entry's
 /// own `%title_1` size.
@@ -875,14 +873,24 @@ impl FolderDialog {
         if !self.is_renaming() {
             return RenameKey::Ignored;
         }
+        // Return commits whatever the modifiers are — `TextEdit`'s Activate is plain-only
+        // (Ctrl+Enter belongs to whoever owns the field), and a Ctrl+Enter that quietly did
+        // nothing instead of committing the rename is not a behavior anyone asked for.
+        if matches!(
+            keysym,
+            Some(Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter)
+        ) {
+            return RenameKey::Commit;
+        }
         let Some(rename) = self.open.as_mut().and_then(|o| o.rename.as_mut()) else {
             return RenameKey::Ignored;
         };
         match rename.edit.handle_key(keysym, ch, mods, theme) {
-            EditOutcome::Activate => RenameKey::Commit,
             EditOutcome::Changed | EditOutcome::Moved => RenameKey::Took,
             // Escape closes the folder, so it must reach the caller unconsumed.
-            EditOutcome::Cancel | EditOutcome::Ignored => RenameKey::Ignored,
+            EditOutcome::Activate | EditOutcome::Cancel | EditOutcome::Ignored => {
+                RenameKey::Ignored
+            }
         }
     }
 
@@ -1115,22 +1123,19 @@ impl FolderDialog {
             .px(size.w)
             .px(size.h)
             .done();
-        // Advances measured in the same physical px the run is shaped at, so caret and
-        // selection land on the boundaries the glyphs agree with. Bold, like the run.
-        let font_px = (crate::ui::pt_to_px(NAME_PT) * scale) as f32;
-        let advance = move |upto: usize| {
-            niri_vk::text::measure_line_width_weighted(&display[..upto], font_px, true)
-        };
-        let display_for_shape = rename.edit.text().to_owned();
+
         match widget::bake(
             renderer,
             &mut self.cache.borrow_mut().entry,
             scale,
             size,
             revision,
-            move |r| {
-                let mut shaper = widget::TextShaper::new(r, scale);
-                shaper.shape(&display_for_shape, widget::TextStyle::new(NAME_PT).bold())
+            {
+                let display = display.clone();
+                move |r: &mut crate::render_helpers::vulkan::VulkanRenderer| {
+                    let mut shaper = widget::TextShaper::new(r, scale);
+                    shaper.shape(&display, widget::TextStyle::new(NAME_PT).bold())
+                }
             },
             move |frame, phys, text| {
                 let mut p = Painter::new(frame, scale, phys);
@@ -1138,22 +1143,35 @@ impl FolderDialog {
                 p.fill_rounded_full(ENTRY_RADIUS, style::ENTRY_BG)?;
                 p.stroke_rounded_full(ENTRY_RADIUS, FOCUS_RING_W, ring)?;
                 let center = Point::from((size.w / 2., size.h / 2.));
-                // `Align::CENTER` anchors the run's *ink* box on `center`; the pen origin the
-                // advances are measured from is that box's left edge less the ink's own
-                // bearing. Deriving both from it keeps caret and selection on the glyphs.
-                let (ink_x, _, ink_w, ink_h) = text.ink_bounds();
-                let pen = (center.x * scale - f64::from(ink_w) / 2.) - f64::from(ink_x);
-                let at = |adv: f64| (pen + adv) / scale;
-                let h = f64::from(ink_h) / scale;
-                let bar = |x: f64, w: f64| {
-                    Rectangle::new(Point::from((x, center.y - h / 2.)), Size::from((w, h)))
-                };
+                // Shared with the pill entry: `Align::CENTER` anchors the run's *ink*, while
+                // the advances a caret rides start at the pen. See `widget::CaretMetrics`.
+                let m = widget::CaretMetrics::new(
+                    text,
+                    center.x,
+                    widget::HAlign::Center,
+                    scale,
+                    NAME_PT,
+                    true,
+                );
+                // A line-box band, never the ink's height: select-all + BackSpace empties the
+                // name, and an ink-sized caret would disappear on the one field where it is
+                // the only thing left to look at.
+                let h = f64::from(text.line_box_height()) / scale;
+                let band = Rectangle::new(
+                    Point::from((0., center.y - h / 2.)),
+                    Size::from((size.w, h)),
+                );
                 if let Some(sel) = &sel {
-                    let (x0, x1) = (at(advance(sel.start)), at(advance(sel.end)));
-                    p.fill_rounded(bar(x0, x1 - x0), 0., selection)?;
+                    p.selection(
+                        m.x_at(&display, sel.start),
+                        m.x_at(&display, sel.end),
+                        band,
+                        selection,
+                        None,
+                    )?;
                 }
                 p.text(text, center, Align::CENTER, style::TEXT)?;
-                p.fill_rounded(bar(at(advance(caret)), CARET_W), 0., style::TEXT)?;
+                p.caret(m.x_at(&display, caret), band, style::TEXT, None)?;
                 Ok(())
             },
         ) {

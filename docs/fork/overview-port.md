@@ -1334,6 +1334,35 @@ the Wayland selection, so it belongs to a caller, not to a plain-data model.
 * **A caret is not in a text-keyed revision.** `Entry::bake` folds cursor/selection/scroll into
   the caller's revision itself rather than trusting every caller to remember — moving the caret
   changes what is drawn without changing the text.
+* **A caret sized from the ink box vanishes exactly when it matters.** Both entry surfaces first
+  derived the caret's height (and, in the search entry, its existence) from the drawn glyphs —
+  so an emptied field drew *nothing at all*, which reads as a dead control. The caret is gated
+  on **focus**, never on there being text, and its band is a fixed inset (or the run's line box),
+  never the ink.
+* **A kill buffer is a second copy of the password.** `Ctrl-u`/`Ctrl-k` are *default-theme*
+  bindings and reach both password entries. GNOME discards what they delete (`st-entry.c:743-762`
+  calls `clutter_text_delete_text` and nothing else) and has no `Ctrl-y` to paste it back, so
+  remembering it there bought nothing and cost a full unzeroed copy of the secret, surviving
+  `secure_clear`. `TextEdit::kill` is now written only under `KeyTheme::Emacs`, zeroed by
+  `secure_clear`, and zeroed before every overwrite.
+* **A setter nothing calls is a feature nothing has.** `OverviewSearch` held its own `key_theme`
+  field with a `set_key_theme` that was never wired, so four entries honored `gtk-key-theme` and
+  the flagship one silently did not. The theme is now a `handle_key` argument read live at the
+  call site, like the other four — there is no field to forget to feed.
+* **`TextEdit`'s Activate arm is plain-only, so a caller that owns Return must claim it first.**
+  Ctrl+Enter belongs to whoever owns the field (GNOME's open-in-new-window), so the model refuses
+  it — which silently broke the run dialog, where `CONTROL_MASK` on the activate event means "run
+  in a terminal" (`runDialog.js:113-114`, `_run(input, inTerminal)` `:204,218`), and the folder
+  rename, which committed on Return with any modifier.
+
+**Known limitations, deliberate.** The caret maps an offset to an x by re-measuring
+`text[..offset]`, which assumes logical order is visual order — wrong for **RTL/bidi** runs, where
+the caret lands at the LTR-prefix width. Fixing it needs an index→x mapping out of the shaper
+(cosmic-text has the per-glyph byte ranges; `niri_vk::text::ShapedRun` does not expose them), not
+a change in the widget. And `Entry::bake`'s horizontal scroll is derived from the caret alone
+rather than held as view state, so walking Left through overflowing text holds the caret at the
+trailing edge and slides the text under it where GNOME would hold the viewport — monotonic, and
+it never hides the caret, but it is not GNOME's.
 
 ## 12. Chrome divergences on the thumbnail strip (landed 2026-07-28)
 

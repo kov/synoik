@@ -1077,10 +1077,13 @@ impl State {
                         let starts = text.is_some_and(|c| !c.is_whitespace() && !c.is_control());
                         if active || expanded || starts {
                             use crate::ui::overview_search::SearchOutcome;
-                            let outcome =
-                                this.niri
-                                    .overview_search
-                                    .handle_key(raw, text, edit_mods(mods));
+                            let theme = this.niri.gnome_settings.key_theme;
+                            let outcome = this.niri.overview_search.handle_key(
+                                raw,
+                                text,
+                                edit_mods(mods),
+                                theme,
+                            );
                             // Ignored = a key the search doesn't handle (bare modifier, F-key);
                             // let it fall through to the hardcoded overview binds, unconsumed.
                             if !matches!(outcome, SearchOutcome::Ignored) {

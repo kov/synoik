@@ -227,8 +227,6 @@ struct SearchCache {
 pub struct OverviewSearch {
     /// The editable query — caret, selection and all (see [`crate::ui::text_edit`]).
     edit: TextEdit,
-    /// `org.gnome.desktop.interface gtk-key-theme`, pushed from the settings watcher.
-    key_theme: KeyTheme,
     /// Whether the entry is grown to GNOME's pill. Distinct from [`Self::is_active`]: you can
     /// be expanded with an empty query (you clicked the puck and have not typed yet).
     expanded: bool,
@@ -263,7 +261,6 @@ impl OverviewSearch {
     pub fn new() -> Self {
         Self {
             edit: TextEdit::new(),
-            key_theme: KeyTheme::default(),
             expanded: false,
             expand: 0.,
             results: Vec::new(),
@@ -299,11 +296,6 @@ impl OverviewSearch {
         self.expand = progress.clamp(0., 1.);
     }
 
-    /// Which editing bindings the entry honors, from the settings watcher.
-    pub fn set_key_theme(&mut self, theme: KeyTheme) {
-        self.key_theme = theme;
-    }
-
     /// The selected result's id, if any (what Enter activates).
     pub fn selected_id(&self) -> Option<&str> {
         self.results.get(self.selected).map(|e| e.id.as_str())
@@ -333,6 +325,10 @@ impl OverviewSearch {
         raw: Option<Keysym>,
         text: Option<char>,
         mods: EditMods,
+        // `org.gnome.desktop.interface gtk-key-theme`, read live at the call site — the same
+        // way the other four entries take it. It used to be a field with a setter nothing
+        // called, so this entry was the one that silently ignored the setting.
+        theme: KeyTheme,
     ) -> SearchOutcome {
         // --- Result navigation comes first, because these keys mean navigation to the
         // *results view*, not to the caret (`searchController.js:274-311`).
@@ -368,7 +364,7 @@ impl OverviewSearch {
         // --- Everything else is the entry's. The shared model owns the bindings; this
         // only maps its outcome onto the search's own policy.
         let was = self.edit.text().to_owned();
-        match self.edit.handle_key(raw, text, mods, self.key_theme) {
+        match self.edit.handle_key(raw, text, mods, theme) {
             EditOutcome::Activate => {
                 // activateDefault: launch the selected result, else consume (must NOT
                 // fall through, or the hardcoded Return bind would toggle the overview).
@@ -1132,21 +1128,26 @@ mod tests {
         // stutter that bites once providers make the result set large). Query/result
         // changes, which DO change the labels, still bump it.
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), EditMods::default());
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
         let rev = s.content_rev();
         assert!(
             s.set_hovered(Some(SearchHit::Result(1))),
             "a new hover reports a change"
         );
-        s.handle_key(Some(Keysym::Down), None, EditMods::default()); // move the keyboard selection
+        s.handle_key(
+            Some(Keysym::Down),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        ); // move the keyboard selection
         assert_eq!(
             s.content_rev(),
             rev,
             "hover + selection must not invalidate the label bake"
         );
         // A query change re-shapes (the labels differ).
-        s.handle_key(None, Some('b'), EditMods::default());
+        s.handle_key(None, Some('b'), EditMods::default(), KeyTheme::default());
         assert_ne!(s.content_rev(), rev, "a query change re-bakes");
     }
 
@@ -1155,11 +1156,11 @@ mod tests {
         let mut s = OverviewSearch::new();
         assert!(!s.is_active());
         assert_eq!(
-            s.handle_key(None, Some('f'), EditMods::default()),
+            s.handle_key(None, Some('f'), EditMods::default(), KeyTheme::default()),
             SearchOutcome::QueryChanged
         );
         assert_eq!(
-            s.handle_key(None, Some('i'), EditMods::default()),
+            s.handle_key(None, Some('i'), EditMods::default(), KeyTheme::default()),
             SearchOutcome::QueryChanged
         );
         assert!(s.is_active());
@@ -1167,7 +1168,12 @@ mod tests {
 
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
         assert_eq!(
-            s.handle_key(Some(Keysym::Return), None, EditMods::default()),
+            s.handle_key(
+                Some(Keysym::Return),
+                None,
+                EditMods::default(),
+                KeyTheme::default()
+            ),
             SearchOutcome::Activate("a.desktop".to_owned())
         );
     }
@@ -1177,16 +1183,36 @@ mod tests {
     #[test]
     fn arrow_moves_selection_and_clamps() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), EditMods::default());
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
         // Right at the end of the text → index 1, then clamp at the last.
-        s.handle_key(Some(Keysym::Right), None, EditMods::default());
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
         assert_eq!(s.selected_id(), Some("b.desktop"));
-        s.handle_key(Some(Keysym::Right), None, EditMods::default());
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
         assert_eq!(s.selected_id(), Some("b.desktop"));
         // Up back to 0, saturating.
-        s.handle_key(Some(Keysym::Up), None, EditMods::default());
-        s.handle_key(Some(Keysym::Up), None, EditMods::default());
+        s.handle_key(
+            Some(Keysym::Up),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
+        s.handle_key(
+            Some(Keysym::Up),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
         assert_eq!(s.selected_id(), Some("a.desktop"));
     }
 
@@ -1196,24 +1222,87 @@ mod tests {
     fn left_moves_the_caret_and_parks_right_navigation() {
         let mut s = OverviewSearch::new();
         for c in "ab".chars() {
-            s.handle_key(None, Some(c), EditMods::default());
+            s.handle_key(None, Some(c), EditMods::default(), KeyTheme::default());
         }
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
-        s.handle_key(Some(Keysym::Left), None, EditMods::default());
+        s.handle_key(
+            Some(Keysym::Left),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
         assert_eq!(
             s.selected_id(),
             Some("a.desktop"),
             "Left must not have stepped the selection"
         );
         // Typing now lands mid-string, which the old end-only caret could not do.
-        s.handle_key(None, Some('x'), EditMods::default());
+        s.handle_key(None, Some('x'), EditMods::default(), KeyTheme::default());
         assert_eq!(s.query(), "axb");
         // The caret is no longer at the end, so Right moves it rather than navigating.
-        s.handle_key(Some(Keysym::Right), None, EditMods::default());
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
         assert_eq!(s.selected_id(), Some("a.desktop"));
         // Back at the end, Right navigates again.
-        s.handle_key(Some(Keysym::Right), None, EditMods::default());
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
         assert_eq!(s.selected_id(), Some("b.desktop"));
+    }
+
+    /// An emptied-but-open entry still shows its caret. Backspacing the last character leaves
+    /// a focused pill with no text and (for this entry) no placeholder either — gating the
+    /// caret on "has text" made it draw literally nothing, which reads as a dead control.
+    #[test]
+    fn an_emptied_entry_still_has_a_caret() {
+        let mut s = OverviewSearch::new();
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
+        s.handle_key(
+            Some(Keysym::BackSpace),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
+        assert_eq!(s.query(), "");
+        assert!(
+            s.is_expanded(),
+            "backspacing to empty leaves the pill open — only Escape/clear collapses it"
+        );
+        let content = widget::EntryContent::of(&s.edit, "", s.is_expanded());
+        assert_eq!(
+            content.cursor,
+            Some(0),
+            "the caret must survive an empty entry, or the open pill draws nothing at all"
+        );
+    }
+
+    /// The key theme reaches the entry. It used to be a field with a setter nothing called, so
+    /// this entry — the one this whole change is about — silently ignored the setting while the
+    /// other four honored it.
+    #[test]
+    fn the_entry_honors_the_key_theme() {
+        let mut s = OverviewSearch::new();
+        for c in "one two".chars() {
+            s.handle_key(None, Some(c), EditMods::default(), KeyTheme::Emacs);
+        }
+        // Ctrl-w is Emacs-only: in the default theme it falls through unconsumed.
+        assert_eq!(
+            s.handle_key(Some(Keysym::w), None, EditMods::ctrl(), KeyTheme::Default),
+            SearchOutcome::Ignored
+        );
+        assert_eq!(s.query(), "one two");
+        assert_eq!(
+            s.handle_key(Some(Keysym::w), None, EditMods::ctrl(), KeyTheme::Emacs),
+            SearchOutcome::QueryChanged
+        );
+        assert_eq!(s.query(), "one ");
     }
 
     /// The GNOME editing combos reach the query, which the old `push`/`pop` model could not
@@ -1222,10 +1311,15 @@ mod tests {
     fn gnome_editing_combos_reach_the_query() {
         let mut s = OverviewSearch::new();
         for c in "one two".chars() {
-            s.handle_key(None, Some(c), EditMods::default());
+            s.handle_key(None, Some(c), EditMods::default(), KeyTheme::default());
         }
         assert_eq!(
-            s.handle_key(Some(Keysym::BackSpace), None, EditMods::ctrl()),
+            s.handle_key(
+                Some(Keysym::BackSpace),
+                None,
+                EditMods::ctrl(),
+                KeyTheme::default()
+            ),
             SearchOutcome::QueryChanged
         );
         assert_eq!(
@@ -1233,9 +1327,19 @@ mod tests {
             "one ",
             "Ctrl-BackSpace deletes the previous word"
         );
-        s.handle_key(Some(Keysym::Home), None, EditMods::default());
-        s.handle_key(Some(Keysym::Right), None, EditMods::ctrl_shift());
-        s.handle_key(None, Some('t'), EditMods::default());
+        s.handle_key(
+            Some(Keysym::Home),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::ctrl_shift(),
+            KeyTheme::default(),
+        );
+        s.handle_key(None, Some('t'), EditMods::default(), KeyTheme::default());
         assert_eq!(
             s.query(),
             "t ",
@@ -1246,14 +1350,29 @@ mod tests {
     #[test]
     fn selection_never_underflows_on_empty() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('z'), EditMods::default());
+        s.handle_key(None, Some('z'), EditMods::default(), KeyTheme::default());
         // No results seeded.
-        s.handle_key(Some(Keysym::Right), None, EditMods::default());
-        s.handle_key(Some(Keysym::Left), None, EditMods::default());
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
+        s.handle_key(
+            Some(Keysym::Left),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
         assert_eq!(s.selected_id(), None);
         // Enter with no results is consumed, not an activate.
         assert_eq!(
-            s.handle_key(Some(Keysym::Return), None, EditMods::default()),
+            s.handle_key(
+                Some(Keysym::Return),
+                None,
+                EditMods::default(),
+                KeyTheme::default()
+            ),
             SearchOutcome::Handled
         );
     }
@@ -1263,15 +1382,25 @@ mod tests {
         let mut s = OverviewSearch::new();
         // Inactive Escape → Close (normally unreachable via the input gate).
         assert_eq!(
-            s.handle_key(Some(Keysym::Escape), None, EditMods::default()),
+            s.handle_key(
+                Some(Keysym::Escape),
+                None,
+                EditMods::default(),
+                KeyTheme::default()
+            ),
             SearchOutcome::Close
         );
 
-        s.handle_key(None, Some('x'), EditMods::default());
+        s.handle_key(None, Some('x'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A")]);
         assert!(s.is_active());
         assert_eq!(
-            s.handle_key(Some(Keysym::Escape), None, EditMods::default()),
+            s.handle_key(
+                Some(Keysym::Escape),
+                None,
+                EditMods::default(),
+                KeyTheme::default()
+            ),
             SearchOutcome::Cleared
         );
         assert!(!s.is_active());
@@ -1282,10 +1411,15 @@ mod tests {
     #[test]
     fn backspace_empties_and_deactivates() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), EditMods::default());
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         assert!(s.is_active());
         assert_eq!(
-            s.handle_key(Some(Keysym::BackSpace), None, EditMods::default()),
+            s.handle_key(
+                Some(Keysym::BackSpace),
+                None,
+                EditMods::default(),
+                KeyTheme::default()
+            ),
             SearchOutcome::QueryChanged
         );
         assert!(!s.is_active());
@@ -1294,22 +1428,32 @@ mod tests {
     #[test]
     fn query_change_resets_selection_to_first() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), EditMods::default());
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
-        s.handle_key(Some(Keysym::Right), None, EditMods::default());
+        s.handle_key(
+            Some(Keysym::Right),
+            None,
+            EditMods::default(),
+            KeyTheme::default(),
+        );
         assert_eq!(s.selected_id(), Some("b.desktop"));
         // Typing another char resets selection to the first.
-        s.handle_key(None, Some('b'), EditMods::default());
+        s.handle_key(None, Some('b'), EditMods::default(), KeyTheme::default());
         assert_eq!(s.selected(), 0);
     }
 
     #[test]
     fn unhandled_key_is_ignored_not_consumed() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), EditMods::default()); // active
-                                                            // F5 (no text, not a nav key) must be Ignored so the caller doesn't eat it.
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default()); // active
+                                                                                 // F5 (no text, not a nav key) must be Ignored so the caller doesn't eat it.
         assert_eq!(
-            s.handle_key(Some(Keysym::F5), None, EditMods::default()),
+            s.handle_key(
+                Some(Keysym::F5),
+                None,
+                EditMods::default(),
+                KeyTheme::default()
+            ),
             SearchOutcome::Ignored
         );
     }
@@ -1361,7 +1505,7 @@ mod tests {
         // Well away from the entry: no hit at all.
         assert_eq!(s.hit_test(Point::from((10., 600.)), area), None);
 
-        s.handle_key(None, Some('a'), EditMods::default());
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
         // Mid-grow the clear glyph is not hittable yet: its 32px disc would cover the whole
         // 40px puck, so a click meant for the field would wipe the query.
@@ -1409,7 +1553,7 @@ mod tests {
         assert_eq!(s.layout(area).find_icon.x, puck.loc.x + COLLAPSED_W / 2.);
 
         // Typing expands it; the animation progress is pushed in by Niri, so drive it here.
-        s.handle_key(None, Some('a'), EditMods::default());
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         assert!(s.is_expanded());
         s.set_expand(1.);
         let pill = s.layout(area).entry.pill;
@@ -1465,7 +1609,7 @@ mod tests {
     #[test]
     fn modified_keys_are_ignored_while_active() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), EditMods::default());
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
 
         // Super is never an entry's, and Alt is bound to nothing here — both must fall
@@ -1488,7 +1632,7 @@ mod tests {
                 Keysym::BackSpace,
             ] {
                 assert_eq!(
-                    s.handle_key(Some(raw), None, mods),
+                    s.handle_key(Some(raw), None, mods, KeyTheme::default()),
                     SearchOutcome::Ignored,
                     "{raw:?} with {mods:?} held must be ignored, not acted on"
                 );
@@ -1523,7 +1667,7 @@ mod tests {
         // The card grows with the bigger tiles, and still centers them — plus the room a
         // resting caption needs below its tile box ([`LABEL_OVERHANG`]).
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('a'), EditMods::default());
+        s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         s.set_results(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
         let l = s.layout(area_1080());
         let card = l.card.expect("an active search has a card");
@@ -1556,7 +1700,7 @@ mod tests {
     #[test]
     fn empty_results_card_is_wide_enough_for_the_status_text() {
         let mut s = OverviewSearch::new();
-        s.handle_key(None, Some('z'), EditMods::default());
+        s.handle_key(None, Some('z'), EditMods::default(), KeyTheme::default());
         let card = s
             .layout(area_1080())
             .card
