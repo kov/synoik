@@ -35,6 +35,33 @@ pub const WORKSPACE_CUT_SIZE: f64 = 10.;
 /// `.placeholder`).
 pub const PLACEHOLDER_WIDTH: f64 = 18.;
 
+/// The close button's box on a thumbnail, logical px at ramp 1.
+///
+/// **Divergence (approved 2026-08-03).** gnome-shell has no such button — it reaps empty
+/// workspaces instead (`docs/fork/dynamic-workspaces-divergence.md`). Smaller than the
+/// window preview's `window_preview::CLOSE_SIZE` (32) because a thumbnail is a miniature,
+/// and **inset** rather than half-overhanging the corner the way a preview's is: the strip
+/// clips everything it draws to its band, and an overhanging button would be sliced in half
+/// along the band's top edge.
+pub const CLOSE_SIZE: f64 = 24.;
+
+/// How far the button is inset from the thumbnail's top-right corner, logical px at ramp 1.
+pub const CLOSE_INSET: f64 = 6.;
+
+/// The close button's box for the thumbnail *as drawn* at `thumb` (its slot after the
+/// inactive-workspace shrink), ramped with the rest of the overview chrome.
+pub fn close_rect(thumb: Rectangle<f64, Logical>, ramp: f64) -> Rectangle<f64, Logical> {
+    let size = (CLOSE_SIZE * ramp).round();
+    let inset = (CLOSE_INSET * ramp).round();
+    Rectangle::new(
+        Point::from((
+            thumb.loc.x + thumb.size.w - inset - size,
+            thumb.loc.y + inset,
+        )),
+        Size::from((size, size)),
+    )
+}
+
 /// The laid-out strip.
 #[derive(Debug)]
 pub struct Strip {
@@ -385,6 +412,34 @@ mod tests {
         let total_w = THUMB_W * 3. + SPACING * 2.;
         assert!(total_w > 800.);
         assert_eq!(strip.thumbs[0].loc.x, (40. + (800. - THUMB_W) / 2.).round());
+    }
+
+    /// The close button is **inset**, not corner-centred like the window preview's: the
+    /// strip clips everything it draws to its band, and the band is exactly one thumbnail
+    /// tall, so a half-overhanging button would be sliced along its top edge.
+    #[test]
+    fn the_close_button_sits_inside_its_thumbnail() {
+        let strip = strip(3, None);
+        let thumb = strip.thumbs[1];
+        let rect = close_rect(thumb, 1.);
+
+        assert_eq!(rect.size, Size::from((CLOSE_SIZE, CLOSE_SIZE)));
+        // Top-right corner, inset on both edges it touches.
+        assert_eq!(rect.loc.y, thumb.loc.y + CLOSE_INSET);
+        assert_eq!(
+            rect.loc.x + rect.size.w,
+            thumb.loc.x + thumb.size.w - CLOSE_INSET
+        );
+        // Wholly inside, so both the clip and the hit test see all of it.
+        assert!(
+            rect.loc.x >= thumb.loc.x && rect.loc.y + rect.size.h <= thumb.loc.y + thumb.size.h
+        );
+
+        // It ramps with the rest of the overview chrome, so it stays proportionate on a
+        // canvas whose thumbnails have shrunk.
+        let small = close_rect(thumb, 0.5);
+        assert_eq!(small.size, Size::from((12., 12.)));
+        assert_eq!(small.loc.y, thumb.loc.y + 3.);
     }
 
     #[test]

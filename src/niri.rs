@@ -196,6 +196,7 @@ use crate::ui::screenshot_ui::{
 use crate::ui::switcher::app_switcher::app_items;
 use crate::ui::switcher::ui::{Items, OpenRequest};
 use crate::ui::switcher::SwitcherKey;
+use crate::ui::thumbnail_chrome::{ThumbnailChrome, ThumbnailClose};
 use crate::ui::window_preview::{PreviewChrome, PreviewOverlay};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
@@ -864,6 +865,13 @@ pub struct Niri {
     pub preview_chrome: PreviewChrome,
     /// The preview whose close button the pointer is on, for its hover fill.
     pub preview_close_hovered: Option<Window>,
+    /// GPU caches for the strip's per-thumbnail close button.
+    pub thumbnail_chrome: ThumbnailChrome,
+    /// The strip thumbnail the pointer is on: an empty workspace shows its close button
+    /// while hovered (divergence, `docs/fork/dynamic-workspaces-divergence.md`).
+    pub thumbnail_hovered: Option<WorkspaceId>,
+    /// …and the workspace whose close button it is *on*, for that button's hover fill.
+    pub thumbnail_close_hovered: Option<WorkspaceId>,
     /// An app icon being dragged onto a workspace — see [`AppDrag`].
     pub app_drag: Option<AppDrag>,
     /// The icon whose context menu is open, so it can keep its highlight for as long as
@@ -6123,6 +6131,9 @@ impl Niri {
             folder_dialog: crate::ui::folder_dialog::FolderDialog::new(animation_clock.clone()),
             preview_chrome: PreviewChrome::new(),
             preview_close_hovered: None,
+            thumbnail_chrome: ThumbnailChrome::new(),
+            thumbnail_hovered: None,
+            thumbnail_close_hovered: None,
             app_drag: None,
             app_menu_source: None,
             app_icon_uploads: crate::ui::widget::SharedAppIconUploads::default(),
@@ -6910,6 +6921,14 @@ impl Niri {
             .thumbnail_strip()?
             .thumb_under(pos_within_output)?;
         Some((output, pos_within_output, idx))
+    }
+
+    /// The workspace whose thumbnail close button is under the position — tested *before*
+    /// the thumbnail itself, since the button sits inside its thumbnail's body.
+    pub fn thumbnail_close_under(&self, pos: Point<f64, Logical>) -> Option<WorkspaceId> {
+        let (output, pos_within_output) = self.thumbnail_strip_under(pos)?;
+        self.layout
+            .thumbnail_close_under(&output, pos_within_output)
     }
 
     /// The workspace whose overview strip thumbnail is under the position.
@@ -8869,6 +8888,30 @@ impl Niri {
             {
                 let thumbnails_alpha = picker_alpha * (1. - mon.app_grid_fraction() as f32);
                 let mut group = Vec::new();
+
+                // Topmost in the group (first pushed = topmost): the close button an empty
+                // workspace grows while hovered. Inside the group, so it fades with the
+                // strip rather than hanging over the picker on the way out.
+                let buttons: Vec<_> = mon
+                    .thumbnail_close_rects()
+                    .into_iter()
+                    .filter(|(id, _)| self.thumbnail_hovered == Some(*id))
+                    .map(|(id, rect)| ThumbnailClose {
+                        rect,
+                        alpha: 1.,
+                        hovered: self.thumbnail_close_hovered == Some(id),
+                    })
+                    .collect();
+                for element in self.thumbnail_chrome.render(
+                    ctx.renderer,
+                    &self.icon_cache,
+                    fade_scale,
+                    crate::ui::widget::style::accent_rgba(self.gnome_settings.accent_color),
+                    &buttons,
+                ) {
+                    group.push(element.into());
+                }
+
                 mon.render_thumbnails(ctx.r(), Some(&self.wallpaper), &mut |elem| {
                     group.push(elem.into())
                 });
@@ -13040,6 +13083,7 @@ niri_render_elements! {
         Offscreen = OffscreenRenderElement,
         // The window picker's per-preview chrome: close button, caption, app icon.
         PreviewChrome = crate::ui::window_preview::PreviewChromeRenderElement,
+        ThumbnailChrome = crate::ui::thumbnail_chrome::ThumbnailChromeRenderElement,
     }
 }
 

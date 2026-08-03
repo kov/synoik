@@ -3940,6 +3940,22 @@ impl State {
             self.niri.queue_redraw_all();
         }
 
+        // A strip thumbnail standing for an empty workspace shows its close button while
+        // the pointer is on it, and that button lightens when the pointer is on the button
+        // (divergence, `docs/fork/dynamic-workspaces-divergence.md`).
+        let thumb_hovered = self
+            .niri
+            .thumbnail_workspace_under(pos)
+            .map(|(_, ws)| ws.id());
+        let thumb_close_hovered = self.niri.thumbnail_close_under(pos);
+        if self.niri.thumbnail_hovered != thumb_hovered
+            || self.niri.thumbnail_close_hovered != thumb_close_hovered
+        {
+            self.niri.thumbnail_hovered = thumb_hovered;
+            self.niri.thumbnail_close_hovered = thumb_close_hovered;
+            self.niri.queue_redraw_all();
+        }
+
         // Hovering the notification banner holds its expiry and expands the
         // banner; leaving restarts the countdown
         // (`js/ui/messageTray.js:970-1050,1102-1105`, simplified).
@@ -6522,7 +6538,21 @@ impl State {
             // workspace reorder from a plain click (divergence, see `ThumbGrab`). It comes
             // before the window check because a thumbnail is drawn over the picker, and
             // after the modifier gestures above, which stay in charge of their buttons.
+            // The close button sits *inside* its thumbnail's body, so it has to be tested
+            // before the grab or the reorder drag swallows every press aimed at it.
             if button == Some(MouseButton::Left) && !pointer.is_grabbed() && is_overview_open {
+                if let Some(ws_id) = self.niri.thumbnail_close_under(pointer.current_location()) {
+                    if self.niri.layout.close_workspace(ws_id) {
+                        // The strip re-lays around the gap; nothing is under the pointer
+                        // where the button was, so drop both hovers rather than leaving a
+                        // button lit over a workspace that is gone.
+                        self.niri.thumbnail_hovered = None;
+                        self.niri.thumbnail_close_hovered = None;
+                        self.niri.queue_redraw_all();
+                    }
+                    return;
+                }
+
                 let hit = self
                     .niri
                     .thumbnail_under(pointer.current_location())

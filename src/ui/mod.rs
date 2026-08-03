@@ -29,6 +29,7 @@ pub mod screenshot_ui;
 pub mod switcher;
 pub mod text_edit;
 pub mod theme_node;
+pub mod thumbnail_chrome;
 pub mod widget;
 pub mod window_preview;
 

@@ -158,6 +158,9 @@ pub struct Monitor<W: LayoutElement> {
     thumb_placeholder: FocusRing,
     /// A thumbnail being dragged along the strip to reorder the workspaces.
     thumb_drag: Option<ThumbDrag>,
+    /// The strip closing the gap left by a workspace you dismissed — see
+    /// [`Self::close_workspace`].
+    thumb_close_slide: Option<CloseSlide>,
     /// Whether the overview is open.
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
@@ -270,6 +273,25 @@ struct ThumbDrag {
     grab_offset: f64,
     /// The pointer's current position, in view coordinates.
     pos: Point<f64, Logical>,
+}
+
+/// The strip closing the gap a dismissed workspace left behind.
+///
+/// The workspace is gone from the model the instant it is closed — nothing may keep a
+/// removed workspace alive for an animation's sake, or every index in the layout is a lie
+/// for 250ms. What is animated is only *where the survivors are drawn*: the row is laid out
+/// twice, once at the old count and once at the new, and the thumbnails ease between the
+/// two. A workspace vanishing with no motion reads as a glitch rather than as something
+/// you did.
+#[derive(Debug)]
+struct CloseSlide {
+    /// The index the closed workspace occupied, so the old row can be reconstructed.
+    removed_idx: usize,
+    /// Whether the active workspace was below it, i.e. whether the old row's focus index
+    /// was one higher than the current one.
+    active_was_below: bool,
+    /// 0 = the row as it stood with the workspace still in it, 1 = closed up.
+    anim: Animation,
 }
 
 /// The index an armed drag would drop at: how many of the *other* thumbnails the dragged
@@ -497,6 +519,7 @@ impl<W: LayoutElement> Monitor<W> {
             )),
             thumb_placeholder: FocusRing::new(thumbnail_placeholder_config()),
             thumb_drag: None,
+            thumb_close_slide: None,
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
@@ -805,6 +828,84 @@ impl<W: LayoutElement> Monitor<W> {
         while self.workspaces.len() < MIN_NUM_WORKSPACES {
             self.add_workspace_bottom();
         }
+    }
+
+    /// Every closable workspace's close-button rect, in view coordinates — the strip's
+    /// hover chrome and the hit test read the same list, so a button you can see is a
+    /// button you can press. See [`Self::workspace_is_closable`].
+    ///
+    /// At rest (the only time this is asked: the buttons are hover-driven and the pointer
+    /// is not aiming at anything mid-slide), so no slide offset is applied.
+    pub fn thumbnail_close_rects(&self) -> Vec<(WorkspaceId, Rectangle<f64, Logical>)> {
+        let Some(strip) = self.thumbnail_strip() else {
+            return Vec::new();
+        };
+        let ramp = overview_layout::chrome_ramp(self.view_size);
+        zip(&self.workspaces, &strip.thumbs)
+            .enumerate()
+            .filter(|(idx, _)| self.workspace_is_closable(*idx))
+            .map(|(idx, (ws, slot))| {
+                let thumb =
+                    thumbnail_drawn_rect(*slot, self.workspace_render_scale(idx), Point::default());
+                (ws.id(), thumbnails::close_rect(thumb, ramp))
+            })
+            .collect()
+    }
+
+    /// The workspace whose thumbnail close button is under the position.
+    pub fn thumbnail_close_under(&self, pos: Point<f64, Logical>) -> Option<WorkspaceId> {
+        // Clipped to the band like everything else the strip draws: a button scrolled out
+        // of the band is not drawn, so it is not there to aim at either.
+        let strip = self.thumbnail_strip()?;
+        if !strip.band.contains(pos) {
+            return None;
+        }
+        self.thumbnail_close_rects()
+            .into_iter()
+            .find(|(_, rect)| rect.contains(pos))
+            .map(|(id, _)| id)
+    }
+
+    /// Closes the workspace with this id, if it is closable. Returns whether it went.
+    ///
+    /// The remaining workspaces slide up into the gap: `move_workspace_to_idx`-style
+    /// reordering is what the strip already animates, and a workspace vanishing with no
+    /// motion reads as a glitch rather than as something you did.
+    pub fn close_workspace(&mut self, id: WorkspaceId) -> bool {
+        let Some(idx) = self.workspaces.iter().position(|ws| ws.id() == id) else {
+            return false;
+        };
+        if !self.workspace_is_closable(idx) {
+            return false;
+        }
+
+        // A switch in flight indexes workspaces by position, so it cannot survive one
+        // being spliced out from under it.
+        self.workspace_switch = None;
+        self.workspaces.remove(idx);
+        let active_was_below = self.active_workspace_idx > idx;
+        if active_was_below {
+            self.active_workspace_idx -= 1;
+        }
+        self.clean_up_workspaces();
+
+        // gnome-shell's own strip transitions run on `SIDE_CONTROLS_ANIMATION_TIME`
+        // (250ms, EASE_OUT_QUAD, `overviewControls.js:360-366`) — a fixed duration, not the
+        // configurable overview open/close one. Only whether animations run at all is
+        // inherited from the config.
+        let config = niri_config::Animation {
+            off: self.options.animations.overview_open_close.0.off,
+            kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+                duration_ms: 250,
+                curve: niri_config::animations::Curve::EaseOutQuad,
+            }),
+        };
+        self.thumb_close_slide = Some(CloseSlide {
+            removed_idx: idx,
+            active_was_below,
+            anim: Animation::new(self.clock.clone(), 0., 1., 0., config),
+        });
+        true
     }
 
     /// How many workspaces this monitor has, never fewer than [`MIN_NUM_WORKSPACES`].
@@ -1233,12 +1334,14 @@ impl<W: LayoutElement> Monitor<W> {
             .as_ref()
             .is_some_and(|s| s.is_animation_ongoing())
             || self.app_grid_expand.is_some()
+            || self.thumb_close_slide.is_some()
             || self.workspaces.iter().any(|ws| ws.are_animations_ongoing())
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
         self.workspace_switch.is_some()
             || self.app_grid_expand.is_some()
+            || self.thumb_close_slide.is_some()
             || self
                 .workspaces
                 .iter()
@@ -1894,10 +1997,17 @@ impl<W: LayoutElement> Monitor<W> {
         1.
     }
 
-    /// Retires the show-apps ease when it lands.
+    /// Retires the show-apps and close-slide eases when they land.
     fn update_app_grid_expand(&mut self) {
         if self.app_grid_expand.as_ref().is_some_and(|a| a.is_done()) {
             self.app_grid_expand = None;
+        }
+        if self
+            .thumb_close_slide
+            .as_ref()
+            .is_some_and(|s| s.anim.is_done())
+        {
+            self.thumb_close_slide = None;
         }
     }
 
@@ -2084,14 +2194,44 @@ impl<W: LayoutElement> Monitor<W> {
                 InsertWorkspace::Existing(_) => None,
             }
         });
-        Some(thumbnails::strip_geometry(
-            self.view_size,
-            self.controls_layout().thumbnails,
-            self.thumbnail_height(),
-            self.workspaces.len(),
-            placeholder,
-            self.workspace_render_idx(),
-        ))
+        let lay = |n: usize, focus: f64| {
+            thumbnails::strip_geometry(
+                self.view_size,
+                self.controls_layout().thumbnails,
+                self.thumbnail_height(),
+                n,
+                placeholder,
+                focus,
+            )
+        };
+        let strip = lay(self.workspaces.len(), self.workspace_render_idx());
+        Some(self.apply_close_slide(strip, &lay))
+    }
+
+    /// Eases the row from where it stood with a just-closed workspace still in it to where
+    /// it stands without — see [`CloseSlide`]. The survivors keep their identity
+    /// (`thumbs[i]` is still `workspaces[i]`); only their positions are interpolated.
+    fn apply_close_slide(&self, mut strip: Strip, lay: &dyn Fn(usize, f64) -> Strip) -> Strip {
+        let Some(slide) = &self.thumb_close_slide else {
+            return strip;
+        };
+        let t = slide.anim.clamped_value().clamp(0., 1.);
+
+        // The row as it was: one more workspace, and the focus index shifted back up if the
+        // closed one sat above the active workspace.
+        let focus_before =
+            self.workspace_render_idx() + f64::from(u8::from(slide.active_was_below));
+        let before = lay(self.workspaces.len() + 1, focus_before);
+
+        for (i, rect) in strip.thumbs.iter_mut().enumerate() {
+            // Map this survivor back onto the slot it held in the old row.
+            let was = if i < slide.removed_idx { i } else { i + 1 };
+            let Some(from) = before.thumbs.get(was) else {
+                continue;
+            };
+            rect.loc.x = from.loc.x + (rect.loc.x - from.loc.x) * t;
+        }
+        strip
     }
 
     /// Re-lays a strip around a reorder drag: the dragged thumbnail follows the
@@ -2697,18 +2837,8 @@ impl<W: LayoutElement> Monitor<W> {
         }
 
         for (idx, (ws, slot)) in zip(&self.workspaces, &strip.thumbs).enumerate() {
-            // Inactive workspaces shrink about their slot's center, exactly as they do in
-            // the row this strip is modelled on (`_updateWorkspacesState`,
-            // `workspacesView.js:243-266`) — the strip's own "which one am I on" cue,
-            // under the accent glow.
             let shrink = self.workspace_render_scale(idx);
-            let size = slot.size.downscale(1. / shrink);
-            let thumb = Rectangle::new(
-                slot.loc
-                    + slide
-                    + Point::from(((slot.size.w - size.w) / 2., (slot.size.h - size.h) / 2.)),
-                size,
-            );
+            let thumb = thumbnail_drawn_rect(*slot, shrink, slide);
             let thumb_scale = strip.scale * shrink;
             let thumb_loc_physical = thumb.loc.to_physical_precise_round(scale);
             let xray_pos = XrayPos::new(thumb.loc, thumb_scale);
@@ -3415,6 +3545,26 @@ impl<W: LayoutElement> Monitor<W> {
 fn workspace_render_scale(scroll_position: f64, idx: usize, ramp: f64) -> f64 {
     let distance = (scroll_position - idx as f64).abs().clamp(0., 1.);
     1. - (1. - WORKSPACE_INACTIVE_SCALE) * distance * ramp
+}
+
+/// Where a thumbnail is actually *drawn* inside its strip slot: inactive workspaces
+/// shrink about the slot's centre, exactly as they do in the row this strip is modelled
+/// on (`_updateWorkspacesState`, `workspacesView.js:243-266`) — the strip's own "which one
+/// am I on" cue, under the accent glow.
+///
+/// One expression, because the close button has to land on the drawn rect and not on the
+/// slot: the workspaces that grow a close button are the empty ones, which are hardly ever
+/// the active one, so they are hardly ever drawn at slot size.
+fn thumbnail_drawn_rect(
+    slot: Rectangle<f64, Logical>,
+    shrink: f64,
+    slide: Point<f64, Logical>,
+) -> Rectangle<f64, Logical> {
+    let size = slot.size.downscale(1. / shrink);
+    Rectangle::new(
+        slot.loc + slide + Point::from(((slot.size.w - size.w) / 2., (slot.size.h - size.h) / 2.)),
+        size,
+    )
 }
 
 /// The fit-single row: the active workspace centered in the view, its neighbours

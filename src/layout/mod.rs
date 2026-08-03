@@ -2443,6 +2443,26 @@ impl<W: LayoutElement> Layout<W> {
         mon.thumbnail_workspace_under(pos_within_output)
     }
 
+    /// The workspace whose thumbnail close button is under the position.
+    pub fn thumbnail_close_under(
+        &self,
+        output: &Output,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Option<WorkspaceId> {
+        let mon = self.monitor_for_output(output)?;
+        mon.thumbnail_close_under(pos_within_output)
+    }
+
+    /// Closes an empty workspace from its thumbnail. Returns whether it went.
+    pub fn close_workspace(&mut self, id: WorkspaceId) -> bool {
+        for mon in self.monitors_mut() {
+            if mon.close_workspace(id) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The workspace zoom on an output. In GNOME mode the fully-zoomed-out
     /// size follows that monitor's overview chrome, so this is per-output
     /// rather than a layout-wide constant.

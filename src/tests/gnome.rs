@@ -3520,6 +3520,302 @@ fn thumbnail_center(f: &mut Fixture, idx: usize) -> (f64, f64) {
     (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.)
 }
 
+/// The close button of the strip thumbnail at `idx`, if it has one.
+fn thumbnail_close_rect(
+    f: &mut Fixture,
+    idx: usize,
+) -> Option<smithay::utils::Rectangle<f64, smithay::utils::Logical>> {
+    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let mon = mon.expect("workspaces must be on a monitor");
+    let id = mon.workspace_at(idx).expect("a workspace at idx").id();
+    mon.thumbnail_close_rects()
+        .into_iter()
+        .find(|(ws, _)| *ws == id)
+        .map(|(_, rect)| rect)
+}
+
+/// A fixture with two populated desktops in the overview, the first of them then emptied:
+/// [empty, window, trailing empty]. Three thumbs of 279 plus 24 spacing fit the 1168-wide
+/// band with room to spare, so nothing under test is scrolled out of reach — which is the
+/// only way to hit a thumbnail, since the strip clips to its band.
+///
+/// Returns the emptied workspace's id and the survivor's.
+fn dismissable_desktop_fixture(
+    f: &mut Fixture,
+    id: ClientId,
+) -> (
+    crate::layout::workspace::WorkspaceId,
+    crate::layout::workspace::WorkspaceId,
+) {
+    setup_n_desktops(f, id, 2);
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.settle_animations();
+
+    let win = {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        mon.unwrap()
+            .workspace_at(0)
+            .unwrap()
+            .windows()
+            .next()
+            .unwrap()
+            .window
+            .clone()
+    };
+    f.niri()
+        .layout
+        .remove_window(&win, crate::utils::transaction::Transaction::new());
+    f.settle_animations();
+
+    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let mon = mon.unwrap();
+    assert_eq!(mon.workspace_count(), 3);
+    (
+        mon.workspace_at(0).unwrap().id(),
+        mon.workspace_at(1).unwrap().id(),
+    )
+}
+
+/// **Divergence (approved 2026-08-03, `docs/fork/dynamic-workspaces-divergence.md`).**
+/// An emptied workspace is not reaped; it grows a close button instead. Which thumbnails
+/// get one is the whole policy: windowless, unnamed, not the trailing empty, and never so
+/// many closed that the monitor drops under `MIN_NUM_WORKSPACES`.
+#[test]
+fn thumbnail_close_button_only_on_dismissable_desktops() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (empty_id, _) = dismissable_desktop_fixture(&mut f, id);
+
+    // A populated desktop has no close button, and neither has the trailing empty one —
+    // closing that would re-append it on the spot.
+    assert!(
+        thumbnail_close_rect(&mut f, 1).is_none(),
+        "a populated desktop is not dismissable"
+    );
+    assert!(
+        thumbnail_close_rect(&mut f, 2).is_none(),
+        "the trailing empty desktop is not dismissable"
+    );
+
+    let rect = thumbnail_close_rect(&mut f, 0).expect("the emptied desktop must be dismissable");
+    // Inside its thumbnail: the strip clips to its band, so an overhanging button would be
+    // sliced in half along the band's top edge.
+    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let strip = mon.unwrap().thumbnail_strip().unwrap();
+    let thumb = strip.thumbs[0];
+    assert!(
+        rect.loc.x >= thumb.loc.x
+            && rect.loc.y >= thumb.loc.y
+            && rect.loc.x + rect.size.w <= thumb.loc.x + thumb.size.w
+            && rect.loc.y + rect.size.h <= thumb.loc.y + thumb.size.h,
+        "the close button must sit inside its thumbnail, got {rect:?} in {thumb:?}"
+    );
+
+    // Naming a workspace is how you say you want it kept — that is already what makes one
+    // un-reapable, and it takes the close button away too.
+    f.niri().layout.set_workspace_name(
+        String::from("kept"),
+        Some(niri_config::WorkspaceReference::Id(empty_id.get())),
+    );
+    f.settle_animations();
+    assert!(
+        thumbnail_close_rect(&mut f, 0).is_none(),
+        "a named empty desktop is not dismissable"
+    );
+}
+
+/// Clicking that button dismisses the desktop and the strip closes the gap — the point of
+/// the whole divergence is that the *other* desktops survive, keeping the indices you have
+/// been aiming `Super+N` at all day.
+#[test]
+fn thumbnail_close_button_dismisses_the_desktop() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (_, survivor) = dismissable_desktop_fixture(&mut f, id);
+
+    let rect = thumbnail_close_rect(&mut f, 0).expect("the emptied desktop must be dismissable");
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle_animations();
+
+    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let mon = mon.unwrap();
+    assert_eq!(mon.workspace_count(), 2, "the desktop must be gone");
+    assert_eq!(
+        mon.workspace_at(0).unwrap().id(),
+        survivor,
+        "the desktop below it must have moved up into the gap"
+    );
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "dismissing a desktop must leave the overview open"
+    );
+}
+
+/// The button is hover-driven: it is drawn only while the pointer is on its thumbnail, and
+/// lightens only while the pointer is on the button. Both flags gate the draw, so a wrong
+/// one is an invisible button or a permanently lit one.
+#[test]
+fn thumbnail_close_button_follows_the_pointer() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (empty_id, _) = dismissable_desktop_fixture(&mut f, id);
+
+    let rect = thumbnail_close_rect(&mut f, 0).expect("the emptied desktop must be dismissable");
+
+    // On the thumbnail but away from the button. Not its centre: the row pins the *active*
+    // workspace to the band's centre, so the left part of the first thumbnail is scrolled
+    // out of the band and, being undrawn, is deliberately un-hittable.
+    pointer_motion_to(&mut f, rect.loc.x - 10., rect.loc.y + rect.size.h / 2.);
+    assert_eq!(f.niri().thumbnail_hovered, Some(empty_id));
+    assert_eq!(f.niri().thumbnail_close_hovered, None);
+
+    // On the button: lit.
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    assert_eq!(f.niri().thumbnail_hovered, Some(empty_id));
+    assert_eq!(f.niri().thumbnail_close_hovered, Some(empty_id));
+
+    // Off the strip entirely: neither.
+    pointer_motion_to(&mut f, 960., 900.);
+    assert_eq!(f.niri().thumbnail_hovered, None);
+    assert_eq!(f.niri().thumbnail_close_hovered, None);
+}
+
+/// Dismissing a desktop slides the survivors into the gap rather than teleporting them:
+/// mid-animation the row must be strictly between where it stood with the workspace still
+/// in it and where it lands without. (Sampling only the endpoints cannot tell a real ease
+/// from a settled one.)
+///
+/// The row pins the *active* workspace to the band's centre, so only the desktops *below*
+/// the closed one move at all — closing one above the active desktop leaves every offset
+/// unchanged, which is a feature (nothing jumps) but shows no slide. Hence: a survivor
+/// below the doomed desktop, and the focus above it.
+#[test]
+fn dismissing_a_desktop_slides_the_strip_closed() {
+    let mut f = Fixture::new();
+    // Wide enough for four thumbnails (4x375 + 3x24 = 1572) inside the 1808-wide band:
+    // a scrolled-out thumbnail is not drawn, and so cannot be aimed at.
+    f.add_output(1, (2560, 1440));
+    let id = f.add_client();
+
+    setup_n_desktops(&mut f, id, 3);
+    f.niri_state().do_action(Action::OpenOverview, false);
+    f.settle_animations();
+
+    // Empty desktop 1 and focus desktop 0: [window, empty, window, trailing empty].
+    let win = {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        mon.unwrap()
+            .workspace_at(1)
+            .unwrap()
+            .windows()
+            .next()
+            .unwrap()
+            .window
+            .clone()
+    };
+    f.niri()
+        .layout
+        .remove_window(&win, crate::utils::transaction::Transaction::new());
+    for _ in 0..3 {
+        f.niri_state().do_action(Action::FocusWorkspaceUp, false);
+    }
+    f.settle_animations();
+    let survivor = {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let mon = mon.unwrap();
+        assert_eq!(mon.workspace_count(), 4);
+        mon.workspace_at(2).unwrap().id()
+    };
+
+    // The survivor's own thumbnail, followed by identity rather than by index: closing a
+    // workspace renumbers everything below it, so an index would track two different
+    // thumbnails on either side of the close.
+    let survivor_x = |f: &mut Fixture| {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let mon = mon.unwrap();
+        let idx = (0..mon.workspace_count())
+            .find(|i| mon.workspace_at(*i).unwrap().id() == survivor)
+            .expect("the survivor must still be there");
+        mon.thumbnail_strip().unwrap().thumbs[idx].loc.x
+    };
+
+    let rect = thumbnail_close_rect(&mut f, 1).expect("the emptied desktop must be dismissable");
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    // At t = 0 the row is still drawn exactly as it stood before the close.
+    let start = survivor_x(&mut f);
+    {
+        let niri = f.niri();
+        let now = niri.clock.now_unadjusted();
+        niri.clock.set_unadjusted(now + Duration::from_millis(60));
+        niri.advance_animations();
+    }
+    let mid = survivor_x(&mut f);
+    f.settle_animations();
+    let end = survivor_x(&mut f);
+
+    assert!(start != end, "the strip must actually have a gap to close");
+    let (lo, hi) = if start < end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    assert!(
+        mid > lo && mid < hi,
+        "mid-slide the survivor must be between {start} and {end}, got {mid}"
+    );
+}
+
+/// A press aimed at the close button must not be swallowed by the reorder drag: the button
+/// sits *inside* its thumbnail's body, so the hit test has to run before `ThumbGrab` takes
+/// the press. (It went the other way round first, and every click reordered instead.)
+#[test]
+fn thumbnail_close_press_beats_the_reorder_grab() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (_, _) = dismissable_desktop_fixture(&mut f, id);
+
+    let rect = thumbnail_close_rect(&mut f, 0).expect("the emptied desktop must be dismissable");
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        assert!(
+            !mon.unwrap().thumb_drag_active(),
+            "a press on the close button must not arm a reorder drag"
+        );
+    }
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle_animations();
+
+    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    assert_eq!(mon.unwrap().workspace_count(), 2);
+}
+
 /// **Divergence (approved 2026-07-28).** Dragging a *thumbnail* along the strip reorders
 /// the workspaces, macOS Mission Control style. gnome-shell's thumbnails never reorder — a
 /// drag there is only ever a window being moved — and that gesture is kept, because the two

@@ -68,6 +68,44 @@ closing it would drop below `MIN_NUM_WORKSPACES`.
 A fresh session therefore shows two thumbnails, neither closable. That is intended: the second
 desktop is scratch space, not clutter to tidy away.
 
+### The button
+
+Geometry in `layout::thumbnails::close_rect`, paint in `ui::thumbnail_chrome`. It is
+`widget::IconButton` — the toolkit's circular glyph button — so its hover wash and its *round*
+hit test are the ones every other icon button in the shell uses, and it carries the window
+picker's `preview-close-symbolic` glyph so the two "dismiss this" affordances in the overview
+read as one control at two sizes.
+
+Two things it does differently from the window preview's close button
+(`ui::window_preview::close_rect`), both forced by the strip:
+
+- **Inset, not corner-centred.** A preview's button half-overhangs its top-right corner
+  (`windowPreview.js:203-218`). The strip clips everything it draws to its band, and the band is
+  exactly one thumbnail tall, so an overhanging button would be sliced along its top edge — and
+  the half sticking out would not be hittable either, since the hit test clips to the same band.
+- **Ramped, not fixed at 32px.** Thumbnails are a fraction of the work area, so they shrink a
+  long way on a small canvas; the button follows via `overview_layout::chrome_ramp`, the same
+  factor the strip's own spacing uses.
+
+The press is tested **before** `ThumbGrab` takes it (`input/mod.rs`): the button sits inside its
+thumbnail's body, so the reorder drag would otherwise swallow every click aimed at it.
+
+### Closing animates; showing does not
+
+Dismissing a desktop eases the survivors into the gap over 250ms (`CloseSlide`,
+`layout/monitor.rs`). The workspace itself is removed from the model *immediately* — nothing may
+keep a removed workspace alive for an animation's sake, or every index in the layout is a lie for
+a quarter second. What is animated is only where the survivors are *drawn*: the row is laid out
+twice, at the old count and the new, and the thumbnails interpolate between the two.
+
+Note that only desktops *below* the closed one move: the row pins the active workspace to the
+band's centre, so closing one above the focus leaves every offset unchanged. That is a feature
+(nothing jumps under you), not a missing animation.
+
+**Known gap:** the button itself pops in and out with the hover rather than fading, unlike the
+window preview's, whose alpha rides the picker's hover state. A per-workspace fade wants an
+animation per thumbnail; deferred until it actually reads badly on the seat.
+
 ## Accepted losses
 
 **Empty workspaces do not survive their output going away.** `Monitor::into_workspaces` and
