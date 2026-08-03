@@ -38,13 +38,24 @@ Keep a non-Flatpak consumer in the loop for exactly that reason.
 
 ## Requirements
 
-`pipewire`, `dbus-daemon`, `gst-launch-1.0` with `pipewiresrc` (`gstreamer1-plugin-pipewire`), and
-a render node. Override with `NH_DIR`, `NIRI_BIN`, `NIRI_HEADLESS_RENDER_NODE`.
+`pipewire`, `wireplumber`, `dbus-daemon`, `gst-launch-1.0` with `pipewiresrc`
+(`gstreamer1-plugin-pipewire`), and a render node. Override with `NH_DIR`, `NIRI_BIN`,
+`NIRI_HEADLESS_RENDER_NODE`.
 
-## Known gap
+## What "no frames" meant, and does not mean
 
-`Headless::render` (`src/backend/headless.rs`) only emits presentation feedback — it does not
-render. So a cast **starts** (a GBM device comes from the render node since `99c1f680`, the stream
-reaches `Paused` and emits a node id) but no frames ever flow, and `cast.sh` reports `frames: 0`.
-Wiring the live headless redraw loop to render through `with_vulkan_renderer` — the way the
-`Fixture` tests already drive `Niri::render` — is the last step to a working reproduction.
+A run that reports `frames: 0` with a node id printed used to look exactly like "the compositor
+never rendered". It was not: a screencast is rendered as a side effect of the redraw
+(`Niri::render_captures_with`), through the same Vulkan renderer the tests use, and the headless
+backend has had one since `add_renderer`. Two other things were missing, and both failed silently:
+
+- **No session manager.** Nothing links the consumer to our node, so a consumer connects without
+  error and then blocks forever. `start.sh` runs `wireplumber -p policy` for this.
+- **No next frame.** Headless has no VBlank, so an animation rendered one frame and stopped. The
+  backend now arms its own frame timer while animations are unfinished, pinned by
+  `the_headless_redraw_loop_keeps_an_animation_going`.
+
+With both in place the reproduction runs: a monitor cast negotiates the memory (memfd) sink and
+delivers changing frames, e.g. `frames: 25  distinct: 23`. Note that this means the frozen-frame
+bug seen on the seat does **not** reproduce here as of 2026-08-03 — so a passing run is not
+evidence the bug is gone; it means the difference is somewhere this harness does not yet cover.

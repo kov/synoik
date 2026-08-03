@@ -32,6 +32,13 @@ rm -f "$R"/pipewire-0* "$R"/wayland-* "$R"/niri.*.sock "$R"/*.log
 
 pipewire > "$R/pw.log" 2>&1 & echo $! >> "$R/pids"
 sleep 1
+# A session manager is REQUIRED, and its absence looks nothing like its cause: the cast starts, a
+# node id is emitted, a consumer connects without error — and then blocks forever, because nobody
+# ever links the two nodes. That cost an afternoon and a wrong diagnosis ("headless never
+# renders"). `-p policy` loads only the linking policy: no ALSA, no bluez, no camera monitors, so
+# this instance cannot touch the real session's hardware.
+wireplumber -p policy > "$R/wp.log" 2>&1 & echo $! >> "$R/pids"
+sleep 1
 dbus-daemon --session --fork --address="unix:path=$R/bus" --print-pid=1 > "$R/dbus.pid" 2>/dev/null
 cat "$R/dbus.pid" >> "$R/pids" 2>/dev/null
 sleep 1

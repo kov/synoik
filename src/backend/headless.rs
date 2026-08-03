@@ -5,6 +5,7 @@
 
 use std::mem;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use niri_config::OutputName;
@@ -15,6 +16,7 @@ use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::renderer::element::RenderElementStates;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 #[cfg(feature = "xdp-gnome-screencast")]
 use smithay::reexports::rustix::fs::{self as rfs, OFlags};
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
@@ -30,7 +32,9 @@ use crate::utils::{get_monotonic_time, logical_output};
 /// The headless backend's optional renderer. Clients need one to draw (and for screencasting);
 /// the compositor logic itself is driveable over IPC with none.
 pub struct Headless {
-    // Read by the test-only `with_vulkan_renderer`; the live headless `render` is a no-op.
+    // Reached through `with_vulkan_renderer`: `render` itself composites nothing (there is no
+    // scanout to composite for), but everything that captures the output as a side effect of the
+    // redraw — screencast, screencopy, screenshots — draws through this renderer.
     #[cfg_attr(not(test), allow(dead_code))]
     renderer: Option<crate::render_helpers::vulkan::VulkanRenderer>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
@@ -197,7 +201,12 @@ impl Headless {
         self.renderer.as_mut().map(f)
     }
 
-    pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
+    pub fn render(
+        &mut self,
+        niri: &mut Niri,
+        output: &Output,
+        target_presentation_time: Duration,
+    ) -> RenderResult {
         let states = RenderElementStates::default();
         let mut presentation_feedbacks = niri.take_presentation_feedbacks(output, &states);
         presentation_feedbacks.presented::<_, smithay::utils::Monotonic>(
@@ -209,16 +218,20 @@ impl Headless {
 
         let output_state = niri.output_state.get_mut(output).unwrap();
         match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
-            RedrawState::Idle => unreachable!(),
             RedrawState::Queued => (),
-            RedrawState::WaitingForVBlank { .. } => unreachable!(),
-            RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
-            RedrawState::WaitingForEstimatedVBlankAndQueued(_) => unreachable!(),
+            // Damage landed while the next animation frame was pending (see `queue_next_frame`),
+            // and that redraw is this one — so the timer has nothing left to ask for.
+            RedrawState::WaitingForEstimatedVBlankAndQueued(token) => niri.event_loop.remove(token),
+            RedrawState::Idle
+            | RedrawState::WaitingForVBlank { .. }
+            | RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
         }
+
+        let output_state = niri.output_state.get_mut(output).unwrap();
 
         output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
 
-        // FIXME: request redraw on unfinished animations remain
+        queue_next_frame(niri, output, target_presentation_time);
 
         RenderResult::Submitted
     }
@@ -235,6 +248,73 @@ impl Headless {
 impl Default for Headless {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Ask for the next frame of an ongoing animation.
+///
+/// Headless has no VBlank, so nothing else ever will: a redraw leaves the output `Idle` and only
+/// new damage brings it back. An animation would therefore render exactly **one** frame and then
+/// sit at whatever progress it reached — and since a screencast is rendered as a side effect of
+/// the redraw ([`Niri::render_captures_with`]), a cast of a headless session sees that same single
+/// frame. This is the estimated-vblank timer the TTY backend keeps for the same reason (no
+/// presentation time from DRM), minus the DRM parts.
+///
+/// [`Niri::render_captures_with`]: crate::niri::Niri
+fn queue_next_frame(niri: &mut Niri, output: &Output, target_presentation_time: Duration) {
+    let output_state = niri.output_state.get_mut(output).unwrap();
+    if !output_state.unfinished_animations_remain {
+        return;
+    }
+
+    // A zero-length timer would just spin: `render` already sent this frame's callbacks, so wait
+    // out the frame interval before asking for the next one.
+    let mut duration = target_presentation_time.saturating_sub(get_monotonic_time());
+    if duration.is_zero() {
+        duration += output_state
+            .frame_clock
+            .refresh_interval()
+            .unwrap_or(Duration::from_micros(16_667));
+    }
+
+    let timer_output = output.clone();
+    let token = niri
+        .event_loop
+        .insert_source(Timer::from_duration(duration), move |_, _, data| {
+            on_frame_timer(&mut data.niri, &timer_output);
+            TimeoutAction::Drop
+        })
+        .unwrap();
+
+    // Claim the output for the duration, so a `queue_redraw` in between lands as
+    // `WaitingForEstimatedVBlankAndQueued` instead of starting a second, unpaced redraw loop.
+    let output_state = niri.output_state.get_mut(output).unwrap();
+    output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
+}
+
+/// The timer from [`queue_next_frame`] fired: hand the output back and ask for the next frame.
+fn on_frame_timer(niri: &mut Niri, output: &Output) {
+    let Some(output_state) = niri.output_state.get_mut(output) else {
+        // The output went away while the timer was pending.
+        return;
+    };
+
+    match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
+        RedrawState::WaitingForEstimatedVBlank(_) => (),
+        // Something damaged the output while we were waiting; that redraw is already queued.
+        RedrawState::WaitingForEstimatedVBlankAndQueued(_) => {
+            output_state.redraw_state = RedrawState::Queued;
+            return;
+        }
+        RedrawState::Idle | RedrawState::Queued | RedrawState::WaitingForVBlank { .. } => {
+            unreachable!()
+        }
+    }
+
+    if output_state.unfinished_animations_remain {
+        niri.queue_redraw(output);
+    } else {
+        niri.send_frame_callbacks(output);
     }
 }
 

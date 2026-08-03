@@ -188,3 +188,43 @@ fn egl_clientside_height_change_doesnt_animate() {
     200 × 200 at x:  0 y: 50
     ");
 }
+
+/// Headless has no VBlank, so nothing outside the backend ever asks for the *next* frame of an
+/// animation: a redraw leaves the output idle, and only fresh damage brings it back. Without the
+/// backend's own frame timer an animation therefore renders exactly one frame and sits there —
+/// invisible to every test that steps the clock by hand, and the reason a headless screencast
+/// delivered a single frame and then nothing (`tools/headless-cast`).
+///
+/// Driving the real event loop is the point: `frame_callback_sequence` advances once per headless
+/// render, so more than one of them means the loop re-armed itself.
+#[test]
+fn the_headless_redraw_loop_keeps_an_animation_going() {
+    let (mut f, id, surface1, surface2) = set_up_two_in_column();
+
+    // Start the resize animation (1000 ms, and the clock is frozen, so it stays unfinished).
+    f.niri()
+        .layout
+        .set_window_height(None, SizeChange::AdjustFixed(-50));
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface1);
+    window.set_size(100, 50);
+    window.ack_last_and_commit();
+    let window = f.client(id).window(&surface2);
+    window.ack_last_and_commit();
+    f.roundtrip(id);
+
+    let output = f.niri_output(1);
+    let before = f.niri().output_state[&output].frame_callback_sequence;
+    f.niri().queue_redraw(&output);
+
+    let kept_going = f.dispatch_until(Duration::from_millis(500), |state| {
+        state.niri.output_state[&output]
+            .frame_callback_sequence
+            .wrapping_sub(before)
+            >= 3
+    });
+    assert!(
+        kept_going,
+        "the headless backend must ask for the next frame while animations are unfinished"
+    );
+}
