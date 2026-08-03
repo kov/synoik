@@ -37,6 +37,14 @@ const POPOVER_RISE: f64 = 6.;
 /// from the panel & screen edge" (6px), so the menu doesn't sit flush against either.
 const POPOVER_MARGIN: f64 = 6.;
 
+/// Horizontal inset a **panel** menu keeps from the screen edge when its anchor is close
+/// enough that the clamp binds, logical px. Not `POPOVER_MARGIN`: this one exists to line
+/// the menu's edge up with the edge-most panel button's *pill*, which the `panel_button`
+/// mixin already floats [`BTN_MARGIN_X`] in from the screen (`_drawing.scss`). Two
+/// different jobs — one is a gap, this one is an alignment — so they are two constants
+/// even while the shell's theme happens to make them close.
+const PANEL_EDGE_INSET: f64 = crate::ui::panel::BTN_MARGIN_X;
+
 /// `.popup-menu-content` `box-shadow: 0 2px 4px 0 $shadow_color` (`_popovers.scss:32`) — the drop
 /// shadow every panel popover (QS / date / input-source BoxPointer) casts; `$shadow_color` (dark)
 /// = `rgba(0,0,0,0.2)`.
@@ -1010,10 +1018,24 @@ impl PanelPopover {
         }
     }
 
+    /// The open popover's content size, or `None` when closed. With [`Self::location`],
+    /// enough to pin where the surface actually lands on an output — which is all this is
+    /// for, hence the gate; the render path takes the size from the content directly.
+    #[cfg(test)]
+    pub(crate) fn content_size(&self) -> Option<Size<f64, Logical>> {
+        self.content.as_ref().map(|c| c.logical_size())
+    }
+
     /// The popover's resting top-left, output-local logical: centered under the anchor,
-    /// clamped into the output with a `POPOVER_MARGIN` inset from the screen edges, and
-    /// sitting `POPOVER_MARGIN` below the panel (not flush); snapped to the pixel grid.
-    fn location(&self, output: &Output) -> Point<f64, Logical> {
+    /// clamped into the output, and sitting `POPOVER_MARGIN` below the panel (not flush);
+    /// snapped to the pixel grid.
+    ///
+    /// A **panel** menu's horizontal clamp insets by [`PANEL_EDGE_INSET`], not
+    /// `POPOVER_MARGIN`: an edge-most panel button's own pill already stops that far in, so
+    /// this is what lines the menu's edge up with the button's instead of leaving it 2px
+    /// short. It bites on the roles that live at the ends of the bar — with the clock now
+    /// in the right corner ([`crate::ui::panel`]), the calendar is clamped every time.
+    pub(crate) fn location(&self, output: &Output) -> Point<f64, Logical> {
         let scale = output.current_scale().fractional_scale();
         let os = output_size(output);
         let size = self
@@ -1023,10 +1045,14 @@ impl PanelPopover {
             .unwrap_or_default();
         // Keep a margin from the screen edges on both axes (each upper bound falls back
         // to the lower one when the popover is larger than the margined area).
-        let max_x = (os.w - size.w - POPOVER_MARGIN).max(POPOVER_MARGIN);
+        let x_inset = match self.side {
+            PopoverSide::Top => PANEL_EDGE_INSET,
+            _ => POPOVER_MARGIN,
+        };
+        let max_x = (os.w - size.w - x_inset).max(x_inset);
         let max_y = (os.h - size.h - POPOVER_MARGIN).max(POPOVER_MARGIN);
-        let centered_x = (self.anchor.loc.x + self.anchor.size.w / 2. - size.w / 2.)
-            .clamp(POPOVER_MARGIN, max_x);
+        let centered_x =
+            (self.anchor.loc.x + self.anchor.size.w / 2. - size.w / 2.).clamp(x_inset, max_x);
 
         let loc = match self.side {
             // Panel menus: centered under the panel, ignoring the anchor's own y.

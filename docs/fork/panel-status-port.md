@@ -79,6 +79,21 @@ context, but the review is deliberately re-framed to *attack* the diff. See
 Our model exposes exactly three roles (`ROLE_ACTIVITIES`, `ROLE_DATE_MENU`, `ROLE_QUICK_SETTINGS`) in
 `panel.rs`; the five standalone right-box indicators between them and quickSettings are all unbuilt.
 
+**Accepted divergence — the clock is at the far right, not centred.** `ROLE_DATE_MENU` is the
+last entry of `RIGHT_BOX_ORDER` in `panel.rs`, past `quickSettings`, so it anchors the output's
+right corner and the status cluster sits to its left; our centre box is empty. Nothing else about
+the button changes — same pill, padding, hit box and calendar popover, which stays centred on the
+button and clamped a `POPOVER_MARGIN` in from the screen edge. GNOME's `dateMenu.js:871-879`
+leading pad goes with the centring it existed for, and the messages dot moves *inside* the clock
+button's own trailing `clock_h_padding()` rather than sitting beside it. The dot then costs no
+layout, which is the point: with a right-anchored box, a dot that occupied width would shove the
+clock — and every indicator left of it — sideways on every notification arriving or being read.
+The cost is that the dot draws over the button's pill instead of beside it (GNOME never does this;
+it reads as a trailing badge). Pinned by `panel_clock_sits_right_of_the_status_indicators`
+(`src/tests/gnome.rs`) and `the_messages_dot_moves_nothing` / `items_expose_roles_and_boxes`
+(`panel.rs`). Tests must ask the panel where the clock is (`clock_center_x`, `qs_center_x`,
+`popover_origin` in `src/tests/gnome.rs`) — hardcoded panel x's are exactly what this broke.
+
 ---
 
 ## LEFT box
@@ -92,6 +107,8 @@ Our model exposes exactly three roles (`ROLE_ACTIVITIES`, `ROLE_DATE_MENU`, `ROL
 ---
 
 ## CENTER box — dateMenu
+
+*(GNOME's box. Ours renders at the right end of the panel — see the accepted divergence above.)*
 
 Reference: `DateMenuButton` — `js/ui/dateMenu.js:861`. Panel button = clock label + a notifications
 dot; popover = **two columns** (`calendarArea` hbox, `dateMenu.js:893-897`).
@@ -346,12 +363,13 @@ carved these out as separate work — none block R1 for daily use:
     header is 36px (GNOME ≈44px); the header source title is not ellipsized (a hostile long app
     name overdraws under the always-on-top chevron); the peek bgs are within a few /255 of the
     exact `darken()` values (style-reference tolerance)); C2 MessagesIndicator — slice 4 ✅ (`44e1a1c9`+`704f02a6`: the
-    dateMenu unread dot (`message-indicator-symbolic`, bundled) after the clock with a
-    size-matched leading pad so the clock stays centered (`dateMenu.js:871-886`); visible iff
+    dateMenu unread dot (`message-indicator-symbolic`, bundled) after the clock
+    (`dateMenu.js:871-886`); visible iff
     `show-banners && unseen − queued > 0` (`:787-798`), recomputed on every store mutation, on
     the QS DND-tile flip, and on the gsettings DND change; composited from the icon cache atop
-    the bar; hit rect widens to keep the dot clickable while the lit pill stays on the clock
-    alone; anchored 2px off the pill edge like GNOME's box spacing. Pinned by panel-geometry,
+    the bar; it draws inside the clock button's trailing padding, so it is clickable as part of
+    the button and costs no layout (see the clock-on-the-right divergence above; GNOME's 2px
+    off-the-pill-edge anchoring went with the pad). Pinned by panel-geometry,
     gnome.rs unseen/DND, and a Vulkan differential). Message-list scrolling — un-deferred ✅
     (`e1f44f6f` + review follow-ups `e20033fe`: gnome-shell's `St.ScrollView`, `calendar.js:816`.
     The list lays out in content space (never dropping); when it overflows the fixed popover

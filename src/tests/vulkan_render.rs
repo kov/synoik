@@ -1970,8 +1970,10 @@ fn vulkan_renders_the_top_panel() {
     );
 }
 
-/// The dateMenu messages-indicator dot composites right of the clock when shown,
-/// and nothing does there when it's hidden (`js/ui/dateMenu.js:871-886`). A
+/// The dateMenu messages-indicator dot composites into the clock button's trailing
+/// padding when shown, and nothing does there when it's hidden (`js/ui/dateMenu.js:871-886`).
+/// The differential doubles as the check that the padding really is empty in the hidden
+/// state — if the clock label ever grew into it, the "off" count would stop being zero. A
 /// differential over the same panel proves it's the dot — bundled from
 /// `message-indicator-symbolic` through the embedded-icon fallback — not a stray
 /// clock glyph, and that the bundled SVG rasterizes at all.
@@ -1986,11 +1988,18 @@ fn vulkan_renders_the_messages_indicator_dot() {
     let width = to_physical_precise_round(scale.x, ow);
     let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::panel_height());
 
-    // The dot's center, in physical pixels: 2px right of the clock PILL edge
-    // (the clock rect inset by BTN_MARGIN_X = 4), then half the 16px icon.
-    let clock = f.niri().panel.date_menu_rect(ow);
-    let dot_cx =
-        to_physical_precise_round::<i32>(scale.x, clock.loc.x + clock.size.w - 4. + 2. + 8.);
+    // The dot's center, in physical pixels — asked of the panel rather than derived from
+    // the clock rect, so this probe keeps pointing at the dot if its placement inside the
+    // button's padding is ever retuned. Toggling to read it is safe precisely because the
+    // dot costs no layout (`the_messages_dot_moves_nothing`).
+    let dot = {
+        let panel = &mut f.niri().panel;
+        panel.set_messages_indicator(true);
+        let rect = panel.messages_indicator_rect(ow).expect("shown");
+        panel.set_messages_indicator(false);
+        rect
+    };
+    let dot_cx = to_physical_precise_round::<i32>(scale.x, dot.loc.x + dot.size.w / 2.);
     let dot_cy = bar_h / 2;
     // Count near-white opaque pixels within a small box around the dot center.
     let bright_at_dot = |pixels: &[u8]| -> usize {
@@ -2064,7 +2073,7 @@ fn vulkan_composites_the_workspace_dots() {
     let width = to_physical_precise_round(scale.x, ow);
     let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::panel_height());
 
-    // The dots live inside the left indicator button, far from the centered clock.
+    // The dots live inside the left indicator button, far from the right-anchored clock.
     let ws = crate::ui::panel::WorkspaceState {
         count: 3,
         active: 1,
@@ -7020,8 +7029,8 @@ fn vulkan_overview_panel_background_matches_the_backdrop() {
     let output = f.niri_output(1);
     f.niri().hotkey_overlay.hide();
 
-    // A column with no panel content in either state: left of the centered clock,
-    // right of the Activities button, and clear of the right-hand status cluster.
+    // A column with no panel content in either state: right of the Activities button and
+    // well clear of the right-hand cluster (the status indicators and, past them, the clock).
     let x = 300;
     // Where the backdrop is sampled. The picker box now starts one spacing under the
     // panel (the search entry floats, so it no longer pushes the row down), which puts

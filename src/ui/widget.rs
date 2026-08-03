@@ -1642,7 +1642,7 @@ impl TextStyle {
 /// [`Painter::text`] (ink-box anchored + clipped to the buffer),
 /// [`text_clipped`](Painter::text_clipped) (a custom clip rect — a header label
 /// stopping short of a right-aligned time), or [`text_px`](Painter::text_px) (a
-/// hand-computed physical origin — the advance-centered panel clock).
+/// hand-computed physical origin — the right-anchored panel clock).
 #[derive(Clone)]
 pub struct ShapedText {
     run: GlyphRun,
@@ -2502,8 +2502,9 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     /// Draw a shaped run at a precomputed **physical** glyph-layout `origin`, tinted
     /// `color`, clipped to the whole buffer. The physical-coordinate counterpart to
     /// [`text`](Self::text) for a run whose placement isn't a simple ink-box anchor —
-    /// the panel clock is *advance-centered* (tabular figures keep it from jittering as
-    /// the seconds tick), so its origin is computed by hand rather than via [`Align`].
+    /// the panel clock is placed from its right-anchored button's padding (tabular
+    /// figures keep that button's width, and so the label, from jittering as the seconds
+    /// tick), so its origin is computed by hand rather than via [`Align`].
     pub fn text_px(
         &mut self,
         shaped: &ShapedText,
