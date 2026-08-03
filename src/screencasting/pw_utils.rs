@@ -1053,6 +1053,26 @@ impl Cast {
         unsafe { NonNull::new(self.stream.dequeue_raw_buffer()) }
     }
 
+    /// Ask PipeWire to schedule a graph cycle for the frame we just queued.
+    ///
+    /// Our stream carries [`StreamFlags::DRIVER`], and for a driving stream queueing is only half
+    /// the handover: *"When the stream is driving, `pw_stream_trigger_process()` needs to be
+    /// called when data is available (output)"* (`pipewire/stream.h`). Without it a queued frame
+    /// reaches the consumer only when a cycle happens to run for some other reason — which
+    /// presents as a consumer that shows one frame and then freezes while our buffers are
+    /// provably correct, and as a second consumer that works because it drives cycles itself.
+    ///
+    /// Not an error path: `trigger_process` refuses while a cycle is already in flight, and the
+    /// frame it would have carried is picked up by the cycle that is already running.
+    fn trigger_if_driving(&self) {
+        if !self.stream.is_driving() {
+            return;
+        }
+        if let Err(err) = self.stream.trigger_process() {
+            trace!("trigger_process: {err:?}");
+        }
+    }
+
     fn queue_completed_buffers(&mut self) {
         let mut inner = self.inner.borrow_mut();
 
@@ -1066,11 +1086,18 @@ impl Cast {
             .position(|(_, sync)| !sync.is_reached())
             .unwrap_or(inner.rendering_buffers.len());
 
+        let mut queued = false;
         for (buffer, _) in inner.rendering_buffers.drain(..first_in_progress_idx) {
             trace!("queueing completed buffer");
             unsafe {
                 pw_stream_queue_buffer(self.stream.as_raw_ptr(), buffer.as_ptr());
             }
+            queued = true;
+        }
+        drop(inner);
+
+        if queued {
+            self.trigger_if_driving();
         }
     }
 
@@ -1271,6 +1298,7 @@ impl Cast {
                             );
                         }
                         pw_stream_queue_buffer(self.stream.as_raw_ptr(), pw_buffer.as_ptr());
+                        self.trigger_if_driving();
                         true
                     }
                     Err(err) => {
@@ -1348,6 +1376,7 @@ impl Cast {
                     self.sequence_counter
                 );
                 pw_stream_queue_buffer(self.stream.as_raw_ptr(), pw_buffer.as_ptr());
+                self.trigger_if_driving();
                 return true;
             }
 
