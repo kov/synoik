@@ -1,6 +1,8 @@
 # The portal surface — screenshots and screen sharing
 
-Status: **2026-08-02.** Slices 1-3 and 6 landed; 4-5 not started.
+Status: **2026-08-02.** Slices 1-3 and 6 landed; slice 4 is *partly* landed (`Stream.Start`/`Stop`
+in, `RecordVirtual` not); slice 5 not started. Screenshots are seat-validated — wayshot captures
+through the portal.
 
 **The slice order was wrong, and a live run found it.** Slice 6 (`InteractiveScreenshot`) was put
 last on the reasoning that "nothing in the portal path needs it" — drawn from a `strings` scan that
@@ -86,7 +88,16 @@ Ordered by what unblocks the portal soonest, not by interface.
    failing. That is why all the `ScreenshotUi::close` call sites now route through
    `Niri::close_screenshot_ui`, and why it answers unconditionally rather than only when the picker
    was open. Pinned by `select_area_always_answers_its_caller`.
-4. **ScreenCast completion.** `Stream.Start`/`Stop`, then `RecordVirtual`.
+4. **ScreenCast completion.** — **PART DONE.** `Stream.Start`/`Stop` are in. `Stream.Stop` is
+   deliberately *not* a wrapper around session stop: one session can carry several streams (a
+   browser sharing two monitors), so tearing the session down when one stream ends would kill the
+   others and close the session object out from under the caller. That is why `Niri::stop_stream`
+   exists beside `stop_cast`.
+
+   **Left: `RecordVirtual`**, and it is bigger than it looks. It asks the compositor to *create a
+   virtual monitor* to record — the remote-desktop "connect to a headless screen" case. The only
+   thing resembling that today is `backend/headless.rs`'s `add_output`, which is test scaffolding,
+   not a runtime capability. Scope it as its own piece of work rather than as a D-Bus method.
 5. **`org.gnome.Mutter.RemoteDesktop`.** The whole name — screen sharing *with input*, and
    `EnableClipboard`. Largest, and the only one that needs new input-injection plumbing.
 6. **`InteractiveScreenshot`.** — **DONE**, and it should have been first. The shell's own picker
@@ -144,6 +155,10 @@ by design. Test through the portal, or from an allowlisted peer.
   as a dismissal first — get that wrong and *every* interactive screenshot reports cancelled. It
   needs a real capture to reach, and the corpus has no renderer.
 - The **happy path of `SelectArea`** — a real drag coming back as the right rectangle — likewise.
+- **`stop_stream` has no test at all.** A `Cast` owns a live PipeWire stream and a `PendingCast`
+  holds a `SignalEmitter`, so neither can be built without a bus and a running PipeWire; a test that
+  hand-rolled fakes for them would not fail for the mistakes that matter. Exercise it by sharing two
+  monitors in one session and stopping one.
 - `version` was declared `i` where the XML says `u`. xdg-desktop-portal-gnome logged
   `Received property version with type i does not match expected type u` at startup and its
   Introspect proxy was no use afterwards; "Could not get window list" downstream is the likely

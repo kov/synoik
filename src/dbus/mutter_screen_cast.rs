@@ -136,6 +136,10 @@ pub enum ScreenCastToNiri {
     StopCast {
         session_id: CastSessionId,
     },
+    /// One stream of a session, not the whole session — see `Niri::stop_stream`.
+    StopStream {
+        stream_id: CastStreamId,
+    },
 }
 
 #[interface(name = "org.gnome.Mutter.ScreenCast")]
@@ -370,6 +374,24 @@ impl Session {
 
 #[interface(name = "org.gnome.Mutter.ScreenCast.Stream")]
 impl Stream {
+    /// "Start a stream of an already started session." The session's own `Start` starts every
+    /// stream it holds; this starts one that was added later, or one the caller held back.
+    #[zbus(name = "Start")]
+    async fn start_stream(&self, #[zbus(signal_context)] ctxt: SignalEmitter<'_>) {
+        self.start(ctxt.to_owned());
+    }
+
+    /// Stop *this* stream. The session stays up with whatever else it holds.
+    #[zbus(name = "Stop")]
+    async fn stop_stream(&self) {
+        if let Err(err) = self
+            .to_niri
+            .send(ScreenCastToNiri::StopStream { stream_id: self.id })
+        {
+            warn!("error sending StopStream to niri: {err:?}");
+        }
+    }
+
     #[zbus(signal)]
     pub async fn pipe_wire_stream_added(ctxt: &SignalEmitter<'_>, node_id: u32)
         -> zbus::Result<()>;

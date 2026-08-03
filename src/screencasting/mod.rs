@@ -487,6 +487,7 @@ impl State {
                 }
             }
             ScreenCastToNiri::StopCast { session_id } => self.niri.stop_cast(session_id),
+            ScreenCastToNiri::StopStream { stream_id } => self.niri.stop_stream(stream_id),
         }
     }
 }
@@ -888,6 +889,50 @@ impl Niri {
 
         for id in casts_to_stop {
             self.stop_cast(id);
+        }
+    }
+
+    /// Stop one stream of a session, leaving the session and its other streams alone —
+    /// `org.gnome.Mutter.ScreenCast.Stream.Stop`.
+    ///
+    /// Not a thin wrapper around [`Self::stop_cast`]: a session may carry several streams (a
+    /// browser sharing two monitors is one session), and tearing the session down because one
+    /// stream ended would kill the others and close the D-Bus session object out from under the
+    /// caller.
+    pub fn stop_stream(&mut self, stream_id: CastStreamId) {
+        let _span = tracy_client::span!("Niri::stop_stream");
+        let _span = debug_span!("stop_stream", %stream_id).entered();
+
+        self.casting
+            .pending_dynamic_casts
+            .retain(|p| p.stream_id != stream_id);
+
+        let Some(idx) = self
+            .casting
+            .casts
+            .iter()
+            .position(|cast| cast.stream_id == stream_id)
+        else {
+            return;
+        };
+
+        let cast = self.casting.casts.swap_remove(idx);
+        let was_recording = self
+            .casting
+            .recordings
+            .iter()
+            .any(|r| r.session_id == cast.session_id);
+        if let Err(err) = cast.stream.disconnect() {
+            warn!("error disconnecting stream: {err:?}");
+        }
+
+        // The panel's recording indicator is driven by whether any recording is live, so it has to
+        // be re-derived when one of them goes away.
+        if was_recording {
+            self.casting
+                .recordings
+                .retain(|r| r.session_id != cast.session_id);
+            self.refresh_screen_recording();
         }
     }
 
