@@ -1,30 +1,26 @@
 # The portal surface — screenshots and screen sharing
 
-Status: **2026-08-02.** Slices 1-3 and 6 landed; slice 4 is *partly* landed (`Stream.Start`/`Stop`
+Status: **2026-08-03.** Slices 1-3 and 6 landed; slice 4 is *partly* landed (`Stream.Start`/`Stop`
 in, `RecordVirtual` not); slice 5 not started. Screenshots are seat-validated — wayshot captures
-through the portal.
+through the portal. Screencasting is seat-validated too: casts start, and the frames we hand over
+are current (see the OBS section below — the one remaining complaint there is a client-side bug
+that reproduces under real mutter).
 
-**Fixed in `f7a629da`, awaiting seat validation: we advertised dmabuf-only formats, so any
-consumer without dmabuf import could not start.** Diagnosed 2026-08-03 from the gsrs journal.
-
-The reported symptom was "OBS shows stale content", but OBS's stream *never starts*: it goes
-`connecting -> paused -> error` in the same second, every session, with
-`res=-32 (Broken pipe): no more input formats`. The stuck preview is OBS's own last texture, not
-a frame we sent. `gnome-software` fails identically, so this is not an OBS quirk — Firefox is the
-outlier that happens to do dmabuf well.
+**`f7a629da`: we advertised dmabuf-only formats, so any consumer without dmabuf import could not
+start** — seat-validated, OBS and gnome-software now reach `Streaming` where they used to fail with
+`res=-32 (Broken pipe): no more input formats`.
 
 Cause, read on both sides. Mutter offers each format **twice** — `build_format_params`
 (`meta-screen-cast-stream-src.c:1576-1592`) loops all formats with `with_modifiers=TRUE`, then
 again with `FALSE`, and the second pass calls `push_format_object(..., NULL, 0, ...)`
 (`:1543-1553`), emitting a format param with **no modifier property at all**. That is the
 SHM/MemPtr fallback. `push_format_object` only attaches the modifier when `n_modifiers > 0`
-(`:297`). We offer one param per format and *always* attach a `MANDATORY` modifier
-(`pw_utils.rs:1300-1310`), and advertise `DataType::DmaBuf` alone (`:656-657`) with an `assert!`
-rejecting anything else (`:750`). A consumer that cannot import our modifiers is left with
-nothing to accept.
+(`:297`). We offered one param per format and *always* attached a `MANDATORY` modifier, and
+advertised `DataType::DmaBuf` alone with an `assert!` rejecting anything else. A consumer that
+cannot import our modifiers was left with nothing to accept.
 
-The fix needed the memfd path as well as the wider offer, because widening alone would have
-turned a negotiation failure into a crash — `dequeue_buffer_and_render` looks the block's fd up in
+The fix needed the memfd path as well as the wider offer, because widening alone would have turned
+a negotiation failure into a crash — `dequeue_buffer_and_render` looks the block's fd up in
 `inner.dmabufs` and `add_buffer` asserted DmaBuf. What landed:
 
 - `make_video_params` takes `with_modifier`; `false` omits the property entirely and returns
@@ -42,24 +38,13 @@ already synchronized with the GPU, so there is no fence left to wait on.
 Still divergent, deliberately: mutter offers `VideoSize` as a `CHOICE_RANGE` where we send a fixed
 rectangle. Worth matching, but it is not what broke negotiation.
 
-An earlier theory was *falsified* and should not be re-derived: it is not partial-damage
-under-painting.
-`render_to_dmabuf` (`src/render_helpers/mod.rs`) hardcodes age `0` into
-`render_output_with_states`, and Smithay treats age 0 as "damage everything"
-(`damage/mod.rs:747`), so **every cast frame that renders at all is already a full repaint**. A
-commit that made the *skip* decision use each buffer's real age was written as the fix, did not
-change the symptom, and was dropped from history — with the render at age 0 the skip decision
-wants age 1 ("changed since the frame we last sent"), so the change was also wrong on its own
-terms. Remaining leads, both unmeasured: buffers queued out of order via `queue_after_sync`, and
-the fact that we call `damage_output` *twice* per frame (once in `dequeue_buffer_and_render`,
-once inside `render_output_with_states`), pushing two entries per frame into Smithay's damage
-history and corrupting age accounting. Next step is a measurement, not a third theory:
-`RUST_LOG=niri::screencasting=trace` on the seat, and check whether a stall correlates with
-`no damage, skipping frame` bursts or with sequence numbers going backwards at queue time.
-
-Separately worth doing regardless of that bug: thread the real per-buffer age *into*
-`render_to_dmabuf` and collapse to one damage computation per frame. That makes partial damage
-actually work — it is an optimisation, not the fix.
+Worth doing on its own merits, and **not** a bug fix: `render_to_dmabuf`
+(`src/render_helpers/mod.rs`) hardcodes age `0` into `render_output_with_states`, and Smithay treats
+age 0 as "damage everything" (`damage/mod.rs:747`), so every cast frame that renders at all is a
+full repaint. Threading the real per-buffer age *in* — and collapsing the two `damage_output` calls
+per frame down to one — would make partial damage actually work. A commit that made only the *skip*
+decision use each buffer's real age was written as a fix for the frozen-frame report, changed
+nothing, and was dropped from history.
 
 **The slice order was wrong, and a live run found it.** Slice 6 (`InteractiveScreenshot`) was put
 last on the reasoning that "nothing in the portal path needs it" — drawn from a `strings` scan that
