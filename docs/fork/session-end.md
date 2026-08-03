@@ -194,17 +194,28 @@ tests in `src/tests/gnome.rs` set the flag by hand.
 
 ## 3. Known gaps
 
-- **An app that ignores SIGTERM cannot be drained, and OBS is one.** Measured 2026-08-03 across
-  three logouts: OBS is asked to stop, logs **nothing at all** for its full five seconds, and is
-  SIGKILLed. The contrast is in the same journal — quit from its own menu, it prints
-  `==== Shutting down ====` … `Number of memory leaks: 0` in ~130 ms. So it never *begins* shutting
-  down: waiting longer only postpones the SIGKILL, and holding its Wayland socket open (which we
-  did, for the whole five seconds) does not prompt it either. That is why it still reports "Crash
-  or unclean shutdown detected" on the next start, and why nothing on the compositor side fixes it.
-  Stock GNOME uses the same scope, the same drop-in and the same five seconds, so it should nag
-  identically there — worth a real-GNOME control run before anyone spends time on it. The one thing
-  that *would* reach it is an `xdg_toplevel.close` sweep, which §2.2 rejects on purpose; if that
-  trade is ever revisited, this is the case that argues for it.
+- **OPEN: OBS is SIGKILLed at every logout on our session and exits cleanly on stock GNOME.**
+  Measured 2026-08-03. On ours, three logouts in a row: the scope is stopped, OBS logs **nothing at
+  all** for its full five seconds, and is SIGKILLed — so it never begins shutting down, and the
+  next start reports "Crash or unclean shutdown detected". On kov's GNOME 50 session, same machine,
+  same flatpak, same scope mechanism, twice: `Stopping app-flatpak-…obsproject…scope` →
+  `==== Shutting down ====` **0.8 ms later**, done in ~630 ms.
+
+  So this is ours, not OBS's — the first reading of it, that OBS simply ignores SIGTERM, is
+  **refuted** by that control. Nor is it the drain holding the socket open: OBS ignores five
+  seconds of live Wayland connection just as thoroughly.
+
+  The lead is a confound in the traces rather than a mechanism: **in all three of our logouts an
+  OBS screencast was actively `Streaming`** (it only leaves that state *after* the SIGKILL, as a
+  consequence of the process dying), while kov's clean-exit instances lived 6–9 s and almost
+  certainly never started a capture. If OBS's Qt main thread is parked in the PipeWire capture path
+  it never processes the quit its SIGTERM handler posts, which fits "handler exists, nothing
+  happens" exactly. Untested either way.
+
+  **The experiment that decides it**: open OBS on the seat, start *no* capture, log out. Clean exit
+  ⇒ the trigger is the live screencast, not session end, and this belongs with the cast work.
+  Still hangs ⇒ it is the drain or the shutdown path, and `eu-stack -p <obs pid>` during the
+  five-second window says where.
 - **Terminal-spawned clients have no scope**, so `stop_app_scopes` cannot reach them and nothing
   SIGTERMs them at logout. The drain still waits for their windows; they are only asked to leave
   when the socket dies, as under GNOME. (A flatpak app started from a terminal is the exception —
