@@ -2032,7 +2032,7 @@ impl State {
             .iter()
             .any(|r| matches!(r.kind, RecordingKind::Native(_)));
         if recording {
-            self.niri.stop_screen_recordings();
+            self.stop_screen_recordings();
         } else if let Some(output) = self.niri.layout.active_output().cloned() {
             match crate::recording::default_recording_path() {
                 Ok(path) => {
@@ -6418,7 +6418,7 @@ impl State {
                                 // Recognize on press (GNOME's `ScreenRecordingIndicator`):
                                 // clicking the indicator stops the recording(s).
                                 self.niri.suppressed_buttons.insert(button_code);
-                                self.niri.stop_screen_recordings();
+                                self.stop_screen_recordings();
                                 self.niri.queue_redraw_all();
                                 return;
                             }

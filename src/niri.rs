@@ -192,8 +192,8 @@ use crate::ui::popover::PanelPopover;
 use crate::ui::run_dialog::{RunDialog, RunDialogRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{
-    OutputScreenshot, PendingTarget, PointerUp, ScreenshotNeutral, ScreenshotUi,
-    ScreenshotUiRenderElement,
+    CaptureMode, CaptureType, OutputScreenshot, PendingTarget, PointerUp, ScreenshotNeutral,
+    ScreenshotUi, ScreenshotUiRenderElement,
 };
 use crate::ui::switcher::app_switcher::app_items;
 use crate::ui::switcher::ui::{Items, OpenRequest};
@@ -1008,17 +1008,44 @@ pub struct Niri {
 /// it. The output is held weakly so an unplug during the countdown cancels rather than resurrects.
 pub struct PendingCapture {
     output: WeakOutput,
-    target: PendingTarget,
-    show_pointer: bool,
-    write_to_disk: bool,
-    path: Option<String>,
-    /// The `InteractiveScreenshot` caller still waiting, lifted out of `Niri` as this armed so the
-    /// close would not answer it with a dismissal.
-    #[cfg(feature = "dbus")]
-    reply: Option<crate::dbus::gnome_shell_screenshot::InteractiveReply>,
+    action: PendingAction,
     /// Monotonic; the countdown reads it, and it — not the tick count — decides when to fire.
     fires_at: Duration,
     token: RegistrationToken,
+}
+
+/// What the countdown ends in. The picker's shot/cast control decides which, and the two share
+/// every cancellation rule — a lock or a vanished output must stop a recording from starting just
+/// as firmly as it stops a photograph being taken.
+enum PendingAction {
+    Shot {
+        target: PendingTarget,
+        show_pointer: bool,
+        write_to_disk: bool,
+        path: Option<String>,
+        /// The `InteractiveScreenshot` caller still waiting, lifted out of `Niri` as this armed so
+        /// the close would not answer it with a dismissal.
+        #[cfg(feature = "dbus")]
+        reply: Option<crate::dbus::gnome_shell_screenshot::InteractiveReply>,
+    },
+    Cast {
+        /// Global-logical, or `None` for the whole output.
+        crop: Option<Rectangle<i32, Logical>>,
+        draw_cursor: bool,
+    },
+}
+
+impl PendingAction {
+    /// Answer whatever caller this action was holding with a dismissal. A cast holds none.
+    fn dismiss(self) {
+        #[cfg(feature = "dbus")]
+        if let Self::Shot {
+            reply: Some(tx), ..
+        } = self
+        {
+            let _ = tx.send_blocking(None);
+        }
+    }
 }
 
 impl PendingCapture {
@@ -3522,7 +3549,7 @@ impl State {
     /// shot is taken from the **live** screen when the timer runs out. That is why every scrap of
     /// context the capture will need — the output, the target, the reply channel, the path — is
     /// lifted out here: none of it survives `close_screenshot_ui`.
-    fn arm_delayed_capture(&mut self, delay: Duration, write_to_disk: bool, path: Option<String>) {
+    fn arm_delayed_shot(&mut self, delay: Duration, write_to_disk: bool, path: Option<String>) {
         let Some((output, target)) = self.niri.screenshot_ui.pending_target() else {
             warn!("nothing to capture; not arming the delay");
             self.cancel_screenshot();
@@ -3535,6 +3562,22 @@ impl State {
         #[cfg(feature = "dbus")]
         let reply = self.niri.interactive_screenshot_reply.take();
 
+        self.arm_delayed_capture(
+            delay,
+            output,
+            PendingAction::Shot {
+                target,
+                show_pointer,
+                write_to_disk,
+                path,
+                #[cfg(feature = "dbus")]
+                reply,
+            },
+        );
+    }
+
+    /// Arm `action` to fire on `output` after `delay`, and dismiss the picker.
+    fn arm_delayed_capture(&mut self, delay: Duration, output: Output, action: PendingAction) {
         self.niri.close_screenshot_ui();
         self.niri
             .cursor_manager
@@ -3555,24 +3598,79 @@ impl State {
             .map_err(|err| warn!("error arming the delayed capture: {err:?}"))
             .ok();
         let Some(token) = token else {
-            #[cfg(feature = "dbus")]
-            if let Some(tx) = reply {
-                let _ = tx.send_blocking(None);
-            }
+            action.dismiss();
             return;
         };
 
         self.niri.pending_capture = Some(PendingCapture {
             output: output.downgrade(),
-            target,
-            show_pointer,
-            write_to_disk,
-            path,
-            #[cfg(feature = "dbus")]
-            reply,
+            action,
             fires_at,
             token,
         });
+        self.niri.queue_redraw_all();
+    }
+
+    /// Start a recording of whatever the picker has selected, and dismiss it.
+    ///
+    /// GNOME closes the UI **instantly** here rather than fading it, "so the fade-out doesn't get
+    /// recorded" (`js/ui/screenshot.js:2035-2036`) — and the same reasoning is why a delay applies:
+    /// it is armed through the same [`State::arm_delayed_capture`] path, so the countdown runs with
+    /// the picker already gone.
+    fn start_screencast_from_picker(&mut self) {
+        // Screen mode selects the whole output, and a whole-output recording wants no crop at all —
+        // the crop path relocates every frame into a smaller buffer for nothing.
+        let crop = (self.niri.screenshot_ui.capture_type() != CaptureType::Screen)
+            .then(|| self.niri.screenshot_ui.selection_rect_global())
+            .flatten();
+        let draw_cursor = self.niri.screenshot_ui.show_pointer();
+        let output = self.niri.screenshot_ui.selection_output().cloned();
+
+        if let (Some(delay), Some(output)) = (self.niri.screenshot_ui.delay(), output.clone()) {
+            self.arm_delayed_capture(delay, output, PendingAction::Cast { crop, draw_cursor });
+            return;
+        }
+
+        self.niri.close_screenshot_ui();
+        self.niri
+            .cursor_manager
+            .set_cursor_image(CursorImageStatus::default_named());
+        self.niri.queue_redraw_all();
+
+        self.start_picker_recording(output, crop, draw_cursor);
+    }
+
+    /// The recorder call both the immediate and the delayed path end at.
+    fn start_picker_recording(
+        &mut self,
+        output: Option<Output>,
+        crop: Option<Rectangle<i32, Logical>>,
+        draw_cursor: bool,
+    ) {
+        let Some(output) = output else {
+            warn!("no output to record");
+            return;
+        };
+
+        // GNOME's own template and folder (`js/ui/screenshot.js:2056-2065`), which is what
+        // `default_recording_path` already encodes — so the picker's recordings land beside the
+        // keybind's rather than in a second place.
+        let path = match crate::recording::default_recording_path() {
+            Ok(path) => path,
+            Err(err) => {
+                warn!("could not resolve the recording path: {err:?}");
+                return;
+            }
+        };
+
+        // 30fps is what `org.gnome.Shell.Screencast` defaults to when a caller omits `framerate`.
+        if let Err(err) = self
+            .niri
+            .start_native_recording(&output, path, 30, draw_cursor, crop)
+        {
+            warn!("could not start the recorder: {err:?}");
+            return;
+        }
         self.niri.queue_redraw_all();
     }
 
@@ -3609,92 +3707,88 @@ impl State {
         calloop::timer::TimeoutAction::Drop
     }
 
-    /// Take the shot the delay was armed for, from the live screen.
+    /// Do what the delay was armed for, against the live screen.
     fn fire_pending_capture(&mut self) {
         let Some(pending) = self.niri.pending_capture.take() else {
             return;
         };
-        // The timer that got us here is about to be dropped by its own return value; removing it
-        // as well would be a double removal.
-        let PendingCapture {
-            output,
-            target,
-            show_pointer,
-            write_to_disk,
-            path,
-            #[cfg(feature = "dbus")]
-            reply,
-            ..
-        } = pending;
+        // The timer that got us here is dropped by its own return value; removing it as well would
+        // be a double removal, so the token is deliberately left alone.
+        let PendingCapture { output, action, .. } = pending;
         let Some(output) = output.upgrade() else {
-            #[cfg(feature = "dbus")]
-            if let Some(tx) = reply {
-                let _ = tx.send_blocking(None);
-            }
+            action.dismiss();
             return;
         };
 
-        // The countdown card is gone by the time anything is rendered for the shot (it reads
-        // `pending_capture`, which is now `None`), but this is also the redraw that clears it.
+        // The card is gone by the time anything is rendered for the capture (it reads
+        // `pending_capture`, which is now `None`), and this is the redraw that clears it.
         self.niri.queue_redraw_all();
 
-        // The reply travels into `save_screenshot`, which answers it once the PNG lands. The spare
-        // is for the paths that never get that far — the channel is used once, so whichever sends
-        // first is the answer.
-        #[cfg(feature = "dbus")]
-        let spare = reply.clone();
-        let res = self.backend.with_vulkan_renderer(|renderer| match target {
-            PendingTarget::Window(id) => {
-                let found = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
-                let Some((_, mapped)) = found else {
-                    return Err(anyhow::anyhow!("the window is gone"));
-                };
-                self.niri.screenshot_window(
-                    renderer,
-                    &output,
-                    mapped,
-                    write_to_disk,
-                    show_pointer,
-                    path,
-                    #[cfg(feature = "dbus")]
-                    reply,
-                )
+        match action {
+            PendingAction::Cast { crop, draw_cursor } => {
+                self.start_picker_recording(Some(output), crop, draw_cursor)
             }
-            PendingTarget::Area(rect) => self.niri.screenshot_area(
-                renderer,
-                &output,
-                rect,
-                write_to_disk,
+            PendingAction::Shot {
+                target,
                 show_pointer,
+                write_to_disk,
                 path,
                 #[cfg(feature = "dbus")]
                 reply,
-            ),
-        });
+            } => {
+                // The reply travels into `save_screenshot`, which answers it once the PNG lands.
+                // The spare is for the paths that never get that far — the channel is used once, so
+                // whichever sends first is the answer.
+                #[cfg(feature = "dbus")]
+                let spare = reply.clone();
+                let res = self.backend.with_vulkan_renderer(|renderer| match target {
+                    PendingTarget::Window(id) => {
+                        let found = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                        let Some((_, mapped)) = found else {
+                            return Err(anyhow::anyhow!("the window is gone"));
+                        };
+                        self.niri.screenshot_window(
+                            renderer,
+                            &output,
+                            mapped,
+                            write_to_disk,
+                            show_pointer,
+                            path,
+                            #[cfg(feature = "dbus")]
+                            reply,
+                        )
+                    }
+                    PendingTarget::Area(rect) => self.niri.screenshot_area(
+                        renderer,
+                        &output,
+                        rect,
+                        write_to_disk,
+                        show_pointer,
+                        path,
+                        #[cfg(feature = "dbus")]
+                        reply,
+                    ),
+                });
 
-        match res {
-            Some(Ok(())) => {}
-            Some(Err(err)) => {
-                warn!("error taking the delayed screenshot: {err:?}");
-                #[cfg(feature = "dbus")]
-                if let Some(tx) = spare {
-                    let _ = tx.send_blocking(None);
+                let failed = match res {
+                    Some(Ok(())) => None,
+                    Some(Err(err)) => Some(format!("{err:?}")),
+                    None => Some(String::from("no renderer available")),
+                };
+                if let Some(err) = failed {
+                    warn!("error taking the delayed screenshot: {err}");
+                    #[cfg(feature = "dbus")]
+                    if let Some(tx) = spare {
+                        let _ = tx.send_blocking(None);
+                    }
+                    return;
                 }
-                return;
-            }
-            None => {
-                warn!("renderer unavailable for the delayed screenshot");
+
+                // `save_screenshot` owns the reply from here; it answers when the PNG lands.
                 #[cfg(feature = "dbus")]
-                if let Some(tx) = spare {
-                    let _ = tx.send_blocking(None);
-                }
-                return;
+                drop(spare);
             }
         }
-
-        // `save_screenshot` owns the reply from here; it is answered when the PNG lands.
-        #[cfg(feature = "dbus")]
-        drop(spare);
     }
 
     /// Disarm whatever is counting down, answering its caller with a dismissal.
@@ -3703,10 +3797,7 @@ impl State {
             return false;
         };
         self.niri.event_loop.remove(pending.token);
-        #[cfg(feature = "dbus")]
-        if let Some(tx) = pending.reply {
-            let _ = tx.send_blocking(None);
-        }
+        pending.action.dismiss();
         self.niri.queue_redraw_all();
         true
     }
@@ -3716,6 +3807,14 @@ impl State {
             return;
         };
         let path = path.take();
+
+        // Cast mode takes no picture at all: the capture button starts a recording, and everything
+        // below — the frozen neutral, the clipboard, the D-Bus screenshot reply — is beside the
+        // point (`_onCaptureButtonClicked`, `js/ui/screenshot.js:2085-2095`).
+        if self.niri.screenshot_ui.mode() == CaptureMode::Cast {
+            self.start_screencast_from_picker();
+            return;
+        }
 
         // A `SelectArea` caller wanted coordinates, not a picture: hand them over and save
         // nothing. Answered before the close, which would otherwise answer `None`.
@@ -3729,7 +3828,7 @@ impl State {
             let rect = self.niri.screenshot_ui.selection_rect_global();
             self.niri.answer_select_area(rect);
         } else if let Some(delay) = self.niri.screenshot_ui.delay() {
-            self.arm_delayed_capture(delay, write_to_disk, path);
+            self.arm_delayed_shot(delay, write_to_disk, path);
             return;
         } else {
             // Save from the frozen-screen neutral CPU buffer: a pure crop + pointer composite, no
@@ -3759,6 +3858,48 @@ impl State {
             .cursor_manager
             .set_cursor_image(CursorImageStatus::default_named());
         self.niri.queue_redraw_all();
+    }
+
+    /// Stop every live recording and report the ones that produced a file.
+    ///
+    /// The notification comes from *here* rather than from `Niri::stop_screen_recordings`, and so
+    /// does not fire for a `org.gnome.Shell.Screencast.StopScreencast` caller: in GNOME the shell
+    /// UI is what notifies (`_showNotification`, `js/ui/screenshot.js:2109-2144`) and the recorder
+    /// service does not, so a client driving the recorder gets to do its own reporting.
+    pub fn stop_screen_recordings(&mut self) {
+        for path in self.niri.stop_screen_recordings() {
+            self.show_screencast_notification(path);
+        }
+    }
+
+    /// The "Screencast recorded" notification (`js/ui/screenshot.js:2109-2185`) — same source and
+    /// shape as the screenshot one, minus the image (there is no still to show) and with the body
+    /// and button pointing at the video.
+    pub fn show_screencast_notification(&mut self, path: PathBuf) {
+        use crate::notifications::{NotificationIcon, ShellAction, ShellNotifyRequest, Urgency};
+
+        let req = ShellNotifyRequest {
+            source: crate::notifications::SHELL_SOURCE_SCREENSHOT,
+            source_title: String::from("Screenshot"),
+            source_icon: Some(NotificationIcon::Themed(String::from(
+                "applets-screenshooter-symbolic",
+            ))),
+            title: String::from("Screencast recorded"),
+            body: String::from("Click here to view the video"),
+            icon: None,
+            actions: vec![(
+                String::from("Show in Files"),
+                ShellAction::ShowInFiles(path.clone()),
+            )],
+            default_action: Some(ShellAction::OpenFile(path)),
+            urgency: Urgency::Normal,
+            transient: true,
+        };
+
+        let now = self.niri.clock.now_unadjusted();
+        let show_banners = !self.niri.gnome_settings.quick_toggles.do_not_disturb;
+        let (_, effects) = self.niri.notifications.add_shell(req, show_banners, now);
+        self.apply_notification_effects(effects);
     }
 
     /// The "Screenshot captured" notification (`js/ui/screenshot.js:2386-2420`).
@@ -8853,10 +8994,16 @@ impl Niri {
                 &mut |elem| push(elem.into()),
             );
 
-            // Add the backdrop for outputs that were connected while the screenshot UI was open.
-            push(backdrop);
-
-            return;
+            // In Shot mode the frozen screenshot *is* the desktop — the real scene is never
+            // rendered, which is what makes the picker a still. Cast mode has no still (see
+            // `ScreenshotUi::render_output`), so it must fall through and let the live scene draw
+            // underneath the chrome we just pushed; elements pushed first are topmost, so the
+            // picker still sits on top.
+            if self.screenshot_ui.mode() == CaptureMode::Shot {
+                // Add the backdrop for outputs that were connected while the UI was open.
+                push(backdrop);
+                return;
+            }
         }
 
         // An app icon being dragged onto a workspace rides above everything, like

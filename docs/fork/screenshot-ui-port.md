@@ -1,9 +1,10 @@
 # The screenshot UI — porting GNOME's control panel
 
-Status: **2026-08-03, slices 1, 2, 3 and 5 landed and checked on the headless harness.** The help
-text is gone; the panel is GNOME's control panel — type row, shot pill, capture button,
-show-pointer toggle, close button and tooltips — all three capture types work, and the delay is
-armed from a fourth round button beside show-pointer. Slice 4 (cast mode) is open.
+Status: **2026-08-03, all five slices landed and checked on the headless harness.** The help text
+is gone; the panel is GNOME's control panel — type row, shot/cast pill, capture button,
+show-pointer toggle, close button and tooltips. All three capture types work, the delay is armed
+from a fourth round button beside show-pointer, and the cast segment records to WebM through our
+own recorder.
 
 Reference: `js/ui/screenshot.js` (50.3) and `_screenshot.scss`. The visual spec is already cached
 and cited in `docs/fork/gnome-style-reference.md` §screenshot (every class, colour, radius and
@@ -93,10 +94,28 @@ Two things the panel's shape now fixes in place, worth knowing before touching i
    the delay is ignored, because it wants coordinates and already has them; and the countdown is
    pushed *after* the lock branch's early return, so a lock that lands between two ticks cannot get
    a countdown drawn over its surface even for the one frame before the tick cancels.
-4. **Cast mode.** The shot/cast segmented control wired to our recorder, plus the capture button's
-   `:cast` state (inner circle goes `$red_4`). This is the real trigger GNOME uses for the panel's
-   recording indicator — see `docs/fork/panel-status-port.md` R1, which is currently driven by a
-   direct `RecordArea` call for want of this.
+4. **DONE.** Cast mode. The segmented control has both halves, the capture button's inner circle
+   goes `$red_4` under `:cast`, and clicking it starts a native recording of the selected geometry
+   (whole output in Screen mode, which passes **no crop** rather than a whole-output one — the crop
+   path relocates every frame into a smaller buffer for nothing). Stopping it notifies with a way
+   into Files, the same shape as the screenshot notification. This is the real trigger for the
+   panel's recording indicator (`docs/fork/panel-status-port.md` R1), which no longer needs a
+   direct `RecordArea` call to exercise.
+
+   The thing that made this more than a mode flag: **in Shot mode the frozen screenshot *is* the
+   desktop.** `render_inner` returns early when the picker is open, because the still stands in for
+   the scene. Cast mode has no still — a recording is of the live screen, and showing a photograph
+   of the moment the picker opened while claiming to record the present is a lie — so it must fall
+   through and let the real scene draw underneath. Dropping the still without lifting that early
+   return leaves a void, which is exactly what the first run produced.
+
+   Window mode is refused while casting, as in GNOME (`_startScreencast` returns early on
+   `_windowButton.checked`); `window_enabled()` is now the single authority the bake, the hover
+   filter and `set_capture_type` all read, so there is one place that can be wrong.
+
+   The recording notification comes from `State::stop_screen_recordings`, not from
+   `Niri::stop_screen_recordings`, so a `org.gnome.Shell.Screencast.StopScreencast` caller does not
+   get one — in GNOME the shell UI notifies and the recorder service does not.
 5. **DONE.** Tooltips. `widget::Tooltip` and `Painter::tooltip` already existed; what this added
    is the timing (300ms delay, then a 150ms fade) and root-level placement — centred on the
    control, clamped into the output, 24px *above* it, and pushed before the panel so it draws over
@@ -201,6 +220,14 @@ have had to fabricate the armed state instead of driving the real one.
   asserted to keep counting, so it cannot pass for the wrong reason.
 - `vulkan_screenshot_ui_countdown_cannot_reach_a_capture` — the same pixel rendered at `Output` and
   at `ScreenCapture`, against a reference capture taken before any of it.
+
+Cast mode's two:
+
+- `vulkan_screenshot_ui_cast_mode_drops_the_frozen_screen_and_window_mode` — recolours the live
+  window *after* switching to cast and asserts the new colour reaches the frame, which is the only
+  way to tell "the still is gone" from "the still happens to match".
+- `vulkan_screenshot_ui_cast_mode_capture_starts_a_recording` — the capture button starts the
+  recorder, the picker closes instantly, and stopping notifies.
 
 The countdown card is the one thing the headless harness cannot photograph: `grim` goes through
 wlr-screencopy, which is `RenderTarget::ScreenCapture`, and the card refuses that target on purpose.

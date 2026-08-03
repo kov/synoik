@@ -1165,7 +1165,11 @@ impl Niri {
     /// Stop every live recording (the R1 indicator's click action). External casts are torn down
     /// via `stop_cast`; native recordings finalize their encoder (writing the file trailer).
     /// Both prune the ledger and refresh the panel.
-    pub fn stop_screen_recordings(&mut self) {
+    /// Returns the file each finalized native recording is being written to, in stop order, for
+    /// the caller to notify about. Empty when only external casts were torn down — those belong to
+    /// a client that is doing its own reporting.
+    pub fn stop_screen_recordings(&mut self) -> Vec<std::path::PathBuf> {
+        let mut finished = Vec::new();
         let ids: Vec<_> = self
             .casting
             .recordings
@@ -1188,12 +1192,14 @@ impl Niri {
                     // Finalize off-thread so the stop-click doesn't stall the compositor on encoder
                     // drain + WebM finalize.
                     n.recorder.finish_async(n.path.display().to_string());
+                    finished.push(n.path);
                 }
                 self.refresh_screen_recording();
             } else {
                 self.stop_cast(id);
             }
         }
+        finished
     }
 
     /// Finalize and drop every native recording targeting `output` (its connector is going away).

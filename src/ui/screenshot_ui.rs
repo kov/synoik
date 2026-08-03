@@ -67,6 +67,13 @@ const CAPTURE_CIRCLE: [f32; 4] = [1., 1., 1., 1.];
 const CAPTURE_CIRCLE_HOVER: [f32; 4] = [0.8, 0.8, 0.8, 1.];
 const CAPTURE_CIRCLE_ACTIVE: [f32; 4] = [0.5, 0.5, 0.5, 1.];
 
+/// The same circle under `&:cast` (`_screenshot.scss:66-79`): `$screenshot_ui_button_red` is
+/// `$red_4` (`#c01c28`), `lighten(…, 5%)` on hover and `darken(…, 7%)` while pressed. Lightness
+/// steps are in HSL, which is why these are not a flat scale of the base.
+const CAST_CIRCLE: [f32; 4] = [0.753, 0.110, 0.157, 1.];
+const CAST_CIRCLE_HOVER: [f32; 4] = [0.840, 0.123, 0.175, 1.];
+const CAST_CIRCLE_ACTIVE: [f32; 4] = [0.631, 0.092, 0.131, 1.];
+
 /// `.screenshot-ui-close-button` extends `.window-close` but overrides its padding to
 /// `$base_padding` (`_screenshot.scss:19`), so the box grows to fit the `$medium_icon_size` glyph
 /// plus 6px a side rather than staying at `.window-close`'s 32px.
@@ -102,6 +109,7 @@ pub enum ScreenshotUi {
         /// Seconds to wait before the capture fires, cycling through [`DELAYS`]. Our divergence:
         /// GNOME's shell UI has no delay, only gnome-screenshot did.
         delay: u8,
+        mode: CaptureMode,
         capture_type: CaptureType,
         /// The window the selector has picked, as `(output, window id)`.
         ///
@@ -207,6 +215,43 @@ pub struct OutputData {
     tooltip_cache: RefCell<widget::BakeCache>,
 }
 
+/// Shot or cast: the two halves of the panel's segmented control (`screenshot.js:1360-1391`).
+///
+/// This is *how* the capture is taken, as against [`CaptureType`]'s *what* — the same area can be
+/// photographed or recorded, which is why they are separate controls in GNOME and separate state
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptureMode {
+    #[default]
+    Shot,
+    Cast,
+}
+
+impl CaptureMode {
+    /// The segment index this mode occupies, and the reverse.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Shot => 0,
+            Self::Cast => 1,
+        }
+    }
+
+    fn from_index(i: usize) -> Self {
+        if i == 0 {
+            Self::Shot
+        } else {
+            Self::Cast
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Shot => "camera-photo-symbolic",
+            Self::Cast => "camera-web-symbolic",
+        }
+    }
+}
+
 /// What an armed delayed capture will shoot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingTarget {
@@ -226,6 +271,7 @@ struct PanelState {
     window_enabled: bool,
     show_pointer: bool,
     delay: u8,
+    mode: CaptureMode,
     hover: Option<Control>,
     /// The control currently held down, for the `:active` fills.
     active: Option<Control>,
@@ -549,6 +595,7 @@ impl ScreenshotUi {
             button: Button::Up,
             show_pointer,
             delay: 0,
+            mode: CaptureMode::default(),
             capture_type: CaptureType::default(),
             selected_window,
             hovered_window: None,
@@ -617,6 +664,7 @@ impl ScreenshotUi {
     /// `Screen` takes the whole output as the selection, so the shade collapses and the ordinary
     /// capture path needs no special case — the rect it crops is simply the full frame.
     pub fn set_capture_type(&mut self, ty: CaptureType) {
+        let window_enabled = self.window_enabled();
         let Self::Open {
             capture_type,
             selection,
@@ -631,7 +679,7 @@ impl ScreenshotUi {
             return;
         }
         // An insensitive button must not switch modes even if a click somehow reaches it.
-        if ty == CaptureType::Window && output_data.values().all(|d| d.windows.is_empty()) {
+        if ty == CaptureType::Window && !window_enabled {
             return;
         }
         *capture_type = ty;
@@ -669,6 +717,43 @@ impl ScreenshotUi {
             Self::Open { output_data, .. } => output_data.values().any(|d| !d.windows.is_empty()),
             Self::Closed { .. } => false,
         }
+    }
+
+    /// Whether Window mode can be entered — the one authority, read by the bake, the hit test's
+    /// hover filter and [`Self::set_capture_type`].
+    ///
+    /// Cast mode refuses it outright: recording a single window is not something GNOME's recorder
+    /// does either (`_startScreencast` returns early on `_windowButton.checked`,
+    /// `js/ui/screenshot.js:2013`, and `_onCastButtonToggled` greys the button rather than leaving
+    /// a mode that silently does nothing).
+    pub fn window_enabled(&self) -> bool {
+        self.mode() == CaptureMode::Shot && self.any_windows()
+    }
+
+    pub fn mode(&self) -> CaptureMode {
+        match self {
+            Self::Open { mode, .. } => *mode,
+            Self::Closed { .. } => CaptureMode::default(),
+        }
+    }
+
+    /// Switch between photographing and recording.
+    ///
+    /// Cast mode drops the frozen screen (the recording is of the *live* one, and a still of the
+    /// moment the picker opened would be a lie about what is being recorded) and takes Window mode
+    /// with it, falling back to Selection if that is where we were — GNOME does both in
+    /// `_onCastButtonToggled` (`js/ui/screenshot.js:1880-1906`).
+    pub fn set_mode(&mut self, new: CaptureMode) {
+        if self.mode() == new {
+            return;
+        }
+        if let Self::Open { mode, .. } = self {
+            *mode = new;
+        }
+        if new == CaptureMode::Cast && self.capture_type() == CaptureType::Window {
+            self.set_capture_type(CaptureType::Selection);
+        }
+        self.update_buffers();
     }
 
     /// The window the selector has picked, as `(output, id)`.
@@ -1179,6 +1264,7 @@ impl ScreenshotUi {
             output_data,
             show_pointer,
             delay,
+            mode,
             capture_type,
             selected_window,
             hovered_window,
@@ -1204,9 +1290,10 @@ impl ScreenshotUi {
         let hover = if output == &selection.0 { *hover } else { None };
         let state = PanelState {
             capture_type: *capture_type,
-            window_enabled: self.any_windows(),
+            window_enabled: self.window_enabled(),
             show_pointer: *show_pointer,
             delay: *delay,
+            mode: *mode,
             hover,
             // `:active` only while the pointer is still on the control the press armed — a press
             // dragged off a button must let go of it, as it does anywhere else.
@@ -1276,7 +1363,14 @@ impl ScreenshotUi {
             }
         }
 
-        // The screenshot itself goes last.
+        // The screenshot itself goes last — but only in Shot mode. A recording is of the *live*
+        // screen, so leaving a still of the moment the picker opened underneath it would show the
+        // user something other than what they are about to record (`_onCastButtonToggled` fades
+        // `_stageScreenshotContainer` out for exactly this, `js/ui/screenshot.js:1888-1894`).
+        if *mode == CaptureMode::Cast {
+            return;
+        }
+
         let index = match target {
             RenderTarget::Output => 0,
             RenderTarget::Screencast => 1,
@@ -1497,6 +1591,7 @@ impl ScreenshotUi {
     /// Recompute which control the pointer is over, on the selection output. Returns whether it
     /// changed — a rebake and a redraw only happen when it does.
     fn update_hover(&mut self, point: Point<i32, Physical>) -> bool {
+        let window_enabled = self.window_enabled();
         let Self::Open {
             selection,
             output_data,
@@ -1513,7 +1608,6 @@ impl ScreenshotUi {
         // An insensitive control takes no hover, exactly as `reactive = false` gives St.Button no
         // `notify::hover` — which is what keeps it from lighting up, and from offering a tooltip
         // for something it will not do.
-        let window_enabled = output_data.values().any(|d| !d.windows.is_empty());
         let new = data
             .and_then(|data| data.control_at(point))
             .filter(|c| *c != Control::Type(CaptureType::Window) || window_enabled);
@@ -1765,8 +1859,10 @@ impl ScreenshotUi {
                 self.cycle_delay();
                 PointerUp::Redraw
             }
-            // Only the shot segment exists until slice 4, and it is already checked.
-            Control::ShotCast(_) => PointerUp::Redraw,
+            Control::ShotCast(i) => {
+                self.set_mode(CaptureMode::from_index(i));
+                PointerUp::Redraw
+            }
         }
     }
 }
@@ -2198,15 +2294,22 @@ impl OutputData {
         }
 
         // The checked segment is a solid white pill, so its glyph inverts to the panel colour
-        // (`_screenshot.scss:108`). Only the shot segment exists until slice 4, and it is checked.
-        let shot = widget::Segmented::segment_rect(layout.shot_cast, 0);
-        icon(
-            "camera-photo-symbolic",
-            widget::Segmented::ICON_PX,
-            style::OSD_BG,
-            origin,
-            centre(shot),
-        );
+        // (`_screenshot.scss:108`); the other keeps `$osd_fg_color`.
+        for mode in [CaptureMode::Shot, CaptureMode::Cast] {
+            let seg = widget::Segmented::segment_rect(layout.shot_cast, mode.index());
+            let color = if state.mode == mode {
+                style::OSD_BG
+            } else {
+                style::OSD_FG
+            };
+            icon(
+                mode.icon(),
+                widget::Segmented::ICON_PX,
+                color,
+                origin,
+                centre(seg),
+            );
+        }
 
         icon(
             "screenshot-ui-show-pointer-symbolic",
@@ -2439,6 +2542,7 @@ impl Control {
             Control::Type(CaptureType::Screen) => "Screen Selection",
             Control::Type(CaptureType::Window) => "Window Selection",
             Control::ShotCast(0) => "Take Screenshot",
+            Control::ShotCast(1) => "Record Screen",
             // `Record Screen`, once slice 4 puts a cast segment there.
             Control::ShotCast(_) => return None,
             Control::Capture => "Capture",
@@ -2501,7 +2605,7 @@ impl PanelLayout {
         let type_h = type_sizes.iter().fold(0f64, |acc, s| acc.max(s.h));
         let type_row_w = type_w * 3. + Self::TYPE_SPACING * 2.;
 
-        let shot_cast_size = widget::Segmented::size(1);
+        let shot_cast_size = widget::Segmented::size(2);
         let show_pointer_d =
             widget::IconButton::diameter(widget::IconButton::ICON_PX, Self::SHOW_POINTER_PAD);
         let bottom_h = Self::CAPTURE_DIAMETER
@@ -2596,9 +2700,11 @@ impl PanelLayout {
             }
         }
         if self.shot_cast.contains(p) {
-            let seg = widget::Segmented::segment_rect(self.shot_cast, 0);
-            if seg.contains(p) {
-                return Some(Control::ShotCast(0));
+            for i in 0..2 {
+                let seg = widget::Segmented::segment_rect(self.shot_cast, i);
+                if seg.contains(p) {
+                    return Some(Control::ShotCast(i));
+                }
             }
         }
         None
@@ -2848,11 +2954,10 @@ fn generate_panel(
             )?;
         }
 
-        // Only the shot segment exists until slice 4, and it is what is checked.
         p.segmented(
             layout.shot_cast,
-            1,
-            0,
+            2,
+            state.mode.index(),
             match state.hover {
                 Some(Control::ShotCast(i)) => Some(i),
                 _ => None,
@@ -2904,10 +3009,21 @@ fn generate_panel(
             cap.loc + Point::from((inset, inset)),
             Size::from((CAPTURE_INNER, CAPTURE_INNER)),
         );
+        let cast = state.mode == CaptureMode::Cast;
         let circle = if state.active == Some(Control::Capture) {
-            CAPTURE_CIRCLE_ACTIVE
+            if cast {
+                CAST_CIRCLE_ACTIVE
+            } else {
+                CAPTURE_CIRCLE_ACTIVE
+            }
         } else if state.hover == Some(Control::Capture) {
-            CAPTURE_CIRCLE_HOVER
+            if cast {
+                CAST_CIRCLE_HOVER
+            } else {
+                CAPTURE_CIRCLE_HOVER
+            }
+        } else if cast {
+            CAST_CIRCLE
         } else {
             CAPTURE_CIRCLE
         };

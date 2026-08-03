@@ -493,6 +493,146 @@ fn click_control(f: &mut Fixture, output: &Output, rect: Rectangle<f64, Logical>
         .expect("the release must land on a control")
 }
 
+/// The cast segment is not just a mode flag: it drops the frozen screen, greys out Window, and
+/// turns the capture button red. All three come from `_onCastButtonToggled`
+/// (`js/ui/screenshot.js:1880-1906`).
+#[test]
+fn vulkan_screenshot_ui_cast_mode_drops_the_frozen_screen_and_window_mode() {
+    let Some((mut f, client, surface)) = window_fixture_with_client(GREEN, true, None) else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    f.niri_state().open_screenshot_ui(false, None);
+    settle_screenshot_ui_open(&mut f);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    assert_eq!(
+        f.niri().screenshot_ui.mode(),
+        crate::ui::screenshot_ui::CaptureMode::Shot
+    );
+    assert!(
+        f.niri().screenshot_ui.window_enabled(),
+        "there is a window, so Window mode is available in Shot mode"
+    );
+
+    // Park in Window mode first, so the switch has something to take away.
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.type_buttons[2]);
+    assert_eq!(
+        f.niri().screenshot_ui.capture_type(),
+        CaptureType::Window,
+        "the click must land on the Window button"
+    );
+
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let cast = crate::ui::widget::Segmented::segment_rect(layout.shot_cast, 1);
+    click_control(&mut f, &output, cast);
+
+    assert_eq!(
+        f.niri().screenshot_ui.mode(),
+        crate::ui::screenshot_ui::CaptureMode::Cast
+    );
+    assert_eq!(
+        f.niri().screenshot_ui.capture_type(),
+        CaptureType::Selection,
+        "recording a single window is not a thing, so cast mode must move off Window rather than \
+         leave a mode whose capture button does nothing"
+    );
+    assert!(
+        !f.niri().screenshot_ui.window_enabled(),
+        "and it must stay unavailable while cast is checked, window or no window"
+    );
+
+    // The frozen screen is gone: recolouring the live window now shows through the picker, which it
+    // could not do while a still of the moment it opened was drawn on top.
+    recolor_window(&mut f, client, &surface, [0, 0, u32::MAX, u32::MAX]);
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    // Not an exact match: the picker's shade dims everything outside the selection, so the live
+    // window arrives blended. Blue-dominant is the honest question.
+    let blue = (0..w * h)
+        .map(|i| px(&pixels, w, i % w, i / w))
+        .filter(|p| p[2] > 60 && u32::from(p[2]) > u32::from(p[0]) * 3)
+        .filter(|p| u32::from(p[2]) > u32::from(p[1]) * 3)
+        .count();
+    assert!(
+        blue > 0,
+        "cast mode still draws the frozen screen — the picker is showing a still of the past while \
+         claiming to record the present"
+    );
+
+    // Back to shot, and the button is live again.
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let shot = crate::ui::widget::Segmented::segment_rect(layout.shot_cast, 0);
+    click_control(&mut f, &output, shot);
+    assert_eq!(
+        f.niri().screenshot_ui.mode(),
+        crate::ui::screenshot_ui::CaptureMode::Shot
+    );
+    assert!(f.niri().screenshot_ui.window_enabled());
+}
+
+/// The capture button clicked in cast mode starts a recording instead of taking a picture.
+#[test]
+fn vulkan_screenshot_ui_cast_mode_capture_starts_a_recording() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+
+    f.niri_state().open_screenshot_ui(false, None);
+    settle_screenshot_ui_open(&mut f);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(&mut f, &output, layout.type_buttons[1]);
+
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    click_control(
+        &mut f,
+        &output,
+        crate::ui::widget::Segmented::segment_rect(layout.shot_cast, 1),
+    );
+
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    assert_eq!(
+        click_control(&mut f, &output, layout.capture),
+        PointerUp::Capture,
+        "the capture button reports the same release in either mode; the branch is the compositor's"
+    );
+    f.niri_state()
+        .handle_screenshot_ui_pointer_up(PointerUp::Capture);
+
+    assert!(
+        !f.niri().screenshot_ui.is_open(),
+        "GNOME closes instantly here so the fade-out is not recorded"
+    );
+    assert!(
+        !f.niri().casting.recordings.is_empty(),
+        "the capture button in cast mode must start the recorder"
+    );
+
+    // And stopping it finalizes the file and says so.
+    f.niri_state().stop_screen_recordings();
+    assert!(f.niri().casting.recordings.is_empty());
+    let notif = f
+        .niri()
+        .notifications
+        .sources
+        .iter()
+        .flat_map(|s| s.notifications.iter())
+        .find(|n| n.title == "Screencast recorded")
+        .expect("stopping a recording must notify, the way a taken screenshot does");
+    assert_eq!(
+        notif.actions.len(),
+        1,
+        "the notification carries a way into Files"
+    );
+}
+
 /// **Our divergence** — GNOME's screenshot UI has no delay. Arming one hands the *whole* capture
 /// over to a timer, so the two things that must not happen at that moment are answering the D-Bus
 /// caller (it has not been given anything yet) and losing the capture when the picker closes.
