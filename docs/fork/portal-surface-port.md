@@ -90,11 +90,15 @@ EnableClipboard
 
 | interface | ours | missing |
 | --- | --- | --- |
-| `org.gnome.Shell.Screenshot` | `Screenshot`, `PickColor` | `ScreenshotArea`, `SelectArea`, `FlashArea`, `ScreenshotWindow`, `InteractiveScreenshot` |
-| `org.gnome.Shell.Introspect` | `GetWindows`, `WindowsChanged` | `GetRunningApplications`, `ScreenSize`, `AnimationsEnabled`, `RunningApplicationsChanged`, `version` |
+| `org.gnome.Shell.Screenshot` | all of it | — |
+| `org.gnome.Shell.Introspect` | all of it | — |
 | `org.gnome.Mutter.ScreenCast.Session` | `Start`, `Stop`, `RecordMonitor`, `RecordWindow`, `RecordArea`, `Closed` | `RecordVirtual` |
-| `org.gnome.Mutter.ScreenCast.Stream` | `PipeWireStreamAdded`, `Parameters` | `Start`, `Stop` |
+| `org.gnome.Mutter.ScreenCast.Stream` | all of it | — |
 | `org.gnome.Mutter.RemoteDesktop` | — | the whole name |
+
+The rows above were the state at scoping; slices 1, 2, 3 and 6 have since closed the first two and
+the stream row. `RecordVirtual` and `RemoteDesktop` are the remainder, both scoped as their own
+work below.
 
 ## Two things found while scoping, both of which change slice 1
 
@@ -204,6 +208,41 @@ itself is now shared (`dbus::check_sender`); only the list belongs to each inter
 
 Consequence worth knowing: **`gdbus call` against these interfaces from a terminal is now refused**,
 by design. Test through the portal, or from an allowlisted peer.
+
+## The OBS frozen-frame hunt, and why it ended outside this repo
+
+A monitor cast delivered one frame to OBS and then appeared to freeze, with pieces of old frames
+overlapping. It cost several days. **It is not ours: it reproduces identically under real GNOME
+Shell / mutter 50.3 on this same machine.** Log into `gnome.desktop` and try the same capture
+before spending anything on a client that misbehaves against us — that control ran in one login and
+would have ended the hunt on day one.
+
+The mechanism is client-side. OBS logs `Cannot query the number of formats` just before it creates
+its stream: its DMA-BUF format query fails on `Mesa zink -> Venus` (GL is routed through zink
+system-wide by `/etc/environment.d/90-limina-zink.conf`). With no dmabuf formats advertised,
+negotiation is forced onto OBS's shm branch, which is barely exercised anywhere else because every
+other stack hands it dmabufs.
+
+Established about our side, so it need not be re-derived:
+
+- The producer is correct. A digest of the bytes taken *at the instant of the handover* (TRACE, in
+  `dequeue_buffer_and_render`) tracks screen content exactly — long runs while the desktop is
+  settled, distinct frames through every animation.
+- Delivery is correct. A second consumer (host `gst-launch` `pipewiresrc`) on the same node and the
+  same link receives the **live** desktop while OBS sits frozen — caught in a single captured frame
+  showing the current clock with OBS's stale preview inside it.
+- Our memfd allocation matches mutter field-for-field (`meta-screen-cast-stream-src.c:2318-2358`).
+
+Two instrument traps worth keeping: dumping the buffer fds from `/proc` samples them *now*, not at
+queue time, so it cannot tell "every queued frame was fresh" from "the buffers change over time" —
+that weak inference stood for a day. And `gst-launch -q … | tail` hides a failed pipeline; a
+"200 buffers in 0.02s" reading was an error exit, not a rate.
+
+Kept from the hunt: `87e89fa1` calls `pw_stream_trigger_process()` after queueing when
+`pw_stream_is_driving()`. It did not fix this symptom, but a `DRIVER` stream owes the graph that
+call (`pipewire/stream.h`, and mutter does it at `meta-screen-cast-stream-src.c:995-1008`).
+`986c829d` logs the driving state on entry to `Streaming` — **that line has never been read on the
+seat**, so whether `is_driving()` is true here is still unknown.
 
 ## Known gaps in cover
 
