@@ -62,7 +62,7 @@ const KEY_PAGEDOWN: u32 = 109;
 const KEY_O: u32 = 24;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
-const BTN_LEFT: u32 = 0x110;
+pub(super) const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
 
@@ -3477,7 +3477,7 @@ fn setup_two_desktops_in_overview_on(
 }
 
 /// Absolute pointer motion: `Fixture::pointer_motion` takes deltas.
-fn pointer_motion_to(f: &mut Fixture, x: f64, y: f64) {
+pub(super) fn pointer_motion_to(f: &mut Fixture, x: f64, y: f64) {
     let cur = f.niri().seat.get_pointer().unwrap().current_location();
     f.pointer_motion(x - cur.x, y - cur.y);
 }
@@ -3495,7 +3495,7 @@ fn clock_center_x(f: &mut Fixture, output_w: f64) -> f64 {
 /// Horizontal centre of the quick-settings indicator — likewise asked of the panel. It no
 /// longer owns the top-right corner: the dateMenu was moved past it (see
 /// [`crate::ui::panel`]), so the cluster starts wherever the clock's box ends.
-fn qs_center_x(f: &mut Fixture, output_w: f64) -> f64 {
+pub(super) fn qs_center_x(f: &mut Fixture, output_w: f64) -> f64 {
     let rect = f.niri().panel.quick_settings_rect(output_w);
     rect.loc.x + rect.size.w / 2.
 }
@@ -3504,7 +3504,9 @@ fn qs_center_x(f: &mut Fixture, output_w: f64) -> f64 {
 /// recomputed from its anchor. The anchor is frozen when the menu opens, while the
 /// indicator it hangs off keeps moving (showing the messages dot widens the dateMenu box,
 /// sliding every right-box role left of it), so a hand-rolled origin goes stale mid-test.
-fn popover_origin(f: &mut Fixture) -> smithay::utils::Point<f64, smithay::utils::Logical> {
+pub(super) fn popover_origin(
+    f: &mut Fixture,
+) -> smithay::utils::Point<f64, smithay::utils::Logical> {
     let output = f.niri_output(1);
     f.niri().panel_popover.location(&output)
 }

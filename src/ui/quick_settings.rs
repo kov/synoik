@@ -1180,7 +1180,7 @@ fn network_icons(network: NetworkStatus) -> Vec<String> {
 /// The system-row buttons (gnome-shell's `SystemItem`, `js/ui/status/system.js`):
 /// screenshot + settings, then lock + power.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SysButton {
+pub(crate) enum SysButton {
     Screenshot,
     Settings,
     Lock,
@@ -1383,7 +1383,7 @@ impl QuickSettings {
     }
 
     /// Whether the battery pill is shown (governs the system-row layout).
-    fn has_pill(&self) -> bool {
+    pub(crate) fn has_pill(&self) -> bool {
         self.battery.is_some()
     }
 
@@ -3027,7 +3027,7 @@ fn pill_rect(has_pill: bool) -> Option<Rectangle<f64, Logical>> {
 /// mirroring gnome-shell's `SystemItem`: with a battery, the pill leads at the
 /// left and screenshot/settings/lock/power cluster at the right; without one,
 /// screenshot/settings sit on the left and lock/power on the right.
-fn sys_rect(button: SysButton, has_pill: bool) -> Rectangle<f64, Logical> {
+pub(crate) fn sys_rect(button: SysButton, has_pill: bool) -> Rectangle<f64, Logical> {
     // Outermost disc edges align with the tile-grid columns (both inset by PAD).
     let left = PAD + SYS_HIT / 2.;
     let right = menu_w() - PAD - SYS_HIT / 2.;

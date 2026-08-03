@@ -401,6 +401,16 @@ impl PanelPopover {
         self.output.as_ref()
     }
 
+    /// The quick-settings menu, if that is what is up. A seam so a test can click a real control
+    /// at the coordinates the menu itself lays out, rather than reimplementing that arithmetic.
+    #[cfg(test)]
+    pub fn quick_settings(&self) -> Option<&crate::ui::quick_settings::QuickSettings> {
+        match self.content.as_ref() {
+            Some(PopoverContent::QuickSettings(qs)) => Some(qs),
+            _ => None,
+        }
+    }
+
     /// Toggle the dateMenu popover (message list + calendar): open it anchored
     /// at `anchor` on `output`, or close it if it's already open (from the same
     /// button). `cards` is the notification-store snapshot for the message
@@ -917,6 +927,23 @@ impl PanelPopover {
         self.closing = true;
         let from = f64::from(self.progress());
         self.anim = Some(self.make_anim(from, 0.));
+    }
+
+    /// Close with no fade — GNOME's `close(PopupAnimation.NONE)`.
+    ///
+    /// For the one caller that must not merely *start* the menu going away: the screenshot button
+    /// freezes the screen, and a fading popover is still on the screen it freezes. GNOME closes
+    /// this menu without animation and defers the open to a `BEFORE_REDRAW` later
+    /// (`js/ui/status/system.js:121-128`) for exactly that reason.
+    pub fn close_immediately(&mut self) {
+        if !self.open {
+            return;
+        }
+        self.open = false;
+        self.closing = false;
+        self.output = None;
+        self.content = None;
+        self.anim = None;
     }
 
     /// Feed a key while the popover is open. Escape closes it; every other key is

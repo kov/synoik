@@ -1419,7 +1419,16 @@ impl State {
             // screenshot button only closes the quick-settings menu and calls
             // `Main.screenshotUI.open()` (`js/ui/status/system.js:120-127`), which has no
             // `Main.overview.hide()` anywhere in it.
-            PopoverAction::Screenshot => self.open_screenshot_ui(true, None),
+            PopoverAction::Screenshot => {
+                // `closes_menu()` already started the fade, but opening the picker *freezes the
+                // screen*, and a fading popover is still on it — so every shot taken from this
+                // button had the quick-settings menu burnt into it. GNOME closes this one menu
+                // with `PopupAnimation.NONE` and defers the open to a `BEFORE_REDRAW` later
+                // (`js/ui/status/system.js:121-128`); dropping the popover outright before the
+                // capture is the same ordering without the later.
+                self.niri.panel_popover.close_immediately();
+                self.open_screenshot_ui(true, None);
+            }
             // Every shell surface that starts an app leaves the overview first —
             // `Main.overview.hide(); Main.panel.close…(); app.activate()`, in the
             // quick-settings system rows (`js/ui/status/system.js:53-57,150-154`), the

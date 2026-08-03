@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use niri_config::{Action, Config, CornerRadius, WindowRule};
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::input::ButtonState;
 use smithay::backend::renderer::element::{Element, RenderElement};
 use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Renderer};
 use smithay::output::Output;
@@ -23,7 +24,7 @@ use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::fixture::Fixture;
-use super::gnome::map_window_for_app;
+use super::gnome::{map_window_for_app, BTN_LEFT};
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget, NATIVE_FOURCC};
@@ -12422,5 +12423,106 @@ fn vulkan_draws_the_unlock_prompt_with_a_masked_entry() {
         differing, 0,
         "{differing} px changed when only the password's characters did — \
          the entry is drawing the plaintext, not the mask"
+    );
+}
+
+/// Opening the picker from the quick-settings screenshot button must not photograph the
+/// quick-settings menu.
+///
+/// The picker works by *freezing the screen* — `open_screenshot_ui` captures neutrals through the
+/// renderer before it opens — and our menus close on a fade, so the menu was still fully drawn at
+/// the instant of that capture and landed in every shot taken from its own button. GNOME closes
+/// this one menu with `PopupAnimation.NONE` and defers the open to a `BEFORE_REDRAW` later
+/// (`js/ui/status/system.js:121-128`) for exactly this reason.
+///
+/// Driven through real pointer input at the coordinates the menu itself lays out, and asserted on
+/// the *pixels of the frozen screen*: what makes this a bug is what ends up in the capture, so
+/// checking that the popover's state flag flipped would be checking the fix rather than the defect.
+#[test]
+fn vulkan_screenshot_from_quick_settings_does_not_freeze_the_menu_into_the_shot() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+    f.niri().update_render_elements(None);
+
+    // Open quick settings from the panel.
+    let x = super::gnome::qs_center_x(&mut f, f64::from(OUT_W));
+    super::gnome::pointer_motion_to(&mut f, x, 10.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle_animations();
+    assert_eq!(
+        f.niri().panel_popover.open_role(),
+        Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
+        "the status cluster must open quick settings"
+    );
+
+    // Remember where the menu is *while it is still up* — after the click it is gone, and this
+    // rect is the region the assertion below inspects.
+    let origin = super::gnome::popover_origin(&mut f);
+    let size = f
+        .niri()
+        .panel_popover
+        .content_size()
+        .expect("the open menu must have a size");
+    let scale = output.current_scale().fractional_scale();
+    let menu =
+        Rectangle::<f64, Logical>::new(origin, size).to_physical_precise_round::<_, i32>(scale);
+
+    // The screenshot button's own rect, asked of the menu rather than recomputed: the system row
+    // is laid out differently with and without a battery pill.
+    let has_pill = f
+        .niri()
+        .panel_popover
+        .quick_settings()
+        .expect("quick settings must be the open content")
+        .has_pill();
+    let button = crate::ui::quick_settings::sys_rect(
+        crate::ui::quick_settings::SysButton::Screenshot,
+        has_pill,
+    );
+
+    super::gnome::pointer_motion_to(
+        &mut f,
+        origin.x + button.loc.x + button.size.w / 2.,
+        origin.y + button.loc.y + button.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert!(
+        f.niri().screenshot_ui.is_open(),
+        "the quick-settings screenshot button must open the picker"
+    );
+
+    settle_screenshot_ui_open(&mut f);
+    let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    // `.popup-menu-content`'s `$bg_color` is #36363a. The picker shades the unselected area to 50%
+    // black, so a frozen menu reads as roughly half that — count both, since the menu's default
+    // position may straddle the selection edge.
+    let is_menu_bg = |p: [u8; 4]| {
+        let near = |v: u8, t: i16| (i16::from(v) - t).abs() <= 4;
+        (near(p[0], 54) && near(p[1], 54) && near(p[2], 58))
+            || (near(p[0], 27) && near(p[1], 27) && near(p[2], 29))
+    };
+    let mut menu_px = 0;
+    for y in menu.loc.y.max(0)..(menu.loc.y + menu.size.h).min(h) {
+        for x in menu.loc.x.max(0)..(menu.loc.x + menu.size.w).min(w) {
+            if is_menu_bg(px(&pixels, w, x, y)) {
+                menu_px += 1;
+            }
+        }
+    }
+    let area = menu.size.w * menu.size.h;
+    eprintln!(
+        "vulkan_screenshot_from_quick_settings_does_not_freeze_the_menu_into_the_shot: \
+         {menu_px} menu-bg px of {area} in {menu:?}"
+    );
+    // A frozen menu fills essentially all of this rect; stray wallpaper pixels cannot.
+    assert!(
+        menu_px * 10 < area,
+        "the quick-settings menu is in the frozen screen ({menu_px} of {area} px in {menu:?})"
     );
 }
