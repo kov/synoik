@@ -2050,10 +2050,10 @@ fn adopted_niri_keybindings() -> Vec<(String, Action, Vec<String>, Option<Durati
     }
 
     let keys = vec![
-        key("focus-column-left", FocusColumnLeft, "<Super>h"),
-        key("focus-column-right", FocusColumnRight, "<Super>l"),
-        key("focus-window-up", FocusWindowUp, "<Super>k"),
-        key("focus-window-down", FocusWindowDown, "<Super>j"),
+        key("focus-column-left", FocusColumnLeft, "<Super><Alt>h"),
+        key("focus-column-right", FocusColumnRight, "<Super><Alt>l"),
+        key("focus-window-up", FocusWindowUp, "<Super><Alt>k"),
+        key("focus-window-down", FocusWindowDown, "<Super><Alt>j"),
         key(
             "focus-column-first",
             FocusColumnFirst,
@@ -3539,6 +3539,142 @@ mod tests {
             for accel in parse_accels(&key, defaults) {
                 if let Some((_, theirs)) = gnome.iter().find(|(a, _)| *a == accel) {
                     clashes.push(format!("{key} wants {accel:?}, which is GNOME's {theirs}"));
+                }
+            }
+        }
+        assert!(clashes.is_empty(), "{clashes:#?}");
+    }
+
+    /// Pull `(key name, accelerator)` pairs out of a `.gschema.xml`'s array defaults.
+    ///
+    /// Deliberately dumb, but not naive about the three ways these files vary: attribute
+    /// order (`<key name= type=>` vs `<key type= name=>`), quote style (mutter uses
+    /// `'…'`, gnome-shell uses `"…"`), and CDATA — `org.gnome.desktop.wm.keybindings`
+    /// wraps every default in `<![CDATA[…]]>`. Missing any of them silently shrinks the
+    /// set a collision is checked against, which is how a guard passes while being blind;
+    /// the caller asserts on the count for exactly that reason.
+    fn schema_default_accels(xml: &str) -> Vec<(String, String)> {
+        let mut rv = Vec::new();
+        for chunk in xml.split("<key ").skip(1) {
+            let Some(elem) = chunk.split("</key>").next() else {
+                continue;
+            };
+            let Some(name) = elem
+                .split("name=\"")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+            else {
+                continue;
+            };
+            let Some(default) = elem
+                .split("<default>")
+                .nth(1)
+                .and_then(|r| r.split("</default>").next())
+            else {
+                continue;
+            };
+            let default = default
+                .replace("<![CDATA[", "")
+                .replace("]]>", "")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"");
+            let default = default.trim();
+            // Only array-typed keys are accelerator lists.
+            if !default.starts_with('[') {
+                continue;
+            }
+            let mut rest = default;
+            while let Some(open) = rest.find(['\'', '"']) {
+                let quote = rest.as_bytes()[open] as char;
+                let after = &rest[open + 1..];
+                let Some(close) = after.find(quote) else {
+                    break;
+                };
+                let value = &after[..close];
+                if !value.is_empty() {
+                    rv.push((name.to_owned(), value.to_owned()));
+                }
+                rest = &after[close + 1..];
+            }
+        }
+        rv
+    }
+
+    /// No accelerator of ours may take a chord GNOME *ships*, adopted or not.
+    ///
+    /// [`niri_accels_do_not_collide_with_gnome`] only compares against the keys we adopt,
+    /// which leaves two blind spots that both turned out to be real: GNOME keys we
+    /// deliberately deferred still have defaults (`minimize` is `<Super>h`), and
+    /// gnome-settings-daemon's media keys are not in any table of ours at all
+    /// (`screensaver` is `<Super>l` — the lock key). Ours would win both, because the
+    /// settings model resolves ahead of external accelerator grabs, so taking one does not
+    /// produce a dead key of ours: it silently disables GNOME's.
+    ///
+    /// Comparison goes through `parse_accelerator`, so modifier order and spelling
+    /// (`<Primary>` vs `<Control>`, `<Alt><Super>` vs `<Super><Alt>`) cannot hide a clash.
+    #[test]
+    fn niri_accels_do_not_collide_with_anything_gnome_ships() {
+        let vendored = [
+            (
+                "org.gnome.desktop.wm.keybindings",
+                include_str!("../resources/schemas/org.gnome.desktop.wm.keybindings.gschema.xml"),
+            ),
+            (
+                "org.gnome.mutter",
+                include_str!("../resources/schemas/org.gnome.mutter.gschema.xml"),
+            ),
+            (
+                "org.gnome.mutter.wayland",
+                include_str!("../resources/schemas/org.gnome.mutter.wayland.gschema.xml"),
+            ),
+            (
+                "org.gnome.shell",
+                include_str!("../resources/schemas/org.gnome.shell.gschema.xml"),
+            ),
+        ];
+
+        let mut theirs: Vec<(Accel, String)> = Vec::new();
+        let mut sources = 0;
+        let mut add = |schema: &str, xml: &str, sources: &mut usize| {
+            *sources += 1;
+            for (key, accel) in schema_default_accels(xml) {
+                for parsed in parse_accels(&key, vec![accel]) {
+                    theirs.push((parsed, format!("{schema} {key}")));
+                }
+            }
+        };
+        for (schema, xml) in vendored {
+            add(schema, xml, &mut sources);
+        }
+        // gnome-settings-daemon is a package we do not replace, so its schema is not
+        // vendored — read the installed one where it exists.
+        let gsd = "/usr/share/glib-2.0/schemas/\
+                   org.gnome.settings-daemon.plugins.media-keys.gschema.xml"
+            .replace(char::is_whitespace, "");
+        match std::fs::read_to_string(&gsd) {
+            Ok(xml) => add(
+                "org.gnome.settings-daemon.plugins.media-keys",
+                &xml,
+                &mut sources,
+            ),
+            Err(_) => eprintln!("gsd media-keys schema not installed; media keys unchecked"),
+        }
+
+        assert!(
+            theirs.len() > 100,
+            "only {} accelerators parsed out of {sources} schemas — the extractor is blind, \
+             not GNOME's keymap empty",
+            theirs.len(),
+        );
+
+        let mut clashes = Vec::new();
+        for (key, _, defaults, _) in adopted_niri_keybindings() {
+            for accel in parse_accels(&key, defaults) {
+                if let Some((_, theirs)) = theirs.iter().find(|(a, _)| *a == accel) {
+                    clashes.push(format!(
+                        "{key} wants {accel:?}, which GNOME ships as {theirs}"
+                    ));
                 }
             }
         }

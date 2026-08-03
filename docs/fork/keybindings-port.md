@@ -137,12 +137,31 @@ generic over `Into<KeybindingAction>`, so the GNOME tables were not touched by t
 `move-to-monitor-*`. So this half of the model is hjkl. Likewise `<Super>v` and `<Super>m` are
 the message tray, which is why floating is `<Super>g`.
 
+**Focus nav is `<Super><Alt>`+hjkl, not bare `<Super>`+hjkl.** Bare `<Super>h` is GNOME's
+`minimize` and bare `<Super>l` is gnome-settings-daemon's `screensaver` — the lock key. Ours
+would win both, because the settings model resolves *ahead* of external accelerator grabs
+(`find_gnome_bind` before `find_accel_grab_bind`), so taking them does not leave a dead key of
+ours: it silently disables GNOME's. Super+L not locking the screen is the one that matters.
+The derived families keep their letters — `<Super><Control>`+hjkl to move, `<Super><Shift>`+hjkl
+for monitors — because only the bare chords clash. `<Super><Alt>` is otherwise untouched by
+GNOME and gsd, apart from `<Alt><Super>s` (screen reader) and `<Alt><Super>8` (magnifier).
+
 Three unit tests keep it honest, each covering a failure that is otherwise silent:
 
 - `niri_accels_do_not_collide_with_gnome` — no accelerator of ours may take a chord we adopt
   from GNOME. This is the fork tenet made mechanical: GNOME wins, so ours must not ask. A
   collision would leave a settings key that changes nothing, which is worse than one that
   isn't there.
+- `niri_accels_do_not_collide_with_anything_gnome_ships` — the same question against every
+  *default* in the vendored schemas plus gnome-settings-daemon's media keys, adopted or not.
+  The narrower test above has two blind spots and both were real: a GNOME key we deliberately
+  **deferred** still ships a default (`minimize` = `<Super>h`), and **gsd's keys are in no
+  table of ours at all** (`screensaver` = `<Super>l`). Comparison goes through
+  `parse_accelerator`, so `<Primary>` vs `<Control>` and `<Alt><Super>` vs `<Super><Alt>`
+  cannot hide a clash. It asserts on the *number* of accelerators it extracted, because the
+  failure mode of a hand-rolled XML reader is silently seeing fewer keys — the first draft
+  parsed 96 of 197, having missed that `org.gnome.desktop.wm.keybindings` wraps every default
+  in `<![CDATA[…]]>` while gnome-shell uses `"…"` and mutter uses `'…'`.
 - `our_schema_matches_the_table` — the XML and `adopted_niri_keybindings()` are two hand-written
   copies of one list (the table runs where the schema isn't installed, the XML is what
   `gsettings` and Settings see). Drift shows up as a key nobody reads.

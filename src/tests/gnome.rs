@@ -873,21 +873,27 @@ fn our_own_keybindings_resolve_too() {
     let focused = |f: &mut Fixture| f.niri().layout.focus().map(|m| m.id());
     let newest = f.niri().layout.focus().map(|m| m.id());
 
+    // <Super><Alt>, not bare <Super>: bare <Super>h is GNOME's `minimize` and <Super>l is
+    // gnome-settings-daemon's lock key, and ours would win both.
     f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_K);
+    f.key_release(KEY_LEFTALT);
     f.key_release(KEY_LEFTMETA);
     f.niri_complete_animations();
     assert_ne!(
         focused(&mut f),
         newest,
-        "<Super>k must focus the window above"
+        "<Super><Alt>k must focus the window above"
     );
 
     f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_J);
+    f.key_release(KEY_LEFTALT);
     f.key_release(KEY_LEFTMETA);
     f.niri_complete_animations();
-    assert_eq!(focused(&mut f), newest, "<Super>j must come back down");
+    assert_eq!(focused(&mut f), newest, "<Super><Alt>j must come back down");
 
     // And rebinding one in the model takes effect, like any other key.
     let binding = f

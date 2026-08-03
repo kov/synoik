@@ -17,22 +17,26 @@
 <schemalist>
   <schema id="org.gnome.shell-rs.keybindings" path="/org/gnome/shell-rs/keybindings/">
 
-    <!-- Moving the focus within a workspace. The arrow keys are GNOME's
-         (tiling and maximize), so this half of the model is hjkl-only. -->
+    <!-- Moving the focus within a workspace. The arrow keys are GNOME's (tiling and
+         maximize), so this half of the model is hjkl. On &lt;Super&gt;&lt;Alt&gt; rather
+         than bare &lt;Super&gt;, because bare &lt;Super&gt;h is GNOME's `minimize` and
+         &lt;Super&gt;l is gnome-settings-daemon's `screensaver` — the lock key. Ours would
+         win both (the settings model resolves ahead of external accelerator grabs), so
+         taking them means Super+L stops locking the screen. -->
     <key name="focus-column-left" type="as">
-      <default>['&lt;Super&gt;h']</default>
+      <default>['&lt;Super&gt;&lt;Alt&gt;h']</default>
       <summary>Focus the column to the left</summary>
     </key>
     <key name="focus-column-right" type="as">
-      <default>['&lt;Super&gt;l']</default>
+      <default>['&lt;Super&gt;&lt;Alt&gt;l']</default>
       <summary>Focus the column to the right</summary>
     </key>
     <key name="focus-window-up" type="as">
-      <default>['&lt;Super&gt;k']</default>
+      <default>['&lt;Super&gt;&lt;Alt&gt;k']</default>
       <summary>Focus the window above in the column</summary>
     </key>
     <key name="focus-window-down" type="as">
-      <default>['&lt;Super&gt;j']</default>
+      <default>['&lt;Super&gt;&lt;Alt&gt;j']</default>
       <summary>Focus the window below in the column</summary>
     </key>
     <key name="focus-column-first" type="as">

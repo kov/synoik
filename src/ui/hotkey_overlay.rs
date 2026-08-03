@@ -717,7 +717,7 @@ mod tests {
         );
         assert_snapshot!(
             check(&keybindings, Action::FocusColumnLeft),
-            @" Super + H : Focus Column to the Left"
+            @" Super + Alt + H : Focus Column to the Left"
         );
 
         // An action nothing binds still gets a row, marked as such. `toggle-overview` is the
