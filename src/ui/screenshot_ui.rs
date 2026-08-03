@@ -1422,6 +1422,207 @@ pub(crate) fn crop_screenshot_neutral(
     out
 }
 
+/// What the capture button will act on — GNOME's three type buttons
+/// (`screenshot.js:1305-1348`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptureType {
+    /// A dragged rectangle. GNOME's `Selection`, and the only mode niri's picker ever had.
+    #[default]
+    Selection,
+    /// The whole output.
+    Screen,
+    /// A window chosen from the selector. Not yet implemented — see slice 2 in
+    /// `docs/fork/screenshot-ui-port.md`; the button is built but hidden until it works.
+    Window,
+}
+
+impl CaptureType {
+    /// The type row, left to right, in GNOME's order (`screenshot.js:1305-1342`).
+    pub const ROW: [CaptureType; 3] = [
+        CaptureType::Selection,
+        CaptureType::Screen,
+        CaptureType::Window,
+    ];
+
+    /// The button's glyph.
+    pub fn icon(self) -> &'static str {
+        match self {
+            CaptureType::Selection => "screenshot-ui-area-symbolic",
+            CaptureType::Screen => "screenshot-ui-display-symbolic",
+            CaptureType::Window => "screenshot-ui-window-symbolic",
+        }
+    }
+
+    /// The button's caption.
+    pub fn label(self) -> &'static str {
+        match self {
+            CaptureType::Selection => "Selection",
+            CaptureType::Screen => "Screen",
+            CaptureType::Window => "Window",
+        }
+    }
+
+    /// Whether the mode is offered yet. `Window` is built and laid out but not drawn — **our**
+    /// scaffolding, not GNOME's practice: GNOME never hides `_windowButton` (it hides the *cast*
+    /// button, and on a runtime capability, `screenshot.js:1524`). Delete this the moment slice 2
+    /// lands rather than growing more callers.
+    pub fn is_available(self) -> bool {
+        self != CaptureType::Window
+    }
+}
+
+/// A clickable control in the panel. The panel is one baked texture, so hit-testing is geometry
+/// against [`PanelLayout`] rather than a tree walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    Type(CaptureType),
+    /// The shot/cast segment at this index. Only index 0 (shot) exists until slice 4.
+    ShotCast(usize),
+    Capture,
+    ShowPointer,
+    Close,
+}
+
+/// Where every control sits inside the panel, in panel-local **logical** coordinates.
+///
+/// One layout feeds the bake, the icon placement and the hit test, so a control cannot be drawn
+/// somewhere the pointer does not find it. Built from the caption sizes, which need a shaper —
+/// hence it is produced during the bake and cached, and the panel is not clickable until one frame
+/// has drawn (the same caveat the capture button already carried).
+#[derive(Debug, Clone, Copy)]
+pub struct PanelLayout {
+    pub size: Size<f64, Logical>,
+    /// Indexed by [`CaptureType::ROW`].
+    pub type_buttons: [Rectangle<f64, Logical>; 3],
+    pub shot_cast: Rectangle<f64, Logical>,
+    pub capture: Rectangle<f64, Logical>,
+    pub show_pointer: Rectangle<f64, Logical>,
+}
+
+impl PanelLayout {
+    /// `padding: $screenshot_ui_panel_padding` = `$base_padding * 3` (`_screenshot.scss:3,10`).
+    const PAD: f64 = 18.;
+    /// `padding-bottom: … - $base_padding` — trimmed "to accommodate the large capture button"
+    /// (`_screenshot.scss:11-12`).
+    const PAD_BOTTOM: f64 = 12.;
+    /// `spacing: $base_padding * 2` between the type row and the bottom row
+    /// (`_screenshot.scss:14`).
+    const ROW_SPACING: f64 = 12.;
+    /// `.screenshot-ui-type-button-container` spacing (`screenshot.js:1299`).
+    const TYPE_SPACING: f64 = 12.;
+    /// `.screenshot-ui-capture-button`: a `$large_icon_size` box inside `$base_margin` padding and
+    /// a 4px border (`_screenshot.scss:40-45`).
+    pub const CAPTURE_DIAMETER: f64 = 32. + 4. * 2. + 4. * 2.;
+    /// `.screenshot-ui-show-pointer-button` extends `.icon-button`, whose padding is
+    /// `$scaled_padding * 2` (`_buttons.scss:18-38`).
+    const SHOW_POINTER_PAD: f64 = 12.;
+
+    /// Lay the panel out around captions of `label_w` (one per type button) and `label_h`.
+    ///
+    /// The bottom row is a **BinLayout** in GNOME (`screenshot.js:1350`): the shot/cast pill, the
+    /// capture button and the show-pointer button all occupy the same band, aligned start, centre
+    /// and end. Laying them out in sequence instead would push the capture button off-centre,
+    /// which is the mistake this arithmetic exists to prevent.
+    pub fn new(label_w: [f64; 3], label_h: f64) -> Self {
+        let type_sizes = label_w.map(|w| widget::IconLabelButton::size(w, label_h));
+
+        // `homogeneous: true` (`screenshot.js:1300`) — every type button is as wide as the widest.
+        let type_w = type_sizes.iter().fold(0f64, |acc, s| acc.max(s.w));
+        let type_h = type_sizes.iter().fold(0f64, |acc, s| acc.max(s.h));
+        let type_row_w = type_w * 3. + Self::TYPE_SPACING * 2.;
+
+        let shot_cast_size = widget::Segmented::size(1);
+        let show_pointer_d =
+            widget::IconButton::diameter(widget::IconButton::ICON_PX, Self::SHOW_POINTER_PAD);
+        let bottom_h = Self::CAPTURE_DIAMETER
+            .max(shot_cast_size.h)
+            .max(show_pointer_d);
+
+        // The bottom row must fit its three children side by side even though they are stacked in
+        // a bin — otherwise the pill and the toggle would overlap the capture button on a narrow
+        // panel.
+        let bottom_min_w =
+            shot_cast_size.w + Self::CAPTURE_DIAMETER + show_pointer_d + Self::ROW_SPACING * 2.;
+        let content_w = type_row_w.max(bottom_min_w);
+
+        let size = Size::from((
+            content_w + Self::PAD * 2.,
+            Self::PAD + type_h + Self::ROW_SPACING + bottom_h + Self::PAD_BOTTOM,
+        ));
+
+        let type_y = Self::PAD;
+        let type_x0 = Self::PAD + (content_w - type_row_w) / 2.;
+        let type_buttons = [0usize, 1, 2].map(|i| {
+            Rectangle::new(
+                Point::from((type_x0 + (type_w + Self::TYPE_SPACING) * i as f64, type_y)),
+                Size::from((type_w, type_h)),
+            )
+        });
+
+        let bottom_y = Self::PAD + type_h + Self::ROW_SPACING;
+        // Centre each child on the band, then align it start / centre / end.
+        let centred = |w: f64, h: f64, x: f64| {
+            Rectangle::new(
+                Point::from((x, bottom_y + (bottom_h - h) / 2.)),
+                Size::from((w, h)),
+            )
+        };
+        let shot_cast = centred(shot_cast_size.w, shot_cast_size.h, Self::PAD);
+        let capture = centred(
+            Self::CAPTURE_DIAMETER,
+            Self::CAPTURE_DIAMETER,
+            (size.w - Self::CAPTURE_DIAMETER) / 2.,
+        );
+        let show_pointer = centred(
+            show_pointer_d,
+            show_pointer_d,
+            size.w - Self::PAD - show_pointer_d,
+        );
+
+        Self {
+            size,
+            type_buttons,
+            shot_cast,
+            capture,
+            show_pointer,
+        }
+    }
+
+    /// The control at `p`, in panel-local logical coordinates.
+    ///
+    /// The capture button and the show-pointer toggle are **round**, so they are hit-tested as
+    /// circles: a click in the corner of a circular button's box reads as a misfire, not as a
+    /// generous target (the same rule [`widget::IconButton::contains`] follows).
+    pub fn control_at(&self, p: Point<f64, Logical>) -> Option<Control> {
+        let in_circle = |r: Rectangle<f64, Logical>| {
+            let radius = r.size.w.min(r.size.h) / 2.;
+            let cx = r.loc.x + r.size.w / 2.;
+            let cy = r.loc.y + r.size.h / 2.;
+            let (dx, dy) = (p.x - cx, p.y - cy);
+            dx * dx + dy * dy <= radius * radius
+        };
+
+        if in_circle(self.capture) {
+            return Some(Control::Capture);
+        }
+        if in_circle(self.show_pointer) {
+            return Some(Control::ShowPointer);
+        }
+        for (i, ty) in CaptureType::ROW.iter().enumerate() {
+            if ty.is_available() && self.type_buttons[i].contains(p) {
+                return Some(Control::Type(*ty));
+            }
+        }
+        if self.shot_cast.contains(p) {
+            let seg = widget::Segmented::segment_rect(self.shot_cast, 0);
+            if seg.contains(p) {
+                return Some(Control::ShotCast(0));
+            }
+        }
+        None
+    }
+}
+
 fn panel_location(output_data: &OutputData, panel_size: Size<i32, Buffer>) -> Point<i32, Physical> {
     let scale = output_data.scale;
     let padding: i32 = to_physical_precise_round(scale, PADDING);
@@ -1629,4 +1830,118 @@ fn generate_panel(
 
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Plausible caption metrics at scale 1 — the three labels differ in width, which is what makes
+    // the homogeneous rule observable.
+    const LABEL_W: [f64; 3] = [58., 42., 48.];
+    const LABEL_H: f64 = 13.;
+
+    fn layout() -> PanelLayout {
+        PanelLayout::new(LABEL_W, LABEL_H)
+    }
+
+    // GNOME's bottom row is a BinLayout (`screenshot.js:1350`), so the capture button is centred on
+    // the *panel*, with the pill and the toggle aligned to the ends of the same band. Laying the
+    // three out in sequence — the reflex, and what a BoxLayout would give — puts the capture button
+    // wherever the pill's width leaves it, which is visibly off-centre and the whole reason this
+    // arithmetic exists.
+    #[test]
+    fn the_capture_button_is_centred_on_the_panel_not_after_the_pill() {
+        let l = layout();
+
+        let capture_centre = l.capture.loc.x + l.capture.size.w / 2.;
+        assert!(
+            (capture_centre - l.size.w / 2.).abs() < 0.001,
+            "capture button at {capture_centre}, panel centre {}",
+            l.size.w / 2.
+        );
+
+        // The pill starts at the left padding and the toggle ends at the right padding.
+        assert_eq!(l.shot_cast.loc.x, PanelLayout::PAD);
+        assert_eq!(
+            l.show_pointer.loc.x + l.show_pointer.size.w,
+            l.size.w - PanelLayout::PAD
+        );
+
+        // All three share the band, so their vertical centres agree.
+        let mid = |r: Rectangle<f64, Logical>| r.loc.y + r.size.h / 2.;
+        assert!((mid(l.capture) - mid(l.shot_cast)).abs() < 0.001);
+        assert!((mid(l.capture) - mid(l.show_pointer)).abs() < 0.001);
+
+        // ...and they do not overlap, which a bin layout alone would not guarantee.
+        assert!(l.shot_cast.loc.x + l.shot_cast.size.w <= l.capture.loc.x);
+        assert!(l.capture.loc.x + l.capture.size.w <= l.show_pointer.loc.x);
+    }
+
+    // `homogeneous: true` (`screenshot.js:1300`): every type button takes the width of the widest,
+    // so the row does not jitter as the captions change with translation.
+    #[test]
+    fn the_type_buttons_are_homogeneous_and_evenly_spaced() {
+        let l = layout();
+
+        let w = l.type_buttons[0].size.w;
+        for b in &l.type_buttons {
+            assert_eq!(b.size.w, w);
+            assert_eq!(b.size.h, l.type_buttons[0].size.h);
+            assert_eq!(b.loc.y, PanelLayout::PAD);
+        }
+        for i in 1..3 {
+            assert_eq!(
+                l.type_buttons[i].loc.x - l.type_buttons[i - 1].loc.x,
+                w + PanelLayout::TYPE_SPACING
+            );
+        }
+
+        // The widest caption sets the width, not the first one.
+        let widest = LABEL_W.iter().cloned().fold(0f64, f64::max);
+        assert_eq!(w, widget::IconLabelButton::size(widest, LABEL_H).w);
+    }
+
+    // A click in the corner of a circular button's bounding box is an inch from any drawn pixel.
+    // Treating it as a hit is the kind of generosity that fires the shutter when the user meant to
+    // drag a selection.
+    #[test]
+    fn the_round_controls_are_hit_tested_as_circles() {
+        let l = layout();
+
+        let centre = |r: Rectangle<f64, Logical>| {
+            Point::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
+        };
+        assert_eq!(l.control_at(centre(l.capture)), Some(Control::Capture));
+        assert_eq!(
+            l.control_at(centre(l.show_pointer)),
+            Some(Control::ShowPointer)
+        );
+
+        // The box corner of the capture button is outside the circle.
+        let corner = Point::from((l.capture.loc.x + 1., l.capture.loc.y + 1.));
+        assert!(l.capture.contains(corner));
+        assert_ne!(l.control_at(corner), Some(Control::Capture));
+    }
+
+    // Window mode is laid out but not offered yet, and a button nobody can see must not be
+    // clickable — an invisible hit region that silently switches modes is worse than no button.
+    #[test]
+    fn the_unavailable_window_button_does_not_take_clicks() {
+        let l = layout();
+
+        let centre_of = |i: usize| {
+            let r = l.type_buttons[i];
+            Point::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
+        };
+        assert_eq!(
+            l.control_at(centre_of(0)),
+            Some(Control::Type(CaptureType::Selection))
+        );
+        assert_eq!(
+            l.control_at(centre_of(1)),
+            Some(Control::Type(CaptureType::Screen))
+        );
+        assert_eq!(l.control_at(centre_of(2)), None);
+    }
 }
