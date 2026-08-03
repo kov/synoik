@@ -4,6 +4,25 @@ Status: **2026-08-02.** Slices 1-3 and 6 landed; slice 4 is *partly* landed (`St
 in, `RecordVirtual` not); slice 5 not started. Screenshots are seat-validated — wayshot captures
 through the portal.
 
+**Open: OBS shows stale screencast content** (Firefox's `getUserMedia` is fine on the same
+build). Not diagnosed. One theory has been *falsified*: it is not partial-damage under-painting.
+`render_to_dmabuf` (`src/render_helpers/mod.rs`) hardcodes age `0` into
+`render_output_with_states`, and Smithay treats age 0 as "damage everything"
+(`damage/mod.rs:747`), so **every cast frame that renders at all is already a full repaint**. A
+commit that made the *skip* decision use each buffer's real age was written as the fix, did not
+change the symptom, and was dropped from history — with the render at age 0 the skip decision
+wants age 1 ("changed since the frame we last sent"), so the change was also wrong on its own
+terms. Remaining leads, both unmeasured: buffers queued out of order via `queue_after_sync`, and
+the fact that we call `damage_output` *twice* per frame (once in `dequeue_buffer_and_render`,
+once inside `render_output_with_states`), pushing two entries per frame into Smithay's damage
+history and corrupting age accounting. Next step is a measurement, not a third theory:
+`RUST_LOG=niri::screencasting=trace` on the seat, and check whether a stall correlates with
+`no damage, skipping frame` bursts or with sequence numbers going backwards at queue time.
+
+Separately worth doing regardless of that bug: thread the real per-buffer age *into*
+`render_to_dmabuf` and collapse to one damage computation per frame. That makes partial damage
+actually work — it is an optimisation, not the fix.
+
 **The slice order was wrong, and a live run found it.** Slice 6 (`InteractiveScreenshot`) was put
 last on the reasoning that "nothing in the portal path needs it" — drawn from a `strings` scan that
 found `ScreenshotArea`/`SelectArea`/`FlashArea` in the shipped binary. Those symbols exist, but
