@@ -190,32 +190,56 @@ did — there is no session teardown to outlive, and a five-second wait on every
 dev-loop tax paid for nothing. It is also what keeps the headless tests fast; the three conformance
 tests in `src/tests/gnome.rs` set the flag by hand.
 
+### 2.5 An app must not inherit the compositor's signal mask
+
+The drain had never once succeeded before 2026-08-03, and this is why: **every app launched from
+the dash, grid or search started life unable to receive SIGTERM.**
+
+`signals::block_early` (`src/main.rs:63`) blocks SIGHUP/SIGINT/SIGTERM process-wide, so the calloop
+`Signals` source can own them — and a blocked mask survives both `fork` and `execve`. GIO's
+`g_app_info_launch` forks out of *our* process and offers no hook between the two, so the app came
+up deaf to the one signal that asks it to quit. Nothing but SIGKILL could touch it. The
+`spawn`/`spawn-at-startup` path had always known this and cleared the mask in `pre_exec`
+(`utils::spawning:157`), as does xwayland-satellite; the app path was the one that did not.
+
+Measured, three logouts in a row: OBS, Firefox and Epiphany each sat through their five seconds in
+total silence and were killed — OBS then reporting "Crash or unclean shutdown detected" on the next
+start. The control that named it: the same OBS flatpak on a GNOME 50 session, same machine, reacted
+to the same `StopUnit` in **0.8 ms** and was done in 630 ms. Reproduced away from the compositor,
+and the A/B is one line:
+
+```
+plain launch()             SigBlk=0000000000004003   state after SIGTERM = S   (alive)
+as_manager + child setup   SigBlk=0000000000000000   state after SIGTERM = Z   (gone)
+```
+
+So `launch_default` (`src/app_system.rs`) uses `launch_uris_as_manager_with_fds`, whose `user_setup`
+runs in the child between fork and exec — the same window `pre_exec` uses. Three things about that
+choice are load-bearing:
+
+- **`DBusActivatable` apps keep plain `launch()`.** They are forked by the bus, not by us, so they
+  never had our mask; and `as_manager` never activates, it always spawns, which would lose the
+  activation entirely.
+- **`pid_callback` is deliberately unused.** `as_manager` still emits `launched` on the context, so
+  `scoped_launch_context` stays the single place a scope is started rather than becoming one of two.
+- **`DO_NOT_REAP_CHILD` is not optional.** Without it glib spawns through an intermediate fork and
+  reports *its* pid, which has already exited by the time we would put it in a scope. It is what
+  GIO's own launch path passes.
+
+`a_launched_app_can_be_asked_to_quit` pins it, by reading `SigBlk` out of `/proc` for a child of the
+real `launch_default`. It blocks the mask on its own thread rather than the process, so a parallel
+test binary is unharmed and the fork still inherits from the forking thread — which is exactly the
+compositor's situation. Confirmed to fail against the old `launch()` call.
+
 ---
 
 ## 3. Known gaps
 
-- **OPEN: OBS is SIGKILLed at every logout on our session and exits cleanly on stock GNOME.**
-  Measured 2026-08-03. On ours, three logouts in a row: the scope is stopped, OBS logs **nothing at
-  all** for its full five seconds, and is SIGKILLed — so it never begins shutting down, and the
-  next start reports "Crash or unclean shutdown detected". On kov's GNOME 50 session, same machine,
-  same flatpak, same scope mechanism, twice: `Stopping app-flatpak-…obsproject…scope` →
-  `==== Shutting down ====` **0.8 ms later**, done in ~630 ms.
-
-  So this is ours, not OBS's — the first reading of it, that OBS simply ignores SIGTERM, is
-  **refuted** by that control. Nor is it the drain holding the socket open: OBS ignores five
-  seconds of live Wayland connection just as thoroughly.
-
-  The lead is a confound in the traces rather than a mechanism: **in all three of our logouts an
-  OBS screencast was actively `Streaming`** (it only leaves that state *after* the SIGKILL, as a
-  consequence of the process dying), while kov's clean-exit instances lived 6–9 s and almost
-  certainly never started a capture. If OBS's Qt main thread is parked in the PipeWire capture path
-  it never processes the quit its SIGTERM handler posts, which fits "handler exists, nothing
-  happens" exactly. Untested either way.
-
-  **The experiment that decides it**: open OBS on the seat, start *no* capture, log out. Clean exit
-  ⇒ the trigger is the live screencast, not session end, and this belongs with the cast work.
-  Still hangs ⇒ it is the drain or the shutdown path, and `eu-stack -p <obs pid>` during the
-  five-second window says where.
+- **Desktop *actions* still hand the child a deaf signal mask.** `g_desktop_app_info_launch_action`
+  has no `as_manager` variant, so there is nowhere to hang the child setup §2.5 describes; an app
+  started from a `.desktop` action (a jumplist entry: "New Window", "New Private Window") inherits
+  the blocked SIGTERM and can only be SIGKILLed. Same bug, smaller door. Fixing it means either
+  spawning the action's `Exec` ourselves or reopening the temporary-unblock idea §2.5 rejected.
 - **Terminal-spawned clients have no scope**, so `stop_app_scopes` cannot reach them and nothing
   SIGTERMs them at logout. The drain still waits for their windows; they are only asked to leave
   when the socket dies, as under GNOME. (A flatpak app started from a terminal is the exception —

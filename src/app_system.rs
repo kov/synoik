@@ -1129,15 +1129,64 @@ impl AppLauncher for GioLauncher {
             .ok_or_else(|| format!("no desktop entry: {}", entry.id))?;
         let context = scoped_launch_context(token);
         match verb {
-            ResolvedLaunch::Default => desktop
-                .launch(&[], Some(&context))
-                .map_err(|e| e.to_string()),
+            ResolvedLaunch::Default => launch_default(&desktop, &context),
             ResolvedLaunch::Action(name) => {
+                // FIXME: this one still hands the child our signal mask — see `launch_default`.
+                // `g_desktop_app_info_launch_action` has no `as_manager` variant, so there is
+                // nowhere to hang a child setup; an app launched through a desktop *action*
+                // cannot be asked to quit.
                 desktop.launch_action(name, Some(&context));
                 Ok(())
             }
         }
     }
+}
+
+/// Launch an entry's default verb with a signal mask the app can actually live with.
+///
+/// **The child must not inherit the compositor's blocked SIGTERM.** `signals::block_early` blocks
+/// SIGHUP/SIGINT/SIGTERM process-wide so the calloop `Signals` source can own them, and a blocked
+/// mask survives both `fork` and `execve` — so an app forked out of this process starts life unable
+/// to receive the signal that asks it to quit. Nothing can then stop it but SIGKILL: measured
+/// 2026-08-03, OBS, Firefox and Epiphany each sat through a five-second logout in silence and were
+/// killed, while the same builds on a GNOME 50 session reacted in under a millisecond. The
+/// `spawn`/`spawn-at-startup` path already knew this and clears the mask in `pre_exec`
+/// (`utils::spawning`); this is the path that did not.
+///
+/// `g_app_info_launch` offers no hook between fork and exec, so the default verb goes through
+/// `launch_uris_as_manager_with_fds`, whose `user_setup` runs in the child in exactly that window.
+/// Its other hook, `pid_callback`, is deliberately unused: `as_manager` still emits `launched` on
+/// the context, so [`scoped_launch_context`] keeps being the single place a scope is started.
+fn launch_default(desktop: &DesktopAppInfo, context: &gio::AppLaunchContext) -> Result<(), String> {
+    // A `DBusActivatable` app is started by the bus, so it never inherits anything of ours — and
+    // `as_manager` would spawn it directly and lose the activation. GIO keeps that one.
+    if desktop.boolean("DBusActivatable") {
+        return desktop
+            .launch(&[], Some(context))
+            .map_err(|e| e.to_string());
+    }
+
+    desktop
+        .launch_uris_as_manager_with_fds(
+            &[],
+            Some(context),
+            // GIO's own flags for this path. `DO_NOT_REAP_CHILD` is load-bearing: without it glib
+            // spawns through an intermediate fork and reports *its* pid, which has already exited
+            // by the time we would put it in a scope.
+            glib::SpawnFlags::SEARCH_PATH | glib::SpawnFlags::DO_NOT_REAP_CHILD,
+            Some(Box::new(|| {
+                // In the child, after fork, before exec. Failure here would hand the app the same
+                // deaf mask, so say so — but there is no way to report it except the log.
+                if let Err(err) = crate::utils::signals::unblock_all() {
+                    eprintln!("could not reset the child's signal mask: {err}");
+                }
+            })),
+            None,
+            None::<std::fs::File>,
+            None::<std::fs::File>,
+            None::<std::fs::File>,
+        )
+        .map_err(|e| e.to_string())
 }
 
 /// A launch context that moves whatever it launches into its own systemd scope.
@@ -1325,6 +1374,87 @@ impl AppEntry {
 
 #[cfg(test)]
 mod tests {
+    /// An app must not inherit the compositor's blocked SIGTERM, or nothing short of SIGKILL can
+    /// ever ask it to quit — see [`super::launch_default`] for how that shipped and what it cost.
+    ///
+    /// The mask is set on *this thread* rather than the process: `pthread_sigmask` is thread-local,
+    /// so a parallel test binary is unharmed, and the fork inherits from the forking thread either
+    /// way — which is precisely the compositor's situation.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launched_app_can_be_asked_to_quit() {
+        use std::io::Write as _;
+
+        use gio_unix::prelude::*;
+
+        use super::{launch_default, DesktopAppInfo};
+
+        // Same three the compositor blocks in `signals::block_early`.
+        let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        unsafe {
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGTERM);
+            libc::sigaddset(&mut blocked, libc::SIGINT);
+            libc::sigaddset(&mut blocked, libc::SIGHUP);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()),
+                0
+            );
+        }
+
+        let path =
+            std::env::temp_dir().join(format!("niri-masktest-{}.desktop", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        // `sleep` rather than anything of ours: the test is about the mask the child starts with,
+        // and a process that would exit on its own could pass this by being gone already.
+        file.write_all(b"[Desktop Entry]\nType=Application\nName=niri mask test\nExec=sleep 30\n")
+            .unwrap();
+        drop(file);
+
+        let desktop = DesktopAppInfo::from_filename(&path).unwrap();
+        let context = gio::AppLaunchContext::new();
+        let pid = std::rc::Rc::new(std::cell::Cell::new(0i32));
+        let seen = pid.clone();
+        context.connect_launched(move |_, _, platform_data| {
+            if let Some(pid) = super::launched_pid(platform_data) {
+                seen.set(pid);
+            }
+        });
+
+        launch_default(&desktop, &context).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let pid = pid.get();
+        assert_ne!(pid, 0, "the launch reported no pid");
+
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let blk = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigBlk:"))
+            .unwrap()
+            .trim();
+        let blk = u64::from_str_radix(blk, 16).unwrap();
+
+        // Reap before asserting, so a failure does not also leak a process for 30 seconds.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &blocked, std::ptr::null_mut());
+        }
+
+        for (signal, name) in [
+            (libc::SIGTERM, "SIGTERM"),
+            (libc::SIGINT, "SIGINT"),
+            (libc::SIGHUP, "SIGHUP"),
+        ] {
+            assert_eq!(
+                blk & (1 << (signal - 1)),
+                0,
+                "{name} is blocked in the child (SigBlk {blk:#x}); it could not be asked to quit"
+            );
+        }
+    }
+
     /// A ping is not proof of a change. glib's monitors fire for any write under a
     /// watched directory and one lands a few seconds into every session, so the
     /// reload has to check rather than trust the signal — everything it re-derives
