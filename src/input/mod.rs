@@ -49,7 +49,8 @@ use crate::app_system::{AppState, LaunchMode};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::gnome::{
-    Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction, GnomeKeybinding, TileSide,
+    Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction, GnomeKeybinding, ScreenDirection,
+    TileSide,
 };
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::workspace::WorkspaceId;
@@ -578,6 +579,17 @@ impl State {
         pos.x = pos.x.clamp(0.0, target_geo.size.w - px);
         pos.y = pos.y.clamp(0.0, target_geo.size.h - px);
         Some(pos + target_geo.loc)
+    }
+
+    /// The 1-based index of the last workspace on the active monitor — the target
+    /// of GNOME's `-last` workspace bindings, whose handler takes
+    /// `get_workspace_by_index(n_workspaces - 1)` (`_showWorkspaceSwitcher`).
+    ///
+    /// 1-based because that is what [`WorkspaceReference::Index`] speaks, matching
+    /// the `switch-to-workspace-N` settings keys.
+    fn last_workspace_index(&self) -> Option<u8> {
+        let n = self.niri.layout.active_monitor_ref()?.n_workspaces();
+        u8::try_from(n).ok().filter(|n| *n > 0)
     }
 
     fn is_inhibiting_shortcuts(&self) -> bool {
@@ -3756,6 +3768,22 @@ impl State {
             }
             Action::StopCast(session_id) => {
                 self.niri.stop_cast(CastSessionId::from(session_id));
+            }
+            Action::FocusWorkspaceLast => {
+                if let Some(last) = self.last_workspace_index() {
+                    self.do_action(
+                        Action::FocusWorkspace(WorkspaceReference::Index(last)),
+                        false,
+                    );
+                }
+            }
+            Action::MoveWindowToWorkspaceLast(focus) => {
+                if let Some(last) = self.last_workspace_index() {
+                    self.do_action(
+                        Action::MoveWindowToWorkspace(WorkspaceReference::Index(last), focus),
+                        false,
+                    );
+                }
             }
             Action::ToggleOverview => {
                 self.niri.layout.toggle_overview();
@@ -8743,6 +8771,24 @@ pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         GnomeKeyAction::SwitchToSession(n) => Action::ChangeVt(i32::from(n)),
         GnomeKeyAction::Maximize => Action::Maximize,
         GnomeKeyAction::Unmaximize => Action::Unmaximize,
+        // niri's name for the same thing: it already calls `layout.toggle_maximized`,
+        // which is mutter's `handle_toggle_maximized` (maximized → unmaximize, anything
+        // else → maximize). The name is niri's and outlives its binding; renaming it
+        // reaches into niri-ipc, so it is left for whenever that surface is revisited.
+        GnomeKeyAction::ToggleMaximized => Action::MaximizeWindowToEdges,
+        GnomeKeyAction::SwitchToWorkspaceLast => Action::FocusWorkspaceLast,
+        GnomeKeyAction::MoveToWorkspaceLast => Action::MoveWindowToWorkspaceLast(true),
+        GnomeKeyAction::MoveToMonitor(dir) => match dir {
+            ScreenDirection::Left => Action::MoveWindowToMonitorLeft,
+            ScreenDirection::Right => Action::MoveWindowToMonitorRight,
+            ScreenDirection::Up => Action::MoveWindowToMonitorUp,
+            ScreenDirection::Down => Action::MoveWindowToMonitorDown,
+        },
+        GnomeKeyAction::SwitchInputSource { backward } => Action::SwitchLayout(if backward {
+            LayoutSwitchTarget::Prev
+        } else {
+            LayoutSwitchTarget::Next
+        }),
         GnomeKeyAction::ToggleTiled(TileSide::Left) => Action::ToggleTiledLeft,
         GnomeKeyAction::ToggleTiled(TileSide::Right) => Action::ToggleTiledRight,
         GnomeKeyAction::ScreenBrightness {

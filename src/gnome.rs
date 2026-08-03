@@ -971,6 +971,23 @@ pub enum GnomeKeyAction {
     /// the focused window to the given half of the work area, or untile it if
     /// already tiled there.
     ToggleTiled(TileSide),
+    /// `toggle-maximized` (`<Alt>F10`): maximize the focused window, or
+    /// unmaximize it if it already is.
+    ToggleMaximized,
+    /// `switch-to-workspace-last` (`<Super>End`).
+    SwitchToWorkspaceLast,
+    /// `move-to-workspace-last` (`<Super><Shift>End`).
+    MoveToWorkspaceLast,
+    /// `move-to-monitor-{left,right,up,down}` (`<Super><Shift>` + arrows): move
+    /// the focused window to the neighbouring monitor.
+    MoveToMonitor(ScreenDirection),
+    /// `switch-input-source` / `-backward` (`<Super>space`): step through the
+    /// configured keyboard layouts.
+    ///
+    /// **DIVERGENCE:** gnome-shell puts up an input-source switcher popup for
+    /// the duration of the modifier hold; we switch straight away. The popup is
+    /// the same shape as the alt-tab switchers and belongs with them.
+    SwitchInputSource { backward: bool },
     /// `toggle-overview` (`org.gnome.shell.keybindings`): the overview. Unbound by
     /// default — GNOME opens the overview with the overlay key.
     ToggleOverview,
@@ -1010,6 +1027,15 @@ impl GnomeKeyAction {
     pub(crate) fn is_non_maskable(self) -> bool {
         matches!(self, Self::RestoreShortcuts | Self::SwitchToSession(_))
     }
+}
+
+/// One of the four screen directions, for the keys that act on a neighbour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenDirection {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 /// Which half of the work area a window is tiled to.
@@ -1171,6 +1197,53 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
             "cycle-group-backward".to_owned(),
             CycleGroup { backward: true },
             strs(&["<Shift><Alt>F6"]),
+        ),
+        (
+            "toggle-maximized".to_owned(),
+            ToggleMaximized,
+            strs(&["<Alt>F10"]),
+        ),
+        (
+            "switch-to-workspace-last".to_owned(),
+            SwitchToWorkspaceLast,
+            strs(&["<Super>End"]),
+        ),
+        (
+            "move-to-workspace-last".to_owned(),
+            MoveToWorkspaceLast,
+            strs(&["<Super><Shift>End"]),
+        ),
+        (
+            "move-to-monitor-left".to_owned(),
+            MoveToMonitor(ScreenDirection::Left),
+            strs(&["<Super><Shift>Left"]),
+        ),
+        (
+            "move-to-monitor-right".to_owned(),
+            MoveToMonitor(ScreenDirection::Right),
+            strs(&["<Super><Shift>Right"]),
+        ),
+        (
+            "move-to-monitor-up".to_owned(),
+            MoveToMonitor(ScreenDirection::Up),
+            strs(&["<Super><Shift>Up"]),
+        ),
+        (
+            "move-to-monitor-down".to_owned(),
+            MoveToMonitor(ScreenDirection::Down),
+            strs(&["<Super><Shift>Down"]),
+        ),
+        // Owned by gnome-shell's input-source manager rather than any mutter table,
+        // but it is a key in this schema.
+        (
+            "switch-input-source".to_owned(),
+            SwitchInputSource { backward: false },
+            strs(&["<Super>space", "XF86Keyboard"]),
+        ),
+        (
+            "switch-input-source-backward".to_owned(),
+            SwitchInputSource { backward: true },
+            strs(&["<Shift><Super>space", "<Shift>XF86Keyboard"]),
         ),
         // Super+Tab only — upstream also lists `<Alt>Tab` here; see the divergence note
         // on `switch-windows` above.

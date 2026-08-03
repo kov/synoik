@@ -49,7 +49,19 @@ gsd media keys.
 `maximize`, `unmaximize`, `switch-to-workspace-{left,right,up,down,1..12}`,
 `move-to-workspace-{left,right,up,down,1..12}`, `switch-windows(-backward)`,
 `switch-group(-backward)`, `cycle-windows(-backward)`, `cycle-group(-backward)`,
-`switch-applications(-backward)`.
+`switch-applications(-backward)`, `toggle-maximized`, `switch-to-workspace-last`,
+`move-to-workspace-last`, `move-to-monitor-{left,right,up,down}`,
+`switch-input-source(-backward)`.
+
+`switch-input-source` is a **divergence**: gnome-shell puts up an input-source switcher popup
+for the duration of the modifier hold, and we switch straight away. That popup is the same
+shape as the alt-tab switchers and belongs with them.
+
+`toggle-maximized` maps onto the existing `Action::MaximizeWindowToEdges`, which already calls
+`layout.toggle_maximized` — mutter's `handle_toggle_maximized` exactly (maximized →
+unmaximize, anything else → maximize; an edge-tiled window is not `maximized_vertically &&
+horizontally`, so it maximizes). Only the *name* is niri's, and it reaches into niri-ipc, so
+renaming it is left for whenever that surface is revisited rather than done here.
 
 `org.gnome.mutter.keybindings` — `toggle-tiled-left`, `toggle-tiled-right`.
 
@@ -155,7 +167,7 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 | S1 | Fix the invented fallback defaults for `switch-to-workspace-N` | **done** |
 | S2 | `non_maskable` flag + `restore-shortcuts` + `switch-to-session-N` | **done** |
 | S3 | Shell UI toggles: overview, app grid, quick settings, message tray | **done** |
-| S4 | wm/mutter window + monitor keys: `toggle-maximized`, `move-to-monitor-*`, `*-workspace-last`, `switch-input-source` | |
+| S4 | wm/mutter window + monitor keys: `toggle-maximized`, `move-to-monitor-*`, `*-workspace-last`, `switch-input-source` | **done** |
 | S5 | `switch-to-application-N` + `open-new-window-application-N`, on a real focus-or-launch path | |
 | S6 | Our own schema for the niri actions, plus its packaging | |
 | S7 | Route the non-keyboard triggers (mouse, wheel, touchpad, tablet) through the model | |

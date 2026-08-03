@@ -61,6 +61,7 @@ const KEY_END: u32 = 107;
 const KEY_PAGEDOWN: u32 = 109;
 const KEY_O: u32 = 24;
 const KEY_S: u32 = 31;
+const KEY_F10: u32 = 68;
 const KEY_V: u32 = 47;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
@@ -798,6 +799,148 @@ fn shortcuts_inhibit_masks_gnome_keybindings() {
     assert!(
         f.client(id).window(&surface).close_requested,
         "releasing the inhibitor must restore the keybinding"
+    );
+}
+
+/// `toggle-maximized` (`<Alt>F10`) is the one key that goes both ways:
+/// `handle_toggle_maximized` unmaximizes a maximized window and maximizes
+/// anything else, where `maximize`/`unmaximize` (`<Super>Up`/`<Super>Down`) are
+/// one-directional.
+#[test]
+fn alt_f10_toggles_maximized() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_F10);
+    f.key_release(KEY_LEFTALT);
+    f.double_roundtrip(id);
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("Maximized"),
+        "<Alt>F10 must maximize an unmaximized window, got: {configures}"
+    );
+
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_F10);
+    f.key_release(KEY_LEFTALT);
+    f.double_roundtrip(id);
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        !configures.contains("Maximized"),
+        "pressing it again must unmaximize, got: {configures}"
+    );
+}
+
+/// `switch-to-workspace-last` (`<Super>End`) goes to the last workspace on the
+/// monitor — `get_workspace_by_index(n_workspaces - 1)` in
+/// `_showWorkspaceSwitcher`, which under dynamic workspaces means the trailing
+/// empty one counts.
+#[test]
+fn super_end_focuses_the_last_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // A mapped window gives an occupied workspace plus the trailing empty one.
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    let last = f.niri().layout.active_monitor_ref().unwrap().n_workspaces() - 1;
+    assert!(last > 0, "there must be a workspace to go to");
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_END);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert_eq!(
+        f.niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx(),
+        last,
+        "<Super>End must focus the last workspace"
+    );
+}
+
+/// `move-to-monitor-{left,right,up,down}` (`<Super><Shift>` + arrows) sends the
+/// focused window to the neighbouring monitor, and the focus follows it.
+#[test]
+fn super_shift_right_moves_the_window_to_the_next_monitor() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    let first = f.niri().layout.active_output().unwrap().clone();
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_LEFTSHIFT);
+    tap(&mut f, KEY_RIGHT);
+    f.key_release(KEY_LEFTSHIFT);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    let now = f.niri().layout.active_output().unwrap().clone();
+    assert_ne!(
+        now, first,
+        "<Super><Shift>Right must move the window to the monitor on the right, focus following"
+    );
+    // Focus landing on the other monitor is not enough — a *focus*-monitor action
+    // would do that too, leaving the window behind on an now-unfocused output.
+    assert!(
+        f.niri().layout.focus().is_some(),
+        "the window must have come along, not just the focus"
+    );
+}
+
+/// `switch-input-source` (`<Super>space`) steps through the configured keyboard
+/// layouts, `-backward` steps the other way.
+///
+/// **DIVERGENCE:** gnome-shell shows an input-source switcher popup while the
+/// modifier is held; we switch immediately. The popup belongs with the alt-tab
+/// switchers it is built from.
+#[test]
+fn super_space_switches_the_input_source() {
+    let mut config = Config::default();
+    config.input.keyboard.xkb.layout = "us,de,fr".to_owned();
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+
+    let layout_index = |f: &mut Fixture| {
+        let keyboard = f.niri_state().niri.seat.get_keyboard().unwrap();
+        keyboard.with_xkb_state(f.niri_state(), |context| {
+            context.xkb().lock().unwrap().active_layout().0
+        })
+    };
+    assert_eq!(layout_index(&mut f), 0);
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_SPACE);
+    f.key_release(KEY_LEFTMETA);
+    assert_eq!(layout_index(&mut f), 1, "<Super>space must step forward");
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_LEFTSHIFT);
+    tap(&mut f, KEY_SPACE);
+    f.key_release(KEY_LEFTSHIFT);
+    f.key_release(KEY_LEFTMETA);
+    assert_eq!(
+        layout_index(&mut f),
+        0,
+        "<Shift><Super>space must step back"
     );
 }
 

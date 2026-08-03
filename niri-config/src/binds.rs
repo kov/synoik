@@ -381,6 +381,14 @@ pub enum Action {
     ClearDynamicCastTarget,
     #[knuffel(skip)]
     StopCast(u64),
+    /// GNOME's `switch-to-workspace-last` (`<Super>End`): the last workspace on
+    /// the active monitor, `get_workspace_by_index(n_workspaces - 1)`
+    /// (`windowManager.js`, `_showWorkspaceSwitcher`) — the trailing empty one
+    /// included, since it is a workspace like any other under dynamic workspaces.
+    FocusWorkspaceLast,
+    /// GNOME's `move-to-workspace-last` (`<Super><Shift>End`). The flag is
+    /// whether to follow the window, matching [`MoveWindowToWorkspace`].
+    MoveWindowToWorkspaceLast(#[knuffel(property(name = "focus"), default = true)] bool),
     ToggleOverview,
     /// GNOME's `toggle-application-view` (`<Super>a`): from the window picker it
     /// flips to the app grid and back, and from a closed overview it opens
