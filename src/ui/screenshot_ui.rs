@@ -3,6 +3,7 @@ use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::iter::zip;
 use std::rc::Rc;
+use std::time::Duration;
 
 use niri_config::{Action, Config};
 use niri_ipc::SizeChange;
@@ -107,6 +108,8 @@ pub enum ScreenshotUi {
         selected_window: Option<(Output, u64)>,
         /// The window under the pointer, for the hover border.
         hovered_window: Option<(Output, u64)>,
+        /// The pending or showing tooltip, if the pointer has settled on a control.
+        tooltip: Option<TooltipState>,
         /// The control under the pointer, on the **selection output's** panel.
         ///
         /// Motion only ever reaches us in the selection output's coordinate space (every call site
@@ -119,6 +122,24 @@ pub enum ScreenshotUi {
         config: Rc<RefCell<Config>>,
         path: Option<String>,
     },
+}
+
+/// GNOME's tooltip appears 300ms after the pointer settles, then fades in over 150ms
+/// (`Tooltip.open`, `js/ui/screenshot.js:95-119`). The delay is what keeps a pointer crossing the
+/// panel from strobing seven tips on its way past.
+const TOOLTIP_DELAY: Duration = Duration::from_millis(300);
+const TOOLTIP_FADE_MS: u64 = 150;
+/// `.screenshot-ui-tooltip { -y-offset: $base_margin * 6 }` (`_screenshot.scss:202`) — how far
+/// above its control the tip sits.
+const TOOLTIP_Y_OFFSET: f64 = 24.;
+
+/// A tooltip waiting out its delay, or fading in.
+pub struct TooltipState {
+    control: Control,
+    /// When the tip becomes due. Before this it is not drawn at all.
+    due: Duration,
+    /// The fade, started once `due` passes. `None` while still waiting.
+    fade: Option<Animation>,
 }
 
 /// State for moving the selection (as opposed to just drawing).
@@ -173,6 +194,9 @@ pub struct OutputData {
     /// windows on its active workspace.
     windows: Vec<WindowShot>,
     slots: Vec<Rectangle<f64, Logical>>,
+    /// The tooltip pill. One cache per output, re-baked when the text changes (the revision is
+    /// the text's hash) — there is only ever one tip up.
+    tooltip_cache: RefCell<widget::BakeCache>,
 }
 
 /// The panel state the bake depends on. Anything else — the selection, the animation, the pointer
@@ -467,6 +491,7 @@ impl ScreenshotUi {
                     panel: RefCell::new(PanelCache::default()),
                     windows,
                     slots,
+                    tooltip_cache: RefCell::new(widget::BakeCache::default()),
                 };
                 (output, data)
             })
@@ -508,6 +533,7 @@ impl ScreenshotUi {
             capture_type: CaptureType::default(),
             selected_window,
             hovered_window: None,
+            tooltip: None,
             hover: None,
             open_anim,
             clock: clock.clone(),
@@ -582,6 +608,21 @@ impl ScreenshotUi {
         }
 
         self.update_buffers();
+    }
+
+    /// The tooltip currently *drawn*, or `None` while one is still waiting out its delay.
+    ///
+    /// Test-only, and deliberately reports the drawn state rather than the pending one: a tip
+    /// scheduled but not yet due is invisible, and a test that could not tell those apart would
+    /// pass on the bug this exists to catch.
+    #[cfg(test)]
+    pub fn tooltip_text(&self) -> Option<&'static str> {
+        let Self::Open { tooltip, .. } = self else {
+            return None;
+        };
+        let state = tooltip.as_ref()?;
+        state.fade.as_ref()?;
+        state.control.tooltip()
     }
 
     /// Whether any output has a window to pick — what makes the Window button sensitive.
@@ -904,14 +945,42 @@ impl ScreenshotUi {
         self.update_buffers();
     }
 
-    pub fn advance_animations(&mut self) {}
+    pub fn advance_animations(&mut self) {
+        let Self::Open { tooltip, clock, .. } = self else {
+            return;
+        };
+
+        let Some(state) = tooltip else {
+            return;
+        };
+        if state.fade.is_none() && clock.now_unadjusted() >= state.due {
+            state.fade = Some(Animation::ease(
+                clock.clone(),
+                0.,
+                1.,
+                0.,
+                TOOLTIP_FADE_MS,
+                crate::animation::Curve::EaseOutQuad,
+            ));
+        }
+    }
 
     pub fn are_animations_ongoing(&self) -> bool {
-        let Self::Open { open_anim, .. } = self else {
+        let Self::Open {
+            open_anim, tooltip, ..
+        } = self
+        else {
             return false;
         };
 
-        !open_anim.is_done()
+        // A tooltip still counting down its delay has no animation yet, but the loop must keep
+        // ticking or it never becomes due — a tip that only appears when something else happens
+        // to redraw is worse than none.
+        let tooltip_pending = tooltip
+            .as_ref()
+            .is_some_and(|t| t.fade.as_ref().is_none_or(|a| !a.is_done()));
+
+        !open_anim.is_done() || tooltip_pending
     }
 
     fn update_buffers(&mut self) {
@@ -1039,6 +1108,7 @@ impl ScreenshotUi {
             capture_type,
             selected_window,
             hovered_window,
+            tooltip,
             hover,
             button,
             open_anim,
@@ -1080,7 +1150,21 @@ impl ScreenshotUi {
             let location = panel_location(output_data, size).to_f64().to_logical(scale);
 
             // Earlier-pushed elements are composited on top (the screenshot goes last), so the
-            // glyphs are pushed before the panel they sit on, and the shadow after it.
+            // glyphs are pushed before the panel they sit on, and the shadow after it. The tooltip
+            // goes first of all: GNOME parents it to the root so it draws over the panel.
+            if output == &selection.0 {
+                if let Some(tip) = tooltip {
+                    // Nothing until the delay elapses; then it fades in.
+                    if let Some(fade) = &tip.fade {
+                        let tip_alpha = fade.clamped_value().clamp(0., 1.) as f32 * progress;
+                        if let Some(elem) =
+                            output_data.tooltip_element(renderer, tip.control, tip_alpha)
+                        {
+                            push(ScreenshotUiRenderElement::Screenshot(elem));
+                        }
+                    }
+                }
+            }
             output_data.push_icons(renderer, icons, location, alpha, state, push);
             if let Some(elem) = output_data.close_element(renderer, alpha) {
                 push(ScreenshotUiRenderElement::Screenshot(elem));
@@ -1351,7 +1435,13 @@ impl ScreenshotUi {
         };
 
         let data = output_data.get(&selection.0);
-        let new = data.and_then(|data| data.control_at(point));
+        // An insensitive control takes no hover, exactly as `reactive = false` gives St.Button no
+        // `notify::hover` — which is what keeps it from lighting up, and from offering a tooltip
+        // for something it will not do.
+        let window_enabled = output_data.values().any(|d| !d.windows.is_empty());
+        let new = data
+            .and_then(|data| data.control_at(point))
+            .filter(|c| *c != Control::Type(CaptureType::Window) || window_enabled);
         // The panel sits above the selector, so a control under the pointer wins the hover — the
         // window behind it must not light up too.
         let new_window = (*capture_type == CaptureType::Window && new.is_none())
@@ -1364,7 +1454,39 @@ impl ScreenshotUi {
         }
         *hover = new;
         *hovered_window = new_window;
+        self.retarget_tooltip();
         true
+    }
+
+    /// Point the tooltip at whatever the pointer is now on, restarting its delay.
+    ///
+    /// Moving between controls restarts the wait rather than carrying the old tip across: GNOME's
+    /// `close()` cancels a pending timeout outright and the next `open()` schedules a fresh one
+    /// (`js/ui/screenshot.js:122-129`).
+    fn retarget_tooltip(&mut self) {
+        let Self::Open {
+            hover,
+            tooltip,
+            clock,
+            ..
+        } = self
+        else {
+            return;
+        };
+
+        match *hover {
+            Some(control) if control.tooltip().is_some() => {
+                if tooltip.as_ref().map(|t| t.control) == Some(control) {
+                    return;
+                }
+                *tooltip = Some(TooltipState {
+                    control,
+                    due: clock.now_unadjusted() + TOOLTIP_DELAY,
+                    fade: None,
+                });
+            }
+            _ => *tooltip = None,
+        }
     }
 
     pub fn pointer_down(
@@ -1754,6 +1876,68 @@ impl OutputData {
         ))
     }
 
+    /// The tooltip pill for `control`, above it and centred on it.
+    ///
+    /// GNOME adds tooltips to the **root** widget rather than to the buttons they describe
+    /// (`js/ui/screenshot.js:1314`), which is what lets them draw over the panel — so this is
+    /// pushed before the panel, not with it.
+    fn tooltip_element(
+        &self,
+        renderer: &mut VulkanRenderer,
+        control: Control,
+        alpha: f32,
+    ) -> Option<CapturedTextureRenderElement> {
+        let text = control.tooltip()?;
+        let anchor = self.control_rect(control)?;
+        let scale = self.scale;
+        let size = widget::Tooltip::size(text);
+
+        // Centre on the control, then clamp into the output — GNOME clamps to the stage for the
+        // same reason: a tip on the leftmost control would otherwise hang off the screen.
+        let output = self.size.to_f64().to_logical(scale);
+        let x =
+            (anchor.loc.x + (anchor.size.w - size.w) / 2.).clamp(0., (output.w - size.w).max(0.));
+        let y = anchor.loc.y - size.h - TOOLTIP_Y_OFFSET;
+
+        let revision = widget::Revision::new().of(text).done();
+        let texture = widget::bake(
+            renderer,
+            &mut self.tooltip_cache.borrow_mut(),
+            scale,
+            size,
+            revision,
+            |vk| TextShaper::new(vk, scale).shape(text, TextStyle::new(widget::Tooltip::TEXT_PT)),
+            |frame, phys, label| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.tooltip(size, label)
+            },
+        )
+        .map_err(|err| warn!("error rendering the screenshot tooltip: {err:?}"))
+        .ok()?;
+
+        Some(self.texture_element(renderer, texture, Point::from((x, y)), alpha))
+    }
+
+    /// A control's on-screen rect in output-logical px. `None` before the panel has baked.
+    fn control_rect(&self, control: Control) -> Option<Rectangle<f64, Logical>> {
+        let panel = self.panel_rect_logical()?;
+        if control == Control::Close {
+            return Some(close_rect(panel));
+        }
+
+        let layout = self.panel.borrow().layout?;
+        let local = match control {
+            Control::Type(ty) => {
+                layout.type_buttons[CaptureType::ROW.iter().position(|t| *t == ty)?]
+            }
+            Control::ShotCast(i) => widget::Segmented::segment_rect(layout.shot_cast, i),
+            Control::Capture => layout.capture,
+            Control::ShowPointer => layout.show_pointer,
+            Control::Close => unreachable!("handled above"),
+        };
+        Some(Rectangle::new(panel.loc + local.loc, local.size))
+    }
+
     /// The Window-mode selector: an opaque backdrop, then every frozen window at its slot with a
     /// border that tints on hover and on selection.
     ///
@@ -2138,6 +2322,27 @@ pub enum Control {
     Close,
 }
 
+impl Control {
+    /// The control's tooltip, or `None` for one GNOME gives no tip.
+    ///
+    /// Deliberately not the button's own caption: the type buttons read "Selection" and say
+    /// "Area Selection" (`js/ui/screenshot.js:1314-1348`), which is the point of having both.
+    pub fn tooltip(self) -> Option<&'static str> {
+        Some(match self {
+            Control::Type(CaptureType::Selection) => "Area Selection",
+            Control::Type(CaptureType::Screen) => "Screen Selection",
+            Control::Type(CaptureType::Window) => "Window Selection",
+            Control::ShotCast(0) => "Take Screenshot",
+            // `Record Screen`, once slice 4 puts a cast segment there.
+            Control::ShotCast(_) => return None,
+            Control::Capture => "Capture",
+            Control::ShowPointer => "Show Pointer",
+            // GNOME's close button carries no tooltip.
+            Control::Close => return None,
+        })
+    }
+}
+
 /// Where every control sits inside the panel, in panel-local **logical** coordinates.
 ///
 /// One layout feeds the bake, the icon placement and the hit test, so a control cannot be drawn
@@ -2495,17 +2700,18 @@ fn generate_panel(
 
         for (i, ty) in CaptureType::ROW.iter().enumerate() {
             let control = Control::Type(*ty);
-            let enabled = state.enables(*ty);
+            // Hover is filtered at its source (`update_hover`), so an insensitive button can never
+            // arrive here hovered — only its foreground differs.
             let button = widget::IconLabelButton::new(layout.type_buttons[i])
                 .checked(state.capture_type == *ty)
-                .hovered(enabled && state.hover == Some(control))
-                .active(enabled && state.active == Some(control));
+                .hovered(state.hover == Some(control))
+                .active(state.active == Some(control));
             p.icon_label_button(&button, accent)?;
             p.text(
                 &captions[i],
                 button.label_centre(label_h),
                 Align::CENTER,
-                type_fg(enabled),
+                type_fg(state.enables(*ty)),
             )?;
         }
 

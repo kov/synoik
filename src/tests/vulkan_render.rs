@@ -12647,11 +12647,132 @@ fn vulkan_screenshot_ui_window_button_is_inert_without_windows() {
     assert!(!f.niri().screenshot_ui.any_windows());
     assert!(f.niri().screenshot_ui.selected_window().is_none());
 
+    let panel = f.niri().screenshot_ui.panel_rect(&output).unwrap();
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let button = layout.type_buttons[2];
+    let scale = output.current_scale().fractional_scale();
+    let point = Point::<f64, Logical>::from((
+        button.loc.x + button.size.w / 2.,
+        button.loc.y + button.size.h / 2.,
+    ))
+    .to_physical(scale)
+    .to_i32_round::<i32>()
+        + panel.loc;
+
+    // No hover and no tooltip: an insensitive St.Button is `reactive = false`, so it never emits
+    // `notify::hover` and its tip is never scheduled. A button that lit up and advertised itself
+    // while refusing every click would be the worst of both.
+    f.niri_state()
+        .niri
+        .screenshot_ui
+        .pointer_motion(point, None);
+    f.settle_animations();
+    assert_eq!(
+        f.niri().screenshot_ui.tooltip_text(),
+        None,
+        "an insensitive Window button must not offer a tooltip"
+    );
+
     let ui = &mut f.niri_state().niri.screenshot_ui;
     ui.set_capture_type(CaptureType::Window);
     assert_eq!(
         ui.capture_type(),
         CaptureType::Selection,
         "Window mode must refuse to engage with nothing to select"
+    );
+
+    // ...and clicking it does nothing either.
+    ui.pointer_down(output.clone(), point, None, false);
+    ui.pointer_up(None);
+    assert_eq!(ui.capture_type(), CaptureType::Selection);
+}
+
+/// A tooltip waits out its delay before it draws, and follows the pointer between controls.
+///
+/// The delay is the feature: without it, a pointer crossing the panel on its way somewhere else
+/// strobes every tip in the row. GNOME schedules the tip 300ms out and cancels that timeout
+/// outright when the pointer leaves (`Tooltip.open`/`close`, `js/ui/screenshot.js:95-129`).
+///
+/// Driven through the real clock rather than by inspecting a timer field: the failure this pins is
+/// a tip drawn too early, and only advancing time can tell those apart.
+#[test]
+fn vulkan_screenshot_ui_tooltip_waits_before_it_shows() {
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+    let output = f.niri_output(1);
+    let scale = output.current_scale().fractional_scale();
+
+    f.niri_state().open_screenshot_ui(false, None);
+    settle_screenshot_ui_open(&mut f);
+    render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
+
+    let panel = f.niri().screenshot_ui.panel_rect(&output).unwrap();
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let at = |r: Rectangle<f64, Logical>| {
+        Point::<f64, Logical>::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
+            .to_physical(scale)
+            .to_i32_round::<i32>()
+            + panel.loc
+    };
+
+    // Land on the Screen button. Nothing is due yet.
+    f.niri_state()
+        .niri
+        .screenshot_ui
+        .pointer_motion(at(layout.type_buttons[1]), None);
+    assert_eq!(
+        f.niri().screenshot_ui.tooltip_text(),
+        None,
+        "the tip must not draw before its delay elapses"
+    );
+    assert!(
+        f.niri().screenshot_ui.are_animations_ongoing(),
+        "a pending tip must keep the redraw loop alive, or it never becomes due"
+    );
+
+    // Wait it out. `settle_animations` moves the clock and advances, which is what makes the
+    // delay actually elapse (the headless-animation-clock trap: completing animations does not).
+    f.settle_animations();
+    assert_eq!(
+        f.niri().screenshot_ui.tooltip_text(),
+        Some("Screen Selection"),
+        "the tip must say what the button does, not repeat its caption"
+    );
+
+    // Moving to another control restarts the wait rather than carrying the old tip across.
+    f.niri_state()
+        .niri
+        .screenshot_ui
+        .pointer_motion(at(layout.capture), None);
+    assert_eq!(
+        f.niri().screenshot_ui.tooltip_text(),
+        None,
+        "moving between controls must restart the delay, not swap the text instantly"
+    );
+
+    f.settle_animations();
+    assert_eq!(f.niri().screenshot_ui.tooltip_text(), Some("Capture"));
+
+    // Leaving the panel drops it.
+    f.niri_state()
+        .niri
+        .screenshot_ui
+        .pointer_motion(Point::from((5, 5)), None);
+    assert_eq!(f.niri().screenshot_ui.tooltip_text(), None);
+
+    // An insensitive control offers no tooltip either: this fixture has a window, so unmap it and
+    // check the Window button goes quiet rather than advertising a mode it will not enter.
+    // (`reactive = false` gives St.Button no `notify::hover` at all, which is what drives both.)
+    let window_button = at(layout.type_buttons[2]);
+    f.niri_state()
+        .niri
+        .screenshot_ui
+        .pointer_motion(window_button, None);
+    f.settle_animations();
+    assert_eq!(
+        f.niri().screenshot_ui.tooltip_text(),
+        Some("Window Selection"),
+        "a sensitive Window button does offer its tip"
     );
 }

@@ -1,8 +1,9 @@
 # The screenshot UI — porting GNOME's control panel
 
-Status: **2026-08-03, slices 1-2 landed and checked on the headless harness.** The help text is
-gone; the panel is GNOME's control panel — type row, shot pill, capture button, show-pointer toggle
-and close button — and all three capture types work. Slices 3-5 below are open.
+Status: **2026-08-03, slices 1, 2 and 5 landed and checked on the headless harness.** The help text
+is gone; the panel is GNOME's control panel — type row, shot pill, capture button, show-pointer
+toggle, close button and tooltips — and all three capture types work. Slices 3 (delayed capture)
+and 4 (cast mode) are open.
 
 Reference: `js/ui/screenshot.js` (50.3) and `_screenshot.scss`. The visual spec is already cached
 and cited in `docs/fork/gnome-style-reference.md` §screenshot (every class, colour, radius and
@@ -81,9 +82,14 @@ Two things the panel's shape now fixes in place, worth knowing before touching i
    `:cast` state (inner circle goes `$red_4`). This is the real trigger GNOME uses for the panel's
    recording indicator — see `docs/fork/panel-status-port.md` R1, which is currently driven by a
    direct `RecordArea` call for want of this.
-5. **Tooltips.** Wiring, not toolkit: `widget::Tooltip` and `Painter::tooltip` already exist
-   (`widget.rs:638-670`). What is missing is hover timing and root-level placement, 24px below the
-   control, so they draw above the panel.
+5. **DONE.** Tooltips. `widget::Tooltip` and `Painter::tooltip` already existed; what this added
+   is the timing (300ms delay, then a 150ms fade) and root-level placement — centred on the
+   control, clamped into the output, 24px *above* it, and pushed before the panel so it draws over
+   it. The delay is the feature: without it a pointer crossing the row strobes every tip on its
+   way past. Two consequences worth keeping: a pending tip has no animation yet but must still
+   keep the redraw loop alive, or it never becomes due; and an insensitive control takes no hover
+   at all, which is what stops the Window button lighting up and advertising a mode it refuses to
+   enter.
 
 ## Approved divergence: delayed capture
 
