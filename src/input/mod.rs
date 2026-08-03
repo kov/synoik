@@ -4154,7 +4154,7 @@ impl State {
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
-            if self.niri.screenshot_ui.pointer_motion(point, None) {
+            if self.handle_screenshot_ui_motion(point, None) {
                 self.niri.queue_redraw_all();
             }
         }
@@ -4322,7 +4322,7 @@ impl State {
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
-            if self.niri.screenshot_ui.pointer_motion(point, None) {
+            if self.handle_screenshot_ui_motion(point, None) {
                 self.niri.queue_redraw_all();
             }
         }
@@ -7496,7 +7496,7 @@ impl State {
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
-            if self.niri.screenshot_ui.pointer_motion(point, None) {
+            if self.handle_screenshot_ui_motion(point, None) {
                 self.niri.queue_redraw_all();
             }
         }
@@ -8283,7 +8283,7 @@ impl State {
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
-            if self.niri.screenshot_ui.pointer_motion(point, Some(slot)) {
+            if self.handle_screenshot_ui_motion(point, Some(slot)) {
                 self.niri.queue_redraw(&output);
             }
         }

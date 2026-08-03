@@ -175,6 +175,25 @@ Where the control goes: the bottom row already ends with show-pointer, and a del
 of persistent capture option, so it belongs beside it — keeping the type row (*what* to capture)
 and the bottom row (*how* to capture it) separated the way GNOME has them.
 
+## The cursor
+
+GNOME sets the crosshair on **`_areaSelector`**, not on the picker
+(`set_cursor_type`, `js/ui/screenshot.js:448`), so the panel's buttons are siblings that inherit the
+default, and leaving Selection mode resets it outright (`:1792`). We set it once for the whole
+picker and never changed it, so it stayed a crosshair over every button — reported 2026-08-03,
+fixed the same day. It is now derived in `update_hover` (same hit test as the hover) and applied
+through `State::handle_screenshot_ui_motion`, one funnel for all four motion call sites, plus a
+re-sync on click so switching to Screen mode drops the crosshair without the pointer moving.
+
+**Still missing, and it needs an interaction first.** GNOME's `_computeCursorType`
+(`js/ui/screenshot.js:354-398`) also returns `MOVE` inside the selection and eight resize variants
+near its edges and corner handles. We have none of those cursors because we have none of that
+interaction: our press either starts a fresh selection or moves the existing one, and *moving*
+requires a held modifier (`mod_down` at the three `pointer_down` call sites in `src/input/mod.rs`)
+rather than being a function of where the pointer is. Edge/corner resize does not exist at all.
+Porting the cursors without the interaction would be a cursor that promises a drag nothing
+implements, so this is one gap, not two: **selection resize handles**, with their cursors.
+
 ## Toolkit first
 
 Checked against `src/ui/widget.rs` rather than assumed:

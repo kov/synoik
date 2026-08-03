@@ -3538,6 +3538,10 @@ impl State {
             path,
         );
 
+        // Selection is the mode it opens in, so the crosshair is right — and it is all we can say
+        // yet: the panel has no rect until the first bake, so `over_chrome` cannot answer. The
+        // first motion refines it, which is also the first moment the panel is on screen to be
+        // pointed at.
         self.niri
             .cursor_manager
             .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
@@ -3981,12 +3985,46 @@ impl State {
         self.niri.queue_redraw_all();
     }
 
+    /// Feed the picker a pointer motion and put the cursor where that motion says it belongs.
+    ///
+    /// Every motion goes through here rather than calling `pointer_motion` directly, for the same
+    /// reason the release does: the cursor is a consequence of the hit test, and a hit test whose
+    /// consequence is applied at three of four call sites is a bug waiting for the fourth.
+    /// Returns whether anything changed, so callers keep their own redraw scope.
+    pub fn handle_screenshot_ui_motion(
+        &mut self,
+        point: Point<i32, Physical>,
+        slot: Option<smithay::backend::input::TouchSlot>,
+    ) -> bool {
+        let changed = self.niri.screenshot_ui.pointer_motion(point, slot);
+        self.sync_screenshot_ui_cursor();
+        changed
+    }
+
+    /// Apply the picker's current cursor. Also the way a *click* that changes mode gets a fresh
+    /// cursor without the pointer having to move — switching to Screen mode under a parked pointer
+    /// must drop the crosshair there and then.
+    fn sync_screenshot_ui_cursor(&mut self) {
+        if !self.niri.screenshot_ui.is_open() {
+            return;
+        }
+        let icon = self.niri.screenshot_ui.cursor_icon();
+        self.niri
+            .cursor_manager
+            .set_cursor_image(CursorImageStatus::Named(icon));
+    }
+
     /// Act on a release over the screenshot UI's control panel.
     pub fn handle_screenshot_ui_pointer_up(&mut self, up: PointerUp) {
         match up {
             PointerUp::Capture => self.confirm_screenshot(true),
             PointerUp::Close => self.cancel_screenshot(),
-            PointerUp::Redraw => self.niri.queue_redraw_all(),
+            PointerUp::Redraw => {
+                // A click can change the capture type or the mode, and both change what the cursor
+                // over that very spot should be.
+                self.sync_screenshot_ui_cursor();
+                self.niri.queue_redraw_all();
+            }
         }
     }
 

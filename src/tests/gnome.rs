@@ -16475,6 +16475,101 @@ fn a_lock_mid_countdown_cancels_the_delayed_capture() {
     );
 }
 
+/// The crosshair belongs to the area selector, not to the whole picker.
+///
+/// In GNOME the cursor is set on `_areaSelector` (`js/ui/screenshot.js:448`), so the panel's
+/// buttons are siblings that inherit the default, and leaving Selection mode resets it outright
+/// (`:1792`). A crosshair everywhere says "click to select an area" over chrome that does nothing
+/// of the kind.
+#[test]
+fn the_crosshair_is_only_over_the_selectable_area() {
+    use smithay::input::pointer::CursorIcon;
+    use smithay::utils::{Logical, Physical, Point, Rectangle};
+
+    use crate::ui::screenshot_ui::CaptureType;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    map_focused_window(&mut f, id);
+
+    open_picker_headless(&mut f);
+    let output = f.niri_output(1);
+    let scale = output.current_scale().fractional_scale();
+    let panel = f.niri().screenshot_ui.panel_rect(&output).unwrap();
+    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+
+    let physical = |r: Rectangle<f64, Logical>| {
+        Point::<f64, Logical>::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
+            .to_physical(scale)
+            .to_i32_round::<i32>()
+            + panel.loc
+    };
+    let move_to = |f: &mut Fixture, p: Point<i32, Physical>| {
+        f.niri_state().handle_screenshot_ui_motion(p, None);
+        f.niri().screenshot_ui.cursor_icon()
+    };
+
+    // Over the free screen: this is the selectable area.
+    assert_eq!(
+        move_to(&mut f, Point::from((40, 40))),
+        CursorIcon::Crosshair
+    );
+
+    // Over a button.
+    assert_eq!(
+        move_to(&mut f, physical(layout.capture)),
+        CursorIcon::Default,
+        "a crosshair over the capture button offers a selection the button will not start"
+    );
+
+    // Over the panel's own background, between controls — chrome too, and the case a hit test that
+    // only knew about *controls* would get wrong.
+    let gap = Point::<f64, Logical>::from((
+        layout.shot_cast.loc.x
+            + layout.shot_cast.size.w
+            + (layout.capture.loc.x - layout.shot_cast.loc.x - layout.shot_cast.size.w) / 2.,
+        layout.capture.loc.y + layout.capture.size.h / 2.,
+    ));
+    assert_eq!(
+        f.niri()
+            .screenshot_ui
+            .panel_layout(&output)
+            .unwrap()
+            .control_at(gap),
+        None,
+        "the sample point must really be between controls, or this proves nothing"
+    );
+    assert_eq!(
+        move_to(
+            &mut f,
+            gap.to_physical(scale).to_i32_round::<i32>() + panel.loc
+        ),
+        CursorIcon::Default
+    );
+
+    // Screen mode has nothing to drag out, so the crosshair goes even over open screen — and it
+    // must go *without* the pointer moving, because a click is what changed the mode.
+    let at_40 = Point::from((40, 40));
+    move_to(&mut f, at_40);
+    click_picker_control(&mut f, layout.type_buttons[1]);
+    assert_eq!(f.niri().screenshot_ui.capture_type(), CaptureType::Screen);
+    assert_eq!(
+        f.niri().screenshot_ui.cursor_icon(),
+        CursorIcon::Default,
+        "switching out of Selection must drop the crosshair where the pointer already is"
+    );
+
+    // And Window mode likewise.
+    click_picker_control(&mut f, layout.type_buttons[2]);
+    assert_eq!(f.niri().screenshot_ui.capture_type(), CaptureType::Window);
+    assert_eq!(move_to(&mut f, at_40), CursorIcon::Default);
+
+    // Back to Selection, and it returns.
+    click_picker_control(&mut f, layout.type_buttons[0]);
+    assert_eq!(move_to(&mut f, at_40), CursorIcon::Crosshair);
+}
+
 /// Cast mode takes Window mode with it, and gives it back. Recording a single window is not
 /// something the recorder does, so GNOME greys the button rather than leaving a mode whose capture
 /// button would silently do nothing (`_onCastButtonToggled`, `js/ui/screenshot.js:1880-1906`).

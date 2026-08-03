@@ -11,6 +11,7 @@ use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer, Texture};
 use smithay::input::keyboard::{Keysym, ModifiersState};
+use smithay::input::pointer::CursorIcon;
 use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
@@ -119,6 +120,8 @@ pub enum ScreenshotUi {
         selected_window: Option<(Output, u64)>,
         /// The window under the pointer, for the hover border.
         hovered_window: Option<(Output, u64)>,
+        /// What the pointer should look like where it currently is. See [`Self::cursor_icon`].
+        cursor: CursorIcon,
         /// The pending or showing tooltip, if the pointer has settled on a control.
         tooltip: Option<TooltipState>,
         /// The control under the pointer, on the **selection output's** panel.
@@ -632,6 +635,7 @@ impl ScreenshotUi {
             capture_type: CaptureType::default(),
             selected_window,
             hovered_window: None,
+            cursor: CursorIcon::Crosshair,
             tooltip: None,
             hover: None,
             open_anim,
@@ -785,6 +789,18 @@ impl ScreenshotUi {
     /// a mode that silently does nothing).
     pub fn window_enabled(&self) -> bool {
         self.mode() == CaptureMode::Shot && self.any_windows()
+    }
+
+    /// What the pointer should look like where it currently is.
+    ///
+    /// Tracked rather than asked per-call because it falls out of the same hit test as the hover,
+    /// and it shares that hit test's one honest limitation: motion only ever reaches us in the
+    /// selection output's coordinate space, so a second monitor's panel does not steer it.
+    pub fn cursor_icon(&self) -> CursorIcon {
+        match self {
+            Self::Open { cursor, .. } => *cursor,
+            Self::Closed { .. } => CursorIcon::Default,
+        }
     }
 
     pub fn mode(&self) -> CaptureMode {
@@ -1655,6 +1671,7 @@ impl ScreenshotUi {
             capture_type,
             hover,
             hovered_window,
+            cursor,
             ..
         } = self
         else {
@@ -1662,6 +1679,21 @@ impl ScreenshotUi {
         };
 
         let data = output_data.get(&selection.0);
+
+        // The crosshair belongs to the area selector, not to the whole picker: in GNOME it is set
+        // on `_areaSelector` (`set_cursor_type`, `js/ui/screenshot.js:448`), so the panel's buttons
+        // are siblings that inherit the default, and leaving Selection mode resets it outright
+        // (`:1792`). A crosshair over a button says "click to select an area" about a surface that
+        // does nothing of the kind.
+        let new_cursor = if *capture_type != CaptureType::Selection
+            || data.is_some_and(|data| data.over_chrome(point))
+        {
+            CursorIcon::Default
+        } else {
+            CursorIcon::Crosshair
+        };
+        let cursor_changed = *cursor != new_cursor;
+        *cursor = new_cursor;
         // An insensitive control takes no hover, exactly as `reactive = false` gives St.Button no
         // `notify::hover` — which is what keeps it from lighting up, and from offering a tooltip
         // for something it will not do.
@@ -1675,7 +1707,7 @@ impl ScreenshotUi {
             .flatten()
             .map(|id| (selection.0.clone(), id));
 
-        if *hover == new && *hovered_window == new_window {
+        if *hover == new && *hovered_window == new_window && !cursor_changed {
             return false;
         }
         *hover = new;
@@ -2036,6 +2068,20 @@ impl OutputData {
             shadow,
             close,
         };
+    }
+
+    /// Whether an output-local **physical** point is over the panel's own chrome — the card or the
+    /// close button that straddles its corner.
+    ///
+    /// Broader than [`Self::control_at`] on purpose: the card's background between buttons is
+    /// chrome too, and it is not a surface you can start a selection on.
+    fn over_chrome(&self, point: Point<i32, Physical>) -> bool {
+        let Some(panel) = self.panel_rect_logical() else {
+            return false;
+        };
+        let p = point.to_f64().to_logical(self.scale);
+        let close = widget::IconButton::new(close_rect(panel), CLOSE_ICON_PX, style::TRANSPARENT);
+        panel.contains(p) || close.contains(p)
     }
 
     /// The window whose selector slot contains an output-local **physical** point.
