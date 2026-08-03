@@ -277,54 +277,46 @@ pub fn render_to_dmabuf(
 /// thing they disagree about is where the destination bytes live. Keep it that way — the second
 /// copy of this function is where the two paths start to drift.
 ///
+/// **Every frame is drawn in full, deliberately.** An [`OutputDamageTracker`] must not be used
+/// here even though the caller has one: partial damage is only sound against a framebuffer that
+/// still holds the previous frame, and this allocates a *fresh* texture each call. Smithay's
+/// damage render skips clearing anything an opaque element covers and `continue`s past elements
+/// whose damage is empty after occlusion (`damage/mod.rs:876-911`), so on a new allocation those
+/// pixels are never written at all and the consumer sees uninitialized GPU memory — which reads
+/// as a collage of old windows, popovers and animation frames rather than as obvious garbage.
+/// That is a real bug this function used to have; the damage tracker still decides *whether* to
+/// produce a frame, never *how much* of one.
+///
 /// The destination receives `size.h` rows of `size.w * 4` bytes at `dst_stride` byte intervals.
 ///
 /// # Safety
 ///
 /// `dst` must be valid for writes of `dst_stride * size.h` bytes, and `dst_stride` must be at
 /// least `size.w * 4`. The caller is responsible for the destination outliving the call.
-pub unsafe fn render_and_copy_to_memory(
+pub unsafe fn render_and_copy_to_memory<E>(
     renderer: &mut VulkanRenderer,
-    damage_tracker: &mut OutputDamageTracker,
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    transform: Transform,
     dst: *mut u8,
     dst_stride: usize,
-    elements: &[impl RenderElement<VulkanRenderer>],
-    states: RenderElementStates,
-) -> anyhow::Result<()> {
+    elements: impl Iterator<Item = E>,
+) -> anyhow::Result<()>
+where
+    E: RenderElement<VulkanRenderer>,
+{
     let _span = tracy_client::span!();
 
-    // The destination wants `Xrgb8888` — BGRA byte order, which is what we read back below,
-    // straight into it. That is also the renderer's own order ([`NATIVE_FOURCC`]) since
-    // 2026-07-31, so the readback is a plain copy: no staging image, no conversion blit.
-    let render_fourcc = NATIVE_FOURCC;
-
-    let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
     let row_bytes = size.w as usize * 4;
     ensure!(
         dst_stride >= row_bytes,
         "destination stride {dst_stride} is narrower than a {row_bytes}-byte row"
     );
 
-    let mut texture =
-        create_texture(renderer, size, render_fourcc).context("error creating texture")?;
-    let mut target = renderer
-        .bind(&mut texture)
-        .context("error binding texture")?;
-
-    let _res = damage_tracker
-        .render_output_with_states(
-            renderer,
-            &mut target,
-            0,
-            elements,
-            Color32F::TRANSPARENT,
-            states,
-        )
+    // The destination wants `Xrgb8888` — BGRA byte order. That is also the renderer's own order
+    // ([`NATIVE_FOURCC`]) since 2026-07-31, so the readback is a plain copy: no conversion blit.
+    let mapping = render_and_download(renderer, size, scale, transform, Fourcc::Xrgb8888, elements)
         .context("error rendering")?;
-
-    // Read back in the destination's own order on both renderers, so this is a straight copy.
-    let mapping = copy_framebuffer(renderer, &target, Fourcc::Xrgb8888)
-        .context("error copying framebuffer")?;
     let bytes = renderer
         .map_texture(&mapping)
         .context("error mapping texture")?;
@@ -361,13 +353,12 @@ pub fn render_to_shm(
     damage_tracker: &mut OutputDamageTracker,
     buffer: &WlBuffer,
     elements: &[impl RenderElement<VulkanRenderer>],
-    states: RenderElementStates,
 ) -> anyhow::Result<()> {
     let _span = tracy_client::span!();
 
-    shm::with_buffer_contents_mut(buffer, |shm_buffer, shm_len, buffer_data| {
-        let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
+    let (size, scale, transform) = damage_tracker.mode().try_into().unwrap();
 
+    shm::with_buffer_contents_mut(buffer, |shm_buffer, shm_len, buffer_data| {
         ensure!(
             // The buffer prefers pixels in little endian ...
             buffer_data.format == wl_shm::Format::Xrgb8888
@@ -381,11 +372,12 @@ pub fn render_to_shm(
         unsafe {
             render_and_copy_to_memory(
                 renderer,
-                damage_tracker,
+                size,
+                scale,
+                transform,
                 shm_buffer.cast(),
                 buffer_data.stride as usize,
-                elements,
-                states,
+                elements.iter().rev(),
             )
         }
     })

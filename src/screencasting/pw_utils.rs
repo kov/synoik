@@ -1236,14 +1236,18 @@ impl Cast {
                     return false;
                 };
                 let (dst, dst_len, stride) = (mapping.ptr.as_ptr(), mapping.len, mapping.stride);
+                let (size, scale, transform) = damage_tracker.mode().try_into().unwrap();
 
+                // Full frame, every time — see `render_and_copy_to_memory`. The damage tracker
+                // above decided *whether* we render; it must not decide how much.
                 let res = render_and_copy_to_memory(
                     renderer,
-                    damage_tracker,
+                    size,
+                    scale,
+                    transform,
                     dst,
                     stride,
-                    elements,
-                    states,
+                    elements.iter().rev(),
                 );
                 drop(inner);
 

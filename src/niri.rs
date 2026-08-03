@@ -10116,7 +10116,7 @@ impl Niri {
                 Some(sync)
             }
             ScreencopyBuffer::Shm(wl_buffer) => {
-                render_to_shm(renderer, damage_tracker, wl_buffer, elements, states)
+                render_to_shm(renderer, damage_tracker, wl_buffer, elements)
                     .context("error rendering to screencopy shm buffer")?;
                 None
             }
