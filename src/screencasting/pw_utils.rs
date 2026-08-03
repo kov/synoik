@@ -1260,7 +1260,16 @@ impl Cast {
                         (*chunk).stride = stride as i32;
 
                         mark_buffer_as_good(pw_buffer, &mut self.sequence_counter, dst_len as u32);
-                        trace!("queueing memory buffer with seq={}", self.sequence_counter);
+                        if tracing::enabled!(tracing::Level::TRACE) {
+                            let header = find_meta_header(spa_buffer);
+                            let pts = header.map_or(0, |h| (*h.as_ptr()).pts);
+                            trace!(
+                                "queueing memory buffer with seq={} fd={fd} pts={pts} \
+                                 size={dst_len} stride={stride} digest={:016x}",
+                                self.sequence_counter,
+                                sample_digest(dst, dst_len),
+                            );
+                        }
                         pw_stream_queue_buffer(self.stream.as_raw_ptr(), pw_buffer.as_ptr());
                         true
                     }
@@ -1828,6 +1837,29 @@ unsafe fn mark_buffer_as_good(pw_buffer: NonNull<pw_buffer>, sequence: &mut u64,
         // flickering against each other instead of playing.
         (*header).pts = i64::try_from(get_monotonic_time().as_nanos()).unwrap_or(i64::MAX);
     }
+}
+
+/// A cheap digest of the bytes in a memory buffer, for the one question a `/proc/<pid>/fd` dump
+/// cannot answer.
+///
+/// Dumping the fds from outside samples them *now* — long after the queue, and after any number of
+/// later frames have been written into them. Two dumps that differ therefore prove only that the
+/// buffers change over time, not that each queued frame carried fresh content. This is taken at
+/// the instant of the handover, so a run of identical digests across increasing sequence numbers
+/// says the producer is the one repeating itself, and differing digests move the fault past us.
+///
+/// Sampled with a prime stride (never aligning with a row) rather than hashed in full: it runs per
+/// frame on the compositor thread over ~10 MB, and only when the TRACE level is on.
+unsafe fn sample_digest(ptr: *const u8, len: usize) -> u64 {
+    const STRIDE: usize = 4093;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < len {
+        hash ^= u64::from(*ptr.add(i));
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        i += STRIDE;
+    }
+    hash
 }
 
 unsafe fn find_meta_header(buffer: *mut spa_buffer) -> Option<NonNull<spa_meta_header>> {

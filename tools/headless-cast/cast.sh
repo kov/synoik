@@ -19,8 +19,13 @@ SC=org.gnome.Mutter.ScreenCast
 call() { gdbus call --session --dest $SC "$@"; }
 path_of() { sed -E "s/.*'([^']+)'.*/\1/"; }
 
+# CURSOR_MODE mirrors what a real consumer asks for: 0 hidden (default here), 1 embedded (drawn
+# into the frame), 2 metadata (sent beside it, and a different queue path in pw_utils).
+OPTS="{}"
+[ -n "${CURSOR_MODE:-}" ] && OPTS="{'cursor-mode': <uint32 $CURSOR_MODE>}"
+
 SP=$(call --object-path /org/gnome/Mutter/ScreenCast --method $SC.CreateSession "{}" | path_of)
-STP=$(call --object-path "$SP" --method $SC.Session.RecordMonitor "headless-1" "{}" | path_of)
+STP=$(call --object-path "$SP" --method $SC.Session.RecordMonitor "headless-1" "$OPTS" | path_of)
 gdbus monitor --session --dest $SC --object-path "$STP" > "$R/mon.log" 2>&1 & echo $! >> "$R/pids"
 sleep 1
 call --object-path "$SP" --method $SC.Session.Start > /dev/null
@@ -32,16 +37,28 @@ echo "node=$NODE session=$SP"
 echo "$SP" > "$R/sess"
 
 rm -f "$R"/f_*.png
-# Change the screen while capturing, so identical frames mean a real freeze rather than a still
-# desktop. No videorate in the pipeline: it pads with duplicates and would fake exactly that.
-( sleep 1; NIRI_SOCKET=$NIRI_SOCKET "$NIRI_BIN" msg action "$ACTION" >/dev/null 2>&1
-  sleep 2; NIRI_SOCKET=$NIRI_SOCKET "$NIRI_BIN" msg action "$ACTION" >/dev/null 2>&1 ) &
+# Keep the screen changing for the WHOLE capture, so identical frames mean a real freeze rather
+# than a still desktop — and so the stream runs at a rate comparable to a real cast. A few frames
+# seconds apart cannot show a bug that needs sustained throughput; CHURN_INTERVAL is the knob.
+# No videorate in the pipeline: it pads with duplicates and would fake exactly that.
+churn() {
+    while :; do
+        NIRI_SOCKET=$NIRI_SOCKET "$NIRI_BIN" msg action "$ACTION" >/dev/null 2>&1
+        sleep "${CHURN_INTERVAL:-0.4}"
+    done
+}
+churn & CHURN_PID=$!
 
-timeout 20 gst-launch-1.0 -q pipewiresrc path="$NODE" num-buffers="$FRAMES" \
+START=$(date +%s.%N)
+timeout "${CAPTURE_TIMEOUT:-20}" gst-launch-1.0 -q pipewiresrc path="$NODE" num-buffers="$FRAMES" \
     ! videoconvert ! pngenc ! multifilesink location="$R/f_%03d.png" 2>&1 | tail -3
+ELAPSED=$(echo "$(date +%s.%N) - $START" | bc)
+
+kill "$CHURN_PID" 2>/dev/null
 
 N=$(ls "$R"/f_*.png 2>/dev/null | wc -l)
 D=$(md5sum "$R"/f_*.png 2>/dev/null | awk '{print $1}' | sort -u | wc -l)
-echo "frames: $N  distinct: $D"
+printf 'frames: %s  distinct: %s  in %.1fs (%.1f fps)\n' "$N" "$D" "$ELAPSED" \
+    "$(echo "$N / $ELAPSED" | bc -l)"
 [ "$N" -gt 1 ] && [ "$D" -le 1 ] && echo "FROZEN: every delivered frame is identical"
 exit 0
