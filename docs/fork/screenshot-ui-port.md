@@ -1,9 +1,9 @@
 # The screenshot UI — porting GNOME's control panel
 
-Status: **2026-08-03, scoping.** What we have is niri's area picker wearing GNOME's OSD chrome:
-the shade, the selection rectangle, a capture button, and a panel that says *"Press Space to save
-the screenshot"*. GNOME's panel is a row of real controls, and per the fork tenet its way replaces
-niri's — the help text goes.
+Status: **2026-08-03, scoping (reviewed).** What we have is niri's area picker wearing GNOME's OSD
+chrome: the shade, the selection rectangle, a capture button, and a panel that says *"Press Space to
+save the screenshot"*. GNOME's panel is a row of real controls, and per the fork tenet its way
+replaces niri's — the help text goes.
 
 Reference: `js/ui/screenshot.js` (50.3) and `_screenshot.scss`. The visual spec is already cached
 and cited in `docs/fork/gnome-style-reference.md` §screenshot (every class, colour, radius and
@@ -11,7 +11,7 @@ padding below comes from that table — re-grep the SCSS only if a row looks wro
 
 ## What GNOME builds, in construction order
 
-Child order comes from the JS, never from what looks right (`screenshot.js:1226-1430`):
+Child order comes from the JS, never from what looks right (`screenshot.js:1226-1445`):
 
 ```
 ScreenshotUI
@@ -23,13 +23,16 @@ ScreenshotUI
 │   │       ├── _shotCastContainer   x_align START   [ shot | cast ]
 │   │       ├── _captureButton       centred
 │   │       └── _showPointerButtonContainer  x_align END  [ show-pointer ]
-│   └── _closeButton         constrained to the panel's top-left, outside it
+│   └── _closeButton         constrained to the panel, outside it
 └── Tooltips                 added to the ROOT, so they draw above the panel
 ```
 
-Two details that are easy to get backwards: the bottom row is a **BinLayout**, so the capture
-button is centred on the panel rather than placed after the shot/cast pair; and the tooltips are
-children of the root widget, not of the buttons they describe.
+Three details that are easy to get backwards: the bottom row is a **BinLayout**, so the capture
+button is centred on the panel rather than placed after the shot/cast pair; the tooltips are
+children of the root widget, not of the buttons they describe; and the close button is **not fixed
+to one corner** — it has `.left`/`.right` variants (`_screenshot.scss:22-23`) and an X-align
+constraint GNOME flips as the selection moves (`_closeButtonXAlignConstraint`,
+`screenshot.js:1262-1267`).
 
 ## What we have today
 
@@ -43,28 +46,93 @@ No type buttons, no shot/cast control, no close button, no tooltips, no window s
 1. **The panel becomes GNOME's, with Selection and Screen.** Replace the help lines with the type
    row and the bottom row. `Selection` is what we already do; `Screen` selects the whole output.
    The show-pointer state becomes a real button (keeping `P` as its accelerator), and the close
-   button lands. `Window` is built but hidden until slice 2 — GNOME hides `_castButton` the same
-   way until screencasting is available, so a hidden-until-supported control is in keeping.
-2. **Window mode.** The window selector: per-window borders with hover and checked states
-   (`.screenshot-ui-window-selector-window-border`, accent-tinted), and capture of the chosen
-   window. `ScreenshotWindow` already exists on the bus, so this is selection UI over an existing
-   capture.
-3. **Cast mode.** The shot/cast segmented control wired to our recorder, plus the capture button's
+   button lands. `Window` is built but hidden — **our scaffolding, not GNOME's practice**: GNOME
+   never hides `_windowButton`. (It does hide `_castButton`, but on a runtime capability —
+   `visible = this._screencastSupported`, `screenshot.js:1524` — which is the parallel to slice 3,
+   not to this.) The hidden Window button is a debt to pay in slice 2, and should be labelled as
+   such in the code.
+2. **Window mode.** Bigger than it looks, and *not* "selection UI over an existing capture": GNOME
+   freezes **every** window's content at open and captures the chosen one from that snapshot
+   (`screenshot.js:1638-1639`), while our `ScreenshotWindow` renders the **focused** window
+   **live** (`screenshot_window` → `render_window_to_pixels`, `src/niri.rs:10359-10369`). So this
+   slice owes per-window neutrals captured at open, plus the selector chrome: per-window borders
+   with hover and checked states (`.screenshot-ui-window-selector-window-border`, accent-tinted).
+3. **Delayed capture.** Our divergence — see below. After slice 1 because it needs the panel, but
+   its *foundation* is slice 1's problem, not this slice's.
+4. **Cast mode.** The shot/cast segmented control wired to our recorder, plus the capture button's
    `:cast` state (inner circle goes `$red_4`). This is the real trigger GNOME uses for the panel's
    recording indicator — see `docs/fork/panel-status-port.md` R1, which is currently driven by a
    direct `RecordArea` call for want of this.
-4. **Tooltips.** `%tooltip`, 24px below the control, on the root so they draw above the panel.
+5. **Tooltips.** Wiring, not toolkit: `widget::Tooltip` and `Painter::tooltip` already exist
+   (`widget.rs:638-670`). What is missing is hover timing and root-level placement, 24px below the
+   control, so they draw above the panel.
+
+## Approved divergence: delayed capture
+
+Requested 2026-08-03. GNOME's shell UI has no delay (gnome-screenshot had one; the shell dropped
+it). We want it, and it is not a button we can bolt on at the end, because of what the picker is.
+
+**The picker shows a frozen screen.** Opening it captures the output through the renderer
+(`capture_screenshot_neutrals`, `src/niri.rs:3416-3423`) and draws that texture; `Space` saves by
+cropping the frozen buffer (`confirm_screenshot` → `capture_from_neutral`, `src/niri.rs:3480`).
+GNOME's model is the same (`_stageScreenshot`, `screenshot.js:1211-1216`). A delayed shot is
+therefore *not* a delayed read of that texture — the point is to capture something that has not
+happened yet. The sequence has to be: arm and dismiss the UI → unfreeze → count down visibly →
+capture the **live** screen → save through the ordinary path (clipboard, notification,
+`Screenshots/`).
+
+Six things that must be designed in slice 1, not discovered later:
+
+- **Arming must not answer the D-Bus caller.** `close_screenshot_ui` answers `SelectArea` and
+  `InteractiveScreenshot` with `None` **unconditionally, by design** (`src/niri.rs:10685-10691`) —
+  precisely so a dismissal can never leave a caller blocked until its timeout. Arming a delay goes
+  straight through that path, so a delayed `InteractiveScreenshot` would be told "cancelled" before
+  the countdown even starts. The pending capture must **take** the reply sender (and the `path`
+  from the `Open` variant, `screenshot_ui.rs:81`) as it arms, so the answer travels with the
+  pending capture and is delivered at fire time. This is the single change slice 1 most needs to
+  get right.
+- **Where the state lives.** Not in `ScreenshotUi::Open` — it outlives the picker. It belongs
+  beside `select_area_reply`/`interactive_screenshot_reply` on `Niri` (`src/niri.rs:824-829`),
+  driven by a loop timer. It carries: mode, output, rect-or-window-id, `show_pointer`, the taken
+  reply sender, and the target `path`.
+- **Hold the output weakly.** `Closed::last_selection` already uses `WeakOutput`
+  (`screenshot_ui.rs:69`) for exactly this reason, and the picker itself closes on output change
+  (`src/niri.rs:6639-6647`). Unplug mid-countdown cancels.
+- **A lock mid-countdown must cancel it, fail-closed.** `open_screenshot_ui` refuses while locked
+  (`src/niri.rs:3402`), but nothing stops a lock landing *during* a countdown, and a live capture
+  then photographs the lock screen — or races `WaitingForSurfaces` and captures pre-lock content.
+  That is the ClosingWindow fail-closed rule in a new place: when in doubt, capture nothing.
+- **The countdown must not appear in the shot.** It is on screen at fire time by definition. Either
+  hide it for the capture frame or give it a render-target block, the way the capture targets
+  already distinguish output/screencast/screen-capture — otherwise the default outcome is a "1"
+  burned into every delayed screenshot.
+- **Escape must cancel, with the picker closed.** Today Escape reaches the picker only while it is
+  open (`src/niri.rs:2551`); a countdown needs its own route.
+
+Cast mode compounds it: a delayed *recording* start ends the countdown by starting a stream, not by
+taking a frame. So the fire action is an indirection from the start, not a call to
+`confirm_screenshot`.
+
+Where the control goes: the bottom row already ends with show-pointer, and a delay is the same kind
+of persistent capture option, so it belongs beside it — keeping the type row (*what* to capture)
+and the bottom row (*how* to capture it) separated the way GNOME has them.
 
 ## Toolkit first
 
-Two controls here appear more than once and must land as `widget::` types rather than as drawing
-inside `screenshot_ui.rs`:
+Checked against `src/ui/widget.rs` rather than assumed:
 
-- **Icon-over-label button** (`IconLabelButton`, 32px icon above a 9pt caption) — the three type
-  buttons, and the same shape appears elsewhere in the shell.
-- **Segmented toggle** (`.screenshot-ui-shot-cast-container`: a pill of translucent white holding
-  buttons whose `:checked` state inverts to white-on-dark) — shot/cast here, and the same control
-  shows up in the quick-settings and calendar surfaces.
+- **Already exists, use it:** `widget::IconButton` (`widget.rs:2212`) is the circular one-glyph
+  button — the close button, the show-pointer toggle and the two shot/cast segments are all that
+  shape. `widget::Tooltip` + `Painter::tooltip` (`widget.rs:638-670`) cover slice 5.
+- **Genuinely new:** the **icon-over-label button** (32px icon above a 9pt caption) for the three
+  type buttons. It needs a checked state over `%osd_button_flat` that `ButtonStyle` does not have
+  (`widget.rs:2126-2138`). Note it does *not* recur in GNOME — `IconLabelButton` is defined inside
+  `screenshot.js:53-73` and used only here — so it earns `widget::` on the checked-state gap and on
+  our own tenet, not on a false recurrence claim.
+- **Genuinely new:** the **segmented toggle** (a pill of translucent white holding buttons whose
+  `:checked` inverts to white-on-dark). Also unique in 50.3 (`_screenshot.scss:83,95`); the
+  quick-settings split toggle is a *different* construct (`_quick-settings.scss:57-77`). Build it
+  as a widget for the composition, not because it recurs today.
 
 ## Icons
 
@@ -78,5 +146,10 @@ carry): `screenshot-ui-area-symbolic`, `screenshot-ui-display-symbolic`,
 
 The corpus can open the picker only through the renderer (it has to freeze the screen first), so
 the Vulkan tests in `src/tests/vulkan_render.rs` are where this is pinned —
-`vulkan_screenshot_ui_draws_the_help_panel` is the test that has to change shape first, since the
-help panel it asserts on is what slice 1 deletes.
+`vulkan_screenshot_ui_draws_the_help_panel` (`:413`) is the test that has to change shape first,
+since the help panel it asserts on is what slice 1 deletes.
+
+The delay slice needs cover the renderer cannot give: that arming *does not* answer the D-Bus
+caller, that firing does, and that a lock or an output change cancels instead of capturing. Those
+are `Niri`-level state transitions, so they belong in the headless corpus (`src/tests/gnome.rs`)
+beside the existing `select_area_always_answers_its_caller`.
