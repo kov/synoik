@@ -901,6 +901,18 @@ pub struct GnomeKeybinding {
 /// axes map onto niri's vertical workspace column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GnomeKeyAction {
+    /// `show-screenshot-ui`: the shell's screenshot picker (`<Shift>Print`).
+    ShowScreenshotUi,
+    /// `screenshot`: capture the whole screen straight to a file, no UI (`Print`).
+    Screenshot,
+    /// `screenshot-window`: the focused window straight to a file (`<Alt>Print`).
+    ScreenshotWindow,
+    /// `show-screen-recording-ui`: `<Ctrl><Shift><Alt>R`.
+    ///
+    /// In GNOME this *opens the screenshot UI in recording mode* rather than recording anything.
+    /// Until that UI is ported it starts and stops a recording directly — see the divergence note
+    /// on [`adopted_shell_keybindings`].
+    ShowScreenRecordingUi,
     /// `panel-run-dialog`: open the Alt+F2 run dialog.
     PanelRunDialog,
     /// `close`: close the focused window.
@@ -1640,8 +1652,16 @@ impl GnomeSettingsWriter {
 /// defaults (this schema ships with mutter, so the defaults are authoritative
 /// in the reference checkout).
 /// The `org.gnome.shell.keybindings` keys we honor. Unlike the wm/mutter tables these are the
-/// *shell's* own bindings; brightness is the only group we implement so far
-/// (`data/org.gnome.shell.gschema.xml.in:281-304`).
+/// *shell's* own bindings (`data/org.gnome.shell.gschema.xml.in:265-304`).
+///
+/// These replace niri's own screenshot/recording binds: the keys come from GNOME's settings, not
+/// from the KDL config. `Action::ToggleScreenRecord` in particular had no default binding at all,
+/// so there was no way to start a recording from the keyboard.
+///
+/// **Divergence, to retire with the screenshot UI port.** GNOME's `show-screen-recording-ui` opens
+/// the screenshot UI switched to recording mode; the user then picks screen or area and presses a
+/// button, and stops from the panel indicator. We have no such UI yet, so the key toggles a
+/// full-screen recording directly. The binding is right, what it opens is not.
 fn adopted_shell_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
     use crate::brightness::Step;
 
@@ -1662,6 +1682,26 @@ fn adopted_shell_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
     }
 
     vec![
+        (
+            "show-screenshot-ui".to_owned(),
+            GnomeKeyAction::ShowScreenshotUi,
+            vec!["<Shift>Print".to_owned()],
+        ),
+        (
+            "screenshot".to_owned(),
+            GnomeKeyAction::Screenshot,
+            vec!["Print".to_owned()],
+        ),
+        (
+            "screenshot-window".to_owned(),
+            GnomeKeyAction::ScreenshotWindow,
+            vec!["<Alt>Print".to_owned()],
+        ),
+        (
+            "show-screen-recording-ui".to_owned(),
+            GnomeKeyAction::ShowScreenRecordingUi,
+            vec!["<Ctrl><Shift><Alt>R".to_owned()],
+        ),
         entry(
             "screen-brightness-up",
             Step::Up,

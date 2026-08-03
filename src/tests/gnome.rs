@@ -16043,3 +16043,71 @@ fn select_area_always_answers_its_caller() {
     // reply so the close that follows cannot answer it as a dismissal first — but reaching that
     // needs a real capture, and the headless corpus has no renderer. See the port doc.
 }
+
+/// The screenshot and recording keys come from `org.gnome.shell.keybindings`, not from niri's
+/// config.
+///
+/// `Action::ToggleScreenRecord` had no default binding anywhere, so before this there was no key
+/// that started a recording at all.
+///
+/// This covers adoption and the mapping, **not the effect**: every one of these actions opens the
+/// picker or captures, and both need a renderer to freeze the screen, which the headless corpus
+/// does not have.
+#[test]
+fn the_screenshot_keys_come_from_gnome_settings() {
+    use crate::gnome::GnomeKeyAction;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // The four keys are adopted with GNOME's own defaults.
+    let adopted: Vec<_> = f
+        .niri()
+        .gnome_settings
+        .keybindings
+        .iter()
+        .filter(|kb| {
+            matches!(
+                kb.action,
+                GnomeKeyAction::ShowScreenshotUi
+                    | GnomeKeyAction::Screenshot
+                    | GnomeKeyAction::ScreenshotWindow
+                    | GnomeKeyAction::ShowScreenRecordingUi
+            )
+        })
+        .map(|kb| kb.action)
+        .collect();
+    assert_eq!(adopted.len(), 4, "all four keys adopted, got {adopted:?}");
+
+    // ...with GNOME's own accelerators, and mapped to the actions those keys mean.
+    let screenshot_accels = f
+        .niri()
+        .gnome_settings
+        .keybindings
+        .iter()
+        .find(|kb| kb.action == GnomeKeyAction::Screenshot)
+        .map(|kb| kb.accels.len())
+        .expect("adopted");
+    assert_eq!(screenshot_accels, 1, "Print, from GNOME's own default");
+
+    use crate::input::action_for_gnome;
+    assert!(matches!(
+        action_for_gnome(GnomeKeyAction::ShowScreenshotUi),
+        Some(Action::Screenshot(true, None))
+    ));
+    assert!(matches!(
+        action_for_gnome(GnomeKeyAction::Screenshot),
+        Some(Action::ScreenshotScreen(true, true, None))
+    ));
+    assert!(matches!(
+        action_for_gnome(GnomeKeyAction::ScreenshotWindow),
+        Some(Action::ScreenshotWindow(true, true, None))
+    ));
+    assert!(
+        matches!(
+            action_for_gnome(GnomeKeyAction::ShowScreenRecordingUi),
+            Some(Action::ToggleScreenRecord)
+        ),
+        "the interim mapping, to be replaced when the recording UI lands"
+    );
+}

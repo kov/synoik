@@ -8681,7 +8681,7 @@ fn accel_matches(
 /// The niri action implementing a GNOME keybinding action, or `None` for
 /// actions adopted in the settings model but not implemented yet (their keys
 /// stay with the client). Workspace indices are 1-based on both sides.
-fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
+pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
     Some(match action {
         GnomeKeyAction::PanelRunDialog => Action::ShowRunDialog,
         GnomeKeyAction::Maximize => Action::Maximize,
@@ -8696,6 +8696,14 @@ fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
             crate::brightness::Step::Down => Action::ScreenBrightnessDown(current_monitor),
             crate::brightness::Step::Cycle => Action::ScreenBrightnessCycle(current_monitor),
         },
+        // `path: None` in all three means our configured screenshot location. Note the leading
+        // argument differs: `Screenshot` opens the UI and takes `show_pointer`, while the two
+        // direct captures take `write_to_disk` first — GNOME's unmodified `Print` saves a file
+        // rather than only filling the clipboard.
+        GnomeKeyAction::ShowScreenshotUi => Action::Screenshot(true, None),
+        GnomeKeyAction::Screenshot => Action::ScreenshotScreen(true, true, None),
+        GnomeKeyAction::ScreenshotWindow => Action::ScreenshotWindow(true, true, None),
+        GnomeKeyAction::ShowScreenRecordingUi => Action::ToggleScreenRecord,
         GnomeKeyAction::Close => Action::CloseWindow,
         GnomeKeyAction::ToggleFullscreen => Action::FullscreenWindow,
         GnomeKeyAction::SwitchToWorkspace(n) => {
