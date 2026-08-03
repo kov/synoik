@@ -3,14 +3,28 @@ use std::path::PathBuf;
 
 use niri_ipc::PickedColor;
 use zbus::fdo::{self, RequestNameFlags};
+use zbus::message::Header;
 use zbus::zvariant::OwnedValue;
 use zbus::{interface, zvariant};
 
 use super::Start;
 
+/// Who may take a picture of the screen (`screenshot.js:2489-2492`).
+///
+/// A *different* list from `org.gnome.Shell.Introspect`'s, and deliberately so: gsd-media-keys owns
+/// the Print Screen key and has to be able to call this, while the GTK portal has no business
+/// here. Without the check, any application on the session bus could silently capture the screen
+/// to a path of its choosing.
+const ALLOWLIST: [&str; 2] = [
+    "org.gnome.SettingsDaemon.MediaKeys",
+    "org.freedesktop.impl.portal.desktop.gnome",
+];
+
 pub struct Screenshot {
     to_niri: calloop::channel::Sender<ScreenshotToNiri>,
     from_niri: async_channel::Receiver<NiriToScreenshot>,
+    /// Filled in by [`Start`]: the allowlist check has to ask the bus who owns a name.
+    conn: Option<zbus::Connection>,
 }
 
 /// The rectangle `SelectArea` hands back: x, y, width, height in global logical coordinates.
@@ -18,6 +32,9 @@ pub type SelectedArea = (i32, i32, i32, i32);
 
 /// Where a `SelectArea` result goes. `None` means the user dismissed the picker.
 pub type SelectAreaReply = async_channel::Sender<Option<SelectedArea>>;
+
+/// Where an `InteractiveScreenshot` result goes: the saved file's URI, or `None` if dismissed.
+pub type InteractiveReply = async_channel::Sender<Option<String>>;
 
 pub enum ScreenshotToNiri {
     TakeScreenshot {
@@ -43,6 +60,9 @@ pub enum ScreenshotToNiri {
     /// Open the picker for `SelectArea`; the reply carries the chosen rectangle, or `None` if the
     /// user dismissed it.
     SelectArea(SelectAreaReply),
+    /// Open the shell's screenshot UI; the reply carries the saved file's URI, or `None` if the
+    /// user dismissed it.
+    Interactive(InteractiveReply),
     PickColor(async_channel::Sender<Option<PickedColor>>),
 }
 
@@ -60,7 +80,9 @@ impl Screenshot {
         include_cursor: bool,
         _flash: bool,
         filename: String,
+        #[zbus(header)] hdr: Header<'_>,
     ) -> fdo::Result<(bool, PathBuf)> {
+        self.check_sender(&hdr, "Screenshot").await?;
         self.capture(ScreenshotToNiri::TakeScreenshot {
             include_cursor,
             path: wanted_path(filename),
@@ -76,7 +98,9 @@ impl Screenshot {
         include_cursor: bool,
         _flash: bool,
         filename: String,
+        #[zbus(header)] hdr: Header<'_>,
     ) -> fdo::Result<(bool, PathBuf)> {
+        self.check_sender(&hdr, "ScreenshotWindow").await?;
         self.capture(ScreenshotToNiri::TakeScreenshotWindow {
             include_cursor,
             path: wanted_path(filename),
@@ -86,7 +110,15 @@ impl Screenshot {
 
     /// Fire-and-forget: GNOME's `FlashArea` returns as soon as the effect is started
     /// (`screenshot.js`), and the caller does not wait for it to finish.
-    async fn flash_area(&self, x: i32, y: i32, width: i32, height: i32) -> fdo::Result<()> {
+    async fn flash_area(
+        &self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        #[zbus(header)] hdr: Header<'_>,
+    ) -> fdo::Result<()> {
+        self.check_sender(&hdr, "FlashArea").await?;
         if width <= 0 || height <= 0 {
             return Err(fdo::Error::InvalidArgs("empty area".to_owned()));
         }
@@ -99,12 +131,45 @@ impl Screenshot {
         Ok(())
     }
 
+    /// The shell's own screenshot UI, driven over the bus — **the method the portal actually
+    /// calls first** (`InteractiveScreenshotAsync`, `screenshot.js:2729-2755`).
+    ///
+    /// A dismissal is `(false, "")`, not an error: GNOME returns that on the UI's `closed` signal
+    /// (`:2742-2745`), and the portal reads the boolean rather than catching a fault. This is the
+    /// opposite convention from `SelectArea` next door, which does error — matched to each, not
+    /// unified, because the callers differ.
+    async fn interactive_screenshot(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+    ) -> fdo::Result<(bool, String)> {
+        self.check_sender(&hdr, "InteractiveScreenshot").await?;
+
+        let (tx, rx) = async_channel::bounded(1);
+        if let Err(err) = self.to_niri.send(ScreenshotToNiri::Interactive(tx)) {
+            warn!("error sending message to niri: {err:?}");
+            return Err(fdo::Error::Failed("internal error".to_owned()));
+        }
+
+        match rx.recv().await {
+            Ok(Some(uri)) => Ok((true, uri)),
+            Ok(None) => Ok((false, String::new())),
+            Err(err) => {
+                warn!("error receiving message from niri: {err:?}");
+                Err(fdo::Error::Failed("internal error".to_owned()))
+            }
+        }
+    }
+
     /// Interactive: puts the picker up and blocks until the user picks or dismisses.
     ///
     /// A dismissal is `Cancelled`, not a zero-sized rectangle — the caller has to be able to tell
     /// "the user said no" from "the user selected nothing", and the portal treats the two
     /// differently.
-    async fn select_area(&self) -> fdo::Result<(i32, i32, i32, i32)> {
+    async fn select_area(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+    ) -> fdo::Result<(i32, i32, i32, i32)> {
+        self.check_sender(&hdr, "SelectArea").await?;
         let (tx, rx) = async_channel::bounded(1);
         if let Err(err) = self.to_niri.send(ScreenshotToNiri::SelectArea(tx)) {
             warn!("error sending message to niri: {err:?}");
@@ -121,6 +186,9 @@ impl Screenshot {
         }
     }
 
+    // GNOME's signature, argument for argument — the caller is the portal, so it is not ours to
+    // condense.
+    #[allow(clippy::too_many_arguments)]
     async fn screenshot_area(
         &self,
         x: i32,
@@ -129,7 +197,9 @@ impl Screenshot {
         height: i32,
         _flash: bool,
         filename: String,
+        #[zbus(header)] hdr: Header<'_>,
     ) -> fdo::Result<(bool, PathBuf)> {
+        self.check_sender(&hdr, "ScreenshotArea").await?;
         if width <= 0 || height <= 0 {
             return Err(fdo::Error::InvalidArgs("empty area".to_owned()));
         }
@@ -140,7 +210,11 @@ impl Screenshot {
         .await
     }
 
-    async fn pick_color(&self) -> fdo::Result<HashMap<String, OwnedValue>> {
+    async fn pick_color(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+    ) -> fdo::Result<HashMap<String, OwnedValue>> {
+        self.check_sender(&hdr, "PickColor").await?;
         let (tx, rx) = async_channel::bounded(1);
         if let Err(err) = self.to_niri.send(ScreenshotToNiri::PickColor(tx)) {
             warn!("error sending pick color message to niri: {err:?}");
@@ -200,13 +274,25 @@ impl Screenshot {
         to_niri: calloop::channel::Sender<ScreenshotToNiri>,
         from_niri: async_channel::Receiver<NiriToScreenshot>,
     ) -> Self {
-        Self { to_niri, from_niri }
+        Self {
+            to_niri,
+            from_niri,
+            conn: None,
+        }
+    }
+
+    async fn check_sender(&self, hdr: &Header<'_>, method: &str) -> fdo::Result<()> {
+        let Some(conn) = self.conn.as_ref() else {
+            return Err(fdo::Error::Failed("internal error".to_owned()));
+        };
+        super::check_sender(conn, hdr.sender(), &ALLOWLIST, method).await
     }
 }
 
 impl Start for Screenshot {
-    fn start(self) -> anyhow::Result<zbus::blocking::Connection> {
+    fn start(mut self) -> anyhow::Result<zbus::blocking::Connection> {
         let conn = zbus::blocking::Connection::session()?;
+        self.conn = Some(conn.inner().clone());
         let flags = RequestNameFlags::AllowReplacement
             | RequestNameFlags::ReplaceExisting
             | RequestNameFlags::DoNotQueue;

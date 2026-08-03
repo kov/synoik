@@ -823,6 +823,11 @@ pub struct Niri {
     #[cfg(feature = "dbus")]
     pub select_area_reply: Option<crate::dbus::gnome_shell_screenshot::SelectAreaReply>,
 
+    /// Set while the picker is up on behalf of `InteractiveScreenshot`: the caller wants the URI
+    /// of whatever gets saved. Answered when the save completes, and on every close.
+    #[cfg(feature = "dbus")]
+    pub interactive_screenshot_reply: Option<crate::dbus::gnome_shell_screenshot::InteractiveReply>,
+
     /// The screenshot flash (`org.gnome.Shell.Screenshot.FlashArea`).
     pub flashspot: crate::ui::flashspot::FlashSpot,
     pub polkit_dialog: crate::polkit_dialog::PolkitDialog,
@@ -3474,7 +3479,16 @@ impl State {
             // that capture failed (warned there) — fail closed rather than save a wrong screenshot.
             match self.niri.screenshot_ui.capture_from_neutral() {
                 Some((size, pixels)) => {
-                    if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
+                    #[cfg(feature = "dbus")]
+                    let reply = self.niri.interactive_screenshot_reply.take();
+                    if let Err(err) = self.niri.save_screenshot(
+                        size,
+                        pixels,
+                        write_to_disk,
+                        path,
+                        #[cfg(feature = "dbus")]
+                        reply,
+                    ) {
                         warn!("error saving screenshot: {err:?}");
                     }
                 }
@@ -3564,6 +3578,9 @@ impl State {
             ScreenshotToNiri::SelectArea(tx) => {
                 self.handle_select_area(tx);
             }
+            ScreenshotToNiri::Interactive(tx) => {
+                self.handle_interactive_screenshot(tx);
+            }
             ScreenshotToNiri::FlashArea { area } => {
                 let (x, y, w, h) = area;
                 let area = Rectangle::new(Point::from((x, y)), Size::from((w, h)));
@@ -3618,6 +3635,22 @@ impl State {
         // D-Bus timeout.
         if !self.niri.screenshot_ui.is_open() {
             self.niri.answer_select_area(None);
+        }
+    }
+
+    /// `InteractiveScreenshot` — the shell's own picker, answering with the saved file's URI.
+    #[cfg(feature = "dbus")]
+    fn handle_interactive_screenshot(
+        &mut self,
+        tx: crate::dbus::gnome_shell_screenshot::InteractiveReply,
+    ) {
+        self.niri.interactive_screenshot_reply = Some(tx);
+        self.open_screenshot_ui(false, None);
+
+        // Same reason as `SelectArea`: a picker that refuses to open must still answer, or the
+        // caller blocks until its D-Bus timeout with nothing on screen to explain why.
+        if !self.niri.screenshot_ui.is_open() {
+            self.niri.answer_interactive_screenshot(None);
         }
     }
 
@@ -6069,6 +6102,8 @@ impl Niri {
             #[cfg(feature = "dbus")]
             #[cfg(feature = "dbus")]
             select_area_reply: None,
+            #[cfg(feature = "dbus")]
+            interactive_screenshot_reply: None,
             flashspot: crate::ui::flashspot::FlashSpot::new(),
             polkit_dialog: crate::polkit_dialog::PolkitDialog::new(),
             #[cfg(feature = "dbus")]
@@ -10310,8 +10345,15 @@ impl Niri {
             elements,
         )?;
 
-        self.save_screenshot(size, pixels, write_to_disk, path)
-            .context("error saving screenshot")
+        self.save_screenshot(
+            size,
+            pixels,
+            write_to_disk,
+            path,
+            #[cfg(feature = "dbus")]
+            None,
+        )
+        .context("error saving screenshot")
     }
 
     pub fn screenshot_window(
@@ -10325,8 +10367,15 @@ impl Niri {
     ) -> anyhow::Result<()> {
         let (size, pixels) =
             self.render_window_to_pixels(renderer, output, mapped, show_pointer)?;
-        self.save_screenshot(size, pixels, write_to_disk, path)
-            .context("error saving screenshot")
+        self.save_screenshot(
+            size,
+            pixels,
+            write_to_disk,
+            path,
+            #[cfg(feature = "dbus")]
+            None,
+        )
+        .context("error saving screenshot")
     }
 
     /// `ScreenshotWindow` — writes the file and nothing else.
@@ -10419,12 +10468,19 @@ impl Niri {
         Ok((geo.size, pixels))
     }
 
+    /// `interactive_reply` is threaded through rather than read off `self` in the completion
+    /// callback: the caller closes the picker as soon as this returns, and the close answers a
+    /// pending reply as a dismissal. Since the encode happens on a thread, the close would always
+    /// win the race and every interactive screenshot would report as cancelled.
     pub fn save_screenshot(
         &self,
         size: Size<i32, Physical>,
         pixels: Vec<u8>,
         write_to_disk: bool,
         path_arg: Option<String>,
+        #[cfg(feature = "dbus")] interactive_reply: Option<
+            crate::dbus::gnome_shell_screenshot::InteractiveReply,
+        >,
     ) -> anyhow::Result<()> {
         let path = write_to_disk
             .then(|| {
@@ -10459,10 +10515,16 @@ impl Niri {
             .unwrap();
 
         // Prepare to send screenshot completion event back to main thread.
+        #[cfg(feature = "dbus")]
+        let mut interactive_reply = interactive_reply;
         let (event_tx, event_rx) = calloop::channel::sync_channel::<Option<String>>(1);
         self.event_loop
             .insert_source(event_rx, move |event, _, state| match event {
                 calloop::channel::Event::Msg(path) => {
+                    #[cfg(feature = "dbus")]
+                    if let Some(tx) = interactive_reply.take() {
+                        let _ = tx.send_blocking(path.as_deref().map(|p| format!("file://{p}")));
+                    }
                     state.ipc_screenshot_taken(path);
                 }
                 calloop::channel::Event::Closed => (),
@@ -10626,6 +10688,7 @@ impl Niri {
         // Unconditional, not gated on `was_open`: a pending reply with no picker on screen is
         // precisely the stuck state this exists to prevent, so closing always resolves it.
         self.answer_select_area(None);
+        self.answer_interactive_screenshot(None);
         was_open
     }
 
@@ -10640,6 +10703,19 @@ impl Niri {
 
     #[cfg(not(feature = "dbus"))]
     pub fn answer_select_area(&mut self, _rect: Option<Rectangle<i32, Logical>>) {}
+
+    /// Hand an `InteractiveScreenshot` caller its result, once. `None` is a dismissal.
+    #[cfg(feature = "dbus")]
+    pub fn answer_interactive_screenshot(&mut self, path: Option<&str>) {
+        if let Some(tx) = self.interactive_screenshot_reply.take() {
+            // GNOME returns `file.get_uri()`, not a path.
+            let uri = path.map(|p| format!("file://{p}"));
+            let _ = tx.send_blocking(uri);
+        }
+    }
+
+    #[cfg(not(feature = "dbus"))]
+    pub fn answer_interactive_screenshot(&mut self, _path: Option<&str>) {}
 
     pub fn is_locked(&self) -> bool {
         match self.lock_state {

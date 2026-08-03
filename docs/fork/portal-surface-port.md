@@ -1,7 +1,15 @@
 # The portal surface — screenshots and screen sharing
 
-Status: **2026-08-02.** Slices 1-3 landed; 4-6 not started. Not yet seat-validated — that is the
-next step, and is what slices 1-3 were sequenced to make possible.
+Status: **2026-08-02.** Slices 1-3 and 6 landed; 4-5 not started.
+
+**The slice order was wrong, and a live run found it.** Slice 6 (`InteractiveScreenshot`) was put
+last on the reasoning that "nothing in the portal path needs it" — drawn from a `strings` scan that
+found `ScreenshotArea`/`SelectArea`/`FlashArea` in the shipped binary. Those symbols exist, but
+xdg-desktop-portal-gnome 50.0's Screenshot backend calls **`InteractiveScreenshot` first** and only
+falls back to the piecemeal methods. The journal said so in one line:
+`InteractiveScreenshot failed: ... Unknown method 'InteractiveScreenshot'`. A symbol being present
+in a binary says nothing about which call path is taken; the lesson is to read the caller's code or
+watch the bus, not to grep for names.
 
 `xdg-desktop-portal-gnome` is the path every Flatpak app, every browser screen-share and every
 in-app "take a screenshot" goes through. It is not optional for a daily-driven session, and it is
@@ -81,8 +89,9 @@ Ordered by what unblocks the portal soonest, not by interface.
 4. **ScreenCast completion.** `Stream.Start`/`Stop`, then `RecordVirtual`.
 5. **`org.gnome.Mutter.RemoteDesktop`.** The whole name — screen sharing *with input*, and
    `EnableClipboard`. Largest, and the only one that needs new input-injection plumbing.
-6. **`InteractiveScreenshot`.** The shell's own dialog driven over D-Bus. Last: nothing in the
-   portal path needs it.
+6. **`InteractiveScreenshot`.** — **DONE**, and it should have been first. The shell's own picker
+   driven over the bus. Its dismissal is `(false, "")`, *not* an error (`screenshot.js:2742-2745`) —
+   the opposite convention from `SelectArea` next door, matched per-caller rather than unified.
 
 ## Open questions
 
@@ -116,3 +125,26 @@ first — so the conformance test covers the *refusal* and *dismissal* exits onl
 where a real selection comes back as a rectangle, has no automated cover and is exactly what the
 seat run has to exercise: open a browser's screen-share or a Flatpak screenshot and check the
 returned area matches what was dragged.
+
+## Two access-control gaps, both closed
+
+`org.gnome.Shell.Screenshot` has its own sender allowlist in GNOME (`screenshot.js:2489-2492`) and
+we had none, so any application on the session bus could capture the screen to a path of its
+choosing. It is a *different* list from `Introspect`'s — `org.gnome.SettingsDaemon.MediaKeys` (which
+owns Print Screen) and `org.freedesktop.impl.portal.desktop.gnome`, with no GTK portal. The check
+itself is now shared (`dbus::check_sender`); only the list belongs to each interface.
+
+Consequence worth knowing: **`gdbus call` against these interfaces from a terminal is now refused**,
+by design. Test through the portal, or from an allowlisted peer.
+
+## Known gaps in cover
+
+- The **save/close race on the confirm path** has no headless test. `save_screenshot` takes the
+  `InteractiveScreenshot` reply with it precisely so the close that follows cannot answer the caller
+  as a dismissal first — get that wrong and *every* interactive screenshot reports cancelled. It
+  needs a real capture to reach, and the corpus has no renderer.
+- The **happy path of `SelectArea`** — a real drag coming back as the right rectangle — likewise.
+- `version` was declared `i` where the XML says `u`. xdg-desktop-portal-gnome logged
+  `Received property version with type i does not match expected type u` at startup and its
+  Introspect proxy was no use afterwards; "Could not get window list" downstream is the likely
+  consequence. Re-check that line on the next seat run before assuming it is gone.

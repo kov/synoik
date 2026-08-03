@@ -561,3 +561,52 @@ fn call_app_details(app_id: String) -> zbus::Result<()> {
     )?;
     Ok(())
 }
+
+/// Reject a D-Bus caller that is not on `allowlist` — GNOME's `DBusSenderChecker`
+/// (`js/misc/util.js:344-409`).
+///
+/// Several of the shell's interfaces hand out things the user would not want handed out on request
+/// — the window list, a picture of the screen — and GNOME gates each on a *different* short list of
+/// well-known names. So the list belongs to the caller, but the check does not: it is the same
+/// resolve-and-compare every time, and a second copy of it is a second place to get it subtly
+/// wrong.
+///
+/// The owners are resolved per call rather than cached from a `watch_name`. These calls happen when
+/// a portal dialog opens, so the round trips cost nothing anyone can perceive, and a cache that
+/// goes stale in the permissive direction is exactly the hole the list exists to close.
+///
+/// GNOME also skips the whole check under `global.context.unsafe_mode`. We have no unsafe mode and
+/// are not adding one for this.
+pub async fn check_sender(
+    conn: &zbus::Connection,
+    sender: Option<&zbus::names::UniqueName<'_>>,
+    allowlist: &[&str],
+    method: &str,
+) -> zbus::fdo::Result<()> {
+    let denied = || zbus::fdo::Error::AccessDenied(format!("{method} is not allowed"));
+
+    // No sender means no way to tell who is asking, which is not a reason to answer.
+    let Some(sender) = sender else {
+        return Err(denied());
+    };
+
+    let proxy = zbus::fdo::DBusProxy::new(conn)
+        .await
+        .map_err(|err| zbus::fdo::Error::Failed(format!("{err}")))?;
+
+    for name in allowlist {
+        let Ok(name) = zbus::names::BusName::try_from(*name) else {
+            continue;
+        };
+        // An allowlisted name with no owner simply does not match: that peer is not running, so
+        // nothing it would have been allowed to ask is being asked.
+        if let Ok(owner) = proxy.get_name_owner(name).await {
+            if owner.as_str() == sender.as_str() {
+                return Ok(());
+            }
+        }
+    }
+
+    warn!("{method} refused for {sender}: not an allowed caller");
+    Err(denied())
+}

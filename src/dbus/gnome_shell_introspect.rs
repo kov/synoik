@@ -13,15 +13,20 @@
 use std::collections::HashMap;
 
 use zbus::fdo::{self, RequestNameFlags};
+use zbus::interface;
 use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{SerializeDict, Type, Value};
-use zbus::{interface, proxy};
 
 use super::Start;
 
 /// `INTROSPECT_DBUS_API_VERSION` (`introspect.js:12`).
-const API_VERSION: i32 = 3;
+///
+/// `u`, not `i` — the interface XML says
+/// `<property name="version" type="u" access="read"/>`. Getting the width right is not cosmetic:
+/// xdg-desktop-portal-gnome logs "Received property version with type i does not match expected
+/// type u" and its Introspect proxy is no use afterwards.
+const API_VERSION: u32 = 3;
 
 /// The only senders allowed to read the window list (`introspect.js:7-11`).
 ///
@@ -93,15 +98,6 @@ pub struct AppProperties {
     pub active_on_seats: Option<Vec<String>>,
 }
 
-#[proxy(
-    interface = "org.freedesktop.DBus",
-    default_service = "org.freedesktop.DBus",
-    default_path = "/org/freedesktop/DBus"
-)]
-trait NameOwner {
-    fn get_name_owner(&self, name: &str) -> zbus::Result<String>;
-}
-
 #[interface(name = "org.gnome.Shell.Introspect")]
 impl Introspect {
     async fn get_windows(
@@ -148,7 +144,7 @@ impl Introspect {
     }
 
     #[zbus(property, name = "version")]
-    fn version(&self) -> i32 {
+    fn version(&self) -> u32 {
         API_VERSION
     }
 
@@ -171,42 +167,11 @@ impl Introspect {
         }
     }
 
-    /// Reject anyone who is not one of the two portal implementations
-    /// (`DBusSenderChecker::checkInvocation`, `util.js:399-409`).
-    ///
-    /// GNOME keeps a live `watch_name` map of well-known name → current owner and compares the
-    /// invocation's unique sender against its values. We resolve on demand instead: these calls
-    /// happen when a portal dialog opens, so the two round trips cost nothing anyone can perceive,
-    /// and a cache that can go stale is the failure mode we would rather not own — stale in the
-    /// permissive direction is exactly the leak.
-    ///
-    /// GNOME also bypasses the whole check under `global.context.unsafe_mode`. We have no unsafe
-    /// mode and are not adding one for this.
     async fn check_sender(&self, hdr: &Header<'_>, method: &str) -> fdo::Result<()> {
-        let Some(sender) = hdr.sender() else {
-            // No sender means no way to tell who is asking, which is not a reason to answer.
-            return Err(fdo::Error::AccessDenied(format!("{method} is not allowed")));
-        };
         let Some(conn) = self.conn.as_ref() else {
             return Err(fdo::Error::Failed("internal error".to_owned()));
         };
-
-        let proxy = NameOwnerProxy::new(conn)
-            .await
-            .map_err(|err| fdo::Error::Failed(format!("{err}")))?;
-
-        for name in APP_ALLOWLIST {
-            // An allowlisted name with no owner simply does not match: the portal is not running,
-            // so nothing it would have been allowed to ask is being asked.
-            if let Ok(owner) = proxy.get_name_owner(name).await {
-                if owner == sender.as_str() {
-                    return Ok(());
-                }
-            }
-        }
-
-        warn!("{method} refused for {sender}: not a portal implementation");
-        Err(fdo::Error::AccessDenied(format!("{method} is not allowed")))
+        super::check_sender(conn, hdr.sender(), &APP_ALLOWLIST, method).await
     }
 
     async fn ask(&self, msg: IntrospectToNiri) -> fdo::Result<NiriToIntrospect> {

@@ -16022,4 +16022,24 @@ fn select_area_always_answers_its_caller() {
     f.niri().select_area_reply = Some(tx);
     f.niri().close_screenshot_ui();
     assert_eq!(rx.try_recv(), Ok(None), "a dismissal must reach the caller");
+
+    // `InteractiveScreenshot` shares both exits, and its dismissal is a `None` URI rather than an
+    // error — the portal reads the boolean instead of catching a fault.
+    let (tx, rx) = async_channel::bounded(1);
+    f.niri_state()
+        .on_screen_shot_msg(&to_screenshot, ScreenshotToNiri::Interactive(tx));
+    assert_eq!(
+        rx.try_recv(),
+        Ok(None),
+        "an interactive picker that never opened must still answer"
+    );
+
+    let (tx, rx) = async_channel::bounded(1);
+    f.niri().interactive_screenshot_reply = Some(tx);
+    f.niri().close_screenshot_ui();
+    assert_eq!(rx.try_recv(), Ok(None), "and a dismissal must reach it too");
+
+    // NOT covered here: the save/close race on the *confirm* path. `save_screenshot` takes the
+    // reply so the close that follows cannot answer it as a dismissal first — but reaching that
+    // needs a real capture, and the headless corpus has no renderer. See the port doc.
 }
