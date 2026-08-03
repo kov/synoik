@@ -578,10 +578,26 @@ mod systemd {
         Ok(())
     }
 
-    /// The unit-name patterns covering every scope we start: `app-gnome-*` from
-    /// [`start_app_scope`] (GNOME's prefix, which we match on purpose) and `app-niri-*` from
-    /// [`start_systemd_scope`] (the `spawn` path).
-    const APP_SCOPE_PATTERNS: &[&str] = &["app-gnome-*.scope", "app-niri-*.scope"];
+    /// The unit-name patterns covering every scope an app of ours can end up in: `app-gnome-*`
+    /// from [`start_app_scope`] (GNOME's prefix, which we match on purpose), `app-niri-*` from
+    /// [`start_systemd_scope`] (the `spawn` path), and `app-flatpak-*`, which is **not** ours to
+    /// create but is where a flatpak app actually lives.
+    ///
+    /// That last one is why this is a pattern list and not a registry of what we launched. We do
+    /// start an `app-gnome-<id>-<pid>.scope` for a flatpak app — and then `flatpak run` hands the
+    /// real processes to a scope of its own and exits, so ours goes empty and
+    /// `CollectMode=inactive-or-failed` takes it away. By logout the only unit holding the app is
+    /// flatpak's, under a prefix we did not match: measured 2026-08-03, OBS was never asked to quit
+    /// until the `graphical-session.target` teardown reached it, five seconds into a drain that had
+    /// already given up on it. It is the same class of unit either way —
+    /// `/usr/lib/systemd/user/app-flatpak-.scope.d/` carries the same
+    /// `PartOf=graphical-session.target` and `TimeoutStopSec=5s` drop-in as `app-gnome-`— so
+    /// all this changes is *when* it is asked.
+    const APP_SCOPE_PATTERNS: &[&str] = &[
+        "app-gnome-*.scope",
+        "app-niri-*.scope",
+        "app-flatpak-*.scope",
+    ];
 
     fn stop_scopes_matching(patterns: &[&str]) -> anyhow::Result<()> {
         use anyhow::Context;

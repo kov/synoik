@@ -131,12 +131,36 @@ the last client window is gone or `DRAIN_TIMEOUT` (5 s) expires.
   if gnome-session's teardown ever stalled. A SIGTERM folding into a confirm drain sends it then.
 - **Timing out is a warning that names the apps.** Which client ignored a five-second SIGTERM is
   the only thing worth knowing from that line.
+- **`DRAIN_TIMEOUT` cannot usefully exceed the scope's `TimeoutStopSec`, and both are 5 s because
+  we set both.** systemd starts its own five-second clock on the same `StopUnit` that begins the
+  drain, and SIGKILLs the app when it expires. Measured 2026-08-03: firefox was asked at
+  `22.8280`, we gave up at `27.800`, systemd killed it at `27.8277` — the two clocks land 27 ms
+  apart by construction. So the drain buys an app the *compositor's* company for up to 5 s (against
+  the 341 ms head start in §1, which is the win), but it cannot buy it more life than its scope
+  has. Raising one number alone does nothing; `TimeoutStopUSec` in `start_transient_scope` and
+  `DRAIN_TIMEOUT` in `src/niri.rs` move together or not at all.
 
 Apps are asked to go the way GNOME asks them — SIGTERM, by stopping their scopes
 (`spawning::stop_app_scopes`, `ListUnitsByPatterns` + `StopUnit`). There is deliberately **no
 `xdg_toplevel.close` sweep**: mutter has none, and sending one would put "save changes?" dialogs in
 front of a logout the user has already confirmed. GNOME's answer to unsaved work is the inhibitor
 protocol, not a close sweep. What we add over GNOME is only the waiting.
+
+**A flatpak app is not in the scope we started for it**, which is why the patterns include
+`app-flatpak-*` — a prefix we never create. We do call `start_app_scope` and get
+`app-gnome-<id>-<pid>.scope`; then `flatpak run` moves the real processes into a scope of its own
+and exits, ours goes empty, and `CollectMode=inactive-or-failed` collects it. By logout the only
+unit holding the app is flatpak's. Measured 2026-08-03 with OBS: our scope was started at
+`16:14:11.500`, flatpak's 70 ms later, and at `16:14:22.827` the stop went to firefox, Epiphany and
+a gsd helper — OBS was not asked to quit until the `graphical-session.target` teardown reached it
+at `16:14:27.835`, five seconds into a drain that had already timed out naming it. Nothing else
+covered it: it is the same class of unit (`/usr/lib/systemd/user/app-flatpak-.scope.d/` ships the
+same `PartOf=graphical-session.target` + `TimeoutStopSec=5s` drop-in), so all the pattern changes is
+*when* it is asked — at the start of the drain instead of after it.
+
+This is also the argument for the pattern list over a registry of what we launched, sharper than
+the one in the code comment: a registry would have recorded the scope we started, which is exactly
+the one that no longer holds the app.
 
 On an externally driven logout, `stop_app_scopes` joins stop jobs systemd has already queued and is
 a no-op. On the `Quit` and dialog paths it is the only thing that asks the apps at all — which is
@@ -172,7 +196,8 @@ tests in `src/tests/gnome.rs` set the flag by hand.
 
 - **Terminal-spawned clients have no scope**, so `stop_app_scopes` cannot reach them and nothing
   SIGTERMs them at logout. The drain still waits for their windows; they are only asked to leave
-  when the socket dies, as under GNOME.
+  when the socket dies, as under GNOME. (A flatpak app started from a terminal is the exception —
+  `flatpak run` makes it a scope regardless of who launched it, so `app-flatpak-*` now reaches it.)
 - **`DBusActivatable` apps are handled by GNOME restarting the bus** — see §4; that covers us too
   on every path except a bare `Quit`.
 - **`--session` under a non-systemd init** (dinit) drains with no way to stop the scopes, so a
@@ -188,9 +213,13 @@ tests in `src/tests/gnome.rs` set the flag by hand.
   confirm is not something we have seen, so this is recorded rather than fixed; the fix is for
   `Close` to cancel `session_drain_confirm`, which needs a decision about what the half-stopped
   session should then look like.
-- **A stuck app can cost two budgets.** If a confirm drain times out on it, gnome-session's
-  subsequent SIGTERM starts a fresh drain that gives the same app another 5 s — worst case a ~10 s
-  logout. Carrying the deadline across would fix it; not worth the state until it is seen.
+- **A stuck app can cost two budgets — seen 2026-08-03, and it cost 10.07 s.** If a confirm drain
+  times out, gnome-session's subsequent SIGTERM starts a fresh drain that gives what is left
+  another 5 s. Measured with firefox, Epiphany and OBS up: drain 1 `22.829 → 27.800`, SIGTERM at
+  `27.894`, drain 2 `27.915 → 32.897`. Worth reading *why* before adding state to fix it: the only
+  app in drain 2 was OBS, and OBS was in it because nothing had asked it to quit yet — the flatpak
+  scope fix above is what that logout actually needed. Carrying the deadline across is still the
+  fix for the general case; it is not obviously the fix for the case we have.
 - **Inhibitors are still parsed and discarded.** `EndSessionDialog.Open` takes a list of inhibitor
   object paths (`src/dbus/gnome_session.rs:59`) and the dialog does not show them, so an app with
   unsaved work has no way to say so. This is the piece that would let apps push back on a logout,
