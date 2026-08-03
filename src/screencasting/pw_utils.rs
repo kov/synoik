@@ -1818,6 +1818,15 @@ unsafe fn mark_buffer_as_good(pw_buffer: NonNull<pw_buffer>, sequence: &mut u64,
         // Clear the corrupted flag we may have set before.
         (*header).flags = 0;
         (*header).seq = *sequence;
+
+        // The frame's presentation timestamp, in nanoseconds on the monotonic clock — mutter sets
+        // it on every queued buffer (`meta-screen-cast-stream-src.c:1295`).
+        //
+        // We used to leave it alone. A consumer that orders frames by `pts` then has nothing to
+        // order them by: with a pool of eight buffers it renders whichever one it happens to pick
+        // rather than the newest, so a running animation shows up as its intermediate frames
+        // flickering against each other instead of playing.
+        (*header).pts = i64::try_from(get_monotonic_time().as_nanos()).unwrap_or(i64::MAX);
     }
 }
 
