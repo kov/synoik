@@ -207,9 +207,20 @@ the Vulkan tests in `src/tests/vulkan_render.rs` are where this is pinned —
 `vulkan_screenshot_ui_draws_the_help_panel` (`:413`) is the test that has to change shape first,
 since the help panel it asserts on is what slice 1 deletes.
 
-The delay slice's cover ended up in `vulkan_render.rs` after all, not the headless corpus: every
-one of its transitions starts at a picker that only opens with a renderer, so a corpus test would
-have had to fabricate the armed state instead of driving the real one.
+The delay slice's cover ended up in `vulkan_render.rs`, not the headless corpus. Not because the
+corpus *cannot* do it — `overview_dash_inert_behind_screenshot_ui` (`src/tests/gnome.rs:11360`)
+already opens the picker there with `headless().add_renderer()` behind a no-device skip guard, and
+these tests would work the same way. It is that doing so buys nothing: the guard means they would
+**skip** on a machine without a Vulkan device rather than run, and a skipped test is silent, whereas
+in `vulkan_render.rs` skipping is the whole file's stated contract.
+
+What would be worth having is cover that runs with **no device at all**, and the blocker for that is
+not opening the picker (`open_screenshot_ui` already tolerates a missing renderer — the neutrals are
+`unwrap_or_default()`) but **clicking** it: `PanelLayout` is produced by the bake, because the panel
+is content-sized and the captions need a `TextShaper`. No renderer → no layout → `control_at`
+returns `None` → no control can be driven. Giving the layout a shaper-free path (measured captions
+injected, or a metrics trait) is the seam that would move the D-Bus and cancellation assertions into
+the device-free corpus. It has not been built.
 
 - `vulkan_screenshot_ui_delay_arms_the_capture_without_answering_its_caller` — the cycle through
   the three stops, and the D-Bus contract on both sides: arming stays silent, cancelling answers.
