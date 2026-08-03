@@ -1,6 +1,6 @@
 ---
 source: src/tests/window_opening.rs
-description: "config:\nwindow-rule {\n    open-fullscreen true\n}"
+description: "open fullscreen: true"
 expression: snapshot
 ---
 initial configure:

@@ -1,5 +1,4 @@
 use bitflags::bitflags;
-use knuffel::errors::DecodeError;
 use niri_ipc::{
     ColumnDisplay, LayoutSwitchTarget, PositionChange, SizeChange, WorkspaceReferenceArg,
 };
@@ -85,15 +84,11 @@ bitflags! {
     }
 }
 
-#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct SwitchBinds {
-    #[knuffel(child)]
     pub lid_open: Option<SwitchAction>,
-    #[knuffel(child)]
     pub lid_close: Option<SwitchAction>,
-    #[knuffel(child)]
     pub tablet_mode_on: Option<SwitchAction>,
-    #[knuffel(child)]
     pub tablet_mode_off: Option<SwitchAction>,
 }
 
@@ -109,17 +104,15 @@ impl MergeWith<SwitchBinds> for SwitchBinds {
     }
 }
 
-#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SwitchAction {
-    #[knuffel(child, unwrap(arguments))]
     pub spawn: Vec<String>,
 }
 
 // Remember to add new actions to the CLI enum too.
-#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    Quit(#[knuffel(property(name = "skip-confirmation"), default)] bool),
-    #[knuffel(skip)]
+    Quit(bool),
     ChangeVt(i32),
     Suspend,
     PowerOffMonitors,
@@ -130,45 +123,37 @@ pub enum Action {
     ToggleDebugTint,
     DebugToggleOpaqueRegions,
     DebugToggleDamage,
-    Spawn(#[knuffel(arguments)] Vec<String>),
-    SpawnSh(#[knuffel(argument)] String),
-    DoScreenTransition(#[knuffel(property(name = "delay-ms"))] Option<u16>),
-    #[knuffel(skip)]
+    Spawn(Vec<String>),
+    SpawnSh(String),
+    DoScreenTransition(Option<u16>),
     ConfirmScreenshot {
         write_to_disk: bool,
     },
-    #[knuffel(skip)]
     CancelScreenshot,
-    #[knuffel(skip)]
     ScreenshotTogglePointer,
     /// Pick the area type from the screenshot UI's type row (its `s`/`c`/`w` keys).
-    #[knuffel(skip)]
     ScreenshotTypeSelection,
-    #[knuffel(skip)]
     ScreenshotTypeScreen,
-    #[knuffel(skip)]
     ScreenshotTypeWindow,
     /// Flip the screenshot UI between its shot and cast modes (its `v` key).
-    #[knuffel(skip)]
     ScreenshotToggleCast,
     Screenshot(
-        #[knuffel(property(name = "show-pointer"), default = true)] bool,
+        bool,
         // Path; not settable from knuffel
         Option<String>,
     ),
     ScreenshotScreen(
-        #[knuffel(property(name = "write-to-disk"), default = true)] bool,
-        #[knuffel(property(name = "show-pointer"), default = true)] bool,
+        bool,
+        bool,
         // Path; not settable from knuffel
         Option<String>,
     ),
     ScreenshotWindow(
-        #[knuffel(property(name = "write-to-disk"), default = true)] bool,
-        #[knuffel(property(name = "show-pointer"), default = false)] bool,
+        bool,
+        bool,
         // Path; not settable from knuffel
         Option<String>,
     ),
-    #[knuffel(skip)]
     ScreenshotWindowById {
         id: u64,
         write_to_disk: bool,
@@ -184,29 +169,23 @@ pub enum Action {
     /// it must not be able to *start* inhibiting the way a toggle would.
     RestoreKeyboardShortcuts,
     CloseWindow,
-    #[knuffel(skip)]
     CloseWindowById(u64),
     FullscreenWindow,
-    #[knuffel(skip)]
     FullscreenWindowById(u64),
     ToggleWindowedFullscreen,
-    #[knuffel(skip)]
     ToggleWindowedFullscreenById(u64),
-    #[knuffel(skip)]
     FocusWindow(u64),
-    FocusWindowInColumn(#[knuffel(argument)] u8),
+    FocusWindowInColumn(u8),
     FocusWindowPrevious,
     FocusColumnLeft,
-    #[knuffel(skip)]
     FocusColumnLeftUnderMouse,
     FocusColumnRight,
-    #[knuffel(skip)]
     FocusColumnRightUnderMouse,
     FocusColumnFirst,
     FocusColumnLast,
     FocusColumnRightOrFirst,
     FocusColumnLeftOrLast,
-    FocusColumn(#[knuffel(argument)] usize),
+    FocusColumn(usize),
     FocusWindowOrMonitorUp,
     FocusWindowOrMonitorDown,
     FocusColumnOrMonitorLeft,
@@ -229,92 +208,75 @@ pub enum Action {
     MoveColumnToLast,
     MoveColumnLeftOrToMonitorLeft,
     MoveColumnRightOrToMonitorRight,
-    MoveColumnToIndex(#[knuffel(argument)] usize),
+    MoveColumnToIndex(usize),
     MoveWindowDown,
     MoveWindowUp,
     MoveWindowDownOrToWorkspaceDown,
     MoveWindowUpOrToWorkspaceUp,
     ConsumeOrExpelWindowLeft,
-    #[knuffel(skip)]
     ConsumeOrExpelWindowLeftById(u64),
     ConsumeOrExpelWindowRight,
-    #[knuffel(skip)]
     ConsumeOrExpelWindowRightById(u64),
     ConsumeWindowIntoColumn,
     ExpelWindowFromColumn,
     SwapWindowLeft,
     SwapWindowRight,
     ToggleColumnTabbedDisplay,
-    SetColumnDisplay(#[knuffel(argument, str)] ColumnDisplay),
+    SetColumnDisplay(ColumnDisplay),
     CenterColumn,
     CenterWindow,
-    #[knuffel(skip)]
     CenterWindowById(u64),
     CenterVisibleColumns,
     FocusWorkspaceDown,
-    #[knuffel(skip)]
     FocusWorkspaceDownUnderMouse,
     FocusWorkspaceUp,
-    #[knuffel(skip)]
     FocusWorkspaceUpUnderMouse,
-    FocusWorkspace(#[knuffel(argument)] WorkspaceReference),
+    FocusWorkspace(WorkspaceReference),
     FocusWorkspacePrevious,
-    MoveWindowToWorkspaceDown(#[knuffel(property(name = "focus"), default = true)] bool),
-    MoveWindowToWorkspaceUp(#[knuffel(property(name = "focus"), default = true)] bool),
-    MoveWindowToWorkspace(
-        #[knuffel(argument)] WorkspaceReference,
-        #[knuffel(property(name = "focus"), default = true)] bool,
-    ),
-    #[knuffel(skip)]
+    MoveWindowToWorkspaceDown(bool),
+    MoveWindowToWorkspaceUp(bool),
+    MoveWindowToWorkspace(WorkspaceReference, bool),
     MoveWindowToWorkspaceById {
         window_id: u64,
         reference: WorkspaceReference,
         focus: bool,
     },
-    MoveColumnToWorkspaceDown(#[knuffel(property(name = "focus"), default = true)] bool),
-    MoveColumnToWorkspaceUp(#[knuffel(property(name = "focus"), default = true)] bool),
-    MoveColumnToWorkspace(
-        #[knuffel(argument)] WorkspaceReference,
-        #[knuffel(property(name = "focus"), default = true)] bool,
-    ),
+    MoveColumnToWorkspaceDown(bool),
+    MoveColumnToWorkspaceUp(bool),
+    MoveColumnToWorkspace(WorkspaceReference, bool),
     MoveWorkspaceDown,
     MoveWorkspaceUp,
-    MoveWorkspaceToIndex(#[knuffel(argument)] usize),
-    #[knuffel(skip)]
+    MoveWorkspaceToIndex(usize),
     MoveWorkspaceToIndexByRef {
         new_idx: usize,
         reference: WorkspaceReference,
     },
-    #[knuffel(skip)]
     MoveWorkspaceToMonitorByRef {
         output_name: String,
         reference: WorkspaceReference,
     },
-    MoveWorkspaceToMonitor(#[knuffel(argument)] String),
-    SetWorkspaceName(#[knuffel(argument)] String),
-    #[knuffel(skip)]
+    MoveWorkspaceToMonitor(String),
+    SetWorkspaceName(String),
     SetWorkspaceNameByRef {
         name: String,
         reference: WorkspaceReference,
     },
     UnsetWorkspaceName,
-    #[knuffel(skip)]
-    UnsetWorkSpaceNameByRef(#[knuffel(argument)] WorkspaceReference),
+    UnsetWorkSpaceNameByRef(WorkspaceReference),
     FocusMonitorLeft,
     FocusMonitorRight,
     FocusMonitorDown,
     FocusMonitorUp,
     FocusMonitorPrevious,
     FocusMonitorNext,
-    FocusMonitor(#[knuffel(argument)] String),
+    FocusMonitor(String),
     MoveWindowToMonitorLeft,
     MoveWindowToMonitorRight,
     MoveWindowToMonitorDown,
     MoveWindowToMonitorUp,
     MoveWindowToMonitorPrevious,
     MoveWindowToMonitorNext,
-    MoveWindowToMonitor(#[knuffel(argument)] String),
-    #[knuffel(skip)]
+    MoveWindowToMonitor(String),
     MoveWindowToMonitorById {
         id: u64,
         output: String,
@@ -325,43 +287,35 @@ pub enum Action {
     MoveColumnToMonitorUp,
     MoveColumnToMonitorPrevious,
     MoveColumnToMonitorNext,
-    MoveColumnToMonitor(#[knuffel(argument)] String),
-    SetWindowWidth(#[knuffel(argument, str)] SizeChange),
-    #[knuffel(skip)]
+    MoveColumnToMonitor(String),
+    SetWindowWidth(SizeChange),
     SetWindowWidthById {
         id: u64,
         change: SizeChange,
     },
-    SetWindowHeight(#[knuffel(argument, str)] SizeChange),
-    #[knuffel(skip)]
+    SetWindowHeight(SizeChange),
     SetWindowHeightById {
         id: u64,
         change: SizeChange,
     },
     ResetWindowHeight,
-    #[knuffel(skip)]
     ResetWindowHeightById(u64),
     SwitchPresetColumnWidth,
     SwitchPresetColumnWidthBack,
     SwitchPresetWindowWidth,
     SwitchPresetWindowWidthBack,
-    #[knuffel(skip)]
     SwitchPresetWindowWidthById(u64),
-    #[knuffel(skip)]
     SwitchPresetWindowWidthBackById(u64),
     SwitchPresetWindowHeight,
     SwitchPresetWindowHeightBack,
-    #[knuffel(skip)]
     SwitchPresetWindowHeightById(u64),
-    #[knuffel(skip)]
     SwitchPresetWindowHeightBackById(u64),
     MaximizeColumn,
     MaximizeWindowToEdges,
-    #[knuffel(skip)]
     MaximizeWindowToEdgesById(u64),
-    SetColumnWidth(#[knuffel(argument, str)] SizeChange),
+    SetColumnWidth(SizeChange),
     ExpandColumnToAvailableWidth,
-    SwitchLayout(#[knuffel(argument, str)] LayoutSwitchTarget),
+    SwitchLayout(LayoutSwitchTarget),
     ShowHotkeyOverlay,
     MoveWorkspaceToMonitorLeft,
     MoveWorkspaceToMonitorRight,
@@ -370,32 +324,25 @@ pub enum Action {
     MoveWorkspaceToMonitorPrevious,
     MoveWorkspaceToMonitorNext,
     ToggleWindowFloating,
-    #[knuffel(skip)]
     ToggleWindowFloatingById(u64),
     MoveWindowToFloating,
-    #[knuffel(skip)]
     MoveWindowToFloatingById(u64),
     MoveWindowToTiling,
-    #[knuffel(skip)]
     MoveWindowToTilingById(u64),
     FocusFloating,
     FocusTiling,
     SwitchFocusBetweenFloatingAndTiling,
-    #[knuffel(skip)]
     MoveFloatingWindowById {
         id: Option<u64>,
         x: PositionChange,
         y: PositionChange,
     },
     ToggleWindowRuleOpacity,
-    #[knuffel(skip)]
     ToggleWindowRuleOpacityById(u64),
     SetDynamicCastWindow,
-    #[knuffel(skip)]
     SetDynamicCastWindowById(u64),
-    SetDynamicCastMonitor(#[knuffel(argument)] Option<String>),
+    SetDynamicCastMonitor(Option<String>),
     ClearDynamicCastTarget,
-    #[knuffel(skip)]
     StopCast(u64),
     /// GNOME's `switch-to-workspace-last` (`<Super>End`): the last workspace on
     /// the active monitor, `get_workspace_by_index(n_workspaces - 1)`
@@ -404,15 +351,13 @@ pub enum Action {
     FocusWorkspaceLast,
     /// GNOME's `move-to-workspace-last` (`<Super><Shift>End`). The flag is
     /// whether to follow the window, matching [`MoveWindowToWorkspace`].
-    MoveWindowToWorkspaceLast(#[knuffel(property(name = "focus"), default = true)] bool),
+    MoveWindowToWorkspaceLast(bool),
     /// GNOME's `switch-to-application-N` (`<Super>1..9`): activate the Nth dash
     /// favourite — launch it if stopped, else raise its most recently used
     /// window (`_switchToApplication`, `windowManager.js:1725`).
-    #[knuffel(skip)]
     SwitchToApplication(u8),
     /// GNOME's `open-new-window-application-N` (`<Super><Ctrl>1..9`): ask the Nth
     /// favourite for another window rather than raising the one it has.
-    #[knuffel(skip)]
     OpenNewWindowApplication(u8),
     ToggleOverview,
     /// GNOME's `toggle-application-view` (`<Super>a`): from the window picker it
@@ -435,48 +380,39 @@ pub enum Action {
     ToggleTiledRight,
     /// Step the brightness scales up / down / cyclically. The bool is GNOME's `-monitor`
     /// variant: act on the monitor under the pointer instead of the global scale.
-    ScreenBrightnessUp(#[knuffel(property(name = "current-monitor"), default)] bool),
-    ScreenBrightnessDown(#[knuffel(property(name = "current-monitor"), default)] bool),
-    ScreenBrightnessCycle(#[knuffel(property(name = "current-monitor"), default)] bool),
+    ScreenBrightnessUp(bool),
+    ScreenBrightnessDown(bool),
+    ScreenBrightnessCycle(bool),
     /// Notify a grabbed accelerator (org.gnome.Shell GrabAccelerator); the
     /// argument is the grab's action id. Internal, not bindable from config.
-    #[knuffel(skip)]
     ActivateAcceleratorGrab(u32),
-    #[knuffel(skip)]
     ToggleWindowUrgent(u64),
-    #[knuffel(skip)]
     SetWindowUrgent(u64),
-    #[knuffel(skip)]
     UnsetWindowUrgent(u64),
     /// GNOME's `switch-applications` — raise the app switcher, or advance it if it is already
     /// up. `backward` is the binding's `-backward` half (`windowManager.js:1705`).
-    #[knuffel(skip)]
     SwitchApplications {
         backward: bool,
     },
     /// GNOME's `switch-windows` — the per-*window* Alt-Tab switcher, a different popup class
     /// from the app switcher above (`windowManager.js:1670-1694`).
-    #[knuffel(skip)]
     SwitchWindows {
         backward: bool,
     },
     /// GNOME's `switch-group` — the *same* popup as `switch-applications`, opened inside the
     /// current app: the app row is pinned to item 0 and the window sub-list comes up with it
     /// (`AppSwitcherPopup._initialSelection`, `altTab.js:117-137`).
-    #[knuffel(skip)]
     SwitchGroup {
         backward: bool,
     },
     /// GNOME's `cycle-windows` (`<Alt>Escape`) — `WindowCyclerPopup` (`altTab.js:638-667`). Same
     /// window list as the window switcher, but **no popup**: the selected window is raised and
     /// framed in place.
-    #[knuffel(skip)]
     CycleWindows {
         backward: bool,
     },
     /// GNOME's `cycle-group` (`<Alt>F6`) — `GroupCyclerPopup` (`altTab.js:541-580`), the same
     /// listless cycler restricted to the focused app's windows.
-    #[knuffel(skip)]
     CycleGroup {
         backward: bool,
     },
@@ -825,44 +761,6 @@ impl From<WorkspaceReferenceArg> for WorkspaceReference {
             WorkspaceReferenceArg::Id(id) => Self::Id(id),
             WorkspaceReferenceArg::Index(i) => Self::Index(i),
             WorkspaceReferenceArg::Name(n) => Self::Name(n),
-        }
-    }
-}
-
-impl<S: knuffel::traits::ErrorSpan> knuffel::DecodeScalar<S> for WorkspaceReference {
-    fn type_check(
-        type_name: &Option<knuffel::span::Spanned<knuffel::ast::TypeName, S>>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) {
-        if let Some(type_name) = &type_name {
-            ctx.emit_error(DecodeError::unexpected(
-                type_name,
-                "type name",
-                "no type name expected for this node",
-            ));
-        }
-    }
-
-    fn raw_decode(
-        val: &knuffel::span::Spanned<knuffel::ast::Literal, S>,
-        ctx: &mut knuffel::decode::Context<S>,
-    ) -> Result<WorkspaceReference, DecodeError<S>> {
-        match &**val {
-            knuffel::ast::Literal::String(ref s) => Ok(WorkspaceReference::Name(s.clone().into())),
-            knuffel::ast::Literal::Int(ref value) => match value.try_into() {
-                Ok(v) => Ok(WorkspaceReference::Index(v)),
-                Err(e) => {
-                    ctx.emit_error(DecodeError::conversion(val, e));
-                    Ok(WorkspaceReference::Index(0))
-                }
-            },
-            _ => {
-                ctx.emit_error(DecodeError::unsupported(
-                    val,
-                    "Unsupported value, only numbers and strings are recognized",
-                ));
-                Ok(WorkspaceReference::Index(0))
-            }
         }
     }
 }

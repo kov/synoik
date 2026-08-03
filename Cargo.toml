@@ -192,10 +192,6 @@ debug = true
 overflow-checks = true
 lto = "thin"
 
-[profile.release.package.niri-config]
-# knuffel with chomsky generates a metric ton of debuginfo.
-debug = false
-
 # Dev builds are optimized, ours and our dependencies' alike. The dev binary is what the
 # gsrs seat runs, so anything slow here is slow in the session — and the three settings
 # below are what it took to make the stock 4K JPEG-XL wallpaper decode in 0.28s instead of

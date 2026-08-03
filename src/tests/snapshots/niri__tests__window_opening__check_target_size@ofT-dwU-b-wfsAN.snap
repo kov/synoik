@@ -1,6 +1,6 @@
 ---
 source: src/tests/window_opening.rs
-description: "want fullscreen: AN\nconfig:\nwindow-rule {\n    open-floating true\n    default-column-width {  }\n    border { on; }\n}"
+description: "open floating: true\ndefault column width: U\nborder on\nwant fullscreen: AN"
 expression: snapshot
 ---
 initial configure:

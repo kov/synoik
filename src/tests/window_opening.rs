@@ -1,13 +1,29 @@
-use std::fmt::{self, Write as _};
+use std::fmt;
+use std::str::FromStr as _;
 
 use insta::assert_snapshot;
-use niri_config::Config;
+use niri_config::utils::RegexEq;
+use niri_config::window_rule::Match;
+use niri_config::workspace::WorkspaceName;
+use niri_config::{
+    BorderRule, Config, DefaultPresetSize, FloatOrInt, LayoutPart, Output, Outputs, PresetSize,
+    WindowRule, Workspace, WorkspaceLayoutPart,
+};
+use niri_ipc::ColumnDisplay;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use super::*;
 use crate::layout::LayoutElement as _;
 use crate::utils::spawning::store_and_increase_nofile_rlimit;
 use crate::utils::with_toplevel_role;
+
+/// A window rule match on the window title, the way the config file used to spell it.
+fn title_match(title: &str) -> Match {
+    Match {
+        title: Some(RegexEq::from_str(title).unwrap()),
+        ..Default::default()
+    }
+}
 
 #[test]
 fn simple_no_workspaces() {
@@ -151,6 +167,16 @@ enum DefaultSize {
     Fixed(&'static str),
 }
 
+impl DefaultSize {
+    fn to_preset(self) -> DefaultPresetSize {
+        DefaultPresetSize(match self {
+            DefaultSize::WindowChooses => None,
+            DefaultSize::Proportion(prop) => Some(PresetSize::Proportion(prop.parse().unwrap())),
+            DefaultSize::Fixed(fixed) => Some(PresetSize::Fixed(fixed.parse().unwrap())),
+        })
+    }
+}
+
 impl fmt::Display for DefaultSize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -224,57 +250,65 @@ fn check_target_output_and_workspace(
     let mut snapshot_desc = Vec::new();
     let mut snapshot_suffix = Vec::new();
 
-    let mut config = String::from(
-        r##"
-output "headless-2" {
-    layout {
-        border {
-            on
-        }
-    }
-}
+    let mut config = Config {
+        outputs: Outputs(vec![Output {
+            name: String::from("headless-2"),
+            layout: Some(LayoutPart {
+                border: Some(BorderRule {
+                    on: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]),
+        workspaces: vec![
+            Workspace {
+                name: WorkspaceName(String::from("ws-1")),
+                open_on_output: Some(String::from("headless-1")),
+                layout: None,
+            },
+            Workspace {
+                name: WorkspaceName(String::from("ws-2")),
+                open_on_output: Some(String::from("headless-2")),
+                layout: Some(WorkspaceLayoutPart(LayoutPart {
+                    border: Some(BorderRule {
+                        width: Some(FloatOrInt(10.)),
+                        ..Default::default()
+                    }),
+                    default_column_width: Some(DefaultPresetSize(Some(PresetSize::Fixed(500)))),
+                    ..Default::default()
+                })),
+            },
+        ],
+        ..Default::default()
+    };
 
-workspace "ws-1" {
-    open-on-output "headless-1"
-}
-
-workspace "ws-2" {
-    open-on-output "headless-2"
-
-    layout {
-        border {
-            width 10
-        }
-
-        default-column-width {
-            fixed 500
-        }
-    }
-}
-
-window-rule {
-    exclude title="parent"
-
-"##,
-    );
+    let mut rule = WindowRule {
+        excludes: vec![title_match("parent")],
+        ..Default::default()
+    };
 
     if let Some(x) = open_on_workspace {
-        writeln!(config, "    open-on-workspace \"ws-{x}\"").unwrap();
+        rule.open_on_workspace = Some(format!("ws-{x}"));
+        snapshot_desc.push(format!("open on workspace: ws-{x}"));
         snapshot_suffix.push(format!("ws{x}"));
     }
 
     if let Some(x) = open_on_output {
-        writeln!(config, "    open-on-output \"headless-{x}\"").unwrap();
+        rule.open_on_output = Some(format!("headless-{x}"));
+        snapshot_desc.push(format!("open on output: headless-{x}"));
         snapshot_suffix.push(format!("out{x}"));
     }
 
     if let Some(x) = open_fullscreen {
-        writeln!(config, "    open-fullscreen {x}").unwrap();
+        rule.open_fullscreen = Some(x == "true");
+        snapshot_desc.push(format!("open fullscreen: {x}"));
 
         let x = if x == "true" { "T" } else { "F" };
         snapshot_suffix.push(format!("fs{x}"));
     }
-    config.push('}');
+    config.window_rules.push(rule);
 
     match &want_fullscreen {
         WantFullscreen::No => (),
@@ -289,24 +323,17 @@ window-rule {
             SetParent::BeforeInitial(mon) => mon,
             SetParent::AfterInitial(mon) => mon,
         };
-        write!(
-            config,
-            "
-
-window-rule {{
-    match title=\"parent\"
-    open-on-output \"headless-{mon}\"
-}}"
-        )
-        .unwrap();
+        config.window_rules.push(WindowRule {
+            matches: vec![title_match("parent")],
+            open_on_output: Some(format!("headless-{mon}")),
+            ..Default::default()
+        });
 
         snapshot_desc.push(format!("set parent: {set_parent}"));
         snapshot_suffix.push(format!("sp{set_parent}"));
     }
 
-    snapshot_desc.push(format!("config:{config}"));
-
-    let config = scrolling(Config::parse_mem(&config).unwrap());
+    let config = scrolling(config);
 
     let mut f = Fixture::with_config(config);
     f.add_output(1, (1280, 720));
@@ -519,65 +546,56 @@ fn check_target_size(
     let mut snapshot_desc = Vec::new();
     let mut snapshot_suffix = Vec::new();
 
-    let mut config = String::from(
-        r##"
-window-rule {
-"##,
-    );
+    let mut config = Config::default();
+    let mut rule = WindowRule::default();
 
     if let Some(x) = open_fullscreen {
-        writeln!(config, "    open-fullscreen {x}").unwrap();
+        rule.open_fullscreen = Some(x == "true");
+        snapshot_desc.push(format!("open fullscreen: {x}"));
 
         let x = if x == "true" { "T" } else { "F" };
         snapshot_suffix.push(format!("fs{x}"));
     }
 
     if let Some(x) = open_maximized {
-        writeln!(config, "    open-maximized {x}").unwrap();
+        rule.open_maximized = Some(x == "true");
+        snapshot_desc.push(format!("open maximized: {x}"));
 
         let x = if x == "true" { "T" } else { "F" };
         snapshot_suffix.push(format!("om{x}"));
     }
 
     if let Some(x) = open_floating {
-        writeln!(config, "    open-floating {x}").unwrap();
+        rule.open_floating = Some(x == "true");
+        snapshot_desc.push(format!("open floating: {x}"));
 
         let x = if x == "true" { "T" } else { "F" };
         snapshot_suffix.push(format!("of{x}"));
     }
 
     if let Some(x) = default_width {
-        let value = match x {
-            DefaultSize::WindowChooses => String::new(),
-            DefaultSize::Proportion(prop) => format!("proportion {prop};"),
-            DefaultSize::Fixed(fixed) => format!("fixed {fixed};"),
-        };
-        writeln!(config, "    default-column-width {{ {value} }}").unwrap();
-
+        rule.default_column_width = Some(x.to_preset());
+        snapshot_desc.push(format!("default column width: {x}"));
         snapshot_suffix.push(format!("dw{x}"));
     }
 
     if let Some(x) = default_height {
-        let value = match x {
-            DefaultSize::WindowChooses => String::new(),
-            DefaultSize::Proportion(prop) => format!("proportion {prop};"),
-            DefaultSize::Fixed(fixed) => format!("fixed {fixed};"),
-        };
-        writeln!(config, "    default-window-height {{ {value} }}").unwrap();
-
+        rule.default_window_height = Some(x.to_preset());
+        snapshot_desc.push(format!("default window height: {x}"));
         snapshot_suffix.push(format!("dh{x}"));
     }
 
     if border {
-        writeln!(config, "    border {{ on; }}").unwrap();
+        rule.border.on = true;
+        snapshot_desc.push(String::from("border on"));
         snapshot_suffix.push(String::from("b"));
     }
 
     if tabbed {
-        writeln!(config, "    default-column-display \"tabbed\"").unwrap();
+        rule.default_column_display = Some(ColumnDisplay::Tabbed);
     }
 
-    config.push('}');
+    config.window_rules.push(rule);
 
     match &want_fullscreen {
         WantFullscreen::No => (),
@@ -588,20 +606,12 @@ window-rule {
     }
 
     if tabbed {
-        config.push_str(
-            "\n
-layout {
-    tab-indicator {
-        place-within-column
-    }
-}",
-        );
+        config.layout.tab_indicator.place_within_column = true;
+        snapshot_desc.push(String::from("tabbed"));
         snapshot_suffix.push(String::from("t"));
     }
 
-    snapshot_desc.push(format!("config:{config}"));
-
-    let config = scrolling(Config::parse_mem(&config).unwrap());
+    let config = scrolling(config);
 
     let mut f = Fixture::with_config(config);
     f.add_output(1, (1280, 720));
@@ -732,27 +742,26 @@ fn check_fullscreen_maximize(
     let mut snapshot_desc = Vec::new();
     let mut snapshot_suffix = Vec::new();
 
-    let mut config = String::from(
-        r##"
-window-rule {
-"##,
-    );
+    let mut config = Config::default();
+    let mut rule = WindowRule::default();
 
     if let Some(x) = open_fullscreen {
-        writeln!(config, "    open-fullscreen {x}").unwrap();
+        rule.open_fullscreen = Some(x == "true");
+        snapshot_desc.push(format!("open fullscreen: {x}"));
 
         let x = if x == "true" { "T" } else { "F" };
         snapshot_suffix.push(format!("fs{x}"));
     }
 
     if let Some(x) = open_maximized {
-        writeln!(config, "    open-maximized-to-edges {x}").unwrap();
+        rule.open_maximized_to_edges = Some(x == "true");
+        snapshot_desc.push(format!("open maximized to edges: {x}"));
 
         let x = if x == "true" { "T" } else { "F" };
         snapshot_suffix.push(format!("tm{x}"));
     }
 
-    config.push('}');
+    config.window_rules.push(rule);
 
     match &want_fullscreen {
         WantFullscreen::No => (),
@@ -770,9 +779,7 @@ window-rule {
         }
     }
 
-    snapshot_desc.push(format!("config:{config}"));
-
-    let config = scrolling(Config::parse_mem(&config).unwrap());
+    let config = scrolling(config);
 
     let mut f = Fixture::with_config(config);
     f.add_output(1, (1280, 720));

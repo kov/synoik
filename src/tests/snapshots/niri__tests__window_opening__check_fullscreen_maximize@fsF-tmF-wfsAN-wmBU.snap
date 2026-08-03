@@ -1,6 +1,6 @@
 ---
 source: src/tests/window_opening.rs
-description: "want fullscreen: AN\nwant maximized: BU\nconfig:\nwindow-rule {\n    open-fullscreen false\n    open-maximized-to-edges false\n}"
+description: "open fullscreen: false\nopen maximized to edges: false\nwant fullscreen: AN\nwant maximized: BU"
 expression: snapshot
 ---
 initial configure:

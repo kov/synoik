@@ -159,10 +159,12 @@ remaining slow frame is an overview animation or first-time startup work.
 - **An A/B on the live seat does not need a restart, and comparing two sessions is not an A/B.**
   Session-to-session numbers are dominated by how much the desktop was driven — the same build
   reported 0.8 and 12.3 over-budget frames/min depending on the session. `debug` options are read
-  per frame out of the live config and niri re-reads the file on save, so the control can run in
-  the *same process* minutes later: writing
-  `debug { wait-for-frame-completion-before-queueing }` into `~gsrs/.config/niri/config.kdl` is
-  what turned "the deferred run looks better" into an attributable 13.33 ms.
+  per frame out of the live config, so the control can run in the *same process* minutes later:
+  setting `wait-for-frame-completion-before-queueing` is what turned "the deferred run looks
+  better" into an attributable 13.33 ms. (At the time that meant writing a `debug {}` block into
+  `~gsrs/.config/niri/config.kdl` and saving, which the watcher picked up. There is no config file
+  any more — the toggles are `NIRI_DEBUG_*` env vars, read once at startup, so the same A/B now
+  costs a session restart. See `RUNNING.md`.)
 - **First-entry costs are not steady-state costs.** Opening the app grid the first time is
   ~40–70 ms of icon uploads (~20 submits). It caches. Do not optimise it by mistake.
 

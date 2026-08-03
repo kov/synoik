@@ -1,6 +1,6 @@
 ---
 source: src/tests/window_opening.rs
-description: "want fullscreen: BN\nconfig:\nwindow-rule {\n    default-column-width { fixed 1000; }\n    border { on; }\n}"
+description: "default column width: F1000\nborder on\nwant fullscreen: BN"
 expression: snapshot
 ---
 initial configure:

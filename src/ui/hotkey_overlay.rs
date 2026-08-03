@@ -734,7 +734,12 @@ mod tests {
     #[test]
     fn hide_not_bound_still_sees_the_settings_model() {
         let keybindings = crate::gnome::GnomeSettings::default().keybindings;
-        let config = Config::parse_mem("hotkey-overlay { hide-not-bound; }").unwrap();
+        let config = Config {
+            hotkey_overlay: niri_config::HotkeyOverlay {
+                hide_not_bound: true,
+            },
+            ..Default::default()
+        };
 
         let actions = collect_actions(&config, &keybindings);
         assert!(actions.contains(&Action::CloseWindow));

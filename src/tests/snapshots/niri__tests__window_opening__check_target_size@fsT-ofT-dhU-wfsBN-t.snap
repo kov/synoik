@@ -1,6 +1,6 @@
 ---
 source: src/tests/window_opening.rs
-description: "want fullscreen: BN\nconfig:\nwindow-rule {\n    open-fullscreen true\n    open-floating true\n    default-window-height {  }\n    default-column-display \"tabbed\"\n}\n\nlayout {\n    tab-indicator {\n        place-within-column\n    }\n}"
+description: "open fullscreen: true\nopen floating: true\ndefault window height: U\nwant fullscreen: BN\ntabbed"
 expression: snapshot
 ---
 initial configure:

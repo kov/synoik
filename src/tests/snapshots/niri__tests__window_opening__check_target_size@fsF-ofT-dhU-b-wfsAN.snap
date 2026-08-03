@@ -1,6 +1,6 @@
 ---
 source: src/tests/window_opening.rs
-description: "want fullscreen: AN\nconfig:\nwindow-rule {\n    open-fullscreen false\n    open-floating true\n    default-window-height {  }\n    border { on; }\n}"
+description: "open fullscreen: false\nopen floating: true\ndefault window height: U\nborder on\nwant fullscreen: AN"
 expression: snapshot
 ---
 initial configure:

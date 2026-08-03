@@ -1,6 +1,6 @@
 ---
 source: src/tests/window_opening.rs
-description: "want fullscreen: AU\nconfig:\nwindow-rule {\n    open-maximized true\n    default-column-width { fixed 1000; }\n    default-window-height { proportion 0.5; }\n    border { on; }\n    default-column-display \"tabbed\"\n}\n\nlayout {\n    tab-indicator {\n        place-within-column\n    }\n}"
+description: "open maximized: true\ndefault column width: F1000\ndefault window height: P0.5\nborder on\nwant fullscreen: AU\ntabbed"
 expression: snapshot
 ---
 initial configure:

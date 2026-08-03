@@ -1,6 +1,6 @@
 ---
 source: src/tests/window_opening.rs
-description: "want fullscreen: AU\nconfig:\nwindow-rule {\n    open-fullscreen true\n    default-column-width { fixed 1000; }\n}"
+description: "open fullscreen: true\ndefault column width: F1000\nwant fullscreen: AU"
 expression: snapshot
 ---
 initial configure:

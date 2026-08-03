@@ -1,6 +1,6 @@
 ---
 source: src/tests/window_opening.rs
-description: "want fullscreen: AN\nconfig:\nwindow-rule {\n    border { on; }\n}"
+description: "border on\nwant fullscreen: AN"
 expression: snapshot
 ---
 initial configure:

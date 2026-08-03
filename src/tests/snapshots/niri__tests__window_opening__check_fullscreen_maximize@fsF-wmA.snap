@@ -1,6 +1,6 @@
 ---
 source: src/tests/window_opening.rs
-description: "want maximized: A\nconfig:\nwindow-rule {\n    open-fullscreen false\n}"
+description: "open fullscreen: false\nwant maximized: A"
 expression: snapshot
 ---
 initial configure:

@@ -1,6 +1,6 @@
 use client::ClientId;
 use insta::assert_snapshot;
-use niri_config::Config;
+use niri_config::{Config, WindowRule};
 use niri_ipc::SizeChange;
 use smithay::utils::Point;
 use wayland_client::protocol::wl_surface::WlSurface;
@@ -902,13 +902,14 @@ fn floating_doesnt_store_maximized_size() {
 
 #[test]
 fn floating_respects_non_fixed_min_max_rule() {
-    let config = r##"
-window-rule {
-    min-width 200
-    max-width 300
-}
-"##;
-    let config = scrolling(Config::parse_mem(config).unwrap());
+    let config = scrolling(Config {
+        window_rules: vec![WindowRule {
+            min_width: Some(200),
+            max_width: Some(300),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
     let (mut f, id, surface) = set_up_with_config(config);
 
     // Commit to the Activated state configure.
@@ -1204,12 +1205,9 @@ fn unmaximize_to_same_size_windowed_fullscreen_floating() {
 
 #[test]
 fn unfullscreen_to_same_size_same_bounds_floating() {
-    let config = r##"
-layout {
-    gaps 0
-}
-"##;
-    let config = scrolling(Config::parse_mem(config).unwrap());
+    let mut config = Config::default();
+    config.layout.gaps = 0.;
+    let config = scrolling(config);
     let (mut f, id, surface) = set_up_with_config(config);
 
     // Make it floating.
@@ -1248,12 +1246,9 @@ layout {
 
 #[test]
 fn unmaximize_to_same_size_same_bounds_floating() {
-    let config = r##"
-layout {
-    gaps 0
-}
-"##;
-    let config = scrolling(Config::parse_mem(config).unwrap());
+    let mut config = Config::default();
+    config.layout.gaps = 0.;
+    let config = scrolling(config);
     let (mut f, id, surface) = set_up_with_config(config);
 
     // Make it floating.

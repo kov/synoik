@@ -1,6 +1,6 @@
 ---
 source: src/tests/window_opening.rs
-description: "want fullscreen: AN\nconfig:\nwindow-rule {\n    open-maximized true\n    default-column-width {  }\n    default-window-height { fixed 500; }\n    border { on; }\n}"
+description: "open maximized: true\ndefault column width: U\ndefault window height: F500\nborder on\nwant fullscreen: AN"
 expression: snapshot
 ---
 initial configure:
