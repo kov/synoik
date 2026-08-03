@@ -1907,11 +1907,22 @@ impl State {
     /// Returns whether the caller should close the overview: GNOME hides it on every branch
     /// (`appDisplay.js:3073`), including the one that does nothing.
     fn activate_app_icon(&mut self, id: &str, button: Option<MouseButton>, origin: &str) {
+        // An icon reads the intent off the input: Ctrl or a middle-click asks for a new
+        // window (`AppIcon._onButtonPress` / `activate`). Keyboard callers state it.
         let ctrl = self.niri.seat.get_keyboard().unwrap().modifier_state().ctrl;
         let wants_new = ctrl || button == Some(MouseButton::Middle);
+        self.activate_app(id, wants_new, origin);
+    }
 
+    /// `shell_app_activate_full` (`shell-app.c:497`): stopped apps launch, starting
+    /// apps are left alone, and a running app raises its most recently used window
+    /// — unless `wants_new`, which asks for another window instead.
+    fn activate_app(&mut self, id: &str, wants_new: bool, origin: &str) {
         match self.niri.app_system.app_state(id) {
             AppState::Stopped => {
+                // `wants_new` makes no difference here: gnome-shell's
+                // `shell_app_open_new_window` on a stopped app falls through to
+                // `shell_app_launch` too, since there is no window to be second to.
                 self.launch_app(id, LaunchMode::Activate, None, origin);
             }
             AppState::Starting => {}
@@ -1924,6 +1935,22 @@ impl State {
                 }
             }
         }
+    }
+
+    /// The nth favourite app's desktop id, 1-based — gnome-shell's
+    /// `_getNthFavoriteApp`, which indexes `AppFavorites.getFavorites()`.
+    ///
+    /// That is the *resolved* list, not the raw `favorite-apps` strv: a stored id
+    /// for an app that isn't installed drops out of it. Counting the raw list
+    /// instead would make `<Super>3` and the third dash tile disagree the moment
+    /// one goes missing.
+    fn nth_favorite_app(&self, n: u8) -> Option<String> {
+        let index = usize::from(n).checked_sub(1)?;
+        self.niri
+            .app_system
+            .favorites()
+            .get(index)
+            .map(|entry| entry.id.clone())
     }
 
     /// The app's most recently used window — `shell_app_activate_window`'s "most recently used
@@ -3783,6 +3810,21 @@ impl State {
                         Action::MoveWindowToWorkspace(WorkspaceReference::Index(last), focus),
                         false,
                     );
+                }
+            }
+            Action::SwitchToApplication(n) => {
+                if let Some(id) = self.nth_favorite_app(n) {
+                    // `_switchToApplication` hides the overview before activating, so the
+                    // key works the same whether or not you are looking at the overview.
+                    self.niri.layout.close_overview();
+                    self.activate_app(&id, false, "keybinding");
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::OpenNewWindowApplication(n) => {
+                if let Some(id) = self.nth_favorite_app(n) {
+                    // `_openNewApplicationWindow` does *not* hide the overview.
+                    self.activate_app(&id, true, "keybinding");
                 }
             }
             Action::ToggleOverview => {
@@ -8763,6 +8805,8 @@ fn accel_matches(
 pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
     Some(match action {
         GnomeKeyAction::PanelRunDialog => Action::ShowRunDialog,
+        GnomeKeyAction::SwitchToApplication(n) => Action::SwitchToApplication(n),
+        GnomeKeyAction::OpenNewWindowApplication(n) => Action::OpenNewWindowApplication(n),
         GnomeKeyAction::ToggleOverview => Action::ToggleOverview,
         GnomeKeyAction::ToggleApplicationView => Action::ToggleApplicationView,
         GnomeKeyAction::ToggleMessageTray => Action::ToggleMessageTray,

@@ -389,6 +389,15 @@ pub enum Action {
     /// GNOME's `move-to-workspace-last` (`<Super><Shift>End`). The flag is
     /// whether to follow the window, matching [`MoveWindowToWorkspace`].
     MoveWindowToWorkspaceLast(#[knuffel(property(name = "focus"), default = true)] bool),
+    /// GNOME's `switch-to-application-N` (`<Super>1..9`): activate the Nth dash
+    /// favourite — launch it if stopped, else raise its most recently used
+    /// window (`_switchToApplication`, `windowManager.js:1725`).
+    #[knuffel(skip)]
+    SwitchToApplication(u8),
+    /// GNOME's `open-new-window-application-N` (`<Super><Ctrl>1..9`): ask the Nth
+    /// favourite for another window rather than raising the one it has.
+    #[knuffel(skip)]
+    OpenNewWindowApplication(u8),
     ToggleOverview,
     /// GNOME's `toggle-application-view` (`<Super>a`): from the window picker it
     /// flips to the app grid and back, and from a closed overview it opens

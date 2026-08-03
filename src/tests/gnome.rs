@@ -802,6 +802,92 @@ fn shortcuts_inhibit_masks_gnome_keybindings() {
     );
 }
 
+/// `<Super>N` is `switch-to-application-N`: it activates the Nth *dash favourite*
+/// — not workspace N, which GNOME leaves unbound. A stopped app launches, and the
+/// overview closes on the way, since `_switchToApplication` calls
+/// `Main.overview.hide()` before `app.activate()`.
+#[test]
+fn super_number_activates_the_nth_favorite() {
+    use crate::app_system::ResolvedLaunch;
+
+    let (mut f, recorder) = dash_fixture(&["a.desktop", "b.desktop"]);
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_2);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    let calls = recorder.calls.borrow();
+    assert_eq!(calls.len(), 1, "exactly one favorite launched");
+    assert_eq!(
+        calls[0].0.id, "b.desktop",
+        "<Super>2 must activate the second favorite"
+    );
+    assert_eq!(calls[0].1, ResolvedLaunch::Default);
+    drop(calls);
+
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "_switchToApplication hides the overview before activating"
+    );
+}
+
+/// The index is into the *resolved* favourites, the same list the dash draws
+/// (`AppFavorites.getFavorites()`): a stored id whose app isn't installed drops
+/// out of it, and `<Super>N` has to keep pointing at the Nth tile rather than the
+/// Nth stored string.
+#[test]
+fn super_number_counts_the_favorites_the_dash_shows() {
+    let (mut f, recorder) = dash_fixture(&["a.desktop", "b.desktop"]);
+
+    // A stored favorite for an app that isn't installed: the dash skips it, so the
+    // second *tile* is the third stored id.
+    f.niri().app_system.set_favorites(vec![
+        "a.desktop".to_owned(),
+        "ghost.desktop".to_owned(),
+        "b.desktop".to_owned(),
+    ]);
+    f.niri().sync_dash_favorites();
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_2);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    let calls = recorder.calls.borrow();
+    assert_eq!(calls.len(), 1, "exactly one favorite launched");
+    assert_eq!(
+        calls[0].0.id, "b.desktop",
+        "<Super>2 must follow the dash, not the raw favorite-apps list"
+    );
+}
+
+/// `<Super><Ctrl>N` is `open-new-window-application-N`, which asks for another
+/// window rather than raising the one the app has — and, unlike its plain
+/// counterpart, leaves the overview up (`_openNewApplicationWindow` has no
+/// `Main.overview.hide()`).
+#[test]
+fn super_ctrl_number_asks_for_a_new_window() {
+    let (mut f, recorder) = dash_fixture(&["a.desktop"]);
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_LEFTCTRL);
+    tap(&mut f, KEY_1);
+    f.key_release(KEY_LEFTCTRL);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+
+    assert_eq!(
+        recorder.calls.borrow().len(),
+        1,
+        "<Super><Ctrl>1 must reach the launcher"
+    );
+    assert!(
+        f.niri().layout.is_overview_open(),
+        "opening a new window must not close the overview"
+    );
+}
+
 /// `toggle-maximized` (`<Alt>F10`) is the one key that goes both ways:
 /// `handle_toggle_maximized` unmaximizes a maximized window and maximizes
 /// anything else, where `maximize`/`unmaximize` (`<Super>Up`/`<Super>Down`) are

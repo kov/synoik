@@ -76,10 +76,15 @@ recovery key could arm the very thing it exists to undo.
 
 `org.gnome.mutter` — `overlay-key` (the Super tap, with mutter's arm/disarm state machine).
 
-`org.gnome.shell.keybindings` — `toggle-overview`, `toggle-application-view`,
+`org.gnome.shell.keybindings` — `switch-to-application-1..9`,
+`open-new-window-application-1..9`, `toggle-overview`, `toggle-application-view`,
 `toggle-message-tray`, `toggle-quick-settings`, `show-screenshot-ui`, `screenshot`,
 `screenshot-window`, `show-screen-recording-ui`,
 `screen-brightness-{up,down,cycle}[-monitor]`.
+
+`switch-to-application-N` indexes the **resolved** favourites — `AppFavorites.getFavorites()`,
+which is what the dash draws — not the raw `favorite-apps` strv. A stored id whose app isn't
+installed drops out of the resolved list, and `<Super>N` has to keep meaning "the Nth tile".
 
 `toggle-message-tray` and `toggle-quick-settings` are registered by gnome-shell with
 `ShellActionMode.POPUP` (`windowManager.js:747-760`), so they keep resolving while a panel menu
@@ -168,7 +173,7 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 | S2 | `non_maskable` flag + `restore-shortcuts` + `switch-to-session-N` | **done** |
 | S3 | Shell UI toggles: overview, app grid, quick settings, message tray | **done** |
 | S4 | wm/mutter window + monitor keys: `toggle-maximized`, `move-to-monitor-*`, `*-workspace-last`, `switch-input-source` | **done** |
-| S5 | `switch-to-application-N` + `open-new-window-application-N`, on a real focus-or-launch path | |
+| S5 | `switch-to-application-N` + `open-new-window-application-N` | **done** |
 | S6 | Our own schema for the niri actions, plus its packaging | |
 | S7 | Route the non-keyboard triggers (mouse, wheel, touchpad, tablet) through the model | |
 | S8 | Prune and then delete the KDL `binds{}` | |

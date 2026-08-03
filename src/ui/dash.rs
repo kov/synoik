@@ -21,12 +21,6 @@
 //! is armed; we have no dash tooltip at all yet, so the arming shows only as its hover
 //! fill.
 //!
-//! **S6 divergence — clicking a *running* app relaunches it.** GNOME's
-//! `AppIcon.activate` calls `shell_app_activate`, which for a running app raises
-//! its most recent window instead of spawning a second copy. We have no
-//! window-activation path from a desktop id yet, so every dash tile launches. That
-//! is deferred; it needs `RunningApp` to carry window ids and a focus action.
-//!
 //! **Input divergences (S3):** a right-click on a GNOME dash icon opens the app
 //! context menu (`AppIconMenu`); we consume it inertly (the menu is a later slice).
 //! The dash is mouse-only for now: touch taps fall through to the overview's touch

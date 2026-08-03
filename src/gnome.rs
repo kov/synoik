@@ -988,6 +988,11 @@ pub enum GnomeKeyAction {
     /// the duration of the modifier hold; we switch straight away. The popup is
     /// the same shape as the alt-tab switchers and belongs with them.
     SwitchInputSource { backward: bool },
+    /// `switch-to-application-N` (`<Super>1..9`, 1-based): activate the Nth dash
+    /// favourite.
+    SwitchToApplication(u8),
+    /// `open-new-window-application-N` (`<Super><Ctrl>1..9`, 1-based).
+    OpenNewWindowApplication(u8),
     /// `toggle-overview` (`org.gnome.shell.keybindings`): the overview. Unbound by
     /// default — GNOME opens the overview with the overlay key.
     ToggleOverview,
@@ -1810,7 +1815,7 @@ fn adopted_shell_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
         )
     }
 
-    vec![
+    let mut keys = vec![
         (
             "toggle-overview".to_owned(),
             GnomeKeyAction::ToggleOverview,
@@ -1888,7 +1893,24 @@ fn adopted_shell_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
             true,
             "<Shift>XF86MonBrightnessCycle",
         ),
-    ]
+    ];
+
+    // The number row belongs to the dash, not to the workspaces: `<Super>N` activates
+    // the Nth favourite and `<Super><Ctrl>N` asks it for another window.
+    for n in 1..=9u8 {
+        keys.push((
+            format!("switch-to-application-{n}"),
+            GnomeKeyAction::SwitchToApplication(n),
+            vec![format!("<Super>{n}")],
+        ));
+        keys.push((
+            format!("open-new-window-application-{n}"),
+            GnomeKeyAction::OpenNewWindowApplication(n),
+            vec![format!("<Super><Control>{n}")],
+        ));
+    }
+
+    keys
 }
 
 /// The `org.gnome.mutter.wayland.keybindings` keys we honor — mutter's two
