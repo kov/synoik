@@ -72,6 +72,7 @@ use crate::utils::{center, get_monotonic_time, output_size, CastSessionId, Resiz
 
 pub mod backend_ext;
 pub mod move_grab;
+pub mod peripherals;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
 pub mod resize_grab;

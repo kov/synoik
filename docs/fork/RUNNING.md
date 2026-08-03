@@ -342,6 +342,11 @@ the fork tenet, GNOME's settings are the settings. What is still only in
 `Config::default()` is work that has not been ported yet, and that is on purpose:
 a compiled-in default is visible as a gap, a config knob hides one.
 
+Input devices are the first block to complete that move: touchpad, mouse, trackball,
+pointingstick and key repeat all come from `org.gnome.desktop.peripherals.*`, so
+**Settings → Mouse & Touchpad** works and takes effect with no restart. Tablet and touchscreen
+are not ported yet — see `docs/fork/input-peripherals-port.md`.
+
 The one escape hatch is the debug toggles that used to live in `debug {}`. They
 come from the environment now — `NIRI_DEBUG_<FIELD_NAME_IN_CAPS>`, the same
 idiom as `NIRI_VK_VALIDATION`, so a systemd drop-in reaches the live session:

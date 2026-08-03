@@ -19,6 +19,7 @@ use niri_config::{Action, Modifiers};
 use niri_ipc::SizeChange;
 use smithay::input::keyboard::{xkb, Keysym};
 
+use crate::input::peripherals::Peripherals;
 use crate::world_clocks::{ResolvedLocation, WorldLocation};
 
 /// The cached coordinate→timezone resolution: the parsed locations that produced
@@ -149,6 +150,9 @@ pub struct GnomeSettings {
     pub app_folders: Vec<AppFolder>,
     /// The accessibility state behind the `a11y` panel indicator and its menu.
     pub a11y: A11ySettings,
+    /// `org.gnome.desktop.peripherals.*`: the pointer and keyboard device settings, which
+    /// GNOME's way replaces niri's `input {}` block with. See [`Peripherals`].
+    pub peripherals: Peripherals,
 }
 
 /// One row of the accessibility menu (`js/ui/status/accessibility.js:45-81`), in
@@ -404,6 +408,7 @@ impl Default for GnomeSettings {
             world_clocks: WorldClocks::default(),
             app_folders: Vec::new(),
             a11y: A11ySettings::default(),
+            peripherals: Peripherals::default(),
         }
     }
 }
@@ -2421,6 +2426,13 @@ struct Stores {
     a11y_interface: Option<gio::Settings>,
     a11y_applications: Option<gio::Settings>,
     a11y_keyboard: Option<gio::Settings>,
+    /// `org.gnome.desktop.peripherals.*` — one store per device class, all from
+    /// gsettings-desktop-schemas. See [`Peripherals`].
+    touchpad: Option<gio::Settings>,
+    mouse: Option<gio::Settings>,
+    keyboard: Option<gio::Settings>,
+    trackball: Option<gio::Settings>,
+    pointingstick: Option<gio::Settings>,
     /// The relocatable `org.gnome.desktop.app-folders.folder` instances, one per
     /// `folder-children` id, opened lazily and then kept alive so the `changed`
     /// subscription installed on first sight stays live (a folder's *contents* live
@@ -2476,6 +2488,11 @@ impl Stores {
             a11y_interface: gsettings("org.gnome.desktop.a11y.interface", b),
             a11y_applications: gsettings("org.gnome.desktop.a11y.applications", b),
             a11y_keyboard: gsettings("org.gnome.desktop.a11y.keyboard", b),
+            touchpad: gsettings("org.gnome.desktop.peripherals.touchpad", b),
+            mouse: gsettings("org.gnome.desktop.peripherals.mouse", b),
+            keyboard: gsettings("org.gnome.desktop.peripherals.keyboard", b),
+            trackball: gsettings("org.gnome.desktop.peripherals.trackball", b),
+            pointingstick: gsettings("org.gnome.desktop.peripherals.pointingstick", b),
             folder_stores: RefCell::new(HashMap::new()),
             folder_on_change: RefCell::new(None),
             clocks_installed: desktop_app_installed("org.gnome.clocks.desktop"),
@@ -2531,6 +2548,11 @@ impl Stores {
             &self.a11y_interface,
             &self.a11y_applications,
             &self.a11y_keyboard,
+            &self.touchpad,
+            &self.mouse,
+            &self.keyboard,
+            &self.trackball,
+            &self.pointingstick,
         ]
         .into_iter()
         .flatten()
@@ -2542,6 +2564,13 @@ impl Stores {
         if let Some(mutter) = &self.mutter {
             settings.load_mutter(mutter);
         }
+        settings.peripherals = Peripherals::load(
+            self.touchpad.as_ref(),
+            self.mouse.as_ref(),
+            self.keyboard.as_ref(),
+            self.trackball.as_ref(),
+            self.pointingstick.as_ref(),
+        );
         settings.load_keybindings(
             self.wm_keybindings.as_ref(),
             self.mutter_keybindings.as_ref(),

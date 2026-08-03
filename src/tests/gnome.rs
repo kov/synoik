@@ -18021,3 +18021,38 @@ fn a_clipboard_only_screenshot_notifies_without_a_file_button() {
     assert!(n.actions.is_empty(), "nothing to open in the file manager");
     assert!(!n.has_default_action);
 }
+
+/// `org.gnome.desktop.peripherals` reaches the compositor: a settings change lands in
+/// `config.input`, which is where `apply_libinput_settings` and the key-repeat timer read it.
+///
+/// This drives `State::apply_peripherals`, the real entry point the live GSettings subscription
+/// calls — the model itself is checked against real GSettings stores in
+/// `crate::input::peripherals`. What is worth pinning here is the *hand-off*, because the
+/// symptom of dropping it is silent: settings look right, devices keep the old behavior.
+#[test]
+fn peripherals_settings_reach_the_input_config() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    assert!(
+        f.niri().config.borrow().input.touchpad.tap,
+        "the default is GNOME's tap-to-click"
+    );
+
+    let p = &mut f.niri().gnome_settings.peripherals;
+    p.touchpad.tap = false;
+    p.touchpad.natural_scroll = false;
+    p.mouse.left_handed = true;
+    p.repeat_delay = 250;
+    p.repeat_rate = 10;
+
+    f.niri_state().apply_peripherals();
+
+    let config = f.niri().config.borrow();
+    let input = &config.input;
+    assert!(!input.touchpad.tap);
+    assert!(!input.touchpad.natural_scroll);
+    assert!(input.mouse.left_handed);
+    assert_eq!(input.keyboard.repeat_delay, 250);
+    assert_eq!(input.keyboard.repeat_rate, 10);
+}

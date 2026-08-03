@@ -97,13 +97,17 @@ impl Default for Keyboard {
     fn default() -> Self {
         Self {
             xkb: Default::default(),
-            // The defaults were chosen to match wlroots and sway.
-            repeat_delay: 600,
-            repeat_rate: 25,
+            // GNOME's defaults, from org.gnome.desktop.peripherals.keyboard: `delay` is
+            // 500ms and `repeat-interval` is 30ms, which is 33 repeats a second. (niri's
+            // were 600/25, chosen to match wlroots and sway — niri's way, so it goes.)
+            repeat_delay: 500,
+            repeat_rate: 33,
             track_layout: Default::default(),
-            // On, like a GNOME session (org.gnome.desktop.peripherals.keyboard
-            // numlock-state) and like the config file we used to ship.
-            numlock: true,
+            // Off: `org.gnome.desktop.peripherals.keyboard numlock-state` defaults to
+            // false, so a GNOME session nobody has configured comes up with numlock off.
+            // The config file we used to ship turned it on; that was niri's default, not
+            // GNOME's, and GNOME's wins.
+            numlock: false,
         }
     }
 }
@@ -229,19 +233,20 @@ impl Default for Touchpad {
     fn default() -> Self {
         Self {
             off: false,
-            // Tap-to-click and natural scrolling on, matching a GNOME session
-            // (org.gnome.desktop.peripherals.touchpad tap-to-click /
-            // natural-scroll) and the config file we used to ship.
+            // Every value here is `org.gnome.desktop.peripherals.touchpad`'s schema default,
+            // so a box with no GNOME schemas installed behaves like one that has them
+            // untouched. `peripherals_defaults_match_a_pristine_gnome_store` pins that.
             tap: true,
             natural_scroll: true,
-            dwt: false,
+            dwt: true,
+            // GNOME has no dwtp key.
             dwtp: false,
-            drag: None,
+            drag: Some(true),
             drag_lock: false,
-            click_method: None,
+            click_method: Some(ClickMethod::Clickfinger),
             accel_speed: Default::default(),
             accel_profile: None,
-            scroll_method: None,
+            scroll_method: Some(ScrollMethod::TwoFinger),
             scroll_button: None,
             scroll_button_lock: false,
             tap_button_map: None,
@@ -299,7 +304,7 @@ pub struct Trackpoint {
     pub middle_emulation: bool,
 }
 
-#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub struct Trackball {
     #[knuffel(child)]
     pub off: bool,
@@ -319,6 +324,25 @@ pub struct Trackball {
     pub left_handed: bool,
     #[knuffel(child)]
     pub middle_emulation: bool,
+}
+
+impl Default for Trackball {
+    fn default() -> Self {
+        Self {
+            off: false,
+            natural_scroll: false,
+            accel_speed: Default::default(),
+            accel_profile: None,
+            // `org.gnome.desktop.peripherals.trackball scroll-wheel-emulation-button`
+            // defaults to 0, which mutter turns into "no scrolling at all" rather than the
+            // device default (meta-input-settings-native.c:379-384).
+            scroll_method: Some(ScrollMethod::NoScroll),
+            scroll_button: None,
+            scroll_button_lock: false,
+            left_handed: false,
+            middle_emulation: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

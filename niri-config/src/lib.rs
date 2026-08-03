@@ -468,21 +468,17 @@ mod tests {
 
     /// The compiled-in defaults are what every session runs on now that there is no config
     /// file, so the shape they used to be checked against — `default-config.kdl` — is gone
-    /// with it. What is left worth pinning is that the values the file used to set are now
-    /// the defaults themselves.
+    /// with it. What is left worth pinning is that the input defaults are GNOME's schema
+    /// defaults; `peripherals_defaults_match_a_pristine_gnome_store` checks the whole set
+    /// against a real GSettings store.
     #[test]
-    fn the_shipped_defaults_are_the_defaults() {
+    fn the_input_defaults_are_gnomes() {
         let config = Config::default();
-        assert!(config.input.keyboard.numlock);
         assert!(config.input.touchpad.tap);
         assert!(config.input.touchpad.natural_scroll);
-    }
-
-    #[test]
-    fn default_repeat_params() {
-        let config = Config::parse_mem("").unwrap();
-        assert_eq!(config.input.keyboard.repeat_delay, 600);
-        assert_eq!(config.input.keyboard.repeat_rate, 25);
+        assert!(!config.input.keyboard.numlock);
+        assert_eq!(config.input.keyboard.repeat_delay, 500);
+        assert_eq!(config.input.keyboard.repeat_rate, 33);
     }
 
     #[track_caller]
@@ -777,7 +773,7 @@ mod tests {
                     repeat_delay: 600,
                     repeat_rate: 25,
                     track_layout: Window,
-                    numlock: true,
+                    numlock: false,
                 },
                 touchpad: Touchpad {
                     off: false,

@@ -1445,6 +1445,10 @@ impl State {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.niri.gnome_settings = initial;
             state.niri.refresh_keybinding_state();
+            // The libinput device settings and the key-repeat parameters (see
+            // `crate::input::peripherals`). Devices come and go later, and each one is
+            // configured as it appears through the same `apply_libinput_settings`.
+            state.apply_peripherals();
             state
                 .niri
                 .screen_shield
@@ -1670,6 +1674,7 @@ impl State {
                         // The scroll bindings live in this model, and the pointer
                         // handlers gate on a set derived from it.
                         state.niri.refresh_keybinding_state();
+                        state.apply_peripherals();
                         state
                             .niri
                             .screen_shield
@@ -2981,6 +2986,67 @@ impl State {
 
     /// Swap in a new [`Config`] wholesale and re-derive everything that depends on it.
     ///
+    /// Push `gnome_settings.peripherals` onto the devices and the keyboard.
+    ///
+    /// The model lands in `config.input` — the same fields the config file used to fill — so
+    /// `apply_libinput_settings` and the repeat timer read it exactly where they always did.
+    /// Safe to call on every settings change: each half is skipped when nothing it cares about
+    /// moved, because re-applying libinput settings walks every device.
+    pub fn apply_peripherals(&mut self) {
+        let _span = tracy_client::span!("State::apply_peripherals");
+
+        let p = self.niri.gnome_settings.peripherals.clone();
+
+        let (devices_changed, repeat_changed, numlock) = {
+            let mut config = self.niri.config.borrow_mut();
+            let input = &mut config.input;
+
+            let devices_changed = input.touchpad != p.touchpad
+                || input.mouse != p.mouse
+                || input.trackpoint != p.trackpoint
+                || input.trackball != p.trackball;
+            input.touchpad = p.touchpad;
+            input.mouse = p.mouse;
+            input.trackpoint = p.trackpoint;
+            input.trackball = p.trackball;
+
+            let kb = &mut input.keyboard;
+            let repeat_changed =
+                kb.repeat_delay != p.repeat_delay || kb.repeat_rate != p.repeat_rate;
+            kb.repeat_delay = p.repeat_delay;
+            kb.repeat_rate = p.repeat_rate;
+            // Only worth pushing at the keyboard when it is being asked for: the lock is
+            // live state the user toggles, not something to keep resetting under them.
+            let numlock = !kb.numlock && p.numlock;
+            kb.numlock = p.numlock;
+
+            (devices_changed, repeat_changed, numlock)
+        };
+
+        if repeat_changed {
+            let config = self.niri.config.borrow();
+            let keyboard = self.niri.seat.get_keyboard().unwrap();
+            keyboard.change_repeat_info(
+                config.input.keyboard.repeat_rate.into(),
+                config.input.keyboard.repeat_delay.into(),
+            );
+        }
+
+        if numlock {
+            let keyboard = self.niri.seat.get_keyboard().unwrap();
+            let mut modifier_state = keyboard.modifier_state();
+            modifier_state.num_lock = true;
+            keyboard.set_modifier_state(modifier_state);
+        }
+
+        if devices_changed {
+            let config = self.niri.config.borrow();
+            for mut device in self.niri.devices.iter().cloned() {
+                apply_libinput_settings(&config.input, &mut device);
+            }
+        }
+    }
+
     /// Nothing in the session reaches this any more — there is no config file to reload — but
     /// it stays as the one place that knows how to apply a config, and the renderer tests use
     /// it to install a custom shader through the real path.
