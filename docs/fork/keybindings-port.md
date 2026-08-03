@@ -57,30 +57,55 @@ gsd media keys.
 `org.gnome.shell.keybindings` — `show-screenshot-ui`, `screenshot`, `screenshot-window`,
 `show-screen-recording-ui`, `screen-brightness-{up,down,cycle}[-monitor]`.
 
-### The fallback defaults are the schema's, verbatim
+### The fallback defaults are the session's defaults
 
 The compiled-in defaults in `adopted_*_keybindings()` only apply where the schema isn't
 installed — but that includes **the whole test corpus**, since `Fixture` runs on
-`Config::default()` and no schema. Inventing a default there is a divergence that hides on a
-GNOME box and silently defines what the conformance tests assert.
+`Config::default()` and no schema. So an *accidental* invention there hides on a GNOME box
+while silently defining what the conformance tests assert. A *deliberate* difference is fine,
+but it must be labelled at the key and carried into the `.gschema.override` we install, so the
+table, the override and the seat all agree.
 
-Two such inventions have been found:
+Two divergences from upstream have been found:
 
-- `switch-to-workspace-1..4` claimed `<Super>1..4`. Wrong: `<Super>N` is
+- `switch-to-workspace-1..4` claimed `<Super>1..4`. Accidental, and wrong: `<Super>N` is
   `switch-to-application-N` (`gnome-shell/data/org.gnome.shell.gschema.xml.in:193+`).
   `switch-to-workspace-1` is `<Super>Home`, 2..12 are `[]`. **Fixed.**
-- `switch-windows` claims `<Alt>Tab` and `switch-applications` only `<Super>Tab`. The schema
-  gives `switch-windows = []` and `switch-applications = ['<Super>Tab','<Alt>Tab']`, i.e. on a
-  real GNOME session Alt+Tab is the *application* switcher. **Open** — see below.
+- `switch-windows = ['<Alt>Tab']` with `switch-applications = ['<Super>Tab']`, where upstream
+  leaves `switch-windows` empty and gives Alt+Tab to `switch-applications`. Arrived by
+  accident, **kept deliberately**: Alt+Tab is our window switcher, Super+Tab our application
+  switcher. Now labelled as ours at the key; to be backed by the override once S6 lands the
+  schema-dir plumbing.
 
-## Open questions
+## Schemas: who ships what, and what a replacement costs
 
-**Alt+Tab.** On the seat, where the schema is installed, `<Alt>Tab` already resolves as
-`switch-applications`; only the fallback table (and therefore the test corpus) says otherwise.
-So the tests currently pin a behavior the live session does not have. Correcting the fallback
-is the tenet-correct move, but it re-points a large part of the alt-tab corpus at the app
-switcher and touches a completed, seat-validated port — so it is called out rather than done
-in passing.
+We currently ship **no schema and no override** — we only read what the system has installed,
+falling back to the tables above.
+
+| Schema | Shipped by | Survives replacing mutter + gnome-shell? |
+|---|---|---|
+| `org.gnome.desktop.wm.keybindings`, `.wm.preferences`, `.interface`, `.input-sources`, `.a11y.*` | gsettings-desktop-schemas | **yes** — shared with GTK apps, gsd, control-center |
+| `org.gnome.mutter*` | mutter | no |
+| `org.gnome.shell*` | gnome-shell | no |
+
+Three glib behaviours, all verified with `glib-compile-schemas`, that constrain the options:
+
+1. **An override cannot stand alone.** In a directory with no matching schema,
+   `glib-compile-schemas` prints *"No schema files found: doing nothing"* and produces nothing.
+   An override only tunes a schema installed **in the same directory** — it is a tuning
+   mechanism, never a replacement one.
+2. **Duplicate schema ids in one directory silently lose.** Two files declaring the same id
+   give `<schema id='…'> already specified. This entire file has been ignored.` — and
+   `glib-compile-schemas` **still exits 0**. So our copies of `org.gnome.shell.*` /
+   `org.gnome.mutter.*` must never go into `/usr/share/glib-2.0/schemas` on a box that also has
+   the real ones, which is exactly this dev VM (real GNOME is the control session).
+3. **A private dir on `GSETTINGS_SCHEMA_DIR` wins over the system dir.** That is the safe home
+   for anything of ours, and it lets us co-exist with a real GNOME install.
+
+If the mutter/shell schemas are absent altogether, the compositor still runs — on the fallback
+tables — but there is no *editable* keybinding config at all: `gsettings set` fails,
+dconf-editor shows nothing, and gnome-control-center's Keyboard panel cannot enumerate
+shortcuts. That is the cost that S10 buys back.
 
 ## Deferred, with reasons
 
@@ -115,6 +140,7 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 | S7 | Route the non-keyboard triggers (mouse, wheel, touchpad, tablet) through the model | |
 | S8 | Prune and then delete the KDL `binds{}` | |
 | S9 | Re-source the hotkey overlay from the settings model | |
+| S10 | Vendor `org.gnome.shell.*` / `org.gnome.mutter.*` into our private schema dir, plus the `.gschema.override` for our differing defaults | after S6 |
 
 ### Ordering hazards
 
@@ -129,6 +155,15 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
   `switch-to-workspace-N` defaults are empty.
 - **Silent fallback drift.** S6's code without S6's packaging leaves the session on
   compiled-in defaults while the user believes they are editing settings.
+
+### S10 vendoring
+
+Depends on S6, which has to build the plumbing anyway: a private schema dir,
+`glib-compile-schemas` at install time, and `GSETTINGS_SCHEMA_DIR` in the session environment.
+Once that exists, vendoring is incremental — drop our copies of the mutter and gnome-shell
+schemas beside our own, and the `.gschema.override` carrying every default where we knowingly
+differ from upstream (starting with Alt+Tab). Never into the shared system dir: see hazard 2
+above.
 
 ### S6 schema design
 

@@ -997,13 +997,17 @@ pub enum EdgeTileTarget {
 /// to shake a maximized window loose.
 pub const SHAKE_THRESHOLD: f64 = 48.;
 
-/// The `org.gnome.desktop.wm.keybindings` keys we honor, with GNOME's default
-/// accelerators for each.
+/// The `org.gnome.desktop.wm.keybindings` keys we honor, with the default
+/// accelerators we ship for each.
 ///
-/// The defaults must be the schema's own, verbatim — they are what we run on
-/// where the schema isn't installed, and a live read replaces them wholesale,
-/// so any invention here is a divergence that only shows up off a GNOME
-/// system (and in the test corpus, which runs on these).
+/// These are the *session's* defaults, not a transcription of the upstream
+/// schema: where we deliberately differ we say so at the key, and the same
+/// values belong in the `.gschema.override` we install (upstream owns that
+/// schema — it comes from gsettings-desktop-schemas, which survives replacing
+/// mutter and gnome-shell). Anywhere we do *not* mean to differ, the value must
+/// match the schema verbatim: these apply where the schema isn't installed,
+/// which includes the whole test corpus, so an accidental invention hides on a
+/// GNOME box while quietly defining what the conformance tests assert.
 fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
     use GnomeKeyAction::*;
 
@@ -1085,6 +1089,12 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
             MoveToWorkspaceNext,
             strs(&["<Control><Shift><Alt>Down"]),
         ),
+        // DIVERGENCE (deliberate, ours): upstream leaves `switch-windows` empty and
+        // gives `<Alt>Tab` to `switch-applications`, so a stock GNOME Alt+Tab is the
+        // *application* switcher. We ship Alt+Tab as the *window* switcher and leave
+        // Super+Tab to the applications. These are the defaults we intend to install
+        // as a `.gschema.override`, so this table is our shipped default rather than a
+        // transcription of the upstream schema — see docs/fork/keybindings-port.md.
         (
             "switch-windows".to_owned(),
             SwitchWindows { backward: false },
@@ -1125,6 +1135,8 @@ fn adopted_wm_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
             CycleGroup { backward: true },
             strs(&["<Shift><Alt>F6"]),
         ),
+        // Super+Tab only — upstream also lists `<Alt>Tab` here; see the divergence note
+        // on `switch-windows` above.
         (
             "switch-applications".to_owned(),
             SwitchApplications { backward: false },
