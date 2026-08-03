@@ -15,7 +15,7 @@ use smithay::backend::drm::DrmNode;
 use smithay::backend::input::{InputEvent, TabletToolDescriptor};
 use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::dnd::{self, DnDGrab, DndGrabHandler, DndTarget};
-use smithay::input::pointer::{CursorIcon, CursorImageStatus, Focus, PointerHandle};
+use smithay::input::pointer::{CursorImageStatus, Focus, PointerHandle};
 use smithay::input::{keyboard, Seat, SeatHandler, SeatState};
 use smithay::output::Output;
 use smithay::reexports::rustix::fs::{fcntl_setfl, OFlags};
@@ -109,10 +109,11 @@ impl SeatHandler for State {
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, mut image: CursorImageStatus) {
-        // FIXME: this hack should be removable once the screenshot UI is tracked with a
-        // PointerFocus properly.
+        // The screenshot UI owns the cursor while it is open: it has no PointerFocus, so smithay
+        // resets us to the default on every leave. Defer to the picker's own per-region shape
+        // rather than letting that reset (or a lingering client request) win.
         if self.niri.screenshot_ui.is_open() {
-            image = CursorImageStatus::Named(CursorIcon::Crosshair);
+            image = CursorImageStatus::Named(self.niri.screenshot_ui.cursor_icon());
         }
         self.niri.cursor_manager.set_cursor_image(image);
         // FIXME: more granular

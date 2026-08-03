@@ -3796,6 +3796,16 @@ impl State {
     /// `pos` is the global-space pointer location. Off any button — or outside GNOME
     /// mode — clears the hover. Redraws only when the hovered button actually changed.
     fn update_panel_hover(&mut self, pos: Point<f64, Logical>) {
+        // Whether a pointer grab currently owns the cursor. A grab — an interactive resize, a move,
+        // a DnD — sets the cursor deliberately and holds it until it ends, so the "force the arrow"
+        // rules below must not fire. They exist because a *client* can no longer paint its own
+        // cursor under our chrome; a compositor grab is not a client, and stomping it mid-drag
+        // replaces the resize cursor with an arrow while the user is still resizing.
+        let grabbed = self
+            .niri
+            .seat
+            .get_pointer()
+            .is_some_and(|pointer| pointer.is_grabbed());
         // The shield is over everything, so while it is down the only thing that tracks `:hover` is
         // its own chrome. Falling through to the panel and overview below would light up buttons
         // nobody can see, and redraw for each one.
@@ -3983,8 +3993,9 @@ impl State {
             }
             // The banner takes the pointer (`contents_under` suppresses the window
             // beneath it), so force the arrow — the app can no longer paint its
-            // own cursor (e.g. an I-beam) under the banner.
-            if inside {
+            // own cursor (e.g. an I-beam) under the banner. Not while a grab owns
+            // the cursor: see `grabbed` above.
+            if inside && !grabbed {
                 self.niri
                     .cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());
@@ -3996,9 +4007,11 @@ impl State {
         // Force the default arrow so a stale client cursor (e.g. a terminal's I-beam that was
         // showing when the popover opened) doesn't linger over the popover.
         if self.niri.panel_popover.is_open() {
-            self.niri
-                .cursor_manager
-                .set_cursor_image(CursorImageStatus::default_named());
+            if !grabbed {
+                self.niri
+                    .cursor_manager
+                    .set_cursor_image(CursorImageStatus::default_named());
+            }
 
             if let Some((output, p)) = self.niri.output_under(pos).map(|(o, p)| (o.clone(), p)) {
                 // Highlight the control under the pointer (or clear it when the

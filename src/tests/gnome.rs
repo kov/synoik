@@ -6335,6 +6335,76 @@ fn tick(f: &mut Fixture, ms: u64) {
     niri.advance_animations();
 }
 
+/// A grab owns the cursor until it ends. Nothing that merely *reacts* to pointer motion may take
+/// it away — while an interactive resize is running, the cursor stays the resize cursor even if the
+/// pointer wanders under a notification banner.
+#[test]
+fn a_resize_grab_keeps_its_cursor_under_a_banner() {
+    use smithay::input::pointer::{
+        CursorIcon, CursorImageStatus, GrabStartData as PointerGrabStartData,
+    };
+    use smithay::utils::Point;
+
+    use crate::utils::ResizeEdge;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+    let window = f.niri().layout.windows().next().unwrap().1.window.clone();
+
+    // Park the pointer somewhere harmless and put a banner up.
+    pointer_motion_to(&mut f, 600., 600.);
+    banner_notify(&mut f, banner_req("app", ":1.1"));
+    f.settle_animations();
+    assert!(f.niri().notification_banner.is_visible());
+
+    // Start a real interactive resize on the bottom-right corner, the way the button handler does.
+    let edges = ResizeEdge::BOTTOM_RIGHT;
+    assert!(f
+        .niri_state()
+        .niri
+        .layout
+        .interactive_resize_begin(window.clone(), edges));
+    let state = f.niri_state();
+    let pointer = state.niri.seat.get_pointer().unwrap();
+    let start_data = PointerGrabStartData {
+        focus: None,
+        button: 0x110,
+        location: pointer.current_location(),
+    };
+    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+    let grab = crate::input::resize_grab::ResizeGrab::new(start_data, window);
+    pointer.set_grab(state, grab, serial, smithay::input::pointer::Focus::Clear);
+    state
+        .niri
+        .cursor_manager
+        .set_cursor_image(CursorImageStatus::Named(edges.cursor_icon()));
+    assert_eq!(
+        *f.niri().cursor_manager.cursor_image(),
+        CursorImageStatus::Named(CursorIcon::SeResize),
+        "the grab starts by advertising what it is resizing"
+    );
+
+    // Drag up into the banner's own rect, which is where the arrow used to take over.
+    pointer_motion_to(&mut f, 960., 40.);
+    let output = f.niri_output(1);
+    assert!(
+        f.niri()
+            .notification_banner
+            .pointer_inside(&output, Point::from((960., 40.))),
+        "the sample point must really be under the banner, or this proves nothing"
+    );
+    assert_eq!(
+        *f.niri().cursor_manager.cursor_image(),
+        CursorImageStatus::Named(CursorIcon::SeResize),
+        "the resize grab still owns the cursor; a banner the pointer passed under must not \
+         replace it with an arrow mid-drag"
+    );
+
+    let _ = surface;
+}
+
 /// The tray's own timing (`js/ui/messageTray.js:19,1279-1292`): a banner shows on
 /// notify, auto-hides after 4 s, and hiding destroys ONLY transient notifications.
 #[test]
