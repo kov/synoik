@@ -208,6 +208,19 @@ where
                 "layer-rule" => m_push!(layer_rules),
                 "workspace" => m_push!(workspaces),
 
+                // Keybindings moved to GSettings; the block is accepted and ignored rather
+                // than rejected, because failing the *whole* config over it would drop every
+                // unrelated setting in the file too. See docs/fork/keybindings-port.md.
+                "binds" => {
+                    warn!(
+                        "ignoring the `binds` block: keybindings now live in GSettings. \
+                         GNOME's own keys are in org.gnome.desktop.wm.keybindings, \
+                         org.gnome.mutter.keybindings and org.gnome.shell.keybindings; the \
+                         scrolling-layout ones are in org.gnome.shell-rs.keybindings. Bind a \
+                         command to a key in Settings -> Keyboard -> Custom Shortcuts."
+                    );
+                }
+
                 // Single-part sections.
                 "environment" => {
                     let part = Environment::decode_node(node, ctx)?;
@@ -1986,6 +1999,31 @@ mod tests {
         }
 
         output
+    }
+
+    /// A `binds{}` block left over from before the GSettings port must not fail the config.
+    ///
+    /// Keybindings moved out, but a real config file has plenty else in it, and rejecting the
+    /// whole file drops all of that too — the session comes up on defaults with an error
+    /// notification, which is what happened to the dogfood seat on the first login after the
+    /// prune.
+    #[test]
+    fn a_leftover_binds_block_is_ignored_not_fatal() {
+        let config = Config::parse_mem(
+            r##"
+            binds {
+                Mod+T hotkey-overlay-title="Terminal" { spawn "alacritty"; }
+                Mod+WheelScrollDown cooldown-ms=150 { focus-workspace-down; }
+                Mod+Escape allow-inhibiting=false { toggle-keyboard-shortcuts-inhibit; }
+            }
+
+            prefer-no-csd
+            "##,
+        )
+        .expect("a leftover binds block must not fail the parse");
+
+        // …and the rest of the file still applies.
+        assert!(config.prefer_no_csd);
     }
 
     #[test]

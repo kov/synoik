@@ -324,6 +324,12 @@ home now:
 | `Mod+Shift+F` (`fullscreen-window`) | `toggle-fullscreen`, which **GNOME ships unbound**. Following that default is the tenet; bind it in Settings if you want it back |
 | `Ctrl+Alt+Delete { quit; }` | gsd's `logout`, pending the seat check that gates S8(b) |
 
+A `binds{}` block in an existing config file is **accepted and ignored, with a warning** — not
+a parse error. Rejecting it fails the *whole* file, so every unrelated setting in it is dropped
+too and the session comes up on defaults behind an error notification. That is exactly what the
+dogfood seat hit on its first login after the prune; `a_leftover_binds_block_is_ignored_not_fatal`
+pins it.
+
 Then the block itself went, along with `find_configured_bind`, the `Bind`/`Binds` config
 types, the `Mod+Key` accelerator syntax and the per-bind properties (`repeat`, `cooldown-ms`,
 `allow-when-locked`, `allow-inhibiting`, `hotkey-overlay-title`). `niri-config` keeps `Key`,
