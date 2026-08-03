@@ -149,12 +149,14 @@ impl Backend {
 
     #[cfg(feature = "xdp-gnome-screencast")]
     pub fn gbm_device(
-        &self,
+        &mut self,
     ) -> Option<smithay::backend::allocator::gbm::GbmDevice<smithay::backend::drm::DrmDeviceFd>>
     {
         match self {
             Backend::Tty(tty) => tty.primary_gbm_device(),
-            Backend::Headless(_) => None,
+            // Opened lazily off the render node, so a headless run can drive the whole screencast
+            // path without a seat.
+            Backend::Headless(headless) => headless.gbm_device(),
         }
     }
 

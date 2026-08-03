@@ -9,9 +9,17 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context as _;
 use niri_config::OutputName;
 use smithay::backend::allocator::dmabuf::Dmabuf;
+#[cfg(feature = "xdp-gnome-screencast")]
+use smithay::backend::allocator::gbm::GbmDevice;
+#[cfg(feature = "xdp-gnome-screencast")]
+use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::renderer::element::RenderElementStates;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+#[cfg(feature = "xdp-gnome-screencast")]
+use smithay::reexports::rustix::fs::{self as rfs, OFlags};
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+#[cfg(feature = "xdp-gnome-screencast")]
+use smithay::utils::DeviceFd;
 use smithay::utils::Size;
 use smithay::wayland::presentation::Refresh;
 
@@ -32,6 +40,16 @@ pub struct Headless {
     /// is exactly what a test of the lock screen's escape hatch needs to know, and the alternative
     /// is asserting on some proxy that can agree while the real path is broken.
     last_vt: Option<i32>,
+    /// A GBM device on the render node, opened lazily the first time a screencast asks for one.
+    ///
+    /// Screencasting refuses to start without one ([`State::prepare_pw_cast`]), which used to make
+    /// the whole cast path untestable headless — and that path is exactly the one that has needed
+    /// a fast, seat-free reproduction. A *render* node is enough for GBM allocation: no DRM
+    /// master, no session, no VT.
+    ///
+    /// [`State::prepare_pw_cast`]: crate::niri::State
+    #[cfg(feature = "xdp-gnome-screencast")]
+    gbm: Option<GbmDevice<DrmDeviceFd>>,
 }
 
 impl Headless {
@@ -40,6 +58,43 @@ impl Headless {
             renderer: None,
             ipc_outputs: Default::default(),
             last_vt: None,
+            #[cfg(feature = "xdp-gnome-screencast")]
+            gbm: None,
+        }
+    }
+
+    /// A GBM device for screencast buffer allocation, opened on first use.
+    ///
+    /// Returns `None` when there is no usable render node, which is a normal state for a headless
+    /// run on a machine with no GPU — the caller reports it as "no GBM device available" and the
+    /// cast simply does not start.
+    #[cfg(feature = "xdp-gnome-screencast")]
+    pub fn gbm_device(&mut self) -> Option<GbmDevice<DrmDeviceFd>> {
+        if let Some(gbm) = &self.gbm {
+            return Some(gbm.clone());
+        }
+
+        let path = std::env::var("NIRI_HEADLESS_RENDER_NODE")
+            .unwrap_or_else(|_| "/dev/dri/renderD128".to_owned());
+
+        let open = |path: &str| -> anyhow::Result<GbmDevice<DrmDeviceFd>> {
+            let flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK;
+            let fd = rfs::open(path, flags, rfs::Mode::empty())
+                .with_context(|| format!("error opening {path}"))?;
+            GbmDevice::new(DrmDeviceFd::new(DeviceFd::from(fd)))
+                .with_context(|| format!("error creating a GBM device on {path}"))
+        };
+
+        match open(&path) {
+            Ok(gbm) => {
+                debug!("headless screencast GBM device: {path}");
+                self.gbm = Some(gbm.clone());
+                Some(gbm)
+            }
+            Err(err) => {
+                warn!("no GBM device for headless screencasting: {err:?}");
+                None
+            }
         }
     }
 
