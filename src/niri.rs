@@ -242,6 +242,13 @@ const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995
 /// rate limit. See [`Niri::queue_app_catalog_reload`].
 const APP_CATALOG_RELOAD_DEBOUNCE: Duration = Duration::from_secs(5);
 
+/// What the portal's share picker calls the dynamic-cast pseudo-window.
+///
+/// User-visible, and deliberately says what it *does* rather than who made it — it sits in a list
+/// beside the user's real windows in a shell that presents itself as GNOME.
+#[cfg(all(feature = "dbus", feature = "xdp-gnome-screencast"))]
+pub const DYNAMIC_CAST_TARGET_LABEL: &str = "Dynamic Target";
+
 /// What the reload timer should do when it fires: `Some(deadline)` to wait again (a ping
 /// arrived mid-wait and pushed the deadline out), `None` to reload now.
 ///
@@ -3603,6 +3610,14 @@ impl State {
 
         let mut windows = HashMap::new();
 
+        // Not a window: a synthetic entry that exists only so the portal's picker can offer a cast
+        // whose target is chosen *later*, and can then be changed live with
+        // `Action::SetDynamicCastWindow` and friends without reopening the share dialog. GNOME has
+        // no equivalent — mutter binds a stream to its target at `RecordWindow` time — so this is
+        // an additional capability we keep rather than one of niri's ways of doing a GNOME thing.
+        //
+        // The label is deliberately product-neutral; the app id still carries niri's, pending the
+        // wider branding decision.
         #[cfg(feature = "xdp-gnome-screencast")]
         windows.insert(
             self.niri.casting.dynamic_cast_id_for_portal.get(),
@@ -3613,7 +3628,7 @@ impl State {
                 has_focus: false,
                 width: 0,
                 height: 0,
-                title: Some(String::from("niri Dynamic Cast Target")),
+                title: Some(String::from(DYNAMIC_CAST_TARGET_LABEL)),
                 wm_class: None,
             },
         );

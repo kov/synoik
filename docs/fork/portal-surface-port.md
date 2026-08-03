@@ -89,10 +89,20 @@ Ordered by what unblocks the portal soonest, not by interface.
 - `ScreenSize` on a multi-output session is `global.screen_width/height`, i.e. the union bounding
   box, not a per-output size. Confirm against our output model before implementing.
 
-## Open question raised by slice 1
+## The dynamic-cast pseudo-window — kept, relabelled
 
-Under `xdp-gnome-screencast` the window list carries a synthetic **"niri Dynamic Cast Target"**
-entry with app id `rs.bxt.niri.desktop`. It is a niri capability rather than a niri *way of doing
-a GNOME thing*, so the tenet says keep it — but it shows up in the portal's chooser as a window
-called "niri", which is a branding leak in a shell that is meant to be GNOME. Decide whether to
-rename it, hide it from `GetWindows`, or leave it.
+Under `xdp-gnome-screencast` the window list carries a synthetic entry that is not a window. Picking
+it in the portal's share dialog starts a cast with **no target yet** (`screencasting/mod.rs:422-433`
+parks it in `pending_dynamic_casts`); the target is then chosen and *changed live* with
+`SetDynamicCastWindow` / `SetDynamicCastWindowById` / `SetDynamicCastMonitor` /
+`ClearDynamicCastTarget` (`input/mod.rs:3622-3650`), without reopening the share dialog. Share once
+at the start of a call, then flip what is shared with a keybind.
+
+GNOME has no equivalent — mutter binds a stream to its target at `RecordWindow`/`RecordMonitor`
+time. So by the tenet this is an **additional capability**, kept.
+
+Decided 2026-08-02: the visible label is **"Dynamic Target"** — it says what the entry does rather
+than who built it, since it sits beside the user's real windows in a shell presenting itself as
+GNOME. The **app id is still `rs.bxt.niri.desktop`**, which resolves to nothing and so draws with no
+icon; that waits on the wider naming decision (neither "niri" nor "gnome-shell-rs" is the intended
+product name). Fix the app id, the desktop file and the icon together when that lands.

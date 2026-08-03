@@ -15724,8 +15724,25 @@ fn the_portal_window_list_carries_what_its_chooser_reads() {
         panic!("wrong reply");
     };
 
-    // Under `xdp-gnome-screencast` the list also carries niri's "Dynamic Cast Target" pseudo-window
-    // — a niri capability, not a GNOME one; see the port doc's open questions.
+    // The list also carries the dynamic-cast pseudo-window, which is not a window at all.
+    #[cfg(feature = "xdp-gnome-screencast")]
+    {
+        let synthetic = windows
+            .values()
+            .find(|p| p.wm_class.is_none())
+            .expect("the dynamic-cast entry");
+        assert_eq!(
+            synthetic.title.as_deref(),
+            Some(crate::niri::DYNAMIC_CAST_TARGET_LABEL),
+            "the picker's label says what it does, not who made it"
+        );
+        assert_eq!(
+            synthetic.title.as_deref(),
+            Some("Dynamic Target"),
+            "and the label itself is pinned: it is user-visible product text"
+        );
+    }
+
     let props = windows
         .values()
         .find(|p| p.wm_class.as_deref() == Some("a"))

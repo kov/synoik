@@ -49,9 +49,9 @@ Check [the corresponding wiki section](./Configuration:-Window-Rules.md#block-ou
 <sup>Since: 25.05</sup>
 
 Niri provides a special screencast stream that you can change dynamically.
-It shows up as "niri Dynamic Cast Target" in the screencast window dialog.
+It shows up as "Dynamic Target" in the screencast window dialog.
 
-![Screencast dialog showing niri Dynamic Cast Target.](https://github.com/user-attachments/assets/e236ce74-98ec-4f3a-a99b-29ac1ff324dd)
+![Screencast dialog showing the Dynamic Target entry.](https://github.com/user-attachments/assets/e236ce74-98ec-4f3a-a99b-29ac1ff324dd)
 
 Choose it, then use the following binds to change what it shows.
 The stream won't start until you make your first target selection.
