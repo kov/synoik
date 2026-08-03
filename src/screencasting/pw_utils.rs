@@ -441,6 +441,10 @@ impl PipeWire {
                         StreamState::Unconnected => (),
                         StreamState::Connecting => (),
                         StreamState::Streaming => {
+                            // Whether we owe the graph a `trigger_process` per frame hinges on
+                            // this, and the answer is a property of the graph rather than of our
+                            // flags — so record it rather than infer it from `DRIVER` being set.
+                            debug!("streaming, driving the graph: {}", stream.is_driving());
                             inner.is_active = true;
                             redraw();
                         }
