@@ -130,6 +130,17 @@ fn clock_h_padding() -> f64 {
 /// which GNOME never does; it reads as a trailing badge on the button.
 const MESSAGES_INDICATOR_ICON: f64 = 16.;
 
+/// How far the dot's trailing edge sits in from the lit pill's, logical px — its only
+/// placement rule, since the pill's rounded end is what it would otherwise collide with.
+///
+/// The room is tight and worth stating: after the clock label's advance box there is just
+/// `clock_h_padding() - BTN_MARGIN_X` (20px) of pill interior for a 16px dot, so this gap
+/// and the one left of the dot trade off directly. 4px reads balanced because the label's
+/// last glyph carries a few px of right side bearing, putting the dot ~4px off the *ink*
+/// even where it touches the advance box. Wanting more air on both sides means shrinking
+/// [`MESSAGES_INDICATOR_ICON`] — that is the knob, not this.
+const MESSAGES_INDICATOR_GAP: f64 = 4.;
+
 /// Bar background (opaque black — GNOME's dark panel `$panel_bg_color` = `$dark_5`
 /// `#000000`, `_colors.scss:24` / `_palette.scss:46`), straight RGBA.
 const BAR_BG: [f32; 4] = [0., 0., 0., 1.];
@@ -153,7 +164,7 @@ fn bar_bg(overview_fade: f64) -> [f32; 4] {
 /// mixin): `$base_margin` (4px) horizontally so an edge button isn't glued to the
 /// screen edge, and the 3px transparent border vertically. What's left is the
 /// fully-rounded (`$forced_circular_radius`) pill that lights up on hover/active.
-const BTN_MARGIN_X: f64 = 4.;
+pub(crate) const BTN_MARGIN_X: f64 = 4.;
 const BTN_INSET_Y: f64 = 3.;
 
 /// Horizontal breathing room between the lit pill and the button's content, logical
@@ -1048,7 +1059,7 @@ impl Panel {
         let right = clock.loc.x + clock.size.w;
         Some(Rectangle::new(
             Point::from((
-                right - (clock_h_padding() + MESSAGES_INDICATOR_ICON) / 2.,
+                right - BTN_MARGIN_X - MESSAGES_INDICATOR_GAP - MESSAGES_INDICATOR_ICON,
                 (panel_height() - MESSAGES_INDICATOR_ICON) / 2.,
             )),
             Size::from((MESSAGES_INDICATOR_ICON, MESSAGES_INDICATOR_ICON)),
@@ -2292,24 +2303,21 @@ mod tests {
             "the status cluster must not move either"
         );
 
-        // The dot is a 16px square centred in the button's trailing padding, so it clears
-        // the label and stays inside the button.
+        // The dot is a 16px square in the button's trailing padding, held clear of both
+        // things it could collide with: the clock label and the pill's rounded end.
         let dot = panel.messages_indicator_rect(ow).unwrap();
         assert_eq!(dot.size.w, MESSAGES_INDICATOR_ICON);
         let label_right = clock.loc.x + clock.size.w - clock_h_padding();
+        let pill_right = container_rect(clock).loc.x + container_rect(clock).size.w;
         assert!(
             dot.loc.x >= label_right,
             "the dot must not overlap the clock label ({} vs {label_right})",
             dot.loc.x,
         );
-        assert!(
-            dot.loc.x + dot.size.w <= clock.loc.x + clock.size.w,
-            "the dot must stay inside the button it badges"
-        );
         assert_eq!(
-            dot.loc.x - label_right,
-            clock.loc.x + clock.size.w - (dot.loc.x + dot.size.w),
-            "centred in the padding: equal gaps to the label and to the button edge"
+            pill_right - (dot.loc.x + dot.size.w),
+            MESSAGES_INDICATOR_GAP,
+            "the dot must stop short of the pill's rounded end, not sit flush in it"
         );
 
         // And it is the same button, so clicking the dot opens the calendar.

@@ -4420,19 +4420,24 @@ fn panel_clock_sits_right_of_the_status_indicators() {
     // on a clock this far right would overflow the output, so the clamp is what decides
     // the position, and the assertion is on the *edge* rather than on the origin: an
     // unclamped popover would land right of this and hang off the screen.
+    //
+    // Asserted against the clock's lit pill rather than a screen-edge constant, because
+    // lining those two up is the actual intent (`PANEL_EDGE_INSET`) — a menu that stopped
+    // 2px short of its own button read as a misalignment, and would again if the clamp
+    // ever drifted back onto `POPOVER_MARGIN`.
     let output = f.niri_output(1);
     let origin = f.niri().panel_popover.location(&output);
     let size = f.niri().panel_popover.content_size().expect("open");
-    let margin = 6.0_f64; // POPOVER_MARGIN
     assert!(
         origin.x > 960.,
         "the calendar must follow the clock to the right half, got x={}",
         origin.x
     );
+    let pill_right = clock.loc.x + clock.size.w - crate::ui::panel::BTN_MARGIN_X;
     assert_eq!(
         origin.x + size.w,
-        1920. - margin,
-        "the calendar must stop a POPOVER_MARGIN short of the screen's right edge"
+        pill_right,
+        "the calendar's right edge must line up with the clock pill's"
     );
 
     f.key_press(KEY_ESC);
