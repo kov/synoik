@@ -50,7 +50,7 @@ means the default disposition — no state save. It is merely not a crash.)
 
 ### The race
 
-The app scopes and `org.gnome.Shell@wayland.service` land in the **same stop transaction with no
+The app scopes and `org.gnome.Shell@user.service` land in the **same stop transaction with no
 `After=` between them**. Start order is shell → `gnome-session-initialized.target` →
 `gnome-session.target` → `graphical-session.target`, so stop order reverses to three inert target
 jobs and then the shell — sub-millisecond hops. Nothing waits for an app scope before killing the
@@ -63,13 +63,22 @@ manager, and that Epiphany was launched by us):
 14:10:15.837  Stopping app-gnome-org.gnome.Epiphany.desktop-190833.scope...   SIGTERM to the app
 14:10:16.175  Stopped target graphical-session.target
 14:10:16.179  Stopping org.gnome.Shell@user.service...                        SIGTERM to us, +341 ms
+14:10:16.441  epiphany[190833]: Lost connection to Wayland compositor.        we went first
+14:10:16.457  Stopped org.gnome.Shell@user.service.
 14:10:16.741  Stopped app-gnome-…-190833.scope                                app done, +562 ms after
 ```
 
-341 ms of head start; the app needed 903 ms. It survived only because our unwind happened to take
-longer than the 562 ms it still needed. Lose that coin flip and the client is mid-shutdown when its
-display goes away — EPIPE, which GTK3 raises as a fatal `g_error` and Firefox turns into an
-`ANOM_ABEND`. That is the crash in `overview-port.md`.
+**Read that fourth line.** The app got a 341 ms head start and needed 903 ms; our unwind took 262 ms.
+So the compositor went away *first*, and Epiphany spent its last 300 ms shutting down against a dead
+socket. This trace is not a near miss that luck saved — it is the failure, captured. It merely did
+not look like one, because GTK4 prints `Lost connection to Wayland compositor.` and exits, where
+GTK3's `gdk/wayland/gdkeventsource.c` raises the same EPIPE as a fatal `g_error` and Firefox turns
+it into the `ANOM_ABEND` recorded in `overview-port.md`. Same race, same loss, different toolkit
+manners.
+
+Which also means the head start is not the safety margin it looks like. 341 ms only helps an app
+that finishes inside it; anything slower is relying on the compositor's own unwind being slower
+still, and ours is fast.
 
 ---
 
@@ -143,10 +152,11 @@ Confirming the dialog (or letting its countdown expire) no longer emits `Confirm
 The answer is what makes gnome-session start the teardown that SIGTERMs us — so emitting it with
 apps still up hands the ordering back to the job graph that has no ordering in it. Draining first
 means gnome-session's phases only ever run on a desktop with no app windows left: the deterministic
-version of the 341 ms of luck above.
+version of the head start above — which, as §1 shows, was not a margin we were winning anyway.
 
 This drain does **not** stop us. gnome-session still drives the teardown exactly as before; its
-SIGTERM just lands on an empty session, where the follow-up drain completes immediately. A SIGTERM
+SIGTERM just lands on an empty session, where the follow-up drain has only its settle left to pay.
+Expect a ~500 ms tail on every logout for that reason: it is `DRAIN_SETTLE`, not a stall. A SIGTERM
 arriving *during* a confirm drain folds into it rather than restarting the clock or being dropped.
 
 ### 2.4 Not in a session, not draining
@@ -169,6 +179,15 @@ tests in `src/tests/gnome.rs` set the flag by hand.
   `Quit` there waits out the full budget before the warning: the drain is gated on
   `is_session_instance` while `stop_app_scopes` is gated on `IS_SYSTEMD_SERVICE`. Nobody runs that
   configuration today.
+- **A withdrawal during a confirm drain is ignored, and now has a window to arrive in.** Confirming
+  stops the app scopes immediately but holds `Confirmed*` for up to ~5.5 s. If gnome-session
+  withdraws the request in that window (`EndSessionDialogToNiri::Close`, `src/niri.rs`),
+  `EndSession::close` is already a no-op — the dialog was taken by `confirm` — so the drain goes on
+  to answer a request that no longer exists, on a desktop whose apps have already been told to quit.
+  Before the drain this window was ~0. The user did confirm, and gnome-session withdrawing after a
+  confirm is not something we have seen, so this is recorded rather than fixed; the fix is for
+  `Close` to cancel `session_drain_confirm`, which needs a decision about what the half-stopped
+  session should then look like.
 - **A stuck app can cost two budgets.** If a confirm drain times out on it, gnome-session's
   subsequent SIGTERM starts a fresh drain that gives the same app another 5 s — worst case a ~10 s
   logout. Carrying the deadline across would fix it; not worth the state until it is seen.

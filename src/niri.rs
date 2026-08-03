@@ -481,7 +481,7 @@ pub struct Niri {
     /// Set once we have been told to stop and are staying alive for our clients (see
     /// `SessionDrain`). `None` for the whole normal life of the session; once set, the compositor
     /// is on its way out and only `poll_session_drain` can end it.
-    pub session_drain: Option<crate::end_session::SessionDrain>,
+    pub session_drain: Option<SessionDrain>,
     /// The timer armed to the drain's give-up deadline (see `SessionDrain::deadline`).
     pub session_drain_timer: Option<RegistrationToken>,
     /// What the drain in flight is for, recorded at its start and acted on at its end. Both can be
