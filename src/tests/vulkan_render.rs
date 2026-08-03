@@ -4380,7 +4380,7 @@ fn vulkan_reaches_the_configured_custom_open_shader() {
          }"
         .to_owned(),
     );
-    f.niri_state().reload_config(Ok(config));
+    f.niri_state().reload_config(config);
 
     // Map a green window and leave its open animation running.
     let id = f.add_client();

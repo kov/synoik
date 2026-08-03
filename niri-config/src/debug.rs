@@ -25,6 +25,85 @@ pub struct Debug {
     pub skip_cursor_only_updates_during_vrr: bool,
 }
 
+impl Debug {
+    /// Read the debug toggles out of the environment.
+    ///
+    /// These used to live in the config file's `debug {}` block; with the file gone they come
+    /// from `NIRI_DEBUG_<SCREAMING_SNAKE_FIELD_NAME>`, the same idiom as `NIRI_VK_VALIDATION`.
+    /// That is deliberate: an env var reaches the *live session* through a systemd drop-in
+    /// (`Environment=NIRI_DEBUG_DISABLE_TRANSACTIONS=1`), which is where these are actually
+    /// used — a debug knob you can only set in a test harness is a knob you cannot debug with.
+    ///
+    /// A flag is on when its variable is set to anything other than `0` or the empty string.
+    pub fn from_env() -> Self {
+        fn flag(name: &str) -> bool {
+            match std::env::var_os(name) {
+                Some(v) => !v.is_empty() && v != "0",
+                None => false,
+            }
+        }
+        fn path(name: &str) -> Option<PathBuf> {
+            std::env::var_os(name)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        }
+
+        Self {
+            preview_render: match std::env::var("NIRI_DEBUG_PREVIEW_RENDER").as_deref() {
+                Ok("screencast") => Some(PreviewRender::Screencast),
+                Ok("screen-capture") => Some(PreviewRender::ScreenCapture),
+                Ok(other) if !other.is_empty() => {
+                    warn!(
+                        "ignoring NIRI_DEBUG_PREVIEW_RENDER={other:?}: \
+                         expected \"screencast\" or \"screen-capture\""
+                    );
+                    None
+                }
+                _ => None,
+            },
+            dbus_interfaces_in_non_session_instances: flag(
+                "NIRI_DEBUG_DBUS_INTERFACES_IN_NON_SESSION_INSTANCES",
+            ),
+            wait_for_frame_completion_before_queueing: flag(
+                "NIRI_DEBUG_WAIT_FOR_FRAME_COMPLETION_BEFORE_QUEUEING",
+            ),
+            enable_overlay_planes: flag("NIRI_DEBUG_ENABLE_OVERLAY_PLANES"),
+            disable_cursor_plane: flag("NIRI_DEBUG_DISABLE_CURSOR_PLANE"),
+            disable_direct_scanout: flag("NIRI_DEBUG_DISABLE_DIRECT_SCANOUT"),
+            restrict_primary_scanout_to_matching_format: flag(
+                "NIRI_DEBUG_RESTRICT_PRIMARY_SCANOUT_TO_MATCHING_FORMAT",
+            ),
+            force_disable_connectors_on_resume: flag(
+                "NIRI_DEBUG_FORCE_DISABLE_CONNECTORS_ON_RESUME",
+            ),
+            render_drm_device: path("NIRI_DEBUG_RENDER_DRM_DEVICE"),
+            // Colon-separated, like a PATH — a device path cannot contain one.
+            ignored_drm_devices: std::env::var_os("NIRI_DEBUG_IGNORE_DRM_DEVICES")
+                .map(|v| {
+                    std::env::split_paths(&v)
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            emulate_zero_presentation_time: flag("NIRI_DEBUG_EMULATE_ZERO_PRESENTATION_TIME"),
+            disable_resize_throttling: flag("NIRI_DEBUG_DISABLE_RESIZE_THROTTLING"),
+            disable_transactions: flag("NIRI_DEBUG_DISABLE_TRANSACTIONS"),
+            keep_laptop_panel_on_when_lid_is_closed: flag(
+                "NIRI_DEBUG_KEEP_LAPTOP_PANEL_ON_WHEN_LID_IS_CLOSED",
+            ),
+            disable_monitor_names: flag("NIRI_DEBUG_DISABLE_MONITOR_NAMES"),
+            strict_new_window_focus_policy: flag("NIRI_DEBUG_STRICT_NEW_WINDOW_FOCUS_POLICY"),
+            honor_xdg_activation_with_invalid_serial: flag(
+                "NIRI_DEBUG_HONOR_XDG_ACTIVATION_WITH_INVALID_SERIAL",
+            ),
+            deactivate_unfocused_windows: flag("NIRI_DEBUG_DEACTIVATE_UNFOCUSED_WINDOWS"),
+            skip_cursor_only_updates_during_vrr: flag(
+                "NIRI_DEBUG_SKIP_CURSOR_ONLY_UPDATES_DURING_VRR",
+            ),
+        }
+    }
+}
+
 #[derive(knuffel::Decode, Debug, Default, PartialEq)]
 pub struct DebugPart {
     #[knuffel(child, unwrap(argument))]

@@ -101,7 +101,9 @@ impl Default for Keyboard {
             repeat_delay: 600,
             repeat_rate: 25,
             track_layout: Default::default(),
-            numlock: Default::default(),
+            // On, like a GNOME session (org.gnome.desktop.peripherals.keyboard
+            // numlock-state) and like the config file we used to ship.
+            numlock: true,
         }
     }
 }
@@ -183,7 +185,7 @@ impl ScrollFactor {
     }
 }
 
-#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]
+#[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub struct Touchpad {
     #[knuffel(child)]
     pub off: bool,
@@ -221,6 +223,34 @@ pub struct Touchpad {
     pub middle_emulation: bool,
     #[knuffel(child)]
     pub scroll_factor: Option<ScrollFactor>,
+}
+
+impl Default for Touchpad {
+    fn default() -> Self {
+        Self {
+            off: false,
+            // Tap-to-click and natural scrolling on, matching a GNOME session
+            // (org.gnome.desktop.peripherals.touchpad tap-to-click /
+            // natural-scroll) and the config file we used to ship.
+            tap: true,
+            natural_scroll: true,
+            dwt: false,
+            dwtp: false,
+            drag: None,
+            drag_lock: false,
+            click_method: None,
+            accel_speed: Default::default(),
+            accel_profile: None,
+            scroll_method: None,
+            scroll_button: None,
+            scroll_button_lock: false,
+            tap_button_map: None,
+            left_handed: false,
+            disabled_on_external_mouse: false,
+            middle_emulation: false,
+            scroll_factor: None,
+        }
+    }
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]

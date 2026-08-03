@@ -170,7 +170,6 @@ install -Dm644 -t %{buildroot}%{zsh_completions_dir} ./_niri
 %files
 %license LICENSE
 %doc README.md
-%doc resources/default-config.kdl
 %doc docs/wiki
 %{_bindir}/niri
 %{_bindir}/niri-session

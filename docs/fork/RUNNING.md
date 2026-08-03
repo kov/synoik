@@ -74,7 +74,7 @@ PROFILE=release scripts/dev-nested.sh
 or by hand:
 
 ```sh
-cargo run -- --config resources/default-config.kdl -- kitty
+cargo run -- -- kitty
 ```
 
 Do **not** pass `--session` when nested — it imports env into systemd/D-Bus
@@ -171,16 +171,9 @@ center on their parent (top-biased third), other windows first-fit without
 overlap and cascade in 50px steps when nothing fits. Window rules
 (`open-floating false`) still override per window.
 
-niri's scrollable tiling is one config line away:
-
-```kdl
-layout {
-    windowing-mode "scrolling"
-}
-```
-
-(The matching GNOME-side setting is deferred; the switch lives in the niri
-config for now.)
+niri's scrollable tiling is still in the tree (`layout.windowing_mode`), but
+there is no longer a way to *ask* for it: the config file is gone and the
+GNOME-side setting is not ported yet, so a session always comes up floating.
 
 GNOME's window keys work on the floating layer: **Super+Left/Right**
 edge-tiles to half the work area and toggles back (`toggle-tiled-left/right`
@@ -339,6 +332,28 @@ gone. GNOME's own schemas own everything GNOME names; the scrolling-layout
 actions it has no name for are in ours, `org.gnome.shell-rs.keybindings`, which
 installs to a private schema dir (see `docs/fork/keybindings-port.md` for the
 adopted tables, the divergences and how to read the keys from a shell).
+
+## Configuration (there is no config file)
+
+There is no `config.kdl`, no `--config`, no `niri validate` and no file watcher.
+A session runs on the compiled-in `Config::default()` (`niri-config/src/lib.rs`)
+plus GSettings, which is where everything user-facing is supposed to land — per
+the fork tenet, GNOME's settings are the settings. What is still only in
+`Config::default()` is work that has not been ported yet, and that is on purpose:
+a compiled-in default is visible as a gap, a config knob hides one.
+
+The one escape hatch is the debug toggles that used to live in `debug {}`. They
+come from the environment now — `NIRI_DEBUG_<FIELD_NAME_IN_CAPS>`, the same
+idiom as `NIRI_VK_VALIDATION`, so a systemd drop-in reaches the live session:
+
+```sh
+NIRI_DEBUG_DISABLE_TRANSACTIONS=1 cargo run
+NIRI_DEBUG_PREVIEW_RENDER=screencast cargo run   # or screen-capture
+NIRI_DEBUG_IGNORE_DRM_DEVICES=/dev/dri/card1:/dev/dri/card2
+```
+
+The field list is `Debug` in `niri-config/src/debug.rs`; every `bool` field is a
+flag var (set to anything but `0`/empty).
 
 ## The run dialog (Alt+F2)
 

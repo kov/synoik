@@ -233,14 +233,6 @@ impl Niri {
         self.a11y.update_tree(update);
     }
 
-    pub fn a11y_announce_config_error(&mut self) {
-        if self.a11y.to_accesskit.is_none() {
-            return;
-        }
-
-        self.a11y_announce(crate::ui::config_error_notification::error_text());
-    }
-
     pub fn a11y_announce_hotkey_overlay(&mut self) {
         if self.a11y.to_accesskit.is_none() {
             return;

@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
@@ -13,12 +12,6 @@ use crate::utils::version;
 #[command(subcommand_value_name = "SUBCOMMAND")]
 #[command(subcommand_help_heading = "Subcommands")]
 pub struct Cli {
-    /// Path to config file (default: `$XDG_CONFIG_HOME/niri/config.kdl`).
-    ///
-    /// This can also be set with the `NIRI_CONFIG` environment variable. If both are set, the
-    /// command line argument takes precedence.
-    #[arg(short, long)]
-    pub config: Option<PathBuf>,
     /// Import environment globally to systemd and D-Bus, run D-Bus services.
     ///
     /// Set this flag in a systemd service started by your display manager, or when running
@@ -52,15 +45,6 @@ pub enum Sub {
         /// Format output as JSON.
         #[arg(short, long)]
         json: bool,
-    },
-    /// Validate the config file.
-    Validate {
-        /// Path to config file (default: `$XDG_CONFIG_HOME/niri/config.kdl`).
-        ///
-        /// This can also be set with the `NIRI_CONFIG` environment variable. If both are set, the
-        /// command line argument takes precedence.
-        #[arg(short, long)]
-        config: Option<PathBuf>,
     },
     /// Cause a panic to check if the backtraces are good.
     Panic,

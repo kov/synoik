@@ -5,7 +5,6 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::FromRawFd;
-use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::{env, mem, thread};
@@ -14,7 +13,6 @@ use calloop::EventLoop;
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use clap_complete_nushell::Nushell;
-use directories::ProjectDirs;
 use niri::backend::BackendMode;
 use niri::cli::{Cli, CompletionShell, Sub};
 #[cfg(feature = "dbus")]
@@ -26,8 +24,8 @@ use niri::utils::spawning::{
     spawn, spawn_sh, store_and_increase_nofile_rlimit, CHILD_DISPLAY, CHILD_ENV,
     REMOVE_ENV_RUST_BACKTRACE, REMOVE_ENV_RUST_LIB_BACKTRACE,
 };
-use niri::utils::{cause_panic, version, watcher, xwayland, IS_SYSTEMD_SERVICE};
-use niri_config::{Config, ConfigPath};
+use niri::utils::{cause_panic, version, xwayland, IS_SYSTEMD_SERVICE};
+use niri_config::Config;
 use niri_ipc::socket::SOCKET_PATH_ENV;
 use sd_notify::NotifyState;
 use smithay::reexports::wayland_server::Display;
@@ -156,13 +154,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         niri::utils::signals::unblock_all().unwrap();
 
         match subcommand {
-            Sub::Validate { config } => {
-                tracy_client::Client::start();
-
-                config_path(config).load().config?;
-                info!("config is valid");
-                return Ok(());
-            }
             Sub::Msg { msg, json } => {
                 handle_msg(msg, json)?;
                 return Ok(());
@@ -199,16 +190,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("starting version {}", &version());
 
-    // Load the config.
-    let config_path = config_path(cli.config);
-    env::remove_var("NIRI_CONFIG");
-    let (config_created_at, config_load_result) = config_path.load_or_create();
-    let config_errored = config_load_result.config.is_err();
-    let mut config = config_load_result.config.unwrap_or_else(|err| {
-        warn!("{err:?}");
-        Config::load_default()
-    });
-    let config_includes = config_load_result.includes;
+    // There is no config file: everything the compositor is configured by now lives in
+    // GSettings (see `src/gnome.rs`), and the rest is compiled in. The exception is the debug
+    // toggles, which the `debug {}` block used to carry and which now come from the environment.
+    let mut config = Config {
+        debug: niri_config::Debug::from_env(),
+        ..Config::default()
+    };
 
     let spawn_at_startup = mem::take(&mut config.spawn_at_startup);
     let spawn_sh_at_startup = mem::take(&mut config.spawn_sh_at_startup);
@@ -350,8 +338,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    watcher::setup(&mut state, &config_path, config_includes);
-
     // Spawn commands from cli and auto-start.
     spawn(cli.command, None);
 
@@ -360,14 +346,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     for elem in spawn_sh_at_startup {
         spawn_sh(elem.command, None);
-    }
-
-    // Show the config error notification right away if needed.
-    if config_errored {
-        state.niri.config_error_notification.show();
-        state.ipc_config_loaded(true);
-    } else if let Some(path) = config_created_at {
-        state.niri.config_error_notification.show_created(path);
     }
 
     // Run the compositor.
@@ -426,45 +404,6 @@ fn import_environment() {
         Err(err) => {
             warn!("error spawning shell to import environment: {err:?}");
         }
-    }
-}
-
-fn env_config_path() -> Option<PathBuf> {
-    env::var_os("NIRI_CONFIG")
-        .filter(|x| !x.is_empty())
-        .map(PathBuf::from)
-}
-
-fn default_config_path() -> Option<PathBuf> {
-    let Some(dirs) = ProjectDirs::from("", "", "niri") else {
-        warn!("error retrieving home directory");
-        return None;
-    };
-
-    let mut path = dirs.config_dir().to_owned();
-    path.push("config.kdl");
-    Some(path)
-}
-
-fn system_config_path() -> PathBuf {
-    PathBuf::from("/etc/niri/config.kdl")
-}
-
-fn config_path(cli_path: Option<PathBuf>) -> ConfigPath {
-    if let Some(explicit) = cli_path.or_else(env_config_path) {
-        return ConfigPath::Explicit(explicit);
-    }
-
-    let system_path = system_config_path();
-
-    if let Some(user_path) = default_config_path() {
-        ConfigPath::Regular {
-            user_path,
-            system_path,
-        }
-    } else {
-        // Couldn't find the home directory, or whatever.
-        ConfigPath::Explicit(system_path)
     }
 }
 

@@ -7,8 +7,8 @@
 //! The convention for `Default` impls is to set the initial values before the parsing occurs.
 //! Then, parsing will update the values with those parsed from the config.
 //!
-//! The `Default` values match those from `default-config.kdl` in almost all cases, with a notable
-//! exception of some window rules.
+//! There is no config *file* any more — a session runs on `Config::default()` plus GSettings —
+//! so the `Default` impls are the shipped configuration, not a starting point for a parse.
 
 #[macro_use]
 extern crate tracing;
@@ -16,14 +16,12 @@ extern crate tracing;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::fs::{self, File};
-use std::io::Write as _;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use knuffel::errors::DecodeError;
 use knuffel::Decode as _;
-use miette::{miette, Context as _, IntoDiagnostic as _};
 
 #[macro_use]
 pub mod macros;
@@ -87,25 +85,6 @@ pub struct Config {
     pub switch_events: SwitchBinds,
     pub debug: Debug,
     pub workspaces: Vec<Workspace>,
-}
-
-#[derive(Debug, Clone)]
-pub enum ConfigPath {
-    /// Explicitly set config path.
-    ///
-    /// Load the config only from this path, never create it.
-    Explicit(PathBuf),
-
-    /// Default config path.
-    ///
-    /// Prioritize the user path, fallback to the system path, fallback to creating the user path
-    /// at compositor startup.
-    Regular {
-        /// User config path, usually `$XDG_CONFIG_HOME/niri/config.kdl`.
-        user_path: PathBuf,
-        /// System config path, usually `/etc/niri/config.kdl`.
-        system_path: PathBuf,
-    },
 }
 
 // Newtypes for putting information into the knuffel context.
@@ -437,38 +416,6 @@ where
 }
 
 impl Config {
-    pub fn load_default() -> Self {
-        let res = Config::parse(
-            Path::new("default-config.kdl"),
-            include_str!("../../resources/default-config.kdl"),
-        );
-
-        // Includes in the default config can break its parsing at runtime.
-        assert!(
-            res.includes.is_empty(),
-            "default config must not have includes",
-        );
-
-        res.config.unwrap()
-    }
-
-    pub fn load(path: &Path) -> ConfigParseResult<Self, miette::Report> {
-        let contents = match fs::read_to_string(path) {
-            Ok(x) => x,
-            Err(err) => {
-                return ConfigParseResult::from_err(
-                    miette!(err).context(format!("error reading {path:?}")),
-                );
-            }
-        };
-
-        Self::parse(path, &contents).map_config_res(|res| {
-            let config = res.context("error parsing")?;
-            debug!("loaded config from {path:?}");
-            Ok(config)
-        })
-    }
-
     pub fn parse(path: &Path, text: &str) -> ConfigParseResult<Self, ConfigIncludeError> {
         let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let filename = path
@@ -512,109 +459,23 @@ impl Config {
     }
 }
 
-impl ConfigPath {
-    /// Loads the config, returns an error if it doesn't exist.
-    pub fn load(&self) -> ConfigParseResult<Config, miette::Report> {
-        let _span = tracy_client::span!("ConfigPath::load");
-
-        self.load_inner(|user_path, system_path| {
-            Err(miette!(
-                "no config file found; create one at {user_path:?} or {system_path:?}",
-            ))
-        })
-        .map_config_res(|res| res.context("error loading config"))
-    }
-
-    /// Loads the config, or creates it if it doesn't exist.
-    ///
-    /// Returns a tuple containing the path that was created, if any, and the loaded config.
-    ///
-    /// If the config was created, but for some reason could not be read afterwards,
-    /// this may return `(Some(_), Err(_))`.
-    pub fn load_or_create(&self) -> (Option<&Path>, ConfigParseResult<Config, miette::Report>) {
-        let _span = tracy_client::span!("ConfigPath::load_or_create");
-
-        let mut created_at = None;
-
-        let result = self
-            .load_inner(|user_path, _| {
-                Self::create(user_path, &mut created_at)
-                    .map(|()| user_path)
-                    .with_context(|| format!("error creating config at {user_path:?}"))
-            })
-            .map_config_res(|res| res.context("error loading config"));
-
-        (created_at, result)
-    }
-
-    fn load_inner<'a>(
-        &'a self,
-        maybe_create: impl FnOnce(&'a Path, &'a Path) -> miette::Result<&'a Path>,
-    ) -> ConfigParseResult<Config, miette::Report> {
-        let path = match self {
-            ConfigPath::Explicit(path) => path.as_path(),
-            ConfigPath::Regular {
-                user_path,
-                system_path,
-            } => {
-                if user_path.exists() {
-                    user_path.as_path()
-                } else if system_path.exists() {
-                    system_path.as_path()
-                } else {
-                    match maybe_create(user_path.as_path(), system_path.as_path()) {
-                        Ok(x) => x,
-                        Err(err) => return ConfigParseResult::from_err(miette!(err)),
-                    }
-                }
-            }
-        };
-        Config::load(path)
-    }
-
-    fn create<'a>(path: &'a Path, created_at: &mut Option<&'a Path>) -> miette::Result<()> {
-        if let Some(default_parent) = path.parent() {
-            fs::create_dir_all(default_parent)
-                .into_diagnostic()
-                .with_context(|| format!("error creating config directory {default_parent:?}"))?;
-        }
-
-        // Create the config and fill it with the default config if it doesn't exist.
-        let mut new_file = match File::options()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-            res => res,
-        }
-        .into_diagnostic()
-        .with_context(|| format!("error opening config file at {path:?}"))?;
-
-        *created_at = Some(path);
-
-        let default = include_bytes!("../../resources/default-config.kdl");
-
-        new_file
-            .write_all(default)
-            .into_diagnostic()
-            .with_context(|| format!("error writing default config to {path:?}"))?;
-
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use insta::{assert_debug_snapshot, assert_snapshot};
+    use insta::assert_debug_snapshot;
     use pretty_assertions::assert_eq;
 
     use super::*;
 
+    /// The compiled-in defaults are what every session runs on now that there is no config
+    /// file, so the shape they used to be checked against — `default-config.kdl` — is gone
+    /// with it. What is left worth pinning is that the values the file used to set are now
+    /// the defaults themselves.
     #[test]
-    fn can_create_default_config() {
-        let _ = Config::load_default();
+    fn the_shipped_defaults_are_the_defaults() {
+        let config = Config::default();
+        assert!(config.input.keyboard.numlock);
+        assert!(config.input.touchpad.tap);
+        assert!(config.input.touchpad.natural_scroll);
     }
 
     #[test]
@@ -916,7 +777,7 @@ mod tests {
                     repeat_delay: 600,
                     repeat_rate: 25,
                     track_layout: Window,
-                    numlock: false,
+                    numlock: true,
                 },
                 touchpad: Touchpad {
                     off: false,
@@ -1968,39 +1829,6 @@ mod tests {
         "#);
     }
 
-    fn diff_lines(expected: &str, actual: &str) -> String {
-        let mut output = String::new();
-        let mut in_change = false;
-
-        for change in diff::lines(expected, actual) {
-            match change {
-                diff::Result::Both(_, _) => {
-                    in_change = false;
-                }
-                diff::Result::Left(line) => {
-                    if !output.is_empty() && !in_change {
-                        output.push('\n');
-                    }
-                    output.push('-');
-                    output.push_str(line);
-                    output.push('\n');
-                    in_change = true;
-                }
-                diff::Result::Right(line) => {
-                    if !output.is_empty() && !in_change {
-                        output.push('\n');
-                    }
-                    output.push('+');
-                    output.push_str(line);
-                    output.push('\n');
-                    in_change = true;
-                }
-            }
-        }
-
-        output
-    }
-
     /// A `binds{}` block left over from before the GSettings port must not fail the config.
     ///
     /// Keybindings moved out, but a real config file has plenty else in it, and rejecting the
@@ -2024,50 +1852,5 @@ mod tests {
 
         // …and the rest of the file still applies.
         assert!(config.prefer_no_csd);
-    }
-
-    #[test]
-    fn diff_empty_to_default() {
-        // We try to write the config defaults in such a way that empty sections (and an empty
-        // config) give the same outcome as the default config bundled with niri. This test
-        // verifies the actual differences between the two.
-        let mut default_config = Config::load_default();
-        let empty_config = Config::parse_mem("").unwrap();
-
-        // Notable omission: the default config has some window rules. Clear them out so they
-        // don't spam the diff.
-        default_config.window_rules.clear();
-
-        assert_snapshot!(
-            diff_lines(
-                &format!("{empty_config:#?}"),
-                &format!("{default_config:#?}")
-            ),
-            @r#"
-        -            numlock: false,
-        +            numlock: true,
-
-        -            tap: false,
-        +            tap: true,
-
-        -            natural_scroll: false,
-        +            natural_scroll: true,
-
-        -    spawn_at_startup: [],
-        +    spawn_at_startup: [
-        +        SpawnAtStartup {
-        +            command: [
-        +                "waybar",
-        +            ],
-        +        },
-        +    ],
-
-        -                0.3333333333333333,
-        +                0.33333,
-
-        -                0.6666666666666666,
-        +                0.66667,
-        "#,
-        );
     }
 }

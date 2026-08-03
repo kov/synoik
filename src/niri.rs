@@ -182,7 +182,6 @@ use crate::render_helpers::{
 use crate::screencasting::Screencasting;
 use crate::system_status::SystemStatus;
 use crate::ui::app_grid::{AppGrid, AppGridEntry};
-use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::dash::{Dash, DashEntry};
 use crate::ui::end_session_dialog::{EndSessionDialog, EndSessionDialogRenderElement};
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
@@ -204,7 +203,6 @@ use crate::ui::window_preview::{PreviewChrome, PreviewOverlay};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
-use crate::utils::watcher::Watcher;
 use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
     center, center_f64, crop_rgba8, expand_home, get_monotonic_time, ipc_transform_to_smithay,
@@ -359,8 +357,6 @@ pub struct Niri {
     /// reloading the config from disk to determine if the output configuration should be reloaded
     /// (and transient changes dropped).
     pub config_file_output_config: niri_config::Outputs,
-
-    pub config_file_watcher: Option<Watcher>,
 
     pub event_loop: LoopHandle<'static, State>,
     pub scheduler: Scheduler<()>,
@@ -824,7 +820,6 @@ pub struct Niri {
     pub locked_hint: Option<bool>,
 
     pub screenshot_ui: ScreenshotUi,
-    pub config_error_notification: ConfigErrorNotification,
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: ExitConfirmDialog,
     pub run_dialog: RunDialog,
@@ -2984,23 +2979,13 @@ impl State {
         }
     }
 
-    pub fn reload_config(&mut self, config: Result<Config, ()>) {
+    /// Swap in a new [`Config`] wholesale and re-derive everything that depends on it.
+    ///
+    /// Nothing in the session reaches this any more — there is no config file to reload — but
+    /// it stays as the one place that knows how to apply a config, and the renderer tests use
+    /// it to install a custom shader through the real path.
+    pub fn reload_config(&mut self, mut config: Config) {
         let _span = tracy_client::span!("State::reload_config");
-
-        let mut config = match config {
-            Ok(config) => config,
-            Err(()) => {
-                self.niri.config_error_notification.show();
-                self.niri.queue_redraw_all();
-
-                #[cfg(feature = "dbus")]
-                self.niri.a11y_announce_config_error();
-
-                return;
-            }
-        };
-
-        self.niri.config_error_notification.hide();
 
         // Find & orphan removed named workspaces.
         let mut removed_workspaces: Vec<String> = vec![];
@@ -6525,8 +6510,6 @@ impl Niri {
         let mods_with_tablet_stylus_binds = mods_with_tablet_stylus_binds(keybindings);
 
         let screenshot_ui = ScreenshotUi::new(animation_clock.clone(), config.clone());
-        let config_error_notification =
-            ConfigErrorNotification::new(animation_clock.clone(), config.clone());
         let notification_banner = crate::ui::notification_banner::NotificationBanner::new(
             animation_clock.clone(),
             config.clone(),
@@ -6649,7 +6632,6 @@ impl Niri {
         let mut niri = Self {
             config,
             config_file_output_config,
-            config_file_watcher: None,
 
             event_loop,
             scheduler,
@@ -6844,7 +6826,6 @@ impl Niri {
             locked_hint: None,
 
             screenshot_ui,
-            config_error_notification,
             hotkey_overlay,
             exit_confirm_dialog,
             run_dialog: RunDialog::new(),
@@ -8724,7 +8705,6 @@ impl Niri {
         // can move or resize while the cycler is up.
         self.sync_cycler_highlight();
 
-        self.config_error_notification.advance_animations();
         self.exit_confirm_dialog.advance_animations();
         self.end_session_dialog.advance_animations();
         #[cfg(feature = "dbus")]
@@ -9032,11 +9012,6 @@ impl Niri {
             self.clock.now_unadjusted(),
             &mut |elem| push(elem.into()),
         );
-
-        // Next, the config error notification too.
-        if let Some(element) = self.config_error_notification.render(ctx.renderer, output) {
-            push(element.into());
-        }
 
         // If the session is locked, draw the lock surface.
         if self.is_locked() {
@@ -10025,8 +10000,6 @@ impl Niri {
         if self.monitors_active {
             let state = self.output_state.get_mut(output).unwrap();
             state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
-            state.unfinished_animations_remain |=
-                self.config_error_notification.are_animations_ongoing();
             state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
             state.unfinished_animations_remain |= self.end_session_dialog.are_animations_ongoing();
             #[cfg(feature = "dbus")]

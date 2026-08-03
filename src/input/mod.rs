@@ -3907,11 +3907,6 @@ impl State {
                 }
                 self.niri.queue_redraw_all();
             }
-            Action::LoadConfigFile(path) => {
-                if let Some(watcher) = &self.niri.config_file_watcher {
-                    watcher.load_config(path);
-                }
-            }
             Action::SwitchApplications { backward } => {
                 self.switch_applications(backward);
             }

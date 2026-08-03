@@ -15,17 +15,13 @@ NIRI=${NIRI_BIN:-$ROOT/target/debug/niri}
 
 [ -x "$NIRI" ] || { echo "no niri binary at $NIRI (cargo build --bin niri)"; exit 1; }
 
-mkdir -p "$R/config/niri" && chmod 700 "$R"
+mkdir -p "$R/config" && chmod 700 "$R"
 export XDG_RUNTIME_DIR=$R PIPEWIRE_RUNTIME_DIR=$R XDG_CONFIG_HOME=$R/config
 export DBUS_SESSION_BUS_ADDRESS=unix:path=$R/bus
 export RUST_LOG=${RUST_LOG:-niri=info,niri::screencasting=trace}
 
 # The screencast D-Bus interfaces are session-instance only unless this is set.
-cat > "$R/config/niri/config.kdl" <<'CFG'
-debug {
-    dbus-interfaces-in-non-session-instances
-}
-CFG
+export NIRI_DEBUG_DBUS_INTERFACES_IN_NON_SESSION_INSTANCES=1
 
 : > "$R/pids"
 rm -f "$R"/pipewire-0* "$R"/wayland-* "$R"/niri.*.sock "$R"/*.log

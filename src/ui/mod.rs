@@ -2,7 +2,6 @@ pub mod a11y_menu;
 pub mod app_grid;
 pub mod app_menu;
 pub mod calendar;
-pub mod config_error_notification;
 pub mod dash;
 pub mod end_session_dialog;
 pub mod exit_confirm_dialog;

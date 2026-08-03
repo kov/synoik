@@ -448,8 +448,6 @@ pub enum Action {
     SetWindowUrgent(u64),
     #[knuffel(skip)]
     UnsetWindowUrgent(u64),
-    #[knuffel(skip)]
-    LoadConfigFile(#[knuffel(argument)] Option<String>),
     /// GNOME's `switch-applications` — raise the app switcher, or advance it if it is already
     /// up. `backward` is the binding's `-backward` half (`windowManager.js:1705`).
     #[knuffel(skip)]
@@ -810,7 +808,6 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::ToggleWindowUrgent { id } => Self::ToggleWindowUrgent(id),
             niri_ipc::Action::SetWindowUrgent { id } => Self::SetWindowUrgent(id),
             niri_ipc::Action::UnsetWindowUrgent { id } => Self::UnsetWindowUrgent(id),
-            niri_ipc::Action::LoadConfigFile { path } => Self::LoadConfigFile(path),
         }
     }
 }
