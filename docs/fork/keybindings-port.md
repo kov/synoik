@@ -144,6 +144,27 @@ Three unit tests keep it honest, each covering a failure that is otherwise silen
   `update_binding`, so a typo in a keysym name yields a binding with no accelerators rather than
   an error. Our own defaults are not user input.
 
+### The scroll bindings
+
+mutter's accelerators are keys only, so the trigger names (`WheelScrollDown`, `MouseMiddle`,
+`TabletStylusButton1`, …) are an extension of ours, spelled by `Trigger::from_name` — one
+parser shared with the KDL key syntax, so `<Super>WheelScrollDown` in the schema and
+`Mod+WheelScrollDown` in a config file cannot drift apart.
+
+They are named for the trigger (`scroll-focus-workspace-down`) rather than the action, because
+several bind an action that already has a key of its own and a settings key cannot appear twice.
+The workspace ones carry a compiled-in cooldown, which is *not* a settings key: a wheel detent
+is not a keypress, and a flick of a free-spinning wheel would otherwise cross several
+workspaces.
+
+**The fast-path trap.** The pointer, wheel, touchpad and stylus handlers gate on
+`mods_with_*_binds` — sets of the modifier combinations any binding uses — before doing any
+lookup, so an unmodified scroll costs nothing. They were built from `config.binds` alone, which
+means a binding in the settings model was not merely slow to find but *never found at all*.
+`Niri::refresh_mods_with_binds` now rebuilds them from both sources, and runs wherever either
+changes: config reload, the initial settings read, and every live settings change. Construction
+builds them from the compiled-in model, which is what the headless tests run on.
+
 ### Packaging
 
 The schema installs to a **private** directory, never `/usr/share/glib-2.0/schemas`:
@@ -220,7 +241,7 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 | S4 | wm/mutter window + monitor keys: `toggle-maximized`, `move-to-monitor-*`, `*-workspace-last`, `switch-input-source` | **done** |
 | S5 | `switch-to-application-N` + `open-new-window-application-N` | **done** |
 | S6 | Our own schema for the niri actions, plus its packaging | **done** |
-| S7 | Route the non-keyboard triggers (mouse, wheel, touchpad, tablet) through the model | |
+| S7 | Route the non-keyboard triggers (mouse, wheel, touchpad, tablet) through the model | **done** |
 | S8 | Prune and then delete the KDL `binds{}` | |
 | S9 | Re-source the hotkey overlay from the settings model | |
 | S10 | Vendor `org.gnome.shell.*` / `org.gnome.mutter.*` into our private schema dir, plus the `.gschema.override` for our differing defaults | after S6 |

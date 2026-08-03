@@ -56,6 +56,40 @@ pub enum Trigger {
     TabletStylusButton3,
 }
 
+impl Trigger {
+    /// The non-keyboard triggers by name, case-insensitively — everything a
+    /// binding can be on that is not a keysym.
+    ///
+    /// Shared by the KDL key syntax and the accelerator parser, which both spell
+    /// these the same way, so `<Super>WheelScrollDown` in our GSettings schema and
+    /// `Mod+WheelScrollDown` in a config file cannot drift apart.
+    ///
+    /// Never returns [`Trigger::Keysym`]: a name that is not one of these is a
+    /// keysym, and resolving it is the caller's business.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let trigger = match () {
+            _ if name.eq_ignore_ascii_case("MouseLeft") => Self::MouseLeft,
+            _ if name.eq_ignore_ascii_case("MouseRight") => Self::MouseRight,
+            _ if name.eq_ignore_ascii_case("MouseMiddle") => Self::MouseMiddle,
+            _ if name.eq_ignore_ascii_case("MouseBack") => Self::MouseBack,
+            _ if name.eq_ignore_ascii_case("MouseForward") => Self::MouseForward,
+            _ if name.eq_ignore_ascii_case("WheelScrollDown") => Self::WheelScrollDown,
+            _ if name.eq_ignore_ascii_case("WheelScrollUp") => Self::WheelScrollUp,
+            _ if name.eq_ignore_ascii_case("WheelScrollLeft") => Self::WheelScrollLeft,
+            _ if name.eq_ignore_ascii_case("WheelScrollRight") => Self::WheelScrollRight,
+            _ if name.eq_ignore_ascii_case("TouchpadScrollDown") => Self::TouchpadScrollDown,
+            _ if name.eq_ignore_ascii_case("TouchpadScrollUp") => Self::TouchpadScrollUp,
+            _ if name.eq_ignore_ascii_case("TouchpadScrollLeft") => Self::TouchpadScrollLeft,
+            _ if name.eq_ignore_ascii_case("TouchpadScrollRight") => Self::TouchpadScrollRight,
+            _ if name.eq_ignore_ascii_case("TabletStylusButton1") => Self::TabletStylusButton1,
+            _ if name.eq_ignore_ascii_case("TabletStylusButton2") => Self::TabletStylusButton2,
+            _ if name.eq_ignore_ascii_case("TabletStylusButton3") => Self::TabletStylusButton3,
+            _ => return None,
+        };
+        Some(trigger)
+    }
+}
+
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct Modifiers : u8 {
@@ -1068,38 +1102,8 @@ impl FromStr for Key {
             }
         }
 
-        let trigger = if key.eq_ignore_ascii_case("MouseLeft") {
-            Trigger::MouseLeft
-        } else if key.eq_ignore_ascii_case("MouseRight") {
-            Trigger::MouseRight
-        } else if key.eq_ignore_ascii_case("MouseMiddle") {
-            Trigger::MouseMiddle
-        } else if key.eq_ignore_ascii_case("MouseBack") {
-            Trigger::MouseBack
-        } else if key.eq_ignore_ascii_case("MouseForward") {
-            Trigger::MouseForward
-        } else if key.eq_ignore_ascii_case("WheelScrollDown") {
-            Trigger::WheelScrollDown
-        } else if key.eq_ignore_ascii_case("WheelScrollUp") {
-            Trigger::WheelScrollUp
-        } else if key.eq_ignore_ascii_case("WheelScrollLeft") {
-            Trigger::WheelScrollLeft
-        } else if key.eq_ignore_ascii_case("WheelScrollRight") {
-            Trigger::WheelScrollRight
-        } else if key.eq_ignore_ascii_case("TouchpadScrollDown") {
-            Trigger::TouchpadScrollDown
-        } else if key.eq_ignore_ascii_case("TouchpadScrollUp") {
-            Trigger::TouchpadScrollUp
-        } else if key.eq_ignore_ascii_case("TouchpadScrollLeft") {
-            Trigger::TouchpadScrollLeft
-        } else if key.eq_ignore_ascii_case("TouchpadScrollRight") {
-            Trigger::TouchpadScrollRight
-        } else if key.eq_ignore_ascii_case("TabletStylusButton1") {
-            Trigger::TabletStylusButton1
-        } else if key.eq_ignore_ascii_case("TabletStylusButton2") {
-            Trigger::TabletStylusButton2
-        } else if key.eq_ignore_ascii_case("TabletStylusButton3") {
-            Trigger::TabletStylusButton3
+        let trigger = if let Some(trigger) = Trigger::from_name(key) {
+            trigger
         } else {
             let mut keysym = keysym_from_name(key, KEYSYM_CASE_INSENSITIVE);
             // The keyboard event handling code can receive either

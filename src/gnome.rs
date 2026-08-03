@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use gio::glib;
 use gio::glib::prelude::ObjectExt;
@@ -861,13 +862,35 @@ impl GnomeSettings {
 /// Reads one adopted-keybindings table, one entry per settings key in table
 /// order, from its store where open (a missing key falls back to our
 /// built-in default rather than aborting inside gio).
-fn read_keybinding_table<A: Into<KeybindingAction>>(
+/// One row of an adopted-keybindings table: the settings key, what it does, the
+/// default accelerators, and optionally a cooldown.
+///
+/// A trait rather than a four-field tuple everywhere, so the GNOME tables — none
+/// of which has a cooldown — keep their three-element rows.
+trait AdoptedKey {
+    fn into_parts(self) -> (String, KeybindingAction, Vec<String>, Option<Duration>);
+}
+
+impl<A: Into<KeybindingAction>> AdoptedKey for (String, A, Vec<String>) {
+    fn into_parts(self) -> (String, KeybindingAction, Vec<String>, Option<Duration>) {
+        (self.0, self.1.into(), self.2, None)
+    }
+}
+
+impl<A: Into<KeybindingAction>> AdoptedKey for (String, A, Vec<String>, Option<Duration>) {
+    fn into_parts(self) -> (String, KeybindingAction, Vec<String>, Option<Duration>) {
+        (self.0, self.1.into(), self.2, self.3)
+    }
+}
+
+fn read_keybinding_table<K: AdoptedKey>(
     store: Option<&gio::Settings>,
-    table: Vec<(String, A, Vec<String>)>,
+    table: Vec<K>,
 ) -> Vec<GnomeKeybinding> {
     table
         .into_iter()
-        .map(|(key, action, defaults)| {
+        .map(AdoptedKey::into_parts)
+        .map(|(key, action, defaults, cooldown)| {
             let values = match store {
                 Some(store) if settings_has_key(store, &key) => {
                     store.strv(&key).iter().map(|s| s.to_string()).collect()
@@ -879,8 +902,9 @@ fn read_keybinding_table<A: Into<KeybindingAction>>(
                 None => defaults,
             };
             GnomeKeybinding {
-                action: action.into(),
+                action,
                 accels: parse_accels(&key, values),
+                cooldown,
             }
         })
         .collect()
@@ -906,6 +930,12 @@ fn read_source_tuples(value: &glib::Variant) -> Vec<(String, String)> {
 pub struct GnomeKeybinding {
     pub action: KeybindingAction,
     pub accels: Vec<Accel>,
+    /// How long after firing before this binding may fire again — niri's
+    /// `cooldown-ms`, and `None` for everything GNOME names.
+    ///
+    /// It exists for the scroll bindings: a wheel detent is not a keypress, and a
+    /// free-spinning wheel would otherwise walk a dozen workspaces per flick.
+    pub cooldown: Option<Duration>,
 }
 
 /// What a keybinding does: one of GNOME's semantic actions, or — for the
@@ -1971,14 +2001,14 @@ fn adopted_shell_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
 /// Arrow keys are absent throughout: `<Super>` plus an arrow is GNOME's, four
 /// times over (tiling, maximize, unmaximize, move-to-monitor), so this half of
 /// the model is hjkl.
-fn adopted_niri_keybindings() -> Vec<(String, Action, Vec<String>)> {
+fn adopted_niri_keybindings() -> Vec<(String, Action, Vec<String>, Option<Duration>)> {
     use Action::*;
 
     fn key(name: &str, action: Action, accel: &str) -> (String, Action, Vec<String>) {
         (name.to_owned(), action, vec![accel.to_owned()])
     }
 
-    vec![
+    let keys = vec![
         key("focus-column-left", FocusColumnLeft, "<Super>h"),
         key("focus-column-right", FocusColumnRight, "<Super>l"),
         key("focus-window-up", FocusWindowUp, "<Super>k"),
@@ -2109,7 +2139,95 @@ fn adopted_niri_keybindings() -> Vec<(String, Action, Vec<String>)> {
         ),
         key("power-off-monitors", PowerOffMonitors, "<Super><Shift>p"),
         key("quit", Quit(false), "<Super><Shift>e"),
-    ]
+    ];
+
+    // The scroll bindings. Named for the trigger rather than the action because
+    // several of them bind an action that already has a key of its own above, and
+    // one settings key cannot appear twice.
+    //
+    // mutter's accelerators are keys, so the trigger names are our extension —
+    // spelled exactly as `Trigger::from_name` spells them, which is exactly as the
+    // config file spells them.
+    fn scroll(
+        name: &str,
+        action: Action,
+        accels: &[&str],
+        cooldown: Option<Duration>,
+    ) -> (String, Action, Vec<String>, Option<Duration>) {
+        (
+            name.to_owned(),
+            action,
+            accels.iter().map(|a| (*a).to_owned()).collect(),
+            cooldown,
+        )
+    }
+
+    // A flick of a free-spinning wheel is many detents; without this it would
+    // cross several workspaces before your hand stopped. Column moves are
+    // deliberately uncapped — those you want to be able to run.
+    let workspace_cooldown = Some(Duration::from_millis(150));
+
+    let scrolls = vec![
+        scroll(
+            "scroll-focus-column-left",
+            FocusColumnLeft,
+            &["<Super>WheelScrollLeft", "<Super><Shift>WheelScrollUp"],
+            None,
+        ),
+        scroll(
+            "scroll-focus-column-right",
+            FocusColumnRight,
+            &["<Super>WheelScrollRight", "<Super><Shift>WheelScrollDown"],
+            None,
+        ),
+        scroll(
+            "scroll-move-column-left",
+            MoveColumnLeft,
+            &[
+                "<Super><Control>WheelScrollLeft",
+                "<Super><Control><Shift>WheelScrollUp",
+            ],
+            None,
+        ),
+        scroll(
+            "scroll-move-column-right",
+            MoveColumnRight,
+            &[
+                "<Super><Control>WheelScrollRight",
+                "<Super><Control><Shift>WheelScrollDown",
+            ],
+            None,
+        ),
+        scroll(
+            "scroll-focus-workspace-down",
+            FocusWorkspaceDown,
+            &["<Super>WheelScrollDown"],
+            workspace_cooldown,
+        ),
+        scroll(
+            "scroll-focus-workspace-up",
+            FocusWorkspaceUp,
+            &["<Super>WheelScrollUp"],
+            workspace_cooldown,
+        ),
+        scroll(
+            "scroll-move-column-to-workspace-down",
+            MoveColumnToWorkspaceDown(true),
+            &["<Super><Control>WheelScrollDown"],
+            workspace_cooldown,
+        ),
+        scroll(
+            "scroll-move-column-to-workspace-up",
+            MoveColumnToWorkspaceUp(true),
+            &["<Super><Control>WheelScrollUp"],
+            workspace_cooldown,
+        ),
+    ];
+
+    keys.into_iter()
+        .map(|(name, action, accels)| (name, action, accels, None))
+        .chain(scrolls)
+        .collect()
 }
 
 /// The `org.gnome.mutter.wayland.keybindings` keys we honor — mutter's two
@@ -2987,6 +3105,14 @@ pub enum AccelTrigger {
     /// A hardware (xkb) keycode: the `0xNN` syntax, and `Above_Tab`, which
     /// mutter resolves straight to the key above Tab regardless of layout.
     Keycode(u32),
+    /// A non-keyboard trigger — a mouse button, a scroll direction, a tablet
+    /// stylus button — spelled by name, e.g. `<Super>WheelScrollDown`.
+    ///
+    /// **Ours, not GNOME's.** mutter's accelerators are keys only; this exists
+    /// because a scrolling window manager binds the scroll wheel, and it would
+    /// otherwise be the one part of the model with nowhere to live. Never holds
+    /// [`Trigger::Keysym`] — [`Trigger::from_name`] does not produce it.
+    Device(niri_config::Trigger),
 }
 
 /// One parsed keyboard accelerator — a single entry of a keybinding's
@@ -3075,7 +3201,12 @@ pub(crate) fn parse_accelerator(accel: &str) -> Result<Option<Accel>, ()> {
         return Ok(None);
     }
 
-    let trigger = if let Some(keycode) = parse_accel_keycode(rest) {
+    let trigger = if let Some(trigger) = niri_config::Trigger::from_name(rest) {
+        // Checked before the keysym lookup, which is safe because none of these
+        // names is a keysym (nor an XF86 one, which is what the retry below would
+        // otherwise turn them into).
+        AccelTrigger::Device(trigger)
+    } else if let Some(keycode) = parse_accel_keycode(rest) {
         AccelTrigger::Keycode(keycode)
     } else if rest == "Above_Tab" {
         AccelTrigger::Keycode(ABOVE_TAB_KEYCODE)
@@ -3340,7 +3471,7 @@ mod tests {
         }
 
         let mut clashes = Vec::new();
-        for (key, _, defaults) in adopted_niri_keybindings() {
+        for (key, _, defaults, _) in adopted_niri_keybindings() {
             for accel in parse_accels(&key, defaults) {
                 if let Some((_, theirs)) = gnome.iter().find(|(a, _)| *a == accel) {
                     clashes.push(format!("{key} wants {accel:?}, which is GNOME's {theirs}"));
@@ -3359,7 +3490,7 @@ mod tests {
     /// nothing. Our own defaults are not user input and have no excuse.
     #[test]
     fn our_defaults_all_parse() {
-        for (key, _, defaults) in adopted_niri_keybindings() {
+        for (key, _, defaults, _) in adopted_niri_keybindings() {
             let want = defaults.len();
             let got = parse_accels(&key, defaults).len();
             assert_eq!(got, want, "{key} has an accelerator that does not parse");
@@ -3399,7 +3530,7 @@ mod tests {
 
         let in_table: Vec<(String, Vec<String>)> = adopted_niri_keybindings()
             .into_iter()
-            .map(|(key, _, defaults)| (key, defaults))
+            .map(|(key, _, defaults, _)| (key, defaults))
             .collect();
 
         assert_eq!(

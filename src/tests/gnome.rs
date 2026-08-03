@@ -806,6 +806,53 @@ fn shortcuts_inhibit_masks_gnome_keybindings() {
     );
 }
 
+/// The scroll bindings live in the settings model too, not only in the config
+/// file: `<Super>` plus a wheel notch walks the workspaces, and rebinding it in
+/// the model takes effect like any other key.
+///
+/// mutter's accelerators are keys only, so the trigger names are our extension —
+/// but they run through the same table, the same modifier matching and the same
+/// `handle_bind` as everything else.
+#[test]
+fn a_wheel_notch_resolves_through_the_settings_model() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // A mapped window gives the monitor a second workspace to scroll to. The
+    // pointer goes over it, away from the panel and the hot corner, so this
+    // measures the binding and not some other scroll consumer.
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.pointer_motion(960., 540.);
+    let active = |f: &mut Fixture| {
+        f.niri()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx()
+    };
+    assert_eq!(active(&mut f), 0);
+
+    // Without the modifier it is an ordinary scroll, not a binding.
+    f.scroll_wheel();
+    f.niri_complete_animations();
+    assert_eq!(
+        active(&mut f),
+        0,
+        "a bare wheel notch must not switch workspaces"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    f.scroll_wheel();
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert_eq!(
+        active(&mut f),
+        1,
+        "<Super> + a wheel notch down must go to the next workspace"
+    );
+}
+
 /// Our own schema's bindings resolve through the same path as GNOME's: they are
 /// entries in one keybinding model, differing only in which action they carry.
 ///

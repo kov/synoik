@@ -6562,7 +6562,13 @@ impl State {
                 .and_then(|trigger| {
                     let config = self.niri.config.borrow();
                     let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
-                    find_configured_bind(bindings, mod_key, trigger, mods)
+                    find_trigger_bind(
+                        bindings,
+                        &self.niri.gnome_settings.keybindings,
+                        mod_key,
+                        trigger,
+                        mods,
+                    )
                 })
                 .filter(|bind| {
                     !self.niri.screenshot_ui.is_open() || allowed_during_screenshot(&bind.action)
@@ -7181,8 +7187,9 @@ impl State {
                         } else {
                             let config = self.niri.config.borrow();
                             let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
-                            let bind_left = find_configured_bind(
+                            let bind_left = find_trigger_bind(
                                 bindings.clone(),
+                                &self.niri.gnome_settings.keybindings,
                                 mod_key,
                                 Trigger::WheelScrollLeft,
                                 mods,
@@ -7191,8 +7198,9 @@ impl State {
                                 !self.niri.screenshot_ui.is_open()
                                     || allowed_during_screenshot(&bind.action)
                             });
-                            let bind_right = find_configured_bind(
+                            let bind_right = find_trigger_bind(
                                 bindings,
+                                &self.niri.gnome_settings.keybindings,
                                 mod_key,
                                 Trigger::WheelScrollRight,
                                 mods,
@@ -7275,8 +7283,9 @@ impl State {
                     } else {
                         let config = self.niri.config.borrow();
                         let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
-                        let bind_up = find_configured_bind(
+                        let bind_up = find_trigger_bind(
                             bindings.clone(),
+                            &self.niri.gnome_settings.keybindings,
                             mod_key,
                             Trigger::WheelScrollUp,
                             mods,
@@ -7285,12 +7294,17 @@ impl State {
                             !self.niri.screenshot_ui.is_open()
                                 || allowed_during_screenshot(&bind.action)
                         });
-                        let bind_down =
-                            find_configured_bind(bindings, mod_key, Trigger::WheelScrollDown, mods)
-                                .filter(|bind| {
-                                    !self.niri.screenshot_ui.is_open()
-                                        || allowed_during_screenshot(&bind.action)
-                                });
+                        let bind_down = find_trigger_bind(
+                            bindings,
+                            &self.niri.gnome_settings.keybindings,
+                            mod_key,
+                            Trigger::WheelScrollDown,
+                            mods,
+                        )
+                        .filter(|bind| {
+                            !self.niri.screenshot_ui.is_open()
+                                || allowed_during_screenshot(&bind.action)
+                        });
                         (bind_up, bind_down)
                     };
 
@@ -7427,8 +7441,9 @@ impl State {
                 if ticks != 0 {
                     let config = self.niri.config.borrow();
                     let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
-                    let bind_left = find_configured_bind(
+                    let bind_left = find_trigger_bind(
                         bindings.clone(),
+                        &self.niri.gnome_settings.keybindings,
                         mod_key,
                         Trigger::TouchpadScrollLeft,
                         mods,
@@ -7437,12 +7452,17 @@ impl State {
                         !self.niri.screenshot_ui.is_open()
                             || allowed_during_screenshot(&bind.action)
                     });
-                    let bind_right =
-                        find_configured_bind(bindings, mod_key, Trigger::TouchpadScrollRight, mods)
-                            .filter(|bind| {
-                                !self.niri.screenshot_ui.is_open()
-                                    || allowed_during_screenshot(&bind.action)
-                            });
+                    let bind_right = find_trigger_bind(
+                        bindings,
+                        &self.niri.gnome_settings.keybindings,
+                        mod_key,
+                        Trigger::TouchpadScrollRight,
+                        mods,
+                    )
+                    .filter(|bind| {
+                        !self.niri.screenshot_ui.is_open()
+                            || allowed_during_screenshot(&bind.action)
+                    });
                     drop(config);
 
                     if let Some(right) = bind_right {
@@ -7464,8 +7484,9 @@ impl State {
                 if ticks != 0 {
                     let config = self.niri.config.borrow();
                     let bindings = make_binds_iter(&config, self.niri.switcher.is_open());
-                    let bind_up = find_configured_bind(
+                    let bind_up = find_trigger_bind(
                         bindings.clone(),
+                        &self.niri.gnome_settings.keybindings,
                         mod_key,
                         Trigger::TouchpadScrollUp,
                         mods,
@@ -7474,12 +7495,17 @@ impl State {
                         !self.niri.screenshot_ui.is_open()
                             || allowed_during_screenshot(&bind.action)
                     });
-                    let bind_down =
-                        find_configured_bind(bindings, mod_key, Trigger::TouchpadScrollDown, mods)
-                            .filter(|bind| {
-                                !self.niri.screenshot_ui.is_open()
-                                    || allowed_during_screenshot(&bind.action)
-                            });
+                    let bind_down = find_trigger_bind(
+                        bindings,
+                        &self.niri.gnome_settings.keybindings,
+                        mod_key,
+                        Trigger::TouchpadScrollDown,
+                        mods,
+                    )
+                    .filter(|bind| {
+                        !self.niri.screenshot_ui.is_open()
+                            || allowed_during_screenshot(&bind.action)
+                    });
                     drop(config);
 
                     if let Some(down) = bind_down {
@@ -7867,7 +7893,13 @@ impl State {
                         let bind = {
                             let config = self.niri.config.borrow();
                             let bindings = config.binds.0.iter();
-                            find_configured_bind(bindings, mod_key, trigger, mods)
+                            find_trigger_bind(
+                                bindings,
+                                &self.niri.gnome_settings.keybindings,
+                                mod_key,
+                                trigger,
+                                mods,
+                            )
                         }
                         .filter(|bind| {
                             !self.niri.screenshot_ui.is_open()
@@ -8738,6 +8770,53 @@ fn find_gnome_bind(
     })
 }
 
+/// Find a binding for a non-keyboard trigger — a mouse button, a scroll
+/// direction, a tablet stylus button — in the keybinding model, then in the
+/// config binds.
+///
+/// The GSettings half only ever matches our own schema: mutter's accelerators
+/// are keys, so nothing GNOME names can be on a trigger.
+fn find_trigger_bind<'a>(
+    bindings: impl IntoIterator<Item = &'a Bind>,
+    keybindings: &[GnomeKeybinding],
+    mod_key: ModKey,
+    trigger: Trigger,
+    mods: ModifiersState,
+) -> Option<Bind> {
+    if let Some(bind) = find_gnome_trigger_bind(keybindings, trigger, mods) {
+        return Some(bind);
+    }
+    find_configured_bind(bindings, mod_key, trigger, mods)
+}
+
+fn find_gnome_trigger_bind(
+    keybindings: &[GnomeKeybinding],
+    trigger: Trigger,
+    mods: ModifiersState,
+) -> Option<Bind> {
+    let keybinding = keybindings.iter().find(|kb| {
+        kb.accels.iter().any(|accel| {
+            accel.trigger == AccelTrigger::Device(trigger) && accel_mods_match(accel.mods, mods)
+        })
+    })?;
+
+    let action = action_for_keybinding(&keybinding.action)?;
+    Some(Bind {
+        key: Key {
+            trigger,
+            modifiers: Modifiers::empty(),
+        },
+        action,
+        // A scroll tick is not a key press: there is no auto-repeat to inherit, and
+        // the cooldown is what keeps a flick of the wheel from crossing the desktop.
+        repeat: false,
+        cooldown: keybinding.cooldown,
+        allow_when_locked: false,
+        allow_inhibiting: true,
+        hotkey_overlay_title: None,
+    })
+}
+
 /// What an open switcher does with a plain keysym — the half of `_keyPressHandler` that matches
 /// on the key rather than on the resolved binding action.
 ///
@@ -8772,12 +8851,8 @@ fn switcher_key_for(raw: Keysym) -> Option<SwitcherKey> {
     })
 }
 
-/// Whether an accelerator matches this key event. Mirrors mutter's matching:
-/// Caps/Num/Scroll Lock never participate (`ModifiersState` already keeps
-/// locks out of ctrl/alt/shift/logo), and the virtual META/HYPER modifiers
-/// match their conventional homes (the Alt and Super keys) rather than going
-/// through the keymap's modmap. Accelerators demanding the raw MOD2/MOD3
-/// masks never match — we don't track those as modifiers.
+/// Whether an accelerator matches this key event — mutter's matching, with the
+/// modifier half in [`accel_mods_match`].
 fn accel_matches(
     accel: &Accel,
     key_code: Keycode,
@@ -8787,16 +8862,29 @@ fn accel_matches(
     let trigger_matches = match accel.trigger {
         AccelTrigger::Keysym(keysym) => raw == Some(keysym),
         AccelTrigger::Keycode(keycode) => key_code.raw() == keycode,
+        // A key event is never a mouse button or a scroll tick.
+        AccelTrigger::Device(_) => false,
     };
     if !trigger_matches {
         return false;
     }
 
-    if accel.mods.intersects(AccelMods::MOD2 | AccelMods::MOD3) {
+    accel_mods_match(accel.mods, mods)
+}
+
+/// Whether the modifiers held match what an accelerator asks for, exactly.
+///
+/// Caps/Num/Scroll Lock never participate (`ModifiersState` already keeps locks
+/// out of ctrl/alt/shift/logo), and the virtual META/HYPER modifiers match their
+/// conventional homes (the Alt and Super keys) rather than going through the
+/// keymap's modmap. Accelerators demanding the raw MOD2/MOD3 masks never match —
+/// we don't track those as modifiers.
+fn accel_mods_match(accel_mods: AccelMods, mods: ModifiersState) -> bool {
+    if accel_mods.intersects(AccelMods::MOD2 | AccelMods::MOD3) {
         return false;
     }
 
-    let want = |m: AccelMods| accel.mods.intersects(m);
+    let want = |m: AccelMods| accel_mods.intersects(m);
     mods.ctrl == want(AccelMods::CONTROL)
         && mods.shift == want(AccelMods::SHIFT)
         && mods.alt == want(AccelMods::MOD1 | AccelMods::META)
@@ -9449,7 +9537,19 @@ pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::
     }
 }
 
-pub fn mods_with_binds(mod_key: ModKey, binds: &Binds, triggers: &[Trigger]) -> HashSet<Modifiers> {
+/// The modifier combinations any binding uses with these triggers.
+///
+/// A fast path: the pointer, wheel, touchpad and stylus handlers consult it
+/// before doing any lookup, so an unmodified scroll costs nothing. That makes it
+/// a **trap** — a binding whose modifiers are missing here is not merely slow to
+/// find, it is never found at all. Both sources of bindings have to be in it, and
+/// it has to be recomputed when either changes ([`Niri::refresh_mods_with_binds`]).
+pub fn mods_with_binds(
+    mod_key: ModKey,
+    binds: &Binds,
+    keybindings: &[GnomeKeybinding],
+    triggers: &[Trigger],
+) -> HashSet<Modifiers> {
     let mut rv = HashSet::new();
     for bind in &binds.0 {
         if !triggers.contains(&bind.key.trigger) {
@@ -9465,13 +9565,52 @@ pub fn mods_with_binds(mod_key: ModKey, binds: &Binds, triggers: &[Trigger]) -> 
         rv.insert(mods);
     }
 
+    for keybinding in keybindings {
+        for accel in &keybinding.accels {
+            let AccelTrigger::Device(trigger) = accel.trigger else {
+                continue;
+            };
+            if triggers.contains(&trigger) {
+                rv.insert(modifiers_from_accel(accel.mods));
+            }
+        }
+    }
+
     rv
 }
 
-pub fn mods_with_mouse_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifiers> {
+/// An accelerator's modifiers as the config's [`Modifiers`], following the same
+/// equivalences [`accel_mods_match`] applies: the virtual META/HYPER masks live
+/// on Alt and Super, and MOD4 is Super.
+fn modifiers_from_accel(accel_mods: AccelMods) -> Modifiers {
+    let mut mods = Modifiers::empty();
+    if accel_mods.contains(AccelMods::CONTROL) {
+        mods |= Modifiers::CTRL;
+    }
+    if accel_mods.contains(AccelMods::SHIFT) {
+        mods |= Modifiers::SHIFT;
+    }
+    if accel_mods.intersects(AccelMods::MOD1 | AccelMods::META) {
+        mods |= Modifiers::ALT;
+    }
+    if accel_mods.intersects(AccelMods::SUPER | AccelMods::HYPER | AccelMods::MOD4) {
+        mods |= Modifiers::SUPER;
+    }
+    if accel_mods.contains(AccelMods::MOD5) {
+        mods |= Modifiers::ISO_LEVEL3_SHIFT;
+    }
+    mods
+}
+
+pub fn mods_with_mouse_binds(
+    mod_key: ModKey,
+    binds: &Binds,
+    keybindings: &[GnomeKeybinding],
+) -> HashSet<Modifiers> {
     mods_with_binds(
         mod_key,
         binds,
+        keybindings,
         &[
             Trigger::MouseLeft,
             Trigger::MouseRight,
@@ -9482,10 +9621,15 @@ pub fn mods_with_mouse_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifier
     )
 }
 
-pub fn mods_with_wheel_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifiers> {
+pub fn mods_with_wheel_binds(
+    mod_key: ModKey,
+    binds: &Binds,
+    keybindings: &[GnomeKeybinding],
+) -> HashSet<Modifiers> {
     mods_with_binds(
         mod_key,
         binds,
+        keybindings,
         &[
             Trigger::WheelScrollUp,
             Trigger::WheelScrollDown,
@@ -9495,10 +9639,15 @@ pub fn mods_with_wheel_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifier
     )
 }
 
-pub fn mods_with_finger_scroll_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifiers> {
+pub fn mods_with_finger_scroll_binds(
+    mod_key: ModKey,
+    binds: &Binds,
+    keybindings: &[GnomeKeybinding],
+) -> HashSet<Modifiers> {
     mods_with_binds(
         mod_key,
         binds,
+        keybindings,
         &[
             Trigger::TouchpadScrollUp,
             Trigger::TouchpadScrollDown,
@@ -9508,10 +9657,15 @@ pub fn mods_with_finger_scroll_binds(mod_key: ModKey, binds: &Binds) -> HashSet<
     )
 }
 
-pub fn mods_with_tablet_stylus_binds(mod_key: ModKey, binds: &Binds) -> HashSet<Modifiers> {
+pub fn mods_with_tablet_stylus_binds(
+    mod_key: ModKey,
+    binds: &Binds,
+    keybindings: &[GnomeKeybinding],
+) -> HashSet<Modifiers> {
     mods_with_binds(
         mod_key,
         binds,
+        keybindings,
         &[
             Trigger::TabletStylusButton1,
             Trigger::TabletStylusButton2,

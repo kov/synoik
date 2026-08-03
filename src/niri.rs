@@ -1449,6 +1449,12 @@ impl State {
         if mode != BackendMode::HeadlessTest {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.niri.gnome_settings = initial;
+            {
+                let config = state.niri.config.clone();
+                let config = config.borrow();
+                let mod_key = state.backend.mod_key(&config);
+                state.niri.refresh_mods_with_binds(mod_key, &config.binds);
+            }
             state
                 .niri
                 .screen_shield
@@ -1671,6 +1677,14 @@ impl State {
                             || state.niri.gnome_settings.base_font_family
                                 != settings.base_font_family;
                         state.niri.gnome_settings = settings;
+                        // The scroll bindings live in this model, and the pointer
+                        // handlers gate on a set derived from it.
+                        {
+                            let config = state.niri.config.clone();
+                            let config = config.borrow();
+                            let mod_key = state.backend.mod_key(&config);
+                            state.niri.refresh_mods_with_binds(mod_key, &config.binds);
+                        }
                         state
                             .niri
                             .screen_shield
@@ -3036,7 +3050,10 @@ impl State {
         let mut shaders_changed = false;
         let mut cursor_inactivity_timeout_changed = false;
         let mut xwls_changed = false;
-        let mut old_config = self.niri.config.borrow_mut();
+        // Through a clone of the Rc, so holding this borrow does not also hold a
+        // borrow of `self.niri` — several of the updates below need it mutably.
+        let config_cell = self.niri.config.clone();
+        let mut old_config = config_cell.borrow_mut();
 
         // Reload the cursor.
         if config.cursor != old_config.cursor {
@@ -3092,12 +3109,8 @@ impl State {
             self.niri
                 .hotkey_overlay
                 .on_hotkey_config_updated(new_mod_key);
-            self.niri.mods_with_mouse_binds = mods_with_mouse_binds(new_mod_key, &config.binds);
-            self.niri.mods_with_wheel_binds = mods_with_wheel_binds(new_mod_key, &config.binds);
-            self.niri.mods_with_tablet_stylus_binds =
-                mods_with_tablet_stylus_binds(new_mod_key, &config.binds);
-            self.niri.mods_with_finger_scroll_binds =
-                mods_with_finger_scroll_binds(new_mod_key, &config.binds);
+            self.niri
+                .refresh_mods_with_binds(new_mod_key, &config.binds);
         }
 
         if config.window_rules != old_config.window_rules {
@@ -6472,10 +6485,17 @@ impl Niri {
             CursorManager::new(&config_.cursor.xcursor_theme, config_.cursor.xcursor_size);
 
         let mod_key = backend.mod_key(&config.borrow());
-        let mods_with_mouse_binds = mods_with_mouse_binds(mod_key, &config_.binds);
-        let mods_with_wheel_binds = mods_with_wheel_binds(mod_key, &config_.binds);
-        let mods_with_finger_scroll_binds = mods_with_finger_scroll_binds(mod_key, &config_.binds);
-        let mods_with_tablet_stylus_binds = mods_with_tablet_stylus_binds(mod_key, &config_.binds);
+        // The compiled-in model, which a live session replaces right after
+        // construction (and then calls `refresh_mods_with_binds`). Headless tests keep
+        // exactly this one, so the fast-path sets have to be built from it here.
+        let gnome_settings = GnomeSettings::default();
+        let keybindings = &gnome_settings.keybindings;
+        let mods_with_mouse_binds = mods_with_mouse_binds(mod_key, &config_.binds, keybindings);
+        let mods_with_wheel_binds = mods_with_wheel_binds(mod_key, &config_.binds, keybindings);
+        let mods_with_finger_scroll_binds =
+            mods_with_finger_scroll_binds(mod_key, &config_.binds, keybindings);
+        let mods_with_tablet_stylus_binds =
+            mods_with_tablet_stylus_binds(mod_key, &config_.binds, keybindings);
 
         let screenshot_ui = ScreenshotUi::new(animation_clock.clone(), config.clone());
         let config_error_notification =
@@ -6677,7 +6697,7 @@ impl Niri {
             ext_data_control_state,
             popups: PopupManager::default(),
             popup_grab: None,
-            gnome_settings: GnomeSettings::default(),
+            gnome_settings,
             gnome_settings_writer: None,
             app_system: crate::app_system::AppSystem::disconnected(),
             app_catalog_reload_at: None,
@@ -8162,6 +8182,26 @@ impl Niri {
     }
 
     /// Schedules an immediate redraw on all outputs if one is not already scheduled.
+    /// Recompute the modifier fast-path sets the pointer, wheel, touchpad and
+    /// stylus handlers gate on.
+    ///
+    /// Both sources feed them — the config binds and the GSettings keybinding
+    /// model — so this runs whenever either changes. A stale set does not make a
+    /// binding slow, it makes it *invisible*: the handlers never look it up.
+    pub fn refresh_mods_with_binds(
+        &mut self,
+        mod_key: niri_config::ModKey,
+        binds: &niri_config::Binds,
+    ) {
+        let keybindings = &self.gnome_settings.keybindings;
+        self.mods_with_mouse_binds = mods_with_mouse_binds(mod_key, binds, keybindings);
+        self.mods_with_wheel_binds = mods_with_wheel_binds(mod_key, binds, keybindings);
+        self.mods_with_tablet_stylus_binds =
+            mods_with_tablet_stylus_binds(mod_key, binds, keybindings);
+        self.mods_with_finger_scroll_binds =
+            mods_with_finger_scroll_binds(mod_key, binds, keybindings);
+    }
+
     pub fn queue_redraw_all(&mut self) {
         for state in self.output_state.values_mut() {
             state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();

@@ -204,5 +204,47 @@
       <summary>Exit the compositor</summary>
     </key>
 
+    <!-- The scroll bindings. mutter's accelerators are keys only, so the trigger
+         names (WheelScrollDown, MouseMiddle, TabletStylusButton1, …) are an
+         extension of ours; they are spelled exactly as the config file spells
+         them. Named for the trigger rather than the action because several bind
+         an action that already has a key of its own above.
+
+         The workspace ones carry a compiled-in cooldown, which is not a settings
+         key: a wheel detent is not a keypress, and a flick of a free-spinning
+         wheel would otherwise cross several workspaces. -->
+    <key name="scroll-focus-column-left" type="as">
+      <default>['&lt;Super&gt;WheelScrollLeft', '&lt;Super&gt;&lt;Shift&gt;WheelScrollUp']</default>
+      <summary>Scroll to the column on the left</summary>
+    </key>
+    <key name="scroll-focus-column-right" type="as">
+      <default>['&lt;Super&gt;WheelScrollRight', '&lt;Super&gt;&lt;Shift&gt;WheelScrollDown']</default>
+      <summary>Scroll to the column on the right</summary>
+    </key>
+    <key name="scroll-move-column-left" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;WheelScrollLeft', '&lt;Super&gt;&lt;Control&gt;&lt;Shift&gt;WheelScrollUp']</default>
+      <summary>Scroll the column to the left</summary>
+    </key>
+    <key name="scroll-move-column-right" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;WheelScrollRight', '&lt;Super&gt;&lt;Control&gt;&lt;Shift&gt;WheelScrollDown']</default>
+      <summary>Scroll the column to the right</summary>
+    </key>
+    <key name="scroll-focus-workspace-down" type="as">
+      <default>['&lt;Super&gt;WheelScrollDown']</default>
+      <summary>Scroll to the next workspace</summary>
+    </key>
+    <key name="scroll-focus-workspace-up" type="as">
+      <default>['&lt;Super&gt;WheelScrollUp']</default>
+      <summary>Scroll to the previous workspace</summary>
+    </key>
+    <key name="scroll-move-column-to-workspace-down" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;WheelScrollDown']</default>
+      <summary>Scroll the column to the next workspace</summary>
+    </key>
+    <key name="scroll-move-column-to-workspace-up" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;WheelScrollUp']</default>
+      <summary>Scroll the column to the previous workspace</summary>
+    </key>
+
   </schema>
 </schemalist>
