@@ -303,11 +303,20 @@ no "Crash or unclean shutdown detected" on the next start.
   `gcr-prompter`, which is the D-Bus-activated case above and would not have been helped by either
   budget. So the second budget is now only ever spent on clients the drain cannot influence, which
   is an argument for capping the *total* rather than for carrying the deadline.
-- **Inhibitors are still parsed and discarded.** `EndSessionDialog.Open` takes a list of inhibitor
-  object paths (`src/dbus/gnome_session.rs:59`) and the dialog does not show them, so an app with
-  unsaved work has no way to say so. This is the piece that would let apps push back on a logout,
-  and it is GNOME's designed answer to the problem a close sweep would create; it belongs with the
-  dialog work, not here.
+- **Inhibitors are still parsed and discarded**, and this is the one gap here that is a missing
+  *feature* rather than a limit. `EndSessionDialog.Open` takes a list of inhibitor object paths
+  (`src/dbus/gnome_session.rs:59`) and the dialog does not show them, so an app with unsaved work
+  has no way to say so — which matters doubly for us, because §2.2 deliberately declines the
+  `xdg_toplevel.close` sweep on the grounds that inhibitors are GNOME's designed answer to exactly
+  that problem. Declining the sweep and never building the answer leaves the user with neither.
+
+  **Owned by the end-session dialog audit** (`docs/fork/end-session-dialog-port.md`, to be written),
+  not by this document: the filtering rules live in the dialog. GNOME loads each path as a
+  `GnomeSession.Inhibitor`, resolves it to an app (`findAppFromInhibitor`,
+  `js/ui/endSessionDialog.js:153`), and lists only those whose flags include
+  `InhibitFlags.LOGOUT` *and* which resolve to a real app — services and non-logout inhibitors are
+  dropped (`_onInhibitorLoaded`, `:571-591`). Dead inhibitors are expected and tolerated (`:158`).
+  The withdrawal-during-a-confirm-drain gap above belongs to the same audit.
 - **No `RegisterClient` participation.** We do not register as a session client, matching
   gnome-shell. Since GTK4 dropped registration this protocol is dead for apps too, so there is
   nothing to gain until something starts speaking it again — the new `xx_session_v1` toplevel
