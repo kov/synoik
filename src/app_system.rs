@@ -1127,17 +1127,12 @@ impl AppLauncher for GioLauncher {
     ) -> Result<(), String> {
         let desktop = DesktopAppInfo::new(&entry.id)
             .ok_or_else(|| format!("no desktop entry: {}", entry.id))?;
-        let context = scoped_launch_context(token);
+        // The scope is named for the entry we were asked to launch, not for whatever GIO ends up
+        // handing back: an action is launched as a synthesized entry with no id of its own.
+        let context = scoped_launch_context(token, &entry.id);
         match verb {
             ResolvedLaunch::Default => launch_default(&desktop, &context),
-            ResolvedLaunch::Action(name) => {
-                // FIXME: this one still hands the child our signal mask — see `launch_default`.
-                // `g_desktop_app_info_launch_action` has no `as_manager` variant, so there is
-                // nowhere to hang a child setup; an app launched through a desktop *action*
-                // cannot be asked to quit.
-                desktop.launch_action(name, Some(&context));
-                Ok(())
-            }
+            ResolvedLaunch::Action(name) => launch_action(&desktop, name, &context),
         }
     }
 }
@@ -1189,6 +1184,84 @@ fn launch_default(desktop: &DesktopAppInfo, context: &gio::AppLaunchContext) -> 
         .map_err(|e| e.to_string())
 }
 
+/// Launch one of an entry's desktop actions ("New Window", "New Private Window", …).
+///
+/// `g_desktop_app_info_launch_action` has no `as_manager` variant, so it has nowhere to hang the
+/// child setup [`launch_default`] depends on — an action launched through it comes up with our
+/// blocked SIGTERM and can only be SIGKILLed. So the action is rebuilt as a one-off entry and sent
+/// back through `launch_default`, which is the only place that knows how to fork safely.
+///
+/// A `DBusActivatable` app is exempt and keeps GIO's own path: its actions go out as
+/// `org.freedesktop.Application.ActivateAction` and nothing is forked here at all.
+fn launch_action(
+    desktop: &DesktopAppInfo,
+    action: &str,
+    context: &gio::AppLaunchContext,
+) -> Result<(), String> {
+    if desktop.boolean("DBusActivatable") {
+        desktop.launch_action(action, Some(context));
+        return Ok(());
+    }
+
+    match action_as_entry(desktop, action) {
+        Some(entry) => launch_default(&entry, context),
+        None => {
+            // Launching it deaf beats not launching it: the mask costs the user a clean quit at
+            // logout, refusing costs them the thing they clicked.
+            warn!("could not rebuild the {action:?} action; launching it with our signal mask");
+            desktop.launch_action(action, Some(context));
+            Ok(())
+        }
+    }
+}
+
+/// An entry's desktop action, as a standalone [`DesktopAppInfo`].
+///
+/// The action group carries only what makes it *this* action (`Exec`, `Name`, sometimes `Icon`);
+/// everything about how to *run* it — the working directory, whether it wants a terminal — belongs
+/// to the parent entry and is carried over, as `g_desktop_app_info_launch_action` does.
+fn action_as_entry(desktop: &DesktopAppInfo, action: &str) -> Option<DesktopAppInfo> {
+    const ENTRY: &str = "Desktop Entry";
+
+    let source = glib::KeyFile::new();
+    source
+        .load_from_file(desktop.filename()?, glib::KeyFileFlags::NONE)
+        .ok()?;
+
+    let group = format!("Desktop Action {action}");
+    let built = glib::KeyFile::new();
+    built.set_string(ENTRY, "Type", "Application");
+    built.set_string(ENTRY, "Exec", source.string(&group, "Exec").ok()?.as_str());
+    built.set_string(
+        ENTRY,
+        "Name",
+        source
+            .string(&group, "Name")
+            .map(|name| name.to_string())
+            .unwrap_or_else(|_| desktop.name().to_string())
+            .as_str(),
+    );
+
+    // `Icon` may be overridden per action; the rest never is.
+    for (key, from_action) in [
+        ("Icon", true),
+        ("Path", false),
+        ("Terminal", false),
+        ("StartupNotify", false),
+        ("StartupWMClass", false),
+    ] {
+        let value = from_action
+            .then(|| source.string(&group, key).ok())
+            .flatten()
+            .or_else(|| source.string(ENTRY, key).ok());
+        if let Some(value) = value {
+            built.set_string(ENTRY, key, value.as_str());
+        }
+    }
+
+    DesktopAppInfo::from_keyfile(&built)
+}
+
 /// A launch context that moves whatever it launches into its own systemd scope.
 ///
 /// GNOME builds the same thing in `shell-global.c:1221` (`create_app_launch_context`) and hooks
@@ -1202,13 +1275,14 @@ fn launch_default(desktop: &DesktopAppInfo, context: &gio::AppLaunchContext) -> 
 /// would have set. `DESKTOP_STARTUP_ID` goes along with it because
 /// `g_desktop_app_info` sets both, and XWayland clients (through
 /// xwayland-satellite) only understand the latter.
-fn scoped_launch_context(token: Option<&str>) -> gio::AppLaunchContext {
+fn scoped_launch_context(token: Option<&str>, id: &str) -> gio::AppLaunchContext {
     let context = gio::AppLaunchContext::new();
     if let Some(token) = token {
         context.setenv("XDG_ACTIVATION_TOKEN", token);
         context.setenv("DESKTOP_STARTUP_ID", token);
     }
-    context.connect_launched(|_context, info, platform_data| {
+    let id = id.to_owned();
+    context.connect_launched(move |_context, info, platform_data| {
         let Some(pid) = launched_pid(platform_data) else {
             return;
         };
@@ -1218,10 +1292,14 @@ fn scoped_launch_context(token: Option<&str>) -> gio::AppLaunchContext {
             return;
         }
 
-        let id = info
-            .id()
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| info.executable().to_string_lossy().into_owned());
+        // The caller's id, falling back the way GNOME does only if we somehow have none.
+        let id = if id.is_empty() {
+            info.id()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| info.executable().to_string_lossy().into_owned())
+        } else {
+            id.clone()
+        };
         crate::utils::spawning::start_app_scope(&id, pid as u32);
     });
     context
@@ -1376,6 +1454,8 @@ impl AppEntry {
 mod tests {
     /// An app must not inherit the compositor's blocked SIGTERM, or nothing short of SIGKILL can
     /// ever ask it to quit — see [`super::launch_default`] for how that shipped and what it cost.
+    /// Both doors are covered: the default verb, and a desktop *action*, which reaches the fork by
+    /// a different route and was left deaf for one commit longer.
     ///
     /// The mask is set on *this thread* rather than the process: `pthread_sigmask` is thread-local,
     /// so a parallel test binary is unharmed, and the fork inherits from the forking thread either
@@ -1387,7 +1467,7 @@ mod tests {
 
         use gio_unix::prelude::*;
 
-        use super::{launch_default, DesktopAppInfo};
+        use super::{launch_action, launch_default, DesktopAppInfo};
 
         // Same three the compositor blocks in `signals::block_early`.
         let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
@@ -1407,51 +1487,74 @@ mod tests {
         let mut file = std::fs::File::create(&path).unwrap();
         // `sleep` rather than anything of ours: the test is about the mask the child starts with,
         // and a process that would exit on its own could pass this by being gone already.
-        file.write_all(b"[Desktop Entry]\nType=Application\nName=niri mask test\nExec=sleep 30\n")
-            .unwrap();
+        file.write_all(
+            b"[Desktop Entry]\nType=Application\nName=niri mask test\nExec=sleep 30\n\
+Actions=newwin;\n\n\
+              [Desktop Action newwin]\nName=New Window\nExec=sleep 31\n",
+        )
+        .unwrap();
         drop(file);
 
         let desktop = DesktopAppInfo::from_filename(&path).unwrap();
-        let context = gio::AppLaunchContext::new();
-        let pid = std::rc::Rc::new(std::cell::Cell::new(0i32));
-        let seen = pid.clone();
-        context.connect_launched(move |_, _, platform_data| {
-            if let Some(pid) = super::launched_pid(platform_data) {
-                seen.set(pid);
+        assert_eq!(
+            desktop.list_actions().len(),
+            1,
+            "the action group did not parse, so the action arm would prove nothing"
+        );
+
+        // The mask a child of `launch` comes up with, as `SigBlk`.
+        let child_mask = |launch: &dyn Fn(&gio::AppLaunchContext) -> Result<(), String>| {
+            let context = gio::AppLaunchContext::new();
+            let pid = std::rc::Rc::new(std::cell::Cell::new(0i32));
+            let seen = pid.clone();
+            context.connect_launched(move |_, _, platform_data| {
+                if let Some(pid) = super::launched_pid(platform_data) {
+                    seen.set(pid);
+                }
+            });
+
+            launch(&context).unwrap();
+
+            let pid = pid.get();
+            assert_ne!(pid, 0, "the launch reported no pid");
+            let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+            let blk = status
+                .lines()
+                .find_map(|line| line.strip_prefix("SigBlk:"))
+                .unwrap()
+                .trim()
+                .to_owned();
+
+            // Reap before asserting, so a failure does not also leak a process for 30 seconds.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
             }
-        });
+            u64::from_str_radix(&blk, 16).unwrap()
+        };
 
-        launch_default(&desktop, &context).unwrap();
+        let by_verb = child_mask(&|context| launch_default(&desktop, context));
+        let by_action = child_mask(&|context| launch_action(&desktop, "newwin", context));
+
         let _ = std::fs::remove_file(&path);
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &blocked, std::ptr::null_mut()) };
 
-        let pid = pid.get();
-        assert_ne!(pid, 0, "the launch reported no pid");
-
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
-        let blk = status
-            .lines()
-            .find_map(|line| line.strip_prefix("SigBlk:"))
-            .unwrap()
-            .trim();
-        let blk = u64::from_str_radix(blk, 16).unwrap();
-
-        // Reap before asserting, so a failure does not also leak a process for 30 seconds.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, std::ptr::null_mut(), 0);
-            libc::pthread_sigmask(libc::SIG_UNBLOCK, &blocked, std::ptr::null_mut());
-        }
-
-        for (signal, name) in [
-            (libc::SIGTERM, "SIGTERM"),
-            (libc::SIGINT, "SIGINT"),
-            (libc::SIGHUP, "SIGHUP"),
+        for (blk, how) in [
+            (by_verb, "the default verb"),
+            (by_action, "a desktop action"),
         ] {
-            assert_eq!(
-                blk & (1 << (signal - 1)),
-                0,
-                "{name} is blocked in the child (SigBlk {blk:#x}); it could not be asked to quit"
-            );
+            for (signal, name) in [
+                (libc::SIGTERM, "SIGTERM"),
+                (libc::SIGINT, "SIGINT"),
+                (libc::SIGHUP, "SIGHUP"),
+            ] {
+                assert_eq!(
+                    blk & (1 << (signal - 1)),
+                    0,
+                    "{name} is blocked in a child launched through {how} \
+                     (SigBlk {blk:#x}); it could not be asked to quit"
+                );
+            }
         }
     }
 

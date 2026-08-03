@@ -226,20 +226,39 @@ choice are load-bearing:
   reports *its* pid, which has already exited by the time we would put it in a scope. It is what
   GIO's own launch path passes.
 
-`a_launched_app_can_be_asked_to_quit` pins it, by reading `SigBlk` out of `/proc` for a child of the
-real `launch_default`. It blocks the mask on its own thread rather than the process, so a parallel
-test binary is unharmed and the fork still inherits from the forking thread — which is exactly the
-compositor's situation. Confirmed to fail against the old `launch()` call.
+**Desktop actions come in by a different door**, and were left deaf for one commit longer.
+`g_desktop_app_info_launch_action` has no `as_manager` variant either, so `launch_action` rebuilds
+the action as a standalone `DesktopAppInfo` — `Exec` and `Name` from the `Desktop Action` group,
+`Path`/`Terminal`/`StartupNotify`/`StartupWMClass` carried over from the parent because they say how
+to *run* it and an action has no opinion — and sends that back through `launch_default`, so there
+stays exactly one place that knows how to fork safely. `DBusActivatable` apps are exempt here too:
+their actions go out as `ActivateAction` and fork nothing. The scope keeps the *parent's* app id,
+which is why `scoped_launch_context` now takes one rather than reading it off whatever GIO hands
+back — a synthesized entry has no id of its own and would otherwise be scoped under its executable.
+
+`a_launched_app_can_be_asked_to_quit` pins both doors, by reading `SigBlk` out of `/proc` for a child
+of the real `launch_default` and the real `launch_action`. It blocks the mask on its own thread
+rather than the process, so a parallel test binary is unharmed and the fork still inherits from the
+forking thread — which is exactly the compositor's situation. Both arms confirmed to fail against
+the calls they replaced. The action arm also asserts `list_actions().len() == 1` before proving
+anything: a `Desktop Action` group is invisible without an `Actions=` key in the main group, and
+without that guard the arm would have passed by testing nothing.
+
+**Measured on the seat afterwards**, the same OBS that had been SIGKILLed three logouts running:
+
+```
+16:50:44.358482  asked systemd to stop app-flatpak-…obsproject…scope
+16:50:44.359444  OBS: ==== Shutting down ====                        ← 0.96 ms
+16:50:44.918195  clients are gone, ending the session                ← 559 ms
+```
+
+0.96 ms against GNOME's 0.8 ms, a drain that ends on `clients are gone` instead of timing out, and
+no "Crash or unclean shutdown detected" on the next start.
 
 ---
 
 ## 3. Known gaps
 
-- **Desktop *actions* still hand the child a deaf signal mask.** `g_desktop_app_info_launch_action`
-  has no `as_manager` variant, so there is nowhere to hang the child setup §2.5 describes; an app
-  started from a `.desktop` action (a jumplist entry: "New Window", "New Private Window") inherits
-  the blocked SIGTERM and can only be SIGKILLed. Same bug, smaller door. Fixing it means either
-  spawning the action's `Exec` ourselves or reopening the temporary-unblock idea §2.5 rejected.
 - **Terminal-spawned clients have no scope**, so `stop_app_scopes` cannot reach them and nothing
   SIGTERMs them at logout. The drain still waits for their windows; they are only asked to leave
   when the socket dies, as under GNOME. (A flatpak app started from a terminal is the exception —
