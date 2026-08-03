@@ -4,6 +4,12 @@
 sub-decisions taken up front (named workspaces stay un-closable; closing animates the strip
 closed; niri's `empty-workspace-above-first` goes).
 
+**Validated on the headless harness** the same day: a fresh session comes up with two workspaces
+and the strip already showing; emptying a desktop leaves it in place; its thumbnail draws the
+close button inset in its top-right corner; clicking it dismisses the desktop, closes the strip
+up to two, and leaves the overview open. (Judge *structure* from IPC there, never window
+contents — GPU clients composite empty headless.)
+
 Three changes, only two of which are divergences.
 
 ## 1. Two workspaces at startup — *not* a divergence, a missed behavior
