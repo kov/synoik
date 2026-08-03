@@ -49,8 +49,8 @@ use crate::app_system::{AppState, LaunchMode};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::gnome::{
-    Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction, GnomeKeybinding, ScreenDirection,
-    TileSide,
+    Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction, GnomeKeybinding, KeybindingAction,
+    ScreenDirection, TileSide,
 };
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::workspace::WorkspaceId;
@@ -8697,22 +8697,28 @@ fn find_gnome_bind(
 
     // The switcher is modal (GNOME holds a grab while it's up; niri disables the general binds):
     // only the actions the popup that is up actually matches keep resolving, so further taps
-    // continue cycling and everything else falls through to the popup's keysym handling.
-    if !switcher.resolves(keybinding.action) {
-        return None;
+    // continue cycling and everything else falls through to the popup's keysym handling. Our
+    // own actions never resolve through it — the popup owns the keyboard.
+    let gnome = keybinding.action.gnome();
+    match gnome {
+        Some(action) if !switcher.resolves(action) => return None,
+        None if switcher.is_open() => return None,
+        _ => {}
     }
 
-    let action = action_for_gnome(keybinding.action)?;
+    let action = action_for_keybinding(&keybinding.action)?;
 
     // Mutter flags the workspace switches META_KEY_BINDING_IGNORE_AUTOREPEAT.
     let repeat = !matches!(
-        keybinding.action,
-        GnomeKeyAction::SwitchToWorkspace(_)
-            | GnomeKeyAction::SwitchToWorkspacePrevious
-            | GnomeKeyAction::SwitchToWorkspaceNext
-            | GnomeKeyAction::MoveToWorkspace(_)
-            | GnomeKeyAction::MoveToWorkspacePrevious
-            | GnomeKeyAction::MoveToWorkspaceNext
+        gnome,
+        Some(
+            GnomeKeyAction::SwitchToWorkspace(_)
+                | GnomeKeyAction::SwitchToWorkspacePrevious
+                | GnomeKeyAction::SwitchToWorkspaceNext
+                | GnomeKeyAction::MoveToWorkspace(_)
+                | GnomeKeyAction::MoveToWorkspacePrevious
+                | GnomeKeyAction::MoveToWorkspaceNext
+        )
     );
 
     Some(Bind {
@@ -8727,7 +8733,7 @@ fn find_gnome_bind(
         allow_when_locked: false,
         // mutter suppresses every binding not flagged NON_MASKABLE while the focused
         // window inhibits shortcuts — which is all of them bar the recovery keys.
-        allow_inhibiting: !keybinding.action.is_non_maskable(),
+        allow_inhibiting: !gnome.is_some_and(GnomeKeyAction::is_non_maskable),
         hotkey_overlay_title: None,
     })
 }
@@ -8802,6 +8808,14 @@ fn accel_matches(
 /// The niri action implementing a GNOME keybinding action, or `None` for
 /// actions adopted in the settings model but not implemented yet (their keys
 /// stay with the client). Workspace indices are 1-based on both sides.
+pub(crate) fn action_for_keybinding(action: &KeybindingAction) -> Option<Action> {
+    match action {
+        KeybindingAction::Gnome(action) => action_for_gnome(*action),
+        // Our own schema speaks niri actions directly; there is nothing to map.
+        KeybindingAction::Niri(action) => Some(action.clone()),
+    }
+}
+
 pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
     Some(match action {
         GnomeKeyAction::PanelRunDialog => Action::ShowRunDialog,

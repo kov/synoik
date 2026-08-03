@@ -11,4 +11,9 @@ Before=xdg-desktop-autostart.target
 [Service]
 Slice=session.slice
 Type=notify
+# Our own GSettings schema lives in a private dir, not the shared
+# glib-2.0/schemas — see the %install notes in niri.spec.rpkg. This dir is
+# searched ahead of the system one, and inherited by everything the session
+# launches, so gnome-control-center sees those keys too.
+Environment=GSETTINGS_SCHEMA_DIR=/usr/share/gnome-shell-rs/glib-2.0/schemas
 ExecStart=niri --session

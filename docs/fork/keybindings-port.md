@@ -115,10 +115,55 @@ Three divergences from upstream have been found:
   switcher. Now labelled as ours at the key; to be backed by the override once S6 lands the
   schema-dir plumbing.
 
+## Our own schema
+
+`org.gnome.shell-rs.keybindings`, path `/org/gnome/shell-rs/keybindings/`, source in
+`resources/org.gnome.shell-rs.keybindings.gschema.xml` — the scrolling-window-manager actions
+GNOME has no key for: column focus and movement, monitor focus, consume/expel, the preset
+width and height cycles, centring, tabbed display, floating, and the session keys.
+
+`GnomeKeybinding.action` is a `KeybindingAction { Gnome(GnomeKeyAction), Niri(Action) }` rather
+than a `GnomeKeyAction` grown into a mirror of niri's ~200 actions. `read_keybinding_table` is
+generic over `Into<KeybindingAction>`, so the GNOME tables were not touched by the change.
+
+**No arrow keys.** `<Super>` plus an arrow is GNOME's four times over — `toggle-tiled-left`,
+`toggle-tiled-right`, `maximize`, `unmaximize` — and `<Super><Shift>` plus an arrow is
+`move-to-monitor-*`. So this half of the model is hjkl. Likewise `<Super>v` and `<Super>m` are
+the message tray, which is why floating is `<Super>g`.
+
+Three unit tests keep it honest, each covering a failure that is otherwise silent:
+
+- `niri_accels_do_not_collide_with_gnome` — no accelerator of ours may take a chord we adopt
+  from GNOME. This is the fork tenet made mechanical: GNOME wins, so ours must not ask. A
+  collision would leave a settings key that changes nothing, which is worse than one that
+  isn't there.
+- `our_schema_matches_the_table` — the XML and `adopted_niri_keybindings()` are two hand-written
+  copies of one list (the table runs where the schema isn't installed, the XML is what
+  `gsettings` and Settings see). Drift shows up as a key nobody reads.
+- `our_defaults_all_parse` — `parse_accels` is deliberately forgiving, mirroring mutter's
+  `update_binding`, so a typo in a keysym name yields a binding with no accelerators rather than
+  an error. Our own defaults are not user input.
+
+### Packaging
+
+The schema installs to a **private** directory, never `/usr/share/glib-2.0/schemas`:
+`%{_datadir}/gnome-shell-rs/glib-2.0/schemas` from the RPM,
+`/usr/local/share/gnome-shell-rs/glib-2.0/schemas` from `scripts/install-test-session.sh`. The
+session finds it through `GSETTINGS_SCHEMA_DIR` (`resources/niri.service`, and the systemd
+drop-in the test-session script writes), which is searched ahead of the system dir and is
+inherited by everything the session launches — so gnome-control-center sees those keys too.
+
+To read or write them from a shell, set the same variable:
+
+```
+GSETTINGS_SCHEMA_DIR=/usr/local/share/gnome-shell-rs/glib-2.0/schemas \
+    gsettings list-recursively org.gnome.shell-rs.keybindings
+```
+
 ## Schemas: who ships what, and what a replacement costs
 
-We currently ship **no schema and no override** — we only read what the system has installed,
-falling back to the tables above.
+We ship our own schema and **no override yet** — everything GNOME names is read from what the
+system has installed, falling back to the tables above.
 
 | Schema | Shipped by | Survives replacing mutter + gnome-shell? |
 |---|---|---|
@@ -174,7 +219,7 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 | S3 | Shell UI toggles: overview, app grid, quick settings, message tray | **done** |
 | S4 | wm/mutter window + monitor keys: `toggle-maximized`, `move-to-monitor-*`, `*-workspace-last`, `switch-input-source` | **done** |
 | S5 | `switch-to-application-N` + `open-new-window-application-N` | **done** |
-| S6 | Our own schema for the niri actions, plus its packaging | |
+| S6 | Our own schema for the niri actions, plus its packaging | **done** |
 | S7 | Route the non-keyboard triggers (mouse, wheel, touchpad, tablet) through the model | |
 | S8 | Prune and then delete the KDL `binds{}` | |
 | S9 | Re-source the hotkey overlay from the settings model | |
@@ -194,8 +239,9 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
   and `screensaver` (`<Super>l`) removes quit and lock outright.
 - **Dead number row.** S8 before S5 leaves `<Super>1..9` doing nothing, since GNOME's
   `switch-to-workspace-N` defaults are empty.
-- **Silent fallback drift.** S6's code without S6's packaging leaves the session on
-  compiled-in defaults while the user believes they are editing settings.
+- **Silent fallback drift.** Closed by S6, which shipped the packaging in the same slice: code
+  without it would leave the session on compiled-in defaults while the user believed they were
+  editing settings.
 
 ### S10 vendoring
 

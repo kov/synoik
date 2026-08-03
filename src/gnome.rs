@@ -14,6 +14,7 @@ use std::rc::Rc;
 use gio::glib;
 use gio::glib::prelude::ObjectExt;
 use gio::prelude::{DBusProxyExt, SettingsExt, SettingsExtManual};
+use niri_config::Action;
 use smithay::input::keyboard::{xkb, Keysym};
 
 use crate::world_clocks::{ResolvedLocation, WorldLocation};
@@ -831,6 +832,7 @@ impl GnomeSettings {
         mutter_keybindings: Option<&gio::Settings>,
         shell_keybindings: Option<&gio::Settings>,
         wayland_keybindings: Option<&gio::Settings>,
+        niri_keybindings: Option<&gio::Settings>,
     ) {
         let mut keybindings = read_keybinding_table(wm, adopted_wm_keybindings());
         keybindings.extend(read_keybinding_table(
@@ -845,6 +847,13 @@ impl GnomeSettings {
             wayland_keybindings,
             adopted_wayland_keybindings(),
         ));
+        // Ours last: GNOME's bindings are matched first, so a chord in both models
+        // resolves to GNOME's. The collision test means that should never happen,
+        // but the order is the belt to its braces.
+        keybindings.extend(read_keybinding_table(
+            niri_keybindings,
+            adopted_niri_keybindings(),
+        ));
         self.keybindings = keybindings;
     }
 }
@@ -852,9 +861,9 @@ impl GnomeSettings {
 /// Reads one adopted-keybindings table, one entry per settings key in table
 /// order, from its store where open (a missing key falls back to our
 /// built-in default rather than aborting inside gio).
-fn read_keybinding_table(
+fn read_keybinding_table<A: Into<KeybindingAction>>(
     store: Option<&gio::Settings>,
-    table: Vec<(String, GnomeKeyAction, Vec<String>)>,
+    table: Vec<(String, A, Vec<String>)>,
 ) -> Vec<GnomeKeybinding> {
     table
         .into_iter()
@@ -870,7 +879,7 @@ fn read_keybinding_table(
                 None => defaults,
             };
             GnomeKeybinding {
-                action,
+                action: action.into(),
                 accels: parse_accels(&key, values),
             }
         })
@@ -895,8 +904,45 @@ fn read_source_tuples(value: &glib::Variant) -> Vec<(String, String)> {
 /// currently bound to it (possibly none — an unbound action).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GnomeKeybinding {
-    pub action: GnomeKeyAction,
+    pub action: KeybindingAction,
     pub accels: Vec<Accel>,
+}
+
+/// What a keybinding does: one of GNOME's semantic actions, or — for the
+/// scrolling-window-manager behaviors GNOME has no equivalent for — a niri
+/// action straight from our own schema.
+///
+/// The niri arm carries [`Action`] rather than growing [`GnomeKeyAction`] into a
+/// mirror of it. The tables stay hand-curated either way (the `.gschema.xml` has
+/// to enumerate its keys), and keeping niri's actions in niri's vocabulary makes
+/// it obvious which half of the model a binding belongs to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeybindingAction {
+    Gnome(GnomeKeyAction),
+    Niri(Action),
+}
+
+impl From<GnomeKeyAction> for KeybindingAction {
+    fn from(action: GnomeKeyAction) -> Self {
+        Self::Gnome(action)
+    }
+}
+
+impl From<Action> for KeybindingAction {
+    fn from(action: Action) -> Self {
+        Self::Niri(action)
+    }
+}
+
+impl KeybindingAction {
+    /// The GNOME action, for the callers that only speak that half — the
+    /// switcher's modal allowlist and the NON_MASKABLE check.
+    pub fn gnome(&self) -> Option<GnomeKeyAction> {
+        match self {
+            Self::Gnome(action) => Some(*action),
+            Self::Niri(_) => None,
+        }
+    }
 }
 
 /// The semantic actions of the adopted GNOME keybindings, named after their
@@ -1300,6 +1346,7 @@ fn default_keybindings() -> Vec<GnomeKeybinding> {
     keybindings.extend(read_keybinding_table(None, adopted_mutter_keybindings()));
     keybindings.extend(read_keybinding_table(None, adopted_shell_keybindings()));
     keybindings.extend(read_keybinding_table(None, adopted_wayland_keybindings()));
+    keybindings.extend(read_keybinding_table(None, adopted_niri_keybindings()));
     keybindings
 }
 
@@ -1913,6 +1960,158 @@ fn adopted_shell_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
     keys
 }
 
+/// Our own schema, `org.gnome.shell-rs.keybindings`: the scrolling-window-manager
+/// behaviors GNOME has no equivalent for.
+///
+/// Mirrors `resources/org.gnome.shell-rs.keybindings.gschema.xml` key for key —
+/// `our_schema_matches_the_table` fails if the two drift apart. Nothing here may
+/// take a chord we adopt from GNOME; `niri_accels_do_not_collide_with_gnome`
+/// checks that, so the fork tenet is enforced rather than remembered.
+///
+/// Arrow keys are absent throughout: `<Super>` plus an arrow is GNOME's, four
+/// times over (tiling, maximize, unmaximize, move-to-monitor), so this half of
+/// the model is hjkl.
+fn adopted_niri_keybindings() -> Vec<(String, Action, Vec<String>)> {
+    use Action::*;
+
+    fn key(name: &str, action: Action, accel: &str) -> (String, Action, Vec<String>) {
+        (name.to_owned(), action, vec![accel.to_owned()])
+    }
+
+    vec![
+        key("focus-column-left", FocusColumnLeft, "<Super>h"),
+        key("focus-column-right", FocusColumnRight, "<Super>l"),
+        key("focus-window-up", FocusWindowUp, "<Super>k"),
+        key("focus-window-down", FocusWindowDown, "<Super>j"),
+        key(
+            "focus-column-first",
+            FocusColumnFirst,
+            "<Super><Control>Home",
+        ),
+        key("focus-column-last", FocusColumnLast, "<Super><Control>End"),
+        key("move-column-left", MoveColumnLeft, "<Super><Control>h"),
+        key("move-column-right", MoveColumnRight, "<Super><Control>l"),
+        key("move-window-up", MoveWindowUp, "<Super><Control>k"),
+        key("move-window-down", MoveWindowDown, "<Super><Control>j"),
+        key(
+            "move-column-to-first",
+            MoveColumnToFirst,
+            "<Super><Control><Shift>Home",
+        ),
+        key(
+            "move-column-to-last",
+            MoveColumnToLast,
+            "<Super><Control><Shift>End",
+        ),
+        key("focus-monitor-left", FocusMonitorLeft, "<Super><Shift>h"),
+        key("focus-monitor-right", FocusMonitorRight, "<Super><Shift>l"),
+        key("focus-monitor-up", FocusMonitorUp, "<Super><Shift>k"),
+        key("focus-monitor-down", FocusMonitorDown, "<Super><Shift>j"),
+        key(
+            "move-column-to-monitor-left",
+            MoveColumnToMonitorLeft,
+            "<Super><Control><Shift>h",
+        ),
+        key(
+            "move-column-to-monitor-right",
+            MoveColumnToMonitorRight,
+            "<Super><Control><Shift>l",
+        ),
+        key(
+            "move-column-to-monitor-up",
+            MoveColumnToMonitorUp,
+            "<Super><Control><Shift>k",
+        ),
+        key(
+            "move-column-to-monitor-down",
+            MoveColumnToMonitorDown,
+            "<Super><Control><Shift>j",
+        ),
+        key(
+            "move-column-to-workspace-up",
+            MoveColumnToWorkspaceUp(true),
+            "<Super><Control>i",
+        ),
+        key(
+            "move-column-to-workspace-down",
+            MoveColumnToWorkspaceDown(true),
+            "<Super><Control>u",
+        ),
+        key("move-workspace-up", MoveWorkspaceUp, "<Super><Shift>i"),
+        key("move-workspace-down", MoveWorkspaceDown, "<Super><Shift>u"),
+        key(
+            "consume-or-expel-window-left",
+            ConsumeOrExpelWindowLeft,
+            "<Super>bracketleft",
+        ),
+        key(
+            "consume-or-expel-window-right",
+            ConsumeOrExpelWindowRight,
+            "<Super>bracketright",
+        ),
+        key(
+            "consume-window-into-column",
+            ConsumeWindowIntoColumn,
+            "<Super>comma",
+        ),
+        key(
+            "expel-window-from-column",
+            ExpelWindowFromColumn,
+            "<Super>period",
+        ),
+        key(
+            "switch-preset-column-width",
+            SwitchPresetColumnWidth,
+            "<Super>r",
+        ),
+        key(
+            "switch-preset-column-width-back",
+            SwitchPresetColumnWidthBack,
+            "<Super><Shift>r",
+        ),
+        key(
+            "switch-preset-window-height",
+            SwitchPresetWindowHeight,
+            "<Super><Control><Shift>r",
+        ),
+        key(
+            "reset-window-height",
+            ResetWindowHeight,
+            "<Super><Control>r",
+        ),
+        key("maximize-column", MaximizeColumn, "<Super>f"),
+        key(
+            "expand-column-to-available-width",
+            ExpandColumnToAvailableWidth,
+            "<Super><Control>f",
+        ),
+        key("center-column", CenterColumn, "<Super>c"),
+        key(
+            "center-visible-columns",
+            CenterVisibleColumns,
+            "<Super><Control>c",
+        ),
+        key(
+            "toggle-column-tabbed-display",
+            ToggleColumnTabbedDisplay,
+            "<Super>w",
+        ),
+        key("toggle-window-floating", ToggleWindowFloating, "<Super>g"),
+        key(
+            "switch-focus-between-floating-and-tiling",
+            SwitchFocusBetweenFloatingAndTiling,
+            "<Super><Shift>g",
+        ),
+        key(
+            "show-hotkey-overlay",
+            ShowHotkeyOverlay,
+            "<Super><Shift>slash",
+        ),
+        key("power-off-monitors", PowerOffMonitors, "<Super><Shift>p"),
+        key("quit", Quit(false), "<Super><Shift>e"),
+    ]
+}
+
 /// The `org.gnome.mutter.wayland.keybindings` keys we honor — mutter's two
 /// recovery bindings, both `META_KEY_BINDING_NON_MASKABLE`.
 ///
@@ -2011,6 +2210,10 @@ struct Stores {
     mutter_keybindings: Option<gio::Settings>,
     /// `org.gnome.mutter.wayland.keybindings` — the two recovery bindings.
     wayland_keybindings: Option<gio::Settings>,
+    /// `org.gnome.shell-rs.keybindings` — our own, for the scrolling-window-manager
+    /// actions GNOME has no key for. `None` until the schema is installed, which
+    /// leaves the compiled-in defaults in charge.
+    niri_keybindings: Option<gio::Settings>,
     shell_keybindings: Option<gio::Settings>,
     wm_keybindings: Option<gio::Settings>,
     wm_preferences: Option<gio::Settings>,
@@ -2069,6 +2272,7 @@ impl Stores {
             mutter: gsettings("org.gnome.mutter", b),
             mutter_keybindings: gsettings("org.gnome.mutter.keybindings", b),
             wayland_keybindings: gsettings("org.gnome.mutter.wayland.keybindings", b),
+            niri_keybindings: gsettings("org.gnome.shell-rs.keybindings", b),
             shell_keybindings: gsettings("org.gnome.shell.keybindings", b),
             wm_keybindings: gsettings("org.gnome.desktop.wm.keybindings", b),
             wm_preferences: gsettings("org.gnome.desktop.wm.preferences", b),
@@ -2123,6 +2327,7 @@ impl Stores {
             &self.mutter,
             &self.mutter_keybindings,
             &self.wayland_keybindings,
+            &self.niri_keybindings,
             &self.shell_keybindings,
             &self.wm_keybindings,
             &self.wm_preferences,
@@ -2160,6 +2365,7 @@ impl Stores {
             self.mutter_keybindings.as_ref(),
             self.shell_keybindings.as_ref(),
             self.wayland_keybindings.as_ref(),
+            self.niri_keybindings.as_ref(),
         );
         if let Some(wm) = &self.wm_preferences {
             settings.load_wm_preferences(wm);
@@ -3112,6 +3318,97 @@ fn resolve_picture_uri(uri: &str, options: BackgroundOptions) -> Option<PathBuf>
 
 #[cfg(test)]
 mod tests {
+    /// No accelerator in our own schema may take a chord we adopt from GNOME.
+    ///
+    /// This is the fork tenet made mechanical: where the two models want the same
+    /// key, GNOME's wins, so ours must not ask for it in the first place. Matching
+    /// order already favours GNOME, but a collision would mean a key in our schema
+    /// that silently does nothing — a setting you can change with no effect, which
+    /// is worse than one that isn't there.
+    #[test]
+    fn niri_accels_do_not_collide_with_gnome() {
+        let mut gnome: Vec<(Accel, String)> = Vec::new();
+        for (key, _, defaults) in adopted_wm_keybindings()
+            .into_iter()
+            .chain(adopted_mutter_keybindings())
+            .chain(adopted_shell_keybindings())
+            .chain(adopted_wayland_keybindings())
+        {
+            for accel in parse_accels(&key, defaults) {
+                gnome.push((accel, key.clone()));
+            }
+        }
+
+        let mut clashes = Vec::new();
+        for (key, _, defaults) in adopted_niri_keybindings() {
+            for accel in parse_accels(&key, defaults) {
+                if let Some((_, theirs)) = gnome.iter().find(|(a, _)| *a == accel) {
+                    clashes.push(format!("{key} wants {accel:?}, which is GNOME's {theirs}"));
+                }
+            }
+        }
+        assert!(clashes.is_empty(), "{clashes:#?}");
+    }
+
+    /// Every default in our schema must actually parse.
+    ///
+    /// `parse_accels` is deliberately forgiving — mutter's `update_binding` warns
+    /// about a bad accelerator and keeps the rest of the key — so a typo in a
+    /// keysym name (`bracketleft`, `slash`, `period`) does not fail anything. It
+    /// just yields a binding with no accelerators, i.e. a key that quietly does
+    /// nothing. Our own defaults are not user input and have no excuse.
+    #[test]
+    fn our_defaults_all_parse() {
+        for (key, _, defaults) in adopted_niri_keybindings() {
+            let want = defaults.len();
+            let got = parse_accels(&key, defaults).len();
+            assert_eq!(got, want, "{key} has an accelerator that does not parse");
+        }
+    }
+
+    /// The table and the `.gschema.xml` that ships beside it must name the same
+    /// keys with the same defaults.
+    ///
+    /// They are two hand-written copies of one list: the table is what runs where
+    /// the schema isn't installed, the XML is what `gsettings` and the Settings UI
+    /// see. Drift between them is invisible until someone edits a key that turns
+    /// out not to be read, so it is checked rather than trusted.
+    #[test]
+    fn our_schema_matches_the_table() {
+        let xml = include_str!("../resources/org.gnome.shell-rs.keybindings.gschema.xml");
+
+        // A deliberately dumb reader: enough of the file's shape to compare, and no
+        // XML dependency for one test.
+        let mut in_file = Vec::new();
+        for chunk in xml.split("<key name=\"").skip(1) {
+            let (name, rest) = chunk.split_once('"').expect("key name is quoted");
+            let (_, rest) = rest.split_once("<default>").expect("key has a default");
+            let (default, _) = rest.split_once("</default>").expect("default is closed");
+            let accels: Vec<String> = default
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .map(|s| s.trim().trim_matches('\'').to_owned())
+                .filter(|s| !s.is_empty())
+                .collect();
+            in_file.push((name.to_owned(), accels));
+        }
+
+        let in_table: Vec<(String, Vec<String>)> = adopted_niri_keybindings()
+            .into_iter()
+            .map(|(key, _, defaults)| (key, defaults))
+            .collect();
+
+        assert_eq!(
+            in_file, in_table,
+            "resources/org.gnome.shell-rs.keybindings.gschema.xml and \
+             adopted_niri_keybindings() have drifted apart"
+        );
+    }
+
     /// The brightness keys come from `org.gnome.shell.keybindings`, which we had never read
     /// before: they are the shell's own bindings, not the wm's. Their defaults are the bare
     /// `XF86MonBrightness*` keysyms, with the `-monitor` variants on Shift
@@ -3125,11 +3422,11 @@ mod tests {
             bindings
                 .iter()
                 .find(|kb| {
-                    kb.action
-                        == GnomeKeyAction::ScreenBrightness {
+                    kb.action.gnome()
+                        == Some(GnomeKeyAction::ScreenBrightness {
                             step,
                             current_monitor,
-                        }
+                        })
                 })
                 .unwrap_or_else(|| panic!("no binding for {step:?} monitor={current_monitor}"))
         };
@@ -3633,7 +3930,7 @@ mod tests {
             settings
                 .keybindings
                 .iter()
-                .filter(|kb| kb.action == action)
+                .filter(|kb| kb.action.gnome() == Some(action))
                 .flat_map(|kb| kb.accels.clone())
                 .collect::<Vec<_>>()
         };
@@ -3739,7 +4036,7 @@ mod tests {
                 .and_then(|s| {
                     s.keybindings
                         .iter()
-                        .find(|kb| kb.action == GnomeKeyAction::Close)
+                        .find(|kb| kb.action.gnome() == Some(GnomeKeyAction::Close))
                 })
                 .map(|kb| kb.accels.clone());
             assert_eq!(

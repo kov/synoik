@@ -74,6 +74,8 @@ BuildRequires:  pkgconfig(libseat)
 BuildRequires:  pkgconfig(libdisplay-info)
 BuildRequires:  pipewire-devel
 BuildRequires:  pango-devel
+# glib-compile-schemas, for our own GSettings schema
+BuildRequires:  glib2-devel
 BuildRequires:  cairo-gobject-devel
 # Needed for pipewire-rs
 BuildRequires:  clang
@@ -142,6 +144,16 @@ install -Dm644 -t %{buildroot}%{_datadir}/xdg-desktop-portal ./resources/niri-po
 install -Dm644 -t %{buildroot}%{_userunitdir} ./resources/niri.service
 install -Dm644 -t %{buildroot}%{_userunitdir} ./resources/niri-shutdown.target
 
+# Our own GSettings schema, in a private dir rather than %%{_datadir}/glib-2.0/schemas.
+# Two files declaring one schema id in a single directory means glib-compile-schemas
+# drops one of them and still exits 0 — and this is meant to be installable beside a
+# real gnome-shell. The session finds it through GSETTINGS_SCHEMA_DIR (see
+# resources/niri.service), which is searched ahead of the system dir. Compiled here so
+# there is nothing to do in %%post.
+install -Dm644 -t %{buildroot}%{_datadir}/gnome-shell-rs/glib-2.0/schemas \
+    ./resources/org.gnome.shell-rs.keybindings.gschema.xml
+glib-compile-schemas %{buildroot}%{_datadir}/gnome-shell-rs/glib-2.0/schemas
+
 install -Dm644 -t %{buildroot}%{bash_completions_dir} ./niri
 install -Dm644 -t %{buildroot}%{fish_completions_dir} ./niri.fish
 install -Dm644 -t %{buildroot}%{zsh_completions_dir} ./_niri
@@ -163,6 +175,9 @@ install -Dm644 -t %{buildroot}%{zsh_completions_dir} ./_niri
 %{_datadir}/xdg-desktop-portal/niri-portals.conf
 %{_userunitdir}/niri.service
 %{_userunitdir}/niri-shutdown.target
+%dir %{_datadir}/gnome-shell-rs
+%{_datadir}/gnome-shell-rs/glib-2.0/schemas/org.gnome.shell-rs.keybindings.gschema.xml
+%{_datadir}/gnome-shell-rs/glib-2.0/schemas/gschemas.compiled
 %{bash_completions_dir}/niri
 %{fish_completions_dir}/niri.fish
 %{zsh_completions_dir}/_niri

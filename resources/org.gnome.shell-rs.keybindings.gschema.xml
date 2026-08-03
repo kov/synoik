@@ -1,0 +1,208 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Keybindings for the scrolling-window-manager behaviors GNOME has no equivalent
+  for. Everything GNOME already names lives in its own schema and is read from
+  there: window and workspace management in org.gnome.desktop.wm.keybindings,
+  tiling in org.gnome.mutter.keybindings, the shell's own UI in
+  org.gnome.shell.keybindings.
+
+  Shape follows mutter's: every key is an array of accelerators in
+  gtk_accelerator_parse form, and the empty array means unbound.
+
+  No accelerator here may collide with one we adopt from GNOME — where the two
+  models want the same chord, GNOME wins. `niri_accels_do_not_collide_with_gnome`
+  in src/gnome.rs checks that mechanically, and `our_schema_matches_the_table`
+  checks this file against the table that mirrors it.
+-->
+<schemalist>
+  <schema id="org.gnome.shell-rs.keybindings" path="/org/gnome/shell-rs/keybindings/">
+
+    <!-- Moving the focus within a workspace. The arrow keys are GNOME's
+         (tiling and maximize), so this half of the model is hjkl-only. -->
+    <key name="focus-column-left" type="as">
+      <default>['&lt;Super&gt;h']</default>
+      <summary>Focus the column to the left</summary>
+    </key>
+    <key name="focus-column-right" type="as">
+      <default>['&lt;Super&gt;l']</default>
+      <summary>Focus the column to the right</summary>
+    </key>
+    <key name="focus-window-up" type="as">
+      <default>['&lt;Super&gt;k']</default>
+      <summary>Focus the window above in the column</summary>
+    </key>
+    <key name="focus-window-down" type="as">
+      <default>['&lt;Super&gt;j']</default>
+      <summary>Focus the window below in the column</summary>
+    </key>
+    <key name="focus-column-first" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;Home']</default>
+      <summary>Focus the first column</summary>
+    </key>
+    <key name="focus-column-last" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;End']</default>
+      <summary>Focus the last column</summary>
+    </key>
+
+    <!-- Moving windows and columns within a workspace. -->
+    <key name="move-column-left" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;h']</default>
+      <summary>Move the column left</summary>
+    </key>
+    <key name="move-column-right" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;l']</default>
+      <summary>Move the column right</summary>
+    </key>
+    <key name="move-window-up" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;k']</default>
+      <summary>Move the window up in the column</summary>
+    </key>
+    <key name="move-window-down" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;j']</default>
+      <summary>Move the window down in the column</summary>
+    </key>
+    <key name="move-column-to-first" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;&lt;Shift&gt;Home']</default>
+      <summary>Move the column to the start</summary>
+    </key>
+    <key name="move-column-to-last" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;&lt;Shift&gt;End']</default>
+      <summary>Move the column to the end</summary>
+    </key>
+
+    <!-- Monitors. GNOME binds move-to-monitor-* but has no focus-monitor keys,
+         so only the focus half and the whole-column move are ours. -->
+    <key name="focus-monitor-left" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;h']</default>
+      <summary>Focus the monitor to the left</summary>
+    </key>
+    <key name="focus-monitor-right" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;l']</default>
+      <summary>Focus the monitor to the right</summary>
+    </key>
+    <key name="focus-monitor-up" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;k']</default>
+      <summary>Focus the monitor above</summary>
+    </key>
+    <key name="focus-monitor-down" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;j']</default>
+      <summary>Focus the monitor below</summary>
+    </key>
+    <key name="move-column-to-monitor-left" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;&lt;Shift&gt;h']</default>
+      <summary>Move the column to the monitor on the left</summary>
+    </key>
+    <key name="move-column-to-monitor-right" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;&lt;Shift&gt;l']</default>
+      <summary>Move the column to the monitor on the right</summary>
+    </key>
+    <key name="move-column-to-monitor-up" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;&lt;Shift&gt;k']</default>
+      <summary>Move the column to the monitor above</summary>
+    </key>
+    <key name="move-column-to-monitor-down" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;&lt;Shift&gt;j']</default>
+      <summary>Move the column to the monitor below</summary>
+    </key>
+
+    <!-- Workspaces. Switching between them is GNOME's; moving a whole column
+         to one, and reordering the workspaces themselves, are ours. -->
+    <key name="move-column-to-workspace-up" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;i']</default>
+      <summary>Move the column to the workspace above</summary>
+    </key>
+    <key name="move-column-to-workspace-down" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;u']</default>
+      <summary>Move the column to the workspace below</summary>
+    </key>
+    <key name="move-workspace-up" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;i']</default>
+      <summary>Move the workspace up in the order</summary>
+    </key>
+    <key name="move-workspace-down" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;u']</default>
+      <summary>Move the workspace down in the order</summary>
+    </key>
+
+    <!-- Columns: what windows they hold and how wide they are. -->
+    <key name="consume-or-expel-window-left" type="as">
+      <default>['&lt;Super&gt;bracketleft']</default>
+      <summary>Consume or expel the window on the left</summary>
+    </key>
+    <key name="consume-or-expel-window-right" type="as">
+      <default>['&lt;Super&gt;bracketright']</default>
+      <summary>Consume or expel the window on the right</summary>
+    </key>
+    <key name="consume-window-into-column" type="as">
+      <default>['&lt;Super&gt;comma']</default>
+      <summary>Consume the next window into this column</summary>
+    </key>
+    <key name="expel-window-from-column" type="as">
+      <default>['&lt;Super&gt;period']</default>
+      <summary>Expel the window from its column</summary>
+    </key>
+    <key name="switch-preset-column-width" type="as">
+      <default>['&lt;Super&gt;r']</default>
+      <summary>Cycle the column through the preset widths</summary>
+    </key>
+    <key name="switch-preset-column-width-back" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;r']</default>
+      <summary>Cycle the column back through the preset widths</summary>
+    </key>
+    <key name="switch-preset-window-height" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;&lt;Shift&gt;r']</default>
+      <summary>Cycle the window through the preset heights</summary>
+    </key>
+    <key name="reset-window-height" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;r']</default>
+      <summary>Reset the window height</summary>
+    </key>
+    <key name="maximize-column" type="as">
+      <default>['&lt;Super&gt;f']</default>
+      <summary>Maximize the column</summary>
+    </key>
+    <key name="expand-column-to-available-width" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;f']</default>
+      <summary>Expand the column into the free width</summary>
+    </key>
+    <key name="center-column" type="as">
+      <default>['&lt;Super&gt;c']</default>
+      <summary>Center the column on screen</summary>
+    </key>
+    <key name="center-visible-columns" type="as">
+      <default>['&lt;Super&gt;&lt;Control&gt;c']</default>
+      <summary>Center all visible columns</summary>
+    </key>
+    <key name="toggle-column-tabbed-display" type="as">
+      <default>['&lt;Super&gt;w']</default>
+      <summary>Show the column's windows as tabs</summary>
+    </key>
+
+    <!-- Floating. GNOME has no tiling/floating split to name, so both are ours.
+         Note <Super>v is GNOME's message tray, which is why this is not it. -->
+    <key name="toggle-window-floating" type="as">
+      <default>['&lt;Super&gt;g']</default>
+      <summary>Float the window, or tile it again</summary>
+    </key>
+    <key name="switch-focus-between-floating-and-tiling" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;g']</default>
+      <summary>Move the focus between the floating and tiling layers</summary>
+    </key>
+
+    <!-- Session. `quit` is the hard exit, distinct from the end-session dialog
+         gnome-settings-daemon's logout key brings up. -->
+    <key name="show-hotkey-overlay" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;slash']</default>
+      <summary>Show the keyboard shortcuts</summary>
+    </key>
+    <key name="power-off-monitors" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;p']</default>
+      <summary>Turn the monitors off</summary>
+    </key>
+    <key name="quit" type="as">
+      <default>['&lt;Super&gt;&lt;Shift&gt;e']</default>
+      <summary>Exit the compositor</summary>
+    </key>
+
+  </schema>
+</schemalist>

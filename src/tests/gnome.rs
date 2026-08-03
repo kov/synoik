@@ -25,7 +25,9 @@ use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::*;
-use crate::gnome::{Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction};
+use crate::gnome::{
+    Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction, KeybindingAction,
+};
 use crate::ui::osd::OsdLevel;
 use crate::utils::get_monotonic_time;
 
@@ -62,6 +64,8 @@ const KEY_PAGEDOWN: u32 = 109;
 const KEY_O: u32 = 24;
 const KEY_S: u32 = 31;
 const KEY_F10: u32 = 68;
+const KEY_J: u32 = 36;
+const KEY_K: u32 = 37;
 const KEY_V: u32 = 47;
 const KEY_LEFTMETA: u32 = 125;
 const KEY_RIGHTMETA: u32 = 126;
@@ -586,7 +590,7 @@ fn numbered_workspace_switches_follow_the_settings() {
         .gnome_settings
         .keybindings
         .iter_mut()
-        .find(|kb| kb.action == GnomeKeyAction::SwitchToWorkspace(2))
+        .find(|kb| kb.action.gnome() == Some(GnomeKeyAction::SwitchToWorkspace(2)))
         .unwrap();
     switch_2.accels = vec![Accel {
         trigger: AccelTrigger::Keysym(Keysym::_2),
@@ -736,7 +740,7 @@ fn keybindings_follow_the_settings_model() {
         .gnome_settings
         .keybindings
         .iter_mut()
-        .find(|kb| kb.action == GnomeKeyAction::Close)
+        .find(|kb| kb.action.gnome() == Some(GnomeKeyAction::Close))
         .unwrap();
     close.accels = vec![Accel {
         trigger: AccelTrigger::Keysym(Keysym::w),
@@ -800,6 +804,68 @@ fn shortcuts_inhibit_masks_gnome_keybindings() {
         f.client(id).window(&surface).close_requested,
         "releasing the inhibitor must restore the keybinding"
     );
+}
+
+/// Our own schema's bindings resolve through the same path as GNOME's: they are
+/// entries in one keybinding model, differing only in which action they carry.
+///
+/// `<Super>k`/`<Super>j` walk the windows in a column — the arrows can't, since
+/// `<Super>` plus an arrow is GNOME's four times over (tiling, maximize,
+/// unmaximize, move-to-monitor), which is exactly the sort of collision
+/// `niri_accels_do_not_collide_with_gnome` exists to keep out.
+#[test]
+fn our_own_keybindings_resolve_too() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let left = f.add_client();
+    let _left_surface = map_focused_window(&mut f, left);
+    let right = f.add_client();
+    let right_surface = map_focused_window(&mut f, right);
+
+    let focused = |f: &mut Fixture| f.niri().layout.focus().map(|m| m.id());
+    let newest = f.niri().layout.focus().map(|m| m.id());
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_K);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert_ne!(
+        focused(&mut f),
+        newest,
+        "<Super>k must focus the window above"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_J);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert_eq!(focused(&mut f), newest, "<Super>j must come back down");
+
+    // And rebinding one in the model takes effect, like any other key.
+    let binding = f
+        .niri()
+        .gnome_settings
+        .keybindings
+        .iter_mut()
+        .find(|kb| kb.action == KeybindingAction::Niri(Action::FocusWindowUp))
+        .expect("our schema's keys are in the model");
+    binding.accels = vec![Accel {
+        trigger: AccelTrigger::Keysym(Keysym::z),
+        mods: AccelMods::SUPER,
+    }];
+
+    f.key_press(KEY_LEFTMETA);
+    tap(&mut f, KEY_Z);
+    f.key_release(KEY_LEFTMETA);
+    f.niri_complete_animations();
+    assert_ne!(
+        focused(&mut f),
+        newest,
+        "the rebound accelerator must focus up"
+    );
+
+    let _ = right_surface;
 }
 
 /// `<Super>N` is `switch-to-application-N`: it activates the Nth *dash favourite*
@@ -1185,7 +1251,7 @@ fn switch_to_session_beats_the_inhibitor() {
         .gnome_settings
         .keybindings
         .iter_mut()
-        .find(|kb| kb.action == GnomeKeyAction::SwitchToSession(3))
+        .find(|kb| kb.action.gnome() == Some(GnomeKeyAction::SwitchToSession(3)))
         .expect("the wayland keybindings table must be loaded");
     session_3.accels = vec![Accel {
         trigger: AccelTrigger::Keysym(Keysym::F6),
@@ -17691,16 +17757,16 @@ fn the_screenshot_keys_come_from_gnome_settings() {
         .gnome_settings
         .keybindings
         .iter()
-        .filter(|kb| {
+        .filter_map(|kb| kb.action.gnome())
+        .filter(|action| {
             matches!(
-                kb.action,
+                action,
                 GnomeKeyAction::ShowScreenshotUi
                     | GnomeKeyAction::Screenshot
                     | GnomeKeyAction::ScreenshotWindow
                     | GnomeKeyAction::ShowScreenRecordingUi
             )
         })
-        .map(|kb| kb.action)
         .collect();
     assert_eq!(adopted.len(), 4, "all four keys adopted, got {adopted:?}");
 
@@ -17710,7 +17776,7 @@ fn the_screenshot_keys_come_from_gnome_settings() {
         .gnome_settings
         .keybindings
         .iter()
-        .find(|kb| kb.action == GnomeKeyAction::Screenshot)
+        .find(|kb| kb.action.gnome() == Some(GnomeKeyAction::Screenshot))
         .map(|kb| kb.accels.len())
         .expect("adopted");
     assert_eq!(
