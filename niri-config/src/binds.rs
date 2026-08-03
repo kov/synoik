@@ -125,6 +125,16 @@ pub enum Action {
     CancelScreenshot,
     #[knuffel(skip)]
     ScreenshotTogglePointer,
+    /// Pick the area type from the screenshot UI's type row (its `s`/`c`/`w` keys).
+    #[knuffel(skip)]
+    ScreenshotTypeSelection,
+    #[knuffel(skip)]
+    ScreenshotTypeScreen,
+    #[knuffel(skip)]
+    ScreenshotTypeWindow,
+    /// Flip the screenshot UI between its shot and cast modes (its `v` key).
+    #[knuffel(skip)]
+    ScreenshotToggleCast,
     Screenshot(
         #[knuffel(property(name = "show-pointer"), default = true)] bool,
         // Path; not settable from knuffel

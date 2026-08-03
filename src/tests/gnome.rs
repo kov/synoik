@@ -16881,6 +16881,59 @@ fn cast_mode_refuses_window_capture() {
     );
 }
 
+/// Single keys drive the type row and the shot/cast pill, so the picker is usable without the
+/// pointer (`vfunc_key_press_event`, `js/ui/screenshot.js:2207-2233`). The insensitive Window
+/// button still refuses its key, as its click already does.
+#[test]
+fn single_keys_pick_the_capture_type_and_mode() {
+    use crate::ui::screenshot_ui::{CaptureMode, CaptureType};
+
+    const KEY_W: u32 = 17;
+    const KEY_S: u32 = 31;
+    const KEY_C: u32 = 46;
+    const KEY_V: u32 = 47;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    map_focused_window(&mut f, id);
+
+    open_picker_headless(&mut f);
+    assert_eq!(
+        f.niri().screenshot_ui.capture_type(),
+        CaptureType::Selection
+    );
+
+    let tap = |f: &mut Fixture, code| {
+        f.key_press(code);
+        f.key_release(code);
+    };
+
+    tap(&mut f, KEY_C);
+    assert_eq!(f.niri().screenshot_ui.capture_type(), CaptureType::Screen);
+    tap(&mut f, KEY_W);
+    assert_eq!(f.niri().screenshot_ui.capture_type(), CaptureType::Window);
+    tap(&mut f, KEY_S);
+    assert_eq!(
+        f.niri().screenshot_ui.capture_type(),
+        CaptureType::Selection
+    );
+
+    tap(&mut f, KEY_V);
+    assert_eq!(f.niri().screenshot_ui.mode(), CaptureMode::Cast);
+    tap(&mut f, KEY_W);
+    assert_eq!(
+        f.niri().screenshot_ui.capture_type(),
+        CaptureType::Selection,
+        "Window is insensitive under cast, and its key must be refused like its button"
+    );
+    tap(&mut f, KEY_V);
+    assert_eq!(f.niri().screenshot_ui.mode(), CaptureMode::Shot);
+
+    // And none of it leaked out to the compositor underneath.
+    assert!(f.niri().screenshot_ui.is_open());
+}
+
 /// The headless corpus has no renderer, so the picker cannot freeze the screen and open here —
 /// which makes this fixture exactly the refusal case, driven through the real
 /// `State::on_screen_shot_msg`. The dismissal is driven through `Niri::close_screenshot_ui`, the

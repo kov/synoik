@@ -2852,11 +2852,21 @@ fn action(raw: Keysym, mods: ModifiersState) -> Option<Action> {
         });
     }
 
-    if !mods.ctrl && raw == Keysym::p {
-        return Some(Action::ScreenshotTogglePointer);
+    if mods.ctrl {
+        return None;
     }
 
-    None
+    // The type row and the shot/cast pill answer to single keys, as in `screenshot.js:2207-2233`.
+    // An insensitive control still swallows its key there, and `set_capture_type` refuses the
+    // switch on its own, so these need no extra gating here.
+    match raw {
+        Keysym::p => Some(Action::ScreenshotTogglePointer),
+        Keysym::s => Some(Action::ScreenshotTypeSelection),
+        Keysym::c => Some(Action::ScreenshotTypeScreen),
+        Keysym::w => Some(Action::ScreenshotTypeWindow),
+        Keysym::v => Some(Action::ScreenshotToggleCast),
+        _ => None,
+    }
 }
 
 pub fn rect_from_corner_points(

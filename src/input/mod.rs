@@ -65,7 +65,7 @@ use crate::ui::folder_dialog::{DialogHit, POPDOWN_DIALOG_MS};
 use crate::ui::overview_search::SearchHit;
 use crate::ui::popover::PopoverSide;
 use crate::ui::run_dialog::{self, KeyOutcome};
-use crate::ui::screenshot_ui::ScreenshotUi;
+use crate::ui::screenshot_ui::{CaptureType, ScreenshotUi};
 use crate::ui::switcher::SwitcherKey;
 use crate::ui::window_preview;
 use crate::utils::spawning::{spawn, spawn_sh};
@@ -2146,6 +2146,18 @@ impl State {
             Action::ScreenshotTogglePointer => {
                 self.niri.screenshot_ui.toggle_pointer();
                 self.niri.queue_redraw_all();
+            }
+            Action::ScreenshotTypeSelection => {
+                self.set_screenshot_capture_type(CaptureType::Selection);
+            }
+            Action::ScreenshotTypeScreen => {
+                self.set_screenshot_capture_type(CaptureType::Screen);
+            }
+            Action::ScreenshotTypeWindow => {
+                self.set_screenshot_capture_type(CaptureType::Window);
+            }
+            Action::ScreenshotToggleCast => {
+                self.toggle_screenshot_capture_mode();
             }
             Action::Screenshot(show_cursor, path) => {
                 self.open_screenshot_ui(show_cursor, path);

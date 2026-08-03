@@ -4045,6 +4045,31 @@ impl State {
             .set_cursor_image(CursorImageStatus::Named(icon));
     }
 
+    /// Switch the picker's capture type, as its type row would. A no-op unless it is open.
+    pub fn set_screenshot_capture_type(&mut self, ty: CaptureType) {
+        if !self.niri.screenshot_ui.is_open() {
+            return;
+        }
+        self.niri.screenshot_ui.set_capture_type(ty);
+        // The type decides what the pointer means where it already is.
+        self.sync_screenshot_ui_cursor();
+        self.niri.queue_redraw_all();
+    }
+
+    /// Flip the picker between shot and cast, as its pill would. A no-op unless it is open.
+    pub fn toggle_screenshot_capture_mode(&mut self) {
+        if !self.niri.screenshot_ui.is_open() {
+            return;
+        }
+        let next = match self.niri.screenshot_ui.mode() {
+            CaptureMode::Shot => CaptureMode::Cast,
+            CaptureMode::Cast => CaptureMode::Shot,
+        };
+        self.niri.screenshot_ui.set_mode(next);
+        self.sync_screenshot_ui_cursor();
+        self.niri.queue_redraw_all();
+    }
+
     /// Act on a release over the screenshot UI's control panel.
     pub fn handle_screenshot_ui_pointer_up(&mut self, up: PointerUp) {
         match up {
