@@ -49,8 +49,8 @@ use crate::app_system::{AppState, LaunchMode};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::gnome::{
-    Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction, GnomeKeybinding, KeybindingAction,
-    ScreenDirection, TileSide,
+    modifiers_from_accel, Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction,
+    GnomeKeybinding, KeybindingAction, ScreenDirection, TileSide,
 };
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::workspace::WorkspaceId;
@@ -9543,7 +9543,7 @@ pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::
 /// before doing any lookup, so an unmodified scroll costs nothing. That makes it
 /// a **trap** — a binding whose modifiers are missing here is not merely slow to
 /// find, it is never found at all. Both sources of bindings have to be in it, and
-/// it has to be recomputed when either changes ([`Niri::refresh_mods_with_binds`]).
+/// it has to be recomputed when either changes ([`Niri::refresh_keybinding_state`]).
 pub fn mods_with_binds(
     mod_key: ModKey,
     binds: &Binds,
@@ -9577,29 +9577,6 @@ pub fn mods_with_binds(
     }
 
     rv
-}
-
-/// An accelerator's modifiers as the config's [`Modifiers`], following the same
-/// equivalences [`accel_mods_match`] applies: the virtual META/HYPER masks live
-/// on Alt and Super, and MOD4 is Super.
-fn modifiers_from_accel(accel_mods: AccelMods) -> Modifiers {
-    let mut mods = Modifiers::empty();
-    if accel_mods.contains(AccelMods::CONTROL) {
-        mods |= Modifiers::CTRL;
-    }
-    if accel_mods.contains(AccelMods::SHIFT) {
-        mods |= Modifiers::SHIFT;
-    }
-    if accel_mods.intersects(AccelMods::MOD1 | AccelMods::META) {
-        mods |= Modifiers::ALT;
-    }
-    if accel_mods.intersects(AccelMods::SUPER | AccelMods::HYPER | AccelMods::MOD4) {
-        mods |= Modifiers::SUPER;
-    }
-    if accel_mods.contains(AccelMods::MOD5) {
-        mods |= Modifiers::ISO_LEVEL3_SHIFT;
-    }
-    mods
 }
 
 pub fn mods_with_mouse_binds(

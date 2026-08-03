@@ -1453,7 +1453,7 @@ impl State {
                 let config = state.niri.config.clone();
                 let config = config.borrow();
                 let mod_key = state.backend.mod_key(&config);
-                state.niri.refresh_mods_with_binds(mod_key, &config.binds);
+                state.niri.refresh_keybinding_state(mod_key, &config.binds);
             }
             state
                 .niri
@@ -1683,7 +1683,7 @@ impl State {
                             let config = state.niri.config.clone();
                             let config = config.borrow();
                             let mod_key = state.backend.mod_key(&config);
-                            state.niri.refresh_mods_with_binds(mod_key, &config.binds);
+                            state.niri.refresh_keybinding_state(mod_key, &config.binds);
                         }
                         state
                             .niri
@@ -3110,7 +3110,7 @@ impl State {
                 .hotkey_overlay
                 .on_hotkey_config_updated(new_mod_key);
             self.niri
-                .refresh_mods_with_binds(new_mod_key, &config.binds);
+                .refresh_keybinding_state(new_mod_key, &config.binds);
         }
 
         if config.window_rules != old_config.window_rules {
@@ -6486,7 +6486,7 @@ impl Niri {
 
         let mod_key = backend.mod_key(&config.borrow());
         // The compiled-in model, which a live session replaces right after
-        // construction (and then calls `refresh_mods_with_binds`). Headless tests keep
+        // construction (and then calls `refresh_keybinding_state`). Headless tests keep
         // exactly this one, so the fast-path sets have to be built from it here.
         let gnome_settings = GnomeSettings::default();
         let keybindings = &gnome_settings.keybindings;
@@ -6512,7 +6512,7 @@ impl Niri {
         // session, and a modal cheat-sheet in front of the desktop is niri's
         // welcome, not GNOME's. The overlay itself stays available on demand
         // (`Action::ShowHotkeyOverlay`).
-        let hotkey_overlay = HotkeyOverlay::new(config.clone(), mod_key);
+        let hotkey_overlay = HotkeyOverlay::new(config.clone(), mod_key, keybindings);
 
         let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone());
         let end_session_dialog = EndSessionDialog::new(animation_clock.clone(), config.clone());
@@ -8182,13 +8182,15 @@ impl Niri {
     }
 
     /// Schedules an immediate redraw on all outputs if one is not already scheduled.
-    /// Recompute the modifier fast-path sets the pointer, wheel, touchpad and
-    /// stylus handlers gate on.
+    /// Recompute everything derived from the two keybinding sources: the modifier
+    /// fast-path sets the pointer, wheel, touchpad and stylus handlers gate on, and
+    /// the hotkey overlay's baked content.
     ///
     /// Both sources feed them — the config binds and the GSettings keybinding
     /// model — so this runs whenever either changes. A stale set does not make a
-    /// binding slow, it makes it *invisible*: the handlers never look it up.
-    pub fn refresh_mods_with_binds(
+    /// binding slow, it makes it *invisible*: the handlers never look it up, and the
+    /// overlay never re-bakes.
+    pub fn refresh_keybinding_state(
         &mut self,
         mod_key: niri_config::ModKey,
         binds: &niri_config::Binds,
@@ -8200,6 +8202,7 @@ impl Niri {
             mods_with_tablet_stylus_binds(mod_key, binds, keybindings);
         self.mods_with_finger_scroll_binds =
             mods_with_finger_scroll_binds(mod_key, binds, keybindings);
+        self.hotkey_overlay.set_keybindings(keybindings);
     }
 
     pub fn queue_redraw_all(&mut self) {

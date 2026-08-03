@@ -9,6 +9,8 @@ use smithay::input::keyboard::xkb::keysym_get_name;
 use smithay::output::Output;
 use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
 
+use crate::gnome::{key_for_accel, GnomeKeybinding};
+use crate::input::action_for_keybinding;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
 use crate::ui::widget::{self, ContentCache, Painter, ParagraphSpan, ShapedParagraph, TextShaper};
@@ -60,21 +62,41 @@ pub struct HotkeyOverlay {
     is_open: bool,
     config: Rc<RefCell<Config>>,
     mod_key: ModKey,
-    /// Content-sized bake, keyed by `(scale, revision)`. The content depends only on the config +
-    /// mod key, so [`revision`](Self::revision) is a generation counter bumped whenever those
-    /// change (a scale change is already a fresh key).
+    /// The GSettings keybindings, which is where most bindings now live — the
+    /// config binds are only what a user has overridden on top.
+    ///
+    /// A snapshot rather than a borrow, because the bake is cached: a change has
+    /// to bump [`revision`](Self::revision) to be seen, which is what
+    /// [`set_keybindings`](Self::set_keybindings) is for.
+    keybindings: Vec<GnomeKeybinding>,
+    /// Content-sized bake, keyed by `(scale, revision)`. The content depends only on the config,
+    /// the keybindings and the mod key, so [`revision`](Self::revision) is a generation counter
+    /// bumped whenever those change (a scale change is already a fresh key).
     cache: RefCell<ContentCache>,
     revision: u64,
 }
 
 impl HotkeyOverlay {
-    pub fn new(config: Rc<RefCell<Config>>, mod_key: ModKey) -> Self {
+    pub fn new(
+        config: Rc<RefCell<Config>>,
+        mod_key: ModKey,
+        keybindings: &[GnomeKeybinding],
+    ) -> Self {
         Self {
             is_open: false,
             config,
             mod_key,
+            keybindings: keybindings.to_vec(),
             cache: RefCell::new(ContentCache::new()),
             revision: 0,
+        }
+    }
+
+    /// Take a fresh copy of the keybinding model, re-baking if it actually changed.
+    pub fn set_keybindings(&mut self, keybindings: &[GnomeKeybinding]) {
+        if self.keybindings != keybindings {
+            self.keybindings = keybindings.to_vec();
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 
@@ -127,7 +149,7 @@ impl HotkeyOverlay {
                 &mut cache,
                 scale,
                 self.revision,
-                |r| prepare(r, &config, mod_key, scale),
+                |r| prepare(r, &config, &self.keybindings, mod_key, scale),
                 |frame, phys, layout| paint(frame, phys, layout, scale),
             ) {
                 Ok(texture) => Some(texture),
@@ -166,13 +188,14 @@ impl HotkeyOverlay {
 
     pub fn a11y_text(&self) -> String {
         let config = self.config.borrow();
-        let actions = collect_actions(&config);
+        let actions = collect_actions(&config, &self.keybindings);
 
         let mut buf = String::new();
         writeln!(&mut buf, "{TITLE}").unwrap();
 
         for action in actions {
-            let Some((key, label)) = format_bind(&config.binds.0, action) else {
+            let Some((key, label)) = format_bind(&config.binds.0, &self.keybindings, &action)
+            else {
                 continue;
             };
 
@@ -188,7 +211,16 @@ impl HotkeyOverlay {
     }
 }
 
-fn format_bind(binds: &[Bind], action: &Action) -> Option<(Option<Key>, Label)> {
+/// The key shown for `action`, and its label.
+///
+/// A config bind wins over the settings model: the config is what the user layered on top.
+/// `None` means the action should not be listed at all — a bind with a null
+/// `hotkey-overlay-title` hides it explicitly.
+fn format_bind(
+    binds: &[Bind],
+    keybindings: &[GnomeKeybinding],
+    action: &Action,
+) -> Option<(Option<Key>, Label)> {
     let mut bind_with_non_null = None;
     let mut bind_with_custom_title = None;
     let mut found_null_title = false;
@@ -223,7 +255,7 @@ fn format_bind(binds: &[Bind], action: &Action) -> Option<(Option<Key>, Label)> 
 
         Some(bind.key)
     } else {
-        None
+        keybinding_key(keybindings, action)
     };
     // A custom title is user text: render it plain (any pango markup it carries is stripped).
     let label = match custom_title {
@@ -232,6 +264,18 @@ fn format_bind(binds: &[Bind], action: &Action) -> Option<(Option<Key>, Label)> 
     };
 
     Some((key, label))
+}
+
+/// The first showable accelerator bound to `action` in the settings model.
+///
+/// "Showable" drops keycode accelerators: those name a physical key with no
+/// layout-independent name to print. An action bound only that way reads as unbound, which
+/// is the honest answer for an overlay that prints key names.
+fn keybinding_key(keybindings: &[GnomeKeybinding], action: &Action) -> Option<Key> {
+    keybindings
+        .iter()
+        .filter(|kb| action_for_keybinding(&kb.action).as_ref() == Some(action))
+        .find_map(|kb| kb.accels.iter().find_map(key_for_accel))
 }
 
 /// Styled label for a built-in action. Only spawn actions carry structure (a monospace command on a
@@ -277,91 +321,109 @@ fn strip_markup(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-fn collect_actions(config: &Config) -> Vec<&Action> {
+/// Every action bound by either source: the settings model, plus whatever the config binds
+/// layer on top. Actions bound to nothing at all are left out, so "is this bound?" has one
+/// answer regardless of which model the binding came from.
+fn bound_actions(binds: &[Bind], keybindings: &[GnomeKeybinding]) -> Vec<Action> {
+    binds
+        .iter()
+        .map(|bind| bind.action.clone())
+        .chain(
+            keybindings
+                .iter()
+                .filter(|kb| !kb.accels.is_empty())
+                .filter_map(|kb| action_for_keybinding(&kb.action)),
+        )
+        .collect()
+}
+
+fn collect_actions(config: &Config, keybindings: &[GnomeKeybinding]) -> Vec<Action> {
     let binds = &config.binds.0;
+    let bound = bound_actions(binds, keybindings);
 
     // Collect actions that we want to show.
-    let mut actions = vec![&Action::ShowHotkeyOverlay];
+    let mut actions = vec![Action::ShowHotkeyOverlay];
 
     // Prefer Quit(false) if found, otherwise try Quit(true), and if there's neither, fall back to
     // Quit(false).
-    if binds.iter().any(|bind| bind.action == Action::Quit(false)) {
-        actions.push(&Action::Quit(false));
-    } else if binds.iter().any(|bind| bind.action == Action::Quit(true)) {
-        actions.push(&Action::Quit(true));
+    if bound.contains(&Action::Quit(false)) {
+        actions.push(Action::Quit(false));
+    } else if bound.contains(&Action::Quit(true)) {
+        actions.push(Action::Quit(true));
     } else {
-        actions.push(&Action::Quit(false));
+        actions.push(Action::Quit(false));
     }
 
-    actions.extend(&[
-        &Action::CloseWindow,
-        &Action::FocusColumnLeft,
-        &Action::FocusColumnRight,
-        &Action::MoveColumnLeft,
-        &Action::MoveColumnRight,
-        &Action::FocusWorkspaceDown,
-        &Action::FocusWorkspaceUp,
+    actions.extend([
+        Action::CloseWindow,
+        Action::FocusColumnLeft,
+        Action::FocusColumnRight,
+        Action::MoveColumnLeft,
+        Action::MoveColumnRight,
+        Action::FocusWorkspaceDown,
+        Action::FocusWorkspaceUp,
     ]);
 
     // Prefer move-column-to-workspace-down, but fall back to move-window-to-workspace-down.
-    if let Some(bind) = binds
+    if let Some(action) = bound
         .iter()
-        .find(|bind| matches!(bind.action, Action::MoveColumnToWorkspaceDown(_)))
+        .find(|action| matches!(action, Action::MoveColumnToWorkspaceDown(_)))
     {
-        actions.push(&bind.action);
-    } else if binds
+        actions.push(action.clone());
+    } else if bound
         .iter()
-        .any(|bind| matches!(bind.action, Action::MoveWindowToWorkspaceDown(_)))
+        .any(|action| matches!(action, Action::MoveWindowToWorkspaceDown(_)))
     {
-        actions.push(&Action::MoveWindowToWorkspaceDown(true));
+        actions.push(Action::MoveWindowToWorkspaceDown(true));
     } else {
-        actions.push(&Action::MoveColumnToWorkspaceDown(true));
+        actions.push(Action::MoveColumnToWorkspaceDown(true));
     }
 
     // Same for -up.
-    if let Some(bind) = binds
+    if let Some(action) = bound
         .iter()
-        .find(|bind| matches!(bind.action, Action::MoveColumnToWorkspaceUp(_)))
+        .find(|action| matches!(action, Action::MoveColumnToWorkspaceUp(_)))
     {
-        actions.push(&bind.action);
-    } else if binds
+        actions.push(action.clone());
+    } else if bound
         .iter()
-        .any(|bind| matches!(bind.action, Action::MoveWindowToWorkspaceUp(_)))
+        .any(|action| matches!(action, Action::MoveWindowToWorkspaceUp(_)))
     {
-        actions.push(&Action::MoveWindowToWorkspaceUp(true));
+        actions.push(Action::MoveWindowToWorkspaceUp(true));
     } else {
-        actions.push(&Action::MoveColumnToWorkspaceUp(true));
+        actions.push(Action::MoveColumnToWorkspaceUp(true));
     }
 
-    actions.extend(&[
-        &Action::SwitchPresetColumnWidth,
-        &Action::MaximizeColumn,
-        &Action::ConsumeOrExpelWindowLeft,
-        &Action::ConsumeOrExpelWindowRight,
-        &Action::ToggleWindowFloating,
-        &Action::SwitchFocusBetweenFloatingAndTiling,
-        &Action::ToggleOverview,
+    actions.extend([
+        Action::SwitchPresetColumnWidth,
+        Action::MaximizeColumn,
+        Action::ConsumeOrExpelWindowLeft,
+        Action::ConsumeOrExpelWindowRight,
+        Action::ToggleWindowFloating,
+        Action::SwitchFocusBetweenFloatingAndTiling,
+        Action::ToggleOverview,
     ]);
 
     // Screenshot is not as important, can omit if not bound.
-    if let Some(bind) = binds
+    if let Some(action) = bound
         .iter()
-        .find(|bind| matches!(bind.action, Action::Screenshot(_, _)))
+        .find(|action| matches!(action, Action::Screenshot(_, _)))
     {
-        actions.push(&bind.action);
+        actions.push(action.clone());
     }
 
-    // Add actions with a custom hotkey-overlay-title.
+    // Add actions with a custom hotkey-overlay-title. Only config binds can carry one.
     for bind in binds {
         if matches!(bind.hotkey_overlay_title, Some(Some(_))) {
             // Avoid duplicate actions.
-            if !actions.contains(&&bind.action) {
-                actions.push(&bind.action);
+            if !actions.contains(&bind.action) {
+                actions.push(bind.action.clone());
             }
         }
     }
 
-    // Add the spawn actions.
+    // Add the spawn actions. These are config-only too: spawning is not in our schema, it
+    // reaches us through gsd's custom shortcuts instead.
     for bind in binds.iter().filter(|bind| {
         matches!(bind.action, Action::Spawn(_) | Action::SpawnSh(_))
             // Only show binds with Mod or Super to filter out stuff like volume up/down.
@@ -370,17 +432,15 @@ fn collect_actions(config: &Config) -> Vec<&Action> {
             // Also filter out wheel and touchpad scroll binds.
             && matches!(bind.key.trigger, Trigger::Keysym(_))
     }) {
-        let action = &bind.action;
-
         // We only show one bind for each action, so we need to deduplicate the Spawn actions.
-        if !actions.contains(&action) {
-            actions.push(action);
+        if !actions.contains(&bind.action) {
+            actions.push(bind.action.clone());
         }
     }
 
     if config.hotkey_overlay.hide_not_bound {
         // Only keep actions that have been bound
-        actions.retain(|&action| binds.iter().any(|bind| bind.action == *action))
+        actions.retain(|action| bound.contains(action));
     }
 
     actions
@@ -414,6 +474,7 @@ struct OverlayLayout {
 fn prepare(
     renderer: &mut VulkanRenderer,
     config: &Config,
+    keybindings: &[GnomeKeybinding],
     mod_key: ModKey,
     scale: f64,
 ) -> anyhow::Result<(Size<i32, Physical>, OverlayLayout)> {
@@ -428,9 +489,9 @@ fn prepare(
     let hpad: i32 = (font_px * 0.3).round() as i32;
     let vpad: i32 = (font_px * 0.12).round() as i32;
 
-    let rows: Vec<(String, Label)> = collect_actions(config)
+    let rows: Vec<(String, Label)> = collect_actions(config, keybindings)
         .into_iter()
-        .filter_map(|action| format_bind(&config.binds.0, action))
+        .filter_map(|action| format_bind(&config.binds.0, keybindings, &action))
         .map(|(key, label)| {
             let key = key.map(|key| key_name(false, mod_key, &key));
             let key = key.as_deref().unwrap_or("(not bound)").to_string();
@@ -742,10 +803,16 @@ mod tests {
 
     use super::*;
 
+    /// The config-only case: no settings model, so the KDL binds are the whole story.
     #[track_caller]
     fn check(config: &str, action: Action) -> String {
+        check_with(config, &[], action)
+    }
+
+    #[track_caller]
+    fn check_with(config: &str, keybindings: &[GnomeKeybinding], action: Action) -> String {
         let config = Config::parse_mem(config).unwrap();
-        if let Some((key, label)) = format_bind(&config.binds.0, &action) {
+        if let Some((key, label)) = format_bind(&config.binds.0, keybindings, &action) {
             let key = key.map(|key| key_name(false, ModKey::Super, &key));
             let key = key.as_deref().unwrap_or("(not bound)");
             let title: String = label.iter().map(|s| s.text.as_str()).collect();
@@ -841,5 +908,49 @@ mod tests {
             ),
             @" Super + P : Hello"
         );
+    }
+
+    /// Most bindings live in GSettings now, so the overlay has to read them from
+    /// there — with no config binds at all it would otherwise print "not bound" for
+    /// nearly everything.
+    #[test]
+    fn keybindings_come_from_the_settings_model() {
+        let keybindings = crate::gnome::GnomeSettings::default().keybindings;
+
+        assert_snapshot!(
+            check_with("", &keybindings, Action::CloseWindow),
+            @" Alt + F4 : Close Focused Window"
+        );
+        assert_snapshot!(
+            check_with("", &keybindings, Action::FocusColumnLeft),
+            @" Super + H : Focus Column to the Left"
+        );
+
+        // A config bind is the user's override, so it wins over the model.
+        assert_snapshot!(
+            check_with(
+                r#"binds {
+                    Mod+Shift+K { close-window; }
+                }"#,
+                &keybindings,
+                Action::CloseWindow,
+            ),
+            @" Super + Shift + K : Close Focused Window"
+        );
+    }
+
+    /// `hide-not-bound` drops actions nothing binds. With the settings model as the
+    /// only source, that must not empty the overlay out.
+    #[test]
+    fn hide_not_bound_still_sees_the_settings_model() {
+        let keybindings = crate::gnome::GnomeSettings::default().keybindings;
+        let config = Config::parse_mem("hotkey-overlay { hide-not-bound; }").unwrap();
+
+        let actions = collect_actions(&config, &keybindings);
+        assert!(actions.contains(&Action::CloseWindow));
+        assert!(actions.contains(&Action::FocusColumnLeft));
+
+        // And the empty model is what actually hides them.
+        assert!(collect_actions(&config, &[]).is_empty());
     }
 }

@@ -15,7 +15,7 @@ use std::time::Duration;
 use gio::glib;
 use gio::glib::prelude::ObjectExt;
 use gio::prelude::{DBusProxyExt, SettingsExt, SettingsExtManual};
-use niri_config::Action;
+use niri_config::{Action, Modifiers};
 use smithay::input::keyboard::{xkb, Keysym};
 
 use crate::world_clocks::{ResolvedLocation, WorldLocation};
@@ -1988,6 +1988,46 @@ fn adopted_shell_keybindings() -> Vec<(String, GnomeKeyAction, Vec<String>)> {
     }
 
     keys
+}
+
+/// An accelerator's modifiers as the config's [`Modifiers`], following the same
+/// equivalences [`accel_mods_match`] applies: the virtual META/HYPER masks live
+/// on Alt and Super, and MOD4 is Super.
+pub(crate) fn modifiers_from_accel(accel_mods: AccelMods) -> Modifiers {
+    let mut mods = Modifiers::empty();
+    if accel_mods.contains(AccelMods::CONTROL) {
+        mods |= Modifiers::CTRL;
+    }
+    if accel_mods.contains(AccelMods::SHIFT) {
+        mods |= Modifiers::SHIFT;
+    }
+    if accel_mods.intersects(AccelMods::MOD1 | AccelMods::META) {
+        mods |= Modifiers::ALT;
+    }
+    if accel_mods.intersects(AccelMods::SUPER | AccelMods::HYPER | AccelMods::MOD4) {
+        mods |= Modifiers::SUPER;
+    }
+    if accel_mods.contains(AccelMods::MOD5) {
+        mods |= Modifiers::ISO_LEVEL3_SHIFT;
+    }
+    mods
+}
+
+/// An accelerator as a config [`Key`], for the surfaces that render bindings —
+/// the hotkey overlay, which does not care which model a binding came from.
+///
+/// `None` for a raw-keycode accelerator (`0x29`, `Above_Tab`): there is no
+/// layout-independent name to show for one.
+pub(crate) fn key_for_accel(accel: &Accel) -> Option<niri_config::Key> {
+    let trigger = match accel.trigger {
+        AccelTrigger::Keysym(keysym) => niri_config::Trigger::Keysym(keysym),
+        AccelTrigger::Device(trigger) => trigger,
+        AccelTrigger::Keycode(_) => return None,
+    };
+    Some(niri_config::Key {
+        trigger,
+        modifiers: modifiers_from_accel(accel.mods),
+    })
 }
 
 /// Our own schema, `org.gnome.shell-rs.keybindings`: the scrolling-window-manager

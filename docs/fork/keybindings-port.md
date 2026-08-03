@@ -243,7 +243,7 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
 | S6 | Our own schema for the niri actions, plus its packaging | **done** |
 | S7 | Route the non-keyboard triggers (mouse, wheel, touchpad, tablet) through the model | **done** |
 | S8 | Prune and then delete the KDL `binds{}` | |
-| S9 | Re-source the hotkey overlay from the settings model | |
+| S9 | Re-source the hotkey overlay from the settings model | **done** |
 | S10 | Vendor `org.gnome.shell.*` / `org.gnome.mutter.*` into our private schema dir, plus the `.gschema.override` for our differing defaults | after S6 |
 
 ### Ordering hazards
@@ -260,6 +260,12 @@ No backing implementation; nearly all default to `[]`, so deferring costs nothin
   and `screensaver` (`<Super>l`) removes quit and lock outright.
 - **Dead number row.** S8 before S5 leaves `<Super>1..9` doing nothing, since GNOME's
   `switch-to-workspace-N` defaults are empty.
+- **Empty cheat sheet.** S8 before S9 empties the hotkey overlay: it read `config.binds` and
+  nothing else, so every GNOME-sourced binding was already invisible to it and deleting the KDL
+  defaults would have left it blank. Closed by S9, which reads both sources — a config bind
+  first (it is the user's override), the settings model otherwise. `hide-not-bound` now asks
+  "bound by *either* source", and `hide_not_bound_still_sees_the_settings_model` pins that an
+  empty model is what actually empties it.
 - **Silent fallback drift.** Closed by S6, which shipped the packaging in the same slice: code
   without it would leave the session on compiled-in defaults while the user believed they were
   editing settings.
