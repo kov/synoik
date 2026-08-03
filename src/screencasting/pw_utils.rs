@@ -3,11 +3,11 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::iter::zip;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::ptr::NonNull;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::time::Duration;
-use std::{mem, slice};
+use std::{io, mem, slice};
 
 use anyhow::{ensure, Context as _};
 use calloop::timer::{TimeoutAction, Timer};
@@ -52,7 +52,8 @@ use crate::dbus::mutter_screen_cast::{self, CursorMode};
 use crate::niri::{CastTarget, State};
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{
-    clear_dmabuf, encompassing_geo, render_and_download_as, render_to_dmabuf,
+    clear_dmabuf, encompassing_geo, render_and_copy_to_memory, render_and_download_as,
+    render_to_dmabuf,
 };
 use crate::screencasting::CastRenderElement;
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
@@ -112,6 +113,8 @@ struct CastInner {
     refresh: u32,
     min_time_between_frames: Duration,
     dmabufs: HashMap<i64, Dmabuf>,
+    /// Memfd-backed buffers we allocated, keyed like [`Self::dmabufs`] by the block's fd.
+    memory_buffers: HashMap<i64, MemoryBuffer>,
     /// Buffers dequeued from PipeWire in process of rendering.
     ///
     /// This is an ordered list of buffers that we started rendering to and waiting for the
@@ -119,6 +122,32 @@ struct CastInner {
     /// stored in order from oldest to newest, and the same ordering should be preserved when
     /// submitting completed buffers to PipeWire.
     rendering_buffers: Vec<(NonNull<pw_buffer>, SyncPoint)>,
+}
+
+/// How the consumer takes frames.
+///
+/// Not every consumer can import a dmabuf. OBS and gnome-software both fail negotiation outright
+/// when dmabuf is all we offer, so we advertise plain memory as well and have to remember which
+/// one the stream settled on. Keeping it in one enum rather than an `Option<Modifier>` means the
+/// buffer-allocation, render and teardown paths cannot disagree about which world they are in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sink {
+    Dmabuf {
+        modifier: Modifier,
+        plane_count: i32,
+    },
+    /// PipeWire MemFd/MemPtr: one block of tightly packed BGRA that PipeWire allocates for us.
+    Memory,
+}
+
+impl Sink {
+    /// `SPA_PARAM_BUFFERS_blocks` — one per dmabuf plane, or a single block of memory.
+    fn blocks(self) -> i32 {
+        match self {
+            Sink::Dmabuf { plane_count, .. } => plane_count,
+            Sink::Memory => 1,
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -130,14 +159,12 @@ enum CastState {
     ConfirmationPending {
         size: Size<u32, Physical>,
         alpha: bool,
-        modifier: Modifier,
-        plane_count: i32,
+        sink: Sink,
     },
     Ready {
         size: Size<u32, Physical>,
         alpha: bool,
-        modifier: Modifier,
-        plane_count: i32,
+        sink: Sink,
         // Lazily-initialized to keep the initialization to a single place.
         damage_tracker: Option<OutputDamageTracker>,
         cursor_damage_tracker: Option<OutputDamageTracker>,
@@ -204,24 +231,47 @@ impl<'a, E: Element> CursorData<'a, E> {
     }
 }
 
+/// Build the full `EnumFormat` offer.
+///
+/// Order matters and follows mutter's `build_format_params`
+/// (`meta-screen-cast-stream-src.c:1576-1592`): every format **with** modifiers first, then every
+/// format **without**. A consumer that can import a dmabuf still picks one; a consumer that cannot
+/// falls through to the memory variant instead of failing negotiation outright.
 macro_rules! make_params {
     ($params:ident, $formats:expr, $size:expr, $refresh:expr, $alpha:expr) => {
         let mut b1 = Vec::new();
         let mut b2 = Vec::new();
+        let mut b3 = Vec::new();
+        let mut b4 = Vec::new();
 
-        let o1 = make_video_params($formats, $size, $refresh, false);
-        let pod1 = make_pod(&mut b1, o1);
-
-        let mut p1;
-        let mut p2;
-        $params = if $alpha {
-            let o2 = make_video_params($formats, $size, $refresh, true);
-            p2 = [pod1, make_pod(&mut b2, o2)];
-            &mut p2[..]
+        let o1 = make_video_params($formats, $size, $refresh, false, true);
+        let o2 = if $alpha {
+            make_video_params($formats, $size, $refresh, true, true)
         } else {
-            p1 = [pod1];
-            &mut p1[..]
+            None
         };
+        let o3 = make_video_params($formats, $size, $refresh, false, false);
+        let o4 = if $alpha {
+            make_video_params($formats, $size, $refresh, true, false)
+        } else {
+            None
+        };
+
+        let mut pods = Vec::new();
+        if let Some(o) = o1 {
+            pods.push(make_pod(&mut b1, o));
+        }
+        if let Some(o) = o2 {
+            pods.push(make_pod(&mut b2, o));
+        }
+        if let Some(o) = o3 {
+            pods.push(make_pod(&mut b3, o));
+        }
+        if let Some(o) = o4 {
+            pods.push(make_pod(&mut b4, o));
+        }
+
+        $params = pods;
     };
 }
 
@@ -344,6 +394,7 @@ impl PipeWire {
             refresh,
             min_time_between_frames: Duration::ZERO,
             dmabufs: HashMap::new(),
+            memory_buffers: HashMap::new(),
             rendering_buffers: Vec::new(),
         }));
 
@@ -459,11 +510,37 @@ impl PipeWire {
                     inner.min_time_between_frames = min_frame_time;
 
                     let object = pod.as_object().unwrap();
-                    let Some(prop_modifier) =
-                        object.find_prop(spa::utils::Id(FormatProperties::VideoModifier.0))
-                    else {
-                        warn!("modifier prop missing");
-                        stop_cast();
+                    let prop_modifier =
+                        object.find_prop(spa::utils::Id(FormatProperties::VideoModifier.0));
+
+                    // No modifier means the consumer took our memory offer. That is not an error —
+                    // it is the whole point of advertising the modifier-less variant. Mutter picks
+                    // its buffer type the same way: `prop_modifier ? DmaBuf : MemFd`
+                    // (`meta-screen-cast-stream-src.c:1929-1934`).
+                    let Some(prop_modifier) = prop_modifier else {
+                        debug!("no modifier negotiated, using memory buffers");
+
+                        let (damage_tracker, cursor_damage_tracker) = if let CastState::Ready {
+                            damage_tracker,
+                            cursor_damage_tracker,
+                            ..
+                        } = &mut *state
+                        {
+                            (damage_tracker.take(), cursor_damage_tracker.take())
+                        } else {
+                            (None, None)
+                        };
+
+                        *state = CastState::Ready {
+                            size: format_size,
+                            alpha: format_has_alpha,
+                            sink: Sink::Memory,
+                            damage_tracker,
+                            cursor_damage_tracker,
+                            last_cursor_location: None,
+                        };
+
+                        update_buffer_params(stream, Sink::Memory, cursor_mode, &stop_cast);
                         return;
                     };
 
@@ -508,8 +585,10 @@ impl PipeWire {
                         *state = CastState::ConfirmationPending {
                             size: format_size,
                             alpha: format_has_alpha,
-                            modifier,
-                            plane_count: plane_count as i32,
+                            sink: Sink::Dmabuf {
+                                modifier,
+                                plane_count: plane_count as i32,
+                            },
                         };
 
                         let fixated_format = FormatSet::from_iter([Format {
@@ -519,24 +598,40 @@ impl PipeWire {
 
                         let mut b1 = Vec::new();
                         let mut b2 = Vec::new();
+                        let mut b3 = Vec::new();
 
-                        let o1 = make_video_params(
+                        // The fixated single modifier, then the full modifier set, then the
+                        // memory fallback — so a re-negotiation can still land on memory.
+                        let mut params = Vec::new();
+                        if let Some(o) = make_video_params(
                             &fixated_format,
                             format_size,
                             inner.refresh,
                             format_has_alpha,
-                        );
-                        let pod1 = make_pod(&mut b1, o1);
-
-                        let o2 = make_video_params(
+                            true,
+                        ) {
+                            params.push(make_pod(&mut b1, o));
+                        }
+                        if let Some(o) = make_video_params(
                             &formats,
                             format_size,
                             inner.refresh,
                             format_has_alpha,
-                        );
-                        let mut params = [pod1, make_pod(&mut b2, o2)];
+                            true,
+                        ) {
+                            params.push(make_pod(&mut b2, o));
+                        }
+                        if let Some(o) = make_video_params(
+                            &formats,
+                            format_size,
+                            inner.refresh,
+                            format_has_alpha,
+                            false,
+                        ) {
+                            params.push(make_pod(&mut b3, o));
+                        }
 
-                        if let Err(err) = stream.update_params(&mut params) {
+                        if let Err(err) = stream.update_params(&mut params[..]) {
                             warn!("error updating stream params: {err:?}");
                             stop_cast();
                         }
@@ -545,26 +640,20 @@ impl PipeWire {
                     }
 
                     // Verify that alpha and modifier didn't change.
-                    let plane_count = match &*state {
-                        CastState::ConfirmationPending {
-                            size,
-                            alpha,
-                            modifier,
-                            plane_count,
-                        }
+                    let sink = match &*state {
+                        CastState::ConfirmationPending { size, alpha, sink }
                         | CastState::Ready {
-                            size,
-                            alpha,
-                            modifier,
-                            plane_count,
-                            ..
+                            size, alpha, sink, ..
                         } if *alpha == format_has_alpha
-                            && *modifier == Modifier::from(format.modifier()) =>
+                            && matches!(
+                                sink,
+                                Sink::Dmabuf { modifier, .. }
+                                    if *modifier == Modifier::from(format.modifier())
+                            ) =>
                         {
                             let size = *size;
                             let alpha = *alpha;
-                            let modifier = *modifier;
-                            let plane_count = *plane_count;
+                            let sink = *sink;
 
                             let (damage_tracker, cursor_damage_tracker) =
                                 if let CastState::Ready {
@@ -583,14 +672,13 @@ impl PipeWire {
                             *state = CastState::Ready {
                                 size,
                                 alpha,
-                                modifier,
-                                plane_count,
+                                sink,
                                 damage_tracker,
                                 cursor_damage_tracker,
                                 last_cursor_location: None,
                             };
 
-                            plane_count
+                            sink
                         }
                         _ => {
                             // We're negotiating a single modifier, or alpha or modifier changed,
@@ -615,88 +703,25 @@ impl PipeWire {
                                  moving to ready"
                             );
 
+                            let sink = Sink::Dmabuf {
+                                modifier,
+                                plane_count: plane_count as i32,
+                            };
+
                             *state = CastState::Ready {
                                 size: format_size,
                                 alpha: format_has_alpha,
-                                modifier,
-                                plane_count: plane_count as i32,
+                                sink,
                                 damage_tracker: None,
                                 cursor_damage_tracker: None,
                                 last_cursor_location: None,
                             };
 
-                            plane_count as i32
+                            sink
                         }
                     };
 
-                    // const BPP: u32 = 4;
-                    // let stride = format.size().width * BPP;
-                    // let size = stride * format.size().height;
-
-                    let o1 = pod::object!(
-                        SpaTypes::ObjectParamBuffers,
-                        ParamType::Buffers,
-                        Property::new(
-                            SPA_PARAM_BUFFERS_buffers,
-                            pod::Value::Choice(ChoiceValue::Int(Choice(
-                                ChoiceFlags::empty(),
-                                ChoiceEnum::Range {
-                                    default: 8,
-                                    min: 2,
-                                    max: 16
-                                }
-                            ))),
-                        ),
-                        Property::new(SPA_PARAM_BUFFERS_blocks, pod::Value::Int(plane_count)),
-                        Property::new(
-                            SPA_PARAM_BUFFERS_dataType,
-                            pod::Value::Choice(ChoiceValue::Int(Choice(
-                                ChoiceFlags::empty(),
-                                ChoiceEnum::Flags {
-                                    default: 1 << DataType::DmaBuf.as_raw(),
-                                    flags: vec![1 << DataType::DmaBuf.as_raw()],
-                                },
-                            ))),
-                        ),
-                    );
-
-                    let o2 = pod::object!(
-                        SpaTypes::ObjectParamMeta,
-                        ParamType::Meta,
-                        Property::new(
-                            SPA_PARAM_META_type,
-                            pod::Value::Id(spa::utils::Id(SPA_META_Header))
-                        ),
-                        Property::new(
-                            SPA_PARAM_META_size,
-                            pod::Value::Int(size_of::<spa_meta_header>() as i32)
-                        ),
-                    );
-                    let mut b1 = vec![];
-                    let mut b2 = vec![];
-                    let mut params = vec![make_pod(&mut b1, o1), make_pod(&mut b2, o2)];
-
-                    let mut b_cursor = vec![];
-                    if cursor_mode == CursorMode::Metadata {
-                        let o_cursor = pod::object!(
-                            SpaTypes::ObjectParamMeta,
-                            ParamType::Meta,
-                            Property::new(
-                                SPA_PARAM_META_type,
-                                pod::Value::Id(spa::utils::Id(SPA_META_Cursor))
-                            ),
-                            Property::new(
-                                SPA_PARAM_META_size,
-                                pod::Value::Int(CURSOR_META_SIZE as i32)
-                            ),
-                        );
-                        params.push(make_pod(&mut b_cursor, o_cursor));
-                    }
-
-                    if let Err(err) = stream.update_params(&mut params) {
-                        warn!("error updating stream params: {err:?}");
-                        stop_cast();
-                    }
+                    update_buffer_params(stream, sink, cursor_mode, &stop_cast);
                 }
             })
             .add_buffer({
@@ -706,20 +731,41 @@ impl PipeWire {
                     let _span = debug_span!("add_buffer", %stream_id).entered();
                     let mut inner = inner.borrow_mut();
 
-                    let (size, alpha, modifier) = if let CastState::Ready {
-                        size,
-                        alpha,
-                        modifier,
-                        ..
+                    let (size, alpha, sink) = if let CastState::Ready {
+                        size, alpha, sink, ..
                     } = &inner.state
                     {
-                        (*size, *alpha, *modifier)
+                        (*size, *alpha, *sink)
                     } else {
                         trace!("add_buffer, but not ready yet");
                         return;
                     };
 
-                    trace!("size={size:?}, alpha={alpha}, modifier={modifier:?}");
+                    trace!("size={size:?}, alpha={alpha}, sink={sink:?}");
+
+                    let Sink::Dmabuf { modifier, .. } = sink else {
+                        // Memory sink: PipeWire gave us an empty buffer to fill in, and we own the
+                        // memfd behind it, exactly as mutter does
+                        // (`meta-screen-cast-stream-src.c:2318-2358`).
+                        match unsafe { attach_memfd(buffer, size) } {
+                            Ok(mapping) => {
+                                let fd = mapping.fd;
+                                assert!(inner.memory_buffers.insert(fd, mapping).is_none());
+                            }
+                            Err(err) => {
+                                warn!("error allocating memfd buffer: {err:?}");
+                                stop_cast();
+                                return;
+                            }
+                        }
+
+                        if inner.memory_buffers.len() == 1
+                            && stream.state() == StreamState::Streaming
+                        {
+                            redraw_();
+                        }
+                        return;
+                    };
 
                     unsafe {
                         let spa_buffer = (*buffer).buffer;
@@ -797,6 +843,8 @@ impl PipeWire {
 
                         let fd = (*spa_data).fd;
                         inner.dmabufs.remove(&fd);
+                        // Dropping the mapping unmaps it; PipeWire owns the fd itself.
+                        inner.memory_buffers.remove(&fd);
                     }
                 }
             })
@@ -808,14 +856,20 @@ impl PipeWire {
             "starting pw stream with size={pending_size:?}, refresh={refresh:?}"
         );
 
-        let params;
+        let mut params;
         make_params!(params, &formats, pending_size, refresh, alpha);
+        ensure!(
+            !params.is_empty(),
+            "no formats to offer, refusing to start a stream nothing can accept"
+        );
         stream
             .connect(
                 Direction::Output,
                 None,
+                // ALLOC_BUFFERS both ways: we allocate the dmabuf *and* the memfd ourselves, which
+                // is what mutter does too (`meta-screen-cast-stream-src.c:2477`).
                 StreamFlags::DRIVER | StreamFlags::ALLOC_BUFFERS,
-                params,
+                &mut params[..],
             )
             .context("error connecting stream")?;
 
@@ -870,7 +924,7 @@ impl Cast {
             pending_size: new_size,
         };
 
-        let params;
+        let mut params;
         make_params!(
             params,
             &self.formats,
@@ -879,7 +933,7 @@ impl Cast {
             self.offer_alpha
         );
         self.stream
-            .update_params(params)
+            .update_params(&mut params[..])
             .context("error updating stream params")?;
 
         Ok(CastSizeChange::Pending)
@@ -897,10 +951,10 @@ impl Cast {
         inner.refresh = refresh;
 
         let size = inner.state.expected_format_size();
-        let params;
+        let mut params;
         make_params!(params, &self.formats, size, refresh, self.offer_alpha);
         self.stream
-            .update_params(params)
+            .update_params(&mut params[..])
             .context("error updating stream params")?;
 
         Ok(())
@@ -1151,9 +1205,15 @@ impl Cast {
 
         let mut inner = self.inner.borrow_mut();
         let inner_ = &mut *inner;
-        let CastState::Ready { damage_tracker, .. } = &mut inner_.state else {
+        let CastState::Ready {
+            damage_tracker,
+            sink,
+            ..
+        } = &mut inner_.state
+        else {
             unreachable!()
         };
+        let sink = *sink;
         let damage_tracker = damage_tracker.as_mut().unwrap();
 
         unsafe {
@@ -1167,6 +1227,48 @@ impl Cast {
             // Unfortunately, I think the OBS PipeWire code needs to be updated first to cleanly
             // allow for that codepath.
             let fd = (*(*spa_buffer).datas).fd;
+
+            if sink == Sink::Memory {
+                let Some(mapping) = inner_.memory_buffers.get(&fd) else {
+                    warn!("no mapping for memory buffer fd={fd}, skipping frame");
+                    drop(inner);
+                    return_unused_buffer(&self.stream, pw_buffer);
+                    return false;
+                };
+                let (dst, dst_len, stride) = (mapping.ptr.as_ptr(), mapping.len, mapping.stride);
+
+                let res = render_and_copy_to_memory(
+                    renderer,
+                    damage_tracker,
+                    dst,
+                    stride,
+                    elements,
+                    states,
+                );
+                drop(inner);
+
+                return match res {
+                    Ok(()) => {
+                        // The readback already synchronized with the GPU, so unlike the dmabuf
+                        // path there is nothing left to wait for: queue it straight away.
+                        let chunk = (*(*spa_buffer).datas).chunk;
+                        (*chunk).offset = 0;
+                        (*chunk).stride = stride as i32;
+                        (*chunk).size = dst_len as u32;
+
+                        mark_buffer_as_good(pw_buffer, &mut self.sequence_counter);
+                        trace!("queueing memory buffer with seq={}", self.sequence_counter);
+                        pw_stream_queue_buffer(self.stream.as_raw_ptr(), pw_buffer.as_ptr());
+                        true
+                    }
+                    Err(err) => {
+                        warn!("error rendering to memory buffer: {err:?}");
+                        return_unused_buffer(&self.stream, pw_buffer);
+                        false
+                    }
+                };
+            }
+
             let dmabuf = inner_.dmabufs[&fd].clone();
 
             let res = render_to_dmabuf(renderer, damage_tracker, dmabuf, elements, states);
@@ -1260,12 +1362,22 @@ fn pw_version_supports_cursor_metadata() -> bool {
     unsafe { pw_check_library_version(1, 4, 8) }
 }
 
+/// One `EnumFormat` offer.
+///
+/// `with_modifier: false` emits the format with **no** `VideoModifier` property at all, which is
+/// what lets PipeWire fall back to MemFd/MemPtr buffers. Mutter offers every format both ways —
+/// `build_format_params` (`meta-screen-cast-stream-src.c:1576-1592`) loops all formats with
+/// modifiers and then loops them all again without, and `push_format_object` only attaches the
+/// modifier when it has one (`:297`). We used to send the modifier variant alone, and a consumer
+/// that could not import any of our modifiers was left with nothing to accept: OBS and
+/// gnome-software both died at connect with `no more input formats`.
 fn make_video_params(
     formats: &FormatSet,
     size: Size<u32, Physical>,
     refresh: u32,
     alpha: bool,
-) -> pod::Object {
+    with_modifier: bool,
+) -> Option<pod::Object> {
     let format = if alpha {
         VideoFormat::BGRA
     } else {
@@ -1278,36 +1390,49 @@ fn make_video_params(
         Fourcc::Xrgb8888
     };
 
-    let formats: Vec<_> = formats
+    let modifiers: Vec<_> = formats
         .iter()
         .filter_map(|f| (f.code == fourcc).then_some(u64::from(f.modifier) as i64))
         .collect();
 
-    trace!("offering: {formats:?}");
-
-    let dont_fixate = if formats.len() > 1 {
-        PropertyFlags::DONT_FIXATE
-    } else {
-        PropertyFlags::empty()
-    };
-
-    pod::object!(
-        SpaTypes::ObjectParamFormat,
-        ParamType::EnumFormat,
+    let mut properties = vec![
         pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
         pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
         pod::property!(FormatProperties::VideoFormat, Id, format),
-        Property {
+    ];
+
+    if with_modifier {
+        // Nothing to advertise: mutter simply does not emit this variant (`:1526-1531`), and
+        // emitting it with an empty choice would offer a format nothing can satisfy.
+        if modifiers.is_empty() {
+            debug!("no modifiers for {fourcc}, not offering it with modifiers");
+            return None;
+        }
+
+        trace!("offering {fourcc} with modifiers: {modifiers:?}");
+
+        let dont_fixate = if modifiers.len() > 1 {
+            PropertyFlags::DONT_FIXATE
+        } else {
+            PropertyFlags::empty()
+        };
+
+        properties.push(Property {
             key: FormatProperties::VideoModifier.as_raw(),
             flags: PropertyFlags::MANDATORY | dont_fixate,
             value: pod::Value::Choice(ChoiceValue::Long(Choice(
                 ChoiceFlags::empty(),
                 ChoiceEnum::Enum {
-                    default: formats[0],
-                    alternatives: formats,
-                }
-            )))
-        },
+                    default: modifiers[0],
+                    alternatives: modifiers,
+                },
+            ))),
+        });
+    } else {
+        trace!("offering {fourcc} without a modifier (memory buffers)");
+    }
+
+    properties.extend([
         pod::property!(
             FormatProperties::VideoSize,
             Rectangle,
@@ -1336,7 +1461,220 @@ fn make_video_params(
                 denom: 1000
             }
         ),
-    )
+    ]);
+
+    Some(pod::Object {
+        type_: SpaTypes::ObjectParamFormat.as_raw(),
+        id: ParamType::EnumFormat.as_raw(),
+        properties,
+    })
+}
+
+/// A memfd we allocated for a [`Sink::Memory`] buffer, kept mapped for the buffer's lifetime.
+///
+/// PipeWire hands us an empty buffer and we own the storage behind it, so the mapping has to live
+/// exactly as long as the `pw_buffer` does — [`remove_buffer`](StreamRef) is what unmaps it. The
+/// fd itself is owned by the `spa_data` after we set it, and PipeWire closes it.
+#[derive(Debug)]
+struct MemoryBuffer {
+    fd: i64,
+    ptr: NonNull<u8>,
+    len: usize,
+    /// Bytes per row, as announced in the buffer's chunk. Carried rather than recomputed so the
+    /// render path cannot derive a different stride from the one the consumer was told.
+    stride: usize,
+}
+
+// The pointer is a private mmap handle used only from the PipeWire loop thread; it is never shared
+// and never aliased, so the raw pointer does not make the struct thread-unsafe on its own.
+unsafe impl Send for MemoryBuffer {}
+
+impl Drop for MemoryBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            if libc::munmap(self.ptr.as_ptr().cast(), self.len) < 0 {
+                warn!(
+                    "error unmapping screencast memfd: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
+/// Allocate, seal and map a memfd, and point `buffer`'s single block at it.
+///
+/// Mirrors mutter's fallback path (`meta-screen-cast-stream-src.c:2318-2358`): sealed against
+/// resize so the consumer can trust `maxsize`, mapped `MAP_SHARED` so our writes are what it
+/// reads, and flagged readable+mappable rather than read-write — the consumer only ever reads.
+///
+/// # Safety
+///
+/// `buffer` must be a live `pw_buffer` with at least one data block, as delivered by `add_buffer`.
+unsafe fn attach_memfd(
+    buffer: *mut pw_buffer,
+    size: Size<u32, Physical>,
+) -> anyhow::Result<MemoryBuffer> {
+    unsafe {
+        let spa_buffer = (*buffer).buffer;
+        ensure!((*spa_buffer).n_datas >= 1, "no data blocks in the buffer");
+
+        let spa_data = (*spa_buffer).datas;
+        ensure!(
+            (*spa_data).type_ & (1 << DataType::MemFd.as_raw()) > 0,
+            "buffer does not accept MemFd"
+        );
+
+        let stride = size.w as usize * 4;
+        let len = stride * size.h as usize;
+
+        let name = c"gnome-shell-rs-screencast";
+        let fd = libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING);
+        ensure!(
+            fd >= 0,
+            "memfd_create failed: {}",
+            io::Error::last_os_error()
+        );
+        // From here on the fd is ours to close on failure; on success it belongs to the spa_data.
+        let guard = OwnedFd::from_raw_fd(fd);
+
+        ensure!(
+            libc::ftruncate(fd, len as libc::off_t) == 0,
+            "ftruncate to {len} failed: {}",
+            io::Error::last_os_error()
+        );
+
+        let seals = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        if libc::fcntl(fd, libc::F_ADD_SEALS, seals) == -1 {
+            // Mutter only warns here too: sealing is a hardening measure, not a requirement.
+            warn!(
+                "failed to seal screencast memfd: {}",
+                io::Error::last_os_error()
+            );
+        }
+
+        let ptr = libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        ensure!(
+            ptr != libc::MAP_FAILED,
+            "mmap of {len} bytes failed: {}",
+            io::Error::last_os_error()
+        );
+        let ptr = NonNull::new(ptr.cast::<u8>()).context("mmap returned null")?;
+
+        (*spa_data).type_ = DataType::MemFd.as_raw();
+        (*spa_data).flags = SPA_DATA_FLAG_READABLE | SPA_DATA_FLAG_MAPPABLE;
+        (*spa_data).fd = guard.into_raw_fd() as i64;
+        (*spa_data).maxsize = len as u32;
+        (*spa_data).mapoffset = 0;
+        (*spa_data).data = ptr.as_ptr().cast();
+
+        let chunk = (*spa_data).chunk;
+        (*chunk).stride = stride as i32;
+        (*chunk).offset = 0;
+        (*chunk).size = len as u32;
+
+        trace!(
+            "memfd buffer: fd={}, stride={stride}, len={len}",
+            (*spa_data).fd
+        );
+
+        Ok(MemoryBuffer {
+            fd: (*spa_data).fd,
+            ptr,
+            len,
+            stride,
+        })
+    }
+}
+
+/// Announce the buffer layout the negotiated [`Sink`] needs.
+///
+/// Shared by both negotiation outcomes so the block count and the data type can never disagree
+/// with the sink the stream actually settled on — the memory path wants one block of MemFd, the
+/// dmabuf path one block per plane. Mutter selects the type the same way
+/// (`meta-screen-cast-stream-src.c:1929-1934`).
+fn update_buffer_params(
+    stream: &Stream,
+    sink: Sink,
+    cursor_mode: CursorMode,
+    stop_cast: &impl Fn(),
+) {
+    let data_type = match sink {
+        Sink::Dmabuf { .. } => 1 << DataType::DmaBuf.as_raw(),
+        Sink::Memory => 1 << DataType::MemFd.as_raw(),
+    };
+
+    let o1 = pod::object!(
+        SpaTypes::ObjectParamBuffers,
+        ParamType::Buffers,
+        Property::new(
+            SPA_PARAM_BUFFERS_buffers,
+            pod::Value::Choice(ChoiceValue::Int(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Range {
+                    default: 8,
+                    min: 2,
+                    max: 16
+                }
+            ))),
+        ),
+        Property::new(SPA_PARAM_BUFFERS_blocks, pod::Value::Int(sink.blocks())),
+        Property::new(
+            SPA_PARAM_BUFFERS_dataType,
+            pod::Value::Choice(ChoiceValue::Int(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Flags {
+                    default: data_type,
+                    flags: vec![data_type],
+                },
+            ))),
+        ),
+    );
+
+    let o2 = pod::object!(
+        SpaTypes::ObjectParamMeta,
+        ParamType::Meta,
+        Property::new(
+            SPA_PARAM_META_type,
+            pod::Value::Id(spa::utils::Id(SPA_META_Header))
+        ),
+        Property::new(
+            SPA_PARAM_META_size,
+            pod::Value::Int(size_of::<spa_meta_header>() as i32)
+        ),
+    );
+    let mut b1 = vec![];
+    let mut b2 = vec![];
+    let mut params = vec![make_pod(&mut b1, o1), make_pod(&mut b2, o2)];
+
+    let mut b_cursor = vec![];
+    if cursor_mode == CursorMode::Metadata {
+        let o_cursor = pod::object!(
+            SpaTypes::ObjectParamMeta,
+            ParamType::Meta,
+            Property::new(
+                SPA_PARAM_META_type,
+                pod::Value::Id(spa::utils::Id(SPA_META_Cursor))
+            ),
+            Property::new(
+                SPA_PARAM_META_size,
+                pod::Value::Int(CURSOR_META_SIZE as i32)
+            ),
+        );
+        params.push(make_pod(&mut b_cursor, o_cursor));
+    }
+
+    if let Err(err) = stream.update_params(&mut params) {
+        warn!("error updating stream params: {err:?}");
+        stop_cast();
+    }
 }
 
 fn make_pod(buffer: &mut Vec<u8>, object: pod::Object) -> &Pod {
@@ -1603,5 +1941,115 @@ unsafe fn add_cursor_metadata(
         bitmap_meta.size.width = size.w as _;
         bitmap_meta.size.height = size.h as _;
         bitmap_meta.stride = size.w * CURSOR_BPP as i32;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a_format_set() -> FormatSet {
+        FormatSet::from_iter([
+            Format {
+                code: Fourcc::Xrgb8888,
+                modifier: Modifier::Linear,
+            },
+            Format {
+                code: Fourcc::Xrgb8888,
+                modifier: Modifier::Invalid,
+            },
+            Format {
+                code: Fourcc::Argb8888,
+                modifier: Modifier::Linear,
+            },
+        ])
+    }
+
+    fn params(object: &pod::Object) -> Vec<u32> {
+        object.properties.iter().map(|p| p.key).collect()
+    }
+
+    fn has_modifier(object: &pod::Object) -> bool {
+        params(object).contains(&FormatProperties::VideoModifier.as_raw())
+    }
+
+    /// The whole point of the memory fallback: the modifier-less offer must carry **no**
+    /// `VideoModifier` property at all. Emitting it with an empty or wildcard choice would still
+    /// be a dmabuf offer, and a consumer that cannot import one would keep failing negotiation
+    /// with "no more input formats" — which is exactly how OBS and gnome-software died.
+    #[test]
+    fn the_memory_offer_carries_no_modifier() {
+        let size = Size::from((1920, 1080));
+
+        let with = make_video_params(&a_format_set(), size, 60_000, false, true)
+            .expect("we have Xrgb modifiers, so the dmabuf offer must exist");
+        assert!(has_modifier(&with), "the dmabuf offer must name modifiers");
+
+        let without = make_video_params(&a_format_set(), size, 60_000, false, false)
+            .expect("the memory offer never depends on having modifiers");
+        assert!(
+            !has_modifier(&without),
+            "the memory offer must omit VideoModifier entirely, got {:?}",
+            params(&without)
+        );
+
+        // Both still describe the same video format, so a consumer picking either gets the
+        // frames it asked for.
+        for object in [&with, &without] {
+            let keys = params(object);
+            for required in [
+                FormatProperties::MediaType,
+                FormatProperties::MediaSubtype,
+                FormatProperties::VideoFormat,
+                FormatProperties::VideoSize,
+                FormatProperties::VideoFramerate,
+            ] {
+                assert!(
+                    keys.contains(&required.as_raw()),
+                    "{required:?} missing from an offer"
+                );
+            }
+        }
+    }
+
+    /// A format we have no modifiers for gets no dmabuf offer — mutter returns early rather than
+    /// advertising an empty modifier list (`meta-screen-cast-stream-src.c:1526-1531`). The memory
+    /// offer is unaffected, which is what keeps such a format usable at all.
+    #[test]
+    fn a_format_without_modifiers_is_only_offered_as_memory() {
+        let size = Size::from((800, 600));
+        // Only Argb has modifiers here, so the Xrgb (alpha = false) dmabuf offer has nothing.
+        let only_argb = FormatSet::from_iter([Format {
+            code: Fourcc::Argb8888,
+            modifier: Modifier::Linear,
+        }]);
+
+        assert!(
+            make_video_params(&only_argb, size, 60_000, false, true).is_none(),
+            "no modifiers for Xrgb, so there must be no dmabuf offer for it"
+        );
+        assert!(
+            make_video_params(&only_argb, size, 60_000, false, false).is_some(),
+            "the memory offer must survive having no modifiers"
+        );
+        assert!(
+            make_video_params(&only_argb, size, 60_000, true, true).is_some(),
+            "Argb does have a modifier, so its dmabuf offer stands"
+        );
+    }
+
+    /// The block count follows the sink, because PipeWire is told it once and both the allocation
+    /// and the render path have to agree with what it was told.
+    #[test]
+    fn a_memory_sink_asks_for_a_single_block() {
+        assert_eq!(Sink::Memory.blocks(), 1);
+        assert_eq!(
+            Sink::Dmabuf {
+                modifier: Modifier::Linear,
+                plane_count: 3,
+            }
+            .blocks(),
+            3
+        );
     }
 }
