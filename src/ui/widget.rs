@@ -119,6 +119,21 @@ pub mod style {
     /// `$osd_fg_color` = `$light_1` (`_colors.scss:16`) — the foreground on an OSD panel.
     pub const OSD_FG: Rgba = TEXT;
 
+    /// `%osd_button_flat` state fills (`_common.scss:324-332`).
+    ///
+    /// The *flat* style is not transparent: `button()` overrides the mix with the background input
+    /// itself (`_drawing.scss:176`), so a flat OSD button's base **is** [`OSD_BG`] — it reads as
+    /// flat because it sits on a panel of the same colour. The states lighten it, and
+    /// `$always_dark: true` means they lighten in both themes (`:204-213`). Flat raises the hover
+    /// step to 7% (`:188-190`); active is 9% and checked 8% (`:182-184`).
+    ///
+    /// Derived by taking `OSD_BG` to HSL (H 240°, S 0.053, L 0.190) and adding the step to L.
+    pub const OSD_FLAT_HOVER: Rgba = [0.246, 0.246, 0.274, 1.];
+    /// See [`OSD_FLAT_HOVER`] — checked, +8% lightness.
+    pub const OSD_FLAT_CHECKED: Rgba = [0.256, 0.256, 0.284, 1.];
+    /// See [`OSD_FLAT_HOVER`] — active/pressed, +9% lightness.
+    pub const OSD_FLAT_ACTIVE: Rgba = [0.265, 0.265, 0.295, 1.];
+
     /// Modal-dialog card background — GNOME `$bg_color` `#36363a` (`_dialogs.scss:4`,
     /// `_colors.scss:12`). Flat, borderless; corners rounded to `$alert_radius` (18px).
     pub const DIALOG_BG: Rgba = [0.212, 0.212, 0.227, 1.];
@@ -2274,6 +2289,54 @@ impl Painter<'_, '_, '_> {
     /// Paint an [`IconButton`]'s chrome — the circle, its hover wash and its focus ring. The glyph
     /// itself is composited by the caller (icons are textures, not paint ops); use
     /// [`IconButton::icon_centre`] to place it.
+    /// Draw an [`IconLabelButton`]'s fill — `%osd_button_flat` with a checked state
+    /// (`_screenshot.scss:26-38`). The caller composites the glyph and the caption on top.
+    ///
+    /// The base fill is [`style::OSD_BG`], not transparent: see [`style::OSD_FLAT_HOVER`] for why
+    /// a "flat" OSD button is the panel's own colour rather than a hole in it.
+    pub fn icon_label_button(&mut self, b: &IconLabelButton, accent: Rgba) -> anyhow::Result<()> {
+        let bg = match (b.checked, b.hovered) {
+            (true, _) => style::OSD_FLAT_CHECKED,
+            (false, true) => style::OSD_FLAT_HOVER,
+            (false, false) => style::OSD_BG,
+        };
+        self.fill_rounded(b.rect, IconLabelButton::RADIUS, bg)?;
+        if b.focused {
+            let ring = [accent[0], accent[1], accent[2], 0.8];
+            self.stroke_rounded(b.rect, IconLabelButton::RADIUS, 2., ring)?;
+        }
+        Ok(())
+    }
+
+    /// Draw a [`Segmented`] container and its segment fills (`_screenshot.scss:83-110`).
+    ///
+    /// `checked` is the index that is selected — it inverts to a solid [`style::OSD_FG`] pill, and
+    /// the caller must tint that segment's glyph [`style::OSD_BG`] to match (`:105`). `hovered` is
+    /// the segment under the pointer, if any.
+    pub fn segmented(
+        &mut self,
+        rect: Rectangle<f64, Logical>,
+        segments: usize,
+        checked: usize,
+        hovered: Option<usize>,
+    ) -> anyhow::Result<()> {
+        // `background-color: transparentize($osd_fg_color, 0.9)` — white at 10%.
+        let radius = rect.size.h / 2.;
+        self.fill_rounded(rect, radius, [1., 1., 1., 0.1])?;
+
+        for i in 0..segments {
+            let seg = Segmented::segment_rect(rect, i);
+            let seg_radius = seg.size.h / 2.;
+            if i == checked {
+                self.fill_rounded(seg, seg_radius, style::OSD_FG)?;
+            } else if hovered == Some(i) {
+                // `:hover { background-color: transparentize($osd_fg_color, 0.8) }` — white at 20%.
+                self.fill_rounded(seg, seg_radius, [1., 1., 1., 0.2])?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn icon_button(&mut self, b: &IconButton, accent: Rgba) -> anyhow::Result<()> {
         // `border-radius: $forced_circular_radius` on a square box.
         let radius = b.rect.size.w.min(b.rect.size.h) / 2.;
@@ -2286,6 +2349,154 @@ impl Painter<'_, '_, '_> {
             self.stroke_rounded(b.rect, radius, 2., ring_color)?;
         }
         Ok(())
+    }
+}
+
+/// GNOME's `.screenshot-ui-type-button` (`_screenshot.scss:26-38`) — a flat OSD button whose
+/// content is a large symbolic glyph stacked over a caption.
+///
+/// Distinct from [`Button`] (rounded rect, one centred label) and [`IconButton`] (circle, one
+/// glyph): this one is a *column*, so its height comes from the icon plus the caption plus the
+/// spacing between them, and it carries a **checked** state — which is what earns it a place here,
+/// since [`ButtonStyle`] has no checked fill.
+///
+/// The glyph and the label are composited by the caller (icons are render elements, not paint
+/// verbs); this type owns the geometry and [`Painter::icon_label_button`] owns the fill.
+///
+/// GNOME defines its `IconLabelButton` inside `screenshot.js:53-73` and uses it only for the three
+/// screenshot type buttons — this is not a shape that recurs upstream. It lives in the toolkit
+/// because a control with hover, checked and focus states must not be hand-drawn in a caller.
+#[derive(Debug, Clone, Copy)]
+pub struct IconLabelButton {
+    pub rect: Rectangle<f64, Logical>,
+    pub hovered: bool,
+    pub checked: bool,
+    pub focused: bool,
+}
+
+impl IconLabelButton {
+    /// `> StIcon { icon-size: $large_icon_size }` (`_screenshot.scss:36`).
+    pub const ICON_PX: f64 = 32.;
+    /// `min-width: 48px` (`_screenshot.scss:28`).
+    ///
+    /// Inert at the default glyph size and kept only so the rule is represented: a 32px glyph
+    /// inside 18px of horizontal padding is already 68px, so nothing this button can contain
+    /// brings it under 48. Do not "fix" the floor into a width.
+    pub const MIN_WIDTH: f64 = 48.;
+    /// `padding: $base_padding * 2 $base_padding * 3` (`_screenshot.scss:29`) — 12px vertical,
+    /// 18px horizontal.
+    pub const PAD_Y: f64 = 12.;
+    pub const PAD_X: f64 = 18.;
+    /// `.icon-label-button-container { spacing: $scaled_padding }` (`_screenshot.scss:33`).
+    pub const SPACING: f64 = 6.;
+    /// `border-radius: $screenshot_ui_panel_border_radius - $screenshot_ui_panel_padding`
+    /// (`_screenshot.scss:30`) = 32 - 18.
+    pub const RADIUS: f64 = 14.;
+    /// `%caption` — the container's font (`_screenshot.scss:32`).
+    pub const LABEL_PT: f64 = 9.;
+
+    /// The button's logical size for a label of `label_w` × `label_h`, honouring `MIN_WIDTH`.
+    pub fn size(label_w: f64, label_h: f64) -> Size<f64, Logical> {
+        let w = (label_w.max(Self::ICON_PX) + Self::PAD_X * 2.).max(Self::MIN_WIDTH);
+        let h = Self::ICON_PX + Self::SPACING + label_h + Self::PAD_Y * 2.;
+        Size::from((w, h))
+    }
+
+    pub fn new(rect: Rectangle<f64, Logical>) -> Self {
+        Self {
+            rect,
+            hovered: false,
+            checked: false,
+            focused: false,
+        }
+    }
+
+    pub fn hovered(mut self, hovered: bool) -> Self {
+        self.hovered = hovered;
+        self
+    }
+
+    pub fn checked(mut self, checked: bool) -> Self {
+        self.checked = checked;
+        self
+    }
+
+    pub fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+
+    /// Centre of the glyph — horizontally centred, sitting on top of the caption.
+    pub fn icon_centre(&self) -> Point<f64, Logical> {
+        Point::from((
+            self.rect.loc.x + self.rect.size.w / 2.,
+            self.rect.loc.y + Self::PAD_Y + Self::ICON_PX / 2.,
+        ))
+    }
+
+    /// Centre of the caption line, below the glyph.
+    pub fn label_centre(&self, label_h: f64) -> Point<f64, Logical> {
+        Point::from((
+            self.rect.loc.x + self.rect.size.w / 2.,
+            self.rect.loc.y + Self::PAD_Y + Self::ICON_PX + Self::SPACING + label_h / 2.,
+        ))
+    }
+
+    pub fn contains(&self, p: Point<f64, Logical>) -> bool {
+        self.rect.contains(p)
+    }
+}
+
+/// GNOME's `.screenshot-ui-shot-cast-container` (`_screenshot.scss:83-110`) — a pill of
+/// translucent white holding two or more segments, of which exactly one is checked.
+///
+/// A geometry-and-paint primitive like [`Switch`]: the owner holds which segment is selected and
+/// where the pill sits, and composites the glyphs; [`Painter::segmented`] draws the container and
+/// the segment fills so the selected-inverts-to-solid behaviour is written once.
+///
+/// Unique in 50.3 (the quick-settings split toggle is a different construct,
+/// `_quick-settings.scss:57-77`), so it is here for the composition, not because it recurs.
+pub struct Segmented;
+
+impl Segmented {
+    /// `padding: $base_padding * 0.5` and `spacing: $base_padding * 0.5`
+    /// (`_screenshot.scss:86-87`).
+    pub const PAD: f64 = 3.;
+    pub const SPACING: f64 = 3.;
+    /// `padding: $base_padding $base_padding * 2` (`_screenshot.scss:96`) — 6px vertical,
+    /// 12px horizontal, around a `$base_icon_size` glyph (`:102`).
+    pub const SEG_PAD_Y: f64 = 6.;
+    pub const SEG_PAD_X: f64 = 12.;
+    pub const ICON_PX: f64 = 16.;
+
+    /// One segment's logical size: the glyph plus its padding.
+    pub fn segment_size() -> Size<f64, Logical> {
+        Size::from((
+            Self::ICON_PX + Self::SEG_PAD_X * 2.,
+            Self::ICON_PX + Self::SEG_PAD_Y * 2.,
+        ))
+    }
+
+    /// The container's logical size for `n` segments.
+    pub fn size(n: usize) -> Size<f64, Logical> {
+        let seg = Self::segment_size();
+        let n_f = n as f64;
+        Size::from((
+            seg.w * n_f + Self::SPACING * (n_f - 1.).max(0.) + Self::PAD * 2.,
+            seg.h + Self::PAD * 2.,
+        ))
+    }
+
+    /// Segment `i`'s rect inside a container placed at `rect`.
+    pub fn segment_rect(rect: Rectangle<f64, Logical>, i: usize) -> Rectangle<f64, Logical> {
+        let seg = Self::segment_size();
+        Rectangle::new(
+            Point::from((
+                rect.loc.x + Self::PAD + (seg.w + Self::SPACING) * i as f64,
+                rect.loc.y + Self::PAD,
+            )),
+            seg,
+        )
     }
 }
 
@@ -3676,4 +3887,61 @@ mod tests {
 
     const ACCENT: [f32; 4] = [0.21, 0.52, 0.89, 1.];
     const RED: [f32; 4] = [0.89, 0.21, 0.21, 1.];
+
+    // The screenshot type button is a *column* — glyph over caption — so its height is the one
+    // dimension a caller cannot guess from a font metric alone, and getting it wrong shifts every
+    // control in the panel. Pinned against the SCSS arithmetic rather than a measured screenshot:
+    // 32px glyph + 6px spacing + the caption, inside 12px of vertical padding.
+    #[test]
+    fn the_type_button_stacks_its_glyph_over_its_caption() {
+        use super::IconLabelButton as B;
+
+        let label_h = 13.;
+        let size = B::size(30., label_h);
+        assert_eq!(size.h, B::PAD_Y * 2. + B::ICON_PX + B::SPACING + label_h);
+
+        // A caption narrower than the glyph leaves the *glyph* setting the width — and note that
+        // `min-width` never binds here, since 32 + 2*18 already clears 48. The floor exists in the
+        // SCSS, not in any button we can draw.
+        assert_eq!(B::size(4., label_h).w, B::ICON_PX + B::PAD_X * 2.);
+        assert!(B::size(4., label_h).w > B::MIN_WIDTH);
+        // ...and a wide one grows by its own padding instead.
+        assert_eq!(B::size(100., label_h).w, 100. + B::PAD_X * 2.);
+
+        let b = B::new(Rectangle::new(
+            Point::from((10., 20.)),
+            B::size(30., label_h),
+        ));
+        // The glyph sits in the top band, the caption below it — not both centred on the button,
+        // which is what a "centre the content" reflex would produce.
+        assert_eq!(b.icon_centre().y, 20. + B::PAD_Y + B::ICON_PX / 2.);
+        assert_eq!(
+            b.label_centre(label_h).y,
+            20. + B::PAD_Y + B::ICON_PX + B::SPACING + label_h / 2.
+        );
+        assert_eq!(b.icon_centre().x, b.label_centre(label_h).x);
+    }
+
+    // The segmented pill's arithmetic: padding outside, spacing only *between* segments. An
+    // off-by-one here (spacing after the last segment) leaves the pill visibly lopsided.
+    #[test]
+    fn the_segmented_pill_spaces_only_between_its_segments() {
+        use super::Segmented as S;
+
+        let seg = S::segment_size();
+        assert_eq!(seg.w, S::ICON_PX + S::SEG_PAD_X * 2.);
+        assert_eq!(seg.h, S::ICON_PX + S::SEG_PAD_Y * 2.);
+
+        assert_eq!(S::size(1).w, seg.w + S::PAD * 2.);
+        assert_eq!(S::size(2).w, seg.w * 2. + S::SPACING + S::PAD * 2.);
+        assert_eq!(S::size(2).h, seg.h + S::PAD * 2.);
+
+        let rect = Rectangle::new(Point::from((5., 7.)), S::size(2));
+        let a = S::segment_rect(rect, 0);
+        let b = S::segment_rect(rect, 1);
+        assert_eq!(a.loc, Point::from((5. + S::PAD, 7. + S::PAD)));
+        assert_eq!(b.loc.x, a.loc.x + seg.w + S::SPACING);
+        // The last segment ends exactly one padding short of the container edge.
+        assert_eq!(b.loc.x + b.size.w + S::PAD, rect.loc.x + rect.size.w);
+    }
 }

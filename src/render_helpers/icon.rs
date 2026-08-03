@@ -474,6 +474,21 @@ fn embedded_icon(name: &str) -> Option<&'static [u8]> {
         "preview-close-symbolic" => Some(include_bytes!(
             "../../resources/icons/preview-close-symbolic.svg"
         )),
+        // The screenshot UI's type buttons and its show-pointer toggle. `camera-photo-symbolic`
+        // and `camera-web-symbolic`, which the shot/cast pair uses, come from the icon theme
+        // instead — those are Adwaita's, not gnome-shell's own.
+        "screenshot-ui-area-symbolic" => Some(include_bytes!(
+            "../../resources/icons/screenshot-ui-area-symbolic.svg"
+        )),
+        "screenshot-ui-display-symbolic" => Some(include_bytes!(
+            "../../resources/icons/screenshot-ui-display-symbolic.svg"
+        )),
+        "screenshot-ui-window-symbolic" => Some(include_bytes!(
+            "../../resources/icons/screenshot-ui-window-symbolic.svg"
+        )),
+        "screenshot-ui-show-pointer-symbolic" => Some(include_bytes!(
+            "../../resources/icons/screenshot-ui-show-pointer-symbolic.svg"
+        )),
         _ => None,
     }
 }
