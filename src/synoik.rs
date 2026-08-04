@@ -9713,7 +9713,10 @@ impl Synoik {
                 ws,
                 ws_position,
                 overview_fade,
-                &self.icon_cache,
+                crate::render_helpers::icon::DrawCaches {
+                    icons: &self.icon_cache,
+                    images: &self.image_cache,
+                },
             ) {
                 push(element.into());
             }
@@ -13564,7 +13567,7 @@ impl Synoik {
             .shown()
             .map(|indicator| crate::ui::panel::PanelIndicator {
                 id: indicator.item.id.clone(),
-                icon_name: indicator.props.effective_icon().map(str::to_owned),
+                icon: indicator.props.effective_icon().clone(),
             })
             .collect();
         if self.panel.set_app_indicators(indicators) {

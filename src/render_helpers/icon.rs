@@ -316,6 +316,69 @@ impl IconCache {
             }
         }
     }
+
+    /// Upload and cache a buffer the **caller** produced, under a caller-chosen identity.
+    ///
+    /// Everything in this cache is an *element*, rebuilt every frame that draws it, and every
+    /// upload is a synchronous submit + fence-wait (~1.7 ms on the Venus queue, size-independent).
+    /// A caller that owns its own pixels — an app indicator's pixmap, or an icon file loaded
+    /// through [`ImageCache`] — therefore needs the same upload-once-then-reuse that
+    /// [`texture`](Self::texture) gives theme icons, including the context guard that drops
+    /// textures belonging to a dead device.
+    ///
+    /// `identity` must change whenever the pixels do (a content hash, not a name), and is
+    /// namespaced by [`FOREIGN_ICON_PREFIX`] so it cannot collide with a theme icon. `make_buffer`
+    /// runs only when nothing is cached.
+    pub fn texture_for_buffer(
+        &self,
+        renderer: &mut VulkanRenderer,
+        identity: &str,
+        logical_px: f64,
+        scale: f64,
+        make_buffer: impl FnOnce() -> Option<MemoryBuffer>,
+    ) -> Option<TextureBuffer<VkTexture>> {
+        let context = renderer.context_id();
+        if self.context.borrow().as_ref() != Some(&context) {
+            self.textures.borrow_mut().clear();
+            self.stale_textures.borrow_mut().clear();
+            *self.context.borrow_mut() = Some(context);
+        }
+
+        let key = icon_key(
+            &format!("{FOREIGN_ICON_PREFIX}{identity}"),
+            logical_px,
+            scale,
+            [0.; 4],
+        );
+        if let Some(tb) = self.textures.borrow().get(&key) {
+            return Some(tb.clone());
+        }
+
+        // Built only on a miss: the caller's buffer may cost a resample, and paying that on every
+        // frame that draws a cached texture is the cost this cache exists to avoid.
+        let buffer = make_buffer()?;
+        match TextureBuffer::from_memory_buffer(renderer, &buffer) {
+            Ok(tb) => {
+                self.textures.borrow_mut().insert(key, tb.clone());
+                Some(tb)
+            }
+            Err(err) => {
+                tracing::error!("error uploading foreign icon {identity:?}: {err:#}");
+                None
+            }
+        }
+    }
+}
+
+/// The picture caches a draw pass reads from, passed as one thing because a pass that draws a
+/// themed icon usually also draws something a client supplied, and threading both through every
+/// element helper separately is how argument lists get away from you.
+#[derive(Clone, Copy)]
+pub struct DrawCaches<'a> {
+    /// Theme icons: symbolic SVGs, recolored to a tint.
+    pub icons: &'a IconCache,
+    /// Pictures an *app* pointed us at: album art, and an app indicator's out-of-theme icon file.
+    pub images: &'a ImageCache,
 }
 
 /// A symbolic icon's identity: the name, the *physical* pixel size (so scale is folded in), and
@@ -441,6 +504,10 @@ fn rasterize_symbolic_in(
 
 /// [`IconCache::textures`]'s key: the name, the *physical* pixel size (so scale is
 /// folded in), and the quantized tint — the three things that change the pixels.
+/// Prefix for cache identities that are **not** theme icon names, so a caller-supplied identity
+/// can never collide with one. No icon name contains a NUL.
+pub const FOREIGN_ICON_PREFIX: &str = "\0foreign:";
+
 fn icon_key(name: &str, logical_px: f64, scale: f64, color: [f32; 4]) -> SymbolicKey {
     let px: u32 = to_physical_precise_round::<i32>(scale, logical_px).max(1) as u32;
     (name.to_string(), px, color_key(color))
@@ -1354,10 +1421,10 @@ fn decode_raster(data: &[u8], px: u32, fit: ImageFit) -> anyhow::Result<Vec<u8>>
         p[2] = (u32::from(p[2]) * a / 255) as u8;
     }
 
-    let (w, h) = (img.width().max(1), img.height().max(1));
-    let filter = image::imageops::FilterType::CatmullRom;
-
     if fit == ImageFit::Cover {
+        let (w, h) = (img.width().max(1), img.height().max(1));
+        let filter = image::imageops::FilterType::CatmullRom;
+
         // **Crop first, then resample.** Cover's scale factor is the *larger* of the two, so
         // resizing before cropping would build an intermediate as long as `w * px / h` on the long
         // axis — bounded by nothing but the source's aspect ratio. A solid-colour 100000×2 PNG is a
@@ -1377,11 +1444,22 @@ fn decode_raster(data: &[u8], px: u32, fit: ImageFit) -> anyhow::Result<Vec<u8>>
         return Ok(image::imageops::resize(&cropped, px, px, filter).into_raw());
     }
 
-    // Contain: fit inside, then centre on transparency. `min` bounds both axes at `px`.
+    Ok(contain_into_square(&img, px))
+}
+
+/// Fit a **premultiplied** RGBA image inside a `px`-square, preserving its aspect, and centre it on
+/// transparency. Returns premultiplied `[R,G,B,A]` bytes, `px * px * 4` of them.
+///
+/// Preserving the aspect is not cosmetic: `indicator-multiload` publishes a wide strip as its
+/// icon, and stretching it to a square is unreadable.
+fn contain_into_square(img: &image::RgbaImage, px: u32) -> Vec<u8> {
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let filter = image::imageops::FilterType::CatmullRom;
+
     let s = (px as f32 / w as f32).min(px as f32 / h as f32);
     let nw = ((w as f32 * s).round() as u32).clamp(1, px);
     let nh = ((h as f32 * s).round() as u32).clamp(1, px);
-    let resized = image::imageops::resize(&img, nw, nh, filter);
+    let resized = image::imageops::resize(img, nw, nh, filter);
 
     let mut out = vec![0u8; (px * px * 4) as usize];
     let ox = (px - nw) / 2;
@@ -1392,7 +1470,34 @@ fn decode_raster(data: &[u8], px: u32, fit: ImageFit) -> anyhow::Result<Vec<u8>>
             out[di..di + 4].copy_from_slice(&resized.get_pixel(x, y).0); // premultiplied [R,G,B,A]
         }
     }
-    Ok(out)
+    out
+}
+
+/// Wrap already-premultiplied RGBA pixels — an app indicator's `IconPixmap`, which arrives as raw
+/// bytes rather than an encoded image — as a buffer sized and tagged for this output.
+///
+/// The size is the *physical* target and the tag is the **output** scale: a buffer tagged with
+/// anything else is invisible or misplaced at fractional scales, which is the whole reason this
+/// does not simply hand the client's own dimensions through.
+pub fn buffer_from_premultiplied_rgba(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    logical_px: f64,
+    scale: f64,
+) -> Option<MemoryBuffer> {
+    if width == 0 || height == 0 || rgba.len() != (width as usize) * (height as usize) * 4 {
+        return None;
+    }
+    let px = to_physical_precise_round::<i32>(scale, logical_px).max(1) as u32;
+    let img = image::RgbaImage::from_raw(width, height, rgba.to_vec())?;
+    Some(MemoryBuffer::new(
+        contain_into_square(&img, px),
+        Fourcc::Abgr8888,
+        Size::from((px as i32, px as i32)),
+        Scale::from(scale),
+        Transform::Normal,
+    ))
 }
 
 #[cfg(test)]

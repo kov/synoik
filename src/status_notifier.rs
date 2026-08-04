@@ -291,6 +291,126 @@ const MAX_TEXT_BYTES: usize = 1024;
 /// An icon name longer than this is not one.
 const MAX_ICON_NAME_BYTES: usize = 255;
 
+/// The largest pixmap edge we will take from a client. A panel icon is 16 logical px; anything
+/// past this is a client sending us its window contents, and the bytes are its choice, not ours.
+pub const MAX_PIXMAP_DIM: u32 = 512;
+
+/// A client-supplied bitmap icon, converted to what the compositor composites: premultiplied
+/// RGBA, byte order `R,G,B,A` (`Fourcc::Abgr8888` on a little-endian machine).
+///
+/// The wire form is `a(iiay)` — width, height, and **ARGB32 in network byte order**, i.e. bytes
+/// `A,R,G,B`, *not* premultiplied (`appIndicator.js:45` asks Cogl for `ARGB_8888`, the
+/// non-premultiplied variant; the extension's `argbToRgba` only reorders,
+/// `pixmapsUtils.js:17-30`, because Cogl premultiplies on upload and we do not).
+#[derive(Clone)]
+pub struct Pixmap {
+    pub width: u32,
+    pub height: u32,
+    /// Premultiplied RGBA, `width * height * 4` bytes.
+    pub rgba: std::sync::Arc<[u8]>,
+    /// Content hash — the identity the texture cache keys on, and what makes comparing two
+    /// `ItemProps` cheap. Two pixmaps with the same hash and size are the same picture.
+    pub hash: u64,
+}
+
+/// Elides the pixels. Anything holding an [`ItemIcon`] is debug-printable, and a 48x48 pixmap is
+/// 9 KB of decimal bytes in a log line that is meant to say which icon an item is using.
+impl std::fmt::Debug for Pixmap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pixmap")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("hash", &format_args!("{:016x}", self.hash))
+            .finish()
+    }
+}
+
+impl PartialEq for Pixmap {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.width == other.width && self.height == other.height
+    }
+}
+
+impl Eq for Pixmap {}
+
+/// Choose which of a client's pixmaps to draw at `preferred_size` physical px.
+///
+/// The spec lets a client offer the same icon at several sizes. The extension prefers the
+/// *smallest* one at least as large as wanted, and falls back to the largest available when
+/// every entry is too small (`pixmapsUtils.js:32-67`) — upscaling a 16px icon to 32 is worse than
+/// downscaling a 64px one. Entries past [`MAX_PIXMAP_DIM`], or whose byte count does not match
+/// their claimed size, are not candidates at all.
+///
+/// Returns the index into `entries`, whose items are `(width, height, byte_len)`.
+pub fn pick_pixmap(entries: &[(i32, i32, usize)], preferred_size: u32) -> Option<usize> {
+    let usable: Vec<(usize, u32, u32)> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(w, h, len))| {
+            let w = u32::try_from(w).ok()?;
+            let h = u32::try_from(h).ok()?;
+            if w == 0 || h == 0 || w > MAX_PIXMAP_DIM || h > MAX_PIXMAP_DIM {
+                return None;
+            }
+            // A client that lies about its dimensions gets no pixels drawn, rather than a read
+            // past the end of what it sent.
+            if len != (w as usize) * (h as usize) * 4 {
+                return None;
+            }
+            Some((i, w, h))
+        })
+        .collect();
+
+    // Big enough, smallest first.
+    usable
+        .iter()
+        .filter(|&&(_, w, h)| w >= preferred_size && h >= preferred_size)
+        .min_by_key(|&&(_, w, h)| w as u64 * h as u64)
+        // Else the largest we were given.
+        .or_else(|| usable.iter().max_by_key(|&&(_, w, h)| w as u64 * h as u64))
+        .map(|&(i, _, _)| i)
+}
+
+/// Convert one wire pixmap into a [`Pixmap`], or `None` if it is not self-consistent.
+///
+/// This is the untrusted-content boundary for pixels: the bytes came from a client, so the size is
+/// bounded, the length is checked against the dimensions, and the conversion cannot read outside
+/// what was sent.
+pub fn pixmap_from_argb(width: i32, height: i32, argb: &[u8]) -> Option<Pixmap> {
+    let width = u32::try_from(width).ok()?;
+    let height = u32::try_from(height).ok()?;
+    if width == 0 || height == 0 || width > MAX_PIXMAP_DIM || height > MAX_PIXMAP_DIM {
+        return None;
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
+    if argb.len() != expected {
+        return None;
+    }
+
+    let mut rgba = Vec::with_capacity(expected);
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for px in argb.chunks_exact(4) {
+        let (a, r, g, b) = (px[0], px[1], px[2], px[3]);
+        // Premultiply: our compositing path takes premultiplied alpha, and the wire form is not.
+        // Skipping this makes every translucent edge glow.
+        let mul = |c: u8| ((c as u16 * a as u16 + 127) / 255) as u8;
+        rgba.extend_from_slice(&[mul(r), mul(g), mul(b), a]);
+        for byte in px {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    Some(Pixmap {
+        width,
+        height,
+        rgba: rgba.into(),
+        hash,
+    })
+}
+
 /// One item's properties, as the model holds them: validated, bounded, and free of anything the
 /// bus layer knows about. Every string here was chosen by the client.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -302,14 +422,10 @@ pub struct ItemProps {
     pub title: String,
     pub status: ItemStatus,
     pub category: ItemCategory,
-    /// `IconName`, normalized by [`normalize_icon_name`]. `None` when absent or not something the
-    /// themed lookup can use — a path or a pixmap-only item waits for S3.
-    pub icon_name: Option<String>,
-    /// `AttentionIconName`, shown instead while [`ItemStatus::NeedsAttention`].
-    pub attention_icon_name: Option<String>,
-    /// `IconThemePath`: an extra directory the icon may live in. Carried but not yet honoured
-    /// (S3).
-    pub icon_theme_path: Option<String>,
+    /// The normal icon, in whichever of the three forms the client offered.
+    pub icon: ItemIcon,
+    /// The attention icon, shown instead while [`ItemStatus::NeedsAttention`].
+    pub attention_icon: ItemIcon,
     /// The `Menu` object path, or `None` when the client has no menu — including the explicit
     /// `/NO_DBUSMENU` sentinel (`appIndicator.js:576-580`).
     pub menu_path: Option<String>,
@@ -338,23 +454,43 @@ impl ItemProps {
     /// The icon to draw right now: the attention icon while asking for attention, falling back to
     /// the normal one when the client set a status but no separate icon for it
     /// (`appIndicator.js:1501`).
-    pub fn effective_icon(&self) -> Option<&str> {
-        if self.status == ItemStatus::NeedsAttention {
-            if let Some(name) = self.attention_icon_name.as_deref() {
-                return Some(name);
-            }
+    pub fn effective_icon(&self) -> &ItemIcon {
+        if self.status == ItemStatus::NeedsAttention && !self.attention_icon.is_none() {
+            return &self.attention_icon;
         }
-        self.icon_name.as_deref()
+        &self.icon
     }
 }
 
-/// Reduce a client's `IconName` to something the themed lookup can take, or `None`.
+/// How a client offered its icon. The three forms are tried in the spec's order of preference —
+/// "names are preferred over pixmaps" (`StatusNotifierItem.xml`) — but a client may offer only one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ItemIcon {
+    /// Nothing usable was offered.
+    #[default]
+    None,
+    /// A themed icon name, normalized by [`normalize_icon_name`].
+    Themed(String),
+    /// A file on disk: either an absolute path the client sent *as* the name, or a name resolved
+    /// inside its own `IconThemePath`. Loaded through [`crate::image_source::ImageSource::File`],
+    /// which is the same validated path album art takes.
+    File(std::path::PathBuf),
+    /// Raw pixels the client sent over the bus.
+    Pixmap(std::sync::Arc<Pixmap>),
+}
+
+impl ItemIcon {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// Reduce a client's `IconName` to a themed name, or `None` when it is not one.
 ///
 /// Two out-of-spec habits are common enough that the extension handles both
 /// (`appIndicator.js:1247-1265`): sending an absolute **path**, and sending a **file name** with a
-/// `.png`/`.svg` extension. The extension resolves paths by loading the file; that is S3's job
-/// (it needs a decode of client-supplied pixels), so here a path yields `None` and the item simply
-/// has no icon yet rather than a lookup for a name that cannot exist.
+/// `.png`/`.svg` extension. A path is not a name — [`icon_from_name`] turns those into
+/// [`ItemIcon::File`] instead.
 pub fn normalize_icon_name(name: &str) -> Option<String> {
     let name = name.trim();
     if name.is_empty() || name.len() > MAX_ICON_NAME_BYTES || name.starts_with('/') {
@@ -372,6 +508,78 @@ pub fn normalize_icon_name(name: &str) -> Option<String> {
         _ => name,
     };
     Some(stem.to_owned())
+}
+
+/// The image file extensions an out-of-theme icon may have, in preference order: SVG scales, so
+/// it beats a raster of unknown size.
+const ICON_FILE_EXTENSIONS: &[&str] = &["svg", "png", "xpm"];
+
+/// Turn a client's `IconName` plus its optional `IconThemePath` into an [`ItemIcon`].
+///
+/// Three cases, all seen in the wild:
+///
+/// 1. **An absolute path.** Out of spec, but `indicator-sensors` does it
+///    (`appIndicator.js:1252-1261`). Taken as a file.
+/// 2. **A name with an `IconThemePath`.** The client ships its own icons outside any installed
+///    theme. The extension builds a private `StIconTheme` whose search path is that directory
+///    (`appIndicator.js:1289-1320`); we look inside it directly, because our themed resolver
+///    (`resolve_symbolic`) is a fixed walk over installed themes and cannot take a per-item root.
+/// 3. **A plain name.** The themed lookup, as before.
+///
+/// `exists` decides whether a candidate file is really there — injected so the search order can be
+/// tested without touching the filesystem.
+pub fn icon_from_name(
+    name: &str,
+    theme_path: Option<&str>,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> ItemIcon {
+    use std::path::{Path, PathBuf};
+
+    let name = name.trim();
+    if name.is_empty() || name.len() > MAX_ICON_NAME_BYTES {
+        return ItemIcon::None;
+    }
+
+    // (1) An absolute path is a file, not a name.
+    if name.starts_with('/') {
+        let path = Path::new(name);
+        return if exists(path) {
+            ItemIcon::File(path.to_owned())
+        } else {
+            ItemIcon::None
+        };
+    }
+
+    // (2) The client's own directory, if it named one. A name is used as a *file stem* here, so a
+    // client cannot walk out of its own directory with `../`: anything with a separator in it was
+    // already refused as a name.
+    if let (Some(dir), Some(stem)) = (theme_path, normalize_icon_name(name)) {
+        let dir = Path::new(dir);
+        if dir.is_absolute() {
+            // Flat first, then the one level of theme structure a client-shipped directory
+            // realistically has. Deliberately not a full theme walk — this is one app's icons,
+            // not an installed theme.
+            let roots: [PathBuf; 3] = [
+                dir.to_owned(),
+                dir.join("hicolor/scalable/apps"),
+                dir.join("hicolor/48x48/apps"),
+            ];
+            for root in roots {
+                for ext in ICON_FILE_EXTENSIONS {
+                    let candidate = root.join(format!("{stem}.{ext}"));
+                    if exists(&candidate) {
+                        return ItemIcon::File(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    // (3) A plain themed name.
+    match normalize_icon_name(name) {
+        Some(name) => ItemIcon::Themed(name),
+        None => ItemIcon::None,
+    }
 }
 
 /// Clamp and flatten an untrusted display string, as notification and MPRIS text are.
@@ -628,6 +836,120 @@ mod tests {
     }
 
     #[test]
+    fn the_best_pixmap_is_the_smallest_one_big_enough() {
+        // Three sizes offered, 16/32/64 px square. Asking for 32 takes the exact one...
+        let entries = [
+            (16, 16, 16 * 16 * 4),
+            (64, 64, 64 * 64 * 4),
+            (32, 32, 32 * 32 * 4),
+        ];
+        assert_eq!(pick_pixmap(&entries, 32), Some(2));
+        // ...asking for 24 takes the 32 (downscaling beats upscaling)...
+        assert_eq!(pick_pixmap(&entries, 24), Some(2));
+        // ...and asking for more than any of them takes the largest.
+        assert_eq!(pick_pixmap(&entries, 128), Some(1));
+    }
+
+    #[test]
+    fn a_pixmap_that_lies_about_its_size_is_not_a_candidate() {
+        // Claimed 64x64 but only 16x16 worth of bytes: drawing it would read past the message.
+        let entries = [(64, 64, 16 * 16 * 4)];
+        assert_eq!(pick_pixmap(&entries, 16), None);
+        // Absurd dimensions are refused before any allocation is sized from them.
+        let huge = (MAX_PIXMAP_DIM + 1) as i32;
+        let entries = [(huge, huge, (huge as usize) * (huge as usize) * 4)];
+        assert_eq!(pick_pixmap(&entries, 16), None);
+        // As are negative ones, which is what an `i32` on the wire allows.
+        assert_eq!(pick_pixmap(&[(-1, -1, 4)], 16), None);
+    }
+
+    #[test]
+    fn a_pixmap_is_reordered_and_premultiplied() {
+        // One opaque red pixel and one half-transparent white one, ARGB in network byte order.
+        let argb = [
+            0xff, 0xff, 0x00, 0x00, // opaque red
+            0x80, 0xff, 0xff, 0xff, // 50% white
+        ];
+        let pixmap = pixmap_from_argb(2, 1, &argb).expect("valid pixmap");
+        assert_eq!(pixmap.width, 2);
+        assert_eq!(pixmap.height, 1);
+        // R,G,B,A order, and the translucent pixel's colour scaled by its alpha — without the
+        // premultiply every soft edge would glow.
+        assert_eq!(&pixmap.rgba[0..4], &[0xff, 0x00, 0x00, 0xff]);
+        assert_eq!(&pixmap.rgba[4..8], &[0x80, 0x80, 0x80, 0x80]);
+
+        // A short buffer is refused rather than padded.
+        assert!(pixmap_from_argb(2, 1, &argb[..7]).is_none());
+        assert!(pixmap_from_argb(0, 1, &[]).is_none());
+    }
+
+    #[test]
+    fn two_pixmaps_with_the_same_pixels_compare_equal() {
+        // Equality is by content hash, so an item re-sending an unchanged pixmap is not a change
+        // and does not re-upload a texture.
+        let argb = [0xff, 0x12, 0x34, 0x56];
+        let a = pixmap_from_argb(1, 1, &argb).unwrap();
+        let b = pixmap_from_argb(1, 1, &argb).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.hash, b.hash);
+
+        let c = pixmap_from_argb(1, 1, &[0xff, 0x12, 0x34, 0x57]).unwrap();
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn an_absolute_icon_name_is_taken_as_a_file() {
+        // `indicator-sensors` sends a path where a name belongs.
+        let exists = |p: &std::path::Path| p == std::path::Path::new("/usr/share/pixmaps/x.png");
+        assert_eq!(
+            icon_from_name("/usr/share/pixmaps/x.png", None, &exists),
+            ItemIcon::File("/usr/share/pixmaps/x.png".into())
+        );
+        // A path that is not there yields nothing — not a themed lookup for a filename.
+        assert_eq!(icon_from_name("/nope/x.png", None, &exists), ItemIcon::None);
+    }
+
+    #[test]
+    fn an_icon_theme_path_is_searched_before_the_installed_themes() {
+        let found = std::path::Path::new("/opt/app/icons/tray.svg");
+        let exists = move |p: &std::path::Path| p == found;
+
+        // A name plus the client's own directory resolves to the client's file...
+        assert_eq!(
+            icon_from_name("tray", Some("/opt/app/icons"), &exists),
+            ItemIcon::File(found.to_owned())
+        );
+        // ...including when the client sent the name with an extension, which is the same
+        // malformation the themed path has to undo.
+        assert_eq!(
+            icon_from_name("tray.png", Some("/opt/app/icons"), &exists),
+            ItemIcon::File(found.to_owned())
+        );
+        // A directory that does not have it falls back to the themed name, so an item whose
+        // theme path is stale still draws.
+        assert_eq!(
+            icon_from_name("tray", Some("/opt/other"), &exists),
+            ItemIcon::Themed("tray".to_owned())
+        );
+        // A relative theme path is ignored: it would resolve against our cwd, not the client's.
+        assert_eq!(
+            icon_from_name("tray", Some("relative/icons"), &exists),
+            ItemIcon::Themed("tray".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_theme_path_cannot_be_escaped_with_a_traversal() {
+        // Any name containing a separator was already refused as a name, so `../../etc/x` cannot
+        // become a lookup outside the directory the client named.
+        let exists = |_: &std::path::Path| true;
+        assert_eq!(
+            icon_from_name("../../etc/passwd", Some("/opt/app/icons"), &exists),
+            ItemIcon::None
+        );
+    }
+
+    #[test]
     fn an_item_is_not_shown_until_it_is_ready_and_active() {
         let mut props = ItemProps::default();
         // Nothing fetched yet: no Id, and Passive by default. Both must keep it out of the panel.
@@ -656,22 +978,23 @@ mod tests {
 
     #[test]
     fn the_attention_icon_wins_only_while_asking_for_attention() {
+        let themed = |n: &str| ItemIcon::Themed(n.to_owned());
         let mut props = ItemProps {
             app_id: "chat".to_owned(),
             status: ItemStatus::Active,
-            icon_name: Some("chat".to_owned()),
-            attention_icon_name: Some("chat-urgent".to_owned()),
+            icon: themed("chat"),
+            attention_icon: themed("chat-urgent"),
             ..ItemProps::default()
         };
-        assert_eq!(props.effective_icon(), Some("chat"));
+        assert_eq!(props.effective_icon(), &themed("chat"));
 
         props.status = ItemStatus::NeedsAttention;
-        assert_eq!(props.effective_icon(), Some("chat-urgent"));
+        assert_eq!(props.effective_icon(), &themed("chat-urgent"));
 
         // A client that flips the status without providing a second icon keeps the first one,
         // rather than losing its icon at the moment it wants to be noticed.
-        props.attention_icon_name = None;
-        assert_eq!(props.effective_icon(), Some("chat"));
+        props.attention_icon = ItemIcon::None;
+        assert_eq!(props.effective_icon(), &themed("chat"));
     }
 
     #[test]

@@ -53,11 +53,12 @@ use crate::gnome::{A11ySettings, ClockFormat, QuickToggles};
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
-use crate::render_helpers::icon::IconCache;
+use crate::render_helpers::icon::{DrawCaches, IconCache, ImageFit};
 use crate::render_helpers::rounded_solid::{RoundedSolidBuffer, RoundedSolidRenderElement};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::status_notifier::ItemIcon;
 use crate::synoik_render_elements;
 use crate::system_status::{self, SystemStatus};
 use crate::ui::widget::{self, Painter, TextShaper, TextStyle};
@@ -501,9 +502,9 @@ fn qs_indicator_width(
 pub struct PanelIndicator {
     /// The item's public id, for routing a click back to the right item.
     pub id: String,
-    /// The themed icon name to draw, already normalized. `None` while the client has offered
-    /// nothing a themed lookup can use (a pixmap-only item, until S3).
-    pub icon_name: Option<String>,
+    /// What to draw, in whichever form the client offered. [`ItemIcon::None`] keeps the slot but
+    /// paints nothing.
+    pub icon: ItemIcon,
 }
 
 /// A live screen recording as the panel sees it: when it started (monotonic, for the
@@ -1386,8 +1387,9 @@ impl Panel {
         ws: WorkspaceState,
         position: f64,
         overview_fade: f64,
-        icons: &IconCache,
+        caches: DrawCaches<'_>,
     ) -> Vec<PanelElement> {
+        let icons = caches.icons;
         let scale = output.current_scale().fractional_scale();
         let width = output_size(output).w;
         let width_px: i32 = to_physical_precise_round(scale, width);
@@ -1411,7 +1413,7 @@ impl Panel {
         // first-topmost (the list is consumed in reverse). The workspace dots are now
         // drawn into the bar texture itself (rounded rects), not composited separately.
         self.qs_indicator_elements(renderer, scale, width, &mut elements, icons);
-        self.app_indicator_elements(renderer, scale, width, &mut elements, icons);
+        self.app_indicator_elements(renderer, scale, width, &mut elements, caches);
 
         // The screen-recording indicator's stop glyph, composited on top of its red pill
         // (which is drawn into the bar below). Same upload/caching as the QS cluster icons.
@@ -1655,22 +1657,62 @@ impl Panel {
         scale: f64,
         output_width: f64,
         elements: &mut Vec<PanelElement>,
-        icons: &IconCache,
+        caches: DrawCaches<'_>,
     ) {
+        let DrawCaches { icons, images } = caches;
         let Some(rect) = self.app_indicators_rect(output_width) else {
             return;
         };
 
         for (i, indicator) in self.app_indicators.iter().enumerate() {
-            let Some(name) = indicator.icon_name.as_deref() else {
+            // Three forms, one slot. A themed name is tinted like every other status icon; a file
+            // or a pixmap keeps the client's own colours, because it *is* the client's artwork —
+            // recoloring an app's logo to the panel foreground would be inventing a look for it.
+            let tb = match &indicator.icon {
+                ItemIcon::None => None,
+                ItemIcon::Themed(name) => icons.texture(renderer, name, QS_ICON, scale, TEXT),
+                ItemIcon::File(path) => {
+                    // `Contain` is what makes a non-square icon safe: `indicator-multiload` sends
+                    // a wide strip and expects its aspect kept, and letterboxing it inside the
+                    // slot is exactly that, with no special case.
+                    icons.texture_for_buffer(
+                        renderer,
+                        &path.display().to_string(),
+                        QS_ICON,
+                        scale,
+                        || {
+                            let source = crate::image_source::ImageSource::File(path.clone());
+                            images.buffer(&source, ImageFit::Contain, QS_ICON, scale)
+                        },
+                    )
+                }
+                ItemIcon::Pixmap(pixmap) => icons.texture_for_buffer(
+                    renderer,
+                    &format!("pixmap:{:016x}", pixmap.hash),
+                    QS_ICON,
+                    scale,
+                    || {
+                        crate::render_helpers::icon::buffer_from_premultiplied_rgba(
+                            &pixmap.rgba,
+                            pixmap.width,
+                            pixmap.height,
+                            QS_ICON,
+                            scale,
+                        )
+                    },
+                ),
+            };
+            let Some(tb) = tb else {
                 continue;
             };
-            let Some(tb) = icons.texture(renderer, name, QS_ICON, scale, TEXT) else {
-                continue;
-            };
+
+            // A pixmap arrives at whatever size the client chose, so it is centred in its slot at
+            // its natural size rather than stretched to the icon box.
             let logical = tb.logical_size();
-            let location =
-                Point::from((qs_icon_x(rect.loc.x, i), (panel_height() - logical.h) / 2.));
+            let location = Point::from((
+                qs_icon_x(rect.loc.x, i) + (QS_ICON - logical.w) / 2.,
+                (panel_height() - logical.h) / 2.,
+            ));
             elements.push(PanelElement::Texture(
                 TextureRenderElement::from_texture_buffer(
                     tb,
@@ -2122,7 +2164,10 @@ mod tests {
     fn indicator(id: &str, icon: Option<&str>) -> PanelIndicator {
         PanelIndicator {
             id: id.to_owned(),
-            icon_name: icon.map(str::to_owned),
+            icon: match icon {
+                Some(name) => ItemIcon::Themed(name.to_owned()),
+                None => ItemIcon::None,
+            },
         }
     }
 
@@ -3019,13 +3064,33 @@ mod tests {
         let icons = IconCache::new("Adwaita");
 
         // First render at rest warms the cache (and pays the one bake).
-        let _ = panel.render(&mut vk, &output, ws, 1., 0., &icons);
+        let _ = panel.render(
+            &mut vk,
+            &output,
+            ws,
+            1.,
+            0.,
+            DrawCaches {
+                icons: &icons,
+                images: &crate::render_helpers::icon::ImageCache::new(),
+            },
+        );
 
         let before = crate::frame_log::bakes();
         let mut backgrounds = Vec::new();
         for step in 0..=10 {
             let fade = f64::from(step) / 10.;
-            let elements = panel.render(&mut vk, &output, ws, 1., fade, &icons);
+            let elements = panel.render(
+                &mut vk,
+                &output,
+                ws,
+                1.,
+                fade,
+                DrawCaches {
+                    icons: &icons,
+                    images: &crate::render_helpers::icon::ImageCache::new(),
+                },
+            );
             let solid = elements.iter().find_map(|e| match e {
                 PanelElement::Solid(s) => Some(s.color()),
                 _ => None,
@@ -3569,7 +3634,17 @@ mod tests {
         clock.set_unadjusted(clock.now_unadjusted() + Duration::from_millis(500));
 
         let icons = IconCache::new("Adwaita");
-        let elements = panel.render(&mut vk, &output, ws, 0., 0., &icons);
+        let elements = panel.render(
+            &mut vk,
+            &output,
+            ws,
+            0.,
+            0.,
+            DrawCaches {
+                icons: &icons,
+                images: &crate::render_helpers::icon::ImageCache::new(),
+            },
+        );
         assert!(
             elements
                 .iter()

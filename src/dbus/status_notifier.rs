@@ -31,9 +31,9 @@ use zbus::{fdo, interface, zvariant};
 
 use super::Start;
 use crate::status_notifier::{
-    clean_text, item_id, normalize_icon_name, parse_service_argument, ItemCategory, ItemProps,
-    ItemRegistry, ItemStatus, ParseError, RegisteredItem, Registration, ServiceRef,
-    StatusNotifierToSynoik, DEFAULT_ITEM_OBJECT_PATH,
+    clean_text, icon_from_name, item_id, parse_service_argument, pick_pixmap, pixmap_from_argb,
+    ItemCategory, ItemIcon, ItemProps, ItemRegistry, ItemStatus, ParseError, RegisteredItem,
+    Registration, ServiceRef, StatusNotifierToSynoik, DEFAULT_ITEM_OBJECT_PATH,
 };
 
 pub const BUS_NAME: &str = "org.kde.StatusNotifierWatcher";
@@ -61,6 +61,14 @@ const NEW_SIGNALS: &[&str] = &[
 /// between tries (`appIndicator.js:501-503`).
 const READY_RETRIES: usize = 3;
 const READY_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// The physical size a panel indicator is drawn at, used to choose among a client's pixmap sizes.
+/// 16 logical px at scale 2 — asking for the larger of the two scales we might draw at means a
+/// scale-2 output never has to upscale.
+const PIXMAP_TARGET_PX: u32 = 32;
+
+/// The `GetAll` reply's shape.
+type PropsMap = std::collections::HashMap<String, zvariant::OwnedValue>;
 
 /// How long a registered item survives its connection's disappearance before we believe it.
 /// The extension uses 500 ms (`statusNotifierWatcher.js:107`).
@@ -484,6 +492,8 @@ async fn read_props(
             .map(str::to_owned)
     };
 
+    let theme_path = string("IconThemePath").filter(|p| !p.is_empty());
+
     // A client that exports the object but not this property is not ready yet, not broken.
     let menu_path = all
         .get("Menu")
@@ -504,11 +514,8 @@ async fn read_props(
             .as_deref()
             .map(ItemCategory::parse)
             .unwrap_or_default(),
-        icon_name: string("IconName").as_deref().and_then(normalize_icon_name),
-        attention_icon_name: string("AttentionIconName")
-            .as_deref()
-            .and_then(normalize_icon_name),
-        icon_theme_path: string("IconThemePath").filter(|p| !p.is_empty()),
+        icon: resolve_icon(&all, "Icon", theme_path.as_deref()),
+        attention_icon: resolve_icon(&all, "AttentionIcon", theme_path.as_deref()),
         menu_path,
         item_is_menu: all
             .get("ItemIsMenu")
@@ -517,6 +524,54 @@ async fn read_props(
         supports_activation: capabilities.supports_activation,
         has_ayatana_secondary_activate: capabilities.has_ayatana_secondary_activate,
     })
+}
+
+/// Resolve one icon slot (`Icon` / `AttentionIcon` / `OverlayIcon`) into an [`ItemIcon`].
+///
+/// The spec says "names are preferred over pixmaps" (`StatusNotifierItem.xml`), so a name that
+/// resolves wins; a client that offers both usually means the pixmap as a fallback for hosts with
+/// no icon theme. A pixmap is only reached when the name yields nothing.
+fn resolve_icon(all: &PropsMap, slot: &str, theme_path: Option<&str>) -> ItemIcon {
+    let name = all
+        .get(&format!("{slot}Name"))
+        .and_then(|v| <&str>::try_from(v).ok())
+        .unwrap_or_default();
+
+    if !name.is_empty() {
+        // The filesystem check runs here, on the watcher's task, and never on the frame thread.
+        let icon = icon_from_name(name, theme_path, &|p: &std::path::Path| p.is_file());
+        if !icon.is_none() {
+            return icon;
+        }
+    }
+
+    pixmap_icon(all, &format!("{slot}Pixmap"))
+}
+
+/// Decode the best entry out of an `a(iiay)` pixmap property.
+fn pixmap_icon(all: &PropsMap, key: &str) -> ItemIcon {
+    let Some(value) = all.get(key) else {
+        return ItemIcon::None;
+    };
+    let Ok(entries) = <Vec<(i32, i32, Vec<u8>)>>::try_from(value.clone()) else {
+        return ItemIcon::None;
+    };
+
+    // Choose before converting: the conversion allocates and premultiplies, and a client may have
+    // offered several sizes we are not going to draw.
+    let sizes: Vec<(i32, i32, usize)> = entries
+        .iter()
+        .map(|(w, h, data)| (*w, *h, data.len()))
+        .collect();
+    let Some(index) = pick_pixmap(&sizes, PIXMAP_TARGET_PX) else {
+        return ItemIcon::None;
+    };
+
+    let (w, h, data) = &entries[index];
+    match pixmap_from_argb(*w, *h, data) {
+        Some(pixmap) => ItemIcon::Pixmap(std::sync::Arc::new(pixmap)),
+        None => ItemIcon::None,
+    }
 }
 
 /// The optional methods an item declares.

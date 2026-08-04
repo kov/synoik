@@ -2287,11 +2287,17 @@ fn vulkan_renders_the_top_panel() {
         .with_vulkan_renderer(|vk| {
             let ws = state.synoik.workspace_state_for(&output);
             let position = state.synoik.workspace_position_for(&output);
-            let elems =
-                state
-                    .synoik
-                    .panel
-                    .render(vk, &output, ws, position, 0., &state.synoik.icon_cache);
+            let elems = state.synoik.panel.render(
+                vk,
+                &output,
+                ws,
+                position,
+                0.,
+                crate::render_helpers::icon::DrawCaches {
+                    icons: &state.synoik.icon_cache,
+                    images: &state.synoik.image_cache,
+                },
+            );
             assert!(
                 !elems.is_empty(),
                 "panel produced no element on Vulkan (still blank)"
@@ -2534,9 +2540,17 @@ fn vulkan_renders_the_messages_indicator_dot() {
             let ws = state.synoik.workspace_state_for(&output);
             let position = state.synoik.workspace_position_for(&output);
             let render_panel = |vk: &mut VulkanRenderer, synoik: &crate::synoik::Synoik| {
-                let elems = synoik
-                    .panel
-                    .render(vk, &output, ws, position, 0., &synoik.icon_cache);
+                let elems = synoik.panel.render(
+                    vk,
+                    &output,
+                    ws,
+                    position,
+                    0.,
+                    crate::render_helpers::icon::DrawCaches {
+                        icons: &synoik.icon_cache,
+                        images: &synoik.image_cache,
+                    },
+                );
                 composite_ui(
                     vk,
                     elems,
@@ -2620,7 +2634,10 @@ fn vulkan_composites_the_workspace_dots() {
                     ws,
                     position,
                     0.,
-                    &state.synoik.icon_cache,
+                    crate::render_helpers::icon::DrawCaches {
+                        icons: &state.synoik.icon_cache,
+                        images: &state.synoik.image_cache,
+                    },
                 );
                 composite_ui(
                     vk,
@@ -2751,7 +2768,7 @@ fn vulkan_draws_an_app_indicator_icon() {
     );
     state.synoik.panel.set_app_indicators(vec![PanelIndicator {
         id: "test".to_owned(),
-        icon_name: Some(name.to_owned()),
+        icon: crate::status_notifier::ItemIcon::Themed(name.to_owned()),
     }]);
     let rect = state
         .synoik
@@ -2773,7 +2790,10 @@ fn vulkan_draws_an_app_indicator_icon() {
                     ws,
                     position,
                     0.,
-                    &state.synoik.icon_cache,
+                    crate::render_helpers::icon::DrawCaches {
+                        icons: &state.synoik.icon_cache,
+                        images: &state.synoik.image_cache,
+                    },
                 );
                 let pixels = composite_ui(
                     vk,
@@ -2808,6 +2828,91 @@ fn vulkan_draws_an_app_indicator_icon() {
     assert!(
         lit > 20,
         "the app indicator's icon must composite inside its own slot ({rect:?}), got {lit} lit px"
+    );
+}
+
+/// A client-supplied **pixmap** draws in the panel, in the client's own colours.
+///
+/// Pixmaps are the form Electron and Qt clients fall back to when they ship no themed icon, and
+/// nothing about them touches the icon theme: the bytes arrive over the bus as ARGB32, get
+/// premultiplied and reordered, and are uploaded straight. Painting one in the panel's foreground
+/// tint — the way a symbolic icon is drawn — would erase the app's own logo, so this asserts the
+/// colour survives, not merely that something was drawn.
+#[test]
+fn vulkan_draws_an_app_indicator_pixmap_in_its_own_colours() {
+    use crate::status_notifier::{pixmap_from_argb, ItemIcon};
+    use crate::ui::panel::PanelIndicator;
+
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    let width = to_physical_precise_round(scale.x, output_size(&output).w);
+    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::panel_height());
+
+    // A solid opaque green square, on the wire: ARGB32, network byte order.
+    let side = 32i32;
+    let argb: Vec<u8> = (0..side * side)
+        .flat_map(|_| [0xff, 0x00, 0xff, 0x00])
+        .collect();
+    let pixmap = pixmap_from_argb(side, side, &argb).expect("valid pixmap");
+
+    let state = f.synoik_state();
+    let ws = state.synoik.workspace_state_for(&output);
+    let position = state.synoik.workspace_position_for(&output);
+    state.synoik.panel.set_app_indicators(vec![PanelIndicator {
+        id: "pixmap-item".to_owned(),
+        icon: ItemIcon::Pixmap(std::sync::Arc::new(pixmap)),
+    }]);
+    let rect = state
+        .synoik
+        .panel
+        .app_indicators_rect(output_size(&output).w)
+        .expect("the cluster takes a slot");
+
+    let green = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let elems = state.synoik.panel.render(
+                vk,
+                &output,
+                ws,
+                position,
+                0.,
+                crate::render_helpers::icon::DrawCaches {
+                    icons: &state.synoik.icon_cache,
+                    images: &state.synoik.image_cache,
+                },
+            );
+            let pixels = composite_ui(
+                vk,
+                elems,
+                Size::<i32, Physical>::from((width, bar_h)),
+                scale,
+            );
+
+            let x0: i32 = to_physical_precise_round(scale.x, rect.loc.x);
+            let x1: i32 = to_physical_precise_round(scale.x, rect.loc.x + rect.size.w);
+            let mut green = 0usize;
+            for y in 0..bar_h {
+                for x in x0.max(0)..x1.min(width) {
+                    let p = &pixels[((y * width + x) as usize) * 4..][..4];
+                    if p[1] > 150 && p[0] < 80 && p[2] < 80 && p[3] > 120 {
+                        green += 1;
+                    }
+                }
+            }
+            green
+        })
+        .expect("vulkan renderer");
+
+    // No worker and no theme lookup is involved, so unlike a symbolic icon this must land on the
+    // very first frame.
+    assert!(
+        green > 50,
+        "a client's pixmap must composite in its own colour inside {rect:?}, got {green} green px"
     );
 }
 
@@ -3749,7 +3854,10 @@ fn vulkan_renders_the_a11y_indicator_icon() {
                     ws,
                     position,
                     0.,
-                    &state.synoik.icon_cache,
+                    crate::render_helpers::icon::DrawCaches {
+                        icons: &state.synoik.icon_cache,
+                        images: &state.synoik.image_cache,
+                    },
                 );
                 composite_ui(
                     vk,
