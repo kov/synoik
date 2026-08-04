@@ -36,11 +36,18 @@ serve (absolute pointing devices, which build no pressure at all and so have no 
 
 ## What is not built yet
 
-- **Absolute pointing devices have no dock.** Their position is mapped into the output, so the
-  clamp never discards anything and no pressure accumulates. The hot corner falls back to its
-  corner pixel; a full bottom edge has no equivalent fallback that isn't a tripwire. If the seat
-  turns out to use an absolute pointer, this needs a different signal — a gesture, or a bindable
-  action.
+- **Absolute pointing devices build no pressure of their own.** Their position is mapped into the
+  output, so the clamp never discards anything. The hot corner falls back to its corner pixel; a
+  full bottom edge has no equivalent fallback that isn't a tripwire.
+
+  This is survivable on a seat that has *both* kinds, which the dev VM does: its pointer sends
+  absolute events for ordinary movement and switches to relative deltas while the host cursor is
+  pinned against a screen edge — so the push that matters is relative and does build pressure.
+  What that split broke once (fixed, and pinned by `leaving_by_any_device_re_arms_the_barrier`):
+  **a barrier's latch must be released from a path every device reaches.** With the release living
+  in the relative-only `push`, the dock fired exactly once per session and every later push landed
+  on a latched barrier, because all the *leaving* was absolute. A seat with only an absolute
+  pointer still has no dock and needs a different signal — a gesture, or a bindable action.
 - **No touch gesture.** A swipe up from the bottom edge is the obvious counterpart and is not
   wired.
 - **Bottom hot corners are gone**, removed with the rest of niri's `gestures.hot_corners` when

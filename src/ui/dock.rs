@@ -241,8 +241,23 @@ impl Dock {
         ))
     }
 
-    /// Track the pointer. Returns `true` if the dock's state changed enough to want a redraw.
+    /// Track the pointer.
     pub fn pointer_motion(&mut self, output: &Output, pos_within_output: Point<f64, Logical>) {
+        // Re-arming the barrier belongs *here*, on the path every pointing device reaches — not
+        // in `push`, which only relative motion calls.
+        //
+        // A barrier latches when it fires and stays latched until the pointer leaves, so that
+        // resting against a triggered edge doesn't re-fire it every frame. If only the relative
+        // path can release that latch, then on a seat where some *other* device delivers the
+        // motion that carries the pointer away, the latch is never released at all: the dock
+        // fires once and then every later push arrives against a barrier that refuses to
+        // accumulate. This VM is exactly that seat — its pointer sends absolute events for
+        // ordinary movement and switches to relative deltas only while the host cursor is pinned
+        // against a screen edge, so *pushing* is relative and *leaving* is absolute.
+        if !Self::segment(output).contains(output_size(output), pos_within_output) {
+            self.barrier.leave();
+        }
+
         let over = self
             .hover_area(output)
             .is_some_and(|area| area.contains(pos_within_output));
@@ -256,6 +271,8 @@ impl Dock {
 
     /// The pointer left the dock's output entirely.
     pub fn pointer_left(&mut self) {
+        // Off the output is off the edge — re-arm, for the reason in [`Self::pointer_motion`].
+        self.barrier.leave();
         if self.hovered {
             self.hovered = false;
             self.leave_at = Some(self.clock.now_unadjusted() + HIDE_DELAY);
@@ -349,6 +366,48 @@ mod tests {
             );
         }
         assert!(tripped, "sustained pushing must trip the dock's barrier");
+    }
+
+    /// The barrier is re-armed by the pointer *moving away*, whichever device moved it — not
+    /// only by the relative path that feeds `push`.
+    ///
+    /// Seat regression (2026-08-04): this VM's pointer sends absolute events for ordinary
+    /// movement and relative deltas only while the host cursor is pinned against a screen edge.
+    /// So pushing is relative and leaving is absolute — and with the release living in `push`,
+    /// the dock fired exactly once and then never again, every later push landing on a latched
+    /// barrier with `pressure=0`. Leaving here goes through `pointer_motion` alone, with no
+    /// `push` call at all, which is what the seat actually did.
+    #[test]
+    fn leaving_by_any_device_re_arms_the_barrier() {
+        let clock = Clock::with_time(Duration::ZERO);
+        let mut dock = Dock::new(clock);
+        let output = crate::utils::test_output(1920, 1080);
+
+        let at_edge = Point::from((960., 1079.));
+        let push = Point::from((0., 20.));
+        let shove = |dock: &mut Dock, at: u64| {
+            let mut tripped = false;
+            for i in 0..10 {
+                tripped |= dock.push(
+                    &output,
+                    at_edge,
+                    push,
+                    push,
+                    Duration::from_millis(at + i * 16),
+                );
+            }
+            tripped
+        };
+
+        assert!(shove(&mut dock, 0), "the first push trips it");
+
+        // The pointer is carried away by a device that never calls `push`.
+        dock.pointer_motion(&output, Point::from((960., 400.)));
+
+        assert!(
+            shove(&mut dock, 2000),
+            "a second push must trip it too — the barrier stayed latched from the first"
+        );
     }
 
     /// Away from the edge there is no barrier to push against.
