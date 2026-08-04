@@ -50,25 +50,39 @@ means the default disposition — no state save. It is merely not a crash.)
 
 ### The race
 
-The app scopes and `org.gnome.Shell@user.service` land in the **same stop transaction with no
-`After=` between them**. Start order is shell → `gnome-session-initialized.target` →
-`gnome-session.target` → `graphical-session.target`, so stop order reverses to three inert target
-jobs and then the shell — sub-millisecond hops. Nothing waits for an app scope before killing the
-compositor; both sides just carry `TimeoutStopSec=5s`.
+The app units and `org.gnome.Shell@user.service` land in the **same stop transaction, and the
+ordering that exists between them is not the one it looks like**. Worth being precise, because the
+shape of the race decides what a fix may touch.
+
+There *is* ordering, and it is in our favour. `gnome-session-shutdown.target` carries
+`After=graphical-session.target` alongside the `Conflicts=`, so the target's stop job completes
+before the shutdown target starts; and the shell is `Before=gnome-session-initialized.target` on
+start, which reverses to "the target stops, then the shell". Both traces below show the shell being
+asked last, after `graphical-session.target` has reported `Stopped`.
+
+**What is missing is that a target's stop job completing does not mean its members have finished
+stopping.** `PartOf=` propagates a stop *job* to each member; nothing orders that job before the
+target's own. So the target can report `Stopped`, the shell can be SIGTERMed and unwind, while an
+app is still inside its five seconds. That is the whole race: the compositor is ordered after a
+line that does not mean what it says.
 
 Measured on our own session (journal, 2026-08-03 14:10:15; `systemd[57776]` is the gsrs user
 manager, and that Epiphany was launched by us):
 
 ```
 14:10:15.837  Stopping app-gnome-org.gnome.Epiphany.desktop-190833.scope...   SIGTERM to the app
-14:10:16.175  Stopped target graphical-session.target
+14:10:16.175  Stopped target graphical-session.target                         ← the app is still up
 14:10:16.179  Stopping org.gnome.Shell@user.service...                        SIGTERM to us, +341 ms
 14:10:16.441  epiphany[190833]: Lost connection to Wayland compositor.        we went first
 14:10:16.457  Stopped org.gnome.Shell@user.service.
 14:10:16.741  Stopped app-gnome-…-190833.scope                                app done, +562 ms after
 ```
 
-**Read that fourth line.** The app got a 341 ms head start and needed 903 ms; our unwind took 262 ms.
+**Read the second and last lines together.** `graphical-session.target` reported `Stopped` 566 ms
+before the scope it consists of actually stopped, which is the propagation gap above, in one
+session.
+
+**Read the fourth line.** The app got a 341 ms head start and needed 903 ms; our unwind took 262 ms.
 So the compositor went away *first*, and Epiphany spent its last 300 ms shutting down against a dead
 socket. This trace is not a near miss that luck saved — it is the failure, captured. It merely did
 not look like one, because GTK4 prints `Lost connection to Wayland compositor.` and exits, where
@@ -171,6 +185,10 @@ same `PartOf=graphical-session.target` + `TimeoutStopSec=5s` drop-in), so all th
 This is also the argument for the pattern list over a registry of what we launched, sharper than
 the one in the code comment: a registry would have recorded the scope we started, which is exactly
 the one that no longer holds the app.
+
+> **Open, 2026-08-03 — this whole mechanism may be the bug.** See §6: the pattern list is one
+> approximation of GNOME's set, but stopping units *at all* is a divergence, and the 5 s
+> gnome-terminal case is caused by the confirm drain, not by the list.
 
 On an externally driven logout, `stop_app_scopes` joins stop jobs systemd has already queued and is
 a no-op. On the `Quit` and dialog paths it is the only thing that asks the apps at all — which is
@@ -422,10 +440,84 @@ across ten logouts on the seat (2026-08-03), 0.69–1.54 s between the scope sta
 beginning to end. The keyboard actions (`Action::Logout` and friends) had always used the direct
 call; only the menu rows went the long way round.
 
+**Suspend goes the same way**, and that is gnome-shell's choice rather than an obvious one:
+`activateSuspend` is `this._session.SuspendAsync()` on the *same* proxy (`:509`), not a call to
+logind, even though gnome-session only forwards it there. It used to spawn `systemctl suspend`.
+Unlike the other three it ends nothing and opens no dialog, so `SessionRequest::Suspend` is the one
+variant that never comes back to us as `EndSessionDialog.Open`.
+
 **One asymmetry is gnome-shell's and is pinned by
 `quick_settings_system_rows_call_gnome_session_directly`:** logout hides the overview first
-(`Main.overview.hide()`, `:487`), power-off and restart do not.
+(`Main.overview.hide()`, `:487`), power-off, restart and suspend do not.
 
-Still a spawn: **Suspend**, which runs `systemctl suspend`. `Action::Suspend` already goes to
-logind through the backend, so the row could use it; left alone because it is a different
-mechanism from the three above and was not what the latency was about.
+---
+
+## 6. Why the race is lost — and the case that the drain, not the list, is the bug
+
+Written 2026-08-03, after a logout with gnome-terminal open cost the full five seconds. Open: the
+conclusion here has not been acted on.
+
+### 6.1 There *is* ordering, and it is on our side
+
+The earlier reading of §1 — "same transaction, no `After=` between them" — is not quite right, and
+the correction matters. `gnome-session-shutdown.target` carries `After=` alongside `Conflicts=` for
+both `graphical-session.target` and `gnome-session-initialized.target`, and
+`org.gnome.Shell@.service` is `Before=gnome-session-initialized.target` on start, which reverses to
+"that target stops, then the shell". Both traces in §1 show it holding: the shell is asked to stop
+*after* `graphical-session.target` has reported `Stopped`.
+
+**What that ordering does not cover is the members.** `PartOf=` propagates a stop *job*; nothing
+orders that job before the target's own. So the target reports `Stopped` while its units are still
+inside their `TimeoutStopSec=5s`, and the compositor's "we go last" guarantee is against a line that
+does not mean what it says. In the 14:10 trace `graphical-session.target` reported `Stopped` at
+`16.175` and the Epiphany scope stopped at `16.741` — 566 ms of app life on the far side of the
+guarantee, with the shell SIGTERMed at `16.179` and gone by `16.457`.
+
+That is the race, and it is why it is lost: **the ordering exists on the targets, and the processes
+are in the leaves.**
+
+### 6.2 The gnome-terminal five seconds is not that race at all
+
+It is ours, and it is a deadlock we built. Journal, 2026-08-03 22:41, one gnome-terminal up:
+
+```
+22:41:24.432  session ending, waiting for clients to exit        ← the *confirm* drain starts
+22:41:29.398  clients did not exit within 5s…: org.gnome.Terminal
+22:41:29.440  Stopping gnome-terminal-server.service...          ← first time anyone asks it
+22:41:29.457  Stopped gnome-terminal-server.service              ← 17 ms
+```
+
+The client needed 17 ms and we waited 5 s, because for the whole of those 5 s **nobody had asked
+it**. §2.3 holds the `Confirmed*` answer until the apps are gone; gnome-session starts the teardown
+when we answer; the teardown is what stops the apps. We wait for an event that our waiting is what
+prevents. `stop_app_scopes` exists to paper over exactly that — it is the confirm drain's substitute
+for the teardown it is holding up — and it misses `gnome-terminal-server.service` because that unit
+declares `PartOf=graphical-session.target` under a name in no `app-*.scope` family.
+
+Fixing the pattern list makes the symptom go away and leaves the inversion in place. **A better set
+would only have hidden it.**
+
+### 6.3 What "do what mutter does" actually means here
+
+mutter asks nobody. It does not read the unit graph, does not stop units, does not consult
+inhibitors (those are gnome-session's, and they gate the *dialog*, not the exit) — it quits the main
+loop and `wl_display_destroy_clients` closes the sockets. Every unit stop in a GNOME logout is
+systemd's, resolved from `PartOf=graphical-session.target`, and it happens because the shell
+*answered immediately*.
+
+So the divergence we should keep is the narrow one — **the compositor outliving its clients**, which
+is the answer to §6.1 — and the ones to drop are the two that grew around it:
+
+- **Answer `Confirmed*` at once**, as gnome-shell does. The teardown then runs, systemd SIGTERMs the
+  real set by declaration, and the stopping drain keeps us serving Wayland while they finish. The
+  confirm drain (§2.3) goes away, and with it the two-budget case in §3 and the
+  withdrawal-during-a-confirm-drain gap.
+- **Stop calling `stop_app_scopes` on that path**, because systemd is now doing it. What remains to
+  decide is the `Quit` action, which has no gnome-session behind it — our unit's `OnSuccess=`
+  triggers the teardown only once we have exited, so a drain there has the same inversion. mutter's
+  answer for `Quit` is to exit; whether we want the drain badly enough to keep asking on that one
+  path is the open question.
+
+The prize is that the set of units asked stops being ours to get right — no patterns, no
+`ConsistsOf` query, no PID-to-unit mapping. `PartOf=graphical-session.target` on our own scopes
+(§2.1) is then the *only* thing we have to keep true, and systemd resolves the rest.
