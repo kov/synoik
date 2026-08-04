@@ -1399,10 +1399,10 @@ Approved as one batch; the first three landed in `66953ae5` + `d2e5bae9`.
   further down. The two full-width content surfaces — the search results strip and the app
   grid — still reserve the entry's height, because they would otherwise render underneath it.
 * **The strip gets double the band.** ✅ `MAX_THUMBNAIL_SCALE` 0.05 → 0.10, so a thumbnail
-  (which keeps the output's aspect) covers four times the area. The row now fits itself to the
-  *band* rather than the view, and the band keeps the floating entry's zone clear at **both**
-  edges (`overview_layout::thumbnails_available_width`) so a centered row can never run under
-  the pill. Judged live at 1024×665 (`NIRI_HEADLESS_MODE=2048x1330` + scale 2).
+  (which keeps the output's aspect) covers four times the area. Judged live at 1024×665
+  (`NIRI_HEADLESS_MODE=2048x1330` + scale 2). **Superseded 2026-08-03 (§12.7):** the strip is the
+  app-grid row, so its size is `small_workspace_height` and its band is the full view width,
+  overlapping the floating pill rather than dodging it.
 * **Dragging a thumbnail reorders the workspaces.** ✅ macOS Mission Control's gesture, on top
   of gnome-shell's window-onto-thumbnail drop, which is kept — the two are told apart by what
   the press landed on. `ThumbGrab` (`src/input/thumb_grab.rs`) recognizes like `MoveGrab`: under
@@ -1647,3 +1647,24 @@ Note this is *not* the same as §12 divergence 4 (`Workspace::expose_area`), whi
 background and the windows drawn on it, and it will interact with that symmetrization — check
 both together, and check it against a maximized window, which is the case that shows nothing
 today.
+
+### 12.7 The strip and the app-grid row became one row (landed 2026-08-03)
+
+Gustavo, from live use of the thumb strip: he wants the strip to *be* the app-grid row — same
+content (exposé previews, not raw window positions), same full-width placement, same drop shadow,
+with the accent glow kept on the selected one; and the strip's reorder / close-an-empty
+affordances available on the app-grid row too. "The UX I am looking for is the user can't tell the
+difference between the thumb strip and the workspaces in the app grid, without affecting how the
+overview workspaces work."
+
+Landed as one row rather than two matched ones — the full design and its consequences are in
+`docs/fork/dynamic-workspaces-divergence.md` §2b. In short: `ControlsLayout::workspace_row` is
+state-independent, `thumbnails::strip_geometry` is the fit-all row, `render_thumbnails` draws
+`render_expose`, and the picker **fades away** on the show-apps leg instead of travelling into the
+row. Follow-up decision taken in the same session: the row's top sits on the search puck's
+*midline*, so the floating entry overlaps its top-right corner rather than the row tucking under
+the entry's reserved height.
+
+Two items above are affected: §12.5's edge fade now applies to a full-width row (and §12.4's
+"centering leaves a partial thumbnail at the edge" no longer holds — fit-all centers the run, so a
+run that fits ends on whole thumbnails at both ends, and only an overflowing one is cut).

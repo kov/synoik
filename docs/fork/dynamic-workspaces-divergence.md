@@ -1,4 +1,4 @@
-# Dynamic workspaces: manual close, always-on strip
+# Dynamic workspaces: manual close, one always-on workspace row
 
 **Status: implemented 2026-08-03.** Approved by Gustavo in the session that wrote it, with three
 sub-decisions taken up front (named workspaces stay un-closable; closing animates the strip
@@ -34,14 +34,49 @@ strip only when `nWorkspaces > NUM_WORKSPACES_THRESHOLD` (2, `:16`), and eases `
 0↔1 as the count crosses that line. Since the trailing empty always counts, GNOME's strip appears
 only once a *second* desktop is populated.
 
-We always show it. The strip is the desktop switcher; one that appears and disappears as a
+We always show it. The row is the desktop switcher; one that appears and disappears as a
 side effect of what you happen to have open is not one you can aim at, and with (3) the count now
-reflects a deliberate user choice rather than a transient. `Monitor::thumbnails_expand_fraction`
-is a constant 1, and the count-crossing ease it used to drive is gone.
+reflects a deliberate user choice rather than a transient. `Monitor::thumbnails_visible` is now
+just "is the overview open", and the count-crossing ease is gone — as is
+`ui::overview_layout`'s `expand_fraction` parameter, which had nothing left to interpolate.
 
-`ui::overview_layout` keeps its `expand_fraction` parameter — that is the ported
-`ControlsManagerLayout` signature and it is unit-tested on its own — and the monitor hands it the
-constant.
+## 2b. DIVERGENCE — the strip and the app-grid row are the *same* row
+
+**Approved 2026-08-03.** gnome-shell has two unrelated rows of workspaces in the overview: the
+`ThumbnailsBox` strip in the window-picker state (`MAX_THUMBNAIL_SCALE`, 5% specks, raw window
+positions, its own band under the search entry), and the window picker *itself* shrunk into
+`_computeWorkspacesBoxForState(APP_GRID)` in the app-grid state (`SMALL_WORKSPACE_RATIO`, 15%,
+exposé previews, full width). The show-apps transition cross-fades one into the other:
+`overviewControls.js:512-548` eases the strip's opacity to 0 while `fitModeAdjustment` slides the
+picker down into the row's place.
+
+Ours is one row, `ControlsLayout::workspace_row`, drawn identically in both states:
+
+- **One box.** Full width, top on the search puck's midline
+  (`overview_search::ENTRY_CONTROL_MID_Y`), one `small_workspace_height` tall. It does not depend
+  on the overview state, so the show-apps transition never moves it.
+- **One layout.** `thumbnails::strip_geometry` is gnome-shell's fit-all row
+  (`_getFirstFitAllWorkspaceBox`) — run centered, `WORKSPACE_MIN_SPACING` between, scrolling to
+  follow the active workspace once it overflows.
+- **One content.** `Monitor::render_thumbnails` draws `Workspace::render_expose` — the picker's
+  own spread previews — over the same rounded wallpaper, at the row's zoom.
+- **One shadow.** The workspace shadow every picker workspace casts, through the miniature's own
+  transform. The **active** workspace gets that shadow in the system accent color
+  (`workspace::accent_workspace_shadow_config`), which is our replacement for gnome-shell's
+  `.workspace-thumbnail-indicator` border ring. The window picker's big workspace does *not* wear
+  it: there the active one is already the centered, whole one.
+- **One set of affordances.** Reorder-by-drag and dismiss-an-empty-desktop are the row's, so they
+  work in the app-grid state too — pinned by
+  `the_workspace_row_closes_and_reorders_in_the_app_grid_too`.
+
+The picker therefore has nowhere to travel to on the `WINDOW_PICKER → APP_GRID` leg: it keeps its
+own box and simply **fades away** over the row that is already there (`row_alpha` vs
+`picker_alpha` in `Niri::render`). Two pieces of machinery went with that trip — the fit-single ↔
+fit-all blend in `Monitor::workspaces_strip_axis`, and `open_fraction`'s saturation across the
+app-grid leg, which existed only to park the zoom while the row re-fitted.
+
+The point is a UX one, Gustavo's: *the user cannot tell the strip and the app-grid workspaces
+apart*, because there is nothing to tell apart.
 
 ## 3. DIVERGENCE — empty workspaces are closed by hand, macOS-style
 
@@ -86,7 +121,7 @@ Two things it does differently from the window preview's close button
 (`ui::window_preview::close_rect`), both forced by the strip:
 
 - **Inset, not corner-centred.** A preview's button half-overhangs its top-right corner
-  (`windowPreview.js:203-218`). The strip clips everything it draws to its band, and the band is
+  (`windowPreview.js:203-218`). The row clips everything it draws to its band, and the band is
   exactly one thumbnail tall, so an overhanging button would be sliced along its top edge — and
   the half sticking out would not be hittable either, since the hit test clips to the same band.
 - **Ramped, not fixed at 32px.** Thumbnails are a fraction of the work area, so they shrink a
@@ -104,9 +139,8 @@ keep a removed workspace alive for an animation's sake, or every index in the la
 a quarter second. What is animated is only where the survivors are *drawn*: the row is laid out
 twice, at the old count and the new, and the thumbnails interpolate between the two.
 
-Note that only desktops *below* the closed one move: the row pins the active workspace to the
-band's centre, so closing one above the focus leaves every offset unchanged. That is a feature
-(nothing jumps under you), not a missing animation.
+Since 2026-08-03 the row centers the *run* rather than the active workspace (fit-all, see 2b), so
+a close shifts everything after the gap and re-centers what is left.
 
 **Known gap:** the button itself pops in and out with the hover rather than fading, unlike the
 window preview's, whose alpha rides the picker's hover state. A per-workspace fade wants an

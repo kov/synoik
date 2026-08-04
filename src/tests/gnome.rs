@@ -3278,20 +3278,20 @@ fn overview_workspace_fills_its_allocated_picker_box() {
     tap(&mut f, KEY_LEFTMETA);
     f.niri_complete_animations();
 
-    // The thumbnails band is always reserved (divergence, see
-    // `docs/fork/dynamic-workspaces-divergence.md`), and one thumbnail is the app-grid
-    // row's workspace height. Work area 1048 tall ⇒ spacing round(20.96) = 21,
-    // round(21·0.6) = 13 above the band, thumbs round(1048·0.15) = 157,
-    // round(21·1.2) = 25 below it. The search entry floats (approved divergence), so it
-    // costs the picker nothing:
-    //   y = 32 + 13 + 157 + 25                     = 227
-    //   h = 1048 − 112(dash) − 21 − 13 − 157 − 25 = 720
+    // The small workspace row is always reserved (divergence, see
+    // `docs/fork/dynamic-workspaces-divergence.md`), and it is one app-grid workspace
+    // tall. Work area 1048 tall ⇒ spacing round(20.96) = 21, row height
+    // round(1048·0.15) = 157 at y = 32 + 40 (the search puck's midline), round(21·1.2) =
+    // 25 below it. The search entry floats (approved divergence), so it costs the picker
+    // nothing:
+    //   y = 32 + 40 + 157 + 25               = 254
+    //   h = 1048 − 112(dash) − 21 − 40 − 157 − 25 = 693
     let controls = overview_controls(&mut f);
-    assert_eq!(controls.workspaces.loc.y, 227.);
-    assert_eq!(controls.workspaces.size.h, 720.);
+    assert_eq!(controls.workspaces.loc.y, 254.);
+    assert_eq!(controls.workspaces.size.h, 693.);
 
     // The row is fit by height into that box, and centered on what width is left.
-    let zoom: f64 = 720. / 1080.;
+    let zoom: f64 = 693. / 1080.;
     let ws_w = (1920. * zoom).ceil();
     let offset_x = ((1920. - ws_w) / 2.).round();
 
@@ -3302,7 +3302,7 @@ fn overview_workspace_fills_its_allocated_picker_box() {
     let rect = f.niri().layout.expose_target_rect(&win).unwrap();
     assert_pos_eq(
         (rect.loc.x, rect.loc.y),
-        (offset_x + 580. * zoom, 227. + 255. * zoom),
+        (offset_x + 580. * zoom, 254. + 255. * zoom),
         "picker slot must sit in the allocated window-picker box",
     );
     assert!(
@@ -3462,14 +3462,15 @@ fn overview_workspace_offset_interpolates_out_of_the_desktop() {
     assert_eq!(row_y(&mut f), 0.);
 }
 
-/// **Divergence (approved 2026-07-28/29).** The search entry floats at the top right
-/// instead of taking a full-width row, and a thumbnail is the app-grid row's workspace
-/// rather than gnome-shell's 5% speck. Judged on both the reference canvas and the
-/// 1024×665 one the adaptive chrome ramp was written for
-/// (`docs/fork/adaptive-overview-chrome.md`), because that is the canvas the sizes
-/// actually have to work on.
+/// **Divergence (approved 2026-07-28/29, revised 2026-08-03).** The search entry floats at
+/// the top right instead of taking a full-width row, and the workspace row is one of
+/// app-grid workspaces rather than gnome-shell's 5% specks — full width, with its top on
+/// the entry puck's midline, so the pill *overlaps* its top-right corner instead of the row
+/// dodging the pill's column. Judged on both the reference canvas and the 1024×665 one the
+/// adaptive chrome ramp was written for (`docs/fork/adaptive-overview-chrome.md`), because
+/// that is the canvas the sizes actually have to work on.
 #[test]
-fn overview_entry_floats_right_of_an_app_grid_sized_thumbnail_strip() {
+fn overview_entry_floats_over_an_app_grid_sized_workspace_row() {
     for size in [(1920u16, 1080u16), (1024, 665)] {
         let mut f = Fixture::new();
         f.add_output(1, size);
@@ -3479,7 +3480,7 @@ fn overview_entry_floats_right_of_an_app_grid_sized_thumbnail_strip() {
 
         let controls = overview_controls(&mut f);
         let pill = f.niri().overview_search.entry_pill(controls.into());
-        let band = controls.thumbnails;
+        let band = controls.workspace_row;
         let view_w = f64::from(size.0);
         let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
         let strip = mon
@@ -3495,12 +3496,12 @@ fn overview_entry_floats_right_of_an_app_grid_sized_thumbnail_strip() {
             "{size:?}: the entry must float at the right edge, gap {right_gap}"
         );
 
-        // It costs the strip no vertical space: the band starts within one spacing of
-        // the panel, where GNOME would have had the entry's whole row above it.
+        // It costs the row no vertical space: the band starts *above* where the entry's
+        // reserved height ends, which is where GNOME would have had its whole row.
         assert!(
             band.loc.y - crate::ui::panel::panel_height()
                 < crate::ui::overview_search::PREFERRED_ENTRY_HEIGHT,
-            "{size:?}: the entry still displaces the strip (band at {})",
+            "{size:?}: the entry still displaces the row (band at {})",
             band.loc.y
         );
 
@@ -3514,14 +3515,17 @@ fn overview_entry_floats_right_of_an_app_grid_sized_thumbnail_strip() {
             "{size:?}: a thumbnail must be the app-grid row's workspace height"
         );
 
-        // And the two never collide. The *band* is what has to clear the pill's column,
-        // not the row: at the app-grid size the row overflows and scrolls, and what runs
-        // past the band is clipped away rather than drawn under the entry.
-        let band_right = band.loc.x + band.size.w;
+        // And the two deliberately *do* overlap: the row is full width and starts at the
+        // puck's midline, so the pill floats over its top-right corner. This is the
+        // divergence, pinned so it cannot be undone by accident.
+        assert_eq!(
+            (band.loc.x, band.size.w),
+            (0., view_w),
+            "{size:?}: the row must span the full width"
+        );
         assert!(
-            band_right <= pill.loc.x,
-            "{size:?}: the strip's band runs under the floating entry ({band_right} vs {})",
-            pill.loc.x
+            band.loc.y < pill.loc.y + pill.size.h,
+            "{size:?}: the row's top must sit inside the pill's band, not below it"
         );
         assert!(
             strip.thumbs[0].loc.x >= band.loc.x,
@@ -3530,43 +3534,51 @@ fn overview_entry_floats_right_of_an_app_grid_sized_thumbnail_strip() {
     }
 }
 
-/// **Divergence (approved 2026-07-29).** The strip is the app-grid row's twin: a
-/// thumbnail is exactly the workspace that row draws, at the same size, so the two rows
-/// cannot drift apart. gnome-shell has no such relationship — its thumbnails are
-/// `MAX_THUMBNAIL_SCALE` (5%) and its app-grid workspaces `SMALL_WORKSPACE_RATIO` (15%).
+/// **Divergence (approved 2026-08-03).** The strip and the app-grid row are the *same*
+/// row: one box, one layout, drawn identically in both overview states, so the show-apps
+/// transition cannot move it and the user cannot tell the two apart. gnome-shell has two
+/// unrelated rows — thumbnails at `MAX_THUMBNAIL_SCALE` (5%) in the window picker, and the
+/// picker itself shrunk to `SMALL_WORKSPACE_RATIO` (15%) in the app grid.
 ///
-/// Asserted against the *rendered* app-grid row rather than the constant, so a change to
-/// either side has to move both.
+/// Asserted across the toggle rather than against a constant, so neither state can drift.
 #[test]
-fn overview_thumbnail_is_the_app_grid_workspace() {
+fn the_workspace_row_is_the_same_in_both_overview_states() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let (_a, _b) = setup_two_desktops_in_overview(&mut f, id);
     f.settle_animations();
 
-    let thumb = {
+    let row = |f: &mut Fixture| {
         let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
         mon.expect("workspaces must be on a monitor")
             .thumbnail_strip()
-            .expect("three workspaces must show the strip")
-            .thumbs[0]
-            .size
+            .expect("the row is always shown in the overview")
+            .thumbs
     };
+
+    let picker = row(&mut f);
+    assert!(picker.len() >= 3, "three workspaces must be laid out");
 
     f.niri().layout.toggle_app_grid();
     f.settle_animations();
-    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
-    let ws = mon
-        .expect("workspaces must be on a monitor")
-        .workspaces_render_geo()
-        .next()
-        .expect("the app grid lays the workspaces out too");
+    assert!(f.niri().layout.is_app_grid_open(), "app grid must open");
 
-    assert!(
-        (thumb.h - ws.size.h).abs() <= 1. && (thumb.w - ws.size.w).abs() <= 1.,
-        "a thumbnail must be the app-grid row's workspace: {thumb:?} vs {:?}",
-        ws.size
+    assert_eq!(
+        row(&mut f),
+        picker,
+        "the workspace row must not move when the app grid opens"
+    );
+
+    // And the picker behind it does not travel into the row either — it fades away in
+    // place, so nothing is left to reconcile with the row that is already there.
+    let controls = overview_controls(&mut f);
+    f.niri().layout.toggle_app_grid();
+    f.settle_animations();
+    assert_eq!(
+        overview_controls(&mut f).workspaces,
+        controls.workspaces,
+        "the window picker's box must not depend on the app-grid state"
     );
 }
 
@@ -3588,7 +3600,7 @@ fn overview_thumbnail_strip_scrolls_instead_of_shrinking() {
 
     let controls = overview_controls(&mut f);
     let pill = f.niri().overview_search.entry_pill(controls.into());
-    let band = controls.thumbnails;
+    let band = controls.workspace_row;
 
     let strip_now = |f: &mut Fixture| {
         let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
@@ -3618,11 +3630,13 @@ fn overview_thumbnail_strip_scrolls_instead_of_shrinking() {
         "the size must not give way to the workspace count"
     );
 
-    // Walk down the strip: the active workspace's thumbnail is inside the band
-    // every step of the way, and the band is clear of the floating entry.
+    // Walk down the row: the active workspace's thumbnail is inside the band every step
+    // of the way. The band no longer dodges the entry — it is full width and the pill
+    // floats over its top-right corner (see
+    // `overview_entry_floats_over_an_app_grid_sized_workspace_row`).
     assert!(
-        band.loc.x + band.size.w <= pill.loc.x,
-        "the band must stay clear of the entry pill"
+        pill.loc.x + pill.size.w <= band.loc.x + band.size.w,
+        "the pill must float over the row, not beside it"
     );
     for _ in 0..n {
         let active = f
@@ -3660,10 +3674,12 @@ fn overview_thumbnail_strip_fills_its_allocated_band() {
     let (_a, _b) = setup_two_desktops_in_overview(&mut f, id);
     f.settle_animations();
 
-    let band = overview_controls(&mut f).thumbnails;
-    // 32 + round(21 × 0.6) = 45 (the entry floats and takes no row), and the app-grid
-    // row's workspace height, round((1080 - 32) × SMALL_WORKSPACE_RATIO) = 157.
-    assert_eq!((band.loc.y, band.size.h), (45., 157.));
+    let band = overview_controls(&mut f).workspace_row;
+    // 32 + 40, the search puck's midline (the entry floats and takes no row), and one
+    // small workspace tall, round((1080 - 32) × SMALL_WORKSPACE_RATIO) = 157.
+    assert_eq!((band.loc.y, band.size.h), (72., 157.));
+    // Full width, in both overview states.
+    assert_eq!((band.loc.x, band.size.w), (0., 1920.));
 
     let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
     let strip = mon
@@ -3699,7 +3715,7 @@ fn overview_picker_box_does_not_move_with_the_workspace_count() {
 
     // One populated desktop plus the trailing empty: the band is already there.
     let one = overview_controls(&mut f).workspaces;
-    assert_eq!((one.loc.y, one.size.h), (227., 720.));
+    assert_eq!((one.loc.y, one.size.h), (254., 693.));
 
     // Populate a second desktop. Sample mid-transition too: an eased band would be
     // caught here, and a popped one would show a different box on the next frame.
@@ -3712,17 +3728,17 @@ fn overview_picker_box_does_not_move_with_the_workspace_count() {
         niri.advance_animations();
     }
     let mid = overview_controls(&mut f).workspaces;
-    assert_eq!((mid.loc.y, mid.size.h), (227., 720.));
+    assert_eq!((mid.loc.y, mid.size.h), (254., 693.));
 
     f.settle_animations();
     let two = overview_controls(&mut f).workspaces;
-    assert_eq!((two.loc.y, two.size.h), (227., 720.));
+    assert_eq!((two.loc.y, two.size.h), (254., 693.));
 
     // …and back. The emptied desktop is not reaped, so this is now three workspaces.
     f.niri().layout.move_to_workspace_up(true);
     f.settle_animations();
     let back = overview_controls(&mut f).workspaces;
-    assert_eq!((back.loc.y, back.size.h), (227., 720.));
+    assert_eq!((back.loc.y, back.size.h), (254., 693.));
 
     let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
     let mon = mon.expect("workspaces must be on a monitor");
@@ -3938,20 +3954,20 @@ fn overview_drag_to_neighbor_keeps_position() {
     );
 }
 
-/// Opening the app grid switches the workspace row from gnome-shell's
-/// `FitMode.SINGLE` to `FitMode.ALL`: instead of sliding the row so the *active*
-/// workspace lands on the centered slot (`_getFirstFitSingleWorkspaceBox`,
-/// `workspacesView.js:172-204`), every workspace is laid out inside the
-/// allocation and the run is centered as a whole
-/// (`_getFirstFitAllWorkspaceBox`, `:128-170`) — so which workspace is active no
-/// longer shifts anything. The fitted row also packs at `WORKSPACE_MIN_SPACING`
-/// rather than the picker's roomy peek-at-the-edges gap (`_getSpacing`'s
-/// `(1 - fitMode)` factor, `:207-226`).
+/// The workspace row is laid out with gnome-shell's `FitMode.ALL`: every workspace inside
+/// the allocation with the run centered as a whole (`_getFirstFitAllWorkspaceBox`,
+/// `workspacesView.js:128-170`), so which workspace is active does not shift anything, and
+/// packed at `WORKSPACE_MIN_SPACING` rather than the picker's roomy peek-at-the-edges gap
+/// (`_getSpacing`'s `(1 - fitMode)` factor, `:207-226`).
 ///
-/// Driven from the *first* of three workspaces, where the two arrangements are
-/// furthest apart: fit-single puts a third of the row off the left edge.
+/// **Divergence (approved 2026-08-03).** gnome-shell only reaches fit-all in the app-grid
+/// state, by sliding the picker into it. Ours is the row's layout in *both* states — the
+/// picker itself stays fit-single behind it and simply fades away.
+///
+/// Driven from the *first* of three workspaces, where fit-all and the picker's fit-single
+/// are furthest apart: fit-single puts a third of the row off the left edge.
 #[test]
-fn app_grid_fits_the_whole_workspace_row() {
+fn the_workspace_row_fits_all_of_the_workspaces() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
@@ -3972,12 +3988,19 @@ fn app_grid_fits_the_whole_workspace_row() {
 
     use smithay::utils::{Logical, Rectangle};
 
-    let row = |f: &mut Fixture| -> Vec<Rectangle<f64, Logical>> {
+    let picker_row = |f: &mut Fixture| -> Vec<Rectangle<f64, Logical>> {
         let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
         mon.expect("workspaces must be on a monitor")
             .workspaces_render_geo()
             .take(3)
             .collect()
+    };
+    let row = |f: &mut Fixture| -> Vec<Rectangle<f64, Logical>> {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        mon.expect("workspaces must be on a monitor")
+            .thumbnail_strip()
+            .expect("the row is always shown in the overview")
+            .thumbs
     };
     // Each workspace is centered in its slot, so slot geometry is read off the
     // rect *centers* — the inactive-workspace shrink leaves those untouched.
@@ -3987,9 +4010,10 @@ fn app_grid_fits_the_whole_workspace_row() {
     };
     let view_center = 1920. / 2.;
 
-    // The picker: fit-single, so the *active* workspace is the centered one and
-    // the run as a whole hangs off to the right.
-    let picker = row(&mut f);
+    // The picker behind it is fit-single, so the *active* workspace is the centered one
+    // and the run as a whole hangs off to the right. That is the arrangement the row is
+    // deliberately *not* in.
+    let picker = picker_row(&mut f);
     assert_eq!(picker.len(), 3, "three workspaces must be laid out");
     assert!(
         (center_of(&picker[0]) - view_center).abs() <= 1.,
@@ -4000,29 +4024,30 @@ fn app_grid_fits_the_whole_workspace_row() {
         "in the picker the run must hang off to one side, got {picker:?}"
     );
 
+    // The row: fit-all, so the run is centered and the active workspace is wherever its
+    // index puts it — and the same before and after the app grid opens.
+    let before = row(&mut f);
     f.niri().layout.toggle_app_grid();
     f.settle_animations();
     assert!(f.niri().layout.is_app_grid_open(), "app grid must open");
-
-    // The app grid: fit-all, so the run is centered and the active workspace is
-    // wherever its index puts it.
     let grid = row(&mut f);
+    assert_eq!(
+        grid, before,
+        "the row must not move with the app-grid state"
+    );
+
     assert!(
         (run_center(&grid) - view_center).abs() <= 1.,
-        "in the app grid the whole run must be centered, got {grid:?}"
+        "the whole run must be centered, got {grid:?}"
     );
     assert!(
         center_of(&grid[1]) > center_of(&grid[0]) && center_of(&grid[2]) > center_of(&grid[1]),
         "the row must stay in workspace order, got {grid:?}"
     );
 
-    // Packed at WORKSPACE_MIN_SPACING. `_getSpacing`'s `(1 - fitMode)` factor is
-    // what does this: at the app grid's small zoom the workspace takes little of
-    // the width, so the fit-*single* formula would run all the way up to
-    // WORKSPACE_MAX_SPACING (80) instead — which is exactly what we drew before
-    // the row learned about fit modes.
-    // Slot pitch minus the slot width; workspace 0 is the active one, so its rect
-    // is the unshrunk slot.
+    // Packed at WORKSPACE_MIN_SPACING. `_getSpacing`'s `(1 - fitMode)` factor is what does
+    // this: at the row's small zoom the workspace takes little of the width, so the
+    // fit-*single* formula would run all the way up to WORKSPACE_MAX_SPACING (80) instead.
     let gap = center_of(&grid[1]) - center_of(&grid[0]) - grid[0].size.w;
     assert!(
         (gap - 24.).abs() <= 1.,
@@ -4041,12 +4066,15 @@ fn setup_n_desktops(f: &mut Fixture, id: ClientId, n: usize) {
     f.niri_complete_animations();
 }
 
-/// With enough workspaces the app grid's fitted row no longer fits, and every
-/// workspace past the edge used to be unreachable: gnome-shell keeps them on screen
-/// by narrowing each box to `availableWidth / n`
-/// (`_getFirstFitAllWorkspaceBox`, `workspacesView.js:127-169`), which we can't do
-/// with one aspect-locked zoom per monitor. The overflowing row scrolls to follow
-/// the active workspace instead (**divergence**, approved 2026-07-29).
+/// With enough workspaces the fitted row no longer fits, and every workspace past the edge
+/// used to be unreachable: gnome-shell keeps them on screen by narrowing each box to
+/// `availableWidth / n` (`_getFirstFitAllWorkspaceBox`, `workspacesView.js:127-169`), which
+/// we can't do with one aspect-locked zoom per monitor. The overflowing row scrolls to
+/// follow the active workspace instead (**divergence**, approved 2026-07-29).
+///
+/// Driven with the app grid *open*, where the row is all there is to aim at;
+/// `overview_thumbnail_strip_scrolls_instead_of_shrinking` drives the same row in the
+/// window-picker state.
 #[test]
 fn app_grid_scrolls_an_overflowing_workspace_row_into_view() {
     use smithay::utils::{Logical, Rectangle};
@@ -4067,8 +4095,9 @@ fn app_grid_scrolls_an_overflowing_workspace_row_into_view() {
     let row = |f: &mut Fixture| -> Vec<Rectangle<f64, Logical>> {
         let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
         mon.expect("workspaces must be on a monitor")
-            .workspaces_render_geo()
-            .collect()
+            .thumbnail_strip()
+            .expect("the row is always shown in the overview")
+            .thumbs
     };
     let n = row(&mut f).len();
     assert!(
@@ -4566,6 +4595,91 @@ fn dismissing_a_desktop_slides_the_strip_closed() {
     assert!(
         mid > lo && mid < hi,
         "mid-slide the survivor must be between {start} and {end}, got {mid}"
+    );
+}
+
+/// The row's two affordances — dismiss an emptied desktop, drag one to reorder — are there
+/// in the **app-grid state** too, because it is the same row.
+///
+/// **Divergence (approved 2026-08-03).** gnome-shell's app-grid workspaces are inert
+/// scenery: the thumbnail strip that carries its (window-drop) interactions is a different
+/// actor, and it is faded out by then (`overviewControls.js:512-548`). Here there is one
+/// row, so what it can do cannot depend on which state is showing. Window *previews* inside
+/// it stay inert in both — that part is gnome-shell's, and
+/// `app_grid_makes_the_shrunken_workspaces_inert` pins it.
+#[test]
+fn the_workspace_row_closes_and_reorders_in_the_app_grid_too() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (win_a, win_b) = setup_two_desktops_in_overview(&mut f, id);
+    f.niri().layout.toggle_app_grid();
+    f.settle_animations();
+    assert!(f.niri().layout.is_app_grid_open(), "app grid must open");
+
+    let ws_idx_of = |f: &mut Fixture, win: &smithay::desktop::Window| {
+        f.niri()
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(win))
+            .map(|(_, idx, _)| idx)
+            .expect("the window must be on a workspace")
+    };
+    assert_eq!(
+        (ws_idx_of(&mut f, &win_a), ws_idx_of(&mut f, &win_b)),
+        (0, 1)
+    );
+
+    // Reorder by dragging, with the grid up.
+    let (t0x, t0y) = thumbnail_center(&mut f, 0);
+    let (t1x, _) = thumbnail_center(&mut f, 1);
+    pointer_motion_to(&mut f, t0x, t0y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, t1x + 1., t0y);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+
+    assert!(
+        f.niri().layout.is_app_grid_open(),
+        "reordering must not drop out of the app grid"
+    );
+    assert_eq!(
+        (ws_idx_of(&mut f, &win_a), ws_idx_of(&mut f, &win_b)),
+        (1, 0),
+        "dragging a workspace past its neighbour must reorder it in the app grid too"
+    );
+
+    // And an emptied desktop can still be dismissed from here. Empty the one that is now
+    // first, then aim at its close button.
+    let win = f.niri().layout.focus().unwrap().window.clone();
+    let empty_idx = ws_idx_of(&mut f, &win_b);
+    f.niri()
+        .layout
+        .remove_window(&win_b, crate::utils::transaction::Transaction::new());
+    let _ = win;
+    f.settle_animations();
+
+    let before = f.niri().layout.workspaces().count();
+    let rect = thumbnail_close_rect(&mut f, empty_idx)
+        .expect("an emptied desktop must be dismissable from the app grid");
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle_animations();
+
+    assert_eq!(
+        f.niri().layout.workspaces().count(),
+        before - 1,
+        "the close button must dismiss the desktop in the app grid too"
+    );
+    assert!(
+        f.niri().layout.is_app_grid_open(),
+        "dismissing must not drop out of the app grid"
     );
 }
 
@@ -13643,9 +13757,11 @@ fn overview_grid_transitions_are_monotonic_with_the_active_workspace_in_the_midd
     assert_row_travels_monotonically(&samples, "app grid -> picker (middle active)");
     f.settle_animations();
     let picker = workspace_geo(&mut f);
-    assert!(
-        picker[0].size.w > grid[0].size.w,
-        "the picker row must be the larger of the two"
+    assert_geo_eq(
+        &picker,
+        &grid,
+        "the picker must not change size across the app-grid leg — it fades, it does \
+         not travel (divergence, 2026-08-03)",
     );
 
     f.niri().layout.toggle_app_grid();
@@ -13660,18 +13776,17 @@ fn overview_grid_transitions_are_monotonic_with_the_active_workspace_in_the_midd
     );
 }
 
-/// The app-grid leg happens at a fully-open overview, so the workspace zoom must
-/// be parked there for its whole length: closing from the grid re-fits the row
-/// first and zooms up after, rather than doing both at once.
+/// Closing from the app grid unwinds the picker cleanly, with the row never folding in on
+/// itself.
 ///
-/// That ordering is not cosmetic. A fit-all row at a near-desktop zoom is
-/// degenerate — the workspaces overflow the view, so the run pins to the left gap
-/// instead of centering — and blending toward it is what threw the row sideways.
-/// gnome-shell cannot reach that state: its single 0..2 adjustment passes through
-/// `WINDOW_PICKER`, which unwinds the fit *before* the zoom starts
-/// (`getStateTransitionParams`, `overviewControls.js:278-308`).
+/// This used to guard an ordering — the zoom parked across the app-grid leg so the row
+/// re-fitted *before* it zoomed, because a fit-all row at a near-desktop zoom is degenerate
+/// and blending toward it threw the row sideways. Since 2026-08-03 the picker does not
+/// change fit mode at all (it fades away instead of travelling into the app-grid row), so
+/// that state is unreachable by construction; what is left worth pinning is the invariant
+/// it was measured by.
 #[test]
-fn overview_close_from_the_app_grid_refits_before_it_zooms() {
+fn overview_close_from_the_app_grid_never_folds_the_row() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
@@ -13698,8 +13813,8 @@ fn overview_close_from_the_app_grid_refits_before_it_zooms() {
         }
     }
 
-    // And the fit is fully unwound before the zoom finishes: by the time the
-    // active workspace is back to full width, the row is the desktop row.
+    // And by the time the active workspace is back to full width, the row is the desktop
+    // row: one screen per workspace, with nothing left to snap.
     let full = samples
         .iter()
         .position(|row| row[0].size.w >= 1919.)
@@ -13707,8 +13822,8 @@ fn overview_close_from_the_app_grid_refits_before_it_zooms() {
     let pitch = samples[full][1].loc.x - samples[full][0].loc.x;
     assert!(
         pitch >= 1919.,
-        "at full width the row must already be unfitted, got pitch {pitch} \
-         (grid pitch was {})",
+        "at full width the row must be the desktop row, got pitch {pitch} \
+         (it was {} in the grid)",
         grid[1].loc.x - grid[0].loc.x,
     );
 }
@@ -14197,7 +14312,7 @@ fn output_scale_is_derived_from_the_current_mode() {
     assert_eq!(back, hidpi, "dropping the override re-derives for the mode");
 }
 
-/// With the app grid up, the shrunken workspaces are scenery, not a picker.
+/// With the app grid up, the workspace previews behind it are scenery, not a picker.
 ///
 /// gnome-shell's workspace mode is 0 in the `APP_GRID` state (`workspacesView.js:236`), and a
 /// window preview's overlay — the hover growth, the close button, the title — is enabled only at
@@ -14243,23 +14358,18 @@ fn app_grid_makes_the_shrunken_workspaces_inert() {
     f.niri().layout.toggle_app_grid();
     f.settle_animations();
 
-    // Sample where the preview *now* is: the row shrank, so the old point would miss it and the
-    // test would pass without proving anything. The hover and the click both resolve through
-    // `Layout::window_under` — not through `Niri::window_under`, which would answer None here
-    // anyway because the app grid covers the layout. This is the path that was still handing a
-    // window over.
+    // Sample where the preview *now* is. The picker no longer travels into the app-grid
+    // row — it fades away in place (divergence, 2026-08-03) — so this is very nearly where
+    // it was, and the point is that it is inert rather than gone. The hover and the click
+    // both resolve through `Layout::window_under` — not through `Niri::window_under`, which
+    // would answer None here anyway because the app grid covers the layout. This is the
+    // path that was still handing a window over.
     let small = f.niri().layout.expose_drawn_rect(&win).unwrap();
-    assert!(
-        small.size.w < rect.size.w,
-        "premise: the app grid shrinks the workspaces ({:?} -> {:?})",
-        rect.size,
-        small.size
-    );
     let small_center = small.loc + small.size.downscale(2.).to_point();
     let out = f.niri_output(1);
     assert!(
         f.niri().layout.window_under(&out, small_center).is_none(),
-        "a shrunken workspace must not hand a window to the pointer"
+        "a faded-out workspace must not hand a window to the pointer"
     );
     assert_eq!(
         hovered(&mut f),

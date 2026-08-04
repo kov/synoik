@@ -9569,10 +9569,16 @@ impl Niri {
         // workspaces, since the interactively-moved window already has a focus ring.
         let focus_ring = !self.layout.interactive_move_is_moving_above_output(output);
 
-        // The window picker and the thumbnails cross-fade out as a search covers
+        // The window picker and the workspace row cross-fade out as a search covers
         // them; outside the overview the fade is 0, so this is a plain pass-through.
         let fade_scale = output.current_scale().fractional_scale();
-        let picker_alpha = (1. - self.overview_search_fade()) as f32;
+        let row_alpha = (1. - self.overview_search_fade()) as f32;
+        // The picker *also* fades away as the app grid opens — see below.
+        let picker_alpha = row_alpha
+            * self
+                .layout
+                .monitor_for_output(output)
+                .map_or(1., |mon| 1. - mon.app_grid_fraction()) as f32;
 
         // Get monitor elements.
         let mon = self.layout.monitor_for_output(output).unwrap();
@@ -9712,15 +9718,19 @@ impl Niri {
 
             mon.render_insert_hint_between_workspaces(&mut |elem| push(elem.into()));
 
-            // The overview workspace thumbnails strip, above the workspaces. It
-            // cross-fades with the search results alongside the picker, and *also*
-            // fades out as the app grid opens: the thumbnails box has no place in the
-            // app grid, so its opacity eases 255 -> 0 across WINDOW_PICKER -> APP_GRID
-            // (`overviewControls.js:512-548`). (GNOME additionally scales it to 0.5 and
-            // sinks it +height/2 during the transition; since it ends fully invisible
-            // that shrink is transient polish, deferred — the fade is what removes it.)
+            // The small workspace row, above the picker. It cross-fades with the search
+            // results alongside the picker, but — unlike the picker — it does **not** fade
+            // out as the app grid opens.
+            //
+            // **Divergence (approved 2026-08-03).** gnome-shell eases the thumbnails box
+            // 255 -> 0 across WINDOW_PICKER -> APP_GRID (`overviewControls.js:512-548`)
+            // because the app grid brings its own row: the picker shrinks into one. Here
+            // the row *is* that row, drawn identically in both states, so it simply stays
+            // — and the picker fades away over it instead of travelling into it. That
+            // makes the show-apps transition a fade of the big previews, with the row the
+            // user is pointing at never moving.
             {
-                let thumbnails_alpha = picker_alpha * (1. - mon.app_grid_fraction() as f32);
+                let thumbnails_alpha = row_alpha;
                 let mut group = Vec::new();
 
                 // Topmost in the group (first pushed = topmost): the close button an empty

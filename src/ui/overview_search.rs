@@ -112,6 +112,14 @@ const ENTRY_MARGIN_BOTTOM: f64 = 6.;
 /// `margin-top`, which is the price of [`PUCK_D`]'s divergence.
 pub const PREFERRED_ENTRY_HEIGHT: f64 = ENTRY_MARGIN_TOP + PUCK_D + ENTRY_MARGIN_BOTTOM;
 
+/// How far the *control's* vertical middle sits below the top of the bin
+/// [`PREFERRED_ENTRY_HEIGHT`] reserves — the puck's centre, which is also the expanded
+/// pill's (the pill centres inside the puck's footprint, see [`PUCK_D`]).
+///
+/// Published because the overview's workspace row is anchored to it: the row's top sits on
+/// the entry control's midline (`crate::ui::overview_layout::ControlsLayout::workspace_row`).
+pub const ENTRY_CONTROL_MID_Y: f64 = ENTRY_MARGIN_TOP + PUCK_D / 2.;
+
 /// Full-color app-icon side in a result tile, logical: `GridSearchResult` builds a
 /// default `IconGrid.BaseIcon` (`search.js:144-146`), whose size is `ICON_SIZE`
 /// (`iconGrid.js:11,83`) — bigger than the dash's 64.
@@ -1426,12 +1434,11 @@ mod tests {
             crate::ui::overview_layout::Measured {
                 search_entry_height: PREFERRED_ENTRY_HEIGHT,
                 search_entry_width: entry_width(1.),
+                search_entry_mid_y: ENTRY_CONTROL_MID_Y,
                 dash_preferred_height: crate::ui::dash::preferred_height(Size::from((
                     1920., 1080.,
                 ))),
-                thumbnails_preferred_height: 108.,
             },
-            1.,
             crate::ui::overview_layout::state::WINDOW_PICKER,
         );
         controls.into()

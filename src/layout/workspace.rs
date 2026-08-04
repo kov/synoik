@@ -2728,7 +2728,28 @@ pub(super) fn compute_working_area(output: &Output, options: &Options) -> Rectan
     area
 }
 
-fn compute_workspace_shadow_config(
+/// [`compute_workspace_shadow_config`] in the system accent color — the **active**
+/// workspace's shadow, in both overview rows.
+///
+/// **Divergence (approved 2026-07-29, extended to the picker row 2026-08-03).** gnome-shell
+/// marks the active workspace with a border ring on the thumbnail
+/// (`.workspace-thumbnail-indicator`); Gustavo asked for an accent glow instead. Identical
+/// geometry and alpha to the plain one — it is the *same* shadow, only colored. Turning it
+/// up as well read as too much.
+pub(super) fn accent_workspace_shadow_config(
+    config: niri_config::WorkspaceShadow,
+    view_size: Size<f64, Logical>,
+    [r, g, b]: [u8; 3],
+) -> niri_config::Shadow {
+    let mut config = compute_workspace_shadow_config(config, view_size);
+    // Colors are stored unpremultiplied, so the alpha carries over untouched.
+    config.color.r = f32::from(r) / 255.;
+    config.color.g = f32::from(g) / 255.;
+    config.color.b = f32::from(b) / 255.;
+    config
+}
+
+pub(super) fn compute_workspace_shadow_config(
     config: niri_config::WorkspaceShadow,
     view_size: Size<f64, Logical>,
 ) -> niri_config::Shadow {

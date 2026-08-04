@@ -17,8 +17,8 @@ use super::shadow::Shadow;
 use super::thumbnails::{self, Strip};
 use super::tile::Tile;
 use super::workspace::{
-    compute_working_area, OutputId, Workspace, WorkspaceAddWindowTarget, WorkspaceId,
-    WorkspaceRenderElement,
+    accent_workspace_shadow_config, compute_working_area, OutputId, Workspace,
+    WorkspaceAddWindowTarget, WorkspaceId, WorkspaceRenderElement,
 };
 use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options};
 use crate::animation::{Animation, Clock};
@@ -82,10 +82,6 @@ const REFERENCE_PREVIEW_H: f64 = 520.;
 /// …and never below this, so a corner stays a corner (the interactive-floor rule).
 const MIN_WORKSPACE_BACKGROUND_CORNER_RADIUS: f64 = 8.;
 
-/// The thumbnail height the strip's shadow constants were chosen at: the app-grid row's
-/// workspace on the 1920×1080 reference canvas with a 35px panel.
-const REFERENCE_THUMB_H: f64 = 157.;
-
 /// How far past its band a thumbnail's shadow is allowed to reach, so the active
 /// workspace's accent glow is not cut flat at the thumbnail's top and bottom edges.
 /// Comfortably more than the glow's own extent (softness + spread).
@@ -140,19 +136,15 @@ pub struct Monitor<W: LayoutElement> {
     insert_hint_element: InsertHintElement,
     /// Location to render the insert hint element.
     insert_hint_render_loc: Option<InsertHintRenderLoc>,
-    /// The drop shadow under a thumbnail on the overview strip — the app-grid row's
-    /// workspace shadow, at the thumbnail's size.
-    thumb_shadow: Shadow,
-    /// The system accent color, kept so the strip's shadows can be rebuilt whenever the
-    /// thumbnail size changes (their geometry is derived from it).
+    /// The system accent color, kept so [`Self::active_shadow`] can be rebuilt whenever it
+    /// or the view size changes.
     accent_color: [u8; 3],
-    /// The **active** thumbnail's shadow: the same shadow in the system accent color and
-    /// turned up, which is what marks the active workspace on the strip.
-    ///
-    /// **Divergence (approved 2026-07-29).** gnome-shell wraps it in a border ring
-    /// (`.workspace-thumbnail-indicator`); Gustavo asked for an accent glow instead, so the
-    /// strip reads exactly like the app-grid row it is modelled on plus one colored cue.
-    thumb_active_shadow: Shadow,
+    /// The **active** workspace's shadow: the workspace shadow every other workspace casts
+    /// (`Workspace::render_shadow`), in the system accent color. Monitor-owned rather than
+    /// per-workspace because only one workspace wears it at a time, and both rows — the
+    /// small row and the window picker — draw it from here, so the cue cannot differ
+    /// between them. See [`workspace::accent_workspace_shadow_config`].
+    active_shadow: Shadow,
     /// The strip's new-workspace drop placeholder pill (gnome-shell's
     /// `.placeholder`).
     thumb_placeholder: FocusRing,
@@ -512,10 +504,10 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint: None,
             insert_hint_element: InsertHintElement::new(options.layout.insert_hint),
             accent_color: crate::gnome::ACCENT_BLUE,
-            thumb_shadow: Shadow::new(thumbnail_shadow_config(None, REFERENCE_THUMB_H)),
-            thumb_active_shadow: Shadow::new(thumbnail_shadow_config(
-                Some(crate::gnome::ACCENT_BLUE),
-                REFERENCE_THUMB_H,
+            active_shadow: Shadow::new(accent_workspace_shadow_config(
+                options.overview.workspace_shadow,
+                view_size,
+                crate::gnome::ACCENT_BLUE,
             )),
             thumb_placeholder: FocusRing::new(thumbnail_placeholder_config()),
             thumb_drag: None,
@@ -1377,29 +1369,27 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn update_render_elements(&mut self, is_active: bool) {
+        // The active workspace's accent shadow, baked exactly as each workspace bakes its
+        // own (`Workspace::update_render_elements`) — same size, same radius — so the two
+        // are interchangeable and both rows can draw either through the same transform.
+        // Rebuilt every frame because the radius rides the overview's opening ramp and the
+        // accent color can change under us at any time.
+        self.active_shadow
+            .update_config(accent_workspace_shadow_config(
+                self.options.overview.workspace_shadow,
+                self.view_size,
+                self.accent_color,
+            ));
+        self.active_shadow.update_render_elements(
+            self.view_size,
+            true,
+            CornerRadius::from(self.workspace_background_radius() as f32),
+            self.scale.fractional_scale(),
+            1.,
+        );
+
         if let Some(strip) = self.thumbnail_strip() {
             let scale = self.scale.fractional_scale();
-            let radius = CornerRadius::from(self.thumbnail_corner_radius() as f32);
-
-            // Both shadows are baked at the *slot* size, once. `render_thumbnails` then puts
-            // each one through the very transform that draws the miniature it sits under, so
-            // it tracks that thumbnail's drawn size exactly instead of approximating it.
-            // Baking a second, pre-shrunk copy meant the shadow was a fixed 6% off its caster
-            // for the whole of a workspace switch and the whole of the overview's opening
-            // ramp, which is visible — worst right after a scale change, where the stale bake
-            // was a different size entirely and the glow visibly closed in on the thumbnail.
-            // Rebuilt from the current thumbnail height every frame: the shadow's geometry
-            // is derived from it (rule 2), so a scale change has to reach the config as well
-            // as the bake, and the accent color can change under us at any time.
-            let full = strip.thumbs[0].size;
-            self.thumb_shadow
-                .update_config(thumbnail_shadow_config(None, full.h));
-            self.thumb_active_shadow
-                .update_config(thumbnail_shadow_config(Some(self.accent_color), full.h));
-            self.thumb_shadow
-                .update_render_elements(full, true, radius, scale, 1.);
-            self.thumb_active_shadow
-                .update_render_elements(full, true, radius, scale, 1.);
 
             if let Some(rect) = strip.placeholder {
                 let view_rect = Rectangle::new(rect.loc.upscale(-1.), self.view_size);
@@ -1750,21 +1740,6 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
-    /// How far the workspace row is toward gnome-shell's [`FitMode::All`]: 0 is
-    /// fit-single, 1 fit-all, in between the blend.
-    ///
-    /// `WorkspacesView._getFitModeForState` (`workspacesView.js:268-279`) picks
-    /// SINGLE for `HIDDEN` and `WINDOW_PICKER` and ALL for `APP_GRID`, and
-    /// `ControlsManager._update` lerps between the two on the state progress
-    /// (`overviewControls.js:594-603`) — which for us is the show-apps fraction.
-    /// niri's vertical strip has no such mode and always stays fit-single.
-    fn fit_mode_fraction(&self) -> f64 {
-        if !self.workspaces_horizontal() {
-            return 0.;
-        }
-        self.fit_mode_fraction_raw()
-    }
-
     /// Where we sit on gnome-shell's state axis: 0 `HIDDEN`, 1 `WINDOW_PICKER`,
     /// 2 `APP_GRID` (`_stateAdjustment`, `overviewControls.js:278-308`).
     ///
@@ -1796,21 +1771,17 @@ impl<W: LayoutElement> Monitor<W> {
         (state > 0.).then_some(state)
     }
 
-    /// How far the overview is open, as the *zoom* blend wants it: the `HIDDEN` →
-    /// `WINDOW_PICKER` leg alone, saturating at 1 for the whole app-grid leg. That
-    /// saturation is what parks the workspace zoom at its fully-open value while
-    /// the row re-fits, so a close from the grid re-fits first and zooms after.
+    /// How far the overview is open, as the *zoom* blend wants it: the raw open
+    /// progress, overshoot included — the open is a spring, and clamping it here would
+    /// quietly flatten the bounce. [`Self::overview_state`] stays clamped instead: an
+    /// overshoot past 1 there would read as "starting to show the apps".
     ///
-    /// With no app grid in play this is the raw progress, overshoot included: the
-    /// open is a spring, and clamping it here would quietly flatten the bounce.
-    /// [`Self::overview_state`] must stay clamped instead — an overshoot past 1
-    /// there would read as "starting to show the apps".
+    /// This used to saturate at 1 across the whole app-grid leg, to park the zoom while
+    /// the picker row re-fitted into the app-grid box. The picker no longer makes that
+    /// trip (see [`Self::workspaces_strip_axis`]), so there is nothing to park for, and
+    /// the saturation only bought a dead zone at the top of a close from the grid.
     fn open_fraction(&self) -> f64 {
-        if self.app_grid_fraction() > 0. {
-            self.overview_state().min(1.)
-        } else {
-            self.overview_progress.as_ref().map_or(0., |p| p.value())
-        }
+        self.overview_progress.as_ref().map_or(0., |p| p.value())
     }
 
     /// Where the row currently sits on the workspace axis — gnome-shell's
@@ -1849,103 +1820,54 @@ impl<W: LayoutElement> Monitor<W> {
 
     /// Where workspace 0 starts on the strip axis, and how far apart consecutive
     /// workspaces sit — both relative to the centered slot
-    /// [`Self::workspaces_static_offset`] places, and both blended between
-    /// gnome-shell's fit-single and fit-all rows on [`Self::fit_mode_fraction`].
+    /// [`Self::workspaces_static_offset`] places.
     ///
-    /// `WorkspacesView.vfunc_allocate` (`workspacesView.js:330-388`) walks a
-    /// fit-single row and a fit-all row in lockstep — each advancing by its own
-    /// width plus its own spacing — and gives each workspace
-    /// `fitSingleBox.interpolate(fitAllBox, fitMode)`. For a uniform row that is
-    /// exactly a lerp of the origin and of the advance, which is what this returns.
+    /// This is gnome-shell's fit-single row (`_getFirstFitSingleWorkspaceBox`,
+    /// `workspacesView.js:171-204`): the whole row slides so the active workspace lands on
+    /// the centered slot.
     ///
-    /// The two rows differ in *where the row is anchored*. Fit-single slides the
-    /// whole row so the active workspace lands on the centered slot; fit-all lays
-    /// every workspace out inside the allocation and centers the run as a whole, so
-    /// which workspace is active no longer moves anything.
-    ///
-    /// **Each row is built at its own endpoint state's zoom, not at the current
-    /// one.** That is `_getInitialBoxes` (`workspacesView.js:281-324`): when a
-    /// transition's two ends disagree on the fit mode — window picker <-> app grid,
-    /// and a close *from* the grid — gnome-shell takes the workspaces box of the
-    /// initial state and of the final state and interpolates between those two
-    /// *frozen* rectangles, falling back to the live allocation only when both ends
-    /// share a fit mode (the plain overview open/close). Evaluating both ends at the
-    /// current, moving zoom instead makes each end of the lerp a function of the very
-    /// parameter driving the lerp, and the row's path bends: it used to overshoot
-    /// ~85px past its landing spot and come back. Here the picker end is the picker
-    /// box at the current *open* progress (so a close still unwinds it to the full
-    /// screen) and the grid end is the app-grid box; at `fit == 0` this reduces
-    /// exactly to the fit-single row at the current zoom.
+    /// **Divergence (approved 2026-08-03).** `WorkspacesView.vfunc_allocate`
+    /// (`workspacesView.js:330-388`) also walks a *fit-all* row and lerps the two on the
+    /// app-grid state, which is how gnome-shell's picker becomes its app-grid row. Ours
+    /// never makes that trip: the small row is drawn in both states by
+    /// [`Self::thumbnail_strip`], and the picker fades away over it instead. So the picker
+    /// is fit-single always, and the fit-all row lives with the row that actually uses it
+    /// ([`thumbnails::strip_geometry`]).
     fn workspaces_strip_axis(&self, zoom: f64) -> (f64, f64) {
         let render_idx = self.workspace_render_idx();
 
-        // niri's vertical strip has no fit-all mode at all.
         if !self.workspaces_horizontal() {
             let extent = self.workspace_extent_with_gap(zoom);
             return (-render_idx * extent, extent);
         }
 
         let view_w = self.view_size.w;
-        // Both rows are expressed against the slot the drawn (blended) size is
-        // centered on, so the lerp between them is a lerp of like for like.
+        // Expressed against the slot the drawn size is centered on.
         let slot = (view_w - self.workspace_size(zoom).w) / 2.;
-
-        let single_row = |zoom: f64| {
-            fit_single_row(
-                view_w,
-                self.workspace_size(zoom).w,
-                self.workspace_gap(zoom, FitMode::Single),
-                render_idx,
-            )
-        };
-
-        let fit = self.fit_mode_fraction();
-        if fit <= 0. {
-            // Both ends of this leg are fit-single, so there is nothing to freeze:
-            // the row is laid out in the live allocation, which is the fallback
-            // `_getInitialBoxes` takes when the fit modes agree.
-            let (x_single, extent_single) = single_row(zoom);
-            return (x_single - slot, extent_single);
-        }
-
-        let (x_single, extent_single) =
-            single_row(self.zoom_for_state(overview_layout::state::WINDOW_PICKER));
-
-        let zoom_all = self.zoom_for_state(overview_layout::state::APP_GRID);
-        let ws_w_all = self.workspace_size(zoom_all).w;
-        let (x_all, extent_all) = fit_all_row(
+        let (x, extent) = fit_single_row(
             view_w,
-            ws_w_all,
-            self.workspace_gap(zoom_all, FitMode::All),
-            self.workspaces.len() as f64,
+            self.workspace_size(zoom).w,
+            self.workspace_gap(zoom, FitMode::Single),
             render_idx,
         );
-
-        let lerp = |a: f64, b: f64| a + (b - a) * fit;
-        (
-            lerp(x_single, x_all) - slot,
-            lerp(extent_single, extent_all),
-        )
+        (x - slot, extent)
     }
 
     /// The allocated box of every piece of overview chrome on this monitor
     /// (gnome-shell's `ControlsManagerLayout`). One place decides where the
-    /// search entry, thumbnails, dash and window picker go; everything else
+    /// search entry, workspace row, dash and window picker go; everything else
     /// consumes these boxes.
     pub fn controls_layout(&self) -> ControlsLayout {
         // WINDOW_PICKER (1) → APP_GRID (2) as the show-apps leg eases in. Below
         // the picker the chrome keeps its picker layout and the *zoom* blends it
         // toward the desktop, which is how gnome-shell's HIDDEN box relates to the
         // WINDOW_PICKER one (`overviewControls.js:207-216`).
-        self.controls_layout_at(
-            overview_layout::state::WINDOW_PICKER + self.fit_mode_fraction_raw(),
-        )
+        self.controls_layout_at(overview_layout::state::WINDOW_PICKER + self.app_grid_leg())
     }
 
-    /// [`Self::fit_mode_fraction`] without the vertical-strip special case: how far
-    /// along the `WINDOW_PICKER` → `APP_GRID` leg we are, which is what the *chrome*
-    /// follows in either windowing mode.
-    fn fit_mode_fraction_raw(&self) -> f64 {
+    /// How far along the `WINDOW_PICKER` → `APP_GRID` leg we are, which is what the
+    /// *chrome* follows in either windowing mode. Only the app-grid box moves on it now.
+    fn app_grid_leg(&self) -> f64 {
         (self.overview_state() - overview_layout::state::WINDOW_PICKER).clamp(0., 1.)
     }
 
@@ -1961,40 +1883,11 @@ impl<W: LayoutElement> Monitor<W> {
             overview_layout::Measured {
                 search_entry_height: crate::ui::overview_search::PREFERRED_ENTRY_HEIGHT,
                 search_entry_width: entry_w,
+                search_entry_mid_y: crate::ui::overview_search::ENTRY_CONTROL_MID_Y,
                 dash_preferred_height: crate::ui::dash::preferred_height(self.view_size),
-                thumbnails_preferred_height: self.thumbnail_height(),
             },
-            self.thumbnails_expand_fraction(),
             state,
         )
-    }
-
-    /// The workspace zoom one state on that axis implies, *fully open*: the box
-    /// that state allocates, fitted by height, with no blend toward the desktop.
-    ///
-    /// This is `getWorkspacesBoxForState` (`overviewControls.js:256-258`), which
-    /// reads a per-state cache — a rectangle that does not move while a transition
-    /// runs. Only the two ends of the `WINDOW_PICKER` → `APP_GRID` leg are ever
-    /// asked for, and that whole leg sits at [`Self::open_fraction`] 1, so leaving
-    /// the open blend out is not an approximation: it is the same number.
-    fn zoom_for_state(&self, state: f64) -> f64 {
-        if self.options.layout.windowing_mode != WindowingMode::Floating {
-            return self.overview_zoom();
-        }
-        self.controls_layout_at(state).workspaces.size.h / self.view_size.h
-    }
-
-    /// `ThumbnailsBox.expandFraction` — always fully expanded.
-    ///
-    /// **Divergence (approved 2026-08-03).** gnome-shell hides the strip below
-    /// `NUM_WORKSPACES_THRESHOLD + 1` workspaces (`workspaceThumbnail.js:697-706`) and eases
-    /// this fraction when the count crosses it. We always show it, so there is nothing to
-    /// ease: the strip is the desktop switcher, and one that appears and disappears under
-    /// you is not one you can aim at. See `docs/fork/dynamic-workspaces-divergence.md`.
-    /// The band allocator keeps its `expand_fraction` parameter — it is the ported
-    /// `ControlsManagerLayout` signature — and we hand it the constant.
-    fn thumbnails_expand_fraction(&self) -> f64 {
-        1.
     }
 
     /// Retires the show-apps and close-slide eases when they land.
@@ -2142,31 +2035,16 @@ impl<W: LayoutElement> Monitor<W> {
         (progress > 0.).then_some(progress)
     }
 
-    /// Whether the overview shows the workspace thumbnails strip: GNOME's
-    /// dynamic workspaces show it only once a second desktop is populated
-    /// (more workspaces than the threshold, counting the trailing empty).
-    pub fn thumbnails_visible(&self) -> bool {
-        self.expose_progress().is_some() && self.thumbnails_expand_fraction() > 0.
-    }
-
-    /// The corner the strip's thumbnails are rounded to, in *drawn* pixels: the same curve
-    /// as the picker's workspace background, evaluated at the thumbnail's own height, so
-    /// the strip and the app-grid row round alike.
+    /// Whether the overview draws the small workspace row.
     ///
-    /// One accessor because the wallpaper, the shadow and the clip all need it and must
-    /// agree — the same reason [`Self::workspace_background_radius`] is one.
-    fn thumbnail_corner_radius(&self) -> f64 {
-        (WORKSPACE_BACKGROUND_CORNER_RADIUS * self.thumbnail_height() / REFERENCE_PREVIEW_H).clamp(
-            MIN_WORKSPACE_BACKGROUND_CORNER_RADIUS,
-            WORKSPACE_BACKGROUND_CORNER_RADIUS,
-        )
-    }
-
-    /// How tall one thumbnail is: the app-grid row's workspace height, so the strip is
-    /// that row's twin rather than a scale of its own (divergence, approved 2026-07-29 —
-    /// see [`overview_layout::small_workspace_height`]).
-    fn thumbnail_height(&self) -> f64 {
-        overview_layout::small_workspace_height(self.view_size, self.working_area.loc.y)
+    /// **Divergence (approved 2026-08-03).** gnome-shell hides its strip below
+    /// `NUM_WORKSPACES_THRESHOLD + 1` workspaces (`workspaceThumbnail.js:697-706`) and
+    /// eases an `expandFraction` when the count crosses it. We always show it, whatever the
+    /// count and in both overview states: the row is the desktop switcher, and one that
+    /// appears and disappears under you is not one you can aim at. See
+    /// `docs/fork/dynamic-workspaces-divergence.md`.
+    pub fn thumbnails_visible(&self) -> bool {
+        self.expose_progress().is_some()
     }
 
     /// The thumbnails strip, laid out in the band [`Self::controls_layout`]
@@ -2194,15 +2072,12 @@ impl<W: LayoutElement> Monitor<W> {
                 InsertWorkspace::Existing(_) => None,
             }
         });
+        let band = self.controls_layout().workspace_row;
+        let zoom = band.size.h / self.view_size.h;
+        let thumb_w = (self.view_size.w * zoom).round();
+        let gap = self.workspace_gap(zoom, FitMode::All);
         let lay = |n: usize, focus: f64| {
-            thumbnails::strip_geometry(
-                self.view_size,
-                self.controls_layout().thumbnails,
-                self.thumbnail_height(),
-                n,
-                placeholder,
-                focus,
-            )
+            thumbnails::strip_geometry(self.view_size, band, thumb_w, gap, n, placeholder, focus)
         };
         let strip = lay(self.workspaces.len(), self.workspace_render_idx());
         Some(self.apply_close_slide(strip, &lay))
@@ -2325,7 +2200,6 @@ impl<W: LayoutElement> Monitor<W> {
     /// height when the strip appears mid-overview; we fold the expand into the
     /// same slide, so the strip slides down as the picker makes room for it.
     fn thumbnail_slide_offset(&self, strip: &Strip, progress: f64) -> f64 {
-        let progress = progress * self.thumbnails_expand_fraction();
         let bounds = strip.bounds();
         let extent = bounds.loc.y + bounds.size.h + thumbnails::INDICATOR_WIDTH;
         -extent * (1. - progress)
@@ -2881,21 +2755,22 @@ impl<W: LayoutElement> Monitor<W> {
                 }};
             }
 
-            // Same layer order as the workspace itself.
-            if ws.scrolling_renders_on_top() {
-                ws.render_scrolling(ctx.r(), xray_pos, false, push_thumb!());
-                ws.render_floating(ctx.r(), xray_pos, false, push_thumb!());
-            } else {
-                ws.render_floating(ctx.r(), xray_pos, false, push_thumb!());
-                ws.render_scrolling(ctx.r(), xray_pos, false, push_thumb!());
-            }
+            // The **picker's** layout, not the workspace's own: the row shows the same
+            // spread previews the window picker does, at the row's scale, so the two read
+            // as one thing at two sizes (and so the show-apps transition, which fades the
+            // picker away over this row, has nothing to reconcile).
+            ws.render_expose(ctx.r(), xray_pos, progress, thumb_scale, push_thumb!());
 
             // The wallpaper behind, rounded exactly as the shadow under it is — the
             // drawn radius expressed in workspace coordinates, since this is applied
             // before the rescale. The solid color backs workspaces without one.
             let mut wallpapered = false;
             if let Some(wallpaper) = wallpaper {
-                let radius = self.thumbnail_corner_radius() / thumb_scale;
+                // The picker's own background radius, in workspace coordinates — this
+                // miniature is the picker scaled, corners included, and the shadow under
+                // it is baked on the very same radius (a square-cornered shadow around a
+                // rounded background shows through each corner as a pointy tab).
+                let radius = self.workspace_background_radius();
                 if let Some(elem) = wallpaper.render(
                     ctx.renderer,
                     Default::default(),
@@ -2936,32 +2811,29 @@ impl<W: LayoutElement> Monitor<W> {
                 }
             }
 
-            // Last pushed = bottommost: the shadow under everything the thumbnail draws.
-            // The active workspace gets the accent one — the strip's replacement for
-            // gnome-shell's indicator ring.
-            let shadow = if idx == self.active_workspace_idx {
-                &self.thumb_active_shadow
-            } else {
-                &self.thumb_shadow
-            };
-            // Drawn through the miniature's own transform — baked at the slot size, scaled
-            // by this thumbnail's shrink and relocated onto it — so the shadow cannot drift
-            // from its caster mid-animation. The crop therefore has to be expressed in the
-            // same pre-transform space, like the contents' one above.
+            // Last pushed = bottommost: the shadow under everything the thumbnail draws —
+            // the very shadow the workspace casts in the window picker, drawn through this
+            // miniature's own transform, so the two rows are shadowed alike and the shadow
+            // cannot drift from its caster mid-animation. The active workspace gets the
+            // accent one, our replacement for gnome-shell's indicator ring.
+            //
+            // The crop is expressed in the same pre-transform (workspace) space as the
+            // contents' one above, widened by the glow's reach so the accent halo is not
+            // sliced flat along the band's top and bottom edges.
             let glow_crop = Rectangle::new(
                 Point::from((
-                    (glow_bounds_logical.loc.x - thumb.loc.x) / shrink,
-                    (glow_bounds_logical.loc.y - thumb.loc.y) / shrink,
+                    (glow_bounds_logical.loc.x - thumb.loc.x) / thumb_scale,
+                    (glow_bounds_logical.loc.y - thumb.loc.y) / thumb_scale,
                 )),
-                glow_bounds_logical.size.downscale(shrink),
+                glow_bounds_logical.size.downscale(thumb_scale),
             )
             .to_physical_precise_round(scale);
-            shadow.render(Point::default(), &mut |elem| {
+            let push_shadow = &mut |elem: ShadowRenderElement| {
                 let elem = elem.with_alpha(progress.clamp(0., 1.) as f32);
                 if let Some(elem) = CropRenderElement::from_element(elem, scale, glow_crop) {
                     let elem = MonitorInnerRenderElement::CroppedShadow(elem);
                     let elem =
-                        RescaleRenderElement::from_element(elem, Point::from((0, 0)), shrink);
+                        RescaleRenderElement::from_element(elem, Point::from((0, 0)), thumb_scale);
                     let elem = RelocateRenderElement::from_element(
                         elem,
                         thumb_loc_physical,
@@ -2969,7 +2841,12 @@ impl<W: LayoutElement> Monitor<W> {
                     );
                     push(elem);
                 }
-            });
+            };
+            if idx == self.active_workspace_idx {
+                self.active_shadow.render(Point::default(), push_shadow);
+            } else {
+                ws.render_shadow(push_shadow);
+            }
         }
     }
 
@@ -3113,7 +2990,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         for ((idx, ws), geo) in self.workspaces_with_render_geo_idx() {
             let ws_zoom = zoom * self.workspace_render_scale(idx);
-            ws.render_shadow(&mut |elem| {
+            let push_shadow: &mut dyn FnMut(ShadowRenderElement) = &mut |elem| {
                 let elem = elem.with_alpha(alpha);
                 let elem = MonitorInnerRenderElement::Shadow(elem);
                 let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), ws_zoom);
@@ -3123,7 +3000,12 @@ impl<W: LayoutElement> Monitor<W> {
                     Relocate::Relative,
                 );
                 push(elem);
-            });
+            };
+            // Deliberately *not* the accent shadow the small row puts under its active
+            // workspace: the row is a switcher, where "this is the one you are on" is
+            // worth a cue, while the picker only ever shows one workspace whole and
+            // centered. A halo there is decoration on something already unambiguous.
+            ws.render_shadow(push_shadow);
         }
     }
 
@@ -3619,28 +3501,6 @@ pub(super) fn center_on_focus(span: f64, focus: f64) -> f64 {
     span / 2. - focus
 }
 
-/// The fit-all row: every workspace laid out inside the allocation with the run
-/// centered (`_getFirstFitAllWorkspaceBox`, `workspacesView.js:127-169`). The gap
-/// is also the space before the first and after the last workspace, so the row
-/// never touches the edges (`:135-137`).
-///
-/// **Divergence (approved 2026-07-29).** When the row is wide enough that the *width*
-/// binds rather than the height (roughly seven or more workspaces at 16:9), gnome-shell
-/// narrows every box to `availableWidth / n` so the whole row always fits. We keep one
-/// zoom per monitor, so ours stay aspect-locked and the run overflows instead — and it
-/// then **scrolls to follow the active workspace**, which is what makes a workspace past
-/// the edge reachable at all. Pinning the overflowing run at the left gap (what this did
-/// before) left the tail permanently off-screen.
-///
-/// Up to that count nothing moves: [`scroll_to_follow`] centers a run that fits, which is
-/// gnome-shell's `Math.max((availableWidth - workspaceWidth * n) / 2, 0)` exactly.
-fn fit_all_row(view_w: f64, ws_w: f64, gap: f64, n: f64, render_idx: f64) -> (f64, f64) {
-    let span = view_w - gap * 2.;
-    let run = ws_w * n + gap * (n - 1.);
-    let focus = render_idx * (ws_w + gap) + ws_w / 2.;
-    (gap + scroll_to_follow(span, run, focus), ws_w + gap)
-}
-
 /// The strip's drop placeholder: a translucent pill marking where the new
 /// workspace goes (gnome-shell's workspace-placeholder asset).
 fn thumbnail_placeholder_config() -> niri_config::FocusRing {
@@ -3657,41 +3517,6 @@ fn thumbnail_placeholder_config() -> niri_config::FocusRing {
     }
 }
 
-/// The drop shadow under a thumbnail on the strip, and — given the system accent color —
-/// the stronger colored one that marks the **active** workspace.
-///
-/// The plain one is the app-grid row's workspace shadow (`_window-picker.scss:56-60`)
-/// scaled down to a thumbnail: same shape, proportionally smaller, since a 40px blur under
-/// a 157px miniature would be a smudge. The active one is the same geometry spread wider
-/// and at full alpha in the accent color, so the cue is a glow around the workspace rather
-/// than gnome-shell's border ring.
-fn thumbnail_shadow_config(accent: Option<[u8; 3]>, thumb_h: f64) -> niri_config::Shadow {
-    // **Adaptive chrome, rule 2 — derived from the widget's own box.** The workspace shadow
-    // normalizes to the view height for the same reason (`compute_workspace_shadow_config`).
-    // Left as a fixed logical constant it was a 14px blur under a 157px thumbnail at scale 1
-    // and the same 14px under a 95px one at scale 2 — a halo half again as deep for its
-    // caster, which is most of why the glow read as sitting too far out on a scaled canvas.
-    let norm = thumb_h / REFERENCE_THUMB_H;
-    // Identical geometry and alpha either way: the accent one is the *same* shadow, only
-    // colored. Turning it up as well read as too much.
-    let color = match accent {
-        Some([r, g, b]) => niri_config::Color::from_rgba8_unpremul(r, g, b, 0x50),
-        None => niri_config::Color::from_rgba8_unpremul(0, 0, 0, 0x50),
-    };
-    niri_config::Shadow {
-        on: true,
-        offset: niri_config::ShadowOffset {
-            x: niri_config::FloatOrInt(0.),
-            y: niri_config::FloatOrInt(3. * norm),
-        },
-        softness: 14. * norm,
-        spread: 3. * norm,
-        draw_behind_window: false,
-        color,
-        inactive_color: None,
-    }
-}
-
 /// Clock-free sweeps over the two row layouts. The animated geometry that lerps
 /// between them is pinned separately, by sampling the real transition
 /// (`overview_grid_transition_moves_the_row_monotonically` in the conformance
@@ -3699,7 +3524,7 @@ fn thumbnail_shadow_config(accent: Option<[u8; 3]>, thumb_h: f64) -> niri_config
 /// regression in either row is attributable without an animation in the picture.
 #[cfg(test)]
 mod row_tests {
-    use super::{fit_all_row, fit_single_row};
+    use super::fit_single_row;
 
     /// The view, a 16:9 workspace zoomed to fit, and a gap — one plausible set of
     /// inputs to sweep the interesting parameters around.
@@ -3707,15 +3532,6 @@ mod row_tests {
 
     fn single_positions(ws_w: f64, gap: f64, render_idx: f64, n: usize) -> Vec<f64> {
         let (x1, pitch) = fit_single_row(VIEW, ws_w, gap, render_idx);
-        (0..n).map(|i| x1 + i as f64 * pitch).collect()
-    }
-
-    fn all_positions(ws_w: f64, gap: f64, n: usize) -> Vec<f64> {
-        all_positions_at(ws_w, gap, n, 0.)
-    }
-
-    fn all_positions_at(ws_w: f64, gap: f64, n: usize, render_idx: f64) -> Vec<f64> {
-        let (x1, pitch) = fit_all_row(VIEW, ws_w, gap, n as f64, render_idx);
         (0..n).map(|i| x1 + i as f64 * pitch).collect()
     }
 
@@ -3757,108 +3573,6 @@ mod row_tests {
                 (x1 - (base - idx * pitch)).abs() < 1e-9,
                 "row not rigid at render_idx={idx}"
             );
-        }
-    }
-
-    /// Fit-all is what the app grid shows: the run of workspaces centered in the
-    /// view as a whole, independent of which one is active.
-    #[test]
-    fn fit_all_centers_the_run() {
-        for gap in [0., 32., 100.] {
-            for n in 1..7usize {
-                // A zoom small enough that n workspaces fit — the height-binds
-                // case, which is the one the app grid is in for realistic counts.
-                let ws_w = (VIEW - gap * (n as f64 + 1.)) / n as f64 * 0.8;
-                let xs = all_positions(ws_w, gap, n);
-                let first = xs[0];
-                let last = xs[n - 1] + ws_w;
-                assert!(
-                    ((first + last) / 2. - VIEW / 2.).abs() < 1e-9,
-                    "run of {n} not centered (gap={gap})"
-                );
-                assert!(first >= gap - 1e-9, "run of {n} touches the left edge");
-                assert!(
-                    last <= VIEW - gap + 1e-9,
-                    "run of {n} touches the right edge"
-                );
-            }
-        }
-    }
-
-    /// The gap is also the margin before the first and after the last workspace
-    /// (`workspacesView.js:135-137`), so a row that exactly fills the allocation
-    /// still leaves one gap on each side.
-    #[test]
-    fn fit_all_keeps_a_gap_at_both_ends() {
-        let (gap, n) = (32., 4usize);
-        let ws_w = (VIEW - gap * (n as f64 + 1.)) / n as f64;
-        let xs = all_positions(ws_w, gap, n);
-        assert!((xs[0] - gap).abs() < 1e-9);
-        assert!((xs[n - 1] + ws_w - (VIEW - gap)).abs() < 1e-9);
-    }
-
-    /// When the width binds instead of the height (many workspaces), we keep the
-    /// aspect-locked width and let the row overflow rather than squashing the boxes
-    /// — the recorded divergence. The overflowing row then scrolls to follow the
-    /// active workspace, or the tail would be unreachable.
-    #[test]
-    fn fit_all_scrolls_an_overflowing_run_to_the_active_workspace() {
-        let (ws_w, gap, n) = (1400., 32., 8usize);
-        let run = ws_w * n as f64 + gap * (n - 1) as f64;
-        assert!(run > VIEW, "this case must actually overflow");
-
-        // Every workspace, selected in turn, is fully on screen.
-        for active in 0..n {
-            let xs = all_positions_at(ws_w, gap, n, active as f64);
-            assert!(
-                xs[active] >= -1e-9 && xs[active] + ws_w <= VIEW + 1e-9,
-                "workspace {active} is off screen at x={}",
-                xs[active]
-            );
-        }
-
-        // The ends stay flush: at the extremes the row has scrolled as far as it
-        // can and no further, so no gap opens past the first or last workspace.
-        let first = all_positions_at(ws_w, gap, n, 0.);
-        assert!((first[0] - gap).abs() < 1e-9);
-        let last = all_positions_at(ws_w, gap, n, (n - 1) as f64);
-        assert!((last[n - 1] + ws_w - (VIEW - gap)).abs() < 1e-9);
-
-        // And the row stays rigid — scrolling moves the whole run, never the pitch.
-        for active in 0..n {
-            let xs = all_positions_at(ws_w, gap, n, active as f64);
-            for w in xs.windows(2) {
-                assert!((w[1] - w[0] - (ws_w + gap)).abs() < 1e-9);
-            }
-        }
-    }
-
-    /// A run that *fits* ignores which workspace is active, exactly as gnome-shell's
-    /// centering does — the scroll only engages on overflow.
-    #[test]
-    fn fit_all_ignores_the_selection_while_the_run_fits() {
-        let (gap, n) = (32., 5usize);
-        let ws_w = (VIEW - gap * (n as f64 + 1.)) / n as f64 * 0.8;
-        let base = all_positions_at(ws_w, gap, n, 0.);
-        for active in 1..n {
-            assert_eq!(base, all_positions_at(ws_w, gap, n, active as f64));
-        }
-    }
-
-    /// Both rows advance by width + gap, so a lerp between them is a lerp of two
-    /// uniform rows — the property `workspaces_strip_axis` relies on to blend a
-    /// whole row with two scalars.
-    #[test]
-    fn both_rows_are_uniform() {
-        let (ws_w, gap) = (1400., 32.);
-        for (x1, pitch) in [
-            fit_single_row(VIEW, ws_w, gap, 2.),
-            fit_all_row(VIEW, ws_w, gap, 4., 1.),
-        ] {
-            let xs: Vec<f64> = (0..4).map(|i| x1 + f64::from(i) * pitch).collect();
-            for w in xs.windows(2) {
-                assert!((w[1] - w[0] - pitch).abs() < 1e-9);
-            }
         }
     }
 }
