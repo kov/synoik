@@ -1,6 +1,7 @@
 # StatusNotifierItem / AppIndicator support
 
-**Status: S1 landed (`efcf7245`), nothing drawn yet.** The rest of this document is the plan.
+**Status: S1 (`efcf7245`) and S2 (`56f6d138`) landed — indicators register and draw.** The
+rest of this document is the plan.
 
 ## Why this one has no GNOME reference
 
@@ -93,17 +94,28 @@ seam** — the corpus drives the model with the messages the bus layer would hav
 (`src/tests/server.rs`, the gdm/accounts pattern). Do the same: the wire code stays thin enough to
 eyeball, the registry/model logic gets the tests, and the bus itself is proved in S7.
 
-### S2 — The item model and one panel icon
+### S2 — The item model and one panel icon ✅ (`56f6d138`)
 Proxy `org.kde.StatusNotifierItem`, resolve `IconName` through our existing icon lookup, place
 it in the panel's right box left of the status cluster, honour `Status` (`Passive` hides —
 `indicatorStatusIcon.js:321`). Themed icons only.
 
-Two things that are part of *this* slice and are easy to defer by accident: **readiness gating**
+Two things that were part of *this* slice and are easy to defer by accident: **readiness gating**
 (see the trap below — an item is not showable the moment it registers) and **capability
 introspection**. The extension calls `org.freedesktop.DBus.Introspectable.Introspect` on the item
 once at setup and records whether `Activate` and `XAyatanaSecondaryActivate` exist
 (`appIndicator.js:446-457`); S6's click ladder is built on that answer, so the probe belongs here
 with the rest of the item model.
+
+Landed with two extra divergences worth naming. **We do not require a menu to show an item** — the
+extension's `isReady` is `hasNameOwner && id && menuPath` (`appIndicator.js:476-486`) and
+`menuPath` is null for `/NO_DBUSMENU`, so an activate-only item never appears in it at all; we gate
+on `Id` alone. And the **liveness probe landed here rather than later**: a property read answering
+one of the six fatal errors retires the item, which is what catches the Electron case below.
+
+The cluster is **one panel role** (`ROLE_APP_INDICATORS`) with per-item hit boxes inside it, the
+shape `quickSettings` already uses for its icons — the panel addresses roles by `&'static str`, and
+indicators are dynamic in count. It leads the right box, so a session that accumulates a dozen
+grows leftward and never displaces the clock or the status cluster.
 
 ### S3 — Pixmap and out-of-theme icons
 `IconPixmap` is `a(iiay)`: ARGB32, **network byte order**, one entry per size. Pick the smallest
