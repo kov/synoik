@@ -94,6 +94,11 @@ Which also means the head start is not the safety margin it looks like. 341 ms o
 that finishes inside it; anything slower is relying on the compositor's own unwind being slower
 still, and ours is fast.
 
+> **That 341 ms is a single sample, and it is an outlier — see §8.3.** Across ten instrumented
+> logouts the gap between the app's SIGTERM and the compositor's is **14–43 ms**. The head start is
+> roughly a tenth of what this trace suggested, which leaves the compositor's own unwind as very
+> nearly the whole of an app's budget.
+
 ---
 
 ## 2. What we do
@@ -203,8 +208,14 @@ without that guard the arm would have passed by testing nothing.
 
 **Measured on the seat afterwards**, the same OBS that had been SIGKILLed three logouts running
 reacted to the teardown's SIGTERM in 0.96 ms, against GNOME's 0.8 ms, and reported no unclean
-shutdown on the next start. That number is the one that matters now: with no drain, an app's whole
-budget is its own scope's `TimeoutStopSec`, and being able to hear the signal is all we can give it.
+shutdown on the next start. That number is the one that matters now: with no drain, being able to
+hear the signal is all we can give it.
+
+> **"An app's whole budget is its own scope's `TimeoutStopSec`" was here, and it is wrong — see
+> §8.** Five seconds is only the deadline for SIGKILL. The deadline that decides whether the app
+> shuts down *cleanly* is when its Wayland socket closes, which is our exit: **48 ms** at HEAD
+> against mutter's 108–128 ms. An app slower than that loses the socket mid-shutdown and dies
+> where it stands, four and a half seconds before its scope's timeout is anywhere near.
 
 ### 2.3 No `xdg_toplevel.close` sweep
 
@@ -423,7 +434,11 @@ shell's, not by the compositor waiting on the side.
 
 ---
 
-## 7. Open: is GNOME actually losing this race?
+## 7. Was GNOME actually losing this race?
+
+> **Answered 2026-08-04 — no, it is not, and §8 is the measurement.** mutter came out clean in 4/4
+> instrumented logouts. What follows is the reasoning that got there; read §7.3's closing
+> speculation as superseded.
 
 Raised 2026-08-03, immediately after §6 landed. **Still open**, but no longer speculative: the two
 leading candidates have now been measured, one is dead and one turned out to be a deficit of ours.
@@ -555,3 +570,157 @@ signal" directly, instead of inferring either from journal timing.
 is 6 ms because we do almost nothing, and to decide deliberately what should happen between the
 signal and the socket closing — which is a design question about our own shutdown, not about waiting
 for clients.
+
+> **The 68 ms does matter, and that last paragraph is the standing recommendation — see §8.6.**
+
+---
+
+## 8. The A/B, run properly: mutter and us in the same GNOME session
+
+Run 2026-08-04, from scratch, disregarding the conclusions above until each was re-derived. The
+question was Gustavo's: *apps like OBS quit gracefully under mutter and not under ours — what
+happens, exactly, between the menu item and the session being gone?*
+
+**The rig.** A real `gnome-session --session=gnome` for the `gsrs` user, started inside a
+`machinectl shell` logind session (mutter needs one; `loginctl enable-linger` alone gives a
+`class=manager` session that `meta_launcher_new` rejects with *"Failed to find any matching
+session"*). Both compositors run `--headless`, so the only difference between arms is one line:
+
+```
+# /home/gsrs/.config/systemd/user/org.gnome.Shell@user.service.d/override.conf
+ExecStart=/usr/bin/gnome-shell --headless --virtual-monitor 1920x1080 --mode=user   # mutter arm
+ExecStart=…/target/debug/niri --session --headless                                   # our arm
+```
+
+Same gnome-session, same unit graph, same systemd transaction, same OBS flatpak, same machine. That
+is what makes the numbers below comparable; nothing else here is.
+
+> `gnome-shell` in 50.3 has **no nested backend** — `meta_context_main_create_backend` offers only
+> headless and native. `--nested` is not a flag (that was mutter's own binary), and setting
+> `WAYLAND_DISPLAY` does not select anything: without `--headless` it takes the native path and
+> demands a logind session.
+
+### 8.1 The oracle: `.sentinel`, not the log tail
+
+OBS creates `config/obs-studio/.sentinel/run_<uuid>` at startup and removes it on a clean exit. A
+leftover file *is* the "Crash or unclean shutdown detected" prompt on the next start — it is the
+user-visible symptom, not a proxy for it. **An empty `.sentinel/` is the pass condition.** The log
+tail corroborates: a clean run reaches `Freeing OBS context data`, a lost one stops mid-stream or at
+`The Wayland connection broke.`
+
+Two traps cost time here:
+
+- **`kill -0 <pid>` across users fails with `EPERM`, not `ESRCH`.** Every "the process is gone" wait
+  loop written as `until ! kill -0 $pid` returned instantly and produced fabricated timings. Poll
+  with `pgrep -u <user>` or read the journal instead.
+- **Globbing another user's home expands to nothing.** `sudo rm -f /home/gsrs/…/.sentinel/run_*` is
+  expanded by the *calling* shell, which cannot read `drwx------ gsrs`, so `rm` gets the literal
+  pattern, `-f` swallows it, and the command reports success having deleted nothing. Files then
+  appear to *survive* deletion. Let root do the globbing: `sudo bash -c 'rm -f …/run_*'`.
+
+### 8.2 Three mechanisms ruled out before the timing mattered
+
+- **The late `SIGSEGV` is OBS's own, and it is not the bug.** OBS segfaults immediately after
+  `Freeing OBS context data` on *every* SIGTERM shutdown — reproduced identically under mutter. It
+  lands after the config is written and the sentinel removed, so the run still counts as clean. Any
+  investigation that starts from the core dump is starting one step past the interesting part.
+- **Not the cgroup-wide SIGTERM, and not bwrap.** `systemctl --user stop app-flatpak-….scope` with
+  the compositor left running is clean every time: full shutdown log, sentinel removed, ~120 ms.
+  Killing the sandbox's PID 1 is not what ends OBS.
+- **The signal mask (§2.2) holds on the real path.** OBS launched the way a user launches it —
+  overlay key, type "OBS", Return, driven over `niri msg input` — came up with
+  `SigBlk: 0000000000001000` (SIGPIPE only; SIGTERM is bit 15) in
+  `app-gnome-com.obsproject.Studio.desktop-*.scope`, `PartOf=graphical-session.target`,
+  `TimeoutStopUSec=5s` read off the live unit. That fix is good on the launch path that matters.
+
+### 8.3 What actually decides it: the socket outliving the signal
+
+Bisected directly, by stopping OBS's scope and killing the compositor a fixed delay `D` afterwards:
+
+| `D` | outcome |
+|---|---|
+| 0 ms | **unclean** — reaches "All scene data cleared", then `The Wayland connection broke.`, `_exit(1)` |
+| 10 ms | **unclean**, same place |
+| 20 ms | **unclean**, same place |
+| 25 ms | **clean** — full shutdown, sentinel removed |
+| 30 ms | clean |
+| ∞ | clean |
+
+**OBS needs 20–25 ms of live Wayland socket after its SIGTERM** — idle, headless, shm-only, trivial
+scene. Below that it dies *part-way through its own shutdown*, which is why the failure leaves a
+half-written log rather than none at all.
+
+Against that, the budget each compositor actually hands an app, from the journal of ten logouts
+(`app scope → stop-sigterm` to the compositor's `Main process exited`):
+
+| | app→compositor SIGTERM | compositor unwind | **budget** |
+|---|---|---|---|
+| mutter (n=5) | 14–20 ms | **88–110 ms** | **108–128 ms** |
+| ours, HEAD (no drain) | 43 ms | **5.2 ms** | **48 ms** |
+| ours, pre-`6cef03fa` (drain) | 15–16 ms | 620–642 ms | 635–658 ms |
+
+**This is the whole finding.** §7.2's shim measured 68 ms vs 5.6 ms and called it 12x; a real logout
+in a real session says 88–110 ms vs 5.2 ms, so ~15–20x, and confirms the shim was reading the right
+quantity. mutter's ~100 ms is not generosity — it is gjs teardown, `PREPARE_SHUTDOWN` and
+`service_channel` — but it is four to five times OBS's requirement, where ours is barely two.
+
+### 8.4 The reproduction failed, and that is part of the result
+
+**In this rig both compositors pass.** mutter 4/4 clean, ours 5/5 clean — across both binaries
+(with and without the drain), both launch paths (shell and overview search), idle and under 20-way
+CPU load. The single unclean full logout in the entire session was a **mutter** one.
+
+Load does not flip it, and the reason is worth recording: load stretches the systemd transaction
+too, so the compositor's SIGTERM slid from +43 ms to +733 ms and the app's budget *grew*. Slowing
+the machine slows the deadline as much as the app.
+
+So the asymmetry Gustavo reports was not reproduced here, and the honest reading is that the rig is
+missing whatever produces it. Two candidates it structurally cannot model:
+
+- **No dmabuf.** Headless is shm-only, so OBS never runs its EGL/dmabuf teardown against the
+  compositor. On the seat that teardown is real work on a socket that may already be gone.
+- **An idle OBS with an empty scene**, where SIGTERM-to-first-log is ~11 ms. A session with sources,
+  preview and capture running has no reason to be that quick.
+
+Either would raise OBS's 20–25 ms requirement. It has to clear 48 ms to break under us and 120 ms to
+break under mutter — which is exactly the shape of "fails on ours, fine on mutter" without either
+number being surprising.
+
+**Settling it needs the real seat**, which needs a human at the GDM greeter: `gsrs` is not autologin
+and `org.gnome.Shell@user.service` is `RefuseManualStart`. The rig is cheap to rebuild; §8's
+`override.conf` swap is the whole of it.
+
+### 8.5 Chain of custody, for the next person
+
+Verified in source *and* observed live, so it can be quoted without re-deriving:
+
+1. `systemActions.activateLogout()` — `Main.overview.hide()`, then `SessionManager.Logout(0)`
+   (`js/misc/systemActions.js:483-489`).
+2. `gsm_manager_logout` sets `logout_type` and calls `end_phase`: `RUNNING` → `QUERY_END_SESSION`
+   (`gsm-manager.c:1655-1712`). `do_phase_query_end_session` sends `QueryEndSession` to registered
+   clients with a 1 s timeout — **an empty set**, per §1.
+3. `query_end_session_complete` → `end_session_or_show_shell_dialog` → `EndSessionDialog.Open` on us.
+   Confirmed by the user or by the 60 s countdown → `ConfirmedLogout`.
+4. `END_SESSION` (`sd_notify STOPPING=1`, `SessionOver` emitted) → `EXIT` → `gsm_client_stop` →
+   `gsm_manager_quit` → `gsm_quit`, which is a bare `g_main_loop_quit` (`service-main.c:41-44`).
+   `gnome-session-service` exits 0.
+5. **The hop that is easy to miss:** `gnome-session-manager@.service` carries
+   `ExecStopPost=-/usr/libexec/gnome-session-ctl --shutdown`, which is what starts
+   `gnome-session-shutdown.target` with `replace-irreversibly`. Nothing else triggers the teardown.
+6. That target `Conflicts=` `graphical-session.target` *and* `gnome-session-initialized.target`, so
+   one stop transaction holds the app scopes (`PartOf=graphical-session.target`, from
+   `/usr/lib/systemd/user/app-{gnome,flatpak}-.scope.d/override.conf`) and the compositor
+   (`PartOf=gnome-session-initialized.target`). **Nothing orders those two against each other** —
+   §6.1's correction stands, and §8.3's 14–43 ms is what it is worth in practice.
+7. Compositor exits → `Display` drops → `wl_display_destroy_clients` → sockets closed (§7.2).
+8. The leader watches `graphical-session-pre.target` go inactive and quits; GDM cleans up
+   (`leader-systemd.c:246-276`).
+
+### 8.6 What to do about it
+
+Nothing yet, deliberately — this is parked pending the seat reproduction in §8.4. When it comes
+back, the recommendation is the one §7.3 already reached and §8.3 now has the numbers for: **our
+5 ms is the lever, and it is ours alone.** Not a drain — §6 settled that, and none of this reopens
+it — but a decision about what belongs between our SIGTERM and the socket closing. mutter spends
+~100 ms there by accident; we spend 5 ms by omission; the app-visible contract is identical either
+way, and only one of the two clears a real client's requirement with room to spare.
