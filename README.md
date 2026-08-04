@@ -4,10 +4,21 @@
 ## About
 
 synoik is a Wayland compositor and shell that reimplements GNOME's behavior in Rust,
-on an owned Vulkan render stack. It is a **hard fork** of
-[niri](https://github.com/niri-wm/niri): niri supplied the compositor foundations, and
-everything above them is being rewritten to behave like gnome-shell rather than like a
-scrollable tiler.
+on an owned Vulkan render stack.
+
+### Built on niri
+
+synoik is a **hard fork** of [niri](https://github.com/niri-wm/niri) by Ivan Molodetskikh
+and the niri contributors, and would not exist without it. niri supplied the foundations —
+the Smithay-based compositor core, the Wayland protocol implementations, the window
+management and animation machinery — and years of work on making all of it correct. Every
+release synoik makes stands on that.
+
+Everything above those foundations is being rewritten to behave like gnome-shell rather
+than like a scrollable tiler. The fork is hard by choice: there is no upstreaming
+obligation in either direction, and no rebasing onto niri. That is a divergence in goals,
+not a judgement about niri, which remains an excellent compositor and is what you want if
+scrollable tiling is what you want.
 
 The endgame is a modern base free of GObject, Cogl, Clutter and GJS. The working rule is
 that GNOME's way replaces niri's: where niri merely did the same thing differently — its
