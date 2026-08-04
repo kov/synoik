@@ -216,6 +216,45 @@ Keep JXL decode on the CPU; make it decode *less*.
 
 ---
 
+## 10. Implicit-modifier KMS — supported, at the cost of client direct scanout
+
+Upstream virtio-gpu sets `mode_config.fb_modifiers_not_supported` (`virtgpu_display.c`), which means
+three things at once: `DRM_CAP_ADDFB2_MODIFIERS` reads 0, no plane carries an `IN_FORMATS` blob, and
+`drmModeAddFB2` rejects `DRM_MODE_FB_MODIFIERS`. Smithay then synthesizes `Modifier::Invalid` for
+every plane format, so nothing explicit is left for `DrmCompositor` to agree on. This VM ran a
+patched kernel that advertised LINEAR purely to keep us working; that patch is no longer needed.
+
+`DRM_FORMAT_MOD_INVALID` is not a layout — it means the two sides agree out of band — and
+`VK_EXT_image_drm_format_modifier` has no encoding for it, so an implicit buffer cannot simply be
+handed to the importer. The split is mutter's (`meta-drm-buffer.c`, `import_scanout_gbm_bo`): the
+buffer stays INVALID for KMS, which is what makes smithay emit a modifier-less `AddFB2`, while the
+renderer imports it under the layout gbm actually chose.
+
+- `backend/scanout_allocator.rs` wraps `GbmAllocator`. When a buffer comes back INVALID it reads the
+  real modifier off the underlying `gbm::BufferObject` (`GbmBuffer` masks it, but keeps it reachable)
+  and **refuses anything but LINEAR**. A tiled implicit buffer imported as linear would scan out as
+  garbage; failing at allocation is the honest end of that.
+- `owned_vulkan_scanout_formats()` adds the INVALID entries to what `DrmCompositor` negotiates with.
+  Client feedback keeps only the explicit set — a client's INVALID buffer has no allocation-time
+  proof behind it, and `import_dmabuf_as_texture` still rejects it.
+- `import_dmabuf_target` substitutes LINEAR for INVALID, backed by the check above.
+
+**What is lost.** Direct scanout of *client* buffers is impossible on such a driver: smithay refuses
+to hand KMS an INVALID buffer (weston's reasoning — an unknown layout can display garbage), and an
+explicit-modifier `AddFB2` is rejected by the driver. The Vulkan path already passes
+`allow_primary = false` (§9), so nothing regresses today; it does mean §9 cannot be finished on an
+unpatched virtio-gpu. Cursor-plane scanout survives via smithay's legacy `AddFB` fallback (one
+"using legacy fbadd" warning per session). The compositor's own scanout buffers are unaffected —
+implicit allocation gives the driver's best layout, which here is the same LINEAR we asked for
+before.
+
+**Testing it without a kernel rebuild:** `NIRI_KMS_IMPLICIT_MODIFIERS=1` drops the explicit entries
+from the scanout set, so negotiation lands on INVALID even on a driver that does name modifiers. The
+whole path — implicit allocation, the layout check, modifier-less `AddFB2`, the renderer's
+substitution — then runs on hardware that still has the explicit path to fall back to.
+
+---
+
 ## Roadmap order (recommended)
 
 1. **Multi-planar / non-LINEAR import** (§1) — affects every machine, including the VM.

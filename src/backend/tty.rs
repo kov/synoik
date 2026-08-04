@@ -6,7 +6,7 @@ use std::num::NonZeroU64;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::{io, mem};
 
@@ -20,7 +20,7 @@ use niri_ipc::{HSyncPolarity, VSyncPolarity};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::{Format, Fourcc};
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{
@@ -61,6 +61,7 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
 use super::{IpcOutputMap, RenderResult};
 use crate::backend::backlight::{BacklightMonitor, Backlights};
+use crate::backend::scanout_allocator::ScanoutAllocator;
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::frame_log::Phase;
@@ -114,7 +115,7 @@ pub struct Tty {
 }
 
 type GbmDrmCompositor = DrmCompositor<
-    GbmAllocator<DrmDeviceFd>,
+    ScanoutAllocator,
     GbmFramebufferExporter<DrmDeviceFd>,
     (OutputPresentationFeedback, Duration),
     DrmDeviceFd,
@@ -132,7 +133,7 @@ pub struct OutputDevice {
     drm: DrmDevice,
     gbm: GbmDevice<DrmDeviceFd>,
     // For display-only devices this will be the allocator from the primary device.
-    allocator: GbmAllocator<DrmDeviceFd>,
+    allocator: ScanoutAllocator,
 
     pub drm_lease_state: Option<DrmLeaseState>,
     non_desktop_connectors: HashSet<(connector::Handle, crtc::Handle)>,
@@ -918,7 +919,7 @@ impl Tty {
             bail!("no allocator available for device");
         };
         let gbm_flags = GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT;
-        let allocator = GbmAllocator::new(allocator_gbm, gbm_flags);
+        let allocator = ScanoutAllocator::new(GbmAllocator::new(allocator_gbm, gbm_flags));
 
         let token = niri
             .event_loop
@@ -1428,16 +1429,21 @@ impl Tty {
         }
 
         // The owned Vulkan renderer's importable/scanout formats (LINEAR 8888): Venus GBM
-        // allocates LINEAR buffers and Vulkan dmabuf import needs an explicit modifier (not
-        // INVALID). The renderer renders RGBA-order buffers (Abgr/Xbgr) directly and BGRA-order
-        // ones (Argb/Xrgb — the usual KMS primary-plane byte order) via a present-blit.
-        // DrmCompositor intersects these with the plane's formats and `SUPPORTED_COLOR_FORMATS` to
-        // pick the buffer format, then allocates via `device.allocator` and imports each into the
-        // renderer via `Bind`. Same set advertised to clients (single source of truth).
+        // allocates LINEAR buffers and Vulkan dmabuf import needs an explicit modifier. The
+        // renderer renders RGBA-order buffers (Abgr/Xbgr) directly and BGRA-order ones (Argb/Xrgb
+        // — the usual KMS primary-plane byte order) via a present-blit. DrmCompositor intersects
+        // these with the plane's formats and `SUPPORTED_COLOR_FORMATS` to pick the buffer format,
+        // then allocates via `device.allocator` and imports each into the renderer via `Bind`.
+        //
+        // The scanout set additionally carries the INVALID entries, because a driver with
+        // `fb_modifiers_not_supported` (upstream virtio-gpu) advertises no modifiers at all and
+        // smithay synthesizes INVALID for every plane format — without them the intersection is
+        // empty and the compositor cannot be created. INVALID never reaches clients: they are
+        // advertised `owned_vulkan_dmabuf_formats()`, which we can import as given.
         //
         // The GLES path used to filter CCS modifiers out of the EGL set here for bandwidth
         // reasons; LINEAR-only sidesteps that entirely.
-        let render_formats = owned_vulkan_dmabuf_formats();
+        let render_formats = owned_vulkan_scanout_formats();
 
         // Create the compositor.
         let res = DrmCompositor::new(
@@ -1454,9 +1460,9 @@ impl Tty {
             Some(device.gbm.clone()),
         );
 
-        // The owned Vulkan renderer cannot import an INVALID-modifier buffer, so the GLES path's
-        // retry-with-invalid-modifier fallback does not apply — surface the error instead (e.g.
-        // KMS rejecting LINEAR scanout).
+        // The GLES path's retry-with-invalid-modifier fallback does not apply: INVALID is already
+        // in the scanout set above, and an implicit allocation that comes back non-linear is
+        // rejected by `ScanoutAllocator` rather than papered over. Surface the error instead.
         let mut compositor =
             res.context("error creating DRM compositor for the Vulkan renderer")?;
 
@@ -2789,6 +2795,52 @@ fn owned_vulkan_dmabuf_formats() -> FormatSet {
     crate::render_helpers::vulkan::dmabuf_formats()
 }
 
+/// The formats the renderer can bind as a **scanout target**, for `DrmCompositor`'s negotiation
+/// with the plane. This is [`owned_vulkan_dmabuf_formats`] plus an INVALID entry per fourcc.
+///
+/// INVALID belongs here and nowhere else. A KMS driver that supports no modifiers offers plane
+/// formats only as INVALID, so without these entries the intersection with the renderer's formats
+/// is empty and there is no pipeline at all. What comes back from such an allocation is a buffer
+/// gbm laid out implicitly, which [`ScanoutAllocator`] proves is linear before we import it.
+///
+/// Clients keep getting [`owned_vulkan_dmabuf_formats`]: a client's INVALID buffer has no such
+/// proof behind it, so `import_dmabuf_as_texture` still refuses it.
+fn owned_vulkan_scanout_formats() -> FormatSet {
+    scanout_formats(force_implicit_modifiers())
+}
+
+/// `NIRI_KMS_IMPLICIT_MODIFIERS=1` drops the explicit entries from the scanout set, so the
+/// compositor negotiates INVALID with the plane even on a driver that does name modifiers.
+///
+/// That is the whole implicit path — implicit gbm allocation, its layout check, a modifier-less
+/// `AddFB2`, the renderer's substitution — exercised on hardware that still has the explicit one
+/// to fall back to. Without it the only way to test the implicit path is to boot a kernel that
+/// cannot do anything else.
+fn force_implicit_modifiers() -> bool {
+    static FORCE: OnceLock<bool> = OnceLock::new();
+    *FORCE.get_or_init(|| {
+        let force = std::env::var_os("NIRI_KMS_IMPLICIT_MODIFIERS").is_some_and(|x| x == "1");
+        if force {
+            warn!("NIRI_KMS_IMPLICIT_MODIFIERS=1: negotiating scanout without explicit modifiers");
+        }
+        force
+    })
+}
+
+fn scanout_formats(force_implicit: bool) -> FormatSet {
+    let explicit = owned_vulkan_dmabuf_formats();
+    let implicit = explicit.iter().map(|f| Format {
+        code: f.code,
+        modifier: Modifier::Invalid,
+    });
+
+    if force_implicit {
+        implicit.collect()
+    } else {
+        explicit.iter().copied().chain(implicit).collect()
+    }
+}
+
 fn surface_dmabuf_feedback(
     compositor: &GbmDrmCompositor,
     primary_formats: FormatSet,
@@ -3832,7 +3884,60 @@ mod tests {
     use niri_config::output::Modeline;
     use niri_ipc::{HSyncPolarity, VSyncPolarity};
 
-    use crate::backend::tty::{calculate_drm_mode_from_modeline, calculate_mode_cvt};
+    use crate::backend::tty::{
+        calculate_drm_mode_from_modeline, calculate_mode_cvt, owned_vulkan_dmabuf_formats,
+        scanout_formats, Format, Modifier,
+    };
+
+    /// A KMS driver that names no modifiers (upstream virtio-gpu) offers its plane formats only as
+    /// INVALID, and `DrmCompositor` intersects those with what we pass it. Drop the INVALID
+    /// entries and that intersection is empty on such a driver — no scanout pipeline at all — so
+    /// this pins them in place.
+    #[test]
+    fn scanout_formats_cover_implicit_planes() {
+        let scanout = scanout_formats(false);
+
+        for explicit in owned_vulkan_dmabuf_formats() {
+            assert!(
+                scanout.contains(&explicit),
+                "scanout formats must keep the explicit {explicit:?}"
+            );
+            let implicit = Format {
+                code: explicit.code,
+                modifier: Modifier::Invalid,
+            };
+            assert!(
+                scanout.contains(&implicit),
+                "scanout formats must offer {:?} implicitly too",
+                explicit.code
+            );
+        }
+    }
+
+    /// The INVALID entries are for plane negotiation only. Advertising them to clients would
+    /// invite buffers whose layout nothing has verified, and `import_dmabuf_as_texture` rejects
+    /// those — so the client-facing set stays explicit.
+    /// `NIRI_KMS_IMPLICIT_MODIFIERS=1` has to leave the plane nothing explicit to agree on, or the
+    /// negotiation keeps picking LINEAR and the switch tests nothing.
+    #[test]
+    fn forced_implicit_scanout_formats_are_invalid_only() {
+        let forced = scanout_formats(true);
+
+        assert_eq!(
+            forced.iter().count(),
+            owned_vulkan_dmabuf_formats().iter().count()
+        );
+        for format in forced.iter() {
+            assert_eq!(format.modifier, Modifier::Invalid, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn client_formats_stay_explicit() {
+        for format in owned_vulkan_dmabuf_formats() {
+            assert_ne!(format.modifier, Modifier::Invalid, "{format:?}");
+        }
+    }
 
     #[test]
     fn test_calculate_drmmode_from_modeline() {

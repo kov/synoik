@@ -11,6 +11,8 @@ use crate::utils::id::IdCounter;
 
 pub mod backlight;
 
+pub mod scanout_allocator;
+
 pub mod tty;
 pub use tty::Tty;
 
