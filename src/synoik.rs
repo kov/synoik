@@ -694,6 +694,13 @@ pub struct Synoik {
     /// it — a replaced OSD would keep the *old* timer and, once that fired,
     /// re-arm nothing and hang on screen until unrelated damage.
     pub osd_timer_at: Option<Duration>,
+    /// Wake-up for the dock's auto-hide, and the deadline it is armed for. Same shape as the
+    /// OSD's above, and needed for the same reason twice over: a *shown* dock reports no ongoing
+    /// animation, so nothing asks for frames, so the grace period after the pointer leaves never
+    /// elapses and the dock sits on screen forever. Its deadline is also set between frames (by
+    /// the pointer leaving), so a before/after-`advance_animations` diff would never re-arm.
+    pub dock_timer: Option<RegistrationToken>,
+    pub dock_timer_at: Option<Duration>,
     pub switcher_timer: Option<RegistrationToken>,
     pub switcher_timer_at: Option<Duration>,
     /// An outcome produced by a timer firing inside `advance_animations`, which is `Synoik`-level
@@ -873,6 +880,8 @@ pub struct Synoik {
     pub flashspot: crate::ui::flashspot::FlashSpot,
     /// The hot corner's ripple.
     pub ripples: crate::ui::ripples::Ripples,
+    /// The dash as a bottom-edge dock (a divergence — see [`crate::ui::dock`]).
+    pub dock: crate::ui::dock::Dock,
     pub polkit_dialog: crate::polkit_dialog::PolkitDialog,
     #[cfg(feature = "dbus")]
     pub polkit_ui: crate::ui::polkit_dialog::PolkitDialogUi,
@@ -6849,6 +6858,8 @@ impl Synoik {
             osd,
             osd_timer: None,
             osd_timer_at: None,
+            dock_timer: None,
+            dock_timer_at: None,
             switcher_timer: None,
             switcher_timer_at: None,
             pending_switcher_outcome: None,
@@ -6959,6 +6970,7 @@ impl Synoik {
             interactive_screenshot_reply: None,
             flashspot: crate::ui::flashspot::FlashSpot::new(),
             ripples: crate::ui::ripples::Ripples::new(),
+            dock: crate::ui::dock::Dock::new(animation_clock.clone()),
             polkit_dialog: crate::polkit_dialog::PolkitDialog::new(),
             #[cfg(feature = "dbus")]
             polkit_ui,
@@ -7640,6 +7652,58 @@ impl Synoik {
         self.hot_corner_barrier
             .shove(self.clock.now_unadjusted())
             .then(|| self.corner_of(&output))
+    }
+
+    /// Feed one motion to the dock's bottom-edge barrier, sliding it out if it trips.
+    ///
+    /// Same pressure as the hot corner's — the motion the output clamp discarded. The dock
+    /// belongs to the output the pointer is on, so pushing the bottom edge of one monitor never
+    /// opens it on another.
+    pub fn push_dock(
+        &mut self,
+        pos: Point<f64, Logical>,
+        unclamped: Point<f64, Logical>,
+        delta: Point<f64, Logical>,
+        time: Duration,
+    ) {
+        // Locked or behind the screenshot UI, the dash is not on screen and must not be
+        // summonable — `dash_area` refuses to place it, so a dock shown here would be an
+        // invisible click-eater.
+        if self.is_locked() || self.screenshot_ui.is_open() {
+            return;
+        }
+
+        let output = self
+            .output_under(pos)
+            .map(|(output, p)| (output.clone(), p));
+        let Some((output, pos_within_output)) = output else {
+            return;
+        };
+
+        let discarded = unclamped - pos;
+        if self
+            .dock
+            .push(&output, pos_within_output, discarded, delta, time)
+        {
+            self.dock.show(&output);
+            self.queue_redraw_all();
+        }
+    }
+
+    /// Track the pointer for the dock's auto-hide.
+    pub fn dock_pointer_motion(&mut self, pos: Point<f64, Logical>) {
+        if !self.dock.is_visible() {
+            return;
+        }
+        match self
+            .output_under(pos)
+            .map(|(output, p)| (output.clone(), p))
+        {
+            Some((output, pos_within_output)) => {
+                self.dock.pointer_motion(&output, pos_within_output);
+            }
+            None => self.dock.pointer_left(),
+        }
     }
 
     /// The global position of an output's hot corner.
@@ -8931,6 +8995,14 @@ impl Synoik {
         self.polkit_ui.advance_animations();
         self.flashspot.advance(self.clock.now_unadjusted());
         self.ripples.advance(self.clock.now_unadjusted());
+        // A drag out of the dock holds it open until the drop, wherever the pointer goes.
+        // Derived from the drag itself rather than hooked into each of the five paths that end
+        // one, none of which could then forget.
+        self.dock.set_dragging(self.app_drag.is_some());
+        self.dock.advance_animations();
+        if self.dock.next_wakeup() != self.dock_timer_at {
+            self.reschedule_dock_timer();
+        }
         self.screenshot_ui.advance_animations();
         self.panel_popover.advance_animations();
         self.panel.advance_animations();
@@ -9646,6 +9718,25 @@ impl Synoik {
             ) {
                 push(element.into());
             }
+            // The dock: the same dash, drawn at the bottom edge with the overview shut. Pushed
+            // here — after the panel, before the overview block — so it sits under the panel and
+            // its popovers like the overview's dash does, and over the windows it overlays.
+            if let Some(area) = self
+                .dash_area(output)
+                .filter(|_| self.dock_owns_dash(output))
+            {
+                for element in self.dash.render(
+                    ctx.renderer,
+                    &self.app_icon_cache,
+                    &self.icon_cache,
+                    output,
+                    area,
+                    1.,
+                ) {
+                    push(element.into());
+                }
+            }
+
             // The overview dash (favorites) fades in with the overview — above the
             // zoomed workspaces (pushed later, below), below the panel/popover/banner.
             if let Some((progress, controls)) = self
@@ -10288,6 +10379,7 @@ impl Synoik {
             // before the last wave has finished expanding.
             state.unfinished_animations_remain |=
                 self.ripples.is_animating(self.clock.now_unadjusted());
+            state.unfinished_animations_remain |= self.dock.are_animations_ongoing();
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.panel_popover.are_animations_ongoing();
             state.unfinished_animations_remain |= self.notification_banner.are_animations_ongoing();
@@ -13161,6 +13253,36 @@ impl Synoik {
             && !self.screenshot_ui.is_open()
     }
 
+    /// Where the dash is on `output` right now, in that output's logical coordinates.
+    ///
+    /// One dash, two homes: the overview's slot while the overview is up, otherwise the dock's
+    /// (see [`crate::ui::dock`]) while it is out. Every dash hit-test, hover and drop-target
+    /// asks this rather than reaching for the overview layout, which is what lets the dock reuse
+    /// the dash's interaction wholesale. `None` when the dash is not on screen at all.
+    pub fn dash_area(&self, output: &Output) -> Option<Rectangle<f64, Logical>> {
+        if self.overview_ui_visible() {
+            return self
+                .layout
+                .controls_layout_for_output(output)
+                .map(|c| c.dash);
+        }
+        // Locked or behind the screenshot UI the dash is not on screen, and a dock summoned
+        // there would be an invisible click-eater in front of the shield — the same trap the
+        // overview's own click intercept documents. The render path asks *this* function rather
+        // than the dock directly, so the gate cannot come apart between what is drawn and what
+        // is clickable. (No test: `LockState` carries a `SessionLocker` a fixture can't build,
+        // so the guarantee is structural instead — one gate, both callers.)
+        if self.is_locked() || self.screenshot_ui.is_open() {
+            return None;
+        }
+        self.dock.area(output)
+    }
+
+    /// Whether the dock — not the overview — currently owns the dash on `output`.
+    pub fn dock_owns_dash(&self, output: &Output) -> bool {
+        !self.overview_ui_visible() && self.dash_area(output).is_some()
+    }
+
     /// Reset the overview search on a fresh overview *enter* (GNOME resets search on
     /// overview enter/unmap). Keyed on the rising edge of "the GNOME overview is open"
     /// — deliberately NOT on [`overview_ui_visible`](Self::overview_ui_visible), which
@@ -13781,6 +13903,31 @@ impl Synoik {
             })
             .unwrap();
         self.osd_timer = Some(token);
+    }
+
+    /// Wake the loop at the dock's auto-hide deadline: a dock resting on screen produces no
+    /// frames of its own for the grace period to expire on.
+    pub fn reschedule_dock_timer(&mut self) {
+        if let Some(token) = self.dock_timer.take() {
+            self.event_loop.remove(token);
+        }
+        self.dock_timer_at = self.dock.next_wakeup();
+        let Some(deadline) = self.dock_timer_at else {
+            return;
+        };
+        let now = self.clock.now_unadjusted();
+        let timer = Timer::from_duration(deadline.saturating_sub(now));
+        let token = self
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.synoik.dock_timer = None;
+                state.synoik.dock_timer_at = None;
+                // The frame's advance_animations re-checks the deadline.
+                state.synoik.queue_redraw_all();
+                TimeoutAction::Drop
+            })
+            .unwrap();
+        self.dock_timer = Some(token);
     }
 
     /// Wake the loop at the switcher's next deadline — the open delay, the no-modifier commit,

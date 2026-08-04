@@ -754,6 +754,37 @@ pub fn cause_panic() {
     let _ = a - b;
 }
 
+/// A bare `Output` of the given logical size, for unit tests that need somewhere to put
+/// geometry but no compositor around it. Not on the global space and not in any layout — for
+/// anything that has to be laid out or rendered, use `Fixture`.
+#[cfg(test)]
+pub fn test_output(w: i32, h: i32) -> Output {
+    let output = Output::new(
+        "test".to_owned(),
+        output::PhysicalProperties {
+            size: Size::from((w, h)),
+            subpixel: output::Subpixel::Unknown,
+            make: String::new(),
+            model: String::new(),
+            serial_number: String::new(),
+        },
+    );
+    output.change_current_state(
+        Some(output::Mode {
+            size: Size::from((w, h)),
+            refresh: 60_000,
+        }),
+        None,
+        None,
+        None,
+    );
+    output.set_preferred(output::Mode {
+        size: Size::from((w, h)),
+        refresh: 60_000,
+    });
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use insta::assert_snapshot;

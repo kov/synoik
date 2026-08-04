@@ -310,6 +310,84 @@ fn hot_corner_honors_enable_hot_corners() {
     );
 }
 
+/// The dock — **our divergence**, not GNOME (`docs/fork/dock-divergence.md`). Pushing into the
+/// bottom edge slides the dash out; touching the edge does not.
+#[test]
+fn the_dock_needs_pressure_on_the_bottom_edge() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+
+    // Arrive at the bottom edge without pushing into it.
+    pointer_motion_to(&mut f, 960., 1079.);
+    f.synoik_complete_animations();
+    assert!(
+        f.synoik().dock.area(&output).is_none(),
+        "touching the bottom edge must not summon the dock"
+    );
+
+    // Travelling *along* it doesn't either, however far.
+    for _ in 0..40 {
+        f.pointer_motion(-20., 4.);
+    }
+    f.synoik_complete_animations();
+    assert!(
+        f.synoik().dock.area(&output).is_none(),
+        "sliding along the bottom edge must not summon the dock"
+    );
+
+    // Pushing does.
+    for _ in 0..10 {
+        f.pointer_motion(0., 20.);
+    }
+    assert!(
+        f.synoik().dock.area(&output).is_some(),
+        "pushing into the bottom edge must slide the dock out"
+    );
+}
+
+/// The dock is the same dash the overview draws: it hit-tests, hovers and activates through the
+/// very same paths, just at a different place on screen.
+#[test]
+fn the_dock_hit_tests_the_same_dash_as_the_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+    seed_favorites(&mut f, &["a.desktop", "b.desktop"]);
+
+    pointer_motion_to(&mut f, 960., 1079.);
+    for _ in 0..10 {
+        f.pointer_motion(0., 20.);
+    }
+    f.synoik_complete_animations();
+
+    let area = f.synoik().dock.area(&output).expect("the dock is out");
+    assert!(
+        f.synoik().dock_owns_dash(&output),
+        "with the overview shut, the dock owns the dash"
+    );
+
+    // The first favorite's tile, asked of the dash rather than guessed at.
+    let center = f
+        .synoik()
+        .dash
+        .tile_center(0, area)
+        .expect("a favorite to aim at");
+    pointer_motion_to(&mut f, center.x, center.y);
+    assert!(
+        f.synoik().dash.hovered_for_test().is_some(),
+        "a pointer over a dock icon must light it up, as in the overview"
+    );
+
+    // And leaving the dock's area hides it again, after the grace period.
+    pointer_motion_to(&mut f, 960., 300.);
+    f.synoik_complete_animations();
+    assert!(
+        f.synoik().dash.hovered_for_test().is_none(),
+        "leaving drops the hover"
+    );
+}
+
 /// GNOME's "overlay key": tapping Super on its own — pressed and released with
 /// nothing in between — toggles the Activities overview. This is the first
 /// genuinely GNOME-distinct behavior (niri has no overlay key), and it pins
@@ -8638,10 +8716,21 @@ fn app_system_is_disconnected_and_injectable_headless() {
 /// click launched. This is the injection idiom of `app_system_is_disconnected_…`
 /// wired through to the dash (`sync_dash_favorites`).
 fn dash_fixture(favorites: &[&str]) -> (Fixture, crate::app_system::RecordingLauncher) {
-    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
-
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
+    let recorder = seed_favorites(&mut f, favorites);
+
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    assert!(f.synoik().layout.is_overview_open(), "overview must open");
+
+    (f, recorder)
+}
+
+/// Give a fixture's dash some favorites to draw, and a launcher that records what they do.
+/// The half of [`dash_fixture`] that doesn't assume the overview — the dock shows the same
+/// dash with the overview shut.
+fn seed_favorites(f: &mut Fixture, favorites: &[&str]) -> crate::app_system::RecordingLauncher {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
 
     let recorder = RecordingLauncher::default();
     let apps = favorites
@@ -8655,10 +8744,7 @@ fn dash_fixture(favorites: &[&str]) -> (Fixture, crate::app_system::RecordingLau
         .set_favorites(favorites.iter().map(|s| s.to_string()).collect());
     f.synoik().sync_dash_favorites();
 
-    f.synoik_state().do_action(Action::OpenOverview, false);
-    assert!(f.synoik().layout.is_overview_open(), "overview must open");
-
-    (f, recorder)
+    recorder
 }
 
 /// The overview chrome's allocated boxes on output 1 — the same

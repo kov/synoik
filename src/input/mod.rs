@@ -4182,7 +4182,9 @@ impl State {
             match self.synoik.output_under(pos) {
                 Some((output, p)) => match self.synoik.layout.controls_layout_for_output(output) {
                     Some(controls) => (
-                        self.synoik.dash.hit_test(p, controls.dash),
+                        self.synoik
+                            .dash_area(output)
+                            .and_then(|area| self.synoik.dash.hit_test(p, area)),
                         self.synoik.overview_search.hit_test(p, controls.into()),
                         grid_reactive
                             .then(|| self.synoik.app_grid.hit_test(p, controls.app_display))
@@ -4196,7 +4198,19 @@ impl State {
                 None => (None, None, None, None),
             }
         } else {
-            (None, None, None, None)
+            // The overview is shut, but the dock may still have the dash on screen — and it is
+            // the same dash, tracking hover the same way. Nothing else of the overview is up.
+            match self.synoik.output_under(pos) {
+                Some((output, p)) => (
+                    self.synoik
+                        .dash_area(output)
+                        .and_then(|area| self.synoik.dash.hit_test(p, area)),
+                    None,
+                    None,
+                    None,
+                ),
+                None => (None, None, None, None),
+            }
         };
         if self.synoik.dash.set_hovered(dash_hit) {
             self.synoik.queue_redraw_all();
@@ -4476,6 +4490,17 @@ impl State {
             )
         };
 
+        // The bottom edge feeds the dock's own barrier off the same discarded motion.
+        if !warped {
+            self.synoik.push_dock(
+                new_pos,
+                unclamped_pos,
+                event.delta(),
+                Duration::from_micros(event.time()),
+            );
+        }
+        self.synoik.dock_pointer_motion(new_pos);
+
         if let Some(output) = self.synoik.screenshot_ui.selection_output() {
             let geom = self.synoik.global_space.output_geometry(output).unwrap();
             let point = (new_pos - geom.loc.to_f64())
@@ -4644,6 +4669,7 @@ impl State {
         let pointer = self.synoik.seat.get_pointer().unwrap();
 
         let hot_corner_triggered = self.synoik.touch_hot_corner(pos);
+        self.synoik.dock_pointer_motion(pos);
 
         if let Some(output) = self.synoik.screenshot_ui.selection_output() {
             let geom = self.synoik.global_space.output_geometry(output).unwrap();
@@ -5599,12 +5625,7 @@ impl State {
             return;
         };
         let (id, output, pos) = (drag.id.clone(), drag.output.clone(), drag.pos);
-        let Some(dash_area) = self
-            .synoik
-            .layout
-            .controls_layout_for_output(&output)
-            .map(|c| c.dash)
-        else {
+        let Some(dash_area) = self.synoik.dash_area(&output) else {
             self.synoik.dash.set_drop_slot(None);
             return;
         };
@@ -6047,6 +6068,17 @@ impl State {
     /// dash, then the search card, then the app grid (reactive only while open and
     /// not covered by a search — the same gate the hover tracking uses).
     fn overview_hit(&self, output: &Output, pos: Point<f64, Logical>) -> Option<OverviewHit> {
+        // The dock puts the dash on screen with the overview shut, and it is the *same* dash —
+        // so it produces the same hit and rides the same activation path. Nothing else of the
+        // overview is up, so nothing else can be hit.
+        if self.synoik.dock_owns_dash(output) {
+            return self
+                .synoik
+                .dash_area(output)
+                .and_then(|area| self.synoik.dash.hit_test(pos, area))
+                .map(OverviewHit::Dash);
+        }
+
         if !self.synoik.overview_ui_visible() {
             return None;
         }
@@ -6069,7 +6101,11 @@ impl State {
 
         let controls = self.synoik.layout.controls_layout_for_output(output)?;
 
-        if let Some(hit) = self.synoik.dash.hit_test(pos, controls.dash) {
+        if let Some(hit) = self
+            .synoik
+            .dash_area(output)
+            .and_then(|area| self.synoik.dash.hit_test(pos, area))
+        {
             return Some(OverviewHit::Dash(hit));
         }
         if let Some(hit) = self.synoik.overview_search.hit_test(pos, controls.into()) {
@@ -6250,6 +6286,13 @@ impl State {
         // `appDisplay.js:1854`); middle is "open a new window", which for a stopped
         // app is the same launch.
         let launches = matches!(button, Some(MouseButton::Left | MouseButton::Middle));
+
+        // Acting on a dock icon dismisses the dock: you asked for a window, and the dock
+        // sitting over it waiting for the pointer to leave would be in the way. A right-click
+        // does not — that opens the app's menu, which belongs to an icon still on screen.
+        if launches && self.synoik.dock_owns_dash(output) && matches!(hit, OverviewHit::Dash(_)) {
+            self.synoik.dock.hide();
+        }
 
         match hit {
             // The close button asks the window to close, like GNOME's
