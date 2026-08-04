@@ -1,6 +1,6 @@
 # StatusNotifierItem / AppIndicator support
 
-**Status: not started.** This document is the plan.
+**Status: S1 landed (`efcf7245`), nothing drawn yet.** The rest of this document is the plan.
 
 ## Why this one has no GNOME reference
 
@@ -81,12 +81,12 @@ with submenus, checkmarks, radio groups and per-row icons. Per the toolkit-first
 
 ## Slices
 
-### S1 — The watcher and the item registry
+### S1 — The watcher and the item registry ✅ (`efcf7245`)
 Own `org.kde.StatusNotifierWatcher`, export the object, accept registrations, track item
 lifetime by bus-name owner, emit the four signals. No UI. Gets us the property that makes clients
 stop hiding their tray affordance, which several check at startup.
 
-**Decide the test seam before writing this**, because S5's tests inherit the answer. The headless
+**The test seam** (decided here; S5's tests inherit it). The headless
 harness runs no session bus, and standing one up inside a parallel test binary collides with the
 dconf/`dbus-run-session` isolation trap. Every other bus feature here is pinned at a **channel
 seam** — the corpus drives the model with the messages the bus layer would have delivered
