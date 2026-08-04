@@ -31,7 +31,7 @@ Version:        %{version}
 Release:        1%{?dist}
 Summary:        GNOME-behaviors Wayland desktop, written in Rust
 
-SourceLicense:  GPL-3.0-or-later
+SourceLicense:  GPL-3.0-only
 
 # (MIT OR Apache-2.0) AND BSD-3-Clause
 # (MIT OR Apache-2.0) AND Unicode-3.0
@@ -44,7 +44,7 @@ SourceLicense:  GPL-3.0-or-later
 # BSD-2-Clause
 # BSD-2-Clause OR Apache-2.0 OR MIT
 # BSD-3-Clause OR MIT OR Apache-2.0
-# GPL-3.0-or-later
+# GPL-3.0-only
 # ISC
 # MIT
 # MIT OR Apache-2.0
@@ -55,7 +55,7 @@ SourceLicense:  GPL-3.0-or-later
 # Unlicense OR MIT
 # Zlib
 # Zlib OR Apache-2.0 OR MIT
-License:        ((MIT OR Apache-2.0) AND BSD-3-Clause) AND ((MIT OR Apache-2.0) AND Unicode-3.0) AND (0BSD OR MIT OR Apache-2.0) AND Apache-2.0 AND (Apache-2.0 AND MIT) AND (Apache-2.0 OR MIT) AND (Apache-2.0 OR MIT OR Unlicense) AND (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) AND BSD-2-Clause AND (BSD-2-Clause OR Apache-2.0 OR MIT) AND (BSD-3-Clause OR MIT OR Apache-2.0) AND GPL-3.0-or-later AND ISC AND MIT AND (MIT OR Apache-2.0) AND (MIT OR Apache-2.0 OR LGPL-2.1-or-later) AND (MIT OR Apache-2.0 OR Zlib) AND (MIT OR Zlib OR Apache-2.0) AND MPL-2.0 AND (Unlicense OR MIT) AND Zlib AND (Zlib OR Apache-2.0 OR MIT)
+License:        ((MIT OR Apache-2.0) AND BSD-3-Clause) AND ((MIT OR Apache-2.0) AND Unicode-3.0) AND (0BSD OR MIT OR Apache-2.0) AND Apache-2.0 AND (Apache-2.0 AND MIT) AND (Apache-2.0 OR MIT) AND (Apache-2.0 OR MIT OR Unlicense) AND (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) AND BSD-2-Clause AND (BSD-2-Clause OR Apache-2.0 OR MIT) AND (BSD-3-Clause OR MIT OR Apache-2.0) AND GPL-3.0-only AND ISC AND MIT AND (MIT OR Apache-2.0) AND (MIT OR Apache-2.0 OR LGPL-2.1-or-later) AND (MIT OR Apache-2.0 OR Zlib) AND (MIT OR Zlib OR Apache-2.0) AND MPL-2.0 AND (Unlicense OR MIT) AND Zlib AND (Zlib OR Apache-2.0 OR MIT)
 # LICENSE.dependencies contains a full license breakdown
 
 VCS:            {{{ git_dir_vcs }}}

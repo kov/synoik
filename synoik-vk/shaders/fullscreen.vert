@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 #version 450
 
 // Fullscreen-triangle vertex stage (no vertex buffer): three vertices whose UVs span 0..2 so

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! `AppSwitcherPopup` / `AppSwitcher` (`js/ui/altTab.js:62-140, 696-908`) — Super-Tab.
 //!
 //! One item per **application**, not per window: a 96px app icon over the app's name, with a

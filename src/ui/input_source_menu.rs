@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The panel input-source (keyboard-layout) popover menu — the fork's port of
 //! gnome-shell's `InputSourceIndicator` popup (`js/ui/status/keyboard.js`
 //! `InputSourceIndicator._init` / `_addSourceIndicators`).

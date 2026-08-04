@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! World-clocks data plane for the dateMenu popover.
 //!
 //! A fork-owned port of gnome-shell's `WorldClocksSection` (`js/ui/dateMenu.js:331-541`):

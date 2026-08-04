@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 #
 # Drive a deterministic, repeatable workload against a *live* compositor session,
 # for frame-timing and latency A/Bs that need the two arms to be comparable.

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Panel popovers: click-anchored popups under a top-panel button.
 //!
 //! GNOME's panel buttons (dateMenu, quickSettings, …) open a popup menu anchored

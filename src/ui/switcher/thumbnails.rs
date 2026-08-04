@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! `ThumbnailSwitcher` (`js/ui/altTab.js:910-999`) — the app switcher's window sub-list.
 //!
 //! A second `.switcher-list` that drops below the app row when the selected app has more than one

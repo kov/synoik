@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The app-folder dialog — gnome-shell's `AppFolderDialog` (`appDisplay.js:2463-2916`).
 //!
 //! Clicking a folder tile in the app grid opens this: a shade over the whole monitor with a

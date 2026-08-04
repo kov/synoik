@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The dateMenu calendar grid.
 //!
 //! A fork-owned port of gnome-shell's `js/ui/calendar.js` month view: a

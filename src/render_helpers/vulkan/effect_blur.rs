@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Cached blur resources for the owned Vulkan renderer's xray effect-buffer path — the blur half of
 //! [`EffectBuffer`](crate::render_helpers::effect_buffer::EffectBuffer)'s Vulkan arm.
 //!

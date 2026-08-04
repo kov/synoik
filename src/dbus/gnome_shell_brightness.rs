@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! `org.gnome.Shell.Brightness` — the session object gsd-power drives the shell's brightness
 //! through (`js/ui/shellDBus.js:595-637`, interface
 //! `data/dbus-interfaces/org.gnome.Shell.Brightness.xml`).

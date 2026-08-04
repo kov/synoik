@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Scanout buffer allocation for KMS drivers that expose **no DRM format modifiers**.
 //!
 //! A driver that sets `fb_modifiers_not_supported` (upstream virtio-gpu does, in

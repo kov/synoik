@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The overview **app grid** — the page of installed apps the show-apps button
 //! reveals (`js/ui/appDisplay.js` `AppDisplay`). Like the dash ([`crate::ui::dash`])
 //! and the search ([`crate::ui::overview_search`]), this owns only plain state (a

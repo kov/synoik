@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The notifications model: sources, notifications, and the banner queue.
 //!
 //! This is the fork-owned, observable model behind all four notification

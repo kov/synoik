@@ -8,8 +8,8 @@ members = [
 [workspace.package]
 version = "26.4.0"
 description = "A GNOME-behaviors Wayland desktop, written in Rust"
-authors = ["Ivan Molodetskikh <yalterz@gmail.com>"]
-license = "GPL-3.0-or-later"
+authors = ["Gustavo Noronha Silva <gustavo@noronha.dev.br>"]
+license = "GPL-3.0-only"
 edition = "2021"
 rust-version = "1.85"
 

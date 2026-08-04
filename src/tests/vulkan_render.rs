@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! End-to-end proof that the live `Synoik::render` compositing path runs on the **owned Vulkan
 //! renderer**, not just GLES: a real client window is mapped through the headless test harness and
 //! the whole scene is composited through `VulkanRenderer`, both into an offscreen buffer (the

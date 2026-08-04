@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Frame-cost instrument: prices a composited frame against the things it might scale with, in a
 //! headless fixture, so a live-seat stutter can be reproduced and attributed without the seat.
 //!

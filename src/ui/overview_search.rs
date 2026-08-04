@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The overview search — a `search-entry` at the top of the Activities overview
 //! feeding the built-in **app** search provider, showing a grid of app results that
 //! Enter/click launches (`js/ui/searchController.js`, `search.js`, `appDisplay.js`

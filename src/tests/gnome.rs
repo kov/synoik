@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! GNOME-behavior conformance corpus.
 //!
 //! This module is the executable "conformance corpus" from the fork strategy

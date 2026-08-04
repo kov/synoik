@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! `WindowSwitcherPopup` / `WindowSwitcher` (`js/ui/altTab.js:580-640, 1002-1060`) — Alt-Tab.
 //!
 //! One item per **window**: a live 128px preview with the app's icon tucked into its

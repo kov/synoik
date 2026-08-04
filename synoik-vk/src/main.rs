@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Stage 0 bring-up spike for the owned Vulkan render stack.
 //!
 //! Run:  `cargo run -p synoik-vk`                         (default ICD → Venus on this VM)

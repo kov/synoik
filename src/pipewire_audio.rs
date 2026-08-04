@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! PipeWire watcher + controller for the default audio sink (feature `audio`).
 //!
 //! GNOME reads the default sink through `gvc` (libgvc → PulseAudio). We talk to

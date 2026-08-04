@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! SPIR-V blobs for the quad-family pipelines, compiled at build time (`build.rs` → `OUT_DIR`).
 //!
 //! Exposed from the library so both the bring-up binary and the compositor-side Vulkan renderer

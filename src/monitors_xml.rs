@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Reading GNOME/mutter's display-configuration store, `~/.config/monitors.xml`.
 //!
 //! This is **GNOME's way** of persisting per-monitor scale / transform / mode / layout: when the

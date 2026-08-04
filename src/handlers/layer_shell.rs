@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Based on niri, copyright Ivan Molodetskikh and the niri contributors,
+// distributed under the GNU General Public License version 3 or later.
+// Modified for synoik in 2026.
+
 use smithay::delegate_layer_shell;
 use smithay::desktop::{layer_map_for_output, LayerSurface, PopupKind, WindowSurfaceType};
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 """Correlate the continuation-frame miss rate against per-frame scene cost.
 
 This answers one question: does a frame miss because of how *long* the GPU runs,

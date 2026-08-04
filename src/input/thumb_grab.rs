@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Dragging a workspace thumbnail along the overview strip to reorder the workspaces.
 //!
 //! **Divergence (approved 2026-07-28).** gnome-shell's thumbnails never reorder: a drag on

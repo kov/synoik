@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! AccountsService — who the session's user is (`org.freedesktop.Accounts`).
 //!
 //! GNOME reaches this through libaccountsservice rather than raw D-Bus

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The GNOME top panel.
 //!
 //! A persistent bar drawn in-compositor at the top of each output while the

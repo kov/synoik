@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Minimal, self-contained reproducer for a Venus (Mesa `venus`) timestamp-query gap.
 //!
 //! The device advertises timestamp queries in full — `timestampComputeAndGraphics = true`,

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 // Dump the live actor tree, with the *resolved* box model, as JSON.
 //
 // Why this exists: porting a widget from the SCSS means reading a cascade and hoping you stacked

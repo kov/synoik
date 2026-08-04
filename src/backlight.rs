@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Display backlight hardware — the compositor half of GNOME 50.1 brightness.
 //!
 //! In 50.1 brightness is **not** gsd-power: mutter owns the hardware and the shell's

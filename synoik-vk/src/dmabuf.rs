@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Stage 1: import a *foreign* dmabuf (allocated by GBM — the real Wayland-client path) as a
 //! VkImage with an explicit DRM format modifier, so the renderer can sample it. This is the #1
 //! front-loaded risk of the owned-Vulkan port: client window buffers arrive as dmabufs from other

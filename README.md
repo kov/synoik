@@ -50,6 +50,6 @@ other crates entirely. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the dev loop
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0. See [LICENSE](LICENSE).
 
 synoik is derived from niri, © Ivan Molodetskikh and contributors, under the same license.

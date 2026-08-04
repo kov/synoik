@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! udev-facing half of the backlight subsystem: enumeration, the per-output device match, and the
 //! change watch.
 //!

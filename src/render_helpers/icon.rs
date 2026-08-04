@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Icon rasterization — symbolic (recolored) and full-color (app) icons.
 //!
 //! Two caches share this module and the `resvg`/`MemoryBuffer` core:

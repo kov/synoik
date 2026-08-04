@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! System-bus watcher for the panel status area: network (NetworkManager),
 //! battery (UPower), power profile (power-profiles-daemon), and bluetooth
 //! (BlueZ, in [`super::bluez`]).

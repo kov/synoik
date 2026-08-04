@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Where an image the shell displays comes from — the plain-data seam between *validating* an
 //! app-supplied URI and *loading* it.
 //!

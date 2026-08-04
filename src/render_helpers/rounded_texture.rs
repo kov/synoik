@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! A texture render element clipped to a rounded rectangle.
 //!
 //! Same idea as [`super::clipped_surface::ClippedSurfaceRenderElement`], but for

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The `org.gnome.Mutter.IdleMonitor` interface — user-activity monitoring.
 //!
 //! gnome-settings-daemon's power plugin hard-codes this bus name: it adds idle watches ("fire when

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The overview workspace row — gnome-shell's `ThumbnailsBox`
 //! (js/ui/workspaceThumbnail.js) fused with its app-grid workspaces box, as pure geometry.
 //!

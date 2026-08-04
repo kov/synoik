@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 #
 # Install a full-GNOME test session that boots this compositor in place of
 # gnome-shell, for a dedicated test user — so the real gnome-session, gsd

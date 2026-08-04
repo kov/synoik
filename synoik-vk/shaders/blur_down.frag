@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 #version 450
 
 // Dual-Kawase downsample tap (ported from render_helpers/shaders/blur_down.frag): center*4 plus

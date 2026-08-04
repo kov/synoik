@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Based on niri, copyright Ivan Molodetskikh and the niri contributors,
+// distributed under the GNU General Public License version 3 or later.
+// Modified for synoik in 2026.
+
 use std::iter::zip;
 
 use smithay::utils::{Logical, Point, Rectangle, Size};

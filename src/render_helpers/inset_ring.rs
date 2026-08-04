@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! A rectangular ring drawn *inside* a rect — a CSS `border` on a box with no background.
 //!
 //! This is the shape St gives any widget with a `border` and no `background-color`: the stroke

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Owned Vulkan (ash) render primitives for the fork's Vulkan render stack.
 //!
 //! Promoted out of the Stage 0/1 bring-up spike (still shipped as this crate's `synoik-vk` binary,

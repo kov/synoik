@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// From niri, copyright Ivan Molodetskikh and the niri contributors.
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;

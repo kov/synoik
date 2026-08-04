@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 #version 450
 
 // Glyph-quad vertex stage: like quad.vert but carries an atlas sub-rect (uv_origin/uv_size) so

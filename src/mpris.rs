@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The MPRIS model: the media players the shell shows a card for, ported from
 //! gnome-shell 50.1's `MprisSource`/`MprisPlayer` (`js/ui/mpris.js`).
 //!

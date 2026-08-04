@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 #version 450
 
 // Shared quad vertex stage: emit a unit quad (two triangles from gl_VertexIndex, no vertex

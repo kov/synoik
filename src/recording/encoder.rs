@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Encoder backends behind the [`EncoderBackend`] seam.
 //!
 //! Slice 1 ships [`FfmpegEncoder`]: captured RGBA frames are streamed to an `ffmpeg` subprocess

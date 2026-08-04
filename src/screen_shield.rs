@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The screen shield — `ScreenShield` (`js/ui/screenShield.js`).
 //!
 //! GNOME's session lock is the shell's own, not an external locker's: gnome-shell *is* the lock

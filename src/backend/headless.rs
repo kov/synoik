@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+//
+// Based on niri, copyright Ivan Molodetskikh and the niri contributors,
+// distributed under the GNU General Public License version 3 or later.
+// Modified for synoik in 2026.
+
 //! Headless backend for tests.
 //!
 //! This can eventually grow into a more complete backend if needed, but for now it's missing some

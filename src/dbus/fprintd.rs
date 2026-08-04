@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Is there a fingerprint reader, and what shape is it? — `net.reactivated.Fprint`.
 //!
 //! **This is a hardware probe, not a setting.** `enable-fingerprint-authentication` only decides

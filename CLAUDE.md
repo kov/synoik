@@ -2,7 +2,7 @@
 
 Rust, GNOME-behaviors Wayland desktop. A **hard fork** (no upstreaming, no niri rebasing),
 bootstrapped from **niri**; the endgame is a modern base free of GObject/Cogl/Clutter/GJS.
-License: GPL-3.0.
+License: GPL-3.0-only (our parts; inherited niri code stays GPL-3.0-or-later).
 
 Design doc: `docs/fork/STRATEGY.md` — read it before any large change.
 

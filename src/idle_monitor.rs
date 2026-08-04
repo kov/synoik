@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The state machine behind `org.gnome.Mutter.IdleMonitor` (see `dbus::mutter_idle_monitor`).
 //!
 //! gnome-settings-daemon's power plugin hard-codes this bus name to drive screen dim, blank, and

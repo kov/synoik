@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// From niri, copyright Ivan Molodetskikh and the niri contributors.
+
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::Renderer;

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The lock screen curtain — `UnlockDialog`'s clock page (`js/ui/unlockDialog.js:357-428`).
 //!
 //! This is what the shield shows before you ask to unlock: the wallpaper, dimmed, with a big clock

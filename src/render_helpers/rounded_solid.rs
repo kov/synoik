@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! A rounded solid-colour rectangle as a *render element*.
 //!
 //! The same SDF material the toolkit's [`Painter::fill_rounded`] paints

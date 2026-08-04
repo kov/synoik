@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Producer-side client-buffer synchronization.
 //!
 //! Producer readiness (the client's buffer is done being written before we sample it) is gated

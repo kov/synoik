@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 # Kills ONLY the PIDs start.sh/cast.sh recorded. Never pattern-matches — see the warning in
 # start.sh for why that distinction is not academic.
 set -u

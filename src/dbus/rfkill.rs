@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Session-bus watcher for rfkill state, from gnome-settings-daemon.
 //!
 //! Mirrors [`crate::dbus::system_status`] but on the **session** bus: one

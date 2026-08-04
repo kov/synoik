@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The panel status area's live system state (network + battery).
 //!
 //! GNOME's top-right cluster shows the current network and power state as

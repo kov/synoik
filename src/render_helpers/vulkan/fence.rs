@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! A submit's completion, as something the rest of the stack can wait on or hand to KMS.
 //!
 //! Smithay's [`Fence`] is the interface a

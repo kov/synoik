@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The logout / power-off / restart confirmation dialog.
 //!
 //! gnome-session raises this by calling `org.gnome.SessionManager.EndSessionDialog.Open` on the

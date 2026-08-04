@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Synthetic input: fabricated events fed through the real input pipeline.
 //!
 //! [`SyntheticInputBackend`] is a minimal [`InputBackend`] whose events are

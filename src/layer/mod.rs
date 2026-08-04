@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Based on niri, copyright Ivan Molodetskikh and the niri contributors,
+// distributed under the GNU General Public License version 3 or later.
+// Modified for synoik in 2026.
+
 use smithay::desktop::LayerSurface;
 use smithay::wayland::shell::wlr_layer::Layer;
 use synoik_config::layer_rule::{LayerRule, Match};

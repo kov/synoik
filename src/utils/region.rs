@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// From niri, copyright Ivan Molodetskikh and the niri contributors.
+
 use std::cmp::{max, min};
 use std::collections::BTreeSet;
 use std::sync::Arc;

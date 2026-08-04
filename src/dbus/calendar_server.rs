@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Session-bus **client** of `org.gnome.Shell.CalendarServer` — the
 //! evolution-data-server-backed service that feeds the dateMenu Events section.
 //! We consume it (we do NOT own the name); it is D-Bus-activatable, so our first

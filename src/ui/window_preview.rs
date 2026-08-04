@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The window picker's per-preview chrome (`js/ui/windowPreview.js`).
 //!
 //! gnome-shell's `WindowPreview` hangs three actors off each preview: the app

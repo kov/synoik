@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Compile every GLSL source in `shaders/` to SPIR-V (`<name>.spv` in OUT_DIR) with
 //! glslangValidator. The compiled modules are pulled in with `include_bytes!` at build time,
 //! so a missing/broken shader fails the build rather than the run.

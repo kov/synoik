@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Session-bus watcher for MPRIS media players — gnome-shell's `MprisSource`
 //! (`js/ui/mpris.js:189-254`).
 //!

@@ -5,7 +5,7 @@ edition = "2021"
 # Above the workspace's 1.85 floor. The optional `pango-ref` reference rasterizer needs pango 0.22
 # (rustc 1.92); this library leads the toolchain requirement even with that feature off.
 rust-version = "1.92"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0-only"
 publish = false
 description = "Owned Vulkan (ash) render primitives for the compositor's Vulkan renderer, plus a headless bring-up/CI binary (see docs/fork render plan)."
 

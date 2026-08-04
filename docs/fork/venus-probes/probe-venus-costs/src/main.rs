@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Guest-side probes for the three claims disputed in `docs/fork/venus-cost.md` §8.
 //!
 //! Each probe is a falsifiable experiment, not a benchmark for its own sake:

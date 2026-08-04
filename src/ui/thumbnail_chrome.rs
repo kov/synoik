@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The overview thumbnail strip's per-thumbnail chrome: the close button an empty
 //! workspace grows while the pointer is on it.
 //!

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The application catalog — our `Shell.AppSystem`/`AppFavorites` equivalent.
 //!
 //! GNOME's dash, app grid, and overview search all resolve apps through

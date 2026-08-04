@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Cached backdrop-blur state for the owned Vulkan renderer's `FramebufferEffectElement` path
 //! (niri's GNOME-style backdrop blur). Owns the mid-frame capture plus, when blur is enabled, the
 //! dual-Kawase [`SharedBlurChain`] and its blurred output. Held across frames in the effect

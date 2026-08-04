@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The gdm reauthentication channel — how the lock screen checks a password.
 //!
 //! **No PAM runs in this process.** GNOME's unlock dialog does not authenticate; it asks gdm to,

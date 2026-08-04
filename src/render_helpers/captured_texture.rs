@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! A concrete render element carrying a `VkTexture` that an overlay captured and uploaded.
 //!
 //! Overlays that freeze the screen (the screen transition, the screenshot UI, the closing window)

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Runtime-compiled custom animation shaders — the owned-renderer port of niri's user-supplied
 //! `resize` / `close` / `open` GLSL snippets (`shaders/mod.rs`, `set_custom_{resize,close,open}`).
 //!

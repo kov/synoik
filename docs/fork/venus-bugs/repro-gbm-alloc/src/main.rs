@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Minimal reproducer: on this virtio-gpu/Venus VM, libgbm buffer allocation
 //! accepts only a narrow set of flag/format combos. In particular the
 //! GBM_BO_USE_WRITE usage flag makes allocation fail with EINVAL, while

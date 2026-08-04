@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! gnome-session's presence, the shield's idle source (`js/misc/gnomeSession.js`, used from
 //! `screenShield.js:78-88`).
 //!

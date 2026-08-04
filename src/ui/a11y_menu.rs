@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The panel accessibility popover menu — the fork's port of gnome-shell's
 //! `ATIndicator` menu (`js/ui/status/accessibility.js:45-86`).
 //!

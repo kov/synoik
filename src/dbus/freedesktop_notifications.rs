@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The `org.freedesktop.Notifications` server.
 //!
 //! We own the well-known name and absorb both halves of gnome-shell 50.1's

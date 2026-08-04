@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// From niri, copyright Ivan Molodetskikh and the niri contributors.
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;

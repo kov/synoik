@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! A live window, composited at a smaller size — `_createWindowClone`
 //! (`js/ui/altTab.js:32-46`).
 //!

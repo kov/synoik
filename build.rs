@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// From niri, copyright Ivan Molodetskikh and the niri contributors.
+
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(have_libinput_plugin_system)");
     if pkg_config::Config::new()

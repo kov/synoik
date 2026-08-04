@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Staging for uploads: a shared per-frame arena ([`StagingPool`]) for everything the render
 //! thread uploads, and a one-shot buffer ([`HostStaging`]) that can be created and **filled off
 //! the render thread**.

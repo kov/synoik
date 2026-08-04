@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! `org.gnome.desktop.peripherals` — the pointer and keyboard device settings.
 //!
 //! GNOME's way replaces niri's: these used to come from the config file's `input {}` block, and

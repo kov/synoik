@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The GNOME run dialog (Alt+F2).
 //!
 //! A fork-owned port of gnome-shell's `js/ui/runDialog.js`, minimal core: type

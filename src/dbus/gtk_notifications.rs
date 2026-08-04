@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The `org.gtk.Notifications` server (GNOME's `GtkNotificationDaemon`,
 //! `js/ui/notificationDaemon.js:581-712`).
 //!

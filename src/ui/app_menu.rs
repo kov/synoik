@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The app-icon context menu — gnome-shell's `AppMenu` (`js/ui/appMenu.js`), the
 //! menu a right-click on a dash / app-grid / search-result icon pops up
 //! (`AppIcon.popupMenu`, `appDisplay.js:3027-3052`).

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! A [`BlurChain`] with a lifetime someone else can hold on to.
 //!
 //! `BlurChain` owns raw Vulkan objects — render passes, pipelines, descriptor sets, level images —

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Fork-owned GNOME desktop policy.
 //!
 //! This module holds the inspectable model of the GNOME *settings* and policy the

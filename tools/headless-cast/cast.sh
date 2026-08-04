@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 # Start a monitor screencast on the headless instance and capture frames with a *host* GStreamer
 # consumer — no portal, no OBS, no Flatpak in the path.
 #

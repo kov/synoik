@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The screenshot flash — `Flashspot` (`js/ui/screenshot.js:3153-3179`).
 //!
 //! A white rectangle over the captured area at full opacity, easing to transparent. It is the only

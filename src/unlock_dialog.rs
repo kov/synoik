@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The unlock dialog's state — `UnlockDialog` + `AuthPrompt` + `ShellUserVerifier`
 //! (`js/ui/unlockDialog.js`, `js/gdm/authPrompt.js`, `js/gdm/util.js`), minus their actors.
 //!

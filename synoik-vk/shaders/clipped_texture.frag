@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 #version 450
 
 // Clipped-surface material: sample a bound texture (like texture.frag, via the tex_transform that

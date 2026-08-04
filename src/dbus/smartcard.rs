@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Is there a smartcard in the reader? — `org.gnome.SettingsDaemon.Smartcard`.
 //!
 //! GNOME does not talk to PC/SC or PKCS#11 itself. gnome-settings-daemon's smartcard plugin owns

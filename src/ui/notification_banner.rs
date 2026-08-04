@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The on-screen notification banner, gnome-shell 50.1's `MessageTray` popup.
 //!
 //! One banner at a time, top-center on a single output (our stand-in for

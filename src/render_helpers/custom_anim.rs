@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The custom window **open**/**close** animation element: a window snapshot `VkTexture` plus a
 //! prebuilt `CustomAnimPush`, drawn through
 //! [`VulkanFrame::render_custom_anim`](super::vulkan::VulkanFrame::render_custom_anim) for the

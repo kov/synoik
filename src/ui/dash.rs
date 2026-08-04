@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The overview dash — the favorites bar (`js/ui/dash.js`).
 //!
 //! A rounded background pill at the bottom-center of the overview holding the

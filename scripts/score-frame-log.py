@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 """Score a frame-log journal window per phase, for A/B arms driven by drive-workload.sh.
 
 The point of this script is the comparability gate. Two arms that ran the same

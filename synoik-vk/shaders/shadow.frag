@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 #version 450
 
 // Shadow material: a gaussian-blurred rounded rectangle (Evan Wallace's fast rounded-rect shadow),

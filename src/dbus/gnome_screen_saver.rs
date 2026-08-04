@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! `org.gnome.ScreenSaver` — the interface a GNOME session locks the screen through
 //! (`js/ui/shellDBus.js:517-566`, `data/dbus-interfaces/org.gnome.ScreenSaver.xml`).
 //!

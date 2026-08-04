@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Forward-looking physical-device probes — data for the stages after this spike, not part of the
 //! rendering. Informational (printed, never asserted) because the answers are ICD-specific: Venus
 //! has real DRM modifiers + external-semaphore support; lavapipe won't.

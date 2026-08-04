@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The MPRIS media card — gnome-shell's `MediaMessage` (`js/ui/messageList.js:770-853`).
 //!
 //! It is a `.message` like a notification card and shares that geometry: the same header row and

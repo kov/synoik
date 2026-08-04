@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The list a switcher switches through — `getWindows` (`js/ui/altTab.js:51-61`) sitting on
 //! mutter's `meta_display_get_tab_list` (`src/core/display.c:1876-1940`).
 //!

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Dual-Kawase blur chain, ported from niri's GLES `render_helpers/blur.rs`.
 //!
 //! A pyramid of `passes + 1` levels halving in size: level 0 is full-size (the output), levels

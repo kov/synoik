@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Per-thread counters for the two things a frame can do too many of: GPU round
 //! trips and draw calls.
 //!

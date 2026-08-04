@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The "Authentication Required" dialog's interactive surface (`js/ui/components/polkitAgent.js`).
 //!
 //! What it is *doing* lives in [`crate::polkit_dialog`]; this is the drawing, the hit-testing and

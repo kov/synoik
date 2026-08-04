@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! A reusable single-line editable text model — the state machine behind every entry
 //! in the shell (overview search, run dialog, polkit password, lock screen, folder
 //! rename).

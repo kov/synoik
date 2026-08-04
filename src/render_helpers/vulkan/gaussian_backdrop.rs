@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! A cached gaussian blur of somebody else's texture — GNOME's `Shell.BlurEffect` in
 //! `BACKGROUND` mode, as the lock screen puts it on its wallpaper (`unlockDialog.js:706-713`).
 //!

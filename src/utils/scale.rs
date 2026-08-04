@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// From niri, copyright Ivan Molodetskikh and the niri contributors.
+
 //! Default monitor scale calculation.
 //!
 //! This module follows logic and tests from Mutter:

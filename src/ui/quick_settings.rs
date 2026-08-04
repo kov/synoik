@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The quick-settings menu (the right-hand panel status area's popover).
 //!
 //! A fork-owned port of gnome-shell's `js/ui/quickSettings.js`: a **system row** at

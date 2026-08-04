@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Based on niri, copyright Ivan Molodetskikh and the niri contributors,
+// distributed under the GNU General Public License version 3 or later.
+// Modified for synoik in 2026.
+
 //! Helpers for keeping track of the event stream state.
 //!
 //! 1. Create an [`EventStreamState`] using `Default::default()`, or any individual state part if

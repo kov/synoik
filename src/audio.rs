@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The default audio sink's live state (volume + mute) for the panel output
 //! indicator and the quick-settings volume slider.
 //!

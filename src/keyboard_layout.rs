@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Deriving the short panel label for the active keyboard layout — the fork's stand-in for
 //! gnome-shell's `InputSourceIndicator` short name (`js/ui/status/keyboard.js:986`,
 //! `sessionMode.js:99` `keyboard` role).

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Offscreen render target + a minimal quad graphics pipeline, built on the [`Gpu`] context.
 //!
 //! A classic render pass / framebuffer (not dynamic rendering) keeps the spike portable across

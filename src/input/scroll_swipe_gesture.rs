@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// From niri, copyright Ivan Molodetskikh and the niri contributors.
+
 //! Swipe gesture from scroll events.
 //!
 //! Tracks when to begin, update, and end a swipe gesture from pointer axis events, also whether

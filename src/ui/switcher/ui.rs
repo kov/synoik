@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The live switcher surface: the state machine of [`super::SwitcherPopup`] plus the items,
 //! geometry and textures needed to actually draw it.
 //!

@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Based on niri, copyright Ivan Molodetskikh and the niri contributors,
+// distributed under the GNU General Public License version 3 or later.
+// Modified for synoik in 2026.
+
 /// How much to blur, straight from the config.
 ///
 /// The blur itself is the renderer's own: [`BackdropBlur`] does the backdrop effect and

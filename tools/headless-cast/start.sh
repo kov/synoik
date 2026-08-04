@@ -1,4 +1,8 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 # Bring up an isolated headless synoik: private PipeWire, private session bus, private runtime dir.
 #
 # Nothing here touches your real session. The runtime dir must stay SHORT — a long one overflows

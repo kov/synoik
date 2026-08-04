@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 #
 # Launch the compositor nested (Winit backend) for quick visual testing, with a
 # terminal spawned inside so there's something to interact with immediately.

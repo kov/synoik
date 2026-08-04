@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The calendar-events model: the day's appointments shown in the dateMenu's
 //! Events section, ported from gnome-shell 50.1's `DBusEventSource`
 //! (`js/ui/calendar.js:207-405`).

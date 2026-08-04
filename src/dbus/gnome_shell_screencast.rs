@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! `org.gnome.Shell.Screencast` — the high-level recorder entry point.
 //!
 //! In stock GNOME this name is owned by a separate gjs `dbusService` process that drives a

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Hinted glyph-atlas text: cosmic-text shapes (harfrust), swash rasterizes each glyph with
 //! hinting on, etagere packs the coverage bitmaps into one R8 atlas, and each glyph draws as a
 //! textured quad. This is the "own the text stack" path — cosmic-text/swash give shaping + hinted

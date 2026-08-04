@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The on-screen display — gnome-shell 50.1's `OsdWindow` / `OsdWindowManager`
 //! (`js/ui/osdWindow.js`).
 //!

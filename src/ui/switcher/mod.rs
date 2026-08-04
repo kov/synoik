@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The Alt-Tab / Super-Tab switchers — gnome-shell 50.3's `SwitcherPopup`
 //! (`js/ui/switcherPopup.js`) and the popups built on it (`js/ui/altTab.js`).
 //!

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! `BrightnessManager` — the shell-side brightness algebra (`js/misc/brightnessManager.js`).
 //!
 //! GNOME 50.1 splits brightness in two: mutter owns the hardware (ported in [`crate::backlight`]

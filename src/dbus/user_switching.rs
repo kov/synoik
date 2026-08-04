@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Going to the login screen — the "Log in as another user" button's action.
 //!
 //! GNOME calls `Gdm.goto_login_session_sync` (`unlockDialog.js:901-905`), a libgdm helper that is

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! A sampled texture: device-local image uploaded from host RGBA via a staging buffer, plus a
 //! view and sampler. This is the infrastructure both the blur passes and the glyph atlas reuse.
 

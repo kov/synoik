@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Based on niri, copyright Ivan Molodetskikh and the niri contributors,
+// distributed under the GNU General Public License version 3 or later.
+// Modified for synoik in 2026.
+
 // References:
 // - https://invent.kde.org/plasma/kwin/-/blob/397fbbe52a8f2d855ad0c9817b51a9bdf06a68e2/src/a11ykeyboardmonitor.cpp#L41
 // - https://gitlab.gnome.org/GNOME/mutter/-/blob/cbb7295ac1f93a2dfd55a7c0544688e7e5c4d2e2/src/backends/meta-a11y-manager.c

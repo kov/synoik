@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The `org.gnome.Shell` interface — accelerator grabs.
 //!
 //! gsd-media-keys (volume/brightness/media keys), gnome-control-center's

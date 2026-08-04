@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Layer A — the St theme node: a resolved style bag plus the box-model math that
 //! consumes it. See `docs/fork/layer-a-theme-node.md`.
 //!

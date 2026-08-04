@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! An owned Vulkan (ash) renderer that implements Smithay's renderer trait family, so synoik's
 //! `RenderElement`s can draw through it exactly as they do through GLES.
 //!

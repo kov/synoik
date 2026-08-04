@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Reference text render via pango + cairo — the same CPU path the panel uses today. Rendered
 //! beside our swash atlas so 1x crispness can be compared directly (they will differ slightly:
 //! pango/cairo use FreeType bytecode hinting, swash uses skrifa's autohinter).

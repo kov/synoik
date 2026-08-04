@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! Stage 3 de-risking spike: does host-GPU work completion actually propagate to a guest
 //! `sync_file` / `drm_syncobj` on this VM?
 //!

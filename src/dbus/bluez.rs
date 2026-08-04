@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! System-bus watcher for BlueZ (`org.bluez`), feeding the QS Bluetooth toggle.
 //!
 //! A fourth task on the shared [`super::system_status`] connection. gnome-shell reaches BlueZ

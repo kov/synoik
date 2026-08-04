@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
 //! The `org.gnome.SessionManager.EndSessionDialog` interface, and the client calls that trigger it.
 //!
 //! synoik runs as the `org.gnome.Shell` component of a real gnome-session (systemd-managed, so no
