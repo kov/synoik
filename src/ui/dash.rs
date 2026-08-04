@@ -192,13 +192,18 @@ pub fn preferred_height(view_size: Size<f64, Logical>) -> f64 {
     DashMetrics::for_icon(icon).preferred_height()
 }
 
-/// `$dash_background_color = mix(#222226, #fafafb, 90%)` (`_dash.scss:20`,
-/// `_colors.scss:50`, `_default-colors.scss:4-5`) ≈ `#38383B`.
-const DASH_BG: [f32; 4] = [0.218, 0.218, 0.233, 1.];
+/// The `.dash-background` pill's fill. GNOME's is opaque `$dash_background_color =
+/// mix(#222226, #fafafb, 90%)` ≈ `#38383B` (`_dash.scss:20`, `_colors.scss:50`,
+/// `_default-colors.scss:4-5`); ours is the shared translucent plate, so the blurred backdrop
+/// reads through it — see [`widget::style::OVERVIEW_PLATE`] for why.
+const DASH_BG: [f32; 4] = widget::style::OVERVIEW_PLATE;
 
-/// The tile hover fill: `st-lighten($dash_background_color, 7%)` (flat + always-dark,
-/// `_drawing.scss:186-189,270-274`). Lightens (the per-widget hover direction).
-const TILE_HOVER: [f32; 4] = [0.286, 0.286, 0.305, 1.];
+/// The tile hover fill. GNOME's is `st-lighten($dash_background_color, 7%)` (flat + always-dark,
+/// `_drawing.scss:186-189,270-274`) — an *absolute* colour derived from an opaque pill, which over
+/// a translucent plate would be an opaque patch on it. A relative wash is the same gesture and
+/// composes: the shared [`widget::style::HOVER_WASH`], which is already what the app grid's tiles
+/// use for this (10% white where GNOME lightens 4%), so the two hovers now match.
+const TILE_HOVER: [f32; 4] = widget::style::HOVER_WASH;
 /// The show-apps glyph color: `$system_fg_color` ≈ `#fafafb` (`_dash.scss:57,62`).
 const SHOW_APPS_FG: [f32; 4] = [0.980, 0.980, 0.984, 1.];
 /// The show-apps button glyph (`view-app-grid-symbolic`, `dash.js:216`).

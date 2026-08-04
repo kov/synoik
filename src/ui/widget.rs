@@ -96,19 +96,25 @@ pub mod style {
     /// so the two can't drift; draw both via [`Painter::hairline`](super::Painter::hairline).
     pub const BORDERS: Rgba = [1., 1., 1., 0.1];
 
-    /// Source-over composite of `fg` (possibly translucent) onto the **opaque** `bg`, returning an
-    /// opaque color — the color a translucent overlay *would* produce over `bg`. Use it to lay a
-    /// translucent [`BORDERS`] hairline onto an opaque surface via the crisp (replacing) clear that
+    /// Source-over composite of `fg` (possibly translucent) onto `bg` — the color a translucent
+    /// overlay *would* produce over `bg`. Use it to lay a translucent [`BORDERS`] hairline onto a
+    /// surface via the crisp (replacing) clear that
     /// [`Painter::hairline`](super::Painter::hairline) uses, so the line reads the same as it would
     /// blended (a raw translucent clear would instead punch a hole to whatever is behind).
+    ///
+    /// `bg` need not be opaque: the result carries the composited alpha, so a hairline laid on a
+    /// *translucent* plate ([`OVERVIEW_PLATE`]) stays as see-through as the plate around it. Taking
+    /// the alpha as 1 — which this did while every surface it served was opaque — draws the line as
+    /// a solid bar across a plate the backdrop is supposed to show through.
     pub fn over(bg: Rgba, fg: Rgba) -> Rgba {
         let a = fg[3];
-        [
-            bg[0] * (1. - a) + fg[0] * a,
-            bg[1] * (1. - a) + fg[1] * a,
-            bg[2] * (1. - a) + fg[2] * a,
-            1.,
-        ]
+        let out_a = a + bg[3] * (1. - a);
+        if out_a <= f32::EPSILON {
+            return TRANSPARENT;
+        }
+        // Premultiplied source-over, un-premultiplied back out.
+        let ch = |i: usize| (fg[i] * a + bg[i] * bg[3] * (1. - a)) / out_a;
+        [ch(0), ch(1), ch(2), out_a]
     }
     /// Icon-name fallback chain for an "active/selected" check mark.
     pub const CHECK_ICONS: &[&str] = &["object-select-symbolic", "emblem-ok-symbolic"];
@@ -169,6 +175,26 @@ pub mod style {
     /// the dash and the `.search-section-content` results card. Same value the dash
     /// bakes as its pill (kept in sync via this one constant).
     pub const OVERLAY_BG: Rgba = [0.218, 0.218, 0.233, 1.];
+    /// The overview chrome's **plate** fill — every opaque surface the overview lays over its
+    /// backdrop: the dash pill, the search entry, the search-results card and the app-grid's folder
+    /// tiles. One constant so the four cannot drift, which is the whole point: they read as one
+    /// material only if they are one colour.
+    ///
+    /// **Divergence (chosen 2026-08-04).** GNOME gives each of these an opaque dark fill of its own
+    /// (`$system_overlay_bg_color`, `%system_entry`, `.app-folder`) because `#overviewGroup` behind
+    /// them is a flat `$system_base_color` slab. Ours is a blurred wallpaper
+    /// (`overview-port.md` §13), and opaque plates over it read as the chrome forgot the backdrop
+    /// changed — the same reason the Blur my Shell extension ships this restyle alongside its blur,
+    /// and this is its "light" variant's value (`overview/style-components`, its default;
+    /// `docs/fork/blur-my-shell-inventory.md` §1).
+    ///
+    /// Deliberately **not** adopted from that stylesheet: its re-specification of every
+    /// hover/focus/active state at `rgba(230,230,230,.08–.3)`. Ours are relative washes over
+    /// whatever they sit on ([`HOVER_WASH`], and an accent-derived focus fill), so they already
+    /// compose over a translucent plate — and keeping them keeps GNOME's accent in the focus state,
+    /// which that stylesheet drops.
+    pub const OVERVIEW_PLATE: Rgba = [0.784, 0.784, 0.784, 0.2];
+
     /// The system accent as an [`Rgba`] — `org.gnome.desktop.interface accent-color` arrives
     /// resolved to 8-bit RGB, and every widget that draws with it needs the float form.
     pub fn accent_rgba(accent: [u8; 3]) -> Rgba {
@@ -194,14 +220,16 @@ pub mod style {
     /// using it directly makes the button invisible against its own container.
     pub const OVERLAY_BUTTON_BG: Rgba = [0.287, 0.287, 0.301, 1.];
 
-    /// `.app-folder` fill — the one tile in the grid that is **raised** rather than
-    /// flat: `tile_button($bg:$system_base_color, $raised:true)` (`_app-grid.scss:41`)
-    /// resolves to `button(normal)`'s `st-mix($system_fg_color, $system_base_color, 9%)`
-    /// = `mix(#fafafb, #222226, 9%)` ≈ `#353539` (`_drawing.scss:353-354`,
-    /// `$background_mix_factor` `_default-colors.scss:33`). An app tile in the same grid
-    /// is `$style: flat` and forced transparent at rest, which is why only folders show
-    /// a resting background.
-    pub const FOLDER_BG: Rgba = [0.210, 0.210, 0.224, 1.];
+    /// `.app-folder` fill — the one tile in the grid that is **raised** rather than flat:
+    /// `tile_button($bg:$system_base_color, $raised:true)` (`_app-grid.scss:41`) resolves to
+    /// `button(normal)`'s `st-mix($system_fg_color, $system_base_color, 9%)` = `mix(#fafafb,
+    /// #222226, 9%)` ≈ `#353539` (`_drawing.scss:353-354`, `$background_mix_factor`
+    /// `_default-colors.scss:33`). An app tile in the same grid is `$style: flat` and forced
+    /// transparent at rest, which is why only folders show a resting background.
+    ///
+    /// Being the grid's only resting plate is exactly why it is [`OVERVIEW_PLATE`] here rather
+    /// than that opaque value: it is the one thing in the app grid the backdrop would stop at.
+    pub const FOLDER_BG: Rgba = OVERVIEW_PLATE;
 
     /// `%system_button`'s normal fill — `button(normal, $tc: $system_fg_color, $c:
     /// $system_bg_color)`, i.e. `st-mix(#fafafb, lighten(#222226, 5%), 9%)` (`_common.scss:348`,
@@ -1076,7 +1104,10 @@ const ENTRY_PAD: f64 = 9.;
 impl EntryStyle {
     fn bg(self) -> Rgba {
         match self {
-            EntryStyle::Search => style::ENTRY_BG,
+            // The one entry that sits on the overview backdrop, so it takes the shared plate
+            // rather than `%system_entry`'s opaque fill — see [`style::OVERVIEW_PLATE`]. The other
+            // two are on a wallpaper and on a dialog respectively, and keep GNOME's values.
+            EntryStyle::Search => style::OVERVIEW_PLATE,
             // `transparentize(white, .9)`.
             EntryStyle::Lockscreen => [1., 1., 1., 0.1],
             EntryStyle::PromptDialog => style::ENTRY_BG,

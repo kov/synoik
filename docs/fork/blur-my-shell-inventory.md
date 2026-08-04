@@ -2,8 +2,8 @@
 
 Source read: `~/.local/share/gnome-shell/extensions/blur-my-shell@aunetx` (v72), plus Gustavo's
 own settings (`dconf dump /org/gnome/shell/extensions/blur-my-shell/`). This is an inventory to
-decide from, not a plan — nothing here is committed to beyond the two items already landed
-(`overview-port.md` §13).
+decide from, not a plan — what has been adopted so far is the two items in `overview-port.md` §13
+plus §1's plates (see §5).
 
 ## 0. What Gustavo actually runs
 
@@ -25,7 +25,7 @@ The `dash-to-dock` component only ever attaches to an actor named `dashtodockCon
 `DashToDock` (`components/dash_to_dock.js:229-234`) — the Dash to Dock *extension*. He does not run
 it, so those keys do nothing.
 
-## 1. The finding: the translucent dash is not a dash blur
+## 1. The finding: the translucent dash is not a dash blur — **adopted 2026-08-04, see §5**
 
 **It is a stylesheet swap over the whole overview**, `overview/style-components` (default `1` =
 "light"), which adds one class to `Main.uiGroup` (`components/overview.js:163-172`) and lets
@@ -143,3 +143,32 @@ per-surface knobs, kept working by a `customize` flag that switches between "use
    costing.
 5. **Forced window opacity** (§2.6) — deliberately last. It overrides the client, we removed
    something like it before, and the protocol-driven path we already have covers the honest case.
+
+## 5. What we took from §1 (landed 2026-08-04)
+
+Adopted: **the plates**. One shared `ui::widget::style::OVERVIEW_PLATE`
+(`rgba(200,200,200,.2)` — the "light" variant's value) now fills the four surfaces the overview
+lays over its backdrop: the dash pill (`DASH_BG`), the search entry (`EntryStyle::Search`), the
+search-results card (`.search-section-content`) and the app grid's folder tiles (`FOLDER_BG`, the
+grid's only tile with a resting fill). One constant, so they cannot drift — they read as one
+material only if they are one colour.
+
+**Not adopted: its re-specification of every interaction state** at `rgba(230,230,230,.08–.3)`.
+Ours are relative washes over whatever they sit on (`HOVER_WASH`, and an accent-derived focus
+fill), so they already compose over a translucent plate — and keeping them keeps GNOME's accent in
+the focus state, which that stylesheet drops. The one absolute state colour that had to go was the
+dash's `TILE_HOVER` (`st-lighten($dash_background_color, 7%)`), an opaque value derived from the
+opaque pill; it is `HOVER_WASH` now, which is what the app grid already used for the same gesture.
+
+Two things fell out of it worth knowing:
+
+- `.overview-tile` needed no change: our app-grid tiles are already transparent at rest, which is
+  what that stylesheet's rule asks for.
+- `style::over` was pinning its result's alpha at 1, correct only while every surface it served was
+  opaque. The dash's separator uses it, because `Painter::hairline` *clears* rather than blends —
+  so on a translucent plate it drew a solid bar across the one thing the backdrop is meant to show
+  through. It is a real source-over now (identical for an opaque base).
+
+Left from §1 for whoever picks it up: `.workspace-thumbnail`'s plate (ours draws the wallpaper, so
+there is nothing to see through), `.page-navigation-arrow`, and `.app-folder-dialog .icon-button` —
+that last one belongs with §2.3's dialog blur, not here.

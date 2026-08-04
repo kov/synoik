@@ -981,7 +981,10 @@ impl OverviewSearch {
                     move |frame, phys, status| {
                         let mut p = Painter::new(frame, scale, phys);
                         p.clear(style::TRANSPARENT)?;
-                        p.fill_rounded_full(CARD_RADIUS, widget::style::OVERLAY_BG)?;
+                        // `.search-section-content` — a plate on the overview backdrop, so it
+                        // takes the shared translucent fill rather than the opaque
+                        // `$system_overlay_bg_color` (`widget::style::OVERVIEW_PLATE`).
+                        p.fill_rounded_full(CARD_RADIUS, widget::style::OVERVIEW_PLATE)?;
                         // Selection always washes; a hovered result adds/overlaps one.
                         for (i, rel) in rel_rects.iter().enumerate() {
                             if i == selected || hovered == Some(SearchHit::Result(i)) {

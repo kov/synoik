@@ -7222,8 +7222,14 @@ fn vulkan_dash_hover_lightens_the_tile() {
     let plain = sample(c1);
     eprintln!("vulkan_dash_hover_lightens_the_tile: hovered={hovered:?} plain={plain:?}");
 
-    // The plain tile is the opaque pill background — proves the dash actually baked.
-    assert_eq!(plain[3], 255, "the dash pill must composite opaquely");
+    // The plain tile is the pill background — proves the dash actually baked. The pill is the
+    // translucent `OVERVIEW_PLATE` now, so what is pinned is *its* alpha: an opaque result would
+    // mean some surface under it went back to painting a solid.
+    let plate_a = (crate::ui::widget::style::OVERVIEW_PLATE[3] * 255.).round() as u8;
+    assert_eq!(
+        plain[3], plate_a,
+        "the dash pill must composite at the plate's alpha ({plate_a}), got {plain:?}"
+    );
     for ch in 0..3 {
         assert!(
             hovered[ch] > plain[ch],
@@ -7732,20 +7738,27 @@ fn vulkan_overview_search_draws_entry_and_selection() {
     };
     let (pixels, w, _h) = result.expect("compositing the search through Vulkan must not error");
 
-    // The entry pill fill, sampled low in the pill (below the text line, left of the
-    // trailing clear glyph): opaque and dark (`ENTRY_BG`).
+    // The entry pill fill, sampled low in the pill (below the text line, left of the trailing
+    // clear glyph). It is the shared translucent `OVERVIEW_PLATE` — the search entry sits on the
+    // overview backdrop — so pin its alpha rather than an opaque dark fill.
     let ex = (pill.loc.x + pill.size.w * 0.5) as i32;
     let ey = (pill.loc.y + pill.size.h - 5.) as i32;
     let entry = px(&pixels, w, ex, ey);
     eprintln!("vulkan_overview_search: entry={entry:?}");
+    let plate = crate::ui::widget::style::OVERVIEW_PLATE;
     assert_eq!(
-        entry[3], 255,
-        "the entry pill must composite opaquely: {entry:?}"
+        entry[3],
+        (plate[3] * 255.).round() as u8,
+        "the entry pill must composite at the plate's alpha: {entry:?}"
     );
-    assert!(
-        entry[0] < 90 && entry[1] < 90 && entry[2] < 90,
-        "the entry pill fill must be dark (ENTRY_BG): {entry:?}"
-    );
+    for ch in 0..3 {
+        // Premultiplied output, so the plate's own channel arrives scaled by its alpha.
+        let want = (plate[ch] * plate[3] * 255.).round() as i32;
+        assert!(
+            (i32::from(entry[ch]) - want).abs() <= 2,
+            "channel {ch}: the entry pill fill must be the plate ({want}): {entry:?}"
+        );
+    }
 
     // Inside each tile's left padding band, clear of the icon: the selected tile 0
     // carries the wash, tile 1 the plain card bg.
@@ -7761,8 +7774,9 @@ fn vulkan_overview_search_draws_entry_and_selection() {
     let plain = edge(t1);
     eprintln!("vulkan_overview_search: selected={selected:?} plain={plain:?}");
     assert_eq!(
-        plain[3], 255,
-        "the results card must composite opaquely: {plain:?}"
+        plain[3],
+        (crate::ui::widget::style::OVERVIEW_PLATE[3] * 255.).round() as u8,
+        "the results card must composite at the plate's alpha: {plain:?}"
     );
     for ch in 0..3 {
         assert!(
@@ -8393,9 +8407,13 @@ fn vulkan_app_grid_composes_a_folder_tile() {
     let folder_corner = px(&pixels, w, fx as i32, fy as i32);
     let plain_corner = px(&pixels, w, px_ as i32, py as i32);
     eprintln!("vulkan_app_grid_folder: folder={folder_corner:?} plain={plain_corner:?}");
-    assert!(
-        folder_corner[3] > 200,
-        "the folder tile is raised: it has an opaque resting fill: {folder_corner:?}"
+    // The folder tile is the grid's only *raised* tile, so it is the only one with a resting
+    // fill at all — the translucent `OVERVIEW_PLATE`. A plain tile's corner is empty, which is
+    // what the comparison below is against.
+    assert_eq!(
+        folder_corner[3],
+        (crate::ui::widget::style::OVERVIEW_PLATE[3] * 255.).round() as u8,
+        "the folder tile has a resting fill at the plate's alpha: {folder_corner:?}"
     );
     assert_eq!(
         plain_corner[3], 0,
@@ -8747,11 +8765,20 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
     );
     eprintln!("dash chrome: pill={pill:?} separator={on_sep:?} dot={dot:?} no_dot={no_dot:?}");
 
-    assert_eq!(pill[3], 255, "the dash pill must composite opaquely");
+    let plate_a = (crate::ui::widget::style::OVERVIEW_PLATE[3] * 255.).round() as u8;
     assert_eq!(
-        on_sep[3], 255,
-        "the divider must stay opaque — a raw translucent hairline would clear a \
-         hole through the pill to the wallpaper: {on_sep:?}"
+        pill[3], plate_a,
+        "the dash pill must composite at the plate's alpha ({plate_a}): {pill:?}"
+    );
+    // `hairline` *clears* rather than blends, so the divider's colour is pre-composited onto the
+    // pill by `style::over`. Over a translucent plate that means the divider comes out *more*
+    // opaque than the pill, never less: anything below the pill's own alpha is the hole this
+    // pre-composite exists to prevent, which is what a fixed-alpha-1 `over` used to produce here
+    // in reverse — a solid bar across a plate the backdrop is meant to show through.
+    assert!(
+        on_sep[3] > plate_a && on_sep[3] < 255,
+        "the divider must be denser than the pill but still let the backdrop through \
+         (pill alpha {plate_a}): {on_sep:?}"
     );
     for ch in 0..3 {
         assert!(
