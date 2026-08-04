@@ -13,9 +13,12 @@
 //! windows never sit under it (see `layout::workspace::compute_working_area`).
 //!
 //! The bar is drawn entirely on the GPU through the owned Vulkan renderer: an
-//! offscreen `VkTexture` is cleared to the bar background, the clock glyph run
+//! offscreen `VkTexture` is cleared transparent, the clock glyph run
 //! is drawn with the [`render_glyphs`](VulkanFrame::render_glyphs) material, and
 //! the result is composited as a `TextureRenderElement` — no cairo/pango raster.
+//! The bar's *background* is not in that bake at all: it is a blurred capture of the scene
+//! behind the bar with a translucent dark wash over it, so the panel is see-through — a
+//! deliberate divergence from gnome-shell's opaque bar, see [`BAR_BG`].
 //! The workspace dots are drawn straight into the bar offscreen with the
 //! [`render_rounded_rect`](VulkanFrame::render_rounded_rect) material (the active
 //! dot a wide pill, the others small circles) — no CPU rasterization.
@@ -47,6 +50,9 @@ use synoik_config::Config;
 use crate::animation::{Animation, Clock};
 use crate::audio::{AudioStatus, MicStatus};
 use crate::gnome::{A11ySettings, ClockFormat, QuickToggles};
+use crate::render_helpers::background_effect::RenderParams;
+use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::rounded_solid::{RoundedSolidBuffer, RoundedSolidRenderElement};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
@@ -147,9 +153,25 @@ const MESSAGES_INDICATOR_ICON: f64 = 12.;
 /// shrank to [`MESSAGES_INDICATOR_ICON`] and both sides get this.
 const MESSAGES_INDICATOR_GAP: f64 = 6.;
 
-/// Bar background (opaque black — GNOME's dark panel `$panel_bg_color` = `$dark_5`
-/// `#000000`, `_colors.scss:24` / `_palette.scss:46`), straight RGBA.
-const BAR_BG: [f32; 4] = [0., 0., 0., 1.];
+/// Bar background — GNOME's dark panel `$panel_bg_color` = `$dark_5` `#000000`
+/// (`_colors.scss:24` / `_palette.scss:46`), straight RGBA, but **translucent**.
+///
+/// **Divergence (deliberate).** gnome-shell's panel is fully opaque; ours is a dark wash over a
+/// blurred capture of whatever is behind it ([`BAR_BLUR`]), the way the widely-used Blur my Shell
+/// extension does it. The alpha is what stands in for a brightness knob — the blur path has none —
+/// so it is chosen to land the backdrop near the 0.6 multiply that keeps the white panel foreground
+/// legible over an arbitrary wallpaper, the same job [`crate::ui::lock_screen::BLUR_BRIGHTNESS`]
+/// does behind the lock clock.
+pub(crate) const BAR_BG: [f32; 4] = [0., 0., 0., 0.4];
+
+/// The panel's backdrop blur — a dual-Kawase pass over the mid-frame capture of the strip behind
+/// the bar. Fixed rather than config-driven: there is no config file (see
+/// `docs/fork/STRATEGY.md`), and these are the values the surface-level effect defaults to
+/// (`synoik_config::Blur::default`).
+const BAR_BLUR: BlurOptions = BlurOptions {
+    passes: 3,
+    offset: 3.,
+};
 
 /// The bar background at `overview_fade`, where 0 is the normal desktop and 1 the
 /// fully-open overview. GNOME drops the panel to `background-color: transparent`
@@ -160,7 +182,8 @@ const BAR_BG: [f32; 4] = [0., 0., 0., 1.];
 /// crossfade is a plain CSS transition on the color, `$panel_transition_duration`
 /// 250ms = the overview's own `ANIMATION_TIME` (`_panel.scss:10-18`), which is why
 /// riding the overview progress directly reproduces it. Only the *background* fades:
-/// the clock, dots and status icons stay fully opaque throughout.
+/// the clock, dots and status icons stay fully opaque throughout. The blur under the wash
+/// ([`BAR_BLUR`]) does not fade — see the note where it is pushed.
 fn bar_bg(overview_fade: f64) -> [f32; 4] {
     let [r, g, b, a] = BAR_BG;
     [r, g, b, a * (1. - overview_fade as f32)]
@@ -180,7 +203,7 @@ const BTN_INSET_Y: f64 = 3.;
 const BTN_H_PADDING: f64 = 12.;
 
 /// `panel_button` fill *alpha* over the dark bar (white `$fg`) — the SDF fill blends
-/// over the opaque background: idle 0, hover `transparentize($fg, .83)`,
+/// over the bar background: idle 0, hover `transparentize($fg, .83)`,
 /// active/`:checked` `transparentize($fg, .72)`, active+hover `transparentize($fg, .68)`.
 /// The container color is white at the (animated) alpha of these.
 const BTN_HOVER_A: f32 = 0.17;
@@ -592,11 +615,13 @@ impl BarCache {
 // GPU round trip, so any animated property folded into it costs one round trip per frame
 // for as long as the animation runs. An alpha can ride the element instead; a size cannot,
 // which is why the dots need a real drawing primitive rather than a cached texture.
+// * `Backdrop` — the blurred capture of the scene behind the bar, under everything else.
 synoik_render_elements! {
     PanelElement => {
         Texture = TextureRenderElement<VkTexture>,
         Solid = SolidColorRenderElement,
         RoundedSolid = RoundedSolidRenderElement,
+        Backdrop = FramebufferEffectElement,
     }
 }
 
@@ -652,6 +677,12 @@ pub struct Panel {
 
     /// Cached GPU chrome, cleared whenever the drawn content changes.
     cache: RefCell<BarCache>,
+
+    /// Identity of the bar's backdrop-blur element — see [`BAR_BG`]. It holds no pixels: the
+    /// capture and the blur chain hang off this `Id` in whatever per-element state the render path
+    /// keeps, which is per output *and* per render target ([`FramebufferEffect::new`]). One stable
+    /// `Id` across frames is all this has to provide.
+    backdrop: FramebufferEffect,
 }
 
 impl Panel {
@@ -687,6 +718,7 @@ impl Panel {
             config,
             fills,
             cache: RefCell::new(BarCache::new()),
+            backdrop: FramebufferEffect::new(),
         }
     }
 
@@ -1368,7 +1400,7 @@ impl Panel {
             }
         }
 
-        // The bar chrome (opaque background, button containers, workspace dots, clock).
+        // The bar chrome (button containers, workspace dots, clock).
         // Button container state (hover/active) invalidates the bar cache on change, so
         // the structural key can stay content-only.
         let mut containers = self.button_containers(width, ws);
@@ -1432,7 +1464,9 @@ impl Panel {
                 scale,
                 Transform::Normal,
                 // The chrome is transparent everywhere it does not draw, so it never
-                // occludes; the background element below claims the opaque region.
+                // occludes. Nothing in the panel does any more: the background below it is a
+                // translucent wash over a blurred backdrop, so the strip has no opaque region
+                // at all and whatever is under the bar still has to be drawn.
                 Vec::new(),
             );
             elements.push(PanelElement::Texture(
@@ -1475,9 +1509,9 @@ impl Panel {
             }
         }
 
-        // The bar background, last so it composites *under* everything pushed above
-        // (this list is front-to-back). Its alpha is the only thing the overview
-        // animates, which is exactly why it is not baked into the chrome.
+        // The bar background wash, under everything pushed above (this list is front-to-back).
+        // Its alpha is the only thing the overview animates, which is exactly why it is not baked
+        // into the chrome.
         let bg = bar_bg(overview_fade);
         cache
             .bg
@@ -1490,6 +1524,29 @@ impl Panel {
                 Kind::Unspecified,
             )));
         }
+
+        // Bottom of the bar: the blurred capture of the scene behind it — see [`BAR_BG`]. It stays
+        // in through the overview: the backdrop revealed there is itself a blurred wallpaper
+        // (`Synoik::render_inner`), so a bar that kept a hard edge on it would read as a band, and
+        // the wash above fading to nothing is what makes the two meet.
+        //
+        // `noise`/`saturation` are left neutral: they are the surface-effect path's decoration, and
+        // a neutral pass has the property that blurring a flat colour returns that same colour —
+        // which is what keeps a wallpaper-less session (and the render corpus) showing the panel
+        // over exactly the fill that is behind it.
+        let geometry = Rectangle::new(Point::from((0., 0.)), Size::from((width, panel_height())));
+        elements.push(PanelElement::Backdrop(self.backdrop.render(
+            None,
+            RenderParams {
+                geometry,
+                subregion: None,
+                clip: None,
+                scale,
+            },
+            Some(BAR_BLUR),
+            0.,
+            1.,
+        )));
 
         elements
     }
@@ -2748,15 +2805,16 @@ mod tests {
         let first = backgrounds[0].expect("the desktop bar has a background");
         let last = backgrounds[10];
         assert!(
-            first > 0.9,
-            "the desktop bar background should be opaque, got {first}"
+            (first - BAR_BG[3]).abs() < 0.01,
+            "the desktop bar wash should be at its full alpha {}, got {first}",
+            BAR_BG[3],
         );
         assert!(
             last.is_none_or(|a| a < 0.01),
             "the overview bar background should have faded out, got {last:?}"
         );
         assert!(
-            backgrounds[5].is_some_and(|a| a > 0.2 && a < 0.8),
+            backgrounds[5].is_some_and(|a| a > first * 0.2 && a < first * 0.8),
             "mid-fade should be partly transparent, got {:?}",
             backgrounds[5]
         );
@@ -3309,15 +3367,18 @@ mod tests {
             to_physical_precise_round(scale, 17.),
             to_physical_precise_round(scale, 6.),
         );
-        // The bar background is opaque here (`overview_fade` 0), so the fill shows as a
-        // grey *level*, not as alpha: white at α0.28 over black is 0.28·255 ≈ 71.
+        // The bar's background is a *black* wash at [`BAR_BG`]'s alpha over a blur of nothing (this
+        // composites the panel alone, onto a transparent clear), so the pill's white fill shows as
+        // a premultiplied grey *level* independent of what is behind: white at α0.28 is 0.28·255 ≈
+        // 71 in every channel. Only the alpha carries the wash — 0.28 over 0.4 ≈ 0.57.
+        let expect_a = (BAR_BG[3] + 0.28 * (1. - BAR_BG[3])) * 255.;
         assert!(
-            inside[3] == 255
+            (inside[3] as f32 - expect_a).abs() <= 2.
                 && inside[0] == inside[1]
                 && inside[1] == inside[2]
                 && (60..=85).contains(&inside[0]),
-            "expected the checked Activities pill fill (grey ~71 over the opaque bar) at \
-             17,6, got {inside:?}",
+            "expected the checked Activities pill fill (grey ~71, alpha ~{expect_a:.0} over the \
+             translucent bar) at 17,6, got {inside:?}",
         );
 
         // Outside the pill's right edge the bar is bare again — so the assertion above is

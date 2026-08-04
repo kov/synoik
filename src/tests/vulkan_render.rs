@@ -7419,11 +7419,15 @@ fn vulkan_search_fade_blends_the_picker_at_partial_alpha() {
 /// unbroken from the top of the screen down and the bar reads as part of the
 /// overview rather than a black band above it.
 ///
-/// Pin both ends over the *same* pixel: opaque black on the desktop, and — in the
-/// overview — the colour the backdrop has just below the bar. Comparing against the
-/// measured backdrop rather than a literal is what makes this a "no visible break"
-/// assertion: it keeps holding if the backdrop colour is retuned, and fails if the
-/// panel keeps any background of its own.
+/// Pin both ends over the *same* pixel: in the overview, the colour the backdrop has just below
+/// the bar. Comparing against the measured backdrop rather than a literal is what makes this a
+/// "no visible break" assertion: it keeps holding if the backdrop colour is retuned, and fails if
+/// the panel keeps any background of its own.
+///
+/// On the desktop the bar is *not* GNOME's opaque black — see [`crate::ui::panel::BAR_BG`]: ours
+/// is a dark wash over a blurred capture of what is behind. Blurring a flat fill returns that same
+/// fill, so with nothing but the workspace background under the bar the wash is the only thing
+/// that happened, and the desktop end pins exactly that: the fill, dimmed by the wash.
 #[test]
 fn vulkan_overview_panel_background_matches_the_backdrop() {
     let Some(mut f) = green_window_fixture() else {
@@ -7446,10 +7450,22 @@ fn vulkan_overview_panel_background_matches_the_backdrop() {
 
     let (pixels, w, _) = render_output_vulkan(&mut f, &output);
     let desktop = px(&pixels, w, x, bar_y);
+    // The workspace fill behind the bar, dimmed by the wash — both from their own constants, so
+    // retuning either one moves the expectation with it.
+    let fill = synoik_config::DEFAULT_BACKGROUND_COLOR.to_array_unpremul()[0];
+    let wash = 1. - crate::ui::panel::BAR_BG[3];
+    let expected = (fill * wash * 255.).round() as u8;
+    for c in 0..3 {
+        assert!(
+            desktop[c].abs_diff(expected) <= 1,
+            "channel {c}: on the desktop the bar should be the workspace fill under it dimmed by \
+             the wash ({expected}), got {desktop:?} — a blur of a flat fill is that same fill, so \
+             anything else means the bar is painting a background of its own",
+        );
+    }
     assert_eq!(
-        [desktop[0], desktop[1], desktop[2], desktop[3]],
-        [0, 0, 0, 255],
-        "on the desktop the bar is opaque $panel_bg_color black"
+        desktop[3], 255,
+        "the bar's own strip is still fully covered"
     );
 
     f.synoik_state().do_action(Action::OpenOverview, false);
@@ -9506,6 +9522,19 @@ fn render_deferred_once(f: &mut Fixture, output: &Output) -> (u64, u64) {
             let _ = synoik_vk::stats::take_creates();
             let d0 = synoik_vk::stats::draws();
             let elements = synoik.render_to_vec(ctx, output, false);
+            // Drop the backdrop-blur elements (the top panel's, `ui::panel::BAR_BG`). They are not
+            // what this measures, and `render_to_texture` has no per-element state to keep their
+            // capture and blur chain in — `render_elements` hands every element a fresh
+            // `UserDataMap` — so on *this* path they allocate once per call by construction, which
+            // would sit on top of the absolute bound below and hide the buffer this is watching.
+            // The live path is the damage tracker's, which keeps that state across frames and only
+            // re-captures when something behind the element damaged.
+            let elements: Vec<_> = elements
+                .iter()
+                .filter(|e| {
+                    !smithay::backend::renderer::element::Element::is_framebuffer_effect(*e)
+                })
+                .collect();
             let (_tex, _sync) = render_to_texture(
                 vk,
                 size,

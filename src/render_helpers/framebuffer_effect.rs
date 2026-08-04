@@ -38,6 +38,14 @@ pub struct FramebufferEffectElement {
 }
 
 impl FramebufferEffect {
+    /// The GPU state (capture texture, blur chain) lives wherever the render path keeps
+    /// per-element state, **not** here: an [`OutputDamageTracker`] keeps a `UserDataMap` per
+    /// element `Id`, so the same effect drawn on two outputs at two sizes gets one capture each,
+    /// and — the part that matters — one render *target* cannot draw from a capture another
+    /// target filled. Block-out rules key off the target, so a shared capture is how a screencast
+    /// would come to composite the un-blocked scene.
+    ///
+    /// [`OutputDamageTracker`]: smithay::backend::renderer::damage::OutputDamageTracker
     pub fn new() -> Self {
         Self {
             id: Id::new(),

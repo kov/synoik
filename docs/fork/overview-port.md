@@ -1680,3 +1680,55 @@ Both halves were the same root cause and are fixed in
 app-grid blends now read the state-derived leg rather than the frozen show-apps scalar, and the
 zoom/exposé leg saturates across the app-grid leg so the two run in sequence rather than on top of
 each other. Seat-validated frame by frame.
+
+## 13. Blurred wallpaper backdrop + a see-through panel (landed 2026-08-04)
+
+Gustavo, running the Blur my Shell extension on his GNOME session: "I like the way it replaces the
+dark grey background with a blurred rendering of the background and how the panel is made
+see-through; I'd like to have those as standard on synoik."
+
+Two chosen divergences from gnome-shell, both default-on, neither configurable (there is no config
+file — `STRATEGY.md`):
+
+- **The overview backdrop is the blurred wallpaper**, not `#overviewGroup`'s flat
+  `$system_base_color` (`_overview.scss:7-9`). `Synoik::render_inner` pushes
+  `Wallpaper::render_blurred` — the same GNOME gaussian the lock screen uses — over the solid
+  backdrop whenever `Monitor::expose_progress()` is non-zero. `OVERVIEW_BLUR_RADIUS` 90 stage px
+  (GNOME's own `unlockDialog.js` radius), `OVERVIEW_BLUR_BRIGHTNESS` 0.45.
+
+  Only while the overview is up: on the desktop a workspace covers the output edge to edge, so the
+  backdrop is invisible and drawing it would be a fullscreen blur nobody can see. The solid stays
+  underneath as the backstop for "no wallpaper" and for a frame where the blur fails to build.
+
+  The brightness is the one tuned number. 0.6 (Blur my Shell's default) leaves a *light* wallpaper
+  bright enough that the panel's white clock — which GNOME drops to `background-color: transparent`
+  in the overview, so it has nothing behind it — loses contrast against the backdrop. 0.45 keeps
+  the picture recognisable and the white chrome legible on `futurecity_light`, which is the bright
+  end of the shipped set.
+
+- **The panel is see-through**: `BAR_BG` is black at α0.4 over a `FramebufferEffect` backdrop blur
+  of the strip behind the bar, instead of gnome-shell's opaque `$panel_bg_color`. The wash is what
+  stands in for a brightness knob — the blur path has none — and it still fades to nothing as the
+  overview opens (`#panel:overview`), which is what makes the bar and the blurred backdrop meet
+  without a seam.
+
+  **What this costs per frame: nothing, on an idle desktop.** Smithay gates the capture on damage
+  *below* the element (`damage/mod.rs:705-730` sets `needs_capture` only when damage overlaps the
+  effect's rect) and scissors the draw to the element's own damage, so a frame where nothing behind
+  the bar changed neither re-captures nor re-blurs — and a frame with no damage at all is never
+  rendered. The capture and the blur chain are recorded into the frame's own command buffer, so
+  even when they do run they cost no extra submit (`frame-submit-discipline.md`). The one path that
+  redoes the work unconditionally is `render_elements` (screenshots, shm screencast frames,
+  offscreen renders), which has no per-element state to keep the capture in — but that path redraws
+  and reallocates everything by construction anyway.
+
+  **Do not give the effect its own capture** to dodge that last path — the shape this was first
+  built in, and wrong twice over. It was justified by per-frame `VkTexture` creation aborting
+  Venus, which was fixed at the VMM level in 2026-07 (`renderer.rs`'s `readback_staging_buffer`
+  carries the surviving cost argument), and it defeats the separation the per-element state map
+  gives for free: that map is per output *and* per render target, block-out rules key off the
+  target, and one target drawing from a capture another target filled is how a screencast comes to
+  composite the un-blocked scene.
+
+Both seat-shaped rather than seat-validated: verified on an owned headless session against a dark
+(`petals_dark`) and a light (`futurecity_light`) wallpaper.

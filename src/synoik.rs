@@ -231,6 +231,22 @@ const SHIELD_DIM_COLOR: [f32; 4] = {
     [0., 0., 0., a]
 };
 
+/// The overview backdrop's blur radius, in **stage pixels** (output physical pixels) like
+/// gnome-shell's own blur constants — [`crate::wallpaper::Wallpaper::render_blurred`] converts it
+/// into the wallpaper texture's resolution.
+///
+/// **Divergence (deliberate).** gnome-shell fills `#overviewGroup` with a flat
+/// `$system_base_color` (`_overview.scss:7-9`); we show the wallpaper blurred behind the shrunk
+/// workspaces instead, the way the widely-used Blur my Shell extension does. The workspace
+/// previews keep their own unblurred wallpaper, so the backdrop reads as the same picture pushed
+/// out of focus rather than as a slab of grey — which is the whole point of the effect.
+const OVERVIEW_BLUR_RADIUS: f64 = 90.;
+
+/// What the overview backdrop's blur multiplies the wallpaper by — the dim that keeps a bright
+/// picture from competing with the window previews and the white dash/search chrome over it. Rides
+/// *inside* the blur pass, like the lock screen's [`crate::ui::lock_screen::BLUR_BRIGHTNESS`].
+const OVERVIEW_BLUR_BRIGHTNESS: f32 = 0.45;
+
 /// Every render target, in `RenderTarget as usize` order — so a `[T; RenderTarget::COUNT]` built
 /// by mapping over this can be indexed by target. A frozen screen (screenshot UI, screen
 /// transition) must be captured once per target, since block-out rules key off the target.
@@ -9941,6 +9957,29 @@ impl Synoik {
         // Then the backdrop.
         push_popups_from_layer!(Layer::Background, true);
         push_normal_from_layer!(Layer::Background, true);
+
+        // The blurred wallpaper standing in for the flat `#overviewGroup` fill — see
+        // [`OVERVIEW_BLUR_RADIUS`]. Only while the overview is up: on the desktop a workspace
+        // covers the output edge to edge, so the backdrop is invisible and this would be a
+        // fullscreen blur nobody can see. Pushed above the solid, which stays as the backstop for
+        // "no wallpaper" and for the frames where the blur cannot be built.
+        if gnome_mode {
+            if let Some(progress) = mon.expose_progress() {
+                if progress > 0. {
+                    let radius = OVERVIEW_BLUR_RADIUS * output_scale.x;
+                    if let Some(elem) = self.wallpaper.render_blurred(
+                        ctx.renderer,
+                        Default::default(),
+                        output_size(output),
+                        output_scale,
+                        radius,
+                        OVERVIEW_BLUR_BRIGHTNESS,
+                    ) {
+                        push(elem.into());
+                    }
+                }
+            }
+        }
 
         push(backdrop);
     }
