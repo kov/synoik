@@ -264,9 +264,15 @@ implicit allocation gives the driver's best layout, which here is the same LINEA
 before.
 
 **Testing it without a kernel rebuild:** `NIRI_KMS_IMPLICIT_MODIFIERS=1` drops the explicit entries
-from the scanout set, so negotiation lands on INVALID even on a driver that does name modifiers. The
-whole path — implicit allocation, the layout check, modifier-less `AddFB2`, the renderer's
-substitution — then runs on hardware that still has the explicit path to fall back to.
+from the scanout set, so negotiation lands on INVALID even on a driver that does name modifiers.
+Seat run 2026-08-04: session came up clean, validation layer silent, picture correct.
+
+Be careful what that proves. It covers negotiation, implicit allocation, keeping gbm's modifier, and
+the import — **all carrying a LINEAR buffer**, because while the patches are in, several layers force
+LINEAR and Venus enumerates no other modifier for these formats (`cargo run -p niri-vk` probes: one
+modifier, `0x0`). It does *not* cover the modifier-less `AddFB2` fallback, which never engages while
+the driver still accepts modifiers, and it says nothing about what gbm picks once those layers stop
+forcing linear. Both only get a real check on the deployed VMM/mesa/kernel.
 
 ---
 
