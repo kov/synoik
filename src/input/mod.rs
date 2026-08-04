@@ -3984,19 +3984,7 @@ impl State {
                 self.synoik.layout.toggle_overview();
                 self.synoik.queue_redraw_all();
             }
-            Action::ToggleApplicationView => {
-                // `_toggleAppsPage` (`overviewControls.js:660-667`): with the overview
-                // up this is the show-apps button, flipping between the window picker
-                // and the grid; with it down it opens the overview *at* the grid rather
-                // than at the picker.
-                if self.synoik.layout.is_overview_open() {
-                    self.synoik.layout.toggle_app_grid();
-                } else {
-                    self.synoik.layout.open_overview();
-                    self.synoik.layout.open_app_grid();
-                }
-                self.synoik.queue_redraw_all();
-            }
+            Action::ToggleApplicationView => self.toggle_apps_page(),
             Action::ToggleMessageTray => {
                 if let Some(output) = self.synoik.layout.active_output().cloned() {
                     self.toggle_date_menu(output);
@@ -6294,6 +6282,24 @@ impl State {
         true
     }
 
+    /// GNOME's `_toggleAppsPage` (`overviewControls.js:660-667`): with the overview up, flip
+    /// between the window picker and the app grid; with it down, open the overview *at* the
+    /// grid (`Main.overview.show(ControlsState.APP_GRID)`) rather than at the picker.
+    ///
+    /// One function because gnome-shell has one: `overviewControls.js:481` binds this same
+    /// handler to the `toggle-application-view` keybinding (Super+A), and the dash's show-apps
+    /// button drives it too. Split in two, the button's copy is the one that quietly forgets the
+    /// overview-shut branch — which is exactly what left it inert on the dock.
+    fn toggle_apps_page(&mut self) {
+        if self.synoik.layout.is_overview_open() {
+            self.synoik.layout.toggle_app_grid();
+        } else {
+            self.synoik.layout.open_overview();
+            self.synoik.layout.open_app_grid();
+        }
+        self.synoik.queue_redraw_all();
+    }
+
     fn activate_overview_hit(
         &mut self,
         output: &Output,
@@ -6309,7 +6315,10 @@ impl State {
         // Acting on a dock icon dismisses the dock: you asked for a window, and the dock
         // sitting over it waiting for the pointer to leave would be in the way. A right-click
         // does not — that opens the app's menu, which belongs to an icon still on screen.
-        if launches && self.synoik.dock_owns_dash(output) && matches!(hit, OverviewHit::Dash(_)) {
+        if launches
+            && self.synoik.dock_owns_dash(output)
+            && matches!(hit, OverviewHit::Dash(DashHit::App(_)))
+        {
             self.synoik.dock.hide();
         }
 
@@ -6335,11 +6344,10 @@ impl State {
                     self.synoik.layout.close_overview();
                 }
             }
-            // The show-apps button toggles the app grid (`ShowAppsIcon`,
-            // `dash.js:189-213`).
-            OverviewHit::Dash(DashHit::ShowApps) if primary => {
-                self.synoik.layout.toggle_app_grid();
-            }
+            // The show-apps button *is* `_toggleAppsPage` (`overviewControls.js:481` binds
+            // the same handler to `toggle-application-view`), so from the dock — overview
+            // shut — it opens the overview at the grid rather than doing nothing.
+            OverviewHit::Dash(DashHit::ShowApps) if primary => self.toggle_apps_page(),
             OverviewHit::Search(SearchHit::Result(i)) if launches => {
                 if let Some(id) = self.synoik.overview_search.result_id(i).map(str::to_owned) {
                     // An app search result *is* an `AppIcon`

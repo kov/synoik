@@ -388,6 +388,52 @@ fn the_dock_hit_tests_the_same_dash_as_the_overview() {
     );
 }
 
+/// The dock's show-apps button opens the overview *at the app grid*, the same as `<Super>A`.
+///
+/// gnome-shell binds one handler (`_toggleAppsPage`, `overviewControls.js:660-667,481`) to both
+/// the button and `toggle-application-view`, and its overview-shut branch is
+/// `Main.overview.show(ControlsState.APP_GRID)`. Ours toggled the grid only, which is a no-op
+/// with the overview down — so on the dock the button did nothing at all.
+#[test]
+fn the_dock_show_apps_button_opens_the_app_grid() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+    seed_favorites(&mut f, &["a.desktop", "b.desktop"]);
+
+    pointer_motion_to(&mut f, 960., 1079.);
+    for _ in 0..10 {
+        f.pointer_motion(0., 20.);
+    }
+    f.synoik_complete_animations();
+    assert!(
+        f.synoik().dock_owns_dash(&output),
+        "the dock is out with the overview shut"
+    );
+
+    // Click the show-apps button, asked of the dash rather than guessed at.
+    let area = f.synoik().dock.area(&output).expect("the dock is out");
+    let i = f.synoik().dash.show_apps_index();
+    let center = f
+        .synoik()
+        .dash
+        .tile_center(i, area)
+        .expect("the show-apps button");
+    pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.synoik_complete_animations();
+
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "it must open the overview"
+    );
+    assert!(
+        f.synoik().layout.is_app_grid_open(),
+        "and land on the app grid, not the window picker"
+    );
+}
+
 /// GNOME's "overlay key": tapping Super on its own — pressed and released with
 /// nothing in between — toggles the Activities overview. This is the first
 /// genuinely GNOME-distinct behavior (niri has no overlay key), and it pins
