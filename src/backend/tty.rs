@@ -19,7 +19,7 @@ use niri_config::{Config, OutputName};
 use niri_ipc::{HSyncPolarity, VSyncPolarity};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::format::FormatSet;
-use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+use smithay::backend::allocator::gbm::{GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::{Format, Fourcc};
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
@@ -919,7 +919,7 @@ impl Tty {
             bail!("no allocator available for device");
         };
         let gbm_flags = GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT;
-        let allocator = ScanoutAllocator::new(GbmAllocator::new(allocator_gbm, gbm_flags));
+        let allocator = ScanoutAllocator::new(allocator_gbm, gbm_flags);
 
         let token = niri
             .event_loop

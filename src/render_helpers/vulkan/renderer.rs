@@ -2623,19 +2623,19 @@ impl VulkanRenderer {
             )));
         }
         let (w, h) = (dmabuf.width(), dmabuf.height());
-        // A KMS driver that supports no modifiers (upstream virtio-gpu sets
-        // `fb_modifiers_not_supported`) makes `DrmCompositor` allocate implicitly, and smithay
-        // tags such a buffer INVALID — the value KMS wants, since it means "plain AddFB2, no
-        // modifier". Vulkan has no such encoding: `VK_EXT_image_drm_format_modifier` needs the
-        // layout named. `ScanoutAllocator` has already read the layout gbm actually chose and
-        // refused the buffer if it was not linear, so the substitution here is a proven fact
-        // about *our own* scanout buffers, not a guess. Client buffers carry no such proof and
-        // are still rejected in `import_dmabuf_as_texture`.
-        let modifier: u64 = match dmabuf.format().modifier {
-            Modifier::Invalid => crate::backend::scanout_allocator::IMPLICIT_SCANOUT_MODIFIER,
-            modifier => modifier,
+        // `VK_EXT_image_drm_format_modifier` cannot express INVALID, and nothing here could
+        // recover the layout: a dmabuf is an fd and a stride, not a description of its tiling.
+        // Our own scanout buffers never arrive this way even on a KMS driver that names no
+        // modifiers — `ScanoutAllocator` keeps gbm's chosen modifier on the buffer precisely so
+        // this import has something to name (see `backend/scanout_allocator.rs`). Guessing a
+        // layout here is how a buffer scans out as garbage instead of erroring.
+        if dmabuf.format().modifier == Modifier::Invalid {
+            return Err(VulkanError::Other(
+                "dmabuf scanout target has no modifier; nothing can name its layout to Vulkan"
+                    .into(),
+            ));
         }
-        .into();
+        let modifier: u64 = dmabuf.format().modifier.into();
         let fd = dmabuf
             .handles()
             .next()

@@ -4,49 +4,95 @@
 //! `virtgpu_display.c`) reports `DRM_CAP_ADDFB2_MODIFIERS = 0`, attaches no `IN_FORMATS` blob to
 //! any plane, and rejects `drmModeAddFB2` calls that carry `DRM_MODE_FB_MODIFIERS`. Smithay then
 //! synthesizes `Modifier::Invalid` for every plane format (`backend::drm::plane_formats`), so the
-//! `DrmCompositor` picks `Invalid` and the swapchain allocates through gbm's *implicit* path.
+//! `DrmCompositor` negotiates `Invalid` and the swapchain allocates through gbm's *implicit* path.
 //!
-//! That is fine for KMS — smithay maps `Invalid` back to "no modifiers" and emits a plain
-//! `AddFB2` — but it is not fine for us: the owned Vulkan renderer imports scanout buffers with
+//! KMS is happy with that — implicit means gbm and the kernel driver of the same device agree out
+//! of band, and we ask for `SCANOUT`, so whatever gbm picks is by construction something the
+//! display engine can scan out. The renderer is not: it imports through
 //! `VK_EXT_image_drm_format_modifier`, which has no encoding for "implicit". The layout has to be
 //! named.
 //!
-//! `DRM_FORMAT_MOD_INVALID` does **not** mean linear; it means "the two sides agree out of band".
-//! So rather than assume, this allocator asks: gbm knows the layout it actually picked, and
-//! [`GbmBuffer`] keeps the underlying `BufferObject` reachable even after smithay masks the
-//! modifier to `Invalid` for the KMS path. We read the real one and refuse the buffer if it is
-//! anything but linear — a tiled implicit buffer imported as linear would scan out as garbage,
-//! and a loud failure at allocation beats that.
+//! Smithay masks the modifier to `Invalid` for implicit allocations, because gbm's answer is not
+//! trustworthy on every driver. This allocator reads it anyway — [`GbmBuffer`] keeps the
+//! underlying `BufferObject` reachable — and keeps it on the buffer, so the exported
+//! [`Dmabuf`](smithay::backend::allocator::dmabuf::Dmabuf) names the layout Vulkan needs.
 //!
-//! The masked `Invalid` is what reaches KMS; [`implicit_scanout_modifier`] is what the renderer
-//! imports with. See `src/render_helpers/vulkan/renderer.rs::import_dmabuf_target`.
+//! Two consequences, both deliberate:
+//!
+//! - KMS sees an explicit modifier and so takes `AddFB2` *with* `MODIFIERS`, which such a driver
+//!   rejects — smithay then falls back to the legacy `AddFB` (one "using legacy fbadd" warning per
+//!   session, one failed ioctl per swapchain buffer, not per frame). That fallback *is* the
+//!   implicit path, and it is correct for the reason above.
+//! - Whether the renderer can actually use the layout gbm picked is Vulkan's question to answer,
+//!   not ours to pre-empt: `check_modifier` queries the driver's features for that exact modifier
+//!   and fails closed. Refusing anything non-linear here instead would turn a working tiled/tiled
+//!   pipeline into a compositor that will not start — and would not catch the failure that actually
+//!   hurts, a buffer *misreported* as linear.
+//!
+//! The one thing we do refuse is gbm reporting `Invalid` back at us: there is then no layout to
+//! name in the import, and guessing one is how a buffer scans out as garbage.
 
 use std::io;
 use std::ops::Deref;
+use std::sync::Mutex;
 
-use smithay::backend::allocator::gbm::{GbmAllocator, GbmBuffer};
-use smithay::backend::allocator::{Allocator, Buffer as _, Fourcc, Modifier};
+use smithay::backend::allocator::gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice};
+use smithay::backend::allocator::{Allocator, Fourcc, Modifier};
 use smithay::backend::drm::DrmDeviceFd;
+use tracing::warn;
 
-/// The layout an implicitly-allocated scanout buffer must have for us to import it.
+/// The layout we expect an implicit allocation to come back with on the stacks we run on.
 ///
-/// Every gbm driver we can drive this way allocates linear when asked without modifiers; this
-/// constant is the single place that assumption is written down, and
-/// [`ScanoutAllocator::create_buffer`] proves it per buffer instead of trusting it.
-pub const IMPLICIT_SCANOUT_MODIFIER: Modifier = Modifier::Linear;
+/// Nothing enforces it — it is what the warning in [`ScanoutAllocator::create_buffer`] is measured
+/// against, so an unexpected layout shows up in the journal instead of silently becoming the new
+/// normal.
+pub const EXPECTED_IMPLICIT_MODIFIER: Modifier = Modifier::Linear;
 
-/// Wraps [`GbmAllocator`] to validate the layout of implicit-modifier allocations.
+/// Wraps [`GbmAllocator`] so implicit allocations keep the modifier gbm actually chose.
 ///
-/// Explicit-modifier allocations pass straight through: the modifier survives into the exported
-/// [`Dmabuf`](smithay::backend::allocator::dmabuf::Dmabuf) and the renderer imports it as-is.
-#[derive(Debug, Clone)]
+/// Explicit-modifier allocations pass straight through — they already carry their modifier.
+#[derive(Debug)]
 pub struct ScanoutAllocator {
     inner: GbmAllocator<DrmDeviceFd>,
+    device: GbmDevice<DrmDeviceFd>,
+    flags: GbmBufferFlags,
+    /// Modifiers we have already reported as unexpected, so a swapchain of N buffers logs once.
+    warned: Mutex<Vec<Modifier>>,
+}
+
+impl Clone for ScanoutAllocator {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            device: self.device.clone(),
+            flags: self.flags,
+            warned: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl ScanoutAllocator {
-    pub fn new(inner: GbmAllocator<DrmDeviceFd>) -> Self {
-        Self { inner }
+    pub fn new(device: GbmDevice<DrmDeviceFd>, flags: GbmBufferFlags) -> Self {
+        Self {
+            inner: GbmAllocator::new(device.clone(), flags),
+            device,
+            flags,
+            warned: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn warn_once(&self, modifier: Modifier, fourcc: Fourcc) {
+        let mut warned = self.warned.lock().unwrap();
+        if warned.contains(&modifier) {
+            return;
+        }
+        warned.push(modifier);
+
+        warn!(
+            "gbm chose {modifier:?} for an implicit {fourcc:?} scanout buffer, not \
+             {EXPECTED_IMPLICIT_MODIFIER:?}; importing under that layout — if the display is \
+             garbled, this is the first thing to suspect"
+        );
     }
 }
 
@@ -61,35 +107,41 @@ impl Allocator for ScanoutAllocator {
         fourcc: Fourcc,
         modifiers: &[Modifier],
     ) -> Result<Self::Buffer, Self::Error> {
-        let buffer = self.inner.create_buffer(width, height, fourcc, modifiers)?;
+        if !wants_implicit(modifiers) {
+            return self.inner.create_buffer(width, height, fourcc, modifiers);
+        }
 
-        // `GbmAllocator` reports `Invalid` for anything it allocated through gbm's pre-modifier
-        // API — either because we asked for `Invalid` (implicit-only KMS) or because an explicit
-        // allocation failed and it retried legacy. Both land here, and both need the check.
-        if buffer.format().modifier == Modifier::Invalid {
-            // `GbmBuffer` derefs to the `gbm::BufferObject`, whose `modifier()` is the layout gbm
-            // really chose — not the masked value `Buffer::format` reports.
-            check_implicit_layout(fourcc, Deref::deref(&buffer).modifier())?;
+        // gbm's pre-modifier entry point: the driver picks the layout, the same way it does for
+        // any client that allocates without `EGL_EXT_image_dma_buf_import_modifiers`.
+        let bo = self
+            .device
+            .create_buffer_object::<()>(width, height, fourcc, self.flags)?;
+
+        // Deliberately `implicit = false`: smithay would otherwise overwrite the modifier with
+        // `Invalid`, and the exported dmabuf is the renderer's only view of this buffer.
+        let buffer = GbmBuffer::from_bo(bo, false);
+
+        // `Buffer::format` now reports what gbm chose, so read the object through the deref to
+        // keep the two straight while checking.
+        let real = Deref::deref(&buffer).modifier();
+        if real == Modifier::Invalid {
+            return Err(io::Error::other(format!(
+                "gbm allocated an implicit {fourcc:?} scanout buffer and reports no modifier for \
+                 it, leaving nothing to name in the Vulkan import"
+            )));
+        }
+        if real != EXPECTED_IMPLICIT_MODIFIER {
+            self.warn_once(real, fourcc);
         }
 
         Ok(buffer)
     }
 }
 
-/// Whether a buffer gbm allocated implicitly is one the renderer can import as
-/// [`IMPLICIT_SCANOUT_MODIFIER`].
-///
-/// Split out from [`ScanoutAllocator::create_buffer`] so the rule is testable without a gbm
-/// device: everything else in that path needs real hardware.
-fn check_implicit_layout(fourcc: Fourcc, real: Modifier) -> Result<(), io::Error> {
-    if real == IMPLICIT_SCANOUT_MODIFIER {
-        return Ok(());
-    }
-
-    Err(io::Error::other(format!(
-        "gbm allocated an implicit {fourcc:?} scanout buffer with modifier {real:?}, but only \
-         {IMPLICIT_SCANOUT_MODIFIER:?} can be imported into Vulkan when KMS names no modifier"
-    )))
+/// Whether this request is for an implicit allocation — i.e. the only thing the plane and the
+/// renderer could agree on was `Invalid`.
+fn wants_implicit(modifiers: &[Modifier]) -> bool {
+    !modifiers.is_empty() && modifiers.iter().all(|m| *m == Modifier::Invalid)
 }
 
 #[cfg(test)]
@@ -97,22 +149,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn implicit_linear_is_importable() {
-        assert!(check_implicit_layout(Fourcc::Xrgb8888, Modifier::Linear).is_ok());
+    fn invalid_only_requests_are_implicit() {
+        assert!(wants_implicit(&[Modifier::Invalid]));
     }
 
     #[test]
-    fn implicit_tiled_is_refused() {
-        // The failure this whole module exists to prevent: gbm picked a tiled layout for an
-        // implicit allocation, and importing it as linear would scan out garbage.
-        let err = check_implicit_layout(Fourcc::Xrgb8888, Modifier::I915_x_tiled).unwrap_err();
-        assert!(err.to_string().contains("I915_x_tiled"), "{err}");
+    fn explicit_requests_are_not_implicit() {
+        assert!(!wants_implicit(&[Modifier::Linear]));
+        // A mixed list still has something explicit to try, and `GbmAllocator` handles the
+        // fallback ordering; taking the implicit path here would throw that away.
+        assert!(!wants_implicit(&[
+            Modifier::Invalid,
+            Modifier::I915_x_tiled
+        ]));
     }
 
     #[test]
-    fn implicit_staying_invalid_is_refused() {
-        // gbm reporting INVALID back means it has nothing to tell us; there is no layout to name
-        // in the Vulkan import, so this must not be waved through as linear.
-        assert!(check_implicit_layout(Fourcc::Xrgb8888, Modifier::Invalid).is_err());
+    fn empty_requests_are_not_implicit() {
+        // An empty list is not a request for implicit; let gbm reject it as it always would.
+        assert!(!wants_implicit(&[]));
     }
 }

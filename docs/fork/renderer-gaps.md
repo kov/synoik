@@ -226,18 +226,33 @@ patched kernel that advertised LINEAR purely to keep us working; that patch is n
 
 `DRM_FORMAT_MOD_INVALID` is not a layout — it means the two sides agree out of band — and
 `VK_EXT_image_drm_format_modifier` has no encoding for it, so an implicit buffer cannot simply be
-handed to the importer. The split is mutter's (`meta-drm-buffer.c`, `import_scanout_gbm_bo`): the
-buffer stays INVALID for KMS, which is what makes smithay emit a modifier-less `AddFB2`, while the
-renderer imports it under the layout gbm actually chose.
+handed to the importer. KMS does not need one named: implicit means gbm and the kernel driver of the
+same device agree, and we allocate with `SCANOUT`, so whatever gbm picks is by construction
+scannable. The renderer does. So the buffer keeps **gbm's** answer rather than smithay's mask.
 
-- `backend/scanout_allocator.rs` wraps `GbmAllocator`. When a buffer comes back INVALID it reads the
-  real modifier off the underlying `gbm::BufferObject` (`GbmBuffer` masks it, but keeps it reachable)
-  and **refuses anything but LINEAR**. A tiled implicit buffer imported as linear would scan out as
-  garbage; failing at allocation is the honest end of that.
+- `backend/scanout_allocator.rs` wraps `GbmAllocator`. For an INVALID-only request it allocates
+  through gbm's pre-modifier entry point and builds the `GbmBuffer` with `implicit = false`, so the
+  modifier gbm chose survives into the exported dmabuf. It refuses only the case where gbm itself
+  reports INVALID — nothing can name that layout — and warns once if the layout is not LINEAR.
 - `owned_vulkan_scanout_formats()` adds the INVALID entries to what `DrmCompositor` negotiates with.
-  Client feedback keeps only the explicit set — a client's INVALID buffer has no allocation-time
-  proof behind it, and `import_dmabuf_as_texture` still rejects it.
-- `import_dmabuf_target` substitutes LINEAR for INVALID, backed by the check above.
+  Client feedback keeps only the explicit set — a client's INVALID buffer was allocated by someone
+  else with no layout we can recover, and `import_dmabuf_as_texture` still rejects it.
+- `import_dmabuf_target` errors on INVALID instead of guessing a layout. Our own buffers never
+  arrive that way; anything that does has bypassed the allocator.
+
+**Do not "fix" this by demanding LINEAR.** With no kernel patch, gbm is free to hand back a tiled
+`SCANOUT|RENDERING` buffer, and tiled/tiled is a perfectly working pipeline — refusing it turns a
+correct configuration into a compositor that will not start. It would not catch the failure that
+actually hurts either (a buffer *misreported* as linear scans out as garbage whichever rule we
+write). Whether the renderer can use the layout is Vulkan's question: `check_modifier` queries the
+driver's features for that exact modifier and fails closed, so an unusable layout surfaces as a
+named import error rather than a wrong picture.
+
+Two costs of keeping the real modifier on the buffer: KMS takes `AddFB2` *with* `MODIFIERS` first
+and gets EINVAL, falling back to smithay's legacy `AddFB` (one failed ioctl per swapchain buffer,
+one "using legacy fbadd" warning per session — not per frame); and if Venus enumerates no features
+for the modifier gbm chose, startup fails at the import. If that happens, the fix is to steer the
+allocation (gbm's `USE_LINEAR` flag, as mutter does for cross-device buffers), not to refuse it here.
 
 **What is lost.** Direct scanout of *client* buffers is impossible on such a driver: smithay refuses
 to hand KMS an INVALID buffer (weston's reasoning — an unknown layout can display garbage), and an
