@@ -681,6 +681,10 @@ pub struct Synoik {
     /// Control channel to the MPRIS watcher task, which owns the bus connection; `None` when the
     /// watcher isn't running.
     pub mpris_emit: Option<async_channel::Sender<crate::mpris::SynoikToMpris>>,
+    /// The app indicators registered with our `org.kde.StatusNotifierWatcher`, in registration
+    /// order. Lifetime only so far — the icon, status and menu arrive with the panel slice; see
+    /// [`crate::status_notifier`] and `docs/fork/status-notifier-port.md`.
+    pub status_notifier_items: Vec<crate::status_notifier::RegisteredItem>,
     /// The on-screen notification banner (gnome-shell's MessageTray popup).
     pub notification_banner: crate::ui::notification_banner::NotificationBanner,
     /// The on-screen display (volume/brightness/…), one window per output.
@@ -6303,6 +6307,29 @@ impl State {
         }
     }
 
+    /// An app indicator appeared or went away. Lifetime only for now: nothing is drawn until the
+    /// panel slice, so this just keeps the list the later slices read from.
+    pub fn on_status_notifier_msg(&mut self, msg: crate::status_notifier::StatusNotifierToSynoik) {
+        use crate::status_notifier::StatusNotifierToSynoik as Msg;
+
+        match msg {
+            Msg::ItemRegistered(item) => {
+                // The watcher is the only writer and refuses duplicates, but a list that can
+                // double an entry is a list that will eventually draw one twice.
+                if let Some(existing) = self.synoik.status_notifier_items.iter_mut().find(|i| {
+                    i.unique_name == item.unique_name && i.object_path == item.object_path
+                }) {
+                    *existing = item;
+                } else {
+                    self.synoik.status_notifier_items.push(item);
+                }
+            }
+            Msg::ItemUnregistered { id } => {
+                self.synoik.status_notifier_items.retain(|i| i.id != id);
+            }
+        }
+    }
+
     /// A media card's transport control (`mpris.js:73-91`). The player is addressed by bus name,
     /// so a card whose player vanished between the click and the call is simply ignored by the
     /// watcher, not an error here.
@@ -6853,6 +6880,7 @@ impl Synoik {
             calendar_range_emit: None,
             mpris: crate::mpris::MprisStore::new(),
             mpris_emit: None,
+            status_notifier_items: Vec::new(),
             notification_banner,
             notification_banner_timer: None,
             osd,

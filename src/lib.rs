@@ -48,6 +48,7 @@ pub mod rubber_band;
 pub mod screen_shield;
 #[cfg(feature = "xdp-gnome-screencast")]
 pub mod screencasting;
+pub mod status_notifier;
 pub mod synoik;
 pub mod system_status;
 pub mod ui;

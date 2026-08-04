@@ -43,6 +43,7 @@ pub mod gnome_shell_screencast;
 #[cfg(feature = "xdp-gnome-screencast")]
 pub mod mutter_screen_cast;
 pub mod smartcard;
+pub mod status_notifier;
 #[cfg(feature = "xdp-gnome-screencast")]
 use mutter_screen_cast::ScreenCast;
 
@@ -58,6 +59,7 @@ use self::gtk_notifications::GtkNotifications;
 use self::mutter_display_config::DisplayConfig;
 use self::mutter_idle_monitor::IdleMonitor;
 use self::mutter_service_channel::ServiceChannel;
+use self::status_notifier::StatusNotifierWatcher;
 
 trait Start: Interface {
     fn start(self) -> anyhow::Result<zbus::blocking::Connection>;
@@ -105,6 +107,9 @@ pub struct DBusServers {
     /// The MPRIS watcher (session bus): every `org.mpris.MediaPlayer2.*` player, plus the
     /// connection its controls are called on.
     pub conn_mpris: Option<Connection>,
+    /// org.kde.StatusNotifierWatcher (session bus) — app-indicator support. Owning this name is
+    /// itself the feature: clients hide their tray affordance when nothing owns it.
+    pub conn_status_notifier: Option<Connection>,
     /// org.gnome.Shell.Brightness (session bus) — gsd-power's way in to idle dimming and the
     /// auto-brightness target. Its own well-known name, hence its own connection.
     pub conn_brightness: Option<Connection>,
@@ -338,6 +343,17 @@ impl DBusServers {
                 dbus.conn_gtk_notifications = Some(conn);
                 synoik.gtk_notifications_emit = Some(to_gtk);
             }
+
+            // App indicators. GNOME has no equivalent — see `docs/fork/status-notifier-port.md`.
+            let (to_niri, from_status_notifier) = calloop::channel::channel();
+            synoik
+                .event_loop
+                .insert_source(from_status_notifier, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(msg) => state.on_status_notifier_msg(msg),
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            dbus.conn_status_notifier = try_start(StatusNotifierWatcher::new(to_niri));
         }
 
         let (to_niri, from_login1) = calloop::channel::channel();
