@@ -433,31 +433,67 @@ routinely, and "the compositor consistently loses a race" is a weak explanation 
 consistent. Something is probably biasing it, and if so it is worth knowing what, because it may be
 something we could have rather than something we must do without.
 
-The first candidate has a measurement behind it already. **mutter takes 2-5x longer to unwind than we
-do**, and against a fixed head start that is not a coin flip, it is a margin:
+### 7.1 The unwind-duration candidate is dead, and its measurement was contaminated
+
+The first guess was that **mutter takes longer to unwind than we do**, so against a fixed head start
+its margin is systematic rather than lucky. It had a number: 1.264 s on kov's session against our
+0.262-0.577 s. **Retracted — that logout crashed.**
 
 ```
-real GNOME (kov, systemd[1101])   22:46:14.365 → 22:46:15.630   1.264 s
-ours (gsrs, systemd[1101097])     22:41:29.491 → 22:41:30.068   0.577 s
-ours, the §1 trace                14:10:16.179 → 14:10:16.457   0.262 s
+22:46:14.468  ERROR:../src/shell-app.c:1776:shell_app_dispose: assertion failed
+22:46:14.468  Bail out!
+22:46:15.607  Main process exited, code=dumped, status=6/ABRT
+22:46:15.630  Stopped org.gnome.Shell@user.service
 ```
 
-If that is the whole answer then GNOME's margin is an accident of how much teardown mutter does, we
-have less of it because we do less, and §1's framing is right in mechanism but wrong in tone — it is
-a *systematic* bias, not luck, and the number is the thing to watch when apps start dying badly.
+Most of that second is the **core dump**. It is also the only real-GNOME logout in the journal
+window — every other `org.gnome.Shell@user.service` stop on this machine belongs to a gsrs manager,
+which is us. So there is no valid measurement of mutter's clean unwind here, and the comparison it
+was drawn from compared a crash to a teardown.
 
-Other candidates not yet examined:
+**The candidate is dead on structure anyway**, which is the more useful half.
+`wl_display_destroy_clients` is called from `meta_context_dispose` (`meta-context.c:802`) *before*
+`meta_display_close` and `meta_backend_destroy`:
 
-- **`wl_display_destroy_clients` may not be equivalent to us exiting.** mutter calls it from
-  `meta_wayland_compositor_prepare_shutdown` and then keeps unwinding; a client that gets a clean
-  protocol disconnect early, with the process still alive to drain its socket, is in a different
-  position from one whose peer vanished.
-- **Losing the display connection may not be what makes an app "unclean" at all.** OBS's crash flag
-  is about its own state file, written from its SIGTERM handler; that path does not need a
-  compositor. If so the failures we attributed to the race were really the blocked-mask bug (§2.2),
-  which is fixed, and the race may cost far less than this document assumes.
-- **Toolkit behaviour on EPIPE differs** (§1 already notes GTK3 aborts where GTK4 exits), so "apps
-  survive under GNOME" may be a statement about which toolkits, not about timing.
+```c
+g_signal_emit (context, signals[PREPARE_SHUTDOWN], 0);
+g_clear_object (&priv->service_channel);
+meta_wayland_compositor_prepare_shutdown (...)          /* wl_display_destroy_clients */
+meta_display_close (...)
+g_clear_object (&priv->wayland_compositor);
+g_clear_pointer (&priv->backend, meta_backend_destroy); /* DRM, GPU, monitors — the slow part */
+```
+
+So however long mutter's unwind is, **its clients are disconnected at the beginning of it.** Their
+grace period from the compositor ends there, not at process exit. A slow unwind buys them nothing;
+the slow part happens after they are already gone.
+
+### 7.2 Which inverts the `wl_display_destroy_clients` question
+
+The obvious follow-up to §6 was "mutter calls `wl_display_destroy_clients` and we don't — why did we
+never try it?" The honest answer to *why* is that the drain was treated as the alternative and the
+exit path itself was never audited. But the answer to *whether it would help* is that it would do the
+opposite: **we keep the socket alive until the process exits, so we already give clients more
+compositor-time than mutter does.** Adding the call would shorten that.
+
+The API is there if we ever want it for faithfulness rather than protection —
+`Client::kill` / `Backend::kill_client` in wayland-server 0.31, and the sys backend calls the real
+`wl_display_destroy_clients`. What it would buy is a *deterministic, server-initiated* disconnect
+with destructors run at a defined point, instead of whatever our drop order happens to do. That is a
+robustness argument, not a client-survival one, and it is not obviously worth making.
+
+### 7.3 What is left
+
+With the unwind candidate gone, the strongest remaining explanation is the one that says the premise
+was wrong: **apps may not need the compositor to shut down cleanly at all.** OBS's crash flag is
+written from its own SIGTERM handler, which touches no display. If that is the story, then every
+"unclean shutdown" we recorded was the blocked signal mask (§2.2) — an app that never got the SIGTERM
+and was SIGKILLed — and the compositor's departure was never the cause we took it for. That would
+also explain why it looked like mutter reliably wins a race it structurally does not run.
+
+The experiment: a real-GNOME logout with OBS up, on a session that does not crash, reading OBS's own
+log for whether it saved state, and where its disconnect falls relative to the shell's stop. Until
+then §1's race is real in mechanism but of unknown cost.
 
 **Do not treat §6's removal as depending on this.** The drain is gone because it inverted the
 teardown, which is true either way. This section is about whether the *exposure* it claimed to cover
