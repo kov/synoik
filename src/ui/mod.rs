@@ -30,6 +30,7 @@ pub mod panel;
 pub mod polkit_dialog;
 pub mod popover;
 pub mod quick_settings;
+pub mod ripples;
 pub mod run_dialog;
 pub mod screen_transition;
 pub mod screenshot_ui;

@@ -871,6 +871,8 @@ pub struct Synoik {
 
     /// The screenshot flash (`org.gnome.Shell.Screenshot.FlashArea`).
     pub flashspot: crate::ui::flashspot::FlashSpot,
+    /// The hot corner's ripple.
+    pub ripples: crate::ui::ripples::Ripples,
     pub polkit_dialog: crate::polkit_dialog::PolkitDialog,
     #[cfg(feature = "dbus")]
     pub polkit_ui: crate::ui::polkit_dialog::PolkitDialogUi,
@@ -6956,6 +6958,7 @@ impl Synoik {
             #[cfg(feature = "dbus")]
             interactive_screenshot_reply: None,
             flashspot: crate::ui::flashspot::FlashSpot::new(),
+            ripples: crate::ui::ripples::Ripples::new(),
             polkit_dialog: crate::polkit_dialog::PolkitDialog::new(),
             #[cfg(feature = "dbus")]
             polkit_ui,
@@ -7593,8 +7596,8 @@ impl Synoik {
         ])
     }
 
-    /// The hot corner for an absolute pointing device: `true` when the pointer lands on the corner
-    /// pixel itself.
+    /// The hot corner for an absolute pointing device: the corner, when the pointer lands on the
+    /// corner pixel itself.
     ///
     /// An absolute device cannot build pressure. Its position is mapped into the output, so the
     /// clamp never discards anything and [`Self::push_hot_corner`] would never fire — a tablet or
@@ -7603,14 +7606,14 @@ impl Synoik {
     /// latch keep it from re-firing while the pointer rests there. Deliberately just the pixel,
     /// not the full L: without a push to qualify it, a 32 px strip of the top edge would toggle
     /// the overview every time the pointer crossed it.
-    pub fn touch_hot_corner(&mut self, pos: Point<f64, Logical>) -> bool {
+    pub fn touch_hot_corner(&mut self, pos: Point<f64, Logical>) -> Option<Point<f64, Logical>> {
         let output = self
             .output_under(pos)
             .map(|(output, p)| (output.clone(), p));
         let Some((output, pos_within_output)) = output else {
             self.hot_corner_barrier.leave();
             self.hot_corner_output = None;
-            return false;
+            return None;
         };
 
         let on_corner = self.hot_corner_segments(&output).is_some()
@@ -7618,7 +7621,7 @@ impl Synoik {
                 .contains(pos_within_output);
         if !on_corner {
             self.hot_corner_barrier.leave();
-            return false;
+            return None;
         }
 
         if self.hot_corner_output.as_ref() != Some(&output) {
@@ -7631,13 +7634,23 @@ impl Synoik {
             .monitor_for_output(&output)
             .is_some_and(|mon| mon.render_above_top_layer());
         if fullscreen && !self.layout.is_overview_open() {
-            return false;
+            return None;
         }
 
-        self.hot_corner_barrier.shove(self.clock.now_unadjusted())
+        self.hot_corner_barrier
+            .shove(self.clock.now_unadjusted())
+            .then(|| self.corner_of(&output))
     }
 
-    /// Feed one motion to the hot-corner barrier; `true` means the corner just tripped.
+    /// The global position of an output's hot corner.
+    fn corner_of(&self, output: &Output) -> Point<f64, Logical> {
+        self.global_space
+            .output_geometry(output)
+            .map(|geom| geom.loc.to_f64())
+            .unwrap_or_default()
+    }
+
+    /// Feed one motion to the hot-corner barrier; `Some(corner)` means it just tripped.
     ///
     /// `pos` is the pointer's position after clamping, `unclamped` where the motion wanted to take
     /// it, and `delta` the raw motion. The difference between the first two is the pressure: see
@@ -7648,20 +7661,20 @@ impl Synoik {
         unclamped: Point<f64, Logical>,
         delta: Point<f64, Logical>,
         time: Duration,
-    ) -> bool {
+    ) -> Option<Point<f64, Logical>> {
         let output = self
             .output_under(pos)
             .map(|(output, p)| (output.clone(), p));
         let Some((output, pos_within_output)) = output else {
             self.hot_corner_barrier.leave();
             self.hot_corner_output = None;
-            return false;
+            return None;
         };
 
         let Some(segments) = self.hot_corner_segments(&output) else {
             self.hot_corner_barrier.leave();
             self.hot_corner_output = None;
-            return false;
+            return None;
         };
 
         // Pressure built against one monitor's corner doesn't carry to another's.
@@ -7678,7 +7691,7 @@ impl Synoik {
             .is_some_and(|mon| mon.render_above_top_layer());
         if fullscreen && !self.layout.is_overview_open() {
             self.hot_corner_barrier.leave();
-            return false;
+            return None;
         }
 
         let size = output_size(&output);
@@ -7700,7 +7713,7 @@ impl Synoik {
             self.hot_corner_barrier.leave();
         }
 
-        triggered
+        triggered.then(|| self.corner_of(&output))
     }
 
     pub fn is_sticky_obscured_under(
@@ -8917,6 +8930,7 @@ impl Synoik {
         #[cfg(feature = "dbus")]
         self.polkit_ui.advance_animations();
         self.flashspot.advance(self.clock.now_unadjusted());
+        self.ripples.advance(self.clock.now_unadjusted());
         self.screenshot_ui.advance_animations();
         self.panel_popover.advance_animations();
         self.panel.advance_animations();
@@ -9174,6 +9188,16 @@ impl Synoik {
 
         // Next, the screenshot flash: over everything the capture could have contained.
         self.flashspot.render(
+            output,
+            output.current_location(),
+            self.clock.now_unadjusted(),
+            &mut |elem| push(elem.into()),
+        );
+
+        // Next, the hot-corner ripple, which gnome-shell raises above the rest of the shell UI
+        // (`Ripples.playAnimation`, `ripples.js:99-101`).
+        self.ripples.render(
+            ctx.renderer,
             output,
             output.current_location(),
             self.clock.now_unadjusted(),
@@ -10260,6 +10284,10 @@ impl Synoik {
             // for a frame.
             state.unfinished_animations_remain |=
                 self.flashspot.is_animating(self.clock.now_unadjusted());
+            // Same for the hot-corner ripple: the overview toggle it accompanies settles well
+            // before the last wave has finished expanding.
+            state.unfinished_animations_remain |=
+                self.ripples.is_animating(self.clock.now_unadjusted());
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.panel_popover.are_animations_ongoing();
             state.unfinished_animations_remain |= self.notification_banner.are_animations_ongoing();

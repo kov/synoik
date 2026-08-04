@@ -2398,6 +2398,84 @@ fn vulkan_fills_a_rect_that_overhangs_the_bake_buffer() {
     }
 }
 
+/// The hot-corner ripple composites as a quarter-disc *pinned to the corner*: lit near the
+/// corner, dark well past its reach, and nothing at all before it is played.
+///
+/// The anchoring is the whole risk. The disc is drawn as a rounded rect centred on the bake
+/// buffer's top-left, so only its bottom-right quadrant lands inside — get the sign wrong and the
+/// buffer is empty, or the shape is a full circle whose visible part is a square. The two
+/// negative controls (before playing; far from the corner) are what makes "lit" mean the ripple
+/// rather than anything else that might one day draw up there.
+#[test]
+fn vulkan_renders_the_hot_corner_ripple() {
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    // A square region around the corner, big enough to hold the largest wave (52 px × 1.5).
+    let extent = to_physical_precise_round(scale.x, 100.);
+    let size = Size::<i32, Physical>::from((extent, extent));
+
+    let near = to_physical_precise_round::<i32>(scale.x, 10.);
+    let far = to_physical_precise_round::<i32>(scale.x, 95.);
+
+    let state = f.synoik_state();
+    let now = state.synoik.clock.now_unadjusted();
+
+    let lit_at = |state: &mut crate::synoik::State, when: Duration| {
+        let output = output.clone();
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| {
+                let mut elems = Vec::new();
+                state.synoik.ripples.render(
+                    vk,
+                    &output,
+                    output.current_location(),
+                    when,
+                    &mut |elem| elems.push(elem),
+                );
+                if elems.is_empty() {
+                    return None;
+                }
+                let pixels = composite_ui(vk, elems, size, scale);
+                Some((
+                    px(&pixels, extent, near, near)[3],
+                    px(&pixels, extent, far, far)[3],
+                ))
+            })
+            .expect("vulkan renderer")
+    };
+
+    assert!(
+        lit_at(state, now).is_none(),
+        "an un-played ripple must produce no elements at all"
+    );
+
+    state.synoik.ripples.play(Point::from((0., 0.)), now);
+    // 200 ms in: the first two waves are up and have grown past the probe near the corner.
+    let (corner, outside) =
+        lit_at(state, now + Duration::from_millis(200)).expect("a played ripple draws");
+
+    assert!(
+        corner > 0,
+        "the ripple did not light the corner it is pinned to"
+    );
+    assert_eq!(
+        outside, 0,
+        "the ripple lit a pixel 95 px diagonally out, well past its reach — it is not a \
+         quarter-disc at the corner"
+    );
+
+    // And it is gone once the last wave has finished.
+    assert!(
+        lit_at(state, now + crate::ui::ripples::DURATION).is_none(),
+        "the ripple outlived its animation"
+    );
+}
+
 /// The dateMenu messages-indicator dot composites into the clock button's trailing
 /// padding when shown, and nothing does there when it's hidden (`js/ui/dateMenu.js:871-886`).
 /// The differential doubles as the check that the padding really is empty in the hidden

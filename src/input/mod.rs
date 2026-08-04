@@ -4465,13 +4465,16 @@ impl State {
         // Motion into the screen edge builds pressure against a hot corner: the clamp above threw
         // away exactly the push mutter's barrier would have reported. Skipped while a spatial grab
         // warps the pointer across the screen, where the discarded motion is a wrap, not a push.
-        let hot_corner_triggered = !warped
-            && self.synoik.push_hot_corner(
+        let hot_corner_triggered: Option<Point<f64, Logical>> = if warped {
+            None
+        } else {
+            self.synoik.push_hot_corner(
                 new_pos,
                 unclamped_pos,
                 event.delta(),
                 Duration::from_micros(event.time()),
-            );
+            )
+        };
 
         if let Some(output) = self.synoik.screenshot_ui.selection_output() {
             let geom = self.synoik.global_space.output_geometry(output).unwrap();
@@ -4591,12 +4594,18 @@ impl State {
 
         // The corner has taken enough pressure. Unlike GNOME we don't hold the pointer there, so
         // whatever is under it keeps its focus and its motion -- only the toggle is ours.
-        if hot_corner_triggered
-            && pointer
+        if let Some(corner) = hot_corner_triggered {
+            if pointer
                 .with_grab(|_, grab| grab_allows_hot_corner(grab))
                 .unwrap_or(true)
-        {
-            self.synoik.layout.toggle_overview();
+            {
+                self.synoik.layout.toggle_overview();
+                // The ripple is feedback for the toggle, so it plays only when one happened
+                // (`HotCorner._toggleOverview`, `layout.js:1253-1255`).
+                let now = self.synoik.clock.now_unadjusted();
+                self.synoik.ripples.play(corner, now);
+                self.synoik.queue_redraw_all();
+            }
         }
 
         // Activate a new confinement if necessary.
@@ -4704,12 +4713,18 @@ impl State {
 
         pointer.frame(self);
 
-        if hot_corner_triggered
-            && pointer
+        if let Some(corner) = hot_corner_triggered {
+            if pointer
                 .with_grab(|_, grab| grab_allows_hot_corner(grab))
                 .unwrap_or(true)
-        {
-            self.synoik.layout.toggle_overview();
+            {
+                self.synoik.layout.toggle_overview();
+                // The ripple is feedback for the toggle, so it plays only when one happened
+                // (`HotCorner._toggleOverview`, `layout.js:1253-1255`).
+                let now = self.synoik.clock.now_unadjusted();
+                self.synoik.ripples.play(corner, now);
+                self.synoik.queue_redraw_all();
+            }
         }
 
         self.synoik.maybe_activate_pointer_constraint();
