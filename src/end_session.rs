@@ -59,14 +59,20 @@ impl EndSessionType {
 }
 
 /// A session action to ask gnome-session to *start* — the compositor's `Logout` / `PowerOff` /
-/// `Reboot` actions. Maps to the like-named method on `org.gnome.SessionManager`, which then calls
-/// `EndSessionDialog.Open` back on us. (This is the trigger side; [`EndSession`] is the dialog
-/// side.)
+/// `Reboot` / `Suspend` actions. Maps to the like-named method on `org.gnome.SessionManager`, which
+/// for the first three calls `EndSessionDialog.Open` back on us. (This is the trigger side;
+/// [`EndSession`] is the dialog side.)
+///
+/// `Suspend` is the odd one: it ends nothing and opens no dialog, gnome-session just forwards it to
+/// logind. It rides along because gnome-shell asks the *same proxy* for it
+/// (`this._session.SuspendAsync()`, `js/misc/systemActions.js:509`) rather than talking to logind
+/// itself — so keeping it here is what makes the quick-settings power rows one mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionRequest {
     Logout,
     PowerOff,
     Reboot,
+    Suspend,
 }
 
 #[derive(Debug)]

@@ -673,11 +673,12 @@ impl DetailOwner {
             }
             // gnome-shell's shutdown submenu, in its two groups: machine-power (Suspend / Restart /
             // Power Off) then, past a separator, the session group (Log Out). The `…` marks the
-            // ones that go through a confirmation dialog; Suspend acts immediately. Restart / Power
-            // Off / Log Out drive our own gnome-session handshake (EndSessionDialog); Suspend goes
-            // straight to logind via systemctl. Switch User is deferred (needs a greeter jump).
+            // ones that go through a confirmation dialog; Suspend acts immediately. All four are
+            // methods on `org.gnome.SessionManager`, as in gnome-shell — the first three come back
+            // to us as EndSessionDialog.Open, Suspend is forwarded to logind and never does.
+            // Switch User is deferred (needs a greeter jump).
             DetailOwner::Power => vec![
-                spawn_row("Suspend", &["systemctl", "suspend"], false),
+                session_row("Suspend", SessionRequest::Suspend, false),
                 session_row("Restart…", SessionRequest::Reboot, false),
                 session_row("Power Off…", SessionRequest::PowerOff, false),
                 session_row("Log Out…", SessionRequest::Logout, true),

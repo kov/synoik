@@ -117,6 +117,11 @@ pub fn request_session_action(conn: &zbus::blocking::Connection, request: Sessio
                     .call_method(dest, path, iface, "Reboot", &())
                     .await
             }
+            SessionRequest::Suspend => {
+                async_conn
+                    .call_method(dest, path, iface, "Suspend", &())
+                    .await
+            }
         };
         if let Err(err) = res {
             warn!("error requesting {request:?} from org.gnome.SessionManager: {err:?}");
