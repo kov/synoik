@@ -132,6 +132,10 @@ pub struct GnomeSettings {
     /// yet; it is here because `org.gnome.Shell.Introspect` publishes it and the portal reads it
     /// to decide whether to animate its dialogs (`introspect.js:184-192`).
     pub enable_animations: bool,
+    /// `org.gnome.desktop.interface enable-hot-corners`: whether the top-left corner toggles the
+    /// overview when the pointer pushes into it (`layout.js:436-443`). GNOME has exactly one hot
+    /// corner and no way to move it; which corner is a text-direction question, not a preference.
+    pub enable_hot_corners: bool,
     /// `org.gnome.desktop.interface clock-*`: how the panel clock label reads.
     pub clock: ClockFormat,
     /// `org.gnome.desktop.calendar`: week start + week-number column.
@@ -397,6 +401,7 @@ impl Default for GnomeSettings {
             focus_new_windows: FocusNewWindows::Smart,
             edge_tiling: true,
             enable_animations: true,
+            enable_hot_corners: true,
             background: BackgroundSettings::default(),
             accent_color: ACCENT_BLUE,
             app_picker_layout: HashMap::new(),
@@ -666,6 +671,9 @@ impl GnomeSettings {
     fn load_interface(&mut self, interface: &gio::Settings) {
         if settings_has_key(interface, "enable-animations") {
             self.enable_animations = interface.boolean("enable-animations");
+        }
+        if settings_has_key(interface, "enable-hot-corners") {
+            self.enable_hot_corners = interface.boolean("enable-hot-corners");
         }
         if settings_has_key(interface, "accent-color") {
             let value = interface.string("accent-color");

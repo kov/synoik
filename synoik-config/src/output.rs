@@ -6,7 +6,6 @@
 
 use synoik_ipc::{ConfiguredMode, Transform};
 
-use crate::gestures::HotCorners;
 use crate::{Color, FloatOrInt, LayoutPart};
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -61,7 +60,6 @@ pub struct Output {
     // Deprecated; use layout.background_color.
     pub background_color: Option<Color>,
     pub backdrop_color: Option<Color>,
-    pub hot_corners: Option<HotCorners>,
     pub layout: Option<LayoutPart>,
 }
 
@@ -94,7 +92,6 @@ impl Default for Output {
             variable_refresh_rate: None,
             background_color: None,
             backdrop_color: None,
-            hot_corners: None,
             layout: None,
         }
     }

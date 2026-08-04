@@ -159,6 +159,157 @@ fn toggle_overview_flips_state() {
     );
 }
 
+/// Shove the pointer into the top-left corner `times` times, `px` px of overshoot each,
+/// starting from wherever it is. Every event past the first is entirely discarded by the
+/// output clamp, which is the pressure a hot corner accumulates.
+fn push_into_corner(f: &mut Fixture, times: usize, px: f64) {
+    for _ in 0..times {
+        f.pointer_motion(-px, -px);
+    }
+}
+
+/// GNOME's hot corner is a *pressure* barrier: brushing the corner does nothing, and the
+/// overview only opens once the pointer has pushed 100 px into it inside a second
+/// (`HOT_CORNER_PRESSURE_THRESHOLD`/`TIMEOUT`, `layout.js:24-25`).
+#[test]
+fn hot_corner_needs_pressure_to_open_the_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Arriving at the corner is not pushing into it: the motion that lands there is spent
+    // travelling, and nothing is discarded.
+    pointer_motion_to(&mut f, 0., 0.);
+    f.synoik_complete_animations();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "merely touching the corner must not open the overview"
+    );
+
+    // Nor is a nudge: 5 px per event, capped by nothing, is 25 px of the 100 px budget.
+    push_into_corner(&mut f, 5, 5.);
+    f.synoik_complete_animations();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "a nudge below the threshold must not open the overview"
+    );
+
+    // Sustained pushing does. The per-event cap is 15 px (`layout.js:1401`), so this is
+    // 5 more events at 15 px on top of the 25 already banked.
+    push_into_corner(&mut f, 5, 20.);
+    f.synoik_complete_animations();
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "pushing past the threshold must open the overview"
+    );
+}
+
+/// Once it has fired, the barrier latches: resting in the corner and pushing on doesn't
+/// toggle the overview shut again (`layout.js:1375-1377`). It re-arms when the pointer
+/// leaves the corner's region.
+#[test]
+fn hot_corner_latches_until_the_pointer_leaves() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    pointer_motion_to(&mut f, 0., 0.);
+    push_into_corner(&mut f, 10, 20.);
+    f.synoik_complete_animations();
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "the corner fires once"
+    );
+
+    push_into_corner(&mut f, 20, 20.);
+    f.synoik_complete_animations();
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "pushing on must not toggle the overview back shut"
+    );
+
+    // Leave the corner's L entirely, then push again.
+    pointer_motion_to(&mut f, 960., 540.);
+    pointer_motion_to(&mut f, 0., 0.);
+    push_into_corner(&mut f, 10, 20.);
+    f.synoik_complete_animations();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "leaving re-arms the corner, so the next push toggles"
+    );
+}
+
+/// The barrier listens along an L of `panelBox.height` down the left edge and the same
+/// across the top (`HotCorner.setBarrierSize`, `layout.js:1195-1233`) — not on a single
+/// pixel. Pushing into the left edge just below the panel builds the same pressure.
+#[test]
+fn hot_corner_listens_along_both_edges() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let size = crate::ui::panel::panel_height();
+
+    // Inside the vertical segment: on the left edge, above `size`.
+    pointer_motion_to(&mut f, 0., size / 2.);
+    for _ in 0..10 {
+        f.pointer_motion(-20., 0.);
+    }
+    f.synoik_complete_animations();
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "the left edge within panel height of the corner is part of the hot corner"
+    );
+
+    f.synoik_state().do_action(Action::CloseOverview, false);
+    f.synoik_complete_animations();
+
+    // Past the segment's end: the same push does nothing.
+    pointer_motion_to(&mut f, 0., size + 100.);
+    for _ in 0..10 {
+        f.pointer_motion(-20., 0.);
+    }
+    f.synoik_complete_animations();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "the left edge below the barrier must not trigger"
+    );
+}
+
+/// Sliding *along* an edge is not pushing *into* it: crossing the top of the screen on the
+/// way somewhere else must not arrive with the corner half-triggered (`layout.js:1393-1396`).
+#[test]
+fn sliding_along_the_top_edge_builds_no_pressure() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    pointer_motion_to(&mut f, 400., 0.);
+    // Each event pushes 4 px up (all discarded, the pointer is already at y = 0) while
+    // travelling 40 px sideways.
+    for _ in 0..40 {
+        f.pointer_motion(-10., -4.);
+    }
+    f.synoik_complete_animations();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "travelling along the edge must not open the overview"
+    );
+}
+
+/// `org.gnome.desktop.interface enable-hot-corners` turns the corner off entirely
+/// (`layout.js:440-443`).
+#[test]
+fn hot_corner_honors_enable_hot_corners() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik_state().synoik.gnome_settings.enable_hot_corners = false;
+
+    pointer_motion_to(&mut f, 0., 0.);
+    push_into_corner(&mut f, 20, 20.);
+    f.synoik_complete_animations();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "a disabled hot corner must not open the overview"
+    );
+}
+
 /// GNOME's "overlay key": tapping Super on its own — pressed and released with
 /// nothing in between — toggles the Activities overview. This is the first
 /// genuinely GNOME-distinct behavior (niri has no overlay key), and it pins

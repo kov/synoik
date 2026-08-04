@@ -83,6 +83,7 @@ pub mod move_grab;
 pub mod peripherals;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
+pub mod pressure;
 pub mod resize_grab;
 pub mod scroll_swipe_gesture;
 pub mod scroll_tracker;
@@ -4325,10 +4326,6 @@ impl State {
     }
 
     fn on_pointer_motion<I: InputBackend>(&mut self, event: I::PointerMotionEvent) {
-        let was_inside_hot_corner = self.synoik.pointer_inside_hot_corner;
-        // Any of the early returns here mean that the pointer is not inside the hot corner.
-        self.synoik.pointer_inside_hot_corner = false;
-
         // We need an output to be able to move the pointer.
         if self.synoik.global_space.outputs().next().is_none() {
             return;
@@ -4342,6 +4339,9 @@ impl State {
 
         // We have an output, so we can compute the new location and focus.
         let mut new_pos = pos + event.delta();
+        // Where the motion wanted to go, before any clamping. What the clamp discards is the
+        // pressure a hot corner accumulates -- see `input::pressure`.
+        let unclamped_pos = new_pos;
 
         // We received an event for the regular pointer, so show it now.
         self.synoik.pointer_visibility = PointerVisibility::Visible;
@@ -4383,6 +4383,9 @@ impl State {
 
             // If the pointer is locked, only send relative motion.
             if pointer_locked {
+                // The pointer isn't going anywhere near an edge; drop any pressure it had built.
+                self.synoik.hot_corner_barrier.leave();
+
                 pointer.relative_motion(
                     self,
                     Some(under.clone()),
@@ -4417,7 +4420,9 @@ impl State {
             }
             None
         });
-        if let Some((output, horizontal)) = spatial_grab.flatten() {
+        let spatial_grab = spatial_grab.flatten();
+        let warped = spatial_grab.is_some();
+        if let Some((output, horizontal)) = spatial_grab {
             if let Some(geo) = self.synoik.global_space.output_geometry(&output) {
                 let geo = geo.to_f64();
                 if horizontal {
@@ -4456,6 +4461,17 @@ impl State {
                 new_pos = center(geom).to_f64();
             }
         }
+
+        // Motion into the screen edge builds pressure against a hot corner: the clamp above threw
+        // away exactly the push mutter's barrier would have reported. Skipped while a spatial grab
+        // warps the pointer across the screen, where the discarded motion is a wrap, not a push.
+        let hot_corner_triggered = !warped
+            && self.synoik.push_hot_corner(
+                new_pos,
+                unclamped_pos,
+                event.delta(),
+                Duration::from_micros(event.time()),
+            );
 
         if let Some(output) = self.synoik.screenshot_ui.selection_output() {
             let geom = self.synoik.global_space.output_geometry(output).unwrap();
@@ -4573,17 +4589,14 @@ impl State {
 
         pointer.frame(self);
 
-        // contents_under() will return no surface when the hot corner should trigger, so
-        // pointer.motion() will set the current focus to None.
-        if under.hot_corner && pointer.current_focus().is_none() {
-            if !was_inside_hot_corner
-                && pointer
-                    .with_grab(|_, grab| grab_allows_hot_corner(grab))
-                    .unwrap_or(true)
-            {
-                self.synoik.layout.toggle_overview();
-            }
-            self.synoik.pointer_inside_hot_corner = true;
+        // The corner has taken enough pressure. Unlike GNOME we don't hold the pointer there, so
+        // whatever is under it keeps its focus and its motion -- only the toggle is ours.
+        if hot_corner_triggered
+            && pointer
+                .with_grab(|_, grab| grab_allows_hot_corner(grab))
+                .unwrap_or(true)
+        {
+            self.synoik.layout.toggle_overview();
         }
 
         // Activate a new confinement if necessary.
@@ -4609,10 +4622,6 @@ impl State {
         &mut self,
         event: I::PointerMotionAbsoluteEvent,
     ) {
-        let was_inside_hot_corner = self.synoik.pointer_inside_hot_corner;
-        // Any of the early returns here mean that the pointer is not inside the hot corner.
-        self.synoik.pointer_inside_hot_corner = false;
-
         let Some(pos) = self.compute_absolute_location(&event, None).or_else(|| {
             self.global_bounding_rectangle().map(|output_geo| {
                 event.position_transformed(output_geo.size) + output_geo.loc.to_f64()
@@ -4624,6 +4633,8 @@ impl State {
         let serial = SERIAL_COUNTER.next_serial();
 
         let pointer = self.synoik.seat.get_pointer().unwrap();
+
+        let hot_corner_triggered = self.synoik.touch_hot_corner(pos);
 
         if let Some(output) = self.synoik.screenshot_ui.selection_output() {
             let geom = self.synoik.global_space.output_geometry(output).unwrap();
@@ -4693,17 +4704,12 @@ impl State {
 
         pointer.frame(self);
 
-        // contents_under() will return no surface when the hot corner should trigger, so
-        // pointer.motion() will set the current focus to None.
-        if under.hot_corner && pointer.current_focus().is_none() {
-            if !was_inside_hot_corner
-                && pointer
-                    .with_grab(|_, grab| grab_allows_hot_corner(grab))
-                    .unwrap_or(true)
-            {
-                self.synoik.layout.toggle_overview();
-            }
-            self.synoik.pointer_inside_hot_corner = true;
+        if hot_corner_triggered
+            && pointer
+                .with_grab(|_, grab| grab_allows_hot_corner(grab))
+                .unwrap_or(true)
+        {
+            self.synoik.layout.toggle_overview();
         }
 
         self.synoik.maybe_activate_pointer_constraint();

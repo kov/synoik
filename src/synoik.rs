@@ -147,6 +147,7 @@ use crate::frame_log::{FrameContext, FrameLog, Phase};
 use crate::gnome::{AccelGrab, GnomeSettings, GnomeSettingsWriter};
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::pick_color_grab::PickColorGrab;
+use crate::input::pressure::{Barrier, Edge, Segment};
 use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
 use crate::input::scroll_tracker::ScrollTracker;
 use crate::input::{
@@ -812,7 +813,11 @@ pub struct Synoik {
     /// Used for limiting the notify to once per iteration, so that it's not spammed with high
     /// resolution mice.
     pub notified_activity_this_iteration: bool,
-    pub pointer_inside_hot_corner: bool,
+    /// Pressure the pointer has built against a hot corner, and the output whose corner it is.
+    /// The corner triggers when the pointer pushes into it, not when it merely touches it
+    /// (`PressureBarrier`, `layout.js:1267-1408`).
+    pub hot_corner_barrier: Barrier,
+    pub hot_corner_output: Option<Output>,
     pub tablet_cursor_location: Option<Point<f64, Logical>>,
     pub gesture_swipe_3f_cumulative: Option<(f64, f64)>,
     pub overview_scroll_swipe_gesture: ScrollSwipeGesture,
@@ -1230,8 +1235,6 @@ pub struct PointContents {
     pub window: Option<(Window, HitType)>,
     // If surface belongs to a layer surface, this is that layer surface.
     pub layer: Option<LayerSurface>,
-    // Pointer is over a hot corner.
-    pub hot_corner: bool,
 }
 
 #[derive(Debug, Default)]
@@ -6920,7 +6923,8 @@ impl Synoik {
             pointer_inactivity_timer: None,
             pointer_inactivity_timer_got_reset: false,
             notified_activity_this_iteration: false,
-            pointer_inside_hot_corner: false,
+            hot_corner_barrier: Barrier::hot_corner(),
+            hot_corner_output: None,
             tablet_cursor_location: None,
             gesture_swipe_3f_cumulative: None,
             overview_scroll_swipe_gesture: ScrollSwipeGesture::new(),
@@ -7558,47 +7562,145 @@ impl Synoik {
             .unwrap_or(0.)
     }
 
-    fn is_inside_hot_corner(&self, output: &Output, pos: Point<f64, Logical>) -> bool {
-        let config = self.config.borrow();
-        let hot_corners = output
-            .user_data()
-            .get::<OutputName>()
-            .and_then(|name| config.outputs.find(name))
-            .and_then(|c| c.hot_corners)
-            .unwrap_or(config.gestures.hot_corners);
+    /// The two edge segments this output's hot corner listens on, in the output's local logical
+    /// coordinates: `panel_height` px down the left edge and the same along the top
+    /// (`HotCorner.setBarrierSize`, `layout.js:1195-1233`, sized from `panelBox.height`).
+    ///
+    /// gnome-shell gives the top-left corner of every monitor a hot corner (top-right under RTL,
+    /// which we do not implement yet), skipping a non-primary monitor whose corner is *interior* —
+    /// another monitor sits directly above it or to its left (`layout.js:452-490`). We skip any
+    /// interior corner, the primary's included: mutter holds the pointer at an interior edge with
+    /// a real barrier until it pushes through, and we have none. Our pressure is the motion the
+    /// output clamp discards, and the clamp only bites at the outer edge of the global space.
+    pub fn hot_corner_segments(&self, output: &Output) -> Option<[Segment; 2]> {
+        if !self.gnome_settings.enable_hot_corners {
+            return None;
+        }
 
-        if hot_corners.off {
+        let geom = self.global_space.output_geometry(output)?;
+        let corner = geom.loc.to_f64();
+
+        // Interior corner: some other output owns the pixel just left of, or just above, ours.
+        let outside = |p: Point<f64, Logical>| self.global_space.output_under(p).next().is_none();
+        if !outside(corner - Point::new(1., 0.)) || !outside(corner - Point::new(0., 1.)) {
+            return None;
+        }
+
+        let size = crate::ui::panel::panel_height();
+        Some([
+            Segment::from_start(Edge::Left, size),
+            Segment::from_start(Edge::Top, size),
+        ])
+    }
+
+    /// The hot corner for an absolute pointing device: `true` when the pointer lands on the corner
+    /// pixel itself.
+    ///
+    /// An absolute device cannot build pressure. Its position is mapped into the output, so the
+    /// clamp never discards anything and [`Self::push_hot_corner`] would never fire — a tablet or
+    /// a VM's absolute pointer would simply have no hot corner. So we fall back to the corner
+    /// pixel, the way this compositor triggered before pressure existed, and let the barrier's
+    /// latch keep it from re-firing while the pointer rests there. Deliberately just the pixel,
+    /// not the full L: without a push to qualify it, a 32 px strip of the top edge would toggle
+    /// the overview every time the pointer crossed it.
+    pub fn touch_hot_corner(&mut self, pos: Point<f64, Logical>) -> bool {
+        let output = self
+            .output_under(pos)
+            .map(|(output, p)| (output.clone(), p));
+        let Some((output, pos_within_output)) = output else {
+            self.hot_corner_barrier.leave();
+            self.hot_corner_output = None;
+            return false;
+        };
+
+        let on_corner = self.hot_corner_segments(&output).is_some()
+            && Rectangle::new(Point::from((0., 0.)), Size::from((1., 1.)))
+                .contains(pos_within_output);
+        if !on_corner {
+            self.hot_corner_barrier.leave();
             return false;
         }
 
-        // Use size from the ceiled output geometry, since that's what we currently use for pointer
-        // motion clamping.
-        let geom = self.global_space.output_geometry(output).unwrap();
-        let size = geom.size.to_f64();
+        if self.hot_corner_output.as_ref() != Some(&output) {
+            self.hot_corner_barrier.leave();
+            self.hot_corner_output = Some(output.clone());
+        }
 
-        let contains = move |corner: Point<f64, Logical>| {
-            Rectangle::new(corner, Size::new(1., 1.)).contains(pos)
+        let fullscreen = self
+            .layout
+            .monitor_for_output(&output)
+            .is_some_and(|mon| mon.render_above_top_layer());
+        if fullscreen && !self.layout.is_overview_open() {
+            return false;
+        }
+
+        self.hot_corner_barrier.shove(self.clock.now_unadjusted())
+    }
+
+    /// Feed one motion to the hot-corner barrier; `true` means the corner just tripped.
+    ///
+    /// `pos` is the pointer's position after clamping, `unclamped` where the motion wanted to take
+    /// it, and `delta` the raw motion. The difference between the first two is the pressure: see
+    /// [`crate::input::pressure`].
+    pub fn push_hot_corner(
+        &mut self,
+        pos: Point<f64, Logical>,
+        unclamped: Point<f64, Logical>,
+        delta: Point<f64, Logical>,
+        time: Duration,
+    ) -> bool {
+        let output = self
+            .output_under(pos)
+            .map(|(output, p)| (output.clone(), p));
+        let Some((output, pos_within_output)) = output else {
+            self.hot_corner_barrier.leave();
+            self.hot_corner_output = None;
+            return false;
         };
 
-        if hot_corners.top_right && contains(Point::new(size.w - 1., 0.)) {
-            return true;
-        }
-        if hot_corners.bottom_left && contains(Point::new(0., size.h - 1.)) {
-            return true;
-        }
-        if hot_corners.bottom_right && contains(Point::new(size.w - 1., size.h - 1.)) {
-            return true;
+        let Some(segments) = self.hot_corner_segments(&output) else {
+            self.hot_corner_barrier.leave();
+            self.hot_corner_output = None;
+            return false;
+        };
+
+        // Pressure built against one monitor's corner doesn't carry to another's.
+        if self.hot_corner_output.as_ref() != Some(&output) {
+            self.hot_corner_barrier.leave();
+            self.hot_corner_output = Some(output.clone());
         }
 
-        // If the user didn't explicitly set any corners, we default to top-left.
-        if (hot_corners.top_left
-            || !(hot_corners.top_right || hot_corners.bottom_right || hot_corners.bottom_left))
-            && contains(Point::new(0., 0.))
-        {
-            return true;
+        // A fullscreen window owns the corner, unless the overview is already up
+        // (`HotCorner._toggleOverview`, `layout.js:1249-1251`).
+        let fullscreen = self
+            .layout
+            .monitor_for_output(&output)
+            .is_some_and(|mon| mon.render_above_top_layer());
+        if fullscreen && !self.layout.is_overview_open() {
+            self.hot_corner_barrier.leave();
+            return false;
         }
 
-        false
+        let size = output_size(&output);
+        let discarded = unclamped - pos;
+
+        let mut triggered = false;
+        let mut engaged = false;
+        for segment in segments {
+            if segment.contains(size, pos_within_output) {
+                engaged = true;
+            }
+            if let Some(push) = segment.push(size, pos_within_output, discarded, delta, time) {
+                triggered |= self.hot_corner_barrier.push(push);
+            }
+        }
+
+        // Leaving the L re-arms the corner; resting on it, having triggered, does not.
+        if !engaged {
+            self.hot_corner_barrier.leave();
+        }
+
+        triggered
     }
 
     pub fn is_sticky_obscured_under(
@@ -7642,10 +7744,6 @@ impl Synoik {
         let mon = self.layout.monitor_for_output(output).unwrap();
         if mon.render_above_top_layer() {
             return false;
-        }
-
-        if self.is_inside_hot_corner(output, pos_within_output) {
-            return true;
         }
 
         if layer_popup_under(Layer::Top) || layer_toplevel_under(Layer::Top) {
@@ -8065,11 +8163,6 @@ impl Synoik {
                 .or_else(|| layer_toplevel_under(Layer::Bottom))
                 .or_else(|| layer_toplevel_under(Layer::Background));
         } else {
-            if self.is_inside_hot_corner(output, pos_within_output) {
-                rv.hot_corner = true;
-                return rv;
-            }
-
             under = under
                 .or_else(|| layer_popup_under(Layer::Top))
                 .or_else(|| layer_toplevel_under(Layer::Top));

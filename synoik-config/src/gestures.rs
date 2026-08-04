@@ -11,14 +11,12 @@ use crate::FloatOrInt;
 pub struct Gestures {
     pub dnd_edge_view_scroll: DndEdgeViewScroll,
     pub dnd_edge_workspace_switch: DndEdgeWorkspaceSwitch,
-    pub hot_corners: HotCorners,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct GesturesPart {
     pub dnd_edge_view_scroll: Option<DndEdgeViewScrollPart>,
     pub dnd_edge_workspace_switch: Option<DndEdgeWorkspaceSwitchPart>,
-    pub hot_corners: Option<HotCorners>,
 }
 
 impl MergeWith<GesturesPart> for Gestures {
@@ -28,7 +26,6 @@ impl MergeWith<GesturesPart> for Gestures {
             dnd_edge_view_scroll,
             dnd_edge_workspace_switch,
         );
-        merge_clone!((self, part), hot_corners);
     }
 }
 
@@ -92,13 +89,4 @@ impl MergeWith<DndEdgeWorkspaceSwitchPart> for DndEdgeWorkspaceSwitch {
         merge!((self, part), trigger_height, max_speed);
         merge_clone!((self, part), delay_ms);
     }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub struct HotCorners {
-    pub off: bool,
-    pub top_left: bool,
-    pub top_right: bool,
-    pub bottom_left: bool,
-    pub bottom_right: bool,
 }
