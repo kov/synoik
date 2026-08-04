@@ -231,9 +231,14 @@ impl Barrier {
         self.engaged
     }
 
-    #[cfg(test)]
-    fn pressure(&self) -> f64 {
+    /// How much pressure has accumulated so far, of [`Barrier::threshold`]. For diagnostics —
+    /// a barrier that never fires is only debuggable by watching this number move (or not).
+    pub fn pressure(&self) -> f64 {
         self.pressure
+    }
+
+    pub fn threshold(&self) -> f64 {
+        self.threshold
     }
 
     fn trigger(&mut self) {

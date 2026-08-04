@@ -98,14 +98,41 @@ impl Dock {
         let size = output_size(output);
         let segment = Self::segment(output);
         if !segment.contains(size, pos_within_output) {
+            // Losing the edge forgets the pressure — which is correct, and is also the prime
+            // suspect whenever pushing "does nothing": anything that moves the pointer off the
+            // last row between pushes (a second, absolute pointing device re-stating the host
+            // cursor's position, say) resets the barrier every time it happens.
+            if self.barrier.pressure() > 0. {
+                trace!(
+                    "dock: left the bottom edge at y={:.1} (of {:.1}), dropping {:.0} px of pressure",
+                    pos_within_output.y,
+                    size.h,
+                    self.barrier.pressure(),
+                );
+            }
             self.barrier.leave();
             return false;
         }
 
-        match segment.push(size, pos_within_output, discarded, delta, time) {
+        let push = segment.push(size, pos_within_output, discarded, delta, time);
+        let tripped = match push {
             Some(push) => self.barrier.push(push),
             None => false,
-        }
+        };
+        trace!(
+            "dock: on the bottom edge at y={:.1}, delta=({:.1},{:.1}) discarded=({:.1},{:.1}) \
+             push={:?} pressure={:.0}/{:.0}{}",
+            pos_within_output.y,
+            delta.x,
+            delta.y,
+            discarded.x,
+            discarded.y,
+            push.map(|p| (p.across, p.along)),
+            self.barrier.pressure(),
+            self.barrier.threshold(),
+            if tripped { " TRIPPED" } else { "" },
+        );
+        tripped
     }
 
     /// Slide the dock out on `output`, or restart its hide timer if it is already out.

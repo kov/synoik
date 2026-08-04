@@ -4669,6 +4669,15 @@ impl State {
         let pointer = self.synoik.seat.get_pointer().unwrap();
 
         let hot_corner_triggered = self.synoik.touch_hot_corner(pos);
+        // An absolute device cannot build edge pressure: its position is mapped into the output,
+        // so nothing is ever clamped away. Worth seeing in a trace next to the relative pushes,
+        // because an absolute event landing between them re-states the pointer's position — and
+        // one that lands off the last row is what drops a dock/hot-corner barrier's pressure.
+        trace!(
+            "absolute pointer motion to ({:.1}, {:.1}) — builds no edge pressure",
+            pos.x,
+            pos.y
+        );
         self.synoik.dock_pointer_motion(pos);
 
         if let Some(output) = self.synoik.screenshot_ui.selection_output() {
