@@ -134,7 +134,6 @@ use crate::dbus::gnome_shell_introspect::{self, IntrospectToNiri, NiriToIntrospe
 use crate::dbus::gnome_shell_screenshot::{NiriToScreenshot, ScreenshotToNiri};
 #[cfg(feature = "dbus")]
 use crate::dbus::system_status::SystemStatusToNiri;
-use crate::end_session::{DrainOutcome, SessionDrain, DRAIN_TIMEOUT};
 use crate::frame_clock::FrameClock;
 use crate::frame_log::{FrameContext, FrameLog, Phase};
 use crate::gnome::{AccelGrab, GnomeSettings, GnomeSettingsWriter};
@@ -474,16 +473,6 @@ pub struct Niri {
     pub end_session: crate::end_session::EndSession,
     /// The timer armed to the countdown's auto-confirm deadline (see `EndSession::deadline`).
     pub end_session_timer: Option<RegistrationToken>,
-    /// Set once we have been told to stop and are staying alive for our clients (see
-    /// `SessionDrain`). `None` for the whole normal life of the session; once set, the compositor
-    /// is on its way out and only `poll_session_drain` can end it.
-    pub session_drain: Option<SessionDrain>,
-    /// The timer armed to the drain's give-up deadline (see `SessionDrain::deadline`).
-    pub session_drain_timer: Option<RegistrationToken>,
-    /// What the drain in flight is for, recorded at its start and acted on at its end. Both can be
-    /// set at once: a SIGTERM landing during a confirm drain answers gnome-session *and* stops.
-    pub session_drain_confirm: Option<crate::end_session::EndSessionType>,
-    pub session_drain_stop: bool,
     /// 1 s repeating timer that ticks the R1 screen-recording indicator's `M:SS` label while any
     /// recording is live; `None` when nothing is recording.
     pub recording_tick: Option<RegistrationToken>,
@@ -1773,13 +1762,6 @@ impl State {
         {
             let _span = tracy_client::span!("flush_clients");
             self.niri.display_handle.flush_clients().unwrap();
-        }
-
-        // After the flush: a client's last window going away is what ends the drain, and this is
-        // the first point at which we have both seen that and pushed everything we owed it. On a
-        // session that is not ending this is a `None` check.
-        if self.niri.session_drain.is_some() {
-            self.niri.poll_session_drain();
         }
 
         #[cfg(feature = "dbus")]
@@ -6760,10 +6742,6 @@ impl Niri {
             idle_monitor_timer: None,
             end_session: crate::end_session::EndSession::new(),
             end_session_timer: None,
-            session_drain: None,
-            session_drain_timer: None,
-            session_drain_confirm: None,
-            session_drain_stop: false,
             recording_tick: None,
             idle_inhibit_manager_state,
             data_device_state,
@@ -13694,9 +13672,7 @@ impl Niri {
     /// or the countdown expired): tell gnome-session to proceed and close the dialog.
     pub fn confirm_end_session(&mut self) {
         if let Some(kind) = self.end_session.confirm() {
-            // Not answered here: `begin_end_session_drain` emits `Confirmed*` once the apps are
-            // gone, so gnome-session's teardown starts on an empty desktop.
-            self.begin_end_session_drain(kind);
+            self.emit_end_session_signal(kind.confirmed_signal());
         }
         self.end_session_dialog.hide();
         self.reschedule_end_session_timer();
@@ -13713,193 +13689,6 @@ impl Niri {
         self.end_session_dialog.hide();
         self.reschedule_end_session_timer();
         self.queue_redraw_all();
-    }
-
-    /// Stop the compositor, but only once our clients have had their chance to exit.
-    ///
-    /// This replaces the bare `stop_signal.stop()` on every path that ends the compositor: the
-    /// termination signals (`utils::signals`) and the `Quit` action. Instead of unwinding
-    /// immediately — which pulls the Wayland socket out from under apps that are still shutting
-    /// down — we stay in the event loop, keep dispatching and flushing clients, and leave when the
-    /// last client window is gone or [`DRAIN_TIMEOUT`] expires.
-    ///
-    /// The apps are asked to go the way GNOME asks them: SIGTERM, from stopping the systemd scopes
-    /// they were launched into. No `xdg_toplevel.close` sweep — mutter has none either
-    /// (`meta-wayland-xdg-shell.c:1167` is only reachable from `meta_window_delete`), and sending
-    /// one would put save-changes dialogs in the way of a logout that has already been confirmed.
-    /// What we add over GNOME is only the waiting.
-    pub fn begin_session_drain(&mut self) {
-        let was_stopping = self.session_drain_stop;
-        self.session_drain_stop = true;
-
-        // Announce it here rather than in `start_session_drain`, because this is the only place
-        // that means it. `STOPPING=1` puts the unit into deactivating and arms its
-        // `TimeoutStopSec`, so sending it on the dialog path — where we deliberately keep running
-        // and let gnome-session drive — would have systemd kill us mid-session if that teardown
-        // ever stalled. Also runs when a SIGTERM folds into a confirm drain already in flight,
-        // which is the ordinary sequence rather than an edge case.
-        if !was_stopping && self.is_session_instance {
-            self.notify_systemd_stopping();
-        }
-
-        self.start_session_drain();
-    }
-
-    /// Tell systemd we heard it, so our unit's `TimeoutStopSec` stops counting against the reply
-    /// and starts counting against the extension instead. Slack on top of the budget: the extension
-    /// has to cover the poll that *notices* the deadline, not just the deadline.
-    fn notify_systemd_stopping(&self) {
-        if !crate::utils::IS_SYSTEMD_SERVICE.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let extend = (DRAIN_TIMEOUT + Duration::from_secs(1)).as_micros() as u32;
-        let res = sd_notify::notify(&[
-            sd_notify::NotifyState::Stopping,
-            sd_notify::NotifyState::ExtendTimeoutUsec(extend),
-            sd_notify::NotifyState::Status("waiting for applications to exit"),
-        ]);
-        if let Err(err) = res {
-            warn!("error notifying systemd that we are stopping: {err:?}");
-        }
-    }
-
-    /// The end-session dialog was confirmed: drain first, then answer gnome-session.
-    ///
-    /// Answering starts a teardown that will SIGTERM us, so doing it while apps are still up hands
-    /// the ordering back to systemd's job graph — where the shell and the app scopes are stopped in
-    /// one transaction with no `After=` between them. Draining first means gnome-session's phases
-    /// only ever run on a session that has no app windows left, which is the deterministic version
-    /// of the head start we currently get by luck.
-    ///
-    /// We do *not* stop ourselves at the end of this drain: gnome-session drives the teardown from
-    /// here, exactly as it does today, and its SIGTERM lands on an empty desktop.
-    pub fn begin_end_session_drain(&mut self, kind: crate::end_session::EndSessionType) {
-        self.session_drain_confirm = Some(kind);
-        self.start_session_drain();
-    }
-
-    /// Enter the drain if it is not already running, having recorded what to do at the end of it.
-    ///
-    /// Re-entrant on purpose: a SIGTERM arriving during a confirm drain must not restart the clock
-    /// or be dropped — it sets `session_drain_stop` on the drain already in flight, so that one
-    /// drain both answers gnome-session and takes us down.
-    fn start_session_drain(&mut self) {
-        if self.session_drain.is_some() {
-            trace!("already draining, folding the request into the drain in flight");
-            return;
-        }
-
-        // Only a real session has clients whose exit we are ordering against. Nested and headless
-        // runs quit at once, as they always did: there is no session teardown to outlive, and a
-        // five-second wait on every `Quit` would be a dev-loop tax paid for nothing.
-        if !self.is_session_instance {
-            self.finish_session_drain();
-            return;
-        }
-
-        // Start the apps going. At a logout driven from outside, systemd is already doing this and
-        // the call joins the stop jobs it queued; on the `Quit` and end-session-dialog paths it is
-        // the only thing that asks them at all, and without it the drain would wait out its whole
-        // budget for apps nobody had told to leave.
-        //
-        // Synchronous, unlike every other systemd call here: the very next thing we do is poll,
-        // and on an empty desktop that poll can take us all the way to process exit — which would
-        // kill a background thread before it had finished connecting to the bus, so the stops
-        // would never go out at all. A D-Bus round trip on the way out costs nothing that matters.
-        crate::utils::spawning::stop_app_scopes();
-
-        let now = self.clock.now_unadjusted();
-        self.session_drain = Some(SessionDrain::new(now));
-        info!("session ending, waiting for clients to exit");
-
-        self.poll_session_drain();
-    }
-
-    /// (Re-)arm the single drain timer for the drain's next decision point.
-    ///
-    /// Re-armed rather than set once because the settle after the last window moves that point
-    /// nearer than the deadline. Without it an idle desktop — nothing rendering, no client traffic
-    /// — would have nothing to run the poll again.
-    fn arm_session_drain_timer(&mut self, after: Duration) {
-        if let Some(token) = self.session_drain_timer.take() {
-            self.event_loop.remove(token);
-        }
-
-        let token = self
-            .event_loop
-            .insert_source(Timer::from_duration(after), move |_, _, state| {
-                // Forget the token before polling: returning `Drop` is what removes this source,
-                // and a re-arm from inside `poll_session_drain` would otherwise try to remove it
-                // here too, while calloop holds it borrowed for this dispatch.
-                state.niri.session_drain_timer = None;
-                state.niri.poll_session_drain();
-                TimeoutAction::Drop
-            })
-            .unwrap();
-        self.session_drain_timer = Some(token);
-    }
-
-    /// Do whatever the drain was for: answer gnome-session, stop, or both.
-    ///
-    /// Also the no-drain path (`is_session_instance` false), so the two callers cannot disagree
-    /// about what a session end means.
-    fn finish_session_drain(&mut self) {
-        if let Some(kind) = self.session_drain_confirm.take() {
-            self.emit_end_session_signal(kind.confirmed_signal());
-        }
-        if self.session_drain_stop {
-            self.stop_signal.stop();
-        }
-    }
-
-    /// Is the drain over? Called from the timer and from every loop iteration (see
-    /// `State::refresh_and_flush_clients`), so the last window closing ends it without waiting for
-    /// the deadline.
-    pub fn poll_session_drain(&mut self) {
-        if self.session_drain.is_none() {
-            return;
-        }
-
-        let mut windows_left = 0;
-        self.layout.with_windows(|_, _, _, _| windows_left += 1);
-
-        let now = self.clock.now_unadjusted();
-        let drain = self.session_drain.as_mut().unwrap();
-        let Some(outcome) = drain.poll(now, windows_left) else {
-            // Not done: re-arm for whichever comes first, the settle or the deadline.
-            let next = drain.next_wakeup(now);
-            self.arm_session_drain_timer(next);
-            return;
-        };
-
-        match outcome {
-            DrainOutcome::ClientsGone => info!("clients are gone, ending the session"),
-            // The clients that are left are about to lose their socket mid-flight, which is the
-            // `Broken pipe` abort this exists to prevent. Name them: which app ignored a five
-            // second SIGTERM is the only thing worth knowing from this line.
-            DrainOutcome::TimedOut => {
-                let mut apps = Vec::new();
-                self.layout.with_windows(|mapped, _, _, _| {
-                    let app_id = crate::utils::with_toplevel_role(mapped.toplevel(), |role| {
-                        role.app_id.clone()
-                    });
-                    apps.push(app_id.unwrap_or_else(|| String::from("<unknown>")));
-                });
-                apps.sort_unstable();
-                apps.dedup();
-                warn!(
-                    "clients did not exit within {DRAIN_TIMEOUT:?}, ending the session anyway: {}",
-                    apps.join(", ")
-                );
-            }
-        }
-
-        self.session_drain = None;
-        if let Some(token) = self.session_drain_timer.take() {
-            self.event_loop.remove(token);
-        }
-        self.finish_session_drain();
     }
 
     /// Re-arm the countdown timer: fire once a second to refresh the displayed seconds and, at the
@@ -13927,9 +13716,8 @@ impl Niri {
         let now = self.clock.now_unadjusted();
 
         if let Some(kind) = self.end_session.tick(now) {
-            // Countdown expired: auto-confirm the default action, exactly as clicking it would —
-            // including draining before the answer goes out.
-            self.begin_end_session_drain(kind);
+            // Countdown expired: auto-confirm the default action, exactly as clicking it would.
+            self.emit_end_session_signal(kind.confirmed_signal());
             self.end_session_dialog.hide();
             self.queue_redraw_all();
             return;

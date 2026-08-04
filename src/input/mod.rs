@@ -825,7 +825,7 @@ impl State {
                 if this.niri.exit_confirm_dialog.is_open() && pressed {
                     if raw == Some(Keysym::Return) {
                         info!("quitting after confirming exit dialog");
-                        this.niri.begin_session_drain();
+                        this.niri.stop_signal.stop();
                     }
 
                     // Don't send this press to any clients.
@@ -2138,7 +2138,7 @@ impl State {
                 }
 
                 info!("quitting as requested");
-                self.niri.begin_session_drain();
+                self.niri.stop_signal.stop();
             }
             Action::ChangeVt(vt) => {
                 self.backend.change_vt(vt);

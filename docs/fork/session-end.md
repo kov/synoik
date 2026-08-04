@@ -98,131 +98,40 @@ still, and ours is fast.
 
 ## 2. What we do
 
+**Since 2026-08-03: the same thing, and nothing more.** SIGTERM stops the compositor, the `Quit`
+action stops the compositor, confirming the end-session dialog answers gnome-session at once. We do
+not wait for clients, do not stop any unit, and do not tell systemd we are stopping. §6 is the
+argument for that; this section is what is left after it.
+
+A drain used to sit on every one of those paths — the compositor stayed in the event loop, serving
+Wayland, until the last client window was gone or five seconds passed, and asked the apps to quit
+itself because nothing else had. It is gone. What survives is the part that was never about waiting:
+making sure the apps GNOME's teardown is *supposed* to reach can actually be reached.
+
 ### 2.1 Scopes carry their session membership explicitly
 
-`start_transient_scope` (`src/utils/spawning.rs`) now sets `PartOf=graphical-session.target`,
+`start_transient_scope` (`src/utils/spawning.rs`) sets `PartOf=graphical-session.target`,
 `Description` and `TimeoutStopUSec` itself, on both scope prefixes.
 
-Our `app-gnome-*` scopes already inherited all of that from gnome-session's drop-in — the prefix
-was matched on purpose, and `DropInPaths` on a live scope confirms it. Setting it directly does two
-things that inheritance does not: it covers `app-niri-*` (the `spawn` path, which matches no
-drop-in and got nothing), and it stops the property that makes logout work from resting on a file
-shipped by the package this fork intends to replace.
+Our `app-gnome-*` scopes already inherited all of that from gnome-session's drop-in — the prefix was
+matched on purpose, and `DropInPaths` on a live scope confirms it. Setting it directly does two
+things that inheritance does not: it covers `app-niri-*` (the `spawn` path, which matches no drop-in
+and got nothing), and it stops the property that makes logout work from resting on a file shipped by
+the package this fork intends to replace.
 
-> Reading these properties back has a trap. `systemctl show` on a unit that no longer exists
-> answers with **stub defaults** rather than an error — `PartOf=`, `TimeoutStopUSec=45s`,
+**This is now the only lever we have on app teardown**, and it is the right one: it is a
+*declaration*, resolved by systemd along with everyone else's, rather than an action of ours. An app
+of ours that is missing it is an app the teardown will not stop.
+
+> Reading these properties back has a trap. `systemctl show` on a unit that no longer exists answers
+> with **stub defaults** rather than an error — `PartOf=`, `TimeoutStopUSec=45s`,
 > `Description=<the unit name>` — which reads exactly like "the drop-in never applied". Check
-> `Transient=yes` / `DropInPaths=` before believing a negative result. This is most likely what is
-> behind the `PartOf=` empty claim in `overview-port.md` §4 gap 2.
+> `Transient=yes` / `DropInPaths=` before believing a negative result.
 
-### 2.2 The compositor outlives its clients
+### 2.2 An app must not inherit the compositor's signal mask
 
-Every path that ends the compositor now goes through **`Niri::begin_session_drain`** instead of
-`stop_signal.stop()`: the termination signals (`utils::signals`) and the `Quit` action. Rather than
-unwinding, we stay in the event loop — still dispatching, still rendering, still flushing — until
-the last client window is gone or `DRAIN_TIMEOUT` (5 s) expires.
-
-- **The oracle is the window count**, `layout.with_windows` — plus a settle. Windows *going away*
-  starts a 500 ms `DRAIN_SETTLE` rather than ending the drain, because unmap is not "done": a toolkit that
-  *handles* SIGTERM destroys its toplevels near the start of shutdown and keeps using the socket
-  afterwards (GL contexts, dmabuf feedback, the registry). Leaving at unmap would reopen the same
-  `Broken pipe` on a shorter fuse, and precisely for the apps that shut down gracefully rather than
-  dying where they stand. An app killed outright never unmaps at all — the compositor sees the
-  disconnect, so the two coincide. The settle restarts if a window reappears and `DRAIN_TIMEOUT`
-  still bounds the whole thing.
-
-  The strictly correct oracle is live client *connections*, but it needs an allowlist for the
-  clients that are ours: xwayland-satellite holds a connection for as long as it runs, so waiting
-  on it would push every logout with an X app to the full timeout. Not worth the machinery for the
-  residual risk; noted here so the option is on record.
-
-  **A drain that never sees a window owes no settle and ends on its first poll** (fixed
-  2026-08-03). The settle exists to outlive a toolkit that unmapped and is still on the socket; if
-  nothing ever unmapped there is nobody to outlive, and the wait is half a second spent on a client
-  that was never there. It cost that on *every* logout, not only an empty one — by the time the
-  stopping drain runs, the confirm drain has already emptied the desktop, so it too starts at zero.
-  Measured before the fix (journal, 22:44:27 on an empty session): 475 ms then 501 ms, back to
-  back, inside a 1.81 s logout. The residual risk is an app launched moments before the logout that
-  has not mapped yet; its scope is SIGTERMed either way, and one settle was never a guarantee for
-  it.
-- **The poll runs after `flush_clients`** in `refresh_and_flush_clients`, plus once on a deadline
-  timer. The first point is what makes the drain end the instant the last window goes; the timer is
-  what wakes an otherwise idle desktop to give up.
-- **`sd_notify(STOPPING=1, EXTEND_TIMEOUT_USEC=…)`** buys the budget against our own unit's
-  `TimeoutStopSec`, which would otherwise be counting the whole time. Sent **only on the stopping
-  path**, never on the dialog drain: `STOPPING=1` moves the unit into deactivating and arms that
-  timeout, so declaring it while we intend to keep running would have systemd kill us mid-session
-  if gnome-session's teardown ever stalled. A SIGTERM folding into a confirm drain sends it then.
-- **Timing out is a warning that names the apps.** Which client ignored a five-second SIGTERM is
-  the only thing worth knowing from that line.
-- **`DRAIN_TIMEOUT` cannot usefully exceed the scope's `TimeoutStopSec`, and both are 5 s because
-  we set both.** systemd starts its own five-second clock on the same `StopUnit` that begins the
-  drain, and SIGKILLs the app when it expires. Measured 2026-08-03: firefox was asked at
-  `22.8280`, we gave up at `27.800`, systemd killed it at `27.8277` — the two clocks land 27 ms
-  apart by construction. So the drain buys an app the *compositor's* company for up to 5 s (against
-  the 341 ms head start in §1, which is the win), but it cannot buy it more life than its scope
-  has. Raising one number alone does nothing; `TimeoutStopUSec` in `start_transient_scope` and
-  `DRAIN_TIMEOUT` in `src/niri.rs` move together or not at all.
-
-Apps are asked to go the way GNOME asks them — SIGTERM, by stopping their scopes
-(`spawning::stop_app_scopes`, `ListUnitsByPatterns` + `StopUnit`). There is deliberately **no
-`xdg_toplevel.close` sweep**: mutter has none, and sending one would put "save changes?" dialogs in
-front of a logout the user has already confirmed. GNOME's answer to unsaved work is the inhibitor
-protocol, not a close sweep. What we add over GNOME is only the waiting.
-
-**A flatpak app is not in the scope we started for it**, which is why the patterns include
-`app-flatpak-*` — a prefix we never create. We do call `start_app_scope` and get
-`app-gnome-<id>-<pid>.scope`; then `flatpak run` moves the real processes into a scope of its own
-and exits, ours goes empty, and `CollectMode=inactive-or-failed` collects it. By logout the only
-unit holding the app is flatpak's. Measured 2026-08-03 with OBS: our scope was started at
-`16:14:11.500`, flatpak's 70 ms later, and at `16:14:22.827` the stop went to firefox, Epiphany and
-a gsd helper — OBS was not asked to quit until the `graphical-session.target` teardown reached it
-at `16:14:27.835`, five seconds into a drain that had already timed out naming it. Nothing else
-covered it: it is the same class of unit (`/usr/lib/systemd/user/app-flatpak-.scope.d/` ships the
-same `PartOf=graphical-session.target` + `TimeoutStopSec=5s` drop-in), so all the pattern changes is
-*when* it is asked — at the start of the drain instead of after it.
-
-This is also the argument for the pattern list over a registry of what we launched, sharper than
-the one in the code comment: a registry would have recorded the scope we started, which is exactly
-the one that no longer holds the app.
-
-> **Open, 2026-08-03 — this whole mechanism may be the bug.** See §6: the pattern list is one
-> approximation of GNOME's set, but stopping units *at all* is a divergence, and the 5 s
-> gnome-terminal case is caused by the confirm drain, not by the list.
-
-On an externally driven logout, `stop_app_scopes` joins stop jobs systemd has already queued and is
-a no-op. On the `Quit` and dialog paths it is the only thing that asks the apps at all — which is
-why it is the one systemd call here that blocks. The rest are fire-and-forget on a thread; this one
-is followed immediately by a poll that can reach process exit within the same call, and a detached
-thread would be killed before it had finished connecting to the bus.
-
-### 2.3 The end-session dialog answers late
-
-Confirming the dialog (or letting its countdown expire) no longer emits `Confirmed*` straight away.
-`begin_end_session_drain` records the answer, drains, and emits it when the apps are gone.
-
-The answer is what makes gnome-session start the teardown that SIGTERMs us — so emitting it with
-apps still up hands the ordering back to the job graph that has no ordering in it. Draining first
-means gnome-session's phases only ever run on a desktop with no app windows left: the deterministic
-version of the head start above — which, as §1 shows, was not a margin we were winning anyway.
-
-This drain does **not** stop us. gnome-session still drives the teardown exactly as before; its
-SIGTERM just lands on an empty session, where the follow-up drain now has nothing left to pay — it
-starts at zero windows and ends on its first poll (see §2.2). Before that fix this cost a ~500 ms
-tail on every logout, on top of the confirm drain's own. A SIGTERM arriving *during* a confirm drain
-folds into it rather than restarting the clock or being dropped.
-
-### 2.4 Not in a session, not draining
-
-`is_session_instance` gates the whole thing. Nested and headless runs quit at once, as they always
-did — there is no session teardown to outlive, and a five-second wait on every `Quit` would be a
-dev-loop tax paid for nothing. It is also what keeps the headless tests fast; the three conformance
-tests in `src/tests/gnome.rs` set the flag by hand.
-
-### 2.5 An app must not inherit the compositor's signal mask
-
-The drain had never once succeeded before 2026-08-03, and this is why: **every app launched from
-the dash, grid or search started life unable to receive SIGTERM.**
+The oldest real bug here, and the one that made every other theory look plausible: **every app
+launched from the dash, grid or search started life unable to receive SIGTERM.**
 
 `signals::block_early` (`src/main.rs:63`) blocks SIGHUP/SIGINT/SIGTERM process-wide, so the calloop
 `Signals` source can own them — and a blocked mask survives both `fork` and `execve`. GIO's
@@ -241,6 +150,14 @@ and the A/B is one line:
 plain launch()             SigBlk=0000000000004003   state after SIGTERM = S   (alive)
 as_manager + child setup   SigBlk=0000000000000000   state after SIGTERM = Z   (gone)
 ```
+
+**Note the divergence underneath it: GNOME never has this problem, because it never blocks.**
+mutter and gnome-shell take SIGTERM with `g_unix_signal_add` (`mutter/src/core/mutter.c:121`,
+`gnome-shell/src/main.c:578-579`), which installs an ordinary `sigaction` handler writing to GLib's
+wakeup pipe — no `sigprocmask` anywhere, so a child forks with a clean mask and there is nothing to
+undo. We block because calloop's `Signals` source is signalfd, and signalfd only delivers a signal
+that is blocked. The mechanism is ours to keep; the *observable* behaviour has to be GNOME's, which
+means every fork path must clear the mask, and that is what the fixes below do.
 
 So `launch_default` (`src/app_system.rs`) uses `launch_uris_as_manager_with_fds`, whose `user_setup`
 runs in the child between fork and exec — the same window `pre_exec` uses. Three things about that
@@ -284,58 +201,33 @@ the calls they replaced. The action arm also asserts `list_actions().len() == 1`
 anything: a `Desktop Action` group is invisible without an `Actions=` key in the main group, and
 without that guard the arm would have passed by testing nothing.
 
-**Measured on the seat afterwards**, the same OBS that had been SIGKILLed three logouts running:
+**Measured on the seat afterwards**, the same OBS that had been SIGKILLed three logouts running
+reacted to the teardown's SIGTERM in 0.96 ms, against GNOME's 0.8 ms, and reported no unclean
+shutdown on the next start. That number is the one that matters now: with no drain, an app's whole
+budget is its own scope's `TimeoutStopSec`, and being able to hear the signal is all we can give it.
 
-```
-16:50:44.358482  asked systemd to stop app-flatpak-…obsproject…scope
-16:50:44.359444  OBS: ==== Shutting down ====                        ← 0.96 ms
-16:50:44.918195  clients are gone, ending the session                ← 559 ms
-```
+### 2.3 No `xdg_toplevel.close` sweep
 
-0.96 ms against GNOME's 0.8 ms, a drain that ends on `clients are gone` instead of timing out, and
-no "Crash or unclean shutdown detected" on the next start.
-
----
+Deliberate, and unchanged. mutter has none — `meta-wayland-xdg-shell.c:1167` is reachable only from
+`meta_window_delete`, i.e. a user closing a window — and sending one at session end would put
+"save changes?" dialogs in front of a logout the user has already confirmed. GNOME's answer to
+unsaved work is the inhibitor protocol; see §3.
 
 ## 3. Known gaps
 
-- **Terminal-spawned clients have no scope**, so `stop_app_scopes` cannot reach them and nothing
-  SIGTERMs them at logout. The drain still waits for their windows; they are only asked to leave
-  when the socket dies, as under GNOME. (A flatpak app started from a terminal is the exception —
-  `flatpak run` makes it a scope regardless of who launched it, so `app-flatpak-*` now reaches it.)
-- **`DBusActivatable` apps are unreachable from the drain** — see §4. The bus restart that ends
-  them is triggered by our own exit, so waiting moves it out of reach rather than into it. Measured
-  with a keyring prompt open: 10 s of drain, then `Broken pipe` anyway.
-- **`--session` under a non-systemd init** (dinit) drains with no way to stop the scopes, so a
-  `Quit` there waits out the full budget before the warning: the drain is gated on
-  `is_session_instance` while `stop_app_scopes` is gated on `IS_SYSTEMD_SERVICE`. Nobody runs that
-  configuration today.
-- **A withdrawal during a confirm drain is ignored, and now has a window to arrive in.** Confirming
-  stops the app scopes immediately but holds `Confirmed*` for up to ~5.5 s. If gnome-session
-  withdraws the request in that window (`EndSessionDialogToNiri::Close`, `src/niri.rs`),
-  `EndSession::close` is already a no-op — the dialog was taken by `confirm` — so the drain goes on
-  to answer a request that no longer exists, on a desktop whose apps have already been told to quit.
-  Before the drain this window was ~0. The user did confirm, and gnome-session withdrawing after a
-  confirm is not something we have seen, so this is recorded rather than fixed; the fix is for
-  `Close` to cancel `session_drain_confirm`, which needs a decision about what the half-stopped
-  session should then look like.
-- **A stuck app can cost two budgets — seen 2026-08-03, and it cost 10.07 s.** If a confirm drain
-  times out, gnome-session's subsequent SIGTERM starts a fresh drain that gives what is left
-  another 5 s. Measured with firefox, Epiphany and OBS up: drain 1 `22.829 → 27.800`, SIGTERM at
-  `27.894`, drain 2 `27.915 → 32.897`. Worth reading *why* before adding state to fix it: the only
-  app in drain 2 was OBS, and OBS was in it because nothing had asked it to quit yet — the flatpak
-  scope fix above is what that logout actually needed. Carrying the deadline across is still the
-  fix for the general case; it is not obviously the fix for the case we have.
+Four of the gaps that used to live here — terminal-spawned clients, D-Bus-activated apps being
+unreachable, a `Quit` under a non-systemd init, a withdrawal arriving during a confirm drain, and a
+stuck app costing two five-second budgets — were all gaps *in the drain*. They went with it. What is
+left is the same set GNOME has.
 
-  With the fix in, measured again 2026-08-03: one logout took **5.6 s and ended on
-  `clients are gone`** — the first clean drain we have recorded — and the next took the full 10 s on
-  `gcr-prompter`, which is the D-Bus-activated case above and would not have been helped by either
-  budget. So the second budget is now only ever spent on clients the drain cannot influence, which
-  is an argument for capping the *total* rather than for carrying the deadline.
+- **An app that ignores SIGTERM is SIGKILLed after its scope's `TimeoutStopSec`**, and loses the
+  socket whenever we happen to exit, which may be sooner. This is GNOME's behaviour and its exposure;
+  §1's race is the shape of it. §2.2 is the only thing that changes the odds, by making sure the
+  signal arrives at all.
 - **Inhibitors are still parsed and discarded**, and this is the one gap here that is a missing
   *feature* rather than a limit. `EndSessionDialog.Open` takes a list of inhibitor object paths
   (`src/dbus/gnome_session.rs:59`) and the dialog does not show them, so an app with unsaved work
-  has no way to say so — which matters doubly for us, because §2.2 deliberately declines the
+  has no way to say so — which matters doubly for us, because §2.3 deliberately declines the
   `xdg_toplevel.close` sweep on the grounds that inhibitors are GNOME's designed answer to exactly
   that problem. Declining the sweep and never building the answer leaves the user with neither.
 
@@ -345,7 +237,6 @@ no "Crash or unclean shutdown detected" on the next start.
   `js/ui/endSessionDialog.js:153`), and lists only those whose flags include
   `InhibitFlags.LOGOUT` *and* which resolve to a real app — services and non-logout inhibitors are
   dropped (`_onInhibitorLoaded`, `:571-591`). Dead inhibitors are expected and tolerated (`:158`).
-  The withdrawal-during-a-confirm-drain gap above belongs to the same audit.
 - **No `RegisterClient` participation.** We do not register as a session client, matching
   gnome-shell. Since GTK4 dropped registration this protocol is dead for apps too, so there is
   nothing to gain until something starts speaking it again — the new `xx_session_v1` toplevel
@@ -392,17 +283,17 @@ The bus restart lands **after** the compositor has been told to stop. So under s
 D-Bus-activated app is *more* exposed than a scoped one, not less: a scoped app at least gets a
 341 ms head start, while this one is not asked to leave until 425 ms after the shell was.
 
-**The drain does *not* cover it, and the reason is worth keeping.** An earlier revision of this
-section argued that it did — the drain keeps us serving Wayland for 5 s, the bus restart lands
-~425 ms after we are told to stop, so the app gets to close its own socket. That reasoning has a
-hole in it: the restart is not at a fixed offset from our *SIGTERM*, it is downstream of our
-*exit*. `gnome-session-restart-dbus.service` is pulled in by `gnome-session-shutdown.target`, which
-`org.gnome.Shell@user.service` triggers through `OnSuccess=`. **Every second the drain waits pushes
-the bus restart back by the same second**, so it can never arrive during the drain — the deadline
-moves with us.
+**The drain could never have covered it, which is worth keeping now that the drain is gone.** An
+early revision of this section argued that it did — the drain keeps us serving Wayland for 5 s, the
+bus restart lands ~425 ms after we are told to stop, so the app gets to close its own socket. That
+reasoning had a hole in it: the restart is not at a fixed offset from our *SIGTERM*, it is downstream
+of our *exit*. `gnome-session-restart-dbus.service` is pulled in by `gnome-session-shutdown.target`,
+which `org.gnome.Shell@user.service` triggers through `OnSuccess=`. Every second the drain waited
+pushed the bus restart back by the same second, so it could never arrive during the drain — the
+deadline moved with us.
 
-Measured 2026-08-03, a logout with a keyring password prompt open (`gcr-prompter`, in
-`dbus-:1.2-org.gnome.keyring.SystemPrompter@0.service`):
+Measured 2026-08-03, back when the drain existed, on a logout with a keyring password prompt open
+(`gcr-prompter`, in `dbus-:1.2-org.gnome.keyring.SystemPrompter@0.service`):
 
 ```
 16:26:51.495  drain 2 starts (after drain 1 timed out on it)
@@ -412,19 +303,13 @@ Measured 2026-08-03, a logout with a keyring password prompt open (`gcr-prompter
 16:26:56.645  Started gnome-session-restart-dbus.service                      ← 47 ms too late
 ```
 
-Ten seconds of drain, both budgets spent, and the client still went out on `Broken pipe` — the
-exact failure the drain exists to prevent, in the one class of client it cannot help. So this is a
-**gap, not a footnote**: a D-Bus-activated client that only exits when the bus goes is unreachable
-from here on *every* path, `Quit` included, because we are what the bus restart is waiting for.
+Ten seconds of waiting, both budgets spent, and the client still went out on `Broken pipe`. **A
+mechanism whose own deadline moves with the wait is one waiting cannot fix** — this was the clearest
+single instance of that, and it generalises to the drain as a whole (§6). Today we exit at once, the
+bus restart follows, and this client class is exposed exactly as it is under GNOME.
 
-What would actually fix it is asking gnome-session to restart the bus before we exit rather than
-after, or stopping the `dbus-:1.x-*` unit for a client whose window is holding the drain. The
-second is tempting and wrong as stated — those units are not ours, and a blanket pattern would take
-out session services we still need — but a *targeted* stop, of a unit we can tie to a window that
-is holding the drain open, is a different proposition and has not been explored.
-
-Do not read "the app has no scope" as "the app is unprotected"; read it as "the drain has no
-lever on this one", which is the conclusion this section now exists to record.
+Do not read "the app has no scope" as "the app is unprotected"; read it as "this one is the bus's to
+end, not ours", which is the conclusion this section exists to record.
 
 ## 5. Starting the session action: D-Bus, not `gnome-session-quit`
 
@@ -452,10 +337,11 @@ variant that never comes back to us as `EndSessionDialog.Open`.
 
 ---
 
-## 6. Why the race is lost — and the case that the drain, not the list, is the bug
+## 6. Why the race is lost — and why the drain went away
 
-Written 2026-08-03, after a logout with gnome-terminal open cost the full five seconds. Open: the
-conclusion here has not been acted on.
+Written 2026-08-03, after a logout with gnome-terminal open cost the full five seconds. **Acted on
+the same day: the drain is gone**, and §2 is what the compositor does now. Kept because the reasoning
+is the reason, and because every part of it was wrong once.
 
 ### 6.1 There *is* ordering, and it is on our side
 
@@ -488,36 +374,48 @@ It is ours, and it is a deadlock we built. Journal, 2026-08-03 22:41, one gnome-
 ```
 
 The client needed 17 ms and we waited 5 s, because for the whole of those 5 s **nobody had asked
-it**. §2.3 holds the `Confirmed*` answer until the apps are gone; gnome-session starts the teardown
-when we answer; the teardown is what stops the apps. We wait for an event that our waiting is what
-prevents. `stop_app_scopes` exists to paper over exactly that — it is the confirm drain's substitute
-for the teardown it is holding up — and it misses `gnome-terminal-server.service` because that unit
+it**. The confirm drain held the `Confirmed*` answer until the apps were gone; gnome-session starts
+the teardown when we answer; the teardown is what stops the apps. We waited for an event that our
+waiting was what prevented. `stop_app_scopes` existed to paper over exactly that — the confirm
+drain's substitute for the teardown it was holding up — and it missed
+`gnome-terminal-server.service` because that unit
 declares `PartOf=graphical-session.target` under a name in no `app-*.scope` family.
 
 Fixing the pattern list makes the symptom go away and leaves the inversion in place. **A better set
 would only have hidden it.**
 
-### 6.3 What "do what mutter does" actually means here
+### 6.3 What "do what mutter does" means here
 
 mutter asks nobody. It does not read the unit graph, does not stop units, does not consult
 inhibitors (those are gnome-session's, and they gate the *dialog*, not the exit) — it quits the main
-loop and `wl_display_destroy_clients` closes the sockets. Every unit stop in a GNOME logout is
-systemd's, resolved from `PartOf=graphical-session.target`, and it happens because the shell
-*answered immediately*.
+loop and `wl_display_destroy_clients` closes the sockets. It does not even declare `STOPPING=1`:
+`shell_util_sd_notify` sends `READY=1` and nothing else (`gnome-shell/src/shell-util.c:774-778`).
+Every unit stop in a GNOME logout is systemd's, resolved from `PartOf=graphical-session.target`, and
+it happens because the shell **answered immediately**.
 
-So the divergence we should keep is the narrow one — **the compositor outliving its clients**, which
-is the answer to §6.1 — and the ones to drop are the two that grew around it:
+The tempting reading was that the drain was fine and only its *ask* was wrong — that a better set of
+units (a `ConsistsOf` query, a PID-to-unit map) would fix the gnome-terminal case. It would have, and
+that is what makes it the trap: it fixes the symptom by making our substitute for the teardown a
+better substitute, and leaves the inversion in place for the next unit that does not fit whatever
+rule we picked. **Twice now the answer to "which units?" has been one more entry.**
 
-- **Answer `Confirmed*` at once**, as gnome-shell does. The teardown then runs, systemd SIGTERMs the
-  real set by declaration, and the stopping drain keeps us serving Wayland while they finish. The
-  confirm drain (§2.3) goes away, and with it the two-budget case in §3 and the
-  withdrawal-during-a-confirm-drain gap.
-- **Stop calling `stop_app_scopes` on that path**, because systemd is now doing it. What remains to
-  decide is the `Quit` action, which has no gnome-session behind it — our unit's `OnSuccess=`
-  triggers the teardown only once we have exited, so a drain there has the same inversion. mutter's
-  answer for `Quit` is to exit; whether we want the drain badly enough to keep asking on that one
-  path is the open question.
+So the whole thing came out:
 
-The prize is that the set of units asked stops being ours to get right — no patterns, no
-`ConsistsOf` query, no PID-to-unit mapping. `PartOf=graphical-session.target` on our own scopes
-(§2.1) is then the *only* thing we have to keep true, and systemd resolves the rest.
+- `SessionDrain`, `DRAIN_TIMEOUT`, `DRAIN_SETTLE`, `poll_session_drain` and the drain timer.
+- The confirm drain. `confirm_end_session` emits `Confirmed*` at once, as `endSessionDialog.js` does;
+  gnome-session's teardown then runs, and systemd stops the real set by declaration.
+- `stop_app_scopes` and its pattern list.
+- `sd_notify(STOPPING=1, EXTEND_TIMEOUT_USEC=…)`, which existed only to buy the drain room against
+  our own `TimeoutStopSec`.
+- SIGTERM, the `Quit` action and the exit-confirm dialog all go back to `stop_signal.stop()`.
+
+**What we give up** is real and worth naming: an app that is slower than our unwind loses its socket
+mid-shutdown, which is §1's race, and we no longer paper over it. What we get back is that the set of
+units asked is no longer ours to get right, and the failure mode is GNOME's rather than one of our
+own invention. The three drain conformance tests went with it; what still pins the behaviour that
+matters is `a_launched_app_can_be_asked_to_quit` (§2.2), because hearing the SIGTERM is now the whole
+of an app's protection.
+
+**If the race is ever worth addressing again, address the race** — the ordering gap in §6.1, which is
+in systemd's job graph and would be fixed by an `After=` that makes the app stops complete before the
+shell's, not by the compositor waiting on the side.

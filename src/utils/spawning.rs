@@ -225,33 +225,6 @@ pub fn start_app_scope(app_id: &str, pid: u32) {
 #[cfg(not(feature = "systemd"))]
 pub fn start_app_scope(_app_id: &str, _pid: u32) {}
 
-/// Ask systemd to stop every app scope we started, which SIGTERMs the apps inside them.
-///
-/// This is what makes a session end *begin*, on the paths where nothing else has asked the apps to
-/// go: the `Quit` action, and confirming the end-session dialog before we answer gnome-session. At
-/// a logout driven from outside (systemd SIGTERMs us and the scopes in one transaction) it is
-/// redundant, and issuing a stop for a unit that already has a stop job is a no-op — so the drain
-/// calls it unconditionally rather than keeping two paths.
-///
-/// The scopes are found by unit-name pattern instead of a registry of what we launched: the pattern
-/// cannot drift out of date, cannot grow without bound over a long session, and picks up scopes
-/// started for us by anything else that uses the same prefix.
-///
-/// Blocking, unlike the other systemd calls here, which are deliberately off-thread. The caller is
-/// about to start polling for the drain to finish, and on an empty desktop that can reach process
-/// exit within the same call — which would kill a background thread before it had finished even
-/// connecting to the bus, so the stops would never be sent. A D-Bus round trip on the way out of
-/// the session costs nothing that matters.
-///
-/// A no-op without the `systemd` feature, and without being a systemd service ourselves.
-#[cfg(feature = "systemd")]
-pub fn stop_app_scopes() {
-    systemd::stop_app_scopes();
-}
-
-#[cfg(not(feature = "systemd"))]
-pub fn stop_app_scopes() {}
-
 #[cfg(feature = "systemd")]
 mod systemd {
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -593,71 +566,6 @@ mod systemd {
     /// `/usr/lib/systemd/user/app-flatpak-.scope.d/` carries the same
     /// `PartOf=graphical-session.target` and `TimeoutStopSec=5s` drop-in as `app-gnome-`— so
     /// all this changes is *when* it is asked.
-    const APP_SCOPE_PATTERNS: &[&str] = &[
-        "app-gnome-*.scope",
-        "app-niri-*.scope",
-        "app-flatpak-*.scope",
-    ];
-
-    fn stop_scopes_matching(patterns: &[&str]) -> anyhow::Result<()> {
-        use anyhow::Context;
-        use zbus::zvariant::OwnedObjectPath;
-
-        let conn = zbus::blocking::Connection::session().context("error connecting to the bus")?;
-        let proxy = zbus::blocking::Proxy::new(
-            &conn,
-            "org.freedesktop.systemd1",
-            "/org/freedesktop/systemd1",
-            "org.freedesktop.systemd1.Manager",
-        )
-        .context("error creating a Proxy")?;
-
-        // `ListUnitsByPatterns(states, patterns)`; an empty `states` means "any". Only the unit
-        // name (field 0) is used, but the reply shape is systemd's full unit tuple.
-        type Unit = (
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            OwnedObjectPath,
-            u32,
-            String,
-            OwnedObjectPath,
-        );
-        let units: Vec<Unit> = proxy
-            .call("ListUnitsByPatterns", &(&[] as &[&str], patterns))
-            .context("error calling ListUnitsByPatterns")?;
-
-        for unit in &units {
-            let name = &unit.0;
-            // "replace": if the unit already has a stop job (the logout case) this simply joins it.
-            let res: zbus::Result<OwnedObjectPath> = proxy.call("StopUnit", &(name, "replace"));
-            match res {
-                Ok(_) => debug!("asked systemd to stop {name}"),
-                // An app that exited between the listing and here is normal, not a problem.
-                Err(err) => trace!("error stopping {name}: {err:?}"),
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn stop_app_scopes() {
-        use crate::utils::IS_SYSTEMD_SERVICE;
-
-        if !IS_SYSTEMD_SERVICE.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let _span = tracy_client::span!();
-
-        if let Err(err) = stop_scopes_matching(APP_SCOPE_PATTERNS) {
-            warn!("error stopping the app scopes: {err:?}");
-        }
-    }
-
     pub fn start_app_scope(app_id: &str, pid: u32) {
         use crate::utils::IS_SYSTEMD_SERVICE;
 

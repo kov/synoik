@@ -50,11 +50,11 @@ mod platform {
                 Signals::new(&[Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP]).unwrap(),
                 |event, _, state| {
                     info!("quitting due to receiving signal {:?}", event.signal());
-                    // Not `stop_signal.stop()`: at logout systemd SIGTERMs us and the apps in the
-                    // same transaction, so quitting here takes the socket away from clients that
-                    // are still shutting down. `begin_session_drain` keeps us serving until they
-                    // are gone.
-                    state.niri.begin_session_drain();
+                    // Quit outright, as mutter's SIGTERM handler does: `meta_context_terminate`
+                    // is a bare `g_main_loop_quit` (`meta-context.c:519-530`). Waiting for the
+                    // clients instead is what `docs/fork/session-end.md` §6 records as the wrong
+                    // shape — systemd is already stopping them, and it is ordered to stop us last.
+                    state.niri.stop_signal.stop();
                 },
             )
             .unwrap();
