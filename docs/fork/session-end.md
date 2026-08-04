@@ -419,3 +419,46 @@ of an app's protection.
 **If the race is ever worth addressing again, address the race** — the ordering gap in §6.1, which is
 in systemd's job graph and would be fixed by an `After=` that makes the app stops complete before the
 shell's, not by the compositor waiting on the side.
+
+
+---
+
+## 7. Open: is GNOME actually losing this race?
+
+Raised 2026-08-03, immediately after §6 landed, and **not resolved** — parked deliberately.
+
+§1 says apps survive under GNOME because mutter's unwind happens to be slower than theirs, and calls
+that luck. That reads badly the moment you say it out loud: OBS shuts down cleanly under mutter
+routinely, and "the compositor consistently loses a race" is a weak explanation for something that
+consistent. Something is probably biasing it, and if so it is worth knowing what, because it may be
+something we could have rather than something we must do without.
+
+The first candidate has a measurement behind it already. **mutter takes 2-5x longer to unwind than we
+do**, and against a fixed head start that is not a coin flip, it is a margin:
+
+```
+real GNOME (kov, systemd[1101])   22:46:14.365 → 22:46:15.630   1.264 s
+ours (gsrs, systemd[1101097])     22:41:29.491 → 22:41:30.068   0.577 s
+ours, the §1 trace                14:10:16.179 → 14:10:16.457   0.262 s
+```
+
+If that is the whole answer then GNOME's margin is an accident of how much teardown mutter does, we
+have less of it because we do less, and §1's framing is right in mechanism but wrong in tone — it is
+a *systematic* bias, not luck, and the number is the thing to watch when apps start dying badly.
+
+Other candidates not yet examined:
+
+- **`wl_display_destroy_clients` may not be equivalent to us exiting.** mutter calls it from
+  `meta_wayland_compositor_prepare_shutdown` and then keeps unwinding; a client that gets a clean
+  protocol disconnect early, with the process still alive to drain its socket, is in a different
+  position from one whose peer vanished.
+- **Losing the display connection may not be what makes an app "unclean" at all.** OBS's crash flag
+  is about its own state file, written from its SIGTERM handler; that path does not need a
+  compositor. If so the failures we attributed to the race were really the blocked-mask bug (§2.2),
+  which is fixed, and the race may cost far less than this document assumes.
+- **Toolkit behaviour on EPIPE differs** (§1 already notes GTK3 aborts where GTK4 exits), so "apps
+  survive under GNOME" may be a statement about which toolkits, not about timing.
+
+**Do not treat §6's removal as depending on this.** The drain is gone because it inverted the
+teardown, which is true either way. This section is about whether the *exposure* it claimed to cover
+is as large as claimed — and the honest answer today is that we do not know.
