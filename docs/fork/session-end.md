@@ -425,13 +425,22 @@ shell's, not by the compositor waiting on the side.
 
 ## 7. Open: is GNOME actually losing this race?
 
-Raised 2026-08-03, immediately after §6 landed, and **not resolved** — parked deliberately.
+Raised 2026-08-03, immediately after §6 landed. **Still open**, but no longer speculative: the two
+leading candidates have now been measured, one is dead and one turned out to be a deficit of ours.
 
 §1 says apps survive under GNOME because mutter's unwind happens to be slower than theirs, and calls
 that luck. That reads badly the moment you say it out loud: OBS shuts down cleanly under mutter
 routinely, and "the compositor consistently loses a race" is a weak explanation for something that
 consistent. Something is probably biasing it, and if so it is worth knowing what, because it may be
 something we could have rather than something we must do without.
+
+**Method note, because it is reusable.** Both answers below came from an `LD_PRELOAD` shim over
+`wl_display_destroy_clients` / `wl_client_destroy` / `wl_display_destroy` that timestamps each call,
+run against our headless compositor *and* against a real nested `gnome-shell --wayland --no-x11`
+(hosted inside a headless niri, on a private bus via `dbus-run-session`, so no seat is touched).
+That is an apples-to-apples A/B of mutter and us on the same machine with the same clients, and it
+settled in minutes what days of journal archaeology had got backwards. **Reach for it before
+reasoning about shutdown ordering again.**
 
 ### 7.1 The unwind-duration candidate is dead, and its measurement was contaminated
 
@@ -468,33 +477,81 @@ So however long mutter's unwind is, **its clients are disconnected at the beginn
 grace period from the compositor ends there, not at process exit. A slow unwind buys them nothing;
 the slow part happens after they are already gone.
 
-### 7.2 Which inverts the `wl_display_destroy_clients` question
+### 7.2 `wl_display_destroy_clients`: we already call it, and we are 12x worse than mutter
 
-The obvious follow-up to §6 was "mutter calls `wl_display_destroy_clients` and we don't — why did we
-never try it?" The honest answer to *why* is that the drain was treated as the alternative and the
-exit path itself was never audited. But the answer to *whether it would help* is that it would do the
-opposite: **we keep the socket alive until the process exits, so we already give clients more
-compositor-time than mutter does.** Adding the call would shorten that.
+Three assumptions were checked rather than argued, because two of them were wrong.
 
-The API is there if we ever want it for faithfulness rather than protection —
-`Client::kill` / `Backend::kill_client` in wayland-server 0.31, and the sys backend calls the real
-`wl_display_destroy_clients`. What it would buy is a *deterministic, server-initiated* disconnect
-with destructors run at a defined point, instead of whatever our drop order happens to do. That is a
-robustness argument, not a client-survival one, and it is not obviously worth making.
+**What the call does — it is not a protocol goodbye.** There is no "server is going away" event in
+core Wayland; nothing exists to send. `wl_display_destroy_clients` walks the client list calling
+`wl_client_destroy` (`wayland/src/wayland-server.c:1629-1653`), and that function
+(`:998-1028`) is:
+
+```c
+wl_priv_signal_final_emit(&client->destroy_signal, client);
+wl_client_flush(client);                                       /* :1014 push queued events */
+wl_map_for_each(&client->objects, remove_and_destroy_resource, NULL);
+wl_event_source_remove(client->source);
+close(wl_connection_destroy(client->connection));              /* :1018 close the fd */
+```
+
+So it *is* the server closing the socket, exactly as one would assume — the only thing it adds over
+the fd dying with the process is the flush of already-queued events and the server-side destructors.
+Worth knowing that **`wl_display_destroy` does not do this** (`:1305-1329` frees the display and its
+listening sockets and never touches `client_list`), so the call is genuinely separate and
+load-bearing.
+
+**Whether we call it — yes, and it is not obvious from our source.** We build smithay with
+`use_system_lib`, which selects wayland-backend's `sys` backend, whose `Drop for State<D>` calls the
+real `wl_display_destroy_clients` (`wayland-backend-0.3.16/src/sys/server_impl/mod.rs:429-436`). Our
+`Display` is owned by the calloop source at `src/niri.rs:6621`, so it drops with `event_loop` when
+`main` returns. **Verified, not assumed**, with an `LD_PRELOAD` shim over
+`wl_display_destroy_clients` / `wl_client_destroy` / `wl_display_destroy` on a headless run with a
+weston-terminal attached: SIGTERM produced `destroy_clients ENTER → wl_client_destroy →
+LEAVE → wl_display_destroy → process exit`. So there was never a mechanism to add.
+
+**How we compare — badly.** The same shim on a *nested real gnome-shell* (`--wayland --no-x11`,
+inside a headless niri, private bus), SIGTERMed the same way:
+
+```
+                      SIGTERM → destroy_clients      → process exit
+mutter  (5 clients)   67.9 ms                        +48.9 ms  =  116.8 ms
+ours    (1 client)     5.6 ms                        + 0.3 ms  =    5.9 ms
+```
+
+**mutter keeps its clients' sockets alive ~12x longer than we do.** The earlier claim in this
+document — that because mutter calls `destroy_clients` at the *top* of its dispose and we get it at
+the *bottom* of ours, we are the more generous one — was wrong in the way that matters. What a client
+experiences is the absolute time from its SIGTERM to its socket closing, and mutter's 68 ms of
+pre-destroy work (gjs shutdown, the `PREPARE_SHUTDOWN` signal, `service_channel` teardown) is longer
+than our entire exit. Where `destroy_clients` sits *within* each teardown is irrelevant; the length
+of the part before it is the whole story.
+
+Two caveats on the numbers: ours is a **debug** build (release would be faster, widening the gap),
+and the nested mutter has no DRM backend — but `meta_backend_destroy` runs *after* `destroy_clients`,
+so a real session cannot shorten the 68 ms, and a real session's heavier pre-shutdown work would
+likely lengthen it. Treat 68 ms as a floor for mutter and 5.6 ms as optimistic for us.
 
 ### 7.3 What is left
 
-With the unwind candidate gone, the strongest remaining explanation is the one that says the premise
-was wrong: **apps may not need the compositor to shut down cleanly at all.** OBS's crash flag is
-written from its own SIGTERM handler, which touches no display. If that is the story, then every
-"unclean shutdown" we recorded was the blocked signal mask (§2.2) — an app that never got the SIGTERM
-and was SIGKILLed — and the compositor's departure was never the cause we took it for. That would
-also explain why it looked like mutter reliably wins a race it structurally does not run.
+Two candidates are now measured rather than guessed, and they point opposite ways:
 
-The experiment: a real-GNOME logout with OBS up, on a session that does not crash, reading OBS's own
-log for whether it saved state, and where its disconnect falls relative to the shell's stop. Until
-then §1's race is real in mechanism but of unknown cost.
+- **We are 12x quicker to close the socket than mutter** (§7.2). If the compositor's presence during
+  an app's shutdown matters at all, that is a real deficit and it is ours, not a race we lose.
+- **But 68 ms is small next to the 341 ms head start** the apps already have from §1, so it is hard
+  to believe it is the difference between a clean shutdown and a crash report.
 
-**Do not treat §6's removal as depending on this.** The drain is gone because it inverted the
-teardown, which is true either way. This section is about whether the *exposure* it claimed to cover
-is as large as claimed — and the honest answer today is that we do not know.
+Which leaves the possibility that the premise was wrong all along: **apps may not need the compositor
+to shut down cleanly.** OBS's crash flag is written from its own SIGTERM handler, which touches no
+display. If that is the story, then every "unclean shutdown" we recorded was the blocked signal mask
+(§2.2) — an app that never got the SIGTERM and was SIGKILLed — and neither the race nor the 68 ms
+ever mattered.
+
+**The experiment that would settle it**, and it is cheap now that the harness exists: run OBS under a
+nested gnome-shell and under our headless compositor, SIGTERM each compositor with OBS up, and read
+OBS's own log for whether it saved state. That distinguishes "needs the compositor" from "needs the
+signal" directly, instead of inferring either from journal timing.
+
+**If it turns out the 68 ms does matter**, the fix is not a drain: it is to notice that our teardown
+is 6 ms because we do almost nothing, and to decide deliberately what should happen between the
+signal and the socket closing — which is a design question about our own shutdown, not about waiting
+for clients.
