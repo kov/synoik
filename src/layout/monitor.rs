@@ -89,6 +89,16 @@ const MIN_WORKSPACE_BACKGROUND_CORNER_RADIUS: f64 = 8.;
 /// **Adaptive chrome, rule 1 — ramped.**
 const SHADOW_GLOW_MARGIN: f64 = 48.;
 
+/// A crop rect that crops nothing. `CropRenderElement` has no "no bounds" mode, so callers that
+/// only want the wrapper for its type pass this; the element still has to survive the intersection,
+/// hence half of `i32::MAX` on each side rather than the full range (which would overflow).
+fn uncropped() -> Rectangle<i32, smithay::utils::Physical> {
+    Rectangle::new(
+        Point::from((-i32::MAX / 2, -i32::MAX / 2)),
+        Size::from((i32::MAX, i32::MAX)),
+    )
+}
+
 /// gnome-shell's `WORKSPACE_INACTIVE_SCALE` (`workspacesView.js:25`): how far a
 /// workspace shrinks once the row has scrolled off it.
 pub const WORKSPACE_INACTIVE_SCALE: f64 = 0.94;
@@ -2875,6 +2885,8 @@ impl<W: LayoutElement> Monitor<W> {
         //
         // The exact crop goes on the axis the workspaces join on, so a window
         // poking out of one workspace doesn't draw over its neighbor.
+        //
+        // The window picker is the exception — see `expose_crop_bounds` below.
         let crop_bounds = if self.workspace_switch.is_some() || self.overview_progress.is_some() {
             if self.workspaces_horizontal() {
                 let width = (self.view_size.w * scale).ceil() as i32;
@@ -2889,11 +2901,16 @@ impl<W: LayoutElement> Monitor<W> {
                 )
             }
         } else {
-            Rectangle::new(
-                Point::from((-i32::MAX / 2, -i32::MAX / 2)),
-                Size::from((i32::MAX, i32::MAX)),
-            )
+            uncropped()
         };
+
+        // The window picker does not clip its previews to the workspace: gnome-shell's
+        // `WorkspaceLayout.vfunc_allocate` calls `container.remove_clip()` for every state up to
+        // and including WINDOW_PICKER (`js/ui/workspace.js:653-665`), and only the *background*
+        // clips to its allocation (`WorkspaceBackground._bin`, `clip_to_allocation: true`,
+        // `js/ui/workspace.js:967`). Previews are meant to spill past the workspace's rounded
+        // rect — a preview against the edge otherwise loses its shadow and looks cramped.
+        let expose_crop_bounds = uncropped();
 
         let zoom = self.overview_zoom();
 
@@ -2919,16 +2936,21 @@ impl<W: LayoutElement> Monitor<W> {
         for ((idx, ws), geo) in self.workspaces_with_render_geo_idx() {
             let ws_zoom = zoom * self.workspace_render_scale(idx);
             // Macro instead of closure because ws and insert hint have different elem types.
-            macro_rules! push {
-                () => {{
+            macro_rules! push_cropped_to {
+                ($bounds:expr) => {{
                     &mut |elem| {
-                        let elem = CropRenderElement::from_element(elem, scale, crop_bounds);
+                        let elem = CropRenderElement::from_element(elem, scale, $bounds);
                         if let Some(elem) = elem {
                             let elem = MonitorInnerRenderElement::from(elem);
                             push(scale_relocate(ws_zoom, geo, elem));
                         }
                     }
                 }};
+            }
+            macro_rules! push {
+                () => {
+                    push_cropped_to!(crop_bounds)
+                };
             }
 
             let xray_pos = XrayPos::new(geo.loc, ws_zoom);
@@ -2947,7 +2969,13 @@ impl<W: LayoutElement> Monitor<W> {
             // instead of the layers at their layout positions.
             if let Some(progress) = self.expose_progress() {
                 push_hint!();
-                ws.render_expose(ctx.r(), xray_pos, progress, ws_zoom, push!());
+                ws.render_expose(
+                    ctx.r(),
+                    xray_pos,
+                    progress,
+                    ws_zoom,
+                    push_cropped_to!(expose_crop_bounds),
+                );
                 continue;
             }
 

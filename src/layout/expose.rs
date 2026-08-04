@@ -15,9 +15,41 @@ use smithay::utils::{Logical, Point, Rectangle, Size};
 
 /// `WINDOW_PREVIEW_MAXIMUM_SCALE` (js/ui/workspace.js).
 const MAXIMUM_SCALE: f64 = 0.95;
-/// `WorkspaceLayout` default `spacing` (js/ui/workspace.js); the CSS override
-/// and preview-chrome oversize don't apply to us (yet).
-const SPACING: f64 = 20.;
+
+/// `.window-picker { spacing: $base_padding }` (`_window-picker.scss:5-8`), which is what
+/// `WorkspaceLayout`'s `spacing` property actually resolves to — the 20px in the JS is only the
+/// property default, overridden by the theme before any layout runs.
+const CSS_SPACING: f64 = 6.;
+
+/// `WINDOW_ACTIVE_SIZE_INC` (`windowPreview.js:20`): how far a preview grows in each direction
+/// while it is the active/hovered one.
+const ACTIVE_SIZE_INC: f64 = 5.;
+
+/// `_adjustSpacingAndPadding` (`workspace.js:478-511`) adds the preview chrome's worst-case
+/// overhang to the row and column spacing, so a close button or app icon never lands on the
+/// neighbouring preview. GNOME takes the max over all four sides
+/// (`chromeHeights`/`chromeWidths`, `windowPreview.js:277-308`):
+///
+/// * top / right — half the close button, which straddles the preview's top-right corner
+/// * bottom — the part of the app icon hanging below the preview
+/// * left — nothing but the active-size increase
+///
+/// plus `ACTIVE_SIZE_INC` on every side. The bottom (icon) side wins for our chrome.
+fn chrome_oversize() -> f64 {
+    use crate::ui::window_preview::{CLOSE_SIZE, ICON_OVERLAP, ICON_SIZE};
+
+    let top = CLOSE_SIZE / 2.;
+    let bottom = (1. - ICON_OVERLAP) * ICON_SIZE;
+    let left = 0.;
+    let right = CLOSE_SIZE / 2.;
+
+    top.max(bottom).max(left).max(right) + ACTIVE_SIZE_INC
+}
+
+/// The effective inter-preview spacing: the theme's value plus the chrome overhang.
+fn spacing() -> f64 {
+    CSS_SPACING + chrome_oversize()
+}
 /// `LAYOUT_SCALE_WEIGHT` / `LAYOUT_SPACE_WEIGHT` (js/ui/workspace.js).
 const SCALE_WEIGHT: f64 = 1.;
 const SPACE_WEIGHT: f64 = 0.1;
@@ -141,8 +173,8 @@ fn center(rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
 
 /// `computeScaleAndSpace`.
 fn compute_scale_and_space(layout: &mut GridLayout, area: Rectangle<f64, Logical>) -> (f64, f64) {
-    let hspacing = (layout.max_columns - 1) as f64 * SPACING;
-    let vspacing = (layout.rows.len() - 1) as f64 * SPACING;
+    let hspacing = (layout.max_columns - 1) as f64 * spacing();
+    let vspacing = (layout.rows.len() - 1) as f64 * spacing();
 
     let horizontal_scale = (area.size.w - hspacing) / layout.grid_width;
     let vertical_scale = (area.size.h - vspacing) / layout.grid_height;
@@ -219,14 +251,14 @@ pub fn compute_slots(
     // `_computeRowSizes`.
     let scale = layout.scale;
     for row in &mut layout.rows {
-        row.width = row.full_width * scale + (row.windows.len() - 1) as f64 * SPACING;
+        row.width = row.full_width * scale + (row.windows.len() - 1) as f64 * spacing();
         row.height = row.full_height * scale;
     }
 
     // `computeWindowSlots`.
     let rows = &mut layout.rows;
     let height_without_spacing: f64 = rows.iter().map(|row| row.height).sum();
-    let vertical_spacing = (rows.len() - 1) as f64 * SPACING;
+    let vertical_spacing = (rows.len() - 1) as f64 * spacing();
     let additional_vertical_scale = f64::min(
         1.,
         (area.size.h - vertical_spacing) / height_without_spacing,
@@ -237,7 +269,7 @@ pub fn compute_slots(
     let mut compensation = 0.;
     let mut y = 0.;
     for row in rows.iter_mut() {
-        let horizontal_spacing = (row.windows.len() - 1) as f64 * SPACING;
+        let horizontal_spacing = (row.windows.len() - 1) as f64 * spacing();
         let width_without_spacing = row.width - horizontal_spacing;
         let additional_horizontal_scale = f64::min(
             1.,
@@ -264,7 +296,7 @@ pub fn compute_slots(
                 0.,
             ) / 2.
             + y;
-        y += row.height * row.additional_scale + SPACING;
+        y += row.height * row.additional_scale + spacing();
     }
 
     compensation /= 2.;
@@ -300,7 +332,7 @@ pub fn compute_slots(
                 Point::from((clone_x.floor(), clone_y.floor())),
                 Size::from((clone_width, clone_height)),
             );
-            x += cell_width + SPACING;
+            x += cell_width + spacing();
         }
     }
 
