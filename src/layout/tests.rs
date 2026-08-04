@@ -1,15 +1,15 @@
 use std::cell::{Cell, OnceCell, RefCell};
 
-use niri_config::utils::{Flag, MergeWith as _};
-use niri_config::workspace::WorkspaceName;
-use niri_config::{
-    CenterFocusedColumn, FloatOrInt, OutputName, Struts, TabIndicatorLength, TabIndicatorPosition,
-    WorkspaceReference,
-};
 use proptest::prelude::*;
 use proptest_derive::Arbitrary;
 use smithay::output::{Mode, PhysicalProperties, Subpixel};
 use smithay::utils::Rectangle;
+use synoik_config::utils::{Flag, MergeWith as _};
+use synoik_config::workspace::WorkspaceName;
+use synoik_config::{
+    CenterFocusedColumn, FloatOrInt, OutputName, Struts, TabIndicatorLength, TabIndicatorPosition,
+    WorkspaceReference,
+};
 
 use super::*;
 
@@ -408,7 +408,7 @@ enum Op {
         #[proptest(strategy = "arbitrary_scale()")]
         scale: f64,
         #[proptest(strategy = "prop::option::of(arbitrary_layout_part().prop_map(Box::new))")]
-        layout_config: Option<Box<niri_config::LayoutPart>>,
+        layout_config: Option<Box<synoik_config::LayoutPart>>,
     },
     RemoveOutput(#[proptest(strategy = "1..=5usize")] usize),
     FocusOutput(#[proptest(strategy = "1..=5usize")] usize),
@@ -416,7 +416,7 @@ enum Op {
         #[proptest(strategy = "1..=5usize")]
         id: usize,
         #[proptest(strategy = "prop::option::of(arbitrary_layout_part().prop_map(Box::new))")]
-        layout_config: Option<Box<niri_config::LayoutPart>>,
+        layout_config: Option<Box<synoik_config::LayoutPart>>,
     },
     AddNamedWorkspace {
         #[proptest(strategy = "1..=5usize")]
@@ -424,7 +424,7 @@ enum Op {
         #[proptest(strategy = "prop::option::of(1..=5usize)")]
         output_name: Option<usize>,
         #[proptest(strategy = "prop::option::of(arbitrary_layout_part().prop_map(Box::new))")]
-        layout_config: Option<Box<niri_config::LayoutPart>>,
+        layout_config: Option<Box<synoik_config::LayoutPart>>,
     },
     UnnameWorkspace {
         #[proptest(strategy = "1..=5usize")]
@@ -434,7 +434,7 @@ enum Op {
         #[proptest(strategy = "1..=5usize")]
         ws_name: usize,
         #[proptest(strategy = "prop::option::of(arbitrary_layout_part().prop_map(Box::new))")]
-        layout_config: Option<Box<niri_config::LayoutPart>>,
+        layout_config: Option<Box<synoik_config::LayoutPart>>,
     },
     AddWindow {
         params: TestWindowParams,
@@ -746,7 +746,7 @@ enum Op {
     ToggleOverview,
     UpdateConfig {
         #[proptest(strategy = "arbitrary_layout_part().prop_map(Box::new)")]
-        layout_config: Box<niri_config::LayoutPart>,
+        layout_config: Box<synoik_config::LayoutPart>,
     },
 }
 
@@ -855,7 +855,7 @@ impl Op {
                 layout.ensure_named_workspace(&WorkspaceConfig {
                     name: WorkspaceName(format!("ws{ws_name}")),
                     open_on_output: output_name.map(|name| format!("output{name}")),
-                    layout: layout_config.map(|x| niri_config::WorkspaceLayoutPart(*x)),
+                    layout: layout_config.map(|x| synoik_config::WorkspaceLayoutPart(*x)),
                 });
             }
             Op::UnnameWorkspace { ws_name } => {
@@ -1614,7 +1614,7 @@ impl Op {
             }
             Op::UpdateConfig { layout_config } => {
                 let options = Options {
-                    layout: niri_config::Layout::from_part(&layout_config),
+                    layout: synoik_config::Layout::from_part(&layout_config),
                     ..Default::default()
                 };
 
@@ -1647,7 +1647,7 @@ fn check_ops(ops: impl IntoIterator<Item = Op>) -> Layout<TestWindow> {
 /// written against.
 fn scrolling_options() -> Options {
     Options {
-        layout: niri_config::Layout {
+        layout: synoik_config::Layout {
             windowing_mode: WindowingMode::Scrolling,
             ..Default::default()
         },
@@ -2509,8 +2509,8 @@ fn fixed_height_takes_max_non_auto_into_account() {
     ];
 
     let options = Options {
-        layout: niri_config::Layout {
-            border: niri_config::Border {
+        layout: synoik_config::Layout {
+            border: synoik_config::Border {
                 off: false,
                 width: 4.,
                 ..Default::default()
@@ -2786,8 +2786,8 @@ fn interactive_move_from_workspace_with_layout_config() {
         Op::AddNamedWorkspace {
             ws_name: 1,
             output_name: Some(2),
-            layout_config: Some(Box::new(niri_config::LayoutPart {
-                border: Some(niri_config::BorderRule {
+            layout_config: Some(Box::new(synoik_config::LayoutPart {
+                border: Some(synoik_config::BorderRule {
                     on: true,
                     ..Default::default()
                 }),
@@ -3135,7 +3135,7 @@ fn preset_column_width_fixed_correct_with_border() {
     // Borders are niri's; GNOME mode forces them off, so this pins the scrolling
     // layer's border arithmetic in the mode that still has one.
     let options = Options {
-        layout: niri_config::Layout {
+        layout: synoik_config::Layout {
             windowing_mode: WindowingMode::Scrolling,
             preset_column_widths: vec![PresetSize::Fixed(500)],
             ..Default::default()
@@ -3149,10 +3149,10 @@ fn preset_column_width_fixed_correct_with_border() {
 
     // Add border.
     let options = Options {
-        layout: niri_config::Layout {
+        layout: synoik_config::Layout {
             windowing_mode: WindowingMode::Scrolling,
             preset_column_widths: vec![PresetSize::Fixed(500)],
-            border: niri_config::Border {
+            border: synoik_config::Border {
                 off: false,
                 width: 5.,
                 ..Default::default()
@@ -3189,7 +3189,7 @@ fn preset_column_width_reset_after_set_width() {
     ];
 
     let options = Options {
-        layout: niri_config::Layout {
+        layout: synoik_config::Layout {
             preset_column_widths: vec![PresetSize::Fixed(500), PresetSize::Fixed(1000)],
             ..Default::default()
         },
@@ -3425,7 +3425,7 @@ fn tabs_with_different_border() {
         Op::AddWindow {
             params: TestWindowParams {
                 rules: Some(ResolvedWindowRules {
-                    border: niri_config::BorderRule {
+                    border: synoik_config::BorderRule {
                         on: true,
                         ..Default::default()
                     },
@@ -3443,7 +3443,7 @@ fn tabs_with_different_border() {
     ];
 
     let options = Options {
-        layout: niri_config::Layout {
+        layout: synoik_config::Layout {
             struts: Struts {
                 left: FloatOrInt(0.),
                 right: FloatOrInt(0.),
@@ -3602,8 +3602,8 @@ prop_compose! {
     fn arbitrary_focus_ring()(
         off in any::<bool>(),
         width in prop::option::of(arbitrary_spacing().prop_map(FloatOrInt)),
-    ) -> niri_config::BorderRule {
-        niri_config::BorderRule {
+    ) -> synoik_config::BorderRule {
+        synoik_config::BorderRule {
             off,
             on: !off,
             width,
@@ -3616,8 +3616,8 @@ prop_compose! {
     fn arbitrary_border()(
         off in any::<bool>(),
         width in prop::option::of(arbitrary_spacing().prop_map(FloatOrInt)),
-    ) -> niri_config::BorderRule {
-        niri_config::BorderRule {
+    ) -> synoik_config::BorderRule {
+        synoik_config::BorderRule {
             off,
             on: !off,
             width,
@@ -3630,8 +3630,8 @@ prop_compose! {
     fn arbitrary_shadow()(
         off in any::<bool>(),
         softness in prop::option::of(arbitrary_spacing().prop_map(FloatOrInt)),
-    ) -> niri_config::ShadowRule {
-        niri_config::ShadowRule {
+    ) -> synoik_config::ShadowRule {
+        synoik_config::ShadowRule {
             off,
             on: !off,
             softness,
@@ -3650,8 +3650,8 @@ prop_compose! {
         length in prop::option::of((0f64..2f64)
             .prop_map(|x| TabIndicatorLength { total_proportion: Some(x) })),
         position in prop::option::of(arbitrary_tab_indicator_position()),
-    ) -> niri_config::TabIndicatorPart {
-        niri_config::TabIndicatorPart {
+    ) -> synoik_config::TabIndicatorPart {
+        synoik_config::TabIndicatorPart {
             off,
             on: !off,
             hide_when_single_tab,
@@ -3675,8 +3675,8 @@ prop_compose! {
         tab_indicator in prop::option::of(arbitrary_tab_indicator()),
         center_focused_column in prop::option::of(arbitrary_center_focused_column()),
         always_center_single_column in prop::option::of(any::<bool>().prop_map(Flag)),
-    ) -> niri_config::LayoutPart {
-        niri_config::LayoutPart {
+    ) -> synoik_config::LayoutPart {
+        synoik_config::LayoutPart {
             gaps,
             struts,
             center_focused_column,
@@ -3857,7 +3857,7 @@ proptest! {
     ) {
         // eprintln!("{ops:?}");
         let options = Options {
-            layout: niri_config::Layout::from_part(&layout_config),
+            layout: synoik_config::Layout::from_part(&layout_config),
             ..Default::default()
         };
 

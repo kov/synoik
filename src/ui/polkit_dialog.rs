@@ -32,13 +32,13 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::image_source::ImageSource;
-use crate::niri_render_elements;
 use crate::polkit_dialog::{Focus, Message, PolkitDialog, TITLE};
 use crate::render_helpers::icon::{IconCache, ImageCache};
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
+use crate::synoik_render_elements;
 use crate::ui::widget::{
     self, style, BakeCache, Painter, ParagraphSpan, Rgba, ShapedParagraph, ShapedText, TextShaper,
     TextStyle,
@@ -111,7 +111,7 @@ const MESSAGE_MARGIN: f64 = 4.;
 /// `CapsLockWarning`'s text (`shellEntry.js:170`).
 const CAPS_TEXT: &str = "Caps lock is on";
 
-niri_render_elements! {
+synoik_render_elements! {
     PolkitDialogRenderElement => {
         Texture = RescaleRenderElement<TextureRenderElement<VkTexture>>,
         Plain = TextureRenderElement<VkTexture>,
@@ -154,13 +154,13 @@ pub struct PolkitDialogUi {
     avatar_uploads: RefCell<widget::ImageUploads>,
 
     clock: crate::animation::Clock,
-    config: std::rc::Rc<RefCell<niri_config::Config>>,
+    config: std::rc::Rc<RefCell<synoik_config::Config>>,
 }
 
 impl PolkitDialogUi {
     pub fn new(
         clock: crate::animation::Clock,
-        config: std::rc::Rc<RefCell<niri_config::Config>>,
+        config: std::rc::Rc<RefCell<synoik_config::Config>>,
     ) -> Self {
         Self {
             state: State::Hidden,
@@ -732,7 +732,7 @@ mod tests {
     use smithay::utils::Buffer as BufferCoord;
 
     use super::*;
-    use crate::dbus::polkit_agent::{BeginRequest, PolkitToNiri};
+    use crate::dbus::polkit_agent::{BeginRequest, PolkitToSynoik};
 
     fn dialog(user: &str, entry: bool, message: Option<Message>, caps: bool) -> PolkitDialog {
         let mut d = PolkitDialog::new();
@@ -744,17 +744,17 @@ mod tests {
             avatar: None,
         });
         if entry {
-            d.on_agent_event(PolkitToNiri::Request {
+            d.on_agent_event(PolkitToSynoik::Request {
                 prompt: "Password:".to_owned(),
                 echo_on: false,
             });
         }
         match message {
             Some(Message::Error(text)) => {
-                d.on_agent_event(PolkitToNiri::ShowError(text));
+                d.on_agent_event(PolkitToSynoik::ShowError(text));
             }
             Some(Message::Info(text)) => {
-                d.on_agent_event(PolkitToNiri::ShowInfo(text));
+                d.on_agent_event(PolkitToSynoik::ShowInfo(text));
             }
             None => (),
         }
@@ -932,7 +932,7 @@ mod tests {
             smithay::output::PhysicalProperties {
                 size: (0, 0).into(),
                 subpixel: smithay::output::Subpixel::Unknown,
-                make: "niri".to_owned(),
+                make: "synoik".to_owned(),
                 model: "test".to_owned(),
                 serial_number: "0".to_owned(),
             },
@@ -953,7 +953,7 @@ mod tests {
 
         let mut ui = PolkitDialogUi::new(
             crate::animation::Clock::with_time(Duration::ZERO),
-            Rc::new(RefCell::new(niri_config::Config::default())),
+            Rc::new(RefCell::new(synoik_config::Config::default())),
         );
         ui.show();
         ui.settle();

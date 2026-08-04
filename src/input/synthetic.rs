@@ -2,14 +2,13 @@
 //!
 //! [`SyntheticInputBackend`] is a minimal [`InputBackend`] whose events are
 //! constructed in process rather than read from hardware. The headless test
-//! fixture builds events directly; the IPC `InjectInput` request (`niri msg
+//! fixture builds events directly; the IPC `InjectInput` request (`synoik msg
 //! input`) goes through [`inject`], which additionally resolves key and
 //! button names against the seat's active keymap.
 //!
 //! Only the event types we actually synthesize are real; the rest are
 //! [`UnusedEvent`].
 
-use niri_ipc::InjectedEvent;
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Device,
     DeviceCapability, Event, InputBackend, InputEvent, KeyState, KeyboardKeyEvent, Keycode,
@@ -18,8 +17,9 @@ use smithay::backend::input::{
 };
 use smithay::input::keyboard::{xkb, Keysym};
 use smithay::output::Output;
+use synoik_ipc::InjectedEvent;
 
-use crate::niri::State;
+use crate::synoik::State;
 use crate::utils::get_monotonic_time;
 
 /// The offset between evdev keycodes and the X11/xkb keycode space keyboards
@@ -164,7 +164,7 @@ fn resolve_char(state: &mut State, ch: char) -> Result<(Keycode, u32), String> {
 /// Scans the active layout for a keycode producing `keysym`, preferring the
 /// base shift level.
 fn find_keysym(state: &mut State, keysym: Keysym) -> Option<(Keycode, u32)> {
-    let keyboard = state.niri.seat.get_keyboard().unwrap();
+    let keyboard = state.synoik.seat.get_keyboard().unwrap();
     keyboard.with_xkb_state(state, |context| {
         let xkb = context.xkb().lock().unwrap();
         let layout = xkb.active_layout().0;
@@ -211,8 +211,8 @@ pub struct SyntheticInputBackend;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SyntheticInputDevice;
 
-impl crate::input::backend_ext::NiriInputDevice for SyntheticInputDevice {
-    fn output(&self, _state: &crate::niri::State) -> Option<Output> {
+impl crate::input::backend_ext::SynoikInputDevice for SyntheticInputDevice {
+    fn output(&self, _state: &crate::synoik::State) -> Option<Output> {
         None
     }
 }
@@ -485,14 +485,14 @@ impl InputBackend for SyntheticInputBackend {
 
 #[cfg(test)]
 mod tests {
-    use niri_ipc::InjectedEvent;
+    use synoik_ipc::InjectedEvent;
 
     use super::*;
     use crate::tests::fixture::Fixture;
 
     fn inject_all(f: &mut Fixture, events: &[InjectedEvent]) {
         for event in events {
-            inject(f.niri_state(), event).unwrap();
+            inject(f.synoik_state(), event).unwrap();
         }
     }
 
@@ -524,19 +524,19 @@ mod tests {
             ],
         );
         assert!(
-            f.niri().run_dialog.is_open(),
+            f.synoik().run_dialog.is_open(),
             "injected <Alt>F2 must open the run dialog"
         );
 
         inject(
-            f.niri_state(),
+            f.synoik_state(),
             &InjectedEvent::Text {
                 text: String::from("Kitty!"),
             },
         )
         .unwrap();
         assert_eq!(
-            f.niri().run_dialog.entry(),
+            f.synoik().run_dialog.entry(),
             "Kitty!",
             "injected text must reach the dialog, including shifted characters"
         );
@@ -549,7 +549,7 @@ mod tests {
         f.add_output(1, (1920, 1080));
 
         let err = inject(
-            f.niri_state(),
+            f.synoik_state(),
             &InjectedEvent::KeyPress {
                 key: String::from("NoSuchKeysym"),
             },
@@ -560,7 +560,7 @@ mod tests {
         // dedicated KEY_EURO key even on the us layout. Cyrillic is safely
         // out of reach.
         let err = inject(
-            f.niri_state(),
+            f.synoik_state(),
             &InjectedEvent::Text {
                 text: String::from("ф"),
             },
@@ -571,7 +571,7 @@ mod tests {
         );
 
         let err = inject(
-            f.niri_state(),
+            f.synoik_state(),
             &InjectedEvent::ButtonPress {
                 button: String::from("pinky"),
             },

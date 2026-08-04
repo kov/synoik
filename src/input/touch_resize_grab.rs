@@ -6,7 +6,7 @@ use smithay::input::touch::{
 use smithay::input::SeatHandler;
 use smithay::utils::{IsAlive, Logical, Point, Serial};
 
-use crate::niri::State;
+use crate::synoik::State;
 
 pub struct TouchResizeGrab {
     start_data: TouchGrabStartData<State>,
@@ -19,7 +19,7 @@ impl TouchResizeGrab {
     }
 
     fn on_ungrab(&mut self, state: &mut State) {
-        state.niri.layout.interactive_resize_end(&self.window);
+        state.synoik.layout.interactive_resize_end(&self.window);
     }
 }
 
@@ -68,7 +68,7 @@ impl TouchGrab<State> for TouchResizeGrab {
         if self.window.alive() {
             let delta = event.location - self.start_data.location;
             let ongoing = data
-                .niri
+                .synoik
                 .layout
                 .interactive_resize_update(&self.window, delta);
             if ongoing {

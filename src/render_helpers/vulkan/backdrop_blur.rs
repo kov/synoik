@@ -55,7 +55,7 @@ impl BackdropBlur {
                 // The chain samples `capture` (its descriptor set is built here, bound to the
                 // capture's stable view) — capture_region refills the capture each frame, so a
                 // cached chain stays valid across frames.
-                let chain = SharedBlurChain::new(&renderer.gpu, capture.niri_texture(), passes)?;
+                let chain = SharedBlurChain::new(&renderer.gpu, capture.synoik_texture(), passes)?;
                 let output = renderer.create_buffer(NATIVE_FOURCC, size)?;
                 Some(BlurState {
                     passes,

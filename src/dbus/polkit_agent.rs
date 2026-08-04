@@ -58,7 +58,7 @@ type Epoch = u64;
 
 /// What the agent tells the compositor.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PolkitToNiri {
+pub enum PolkitToSynoik {
     /// polkitd wants an authentication. Raise the dialog.
     Begin(Box<BeginRequest>),
     /// polkitd withdrew the request it had asked for — the action was answered another way, or the
@@ -106,8 +106,8 @@ pub enum PolkitRequest {
     /// Start a PAM conversation as `user_name`. Sent when the dialog opens, and again after every
     /// refusal.
     Initiate { user_name: String },
-    /// Answer the outstanding [`PolkitToNiri::Request`]. **Carries a password** — see the `Debug`
-    /// impl below.
+    /// Answer the outstanding [`PolkitToSynoik::Request`]. **Carries a password** — see the
+    /// `Debug` impl below.
     Respond(String),
     /// The dialog is finished. `dismissed` is polkitd's answer: `false` completes the call
     /// normally, `true` fails it with `Cancelled`, which is what tells the requesting program the
@@ -241,7 +241,7 @@ fn unescape(escaped: &str) -> String {
 /// Start the agent. Returns the system-bus connection to keep alive and the sender the compositor
 /// drives the dialog's side of the conversation with.
 pub fn start(
-    to_niri: calloop::channel::Sender<PolkitToNiri>,
+    to_niri: calloop::channel::Sender<PolkitToSynoik>,
 ) -> anyhow::Result<(
     zbus::blocking::Connection,
     async_channel::Sender<PolkitRequest>,
@@ -474,7 +474,7 @@ async fn run(
     requests: async_channel::Receiver<PolkitRequest>,
     helper_events: async_channel::Receiver<(Epoch, HelperMessage)>,
     helper_tx: async_channel::Sender<(Epoch, HelperMessage)>,
-    to_niri: calloop::channel::Sender<PolkitToNiri>,
+    to_niri: calloop::channel::Sender<PolkitToSynoik>,
 ) {
     let mut agent = Agent {
         to_niri,
@@ -508,7 +508,7 @@ async fn run(
 }
 
 struct Agent {
-    to_niri: calloop::channel::Sender<PolkitToNiri>,
+    to_niri: calloop::channel::Sender<PolkitToSynoik>,
     helper_tx: async_channel::Sender<(Epoch, HelperMessage)>,
     /// Requests waiting their turn. polkitd may ask for a second authentication while the first
     /// dialog is up, and upstream queues rather than stacking dialogs
@@ -534,7 +534,7 @@ impl Agent {
         };
         let _ = self
             .to_niri
-            .send(PolkitToNiri::Begin(Box::new(begin.request.clone())));
+            .send(PolkitToSynoik::Begin(Box::new(begin.request.clone())));
         self.current = Some(begin);
     }
 
@@ -545,7 +545,7 @@ impl Agent {
     /// (`shell-polkit-authentication-agent.c:266-281`, which completes with `dismissed = FALSE`).
     fn cancel(&mut self, cookie: &str) {
         if self.current.as_ref().is_some_and(|c| c.cookie == cookie) {
-            let _ = self.to_niri.send(PolkitToNiri::Cancel);
+            let _ = self.to_niri.send(PolkitToSynoik::Cancel);
             self.finish(false);
             return;
         }
@@ -578,7 +578,7 @@ impl Agent {
                     Ok(session) => self.session = Some(session),
                     Err(err) => {
                         warn!("polkit: could not start the authentication helper: {err:#}");
-                        let _ = self.to_niri.send(PolkitToNiri::Completed(false));
+                        let _ = self.to_niri.send(PolkitToSynoik::Completed(false));
                     }
                 }
             }
@@ -603,15 +603,15 @@ impl Agent {
             return;
         }
         let event = match msg {
-            HelperMessage::Prompt { text, echo_on } => PolkitToNiri::Request {
+            HelperMessage::Prompt { text, echo_on } => PolkitToSynoik::Request {
                 prompt: text,
                 echo_on,
             },
-            HelperMessage::Error(text) => PolkitToNiri::ShowError(text),
-            HelperMessage::Info(text) => PolkitToNiri::ShowInfo(text),
+            HelperMessage::Error(text) => PolkitToSynoik::ShowError(text),
+            HelperMessage::Info(text) => PolkitToSynoik::ShowInfo(text),
             HelperMessage::Completed(ok) => {
                 self.session = None;
-                PolkitToNiri::Completed(ok)
+                PolkitToSynoik::Completed(ok)
             }
         };
         let _ = self.to_niri.send(event);

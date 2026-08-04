@@ -325,7 +325,7 @@ end, not ours", which is the conclusion this section exists to record.
 ## 5. Starting the session action: D-Bus, not `gnome-session-quit`
 
 The quick-settings **Restart… / Power Off… / Log Out…** rows call `org.gnome.SessionManager`
-directly (`PopoverAction::SessionRequest` → `Niri::request_session_action` →
+directly (`PopoverAction::SessionRequest` → `Synoik::request_session_action` →
 `dbus::gnome_session::request_session_action`). That is what gnome-shell does:
 `this._session.LogoutAsync(0)`, `ShutdownAsync(0)`, `RebootAsync()`
 (`js/misc/systemActions.js:483-501`).
@@ -518,7 +518,7 @@ load-bearing.
 **Whether we call it — yes, and it is not obvious from our source.** We build smithay with
 `use_system_lib`, which selects wayland-backend's `sys` backend, whose `Drop for State<D>` calls the
 real `wl_display_destroy_clients` (`wayland-backend-0.3.16/src/sys/server_impl/mod.rs:429-436`). Our
-`Display` is owned by the calloop source at `src/niri.rs:6621`, so it drops with `event_loop` when
+`Display` is owned by the calloop source at `src/synoik.rs:6621`, so it drops with `event_loop` when
 `main` returns. **Verified, not assumed**, with an `LD_PRELOAD` shim over
 `wl_display_destroy_clients` / `wl_client_destroy` / `wl_display_destroy` on a headless run with a
 weston-terminal attached: SIGTERM produced `destroy_clients ENTER → wl_client_destroy →
@@ -589,7 +589,7 @@ session"*). Both compositors run `--headless`, so the only difference between ar
 ```
 # /home/gsrs/.config/systemd/user/org.gnome.Shell@user.service.d/override.conf
 ExecStart=/usr/bin/gnome-shell --headless --virtual-monitor 1920x1080 --mode=user   # mutter arm
-ExecStart=…/target/debug/niri --session --headless                                   # our arm
+ExecStart=…/target/debug/synoik --session --headless                                   # our arm
 ```
 
 Same gnome-session, same unit graph, same systemd transaction, same OBS flatpak, same machine. That
@@ -628,7 +628,7 @@ Two traps cost time here:
   the compositor left running is clean every time: full shutdown log, sentinel removed, ~120 ms.
   Killing the sandbox's PID 1 is not what ends OBS.
 - **The signal mask (§2.2) holds on the real path.** OBS launched the way a user launches it —
-  overlay key, type "OBS", Return, driven over `niri msg input` — came up with
+  overlay key, type "OBS", Return, driven over `synoik msg input` — came up with
   `SigBlk: 0000000000001000` (SIGPIPE only; SIGTERM is bit 15) in
   `app-gnome-com.obsproject.Studio.desktop-*.scope`, `PartOf=graphical-session.target`,
   `TimeoutStopUSec=5s` read off the live unit. That fix is good on the launch path that matters.

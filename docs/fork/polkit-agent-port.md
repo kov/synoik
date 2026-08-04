@@ -19,7 +19,7 @@ to enrol a fingerprint as the test user (`net.reactivated.fprint.device.enroll` 
 | Registration, the `AuthenticationAgent` interface, the helper conversation | `src/dbus/polkit_agent.rs` |
 | What the dialog is doing | `src/polkit_dialog.rs` |
 | Drawing, hit-testing, the open animation | `src/ui/polkit_dialog.rs` |
-| Focus, input routing, render, the locked deferral | `src/niri.rs`, `src/input/mod.rs` |
+| Focus, input routing, render, the locked deferral | `src/synoik.rs`, `src/input/mod.rs` |
 
 ### The bus half
 
@@ -89,7 +89,7 @@ an explanation and does not suppress it.
 `Completed(false)`, and the dialog answers a refusal by starting another conversation. Every
 conversation therefore carries an epoch, and events from a dead one are dropped.
 
-**`Niri::is_locked()` is not "the screen is covered".** It is only the `ext-session-lock` protocol's
+**`Synoik::is_locked()` is not "the screen is covered".** It is only the `ext-session-lock` protocol's
 state, so a screensaver-only shield (`lock-enabled = false`) reads as unlocked while covering
 everything. `screen_is_covered()` is the one to gate on; the conformance test caught this on its
 first run.

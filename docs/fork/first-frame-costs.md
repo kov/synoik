@@ -87,7 +87,7 @@ which is how ~11 ms sat unnoticed in the first-overview frame.
   scopes, not a sum of the buckets: the buckets nest (a bake allocates and shapes inside itself),
   so a sum double-counts and would read zero residual on exactly the frames that have one. A phase
   with no buckets at all stays quiet. Floor 0.5 ms.
-- Add scoped timers inside `Niri::render_to_vec` at the boundaries that already exist — per UI
+- Add scoped timers inside `Synoik::render_to_vec` at the boundaries that already exist — per UI
   surface (panel, dash, app grid, search, notifications), and around icon resolution. **Not done**
   — deliberately waiting for a validation run on the new binary to say *where* a residual actually
   shows up, rather than instrumenting six surfaces on the strength of one frame from before the
@@ -107,7 +107,7 @@ already is (`src/frame_log.rs`, `BAKE_SITES`), recording per site:
 ```
 site                              calls   first      median    excess
 ui/app_grid.rs:783                   41   2.97ms     0.04ms    2.93ms
-niri-vk/text.rs (shape)            1204   8.20ms     0.17ms    8.03ms
+synoik-vk/text.rs (shape)            1204   8.20ms     0.17ms    8.03ms
 ...
 ```
 
@@ -119,9 +119,9 @@ Two design notes that matter:
 - **Sample the whole warm distribution, not the second call.** The second call may still be cold
   in a different way (a second glyph size, a second icon theme lookup). Median over all calls.
 - **Zero cost when off**, like the rest of the frame log — the registry only records when
-  `NIRI_FRAME_LOG` is set.
+  `SYNOIK_FRAME_LOG` is set.
 
-Emitted on demand rather than on a timer: a `niri msg` request that dumps the table, so it can be
+Emitted on demand rather than on a timer: a `synoik msg` request that dumps the table, so it can be
 read after deliberately exercising a surface for the first time.
 
 Deliverable: a ranked list of first-execution costs across a session, obtained without knowing

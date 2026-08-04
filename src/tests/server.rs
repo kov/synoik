@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use calloop::EventLoop;
-use niri_config::Config;
 use smithay::reexports::wayland_server::Display;
+use synoik_config::Config;
 
 use crate::backend::BackendMode;
-use crate::niri::State;
+use crate::synoik::State;
 
 pub struct Server {
     pub event_loop: EventLoop<'static, State>,
@@ -41,7 +41,7 @@ impl Server {
         let (to_gdm, from_niri) = async_channel::unbounded();
         #[cfg(feature = "dbus")]
         {
-            state.niri.gdm_requests = Some(to_gdm);
+            state.synoik.gdm_requests = Some(to_gdm);
         }
 
         Self {

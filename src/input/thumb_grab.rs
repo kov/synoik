@@ -20,7 +20,7 @@ use smithay::input::SeatHandler;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point};
 
-use crate::niri::State;
+use crate::synoik::State;
 
 /// How far the pointer must travel before a press on a thumbnail is a reorder rather than
 /// a click that switches workspace. The same threshold interactive window moves use.
@@ -47,7 +47,7 @@ impl ThumbGrab {
 
     /// Feeds the pointer position in, arming the drag once it has moved far enough.
     fn update(&mut self, data: &mut State, location: Point<f64, Logical>) {
-        let Some((output, pos_within_output)) = data.niri.output_under(location) else {
+        let Some((output, pos_within_output)) = data.synoik.output_under(location) else {
             return;
         };
         if *output != self.output {
@@ -60,7 +60,7 @@ impl ThumbGrab {
             if c.x * c.x + c.y * c.y < DRAG_THRESHOLD * DRAG_THRESHOLD {
                 return;
             }
-            let Some(mon) = data.niri.layout.monitor_for_output_mut(&output) else {
+            let Some(mon) = data.synoik.layout.monitor_for_output_mut(&output) else {
                 return;
             };
             // The press position, not the current one: the thumbnail must keep the grab
@@ -69,23 +69,23 @@ impl ThumbGrab {
                 return;
             }
             self.armed = true;
-            data.niri
+            data.synoik
                 .cursor_manager
                 .set_cursor_image(CursorImageStatus::Named(CursorIcon::Grabbing));
         }
 
-        if let Some(mon) = data.niri.layout.monitor_for_output_mut(&output) {
+        if let Some(mon) = data.synoik.layout.monitor_for_output_mut(&output) {
             mon.update_thumb_drag(pos_within_output);
         }
-        data.niri.queue_redraw(&output);
+        data.synoik.queue_redraw(&output);
     }
 
     fn on_ungrab(&mut self, data: &mut State) {
         if self.armed {
-            if let Some(mon) = data.niri.layout.monitor_for_output_mut(&self.output) {
+            if let Some(mon) = data.synoik.layout.monitor_for_output_mut(&self.output) {
                 mon.finish_thumb_drag();
             }
-            data.niri
+            data.synoik
                 .cursor_manager
                 .set_cursor_image(CursorImageStatus::default_named());
         } else {
@@ -94,7 +94,7 @@ impl ThumbGrab {
         }
 
         // FIXME: only redraw this output.
-        data.niri.queue_redraw_all();
+        data.synoik.queue_redraw_all();
     }
 }
 

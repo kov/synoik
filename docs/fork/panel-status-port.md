@@ -47,12 +47,12 @@ context, but the review is deliberately re-framed to *attack* the diff. See
      *before* the first item that needs a submenu, so indicators don't each grow a bespoke popover.
    - **Verifiability, classified per item** — say up front which bucket each behavior is in and what
      stays live-only: *functionality* → headless conformance test (`src/tests/gnome.rs`); *rendering* →
-     Vulkan render test (self-skips w/o device) + the `NIRI_VK_VALIDATION=1` grep gate; *animation* →
+     Vulkan render test (self-skips w/o device) + the `SYNOIK_VK_VALIDATION=1` grep gate; *animation* →
      largely **not** honestly headless-testable (the clock trap, [[headless-animation-clock-trap]]) —
      some is live-only on gsrs. Do not fake a unit test around an animation and call it pinned.
 
 **2. Implement, test-first.** Write the pinning test(s) from step 1's classification first, then the
-   code. `cargo test --workspace` green; run `NIRI_VK_VALIDATION=1 cargo test --workspace` and grep for
+   code. `cargo test --workspace` green; run `SYNOIK_VK_VALIDATION=1 cargo test --workspace` and grep for
    `VULKAN ERROR` (must be empty) after any renderer touch.
 
 **3. Adversarial review (same Fable agent).** Continue the agent via SendMessage; feed it the **actual
@@ -61,7 +61,7 @@ context, but the review is deliberately re-framed to *attack* the diff. See
    why not.
 
 **4. Commit** the slice (one commit), then bring it to Gustavo for the live gsrs pass (he drives the
-   restart on the freshly-built `target/debug/niri`).
+   restart on the freshly-built `target/debug/synoik`).
 
 ---
 
@@ -271,7 +271,7 @@ carved these out as separate work — none block R1 for daily use:
    toggle, `8e0bad97` picker, `69f6a2b0` review): `UPower.PowerProfiles` watcher as a 3rd task on
    the shared system-bus connection (name-owner wake, hidden-on-daemon-death); a two-line Power Mode
    tile (first appended conditional, before Airplane) + a >2-gated profile picker; last-selected via
-   `org.gnome.shell last-selected-power-profile`, authoritative on `Niri`. Not live (VM has no ppd).
+   `org.gnome.shell last-selected-power-profile`, authoritative on `Synoik`. Not live (VM has no ppd).
 10. ✅ **QuickMenuToggle detail-view framework** — done (`2f7d2b0a`/`16d81fc9`); consumers so far
     Network tile + Q1 power submenu. Unlocks Q6 Wi-Fi list, Q7 device list, Q2 device picker, Q8
     profiles — each adds a `DetailOwner` arm + its backend.
@@ -289,7 +289,7 @@ carved these out as separate work — none block R1 for daily use:
     further panel work. **Test-harness fix that came with it:** `render_elements`
     (`src/render_helpers/mod.rs:340`) draws in ITERATION order — first element = bottom — while
     every UI `render()` returns front-to-back, which is why each production caller reverses
-    (`Niri::screenshot`, `snapshot.rs`). Four Vulkan tests passed the list through unreversed and
+    (`Synoik::screenshot`, `snapshot.rs`). Four Vulkan tests passed the list through unreversed and
     so composited upside down, passing only because the opaque background box satisfies their
     `opaque > 0` assertion on its own. All UI composites now go through one `composite_ui` helper
     that owns the reverse.
@@ -325,7 +325,7 @@ carved these out as separate work — none block R1 for daily use:
     caret (`messageTray.js:1137`) — hover expands once shown incl. hover started mid-slide
     (`:970-996,1102-1105`) with the popped-under-pointer guard (`:978-991`), CRITICAL
     auto-expands at show/replace (`:1170-1174`); this made the slice-2 always-visible
-    action row faithful (actions only when expanded). niri-vk grew GPU-free
+    action row faithful (actions only when expanded). synoik-vk grew GPU-free
     `wrap_lines_weighted` (scale-independent breaks; bidi-safe after a Fable-review HIGH —
     visual-order glyph ranges panicked on RTL-in-LTR bodies, now min/max + a bidi test).
     Live-validated on the harness: collapsed/hover-expanded/critical banner shots, banner +

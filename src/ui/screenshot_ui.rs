@@ -5,8 +5,6 @@ use std::iter::zip;
 use std::rc::Rc;
 use std::time::Duration;
 
-use niri_config::{Action, Config};
-use niri_ipc::SizeChange;
 use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer, Texture};
@@ -14,11 +12,12 @@ use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::input::pointer::CursorIcon;
 use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use synoik_config::{Action, Config};
+use synoik_ipc::SizeChange;
 
 use crate::animation::{Animation, Clock};
 use crate::layout::expose;
 use crate::layout::floating::DIRECTIONAL_MOVE_PX;
-use crate::niri_render_elements;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::memory::MemoryBuffer;
@@ -26,6 +25,7 @@ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderEleme
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::render_helpers::RenderTarget;
+use crate::synoik_render_elements;
 use crate::ui::widget::{self, style, Align, Painter, Rgba, ShapedText, TextShaper, TextStyle};
 use crate::ui::window_preview::{CLOSE_BG, CLOSE_BG_HOVER};
 use crate::utils::to_physical_precise_round;
@@ -384,7 +384,7 @@ pub enum PointerDown {
 pub enum PointerUp {
     /// The capture button fired.
     Capture,
-    /// The close button was clicked — the caller must go through `Niri::close_screenshot_ui`,
+    /// The close button was clicked — the caller must go through `Synoik::close_screenshot_ui`,
     /// which is also what answers a waiting D-Bus caller.
     Close,
     /// Something changed on screen and nothing else.
@@ -657,7 +657,7 @@ pub struct OutputScreenshot {
     pointer_vk: VkCache,
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     ScreenshotUiRenderElement => {
         Screenshot = CapturedTextureRenderElement,
         SolidColor = SolidColorRenderElement,

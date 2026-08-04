@@ -20,8 +20,8 @@ use zbus::names::InterfaceName;
 use zbus::{fdo, zvariant};
 
 use crate::mpris::{
-    validate_metadata, MetaField, MprisToNiri, NiriToMpris, PlaybackStatus, PlayerState,
-    RawMetadata, MPRIS_PATH, MPRIS_PLAYER_PREFIX,
+    validate_metadata, MetaField, MprisToSynoik, PlaybackStatus, PlayerState, RawMetadata,
+    SynoikToMpris, MPRIS_PATH, MPRIS_PLAYER_PREFIX,
 };
 use crate::notifications::{clamp_text, flatten_text};
 
@@ -36,8 +36,8 @@ const MAX_DESKTOP_ENTRY_BYTES: usize = 255;
 type Props = std::collections::HashMap<String, zvariant::OwnedValue>;
 
 pub fn start(
-    to_niri: calloop::channel::Sender<MprisToNiri>,
-    from_niri: async_channel::Receiver<NiriToMpris>,
+    to_niri: calloop::channel::Sender<MprisToSynoik>,
+    from_niri: async_channel::Receiver<SynoikToMpris>,
 ) -> anyhow::Result<zbus::blocking::Connection> {
     let conn = zbus::blocking::Connection::session()?;
     let async_conn = conn.inner().clone();
@@ -102,10 +102,10 @@ pub fn start(
     let commands = async move {
         while let Ok(command) = from_niri.recv().await {
             let (bus_name, member) = match &command {
-                NiriToMpris::PlayPause(bus) => (bus, "PlayPause"),
-                NiriToMpris::Next(bus) => (bus, "Next"),
-                NiriToMpris::Previous(bus) => (bus, "Previous"),
-                NiriToMpris::Raise(bus) => (bus, "Raise"),
+                SynoikToMpris::PlayPause(bus) => (bus, "PlayPause"),
+                SynoikToMpris::Next(bus) => (bus, "Next"),
+                SynoikToMpris::Previous(bus) => (bus, "Previous"),
+                SynoikToMpris::Raise(bus) => (bus, "Raise"),
             };
             let iface = if member == "Raise" {
                 ROOT_IFACE
@@ -140,7 +140,7 @@ pub fn start(
 fn spawn_player(
     conn: &zbus::Connection,
     bus_name: String,
-    to_niri: calloop::channel::Sender<MprisToNiri>,
+    to_niri: calloop::channel::Sender<MprisToSynoik>,
 ) {
     let conn = conn.clone();
     let task_conn = conn.clone();
@@ -158,7 +158,7 @@ fn spawn_player(
 async fn watch_player(
     conn: zbus::Connection,
     bus_name: String,
-    to_niri: calloop::channel::Sender<MprisToNiri>,
+    to_niri: calloop::channel::Sender<MprisToSynoik>,
 ) {
     /// What woke the loop.
     enum Ev {
@@ -219,7 +219,7 @@ async fn watch_player(
             let state = read_player(&root, &player, &bus_name);
             if last.as_ref() != Some(&state) {
                 last = Some(state.clone());
-                let msg = MprisToNiri::PlayerUpdated {
+                let msg = MprisToSynoik::PlayerUpdated {
                     bus_name: bus_name.clone(),
                     state: Box::new(state),
                 };
@@ -233,7 +233,7 @@ async fn watch_player(
             Some(Ev::Changed) => (),
             // The name is gone, or the bus is: either way this player is over.
             Some(Ev::OwnerGone) | None => {
-                let _ = to_niri.send(MprisToNiri::PlayerRemoved { bus_name });
+                let _ = to_niri.send(MprisToSynoik::PlayerRemoved { bus_name });
                 return;
             }
         }

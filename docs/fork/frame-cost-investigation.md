@@ -37,7 +37,7 @@ Everything else in an animation frame now fits in ~3.5 ms.
 **Fixed, and measured on the seat 2026-07-25** — the scanout submit now hands its fence to KMS
 instead of blocking the compositor
 ([`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md#measured-on-the-seat-2026-07-25)).
-12 min of real use with `NIRI_VK_ASYNC_SCANOUT=1`: **zero frames over budget** after the first
+12 min of real use with `SYNOIK_VK_ASYNC_SCANOUT=1`: **zero frames over budget** after the first
 three seconds, `submit` p50 11.1 → 0.48 ms, and no presentation penalty. The frame class this
 wait created — light 2-submit frames, 376 of 400 over-budget frames in the last pre-change
 session — no longer exists.
@@ -49,7 +49,7 @@ problems**, not one. §6 item 1.
 
 ## 2. What the instrumentation reports
 
-`NIRI_FRAME_LOG=1` (grammar in `src/frame_log.rs`; counters in `niri-vk/src/stats.rs`). A slow
+`SYNOIK_FRAME_LOG=1` (grammar in `src/frame_log.rs`; counters in `synoik-vk/src/stats.rs`). A slow
 frame prints:
 
 ```
@@ -148,13 +148,13 @@ remaining slow frame is an overview animation or first-time startup work.
   trip. So shrinking a bake buys nothing; *removing* one buys everything.
 - **Perf regressions here are invisible to pixels.** A re-baked bar, a re-shaped label and a
   re-uploaded atlas all render identically to the cached version. Tests for this work must
-  assert on the counters (`niri_vk::stats`, `frame_log::bakes()`), not on pixels.
+  assert on the counters (`synoik_vk::stats`, `frame_log::bakes()`), not on pixels.
 - **Verify a mutation actually applied.** A `str.replace` that silently matched nothing once
   "confirmed" a vacuous test for me; the mutation must be asserted to have changed the file.
 - **A counter those tests assert on must be per-thread.** Same reason: the assertion is
   "*this* repaint cost nothing", and libtest runs tests in parallel against their own renderers,
   so a process-wide counter folds a neighbour's bake or submit into your delta. It fails about
-  one run in five under `NIRI_VK_VALIDATION=1` and names the innocent test in front of you
+  one run in five under `SYNOIK_VK_VALIDATION=1` and names the innocent test in front of you
   (`917c69b0`).
 - **An A/B on the live seat does not need a restart, and comparing two sessions is not an A/B.**
   Session-to-session numbers are dominated by how much the desktop was driven — the same build
@@ -163,7 +163,7 @@ remaining slow frame is an overview animation or first-time startup work.
   setting `wait-for-frame-completion-before-queueing` is what turned "the deferred run looks
   better" into an attributable 13.33 ms. (At the time that meant writing a `debug {}` block into
   `~gsrs/.config/niri/config.kdl` and saving, which the watcher picked up. There is no config file
-  any more — the toggles are `NIRI_DEBUG_*` env vars, read once at startup, so the same A/B now
+  any more — the toggles are `SYNOIK_DEBUG_*` env vars, read once at startup, so the same A/B now
   costs a session restart. See `RUNNING.md`.)
 - **First-entry costs are not steady-state costs.** Opening the app grid the first time is
   ~40–70 ms of icon uploads (~20 submits). It caches. Do not optimise it by mistake.
@@ -198,7 +198,7 @@ remaining slow frame is an overview animation or first-time startup work.
    | uncoalesced round trips | `13 glyphs in 13.43ms`, `10 shm in 15.85ms`, `9 upload in 14.67ms` — all in single frames | ~1 ms each, and they go into the **same image** | **done** — all three queue into the frame's command buffer, and the shm/import staging shares one pooled buffer |
 
    **The blur row was wrong, and it was wrong in an instructive way (2026-07-25).** Measured
-   directly — `cargo test -p niri-vk blur_cost -- --ignored --nocapture`, seven source sizes from
+   directly — `cargo test -p synoik-vk blur_cost -- --ignored --nocapture`, seven source sizes from
    2.07 to 43.9 Mpx — the default 3-pass chain costs **0.16 ms + 0.092 ms per megapixel**, linear
    across a 21× range. That frame shaded 8.2× the output in total and a blur shades 1.66× its own
    source, so two blurs at a combined 3.3× the output puts each source at roughly output size:
@@ -232,15 +232,15 @@ remaining slow frame is an overview animation or first-time startup work.
 
 ## 7. Picking this back up
 
-1. `NIRI_FRAME_LOG=1` is set for the gsrs session via
-   `/home/gsrs/.config/environment.d/91-frame-log.conf`, and `NIRI_VK_ASYNC_SCANOUT=1` via
+1. `SYNOIK_FRAME_LOG=1` is set for the gsrs session via
+   `/home/gsrs/.config/environment.d/91-frame-log.conf`, and `SYNOIK_VK_ASYNC_SCANOUT=1` via
    `92-async-scanout.conf` (the deferred scanout submit —
    [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md)). `systemd --user` only
    reads `environment.d` at start or `daemon-reload`, so a plain logout/login may not pick up a
    change.
 2. Read frames with `journalctl _UID=$(id -u gsrs)`; filter on `frame on`. Sessions are
    delimited by the `frame logging on:` line.
-3. `cargo test` does **not** rebuild `target/debug/niri`. After a code change,
-   `cargo build --bin niri` and relog, or the seat keeps running stale code.
-4. Renderer changes: `NIRI_VK_VALIDATION=1 cargo test --workspace`, and trust the **exit
+3. `cargo test` does **not** rebuild `target/debug/synoik`. After a code change,
+   `cargo build --bin synoik` and relog, or the seat keeps running stale code.
+4. Renderer changes: `SYNOIK_VK_VALIDATION=1 cargo test --workspace`, and trust the **exit
    status**, not the `test result: ok` line.

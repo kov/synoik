@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use niri_config::OutputName;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 #[cfg(feature = "xdp-gnome-screencast")]
 use smithay::backend::allocator::gbm::GbmDevice;
@@ -24,9 +23,10 @@ use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_pre
 use smithay::utils::DeviceFd;
 use smithay::utils::Size;
 use smithay::wayland::presentation::Refresh;
+use synoik_config::OutputName;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
-use crate::niri::{Niri, RedrawState};
+use crate::synoik::{RedrawState, Synoik};
 use crate::utils::{get_monotonic_time, logical_output};
 
 /// The headless backend's optional renderer. Clients need one to draw (and for screencasting);
@@ -51,7 +51,7 @@ pub struct Headless {
     /// a fast, seat-free reproduction. A *render* node is enough for GBM allocation: no DRM
     /// master, no session, no VT.
     ///
-    /// [`State::prepare_pw_cast`]: crate::niri::State
+    /// [`State::prepare_pw_cast`]: crate::synoik::State
     #[cfg(feature = "xdp-gnome-screencast")]
     gbm: Option<GbmDevice<DrmDeviceFd>>,
 }
@@ -78,7 +78,7 @@ impl Headless {
             return Some(gbm.clone());
         }
 
-        let path = std::env::var("NIRI_HEADLESS_RENDER_NODE")
+        let path = std::env::var("SYNOIK_HEADLESS_RENDER_NODE")
             .unwrap_or_else(|_| "/dev/dri/renderD128".to_owned());
 
         let open = |path: &str| -> anyhow::Result<GbmDevice<DrmDeviceFd>> {
@@ -102,7 +102,7 @@ impl Headless {
         }
     }
 
-    pub fn init(&mut self, _niri: &mut Niri) {}
+    pub fn init(&mut self, _niri: &mut Synoik) {}
 
     /// Record the request; there is no VT to switch to.
     pub fn change_vt(&mut self, vt: i32) {
@@ -129,9 +129,9 @@ impl Headless {
         Ok(())
     }
 
-    pub fn add_output(&mut self, niri: &mut Niri, n: u8, size: (u16, u16)) {
+    pub fn add_output(&mut self, synoik: &mut Synoik, n: u8, size: (u16, u16)) {
         let connector = format!("headless-{n}");
-        let make = "niri".to_string();
+        let make = "synoik".to_string();
         let model = "headless".to_string();
         let serial = n.to_string();
 
@@ -163,13 +163,13 @@ impl Headless {
         let physical_properties = output.physical_properties();
         self.ipc_outputs.lock().unwrap().insert(
             OutputId::next(),
-            niri_ipc::Output {
+            synoik_ipc::Output {
                 name: output.name(),
                 make: physical_properties.make,
                 model: physical_properties.model,
                 serial: None,
                 physical_size: None,
-                modes: vec![niri_ipc::Mode {
+                modes: vec![synoik_ipc::Mode {
                     width: size.0,
                     height: size.1,
                     refresh_rate: 60_000,
@@ -184,7 +184,7 @@ impl Headless {
             },
         );
 
-        niri.add_output(output, None, false);
+        synoik.add_output(output, None, false);
     }
 
     pub fn seat_name(&self) -> String {
@@ -192,7 +192,7 @@ impl Headless {
     }
 
     /// Access to the owned Vulkan renderer, so the capture paths (screencopy, screenshot) and the
-    /// headless tests can drive the real `Niri::render` through it. Returns `None` before
+    /// headless tests can drive the real `Synoik::render` through it. Returns `None` before
     /// `add_renderer`.
     pub fn with_vulkan_renderer<T>(
         &mut self,
@@ -203,12 +203,12 @@ impl Headless {
 
     pub fn render(
         &mut self,
-        niri: &mut Niri,
+        synoik: &mut Synoik,
         output: &Output,
         target_presentation_time: Duration,
     ) -> RenderResult {
         let states = RenderElementStates::default();
-        let mut presentation_feedbacks = niri.take_presentation_feedbacks(output, &states);
+        let mut presentation_feedbacks = synoik.take_presentation_feedbacks(output, &states);
         presentation_feedbacks.presented::<_, smithay::utils::Monotonic>(
             get_monotonic_time(),
             Refresh::Unknown,
@@ -216,22 +216,24 @@ impl Headless {
             wp_presentation_feedback::Kind::empty(),
         );
 
-        let output_state = niri.output_state.get_mut(output).unwrap();
+        let output_state = synoik.output_state.get_mut(output).unwrap();
         match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
             RedrawState::Queued => (),
             // Damage landed while the next animation frame was pending (see `queue_next_frame`),
             // and that redraw is this one — so the timer has nothing left to ask for.
-            RedrawState::WaitingForEstimatedVBlankAndQueued(token) => niri.event_loop.remove(token),
+            RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
+                synoik.event_loop.remove(token)
+            }
             RedrawState::Idle
             | RedrawState::WaitingForVBlank { .. }
             | RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
         }
 
-        let output_state = niri.output_state.get_mut(output).unwrap();
+        let output_state = synoik.output_state.get_mut(output).unwrap();
 
         output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
 
-        queue_next_frame(niri, output, target_presentation_time);
+        queue_next_frame(synoik, output, target_presentation_time);
 
         RenderResult::Submitted
     }
@@ -256,13 +258,13 @@ impl Default for Headless {
 /// Headless has no VBlank, so nothing else ever will: a redraw leaves the output `Idle` and only
 /// new damage brings it back. An animation would therefore render exactly **one** frame and then
 /// sit at whatever progress it reached — and since a screencast is rendered as a side effect of
-/// the redraw ([`Niri::render_captures_with`]), a cast of a headless session sees that same single
-/// frame. This is the estimated-vblank timer the TTY backend keeps for the same reason (no
+/// the redraw ([`Synoik::render_captures_with`]), a cast of a headless session sees that same
+/// single frame. This is the estimated-vblank timer the TTY backend keeps for the same reason (no
 /// presentation time from DRM), minus the DRM parts.
 ///
-/// [`Niri::render_captures_with`]: crate::niri::Niri
-fn queue_next_frame(niri: &mut Niri, output: &Output, target_presentation_time: Duration) {
-    let output_state = niri.output_state.get_mut(output).unwrap();
+/// [`Synoik::render_captures_with`]: crate::synoik::Synoik
+fn queue_next_frame(synoik: &mut Synoik, output: &Output, target_presentation_time: Duration) {
+    let output_state = synoik.output_state.get_mut(output).unwrap();
     if !output_state.unfinished_animations_remain {
         return;
     }
@@ -278,23 +280,23 @@ fn queue_next_frame(niri: &mut Niri, output: &Output, target_presentation_time: 
     }
 
     let timer_output = output.clone();
-    let token = niri
+    let token = synoik
         .event_loop
         .insert_source(Timer::from_duration(duration), move |_, _, data| {
-            on_frame_timer(&mut data.niri, &timer_output);
+            on_frame_timer(&mut data.synoik, &timer_output);
             TimeoutAction::Drop
         })
         .unwrap();
 
     // Claim the output for the duration, so a `queue_redraw` in between lands as
     // `WaitingForEstimatedVBlankAndQueued` instead of starting a second, unpaced redraw loop.
-    let output_state = niri.output_state.get_mut(output).unwrap();
+    let output_state = synoik.output_state.get_mut(output).unwrap();
     output_state.redraw_state = RedrawState::WaitingForEstimatedVBlank(token);
 }
 
 /// The timer from [`queue_next_frame`] fired: hand the output back and ask for the next frame.
-fn on_frame_timer(niri: &mut Niri, output: &Output) {
-    let Some(output_state) = niri.output_state.get_mut(output) else {
+fn on_frame_timer(synoik: &mut Synoik, output: &Output) {
+    let Some(output_state) = synoik.output_state.get_mut(output) else {
         // The output went away while the timer was pending.
         return;
     };
@@ -312,9 +314,9 @@ fn on_frame_timer(niri: &mut Niri, output: &Output) {
     }
 
     if output_state.unfinished_animations_remain {
-        niri.queue_redraw(output);
+        synoik.queue_redraw(output);
     } else {
-        niri.send_frame_callbacks(output);
+        synoik.send_frame_callbacks(output);
     }
 }
 

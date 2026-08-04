@@ -2,18 +2,18 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Mutex;
 
-use niri_config::Config;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::Texture;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use synoik_config::Config;
 
 use crate::animation::{Animation, Clock};
-use crate::niri_render_elements;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
+use crate::synoik_render_elements;
 use crate::ui::widget::{self, ContentCache, Painter, ParagraphSpan, ShapedParagraph, TextShaper};
 use crate::utils::{output_size, to_physical_precise_round};
 
@@ -48,7 +48,7 @@ pub struct ExitConfirmDialog {
     config: Rc<RefCell<Config>>,
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     ExitConfirmDialogRenderElement => {
         Texture = RescaleRenderElement<TextureRenderElement<VkTexture>>,
         SolidColor = SolidColorRenderElement,
@@ -269,7 +269,7 @@ fn prepare_dialog(
     // Span 1 is the keycap (mono " Enter "), matching KEYCAP_SPAN.
     let key = format!(" {KEY_NAME} ");
     let spans = [
-        ParagraphSpan::new("Are you sure you want to exit niri?\n\nPress", FONT_PT),
+        ParagraphSpan::new("Are you sure you want to exit synoik?\n\nPress", FONT_PT),
         ParagraphSpan::new(&key, FONT_PT).mono(),
         ParagraphSpan::new(" to confirm.", FONT_PT),
     ];
@@ -331,7 +331,7 @@ fn paint_dialog(
 /// The dialog message as plain text (for accessibility).
 fn text() -> String {
     format!(
-        "Are you sure you want to exit niri?\n\n\
+        "Are you sure you want to exit synoik?\n\n\
          Press {KEY_NAME} to confirm."
     )
 }
@@ -339,7 +339,7 @@ fn text() -> String {
 #[cfg(feature = "dbus")]
 pub fn a11y_node() -> accesskit::Node {
     let mut node = accesskit::Node::new(accesskit::Role::AlertDialog);
-    node.set_label("Exit niri");
+    node.set_label("Exit synoik");
     node.set_description(text());
     node.set_modal();
     node

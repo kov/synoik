@@ -195,14 +195,14 @@ it fails on the pre-H2 path and passes after.
   — **not** byte-identical bakes (immediate→helper rounding differs sub-pixel, and scale-1
   byte-equality can't see the DPI bug anyway).
 - `cargo fmt` / clippy (`--features dbus,pipewire -D warnings`) / `cargo test --workspace` /
-  `NIRI_VK_VALIDATION=1 cargo test --workspace` (exit 0, no `VULKAN ERROR`) on each render-touching
+  `SYNOIK_VK_VALIDATION=1 cargo test --workspace` (exit 0, no `VULKAN ERROR`) on each render-touching
   commit, per project policy.
 
 ## 7. Inventory of what exists today (full sweep of `src/ui/*.rs`)
 
 **Shared primitives everyone calls:** `ui::pt_to_px` (`mod.rs:28`); `build_glyph_run_weighted`
 (single line, `renderer.rs:591`) / `build_glyph_paragraph` (multi-span wrapped, `renderer.rs:627`);
-GPU-free `measure_line_width_weighted` / `wrap_lines_weighted` (`niri-vk/text.rs:77,138`); frame ops
+GPU-free `measure_line_width_weighted` / `wrap_lines_weighted` (`synoik-vk/text.rs:77,138`); frame ops
 `render_rounded_rect` (`frame.rs:421`), `render_glyphs` (`:525`), `render_glyphs_spans` (`:541`),
 `clear`; `GlyphRun::ink_bounds`. Two *unused-by-widgets* offscreen facilities exist
 (`OffscreenBuffer`, `render_to_texture`); only the calendar list uses `render_to_texture`
@@ -365,7 +365,7 @@ container.
 
 ### 9.6 The cost model — a bake is round trips, not drawing
 
-Measured on the seat, 2026-07-25 (`NIRI_FRAME_LOG`; see
+Measured on the seat, 2026-07-25 (`SYNOIK_FRAME_LOG`; see
 [`frame-cost-investigation.md`](./frame-cost-investigation.md)). `time_bake()` wraps all of
 `bake_uncached_sized`, which contains **two synchronous GPU round trips**:
 
@@ -478,9 +478,9 @@ the shared helpers rather than left to each test:
 
 ### 10.4 A data-driven widget has an invisible empty state, and nothing in the render path objects
 
-The grid was empty because **`AppGrid` does not read `app_system`**. `Niri::sync_app_grid()` copies
+The grid was empty because **`AppGrid` does not read `app_system`**. `Synoik::sync_app_grid()` copies
 the entries across, and it runs from app-system *change events* — so installing a catalog straight
-onto `Niri` leaves the grid holding nothing. An empty grid lays out no tiles, contributes no
+onto `Synoik` leaves the grid holding nothing. An empty grid lays out no tiles, contributes no
 elements, and is indistinguishable from a healthy one that happens not to be on screen.
 
 That is the layer speaking. Three sibling widgets source their content three different ways with

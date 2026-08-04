@@ -1,4 +1,4 @@
-//! End-to-end proof that the live `Niri::render` compositing path runs on the **owned Vulkan
+//! End-to-end proof that the live `Synoik::render` compositing path runs on the **owned Vulkan
 //! renderer**, not just GLES: a real client window is mapped through the headless test harness and
 //! the whole scene is composited through `VulkanRenderer`, both into an offscreen buffer (the
 //! screenshot path) and into a **GBM-allocated scanout dmabuf** (the KMS-present path — everything
@@ -10,7 +10,6 @@
 
 use std::time::Duration;
 
-use niri_config::{Action, Config, CornerRadius, WindowRule};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::ButtonState;
 use smithay::backend::renderer::element::{Element, RenderElement};
@@ -19,15 +18,16 @@ use smithay::output::Output;
 use smithay::utils::{
     Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
 };
+use synoik_config::{Action, Config, CornerRadius, WindowRule};
 use wayland_client::protocol::wl_shm;
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::fixture::Fixture;
 use super::gnome::{map_window_for_app, BTN_LEFT};
-use crate::niri::OutputRenderElements;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget, NATIVE_FOURCC};
+use crate::synoik::OutputRenderElements;
 use crate::ui::screenshot_ui::{CaptureType, PointerUp};
 use crate::utils::{output_size, to_physical_precise_round};
 
@@ -46,10 +46,10 @@ const RED: [u32; 4] = [u32::MAX, 0, 0, u32::MAX];
 /// Composite UI elements the way the compositor does, and read the frame back.
 ///
 /// The z convention is the trap this exists for. Every UI `render()` in the fork returns
-/// its elements **front-to-back** (first = topmost) — that is what `Niri::render` pushes
+/// its elements **front-to-back** (first = topmost) — that is what `Synoik::render` pushes
 /// and what the real paths hand around. But `render_helpers::render_elements` draws in
 /// **iteration order**, so later elements land on top: it wants back-to-front, which is
-/// why every production caller reverses (`Niri::screenshot`, `snapshot.rs`, …).
+/// why every production caller reverses (`Synoik::screenshot`, `snapshot.rs`, …).
 ///
 /// A test that passes the list straight to `render_to_vec` therefore composites it upside
 /// down. That is not loud: the bottom-most element is usually the opaque background box
@@ -106,7 +106,7 @@ fn window_fixture_with_client(
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -130,7 +130,7 @@ fn window_fixture_with_client(
 
     if settle {
         // Settle any map/open animation so we composite a static scene.
-        f.niri_complete_animations();
+        f.synoik_complete_animations();
         f.double_roundtrip(id);
     }
 
@@ -139,7 +139,7 @@ fn window_fixture_with_client(
 
 /// Put the screenshot UI's chrome on screen by settling its open animation.
 ///
-/// **`niri_complete_animations` does NOT settle this one.** It sets the clock's
+/// **`synoik_complete_animations` does NOT settle this one.** It sets the clock's
 /// `complete_instantly` only for the duration of `advance_animations` and then resets it, so by
 /// render time `Animation::is_clamped_done` is false again and the value is back to
 /// `value_at(clock.now())` — and the lazy clock is still frozen at the moment the UI opened, so
@@ -152,12 +152,12 @@ fn window_fixture_with_client(
 ///
 /// Pinning the clock past the 200ms `screenshot-ui-open` animation is what actually puts it on
 /// screen. Must be called after the last roundtrip and immediately before rendering, since the
-/// event loop clears the clock (`Niri::refresh`).
+/// event loop clears the clock (`Synoik::refresh`).
 fn settle_screenshot_ui_open(f: &mut Fixture) {
-    let mut clock = f.niri().clock.clone();
+    let mut clock = f.synoik().clock.clone();
     let now = clock.now_unadjusted();
     clock.set_unadjusted(now + Duration::from_millis(500));
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 }
 
 /// Recolour the live window built by [`window_fixture_with_client`].
@@ -196,7 +196,7 @@ fn assert_window_and_background(pixels: &[u8], w: i32, h: i32) -> usize {
     green
 }
 
-/// Composite the whole `output` through the owned Vulkan renderer (the `Niri::screenshot` path),
+/// Composite the whole `output` through the owned Vulkan renderer (the `Synoik::screenshot` path),
 /// returning the tight `Abgr8888` readback and its dimensions.
 fn render_output_vulkan(f: &mut Fixture, output: &Output) -> (Vec<u8>, i32, i32) {
     render_output_vulkan_target(f, output, RenderTarget::ScreenCapture)
@@ -209,13 +209,13 @@ fn render_output_vulkan_target(
     output: &Output,
     target: RenderTarget,
 ) -> (Vec<u8>, i32, i32) {
-    let state = f.niri_state();
+    let state = f.synoik_state();
     state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
-            let niri = &mut state.niri;
-            niri.update_render_elements(Some(output));
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(output));
 
             let size: Size<i32, Physical> = output.current_mode().unwrap().size;
             let size = output.current_transform().transform_size(size);
@@ -226,7 +226,7 @@ fn render_output_vulkan_target(
                 target,
                 xray: None,
             };
-            let elements = niri.render_to_vec(ctx, output, false);
+            let elements = synoik.render_to_vec(ctx, output, false);
             let elements = elements.iter().rev();
             let pixels = render_to_vec(
                 vk,
@@ -247,19 +247,19 @@ fn vulkan_composites_a_mapped_window() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Composite the whole output through the owned Vulkan renderer — the same element collection
-    // (`Niri::render_to_vec`) and offscreen readback (`render_helpers::render_to_vec`) that
-    // `Niri::screenshot` drives. Reaching pixels at all proves the guarded GLES-only sub-paths
+    // (`Synoik::render_to_vec`) and offscreen readback (`render_helpers::render_to_vec`) that
+    // `Synoik::screenshot` drives. Reaching pixels at all proves the guarded GLES-only sub-paths
     // degraded instead of panicking.
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let (pixels, w, h) = state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
-            let niri = &mut state.niri;
-            niri.update_render_elements(Some(&output));
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
 
             let size: Size<i32, Physical> = output.current_mode().unwrap().size;
             let size = output.current_transform().transform_size(size);
@@ -270,7 +270,7 @@ fn vulkan_composites_a_mapped_window() {
                 target: RenderTarget::ScreenCapture,
                 xray: None,
             };
-            let elements = niri.render_to_vec(ctx, &output, false);
+            let elements = synoik.render_to_vec(ctx, &output, false);
             let elements = elements.iter().rev();
             let pixels = render_to_vec(
                 vk,
@@ -302,14 +302,14 @@ fn vulkan_composites_a_mapped_window() {
         path.display()
     );
 
-    // Finally, smoke-test the genericized `Niri::screenshot` itself end-to-end on Vulkan (no disk
+    // Finally, smoke-test the genericized `Synoik::screenshot` itself end-to-end on Vulkan (no disk
     // write, so no async encode thread to await): it must run the same path without panicking.
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let ran = state.backend.headless().with_vulkan_renderer(|vk| {
         state
-            .niri
+            .synoik
             .screenshot(vk, &output, false, false, None)
-            .expect("Niri::screenshot must succeed on the Vulkan renderer");
+            .expect("Synoik::screenshot must succeed on the Vulkan renderer");
     });
     assert!(
         ran.is_some(),
@@ -322,15 +322,15 @@ fn vulkan_composites_the_run_dialog() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Baseline: the static scene with no dialog.
     let (before, w, h) = render_output_vulkan(&mut f, &output);
 
     // Open the Alt+F2 run dialog, settle, and recomposite.
-    f.niri_state().do_action(Action::ShowRunDialog, false);
-    f.niri_complete_animations();
-    assert!(f.niri().run_dialog.is_open(), "run dialog must be open");
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+    f.synoik_complete_animations();
+    assert!(f.synoik().run_dialog.is_open(), "run dialog must be open");
     let (after, aw, ah) = render_output_vulkan(&mut f, &output);
     assert_eq!((w, h), (aw, ah), "output size changed between renders");
 
@@ -364,15 +364,15 @@ fn vulkan_screenshot_ui_draws_the_frozen_screen() {
     let Some((mut f, id, surface)) = window_fixture_with_client(GREEN, true, None) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    f.niri_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(false, None);
     assert!(
-        f.niri().screenshot_ui.is_open(),
+        f.synoik().screenshot_ui.is_open(),
         "screenshot UI must be open"
     );
 
-    // Recolour the live window red. `Niri::render` early-returns after the screenshot UI's
+    // Recolour the live window red. `Synoik::render` early-returns after the screenshot UI's
     // elements, above the layout, so the live window is not in this frame at all: every green pixel
     // below therefore comes from the UI's frozen capture, and any red would mean the UI drew
     // nothing and we are looking at the live scene.
@@ -421,16 +421,16 @@ fn vulkan_screenshot_ui_draws_the_control_panel() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    f.niri_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(false, None);
     settle_screenshot_ui_open(&mut f);
 
     // The panel is built lazily on the first render, so render before reading its rect.
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
     let rect = f
-        .niri()
+        .synoik()
         .screenshot_ui
         .panel_rect(&output)
         .expect("the open screenshot UI must have a control panel");
@@ -475,7 +475,7 @@ fn vulkan_screenshot_ui_draws_the_control_panel() {
 /// Click a control on the open picker's panel, by the rect the bake published for it.
 fn click_control(f: &mut Fixture, output: &Output, rect: Rectangle<f64, Logical>) -> PointerUp {
     let panel = f
-        .niri()
+        .synoik()
         .screenshot_ui
         .panel_rect(output)
         .expect("the open screenshot UI must have a control panel");
@@ -486,7 +486,7 @@ fn click_control(f: &mut Fixture, output: &Output, rect: Rectangle<f64, Logical>
             .to_i32_round::<i32>()
             + panel.loc;
 
-    let ui = &mut f.niri_state().niri.screenshot_ui;
+    let ui = &mut f.synoik_state().synoik.screenshot_ui;
     ui.pointer_motion(point, None);
     assert!(ui
         .pointer_down(output.clone(), point, None, false)
@@ -504,20 +504,20 @@ fn vulkan_screenshot_ui_cast_mode_drops_the_frozen_screen() {
     let Some((mut f, client, surface)) = window_fixture_with_client(GREEN, true, None) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    f.niri_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(false, None);
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     click_control(
         &mut f,
         &output,
         crate::ui::widget::Segmented::segment_rect(layout.shot_cast, 1),
     );
     assert_eq!(
-        f.niri().screenshot_ui.mode(),
+        f.synoik().screenshot_ui.mode(),
         crate::ui::screenshot_ui::CaptureMode::Cast
     );
 
@@ -546,16 +546,16 @@ fn vulkan_screenshot_ui_cast_mode_capture_starts_a_recording() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    f.niri_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(false, None);
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     click_control(&mut f, &output, layout.type_buttons[1]);
 
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     click_control(
         &mut f,
         &output,
@@ -563,29 +563,29 @@ fn vulkan_screenshot_ui_cast_mode_capture_starts_a_recording() {
     );
 
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     assert_eq!(
         click_control(&mut f, &output, layout.capture),
         PointerUp::Capture,
         "the capture button reports the same release in either mode; the branch is the compositor's"
     );
-    f.niri_state()
+    f.synoik_state()
         .handle_screenshot_ui_pointer_up(PointerUp::Capture);
 
     assert!(
-        !f.niri().screenshot_ui.is_open(),
+        !f.synoik().screenshot_ui.is_open(),
         "GNOME closes instantly here so the fade-out is not recorded"
     );
     assert!(
-        !f.niri().casting.recordings.is_empty(),
+        !f.synoik().casting.recordings.is_empty(),
         "the capture button in cast mode must start the recorder"
     );
 
     // And stopping it finalizes the file and says so.
-    f.niri_state().stop_screen_recordings();
-    assert!(f.niri().casting.recordings.is_empty());
+    f.synoik_state().stop_screen_recordings();
+    assert!(f.synoik().casting.recordings.is_empty());
     let notif = f
-        .niri()
+        .synoik()
         .notifications
         .sources
         .iter()
@@ -606,43 +606,43 @@ fn vulkan_screenshot_ui_a_delayed_capture_shoots_the_live_screen() {
     let Some((mut f, client, surface)) = window_fixture_with_client(GREEN, true, None) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // An explicit path, so the shot can be read back without going through the D-Bus reply — that
     // is answered from an event-loop source, and a test that blocks on it deadlocks the loop that
     // would answer it.
     let path = std::env::temp_dir().join("gsrs-delayed-capture-test.png");
     std::fs::remove_file(&path).ok();
-    f.niri_state()
+    f.synoik_state()
         .open_screenshot_ui(false, Some(path.to_string_lossy().into_owned()));
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
     // Screen mode, so the crop is the whole output and the centre pixel is the window's.
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     click_control(&mut f, &output, layout.type_buttons[1]);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     click_control(&mut f, &output, layout.delay);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     click_control(&mut f, &output, layout.capture);
-    f.niri_state()
+    f.synoik_state()
         .handle_screenshot_ui_pointer_up(PointerUp::Capture);
-    assert!(f.niri().pending_capture.is_some());
+    assert!(f.synoik().pending_capture.is_some());
 
     // The screen changes during the countdown. A capture from the picker's frozen neutral would
     // still be green.
     recolor_window(&mut f, client, &surface, [0, 0, u32::MAX, u32::MAX]);
 
-    let mut clock = f.niri().clock.clone();
+    let mut clock = f.synoik().clock.clone();
     let now = clock.now_unadjusted();
     clock.set_unadjusted(now + Duration::from_secs(4));
     assert!(matches!(
-        f.niri_state().tick_pending_capture(),
+        f.synoik_state().tick_pending_capture(),
         calloop::timer::TimeoutAction::Drop
     ));
-    assert!(f.niri().pending_capture.is_none());
+    assert!(f.synoik().pending_capture.is_none());
 
     // The PNG is encoded off-thread; bounded work, so this waits rather than polls forever.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -685,24 +685,24 @@ fn vulkan_screenshot_ui_countdown_cannot_reach_a_capture() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let centre = (i32::from(OUT_W) / 2, i32::from(OUT_H) / 2);
     // What a capture of this desktop looks like before any of this — the shot the delay promises.
     let (pixels, w, _) = render_output_vulkan_target(&mut f, &output, RenderTarget::ScreenCapture);
     let undisturbed = px(&pixels, w, centre.0, centre.1);
 
-    f.niri_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(false, None);
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     click_control(&mut f, &output, layout.delay);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     click_control(&mut f, &output, layout.capture);
-    f.niri_state()
+    f.synoik_state()
         .handle_screenshot_ui_pointer_up(PointerUp::Capture);
-    assert!(f.niri().pending_capture.is_some());
+    assert!(f.synoik().pending_capture.is_some());
 
     let (pixels, w, _) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
     let on_screen = px(&pixels, w, centre.0, centre.1);
@@ -726,29 +726,29 @@ fn vulkan_screenshot_ui_type_buttons_take_clicks_where_they_are_drawn() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    f.niri_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(false, None);
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
     let rect = f
-        .niri()
+        .synoik()
         .screenshot_ui
         .panel_rect(&output)
         .expect("the open screenshot UI must have a control panel");
     let scale = output.current_scale().fractional_scale();
 
     assert_eq!(
-        f.niri().screenshot_ui.capture_type(),
+        f.synoik().screenshot_ui.capture_type(),
         CaptureType::Selection,
-        "the picker must open on Selection, the mode niri's picker always had"
+        "the picker must open on Selection, the mode synoik's picker always had"
     );
 
     // Screen is the middle button of the three, so its centre is the panel's horizontal centre at
     // the type row's height — derived from the layout, not from a pixel guess.
     let layout = f
-        .niri()
+        .synoik()
         .screenshot_ui
         .panel_layout(&output)
         .expect("the panel must publish its layout once baked");
@@ -761,7 +761,7 @@ fn vulkan_screenshot_ui_type_buttons_take_clicks_where_they_are_drawn() {
     .to_i32_round::<i32>()
         + rect.loc;
 
-    let ui = &mut f.niri_state().niri.screenshot_ui;
+    let ui = &mut f.synoik_state().synoik.screenshot_ui;
     ui.pointer_motion(point, None);
     assert!(ui
         .pointer_down(output.clone(), point, None, false)
@@ -798,14 +798,14 @@ fn scaled_green_fixture(scale: f64) -> Option<Fixture> {
     }
 
     let mut config = Config::default();
-    config.outputs.0.push(niri_config::Output {
+    config.outputs.0.push(synoik_config::Output {
         name: "headless-1".to_string(),
-        scale: Some(niri_config::FloatOrInt(scale)),
+        scale: Some(synoik_config::FloatOrInt(scale)),
         ..Default::default()
     });
 
     let mut f = Fixture::with_config(config);
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -824,7 +824,7 @@ fn scaled_green_fixture(scale: f64) -> Option<Fixture> {
     window.ack_last_and_commit();
     f.double_roundtrip(id);
 
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
     Some(f)
 }
@@ -839,24 +839,24 @@ fn vulkan_screenshot_ui_button_is_scale_correct() {
     let Some(mut f) = scaled_green_fixture(2.0) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = output.current_scale().fractional_scale();
     assert!(
         (scale - 2.0).abs() < 1e-6,
         "expected a scale-2 output, got {scale}; the guard is vacuous otherwise"
     );
 
-    f.niri_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(false, None);
     settle_screenshot_ui_open(&mut f);
 
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
     let rect = f
-        .niri()
+        .synoik()
         .screenshot_ui
         .panel_rect(&output)
         .expect("the open screenshot UI must have a control panel");
     let layout = f
-        .niri()
+        .synoik()
         .screenshot_ui
         .panel_layout(&output)
         .expect("the panel must publish its layout once baked");
@@ -911,18 +911,18 @@ fn vulkan_captures_the_screenshot_neutral_through_vulkan() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // `open_screenshot_ui` primes render elements before both passes; mirror that here.
-    f.niri().update_render_elements(None);
+    f.synoik().update_render_elements(None);
 
-    // Drive the Vulkan capture pass directly (disjoint borrows of niri + backend).
+    // Drive the Vulkan capture pass directly (disjoint borrows of synoik + backend).
     let neutrals = {
-        let state = f.niri_state();
+        let state = f.synoik_state();
         state
             .backend
             .headless()
-            .with_vulkan_renderer(|vk| state.niri.capture_screenshot_neutrals(vk))
+            .with_vulkan_renderer(|vk| state.synoik.capture_screenshot_neutrals(vk))
             .expect("headless backend must hold a Vulkan renderer")
     };
 
@@ -956,7 +956,7 @@ fn vulkan_captures_the_screenshot_neutral_through_vulkan() {
 /// The recorder capture path (`render_for_recorders`) runs real Vulkan work that no other test
 /// drives: `render_to_vec` of the scene, a `RelocateRenderElement` crop, and an offscreen readback
 /// into an area-sized buffer. Drive it here — whole-output (zero-offset relocate) and an odd-sized
-/// area (non-zero offset + even-rounding) — so `NIRI_VK_VALIDATION=1 cargo test` covers it. The
+/// area (non-zero offset + even-rounding) — so `SYNOIK_VK_VALIDATION=1 cargo test` covers it. The
 /// assertion is implicit: the validation layer must report nothing (checked at process exit).
 #[test]
 fn vulkan_recorder_capture_path_is_clean() {
@@ -976,37 +976,42 @@ fn vulkan_recorder_capture_path_is_clean() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
-    f.niri().update_render_elements(None);
+    let output = f.synoik_output(1);
+    f.synoik().update_render_elements(None);
 
-    let dir = std::env::temp_dir().join(format!("niri-vkrec-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("synoik-vkrec-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     // Whole-output (zero-offset relocate) and an odd-sized area (offset relocate + even-rounding).
-    f.niri()
+    f.synoik()
         .start_native_recording(&output, dir.join("full.webm"), 30, true, None)
         .unwrap();
     let area = Rectangle::new(Point::from((37, 21)), Size::from((641, 481)));
-    f.niri()
+    f.synoik()
         .start_native_recording(&output, dir.join("area.webm"), 30, false, Some(area))
         .unwrap();
 
-    // Drive a few capture passes through the real Vulkan renderer (disjoint niri/backend borrows).
-    let base = f.niri().clock.now_unadjusted();
+    // Drive a few capture passes through the real Vulkan renderer (disjoint synoik/backend
+    // borrows).
+    let base = f.synoik().clock.now_unadjusted();
     for i in 0..3u32 {
         let time = base + Duration::from_millis(u64::from(i) * 40);
-        let state = f.niri_state();
+        let state = f.synoik_state();
         state
             .backend
             .headless()
-            .with_vulkan_renderer(|vk| state.niri.render_for_recorders(vk, &output, time))
+            .with_vulkan_renderer(|vk| state.synoik.render_for_recorders(vk, &output, time))
             .expect("headless backend must hold a Vulkan renderer");
     }
 
-    assert_eq!(f.niri().casting.recordings.len(), 2, "both recordings live");
-    f.niri().stop_screen_recordings();
+    assert_eq!(
+        f.synoik().casting.recordings.len(),
+        2,
+        "both recordings live"
+    );
+    f.synoik().stop_screen_recordings();
     assert!(
-        f.niri().casting.recordings.is_empty(),
+        f.synoik().casting.recordings.is_empty(),
         "recordings cleared on stop"
     );
 
@@ -1017,17 +1022,17 @@ fn vulkan_recorder_capture_path_is_clean() {
 /// [`pin_crossfade_at_start`] before rendering.
 ///
 /// `ScreenTransition::alpha` reads the clock's *unadjusted* time, deliberately ignoring animation
-/// slowdown, so neither `niri_complete_animations` nor a zero clock rate holds the crossfade still
-/// — it advances with real monotonic time. Every event-loop iteration also calls `Clock::clear`
-/// (`Niri::refresh`), so the first read after any roundtrip jumps to however long the test really
-/// took. An unpinned test is therefore racing the 500ms crossfade: past ~78ms of real time, enough
-/// of the live window bleeds through that the blend matches *neither* colour, and the test blank-
-/// fails with `0 green, 0 red`. Three full-screen texture uploads fit inside that budget on a bad
-/// day, which is what made this flaky.
+/// slowdown, so neither `synoik_complete_animations` nor a zero clock rate holds the crossfade
+/// still — it advances with real monotonic time. Every event-loop iteration also calls
+/// `Clock::clear` (`Synoik::refresh`), so the first read after any roundtrip jumps to however long
+/// the test really took. An unpinned test is therefore racing the 500ms crossfade: past ~78ms of
+/// real time, enough of the live window bleeds through that the blend matches *neither* colour, and
+/// the test blank- fails with `0 green, 0 red`. Three full-screen texture uploads fit inside that
+/// budget on a bad day, which is what made this flaky.
 fn start_screen_transition(f: &mut Fixture) -> Duration {
     // The clock is lazy, so this is the same value the transition records as its start.
-    let start_at = f.niri().clock.now_unadjusted();
-    f.niri_state()
+    let start_at = f.synoik().clock.now_unadjusted();
+    f.synoik_state()
         .do_action(Action::DoScreenTransition(Some(0)), false);
     start_at
 }
@@ -1035,7 +1040,7 @@ fn start_screen_transition(f: &mut Fixture) -> Duration {
 /// Pin the unadjusted clock to the crossfade's start, fixing alpha at exactly 1.0 (fully the frozen
 /// capture). Must be called after the last roundtrip, since the event loop clears the clock.
 fn pin_crossfade_at_start(f: &mut Fixture, start_at: Duration) {
-    f.niri().clock.clone().set_unadjusted(start_at);
+    f.synoik().clock.clone().set_unadjusted(start_at);
 }
 
 /// The screen-transition crossfade holds GLES textures (which the owned Vulkan renderer can't
@@ -1052,7 +1057,7 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -1070,15 +1075,15 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Freeze the green-window screen into a transition, pinned at alpha = 1.0 (fully the capture).
     let start_at = start_screen_transition(&mut f);
     assert!(
-        f.niri()
+        f.synoik()
             .output_state
             .values()
             .any(|s| s.screen_transition.is_some()),
@@ -1088,13 +1093,13 @@ fn vulkan_screen_transition_draws_the_captured_frame() {
     // *Every* target must take the Vulkan upload path. The Gles arm draws nothing on the owned
     // renderer, so a target that fell through to it would crossfade from a blank screen.
     {
-        let state = f.niri_state();
+        let state = f.synoik_state();
         state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| {
                 let transition = state
-                    .niri
+                    .synoik
                     .output_state
                     .values()
                     .find_map(|s| s.screen_transition.as_ref())
@@ -1160,7 +1165,7 @@ fn vulkan_screen_transition_draws_the_captured_frame_into_a_cast() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -1178,10 +1183,10 @@ fn vulkan_screen_transition_draws_the_captured_frame_into_a_cast() {
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Freeze the green-window screen into a transition, pinned at alpha = 1.0 (fully the capture).
     let start_at = start_screen_transition(&mut f);
@@ -1231,7 +1236,7 @@ fn vulkan_captures_the_screen_transition_neutral_through_vulkan() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -1249,18 +1254,18 @@ fn vulkan_captures_the_screen_transition_neutral_through_vulkan() {
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    // Drive the Vulkan capture pass directly (disjoint borrows of niri + backend).
+    // Drive the Vulkan capture pass directly (disjoint borrows of synoik + backend).
     let neutrals = {
-        let state = f.niri_state();
+        let state = f.synoik_state();
         state
             .backend
             .headless()
-            .with_vulkan_renderer(|vk| state.niri.capture_screen_transition_neutrals(vk))
+            .with_vulkan_renderer(|vk| state.synoik.capture_screen_transition_neutrals(vk))
             .expect("headless backend must hold a Vulkan renderer")
     };
 
@@ -1463,7 +1468,7 @@ fn vulkan_buffer_transform_follows_the_transform_spec() {
     // distinct, so a 50/channel tolerance still catches sampling the wrong quadrant.
     let near = |p: [u8; 4], c: [u8; 4]| (0..4).all(|i| (p[i] as i32 - c[i] as i32).abs() < 50);
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     for (src_t, out_t) in combos {
         let want = expected_transform_corners(tex, out_size, src_t, out_t);
         let vk = state
@@ -1573,7 +1578,7 @@ fn vulkan_output_transform_follows_the_transform_spec() {
         )
     };
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let mut vk_boxes = Vec::new();
     for t in all {
         let vk = state
@@ -1621,7 +1626,7 @@ fn vulkan_output_transform_follows_the_transform_spec() {
 /// The KMS-present pipeline minus the flip: composite the same live scene straight into a
 /// GBM-allocated **scanout dmabuf** via `Bind<Dmabuf>`, exactly as the tty present path will, and
 /// read it back from the dmabuf's own memory. This proves the whole GPU half of Stage 3 Brick B —
-/// `Niri::render` (Brick 3) → owned Vulkan renderer → scanout buffer (Brick A) — is correct; only
+/// `Synoik::render` (Brick 3) → owned Vulkan renderer → scanout buffer (Brick A) — is correct; only
 /// the DRM framebuffer export + atomic page-flip remain (live-validated). Venus-only (needs GBM).
 ///
 /// The target is `Abgr8888`, which since 2026-07-31 is the order the render pass does *not* declare
@@ -1638,7 +1643,7 @@ fn vulkan_composites_a_scene_into_a_scanout_dmabuf() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Allocate a scanout-flagged GBM buffer the size of the output and export it as a Smithay
     // Dmabuf — the same allocation the tty backend performs for a scanout target.
@@ -1687,13 +1692,13 @@ fn vulkan_composites_a_scene_into_a_scanout_dmabuf() {
         dmabuf.format().modifier,
     );
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let (pixels, w, h) = state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
-            let niri = &mut state.niri;
-            niri.update_render_elements(Some(&output));
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
 
             let size: Size<i32, Physical> = output.current_mode().unwrap().size;
             let size = output.current_transform().transform_size(size);
@@ -1705,7 +1710,7 @@ fn vulkan_composites_a_scene_into_a_scanout_dmabuf() {
                 target: RenderTarget::Output,
                 xray: None,
             };
-            let elements: Vec<OutputRenderElements> = niri.render_to_vec(ctx, &output, false);
+            let elements: Vec<OutputRenderElements> = synoik.render_to_vec(ctx, &output, false);
 
             // Bind the scanout dmabuf as the render target and composite straight into it.
             let mut fb = vk
@@ -1788,7 +1793,7 @@ fn vulkan_composites_a_scene_into_an_argb_scanout_dmabuf() {
     let Some(mut f) = window_fixture(RED) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let file = match File::options()
         .read(true)
@@ -1835,13 +1840,13 @@ fn vulkan_composites_a_scene_into_an_argb_scanout_dmabuf() {
         dmabuf.format().modifier,
     );
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let (pixels, w, h) = state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
-            let niri = &mut state.niri;
-            niri.update_render_elements(Some(&output));
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
 
             let size: Size<i32, Physical> = output.current_mode().unwrap().size;
             let size = output.current_transform().transform_size(size);
@@ -1852,7 +1857,7 @@ fn vulkan_composites_a_scene_into_an_argb_scanout_dmabuf() {
                 target: RenderTarget::Output,
                 xray: None,
             };
-            let elements: Vec<OutputRenderElements> = niri.render_to_vec(ctx, &output, false);
+            let elements: Vec<OutputRenderElements> = synoik.render_to_vec(ctx, &output, false);
 
             // Bind the Argb dmabuf: `Bind<Dmabuf>` takes the present-blit path (shadow + blit).
             let mut fb = vk
@@ -2266,23 +2271,23 @@ fn vulkan_renders_the_top_panel() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
     let width = to_physical_precise_round(scale.x, output_size(&output).w);
     let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::panel_height());
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let opaque = state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let ws = state.niri.workspace_state_for(&output);
-            let position = state.niri.workspace_position_for(&output);
+            let ws = state.synoik.workspace_state_for(&output);
+            let position = state.synoik.workspace_position_for(&output);
             let elems =
                 state
-                    .niri
+                    .synoik
                     .panel
-                    .render(vk, &output, ws, position, 0., &state.niri.icon_cache);
+                    .render(vk, &output, ws, position, 0., &state.synoik.icon_cache);
             assert!(
                 !elems.is_empty(),
                 "panel produced no element on Vulkan (still blank)"
@@ -2315,7 +2320,7 @@ fn vulkan_renders_the_messages_indicator_dot() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
     let ow = output_size(&output).w;
     let width = to_physical_precise_round(scale.x, ow);
@@ -2326,7 +2331,7 @@ fn vulkan_renders_the_messages_indicator_dot() {
     // button's padding is ever retuned. Toggling to read it is safe precisely because the
     // dot costs no layout (`the_messages_dot_moves_nothing`).
     let dot = {
-        let panel = &mut f.niri().panel;
+        let panel = &mut f.synoik().panel;
         panel.set_messages_indicator(true);
         let rect = panel.messages_indicator_rect(ow).expect("shown");
         panel.set_messages_indicator(false);
@@ -2353,17 +2358,17 @@ fn vulkan_renders_the_messages_indicator_dot() {
         n
     };
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let (off, on) = state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let ws = state.niri.workspace_state_for(&output);
-            let position = state.niri.workspace_position_for(&output);
-            let render_panel = |vk: &mut VulkanRenderer, niri: &crate::niri::Niri| {
-                let elems = niri
+            let ws = state.synoik.workspace_state_for(&output);
+            let position = state.synoik.workspace_position_for(&output);
+            let render_panel = |vk: &mut VulkanRenderer, synoik: &crate::synoik::Synoik| {
+                let elems = synoik
                     .panel
-                    .render(vk, &output, ws, position, 0., &niri.icon_cache);
+                    .render(vk, &output, ws, position, 0., &synoik.icon_cache);
                 composite_ui(
                     vk,
                     elems,
@@ -2372,9 +2377,9 @@ fn vulkan_renders_the_messages_indicator_dot() {
                 )
             };
             // Hidden: nothing bright where the dot would sit.
-            let off = bright_at_dot(&render_panel(vk, &state.niri));
-            state.niri.panel.set_messages_indicator(true);
-            let on = bright_at_dot(&render_panel(vk, &state.niri));
+            let off = bright_at_dot(&render_panel(vk, &state.synoik));
+            state.synoik.panel.set_messages_indicator(true);
+            let on = bright_at_dot(&render_panel(vk, &state.synoik));
             (off, on)
         })
         .expect("vulkan renderer");
@@ -2400,7 +2405,7 @@ fn vulkan_composites_the_workspace_dots() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
     let ow = output_size(&output).w;
     let width = to_physical_precise_round(scale.x, ow);
@@ -2412,7 +2417,7 @@ fn vulkan_composites_the_workspace_dots() {
         active: 1,
     };
     let dot_region =
-        to_physical_precise_round::<i32>(scale.x, f.niri().panel.activities_rect(ws).size.w)
+        to_physical_precise_round::<i32>(scale.x, f.synoik().panel.activities_rect(ws).size.w)
             .clamp(1, width);
     // The band row through the dots' vertical center, as (bright, dim) pixel counts.
     let band = |pixels: &[u8]| -> (usize, usize) {
@@ -2435,17 +2440,20 @@ fn vulkan_composites_the_workspace_dots() {
             .unwrap_or(0)
     };
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let ((bright, dim), rest_peak, mid_peak) = state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
             let render_at = |vk: &mut VulkanRenderer, position: f64| -> Vec<u8> {
-                let elems =
-                    state
-                        .niri
-                        .panel
-                        .render(vk, &output, ws, position, 0., &state.niri.icon_cache);
+                let elems = state.synoik.panel.render(
+                    vk,
+                    &output,
+                    ws,
+                    position,
+                    0.,
+                    &state.synoik.icon_cache,
+                );
                 composite_ui(
                     vk,
                     elems,
@@ -2538,15 +2546,15 @@ fn vulkan_renders_the_calendar_popover() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     // Open the calendar popover under the clock.
     {
-        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
-        let cal = f.niri().gnome_settings.calendar;
-        let accent = f.niri().gnome_settings.accent_color;
-        f.niri().panel_popover.toggle_calendar(
+        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.synoik().gnome_settings.calendar;
+        let accent = f.synoik().gnome_settings.accent_color;
+        f.synoik().panel_popover.toggle_calendar(
             output.clone(),
             anchor,
             cal.week_start,
@@ -2555,21 +2563,21 @@ fn vulkan_renders_the_calendar_popover() {
             Vec::new(),
         );
     }
-    assert!(f.niri().panel_popover.is_open());
+    assert!(f.synoik().panel_popover.is_open());
     // Settle the open fade so the popover renders at full opacity (else the anim leaves
     // it at alpha 0 — the headless-animation-clock trap).
     f.settle_animations();
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let opaque = state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state.niri.panel_popover.render(
+            let elems = state.synoik.panel_popover.render(
                 vk,
-                &state.niri.icon_cache,
-                &state.niri.app_icon_cache,
-                &state.niri.image_cache,
+                &state.synoik.icon_cache,
+                &state.synoik.app_icon_cache,
+                &state.synoik.image_cache,
                 &output,
             );
             assert!(
@@ -2600,13 +2608,13 @@ fn vulkan_renders_the_message_list_card() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     {
-        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
-        let cal = f.niri().gnome_settings.calendar;
-        let accent = f.niri().gnome_settings.accent_color;
+        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.synoik().gnome_settings.calendar;
+        let accent = f.synoik().gnome_settings.accent_color;
         let card = crate::ui::notification_card::CardContent {
             id: 1,
             source_title: "App".to_owned(),
@@ -2620,7 +2628,7 @@ fn vulkan_renders_the_message_list_card() {
             critical: false,
             time_text: "Just now".to_owned(),
         };
-        f.niri().panel_popover.toggle_calendar(
+        f.synoik().panel_popover.toggle_calendar(
             output.clone(),
             anchor,
             cal.week_start,
@@ -2637,11 +2645,12 @@ fn vulkan_renders_the_message_list_card() {
     }
     f.settle_animations();
 
-    let state = f.niri_state();
-    let origin = state.niri.panel_popover.content_location(&output);
-    let (_, card_rect, close_rect) = state.niri.panel_popover.date_menu().unwrap().card_rects()[0];
+    let state = f.synoik_state();
+    let origin = state.synoik.panel_popover.content_location(&output);
+    let (_, card_rect, close_rect) =
+        state.synoik.panel_popover.date_menu().unwrap().card_rects()[0];
     let close_icon_available = state
-        .niri
+        .synoik
         .icon_cache
         .resolve("window-close-symbolic")
         .is_some();
@@ -2649,11 +2658,11 @@ fn vulkan_renders_the_message_list_card() {
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state.niri.panel_popover.render(
+            let elems = state.synoik.panel_popover.render(
                 vk,
-                &state.niri.icon_cache,
-                &state.niri.app_icon_cache,
-                &state.niri.image_cache,
+                &state.synoik.icon_cache,
+                &state.synoik.app_icon_cache,
+                &state.synoik.image_cache,
                 &output,
             );
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
@@ -2709,14 +2718,14 @@ fn vulkan_hovering_a_card_close_button_lightens_it() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     {
-        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
-        let cal = f.niri().gnome_settings.calendar;
-        let accent = f.niri().gnome_settings.accent_color;
-        f.niri().panel_popover.toggle_calendar(
+        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.synoik().gnome_settings.calendar;
+        let accent = f.synoik().gnome_settings.accent_color;
+        f.synoik().panel_popover.toggle_calendar(
             output.clone(),
             anchor,
             cal.week_start,
@@ -2745,8 +2754,8 @@ fn vulkan_hovering_a_card_close_button_lightens_it() {
     }
     f.settle_animations();
 
-    let origin = f.niri().panel_popover.content_location(&output);
-    let (_, card, close) = f.niri().panel_popover.date_menu().unwrap().card_rects()[0];
+    let origin = f.synoik().panel_popover.content_location(&output);
+    let (_, card, close) = f.synoik().panel_popover.date_menu().unwrap().card_rects()[0];
     // The close circle's background, in the top-middle gap of the × glyph (not
     // the opaque white glyph); and a card-body pixel at the right edge,
     // mid-height (clear of the left-aligned text and the top-right buttons).
@@ -2772,16 +2781,16 @@ fn vulkan_hovering_a_card_close_button_lightens_it() {
 
     // Render once and read both sample pixels.
     let render_samples = |f: &mut Fixture| -> ([u8; 4], [u8; 4]) {
-        let state = f.niri_state();
+        let state = f.synoik_state();
         state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| {
-                let elems = state.niri.panel_popover.render(
+                let elems = state.synoik.panel_popover.render(
                     vk,
-                    &state.niri.icon_cache,
-                    &state.niri.app_icon_cache,
-                    &state.niri.image_cache,
+                    &state.synoik.icon_cache,
+                    &state.synoik.app_icon_cache,
+                    &state.synoik.image_cache,
                     &output,
                 );
                 let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
@@ -2796,7 +2805,7 @@ fn vulkan_hovering_a_card_close_button_lightens_it() {
 
     let (btn_cold, body_cold) = render_samples(&mut f);
     assert!(
-        f.niri().panel_popover.pointer_hover(&output, center),
+        f.synoik().panel_popover.pointer_hover(&output, center),
         "the pointer over the close button registers a hover"
     );
     let (btn_hot, body_hot) = render_samples(&mut f);
@@ -2825,13 +2834,13 @@ fn vulkan_renders_the_expanded_card_body() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     {
-        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
-        let cal = f.niri().gnome_settings.calendar;
-        let accent = f.niri().gnome_settings.accent_color;
+        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.synoik().gnome_settings.calendar;
+        let accent = f.synoik().gnome_settings.accent_color;
         let card = crate::ui::notification_card::CardContent {
             id: 1,
             source_title: "App".to_owned(),
@@ -2845,7 +2854,7 @@ fn vulkan_renders_the_expanded_card_body() {
             critical: false,
             time_text: "Just now".to_owned(),
         };
-        f.niri().panel_popover.toggle_calendar(
+        f.synoik().panel_popover.toggle_calendar(
             output.clone(),
             anchor,
             cal.week_start,
@@ -2862,10 +2871,10 @@ fn vulkan_renders_the_expanded_card_body() {
     }
     f.settle_animations();
 
-    let state = f.niri_state();
-    let origin = state.niri.panel_popover.content_location(&output);
+    let state = f.synoik_state();
+    let origin = state.synoik.panel_popover.content_location(&output);
     let caret = state
-        .niri
+        .synoik
         .panel_popover
         .date_menu()
         .unwrap()
@@ -2874,15 +2883,15 @@ fn vulkan_renders_the_expanded_card_body() {
 
     // Expand through the real click path.
     let caret_pos = origin + caret.loc + Point::from((caret.size.w / 2., caret.size.h / 2.));
-    state.niri.panel_popover.pointer_click(&output, caret_pos);
-    let (_, card_rect, _) = state.niri.panel_popover.date_menu().unwrap().card_rects()[0];
+    state.synoik.panel_popover.pointer_click(&output, caret_pos);
+    let (_, card_rect, _) = state.synoik.panel_popover.date_menu().unwrap().card_rects()[0];
     assert!(
         card_rect.size.h > 90.,
         "the card grew: {}",
         card_rect.size.h
     );
     let caret = state
-        .niri
+        .synoik
         .panel_popover
         .date_menu()
         .unwrap()
@@ -2893,11 +2902,11 @@ fn vulkan_renders_the_expanded_card_body() {
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state.niri.panel_popover.render(
+            let elems = state.synoik.panel_popover.render(
                 vk,
-                &state.niri.icon_cache,
-                &state.niri.app_icon_cache,
-                &state.niri.image_cache,
+                &state.synoik.icon_cache,
+                &state.synoik.app_icon_cache,
+                &state.synoik.image_cache,
                 &output,
             );
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
@@ -2954,7 +2963,7 @@ fn vulkan_renders_a_grouped_stack_and_header() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
     let key = crate::notifications::SourceKey::PidName(9, "App".to_owned());
 
@@ -2972,10 +2981,10 @@ fn vulkan_renders_a_grouped_stack_and_header() {
         time_text: "Just now".to_owned(),
     };
     {
-        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
-        let cal = f.niri().gnome_settings.calendar;
-        let accent = f.niri().gnome_settings.accent_color;
-        f.niri().panel_popover.toggle_calendar(
+        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.synoik().gnome_settings.calendar;
+        let accent = f.synoik().gnome_settings.accent_color;
+        f.synoik().panel_popover.toggle_calendar(
             output.clone(),
             anchor,
             cal.week_start,
@@ -2992,20 +3001,20 @@ fn vulkan_renders_a_grouped_stack_and_header() {
     }
     f.settle_animations();
 
-    let origin = f.niri().panel_popover.content_location(&output);
+    let origin = f.synoik().panel_popover.content_location(&output);
     let w = to_physical_precise_round(scale.x, output_size(&output).w);
     let h = to_physical_precise_round(scale.x, 500.);
     let render_sample = |f: &mut Fixture, pts: Vec<(f64, f64)>| -> Vec<[u8; 4]> {
-        let state = f.niri_state();
+        let state = f.synoik_state();
         state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| {
-                let elems = state.niri.panel_popover.render(
+                let elems = state.synoik.panel_popover.render(
                     vk,
-                    &state.niri.icon_cache,
-                    &state.niri.app_icon_cache,
-                    &state.niri.image_cache,
+                    &state.synoik.icon_cache,
+                    &state.synoik.app_icon_cache,
+                    &state.synoik.image_cache,
                     &output,
                 );
                 let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
@@ -3029,7 +3038,7 @@ fn vulkan_renders_a_grouped_stack_and_header() {
     // band comes out darker than the lower one (the exact bug a 2-card group
     // cannot expose). Sampled at the card's horizontal center, clear of the
     // rounded corners.
-    let bounds = f.niri().panel_popover.date_menu().unwrap().group_rects()[0].1;
+    let bounds = f.synoik().panel_popover.date_menu().unwrap().group_rects()[0].1;
     let samples = render_sample(
         &mut f,
         vec![
@@ -3056,16 +3065,16 @@ fn vulkan_renders_a_grouped_stack_and_header() {
 
     // Expand the group through the real click path (clear of the close button).
     let expand_pt = origin + bounds.loc + Point::from((20., bounds.size.h - 6.));
-    f.niri().panel_popover.pointer_click(&output, expand_pt);
+    f.synoik().panel_popover.pointer_click(&output, expand_pt);
     assert!(
-        f.niri().panel_popover.date_menu().unwrap().group_rects()[0].2,
+        f.synoik().panel_popover.date_menu().unwrap().group_rects()[0].2,
         "the group expanded"
     );
 
     // The header collapse chevron composites bright over its button (a chevron
     // has no ink at its exact center — brightest pixel in the button).
     let collapse = f
-        .niri()
+        .synoik()
         .panel_popover
         .date_menu()
         .unwrap()
@@ -3101,7 +3110,7 @@ fn vulkan_renders_the_scrolled_message_list() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     let card = |id: u32| CardContent {
@@ -3129,10 +3138,10 @@ fn vulkan_renders_the_scrolled_message_list() {
     let mut groups = vec![group(1, vec![card(1), card(2), card(3)])];
     groups.extend((4..=13).map(|id| group(id, vec![card(id)])));
     {
-        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
-        let cal = f.niri().gnome_settings.calendar;
-        let accent = f.niri().gnome_settings.accent_color;
-        f.niri().panel_popover.toggle_calendar(
+        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.synoik().gnome_settings.calendar;
+        let accent = f.synoik().gnome_settings.accent_color;
+        f.synoik().panel_popover.toggle_calendar(
             output.clone(),
             anchor,
             cal.week_start,
@@ -3143,22 +3152,22 @@ fn vulkan_renders_the_scrolled_message_list() {
     }
     f.settle_animations();
 
-    let origin = f.niri().panel_popover.content_location(&output);
+    let origin = f.synoik().panel_popover.content_location(&output);
     let w = to_physical_precise_round(scale.x, output_size(&output).w);
     let h = to_physical_precise_round(scale.x, 500.);
     let list_w = 29. * crate::ui::pt_to_px(11.);
     let list_pad = crate::ui::calendar::list_pad();
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let samples = state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state.niri.panel_popover.render(
+            let elems = state.synoik.panel_popover.render(
                 vk,
-                &state.niri.icon_cache,
-                &state.niri.app_icon_cache,
-                &state.niri.image_cache,
+                &state.synoik.icon_cache,
+                &state.synoik.app_icon_cache,
+                &state.synoik.image_cache,
                 &output,
             );
             let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
@@ -3226,26 +3235,26 @@ fn vulkan_renders_the_quick_settings_popover() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     // Open the quick-settings popover under the right-box indicator.
     {
         let output_w = output_size(&output).w;
-        let toggles = f.niri().gnome_settings.quick_toggles;
-        let anchor = f.niri().panel.quick_settings_rect(output_w);
-        let network = f.niri().system_status.network;
-        let airplane = f.niri().system_status.airplane;
-        let power = f.niri().system_status.power.clone();
-        let bluetooth = f.niri().system_status.bluetooth.clone();
-        let bluetooth_rfkill = f.niri().system_status.bluetooth_rfkill;
-        let battery = f.niri().system_status.battery.clone();
-        let audio = f.niri().audio;
-        let sink_list = f.niri().sink_list.clone();
-        let mic = f.niri().mic;
-        let source_list = f.niri().source_list.clone();
-        let accent = f.niri().gnome_settings.accent_color;
-        f.niri().panel_popover.toggle_quick_settings(
+        let toggles = f.synoik().gnome_settings.quick_toggles;
+        let anchor = f.synoik().panel.quick_settings_rect(output_w);
+        let network = f.synoik().system_status.network;
+        let airplane = f.synoik().system_status.airplane;
+        let power = f.synoik().system_status.power.clone();
+        let bluetooth = f.synoik().system_status.bluetooth.clone();
+        let bluetooth_rfkill = f.synoik().system_status.bluetooth_rfkill;
+        let battery = f.synoik().system_status.battery.clone();
+        let audio = f.synoik().audio;
+        let sink_list = f.synoik().sink_list.clone();
+        let mic = f.synoik().mic;
+        let source_list = f.synoik().source_list.clone();
+        let accent = f.synoik().gnome_settings.accent_color;
+        f.synoik().panel_popover.toggle_quick_settings(
             output.clone(),
             anchor,
             toggles,
@@ -3265,20 +3274,20 @@ fn vulkan_renders_the_quick_settings_popover() {
             accent,
         );
     }
-    assert!(f.niri().panel_popover.is_open());
+    assert!(f.synoik().panel_popover.is_open());
     // Settle the open fade so the popover renders at full opacity (the clock trap).
     f.settle_animations();
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let opaque = state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state.niri.panel_popover.render(
+            let elems = state.synoik.panel_popover.render(
                 vk,
-                &state.niri.icon_cache,
-                &state.niri.app_icon_cache,
-                &state.niri.image_cache,
+                &state.synoik.icon_cache,
+                &state.synoik.app_icon_cache,
+                &state.synoik.image_cache,
                 &output,
             );
             assert!(
@@ -3300,14 +3309,14 @@ fn vulkan_renders_the_quick_settings_popover() {
 
 /// The quick-settings popover with a live brightness slider and its per-monitor card open renders
 /// on Vulkan: the extra slider row grows the menu, and the card adds label rows plus the shared
-/// slider body. Its real value is the validation-layer run (`NIRI_VK_VALIDATION=1`), which this
+/// slider body. Its real value is the validation-layer run (`SYNOIK_VK_VALIDATION=1`), which this
 /// test's draw path feeds.
 #[test]
 fn vulkan_renders_the_brightness_slider() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     // Seed two backlit monitors, exactly as the udev match would: two scales means the slider
@@ -3324,23 +3333,23 @@ fn vulkan_renders_the_brightness_slider() {
             backlight("DP-2", "Dell 24\u{2033}", 30),
         ],
     };
-    let _ = f.niri().brightness.monitors_changed(&snapshot);
-    f.niri().backlight = snapshot;
+    let _ = f.synoik().brightness.monitors_changed(&snapshot);
+    f.synoik().backlight = snapshot;
 
     open_quick_settings(&mut f, &output);
-    assert!(f.niri().panel_popover.is_open());
+    assert!(f.synoik().panel_popover.is_open());
     f.settle_animations();
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let opaque = state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state.niri.panel_popover.render(
+            let elems = state.synoik.panel_popover.render(
                 vk,
-                &state.niri.icon_cache,
-                &state.niri.app_icon_cache,
-                &state.niri.image_cache,
+                &state.synoik.icon_cache,
+                &state.synoik.app_icon_cache,
+                &state.synoik.image_cache,
                 &output,
             );
             assert!(
@@ -3372,35 +3381,35 @@ fn vulkan_renders_the_a11y_switches() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     // Count accent-blue-ish pixels (the on-state switch track, `_switches.scss:41`).
     let count_accent = |f: &mut Fixture, a11y: A11ySettings| {
-        f.niri().gnome_settings.a11y = a11y;
-        f.niri().panel.set_a11y(a11y);
+        f.synoik().gnome_settings.a11y = a11y;
+        f.synoik().panel.set_a11y(a11y);
         let anchor = f
-            .niri()
+            .synoik()
             .panel
             .a11y_rect(output_size(&output).w)
             .expect("the indicator is pinned on");
-        let accent = f.niri().gnome_settings.accent_color;
+        let accent = f.synoik().gnome_settings.accent_color;
         let out = output.clone();
-        f.niri()
+        f.synoik()
             .panel_popover
             .toggle_a11y(out.clone(), anchor, a11y, accent);
         f.settle_animations();
 
-        let state = f.niri_state();
+        let state = f.synoik_state();
         let n = state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| {
-                let elems = state.niri.panel_popover.render(
+                let elems = state.synoik.panel_popover.render(
                     vk,
-                    &state.niri.icon_cache,
-                    &state.niri.app_icon_cache,
-                    &state.niri.image_cache,
+                    &state.synoik.icon_cache,
+                    &state.synoik.app_icon_cache,
+                    &state.synoik.image_cache,
                     &out,
                 );
                 assert!(!elems.is_empty(), "the a11y menu must render");
@@ -3414,7 +3423,7 @@ fn vulkan_renders_the_a11y_switches() {
                     .count()
             })
             .expect("vulkan renderer");
-        f.niri().panel_popover.close();
+        f.synoik().panel_popover.close();
         f.settle_animations();
         n
     };
@@ -3448,24 +3457,27 @@ fn vulkan_renders_the_a11y_indicator_icon() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
     let width = to_physical_precise_round(scale.x, output_size(&output).w);
     let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::panel_height());
 
     let render_panel = |f: &mut Fixture| {
-        let ws = f.niri().workspace_state_for(&output);
-        let position = f.niri().workspace_position_for(&output);
-        let state = f.niri_state();
+        let ws = f.synoik().workspace_state_for(&output);
+        let position = f.synoik().workspace_position_for(&output);
+        let state = f.synoik_state();
         state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| {
-                let elems =
-                    state
-                        .niri
-                        .panel
-                        .render(vk, &output, ws, position, 0., &state.niri.icon_cache);
+                let elems = state.synoik.panel.render(
+                    vk,
+                    &output,
+                    ws,
+                    position,
+                    0.,
+                    &state.synoik.icon_cache,
+                );
                 composite_ui(
                     vk,
                     elems,
@@ -3478,7 +3490,7 @@ fn vulkan_renders_the_a11y_indicator_icon() {
 
     // Bright pixels inside the indicator's own rect — the glyph, if one resolved.
     let glyph_px = |f: &mut Fixture, pixels: &[u8]| {
-        let rect = f.niri().panel.a11y_rect(output_size(&output).w)?;
+        let rect = f.synoik().panel.a11y_rect(output_size(&output).w)?;
         let x0 = to_physical_precise_round(scale.x, rect.loc.x);
         let x1 = to_physical_precise_round(scale.x, rect.loc.x + rect.size.w);
         let mut n = 0;
@@ -3500,8 +3512,8 @@ fn vulkan_renders_the_a11y_indicator_icon() {
     // Pinned on: the button exists AND draws a glyph.
     let mut a11y = A11ySettings::default();
     a11y.always_show = true;
-    f.niri().gnome_settings.a11y = a11y;
-    f.niri().panel.set_a11y(a11y);
+    f.synoik().gnome_settings.a11y = a11y;
+    f.synoik().panel.set_a11y(a11y);
     let pixels = render_panel(&mut f);
     let n = glyph_px(&mut f, &pixels).expect("the indicator is pinned on");
     assert!(
@@ -3522,7 +3534,7 @@ fn vulkan_translucent_texture_element_claims_no_opaque_regions() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let state = f.niri_state();
+    let state = f.synoik_state();
     state
         .backend
         .headless()
@@ -3574,7 +3586,7 @@ fn vulkan_translucent_texture_element_claims_no_opaque_regions() {
 
 /// A resize animation on a Vulkan session must draw the cross-fade (`render_resize`), not the red
 /// `SolidColorBuffer` placeholder. Reproduces the live "the window becomes a red rect while
-/// maximizing/restoring" bug: map a window, issue a niri-driven (animated) resize, commit the new
+/// maximizing/restoring" bug: map a window, issue a synoik-driven (animated) resize, commit the new
 /// size, and composite mid-animation — the frame must show window content with no pure-red fill.
 ///
 /// This exercises the resize path end-to-end: the pre-resize neutral snapshot is captured through
@@ -3587,8 +3599,8 @@ fn vulkan_translucent_texture_element_claims_no_opaque_regions() {
 /// the silent way to lose the crossfade (verified by negative control).
 #[test]
 fn vulkan_resize_animation_is_not_a_red_rect() {
-    use niri_config::animations::{Curve, EasingParams, Kind};
-    use niri_ipc::SizeChange;
+    use synoik_config::animations::{Curve, EasingParams, Kind};
+    use synoik_ipc::SizeChange;
 
     if VulkanRenderer::new().is_err() {
         eprintln!("skipping vulkan_resize_animation_is_not_a_red_rect: no Vulkan device");
@@ -3603,7 +3615,7 @@ fn vulkan_resize_animation_is_not_a_red_rect() {
     config.animations.window_resize.anim.kind = LINEAR;
 
     let mut f = Fixture::with_config(config);
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -3622,11 +3634,13 @@ fn vulkan_resize_animation_is_not_a_red_rect() {
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
-    // Issue a niri-driven resize (this animates, like a keybind maximize).
-    f.niri().layout.set_column_width(SizeChange::SetFixed(900));
+    // Issue a synoik-driven resize (this animates, like a keybind maximize).
+    f.synoik()
+        .layout
+        .set_column_width(SizeChange::SetFixed(900));
     f.double_roundtrip(id);
 
     // The client commits the new size, which starts the resize animation.
@@ -3636,9 +3650,9 @@ fn vulkan_resize_animation_is_not_a_red_rect() {
     window.ack_last_and_commit();
     f.roundtrip(id);
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     assert!(
-        f.niri().layout.are_animations_ongoing(Some(&output)),
+        f.synoik().layout.are_animations_ongoing(Some(&output)),
         "expected an ongoing resize animation to composite"
     );
 
@@ -3682,7 +3696,7 @@ fn vulkan_resize_animation_is_not_a_red_rect() {
     // green and still red-free. What gives it away is the size — the crossfade shows the window
     // fading from its OLD geometry, while the fall-through draws it at its settled one. Measured:
     // 40k green mid-crossfade, vs 131k for the fall-through, which is exactly the settled count.
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     let (settled, w, h) = render_output_vulkan(&mut f, &output);
     let green_settled = (0..w * h)
         .filter(|i| is_green(px(&settled, w, i % w, i / w)))
@@ -3715,7 +3729,7 @@ fn vulkan_captures_the_resize_neutral_through_vulkan() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -3733,20 +3747,26 @@ fn vulkan_captures_the_resize_neutral_through_vulkan() {
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
-    // The server-side surface of the mapped window (cloned so the `f.niri()` borrow ends before we
-    // borrow the backend's Vulkan renderer).
+    // The server-side surface of the mapped window (cloned so the `f.synoik()` borrow ends before
+    // we borrow the backend's Vulkan renderer).
     let server_surface = {
-        let mapped = f.niri().layout.windows().next().expect("a mapped window").1;
+        let mapped = f
+            .synoik()
+            .layout
+            .windows()
+            .next()
+            .expect("a mapped window")
+            .1;
         mapped.toplevel().wl_surface().clone()
     };
 
     // buf_pos is irrelevant to the buffer content (we relocate by -geo.loc); use the origin.
     let scale = Scale::from(1.);
     let captured = f
-        .niri_state()
+        .synoik_state()
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
@@ -3801,7 +3821,7 @@ fn vulkan_captures_the_close_neutral_through_vulkan() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -3819,26 +3839,32 @@ fn vulkan_captures_the_close_neutral_through_vulkan() {
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
-    // The smithay `Window` backing the mapped tile (cloned so the `f.niri()` borrow ends). Uses the
-    // `LayoutElement::id` trait method (`= &Window`), not the inherent `Mapped::id() -> MappedId`.
+    // The smithay `Window` backing the mapped tile (cloned so the `f.synoik()` borrow ends). Uses
+    // the `LayoutElement::id` trait method (`= &Window`), not the inherent `Mapped::id() ->
+    // MappedId`.
     let window_id = crate::layout::LayoutElement::id(
-        f.niri().layout.windows().next().expect("a mapped window").1,
+        f.synoik()
+            .layout
+            .windows()
+            .next()
+            .expect("a mapped window")
+            .1,
     )
     .clone();
 
     // Capture the unmap snapshot. On a Vulkan session this goes through the owned renderer and
     // bakes no GLES texture at all. `None` output → no xray background, which is all a plain window
     // needs.
-    f.niri_state().store_unmap_snapshot(&window_id, None);
+    f.synoik_state().store_unmap_snapshot(&window_id, None);
 
     // Inspect the tile's captured snapshot. The window is still mapped (storing a snapshot does not
     // unmap it), so the tile is still in the active workspace.
     let snapshot = f
-        .niri_state()
-        .niri
+        .synoik_state()
+        .synoik
         .layout
         .active_workspace_mut()
         .expect("active workspace")
@@ -3885,7 +3911,7 @@ fn vulkan_picks_a_color_through_vulkan() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -3905,10 +3931,10 @@ fn vulkan_picks_a_color_through_vulkan() {
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
     let pos = smithay::utils::Point::<i32, Physical>::from((OUT_W as i32 / 2, OUT_H as i32 / 2));
 
@@ -3933,8 +3959,8 @@ fn vulkan_picks_a_color_through_vulkan() {
         ),
     ];
 
-    let state = f.niri_state();
-    state.niri.update_render_elements(Some(&output));
+    let state = f.synoik_state();
+    state.synoik.update_render_elements(Some(&output));
 
     for (probe, name) in probes {
         let want = px(&frame, fw, probe.x, probe.y);
@@ -3944,7 +3970,7 @@ fn vulkan_picks_a_color_through_vulkan() {
             .headless()
             .with_vulkan_renderer(|vk| {
                 crate::input::pick_color_grab::PickColorGrab::pick_color_with_renderer(
-                    &state.niri,
+                    &state.synoik,
                     vk,
                     &output,
                     probe,
@@ -3973,16 +3999,17 @@ fn vulkan_picks_a_color_through_vulkan() {
 #[test]
 fn vulkan_screenshots_a_window_through_vulkan() {
     // Phase C: window screenshot-to-disk renders through the *active* renderer. Drive the
-    // genericized `Niri::screenshot_window` on the owned Vulkan renderer end-to-end (no disk write,
-    // so no async encode thread to await) — it must run the full render + readback path without
-    // erroring. Pixel correctness of the composited scene is proven by the whole-scene tests above.
+    // genericized `Synoik::screenshot_window` on the owned Vulkan renderer end-to-end (no disk
+    // write, so no async encode thread to await) — it must run the full render + readback path
+    // without erroring. Pixel correctness of the composited scene is proven by the whole-scene
+    // tests above.
     if VulkanRenderer::new().is_err() {
         eprintln!("skipping vulkan_screenshots_a_window_through_vulkan: no Vulkan device");
         return;
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -4000,14 +4027,14 @@ fn vulkan_screenshots_a_window_through_vulkan() {
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
-    let output = f.niri_output(1);
-    let state = f.niri_state();
-    state.niri.update_render_elements(Some(&output));
+    let output = f.synoik_output(1);
+    let state = f.synoik_state();
+    state.synoik.update_render_elements(Some(&output));
     let mapped = state
-        .niri
+        .synoik
         .layout
         .windows()
         .next()
@@ -4016,7 +4043,7 @@ fn vulkan_screenshots_a_window_through_vulkan() {
 
     let ran = state.backend.headless().with_vulkan_renderer(|vk| {
         state
-            .niri
+            .synoik
             .screenshot_window(
                 vk,
                 &output,
@@ -4038,7 +4065,7 @@ fn vulkan_screenshots_a_window_through_vulkan() {
 /// End-to-end `render_to_shm` through the real wlr-screencopy protocol: a client captures the
 /// output into a `wl_shm` `Xrgb8888` buffer, and we read that buffer's bytes back.
 ///
-/// This is the only test that drives `render_to_shm` (`niri.rs`'s shm screencopy branch) as a
+/// This is the only test that drives `render_to_shm` (`synoik.rs`'s shm screencopy branch) as a
 /// whole — every other shm test exercises a piece (the byte-order swizzle, the import cache). A
 /// plain `copy` renders synchronously server-side, so the capture completes within a roundtrip.
 ///
@@ -4142,7 +4169,7 @@ fn vulkan_render_to_dmabuf_composites_the_scene() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let file = match File::options()
         .read(true)
@@ -4182,13 +4209,13 @@ fn vulkan_render_to_dmabuf_composites_the_scene() {
     };
     let mut dmabuf = bo.export().expect("export dmabuf");
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let (pixels, w, h) = state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
-            let niri = &mut state.niri;
-            niri.update_render_elements(Some(&output));
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
 
             let size: Size<i32, Physical> = output.current_mode().unwrap().size;
             let size = output.current_transform().transform_size(size);
@@ -4199,7 +4226,7 @@ fn vulkan_render_to_dmabuf_composites_the_scene() {
                 target: RenderTarget::ScreenCapture,
                 xray: None,
             };
-            let elements: Vec<OutputRenderElements> = niri.render_to_vec(ctx, &output, false);
+            let elements: Vec<OutputRenderElements> = synoik.render_to_vec(ctx, &output, false);
 
             // The exact damage-tracker flow the screencopy path runs: `damage_output` to derive the
             // element states, then `render_to_dmabuf` (which binds + `render_output_with_states`).
@@ -4307,9 +4334,9 @@ fn vulkan_renders_a_window_mid_open_animation() {
     let Some(mut f) = window_fixture_settled(GREEN, false, None) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     assert!(
-        f.niri().layout.are_animations_ongoing(Some(&output)),
+        f.synoik().layout.are_animations_ongoing(Some(&output)),
         "expected the window open animation to be active"
     );
 
@@ -4325,7 +4352,7 @@ fn vulkan_renders_a_window_mid_open_animation() {
     let green_early = count_green(&early, w, h);
 
     // Settled: the window is fully opaque.
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     let (settled, _, _) = render_output_vulkan(&mut f, &output);
     let green_settled = assert_window_and_background(&settled, w, h);
 
@@ -4345,7 +4372,7 @@ fn vulkan_renders_a_window_mid_open_animation() {
 /// proves the shader works while saying nothing about whether the compositor ever gets there.
 ///
 /// The wiring is what is fragile: the install runs inside `reload_config`
-/// (`niri.rs:1717` — `with_vulkan_renderer(|vk| vk.set_custom_open_shader(src))`), and
+/// (`synoik.rs:1717` — `with_vulkan_renderer(|vk| vk.set_custom_open_shader(src))`), and
 /// `opening_window.rs:167` gates on `has_custom_shader`. If that install is skipped — a
 /// `with_vulkan_renderer` returning `None`, or the line going out with the GLES one beside it —
 /// `has_custom_shader` is false and the built-in scale+fade runs instead. No error; the user's
@@ -4363,7 +4390,7 @@ fn vulkan_reaches_the_configured_custom_open_shader() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -4380,7 +4407,7 @@ fn vulkan_reaches_the_configured_custom_open_shader() {
          }"
         .to_owned(),
     );
-    f.niri_state().reload_config(config);
+    f.synoik_state().reload_config(config);
 
     // Map a green window and leave its open animation running.
     let id = f.add_client();
@@ -4394,9 +4421,9 @@ fn vulkan_reaches_the_configured_custom_open_shader() {
     window.ack_last_and_commit();
     f.double_roundtrip(id);
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     assert!(
-        f.niri().layout.are_animations_ongoing(Some(&output)),
+        f.synoik().layout.are_animations_ongoing(Some(&output)),
         "expected the window open animation to be active"
     );
 
@@ -4425,12 +4452,12 @@ fn vulkan_reaches_the_configured_custom_open_shader() {
 /// alpha even mid-fade, so this fails if the Vulkan offscreen arm stops being reached.
 #[test]
 fn vulkan_renders_a_tile_mid_alpha_animation() {
-    use niri_config::animations::{Curve, EasingParams, Kind};
+    use synoik_config::animations::{Curve, EasingParams, Kind};
 
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
     let count_green = |pixels: &[u8], w: i32, h: i32| {
@@ -4444,15 +4471,15 @@ fn vulkan_renders_a_tile_mid_alpha_animation() {
     let green_settled = assert_window_and_background(&settled, w, h);
 
     // Fade the tile out over 1s, linearly, and stop half way.
-    let anim = niri_config::Animation {
+    let anim = synoik_config::Animation {
         off: false,
         kind: Kind::Easing(EasingParams {
             duration_ms: 1000,
             curve: Curve::Linear,
         }),
     };
-    f.niri_state()
-        .niri
+    f.synoik_state()
+        .synoik
         .layout
         .active_workspace_mut()
         .expect("active workspace")
@@ -4461,13 +4488,13 @@ fn vulkan_renders_a_tile_mid_alpha_animation() {
         .expect("a tile")
         .animate_alpha(1., 0., anim);
 
-    let now = f.niri().clock.now_unadjusted();
-    f.niri()
+    let now = f.synoik().clock.now_unadjusted();
+    f.synoik()
         .clock
         .set_unadjusted(now + std::time::Duration::from_millis(500));
-    f.niri().advance_animations();
+    f.synoik().advance_animations();
     assert!(
-        f.niri().layout.are_animations_ongoing(Some(&output)),
+        f.synoik().layout.are_animations_ongoing(Some(&output)),
         "expected the alpha animation to still be running at the half-way point"
     );
 
@@ -4581,7 +4608,7 @@ fn vulkan_a_blurred_frame_adds_no_submits() {
 
     let size = Size::<i32, Physical>::from((256, 256));
     let submits = |_: ()| -> u64 {
-        niri_vk::stats::take_sites()
+        synoik_vk::stats::take_sites()
             .iter()
             .map(|site| site.submits)
             .sum()
@@ -4654,12 +4681,12 @@ fn vulkan_a_blurred_frame_adds_no_submits() {
 /// synchronization.
 #[test]
 fn vulkan_imports_a_client_dmabuf() {
-    use niri_vk::dmabuf::ForeignBuffer;
     use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
     use smithay::backend::allocator::Modifier;
     use smithay::backend::renderer::element::Kind;
     use smithay::backend::renderer::ImportDma;
     use smithay::utils::Point;
+    use synoik_vk::dmabuf::ForeignBuffer;
 
     use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 
@@ -4764,7 +4791,7 @@ fn vulkan_imports_a_client_dmabuf() {
 ///
 /// Two textures (not a solid + a texture) so `render_to_vec`'s element type stays homogeneous.
 /// Note the ordering: `render_helpers::render_to_vec` draws in iterator order, so the **last**
-/// element is the topmost — the opposite of the `Niri::render_to_vec` element list, where the
+/// element is the topmost — the opposite of the `Synoik::render_to_vec` element list, where the
 /// first is. Putting the wash first here paints it *under* the opaque backdrop and the readback is
 /// a flat 51, which is a passing-looking way to test nothing.
 #[test]
@@ -4956,9 +4983,9 @@ fn vulkan_capture_region_splits_the_render_pass() {
 /// lavapipe too. This is the payoff of the mid-frame render-pass split.
 #[test]
 fn vulkan_backdrop_blur_softens_a_hard_edge() {
-    use niri_config::CornerRadius;
     use smithay::backend::renderer::Offscreen;
     use smithay::utils::user_data::UserDataMap;
+    use synoik_config::CornerRadius;
 
     use crate::render_helpers::background_effect::RenderParams;
     use crate::render_helpers::blur::BlurOptions;
@@ -5218,9 +5245,9 @@ fn vulkan_backdrop_blur_honours_the_subregion() {
 /// Offscreen-only, so it runs on lavapipe too.
 #[test]
 fn vulkan_effect_buffer_renders_offscreen_and_blur() {
-    use niri_vk::render::PostprocessPush;
     use smithay::backend::renderer::element::Kind;
     use smithay::backend::renderer::{Offscreen, Texture as _};
+    use synoik_vk::render::PostprocessPush;
 
     use crate::render_helpers::blur::BlurOptions;
     use crate::render_helpers::effect_buffer::EffectBuffer;
@@ -5254,8 +5281,8 @@ fn vulkan_effect_buffer_renders_offscreen_and_blur() {
         bg_color: [0.0; 4],
         input_to_geo: IDENTITY_MAT3,
         sample_transform: IDENTITY_MAT3,
-        niri_scale: 1.0,
-        niri_alpha: 1.0,
+        synoik_scale: 1.0,
+        synoik_alpha: 1.0,
         saturation: 1.0,
         noise: 0.0,
     };
@@ -5341,7 +5368,7 @@ fn vulkan_effect_buffer_renders_offscreen_and_blur() {
         "prepare_vulkan (no blur) failed"
     );
 
-    // The states of the Vulkan render must be observable: `Niri::update_primary_scanout_output`
+    // The states of the Vulkan render must be observable: `Synoik::update_primary_scanout_output`
     // reads them to remap a background layer surface that is visible only through this xray buffer
     // onto the xray element's id. Reading the GLES arm here returned `None` on every real frame, so
     // that remap silently never fired and such a surface had its frame callbacks throttled.
@@ -5489,9 +5516,9 @@ fn vulkan_xray_honors_the_cropped_src_fold() {
     use std::rc::Rc;
 
     use glam::{Mat3, Vec2};
-    use niri_config::CornerRadius;
     use smithay::backend::renderer::element::Kind;
     use smithay::utils::Logical;
+    use synoik_config::CornerRadius;
 
     use crate::render_helpers::effect_buffer::EffectBuffer;
     use crate::render_helpers::render_to_vec;
@@ -5540,7 +5567,7 @@ fn vulkan_xray_honors_the_cropped_src_fold() {
         ]
     }
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
 
     // Vulkan (program = None → draws through render_postprocess).
     let vk = state
@@ -5854,7 +5881,7 @@ fn clipped_window_fixture() -> Option<Fixture> {
     });
 
     let mut f = Fixture::with_config(config);
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -5876,7 +5903,7 @@ fn clipped_window_fixture() -> Option<Fixture> {
     window.ack_last_and_commit();
     f.double_roundtrip(id);
 
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     Some(f)
@@ -5886,16 +5913,17 @@ const CLIP_RADIUS: f32 = 30.;
 
 /// The clip material must both **sample** the window (rounded corners are not blank) and **round**
 /// it (the geometry corners are cut away), matching the GLES oracle. This drives the full
-/// `Niri::render_to_vec` scene — a green window with a corner radius + `clip-to-geometry` — through
-/// both renderers and asserts, without pixel-exact AA comparison, that: the window center is green
-/// (sampled), the corners of the green region are **not** green (rounded away to the backdrop), and
-/// the mid-edges **are** green (only the corners were cut — it is rounding, not a full clip).
+/// `Synoik::render_to_vec` scene — a green window with a corner radius + `clip-to-geometry` —
+/// through both renderers and asserts, without pixel-exact AA comparison, that: the window center
+/// is green (sampled), the corners of the green region are **not** green (rounded away to the
+/// backdrop), and the mid-edges **are** green (only the corners were cut — it is rounding, not a
+/// full clip).
 #[test]
 fn vulkan_clips_a_window_to_rounded_geometry() {
     let Some(mut f) = clipped_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
 
@@ -5978,15 +6006,15 @@ fn vulkan_clipped_tile_pushes_its_rounded_corner_damage() {
     let Some(mut f) = clipped_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let found = state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let niri = &mut state.niri;
-            niri.update_render_elements(Some(&output));
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
             let ctx = RenderCtx {
                 renderer: vk,
                 target: RenderTarget::Output,
@@ -5995,7 +6023,8 @@ fn vulkan_clipped_tile_pushes_its_rounded_corner_damage() {
             // Same `{elem:?}`-sniffing idiom as `render_helpers::debug::push_opaque_regions`: the
             // element list is an opaque enum tree, and `ExtraDamage` is the only thing in this
             // scene that prints as one (blur/background-effect, the other user, is off here).
-            niri.render_to_vec(ctx, &output, false)
+            synoik
+                .render_to_vec(ctx, &output, false)
                 .iter()
                 .any(|elem| format!("{elem:?}").contains("ExtraDamage"))
         })
@@ -6021,14 +6050,14 @@ fn vulkan_clips_a_window_through_the_overview_wrapper() {
     let Some(mut f) = clipped_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    f.niri_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().do_action(Action::OpenOverview, false);
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "the overview must be open"
     );
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
@@ -6040,7 +6069,7 @@ fn vulkan_clips_a_window_through_the_overview_wrapper() {
     // miniature (it is now always shown — `docs/fork/dynamic-workspaces-divergence.md`), and
     // a bbox spanning both would measure the strip rather than the wrapped picker render.
     let picker_top = f
-        .niri()
+        .synoik()
         .layout
         .controls_layout_for_output(&output)
         .expect("output 1 has a monitor")
@@ -6110,7 +6139,7 @@ fn vulkan_draws_a_rounded_focus_ring() {
     });
 
     let mut f = Fixture::with_config(config);
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -6127,10 +6156,10 @@ fn vulkan_draws_a_rounded_focus_ring() {
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
     // The active focus ring: blue-dominant, high blue (~[127,200,255]); distinct from the green
@@ -6180,7 +6209,7 @@ fn shm_window_fixture() -> Option<(Fixture, ClientId, WlSurface, Output)> {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -6198,10 +6227,10 @@ fn shm_window_fixture() -> Option<(Fixture, ClientId, WlSurface, Output)> {
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     Some((f, id, surface, output))
 }
 
@@ -6300,7 +6329,7 @@ fn vulkan_composites_for_a_screencast() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Screencast);
     assert_window_and_background(&pixels, w, h);
@@ -6330,13 +6359,13 @@ fn vulkan_draws_a_window_shadow() {
     config.layout.shadow.softness = 40.;
     config.layout.shadow.spread = 10.;
     // Straight down-and-right offset would bias the sampling; keep it centered.
-    config.layout.shadow.offset = niri_config::ShadowOffset {
-        x: niri_config::FloatOrInt(0.),
-        y: niri_config::FloatOrInt(0.),
+    config.layout.shadow.offset = synoik_config::ShadowOffset {
+        x: synoik_config::FloatOrInt(0.),
+        y: synoik_config::FloatOrInt(0.),
     };
 
     let mut f = Fixture::with_config(config);
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -6353,10 +6382,10 @@ fn vulkan_draws_a_window_shadow() {
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
     // Find the green window, then walk left from its edge along its vertical centre.
@@ -6411,9 +6440,9 @@ fn vulkan_draws_a_window_shadow() {
 /// checked too, so a fix that simply blanks the window everywhere can't pass.
 #[test]
 fn vulkan_blocked_out_window_does_not_leak_while_resizing() {
-    use niri_config::animations::{Curve, EasingParams, Kind};
-    use niri_config::BlockOutFrom;
-    use niri_ipc::SizeChange;
+    use synoik_config::animations::{Curve, EasingParams, Kind};
+    use synoik_config::BlockOutFrom;
+    use synoik_ipc::SizeChange;
 
     if VulkanRenderer::new().is_err() {
         eprintln!("skipping vulkan_blocked_out_window_does_not_leak_while_resizing: no Vulkan");
@@ -6432,7 +6461,7 @@ fn vulkan_blocked_out_window_does_not_leak_while_resizing() {
     });
 
     let mut f = Fixture::with_config(config);
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -6450,11 +6479,13 @@ fn vulkan_blocked_out_window_does_not_leak_while_resizing() {
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     // Start an animated resize, and let the client commit the new size so the crossfade begins.
-    f.niri().layout.set_column_width(SizeChange::SetFixed(900));
+    f.synoik()
+        .layout
+        .set_column_width(SizeChange::SetFixed(900));
     f.double_roundtrip(id);
     let window = f.client(id).window(&surface);
     window.attach_shm_buffer(900, WIN as i32, 0, 255, 0, 255);
@@ -6462,9 +6493,9 @@ fn vulkan_blocked_out_window_does_not_leak_while_resizing() {
     window.ack_last_and_commit();
     f.roundtrip(id);
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     assert!(
-        f.niri().layout.are_animations_ongoing(Some(&output)),
+        f.synoik().layout.are_animations_ongoing(Some(&output)),
         "expected an ongoing resize animation to composite",
     );
 
@@ -6507,11 +6538,11 @@ fn vulkan_screenshot_ui_draws_the_frozen_screen_into_a_cast() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    f.niri_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(false, None);
     assert!(
-        f.niri().screenshot_ui.is_open(),
+        f.synoik().screenshot_ui.is_open(),
         "screenshot UI must be open"
     );
     settle_screenshot_ui_open(&mut f);
@@ -6540,23 +6571,28 @@ fn close_the_only_window(f: &mut Fixture, output: &Output) {
     use crate::utils::transaction::Transaction;
 
     let window_id = crate::layout::LayoutElement::id(
-        f.niri().layout.windows().next().expect("a mapped window").1,
+        f.synoik()
+            .layout
+            .windows()
+            .next()
+            .expect("a mapped window")
+            .1,
     )
     .clone();
 
-    f.niri_state()
+    f.synoik_state()
         .store_unmap_snapshot(&window_id, Some(output));
 
     let transaction = Transaction::new();
     let blocker = transaction.blocker();
-    let state = f.niri_state();
+    let state = f.synoik_state();
     // `None`, as a Vulkan session does: the snapshot is renderer-neutral and no GLES renderer is
     // involved in starting the animation.
     state
-        .niri
+        .synoik
         .layout
         .start_close_animation_for_window(&window_id, blocker);
-    state.niri.layout.remove_window(&window_id, transaction);
+    state.synoik.layout.remove_window(&window_id, transaction);
 }
 
 /// A closing window must draw into a **screencast**, not just on screen.
@@ -6569,11 +6605,11 @@ fn vulkan_draws_a_closing_window_into_a_cast() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     close_the_only_window(&mut f, &output);
     assert!(
-        f.niri().layout.are_animations_ongoing(Some(&output)),
+        f.synoik().layout.are_animations_ongoing(Some(&output)),
         "expected an ongoing close animation to composite",
     );
 
@@ -6619,7 +6655,7 @@ fn vulkan_blocked_out_closing_window_does_not_leak_into_a_cast() {
         return;
     }
 
-    use niri_config::BlockOutFrom;
+    use synoik_config::BlockOutFrom;
 
     let mut config = Config::default();
     config.window_rules.push(WindowRule {
@@ -6628,7 +6664,7 @@ fn vulkan_blocked_out_closing_window_does_not_leak_into_a_cast() {
     });
 
     let mut f = Fixture::with_config(config);
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -6646,13 +6682,13 @@ fn vulkan_blocked_out_closing_window_does_not_leak_into_a_cast() {
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     close_the_only_window(&mut f, &output);
     assert!(
-        f.niri().layout.are_animations_ongoing(Some(&output)),
+        f.synoik().layout.are_animations_ongoing(Some(&output)),
         "expected an ongoing close animation to composite",
     );
 
@@ -6695,10 +6731,10 @@ fn vulkan_hotkey_overlay_draws() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // The overlay is shown at startup by default; hide it for a clean baseline.
-    f.niri().hotkey_overlay.hide();
+    f.synoik().hotkey_overlay.hide();
     let (before, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
     assert_eq!(
         white_px_in_overlay_band(&before, w, h),
@@ -6706,7 +6742,7 @@ fn vulkan_hotkey_overlay_draws() {
         "the overlay band must be empty with the overlay closed, else it cannot witness it"
     );
 
-    f.niri().hotkey_overlay.show();
+    f.synoik().hotkey_overlay.show();
 
     let (after, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
     let white = white_px_in_overlay_band(&after, w, h);
@@ -6731,9 +6767,9 @@ fn vulkan_area_cast_crops_to_the_output_subrect() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let output_geo = f
-        .niri()
+        .synoik()
         .global_space
         .output_geometry(&output)
         .expect("output geometry");
@@ -6741,13 +6777,13 @@ fn vulkan_area_cast_crops_to_the_output_subrect() {
     // A sub-rectangle well inside the 1280×720 output (scale 1 → physical == logical).
     let area = Rectangle::new(Point::from((200, 150)), Size::from((400, 300)));
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let (full, crop) = state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-            let niri = &mut state.niri;
-            niri.update_render_elements(Some(&output));
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
 
             let size: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -6758,7 +6794,7 @@ fn vulkan_area_cast_crops_to_the_output_subrect() {
                 target: RenderTarget::Screencast,
                 xray: None,
             };
-            let elements = niri.render_to_vec(ctx, &output, false);
+            let elements = synoik.render_to_vec(ctx, &output, false);
             let full = render_to_vec(
                 vk,
                 size,
@@ -6829,7 +6865,7 @@ fn an_icon_theme_change_keeps_the_symbolic_icons_drawable() {
     // worker — so a bare replacement has nothing to draw and every symbolic icon on screen
     // (panel status, quick-settings toggles, calendar chevrons) vanishes until it catches up.
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -6840,7 +6876,7 @@ fn an_icon_theme_change_keeps_the_symbolic_icons_drawable() {
     const PX: f64 = 16.;
     const COLOR: [f32; 4] = [1., 1., 1., 1.];
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let outcome = state.backend.headless().with_vulkan_renderer(|vk| {
         let mut cache = IconCache::new("Adwaita");
         let rx = cache.wire_test_worker();
@@ -6905,40 +6941,40 @@ fn a_ping_on_an_unchanged_catalog_keeps_the_dash_icons() {
     // tiles until the worker caught up. That is the single dash flicker ~6s after startup that
     // needed nothing to be happening.
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let catalog = FakeCatalog::new(vec![
         AppEntry::fake("a.desktop", "a.desktop"),
         AppEntry::fake("b.desktop", "b.desktop"),
     ]);
     let apps = catalog.apps.clone();
-    f.niri().app_system =
+    f.synoik().app_system =
         AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
-    f.niri()
+    f.synoik()
         .app_system
         .set_favorites(vec!["a.desktop".into(), "b.desktop".into()]);
-    f.niri().sync_dash_favorites();
+    f.synoik().sync_dash_favorites();
 
     let controls = f
-        .niri()
+        .synoik()
         .layout
         .controls_layout_for_output(&output)
         .expect("output 1 has a monitor");
 
     // Render once, purely to populate the upload cache the reload would drop.
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let rendered = state.backend.headless().with_vulkan_renderer(|vk| {
-        let niri = &mut state.niri;
-        let _ = niri.dash.render(
+        let synoik = &mut state.synoik;
+        let _ = synoik.dash.render(
             vk,
-            &niri.app_icon_cache,
-            &niri.icon_cache,
+            &synoik.app_icon_cache,
+            &synoik.icon_cache,
             &output,
             controls.dash,
             1.0,
@@ -6949,15 +6985,15 @@ fn a_ping_on_an_unchanged_catalog_keeps_the_dash_icons() {
         return;
     }
 
-    let warm = f.niri().dash.icon_upload_count();
+    let warm = f.synoik().dash.icon_upload_count();
     assert!(
         warm > 0,
         "the dash uploaded no icons, so this test could not see them being dropped"
     );
 
-    f.niri().reload_app_catalog();
+    f.synoik().reload_app_catalog();
     assert_eq!(
-        f.niri().dash.icon_upload_count(),
+        f.synoik().dash.icon_upload_count(),
         warm,
         "a ping on an unchanged catalog dropped the dash icon uploads — every tile would \
          draw blank until the off-thread decodes land"
@@ -6965,12 +7001,12 @@ fn a_ping_on_an_unchanged_catalog_keeps_the_dash_icons() {
 
     // And a catalog that really did change must not blank them either: the old pixels
     // stay up until each replacement decode lands, which is when that icon's upload is
-    // dropped (`Niri::drop_app_icon_uploads`).
+    // dropped (`Synoik::drop_app_icon_uploads`).
     apps.borrow_mut()
         .push(AppEntry::fake("c.desktop", "c.desktop"));
-    f.niri().reload_app_catalog();
+    f.synoik().reload_app_catalog();
     assert_eq!(
-        f.niri().dash.icon_upload_count(),
+        f.synoik().dash.icon_upload_count(),
         warm,
         "a changed catalog dropped the uploads up front — the dash would draw blank \
          tiles until the worker caught up, which is the flicker this all exists to avoid"
@@ -6999,45 +7035,45 @@ fn vulkan_dash_icons_shrink_with_the_ramped_tiles() {
     let spill =
         |size: (u16, u16)| -> u32 {
             let mut f = Fixture::new();
-            f.niri_state()
+            f.synoik_state()
                 .backend
                 .headless()
                 .add_renderer()
                 .expect("build the Vulkan renderer");
             f.add_output(1, size);
-            let output = f.niri_output(1);
+            let output = f.synoik_output(1);
 
             let apps = vec![
                 AppEntry::fake("a.desktop", "a.desktop"),
                 AppEntry::fake("b.desktop", "b.desktop"),
             ];
-            f.niri().app_system = AppSystem::with_parts(
+            f.synoik().app_system = AppSystem::with_parts(
                 Box::new(FakeCatalog::new(apps)),
                 Box::new(RecordingLauncher::default()),
             );
-            f.niri()
+            f.synoik()
                 .app_system
                 .set_favorites(vec!["a.desktop".into(), "b.desktop".into()]);
-            f.niri().sync_dash_favorites();
+            f.synoik().sync_dash_favorites();
 
             let controls = f
-                .niri()
+                .synoik()
                 .layout
                 .controls_layout_for_output(&output)
                 .expect("the output has a monitor");
             let band = controls.dash;
             let tiles: Vec<Rectangle<f64, Logical>> = (0..2)
-                .map(|i| f.niri().dash.tile_rect(i, band).expect("a dash tile"))
+                .map(|i| f.synoik().dash.tile_rect(i, band).expect("a dash tile"))
                 .collect();
 
-            let state = f.niri_state();
+            let state = f.synoik_state();
             let composited = state.backend.headless().with_vulkan_renderer(
                 |vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                    let niri = &mut state.niri;
-                    let elements = niri.dash.render(
+                    let synoik = &mut state.synoik;
+                    let elements = synoik.dash.render(
                         vk,
-                        &niri.app_icon_cache,
-                        &niri.icon_cache,
+                        &synoik.app_icon_cache,
+                        &synoik.icon_cache,
                         &output,
                         band,
                         1.,
@@ -7103,46 +7139,54 @@ fn vulkan_dash_hover_lightens_the_tile() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let apps = vec![
         AppEntry::fake("a.desktop", "a.desktop"),
         AppEntry::fake("b.desktop", "b.desktop"),
     ];
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(apps)),
         Box::new(RecordingLauncher::default()),
     );
-    f.niri()
+    f.synoik()
         .app_system
         .set_favorites(vec!["a.desktop".into(), "b.desktop".into()]);
-    f.niri().sync_dash_favorites();
-    f.niri().dash.set_hovered(Some(DashHit::App(0)));
+    f.synoik().sync_dash_favorites();
+    f.synoik().dash.set_hovered(Some(DashHit::App(0)));
 
     let controls = f
-        .niri()
+        .synoik()
         .layout
         .controls_layout_for_output(&output)
         .expect("output 1 has a monitor");
-    let c0 = f.niri().dash.tile_center(0, controls.dash).expect("tile 0");
-    let c1 = f.niri().dash.tile_center(1, controls.dash).expect("tile 1");
+    let c0 = f
+        .synoik()
+        .dash
+        .tile_center(0, controls.dash)
+        .expect("tile 0");
+    let c1 = f
+        .synoik()
+        .dash
+        .tile_center(1, controls.dash)
+        .expect("tile 1");
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let composited = state.backend.headless().with_vulkan_renderer(
         |vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
-            let niri = &mut state.niri;
+            let synoik = &mut state.synoik;
             // Render the dash directly at full opacity — this pins the bake, not the
             // overview open animation (whose progress is subject to the headless clock).
-            let elements = niri.dash.render(
+            let elements = synoik.dash.render(
                 vk,
-                &niri.app_icon_cache,
-                &niri.icon_cache,
+                &synoik.app_icon_cache,
+                &synoik.icon_cache,
                 &output,
                 controls.dash,
                 1.0,
@@ -7196,16 +7240,16 @@ fn vulkan_hovered_preview_draws_its_close_button() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
-    f.niri().hotkey_overlay.hide();
-    let win = f.niri().layout.focus().unwrap().window.clone();
+    let output = f.synoik_output(1);
+    f.synoik().hotkey_overlay.hide();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
 
-    f.niri_state().do_action(Action::OpenOverview, false);
-    f.niri_state().update_keyboard_focus();
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().update_keyboard_focus();
     f.settle_animations();
 
     // Un-hovered: the button's outer corner is bare backdrop.
-    let slot = f.niri().layout.expose_target_rect(&win).unwrap();
+    let slot = f.synoik().layout.expose_target_rect(&win).unwrap();
     let probe = |rect: smithay::utils::Rectangle<f64, smithay::utils::Logical>| {
         let b = close_rect(rect);
         (
@@ -7219,11 +7263,11 @@ fn vulkan_hovered_preview_draws_its_close_button() {
 
     // Hover the preview and settle the 200ms overlay fade.
     let center = slot.loc + slot.size.downscale(2.).to_point();
-    let cur = f.niri().seat.get_pointer().unwrap().current_location();
+    let cur = f.synoik().seat.get_pointer().unwrap().current_location();
     f.pointer_motion(center.x - cur.x, center.y - cur.y);
     f.settle_animations();
 
-    let drawn = f.niri().layout.expose_drawn_rect(&win).unwrap();
+    let drawn = f.synoik().layout.expose_drawn_rect(&win).unwrap();
     let (bx, by) = probe(drawn);
     let (pixels, w, _) = render_output_vulkan(&mut f, &output);
     let button = px(&pixels, w, bx, by);
@@ -7247,12 +7291,12 @@ fn vulkan_hovered_preview_draws_its_close_button() {
 /// The overview search cross-fade actually *blends* the window picker: a mid-fade
 /// frame must read `S·α + B·(1−α)` at the preview center — not `S` (the group
 /// pushed straight through) and not `B` (the group dropped). This pins the
-/// partial-alpha offscreen-composite branch of `Niri::push_group_at_alpha`, which
+/// partial-alpha offscreen-composite branch of `Synoik::push_group_at_alpha`, which
 /// every other test skips by settling the fade to one end.
 ///
 /// Two traps make the naive version of this test lie:
-/// - The startup "Important Hotkeys" overlay (`Niri::new`) sits over the picker and is dismissed by
-///   the *first key press* — so engaging the search would otherwise change the frame by a whole
+/// - The startup "Important Hotkeys" overlay (`Synoik::new`) sits over the picker and is dismissed
+///   by the *first key press* — so engaging the search would otherwise change the frame by a whole
 ///   panel, not just the picker's alpha.
 /// - `green > 200` matches **white**, not green: the panel clock, the entry caret and the card text
 ///   all clear it. The reference has to come from the preview's own rect, and the assertion from
@@ -7264,31 +7308,31 @@ fn vulkan_search_fade_blends_the_picker_at_partial_alpha() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // An empty catalog: on a machine with real desktop entries "a" would match
     // apps and draw their icons over the frame.
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![])),
         Box::new(RecordingLauncher::default()),
     );
-    f.niri().hotkey_overlay.hide();
-    let win = f.niri().layout.focus().unwrap().window.clone();
+    f.synoik().hotkey_overlay.hide();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
 
-    f.niri_state().do_action(Action::OpenOverview, false);
-    f.niri_state().update_keyboard_focus();
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().update_keyboard_focus();
     f.settle_animations();
 
     // The preview's own rect, from the layout — no pixel hunting. Its center
     // holds picker content only (the results card sits well above it).
-    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
     let (cx, cy) = (
         (rect.loc.x + rect.size.w / 2.) as i32,
         (rect.loc.y + rect.size.h / 2.) as i32,
     );
 
     // S — fade 0, the pass-through end.
-    assert_eq!(f.niri().overview_search_fade(), 0.);
+    assert_eq!(f.synoik().overview_search_fade(), 0.);
     let (pixels, w, _) = render_output_vulkan(&mut f, &output);
     let s = px(&pixels, w, cx, cy);
     assert!(
@@ -7299,14 +7343,16 @@ fn vulkan_search_fade_blends_the_picker_at_partial_alpha() {
     // Engage the search and pin the clock part-way through the 250ms ease.
     f.key_press(30); // KEY_A
     f.key_release(30);
-    f.niri().advance_animations();
+    f.synoik().advance_animations();
     {
-        let niri = f.niri();
-        let now = niri.clock.now_unadjusted();
-        niri.clock.set_unadjusted(now + Duration::from_millis(100));
-        niri.advance_animations();
+        let synoik = f.synoik();
+        let now = synoik.clock.now_unadjusted();
+        synoik
+            .clock
+            .set_unadjusted(now + Duration::from_millis(100));
+        synoik.advance_animations();
     }
-    let fade = f.niri().overview_search_fade();
+    let fade = f.synoik().overview_search_fade();
     assert!(
         fade > 0.1 && fade < 0.9,
         "the fade must be partial, got {fade}"
@@ -7316,7 +7362,7 @@ fn vulkan_search_fade_blends_the_picker_at_partial_alpha() {
 
     // B — fade 1, where the group is dropped entirely.
     f.settle_animations();
-    assert_eq!(f.niri().overview_search_fade(), 1.);
+    assert_eq!(f.synoik().overview_search_fade(), 1.);
     let (pixels, ..) = render_output_vulkan(&mut f, &output);
     let b = px(&pixels, w, cx, cy);
     assert!(
@@ -7379,8 +7425,8 @@ fn vulkan_overview_panel_background_matches_the_backdrop() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
-    f.niri().hotkey_overlay.hide();
+    let output = f.synoik_output(1);
+    f.synoik().hotkey_overlay.hide();
 
     // A column with no panel content in either state: right of the Activities button and
     // well clear of the right-hand cluster (the status indicators and, past them, the clock).
@@ -7402,11 +7448,11 @@ fn vulkan_overview_panel_background_matches_the_backdrop() {
         "on the desktop the bar is opaque $panel_bg_color black"
     );
 
-    f.niri_state().do_action(Action::OpenOverview, false);
-    f.niri_state().update_keyboard_focus();
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().update_keyboard_focus();
     f.settle_animations();
     assert_eq!(
-        f.niri()
+        f.synoik()
             .layout
             .monitor_for_output(&output)
             .and_then(|mon| mon.expose_progress()),
@@ -7455,17 +7501,17 @@ fn vulkan_search_result_caption_rests_at_the_grid_line_count() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // A name that needs the second line, and a short one as the control.
     {
-        let s = &mut f.niri().overview_search;
+        let s = &mut f.synoik().overview_search;
         s.handle_key(
             None,
             Some('a'),
@@ -7487,37 +7533,37 @@ fn vulkan_search_result_caption_rests_at_the_grid_line_count() {
     }
 
     let controls = f
-        .niri()
+        .synoik()
         .layout
         .controls_layout_for_output(&output)
         .expect("output 1 has a monitor");
     let area: crate::ui::overview_search::SearchArea = controls.into();
     let mut tile = |i: usize| {
-        f.niri()
+        f.synoik()
             .overview_search
             .result_tile(i, area)
             .expect("a result tile")
     };
     let (long_tile, short_tile) = (tile(0), tile(1));
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let composited =
         state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                let niri = &mut state.niri;
-                let elements = niri.overview_search.render(
+                let synoik = &mut state.synoik;
+                let elements = synoik.overview_search.render(
                     vk,
-                    &niri.app_icon_cache,
-                    &niri.icon_cache,
+                    &synoik.app_icon_cache,
+                    &synoik.icon_cache,
                     &output,
                     area,
                     crate::ui::overview_search::SearchFade {
                         overview: 1.0,
                         search: 1.0,
                     },
-                    niri.gnome_settings.accent_color,
+                    synoik.gnome_settings.accent_color,
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7582,17 +7628,17 @@ fn vulkan_overview_search_draws_entry_and_selection() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Drive the model directly into an active state with two results, tile 0 selected.
     {
-        let s = &mut f.niri().overview_search;
+        let s = &mut f.synoik().overview_search;
         s.handle_key(
             None,
             Some('a'),
@@ -7614,38 +7660,38 @@ fn vulkan_overview_search_draws_entry_and_selection() {
     }
 
     let controls = f
-        .niri()
+        .synoik()
         .layout
         .controls_layout_for_output(&output)
         .expect("output 1 has a monitor");
     let area: crate::ui::overview_search::SearchArea = controls.into();
-    let pill = f.niri().overview_search.entry_pill(area);
+    let pill = f.synoik().overview_search.entry_pill(area);
     let t0 = f
-        .niri()
+        .synoik()
         .overview_search
         .result_tile(0, area)
         .expect("tile 0");
     let t1 = f
-        .niri()
+        .synoik()
         .overview_search
         .result_tile(1, area)
         .expect("tile 1");
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let composited = state.backend.headless().with_vulkan_renderer(
         |vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
-            let niri = &mut state.niri;
-            let elements = niri.overview_search.render(
+            let synoik = &mut state.synoik;
+            let elements = synoik.overview_search.render(
                 vk,
-                &niri.app_icon_cache,
-                &niri.icon_cache,
+                &synoik.app_icon_cache,
+                &synoik.icon_cache,
                 &output,
                 area,
                 crate::ui::overview_search::SearchFade {
                     overview: 1.0,
                     search: 1.0,
                 },
-                niri.gnome_settings.accent_color,
+                synoik.gnome_settings.accent_color,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7744,17 +7790,17 @@ fn vulkan_app_grid_draws_hovered_tile() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Drive three apps into the grid, tile 0 hovered.
     {
-        let g = &mut f.niri().app_grid;
+        let g = &mut f.synoik().app_grid;
         g.set_entries(
             ["A", "B", "C"]
                 .iter()
@@ -7771,17 +7817,17 @@ fn vulkan_app_grid_draws_hovered_tile() {
 
     // A fixed band to lay the grid into (independent of the state animation).
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
-    let t0 = f.niri().app_grid.tile_center(0, area).expect("tile 0");
-    let t1 = f.niri().app_grid.tile_center(1, area).expect("tile 1");
+    let t0 = f.synoik().app_grid.tile_center(0, area).expect("tile 0");
+    let t1 = f.synoik().app_grid.tile_center(1, area).expect("tile 1");
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let composited = state.backend.headless().with_vulkan_renderer(
         |vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
-            let niri = &mut state.niri;
-            let elements = niri.app_grid.render(
+            let synoik = &mut state.synoik;
+            let elements = synoik.app_grid.render(
                 vk,
-                &niri.app_icon_cache,
-                &niri.icon_cache,
+                &synoik.app_icon_cache,
+                &synoik.icon_cache,
                 &output,
                 area,
                 1.0,
@@ -7866,17 +7912,17 @@ fn vulkan_app_grid_expands_a_long_caption_on_hover() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Tile 1's name does not fit the caption box; tile 0's does.
     let long = "Passwords and Keys and Certificates";
-    f.niri().app_grid.set_entries(
+    f.synoik().app_grid.set_entries(
         ["Files", long]
             .iter()
             .map(|n| AppGridEntry {
@@ -7889,7 +7935,7 @@ fn vulkan_app_grid_expands_a_long_caption_on_hover() {
     );
 
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
-    let t1 = f.niri().app_grid.tile_center(1, area).expect("tile 1");
+    let t1 = f.synoik().app_grid.tile_center(1, area).expect("tile 1");
     let m = TileMetrics::overview();
     let tile_top = t1.y - m.size().h / 2.;
     let first_x = (t1.x - m.label_w() / 2.) as i32;
@@ -7900,18 +7946,18 @@ fn vulkan_app_grid_expands_a_long_caption_on_hover() {
     // down, and a row derived from the resting tile top misses it. The claim under test is
     // "one more line of text", so count lines.
     let caption_lines = |f: &mut Fixture, hovered: Option<usize>| -> usize {
-        f.niri().app_grid.set_hovered(hovered);
-        let state = f.niri_state();
+        f.synoik().app_grid.set_hovered(hovered);
+        let state = f.synoik_state();
         let composited =
             state
                 .backend
                 .headless()
                 .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                    let niri = &mut state.niri;
-                    let elements = niri.app_grid.render(
+                    let synoik = &mut state.synoik;
+                    let elements = synoik.app_grid.render(
                         vk,
-                        &niri.app_icon_cache,
-                        &niri.icon_cache,
+                        &synoik.app_icon_cache,
+                        &synoik.icon_cache,
                         &output,
                         area,
                         1.0,
@@ -7981,13 +8027,13 @@ fn vulkan_app_grid_previews_the_next_page_while_dragging() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Enough apps to paginate, so there is a next page to preview.
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
@@ -8005,22 +8051,22 @@ fn vulkan_app_grid_previews_the_next_page_while_dragging() {
             })
             .collect()
     };
-    f.niri().app_grid.set_entries(seed(256));
-    let per_page = f.niri().app_grid.items_per_page(area);
-    f.niri().app_grid.set_entries(seed(per_page + 6));
+    f.synoik().app_grid.set_entries(seed(256));
+    let per_page = f.synoik().app_grid.items_per_page(area);
+    f.synoik().app_grid.set_entries(seed(per_page + 6));
     // The right band is 10% of the width, so 1728..1920. Sample the *first* row of
     // tiles: the next-page arrow lives in this band too, vertically centred, and it is
     // there whether or not anything is being dragged.
     let sample =
         |f: &mut Fixture| -> u8 {
-            let state = f.niri_state();
+            let state = f.synoik_state();
             let composited = state.backend.headless().with_vulkan_renderer(
                 |vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                    let niri = &mut state.niri;
-                    let elements = niri.app_grid.render(
+                    let synoik = &mut state.synoik;
+                    let elements = synoik.app_grid.render(
                         vk,
-                        &niri.app_icon_cache,
-                        &niri.icon_cache,
+                        &synoik.app_icon_cache,
+                        &synoik.icon_cache,
                         &output,
                         area,
                         1.0,
@@ -8053,7 +8099,7 @@ fn vulkan_app_grid_previews_the_next_page_while_dragging() {
     let at_rest = sample(&mut f);
     assert_eq!(at_rest, 0, "with no drag the side bands are empty");
 
-    f.niri().app_grid.set_drag_active(true);
+    f.synoik().app_grid.set_drag_active(true);
     f.settle_animations();
     let peeking = sample(&mut f);
     eprintln!("vulkan_app_grid preview: {peeking}");
@@ -8083,8 +8129,8 @@ fn vulkan_app_grid_batch_uploads_page_icons() {
     // uploads on the page). The harness has no decode worker, so `buffer()` resolves inline and
     // both are ready when the grid renders → the batch path runs.
     let dir = std::env::temp_dir();
-    let red_path = dir.join(format!("niri-batch-red-{}.png", std::process::id()));
-    let blue_path = dir.join(format!("niri-batch-blue-{}.png", std::process::id()));
+    let red_path = dir.join(format!("synoik-batch-red-{}.png", std::process::id()));
+    let blue_path = dir.join(format!("synoik-batch-blue-{}.png", std::process::id()));
     image::RgbaImage::from_pixel(16, 16, image::Rgba([220, 20, 20, 255]))
         .save(&red_path)
         .expect("write red icon");
@@ -8093,16 +8139,16 @@ fn vulkan_app_grid_batch_uploads_page_icons() {
         .expect("write blue icon");
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     {
-        let g = &mut f.niri().app_grid;
+        let g = &mut f.synoik().app_grid;
         g.set_entries(vec![
             AppGridEntry {
                 id: "red.desktop".into(),
@@ -8120,20 +8166,20 @@ fn vulkan_app_grid_batch_uploads_page_icons() {
     }
 
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
-    let c0 = f.niri().app_grid.icon_center(0, area).expect("icon 0");
-    let c1 = f.niri().app_grid.icon_center(1, area).expect("icon 1");
+    let c0 = f.synoik().app_grid.icon_center(0, area).expect("icon 0");
+    let c1 = f.synoik().app_grid.icon_center(1, area).expect("icon 1");
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let composited =
         state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                let niri = &mut state.niri;
-                let elements = niri.app_grid.render(
+                let synoik = &mut state.synoik;
+                let elements = synoik.app_grid.render(
                     vk,
-                    &niri.app_icon_cache,
-                    &niri.icon_cache,
+                    &synoik.app_icon_cache,
+                    &synoik.icon_cache,
                     &output,
                     area,
                     1.0,
@@ -8207,7 +8253,7 @@ fn vulkan_app_grid_composes_a_folder_tile() {
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let path = dir.join(format!("niri-folder-{}-{i}.png", std::process::id()));
+            let path = dir.join(format!("synoik-folder-{}-{i}.png", std::process::id()));
             image::RgbaImage::from_pixel(16, 16, image::Rgba([c[0], c[1], c[2], 255]))
                 .save(&path)
                 .expect("write member icon");
@@ -8216,16 +8262,16 @@ fn vulkan_app_grid_composes_a_folder_tile() {
         .collect();
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     {
-        let g = &mut f.niri().app_grid;
+        let g = &mut f.synoik().app_grid;
         g.set_entries(vec![
             AppGridEntry {
                 id: "plain.desktop".into(),
@@ -8256,28 +8302,32 @@ fn vulkan_app_grid_composes_a_folder_tile() {
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
     let subs: Vec<_> = (0..4)
         .map(|i| {
-            f.niri()
+            f.synoik()
                 .app_grid
                 .folder_subicon_center(1, i, area)
                 .expect("folder sub-icon")
         })
         .collect();
     // A tile corner, inside the folder's rounded box but well clear of its icons.
-    let folder_rect = f.niri().app_grid.entry_rect(1, area).expect("folder tile");
-    let plain_rect = f.niri().app_grid.entry_rect(0, area).expect("app tile");
+    let folder_rect = f
+        .synoik()
+        .app_grid
+        .entry_rect(1, area)
+        .expect("folder tile");
+    let plain_rect = f.synoik().app_grid.entry_rect(0, area).expect("app tile");
     let corner = |r: Rectangle<f64, Logical>| (r.loc.x + r.size.w - 12., r.loc.y + 12.);
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let composited =
         state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                let niri = &mut state.niri;
-                let elements = niri.app_grid.render(
+                let synoik = &mut state.synoik;
+                let elements = synoik.app_grid.render(
                     vk,
-                    &niri.app_icon_cache,
-                    &niri.icon_cache,
+                    &synoik.app_icon_cache,
+                    &synoik.icon_cache,
                     &output,
                     area,
                     1.0,
@@ -8349,13 +8399,13 @@ fn vulkan_app_grid_draws_page_indicator_dots() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
 
@@ -8365,7 +8415,7 @@ fn vulkan_app_grid_draws_page_indicator_dots() {
     // divergence scales the mode up to the canvas — so it is asked of the grid, and asked after
     // seeding, since an empty grid has no layout to report one from.
     {
-        let g = &mut f.niri().app_grid;
+        let g = &mut f.synoik().app_grid;
         let seed = |n: usize| -> Vec<AppGridEntry> {
             (0..n)
                 .map(|i| AppGridEntry {
@@ -8380,18 +8430,26 @@ fn vulkan_app_grid_draws_page_indicator_dots() {
         let per_page = g.items_per_page(area);
         g.set_entries(seed(per_page + 6));
     }
-    let d0 = f.niri().app_grid.indicator_center(0, area).expect("dot 0");
-    let d1 = f.niri().app_grid.indicator_center(1, area).expect("dot 1");
+    let d0 = f
+        .synoik()
+        .app_grid
+        .indicator_center(0, area)
+        .expect("dot 0");
+    let d1 = f
+        .synoik()
+        .app_grid
+        .indicator_center(1, area)
+        .expect("dot 1");
     let mid = Point::from(((d0.x + d1.x) / 2., d0.y));
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let composited = state.backend.headless().with_vulkan_renderer(
         |vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
-            let niri = &mut state.niri;
-            let elements = niri.app_grid.render(
+            let synoik = &mut state.synoik;
+            let elements = synoik.app_grid.render(
                 vk,
-                &niri.app_icon_cache,
-                &niri.icon_cache,
+                &synoik.app_icon_cache,
+                &synoik.icon_cache,
                 &output,
                 area,
                 1.0,
@@ -8448,13 +8506,13 @@ fn vulkan_app_grid_draws_navigation_arrows() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
 
@@ -8464,7 +8522,7 @@ fn vulkan_app_grid_draws_navigation_arrows() {
     // divergence scales the mode up to the canvas — so it is asked of the grid, and asked after
     // seeding, since an empty grid has no layout to report one from.
     {
-        let g = &mut f.niri().app_grid;
+        let g = &mut f.synoik().app_grid;
         let seed = |n: usize| -> Vec<AppGridEntry> {
             (0..n)
                 .map(|i| AppGridEntry {
@@ -8480,7 +8538,7 @@ fn vulkan_app_grid_draws_navigation_arrows() {
         g.set_entries(seed(per_page + 6));
     }
     let center = f
-        .niri()
+        .synoik()
         .app_grid
         .arrow_center(PageArrow::Next, area)
         .expect("the next arrow exists on page 0");
@@ -8490,14 +8548,14 @@ fn vulkan_app_grid_draws_navigation_arrows() {
 
     let render =
         |f: &mut Fixture| -> (Vec<u8>, i32) {
-            let state = f.niri_state();
+            let state = f.synoik_state();
             let composited = state.backend.headless().with_vulkan_renderer(
                 |vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                    let niri = &mut state.niri;
-                    let elements = niri.app_grid.render(
+                    let synoik = &mut state.synoik;
+                    let elements = synoik.app_grid.render(
                         vk,
-                        &niri.app_icon_cache,
-                        &niri.icon_cache,
+                        &synoik.app_icon_cache,
+                        &synoik.icon_cache,
                         &output,
                         area,
                         1.0,
@@ -8540,7 +8598,7 @@ fn vulkan_app_grid_draws_navigation_arrows() {
     );
 
     // Hovering the arrow paints the wash disc under the glyph.
-    assert!(f.niri().app_grid.set_arrow_hovered(Some(PageArrow::Next)));
+    assert!(f.synoik().app_grid.set_arrow_hovered(Some(PageArrow::Next)));
     let (hover, w) = render(&mut f);
     let hover_off = px(&hover, w, off_glyph.x as i32, off_glyph.y as i32);
     eprintln!("vulkan_app_grid_arrow: rest_off={rest_off:?} hover_off={hover_off:?}");
@@ -8570,13 +8628,13 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // One favorite (not running) plus one running non-favorite: the exact
     // condition that draws a divider.
@@ -8584,14 +8642,14 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
         AppEntry::fake("fav.desktop", "fav.desktop"),
         AppEntry::fake_with_wm_class("run.desktop", "run.desktop", "run"),
     ];
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(apps)),
         Box::new(RecordingLauncher::default()),
     );
-    f.niri()
+    f.synoik()
         .app_system
         .set_favorites(vec!["fav.desktop".into()]);
-    f.niri()
+    f.synoik()
         .app_system
         .set_windows(vec![crate::app_system::RunningWindow {
             id: crate::window::mapped::MappedId::next(),
@@ -8599,35 +8657,35 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
             title: None,
             last_focus: None,
         }]);
-    f.niri().sync_dash_favorites();
+    f.synoik().sync_dash_favorites();
 
     let controls = f
-        .niri()
+        .synoik()
         .layout
         .controls_layout_for_output(&output)
         .expect("output 1 has a monitor");
     let area = controls.dash;
     let sep = f
-        .niri()
+        .synoik()
         .dash
         .separator_box(area)
         .expect("a favorite plus a running non-favorite draws the divider");
-    let fav = f.niri().dash.tile_center(0, area).expect("tile 0");
-    let running = f.niri().dash.tile_center(1, area).expect("tile 1");
-    let f_dot = f.niri().dash.dot_box_for(1, area);
+    let fav = f.synoik().dash.tile_center(0, area).expect("tile 0");
+    let running = f.synoik().dash.tile_center(1, area).expect("tile 1");
+    let f_dot = f.synoik().dash.dot_box_for(1, area);
     assert!(
-        f.niri().dash.dot_box_for(0, area).is_none(),
+        f.synoik().dash.dot_box_for(0, area).is_none(),
         "the non-running favorite has no dot"
     );
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let composited = state.backend.headless().with_vulkan_renderer(
         |vk| -> anyhow::Result<(Vec<u8>, i32, i32)> {
-            let niri = &mut state.niri;
-            let elements = niri.dash.render(
+            let synoik = &mut state.synoik;
+            let elements = synoik.dash.render(
                 vk,
-                &niri.app_icon_cache,
-                &niri.icon_cache,
+                &synoik.app_icon_cache,
+                &synoik.icon_cache,
                 &output,
                 area,
                 1.0,
@@ -8709,7 +8767,7 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
 ///   (b) the blur chain outlives the recording that names it. It owns the render pass, pipelines
 ///       and descriptor sets a queued blur binds, so rebuilding it (a resize) while one is queued
 ///       would free objects the command buffer still refers to. `SharedBlurChain`'s reference
-///       count is what holds it; under `NIRI_VK_VALIDATION=1` a missing one is a use-after-free,
+///       count is what holds it; under `SYNOIK_VK_VALIDATION=1` a missing one is a use-after-free,
 ///       not a wrong pixel.
 ///
 /// [`vulkan_effect_buffer_renders_offscreen_and_blur`] covers the same path through a real frame;
@@ -8793,7 +8851,7 @@ fn vulkan_the_xray_blur_costs_no_submit_and_still_lands() {
     // submit of its own would read 2 here whether or not anyone waited for it.
     //
     // The obvious assertion — that the `Blur` site's `retiring` is zero, the number the frame log
-    // prints as `1 blur in Xms` — cannot be used here: `niri_vk::stats`' timers are gated on
+    // prints as `1 blur in Xms` — cannot be used here: `synoik_vk::stats`' timers are gated on
     // `set_enabled`, which only the frame log turns on, so every duration reads zero under test
     // whether or not anything waited.
     assert_eq!(
@@ -8863,11 +8921,11 @@ fn vulkan_a_fresh_offscreen_costs_no_transition_submit() {
             return;
         }
     };
-    let site = niri_vk::stats::SubmitSite::ALL
+    let site = synoik_vk::stats::SubmitSite::ALL
         .iter()
-        .position(|s| *s == niri_vk::stats::SubmitSite::Transition)
+        .position(|s| *s == synoik_vk::stats::SubmitSite::Transition)
         .expect("transition site");
-    let transitions = |_: ()| niri_vk::stats::take_sites()[site].submits;
+    let transitions = |_: ()| synoik_vk::stats::take_sites()[site].submits;
 
     let scale = Scale::from(1.0);
     let mut buffer = EffectBuffer::new();
@@ -8916,7 +8974,7 @@ fn vulkan_a_fresh_offscreen_costs_no_transition_submit() {
     // SHADER_READ_ONLY while the image is really still UNDEFINED is a layout violation — invisible
     // in the pixels (this texture is legitimately blank: its elements never re-rendered into the
     // recreated image), which is why the assertion here is the readback completing at all. Under
-    // `NIRI_VK_VALIDATION=1` a barrier that never got recorded is reported on this draw.
+    // `SYNOIK_VK_VALIDATION=1` a barrier that never got recorded is reported on this draw.
     let tex = buffer.texture_vulkan(true).expect("blurred texture");
     let (w, h) = (tex.size().w, tex.size().h);
     let buf = TextureBuffer::from_texture(&vk, tex, 1.0, Transform::Normal, Vec::new());
@@ -8964,7 +9022,7 @@ fn vulkan_a_fresh_offscreen_costs_no_transition_submit() {
 /// Render `frames` frames of whatever animation is currently running, stepping the
 /// clock by `step` between them, and return each frame's bake sites.
 ///
-/// The clock is driven explicitly rather than through `niri_complete_animations`,
+/// The clock is driven explicitly rather than through `synoik_complete_animations`,
 /// which settles an animation instead of sampling it — the whole point here is to
 /// look *at* the frames in between.
 fn bake_sites_per_frame(
@@ -8976,12 +9034,12 @@ fn bake_sites_per_frame(
     let mut per_frame = Vec::with_capacity(frames);
     let mut animated = 0usize;
     for _ in 0..frames {
-        let mut clock = f.niri().clock.clone();
+        let mut clock = f.synoik().clock.clone();
         let now = clock.now_unadjusted();
         clock.set_unadjusted(now + step);
-        f.niri().advance_animations();
-        if f.niri().layout.are_animations_ongoing(Some(output))
-            || f.niri().panel_popover.are_animations_ongoing()
+        f.synoik().advance_animations();
+        if f.synoik().layout.are_animations_ongoing(Some(output))
+            || f.synoik().panel_popover.are_animations_ongoing()
         {
             animated += 1;
         }
@@ -9027,7 +9085,7 @@ fn overview_open_bake_sites(
     let _ = render_output_vulkan(f, output);
     let _ = crate::frame_log::take_bake_sites();
 
-    f.niri().layout.toggle_overview();
+    f.synoik().layout.toggle_overview();
     bake_sites_per_frame(f, output, 6, Duration::from_millis(40))
 }
 
@@ -9042,7 +9100,7 @@ fn the_overview_animation_rebakes_nothing_per_frame() {
     let Some(mut f) = window_fixture_settled(GREEN, true, Some("overview bake probe")) else {
         return;
     };
-    let output = f.niri().global_space.outputs().next().unwrap().clone();
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
 
     let per_frame = overview_open_bake_sites(&mut f, &output);
     let repeats = sites_baking_repeatedly(&per_frame);
@@ -9070,12 +9128,13 @@ fn the_workspace_switch_rebakes_nothing_per_frame() {
     let Some(mut f) = window_fixture_settled(GREEN, true, Some("workspace bake probe")) else {
         return;
     };
-    let output = f.niri().global_space.outputs().next().unwrap().clone();
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
 
     let _ = render_output_vulkan(&mut f, &output);
     let _ = crate::frame_log::take_bake_sites();
 
-    f.niri_state().do_action(Action::FocusWorkspaceDown, false);
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
     let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(30));
     let repeats = sites_baking_repeatedly(&per_frame);
 
@@ -9092,21 +9151,21 @@ fn the_workspace_switch_rebakes_nothing_per_frame() {
 /// Open the quick-settings popover on `output`, exactly as the panel indicator does.
 fn open_quick_settings(f: &mut Fixture, output: &Output) {
     let output_w = output_size(output).w;
-    let toggles = f.niri().gnome_settings.quick_toggles;
-    let anchor = f.niri().panel.quick_settings_rect(output_w);
-    let network = f.niri().system_status.network;
-    let airplane = f.niri().system_status.airplane;
-    let power = f.niri().system_status.power.clone();
-    let bluetooth = f.niri().system_status.bluetooth.clone();
-    let bluetooth_rfkill = f.niri().system_status.bluetooth_rfkill;
-    let battery = f.niri().system_status.battery.clone();
-    let audio = f.niri().audio;
-    let sink_list = f.niri().sink_list.clone();
-    let mic = f.niri().mic;
-    let source_list = f.niri().source_list.clone();
-    let brightness = f.niri().brightness.view();
-    let accent = f.niri().gnome_settings.accent_color;
-    f.niri().panel_popover.toggle_quick_settings(
+    let toggles = f.synoik().gnome_settings.quick_toggles;
+    let anchor = f.synoik().panel.quick_settings_rect(output_w);
+    let network = f.synoik().system_status.network;
+    let airplane = f.synoik().system_status.airplane;
+    let power = f.synoik().system_status.power.clone();
+    let bluetooth = f.synoik().system_status.bluetooth.clone();
+    let bluetooth_rfkill = f.synoik().system_status.bluetooth_rfkill;
+    let battery = f.synoik().system_status.battery.clone();
+    let audio = f.synoik().audio;
+    let sink_list = f.synoik().sink_list.clone();
+    let mic = f.synoik().mic;
+    let source_list = f.synoik().source_list.clone();
+    let brightness = f.synoik().brightness.view();
+    let accent = f.synoik().gnome_settings.accent_color;
+    f.synoik().panel_popover.toggle_quick_settings(
         output.clone(),
         anchor,
         toggles,
@@ -9129,10 +9188,10 @@ fn open_quick_settings(f: &mut Fixture, output: &Output) {
 
 /// Open the calendar popover on `output`, exactly as the clock does.
 fn open_calendar(f: &mut Fixture, output: &Output) {
-    let anchor = f.niri().panel.date_menu_rect(output_size(output).w);
-    let cal = f.niri().gnome_settings.calendar;
-    let accent = f.niri().gnome_settings.accent_color;
-    f.niri().panel_popover.toggle_calendar(
+    let anchor = f.synoik().panel.date_menu_rect(output_size(output).w);
+    let cal = f.synoik().gnome_settings.calendar;
+    let accent = f.synoik().gnome_settings.accent_color;
+    f.synoik().panel_popover.toggle_calendar(
         output.clone(),
         anchor,
         cal.week_start,
@@ -9164,7 +9223,7 @@ fn a_popover_open_fade_rebakes_nothing_per_frame() {
         let Some(mut f) = window_fixture_settled(GREEN, false, Some("popover bake probe")) else {
             return;
         };
-        let output = f.niri_output(1);
+        let output = f.synoik_output(1);
 
         // Everything that bakes merely because it is being composited for the first time in this
         // process does it now, so it cannot land on an animation frame below.
@@ -9181,13 +9240,13 @@ fn a_popover_open_fade_rebakes_nothing_per_frame() {
             "no {subject} bake while the {name} popover was open and settled, so this test cannot              observe the thing it asserts about. Sites seen: {warm:?}"
         );
 
-        f.niri().panel_popover.close();
+        f.synoik().panel_popover.close();
         f.settle_animations();
         let _ = render_output_vulkan(&mut f, &output);
         let _ = crate::frame_log::take_bake_sites();
 
         open(&mut f, &output);
-        assert!(f.niri().panel_popover.is_open(), "{name} did not open");
+        assert!(f.synoik().panel_popover.is_open(), "{name} did not open");
         let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(20));
         let repeats = sites_baking_repeatedly(&per_frame);
 
@@ -9212,7 +9271,7 @@ fn a_popover_open_fade_rebakes_nothing_per_frame() {
 /// The precondition worth knowing, because it silently made an earlier version of this test assert
 /// nothing at all: `AppGrid`'s entries do not come from `app_system` on demand. `sync_app_grid()`
 /// copies them across and is driven by app-system *change events* — so installing a catalog
-/// straight onto `Niri` leaves the grid empty, rendering nothing, re-baking nothing, and passing.
+/// straight onto `Synoik` leaves the grid empty, rendering nothing, re-baking nothing, and passing.
 /// The "subject baked at least once" assertion below is what makes that failure loud.
 #[test]
 fn the_app_grid_open_rebakes_nothing_per_frame() {
@@ -9221,24 +9280,24 @@ fn the_app_grid_open_rebakes_nothing_per_frame() {
     let Some(mut f) = window_fixture_settled(GREEN, true, Some("app grid bake probe")) else {
         return;
     };
-    let output = f.niri().global_space.outputs().next().unwrap().clone();
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
 
     // Enough tiles to fill a page, each with a distinct name so every label is its own shaped run.
     let apps: Vec<AppEntry> = (0..24)
         .map(|i| AppEntry::fake(&format!("app{i}.desktop"), &format!("Application {i:02}")))
         .collect();
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(apps)),
         Box::new(RecordingLauncher::default()),
     );
-    assert!(f.niri().sync_app_grid(), "the grid took no entries");
+    assert!(f.synoik().sync_app_grid(), "the grid took no entries");
 
     // Settle into the open overview first: this test is about the grid's own animation, not the
     // overview's, which `the_overview_animation_rebakes_nothing_per_frame` already owns.
-    f.niri().layout.toggle_overview();
+    f.synoik().layout.toggle_overview();
     f.settle_animations();
     assert!(
-        f.niri().layout.toggle_app_grid(),
+        f.synoik().layout.toggle_app_grid(),
         "the app grid did not open, so this test proves nothing"
     );
     f.settle_animations();
@@ -9252,12 +9311,12 @@ fn the_app_grid_open_rebakes_nothing_per_frame() {
     );
 
     // Close and reopen, so the sampled frames are a real open animation from a warm cache.
-    assert!(f.niri().layout.toggle_app_grid());
+    assert!(f.synoik().layout.toggle_app_grid());
     f.settle_animations();
     let _ = render_output_vulkan(&mut f, &output);
     let _ = crate::frame_log::take_bake_sites();
 
-    assert!(f.niri().layout.toggle_app_grid());
+    assert!(f.synoik().layout.toggle_app_grid());
     let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(40));
     let repeats = sites_baking_repeatedly(&per_frame);
 
@@ -9297,8 +9356,8 @@ fn a_wallpaper_change_does_not_leave_the_xray_buffer_rebuilding_every_frame() {
     };
 
     set_wallpaper(&mut f, &red);
-    niri_vk::stats::set_enabled(true);
-    let _ = niri_vk::stats::take_creates();
+    synoik_vk::stats::set_enabled(true);
+    let _ = synoik_vk::stats::take_creates();
 
     // Warm: the offscreen, its blur chain and the wallpaper texture all exist and are steady.
     let steady: Vec<(u64, u64)> = (0..4)
@@ -9340,14 +9399,14 @@ fn a_wallpaper_change_does_not_leave_the_xray_buffer_rebuilding_every_frame() {
 /// background, `background-effect` blur+xray) over a window, plus two solid wallpapers to swap
 /// between.
 fn xray_wallpaper_fixture() -> Option<(Fixture, Output, std::path::PathBuf, std::path::PathBuf)> {
-    use niri_config::BackgroundEffectRule;
+    use synoik_config::BackgroundEffectRule;
 
     if let Err(e) = VulkanRenderer::new() {
         eprintln!("skipping: no Vulkan device ({e})");
         return None;
     }
 
-    let dir = std::env::temp_dir().join("niri-xray-wallpaper-test");
+    let dir = std::env::temp_dir().join("synoik-xray-wallpaper-test");
     std::fs::create_dir_all(&dir).unwrap();
     let red = dir.join("red.png");
     let blue = dir.join("blue.png");
@@ -9367,7 +9426,7 @@ fn xray_wallpaper_fixture() -> Option<(Fixture, Output, std::path::PathBuf, std:
     });
 
     let mut f = Fixture::with_config(config);
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -9384,9 +9443,9 @@ fn xray_wallpaper_fixture() -> Option<(Fixture, Output, std::path::PathBuf, std:
     window.set_size(600, 400);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     Some((f, output, red, blue))
 }
 
@@ -9407,10 +9466,10 @@ fn set_wallpaper(f: &mut Fixture, path: &std::path::Path) {
         options: crate::gnome::BackgroundOptions::default(),
     };
     let gpu = f
-        .niri_state()
+        .synoik_state()
         .backend
         .with_vulkan_renderer(|r| r.gpu().clone());
-    f.niri().wallpaper.update(&settings, gpu.as_ref());
+    f.synoik().wallpaper.update(&settings, gpu.as_ref());
 }
 
 /// Render one frame the way the live KMS path does: collect elements, render into a target, and
@@ -9419,7 +9478,7 @@ fn set_wallpaper(f: &mut Fixture, path: &std::path::Path) {
 fn render_deferred_once(f: &mut Fixture, output: &Output) -> (u64, u64) {
     use crate::render_helpers::render_to_texture;
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     state
         .backend
         .headless()
@@ -9428,8 +9487,8 @@ fn render_deferred_once(f: &mut Fixture, output: &Output) -> (u64, u64) {
             // Retirement is a poll; the live seat routinely reaches the next prepare without
             // having observed the previous submit complete. Pin that side of the race.
             vk.set_retire_paused(true);
-            let niri = &mut state.niri;
-            niri.update_render_elements(Some(output));
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(output));
 
             let size: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -9440,9 +9499,9 @@ fn render_deferred_once(f: &mut Fixture, output: &Output) -> (u64, u64) {
             };
             // Reset before *collection*: the xray effect buffer is prepared while elements are
             // built, so its offscreen and blur allocations land there, not in the render below.
-            let _ = niri_vk::stats::take_creates();
-            let d0 = niri_vk::stats::draws();
-            let elements = niri.render_to_vec(ctx, output, false);
+            let _ = synoik_vk::stats::take_creates();
+            let d0 = synoik_vk::stats::draws();
+            let elements = synoik.render_to_vec(ctx, output, false);
             let (_tex, _sync) = render_to_texture(
                 vk,
                 size,
@@ -9452,8 +9511,8 @@ fn render_deferred_once(f: &mut Fixture, output: &Output) -> (u64, u64) {
                 elements.iter().rev(),
             )?;
             Ok((
-                niri_vk::stats::draws() - d0,
-                niri_vk::stats::take_creates().0,
+                synoik_vk::stats::draws() - d0,
+                synoik_vk::stats::take_creates().0,
             ))
         })
         .expect("headless backend must hold a Vulkan renderer")
@@ -9470,7 +9529,7 @@ fn render_deferred_once(f: &mut Fixture, output: &Output) -> (u64, u64) {
 ///
 /// Retried, because `stats::set_enabled` is a process-wide flag and the counters it gates are
 /// per-thread: **every** `Fixture::new` on any test thread runs `FrameLog::from_env`, which turns
-/// timing back off (`NIRI_FRAME_LOG` is unset under libtest). A neighbour constructing a fixture
+/// timing back off (`SYNOIK_FRAME_LOG` is unset under libtest). A neighbour constructing a fixture
 /// mid-measurement therefore reads as "attributed nothing", which is exactly what a broken guard
 /// looks like. Losing that race every attempt is vanishingly unlikely; an unwired guard loses it
 /// every time — mutation-checked. The `<=` invariant needs no retry: it holds whatever the flag is.
@@ -9483,19 +9542,19 @@ fn the_attributed_union_stays_inside_the_work_it_measures() {
     set_wallpaper(&mut f, &red);
 
     // Warm: measure a steady frame, not the first-touch allocation of every cache in the path.
-    niri_vk::stats::set_enabled(true);
+    synoik_vk::stats::set_enabled(true);
     for _ in 0..3 {
         render_deferred_once(&mut f, &output);
     }
 
     let mut measured = None;
     for _ in 0..8 {
-        niri_vk::stats::set_enabled(true);
-        let before = niri_vk::stats::attributed();
+        synoik_vk::stats::set_enabled(true);
+        let before = synoik_vk::stats::attributed();
         let started = std::time::Instant::now();
         render_deferred_once(&mut f, &output);
         let wall = started.elapsed();
-        let attributed = niri_vk::stats::attributed().saturating_sub(before);
+        let attributed = synoik_vk::stats::attributed().saturating_sub(before);
 
         assert!(
             attributed <= wall,
@@ -9540,7 +9599,7 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let path = dir.join(format!("niri-folder-dlg-{}-{i}.png", std::process::id()));
+            let path = dir.join(format!("synoik-folder-dlg-{}-{i}.png", std::process::id()));
             image::RgbaImage::from_pixel(16, 16, image::Rgba([c[0], c[1], c[2], 255]))
                 .save(&path)
                 .expect("write member icon");
@@ -9549,15 +9608,15 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
         .collect();
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    f.niri().folder_dialog.popup(
+    f.synoik().folder_dialog.popup(
         "Utilities",
         "Utilities",
         paths
@@ -9579,25 +9638,25 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
     let l = crate::ui::folder_dialog::layout(view);
     let icons: Vec<_> = (0..2)
         .map(|i| {
-            f.niri()
+            f.synoik()
                 .folder_dialog
                 .icon_center(i, l.grid_area)
                 .expect("member icon center")
         })
         .collect();
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let composited =
         state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                let niri = &mut state.niri;
+                let synoik = &mut state.synoik;
                 let mut elements: Vec<FolderDialogRenderElement> = Vec::new();
-                niri.folder_dialog.render(
+                synoik.folder_dialog.render(
                     vk,
-                    &niri.app_icon_cache,
-                    &niri.icon_cache,
+                    &synoik.app_icon_cache,
+                    &synoik.icon_cache,
                     &output,
                     view,
                     None,
@@ -9772,22 +9831,22 @@ fn vulkan_folder_dialog_clips_its_pages_to_the_panel() {
 
     // A saturated icon nothing else on screen comes near: the shade is black and the panel
     // is dark grey, so any green outside the panel is a tile that escaped the clip.
-    let path = std::env::temp_dir().join(format!("niri-folder-clip-{}.png", std::process::id()));
+    let path = std::env::temp_dir().join(format!("synoik-folder-clip-{}.png", std::process::id()));
     image::RgbaImage::from_pixel(64, 64, image::Rgba([20, 230, 20, 255]))
         .save(&path)
         .expect("write member icon");
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Ten members: nine to a page, so the tenth paginates it.
-    f.niri().folder_dialog.popup(
+    f.synoik().folder_dialog.popup(
         "Utilities",
         "Utilities",
         (0..10)
@@ -9804,26 +9863,26 @@ fn vulkan_folder_dialog_clips_its_pages_to_the_panel() {
     let view: Rectangle<f64, Logical> = Rectangle::new((0., 0.).into(), (1920., 1080.).into());
     let l = crate::ui::folder_dialog::layout(view);
     assert!(
-        f.niri().folder_dialog.set_page(1, view),
+        f.synoik().folder_dialog.set_page(1, view),
         "ten members make a second page"
     );
     // Halfway through the 300 ms slide, where both pages are off-centre and the travel is
     // at its widest.
-    let at = f.niri().clock.now_unadjusted() + std::time::Duration::from_millis(150);
-    f.niri().clock.set_unadjusted(at);
+    let at = f.synoik().clock.now_unadjusted() + std::time::Duration::from_millis(150);
+    f.synoik().clock.set_unadjusted(at);
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let composited =
         state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                let niri = &mut state.niri;
+                let synoik = &mut state.synoik;
                 let mut elements: Vec<FolderDialogRenderElement> = Vec::new();
-                niri.folder_dialog.render(
+                synoik.folder_dialog.render(
                     vk,
-                    &niri.app_icon_cache,
-                    &niri.icon_cache,
+                    &synoik.app_icon_cache,
+                    &synoik.icon_cache,
                     &output,
                     view,
                     None,
@@ -9914,19 +9973,19 @@ fn vulkan_app_grid_eases_tiles_to_their_new_slots() {
     // One saturated icon, so "where is that tile" is a pixel question. The rest are the
     // fallback, which is what everything around it draws as.
     let dir = std::env::temp_dir();
-    let marked = dir.join(format!("niri-grid-ease-{}.png", std::process::id()));
+    let marked = dir.join(format!("synoik-grid-ease-{}.png", std::process::id()));
     image::RgbaImage::from_pixel(64, 64, image::Rgba([230, 20, 20, 255]))
         .save(&marked)
         .expect("write the marker icon");
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Six apps on one page; the *second* is the marked one, so it has neighbours either
     // side to be pushed past.
@@ -9942,16 +10001,16 @@ fn vulkan_app_grid_eases_tiles_to_their_new_slots() {
             folder: None,
         })
         .collect();
-    f.niri().app_grid.set_entries(entries);
+    f.synoik().app_grid.set_entries(entries);
 
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
     let center = |f: &mut Fixture, i: usize| -> Point<f64, Logical> {
-        let t = f.niri().app_grid.entry_rect(i, area).expect("a tile");
+        let t = f.synoik().app_grid.entry_rect(i, area).expect("a tile");
         Point::from((t.loc.x + t.size.w / 2., t.loc.y + t.size.h / 2.))
     };
     let (slot1, slot3) = (center(&mut f, 1), center(&mut f, 3));
     let tile_h = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_rect(0, area)
         .expect("a tile")
@@ -9961,17 +10020,17 @@ fn vulkan_app_grid_eases_tiles_to_their_new_slots() {
     /// A composite, its stride, and every element's center with its width.
     type Shot = (Vec<u8>, i32, Vec<(Point<f64, Logical>, f64)>);
     let shoot = |f: &mut Fixture| -> Shot {
-        let state = f.niri_state();
+        let state = f.synoik_state();
         let composited =
             state
                 .backend
                 .headless()
                 .with_vulkan_renderer(|vk| -> anyhow::Result<Shot> {
-                    let niri = &mut state.niri;
-                    let elements = niri.app_grid.render(
+                    let synoik = &mut state.synoik;
+                    let elements = synoik.app_grid.render(
                         vk,
-                        &niri.app_icon_cache,
-                        &niri.icon_cache,
+                        &synoik.app_icon_cache,
+                        &synoik.icon_cache,
                         &output,
                         area,
                         1.0,
@@ -10031,8 +10090,8 @@ fn vulkan_app_grid_eases_tiles_to_their_new_slots() {
     );
 
     // Move it to slot 3 the way a drop does.
-    let per_page = f.niri().app_grid.items_per_page(area);
-    assert!(f.niri().app_grid.move_entry(
+    let per_page = f.synoik().app_grid.items_per_page(area);
+    assert!(f.synoik().app_grid.move_entry(
         "e1.desktop",
         GridDropTarget {
             page: 0,
@@ -10042,16 +10101,16 @@ fn vulkan_app_grid_eases_tiles_to_their_new_slots() {
         per_page,
     ));
     assert!(
-        f.niri().app_grid.are_animations_ongoing(),
+        f.synoik().app_grid.are_animations_ongoing(),
         "the reflow holds the redraw loop open"
     );
 
     // Halfway through the 250 ms ease (plus this tile's stagger share). Measured on the
     // *elements*, not the pixels: mid-flight the tiles pass through each other and the one
     // on top hides part of the one below, so a colour probe reads a clipped shape.
-    let at = f.niri().clock.now_unadjusted() + std::time::Duration::from_millis(130);
-    f.niri().clock.set_unadjusted(at);
-    f.niri().app_grid.advance_animations();
+    let at = f.synoik().clock.now_unadjusted() + std::time::Duration::from_millis(130);
+    f.synoik().clock.set_unadjusted(at);
+    f.synoik().app_grid.advance_animations();
     let (pixels, w, centers) = shoot(&mut f);
     assert!(
         red_x(&pixels, w, row_y).is_some(),
@@ -10061,7 +10120,7 @@ fn vulkan_app_grid_eases_tiles_to_their_new_slots() {
     // Per-tile elements only: the page's shared bake spans the whole block and belongs to
     // no single tile.
     let tile_w = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_rect(0, area)
         .expect("a tile")
@@ -10109,7 +10168,7 @@ fn vulkan_app_grid_eases_tiles_to_their_new_slots() {
     let before = ink(&pixels, w, caption_y);
 
     f.settle_animations();
-    f.niri().app_grid.advance_animations();
+    f.synoik().app_grid.advance_animations();
     let (pixels, w, _) = shoot(&mut f);
     assert!(
         ink(&pixels, w, caption_y) >= before,
@@ -10124,14 +10183,14 @@ fn vulkan_app_grid_eases_tiles_to_their_new_slots() {
         slot3.x
     );
     assert!(
-        !f.niri().app_grid.are_animations_ongoing(),
+        !f.synoik().app_grid.are_animations_ongoing(),
         "…and lets the redraw loop idle again"
     );
 
     // The dragged tile leaves a hole: picked up, it scales to half and fades to nothing.
-    f.niri().app_grid.set_dragged(Some("e1.desktop"));
+    f.synoik().app_grid.set_dragged(Some("e1.desktop"));
     f.settle_animations();
-    f.niri().app_grid.advance_animations();
+    f.synoik().app_grid.advance_animations();
     let (pixels, w, _) = shoot(&mut f);
     assert!(
         red_x(&pixels, w, row_y).is_none(),
@@ -10159,15 +10218,15 @@ fn vulkan_folder_dialog_shrinks_toward_its_source_tile() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    f.niri().folder_dialog.popup(
+    f.synoik().folder_dialog.popup(
         "Utilities",
         "Utilities",
         vec![AppGridEntry {
@@ -10178,7 +10237,7 @@ fn vulkan_folder_dialog_shrinks_toward_its_source_tile() {
         }],
     );
     f.settle_animations();
-    assert!(f.niri().folder_dialog.popdown(), "start the shrink");
+    assert!(f.synoik().folder_dialog.popdown(), "start the shrink");
 
     let view: Rectangle<f64, Logical> = Rectangle::new((0., 0.).into(), (1920., 1080.).into());
     // A source tile in the top-left quadrant, so the shrink travels somewhere obvious.
@@ -10186,21 +10245,21 @@ fn vulkan_folder_dialog_shrinks_toward_its_source_tile() {
     let panel = crate::ui::folder_dialog::layout(view).panel;
 
     // Sample a third of the way into the 200 ms close.
-    let at = f.niri().clock.now_unadjusted() + std::time::Duration::from_millis(66);
-    f.niri().clock.set_unadjusted(at);
+    let at = f.synoik().clock.now_unadjusted() + std::time::Duration::from_millis(66);
+    f.synoik().clock.set_unadjusted(at);
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let composited =
         state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                let niri = &mut state.niri;
+                let synoik = &mut state.synoik;
                 let mut elements: Vec<FolderDialogRenderElement> = Vec::new();
-                niri.folder_dialog.render(
+                synoik.folder_dialog.render(
                     vk,
-                    &niri.app_icon_cache,
-                    &niri.icon_cache,
+                    &synoik.app_icon_cache,
+                    &synoik.icon_cache,
                     &output,
                     view,
                     Some(source),
@@ -10227,7 +10286,7 @@ fn vulkan_folder_dialog_shrinks_toward_its_source_tile() {
     let (pixels, w) = result.expect("compositing the shrinking dialog must not error");
 
     // Where the panel actually is at this instant, per the same transform the renderer used.
-    let zoom = f.niri().folder_dialog.zoom_for_test();
+    let zoom = f.synoik().folder_dialog.zoom_for_test();
     let shrunk = Zoom::new(view, source, zoom).map(panel);
     eprintln!("vulkan_folder_dialog_shrink: zoom={zoom} panel={panel:?} shrunk={shrunk:?}");
     assert!(
@@ -10284,13 +10343,13 @@ fn vulkan_app_grid_fades_a_folder_tile_caption_with_the_rest_of_it() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let member = AppGridEntry {
         id: "m0.desktop".into(),
@@ -10298,7 +10357,7 @@ fn vulkan_app_grid_fades_a_folder_tile_caption_with_the_rest_of_it() {
         icon: AppIconRef::Fallback,
         folder: None,
     };
-    f.niri().app_grid.set_entries(vec![AppGridEntry {
+    f.synoik().app_grid.set_entries(vec![AppGridEntry {
         id: "Utilities".into(),
         name: "Utilities".into(),
         icon: AppIconRef::Fallback,
@@ -10307,7 +10366,7 @@ fn vulkan_app_grid_fades_a_folder_tile_caption_with_the_rest_of_it() {
 
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
     let tile = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_rect(0, area)
         .expect("the folder tile");
@@ -10316,14 +10375,14 @@ fn vulkan_app_grid_fades_a_folder_tile_caption_with_the_rest_of_it() {
     // is drawn, nothing at all if it faded away with the rest of the tile.
     let brightest_caption =
         |f: &mut Fixture| -> u8 {
-            let state = f.niri_state();
+            let state = f.synoik_state();
             let composited = state.backend.headless().with_vulkan_renderer(
                 |vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                    let niri = &mut state.niri;
-                    let elements = niri.app_grid.render(
+                    let synoik = &mut state.synoik;
+                    let elements = synoik.app_grid.render(
                         vk,
-                        &niri.app_icon_cache,
-                        &niri.icon_cache,
+                        &synoik.app_icon_cache,
+                        &synoik.icon_cache,
                         &output,
                         area,
                         1.0,
@@ -10365,7 +10424,7 @@ fn vulkan_app_grid_fades_a_folder_tile_caption_with_the_rest_of_it() {
     );
 
     assert!(f
-        .niri()
+        .synoik()
         .app_grid
         .set_tile_fade(Some(("Utilities".to_owned(), 0.))));
     let faded = brightest_caption(&mut f);
@@ -10395,13 +10454,13 @@ fn vulkan_folder_tile_bubble_covers_a_two_line_caption() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let member = AppGridEntry {
         id: "m0.desktop".into(),
@@ -10410,7 +10469,7 @@ fn vulkan_folder_tile_bubble_covers_a_two_line_caption() {
         folder: None,
     };
     // Two folders: one whose name needs the second line, one that fits on the first.
-    f.niri().app_grid.set_entries(vec![
+    f.synoik().app_grid.set_entries(vec![
         AppGridEntry {
             id: "sound".into(),
             name: "Sound & Video Recorders".into(),
@@ -10427,24 +10486,24 @@ fn vulkan_folder_tile_bubble_covers_a_two_line_caption() {
 
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
     let mut rect = |i: usize| {
-        f.niri()
+        f.synoik()
             .app_grid
             .entry_rect(i, area)
             .expect("a folder tile")
     };
     let (wide_name, short_name) = (rect(0), rect(1));
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let composited =
         state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                let niri = &mut state.niri;
-                let elements = niri.app_grid.render(
+                let synoik = &mut state.synoik;
+                let elements = synoik.app_grid.render(
                     vk,
-                    &niri.app_icon_cache,
-                    &niri.icon_cache,
+                    &synoik.app_icon_cache,
+                    &synoik.icon_cache,
                     &output,
                     area,
                     1.0,
@@ -10507,16 +10566,16 @@ fn vulkan_app_grid_draws_two_caption_lines_at_rest() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Two entries: a name that needs two lines, and a short one as the control.
-    f.niri().app_grid.set_entries(vec![
+    f.synoik().app_grid.set_entries(vec![
         AppGridEntry {
             id: "long.desktop".into(),
             name: "Passwords and Keys".into(),
@@ -10532,21 +10591,21 @@ fn vulkan_app_grid_draws_two_caption_lines_at_rest() {
     ]);
 
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
-    let metrics = f.niri().app_grid.metrics_for(area);
-    let mut rect = |i: usize| f.niri().app_grid.entry_rect(i, area).expect("a tile");
+    let metrics = f.synoik().app_grid.metrics_for(area);
+    let mut rect = |i: usize| f.synoik().app_grid.entry_rect(i, area).expect("a tile");
     let (long_tile, short_tile) = (rect(0), rect(1));
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let composited =
         state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                let niri = &mut state.niri;
-                let elements = niri.app_grid.render(
+                let synoik = &mut state.synoik;
+                let elements = synoik.app_grid.render(
                     vk,
-                    &niri.app_icon_cache,
-                    &niri.icon_cache,
+                    &synoik.app_icon_cache,
+                    &synoik.icon_cache,
                     &output,
                     area,
                     1.0,
@@ -10616,13 +10675,13 @@ fn vulkan_app_grid_rings_the_keyboard_focused_tile() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let entry = |id: &str, name: &str| AppGridEntry {
         id: id.into(),
@@ -10630,13 +10689,13 @@ fn vulkan_app_grid_rings_the_keyboard_focused_tile() {
         icon: AppIconRef::Fallback,
         folder: None,
     };
-    f.niri()
+    f.synoik()
         .app_grid
         .set_entries(vec![entry("a.desktop", "A"), entry("b.desktop", "B")]);
 
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
     let rect_of = |f: &mut Fixture, i: usize| {
-        f.niri()
+        f.synoik()
             .app_grid
             .entry_rect(i, area)
             .expect("both tiles are on the first page")
@@ -10653,14 +10712,14 @@ fn vulkan_app_grid_rings_the_keyboard_focused_tile() {
 
     let shoot =
         |f: &mut Fixture| -> (Vec<u8>, i32) {
-            let state = f.niri_state();
+            let state = f.synoik_state();
             let composited = state.backend.headless().with_vulkan_renderer(
                 |vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                    let niri = &mut state.niri;
-                    let elements = niri.app_grid.render(
+                    let synoik = &mut state.synoik;
+                    let elements = synoik.app_grid.render(
                         vk,
-                        &niri.app_icon_cache,
-                        &niri.icon_cache,
+                        &synoik.app_icon_cache,
+                        &synoik.icon_cache,
                         &output,
                         area,
                         1.0,
@@ -10696,7 +10755,7 @@ fn vulkan_app_grid_rings_the_keyboard_focused_tile() {
         );
     }
 
-    assert!(f.niri().app_grid.set_focused(Some(1)));
+    assert!(f.synoik().app_grid.set_focused(Some(1)));
     let (pixels, w) = shoot(&mut f);
     let (x, y) = edge(b);
     let ring = px(&pixels, w, x, y);
@@ -10731,13 +10790,13 @@ fn vulkan_app_grid_slides_both_pages_during_a_page_change() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
 
@@ -10755,13 +10814,13 @@ fn vulkan_app_grid_slides_both_pages_during_a_page_change() {
             })
             .collect()
     };
-    f.niri().app_grid.set_entries(seed(256));
-    let per_page = f.niri().app_grid.items_per_page(area);
-    f.niri().app_grid.set_entries(seed(per_page + 6));
+    f.synoik().app_grid.set_entries(seed(256));
+    let per_page = f.synoik().app_grid.items_per_page(area);
+    f.synoik().app_grid.set_entries(seed(per_page + 6));
 
-    assert_eq!(f.niri().app_grid.page_count(area), 2, "two pages");
+    assert_eq!(f.synoik().app_grid.page_count(area), 2, "two pages");
     let tile0 = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_rect(0, area)
         .expect("the first tile");
@@ -10769,14 +10828,14 @@ fn vulkan_app_grid_slides_both_pages_during_a_page_change() {
 
     let shoot =
         |f: &mut Fixture| -> (Vec<u8>, i32) {
-            let state = f.niri_state();
+            let state = f.synoik_state();
             let composited = state.backend.headless().with_vulkan_renderer(
                 |vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                    let niri = &mut state.niri;
-                    let elements = niri.app_grid.render(
+                    let synoik = &mut state.synoik;
+                    let elements = synoik.app_grid.render(
                         vk,
-                        &niri.app_icon_cache,
-                        &niri.icon_cache,
+                        &synoik.app_icon_cache,
+                        &synoik.icon_cache,
                         &output,
                         area,
                         1.0,
@@ -10818,9 +10877,9 @@ fn vulkan_app_grid_slides_both_pages_during_a_page_change() {
     assert!(rest_lo < rest_hi, "the settled page draws something");
 
     // Start the slide and sample a fifth of the way in, before either page has arrived.
-    assert!(f.niri().app_grid.set_page(1, area));
-    let at = f.niri().clock.now_unadjusted() + std::time::Duration::from_millis(60);
-    f.niri().clock.set_unadjusted(at);
+    assert!(f.synoik().app_grid.set_page(1, area));
+    let at = f.synoik().clock.now_unadjusted() + std::time::Duration::from_millis(60);
+    f.synoik().clock.set_unadjusted(at);
     let (pixels, w) = shoot(&mut f);
     let (mid_lo, mid_hi) = span(&pixels, w);
     eprintln!("vulkan_app_grid_slide: mid-slide span {mid_lo}..{mid_hi}");
@@ -10871,13 +10930,13 @@ fn vulkan_app_grid_dots_follow_the_page() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let area: Rectangle<f64, Logical> = Rectangle::new((0., 120.).into(), (1920., 700.).into());
 
@@ -10894,13 +10953,13 @@ fn vulkan_app_grid_dots_follow_the_page() {
             })
             .collect()
     };
-    f.niri().app_grid.set_entries(seed(256));
-    let per_page = f.niri().app_grid.items_per_page(area);
-    f.niri().app_grid.set_entries(seed(per_page + 6));
-    assert_eq!(f.niri().app_grid.page_count(area), 2);
+    f.synoik().app_grid.set_entries(seed(256));
+    let per_page = f.synoik().app_grid.items_per_page(area);
+    f.synoik().app_grid.set_entries(seed(per_page + 6));
+    assert_eq!(f.synoik().app_grid.page_count(area), 2);
     let dots: Vec<_> = (0..2)
         .map(|p| {
-            f.niri()
+            f.synoik()
                 .app_grid
                 .indicator_center(p, area)
                 .expect("both dots are laid out")
@@ -10909,14 +10968,14 @@ fn vulkan_app_grid_dots_follow_the_page() {
 
     let shoot =
         |f: &mut Fixture| -> (Vec<u8>, i32) {
-            let state = f.niri_state();
+            let state = f.synoik_state();
             let composited = state.backend.headless().with_vulkan_renderer(
                 |vk| -> anyhow::Result<(Vec<u8>, i32)> {
-                    let niri = &mut state.niri;
-                    let elements = niri.app_grid.render(
+                    let synoik = &mut state.synoik;
+                    let elements = synoik.app_grid.render(
                         vk,
-                        &niri.app_icon_cache,
-                        &niri.icon_cache,
+                        &synoik.app_icon_cache,
+                        &synoik.icon_cache,
                         &output,
                         area,
                         1.0,
@@ -10955,7 +11014,7 @@ fn vulkan_app_grid_dots_follow_the_page() {
         "the first dot is the lit one on page 0: {on_first:?}"
     );
 
-    assert!(f.niri().app_grid.set_page(1, area));
+    assert!(f.synoik().app_grid.set_page(1, area));
     f.settle_animations();
     let on_second = lit(&mut f);
     eprintln!("vulkan_app_grid_dots: page 1 -> {on_second:?}");
@@ -10977,14 +11036,14 @@ fn vulkan_renders_the_osd() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
     let out_size = output_size(&output);
 
     // (white bar pixels, red overdrive pixels) inside the level bar's own band.
     let sample = |f: &mut Fixture, level: f64, max: f64| {
         let out = output.clone();
-        f.niri().osd.show_one(
+        f.synoik().osd.show_one(
             &out,
             &["audio-volume-high-symbolic"],
             None,
@@ -10993,11 +11052,11 @@ fn vulkan_renders_the_osd() {
         f.settle_animations();
 
         let bar = f
-            .niri()
+            .synoik()
             .osd
             .level_rect(&out)
             .expect("an OSD with a level has a bar");
-        let pill = f.niri().osd.rect(&out).expect("the OSD is visible");
+        let pill = f.synoik().osd.rect(&out).expect("the OSD is visible");
         assert!(
             pill.loc.y + pill.size.h < out_size.h,
             "the pill sits above the bottom edge (margin-bottom: 4em)"
@@ -11008,12 +11067,12 @@ fn vulkan_renders_the_osd() {
         let band_top = to_physical_precise_round::<i32>(scale.x, bar.loc.y);
         let band_bot = to_physical_precise_round::<i32>(scale.x, bar.loc.y + bar.size.h);
 
-        let state = f.niri_state();
+        let state = f.synoik_state();
         state
             .backend
             .headless()
             .with_vulkan_renderer(|vk| {
-                let elems = state.niri.osd.render(vk, &state.niri.icon_cache, &out);
+                let elems = state.synoik.osd.render(vk, &state.synoik.icon_cache, &out);
                 assert!(!elems.is_empty(), "a visible OSD must render");
                 let pixels = composite_ui(vk, elems, Size::<i32, Physical>::from((w, h)), scale);
                 let mut white = 0usize;
@@ -11070,13 +11129,13 @@ fn vulkan_renders_the_media_card() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     // A player in the store, then the popover opened the way the panel opens it.
     let bus = "org.mpris.MediaPlayer2.rhythmbox";
-    f.niri_state()
-        .on_mpris_msg(crate::mpris::MprisToNiri::PlayerUpdated {
+    f.synoik_state()
+        .on_mpris_msg(crate::mpris::MprisToSynoik::PlayerUpdated {
             bus_name: bus.to_owned(),
             state: Box::new(crate::mpris::PlayerState {
                 identity: "Rhythmbox".into(),
@@ -11089,10 +11148,10 @@ fn vulkan_renders_the_media_card() {
             }),
         });
     {
-        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
-        let cal = f.niri().gnome_settings.calendar;
-        let accent = f.niri().gnome_settings.accent_color;
-        f.niri().panel_popover.toggle_calendar(
+        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.synoik().gnome_settings.calendar;
+        let accent = f.synoik().gnome_settings.accent_color;
+        f.synoik().panel_popover.toggle_calendar(
             output.clone(),
             anchor,
             cal.week_start,
@@ -11101,20 +11160,20 @@ fn vulkan_renders_the_media_card() {
             Vec::new(),
         );
     }
-    f.niri().refresh_popover_media();
+    f.synoik().refresh_popover_media();
     f.settle_animations();
 
-    let state = f.niri_state();
-    let origin = state.niri.panel_popover.content_location(&output);
+    let state = f.synoik_state();
+    let origin = state.synoik.panel_popover.content_location(&output);
     let (_, card_rect, controls) = state
-        .niri
+        .synoik
         .panel_popover
         .date_menu()
         .unwrap()
         .media_card_rects()
         .remove(0);
     let play_icon_available = state
-        .niri
+        .synoik
         .icon_cache
         .resolve("media-playback-pause-symbolic")
         .is_some();
@@ -11123,11 +11182,11 @@ fn vulkan_renders_the_media_card() {
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state.niri.panel_popover.render(
+            let elems = state.synoik.panel_popover.render(
                 vk,
-                &state.niri.icon_cache,
-                &state.niri.app_icon_cache,
-                &state.niri.image_cache,
+                &state.synoik.icon_cache,
+                &state.synoik.app_icon_cache,
+                &state.synoik.image_cache,
                 &output,
             );
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
@@ -11202,7 +11261,7 @@ fn vulkan_draws_album_art_without_the_themed_plate() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     // A 2:1 solid-red cover on disk. Wide, so fitting it into the 48px square leaves bands.
@@ -11213,8 +11272,8 @@ fn vulkan_draws_album_art_without_the_themed_plate() {
     cover.save(&art).unwrap();
 
     let bus = "org.mpris.MediaPlayer2.rhythmbox";
-    f.niri_state()
-        .on_mpris_msg(crate::mpris::MprisToNiri::PlayerUpdated {
+    f.synoik_state()
+        .on_mpris_msg(crate::mpris::MprisToSynoik::PlayerUpdated {
             bus_name: bus.to_owned(),
             state: Box::new(crate::mpris::PlayerState {
                 identity: "Rhythmbox".into(),
@@ -11227,10 +11286,10 @@ fn vulkan_draws_album_art_without_the_themed_plate() {
             }),
         });
     {
-        let anchor = f.niri().panel.date_menu_rect(output_size(&output).w);
-        let cal = f.niri().gnome_settings.calendar;
-        let accent = f.niri().gnome_settings.accent_color;
-        f.niri().panel_popover.toggle_calendar(
+        let anchor = f.synoik().panel.date_menu_rect(output_size(&output).w);
+        let cal = f.synoik().gnome_settings.calendar;
+        let accent = f.synoik().gnome_settings.accent_color;
+        f.synoik().panel_popover.toggle_calendar(
             output.clone(),
             anchor,
             cal.week_start,
@@ -11239,13 +11298,13 @@ fn vulkan_draws_album_art_without_the_themed_plate() {
             Vec::new(),
         );
     }
-    f.niri().refresh_popover_media();
+    f.synoik().refresh_popover_media();
     f.settle_animations();
 
-    let state = f.niri_state();
-    let origin = state.niri.panel_popover.content_location(&output);
+    let state = f.synoik_state();
+    let origin = state.synoik.panel_popover.content_location(&output);
     let (_, card_rect, _) = state
-        .niri
+        .synoik
         .panel_popover
         .date_menu()
         .unwrap()
@@ -11258,11 +11317,11 @@ fn vulkan_draws_album_art_without_the_themed_plate() {
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let elems = state.niri.panel_popover.render(
+            let elems = state.synoik.panel_popover.render(
                 vk,
-                &state.niri.icon_cache,
-                &state.niri.app_icon_cache,
-                &state.niri.image_cache,
+                &state.synoik.icon_cache,
+                &state.synoik.app_icon_cache,
+                &state.synoik.image_cache,
                 &output,
             );
             let w = to_physical_precise_round(scale.x, output_size(&output).w);
@@ -11316,22 +11375,22 @@ fn open_window_switcher(f: &mut Fixture) {
     const KEY_LEFTALT: u32 = 56;
     f.key_press(KEY_LEFTALT);
 
-    f.niri_state().do_action(
-        niri_config::Action::SwitchWindows { backward: false },
+    f.synoik_state().do_action(
+        synoik_config::Action::SwitchWindows { backward: false },
         false,
     );
     assert!(
-        f.niri().switcher.is_open(),
+        f.synoik().switcher.is_open(),
         "Alt-Tab must raise the switcher"
     );
 
-    let mut clock = f.niri().clock.clone();
+    let mut clock = f.synoik().clock.clone();
     let now = clock.now_unadjusted();
     clock.set_unadjusted(now + crate::ui::switcher::POPUP_DELAY * 2);
-    f.niri().advance_animations();
+    f.synoik().advance_animations();
 
     assert!(
-        f.niri().switcher.is_visible(),
+        f.synoik().switcher.is_visible(),
         "the popup must be past its open delay before the frame is taken"
     );
 }
@@ -11347,7 +11406,7 @@ fn vulkan_draws_the_window_switcher_panel() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let (before, w, _) = render_output_vulkan(&mut f, &output);
 
@@ -11355,7 +11414,7 @@ fn vulkan_draws_the_window_switcher_panel() {
 
     // Where the panel actually is, from the same layout the renderer used.
     let panel = f
-        .niri()
+        .synoik()
         .switcher
         .panel_rect()
         .expect("an open switcher has a panel");
@@ -11397,7 +11456,7 @@ fn vulkan_draws_the_live_window_preview_in_the_switcher() {
     let Some(mut f) = window_fixture(GREEN) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Count the green the desktop shows on its own, so the preview's green is what is measured.
     let (before, w, h) = render_output_vulkan(&mut f, &output);
@@ -11430,13 +11489,13 @@ fn vulkan_draws_the_arrow_only_under_a_multi_window_app() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![
             AppEntry::fake("org.example.One.desktop", "One"),
             AppEntry::fake("org.example.Two.desktop", "Two"),
@@ -11449,27 +11508,27 @@ fn vulkan_draws_the_arrow_only_under_a_multi_window_app() {
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.Two");
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let (before, w, _) = render_output_vulkan(&mut f, &output);
 
     const KEY_LEFTMETA: u32 = 125;
     f.key_press(KEY_LEFTMETA);
-    f.niri_state()
+    f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
 
-    let mut clock = f.niri().clock.clone();
+    let mut clock = f.synoik().clock.clone();
     let now = clock.now_unadjusted();
     clock.set_unadjusted(now + crate::ui::switcher::POPUP_DELAY * 2);
-    f.niri().advance_animations();
-    assert!(f.niri().switcher.is_visible());
+    f.synoik().advance_animations();
+    assert!(f.synoik().switcher.is_visible());
 
     // Item order is the MRU tab list: "Two" was mapped last, so it leads and "One" follows.
-    let apps = f.niri().switcher.item_count();
+    let apps = f.synoik().switcher.item_count();
     assert_eq!(apps, Some(2), "two running apps, two items");
-    let one = f.niri().switcher.item_rect(1).expect("the second item");
-    let two = f.niri().switcher.item_rect(0).expect("the first item");
+    let one = f.synoik().switcher.item_rect(1).expect("the second item");
+    let two = f.synoik().switcher.item_rect(0).expect("the first item");
 
     let scale = output.current_scale().fractional_scale();
     // The apex: the arrow's own bottom-centre, where its coverage is lowest but nonzero, would be
@@ -11544,13 +11603,13 @@ fn app_window_switcher_fixture_inner(title: &str, n: usize, solid: bool) -> Opti
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake(
             "org.example.One.desktop",
             "One",
@@ -11587,7 +11646,7 @@ fn app_window_switcher_fixture_inner(title: &str, n: usize, solid: bool) -> Opti
         window.ack_last_and_commit();
         f.double_roundtrip(id);
     }
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     Some(f)
@@ -11608,7 +11667,7 @@ fn vulkan_raises_the_cycled_window_above_the_ones_over_it() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -11639,30 +11698,32 @@ fn vulkan_raises_the_cycled_window_above_the_ones_over_it() {
         window.ack_last_and_commit();
         f.double_roundtrip(id);
     }
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = output.current_scale().fractional_scale();
 
     // Both at the same spot: whichever is on top is the only one visible there.
-    let ids: Vec<_> = f.niri().layout.windows().map(|(_, m)| m.id()).collect();
+    let ids: Vec<_> = f.synoik().layout.windows().map(|(_, m)| m.id()).collect();
     for id in ids {
-        let window = f.niri().find_window_by_id(id).unwrap();
-        f.niri().layout.move_floating_window(
+        let window = f.synoik().find_window_by_id(id).unwrap();
+        f.synoik().layout.move_floating_window(
             Some(&window),
-            niri_ipc::PositionChange::SetFixed(100.),
-            niri_ipc::PositionChange::SetFixed(100.),
+            synoik_ipc::PositionChange::SetFixed(100.),
+            synoik_ipc::PositionChange::SetFixed(100.),
             false,
         );
     }
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     const KEY_LEFTALT: u32 = 56;
     f.key_press(KEY_LEFTALT);
-    f.niri_state()
-        .do_action(niri_config::Action::CycleWindows { backward: false }, false);
-    let rect = f.niri().cycler_highlight.expect("the window is framed");
+    f.synoik_state().do_action(
+        synoik_config::Action::CycleWindows { backward: false },
+        false,
+    );
+    let rect = f.synoik().cycler_highlight.expect("the window is framed");
     // A point well inside the cycled window and clear of its own frame stroke.
     let cx = ((rect.loc.x + rect.size.w / 2.) * scale).round() as i32;
     let cy = ((rect.loc.y + rect.size.h / 2.) * scale).round() as i32;
@@ -11676,8 +11737,8 @@ fn vulkan_raises_the_cycled_window_above_the_ones_over_it() {
 
     // Cancel, and it drops back under the newer one — the raise is for the cycler's lifetime,
     // not a restacking.
-    f.niri().switcher.cancel();
-    f.niri().sync_cycler_highlight();
+    f.synoik().switcher.cancel();
+    f.synoik().sync_cycler_highlight();
     let (after, w, _) = render_output_vulkan(&mut f, &output);
     let middle = px(&after, w, cx, cy);
     assert!(
@@ -11698,16 +11759,18 @@ fn vulkan_frames_the_cycled_window_without_covering_it() {
     let Some(mut f) = app_window_switcher_fixture_n("Green", 2) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = output.current_scale().fractional_scale();
 
     const KEY_LEFTALT: u32 = 56;
     f.key_press(KEY_LEFTALT);
-    f.niri_state()
-        .do_action(niri_config::Action::CycleWindows { backward: false }, false);
-    assert!(f.niri().switcher.is_open(), "Alt+Escape raises a cycler");
+    f.synoik_state().do_action(
+        synoik_config::Action::CycleWindows { backward: false },
+        false,
+    );
+    assert!(f.synoik().switcher.is_open(), "Alt+Escape raises a cycler");
 
-    let rect = f.niri().cycler_highlight.expect("the window is framed");
+    let rect = f.synoik().cycler_highlight.expect("the window is framed");
     let at = |x: f64, y: f64| ((x * scale).round() as i32, (y * scale).round() as i32);
     // Two px into the 5px stroke on the top edge, and the middle of the window.
     let (ex, ey) = at(rect.loc.x + rect.size.w / 2., rect.loc.y + 2.);
@@ -11743,11 +11806,11 @@ fn vulkan_draws_the_app_badge_over_the_window_preview() {
     let Some(mut f) = app_window_switcher_fixture("Green") else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     open_window_switcher(&mut f);
 
-    let item = f.niri().switcher.item_rect(0).expect("one item");
+    let item = f.synoik().switcher.item_rect(0).expect("one item");
     let preview = crate::ui::switcher::window_switcher::preview_box(item);
     let badge = crate::ui::switcher::window_switcher::app_icon_center(preview);
     let scale = output.current_scale().fractional_scale();
@@ -11786,12 +11849,12 @@ fn vulkan_draws_the_selected_window_title_in_the_switchers_footer() {
     let Some(mut f) = app_window_switcher_fixture("Untitled Document") else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     open_window_switcher(&mut f);
 
     let footer = f
-        .niri()
+        .synoik()
         .switcher
         .footer_rect()
         .expect("the window switcher has a title band");
@@ -11831,24 +11894,24 @@ fn vulkan_rounds_a_solid_colour_surface_too() {
     let Some(mut f) = solid_buffer_switcher_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     const KEY_LEFTMETA: u32 = 125;
     const KEY_DOWN: u32 = 108;
     f.key_press(KEY_LEFTMETA);
-    f.niri_state()
+    f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
 
-    let mut clock = f.niri().clock.clone();
+    let mut clock = f.synoik().clock.clone();
     clock.set_unadjusted(clock.now_unadjusted() + crate::ui::switcher::POPUP_DELAY * 2);
-    f.niri().advance_animations();
+    f.synoik().advance_animations();
     f.key_press(KEY_DOWN);
     f.key_release(KEY_DOWN);
     clock.set_unadjusted(clock.now_unadjusted() + crate::ui::switcher::thumbnails::FADE_TIME * 2);
-    f.niri().advance_animations();
+    f.synoik().advance_animations();
 
     let preview = f
-        .niri()
+        .synoik()
         .switcher
         .thumbnail_rect(0)
         .expect("an open sub-list has a first preview");
@@ -11899,46 +11962,46 @@ fn vulkan_draws_the_app_switchers_window_sublist() {
     let Some(mut f) = app_window_switcher_fixture_n("Green", 2) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     const KEY_LEFTMETA: u32 = 125;
     const KEY_DOWN: u32 = 108;
     f.key_press(KEY_LEFTMETA);
-    f.niri_state()
+    f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
 
-    let mut clock = f.niri().clock.clone();
+    let mut clock = f.synoik().clock.clone();
     let now = clock.now_unadjusted();
     clock.set_unadjusted(now + crate::ui::switcher::POPUP_DELAY * 2);
-    f.niri().advance_animations();
+    f.synoik().advance_animations();
 
     // Down rather than the 500ms timer: the same sub-list either way, and this keeps the frame
     // free of the clock games (see `settle_screenshot_ui_open`).
     f.key_press(KEY_DOWN);
     f.key_release(KEY_DOWN);
     assert!(
-        f.niri().switcher.thumbnails_open(),
+        f.synoik().switcher.thumbnails_open(),
         "Down must open the window sub-list"
     );
 
     // ...and settle its fade-in, or the frame below is sampled at the alpha it *started* at.
-    // `niri_complete_animations` does not do this (see `settle_screenshot_ui_open`): only moving
+    // `synoik_complete_animations` does not do this (see `settle_screenshot_ui_open`): only moving
     // the clock past the easing does.
     clock.set_unadjusted(clock.now_unadjusted() + crate::ui::switcher::thumbnails::FADE_TIME * 2);
-    f.niri().advance_animations();
+    f.synoik().advance_animations();
     assert_eq!(
-        f.niri().switcher.thumbnail_alpha(),
+        f.synoik().switcher.thumbnail_alpha(),
         Some(1.),
         "the sub-list must be fully faded in before the frame is taken"
     );
 
     let panel = f
-        .niri()
+        .synoik()
         .switcher
         .thumbnail_panel_rect()
         .expect("an open sub-list has a panel");
     let preview = f
-        .niri()
+        .synoik()
         .switcher
         .thumbnail_rect(0)
         .expect("and a first preview");
@@ -12022,23 +12085,23 @@ fn count_green(pixels: &[u8], w: i32, h: i32) -> usize {
 /// vertical middle must hold bright pixels that the dimmed background does not.
 #[test]
 fn vulkan_draws_the_screen_shield_over_the_desktop() {
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // Establish the oracle: the window really is on screen before the shield goes down. Without
     // this the "no green" assertion below passes for a fixture that never had a window.
     let (before, w, h) = render_output_vulkan(&mut f, &output);
     assert_window_and_background(&before, w, h);
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(true));
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
     // The curtain slides in from above; sampled this instant it is still entirely off-screen, and
     // the desktop below would show through for reasons that have nothing to do with the shield.
-    f.niri_state().niri.lock_screen.settle();
+    f.synoik_state().synoik.lock_screen.settle();
     let (pixels, w, h) = render_output_vulkan(&mut f, &output);
 
     let is_green = |p: [u8; 4]| p[0] < 40 && p[1] > 200 && p[2] < 40 && p[3] > 200;
@@ -12088,7 +12151,7 @@ fn the_crossfade_asks_for_one_avatar_not_one_per_frame() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let requests = f.niri().icon_cache.wire_test_worker();
+    let requests = f.synoik().icon_cache.wire_test_worker();
 
     let content = PromptContent {
         display_name: "Test User".to_owned(),
@@ -12099,12 +12162,12 @@ fn the_crossfade_asks_for_one_avatar_not_one_per_frame() {
         ..Default::default()
     };
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let niri = &mut state.niri;
+            let synoik = &mut state.synoik;
             // Walk the crossfade the way a run of frames would.
             for step in 0..=10 {
                 let t = PageTransform::prompt(f64::from(step) / 10.);
@@ -12113,10 +12176,10 @@ fn the_crossfade_asks_for_one_avatar_not_one_per_frame() {
                     monitor: Rectangle::from_size(Size::from((1920., 1080.))),
                     now: Duration::ZERO,
                 };
-                let _ = niri.lock_screen.render_prompt(
+                let _ = synoik.lock_screen.render_prompt(
                     vk,
-                    &niri.icon_cache,
-                    &niri.image_cache,
+                    &synoik.icon_cache,
+                    &synoik.image_cache,
                     ctx,
                     &content,
                     t,
@@ -12158,14 +12221,14 @@ fn the_crossfade_asks_for_one_avatar_not_one_per_frame() {
 fn vulkan_draws_the_account_picture_round() {
     use std::io::Cursor;
 
-    use crate::dbus::accounts_service::{AccountIcon, AccountsToNiri, UserAccount};
+    use crate::dbus::accounts_service::{AccountIcon, AccountsToSynoik, UserAccount};
     use crate::dbus::gdm::VerifierEvent;
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // A solid, saturated magenta rectangle: the colour is one nothing else on the lock screen
     // draws, so any pixel of it is the picture and no chrome can counterfeit it. The 2:1 shape is
@@ -12183,27 +12246,27 @@ fn vulkan_draws_the_account_picture_round() {
 
     // Through the real AccountsService entry point, so the warm and the source both come from the
     // code that runs on the seat rather than from the test.
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::UserChanged(UserAccount {
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::UserChanged(UserAccount {
             real_name: "Test User".to_owned(),
             icon_file: AccountIcon::read(path.clone()),
             ..Default::default()
         }));
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    f.niri_state()
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
             question: "Password:".to_owned(),
             secret: true,
         });
-    f.niri_state()
+    f.synoik_state()
         .on_shield_key(None, Some('a'), Default::default());
-    f.niri_state().niri.lock_screen.settle();
+    f.synoik_state().synoik.lock_screen.settle();
 
     // Watch what the icon cache is asked for across the frame: the fallback branch must not run.
-    let icon_requests = f.niri().icon_cache.wire_test_worker();
+    let icon_requests = f.synoik().icon_cache.wire_test_worker();
 
     let (pixels, w, h) = render_output_vulkan(&mut f, &output);
     let _ = std::fs::remove_file(&path);
@@ -12294,20 +12357,20 @@ fn the_account_picture_uploads_once_per_scale() {
     std::fs::write(&path, &png).expect("write temp avatar");
     let source = ImageSource::File(path.clone());
 
-    let state = f.niri_state();
+    let state = f.synoik_state();
     let mut logical = Vec::new();
     state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
-            let niri = &mut state.niri;
+            let synoik = &mut state.synoik;
             let mut uploads = ImageUploads::new();
             // 1× first, so a scale-blind key hands its texture to the 2× ask.
             for scale in [1., 2.] {
                 let el = Avatar::element(
                     vk,
                     &mut uploads,
-                    &niri.image_cache,
+                    &synoik.image_cache,
                     &source,
                     0,
                     AVATAR_PX,
@@ -12350,37 +12413,37 @@ fn the_account_picture_uploads_once_per_scale() {
 #[cfg(feature = "dbus")]
 #[test]
 fn vulkan_draws_the_switch_user_button_in_its_corner() {
-    use crate::dbus::accounts_service::AccountsToNiri;
+    use crate::dbus::accounts_service::AccountsToSynoik;
     use crate::dbus::gdm::VerifierEvent;
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     // The seat can switch, but there is nobody to switch *to* yet — so the button is hidden and
     // everything else on the page is identical. Differencing against this isolates the button,
     // where differencing the clock page against the prompt page would just show the crossfade.
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::CanSwitch(true));
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    f.niri_state()
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::CanSwitch(true));
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
             question: "Password:".to_owned(),
             secret: true,
         });
-    f.niri_state()
+    f.synoik_state()
         .on_shield_key(None, Some('a'), Default::default());
-    f.niri_state().niri.lock_screen.settle();
+    f.synoik_state().synoik.lock_screen.settle();
     let (without, w, h) = render_output_vulkan(&mut f, &output);
 
     // --- A second account appears: the button, and nothing else, must change. ---
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::MultipleUsers(true));
-    f.niri_state().niri.lock_screen.settle();
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::MultipleUsers(true));
+    f.synoik_state().synoik.lock_screen.settle();
     let (with, _, _) = render_output_vulkan(&mut f, &output);
 
     let drawn: Vec<(i32, i32)> = (0..w * h)
@@ -12437,7 +12500,7 @@ fn vulkan_draws_the_switch_user_button_in_its_corner() {
 #[test]
 fn vulkan_draws_the_caps_lock_warning() {
     use crate::dbus::gdm::VerifierEvent;
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     /// `input-event-codes.h`.
     const KEY_CAPSLOCK: u32 = 58;
@@ -12445,19 +12508,19 @@ fn vulkan_draws_the_caps_lock_warning() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    f.niri_state()
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
             question: "Password:".to_owned(),
             secret: true,
         });
-    f.niri_state()
+    f.synoik_state()
         .on_shield_key(None, Some('a'), Default::default());
-    f.niri_state().niri.lock_screen.settle();
+    f.synoik_state().synoik.lock_screen.settle();
 
     let is_bright = |p: [u8; 4]| p[0] > 200 && p[1] > 200 && p[2] > 200;
     let count_bright = |pixels: &[u8], w: i32, h: i32| {
@@ -12473,8 +12536,8 @@ fn vulkan_draws_the_caps_lock_warning() {
     // likely to be wrong (the press reports the lock state it is about to change).
     f.key_press(KEY_CAPSLOCK);
     f.key_release(KEY_CAPSLOCK);
-    assert!(f.niri().caps_lock, "the seat reports caps lock on");
-    f.niri_state().niri.lock_screen.settle();
+    assert!(f.synoik().caps_lock, "the seat reports caps lock on");
+    f.synoik_state().synoik.lock_screen.settle();
 
     let (during, _, _) = render_output_vulkan(&mut f, &output);
     let bright_during = count_bright(&during, w, h);
@@ -12486,8 +12549,8 @@ fn vulkan_draws_the_caps_lock_warning() {
     // ...and off again puts the frame back exactly.
     f.key_press(KEY_CAPSLOCK);
     f.key_release(KEY_CAPSLOCK);
-    assert!(!f.niri().caps_lock, "and off again");
-    f.niri_state().niri.lock_screen.settle();
+    assert!(!f.synoik().caps_lock, "and off again");
+    f.synoik_state().synoik.lock_screen.settle();
 
     let (after, _, _) = render_output_vulkan(&mut f, &output);
     let differing = before
@@ -12512,33 +12575,33 @@ fn vulkan_draws_the_caps_lock_warning() {
 #[test]
 fn vulkan_draws_the_prompt_message_in_its_own_row() {
     use crate::dbus::gdm::{MessageKind, MessageSource, VerifierEvent};
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    f.niri_state()
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
             question: "Password:".to_owned(),
             secret: true,
         });
-    f.niri_state()
+    f.synoik_state()
         .on_shield_key(None, Some('a'), Default::default());
-    f.niri_state().niri.lock_screen.settle();
+    f.synoik_state().synoik.lock_screen.settle();
     let (before, w, h) = render_output_vulkan(&mut f, &output);
 
-    f.niri_state()
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::ShowMessage {
             text: "Fingerprint reader unavailable".to_owned(),
             kind: MessageKind::Error,
             source: MessageSource::Fingerprint,
         });
-    f.niri_state().niri.lock_screen.settle();
+    f.synoik_state().synoik.lock_screen.settle();
     let (during, _, _) = render_output_vulkan(&mut f, &output);
 
     let drawn: Vec<(i32, i32)> = (0..w * h)
@@ -12572,16 +12635,16 @@ fn vulkan_draws_the_prompt_message_in_its_own_row() {
     // ...and clearing it takes the ink away again. Compared over the pixels the message itself
     // touched rather than the whole frame: the reset that clears it also empties the entry and
     // drops the question, so a frame-wide diff would be measuring those instead.
-    f.niri_state().on_verifier_event(VerifierEvent::Reset);
+    f.synoik_state().on_verifier_event(VerifierEvent::Reset);
     // The read-time floor holds the message up past the reset; drain it the way the timer would.
     let now = crate::utils::get_monotonic_time() + std::time::Duration::from_secs(30);
-    let effects = f.niri_state().niri.unlock_dialog.tick(now);
-    f.niri_state().apply_unlock_effects(effects);
+    let effects = f.synoik_state().synoik.unlock_dialog.tick(now);
+    f.synoik_state().apply_unlock_effects(effects);
     assert!(
-        f.niri().unlock_dialog.message().is_none(),
+        f.synoik().unlock_dialog.message().is_none(),
         "the message outlived the reset"
     );
-    f.niri_state().niri.lock_screen.settle();
+    f.synoik_state().synoik.lock_screen.settle();
 
     let (after, _, _) = render_output_vulkan(&mut f, &output);
     let left_behind = drawn
@@ -12605,35 +12668,35 @@ fn vulkan_draws_the_prompt_message_in_its_own_row() {
 #[test]
 fn vulkan_draws_the_unlock_prompt_with_a_masked_entry() {
     use crate::dbus::gdm::VerifierEvent;
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    f.niri_state()
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
             question: "Password:".to_owned(),
             secret: true,
         });
     // Raise the prompt and type.
     for c in "abcdefgh".chars() {
-        f.niri_state()
+        f.synoik_state()
             .on_shield_key(None, Some(c), Default::default());
     }
     assert_eq!(
-        f.niri().unlock_dialog.entry_display().chars().count(),
+        f.synoik().unlock_dialog.entry_display().chars().count(),
         8,
         "the fixture typed into a live entry"
     );
     // The curtain's slide and the clock↔prompt crossfade both run on the wall clock, and both
     // start from invisible, so a render taken this instant would catch the shield off the top of
     // the screen with the prompt at alpha ~0.
-    f.niri_state().niri.lock_screen.settle();
+    f.synoik_state().synoik.lock_screen.settle();
 
     let (pixels, w, h) = render_output_vulkan(&mut f, &output);
 
@@ -12657,14 +12720,14 @@ fn vulkan_draws_the_unlock_prompt_with_a_masked_entry() {
     // raw text, the ink would move; masked, every frame is the same eight dots.
     let baseline = pixels.clone();
     for _ in 0..8 {
-        f.niri_state().on_shield_key(
+        f.synoik_state().on_shield_key(
             Some(smithay::input::keyboard::Keysym::BackSpace),
             None,
             Default::default(),
         );
     }
     for c in "zyxwvuts".chars() {
-        f.niri_state()
+        f.synoik_state()
             .on_shield_key(None, Some(c), Default::default());
     }
     let (pixels2, _, _) = render_output_vulkan(&mut f, &output);
@@ -12703,8 +12766,8 @@ fn vulkan_screenshot_from_quick_settings_does_not_freeze_the_menu_into_the_shot(
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
-    f.niri().update_render_elements(None);
+    let output = f.synoik_output(1);
+    f.synoik().update_render_elements(None);
 
     // Open quick settings from the panel.
     let x = super::gnome::qs_center_x(&mut f, f64::from(OUT_W));
@@ -12713,7 +12776,7 @@ fn vulkan_screenshot_from_quick_settings_does_not_freeze_the_menu_into_the_shot(
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.settle_animations();
     assert_eq!(
-        f.niri().panel_popover.open_role(),
+        f.synoik().panel_popover.open_role(),
         Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
         "the status cluster must open quick settings"
     );
@@ -12722,7 +12785,7 @@ fn vulkan_screenshot_from_quick_settings_does_not_freeze_the_menu_into_the_shot(
     // rect is the region the assertion below inspects.
     let origin = super::gnome::popover_origin(&mut f);
     let size = f
-        .niri()
+        .synoik()
         .panel_popover
         .content_size()
         .expect("the open menu must have a size");
@@ -12733,7 +12796,7 @@ fn vulkan_screenshot_from_quick_settings_does_not_freeze_the_menu_into_the_shot(
     // The screenshot button's own rect, asked of the menu rather than recomputed: the system row
     // is laid out differently with and without a battery pill.
     let has_pill = f
-        .niri()
+        .synoik()
         .panel_popover
         .quick_settings()
         .expect("quick settings must be the open content")
@@ -12752,7 +12815,7 @@ fn vulkan_screenshot_from_quick_settings_does_not_freeze_the_menu_into_the_shot(
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     assert!(
-        f.niri().screenshot_ui.is_open(),
+        f.synoik().screenshot_ui.is_open(),
         "the quick-settings screenshot button must open the picker"
     );
 
@@ -12800,10 +12863,10 @@ fn vulkan_screenshot_ui_window_mode_picks_a_frozen_window() {
     let Some((mut f, id, surface)) = window_fixture_with_client(GREEN, true, None) else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = output.current_scale().fractional_scale();
 
-    f.niri_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(false, None);
     // Recolour the live window red *after* the picker froze it. Every green pixel below therefore
     // came from the frozen capture, and any red would mean Window mode read the live window —
     // which is the whole difference between this and `screenshot_window`.
@@ -12812,20 +12875,20 @@ fn vulkan_screenshot_ui_window_mode_picks_a_frozen_window() {
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
     assert!(
-        f.niri().screenshot_ui.any_windows(),
+        f.synoik().screenshot_ui.any_windows(),
         "the fixture's window must reach the selector, or the Window button stays insensitive"
     );
 
     // The focused window is picked up front, so the selector opens on something.
     let (_, selected) = f
-        .niri()
+        .synoik()
         .screenshot_ui
         .selected_window()
         .expect("the selector must open with the focused window checked");
 
     // Switch to Window mode by clicking its type button, at the coordinates the layout publishes.
-    let panel = f.niri().screenshot_ui.panel_rect(&output).unwrap();
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let panel = f.synoik().screenshot_ui.panel_rect(&output).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     let window_button = layout.type_buttons[2];
     let point = Point::<f64, Logical>::from((
         window_button.loc.x + window_button.size.w / 2.,
@@ -12836,7 +12899,7 @@ fn vulkan_screenshot_ui_window_mode_picks_a_frozen_window() {
         + panel.loc;
 
     {
-        let ui = &mut f.niri_state().niri.screenshot_ui;
+        let ui = &mut f.synoik_state().synoik.screenshot_ui;
         ui.pointer_motion(point, None);
         ui.pointer_down(output.clone(), point, None, false);
         assert_eq!(ui.pointer_up(None), Some(PointerUp::Redraw));
@@ -12848,7 +12911,7 @@ fn vulkan_screenshot_ui_window_mode_picks_a_frozen_window() {
     }
 
     let (size, pixels) = f
-        .niri()
+        .synoik()
         .screenshot_ui
         .capture_from_neutral()
         .expect("Window mode must capture the selected window");
@@ -12891,24 +12954,24 @@ fn vulkan_screenshot_ui_window_button_is_inert_without_windows() {
     }
 
     let mut f = Fixture::new();
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
-    f.niri().update_render_elements(None);
+    f.synoik().update_render_elements(None);
 
-    let output = f.niri_output(1);
-    f.niri_state().open_screenshot_ui(false, None);
+    let output = f.synoik_output(1);
+    f.synoik_state().open_screenshot_ui(false, None);
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
-    assert!(!f.niri().screenshot_ui.any_windows());
-    assert!(f.niri().screenshot_ui.selected_window().is_none());
+    assert!(!f.synoik().screenshot_ui.any_windows());
+    assert!(f.synoik().screenshot_ui.selected_window().is_none());
 
-    let panel = f.niri().screenshot_ui.panel_rect(&output).unwrap();
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let panel = f.synoik().screenshot_ui.panel_rect(&output).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     let button = layout.type_buttons[2];
     let scale = output.current_scale().fractional_scale();
     let point = Point::<f64, Logical>::from((
@@ -12922,18 +12985,18 @@ fn vulkan_screenshot_ui_window_button_is_inert_without_windows() {
     // No hover and no tooltip: an insensitive St.Button is `reactive = false`, so it never emits
     // `notify::hover` and its tip is never scheduled. A button that lit up and advertised itself
     // while refusing every click would be the worst of both.
-    f.niri_state()
-        .niri
+    f.synoik_state()
+        .synoik
         .screenshot_ui
         .pointer_motion(point, None);
     f.settle_animations();
     assert_eq!(
-        f.niri().screenshot_ui.tooltip_text(),
+        f.synoik().screenshot_ui.tooltip_text(),
         None,
         "an insensitive Window button must not offer a tooltip"
     );
 
-    let ui = &mut f.niri_state().niri.screenshot_ui;
+    let ui = &mut f.synoik_state().synoik.screenshot_ui;
     ui.set_capture_type(CaptureType::Window);
     assert_eq!(
         ui.capture_type(),
@@ -12960,15 +13023,15 @@ fn vulkan_screenshot_ui_tooltip_waits_before_it_shows() {
     let Some(mut f) = green_window_fixture() else {
         return;
     };
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = output.current_scale().fractional_scale();
 
-    f.niri_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(false, None);
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
-    let panel = f.niri().screenshot_ui.panel_rect(&output).unwrap();
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let panel = f.synoik().screenshot_ui.panel_rect(&output).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     let at = |r: Rectangle<f64, Logical>| {
         Point::<f64, Logical>::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
             .to_physical(scale)
@@ -12977,17 +13040,17 @@ fn vulkan_screenshot_ui_tooltip_waits_before_it_shows() {
     };
 
     // Land on the Screen button. Nothing is due yet.
-    f.niri_state()
-        .niri
+    f.synoik_state()
+        .synoik
         .screenshot_ui
         .pointer_motion(at(layout.type_buttons[1]), None);
     assert_eq!(
-        f.niri().screenshot_ui.tooltip_text(),
+        f.synoik().screenshot_ui.tooltip_text(),
         None,
         "the tip must not draw before its delay elapses"
     );
     assert!(
-        f.niri().screenshot_ui.are_animations_ongoing(),
+        f.synoik().screenshot_ui.are_animations_ongoing(),
         "a pending tip must keep the redraw loop alive, or it never becomes due"
     );
 
@@ -12995,43 +13058,43 @@ fn vulkan_screenshot_ui_tooltip_waits_before_it_shows() {
     // delay actually elapse (the headless-animation-clock trap: completing animations does not).
     f.settle_animations();
     assert_eq!(
-        f.niri().screenshot_ui.tooltip_text(),
+        f.synoik().screenshot_ui.tooltip_text(),
         Some("Screen Selection"),
         "the tip must say what the button does, not repeat its caption"
     );
 
     // Moving to another control restarts the wait rather than carrying the old tip across.
-    f.niri_state()
-        .niri
+    f.synoik_state()
+        .synoik
         .screenshot_ui
         .pointer_motion(at(layout.capture), None);
     assert_eq!(
-        f.niri().screenshot_ui.tooltip_text(),
+        f.synoik().screenshot_ui.tooltip_text(),
         None,
         "moving between controls must restart the delay, not swap the text instantly"
     );
 
     f.settle_animations();
-    assert_eq!(f.niri().screenshot_ui.tooltip_text(), Some("Capture"));
+    assert_eq!(f.synoik().screenshot_ui.tooltip_text(), Some("Capture"));
 
     // Leaving the panel drops it.
-    f.niri_state()
-        .niri
+    f.synoik_state()
+        .synoik
         .screenshot_ui
         .pointer_motion(Point::from((5, 5)), None);
-    assert_eq!(f.niri().screenshot_ui.tooltip_text(), None);
+    assert_eq!(f.synoik().screenshot_ui.tooltip_text(), None);
 
     // An insensitive control offers no tooltip either: this fixture has a window, so unmap it and
     // check the Window button goes quiet rather than advertising a mode it will not enter.
     // (`reactive = false` gives St.Button no `notify::hover` at all, which is what drives both.)
     let window_button = at(layout.type_buttons[2]);
-    f.niri_state()
-        .niri
+    f.synoik_state()
+        .synoik
         .screenshot_ui
         .pointer_motion(window_button, None);
     f.settle_animations();
     assert_eq!(
-        f.niri().screenshot_ui.tooltip_text(),
+        f.synoik().screenshot_ui.tooltip_text(),
         Some("Window Selection"),
         "a sensitive Window button does offer its tip"
     );

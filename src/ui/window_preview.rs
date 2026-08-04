@@ -34,10 +34,10 @@ use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
 use crate::app_system::AppIconRef;
-use crate::niri_render_elements;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::synoik_render_elements;
 use crate::ui::widget::{
     self, style, BakeCache, Painter, Rgba, SharedAppIconUploads, TextShaper, TextStyle,
 };
@@ -367,7 +367,7 @@ impl PreviewChrome {
     }
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     PreviewChromeRenderElement => {
         Texture = TextureRenderElement<VkTexture>,
         // The app icon, scaled on the overview axis (`_updateIconScale`).

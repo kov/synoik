@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
-use niri_config::Config;
 use smithay::backend::input::{ButtonState, InputEvent, KeyState, Keycode};
 use smithay::output::Output;
 use smithay::utils::{Logical, Rectangle};
+use synoik_config::Config;
 
 use super::client::{Client, ClientId};
 use super::server::Server;
@@ -17,7 +17,7 @@ use crate::input::synthetic::{
     SyntheticPointerButtonEvent, SyntheticPointerMotionEvent, SyntheticTouchDownEvent,
     SyntheticTouchUpEvent,
 };
-use crate::niri::{NewClient, Niri};
+use crate::synoik::{NewClient, Synoik};
 
 pub struct Fixture {
     pub event_loop: EventLoop<'static, State>,
@@ -99,12 +99,12 @@ impl Fixture {
     /// Pump the compositor's own event loop until `pred` holds, giving up after
     /// `timeout`. This spends **real** wall-clock time: it is for the handful of
     /// behaviours driven by a calloop timer rather than by the animation clock (drag
-    /// countdowns), which no amount of `niri_complete_animations` will fire. Returns
+    /// countdowns), which no amount of `synoik_complete_animations` will fire. Returns
     /// whether the predicate came true.
     pub fn dispatch_until(
         &mut self,
         timeout: Duration,
-        mut pred: impl FnMut(&mut crate::niri::State) -> bool,
+        mut pred: impl FnMut(&mut crate::synoik::State) -> bool,
     ) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -119,12 +119,12 @@ impl Fixture {
         }
     }
 
-    pub fn niri_state(&mut self) -> &mut crate::niri::State {
+    pub fn synoik_state(&mut self) -> &mut crate::synoik::State {
         &mut self.state.server.state
     }
 
-    pub fn niri(&mut self) -> &mut Niri {
-        &mut self.niri_state().niri
+    pub fn synoik(&mut self) -> &mut Synoik {
+        &mut self.synoik_state().synoik
     }
 
     /// Give the compositor a [`StubAudio`] backend bound at `volume` (unmuted) and return a handle
@@ -132,7 +132,7 @@ impl Fixture {
     /// no PipeWire — and every audio path silently no-ops, which is exactly how the panel-scroll
     /// OSD went unpinned for so long.
     ///
-    /// Also seeds `niri.audio`, the model the panel icon and the OSD read: the live backend
+    /// Also seeds `synoik.audio`, the model the panel icon and the OSD read: the live backend
     /// publishes it over its calloop channel, and nothing drives that channel here.
     pub fn install_stub_audio(&mut self, volume: f64) -> crate::audio::StubAudio {
         let status = crate::audio::AudioStatus {
@@ -140,46 +140,48 @@ impl Fixture {
             muted: false,
         };
         let stub = crate::audio::StubAudio::with_status(status);
-        self.niri().audio_backend = Some(Box::new(stub.clone()));
+        self.synoik().audio_backend = Some(Box::new(stub.clone()));
         // Through the real entry point, not by assigning the field: `on_audio_status` is what also
         // puts the volume icon in the panel's status cluster, and without it there is nothing to
         // aim a scroll at.
-        self.niri_state().on_audio_status(Some(status));
+        self.synoik_state().on_audio_status(Some(status));
         stub
     }
 
-    pub fn niri_output(&self, n: u8) -> Output {
-        let niri = &self.state.server.state.niri;
+    pub fn synoik_output(&self, n: u8) -> Output {
+        let synoik = &self.state.server.state.synoik;
         let idx = usize::from(n - 1);
-        let output = niri.global_space.outputs().nth(idx).unwrap();
+        let output = synoik.global_space.outputs().nth(idx).unwrap();
         output.clone()
     }
 
-    pub fn niri_focus_output(&mut self, n: u8) {
-        let niri = &mut self.state.server.state.niri;
+    pub fn synoik_focus_output(&mut self, n: u8) {
+        let synoik = &mut self.state.server.state.synoik;
         let idx = usize::from(n - 1);
-        let output = niri.global_space.outputs().nth(idx).unwrap();
-        niri.layout.focus_output(output);
+        let output = synoik.global_space.outputs().nth(idx).unwrap();
+        synoik.layout.focus_output(output);
     }
 
-    pub fn niri_complete_animations(&mut self) {
-        let niri = self.niri();
-        niri.clock.set_complete_instantly(true);
-        niri.advance_animations();
-        niri.clock.set_complete_instantly(false);
+    pub fn synoik_complete_animations(&mut self) {
+        let synoik = self.synoik();
+        synoik.clock.set_complete_instantly(true);
+        synoik.advance_animations();
+        synoik.clock.set_complete_instantly(false);
     }
 
     /// Drive animations to completion by pinning the (lazy) clock forward past any
-    /// running animation, then advancing. Unlike [`niri_complete_animations`], this
+    /// running animation, then advancing. Unlike [`synoik_complete_animations`], this
     /// actually moves the clock, so `is_done`/progress read as finished at render
     /// time too — the correct way to settle a timed overlay (see the
     /// headless-animation-clock trap). Call it immediately before asserting, after
     /// the last input roundtrip (`refresh` clears the lazy clock).
     pub fn settle_animations(&mut self) {
-        let niri = self.niri();
-        let now = niri.clock.now_unadjusted();
-        niri.clock.set_unadjusted(now + Duration::from_millis(1000));
-        niri.advance_animations();
+        let synoik = self.synoik();
+        let now = synoik.clock.now_unadjusted();
+        synoik
+            .clock
+            .set_unadjusted(now + Duration::from_millis(1000));
+        synoik.advance_animations();
     }
 
     /// Sample `f` at `n + 1` evenly spaced instants across the next `duration`,
@@ -202,13 +204,13 @@ impl Fixture {
         n: u32,
         mut f: impl FnMut(&mut Self) -> T,
     ) -> Vec<T> {
-        let start = self.niri().clock.now_unadjusted();
+        let start = self.synoik().clock.now_unadjusted();
         (0..=n)
             .map(|i| {
                 let at = start + duration.mul_f64(f64::from(i) / f64::from(n));
-                let niri = self.niri();
-                niri.clock.set_unadjusted(at);
-                niri.advance_animations();
+                let synoik = self.synoik();
+                synoik.clock.set_unadjusted(at);
+                synoik.advance_animations();
                 f(self)
             })
             .collect()
@@ -223,9 +225,9 @@ impl Fixture {
         duration: Duration,
         n: u32,
     ) -> Vec<Vec<Rectangle<f64, Logical>>> {
-        let output = self.niri_output(output_n);
+        let output = self.synoik_output(output_n);
         self.sample_animation(duration, n, |f| {
-            f.niri()
+            f.synoik()
                 .layout
                 .monitor_for_output(&output)
                 .unwrap()
@@ -259,7 +261,7 @@ impl Fixture {
                 state,
             },
         };
-        self.niri_state().process_input_event(event);
+        self.synoik_state().process_input_event(event);
     }
 
     /// Inject a pointer button event through the real input pipeline.
@@ -273,7 +275,7 @@ impl Fixture {
                 state,
             },
         };
-        self.niri_state().process_input_event(event);
+        self.synoik_state().process_input_event(event);
     }
 
     /// Inject relative pointer motion through the real input pipeline.
@@ -285,7 +287,7 @@ impl Fixture {
                 dy,
             },
         };
-        self.niri_state().process_input_event(event);
+        self.synoik_state().process_input_event(event);
     }
 
     /// Inject one vertical wheel notch (a discrete scroll) through the real
@@ -298,7 +300,7 @@ impl Fixture {
                 finger: None,
             },
         };
-        self.niri_state().process_input_event(event);
+        self.synoik_state().process_input_event(event);
     }
 
     /// Inject one vertical wheel notch in the *other* direction (scroll up).
@@ -310,7 +312,7 @@ impl Fixture {
                 finger: None,
             },
         };
-        self.niri_state().process_input_event(event);
+        self.synoik_state().process_input_event(event);
     }
 
     /// Inject a continuous (touchpad) scroll of `(dx, dy)` through the real input
@@ -324,7 +326,7 @@ impl Fixture {
                 finger: Some((dx, dy)),
             },
         };
-        self.niri_state().process_input_event(event);
+        self.synoik_state().process_input_event(event);
     }
 
     /// Inject a touch-down at `(x, y)` through the real input pipeline.
@@ -336,7 +338,7 @@ impl Fixture {
                 y,
             },
         };
-        self.niri_state().process_input_event(event);
+        self.synoik_state().process_input_event(event);
     }
 
     /// Inject a touch-up (for the single test slot) through the real input
@@ -347,7 +349,7 @@ impl Fixture {
                 time: self.next_input_micros(),
             },
         };
-        self.niri_state().process_input_event(event);
+        self.synoik_state().process_input_event(event);
     }
 
     /// Skip the synthetic input clock forward, so the next injected event carries
@@ -365,21 +367,21 @@ impl Fixture {
     }
 
     pub fn add_output(&mut self, n: u8, size: (u16, u16)) {
-        let state = self.niri_state();
-        let niri = &mut state.niri;
-        state.backend.headless().add_output(niri, n, size);
+        let state = self.synoik_state();
+        let synoik = &mut state.synoik;
+        state.backend.headless().add_output(synoik, n, size);
     }
 
     /// Unplug a headless output added by [`add_output`](Self::add_output), so a test
     /// can exercise the per-output teardown paths (OSD windows, banner retargeting).
     pub fn remove_output(&mut self, n: u8) {
-        let output = self.niri_output(n);
-        self.niri().remove_output(&output);
+        let output = self.synoik_output(n);
+        self.synoik().remove_output(&output);
     }
 
     pub fn add_client(&mut self) -> ClientId {
         let (sock1, sock2) = UnixStream::pair().unwrap();
-        self.niri().insert_client(NewClient {
+        self.synoik().insert_client(NewClient {
             client: sock1,
             restricted: false,
             credentials_unknown: false,
@@ -419,10 +421,10 @@ impl Fixture {
     /// For some reason, when running tests on many threads at once, a single roundtrip is
     /// sometimes not sufficient to get the configure events to the client.
     ///
-    /// I suspect that this is because these configure events are sent from the niri loop callback,
-    /// so they arrive after the sync done event and don't get processed in that client dispatch
-    /// cycle. I'm not sure why this would be dependent on multithreading. But if this is indeed
-    /// the issue, then a double roundtrip fixes it.
+    /// I suspect that this is because these configure events are sent from the synoik loop
+    /// callback, so they arrive after the sync done event and don't get processed in that
+    /// client dispatch cycle. I'm not sure why this would be dependent on multithreading. But
+    /// if this is indeed the issue, then a double roundtrip fixes it.
     pub fn double_roundtrip(&mut self, id: ClientId) {
         self.roundtrip(id);
         self.roundtrip(id);

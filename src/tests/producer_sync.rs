@@ -30,10 +30,10 @@ fn dmabuf_pre_commit_hook_installed_on_every_surface() {
         f.add_output(1, (1920, 1080));
         let id = f.add_client();
 
-        let before = f.niri().dmabuf_pre_commit_hook.len();
+        let before = f.synoik().dmabuf_pre_commit_hook.len();
         f.client(id).create_window();
         f.roundtrip(id);
-        let after = f.niri().dmabuf_pre_commit_hook.len();
+        let after = f.synoik().dmabuf_pre_commit_hook.len();
 
         assert_eq!(
             after - before,

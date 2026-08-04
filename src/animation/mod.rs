@@ -60,7 +60,7 @@ impl Animation {
         from: f64,
         to: f64,
         initial_velocity: f64,
-        config: niri_config::Animation,
+        config: synoik_config::Animation,
     ) -> Self {
         // Scale the velocity by rate to keep the touchpad gestures feeling right.
         let initial_velocity = initial_velocity / clock.rate().max(0.001);
@@ -75,7 +75,7 @@ impl Animation {
         rv
     }
 
-    pub fn replace_config(&mut self, config: niri_config::Animation) {
+    pub fn replace_config(&mut self, config: synoik_config::Animation) {
         self.is_off = config.off;
         if config.off {
             self.duration = Duration::ZERO;
@@ -86,7 +86,7 @@ impl Animation {
         let start_time = self.start_time;
 
         match config.kind {
-            niri_config::animations::Kind::Spring(p) => {
+            synoik_config::animations::Kind::Spring(p) => {
                 let params = SpringParams::new(p.damping_ratio, f64::from(p.stiffness), p.epsilon);
 
                 let spring = Spring {
@@ -97,7 +97,7 @@ impl Animation {
                 };
                 *self = Self::spring(self.clock.clone(), spring);
             }
-            niri_config::animations::Kind::Easing(p) => {
+            synoik_config::animations::Kind::Easing(p) => {
                 *self = Self::ease(
                     self.clock.clone(),
                     self.from,
@@ -357,14 +357,14 @@ impl Curve {
     }
 }
 
-impl From<niri_config::animations::Curve> for Curve {
-    fn from(value: niri_config::animations::Curve) -> Self {
+impl From<synoik_config::animations::Curve> for Curve {
+    fn from(value: synoik_config::animations::Curve) -> Self {
         match value {
-            niri_config::animations::Curve::Linear => Curve::Linear,
-            niri_config::animations::Curve::EaseOutQuad => Curve::EaseOutQuad,
-            niri_config::animations::Curve::EaseOutCubic => Curve::EaseOutCubic,
-            niri_config::animations::Curve::EaseOutExpo => Curve::EaseOutExpo,
-            niri_config::animations::Curve::CubicBezier(x1, y1, x2, y2) => {
+            synoik_config::animations::Curve::Linear => Curve::Linear,
+            synoik_config::animations::Curve::EaseOutQuad => Curve::EaseOutQuad,
+            synoik_config::animations::Curve::EaseOutCubic => Curve::EaseOutCubic,
+            synoik_config::animations::Curve::EaseOutExpo => Curve::EaseOutExpo,
+            synoik_config::animations::Curve::CubicBezier(x1, y1, x2, y2) => {
                 Curve::CubicBezier(CubicBezier::new(x1, y1, x2, y2))
             }
         }

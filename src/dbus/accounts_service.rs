@@ -114,7 +114,7 @@ impl AccountIcon {
 }
 
 #[derive(Debug, Clone)]
-pub enum AccountsToNiri {
+pub enum AccountsToSynoik {
     /// The account's properties, on first read and on every change.
     UserChanged(UserAccount),
     /// Whether the "Other User" button has anywhere to go: more than one non-system account exists
@@ -206,7 +206,7 @@ async fn multiple_users(conn: &zbus::Connection) -> bool {
 
 pub fn start(
     username: String,
-    to_niri: calloop::channel::Sender<AccountsToNiri>,
+    to_niri: calloop::channel::Sender<AccountsToSynoik>,
 ) -> anyhow::Result<zbus::blocking::Connection> {
     let conn = zbus::blocking::Connection::system()?;
 
@@ -273,11 +273,11 @@ pub fn start(
         let user_added = accounts.receive_signal("UserAdded").await;
         let user_deleted = accounts.receive_signal("UserDeleted").await;
 
-        let _ = to_niri.send(AccountsToNiri::UserChanged(read_account(&user).await));
-        let _ = to_niri.send(AccountsToNiri::MultipleUsers(
+        let _ = to_niri.send(AccountsToSynoik::UserChanged(read_account(&user).await));
+        let _ = to_niri.send(AccountsToSynoik::MultipleUsers(
             multiple_users(&async_conn).await,
         ));
-        let _ = to_niri.send(AccountsToNiri::CanSwitch(
+        let _ = to_niri.send(AccountsToSynoik::CanSwitch(
             crate::dbus::user_switching::seat_id(&async_conn)
                 .await
                 .is_some(),
@@ -300,8 +300,8 @@ pub fn start(
 
         while let Some(wake) = events.next().await {
             let msg = match wake {
-                Wake::Account => AccountsToNiri::UserChanged(read_account(&user).await),
-                Wake::Users => AccountsToNiri::MultipleUsers(multiple_users(&async_conn).await),
+                Wake::Account => AccountsToSynoik::UserChanged(read_account(&user).await),
+                Wake::Users => AccountsToSynoik::MultipleUsers(multiple_users(&async_conn).await),
             };
             if to_niri.send(msg).is_err() {
                 break;

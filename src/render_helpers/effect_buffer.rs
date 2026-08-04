@@ -9,11 +9,11 @@ use smithay::backend::renderer::{
 };
 use smithay::utils::{Buffer, Logical, Physical, Scale, Size, Transform};
 
-use crate::niri::OutputRenderElements;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::renderer::OffscreenRenderer as _;
 use crate::render_helpers::vulkan::{EffectBlur, VkTexture, VulkanRenderer};
 use crate::render_helpers::NATIVE_FOURCC;
+use crate::synoik::OutputRenderElements;
 
 #[derive(Debug)]
 pub struct EffectBuffer {
@@ -107,14 +107,14 @@ impl EffectBuffer {
     ///
     /// Reads the Vulkan arm: it is the one the live session fills. Reading the GLES arm here meant
     /// this returned `None` on every real frame, which silently disabled the background-layer id
-    /// remap in `Niri::update_primary_scanout_output` (niri.rs) — a background layer surface
+    /// remap in `Synoik::update_primary_scanout_output` (synoik.rs) — a background layer surface
     /// visible only through an xray blur was then treated as un-presented and its frame callbacks
     /// throttled.
     ///
     /// Callers must have filled and prepared this buffer during the frame they read it in: the
     /// states are only rewritten on the `ElementsVk::New` path, so a caller that skipped its
     /// `elements_vulkan()` + `prepare_vulkan()` would silently get the previous frame's states and
-    /// gate frame callbacks on them. Today `Niri::fill_xray_elements` does both on every frame.
+    /// gate frame callbacks on them. Today `Synoik::fill_xray_elements` does both on every frame.
     pub fn render_element_states(&self) -> Option<&RenderElementStates> {
         self.offscreen_vk.as_ref().map(|o| &o.states)
     }

@@ -1,11 +1,11 @@
 use glam::Vec2;
-use niri_config::{
-    Color, CornerRadius, GradientColorSpace, GradientInterpolation, HueInterpolation,
-};
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
+use synoik_config::{
+    Color, CornerRadius, GradientColorSpace, GradientInterpolation, HueInterpolation,
+};
 
 /// Renders a wide variety of borders and border parts.
 ///
@@ -270,7 +270,7 @@ impl BorderRenderElement {
         &self,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
-    ) -> niri_vk::render::BorderPush {
+    ) -> synoik_vk::render::BorderPush {
         let c = self.computed();
         let p = &self.params;
         // `v_uv * (size * src.size) - (loc - src.loc * size)` == `(src.loc + v_uv * src.size) *
@@ -283,11 +283,11 @@ impl BorderRenderElement {
             src.loc.x as f32 * c.area_size.x,
             src.loc.y as f32 * c.area_size.y,
         ];
-        niri_vk::render::BorderPush {
+        synoik_vk::render::BorderPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
             // proj/target are placeholders; VulkanFrame::render_border fills them from the frame.
-            proj: niri_vk::render::IDENTITY_PROJ,
+            proj: synoik_vk::render::IDENTITY_PROJ,
             target: [0.0, 0.0],
             border_width: p.border_width,
             colorspace: c.colorspace,
@@ -301,8 +301,8 @@ impl BorderRenderElement {
             geo_size: c.geo_size.to_array(),
             grad_width: c.grad_width,
             hue_interpolation: c.hue_interpolation,
-            niri_scale: p.scale,
-            niri_alpha: p.alpha,
+            synoik_scale: p.scale,
+            synoik_alpha: p.alpha,
         }
     }
 }
@@ -427,7 +427,7 @@ mod tests {
             Rectangle::from_size(Size::from((1., 1.))),
             Rectangle::from_size(smithay::utils::Size::from((100, 100))),
         );
-        assert_eq!(push.niri_alpha, 0.25);
+        assert_eq!(push.synoik_alpha, 0.25);
     }
 
     /// Same crop trap as `ShadowRenderElement`: a `CropRenderElement` shrinks `dst` and reports a
@@ -462,7 +462,8 @@ mod tests {
         close(cropped.geo_loc, [-40., 0.]);
         assert_eq!(cropped.geo_size, full.geo_size);
 
-        let coords = |p: &niri_vk::render::BorderPush, uv: f32| uv * p.area_size[0] - p.geo_loc[0];
+        let coords =
+            |p: &synoik_vk::render::BorderPush, uv: f32| uv * p.area_size[0] - p.geo_loc[0];
         assert!((coords(&full, 0.7) - coords(&cropped, 0.5)).abs() < 1e-3);
     }
 }

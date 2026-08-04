@@ -1,0 +1,6 @@
+type           = internal
+restart        = false
+depends-on:    synoik
+waits-for.d:   $XDG_CONFIG_HOME/dinit.d/synoik.d/
+waits-for.d:   $HOME/.config/dinit.d/synoik.d/
+waits-for.d:   /etc/dinit.d/user/synoik.d/

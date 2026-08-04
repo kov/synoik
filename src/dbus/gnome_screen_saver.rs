@@ -59,7 +59,7 @@ impl LockReply {
 
 /// A call from the session into the compositor.
 #[derive(Debug)]
-pub enum ScreenSaverToNiri {
+pub enum ScreenSaverToSynoik {
     /// `Lock` — put the shield down and require authentication (`shellDBus.js:538-546`).
     ///
     /// Carries the waiting caller, if the call came from the bus; `None` from a test or any other
@@ -72,7 +72,7 @@ pub enum ScreenSaverToNiri {
 
 /// A change the compositor wants on the bus.
 #[derive(Debug, Clone, Copy)]
-pub enum NiriToScreenSaver {
+pub enum SynoikToScreenSaver {
     ActiveChanged(bool),
     WakeUpScreen,
 }
@@ -88,8 +88,8 @@ pub struct ShieldSnapshot {
 
 #[derive(Clone)]
 pub struct GnomeScreenSaver {
-    to_niri: calloop::channel::Sender<ScreenSaverToNiri>,
-    from_niri: async_channel::Receiver<NiriToScreenSaver>,
+    to_niri: calloop::channel::Sender<ScreenSaverToSynoik>,
+    from_niri: async_channel::Receiver<SynoikToScreenSaver>,
     snapshot: Arc<Mutex<ShieldSnapshot>>,
 }
 
@@ -112,7 +112,7 @@ impl GnomeScreenSaver {
         let (tx, rx) = async_channel::bounded(1);
         if self
             .to_niri
-            .send(ScreenSaverToNiri::Lock(Some(LockReply(tx))))
+            .send(ScreenSaverToSynoik::Lock(Some(LockReply(tx))))
             .is_err()
         {
             return;
@@ -123,7 +123,7 @@ impl GnomeScreenSaver {
     }
 
     async fn set_active(&self, active: bool) {
-        let _ = self.to_niri.send(ScreenSaverToNiri::SetActive(active));
+        let _ = self.to_niri.send(ScreenSaverToSynoik::SetActive(active));
     }
 
     async fn get_active(&self) -> bool {
@@ -149,8 +149,8 @@ impl GnomeScreenSaver {
 
 impl GnomeScreenSaver {
     pub fn new(
-        to_niri: calloop::channel::Sender<ScreenSaverToNiri>,
-        from_niri: async_channel::Receiver<NiriToScreenSaver>,
+        to_niri: calloop::channel::Sender<ScreenSaverToSynoik>,
+        from_niri: async_channel::Receiver<SynoikToScreenSaver>,
         snapshot: Arc<Mutex<ShieldSnapshot>>,
     ) -> Self {
         Self {
@@ -200,10 +200,10 @@ impl Start for GnomeScreenSaver {
                         };
                         let emitter = iface.signal_emitter();
                         let res = match msg {
-                            NiriToScreenSaver::ActiveChanged(active) => {
+                            SynoikToScreenSaver::ActiveChanged(active) => {
                                 GnomeScreenSaver::active_changed(emitter, active).await
                             }
-                            NiriToScreenSaver::WakeUpScreen => {
+                            SynoikToScreenSaver::WakeUpScreen => {
                                 GnomeScreenSaver::wake_up_screen(emitter).await
                             }
                         };

@@ -33,10 +33,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use niri_config::Config;
 use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use synoik_config::Config;
 
 use crate::animation::{Animation, Clock, Curve};
 use crate::render_helpers::icon::IconCache;
@@ -169,10 +169,9 @@ struct OsdLayout {
 
 fn layout(content: &OsdContent) -> OsdLayout {
     let px = em();
-    let label_w = content
-        .label
-        .as_ref()
-        .map(|t| niri_vk::text::measure_line_width_weighted(t, px as f32, true) + TRAILING_MARGIN);
+    let label_w = content.label.as_ref().map(|t| {
+        synoik_vk::text::measure_line_width_weighted(t, px as f32, true) + TRAILING_MARGIN
+    });
     // The caption's line box, not a ceil of the em: ceiling the font size is a fourth private
     // spelling of a rule that belongs in one place, and it is short — the box is
     // `ceil(ascent) + ceil(descent)`, which at 11pt is 19 against this 15.
@@ -256,7 +255,7 @@ struct OsdWindow {
     /// concurrently with the fade-in (`osdWindow.js:107-110`), so a `show()` that
     /// lands mid-fade re-arms it just the same. Keeping it out of the state enum is
     /// what makes that expressible, and it is the only place a deadline is ever set,
-    /// which is what `Niri::reschedule_osd_timer` needs in order to stay in step.
+    /// which is what `Synoik::reschedule_osd_timer` needs in order to stay in step.
     deadline: Option<Duration>,
     /// Bumped when the *baked chrome* changes (label text, geometry) — deliberately
     /// NOT by the level, whose animated value would otherwise re-bake the whole pill

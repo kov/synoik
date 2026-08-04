@@ -21,8 +21,8 @@
 
 use std::time::Duration;
 
-use niri_config::Modifiers;
 use smithay::utils::{Logical, Point, Rectangle, Size};
+use synoik_config::Modifiers;
 
 use crate::ui::widget::{self, style, Rgba};
 

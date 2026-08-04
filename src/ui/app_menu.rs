@@ -265,8 +265,11 @@ impl AppMenu {
                 // A section header's label shares the row with the rule, so it needs
                 // room for both — the gap keeps the shortest rule from vanishing.
                 Row::Item { label, .. } | Row::SectionHeader(label) => {
-                    let w =
-                        niri_vk::text::measure_line_width_weighted(label, text_px() as f32, false);
+                    let w = synoik_vk::text::measure_line_width_weighted(
+                        label,
+                        text_px() as f32,
+                        false,
+                    );
                     Some(if matches!(r, Row::SectionHeader(_)) {
                         w + HEADER_RULE_GAP + HEADER_RULE_MIN
                     } else {
@@ -413,8 +416,11 @@ impl AppMenu {
                         Align::LEFT_MIDDLE,
                         style::TEXT,
                     )?;
-                    let label_w =
-                        niri_vk::text::measure_line_width_weighted(label, text_px() as f32, false);
+                    let label_w = synoik_vk::text::measure_line_width_weighted(
+                        label,
+                        text_px() as f32,
+                        false,
+                    );
                     let rule_x = label_x + label_w + HEADER_RULE_GAP;
                     let rule_end = rect.loc.x + rect.size.w - ITEM_PAD_H;
                     if rule_end > rule_x {

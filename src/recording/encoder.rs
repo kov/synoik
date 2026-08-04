@@ -97,7 +97,7 @@ impl FfmpegEncoder {
         let stdin = child.stdin.take().expect("piped stdin");
         let mut stderr_pipe = child.stderr.take().expect("piped stderr");
         let stderr = thread::Builder::new()
-            .name("niri-recorder-ffmpeg-err".to_owned())
+            .name("synoik-recorder-ffmpeg-err".to_owned())
             .spawn(move || {
                 let mut buf = Vec::new();
                 let _ = stderr_pipe.read_to_end(&mut buf);
@@ -220,7 +220,7 @@ impl ThreadedRecorder {
     pub fn spawn(mut backend: Box<dyn EncoderBackend>, capacity: usize) -> Self {
         let (tx, rx) = sync_channel::<RecordFrame>(capacity.max(1));
         let handle = thread::Builder::new()
-            .name("niri-recorder".to_owned())
+            .name("synoik-recorder".to_owned())
             .spawn(move || {
                 while let Ok(frame) = rx.recv() {
                     backend.push(frame)?;
@@ -278,7 +278,7 @@ impl ThreadedRecorder {
         self.tx.take();
         let handle = self.handle.take()?;
         thread::Builder::new()
-            .name("niri-recorder-finalize".to_owned())
+            .name("synoik-recorder-finalize".to_owned())
             .spawn(move || match handle.join() {
                 Ok(Ok(())) => info!("saved screen recording to {label}"),
                 Ok(Err(err)) => warn!("error finalizing recording {label}: {err:?}"),
@@ -323,7 +323,7 @@ mod tests {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "niri-rec-test-{}-{tag}-{n}.webm",
+            "synoik-rec-test-{}-{tag}-{n}.webm",
             std::process::id()
         ))
     }

@@ -11,7 +11,7 @@
 //! everything crossing into this model is plain, validated data. The D-Bus
 //! server does ALL untrusted parsing (hints, pixel buffers, markup) on its side
 //! and talks to the compositor exclusively over two message channels
-//! ([`NotificationsToNiri`] in, [`NiriToNotifications`] out) so it can be
+//! ([`NotificationsToSynoik`] in, [`SynoikToNotifications`] out) so it can be
 //! lifted into a separate process later without touching the model. Mutations
 //! here are pure and return [`Effects`] describing the signals to emit and the
 //! banner-surface change; the main loop applies them.
@@ -467,7 +467,7 @@ pub enum BannerEffect {
 }
 
 /// The outcome of a store mutation, applied by the main loop: signals to emit
-/// (via [`NiriToNotifications`]) and the banner-surface change.
+/// (via [`SynoikToNotifications`]) and the banner-surface change.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Effects {
     pub closed: Vec<ClosedSignal>,
@@ -495,7 +495,7 @@ impl Effects {
 pub struct InvalidId;
 
 /// Messages from the D-Bus server into the compositor.
-pub enum NotificationsToNiri {
+pub enum NotificationsToSynoik {
     Notify {
         req: NotifyRequest,
         reply: async_channel::Sender<Result<u32, InvalidId>>,
@@ -517,7 +517,7 @@ pub enum NotificationsToNiri {
 
 /// Emit commands from the compositor back to the D-Bus server, which owns the
 /// connection and performs the actual (unicast) signal emission.
-pub enum NiriToNotifications {
+pub enum SynoikToNotifications {
     Closed {
         id: u32,
         reason: CloseReason,
@@ -535,7 +535,7 @@ pub enum NiriToNotifications {
 }
 
 /// Emit commands from the compositor to the `org.gtk.Notifications` server,
-/// which owns that connection. Kept separate from [`NiriToNotifications`]
+/// which owns that connection. Kept separate from [`SynoikToNotifications`]
 /// because the Gtk interface's `ActionInvoked` has a different signature and is
 /// broadcast (not unicast), and `app.`-prefixed actions route to the app
 /// instead of a signal (`js/ui/notificationDaemon.js:456-465,508-534`).

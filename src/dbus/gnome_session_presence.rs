@@ -39,7 +39,7 @@ impl From<u32> for PresenceStatus {
     }
 }
 
-pub enum PresenceToNiri {
+pub enum PresenceToSynoik {
     StatusChanged(PresenceStatus),
 }
 
@@ -49,7 +49,7 @@ pub enum PresenceToNiri {
 /// and a watcher that only ever hears *changes* would sit there with an uncovered screen until the
 /// user came back and made it available again.
 pub fn start(
-    to_niri: calloop::channel::Sender<PresenceToNiri>,
+    to_niri: calloop::channel::Sender<PresenceToSynoik>,
 ) -> anyhow::Result<zbus::blocking::Connection> {
     let conn = zbus::blocking::Connection::session()?;
 
@@ -81,7 +81,7 @@ pub fn start(
 
         match presence.get_property::<u32>("status").await {
             Ok(status) => {
-                let _ = to_niri.send(PresenceToNiri::StatusChanged(status.into()));
+                let _ = to_niri.send(PresenceToSynoik::StatusChanged(status.into()));
             }
             Err(err) => warn!("error reading the initial gnome-session presence: {err:?}"),
         }
@@ -91,7 +91,7 @@ pub fn start(
                 continue;
             };
             if to_niri
-                .send(PresenceToNiri::StatusChanged(status.into()))
+                .send(PresenceToSynoik::StatusChanged(status.into()))
                 .is_err()
             {
                 break;

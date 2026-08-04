@@ -33,22 +33,22 @@ use std::ptr::null_mut;
 use std::rc::Rc;
 use std::time::Duration;
 
-use niri_config::Config;
 use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{Color32F, ContextId, Renderer};
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use synoik_config::Config;
 
 use crate::animation::{Animation, Clock};
 use crate::audio::{AudioStatus, MicStatus};
 use crate::gnome::{A11ySettings, ClockFormat, QuickToggles};
-use crate::niri_render_elements;
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::rounded_solid::{RoundedSolidBuffer, RoundedSolidRenderElement};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::synoik_render_elements;
 use crate::system_status::{self, SystemStatus};
 use crate::ui::widget::{self, Painter, TextShaper, TextStyle};
 use crate::utils::{output_size, to_physical_precise_round};
@@ -588,7 +588,7 @@ impl BarCache {
 // GPU round trip, so any animated property folded into it costs one round trip per frame
 // for as long as the animation runs. An alpha can ride the element instead; a size cannot,
 // which is why the dots need a real drawing primitive rather than a cached texture.
-niri_render_elements! {
+synoik_render_elements! {
     PanelElement => {
         Texture = TextureRenderElement<VkTexture>,
         Solid = SolidColorRenderElement,
@@ -1032,7 +1032,7 @@ impl Panel {
     /// fixed size whether or not there is anything unread.
     fn date_menu_width(&self) -> f64 {
         let clock_w =
-            niri_vk::text::measure_line_width_weighted(&self.clock_text, font_px() as f32, true);
+            synoik_vk::text::measure_line_width_weighted(&self.clock_text, font_px() as f32, true);
         clock_w + clock_h_padding() * 2.
     }
 
@@ -1090,7 +1090,7 @@ impl Panel {
             return 0.;
         };
         let label_w =
-            niri_vk::text::measure_line_width_weighted(&rec.label, font_px() as f32, true);
+            synoik_vk::text::measure_line_width_weighted(&rec.label, font_px() as f32, true);
         2. * INDICATOR_H_PADDING + label_w + R1_SPACING + R1_ICON
     }
 
@@ -1100,7 +1100,7 @@ impl Panel {
         let Some(label) = &self.keyboard_layout else {
             return 0.;
         };
-        let label_w = niri_vk::text::measure_line_width_weighted(label, font_px() as f32, true);
+        let label_w = synoik_vk::text::measure_line_width_weighted(label, font_px() as f32, true);
         2. * INDICATOR_H_PADDING + label_w
     }
 
@@ -2488,9 +2488,9 @@ mod tests {
     #[test]
     fn clock_advance_width_is_stable_across_seconds() {
         let px = font_px() as f32;
-        let a = niri_vk::text::measure_line_width("12:34:56", px);
-        let b = niri_vk::text::measure_line_width("12:34:07", px);
-        let c = niri_vk::text::measure_line_width("18:88:88", px);
+        let a = synoik_vk::text::measure_line_width("12:34:56", px);
+        let b = synoik_vk::text::measure_line_width("12:34:07", px);
+        let c = synoik_vk::text::measure_line_width("18:88:88", px);
         assert_eq!(
             a, b,
             "clock width must not depend on the digits (tabular figures)"
@@ -2632,7 +2632,7 @@ mod tests {
              that the bake does not contain it proves nothing",
         );
         // Where the right-anchored clock button puts its label on a 400px-wide bar.
-        let clock_w = niri_vk::text::measure_line_width_weighted("12:34", font_px() as f32, true)
+        let clock_w = synoik_vk::text::measure_line_width_weighted("12:34", font_px() as f32, true)
             + clock_h_padding() * 2.;
         let clock_x = width_px as f64 - clock_w + clock_h_padding();
         let mut tex = draw_bar_texture(&mut vk, 1., width_px, "12:34", clock_x, None, None)
@@ -2699,7 +2699,7 @@ mod tests {
             smithay::output::PhysicalProperties {
                 size: (0, 0).into(),
                 subpixel: smithay::output::Subpixel::Unknown,
-                make: "niri".to_owned(),
+                make: "synoik".to_owned(),
                 model: "test".to_owned(),
                 serial_number: "0".to_owned(),
             },
@@ -3242,7 +3242,7 @@ mod tests {
             smithay::output::PhysicalProperties {
                 size: (0, 0).into(),
                 subpixel: smithay::output::Subpixel::Unknown,
-                make: "niri".to_owned(),
+                make: "synoik".to_owned(),
                 model: "test".to_owned(),
                 serial_number: "0".to_owned(),
             },

@@ -1,0 +1,7 @@
+type               = process
+command            = synoik --session
+restart            = false
+working-dir        = $HOME
+ready-notification = pipevar:NOTIFY_FD
+logfile            = $HOME/.local/share/synoik/synoik.log
+depends-on:        dbus

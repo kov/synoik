@@ -3,7 +3,7 @@
 //! In stock GNOME this name is owned by a separate gjs `dbusService` process that drives a
 //! GStreamer pipeline over `org.gnome.Mutter.ScreenCast`. We can't rely on that helper being
 //! present, so we own the name ourselves and back it with the compositor's native recorder
-//! (`Niri::start_native_recording`). The `<Ctrl><Shift><Alt>R` keybinding, the screenshot UI, and
+//! (`Synoik::start_native_recording`). The `<Ctrl><Shift><Alt>R` keybinding, the screenshot UI, and
 //! any `gdbus` caller reach recording through here.
 //!
 //! Matches gnome-shell 50.1: methods `Screencast` (whole output) / `ScreencastArea` (a
@@ -26,7 +26,7 @@ use zbus::{interface, Task};
 use super::Start;
 
 /// A request from the D-Bus service to the compositor. Each carries a reply channel.
-pub enum ScreencastToNiri {
+pub enum ScreencastToSynoik {
     Start {
         /// `Some((x, y, w, h))` for `ScreencastArea`; `None` for a full-output `Screencast`.
         area: Option<(i32, i32, i32, i32)>,
@@ -45,7 +45,7 @@ pub enum ScreencastToNiri {
 }
 
 pub struct Screencast {
-    to_niri: calloop::channel::Sender<ScreencastToNiri>,
+    to_niri: calloop::channel::Sender<ScreencastToSynoik>,
     /// Unique bus name of the client that started the active recording, shared with the monitor
     /// task so it can auto-stop when that client vanishes.
     owner: Arc<Mutex<Option<OwnedUniqueName>>>,
@@ -88,7 +88,7 @@ impl Screencast {
 
         let (reply, rx) = async_channel::bounded(1);
         self.to_niri
-            .send(ScreencastToNiri::Stop { reply })
+            .send(ScreencastToSynoik::Stop { reply })
             .map_err(|_| fdo::Error::Failed("compositor is gone".to_owned()))?;
         rx.recv()
             .await
@@ -97,7 +97,7 @@ impl Screencast {
 }
 
 impl Screencast {
-    pub fn new(to_niri: calloop::channel::Sender<ScreencastToNiri>) -> Self {
+    pub fn new(to_niri: calloop::channel::Sender<ScreencastToSynoik>) -> Self {
         Self {
             to_niri,
             owner: Arc::new(Mutex::new(None)),
@@ -117,7 +117,7 @@ impl Screencast {
 
         let (reply, rx) = async_channel::bounded(1);
         self.to_niri
-            .send(ScreencastToNiri::Start {
+            .send(ScreencastToSynoik::Start {
                 area,
                 template,
                 draw_cursor,
@@ -160,7 +160,7 @@ fn opt_i32(options: &HashMap<String, OwnedValue>, key: &str) -> Option<i32> {
 /// current owner.
 async fn monitor_owner_disconnect(
     conn: &zbus::Connection,
-    to_niri: calloop::channel::Sender<ScreencastToNiri>,
+    to_niri: calloop::channel::Sender<ScreencastToSynoik>,
     owner: Arc<Mutex<Option<OwnedUniqueName>>>,
 ) -> anyhow::Result<()> {
     let proxy = fdo::DBusProxy::new(conn)
@@ -190,7 +190,7 @@ async fn monitor_owner_disconnect(
 
             // Fire-and-forget stop; we don't need the reply.
             let (reply, _rx) = async_channel::bounded(1);
-            let _ = to_niri.send(ScreencastToNiri::Stop { reply });
+            let _ = to_niri.send(ScreencastToSynoik::Stop { reply });
         }
     }
 

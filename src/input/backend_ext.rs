@@ -2,34 +2,34 @@ use ::input as libinput;
 use smithay::backend::input;
 use smithay::output::Output;
 
-use crate::niri::State;
 use crate::protocols::virtual_pointer::VirtualPointer;
+use crate::synoik::State;
 
-pub trait NiriInputBackend: input::InputBackend<Device = Self::NiriDevice> {
-    type NiriDevice: NiriInputDevice;
+pub trait SynoikInputBackend: input::InputBackend<Device = Self::SynoikDevice> {
+    type SynoikDevice: SynoikInputDevice;
 }
-impl<T: input::InputBackend> NiriInputBackend for T
+impl<T: input::InputBackend> SynoikInputBackend for T
 where
-    Self::Device: NiriInputDevice,
+    Self::Device: SynoikInputDevice,
 {
-    type NiriDevice = Self::Device;
+    type SynoikDevice = Self::Device;
 }
 
-pub trait NiriInputDevice: input::Device {
+pub trait SynoikInputDevice: input::Device {
     // FIXME: this should maybe be per-event, not per-device,
     // but it's not clear that this matters in practice?
     // it might be more obvious once we implement it for libinput
     fn output(&self, state: &State) -> Option<Output>;
 }
 
-impl NiriInputDevice for libinput::Device {
+impl SynoikInputDevice for libinput::Device {
     fn output(&self, _state: &State) -> Option<Output> {
         // FIXME: Allow specifying the output per-device?
         None
     }
 }
 
-impl NiriInputDevice for VirtualPointer {
+impl SynoikInputDevice for VirtualPointer {
     fn output(&self, _: &State) -> Option<Output> {
         self.output().cloned()
     }

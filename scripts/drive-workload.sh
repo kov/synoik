@@ -47,15 +47,15 @@ UID_SEAT=${1:-1002}
 WS=${2:-1}
 PROFILE=${3:-mixed}
 RUNTIME=/run/user/$UID_SEAT
-SOCK=$(ls "$RUNTIME"/niri.wayland-*.sock 2>/dev/null | head -1)
-NIRI=${NIRI_BIN:-$(dirname "$0")/../target/debug/niri}
+SOCK=$(ls "$RUNTIME"/synoik.wayland-*.sock 2>/dev/null | head -1)
+SYNOIK=${SYNOIK_BIN:-$(dirname "$0")/../target/debug/synoik}
 
-if [ -z "${SOCK:-}" ]; then echo "no niri socket under $RUNTIME (run as the seat user, or via sudo -u)" >&2; exit 1; fi
-export XDG_RUNTIME_DIR=$RUNTIME NIRI_SOCKET=$SOCK
-msg() { "$NIRI" msg input "$@" >/dev/null 2>&1; }
-act() { "$NIRI" msg action "$@" >/dev/null 2>&1; }
-active_ws() { "$NIRI" msg --json workspaces | python3 -c 'import json,sys;print([w["idx"] for w in json.load(sys.stdin) if w["is_active"]][0])'; }
-n_windows() { "$NIRI" msg --json windows | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))'; }
+if [ -z "${SOCK:-}" ]; then echo "no synoik socket under $RUNTIME (run as the seat user, or via sudo -u)" >&2; exit 1; fi
+export XDG_RUNTIME_DIR=$RUNTIME SYNOIK_SOCKET=$SOCK
+msg() { "$SYNOIK" msg input "$@" >/dev/null 2>&1; }
+act() { "$SYNOIK" msg action "$@" >/dev/null 2>&1; }
+active_ws() { "$SYNOIK" msg --json workspaces | python3 -c 'import json,sys;print([w["idx"] for w in json.load(sys.stdin) if w["is_active"]][0])'; }
+n_windows() { "$SYNOIK" msg --json windows | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))'; }
 
 # --- settle to a known state; twice, because one Escape only unwinds one level
 msg key Escape; sleep 1; msg key Escape; sleep 1

@@ -10,10 +10,10 @@
 //! Process-isolation seam: notifications are untrusted application content.
 //! ALL untrusted parsing (hints, `image-data` pixel buffers, markup) happens
 //! here, and the compositor is reached exclusively through the two plain-data
-//! channels ([`NotificationsToNiri`] in, [`NiriToNotifications`] out) so this
+//! channels ([`NotificationsToSynoik`] in, [`SynoikToNotifications`] out) so this
 //! module can be lifted into a separate process later. The main loop never
 //! touches this connection — signal emission runs here, driven by
-//! [`NiriToNotifications`] commands, unicast to the notification's sender.
+//! [`SynoikToNotifications`] commands, unicast to the notification's sender.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,8 +29,8 @@ use zbus::{interface, zvariant};
 
 use super::Start;
 use crate::notifications::{
-    bounded_pixels, clamp_text, flatten_text, sanitize_text, NiriToNotifications, NotificationIcon,
-    NotificationsToNiri, NotifyRequest, PixelIcon, Urgency,
+    bounded_pixels, clamp_text, flatten_text, sanitize_text, NotificationIcon,
+    NotificationsToSynoik, NotifyRequest, PixelIcon, SynoikToNotifications, Urgency,
 };
 
 pub const PATH: &str = "/org/freedesktop/Notifications";
@@ -39,8 +39,8 @@ pub const BUS_NAME: &str = "org.freedesktop.Notifications";
 type Hints = HashMap<String, zvariant::OwnedValue>;
 
 pub struct Notifications {
-    to_niri: calloop::channel::Sender<NotificationsToNiri>,
-    from_niri: async_channel::Receiver<NiriToNotifications>,
+    to_niri: calloop::channel::Sender<NotificationsToSynoik>,
+    from_niri: async_channel::Receiver<SynoikToNotifications>,
     /// gnome-shell's daemon is single-threaded: `Notify`/`CloseNotification`
     /// are handled strictly in order. zbus dispatches method calls as
     /// concurrent tasks, so rapid same-sender calls (the `notify-send -r`
@@ -50,8 +50,8 @@ pub struct Notifications {
 
 impl Notifications {
     pub fn new(
-        to_niri: calloop::channel::Sender<NotificationsToNiri>,
-        from_niri: async_channel::Receiver<NiriToNotifications>,
+        to_niri: calloop::channel::Sender<NotificationsToSynoik>,
+        from_niri: async_channel::Receiver<SynoikToNotifications>,
     ) -> Self {
         Self {
             to_niri,
@@ -266,11 +266,11 @@ impl Notifications {
 
         let (reply, rx) = async_channel::bounded(1);
         self.to_niri
-            .send(NotificationsToNiri::Notify { req, reply })
-            .map_err(|err| internal_error("error sending message to niri", err))?;
+            .send(NotificationsToSynoik::Notify { req, reply })
+            .map_err(|err| internal_error("error sending message to synoik", err))?;
         rx.recv()
             .await
-            .map_err(|err| internal_error("error receiving message from niri", err))?
+            .map_err(|err| internal_error("error receiving message from synoik", err))?
             .map_err(|_| fdo::Error::InvalidArgs("Invalid notification ID".to_owned()))
     }
 
@@ -283,11 +283,11 @@ impl Notifications {
         let sender = sender(&hdr)?;
         let (reply, rx) = async_channel::bounded(1);
         self.to_niri
-            .send(NotificationsToNiri::Close { id, sender, reply })
-            .map_err(|err| internal_error("error sending message to niri", err))?;
+            .send(NotificationsToSynoik::Close { id, sender, reply })
+            .map_err(|err| internal_error("error sending message to synoik", err))?;
         rx.recv()
             .await
-            .map_err(|err| internal_error("error receiving message from niri", err))?
+            .map_err(|err| internal_error("error receiving message from synoik", err))?
             .map_err(|_| fdo::Error::InvalidArgs("Invalid notification ID".to_owned()))
     }
 
@@ -308,7 +308,7 @@ impl Notifications {
 
     async fn get_server_information(&self) -> (String, String, String, String) {
         (
-            "gnome-shell-rs".to_owned(),
+            "synoik".to_owned(),
             "GNOME".to_owned(),
             env!("CARGO_PKG_VERSION").to_owned(),
             "1.2".to_owned(),
@@ -373,7 +373,7 @@ impl Start for Notifications {
                 async move {
                     while let Ok(msg) = from_niri.recv().await {
                         match msg {
-                            NiriToNotifications::Closed { id, reason, sender } => {
+                            SynoikToNotifications::Closed { id, reason, sender } => {
                                 let Some(sender) = sender else { continue };
                                 let Ok(dest) = BusName::try_from(sender.as_str()) else {
                                     continue;
@@ -394,7 +394,7 @@ impl Start for Notifications {
                                     );
                                 }
                             }
-                            NiriToNotifications::ActionInvoked {
+                            SynoikToNotifications::ActionInvoked {
                                 id,
                                 action,
                                 token,
@@ -462,7 +462,7 @@ impl Start for Notifications {
                     let Ok(args) = signal.args() else { continue };
                     if let (BusName::Unique(name), None) = (&args.name, args.new_owner.as_ref()) {
                         if to_niri
-                            .send(NotificationsToNiri::SenderVanished(name.to_string()))
+                            .send(NotificationsToSynoik::SenderVanished(name.to_string()))
                             .is_err()
                         {
                             return;

@@ -27,13 +27,13 @@ close/zoom/exposé/thumbnail-strip). We keep that and hang GNOME chrome on it.
   `UnalignedLayoutStrategy`.
 - **Workspace thumbnail strip**: `src/layout/thumbnails.rs` — port of `js/ui/workspaceThumbnail.js`
   `ThumbnailsBox`.
-- **Backdrop / per-workspace overview render**: `src/layout/workspace.rs`, `src/niri.rs`
+- **Backdrop / per-workspace overview render**: `src/layout/workspace.rs`, `src/synoik.rs`
   (`backdrop_buffer`, `place_within_backdrop`).
-- **Triggers**: `Action::{ToggleOverview,OpenOverview,CloseOverview}` (`niri-ipc`/`src/input/mod.rs`),
+- **Triggers**: `Action::{ToggleOverview,OpenOverview,CloseOverview}` (`synoik-ipc`/`src/input/mod.rs`),
   the overlay-key (lone Super tap → `ToggleOverview`, mutter `process_special_modifier_key` port,
   `src/input/mod.rs`), the panel **Activities** button (`panel::ROLE_ACTIVITIES`), and the IPC read
   side (`OverviewState`, `Event::OverviewOpenedOrClosed`).
-- **Keyboard-focus/a11y**: `KeyboardFocus::Overview` (`src/niri.rs`), a11y `ID_OVERVIEW` (`src/a11y.rs`).
+- **Keyboard-focus/a11y**: `KeyboardFocus::Overview` (`src/synoik.rs`), a11y `ID_OVERVIEW` (`src/a11y.rs`).
 - **UI toolkit**: `src/ui/widget.rs` (`Painter`, `bake`/`bake_content`/`bake_uncached`, `Button`,
   `CardButton`, `TextShaper`/`ShapedText`, `Align`, `style`), the panel role/hit-test model
   (`src/ui/panel.rs`), the popover framework (`src/ui/popover.rs`). Font sizing via `ui::pt_to_px`.
@@ -265,11 +265,11 @@ toolkit, per the CLAUDE.md "toolkit-first, no faked chrome" tenet.
 Each slice = one advise→implement→adversarial-review cycle (Fable subagent, model `fable`), one commit,
 test-first, reference-cited on both axes (placement + style), per the `panel-status-port.md` method.
 Verifiability is classified per item: catalog/search/launch → headless conformance tests
-(`src/tests/gnome.rs`); chrome rendering → Vulkan render test + `NIRI_VK_VALIDATION=1` grep gate;
+(`src/tests/gnome.rs`); chrome rendering → Vulkan render test + `SYNOIK_VK_VALIDATION=1` grep gate;
 open/close & cross-fade **animation** → largely live-only ([[headless-animation-clock-trap]]).
 
 - **S1 — AppSystem catalog + launch (no UI). ✅ DONE (`d82c5ba8`).** `src/app_system.rs`: an
-  `AppSystem` model (sibling of `GnomeSettings`, owned on `Niri`) over `gio_unix::DesktopAppInfo`
+  `AppSystem` model (sibling of `GnomeSettings`, owned on `Synoik`) over `gio_unix::DesktopAppInfo`
   (needs `gio-unix` + the `v2_58` feature for `search`) behind `AppCatalog`/`AppLauncher` seams —
   installed/lookup/faithful grouped `search`/`launch`, plus favorites mirroring `AppFavorites` in
   **resolved space** (`favorite-apps` read + `set_favorite_apps` writer via the existing gsettings
@@ -307,14 +307,14 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   geometry & hit-testing). Typing while `KeyboardFocus::Overview` engages the entry — the key block
   sits inside the `should_intercept_key` Forward branch, **press-only** on the shared
   `suppressed_keys` (releases are owned globally; a local release arm would leak), with an `Ignored`
-  outcome so unhandled and modifier-decorated keys fall through unconsumed. `Niri::sync_overview_search`
+  outcome so unhandled and modifier-decorated keys fall through unconsumed. `Synoik::sync_overview_search`
   runs the app provider (`AppSystem::search(terms.join(' '))` → tiers → `should_show` → cap 6) and
   feeds results back. Enter activates the selection, a click activates its tile, the clear glyph
   clears; all launch + close the overview. Escape clears while active, else falls through to the
   hardcoded bind that closes. Search resets on overview *enter* (visibility rising edge in
   `State::refresh`) — deliberately not on close (query stays through the fade) nor on a
   screenshot/lock round-trip (GNOME keeps it). Pointer/hover gated by the new shared
-  `Niri::overview_ui_visible()` (also fixed the dash click gate's missing `is_gnome_mode`).
+  `Synoik::overview_ui_visible()` (also fixed the dash click gate's missing `is_gnome_mode`).
   **The active entry body consumes clicks** (it is an opaque control drawn over the thumbnail strip
   pre-S5); the inactive entry is fully click-through so it can't eat thumbnail clicks. Divergences
   in the module doc: no 150ms debounce, no `AppUsage` ordering, no `SystemActions`, caret-at-end
@@ -357,10 +357,10 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   and half-expanded variants, the dash cap) + re-pinned `thumbnails.rs` band tests + 5 conformance
   tests, including the mid-animation offset guard and the mid-expand picker continuity.
   **Not yet live-validated.**
-- **S5b — `search-active` cross-fade. ✅ DONE.** A second continuous adjustment on `Niri`
+- **S5b — `search-active` cross-fade. ✅ DONE.** A second continuous adjustment on `Synoik`
   (`overview_search_fade`, fixed 250ms `EASE_OUT_QUAD` per `SIDE_CONTROLS_ANIMATION_TIME`, armed on the
   `is_active()` edge in `advance_animations`) fades the window picker and the thumbnails out and the
-  results card in (`_onSearchChanged`, `overviewControls.js:609-643`). The fade lives on `Niri`, not
+  results card in (`_onSearchChanged`, `overviewControls.js:609-643`). The fade lives on `Synoik`, not
   `Layout` — `Layout` stays ignorant of the search; the picker/thumbnails are composited as *groups*
   through `OffscreenBuffer` + `OffscreenRenderElement::with_alpha` at the `render_workspaces` /
   `render_thumbnails` call sites, because a per-element alpha would double-darken wherever previews
@@ -379,7 +379,7 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   and asserts the mid frame is `S·α + B·(1−α)` from the two *measured* ends, so it fails both if the
   group is pushed straight through and if it is dropped (mutation-verified both ways).
   **Two traps that made three earlier attempts at this test lie**, worth knowing before writing any
-  full-frame render test here: the startup "Important Hotkeys" overlay (`Niri::new`) covers the picker
+  full-frame render test here: the startup "Important Hotkeys" overlay (`Synoik::new`) covers the picker
   and is dismissed by the *first key press*, so engaging the search changes the frame by a whole panel
   unless you `hotkey_overlay.hide()` first; and a `green > 200` filter matches **white** — the panel
   clock, the entry caret and the card text all clear it — so the reference must come from the
@@ -488,7 +488,7 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
     already match the async worker + in-flight coalescing + decode-cache-forever; the gap is *when* the
     work happens. Plan, in order:
     - **(1) Prewarm the whole grid + favorites' *decode* at startup idle ✅ DONE (`4eea62e4`).** GNOME's
-      resident-grid + idle `_redisplay`. `Niri::prewarm_app_icons` requests the dash (64px) + grid (96px)
+      resident-grid + idle `_redisplay`. `Synoik::prewarm_app_icons` requests the dash (64px) + grid (96px)
       icon decodes off-thread for every connected output scale; `buffer()` dedups cached/in-flight keys so
       it is idempotent. Triggered once a scale exists (`add_output`) and re-warmed on content/theme change
       (installed-changed, favorite-apps, icon-theme). Gated on `has_worker()` (before the worker exists,
@@ -497,15 +497,15 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
       `overview_prewarm_requests_dash_and_grid_icon_decodes`. Makes blank-then-real rare (only a truly cold
       first run or a brand-new app). **Live-validation pending.**
     - **(2) Batch the first-frame GPU uploads ✅ DONE (`ca164e9e`).** Live-confirmed the residual hitch
-      survived (1). Each `NiriTexture::upload` was a separate cbuf + submit + blocking `wait_for_fences`
-      (`niri-vk/src/gpu.rs` `run_commands`); ~24 serialized fence round-trips is the Venus stutter. Added a
-      reusable `TextureBatch` (start/`upload`/`finish`) to niri-vk: stages N textures (staging +
+      survived (1). Each `SynoikTexture::upload` was a separate cbuf + submit + blocking `wait_for_fences`
+      (`synoik-vk/src/gpu.rs` `run_commands`); ~24 serialized fence round-trips is the Venus stutter. Added a
+      reusable `TextureBatch` (start/`upload`/`finish`) to synoik-vk: stages N textures (staging +
       image/view/sampler, no commands) then records every copy into **one** cbuf, one submit, one wait. The
       single `Texture::upload` now shares resource creation (`build_pending`) + copy recording
       (`record_upload_copy`) so the paths can't drift. `VulkanRenderer::import_memory_batch` wraps it; the
       grid render collects a page's 2+ pending icon uploads and imports them in one batch. Fable-reviewed
       (no CRITICAL; also fixed two pre-existing descriptor-pool/texture leaks on `make_texture_set` failure
-      it surfaced). Pinned by a 2-distinct-icon render test + `NIRI_VK_VALIDATION` clean. **Live-validation
+      it surfaced). Pinned by a 2-distinct-icon render test + `SYNOIK_VK_VALIDATION` clean. **Live-validation
       pending.** Reusable for any future many-textures-at-once path.
     - **(3) Shared GPU-texture cache across dash + grid + search (DEFERRED, recorded).** GNOME keeps ONE
       Cogl texture per gicon+size shell-wide; we currently upload per surface (each keeps its own
@@ -595,7 +595,7 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   - **Dragging an app icon onto a workspace launches it there (`135b2773`).** `Workspace.acceptDrop`
     → `source.app.open_new_window(workspaceIndex)` (`workspace.js:1429-1434`). The drag begins once
     the pointer leaves the `drag-threshold` box (`st-dnd-start-gesture.c:73-90`) and cancels the
-    click. Since we have no GIO launch context to carry the workspace, the intent is parked on `Niri`
+    click. Since we have no GIO launch context to carry the workspace, the intent is parked on `Synoik`
     and claimed at map time by the first window that resolves to the app, expiring on mutter's
     `STARTUP_TIMEOUT_MS` (15s). **Divergences:** hardcoded threshold 8 (the mouse schema isn't in the
     gsettings model yet); a drop into a thumbnail *gap* does nothing where ThumbnailsBox would create
@@ -893,7 +893,7 @@ shade. `_zoomAndFadeOut` (`:2697-2740`) is the reverse. The **source icon itself
 
 * **F1 — the model.** *(landed `5296ead7`.)* `GnomeSettings` reads `folder-children` + each
   relocatable folder schema + the `.directory` name translation; `AppEntry` gains `categories`;
-  `Niri::sync_app_grid` resolves membership *before* the sort, drops members from the top level,
+  `Synoik::sync_app_grid` resolves membership *before* the sort, drops members from the top level,
   drops empty folders, and gives each folder entry its `app-picker-layout` slot. No chrome — fully
   headless-testable.
 * **F2 — the folder tile.** A grid entry becomes app-or-folder; render the raised `.app-folder` tile
@@ -1290,7 +1290,7 @@ target on the overview) rather than as a shrunken text field. Clicking the puck 
 it leftward to GNOME's pill with the **right edge pinned**, the find glyph sliding from the
 puck's centre into the leading gutter. Escape/clear collapses it again. Everything about the
 *expanded* entry — width, height, radius, fill, insets, font — is still GNOME's. Animated by
-`Niri::overview_search_expand`, a twin of the existing `overview_search_fade`, whose progress is
+`Synoik::overview_search_expand`, a twin of the existing `overview_search_fade`, whose progress is
 pushed into the model so **hit-testing follows the animating pill** rather than snapping to its
 destination.
 
@@ -1383,7 +1383,7 @@ the Wayland selection, so it belongs to a caller, not to a plain-data model.
 **Known limitations, deliberate.** The caret maps an offset to an x by re-measuring
 `text[..offset]`, which assumes logical order is visual order — wrong for **RTL/bidi** runs, where
 the caret lands at the LTR-prefix width. Fixing it needs an index→x mapping out of the shaper
-(cosmic-text has the per-glyph byte ranges; `niri_vk::text::ShapedRun` does not expose them), not
+(cosmic-text has the per-glyph byte ranges; `synoik_vk::text::ShapedRun` does not expose them), not
 a change in the widget. And `Entry::bake`'s horizontal scroll is derived from the caret alone
 rather than held as view state, so walking Left through overflowing text holds the caret at the
 trailing edge and slides the text under it where GNOME would hold the viewport — monotonic, and
@@ -1400,7 +1400,7 @@ Approved as one batch; the first three landed in `66953ae5` + `d2e5bae9`.
   grid — still reserve the entry's height, because they would otherwise render underneath it.
 * **The strip gets double the band.** ✅ `MAX_THUMBNAIL_SCALE` 0.05 → 0.10, so a thumbnail
   (which keeps the output's aspect) covers four times the area. Judged live at 1024×665
-  (`NIRI_HEADLESS_MODE=2048x1330` + scale 2). **Superseded 2026-08-03 (§12.7):** the strip is the
+  (`SYNOIK_HEADLESS_MODE=2048x1330` + scale 2). **Superseded 2026-08-03 (§12.7):** the strip is the
   app-grid row, so its size is `small_workspace_height` and its band is the full view width,
   overlapping the floating pill rather than dodging it.
 * **Dragging a thumbnail reorders the workspaces.** ✅ macOS Mission Control's gesture, on top

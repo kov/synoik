@@ -48,11 +48,11 @@ const ALLOWED_SENDERS: &[&str] = &[
 type Allowlist = Arc<Mutex<HashMap<String, String>>>;
 
 pub struct GnomeShell {
-    to_niri: calloop::channel::Sender<GnomeShellToNiri>,
+    to_niri: calloop::channel::Sender<GnomeShellToSynoik>,
     allowlist: Allowlist,
 }
 
-pub enum GnomeShellToNiri {
+pub enum GnomeShellToSynoik {
     Grab {
         accelerator: String,
         mode_flags: u32,
@@ -126,7 +126,7 @@ fn sender(hdr: &Header<'_>) -> fdo::Result<String> {
 }
 
 impl GnomeShell {
-    pub fn new(to_niri: calloop::channel::Sender<GnomeShellToNiri>) -> Self {
+    pub fn new(to_niri: calloop::channel::Sender<GnomeShellToSynoik>) -> Self {
         Self {
             to_niri,
             allowlist: Allowlist::default(),
@@ -162,7 +162,7 @@ impl GnomeShell {
     ) -> fdo::Result<u32> {
         let (reply, rx) = async_channel::bounded(1);
         self.to_niri
-            .send(GnomeShellToNiri::Grab {
+            .send(GnomeShellToSynoik::Grab {
                 accelerator,
                 mode_flags,
                 grab_flags,
@@ -170,11 +170,11 @@ impl GnomeShell {
                 reply,
             })
             .map_err(|err| {
-                warn!("error sending message to niri: {err:?}");
+                warn!("error sending message to synoik: {err:?}");
                 fdo::Error::Failed("internal error".to_owned())
             })?;
         rx.recv().await.map_err(|err| {
-            warn!("error receiving message from niri: {err:?}");
+            warn!("error receiving message from synoik: {err:?}");
             fdo::Error::Failed("internal error".to_owned())
         })
     }
@@ -182,17 +182,17 @@ impl GnomeShell {
     async fn ungrab_one(&self, action: u32, sender: String) -> fdo::Result<bool> {
         let (reply, rx) = async_channel::bounded(1);
         self.to_niri
-            .send(GnomeShellToNiri::Ungrab {
+            .send(GnomeShellToSynoik::Ungrab {
                 action,
                 sender,
                 reply,
             })
             .map_err(|err| {
-                warn!("error sending message to niri: {err:?}");
+                warn!("error sending message to synoik: {err:?}");
                 fdo::Error::Failed("internal error".to_owned())
             })?;
         rx.recv().await.map_err(|err| {
-            warn!("error receiving message from niri: {err:?}");
+            warn!("error receiving message from synoik: {err:?}");
             fdo::Error::Failed("internal error".to_owned())
         })
     }
@@ -263,7 +263,7 @@ impl GnomeShell {
         params: HashMap<String, zvariant::OwnedValue>,
     ) -> fdo::Result<()> {
         self.check_sender(&hdr)?;
-        let msg = GnomeShellToNiri::ShowOsd {
+        let msg = GnomeShellToSynoik::ShowOsd {
             connector: params.get("connector").and_then(as_string),
             label: params.get("label").and_then(as_string),
             level: params.get("level").and_then(as_f64),
@@ -271,13 +271,13 @@ impl GnomeShell {
             icon: params.get("icon").and_then(as_string),
         };
         self.to_niri.send(msg).map_err(|err| {
-            warn!("error sending message to niri: {err:?}");
+            warn!("error sending message to synoik: {err:?}");
             fdo::Error::Failed("internal error".to_owned())
         })
     }
 
     // The activated/deactivated signals are emitted unicast to the grabbing
-    // sender from the main loop (`Niri::emit_accelerator_signal`); these
+    // sender from the main loop (`Synoik::emit_accelerator_signal`); these
     // declarations provide the introspection XML.
     #[zbus(signal)]
     pub async fn accelerator_activated(
@@ -335,7 +335,7 @@ impl Start for GnomeShell {
                         // A unique name disappearing entirely.
                         (BusName::Unique(name), None) => {
                             if to_niri
-                                .send(GnomeShellToNiri::SenderVanished(name.to_string()))
+                                .send(GnomeShellToSynoik::SenderVanished(name.to_string()))
                                 .is_err()
                             {
                                 return;

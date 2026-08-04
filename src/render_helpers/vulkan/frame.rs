@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use ash::vk;
 use glam::{Mat3, Vec2, Vec3};
-use niri_vk::render::{
-    as_bytes, BorderPush, ClippedTexturePush, PostprocessPush, QuadPush, ResizePush, ShadowPush,
-    TextPush, IDENTITY_PROJ,
-};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Color32F, ContextId, Frame, Texture};
 use smithay::utils::{Buffer as BufferCoord, Physical, Point, Rectangle, Size, Transform};
+use synoik_vk::render::{
+    as_bytes, BorderPush, ClippedTexturePush, PostprocessPush, QuadPush, ResizePush, ShadowPush,
+    TextPush, IDENTITY_PROJ,
+};
 
 use super::backdrop_blur::BackdropBlur;
 use super::blur_chain::SharedBlurChain;
@@ -36,7 +36,7 @@ pub(crate) struct ClipParams {
     pub input_to_geo: [[f32; 4]; 3],
     pub geo_size: [f32; 2],
     pub corner_radius: [f32; 4],
-    pub niri_scale: f32,
+    pub synoik_scale: f32,
 }
 
 /// An in-progress render into a bound [`VkFramebuffer`]. Records draws into one command buffer
@@ -82,11 +82,11 @@ pub struct VulkanFrame<'frame, 'buffer> {
     /// fate: into the in-flight record on the deferred path, dropped after the fence wait on the
     /// synchronous one. Keying that on `fb.offscreen` instead would miss the KMS frame that falls
     /// back to synchronous because no exportable fence could be made.
-    glyph_staging: Option<niri_vk::texture::GlyphStaging>,
+    glyph_staging: Option<synoik_vk::texture::GlyphStaging>,
     /// The staged texture uploads whose copies this frame's command buffer carries. Held for the
     /// same reason as `glyph_staging`: the GPU reads the staging buffers long after `begin`
     /// returned, so they must survive to the submit's retirement.
-    texture_staging: Vec<niri_vk::texture::StagedTexture>,
+    texture_staging: Vec<synoik_vk::texture::StagedTexture>,
     /// Blur chains this frame's command buffer has recorded. Held for the same reason as the two
     /// above, and it is the one that bites hardest: a chain owns the render pass and pipelines the
     /// recording binds, so destroying it before the submit invalidates the *whole* frame, not just
@@ -228,7 +228,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // Everything folded in ahead of the pass is now recorded; close the prepass phase. This
         // mark is unconditional — a frame with nothing queued reports a near-zero prepass rather
         // than merging it into the render pass.
-        renderer.gpu_timer_mark(cbuf, gpu_slot, niri_vk::stats::GpuPhase::Prepass);
+        renderer.gpu_timer_mark(cbuf, gpu_slot, synoik_vk::stats::GpuPhase::Prepass);
 
         {
             let dev = &renderer.gpu.device;
@@ -340,7 +340,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             dev.cmd_set_scissor(cbuf, 0, std::slice::from_ref(s));
             dev.cmd_draw(cbuf, 6, 1, 0, 0);
             // The quad covers the element, so the scissor IS the shaded area.
-            niri_vk::stats::draw(u64::from(s.extent.width) * u64::from(s.extent.height));
+            synoik_vk::stats::draw(u64::from(s.extent.width) * u64::from(s.extent.height));
         }
     }
 
@@ -395,7 +395,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             // Built by the element from creation-space geometry, so `dst` (possibly rescaled/
             // relocated by an outer wrapper) is used only for placement, never for the clip.
             input_to_geo: clip.input_to_geo,
-            niri_scale: clip.niri_scale,
+            synoik_scale: clip.synoik_scale,
             _pad2: [0.0, 0.0, 0.0],
         };
         self.retain(texture);
@@ -452,7 +452,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             _pad1: [0.0, 0.0],
             clip_corner_radius: clip.corner_radius,
             input_to_geo: clip.input_to_geo,
-            niri_scale: clip.niri_scale,
+            synoik_scale: clip.synoik_scale,
             _pad2: [0.0, 0.0, 0.0],
         };
         let dev = &self.renderer.gpu.device;
@@ -847,7 +847,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                     dev.cmd_draw(self.cbuf, 6, 1, 0, 0);
                     // A glyph quad is far smaller than its scissor (which spans the whole run), so
                     // the glyph's own area is what gets shaded.
-                    niri_vk::stats::draw(u64::from(g.w) * u64::from(g.h));
+                    synoik_vk::stats::draw(u64::from(g.w) * u64::from(g.h));
                 }
             }
         }
@@ -929,7 +929,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         color: [f32; 4],
         corner_radius: f32,
         sigma: f32,
-        niri_scale: f32,
+        synoik_scale: f32,
         box_dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), VulkanError> {
@@ -950,7 +950,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             proj: IDENTITY_PROJ,
             target: [0.0, 0.0],
             sigma,
-            niri_scale,
+            synoik_scale,
             shadow_color: premul,
             corner_radius: [corner_radius; 4],
             window_corner_radius: [0.0; 4],
@@ -962,7 +962,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             geo_size: [box_dst.size.w as f32, box_dst.size.h as f32],
             window_geo_loc: [0.0, 0.0],
             window_geo_size: [0.0, 0.0],
-            niri_alpha: 1.0,
+            synoik_alpha: 1.0,
             _pad0: 0.0,
         };
         self.render_shadow(push, area, damage)
@@ -971,11 +971,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// Draw the postprocess-and-clip material: sample `texture` (from `src`) into `dst`, applying
     /// the saturation / noise / premultiplied-bg + general rounded-corner clip carried by `push`.
     /// The caller fills the material fields (`geo_size`, `corner_radius`, `bg_color`,
-    /// `input_to_geo`, `niri_scale`, `niri_alpha`, `saturation`, `noise`); this fills the placement
-    /// (`origin`/`size`/`target`/`src_rect`), binds the premultiplied-blend postprocess pipeline +
-    /// the texture's descriptor set, and draws the quad. The owned-renderer equivalent of niri's
-    /// clipped-surface / framebuffer-effect postprocess shader. Same unflipped scope as the other
-    /// sampling materials.
+    /// `input_to_geo`, `synoik_scale`, `synoik_alpha`, `saturation`, `noise`); this fills the
+    /// placement (`origin`/`size`/`target`/`src_rect`), binds the premultiplied-blend
+    /// postprocess pipeline + the texture's descriptor set, and draws the quad. The
+    /// owned-renderer equivalent of niri's clipped-surface / framebuffer-effect postprocess
+    /// shader. Same unflipped scope as the other sampling materials.
     // Consumed by the live ClippedSurfaceRenderElement / FramebufferEffectElement wiring (Stage 3);
     // exercised now by the offscreen material test.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1296,7 +1296,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// effect, paired with [`Self::capture_backdrop`]. Samples the cached
     /// [`BackdropBlur::intermediate`] (blurred output, or the raw capture when blur is off)
     /// across its whole extent; the caller fills the material fields of `push` (`geo_size`,
-    /// `corner_radius`, `input_to_geo`, `niri_scale`, `saturation`, `noise`, `bg_color`), this
+    /// `corner_radius`, `input_to_geo`, `synoik_scale`, `saturation`, `noise`, `bg_color`), this
     /// fills the placement + `src_rect` via [`Self::render_postprocess`] and clips to the
     /// rounded geometry.
     pub(crate) fn draw_backdrop(
@@ -1315,7 +1315,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// Draw the resize cross-fade material: blend two window snapshots (`tex_prev`, `tex_next`)
     /// into `dst` by `push.clamped_progress`, then optionally clip/round to the current
     /// geometry. The caller fills the material fields (the three transforms, `curr_geo_size`,
-    /// `corner_radius`, `clamped_progress`, `clip_to_geometry`, `niri_scale`, `niri_alpha`);
+    /// `corner_radius`, `clamped_progress`, `clip_to_geometry`, `synoik_scale`, `synoik_alpha`);
     /// this fills the placement (`origin`/`size`/`target`), binds the premultiplied-blend
     /// resize pipeline with each texture's own descriptor set (prev at set 0, next at set 1),
     /// and draws the quad. The owned-renderer equivalent of niri's `ResizeRenderElement`.
@@ -1634,13 +1634,13 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         present.set_layout(vk::ImageLayout::GENERAL);
     }
 
-    /// Which submit this frame's `finish` is. See [`niri_vk::stats::SubmitSite`].
+    /// Which submit this frame's `finish` is. See [`synoik_vk::stats::SubmitSite`].
     ///
     /// The target alone does not answer it: a screencast or screencopy render is a dmabuf too, and
     /// counting those as scanout is what made "N to scanout" mean "N non-offscreen frames" instead
     /// of the one submit that costs a refresh interval. What separates them is whether the tty
     /// backend is asking for this frame — the same permission the deferred finish rides on.
-    fn submit_site(&self) -> niri_vk::stats::SubmitSite {
+    fn submit_site(&self) -> synoik_vk::stats::SubmitSite {
         submit_site_of(self.fb.offscreen, self.renderer.finish_is_for_kms())
     }
 
@@ -1674,7 +1674,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             self.renderer.gpu_timer_mark(
                 self.cbuf,
                 self.gpu_slot,
-                niri_vk::stats::GpuPhase::Render,
+                synoik_vk::stats::GpuPhase::Render,
             );
             // Present-blit scanout (KMS planes wanting `Argb8888`/`Xrgb8888`): the render pass left
             // the shadow in `TRANSFER_SRC_OPTIMAL` (its subpass→EXTERNAL dependency
@@ -1724,7 +1724,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             };
 
             let timeline = {
-                let _timed = niri_vk::stats::submit(self.submit_site());
+                let _timed = synoik_vk::stats::submit(self.submit_site());
                 self.renderer
                     .gpu
                     .submit(std::slice::from_ref(&self.cbuf), fence)
@@ -1786,7 +1786,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             // 12–14 ms of its budget, and it is the one this renderer means to stop paying on
             // the compositor thread. See `docs/fork/renderer-synchronous-submits.md`.
             {
-                let _timed = niri_vk::stats::retire(self.submit_site());
+                let _timed = synoik_vk::stats::retire(self.submit_site());
                 dev.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
             }
             dev.destroy_fence(fence, None);
@@ -2128,12 +2128,12 @@ fn normalized_src(src: Rectangle<f64, BufferCoord>, texture: &VkTexture) -> [f32
 /// Takes two positional `bool`s, which is exactly the shape that swaps silently:
 /// transposing them still compiles and inverts scanout/offscreen attribution for
 /// the whole session. Pinned by `submit_site_names_the_frame_not_the_target`.
-pub(super) fn submit_site_of(offscreen: bool, for_kms: bool) -> niri_vk::stats::SubmitSite {
+pub(super) fn submit_site_of(offscreen: bool, for_kms: bool) -> synoik_vk::stats::SubmitSite {
     if offscreen {
-        niri_vk::stats::SubmitSite::OffscreenFrame
+        synoik_vk::stats::SubmitSite::OffscreenFrame
     } else if for_kms {
-        niri_vk::stats::SubmitSite::KmsFrame
+        synoik_vk::stats::SubmitSite::KmsFrame
     } else {
-        niri_vk::stats::SubmitSite::DmabufFrame
+        synoik_vk::stats::SubmitSite::DmabufFrame
     }
 }

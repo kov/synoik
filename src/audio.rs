@@ -302,12 +302,12 @@ pub fn volume_icon(status: &AudioStatus) -> &'static str {
 ///
 /// The live implementation is [`crate::pipewire_audio::PwAudio`] (feature `pipewire`), but this
 /// trait mentions no PipeWire type, so it compiles unconditionally and a test can plug in
-/// [`StubAudio`] instead. That is the point: with a concrete `Option<PwAudio>` on `Niri`, a
+/// [`StubAudio`] instead. That is the point: with a concrete `Option<PwAudio>` on `Synoik`, a
 /// headless fixture had no audio at all and *nothing* about the wiring was testable — deleting the
 /// OSD call out of the panel-scroll path left the whole suite green.
 ///
 /// All methods take `&self`: the live backend drives its PipeWire loop on the compositor's calloop
-/// and mutates through interior mutability, and callers hold `&self.niri.audio_backend` while
+/// and mutates through interior mutability, and callers hold `&self.synoik.audio_backend` while
 /// needing `&mut self` for the redraw that follows.
 ///
 /// The control methods return the **optimistically-updated** status for immediate UI feedback,
@@ -356,7 +356,7 @@ pub trait AudioBackend {
 /// (panel icon, OSD level) exercises the same code the compositor runs.
 ///
 /// Cloning shares one state, so a test can hand a clone to the compositor
-/// (`niri.audio_backend = Some(Box::new(stub.clone()))`) and keep its own handle to assert on.
+/// (`synoik.audio_backend = Some(Box::new(stub.clone()))`) and keep its own handle to assert on.
 #[cfg(test)]
 #[derive(Debug, Default, Clone)]
 pub struct StubAudio {

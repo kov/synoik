@@ -80,12 +80,12 @@ Two things the panel's shape now fixes in place, worth knowing before touching i
    by its own shadow.
 3. **DONE.** Delayed capture — our divergence, see below. The button cycles off → 3s → 10s and
    reads as `:checked` when armed, carrying its own baked number in place of `alarm-symbolic`.
-   Arming lifts the whole capture out of the picker into `Niri::pending_capture` and dismisses the
+   Arming lifts the whole capture out of the picker into `Synoik::pending_capture` and dismisses the
    picker, because the delay only means anything with the shell out of the way; the shot is then
    taken from the **live** screen by `screenshot_area`/`screenshot_window`.
 
    All six design points below are handled. The two worth restating: the D-Bus reply is **taken**
-   out of `Niri` as the capture arms, so `close_screenshot_ui`'s unconditional `None` cannot tell a
+   out of `Synoik` as the capture arms, so `close_screenshot_ui`'s unconditional `None` cannot tell a
    still-waiting caller it was cancelled; and the countdown card refuses every `RenderTarget` but
    `Output` inside `Countdown::element`, so there is no way to draw it into a shot, a cast or a
    portal capture. A one-second timer drives it, but the *clock* decides when it fires — a
@@ -115,7 +115,7 @@ Two things the panel's shape now fixes in place, worth knowing before touching i
    filter and `set_capture_type` all read, so there is one place that can be wrong.
 
    The recording notification comes from `State::stop_screen_recordings`, not from
-   `Niri::stop_screen_recordings`, so a `org.gnome.Shell.Screencast.StopScreencast` caller does not
+   `Synoik::stop_screen_recordings`, so a `org.gnome.Shell.Screencast.StopScreencast` caller does not
    get one — in GNOME the shell UI notifies and the recorder service does not.
 5. **DONE.** Tooltips. `widget::Tooltip` and `Painter::tooltip` already existed; what this added
    is the timing (300ms delay, then a 150ms fade) and root-level placement — centred on the
@@ -132,8 +132,8 @@ Requested 2026-08-03. GNOME's shell UI has no delay (gnome-screenshot had one; t
 it). We want it, and it is not a button we can bolt on at the end, because of what the picker is.
 
 **The picker shows a frozen screen.** Opening it captures the output through the renderer
-(`capture_screenshot_neutrals`, `src/niri.rs:3416-3423`) and draws that texture; `Space` saves by
-cropping the frozen buffer (`confirm_screenshot` → `capture_from_neutral`, `src/niri.rs:3480`).
+(`capture_screenshot_neutrals`, `src/synoik.rs:3416-3423`) and draws that texture; `Space` saves by
+cropping the frozen buffer (`confirm_screenshot` → `capture_from_neutral`, `src/synoik.rs:3480`).
 GNOME's model is the same (`_stageScreenshot`, `screenshot.js:1211-1216`). A delayed shot is
 therefore *not* a delayed read of that texture — the point is to capture something that has not
 happened yet. The sequence has to be: arm and dismiss the UI → unfreeze → count down visibly →
@@ -143,7 +143,7 @@ capture the **live** screen → save through the ordinary path (clipboard, notif
 Six things that must be designed in slice 1, not discovered later:
 
 - **Arming must not answer the D-Bus caller.** `close_screenshot_ui` answers `SelectArea` and
-  `InteractiveScreenshot` with `None` **unconditionally, by design** (`src/niri.rs:10685-10691`) —
+  `InteractiveScreenshot` with `None` **unconditionally, by design** (`src/synoik.rs:10685-10691`) —
   precisely so a dismissal can never leave a caller blocked until its timeout. Arming a delay goes
   straight through that path, so a delayed `InteractiveScreenshot` would be told "cancelled" before
   the countdown even starts. The pending capture must **take** the reply sender (and the `path`
@@ -151,14 +151,14 @@ Six things that must be designed in slice 1, not discovered later:
   pending capture and is delivered at fire time. This is the single change slice 1 most needs to
   get right.
 - **Where the state lives.** Not in `ScreenshotUi::Open` — it outlives the picker. It belongs
-  beside `select_area_reply`/`interactive_screenshot_reply` on `Niri` (`src/niri.rs:824-829`),
+  beside `select_area_reply`/`interactive_screenshot_reply` on `Synoik` (`src/synoik.rs:824-829`),
   driven by a loop timer. It carries: mode, output, rect-or-window-id, `show_pointer`, the taken
   reply sender, and the target `path`.
 - **Hold the output weakly.** `Closed::last_selection` already uses `WeakOutput`
   (`screenshot_ui.rs:69`) for exactly this reason, and the picker itself closes on output change
-  (`src/niri.rs:6639-6647`). Unplug mid-countdown cancels.
+  (`src/synoik.rs:6639-6647`). Unplug mid-countdown cancels.
 - **A lock mid-countdown must cancel it, fail-closed.** `open_screenshot_ui` refuses while locked
-  (`src/niri.rs:3402`), but nothing stops a lock landing *during* a countdown, and a live capture
+  (`src/synoik.rs:3402`), but nothing stops a lock landing *during* a countdown, and a live capture
   then photographs the lock screen — or races `WaitingForSurfaces` and captures pre-lock content.
   That is the ClosingWindow fail-closed rule in a new place: when in doubt, capture nothing.
 - **The countdown must not appear in the shot.** It is on screen at fire time by definition. Either
@@ -166,7 +166,7 @@ Six things that must be designed in slice 1, not discovered later:
   already distinguish output/screencast/screen-capture — otherwise the default outcome is a "1"
   burned into every delayed screenshot.
 - **Escape must cancel, with the picker closed.** Today Escape reaches the picker only while it is
-  open (`src/niri.rs:2551`); a countdown needs its own route.
+  open (`src/synoik.rs:2551`); a countdown needs its own route.
 
 Cast mode compounds it: a delayed *recording* start ends the countdown by starting a stream, not by
 taking a frame. So the fire action is an indirection from the start, not a call to

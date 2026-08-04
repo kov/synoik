@@ -11,11 +11,11 @@ things a real session does. Two bugs found *outside* the suite pin the two halve
 
 - **Ordering the suite cannot reach.** The app-grid icon prewarm ran from `add_output`, which on
   the TTY path is reached synchronously from `Tty::init` → `connector_connected` →
-  `niri.add_output` (`src/backend/tty.rs:1524`) — tens of lines before the decode worker is
+  `synoik.add_output` (`src/backend/tty.rs:1524`) — tens of lines before the decode worker is
   spawned, so the warm silently no-op'd. Headless never runs that sequence. Worse, the fix
-  landed inside `if mode != BackendMode::HeadlessTest` (`src/niri.rs:1251`, call at `:1346`), so
+  landed inside `if mode != BackendMode::HeadlessTest` (`src/synoik.rs:1251`, call at `:1346`), so
   no test executes it in either direction. No test anywhere constructs a `Tty`: `Tty::new` has
-  exactly one caller, `State::new` (`src/niri.rs:1228`).
+  exactly one caller, `State::new` (`src/synoik.rs:1228`).
 - **Pixels the suite cannot trust.** GPU-rendering clients composite empty under `--headless`
   (see `[[dmabuf-clients-blank-headless]]`), so window *contents* can never be judged from a
   headless shot — the exact case where a screenshot test would be most valuable.

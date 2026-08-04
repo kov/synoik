@@ -48,8 +48,8 @@ impl GaussianBackdrop {
         radius: f64,
     ) -> Result<Self, VulkanError> {
         let (w, h) = source.extent();
-        let passes = niri_vk::blur::downscale_levels(w, h, radius).max(1);
-        let chain = SharedBlurChain::new_gaussian(&renderer.gpu, source.niri_texture(), passes)?;
+        let passes = synoik_vk::blur::downscale_levels(w, h, radius).max(1);
+        let chain = SharedBlurChain::new_gaussian(&renderer.gpu, source.synoik_texture(), passes)?;
         let output = renderer.create_buffer(NATIVE_FOURCC, source.size())?;
         Ok(Self {
             chain,

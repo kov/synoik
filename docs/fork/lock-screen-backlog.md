@@ -46,7 +46,7 @@ Four details that are easy to miss:
 
 **Our side.** `ModifiersState::caps_lock` already exists (smithay
 `input/keyboard/modifiers_state.rs:22`) and already reaches `on_shield_key`. Caps Lock is in the
-modifier list at `niri.rs:3726-3740`, so pressing it raises the prompt and is not typed — we see the
+modifier list at `synoik.rs:3726-3740`, so pressing it raises the prompt and is not typed — we see the
 event that changes the state. The one thing to get right is that the warning must update on
 **modifier-only** keys too, which is exactly the branch that currently just calls `show_prompt`.
 
@@ -444,7 +444,7 @@ Three things it needed that are worth knowing:
 **Smartcard: detection landed, preemption deferred (decided 2026-08-02).** gsd-smartcard owns the
 readers and exports one object per token over an `ObjectManager`; `dbus::smartcard` reads those,
 gated on `enable-smartcard-authentication` — which defaults to **false**, so on most machines the
-whole path is inert. The flag lands on `Niri::smartcard_detected` and nothing acts on it yet.
+whole path is inert. The flag lands on `Synoik::smartcard_detected` and nothing acts on it yet.
 
 Two rules in there are worth not re-deriving:
 

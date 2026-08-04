@@ -3,10 +3,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
 use ash::vk;
-use niri_vk::gpu::Gpu;
-use niri_vk::texture::Texture as NiriTexture;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::{Texture, TextureMapping};
+use synoik_vk::gpu::Gpu;
+use synoik_vk::texture::Texture as SynoikTexture;
 
 /// The one Vulkan color format this renderer renders/imports/exports. `B8G8R8A8_UNORM` is
 /// `[B,G,R,A]` in memory, i.e. DRM `ARGB8888` (and `XRGB8888` ignoring alpha).
@@ -64,7 +64,7 @@ pub(super) fn import_format(f: Fourcc) -> Option<(vk::Format, bool)> {
 
 struct VkTextureInner {
     gpu: Arc<Gpu>,
-    tex: NiriTexture,
+    tex: SynoikTexture,
     /// A one-set pool owned by this texture, so freeing the set can't outlive a shared pool.
     desc_pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
@@ -111,7 +111,7 @@ impl VkTexture {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         gpu: Arc<Gpu>,
-        tex: NiriTexture,
+        tex: SynoikTexture,
         desc_pool: vk::DescriptorPool,
         set: vk::DescriptorSet,
         width: u32,
@@ -136,7 +136,7 @@ impl VkTexture {
     /// A freshly imported client dmabuf, **before** its acquire barrier: no framebuffer, and
     /// `UNDEFINED` layout because nothing has transitioned it yet.
     ///
-    /// [`niri_vk::texture::Texture::import_dmabuf_sampled`] deliberately does not acquire — that
+    /// [`synoik_vk::texture::Texture::import_dmabuf_sampled`] deliberately does not acquire — that
     /// cost a command buffer, a submit and a fence wait for one pipeline barrier. The caller
     /// queues this texture on
     /// [`VulkanRenderer::pending_dmabuf_acquires`](super::renderer::VulkanRenderer) so the next
@@ -147,7 +147,7 @@ impl VkTexture {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_unacquired_dmabuf(
         gpu: Arc<Gpu>,
-        tex: NiriTexture,
+        tex: SynoikTexture,
         desc_pool: vk::DescriptorPool,
         set: vk::DescriptorSet,
         width: u32,
@@ -173,7 +173,7 @@ impl VkTexture {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_offscreen(
         gpu: Arc<Gpu>,
-        tex: NiriTexture,
+        tex: SynoikTexture,
         desc_pool: vk::DescriptorPool,
         set: vk::DescriptorSet,
         framebuffer: vk::Framebuffer,
@@ -197,12 +197,12 @@ impl VkTexture {
 
     /// A dmabuf-backed scanout render target: like [`Self::new_offscreen`] but carries **no**
     /// descriptor set (a scanout buffer is rendered into and handed to KMS, never sampled), so its
-    /// `NiriTexture` need not — and, being `COLOR_ATTACHMENT`-only, must not — advertise `SAMPLED`
-    /// usage. The null `desc_pool`/`set` are valid no-ops to destroy. Starts `UNDEFINED`; the
-    /// render pass performs the first transition.
+    /// `SynoikTexture` need not — and, being `COLOR_ATTACHMENT`-only, must not — advertise
+    /// `SAMPLED` usage. The null `desc_pool`/`set` are valid no-ops to destroy. Starts
+    /// `UNDEFINED`; the render pass performs the first transition.
     pub(super) fn new_dmabuf_target(
         gpu: Arc<Gpu>,
-        tex: NiriTexture,
+        tex: SynoikTexture,
         framebuffer: vk::Framebuffer,
         width: u32,
         height: u32,
@@ -229,7 +229,7 @@ impl VkTexture {
     /// (never sampled). Starts `UNDEFINED`; the blit barriers transition it.
     pub(super) fn new_present_target(
         gpu: Arc<Gpu>,
-        tex: NiriTexture,
+        tex: SynoikTexture,
         width: u32,
         height: u32,
         format: Fourcc,
@@ -271,9 +271,9 @@ impl VkTexture {
     }
 
     /// The underlying color image (sampled source and, for offscreens, the render-pass attachment).
-    /// The wrapped `niri-vk` texture, for operations that live on it (the glyph atlas's
+    /// The wrapped `synoik-vk` texture, for operations that live on it (the glyph atlas's
     /// region upload).
-    pub(super) fn inner(&self) -> &NiriTexture {
+    pub(super) fn inner(&self) -> &SynoikTexture {
         &self.0.tex
     }
 
@@ -281,9 +281,9 @@ impl VkTexture {
         self.0.tex.image
     }
 
-    /// The underlying niri-vk texture (image + view + sampler), for low-level pipelines that sample
-    /// it directly — e.g. the blur chain, which needs its `view`/`sampler`.
-    pub(super) fn niri_texture(&self) -> &NiriTexture {
+    /// The underlying synoik-vk texture (image + view + sampler), for low-level pipelines that
+    /// sample it directly — e.g. the blur chain, which needs its `view`/`sampler`.
+    pub(super) fn synoik_texture(&self) -> &SynoikTexture {
         &self.0.tex
     }
 
@@ -317,10 +317,10 @@ impl VkTexture {
     /// everything else in that queue: the copy is ordered before any later sample.
     pub(super) fn stage_reupload_shm(
         &self,
-        pool: &mut niri_vk::staging::StagingPool,
+        pool: &mut synoik_vk::staging::StagingPool,
         data: &[u8],
-    ) -> anyhow::Result<niri_vk::texture::StagedTexture> {
-        let staged = niri_vk::texture::StagedTexture::reupload_32bpp(
+    ) -> anyhow::Result<synoik_vk::texture::StagedTexture> {
+        let staged = synoik_vk::texture::StagedTexture::reupload_32bpp(
             &self.0.gpu,
             pool,
             self.image(),
@@ -346,7 +346,7 @@ impl VkTexture {
     /// submit (see [`super::renderer::VulkanRenderer::record_pending_dmabuf_acquires`]). No
     /// allocation — reuses the imported image, view and descriptor set. Reads the current tracked
     /// layout at record time. The image ends in `SHADER_READ_ONLY_OPTIMAL`. See
-    /// [`niri_vk::texture::Texture::record_reacquire_dmabuf_sampled`].
+    /// [`synoik_vk::texture::Texture::record_reacquire_dmabuf_sampled`].
     pub(super) fn record_reacquire_dmabuf(&self, cbuf: vk::CommandBuffer) {
         self.0
             .tex
@@ -396,8 +396,9 @@ impl Texture for VkTexture {
 #[derive(Clone)]
 pub(crate) struct GlyphRun {
     atlas: VkTexture,
-    glyphs: std::sync::Arc<[niri_vk::text::PlacedGlyph]>,
-    /// Source-span index of each glyph, parallel to `glyphs` (see [`niri_vk::text::GlyphAtlas`]).
+    glyphs: std::sync::Arc<[synoik_vk::text::PlacedGlyph]>,
+    /// Source-span index of each glyph, parallel to `glyphs` (see
+    /// [`synoik_vk::text::GlyphAtlas`]).
     spans: std::sync::Arc<[u32]>,
     side: u32,
     /// First-line line-box metrics (run-local px): baseline y, and the font's ascent/descent about
@@ -410,7 +411,7 @@ pub(crate) struct GlyphRun {
 impl GlyphRun {
     pub(crate) fn new(
         atlas: VkTexture,
-        glyphs: Vec<niri_vk::text::PlacedGlyph>,
+        glyphs: Vec<synoik_vk::text::PlacedGlyph>,
         spans: Vec<u32>,
         side: u32,
         line_box: (i32, f32, f32),
@@ -440,7 +441,7 @@ impl GlyphRun {
         &self.atlas
     }
 
-    pub(crate) fn glyphs(&self) -> &[niri_vk::text::PlacedGlyph] {
+    pub(crate) fn glyphs(&self) -> &[synoik_vk::text::PlacedGlyph] {
         &self.glyphs
     }
 
@@ -479,7 +480,7 @@ impl GlyphRun {
 
     /// Tight ink bbox over an iterator of glyphs: `(min_x, min_y, width, height)`, zeros if empty.
     fn bounds_of<'a>(
-        glyphs: impl Iterator<Item = &'a niri_vk::text::PlacedGlyph>,
+        glyphs: impl Iterator<Item = &'a synoik_vk::text::PlacedGlyph>,
     ) -> (i32, i32, i32, i32) {
         let mut bounds: Option<(i32, i32, i32, i32)> = None;
         for g in glyphs {

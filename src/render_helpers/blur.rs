@@ -13,8 +13,8 @@ pub struct BlurOptions {
     pub offset: f64,
 }
 
-impl From<niri_config::Blur> for BlurOptions {
-    fn from(config: niri_config::Blur) -> Self {
+impl From<synoik_config::Blur> for BlurOptions {
+    fn from(config: synoik_config::Blur) -> Self {
         Self {
             passes: config.passes,
             offset: config.offset,

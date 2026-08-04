@@ -258,7 +258,7 @@ pub trait AppLauncher {
     ) -> Result<(), String>;
 }
 
-/// The compositor-owned application model. Owned on `Niri`; fed from the
+/// The compositor-owned application model. Owned on `Synoik`; fed from the
 /// `favorite-apps` gsettings pipeline and the `AppInfoMonitor` channel.
 pub struct AppSystem {
     catalog: Box<dyn AppCatalog>,
@@ -401,7 +401,7 @@ impl AppSystem {
     /// TODO(S3): GNOME re-emits `AppFavorites` `changed` when the *resolved*
     /// favorites change across a refresh; the dash redisplay will want that signal.
     /// This enumerates eagerly on the main thread, so the caller is expected not to
-    /// call it per ping: `Niri::queue_app_catalog_reload` coalesces a burst onto one
+    /// call it per ping: `Synoik::queue_app_catalog_reload` coalesces a burst onto one
     /// reload, the way gnome-shell's `ShellAppCache` does. (GNOME also runs the
     /// enumeration itself off-thread; we do not, yet.)
     ///
@@ -1414,7 +1414,7 @@ impl AppLauncher for RecordingLauncher {
 }
 
 /// The real GIO-enumerated apps — a test helper so other modules (the icon
-/// loader) can exercise real `AppEntry` icon descriptors without a live `Niri`.
+/// loader) can exercise real `AppEntry` icon descriptors without a live `Synoik`.
 #[cfg(test)]
 pub fn gio_installed_for_test() -> Vec<AppEntry> {
     GioCatalog.enumerate()
@@ -1488,12 +1488,12 @@ mod tests {
         }
 
         let path =
-            std::env::temp_dir().join(format!("niri-masktest-{}.desktop", std::process::id()));
+            std::env::temp_dir().join(format!("synoik-masktest-{}.desktop", std::process::id()));
         let mut file = std::fs::File::create(&path).unwrap();
         // `sleep` rather than anything of ours: the test is about the mask the child starts with,
         // and a process that would exit on its own could pass this by being gone already.
         file.write_all(
-            b"[Desktop Entry]\nType=Application\nName=niri mask test\nExec=sleep 30\n\
+            b"[Desktop Entry]\nType=Application\nName=synoik mask test\nExec=sleep 30\n\
 Actions=newwin;\n\n\
               [Desktop Action newwin]\nName=New Window\nExec=sleep 31\n",
         )

@@ -18,9 +18,9 @@
 use std::sync::Arc;
 
 use ash::vk;
-use niri_vk::blur::BlurChain;
-use niri_vk::gpu::Gpu;
-use niri_vk::texture::Texture as NiriTexture;
+use synoik_vk::blur::BlurChain;
+use synoik_vk::gpu::Gpu;
+use synoik_vk::texture::Texture as SynoikTexture;
 
 use super::error::VulkanError;
 
@@ -37,7 +37,7 @@ impl SharedBlurChain {
     /// Build a chain sampling `source`, with `passes` down/up levels.
     pub(crate) fn new(
         gpu: &Arc<Gpu>,
-        source: &NiriTexture,
+        source: &SynoikTexture,
         passes: usize,
     ) -> Result<Arc<Self>, VulkanError> {
         Self::build(gpu, source, passes, false)
@@ -46,7 +46,7 @@ impl SharedBlurChain {
     /// As [`Self::new`], plus the pipelines [`Self::record_gaussian_into`] needs.
     pub(crate) fn new_gaussian(
         gpu: &Arc<Gpu>,
-        source: &NiriTexture,
+        source: &SynoikTexture,
         passes: usize,
     ) -> Result<Arc<Self>, VulkanError> {
         Self::build(gpu, source, passes, true)
@@ -54,7 +54,7 @@ impl SharedBlurChain {
 
     fn build(
         gpu: &Arc<Gpu>,
-        source: &NiriTexture,
+        source: &SynoikTexture,
         passes: usize,
         gaussian: bool,
     ) -> Result<Arc<Self>, VulkanError> {

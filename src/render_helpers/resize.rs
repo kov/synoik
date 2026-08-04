@@ -1,11 +1,11 @@
 use glam::{Mat3, Vec2};
-use niri_config::CornerRadius;
-use niri_vk::render::ResizePush;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::backend::renderer::Texture as _;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Size, Transform};
+use synoik_config::CornerRadius;
+use synoik_vk::render::ResizePush;
 
 use crate::render_helpers::vulkan::{
     CustomResizePush, VkTexture, VulkanError, VulkanFrame, VulkanRenderer,
@@ -16,7 +16,7 @@ use crate::render_helpers::vulkan::{
 ///
 /// Carries the two `VkTexture`s plus a prebuilt push and draws through
 /// [`VulkanFrame::render_resize`](crate::render_helpers::vulkan::VulkanFrame::render_resize), with
-/// the transforms packed affine-diagonal (see `niri-vk/shaders/resize.frag`).
+/// the transforms packed affine-diagonal (see `synoik-vk/shaders/resize.frag`).
 #[derive(Debug)]
 pub struct ResizeRenderElement {
     id: Id,
@@ -39,7 +39,7 @@ enum ResizePushKind {
 }
 
 /// Shared geometry/transform math for the resize crossfade, computed once and lowered to the
-/// `ResizePush` (affine-diagonal). See `niri-vk/shaders/resize.frag`: only `input_to_curr_geo`,
+/// `ResizePush` (affine-diagonal). See `synoik-vk/shaders/resize.frag`: only `input_to_curr_geo`,
 /// `geo_to_tex_prev` and `geo_to_tex_next` are sampled by the built-in crossfade;
 /// `curr_geo_to_{prev,next}_geo` are for the custom shader only.
 struct ResizeTransforms {
@@ -191,8 +191,8 @@ impl ResizeRenderElement {
                 corner_radius: <[f32; 4]>::from(t.corner_radius),
                 clamped_progress,
                 clip_to_geometry,
-                niri_scale: t.scale_x,
-                niri_alpha: result_alpha,
+                synoik_scale: t.scale_x,
+                synoik_alpha: result_alpha,
                 // origin/size/target are filled by render_resize.
                 ..Default::default()
             })

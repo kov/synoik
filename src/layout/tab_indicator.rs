@@ -1,14 +1,14 @@
 use std::iter::zip;
 use std::mem;
 
-use niri_config::{CornerRadius, Gradient, GradientRelativeTo, TabIndicatorPosition};
 use smithay::utils::{Logical, Point, Rectangle, Size};
+use synoik_config::{CornerRadius, Gradient, GradientRelativeTo, TabIndicatorPosition};
 
 use super::tile::Tile;
 use super::LayoutElement;
 use crate::animation::{Animation, Clock};
-use crate::niri_render_elements;
 use crate::render_helpers::border::BorderRenderElement;
+use crate::synoik_render_elements;
 use crate::utils::{
     floor_logical_in_physical_max1, round_logical_in_physical, round_logical_in_physical_max1,
 };
@@ -18,7 +18,7 @@ pub struct TabIndicator {
     shader_locs: Vec<Point<f64, Logical>>,
     shaders: Vec<BorderRenderElement>,
     open_anim: Option<Animation>,
-    config: niri_config::TabIndicator,
+    config: synoik_config::TabIndicator,
 }
 
 #[derive(Debug)]
@@ -29,14 +29,14 @@ pub struct TabInfo {
     pub geometry: Rectangle<f64, Logical>,
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     TabIndicatorRenderElement => {
         Gradient = BorderRenderElement,
     }
 }
 
 impl TabIndicator {
-    pub fn new(config: niri_config::TabIndicator) -> Self {
+    pub fn new(config: synoik_config::TabIndicator) -> Self {
         Self {
             shader_locs: Vec::new(),
             shaders: Vec::new(),
@@ -45,7 +45,7 @@ impl TabIndicator {
         }
     }
 
-    pub fn update_config(&mut self, config: niri_config::TabIndicator) {
+    pub fn update_config(&mut self, config: synoik_config::TabIndicator) {
         self.config = config;
     }
 
@@ -67,7 +67,7 @@ impl TabIndicator {
         self.open_anim.is_some()
     }
 
-    pub fn start_open_animation(&mut self, clock: Clock, config: niri_config::Animation) {
+    pub fn start_open_animation(&mut self, clock: Clock, config: synoik_config::Animation) {
         self.open_anim = Some(Animation::new(clock, 0., 1., 0., config));
     }
 
@@ -333,7 +333,7 @@ impl TabIndicator {
         }
     }
 
-    pub fn config(&self) -> niri_config::TabIndicator {
+    pub fn config(&self) -> synoik_config::TabIndicator {
         self.config
     }
 }
@@ -344,7 +344,7 @@ impl TabInfo {
         position: Point<f64, Logical>,
         is_active: bool,
         is_urgent: bool,
-        config: &niri_config::TabIndicator,
+        config: &synoik_config::TabIndicator,
     ) -> Self {
         let rules = tile.window().rules();
         let rule = rules.tab_indicator;

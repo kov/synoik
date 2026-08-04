@@ -9,7 +9,7 @@
 //!
 //! # Enabling
 //!
-//! `NIRI_FRAME_LOG` takes a comma-separated list:
+//! `SYNOIK_FRAME_LOG` takes a comma-separated list:
 //!
 //! | value | meaning |
 //! |---|---|
@@ -20,8 +20,8 @@
 //! | `summary=<secs>` | how often to emit the rolling summary; `0` turns it off |
 //! | `gpu` | also time the GPU passes (see [`gpu_timing`]) |
 //!
-//! So `NIRI_FRAME_LOG=1` for everyday use, `NIRI_FRAME_LOG=8,summary=5,gpu` to
-//! chase something specific, `NIRI_FRAME_LOG=all` to capture a few seconds in
+//! So `SYNOIK_FRAME_LOG=1` for everyday use, `SYNOIK_FRAME_LOG=8,summary=5,gpu` to
+//! chase something specific, `SYNOIK_FRAME_LOG=all` to capture a few seconds in
 //! full.
 //!
 //! # What it measures
@@ -84,7 +84,7 @@ thread_local! {
     /// flake — libtest runs tests in parallel, so a test asserting "this repaint
     /// re-baked nothing" could read a *different* test's bake and fail. Rare
     /// enough to survive many green runs and then be blamed on whatever change
-    /// is in front of you; it surfaced under `NIRI_VK_VALIDATION=1`, which
+    /// is in front of you; it surfaced under `SYNOIK_VK_VALIDATION=1`, which
     /// perturbs timing enough to lose the race about one run in five.
     static BAKES: Cell<u64> = const { Cell::new(0) };
 
@@ -93,7 +93,7 @@ thread_local! {
     /// This lives *inside* the `collect` phase, which is where the live seat put
     /// 22ms of a 31ms frame with only 18 elements on screen. A phase total says a
     /// frame was slow; this says which part of the widget path it was in. Shaping
-    /// — the other half — is counted by [`niri_vk::stats`], because it happens on
+    /// — the other half — is counted by [`synoik_vk::stats`], because it happens on
     /// both the draw and the measure path and only the renderer crate sees both.
     ///
     /// Per-thread for the same reason as [`BAKES`].
@@ -129,7 +129,7 @@ thread_local! {
     /// flake: samples were a process-wide counter that the timing test drained
     /// first to compensate, which only works while no other test renders at the
     /// same moment.
-    static GPU_SAMPLES: RefCell<Vec<(u64, niri_vk::stats::SubmitSite, Option<Duration>)>> =
+    static GPU_SAMPLES: RefCell<Vec<(u64, synoik_vk::stats::SubmitSite, Option<Duration>)>> =
         const { RefCell::new(Vec::new()) };
 
     /// A frame's GPU time subdivided by where in its command buffer it went.
@@ -137,7 +137,7 @@ thread_local! {
     /// already promised and counted, not promises of their own: they must never
     /// move `count` or `lost`, or a frame would park waiting for a sample that
     /// was only ever a breakdown of another one.
-    static GPU_PHASE_SAMPLES: RefCell<Vec<(u64, niri_vk::stats::GpuPhase, Duration)>> =
+    static GPU_PHASE_SAMPLES: RefCell<Vec<(u64, synoik_vk::stats::GpuPhase, Duration)>> =
         const { RefCell::new(Vec::new()) };
 
     /// How many samples the renderer has promised for the frame being built —
@@ -298,7 +298,7 @@ impl Drop for Timed {
             BAKE_NANOS.with(|c| c.set(c.get().saturating_add(nanos)));
         }
         if self.started.is_some() {
-            niri_vk::stats::leave_attributed();
+            synoik_vk::stats::leave_attributed();
         }
         BAKE_SITES.with(|s| {
             let mut s = s.borrow_mut();
@@ -326,8 +326,8 @@ pub fn time_bake() -> Timed {
     let started = ENABLED.load(Ordering::Relaxed).then(Instant::now);
     if started.is_some() {
         // A bake is the outermost of the nesting: it allocates and shapes inside itself. See
-        // `niri_vk::stats::enter_attributed` for why the residual is a union and not a sum.
-        niri_vk::stats::enter_attributed();
+        // `synoik_vk::stats::enter_attributed` for why the residual is a union and not a sum.
+        synoik_vk::stats::enter_attributed();
     }
     Timed {
         started,
@@ -345,7 +345,7 @@ pub fn bakes() -> u64 {
 }
 
 /// Whether the renderer should measure GPU pass durations, i.e. whether
-/// `NIRI_FRAME_LOG` carries the `gpu` option. See [`FrameLog::from_env`].
+/// `SYNOIK_FRAME_LOG` carries the `gpu` option. See [`FrameLog::from_env`].
 ///
 /// Reads the environment itself instead of waiting to be told, because the first
 /// caller is the renderer's constructor and on the tty backend that runs *before*
@@ -355,10 +355,10 @@ pub fn bakes() -> u64 {
 /// losses, which reads exactly like a device that cannot timestamp.
 pub fn gpu_timing() -> bool {
     *GPU_TIMING
-        .get_or_init(|| std::env::var("NIRI_FRAME_LOG").is_ok_and(|raw| wants_gpu_timing(&raw)))
+        .get_or_init(|| std::env::var("SYNOIK_FRAME_LOG").is_ok_and(|raw| wants_gpu_timing(&raw)))
 }
 
-/// Does this `NIRI_FRAME_LOG` value ask for GPU timing? Split out from
+/// Does this `SYNOIK_FRAME_LOG` value ask for GPU timing? Split out from
 /// [`gpu_timing`] so the token matching is testable: the flag itself is a
 /// process-wide [`OnceLock`] read from the real environment, which a test cannot
 /// set without racing every other test in the binary.
@@ -387,7 +387,7 @@ pub fn expect_gpu_sample() {
 
 /// Report a submit's measured GPU duration against the frame that issued it,
 /// tagged with the site the submit came from.
-pub fn add_gpu_time(seq: u64, site: niri_vk::stats::SubmitSite, duration: Duration) {
+pub fn add_gpu_time(seq: u64, site: synoik_vk::stats::SubmitSite, duration: Duration) {
     push_gpu_sample(seq, site, Some(duration));
 }
 
@@ -396,14 +396,14 @@ pub fn add_gpu_time(seq: u64, site: niri_vk::stats::SubmitSite, duration: Durati
 /// the reported total a sum over an unknown subset of the frame's passes, i.e. a
 /// number that reads like a total and is a floor. With the loss count beside it
 /// the reader can tell the two apart.
-pub fn add_gpu_lost(seq: u64, site: niri_vk::stats::SubmitSite) {
+pub fn add_gpu_lost(seq: u64, site: synoik_vk::stats::SubmitSite) {
     push_gpu_sample(seq, site, None);
 }
 
 /// Report one phase's share of a submit already reported through
 /// [`add_gpu_time`]. Dropped silently outside a frame, like the sample it
 /// subdivides.
-pub fn add_gpu_phase(seq: u64, phase: niri_vk::stats::GpuPhase, duration: Duration) {
+pub fn add_gpu_phase(seq: u64, phase: synoik_vk::stats::GpuPhase, duration: Duration) {
     GPU_PHASE_SAMPLES.with(|s| {
         let mut s = s.borrow_mut();
         if s.len() >= MAX_PENDING_SAMPLES {
@@ -413,7 +413,7 @@ pub fn add_gpu_phase(seq: u64, phase: niri_vk::stats::GpuPhase, duration: Durati
     });
 }
 
-fn push_gpu_sample(seq: u64, site: niri_vk::stats::SubmitSite, sample: Option<Duration>) {
+fn push_gpu_sample(seq: u64, site: synoik_vk::stats::SubmitSite, sample: Option<Duration>) {
     GPU_SAMPLES.with(|s| {
         let mut s = s.borrow_mut();
         if s.len() >= MAX_PENDING_SAMPLES {
@@ -433,14 +433,14 @@ pub struct GpuSamples {
     /// whether the effects offscreen or the scanout pass is what to attack —
     /// which is the whole question when a frame is over budget. Indexed by
     /// `SubmitSite::index`.
-    pub by_site: [Duration; niri_vk::stats::SubmitSite::ALL.len()],
+    pub by_site: [Duration; synoik_vk::stats::SubmitSite::ALL.len()],
     /// The same time again, split by *where inside* the command buffer it went.
     /// Orthogonal to `by_site`, not a refinement of it: `by_site` says which
     /// submit, `by_phase` says prepass / render pass / present. Once the submit
     /// discipline folded everything into the frame's own buffer, `by_site` alone
     /// could only ever answer "scanout", so this is the split that can name what
     /// to attack. Indexed by `GpuPhase::index`.
-    pub by_phase: [Duration; niri_vk::stats::GpuPhase::ALL.len()],
+    pub by_phase: [Duration; synoik_vk::stats::GpuPhase::ALL.len()],
     /// Pairs that came back unusable.
     pub lost: u64,
     /// Pairs of either kind, i.e. how many of the promised samples have landed.
@@ -448,7 +448,7 @@ pub struct GpuSamples {
 }
 
 impl GpuSamples {
-    fn add(&mut self, site: niri_vk::stats::SubmitSite, sample: Option<Duration>) {
+    fn add(&mut self, site: synoik_vk::stats::SubmitSite, sample: Option<Duration>) {
         self.count += 1;
         match sample {
             Some(time) => {
@@ -461,7 +461,7 @@ impl GpuSamples {
 
     /// A subdivision of time already added by [`add`](Self::add) — it must not
     /// touch `time`, `count` or `lost`.
-    fn add_phase(&mut self, phase: niri_vk::stats::GpuPhase, duration: Duration) {
+    fn add_phase(&mut self, phase: synoik_vk::stats::GpuPhase, duration: Duration) {
         self.by_phase[phase.index()] += duration;
     }
 }
@@ -692,7 +692,7 @@ struct InFlight {
     /// When the current phase began — every mark closes one span and opens the next.
     phase_started: Instant,
     /// The attributed-scope union at that same moment, so a span can report how much of itself the
-    /// frame line's other clauses account for. See [`niri_vk::stats::enter_attributed`].
+    /// frame line's other clauses account for. See [`synoik_vk::stats::enter_attributed`].
     phase_attributed: Duration,
     phase: Option<Phase>,
     spans: Vec<Span>,
@@ -711,10 +711,10 @@ struct InFlight {
 struct Totals {
     gpu: Duration,
     /// `gpu`, split by the submit it was spent in. Indexed by `SubmitSite::index`.
-    gpu_sites: [Duration; niri_vk::stats::SubmitSite::ALL.len()],
+    gpu_sites: [Duration; synoik_vk::stats::SubmitSite::ALL.len()],
     /// `gpu`, split by where inside the command buffer it went. Indexed by
     /// `GpuPhase::index`.
-    gpu_phases: [Duration; niri_vk::stats::GpuPhase::ALL.len()],
+    gpu_phases: [Duration; synoik_vk::stats::GpuPhase::ALL.len()],
     /// Timestamp pairs the renderer could not use. Nonzero means `gpu` is a
     /// floor, not a total. See [`GPU_LOST`].
     gpu_lost: u64,
@@ -740,12 +740,12 @@ struct Totals {
     /// The same submits, broken down by where they came from. Without this the line says a
     /// frame made fifteen round trips and nothing about which fifteen — and the fix for a bake
     /// is not the fix for an upload. Indexed by `SubmitSite::ALL`'s order.
-    sites: [niri_vk::stats::SiteTotals; niri_vk::stats::SubmitSite::ALL.len()],
+    sites: [synoik_vk::stats::SiteTotals; synoik_vk::stats::SubmitSite::ALL.len()],
     /// The frame's *first* wait and where it was paid. Not comparable to the others: every submit
     /// is chained on the queue timeline, so the first one cannot begin until the previous frame —
     /// including the scanout submit the CPU walked away from — has finished on the GPU. Whichever
     /// site goes first absorbs that tail and reads as expensive.
-    first_wait: Option<(niri_vk::stats::SubmitSite, Duration)>,
+    first_wait: Option<(synoik_vk::stats::SubmitSite, Duration)>,
     /// Bytes staged into GPU images. Separates a frame that made many small round trips from one
     /// that moved a wallpaper — different costs, different fixes.
     uploaded: u64,
@@ -855,13 +855,13 @@ pub struct FrameLog {
     /// How many dumps this process has written, so successive windows land in
     /// successive files instead of overwriting one another.
     dumps: u64,
-    /// `NIRI_FRAME_LOG_DUMP`, captured **once at construction** rather than read on every
+    /// `SYNOIK_FRAME_LOG_DUMP`, captured **once at construction** rather than read on every
     /// [`dump`](Self::dump).
     ///
     /// Reading it at dump time made the dump path a function of process-global state that any
     /// other test could be mutating: two tests here set and cleared this var, and the pair raced
     /// often enough to fail a full run roughly one time in six (more under
-    /// `NIRI_VK_VALIDATION=1`, whose slowdown widens the window). Capturing it at construction
+    /// `SYNOIK_VK_VALIDATION=1`, whose slowdown widens the window). Capturing it at construction
     /// makes each `FrameLog` carry its own answer, so a test builds one with the path it wants and
     /// touches no environment at all. Same reasoning as [`dump_dir_from`] below, which was split
     /// out after the same class of flake.
@@ -878,16 +878,16 @@ pub struct FrameLog {
 }
 
 impl FrameLog {
-    /// Read `NIRI_FRAME_LOG`. Anything unparseable is reported and ignored rather
+    /// Read `SYNOIK_FRAME_LOG`. Anything unparseable is reported and ignored rather
     /// than failing the session — this is a debugging aid, and a typo in a
     /// session file should not cost you a desktop.
     pub fn from_env() -> Self {
-        let settings = std::env::var("NIRI_FRAME_LOG")
+        let settings = std::env::var("SYNOIK_FRAME_LOG")
             .ok()
             .and_then(|raw| Self::parse(&raw));
 
         ENABLED.store(settings.is_some(), Ordering::Relaxed);
-        niri_vk::stats::set_enabled(settings.is_some());
+        synoik_vk::stats::set_enabled(settings.is_some());
 
         if let Some(settings) = &settings {
             tracing::info!(
@@ -925,7 +925,7 @@ impl FrameLog {
             parked: VecDeque::new(),
             ring,
             dumps: 0,
-            dump_override: std::env::var_os("NIRI_FRAME_LOG_DUMP")
+            dump_override: std::env::var_os("SYNOIK_FRAME_LOG_DUMP")
                 .filter(|s| !s.is_empty())
                 .map(std::path::PathBuf::from),
             stats: HashMap::new(),
@@ -966,19 +966,21 @@ impl FrameLog {
                         enabled = true;
                         settings.ring = Some(n);
                     }
-                    Err(_) => tracing::warn!("NIRI_FRAME_LOG: bad ring size {v:?}, ignoring"),
+                    Err(_) => tracing::warn!("SYNOIK_FRAME_LOG: bad ring size {v:?}, ignoring"),
                 },
                 ("summary", Some(v)) => match v.parse::<u64>() {
                     Ok(0) => settings.summary_every = None,
                     Ok(secs) => settings.summary_every = Some(Duration::from_secs(secs)),
-                    Err(_) => tracing::warn!("NIRI_FRAME_LOG: bad summary period {v:?}, ignoring"),
+                    Err(_) => {
+                        tracing::warn!("SYNOIK_FRAME_LOG: bad summary period {v:?}, ignoring")
+                    }
                 },
                 _ => match key.trim_end_matches("ms").parse::<f64>() {
                     Ok(ms) if ms > 0. => {
                         enabled = true;
                         settings.threshold = Some(Duration::from_secs_f64(ms / 1000.));
                     }
-                    _ => tracing::warn!("NIRI_FRAME_LOG: unknown option {part:?}, ignoring"),
+                    _ => tracing::warn!("SYNOIK_FRAME_LOG: unknown option {part:?}, ignoring"),
                 },
             }
         }
@@ -998,8 +1000,8 @@ impl FrameLog {
         }
 
         // The frame's first wait is measured apart from the rest; tell the counters where the
-        // frame starts. See `niri_vk::stats::begin_frame`.
-        niri_vk::stats::begin_frame();
+        // frame starts. See `synoik_vk::stats::begin_frame`.
+        synoik_vk::stats::begin_frame();
 
         // Anything the last frame promised and never delivered is not this frame's;
         // clear it so a failed submit cannot park the next line forever.
@@ -1014,14 +1016,14 @@ impl FrameLog {
             seq,
             started: now,
             phase_started: now,
-            phase_attributed: niri_vk::stats::attributed(),
+            phase_attributed: synoik_vk::stats::attributed(),
             phase: None,
             spans: Vec::with_capacity(Phase::ALL.len()),
             bakes_at_start: bakes(),
-            shapes_at_start: niri_vk::stats::shapes(),
-            submits_at_start: niri_vk::stats::submits(),
-            draws_at_start: niri_vk::stats::draws(),
-            shaded_at_start: niri_vk::stats::shaded(),
+            shapes_at_start: synoik_vk::stats::shapes(),
+            submits_at_start: synoik_vk::stats::submits(),
+            draws_at_start: synoik_vk::stats::draws(),
+            shaded_at_start: synoik_vk::stats::shaded(),
             context: FrameContext::default(),
         });
     }
@@ -1035,7 +1037,7 @@ impl FrameLog {
         };
 
         let now = Instant::now();
-        let attributed = niri_vk::stats::attributed();
+        let attributed = synoik_vk::stats::attributed();
         if let Some(previous) = frame.phase.replace(phase) {
             frame.spans.push(Span {
                 phase: previous,
@@ -1074,7 +1076,7 @@ impl FrameLog {
             frame.spans.push(Span {
                 phase: last,
                 wall: now - frame.phase_started,
-                attributed: niri_vk::stats::attributed().saturating_sub(frame.phase_attributed),
+                attributed: synoik_vk::stats::attributed().saturating_sub(frame.phase_attributed),
             });
         }
         let total = now - frame.started;
@@ -1088,18 +1090,18 @@ impl FrameLog {
             bakes: bakes() - frame.bakes_at_start,
             baking: Duration::from_nanos(BAKE_NANOS.with(|c| c.replace(0))),
             bake_sites: take_bake_sites(),
-            shapes: niri_vk::stats::shapes() - frame.shapes_at_start,
-            shaping: niri_vk::stats::take_shape_time(),
-            submits: niri_vk::stats::submits() - frame.submits_at_start,
-            submitting: niri_vk::stats::take_submit_time(),
-            retiring: niri_vk::stats::take_retire_time(),
-            sites: niri_vk::stats::take_sites(),
-            first_wait: niri_vk::stats::take_first_wait(),
-            uploaded: niri_vk::stats::take_uploaded_bytes(),
-            creates: niri_vk::stats::take_creates(),
-            staging_write: niri_vk::stats::take_staging_write(),
-            draws: niri_vk::stats::draws() - frame.draws_at_start,
-            shaded: niri_vk::stats::shaded() - frame.shaded_at_start,
+            shapes: synoik_vk::stats::shapes() - frame.shapes_at_start,
+            shaping: synoik_vk::stats::take_shape_time(),
+            submits: synoik_vk::stats::submits() - frame.submits_at_start,
+            submitting: synoik_vk::stats::take_submit_time(),
+            retiring: synoik_vk::stats::take_retire_time(),
+            sites: synoik_vk::stats::take_sites(),
+            first_wait: synoik_vk::stats::take_first_wait(),
+            uploaded: synoik_vk::stats::take_uploaded_bytes(),
+            creates: synoik_vk::stats::take_creates(),
+            staging_write: synoik_vk::stats::take_staging_write(),
+            draws: synoik_vk::stats::draws() - frame.draws_at_start,
+            shaded: synoik_vk::stats::shaded() - frame.shaded_at_start,
         };
 
         // The budget: an explicit threshold if given, else the refresh interval.
@@ -1253,7 +1255,7 @@ impl FrameLog {
             // The split, biggest first, and only when more than one site
             // contributed — on a frame with a single submit it would just restate
             // the total.
-            let mut by_site: Vec<_> = niri_vk::stats::SubmitSite::ALL
+            let mut by_site: Vec<_> = synoik_vk::stats::SubmitSite::ALL
                 .iter()
                 .map(|site| (*site, totals.gpu_sites[site.index()]))
                 .filter(|(_, d)| !d.is_zero())
@@ -1271,7 +1273,7 @@ impl FrameLog {
             // The phase split, in execution order rather than biggest-first: this
             // one is read as a shape ("where did the frame go"), and reordering it
             // per frame makes two lines impossible to compare by eye.
-            let by_phase: Vec<_> = niri_vk::stats::GpuPhase::ALL
+            let by_phase: Vec<_> = synoik_vk::stats::GpuPhase::ALL
                 .iter()
                 .map(|phase| (*phase, totals.gpu_phases[phase.index()]))
                 .collect();
@@ -1320,7 +1322,7 @@ impl FrameLog {
             // which — and a bake, an upload and a blur chain are three different fixes. Sites that
             // submitted nothing are omitted; a site that submitted and waited for nothing prints
             // `0.00ms`, which is the whole point on a deferred scanout.
-            let mut by_site: Vec<_> = niri_vk::stats::SubmitSite::ALL
+            let mut by_site: Vec<_> = synoik_vk::stats::SubmitSite::ALL
                 .iter()
                 .zip(&totals.sites)
                 .filter(|(_, t)| t.submits > 0)
@@ -1578,7 +1580,7 @@ impl FrameLog {
         if let Some(dropped) = take_dropped_lines() {
             tracing::warn!(
                 "{dropped} log lines were DROPPED since the last summary — the non-blocking log \
-                 writer's buffer overflowed, so this log has holes in it. Set NIRI_LOG_BLOCKING=1 \
+                 writer's buffer overflowed, so this log has holes in it. Set SYNOIK_LOG_BLOCKING=1 \
                  to make the writer apply backpressure instead (at the cost of stalling whatever \
                  thread is logging)."
             );
@@ -1733,7 +1735,7 @@ impl FrameLog {
     }
 }
 
-/// Where [`FrameLog::dump`] writes, given the `NIRI_FRAME_LOG_DUMP` override the log captured at
+/// Where [`FrameLog::dump`] writes, given the `SYNOIK_FRAME_LOG_DUMP` override the log captured at
 /// construction ([`FrameLog::dump_override`]); otherwise a numbered file under [`dump_dir`].
 ///
 /// The override is a parameter rather than an env read for a reason — see that field.
@@ -1748,7 +1750,7 @@ fn dump_path(over: Option<std::path::PathBuf>, nth: u64) -> std::path::PathBuf {
     std::path::PathBuf::from(dump_dir()).join(format!("frame-log.{}.{nth}.txt", std::process::id()))
 }
 
-/// Where dumps live by default: `$XDG_STATE_HOME/niri`, i.e. `~/.local/state/niri`.
+/// Where dumps live by default: `$XDG_STATE_HOME/synoik`, i.e. `~/.local/state/synoik`.
 ///
 /// **Not `$XDG_RUNTIME_DIR`**, which is where this used to write. That directory is a
 /// tmpfs by design — it is for sockets and pid files, things that *should* die with the
@@ -1766,7 +1768,7 @@ fn dump_dir() -> std::ffi::OsString {
 ///
 /// Split out so it can be tested without `set_var`. That is not fastidiousness: these
 /// tests run in one process alongside everything else, and the first version of the test
-/// cleared `NIRI_FRAME_LOG_DUMP` and broke a *different* test that was mid-dump. Env
+/// cleared `SYNOIK_FRAME_LOG_DUMP` and broke a *different* test that was mid-dump. Env
 /// mutation in a parallel test binary is a flake generator, and this file already carries
 /// scars from the same class in its counters.
 fn dump_dir_from(
@@ -1776,12 +1778,12 @@ fn dump_dir_from(
 ) -> std::ffi::OsString {
     if let Some(state) = state {
         let mut path = std::path::PathBuf::from(state);
-        path.push("niri");
+        path.push("synoik");
         return path.into_os_string();
     }
     if let Some(home) = home {
         let mut path = std::path::PathBuf::from(home);
-        path.extend([".local", "state", "niri"]);
+        path.extend([".local", "state", "synoik"]);
         return path.into_os_string();
     }
     // No home to write to (a system service, a broken environment). The runtime dir is
@@ -1881,7 +1883,7 @@ fn ms_us(us: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use niri_vk::stats::SubmitSite;
+    use synoik_vk::stats::SubmitSite;
 
     use super::*;
 
@@ -1931,7 +1933,7 @@ mod tests {
         assert!(FrameLog::parse("gpu").is_some());
     }
 
-    /// GPU timing is decided by reading `NIRI_FRAME_LOG` directly, not by
+    /// GPU timing is decided by reading `SYNOIK_FRAME_LOG` directly, not by
     /// `FrameLog::parse` setting a flag, because the renderer asks before the frame
     /// log is built. The whole option was silently dead for a session over exactly
     /// that ordering: the tty backend brings up the device — and its renderer, which
@@ -1958,11 +1960,11 @@ mod tests {
     /// where a frame's budget goes.
     fn sites(
         entries: &[(SubmitSite, u64, Duration)],
-    ) -> [niri_vk::stats::SiteTotals; SubmitSite::ALL.len()] {
-        let mut out = [niri_vk::stats::SiteTotals::default(); SubmitSite::ALL.len()];
+    ) -> [synoik_vk::stats::SiteTotals; SubmitSite::ALL.len()] {
+        let mut out = [synoik_vk::stats::SiteTotals::default(); SubmitSite::ALL.len()];
         for (site, submits, retiring) in entries {
             let i = SubmitSite::ALL.iter().position(|s| s == site).unwrap();
-            out[i] = niri_vk::stats::SiteTotals {
+            out[i] = synoik_vk::stats::SiteTotals {
                 submits: *submits,
                 submitting: Duration::ZERO,
                 retiring: *retiring,
@@ -2201,7 +2203,7 @@ mod tests {
             parked: VecDeque::new(),
             ring: VecDeque::new(),
             dumps: 0,
-            // No env read, and none of these tests may set one: `NIRI_FRAME_LOG_DUMP` is
+            // No env read, and none of these tests may set one: `SYNOIK_FRAME_LOG_DUMP` is
             // process-global, and mutating it here raced the other dump test.
             dump_override: None,
             settings: Some(Settings::default()),
@@ -2240,15 +2242,15 @@ mod tests {
 
         add_gpu_time(
             7,
-            niri_vk::stats::SubmitSite::KmsFrame,
+            synoik_vk::stats::SubmitSite::KmsFrame,
             Duration::from_millis(5),
         );
         add_gpu_time(
             9,
-            niri_vk::stats::SubmitSite::KmsFrame,
+            synoik_vk::stats::SubmitSite::KmsFrame,
             Duration::from_millis(2),
         );
-        add_gpu_lost(7, niri_vk::stats::SubmitSite::KmsFrame);
+        add_gpu_lost(7, synoik_vk::stats::SubmitSite::KmsFrame);
 
         let seven = take_gpu_samples_for(7);
         assert_eq!(seven.time, Duration::from_millis(5), "wrong frame's time");
@@ -2272,7 +2274,7 @@ mod tests {
     /// printing a correct total while the breakdown quietly lands on one site.
     #[test]
     fn gpu_time_splits_by_submit_site() {
-        use niri_vk::stats::SubmitSite;
+        use synoik_vk::stats::SubmitSite;
         let _ = take_gpu_samples();
 
         add_gpu_time(11, SubmitSite::OffscreenFrame, Duration::from_millis(5));
@@ -2314,7 +2316,7 @@ mod tests {
     /// there afterwards".
     #[test]
     fn ring_mode_banks_frames_and_dumps_them() {
-        let dir = std::env::temp_dir().join(format!("niri-ring-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("synoik-ring-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dump.txt");
 
@@ -2469,14 +2471,14 @@ mod tests {
         let path = dump_dir_from(None, os("/home/someone"), run.clone());
         assert_eq!(
             std::path::PathBuf::from(&path),
-            std::path::PathBuf::from("/home/someone/.local/state/niri"),
+            std::path::PathBuf::from("/home/someone/.local/state/synoik"),
             "with no XDG_STATE_HOME, dumps belong under the home state dir"
         );
 
         let path = dump_dir_from(os("/home/someone/.state"), os("/home/someone"), run.clone());
         assert_eq!(
             std::path::PathBuf::from(&path),
-            std::path::PathBuf::from("/home/someone/.state/niri"),
+            std::path::PathBuf::from("/home/someone/.state/synoik"),
             "XDG_STATE_HOME must win over the home fallback"
         );
 
@@ -2495,7 +2497,7 @@ mod tests {
     /// collect. An explicit override is still taken verbatim, because the caller
     /// asked for that name.
     ///
-    /// This test used to `remove_var("NIRI_FRAME_LOG_DUMP")`, which is what broke a
+    /// This test used to `remove_var("SYNOIK_FRAME_LOG_DUMP")`, which is what broke a
     /// *different* test mid-dump: the override is now a parameter, so nothing here
     /// touches process-global state.
     #[test]
@@ -2553,7 +2555,7 @@ mod tests {
 
         add_gpu_time(
             deferred,
-            niri_vk::stats::SubmitSite::KmsFrame,
+            synoik_vk::stats::SubmitSite::KmsFrame,
             Duration::from_millis(9),
         );
         log.flush_parked(log.settings.unwrap());
@@ -3006,7 +3008,7 @@ mod tests {
         // A frame whose CPU time is trivial but whose GPU work blows the budget on its own.
         add_gpu_time(
             seq,
-            niri_vk::stats::SubmitSite::KmsFrame,
+            synoik_vk::stats::SubmitSite::KmsFrame,
             Duration::from_millis(20),
         );
         log.flush_parked(log.settings.unwrap());

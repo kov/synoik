@@ -8,8 +8,8 @@ use std::{io, thread};
 
 use atomic::Atomic;
 use libc::{getrlimit, rlim_t, rlimit, setrlimit, RLIMIT_NOFILE};
-use niri_config::Environment;
 use smithay::wayland::xdg_activation::XdgActivationToken;
+use synoik_config::Environment;
 
 use crate::utils::expand_home;
 
@@ -254,8 +254,8 @@ mod systemd {
         }
 
         // When running as a systemd session, we want to put children into their own transient
-        // scopes in order to separate them from the niri process. This is helpful for
-        // example to prevent the OOM killer from taking down niri together with a
+        // scopes in order to separate them from the synoik process. This is helpful for
+        // example to prevent the OOM killer from taking down synoik together with a
         // misbehaving client.
         //
         // Putting a child into a scope is done by calling systemd's StartTransientUnit D-Bus method
@@ -264,7 +264,7 @@ mod systemd {
         // linger around forever.
         //
         // To prevent this, we'll use our double-fork (done for a separate reason) to help. In our
-        // intermediate child we will send back the grandchild PID, and in niri we will create a
+        // intermediate child we will send back the grandchild PID, and in synoik we will create a
         // transient scope with both our intermediate child and the grandchild PIDs set. Only then
         // we will signal our intermediate child to exit. This way, even if the grandchild
         // exits quickly, a non-empty scope will be created (with just our intermediate
@@ -441,7 +441,7 @@ mod systemd {
         // Extract the basename.
         let name = Path::new(name).file_name().unwrap_or(name);
         let scope_name = format!(
-            "app-niri-{}-{child_pid}.scope",
+            "app-synoik-{}-{child_pid}.scope",
             escape_unit_name(name.as_bytes())
         );
 
@@ -473,7 +473,7 @@ mod systemd {
 
     /// What `systemctl` shows for a scope we started, matching the shape of GNOME's
     /// `"Application launched by %s"` (libgnome-desktop's `gnome_start_systemd_scope`).
-    const SCOPE_DESCRIPTION: &str = "Application launched by niri";
+    const SCOPE_DESCRIPTION: &str = "Application launched by synoik";
 
     /// Ask systemd to put `pids` into a new transient scope called `scope_name`.
     ///
@@ -516,7 +516,7 @@ mod systemd {
         // gnome-session ships for the `app-gnome-` unit-name prefix
         // (`/usr/lib/systemd/user/app-gnome-.scope.d/override.conf`), which our `app-gnome-*`
         // scopes do inherit — verified live, `DropInPaths` names that file. We set it here anyway:
-        // it also covers the `app-niri-*` prefix, which matches no drop-in, and it does not leave
+        // it also covers the `app-synoik-*` prefix, which matches no drop-in, and it does not leave
         // the property that makes logout work resting on a file from the package we intend to
         // replace. `TimeoutStopSec` matches that drop-in's 5s.
         let properties: &[_] = &[
@@ -552,7 +552,7 @@ mod systemd {
     }
 
     /// The unit-name patterns covering every scope an app of ours can end up in: `app-gnome-*`
-    /// from [`start_app_scope`] (GNOME's prefix, which we match on purpose), `app-niri-*` from
+    /// from [`start_app_scope`] (GNOME's prefix, which we match on purpose), `app-synoik-*` from
     /// [`start_systemd_scope`] (the `spawn` path), and `app-flatpak-*`, which is **not** ours to
     /// create but is where a flatpak app actually lives.
     ///

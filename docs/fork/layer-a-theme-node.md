@@ -114,6 +114,6 @@ parser without a stable node target fixes nothing. Nesting: Layer B is additive 
 
 ## Gates (per project policy)
 `cargo fmt --all` / `cargo clippy --workspace --all-targets -D warnings` / `cargo test --workspace` /
-`NIRI_VK_VALIDATION=1 cargo test --workspace` (exit 0, no `VULKAN ERROR`) on every render-touching
+`SYNOIK_VK_VALIDATION=1 cargo test --workspace` (exit 0, no `VULKAN ERROR`) on every render-touching
 commit. Port commits assert **behavioural** invariants (geometry, alignment, pixel probes), not
 byte-identical bakes.

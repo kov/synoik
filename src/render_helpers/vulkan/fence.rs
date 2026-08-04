@@ -18,8 +18,8 @@ use std::os::unix::io::OwnedFd;
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
-use niri_vk::gpu::Gpu;
 use smithay::backend::renderer::sync::{Fence, Interrupted};
+use synoik_vk::gpu::Gpu;
 
 /// The renderer's copies of every sync FD handed to KMS that has not yet signaled.
 ///

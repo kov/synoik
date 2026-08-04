@@ -3,7 +3,7 @@ use std::os::unix::net::UnixStream;
 use zbus::{fdo, interface, zvariant};
 
 use super::Start;
-use crate::niri::NewClient;
+use crate::synoik::NewClient;
 
 pub struct ServiceChannel {
     to_niri: calloop::channel::Sender<NewClient>,
@@ -29,7 +29,7 @@ impl ServiceChannel {
             credentials_unknown: true,
         };
         if let Err(err) = self.to_niri.send(client) {
-            warn!("error sending message to niri: {err:?}");
+            warn!("error sending message to synoik: {err:?}");
             return Err(fdo::Error::Failed("internal error".to_owned()));
         }
 

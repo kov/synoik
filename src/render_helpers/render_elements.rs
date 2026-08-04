@@ -4,7 +4,7 @@
 // These enums used to come in a `$name<R>` flavour too, back when the tree was generic over the
 // renderer. There is only one renderer now, so every variant type names it concretely.
 #[macro_export]
-macro_rules! niri_render_elements {
+macro_rules! synoik_render_elements {
     ($name:ident => { $($(#[$attr:meta])* $variant:ident = $type:ty),+ $(,)? }) => {
         #[allow(clippy::large_enum_variant)]
         #[derive(Debug)]

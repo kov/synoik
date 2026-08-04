@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Synoik
+Comment=A scrollable-tiling Wayland compositor
+Exec=synoik-session
+Type=Application
+DesktopNames=synoik

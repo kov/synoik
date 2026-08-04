@@ -1,12 +1,12 @@
 # Running the compositor for manual testing
 
-The headless conformance corpus (`cargo test -p niri`, see `src/tests/gnome.rs`)
+The headless conformance corpus (`cargo test -p synoik`, see `src/tests/gnome.rs`)
 is the primary loop. This doc covers running the *real* compositor when you want
 to see a change on screen.
 
 ## Backends, and which one you get
 
-The backend is chosen automatically at startup (`src/niri.rs`, `State::new`):
+The backend is chosen automatically at startup (`src/synoik.rs`, `State::new`):
 
 | Situation | Backend | What it is |
 |---|---|---|
@@ -26,29 +26,29 @@ cargo run -- --headless
 starts the real compositor with no display and no input devices: one virtual
 1920×1080 output, a Wayland socket real clients can connect to, and a
 surfaceless-EGL renderer so GL clients actually draw. Everything is driven
-over IPC — the same `niri msg` surface as any other instance:
+over IPC — the same `synoik msg` surface as any other instance:
 
 ```sh
-export NIRI_SOCKET=…   # printed at startup ("IPC listening on: …")
-niri msg action spawn -- kitty
-niri msg windows
-niri msg event-stream
-niri msg action quit --skip-confirmation
+export SYNOIK_SOCKET=…   # printed at startup ("IPC listening on: …")
+synoik msg action spawn -- kitty
+synoik msg windows
+synoik msg event-stream
+synoik msg action quit --skip-confirmation
 ```
 
-Keyboard-driven paths work too: `niri msg input` injects synthetic events
+Keyboard-driven paths work too: `synoik msg input` injects synthetic events
 through the **real input pipeline** (`src/input/synthetic.rs`), so binds,
 grabs, modality and focus behave exactly as if the keys were pressed:
 
 ```sh
-niri msg input key Super          # tap the overlay key → overview toggles
-niri msg input key Alt+F2         # combo: press in order, release reversed
-niri msg input text 'kitty'       # type into whatever is focused
-niri msg input key Return
-niri msg input key-press Alt      # hold…
-niri msg input key Tab            #   Alt+Tab MRU switch
-niri msg input key-release Alt    # …commit on release
-niri msg input pointer-motion 200 300; niri msg input click; niri msg input scroll 1
+synoik msg input key Super          # tap the overlay key → overview toggles
+synoik msg input key Alt+F2         # combo: press in order, release reversed
+synoik msg input text 'kitty'       # type into whatever is focused
+synoik msg input key Return
+synoik msg input key-press Alt      # hold…
+synoik msg input key Tab            #   Alt+Tab MRU switch
+synoik msg input key-release Alt    # …commit on release
+synoik msg input pointer-motion 200 300; synoik msg input click; synoik msg input scroll 1
 ```
 
 Keys are evdev keycodes in decimal (`125`), XKB keysym names
@@ -85,7 +85,7 @@ globally and will disrupt your real session.
 When nested under GNOME, **the host GNOME grabs `Super` globally**, so a `Super`
 press never reaches the nested window. Two consequences:
 
-- niri already knows this: when nested, the *compositor* mod key defaults to
+- synoik already knows this: when nested, the *compositor* mod key defaults to
   `Alt`, not `Super` (`backend/mod.rs`, `mod_key_nested`).
 - The GNOME **overlay key** (Super-tap → overview) therefore can't be exercised
   nested under GNOME.
@@ -95,12 +95,12 @@ the key press over IPC — it takes the real overlay-key code path, host grabs
 notwithstanding:
 
 ```sh
-NIRI_SOCKET=$(ls -t $XDG_RUNTIME_DIR/niri.*.sock | head -1) \
+SYNOIK_SOCKET=$(ls -t $XDG_RUNTIME_DIR/synoik.*.sock | head -1) \
   cargo run -- msg input key Super
 ```
 
 (The running instance also prints its socket path on startup. See the
-Headless section for the full `niri msg input` surface.)
+Headless section for the full `synoik msg input` surface.)
 
 ## TTY (faithful: real Super, real KMS)
 
@@ -115,7 +115,7 @@ This is the way to test the overlay key and anything input- or display-specific.
 3. Run it:
    ```sh
    cd ~/Projects/gnome-shell-rs
-   ./target/release/niri
+   ./target/release/synoik
    ```
    Tap `Super` — the overview should open.
 4. Quit the compositor (its configured quit bind, default `Super+Shift+E`), then
@@ -155,7 +155,7 @@ unaffected either way. Undo everything with
 `sudo scripts/install-test-session.sh --uninstall`.
 
 Expectations: this exercises the Phase 1 contract surface (STRATEGY.md §3.8).
-Display config and most gsd daemons should come up (niri implements the core
+Display config and most gsd daemons should come up (synoik implements the core
 `org.gnome.Mutter.*` names, and `org.gnome.Shell` accelerator grabs — so
 gsd-media-keys' volume/brightness/media keys work, though without OSD popups
 until `ShowOSD` exists); the GNOME top panel is drawn (see below), but the
@@ -183,7 +183,7 @@ unmaximizes or untiles (`maximize`/`unmaximize` from
 `saved_rect` rules, including through tile→maximize chains. Windows covering
 more than 80% of the work area **auto-maximize on map** with a clamped
 restore size (mutter `place.c`). All of it is IPC-drivable:
-`niri msg action toggle-tiled-left` / `maximize` / `unmaximize`.
+`synoik msg action toggle-tiled-left` / `maximize` / `unmaximize`.
 
 Dragging works like mutter too (`meta-window-drag.c`): **drop a window in
 the 48px band at a side of the work area to tile it** to that half (with a
@@ -198,7 +198,7 @@ schema default is `false` and GNOME sessions enable it via a
 session manager set, falling back to `GNOME`), so the full-session flow
 gets it automatically; bare headless runs have no desktop set, so set the
 key explicitly or export `XDG_CURRENT_DESKTOP=GNOME`. To drag over IPC:
-`niri msg input button-press left`, `pointer-motion …`, `button-release
+`synoik msg input button-press left`, `pointer-motion …`, `button-release
 left` with `key-press super` held.
 
 Focus follows GNOME's stealing-prevention rules in this mode (mutter
@@ -335,8 +335,8 @@ adopted tables, the divergences and how to read the keys from a shell).
 
 ## Configuration (there is no config file)
 
-There is no `config.kdl`, no `--config`, no `niri validate` and no file watcher.
-A session runs on the compiled-in `Config::default()` (`niri-config/src/lib.rs`)
+There is no `config.kdl`, no `--config`, no `synoik validate` and no file watcher.
+A session runs on the compiled-in `Config::default()` (`synoik-config/src/lib.rs`)
 plus GSettings, which is where everything user-facing is supposed to land — per
 the fork tenet, GNOME's settings are the settings. What is still only in
 `Config::default()` is work that has not been ported yet, and that is on purpose:
@@ -348,16 +348,16 @@ pointingstick and key repeat all come from `org.gnome.desktop.peripherals.*`, so
 are not ported yet — see `docs/fork/input-peripherals-port.md`.
 
 The one escape hatch is the debug toggles that used to live in `debug {}`. They
-come from the environment now — `NIRI_DEBUG_<FIELD_NAME_IN_CAPS>`, the same
-idiom as `NIRI_VK_VALIDATION`, so a systemd drop-in reaches the live session:
+come from the environment now — `SYNOIK_DEBUG_<FIELD_NAME_IN_CAPS>`, the same
+idiom as `SYNOIK_VK_VALIDATION`, so a systemd drop-in reaches the live session:
 
 ```sh
-NIRI_DEBUG_DISABLE_TRANSACTIONS=1 cargo run
-NIRI_DEBUG_PREVIEW_RENDER=screencast cargo run   # or screen-capture
-NIRI_DEBUG_IGNORE_DRM_DEVICES=/dev/dri/card1:/dev/dri/card2
+SYNOIK_DEBUG_DISABLE_TRANSACTIONS=1 cargo run
+SYNOIK_DEBUG_PREVIEW_RENDER=screencast cargo run   # or screen-capture
+SYNOIK_DEBUG_IGNORE_DRM_DEVICES=/dev/dri/card1:/dev/dri/card2
 ```
 
-The field list is `Debug` in `niri-config/src/debug.rs`; every `bool` field is a
+The field list is `Debug` in `synoik-config/src/debug.rs`; every `bool` field is a
 flag var (set to anything but `0`/empty).
 
 ## The run dialog (Alt+F2)
@@ -371,17 +371,17 @@ history, shared with gnome-shell via `org.gnome.shell command-history`.
 Tab completion, Ctrl+Enter (run in terminal), the open-a-file-path fallback.
 
 Since a nested session can't see Alt+F2 (the host GNOME grabs it — same Super
-caveat as above), open it over IPC when nested: `niri msg input key Alt+F2`
-(or `niri msg action show-run-dialog`).
+caveat as above), open it over IPC when nested: `synoik msg input key Alt+F2`
+(or `synoik msg action show-run-dialog`).
 
 ## Inspecting / driving a running instance (IPC)
 
 ```sh
-niri msg outputs           # or: windows, workspaces, overview-state
-niri msg action toggle-overview
-niri msg action show-run-dialog
-niri msg event-stream      # live event feed
+synoik msg outputs           # or: windows, workspaces, overview-state
+synoik msg action toggle-overview
+synoik msg action show-run-dialog
+synoik msg event-stream      # live event feed
 ```
 
-`niri msg` finds the instance via `$NIRI_SOCKET`; set it to the socket the
+`synoik msg` finds the instance via `$SYNOIK_SOCKET`; set it to the socket the
 instance printed if you have more than one running.

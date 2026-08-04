@@ -1,5 +1,5 @@
 use fixture::Fixture;
-use niri_config::{Config, WindowingMode};
+use synoik_config::{Config, WindowingMode};
 
 /// Puts a config into niri's scrollable-tiling mode.
 ///

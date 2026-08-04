@@ -24,7 +24,7 @@ const BUS_NAME: &str = "org.gnome.Shell.Brightness";
 const PATH: &str = "/org/gnome/Shell/Brightness";
 
 /// A call from gsd-power into the compositor.
-pub enum BrightnessToNiri {
+pub enum BrightnessToSynoik {
     /// `SetDimming(b)`: enable or disable idle dimming — a clamp on top of the scales, not a move
     /// of them (`brightnessManager.js:242-259`).
     SetDimming(bool),
@@ -34,7 +34,7 @@ pub enum BrightnessToNiri {
 }
 
 /// A change the compositor wants reflected on the bus.
-pub enum NiriToBrightness {
+pub enum SynoikToBrightness {
     /// Whether any display has brightness control — the `HasBrightnessControl` property, which
     /// gsd-power reads before bothering to dim (`shellDBus.js:614-624`).
     HasControl(bool),
@@ -45,21 +45,21 @@ pub enum NiriToBrightness {
 }
 
 pub struct Brightness {
-    to_niri: calloop::channel::Sender<BrightnessToNiri>,
-    from_niri: async_channel::Receiver<NiriToBrightness>,
+    to_niri: calloop::channel::Sender<BrightnessToSynoik>,
+    from_niri: async_channel::Receiver<SynoikToBrightness>,
     has_control: Arc<AtomicBool>,
 }
 
 #[interface(name = "org.gnome.Shell.Brightness")]
 impl Brightness {
     async fn set_dimming(&self, enable: bool) {
-        let _ = self.to_niri.send(BrightnessToNiri::SetDimming(enable));
+        let _ = self.to_niri.send(BrightnessToSynoik::SetDimming(enable));
     }
 
     async fn set_auto_brightness_target(&self, target: f64) {
         let _ = self
             .to_niri
-            .send(BrightnessToNiri::SetAutoBrightnessTarget(target));
+            .send(BrightnessToSynoik::SetAutoBrightnessTarget(target));
     }
 
     #[zbus(property)]
@@ -74,8 +74,8 @@ impl Brightness {
 
 impl Brightness {
     pub fn new(
-        to_niri: calloop::channel::Sender<BrightnessToNiri>,
-        from_niri: async_channel::Receiver<NiriToBrightness>,
+        to_niri: calloop::channel::Sender<BrightnessToSynoik>,
+        from_niri: async_channel::Receiver<SynoikToBrightness>,
     ) -> Self {
         Self {
             to_niri,
@@ -127,7 +127,7 @@ impl Start for Brightness {
                         };
 
                         match msg {
-                            NiriToBrightness::HasControl(value) => {
+                            SynoikToBrightness::HasControl(value) => {
                                 if has_control.swap(value, Ordering::SeqCst) == value {
                                     continue;
                                 }
@@ -142,7 +142,7 @@ impl Start for Brightness {
                                     );
                                 }
                             }
-                            NiriToBrightness::UserChanged => {
+                            SynoikToBrightness::UserChanged => {
                                 if let Err(err) =
                                     Brightness::brightness_changed(iface.signal_emitter()).await
                                 {

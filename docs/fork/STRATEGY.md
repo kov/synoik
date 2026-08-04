@@ -183,9 +183,9 @@ unfocused). `c81062ec` defaulted that to `false` as a stop-gap; the removal subs
 
 Scope, already surveyed:
 - `Tile::border` and `Tile::focus_ring` (`src/layout/tile.rs`) — both are `FocusRing` instances.
-- Their config: `layout.border`, `layout.focus_ring` (`niri-config/src/{layout,appearance}.rs`) and
+- Their config: `layout.border`, `layout.focus_ring` (`synoik-config/src/{layout,appearance}.rs`) and
   the `border` / `focus_ring` / `draw_border_with_background` window rules
-  (`niri-config/src/window_rule.rs`, `src/window/mod.rs`).
+  (`synoik-config/src/window_rule.rs`, `src/window/mod.rs`).
 - The geometry contribution — `visual_border_width()` feeds tile sizing, so removing it collapses
   the border-width arithmetic in `tile.rs` onto the already-default "off" path.
 - Fallout in `src/layout/{workspace,scrolling,floating,monitor}.rs` and the layout test suite.
@@ -380,14 +380,14 @@ first-class constraint on this work.
   pipeline (solid / SDF-rounded / textured) + dual-kawase blur + hinted cosmic-text/swash
   glyph-atlas text vs a pango reference, all verified on both Venus and lavapipe via structural
   pixel-invariant `cargo test` (no golden images), plus forward-looking DRM-modifier /
-  external-semaphore probes. Lives in `niri-vk/` (workspace member, promoted from the spike into a
+  external-semaphore probes. Lives in `synoik-vk/` (workspace member, promoted from the spike into a
   reusable ash primitive **library** + a headless bring-up/CI binary, so the Stage-2 Vulkan
   renderer consumes the same low-level pieces). **Text at 1× must stay crisp → hinted glyph atlas, not
   GPU-raster-into-atlas.**
 - **(1) dmabuf import with DRM modifiers on Venus** — the #1 front-loaded risk. Probes show
   Venus exposes only the LINEAR modifier here, so scope the importer to linear.
 - **(2) Vulkan `RenderElement` + Smithay renderer-trait twins behind `--renderer=vulkan`** —
-  starts as a `NiriRenderer` **trait redesign** (renderer-enum + niri-owned primitive API),
+  starts as a `SynoikRenderer` **trait redesign** (renderer-enum + niri-owned primitive API),
   not a second impl bolted beside the Gles hardwiring.
 - **(3) KMS scanout + explicit sync** — see the measured Venus explicit-sync constraints in
   `docs/fork/venus-explicit-sync-gap.md` (bridge via kernel `drm_syncobj` timeline ⟷

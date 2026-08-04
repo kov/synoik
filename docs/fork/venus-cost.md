@@ -42,8 +42,8 @@ talking to the host.
 
 ## 2. How to read the numbers
 
-Everything below comes from `NIRI_FRAME_LOG` on the live seat (grammar in `src/frame_log.rs`,
-counters in `niri-vk/src/stats.rs`). Every submit is attributed to the **call site** that made it,
+Everything below comes from `SYNOIK_FRAME_LOG` on the live seat (grammar in `src/frame_log.rs`,
+counters in `synoik-vk/src/stats.rs`). Every submit is attributed to the **call site** that made it,
 and the fence wait is timed separately from `vkQueueSubmit` itself, because an earlier round of
 this work could not tell "the submit is slow" from "the wait after it is slow" and guessed wrong.
 
@@ -168,7 +168,7 @@ is why §4.4 collapsed N of them into one, and §4.6 moved the write to another 
 > its command buffer completed, so it wrote a silent zero. Root cause, validation and the
 > ~0.4%-of-a-frame cost are in [`venus-timestamp-gap.md` §7](./venus-timestamp-gap.md). The VMM
 > deployed on 2026-07-26 carries it: 600/600 usable in the reproducer, 200/200 through our own
-> renderer. `NIRI_FRAME_LOG=1,gpu` works. **The rest of this section is the original finding.**
+> renderer. `SYNOIK_FRAME_LOG=1,gpu` works. **The rest of this section is the original finding.**
 
 Timestamp queries are advertised in full (`timestampPeriod = 1`, `timestampComputeAndGraphics`,
 64 valid bits on the graphics queue) and **resolve every query to zero, with the availability word
@@ -223,7 +223,7 @@ Both reproduce deterministically, both have standalone reproducer crates, both a
 8.2× frame. We offered it so the ratio in this document would not read as "everything is the VMM".
 
 **What blur actually costs.** Measured directly, sweeping seven source sizes from 2.07 to 43.9 Mpx
-(`cargo test -p niri-vk blur_cost -- --ignored --nocapture`), the default 3-pass dual-Kawase chain
+(`cargo test -p synoik-vk blur_cost -- --ignored --nocapture`), the default 3-pass dual-Kawase chain
 costs, on this device:
 
 | variant | cost |
@@ -325,11 +325,11 @@ A/B — session-to-session frame counts are dominated by how much the desktop wa
 same build reported 0.8 and 12.3 over-budget frames per minute depending on the session. Across a
 reboot that caveat is unavoidable, so:
 
-- **Keep the guest binary identical.** `target/debug/niri` corresponded to `4504c5b5` when this
+- **Keep the guest binary identical.** `target/debug/synoik` corresponded to `4504c5b5` when this
   was written (`2ca2e164` is docs-only and does not change it). If the guest is rebuilt as well,
   nothing in a before/after is attributable.
 
-  > **The guest has since moved — read this before comparing (2026-07-25).** `target/debug/niri` is
+  > **The guest has since moved — read this before comparing (2026-07-25).** `target/debug/synoik` is
   > now `v26.04-597-g63189b0c-modified`, and the tree carries `01dc9384`, which stops texture
   > uploads submitting at all. That changes *precisely* what §3.1 measures, so a naive
   > before/after across the VMM deploy would credit the host with a guest change. To attribute the
@@ -350,8 +350,8 @@ retries, or a fallback path being taken — it is plain round-trip latency on ca
 
 ## 7. Reproducing / re-measuring any of this
 
-1. `NIRI_FRAME_LOG=1` is set for the gsrs session via
-   `/home/gsrs/.config/environment.d/91-frame-log.conf`, and `NIRI_VK_ASYNC_SCANOUT=1` via
+1. `SYNOIK_FRAME_LOG=1` is set for the gsrs session via
+   `/home/gsrs/.config/environment.d/91-frame-log.conf`, and `SYNOIK_VK_ASYNC_SCANOUT=1` via
    `92-async-scanout.conf`. `systemd --user` only reads `environment.d` at start or
    `daemon-reload`, so a plain logout/login may not pick up a change.
 2. Read frames with `journalctl _UID=$(id -u gsrs)` and filter on `frame on`. Sessions are
@@ -741,7 +741,7 @@ Two readings we are confident in, and one we are not:
 
 **This reinterprets §3.1.** "1.52–1.88 ms per upload submit, flat across 0.0 → 3.2 MiB" is the
 signature of a fixed wake cost, not of a payload cost — and our upload path guarantees we pay it:
-`Gpu::run_commands` submits and then blocks on the fence (`niri-vk/src/gpu.rs:681-736`). Any wait
+`Gpu::run_commands` submits and then blocks on the fence (`synoik-vk/src/gpu.rs:681-736`). Any wait
 longer than 1 ms lets the ring park, so the *next* submit pays the wake, whose wait parks it again.
 Every blocking wait we do buys a wake for the call after it.
 
@@ -986,7 +986,7 @@ called the 1.0 entry point — two independent axes, so both are tested:
 
 We cannot see your build metadata from in here, so we cannot tell whether this VM is missing the
 fix or the fix does not cover these shapes. The reproducer is the discriminator either way — a
-shape that starts reporting `WORKS` is one we can move `NIRI_FRAME_LOG=gpu` onto.
+shape that starts reporting `WORKS` is one we can move `SYNOIK_FRAME_LOG=gpu` onto.
 
 ### 11.2 There is no ioctl to stamp: the wait never enters the kernel
 
@@ -1172,7 +1172,7 @@ had an ordering confound.
 
 **Submits carrying real GPU work, back to back** — the compositor's actual shape. Eight blurs, each
 in its own submit with its own fence wait, against the same eight in one command buffer
-(`cargo test -p niri-vk blur_submit_overhead -- --ignored --nocapture`; the per-submit column is
+(`cargo test -p synoik-vk blur_submit_overhead -- --ignored --nocapture`; the per-submit column is
 the difference divided by eight):
 
 | source | per-submit, feedback ON | per-submit, `no_fence_feedback` |
@@ -1260,7 +1260,7 @@ frame's command buffer and resolves after the fence wait. 200 consecutive render
 
 Consequences, in order of how much they unblock:
 
-- **`NIRI_FRAME_LOG=1,gpu` is live.** The `(gpu X, N lost)` field on a logged frame is now a real
+- **`SYNOIK_FRAME_LOG=1,gpu` is live.** The `(gpu X, N lost)` field on a logged frame is now a real
   measurement rather than a permanently-empty one, and the summary's `gpu avg` follows. This is the
   instrument the whole §3.5 handoff existed to get back.
 - **Every "we are blind to GPU time" caveat in §3–§12 expires**, including §9.3's differential

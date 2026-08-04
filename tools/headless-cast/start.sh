@@ -1,5 +1,5 @@
 #!/bin/bash
-# Bring up an isolated headless niri: private PipeWire, private session bus, private runtime dir.
+# Bring up an isolated headless synoik: private PipeWire, private session bus, private runtime dir.
 #
 # Nothing here touches your real session. The runtime dir must stay SHORT — a long one overflows
 # the sockaddr_un path limit and the Wayland/PipeWire sockets silently fail to bind.
@@ -11,20 +11,20 @@
 set -u
 R=${NH_DIR:-/tmp/nh}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-NIRI=${NIRI_BIN:-$ROOT/target/debug/niri}
+SYNOIK=${SYNOIK_BIN:-$ROOT/target/debug/synoik}
 
-[ -x "$NIRI" ] || { echo "no niri binary at $NIRI (cargo build --bin niri)"; exit 1; }
+[ -x "$SYNOIK" ] || { echo "no synoik binary at $SYNOIK (cargo build --bin synoik)"; exit 1; }
 
 mkdir -p "$R/config" && chmod 700 "$R"
 export XDG_RUNTIME_DIR=$R PIPEWIRE_RUNTIME_DIR=$R XDG_CONFIG_HOME=$R/config
 export DBUS_SESSION_BUS_ADDRESS=unix:path=$R/bus
-export RUST_LOG=${RUST_LOG:-niri=info,niri::screencasting=trace}
+export RUST_LOG=${RUST_LOG:-synoik=info,synoik::screencasting=trace}
 
 # The screencast D-Bus interfaces are session-instance only unless this is set.
-export NIRI_DEBUG_DBUS_INTERFACES_IN_NON_SESSION_INSTANCES=1
+export SYNOIK_DEBUG_DBUS_INTERFACES_IN_NON_SESSION_INSTANCES=1
 
 : > "$R/pids"
-rm -f "$R"/pipewire-0* "$R"/wayland-* "$R"/niri.*.sock "$R"/*.log
+rm -f "$R"/pipewire-0* "$R"/wayland-* "$R"/synoik.*.sock "$R"/*.log
 
 pipewire > "$R/pw.log" 2>&1 & echo $! >> "$R/pids"
 sleep 1
@@ -38,11 +38,11 @@ sleep 1
 dbus-daemon --session --fork --address="unix:path=$R/bus" --print-pid=1 > "$R/dbus.pid" 2>/dev/null
 cat "$R/dbus.pid" >> "$R/pids" 2>/dev/null
 sleep 1
-"$NIRI" --headless > "$R/niri.log" 2>&1 & echo $! >> "$R/pids"
+"$SYNOIK" --headless > "$R/synoik.log" 2>&1 & echo $! >> "$R/pids"
 sleep 5
 
-NS=$(ls "$R"/niri.*.sock 2>/dev/null | head -1)
-[ -n "$NS" ] || { echo "niri did not come up; see $R/niri.log"; exit 1; }
-{ echo "NIRI_SOCKET=$NS"; echo "NIRI_BIN=$NIRI"; } > "$R/env"
+NS=$(ls "$R"/synoik.*.sock 2>/dev/null | head -1)
+[ -n "$NS" ] || { echo "synoik did not come up; see $R/synoik.log"; exit 1; }
+{ echo "SYNOIK_SOCKET=$NS"; echo "SYNOIK_BIN=$SYNOIK"; } > "$R/env"
 echo "socket: $NS"
-NIRI_SOCKET=$NS "$NIRI" msg outputs 2>&1 | head -3
+SYNOIK_SOCKET=$NS "$SYNOIK" msg outputs 2>&1 | head -3

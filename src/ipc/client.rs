@@ -4,19 +4,19 @@ use std::path::Path;
 use std::{env, slice};
 
 use anyhow::{anyhow, bail, Context};
-use niri_config::OutputName;
-use niri_ipc::socket::Socket;
-use niri_ipc::{
+use serde_json::json;
+use synoik_config::OutputName;
+use synoik_ipc::socket::Socket;
+use synoik_ipc::{
     Action, Cast, CastKind, CastTarget, Event, KeyboardLayouts, LogicalOutput, Mode, Output,
     OutputConfigChanged, Overview, Request, Response, Transform, Window, WindowLayout,
 };
-use serde_json::json;
 
 use crate::cli::Msg;
 use crate::utils::version;
 
 pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
-    // For actions taking paths, prepend the niri CLI's working directory.
+    // For actions taking paths, prepend the synoik CLI's working directory.
     if let Msg::Action {
         action:
             Action::Screenshot { path, .. }
@@ -54,12 +54,12 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
         },
     };
 
-    let mut socket = Socket::connect().context("error connecting to the niri socket")?;
+    let mut socket = Socket::connect().context("error connecting to the synoik socket")?;
 
     let result = socket.send(request);
 
-    // For errors that can be caused by a version mismatch between the running niri instance and
-    // the niri msg CLI, we will try to fetch and compare the versions.
+    // For errors that can be caused by a version mismatch between the running synoik instance and
+    // the synoik msg CLI, we will try to fetch and compare the versions.
     let check_compositor_version = match &result {
         Err(err) => {
             // Response JSON parsing errors.
@@ -68,13 +68,13 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                 ErrorKind::InvalidData | ErrorKind::UnexpectedEof
             )
         }
-        // Error returned from niri.
+        // Error returned from synoik.
         Ok(Err(_)) => true,
         _ => false,
     };
 
     let compositor_version = if check_compositor_version && !matches!(msg, Msg::Version) {
-        // Reconnect to support older niri versions with one request per connection.
+        // Reconnect to support older synoik versions with one request per connection.
         Socket::connect()
             .and_then(|mut socket| socket.send(Request::Version))
             .ok()
@@ -92,16 +92,16 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
         Some(Ok(Response::Version(compositor_version))) => {
             let cli_version = version();
             if cli_version != compositor_version {
-                eprintln!("Running niri compositor has a different version from the niri CLI:");
+                eprintln!("Running synoik compositor has a different version from the synoik CLI:");
                 eprintln!("Compositor version: {compositor_version}");
                 eprintln!("CLI version:        {cli_version}");
-                eprintln!("Did you forget to restart niri after an update?");
+                eprintln!("Did you forget to restart synoik after an update?");
                 eprintln!();
             }
         }
         Some(_) => {
-            eprintln!("Unable to get the running niri compositor version.");
-            eprintln!("Did you forget to restart niri after an update?");
+            eprintln!("Unable to get the running synoik compositor version.");
+            eprintln!("Did you forget to restart synoik after an update?");
             eprintln!();
         }
         None => {
@@ -110,8 +110,8 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
         }
     }
 
-    let reply = result.context("error communicating with niri")?;
-    let response = reply.map_err(|err_msg| anyhow!(err_msg).context("niri returned an error"))?;
+    let reply = result.context("error communicating with synoik")?;
+    let response = reply.map_err(|err_msg| anyhow!(err_msg).context("synoik returned an error"))?;
 
     match msg {
         Msg::RequestError => {
@@ -136,8 +136,8 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
             }
 
             if cli_version != compositor_version {
-                eprintln!("Running niri compositor has a different version from the niri CLI.");
-                eprintln!("Did you forget to restart niri after an update?");
+                eprintln!("Running synoik compositor has a different version from the synoik CLI.");
+                eprintln!("Did you forget to restart synoik after an update?");
                 eprintln!();
             }
 
@@ -221,19 +221,19 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
             });
             let mut iter = layers.iter().peekable();
 
-            let print = |surface: &niri_ipc::LayerSurface| {
+            let print = |surface: &synoik_ipc::LayerSurface| {
                 println!("    Surface:");
                 println!("      Namespace: \"{}\"", surface.namespace);
 
                 let interactivity = match surface.keyboard_interactivity {
-                    niri_ipc::LayerSurfaceKeyboardInteractivity::None => "none",
-                    niri_ipc::LayerSurfaceKeyboardInteractivity::Exclusive => "exclusive",
-                    niri_ipc::LayerSurfaceKeyboardInteractivity::OnDemand => "on-demand",
+                    synoik_ipc::LayerSurfaceKeyboardInteractivity::None => "none",
+                    synoik_ipc::LayerSurfaceKeyboardInteractivity::Exclusive => "exclusive",
+                    synoik_ipc::LayerSurfaceKeyboardInteractivity::OnDemand => "on-demand",
                 };
                 println!("      Keyboard interactivity: {interactivity}");
             };
 
-            let print_layer = |iter: &mut Peekable<slice::Iter<niri_ipc::LayerSurface>>,
+            let print_layer = |iter: &mut Peekable<slice::Iter<synoik_ipc::LayerSurface>>,
                                output: &str,
                                layer| {
                 let mut empty = true;
@@ -254,16 +254,16 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                 println!("Output \"{output}\":");
 
                 print!("  Background layer:");
-                print_layer(&mut iter, output, niri_ipc::Layer::Background);
+                print_layer(&mut iter, output, synoik_ipc::Layer::Background);
 
                 print!("  Bottom layer:");
-                print_layer(&mut iter, output, niri_ipc::Layer::Bottom);
+                print_layer(&mut iter, output, synoik_ipc::Layer::Bottom);
 
                 print!("  Top layer:");
-                print_layer(&mut iter, output, niri_ipc::Layer::Top);
+                print_layer(&mut iter, output, synoik_ipc::Layer::Top);
 
                 print!("  Overlay layer:");
-                print_layer(&mut iter, output, niri_ipc::Layer::Overlay);
+                print_layer(&mut iter, output, synoik_ipc::Layer::Overlay);
             }
         }
         Msg::FocusedOutput => {
@@ -427,7 +427,7 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
 
             let mut read_event = socket.read_events();
             loop {
-                let event = read_event().context("error reading event from niri")?;
+                let event = read_event().context("error reading event from synoik")?;
 
                 if json {
                     let event = serde_json::to_string(&event).context("error formatting event")?;

@@ -5,19 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ash::vk;
-use niri_vk::blur::BlurChain;
-use niri_vk::gpu::{DeviceSelector, Gpu, ModifierSupport};
-use niri_vk::render::{
-    load_module, sampler_set_layout, BorderPush, ClippedTexturePush, PostprocessPush, QuadPush,
-    ResizePush, ShadowPush, COLOR_RANGE,
-};
-use niri_vk::shaders::{
-    BORDER_FRAG, BORDER_VERT, CLIPPED_SOLID_FRAG, CLIPPED_TEX_FRAG, GRADIENT_FADE_FRAG,
-    POSTPROCESS_FRAG, POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG,
-    SDF_FRAG, SDF_TRIANGLE_FRAG, SHADOW_FRAG, SHADOW_VERT, SOLID_FRAG, TEXT_FRAG, TEXT_VERT,
-    TEX_FRAG,
-};
-use niri_vk::texture::Texture as NiriTexture;
 use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
@@ -27,6 +14,19 @@ use smithay::backend::renderer::{
     TextureFilter,
 };
 use smithay::utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform};
+use synoik_vk::blur::BlurChain;
+use synoik_vk::gpu::{DeviceSelector, Gpu, ModifierSupport};
+use synoik_vk::render::{
+    load_module, sampler_set_layout, BorderPush, ClippedTexturePush, PostprocessPush, QuadPush,
+    ResizePush, ShadowPush, COLOR_RANGE,
+};
+use synoik_vk::shaders::{
+    BORDER_FRAG, BORDER_VERT, CLIPPED_SOLID_FRAG, CLIPPED_TEX_FRAG, GRADIENT_FADE_FRAG,
+    POSTPROCESS_FRAG, POSTPROCESS_VERT, QUAD_VERT, RESIZE_FRAG, RESIZE_VERT, ROUNDED_TEX_FRAG,
+    SDF_FRAG, SDF_TRIANGLE_FRAG, SHADOW_FRAG, SHADOW_VERT, SOLID_FRAG, TEXT_FRAG, TEXT_VERT,
+    TEX_FRAG,
+};
+use synoik_vk::texture::Texture as SynoikTexture;
 use tracing::warn;
 
 use super::blur_chain::SharedBlurChain;
@@ -91,7 +91,7 @@ pub struct VulkanRenderer {
     pub(super) text_pipeline: Pipeline,
     /// The long-lived text stack (font system + scaler cache) behind [`Self::build_glyph_run`], so
     /// chrome redraws reshape a string without rescanning the system fonts each time.
-    text_ctx: niri_vk::text::TextContext,
+    text_ctx: synoik_vk::text::TextContext,
     /// Shaped single-line runs, keyed by `(text, px bits, bold)`. See
     /// [`Self::build_glyph_run_weighted`].
     glyph_runs: HashMap<(String, u32, bool), GlyphRun>,
@@ -106,7 +106,7 @@ pub struct VulkanRenderer {
     /// much whatever it carries. They queue here instead and go in one submit at
     /// [`Self::flush_glyph_uploads`]. The generation is carried because a queued glyph's
     /// coordinates only mean anything in the atlas it was placed in.
-    pending_glyphs: Vec<niri_vk::text::PendingGlyph>,
+    pending_glyphs: Vec<synoik_vk::text::PendingGlyph>,
     pending_glyph_generation: u64,
     /// Bumped whenever the glyph residency is thrown away after a failed upload. Anything holding
     /// a *baked* texture has to notice: a bake that drew blank glyphs is cached under a key its
@@ -121,7 +121,7 @@ pub struct VulkanRenderer {
     custom_open: Option<Pipeline>,
     sampler_set_layout: vk::DescriptorSetLayout,
     pub(super) command_pool: vk::CommandPool,
-    /// Timestamp queries bracketing each submit, when `NIRI_FRAME_LOG=…,gpu` asked
+    /// Timestamp queries bracketing each submit, when `SYNOIK_FRAME_LOG=…,gpu` asked
     /// for GPU timing and the device can answer. `None` otherwise, which is the
     /// normal case — see [`GpuTimer`].
     gpu_timer: Option<GpuTimer>,
@@ -148,7 +148,7 @@ pub struct VulkanRenderer {
     /// now a performance and resource argument, not a stability one — but it is still the
     /// reason this is cached.) Grow-only, so a steady stream of same-size reads allocates once;
     /// a larger read grows it and smaller ones then reuse the larger buffer.
-    readback_staging_buffer: niri_vk::texture::Staging,
+    readback_staging_buffer: synoik_vk::texture::Staging,
     /// Count of readback host-buffer (re)allocations (test-only): the no-churn invariant is that
     /// this stops growing once the largest read size has been seen. See
     /// `vulkan_repeated_readbacks_reuse_the_host_buffer`.
@@ -298,9 +298,9 @@ pub struct VulkanRenderer {
 
     /// The staging every queued upload's pixels are written into: one shared, grow-only buffer
     /// rewound per frame, rather than a mappable blob per upload. See
-    /// [`niri_vk::staging::StagingPool`] — the per-upload version ran the Venus host out of blobs
-    /// two minutes into a live session.
-    staging_pool: niri_vk::staging::StagingPool,
+    /// [`synoik_vk::staging::StagingPool`] — the per-upload version ran the Venus host out of
+    /// blobs two minutes into a live session.
+    staging_pool: synoik_vk::staging::StagingPool,
 }
 
 /// A blur waiting for a frame to record it, with everything it names held alive.
@@ -332,7 +332,7 @@ enum PendingBlurKind {
 ///
 /// The `VkTexture` is here for the reason `record_pending_dmabuf_acquires` returns its images:
 /// recording stores a handle, so the destination has to outlive the *submit*, not the recording
-/// (`docs/fork/frame-submit-discipline.md`). [`niri_vk::texture::StagedTexture`] deliberately
+/// (`docs/fork/frame-submit-discipline.md`). [`synoik_vk::texture::StagedTexture`] deliberately
 /// borrows its image by handle and owns only the staging half, so without this reference the only
 /// thing keeping the image alive is whoever else happens to hold the texture — the shm cache in
 /// the surface's `data_map`, or the element being drawn. A client that commits and then destroys
@@ -343,7 +343,7 @@ enum PendingBlurKind {
 struct PendingTextureUpload {
     /// The destination, held strongly. See the type docs — this reference is the invariant.
     tex: VkTexture,
-    staged: niri_vk::texture::StagedTexture,
+    staged: synoik_vk::texture::StagedTexture,
 }
 
 /// How many differently-sized present-blit shadows to keep. Comfortably covers what a live session
@@ -520,7 +520,7 @@ impl VulkanRenderer {
             TEXT_VERT,
             TEXT_FRAG,
             sampler,
-            std::mem::size_of::<niri_vk::render::TextPush>() as u32,
+            std::mem::size_of::<synoik_vk::render::TextPush>() as u32,
         )?;
         let command_pool = {
             let ci = vk::CommandPoolCreateInfo::default()
@@ -530,7 +530,7 @@ impl VulkanRenderer {
         };
 
         let gpu_for_timer = Arc::clone(&gpu);
-        let staging_pool = niri_vk::staging::StagingPool::new(&gpu);
+        let staging_pool = synoik_vk::staging::StagingPool::new(&gpu);
         Ok(VulkanRenderer {
             gpu,
             context_id: ContextId::new(),
@@ -549,7 +549,7 @@ impl VulkanRenderer {
             postprocess_pipeline,
             resize_pipeline,
             text_pipeline,
-            text_ctx: niri_vk::text::TextContext::new(),
+            text_ctx: synoik_vk::text::TextContext::new(),
             glyph_runs: HashMap::new(),
             glyph_atlas: None,
             pending_glyphs: Vec::new(),
@@ -565,7 +565,7 @@ impl VulkanRenderer {
             exported_scanout_fences: ExportedFenceRegistry::default(),
             finish_may_defer: false,
             defer_scanout: deferred_scanout_requested(),
-            readback_staging_buffer: niri_vk::texture::Staging::new_readback(),
+            readback_staging_buffer: synoik_vk::texture::Staging::new_readback(),
             #[cfg(test)]
             readback_buffer_allocs: 0,
             downscale_filter: TextureFilter::Linear,
@@ -712,7 +712,7 @@ impl VulkanRenderer {
     /// Allocate a one-set descriptor pool and bind `tex`'s image+sampler at set 0, binding 0.
     fn make_texture_set(
         &self,
-        tex: &NiriTexture,
+        tex: &SynoikTexture,
     ) -> Result<(vk::DescriptorPool, vk::DescriptorSet), VulkanError> {
         let dev = &self.gpu.device;
         let sizes = [vk::DescriptorPoolSize::default()
@@ -756,25 +756,26 @@ impl VulkanRenderer {
     }
 
     /// The device this renderer draws on, for the few producers that build GPU resources off the
-    /// render thread ([`niri_vk::staging::HostStaging`], filled by the wallpaper decoder). Handing
-    /// out the `Arc` is what keeps the device alive for as long as such a producer holds one.
-    pub fn gpu(&self) -> &Arc<niri_vk::gpu::Gpu> {
+    /// render thread ([`synoik_vk::staging::HostStaging`], filled by the wallpaper decoder).
+    /// Handing out the `Arc` is what keeps the device alive for as long as such a producer
+    /// holds one.
+    pub fn gpu(&self) -> &Arc<synoik_vk::gpu::Gpu> {
         &self.gpu
     }
 
     /// Import a texture whose pixels a **worker thread already wrote into device-visible memory**
-    /// ([`niri_vk::staging::HostStaging`]). The counterpart of `import_memory`, minus the part that
-    /// costs: the multi-megabyte host write happened on the producer's thread, and the copy is
-    /// queued for the next frame's command buffer rather than submitted here — a live frame
-    /// carried `first upload 18.62ms` for 48 MiB of wallpaper, all of it a round trip nobody
-    /// needed to be in.
+    /// ([`synoik_vk::staging::HostStaging`]). The counterpart of `import_memory`, minus the part
+    /// that costs: the multi-megabyte host write happened on the producer's thread, and the
+    /// copy is queued for the next frame's command buffer rather than submitted here — a live
+    /// frame carried `first upload 18.62ms` for 48 MiB of wallpaper, all of it a round trip
+    /// nobody needed to be in.
     ///
     /// Errors if the staging belongs to a *different* device — a renderer recreated under a decode
     /// in flight. That is not recoverable here (there is no host copy left to fall back to), so the
     /// caller re-requests the decode.
     pub fn import_host_staging(
         &mut self,
-        staging: &Arc<niri_vk::staging::HostStaging>,
+        staging: &Arc<synoik_vk::staging::HostStaging>,
         format: Fourcc,
         size: Size<i32, BufferCoord>,
     ) -> Result<VkTexture, VulkanError> {
@@ -796,11 +797,11 @@ impl VulkanRenderer {
             TextureFilter::Linear => vk::Filter::LINEAR,
             TextureFilter::Nearest => vk::Filter::NEAREST,
         };
-        let (tex, staged) = NiriTexture::stage_from_host_staging(
+        let (tex, staged) = SynoikTexture::stage_from_host_staging(
             &self.gpu, staging, w, h, vk_format, alpha_one, filter,
         )
         .map_err(|e| VulkanError::Other(format!("staged upload: {e:#}")))?;
-        // `NiriTexture` has no `Drop`, so free it if the descriptor set fails (matches
+        // `SynoikTexture` has no `Drop`, so free it if the descriptor set fails (matches
         // `import_memory`).
         let (desc_pool, set) = match self.make_texture_set(&tex) {
             Ok(v) => v,
@@ -914,7 +915,7 @@ impl VulkanRenderer {
         Ok(run)
     }
 
-    /// Lay out a styled, center-aligned paragraph (each [`TextSpan`](niri_vk::text::TextSpan)
+    /// Lay out a styled, center-aligned paragraph (each [`TextSpan`](synoik_vk::text::TextSpan)
     /// carries its own family/weight/size) wrapped to `wrap_px`, into a single [`GlyphRun`] —
     /// placements spanning every line, against the shared coverage atlas. This is the
     /// dialog/notification text path; draw it with [`VulkanFrame::render_glyphs`] at the block
@@ -922,7 +923,7 @@ impl VulkanRenderer {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn build_glyph_paragraph(
         &mut self,
-        spans: &[niri_vk::text::TextSpan],
+        spans: &[synoik_vk::text::TextSpan],
         wrap_px: f32,
         base_px: f32,
     ) -> Result<GlyphRun, VulkanError> {
@@ -946,7 +947,7 @@ impl VulkanRenderer {
         text: &str,
         px: f32,
         bold: bool,
-    ) -> Result<(niri_vk::text::ShapedRun, (VkTexture, u32)), VulkanError> {
+    ) -> Result<(synoik_vk::text::ShapedRun, (VkTexture, u32)), VulkanError> {
         // Split the disjoint borrows: shaping needs `&mut text_ctx`, uploading needs `&gpu`.
         let gpu = self.gpu.clone();
         let pool = self.command_pool;
@@ -970,7 +971,7 @@ impl VulkanRenderer {
         &mut self,
         gpu: &Arc<Gpu>,
         pool: vk::CommandPool,
-        pending: Vec<niri_vk::text::PendingGlyph>,
+        pending: Vec<synoik_vk::text::PendingGlyph>,
     ) -> Result<(VkTexture, u32), VulkanError> {
         let side = self.text_ctx.atlas().side();
         let generation = self.text_ctx.atlas().generation();
@@ -991,7 +992,7 @@ impl VulkanRenderer {
             // dropped on the way out, but its glyphs were recorded resident when they were
             // rasterized, so a retry finds them "already there", emits nothing to upload, and
             // draws blank once an image finally exists. Throw the residency away on the way out.
-            let made = NiriTexture::new_coverage_atlas(gpu, pool, side)
+            let made = SynoikTexture::new_coverage_atlas(gpu, pool, side)
                 .map_err(|e| VulkanError::Other(format!("glyph atlas: {e:#}")))
                 .and_then(|texture| {
                     let set = self.make_texture_set(&texture)?;
@@ -1091,7 +1092,7 @@ impl VulkanRenderer {
 
         let regions: Vec<_> = pending
             .iter()
-            .map(niri_vk::text::PendingGlyph::region)
+            .map(synoik_vk::text::PendingGlyph::region)
             .collect();
         let result =
             atlas
@@ -1128,7 +1129,7 @@ impl VulkanRenderer {
     pub(super) fn record_pending_glyph_uploads(
         &mut self,
         cbuf: vk::CommandBuffer,
-    ) -> Option<niri_vk::texture::GlyphStaging> {
+    ) -> Option<synoik_vk::texture::GlyphStaging> {
         if self.pending_glyphs.is_empty() {
             return None;
         }
@@ -1141,7 +1142,7 @@ impl VulkanRenderer {
 
         let regions: Vec<_> = pending
             .iter()
-            .map(niri_vk::text::PendingGlyph::region)
+            .map(synoik_vk::text::PendingGlyph::region)
             .collect();
         let image = atlas.texture.inner().image;
         match atlas
@@ -1151,7 +1152,7 @@ impl VulkanRenderer {
         {
             Ok(None) => None,
             Ok(Some(staged)) => {
-                niri_vk::texture::record_coverage_copy(&self.gpu.device, cbuf, image, &staged);
+                synoik_vk::texture::record_coverage_copy(&self.gpu.device, cbuf, image, &staged);
                 Some(staged)
             }
             Err(err) => {
@@ -1260,7 +1261,7 @@ impl VulkanRenderer {
                 | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
             "client buffer",
         )?;
-        let tex = NiriTexture::import_dmabuf_sampled(
+        let tex = SynoikTexture::import_dmabuf_sampled(
             &self.gpu,
             w,
             h,
@@ -1344,7 +1345,7 @@ impl VulkanRenderer {
 
         self.gpu.run_commands(
             self.command_pool,
-            niri_vk::stats::SubmitSite::Readback,
+            synoik_vk::stats::SubmitSite::Readback,
             |cbuf| unsafe {
                 if old_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
                     transition_image(
@@ -1511,7 +1512,7 @@ impl VulkanRenderer {
         let image = tex.image();
         self.gpu.run_commands(
             self.command_pool,
-            niri_vk::stats::SubmitSite::Transition,
+            synoik_vk::stats::SubmitSite::Transition,
             |cbuf| unsafe {
                 transition_image(
                     &self.gpu.device,
@@ -1608,7 +1609,7 @@ impl VulkanRenderer {
         let gpu = self.gpu.clone();
         gpu.run_commands(
             self.command_pool,
-            niri_vk::stats::SubmitSite::Transition,
+            synoik_vk::stats::SubmitSite::Transition,
             |cbuf| {
                 for tex in &queued {
                     unsafe {
@@ -1654,8 +1655,8 @@ impl VulkanRenderer {
         let gpu = self.gpu.clone();
         let pool = self.command_pool;
         let passes = (options.passes as usize).clamp(1, 31);
-        let chain = BlurChain::new(&gpu, source.niri_texture(), passes)?;
-        let recorded = gpu.run_commands(pool, niri_vk::stats::SubmitSite::Blur, |cbuf| {
+        let chain = BlurChain::new(&gpu, source.synoik_texture(), passes)?;
+        let recorded = gpu.run_commands(pool, synoik_vk::stats::SubmitSite::Blur, |cbuf| {
             chain.record(&gpu, cbuf, options.offset as f32);
             chain.copy_output_to(&gpu, cbuf, output.image(), w, h);
         });
@@ -1736,10 +1737,10 @@ pub(super) unsafe fn transition_image(
 /// the whole reason GPU timing and deferral used to be mutually exclusive — the
 /// deferral predicates required `gpu_timer.is_none()`, so measuring the renderer
 /// changed the thing it measured, and the live seat silently ran synchronously
-/// whenever `NIRI_FRAME_LOG=…,gpu` was set. With a slot per outstanding submit
+/// whenever `SYNOIK_FRAME_LOG=…,gpu` was set. With a slot per outstanding submit
 /// neither has to give way.
 ///
-/// Only built when `NIRI_FRAME_LOG` asked for `gpu` timing, so the query writes
+/// Only built when `SYNOIK_FRAME_LOG` asked for `gpu` timing, so the query writes
 /// are absent (not merely unread) in a normal session.
 struct GpuTimer {
     pool: vk::QueryPool,
@@ -1779,7 +1780,7 @@ pub(super) struct GpuTimerSlot {
     seq: u64,
     /// Which submit this pair times, so the frame log can split a frame's GPU
     /// total the same way it already splits the CPU's wait on it.
-    site: niri_vk::stats::SubmitSite,
+    site: synoik_vk::stats::SubmitSite,
 }
 
 impl GpuTimer {
@@ -1789,9 +1790,9 @@ impl GpuTimer {
     const SLOTS: u64 = 8;
 
     /// Timestamps per submit: one at the start, then one closing each
-    /// [`niri_vk::stats::GpuPhase`]. Consecutive deltas are the phases; first to
+    /// [`synoik_vk::stats::GpuPhase`]. Consecutive deltas are the phases; first to
     /// last is the submit's total, which is what the pair used to give.
-    const MARKS: u64 = 1 + niri_vk::stats::GpuPhase::ALL.len() as u64;
+    const MARKS: u64 = 1 + synoik_vk::stats::GpuPhase::ALL.len() as u64;
 }
 
 impl GpuTimer {
@@ -1887,11 +1888,11 @@ struct InFlightSubmit {
     /// ([`VulkanRenderer::record_pending_glyph_uploads`]). Held for the same reason as everything
     /// else here — the copy reads it on the GPU long after the CPU has moved on. It frees itself
     /// when this record is dropped, so neither retirement path has to know it exists.
-    _glyph_staging: Option<niri_vk::texture::GlyphStaging>,
+    _glyph_staging: Option<synoik_vk::texture::GlyphStaging>,
     /// The texture-upload staging buffers whose copies this command buffer carries
     /// ([`VulkanRenderer::record_pending_texture_uploads`]). Held for the same reason and freed
     /// the same way as `_glyph_staging`.
-    _texture_staging: Vec<niri_vk::texture::StagedTexture>,
+    _texture_staging: Vec<synoik_vk::texture::StagedTexture>,
     /// The blur chains this command buffer recorded. The widest of these: a chain owns the render
     /// pass, pipelines and descriptor sets the recording *binds*, so letting it go early does not
     /// corrupt the blur — it invalidates the command buffer, and every draw in it. See
@@ -2015,7 +2016,7 @@ impl VulkanRenderer {
         if self.in_flight.is_empty() {
             return;
         }
-        let _timed = niri_vk::stats::retire(niri_vk::stats::SubmitSite::KmsFrame);
+        let _timed = synoik_vk::stats::retire(synoik_vk::stats::SubmitSite::KmsFrame);
         unsafe { self.gpu.device.device_wait_idle() }.ok();
         self.retire_completed();
         // A device that cannot report its timeline leaves the records unretired above; the wait
@@ -2045,8 +2046,8 @@ impl VulkanRenderer {
         fence: VkSubmitFence,
         held: Vec<VkTexture>,
         targets: Vec<VkTexture>,
-        glyph_staging: Option<niri_vk::texture::GlyphStaging>,
-        texture_staging: Vec<niri_vk::texture::StagedTexture>,
+        glyph_staging: Option<synoik_vk::texture::GlyphStaging>,
+        texture_staging: Vec<synoik_vk::texture::StagedTexture>,
         blur_chains: Vec<Arc<SharedBlurChain>>,
     ) {
         self.in_flight.push(InFlightSubmit {
@@ -2200,7 +2201,7 @@ impl VulkanRenderer {
     pub(super) fn gpu_timer_begin(
         &self,
         cbuf: vk::CommandBuffer,
-        site: niri_vk::stats::SubmitSite,
+        site: synoik_vk::stats::SubmitSite,
     ) -> Option<GpuTimerSlot> {
         let timer = self.gpu_timer.as_ref().filter(|t| !t.unusable.get())?;
         if timer.pending.borrow().len() as u64 >= GpuTimer::SLOTS {
@@ -2227,14 +2228,14 @@ impl VulkanRenderer {
     }
 
     /// Close `phase` in `cbuf`. Must be called for every phase, in
-    /// [`GpuPhase::ALL`](niri_vk::stats::GpuPhase::ALL) order and at a fixed point in the
+    /// [`GpuPhase::ALL`](synoik_vk::stats::GpuPhase::ALL) order and at a fixed point in the
     /// recording — a skipped mark does not "leave that phase out", it silently merges it into the
     /// next one and moves cost between phases.
     pub(super) fn gpu_timer_mark(
         &self,
         cbuf: vk::CommandBuffer,
         slot: Option<GpuTimerSlot>,
-        phase: niri_vk::stats::GpuPhase,
+        phase: synoik_vk::stats::GpuPhase,
     ) {
         let (Some(timer), Some(slot)) = (self.gpu_timer.as_ref(), slot) else {
             return;
@@ -2253,7 +2254,7 @@ impl VulkanRenderer {
     /// Stamp the end of `cbuf`, just before it is ended and submitted. This is the mark closing
     /// the last phase, so it doubles as the submit's end.
     pub(super) fn gpu_timer_end(&self, cbuf: vk::CommandBuffer, slot: Option<GpuTimerSlot>) {
-        let last = *niri_vk::stats::GpuPhase::ALL
+        let last = *synoik_vk::stats::GpuPhase::ALL
             .last()
             .expect("GpuPhase::ALL is never empty");
         self.gpu_timer_mark(cbuf, slot, last);
@@ -2350,7 +2351,7 @@ impl VulkanRenderer {
 }
 
 impl VulkanRenderer {
-    /// Split a submit's measured total across [`GpuPhase`](niri_vk::stats::GpuPhase) from the
+    /// Split a submit's measured total across [`GpuPhase`](synoik_vk::stats::GpuPhase) from the
     /// intermediate marks.
     ///
     /// Reported only when the subdivision is *consistent* with the total that was already
@@ -2359,7 +2360,7 @@ impl VulkanRenderer {
     /// bursts), and half a subdivision is worse than none — it would put a frame's whole cost in
     /// whichever phase happened to get its marks, which is a *bias*, not a gap.
     fn report_gpu_phases(&self, ticks: &[u64], slot: GpuTimerSlot, total: Duration) {
-        use niri_vk::stats::GpuPhase;
+        use synoik_vk::stats::GpuPhase;
 
         if ticks.contains(&0) {
             return;
@@ -2442,7 +2443,7 @@ pub(super) fn timestamp_ticks(ticks: [u64; 2], valid_bits: u32) -> TimestampSamp
 }
 
 /// Whether the session asked for the scanout submit to be left in flight, via
-/// `NIRI_VK_ASYNC_SCANOUT=1`. Read once — it decides how frames are built, so it must answer the
+/// `SYNOIK_VK_ASYNC_SCANOUT=1`. Read once — it decides how frames are built, so it must answer the
 /// same way for the whole process.
 ///
 /// Opt-in because the win it targets can only be confirmed on a real seat: headless there is no
@@ -2464,7 +2465,7 @@ const SCANOUT_FENCE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::fr
 fn deferred_scanout_requested() -> bool {
     static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *REQUESTED.get_or_init(|| {
-        std::env::var("NIRI_VK_ASYNC_SCANOUT")
+        std::env::var("SYNOIK_VK_ASYNC_SCANOUT")
             .is_ok_and(|v| matches!(v.trim(), "1" | "on" | "true"))
     })
 }
@@ -2671,7 +2672,7 @@ impl VulkanRenderer {
                             | vk::FormatFeatureFlags::BLIT_SRC,
                         "scanout target",
                     )?;
-                    let tex = NiriTexture::import_dmabuf_render_target(
+                    let tex = SynoikTexture::import_dmabuf_render_target(
                         &self.gpu,
                         w,
                         h,
@@ -2730,7 +2731,7 @@ impl VulkanRenderer {
                         | vk::FormatFeatureFlags::BLIT_SRC,
                     "present-blit target",
                 )?;
-                let present_tex = NiriTexture::import_dmabuf_render_target(
+                let present_tex = SynoikTexture::import_dmabuf_render_target(
                     &self.gpu,
                     w,
                     h,
@@ -2961,7 +2962,7 @@ impl VulkanRenderer {
         // passes it carries.
         gpu.run_commands(
             self.command_pool,
-            niri_vk::stats::SubmitSite::Blur,
+            synoik_vk::stats::SubmitSite::Blur,
             |cbuf| {
                 for blur in &queued {
                     let (w, h) = blur.output.extent();
@@ -3001,7 +3002,7 @@ impl VulkanRenderer {
     /// *permanent* one, where clients kept committing into a queue that would never drain again.
     /// Superseding caps it at one entry per live image instead of one per commit, so the failure
     /// stops feeding itself.
-    fn queue_texture_upload(&mut self, tex: &VkTexture, staged: niri_vk::texture::StagedTexture) {
+    fn queue_texture_upload(&mut self, tex: &VkTexture, staged: synoik_vk::texture::StagedTexture) {
         let entry = PendingTextureUpload {
             tex: tex.clone(),
             staged,
@@ -3029,7 +3030,7 @@ impl VulkanRenderer {
     pub(super) fn record_pending_texture_uploads(
         &mut self,
         cbuf: vk::CommandBuffer,
-    ) -> (Vec<niri_vk::texture::StagedTexture>, Vec<VkTexture>) {
+    ) -> (Vec<synoik_vk::texture::StagedTexture>, Vec<VkTexture>) {
         let queued = std::mem::take(&mut self.pending_texture_uploads);
         let mut staging = Vec::with_capacity(queued.len());
         let mut textures = Vec::with_capacity(queued.len());
@@ -3064,7 +3065,7 @@ impl VulkanRenderer {
         // destination images it holds references to — outlives the copies it carries.
         gpu.run_commands(
             self.command_pool,
-            niri_vk::stats::SubmitSite::Upload,
+            synoik_vk::stats::SubmitSite::Upload,
             |cbuf| {
                 for upload in &queued {
                     upload.staged.record(cbuf);
@@ -3089,7 +3090,7 @@ impl VulkanRenderer {
     }
 
     /// Staging buffers the pool owns (test-only): the count that must not grow with the number of
-    /// client commits. See [`niri_vk::staging::StagingPool`].
+    /// client commits. See [`synoik_vk::staging::StagingPool`].
     #[cfg(test)]
     pub(super) fn staging_chunk_count(&self) -> usize {
         self.staging_pool.chunk_count()
@@ -3097,7 +3098,7 @@ impl VulkanRenderer {
 
     /// Force the staging pool's first chunk into existence (test-only).
     ///
-    /// That chunk is a created resource like any other and `niri_vk::stats::take_creates` counts
+    /// That chunk is a created resource like any other and `synoik_vk::stats::take_creates` counts
     /// it, but it is allocated once per renderer and reused for the rest of the session — so any
     /// test measuring "how many resources did this upload cost" wants it out of the window rather
     /// than folded into the first measurement. Touches no cache: it stages four bytes and drops
@@ -3146,7 +3147,7 @@ impl VulkanRenderer {
 
         // Transfer-only: never rendered into, never sampled. `new_present_target` is the VkTexture
         // shape with no framebuffer and no descriptor set, which is exactly that.
-        let tex = NiriTexture::new_transfer_image(&self.gpu, w, h, format)?;
+        let tex = SynoikTexture::new_transfer_image(&self.gpu, w, h, format)?;
         let staging = VkTexture::new_present_target(self.gpu.clone(), tex, w, h, want);
         #[cfg(test)]
         {
@@ -3192,7 +3193,7 @@ impl VulkanRenderer {
             return Ok(entry.texture.clone());
         }
 
-        let shadow_tex = NiriTexture::new_color_target(&self.gpu, w, h, filter)?;
+        let shadow_tex = SynoikTexture::new_color_target(&self.gpu, w, h, filter)?;
         let framebuffer = self.dmabuf_framebuffer(&shadow_tex, w, h)?;
         let shadow = VkTexture::new_dmabuf_target(
             self.gpu.clone(),
@@ -3256,7 +3257,7 @@ impl VulkanRenderer {
 
     fn dmabuf_framebuffer(
         &self,
-        tex: &NiriTexture,
+        tex: &SynoikTexture,
         w: u32,
         h: u32,
     ) -> Result<vk::Framebuffer, VulkanError> {
@@ -3290,7 +3291,7 @@ impl Offscreen<VkTexture> for VulkanRenderer {
         // A blank, sampleable color-attachment image (see `Texture::new_color_target`), plus a
         // render-pass framebuffer over its view and a descriptor set so it can be re-sampled once
         // rendered into — the offscreen-snapshot / blur / clipped-surface bridge.
-        let tex = NiriTexture::new_color_target(&self.gpu, w, h, filter)?;
+        let tex = SynoikTexture::new_color_target(&self.gpu, w, h, filter)?;
         let (desc_pool, set) = self.make_texture_set(&tex)?;
 
         let fb_ci = vk::FramebufferCreateInfo::default()
@@ -3388,7 +3389,7 @@ impl ImportMem for VulkanRenderer {
         };
         // Staged, not uploaded: the copy is recorded into the next frame's own command buffer
         // (`pending_texture_uploads`) instead of costing a submit and a blocking fence wait here.
-        let (tex, staged) = NiriTexture::stage_32bpp(
+        let (tex, staged) = SynoikTexture::stage_32bpp(
             &self.gpu,
             &mut self.staging_pool,
             w,
@@ -3398,7 +3399,7 @@ impl ImportMem for VulkanRenderer {
             alpha_one,
             filter,
         )?;
-        // `NiriTexture` has no `Drop`, so free it if the descriptor set fails (matches the batch
+        // `SynoikTexture` has no `Drop`, so free it if the descriptor set fails (matches the batch
         // path's cleanup on the same failure). `staged` drops with it, unqueued: its pixels never
         // reach an image, which is exactly what a failed import means.
         let (desc_pool, set) = match self.make_texture_set(&tex) {

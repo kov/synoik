@@ -1,17 +1,17 @@
 use std::fmt::Write as _;
 
 use insta::assert_snapshot;
-use niri_ipc::SizeChange;
+use synoik_ipc::SizeChange;
 use wayland_client::protocol::wl_surface::WlSurface;
 
 use super::client::ClientId;
 use super::*;
 use crate::layout::LayoutElement;
-use crate::niri::Niri;
+use crate::synoik::Synoik;
 
-fn format_window_sizes(niri: &Niri) -> String {
+fn format_window_sizes(synoik: &Synoik) -> String {
     let mut buf = String::new();
-    for (_out, mapped) in niri.layout.windows() {
+    for (_out, mapped) in synoik.layout.windows() {
         let size = mapped.size();
         writeln!(&mut buf, "{} × {}", size.w, size.h).unwrap();
     }
@@ -47,7 +47,7 @@ fn column_resize_waits_for_both_windows() {
     let _ = f.client(id).window(&surface2).recent_configures();
 
     // Consume into one column.
-    f.niri().layout.consume_or_expel_window_left(None);
+    f.synoik().layout.consume_or_expel_window_left(None);
     f.double_roundtrip(id);
 
     // Commit for the column consume.
@@ -68,13 +68,13 @@ fn column_resize_waits_for_both_windows() {
     f.double_roundtrip(id);
 
     // This should say 100 × 100 and 200 × 200.
-    assert_snapshot!(format_window_sizes(f.niri()), @r"
+    assert_snapshot!(format_window_sizes(f.synoik()), @r"
     100 × 100
     200 × 200
     ");
 
     // Issue a resize.
-    f.niri()
+    f.synoik()
         .layout
         .set_column_width(SizeChange::AdjustFixed(10));
     f.double_roundtrip(id);
@@ -86,7 +86,7 @@ fn column_resize_waits_for_both_windows() {
     f.double_roundtrip(id);
 
     // This should still say 100 × 100 as we're waiting in a transaction for the second window.
-    assert_snapshot!(format_window_sizes(f.niri()), @r"
+    assert_snapshot!(format_window_sizes(f.synoik()), @r"
     100 × 100
     200 × 200
     ");
@@ -98,7 +98,7 @@ fn column_resize_waits_for_both_windows() {
     f.double_roundtrip(id);
 
     // This should say 300 × 300 and 400 × 400 as the transaction completed.
-    assert_snapshot!(format_window_sizes(f.niri()), @r"
+    assert_snapshot!(format_window_sizes(f.synoik()), @r"
     300 × 300
     400 × 400
     ");

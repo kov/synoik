@@ -78,7 +78,7 @@ CPU-side signal on buffer drop. The renderer produces no completion fence.
 
 ## Venus trust and the future-work trigger
 
-The commit blocker is a *sound* producer wait on this Venus VM: `niri-vk/src/sync_spike.rs`
+The commit blocker is a *sound* producer wait on this Venus VM: `synoik-vk/src/sync_spike.rs`
 measured a `virtio_gpu` dma_fence as unsignalled-at-export with a downstream wait blocking the
 full GPU busy-work duration (no early signal), and GLES daily-drives tear-free on the identical
 blocker. Client-fence trust is inferred from mechanism identity (same host-fence propagation),

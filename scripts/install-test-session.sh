@@ -39,9 +39,9 @@ repo="$(pwd -P)"
 
 user="${TEST_USER:-gsrs}"
 profile="${PROFILE:-debug}"
-bin="$repo/target/$profile/niri"
+bin="$repo/target/$profile/synoik"
 dropin_dir="/home/$user/.config/systemd/user/org.gnome.Shell@user.service.d"
-schema_dir="/usr/local/share/gnome-shell-rs/glib-2.0/schemas"
+schema_dir="/usr/local/share/synoik/glib-2.0/schemas"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "error: must run as root: sudo $0 ${*:-}" >&2
@@ -52,7 +52,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     rm -f "$dropin_dir/override.conf"
     rmdir --parents --ignore-fail-on-non-empty "$dropin_dir" 2>/dev/null || true
     rm -rf "$schema_dir"
-    rmdir --parents --ignore-fail-on-non-empty "/usr/local/share/gnome-shell-rs" 2>/dev/null || true
+    rmdir --parents --ignore-fail-on-non-empty "/usr/local/share/synoik" 2>/dev/null || true
     echo "Removed the org.gnome.Shell override for '$user'."
     echo "The account is left in place; remove it with: userdel -r $user"
     exit 0
@@ -69,7 +69,7 @@ if [ ! -e "$bin" ]; then
 fi
 
 if ! id "$user" >/dev/null 2>&1; then
-    useradd -m -c "gnome-shell-rs test session" "$user"
+    useradd -m -c "synoik test session" "$user"
     echo "Created user '$user'. Set a password so GDM can log it in:"
     passwd "$user"
 fi
@@ -129,5 +129,5 @@ echo "Our schemas are installed at:"
 echo "  $schema_dir"
 echo "The session gets them via GSETTINGS_SCHEMA_DIR. To read or write those keys"
 echo "from a shell, set it there too:"
-echo "  GSETTINGS_SCHEMA_DIR=$schema_dir gsettings list-recursively org.gnome.shell-rs.keybindings"
+echo "  GSETTINGS_SCHEMA_DIR=$schema_dir gsettings list-recursively org.synoik.keybindings"
 echo "  GSETTINGS_SCHEMA_DIR=$schema_dir gsettings get org.gnome.desktop.wm.keybindings switch-windows"

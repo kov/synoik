@@ -15,9 +15,9 @@
 //! like `FocusRing`'s, and that is the moment to grow this into a shared stroke primitive rather
 //! than to special-case it here.
 
-use niri_config::Color;
 use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Logical, Point, Rectangle, Size};
+use synoik_config::Color;
 
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 

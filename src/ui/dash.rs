@@ -296,7 +296,7 @@ struct DashCache {
     icons: SharedAppIconUploads,
 }
 
-/// The overview dash. Owned on `Niri`; fed by `sync_dash_apps`.
+/// The overview dash. Owned on `Synoik`; fed by `sync_dash_apps`.
 pub struct Dash {
     /// Favorites first, then running non-favorites (`Dash._redisplay`,
     /// `dash.js:677-699`).
@@ -564,7 +564,7 @@ impl Dash {
         self.items.get(i).map(|e| &e.icon)
     }
 
-    /// Every item's icon — for the startup decode prewarm (`Niri::prewarm_app_icons`).
+    /// Every item's icon — for the startup decode prewarm (`Synoik::prewarm_app_icons`).
     pub fn icon_refs(&self) -> impl Iterator<Item = &crate::app_system::AppIconRef> {
         self.items.iter().map(|e| &e.icon)
     }

@@ -13,7 +13,6 @@ use anyhow::{ensure, Context};
 use bitflags::bitflags;
 use directories::UserDirs;
 use git_version::git_version;
-use niri_config::{Config, OutputName};
 use smithay::backend::renderer::utils::{
     with_renderer_surface_state, RendererSurfaceStateUserData,
 };
@@ -31,10 +30,11 @@ use smithay::wayland::shell::xdg::{
     ToplevelCachedState, ToplevelConfigure, ToplevelState, ToplevelSurface, XdgToplevelSurfaceData,
     XdgToplevelSurfaceRoleAttributes,
 };
+use synoik_config::{Config, OutputName};
 use wayland_backend::server::Credentials;
 
 use crate::handlers::KdeDecorationsModeState;
-use crate::niri::ClientState;
+use crate::synoik::ClientState;
 
 pub mod id;
 pub mod region;
@@ -140,7 +140,7 @@ impl ResizeEdge {
 }
 
 pub fn version() -> String {
-    if let Some(v) = option_env!("NIRI_BUILD_VERSION_STRING") {
+    if let Some(v) = option_env!("SYNOIK_BUILD_VERSION_STRING") {
         return String::from(v);
     }
 
@@ -149,7 +149,7 @@ pub fn version() -> String {
     const PATCH: &str = env!("CARGO_PKG_VERSION_PATCH");
 
     let commit =
-        option_env!("NIRI_BUILD_COMMIT").unwrap_or(git_version!(fallback = "unknown commit"));
+        option_env!("SYNOIK_BUILD_COMMIT").unwrap_or(git_version!(fallback = "unknown commit"));
 
     if PATCH == "0" {
         format!("{MAJOR}.{MINOR:0>2} ({commit})")
@@ -204,20 +204,20 @@ pub fn output_size(output: &Output) -> Size<f64, Logical> {
     output_transform.transform_size(logical_size)
 }
 
-pub fn logical_output(output: &Output) -> niri_ipc::LogicalOutput {
+pub fn logical_output(output: &Output) -> synoik_ipc::LogicalOutput {
     let loc = output.current_location();
     let size = output_size(output);
     let transform = match output.current_transform() {
-        Transform::Normal => niri_ipc::Transform::Normal,
-        Transform::_90 => niri_ipc::Transform::_90,
-        Transform::_180 => niri_ipc::Transform::_180,
-        Transform::_270 => niri_ipc::Transform::_270,
-        Transform::Flipped => niri_ipc::Transform::Flipped,
-        Transform::Flipped90 => niri_ipc::Transform::Flipped90,
-        Transform::Flipped180 => niri_ipc::Transform::Flipped180,
-        Transform::Flipped270 => niri_ipc::Transform::Flipped270,
+        Transform::Normal => synoik_ipc::Transform::Normal,
+        Transform::_90 => synoik_ipc::Transform::_90,
+        Transform::_180 => synoik_ipc::Transform::_180,
+        Transform::_270 => synoik_ipc::Transform::_270,
+        Transform::Flipped => synoik_ipc::Transform::Flipped,
+        Transform::Flipped90 => synoik_ipc::Transform::Flipped90,
+        Transform::Flipped180 => synoik_ipc::Transform::Flipped180,
+        Transform::Flipped270 => synoik_ipc::Transform::Flipped270,
     };
-    niri_ipc::LogicalOutput {
+    synoik_ipc::LogicalOutput {
         x: loc.x,
         y: loc.y,
         width: size.w as u32,
@@ -236,16 +236,16 @@ pub fn panel_orientation(output: &Output) -> Transform {
         .unwrap_or(Transform::Normal)
 }
 
-pub fn ipc_transform_to_smithay(transform: niri_ipc::Transform) -> Transform {
+pub fn ipc_transform_to_smithay(transform: synoik_ipc::Transform) -> Transform {
     match transform {
-        niri_ipc::Transform::Normal => Transform::Normal,
-        niri_ipc::Transform::_90 => Transform::_90,
-        niri_ipc::Transform::_180 => Transform::_180,
-        niri_ipc::Transform::_270 => Transform::_270,
-        niri_ipc::Transform::Flipped => Transform::Flipped,
-        niri_ipc::Transform::Flipped90 => Transform::Flipped90,
-        niri_ipc::Transform::Flipped180 => Transform::Flipped180,
-        niri_ipc::Transform::Flipped270 => Transform::Flipped270,
+        synoik_ipc::Transform::Normal => Transform::Normal,
+        synoik_ipc::Transform::_90 => Transform::_90,
+        synoik_ipc::Transform::_180 => Transform::_180,
+        synoik_ipc::Transform::_270 => Transform::_270,
+        synoik_ipc::Transform::Flipped => Transform::Flipped,
+        synoik_ipc::Transform::Flipped90 => Transform::Flipped90,
+        synoik_ipc::Transform::Flipped180 => Transform::Flipped180,
+        synoik_ipc::Transform::Flipped270 => Transform::Flipped270,
     }
 }
 
@@ -372,7 +372,7 @@ pub fn is_laptop_panel(connector: &str) -> bool {
 /// ([`crate::backlight::OutputBacklight::display_name`]); gnome-shell names a brightness scale
 /// after its first monitor's display name (`brightnessManager.js:338`).
 // Adapted from Mutter.
-pub fn make_display_name(output: &niri_ipc::Output, is_laptop_panel: bool) -> String {
+pub fn make_display_name(output: &synoik_ipc::Output, is_laptop_panel: bool) -> String {
     if is_laptop_panel {
         return String::from("Built-in display");
     }

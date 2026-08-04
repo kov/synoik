@@ -6,7 +6,7 @@
 //! **Model split.** Like the dash ([`crate::ui::dash`]), this owns only plain state:
 //! the query string, a snapshot of result entries, the keyboard selection, and mouse
 //! hover. It does NOT own the app catalog — [`OverviewSearch::handle_key`] mutates the
-//! query and returns a [`SearchOutcome`]; `Niri::sync_overview_search` runs
+//! query and returns a [`SearchOutcome`]; `Synoik::sync_overview_search` runs
 //! `AppSystem::search` and feeds results back via [`OverviewSearch::set_results`]
 //! (GNOME's `SearchResultsView.setTerms` → `_doSearch` → provider). Activation returns
 //! the selected app id for the caller to `launch` + `close_overview`.
@@ -232,7 +232,7 @@ struct SearchCache {
     icons: SharedAppIconUploads,
 }
 
-/// The overview search model. Owned on `Niri`; fed results by `sync_overview_search`.
+/// The overview search model. Owned on `Synoik`; fed results by `sync_overview_search`.
 pub struct OverviewSearch {
     /// The editable query — caret, selection and all (see [`crate::ui::text_edit`]).
     edit: TextEdit,
@@ -240,7 +240,7 @@ pub struct OverviewSearch {
     /// be expanded with an empty query (you clicked the puck and have not typed yet).
     expanded: bool,
     /// The expand animation's progress, 0 = puck, 1 = pill. Pushed each frame by
-    /// `Niri::update_overview_search_expand`, so hit-testing follows the animating pill
+    /// `Synoik::update_overview_search_expand`, so hit-testing follows the animating pill
     /// instead of snapping to its destination.
     expand: f64,
     results: Vec<SearchResultEntry>,
@@ -300,7 +300,7 @@ impl OverviewSearch {
         self.expanded = true;
     }
 
-    /// The animated expand progress Niri pushes in, 0 = puck, 1 = pill.
+    /// The animated expand progress Synoik pushes in, 0 = puck, 1 = pill.
     pub fn set_expand(&mut self, progress: f64) {
         self.expand = progress.clamp(0., 1.);
     }
@@ -1531,7 +1531,7 @@ mod tests {
         // The find glyph is centred in the puck, not sitting in a leading gutter.
         assert_eq!(s.layout(area).find_icon.x, puck.loc.x + PUCK_D / 2.);
 
-        // Typing expands it; the animation progress is pushed in by Niri, so drive it here.
+        // Typing expands it; the animation progress is pushed in by Synoik, so drive it here.
         s.handle_key(None, Some('a'), EditMods::default(), KeyTheme::default());
         assert!(s.is_expanded());
         s.set_expand(1.);

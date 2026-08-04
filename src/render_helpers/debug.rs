@@ -5,7 +5,7 @@ use smithay::backend::renderer::Color32F;
 use smithay::utils::Scale;
 
 use super::solid_color::SolidColorRenderElement;
-use crate::niri::OutputRenderElements;
+use crate::synoik::OutputRenderElements;
 
 pub fn push_opaque_regions(
     elem: &OutputRenderElements,

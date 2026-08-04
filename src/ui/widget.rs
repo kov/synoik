@@ -669,7 +669,7 @@ impl Tooltip {
     /// box model (it is a single line), width is the label plus padding.
     pub fn size(text: &str) -> Size<f64, Logical> {
         let px = crate::ui::pt_to_px(Self::TEXT_PT);
-        let w = niri_vk::text::measure_line_width_weighted(text, px as f32, false);
+        let w = synoik_vk::text::measure_line_width_weighted(text, px as f32, false);
         Size::from((w + 2. * Self::PAD_H, px.ceil() + 2. * Self::PAD_V))
     }
 
@@ -898,7 +898,7 @@ pub const TILE_LABEL_LINES: usize = 2;
 ///   name is readable.
 ///
 /// Break points are computed in **logical** px, so they do not move with the output
-/// scale; the result is memoized in [`niri_vk::text::wrap_lines_weighted`].
+/// scale; the result is memoized in [`synoik_vk::text::wrap_lines_weighted`].
 /// `max_lines` is which of the two states this is: [`TILE_LABEL_LINES`] collapsed,
 /// [`TILE_LABEL_EXPAND_LINES`] expanded — or 1 for a caption that is neither, like a
 /// search result's.
@@ -917,7 +917,7 @@ pub fn tile_label_lines(
     break_words: bool,
 ) -> Vec<String> {
     let px = crate::ui::pt_to_px(pt) as f32;
-    niri_vk::text::wrap_lines_weighted(name, px, false, wrap_w, max_lines.max(1), break_words)
+    synoik_vk::text::wrap_lines_weighted(name, px, false, wrap_w, max_lines.max(1), break_words)
 }
 
 /// One line of `text`, ellipsized at the end if it does not fit `max_w` logical px.
@@ -931,7 +931,7 @@ pub fn tile_label_lines(
 /// Break points are computed in logical px, so they do not move with the output scale.
 pub fn ellipsized_line(text: &str, pt: f64, max_w: f64) -> String {
     let px = crate::ui::pt_to_px(pt) as f32;
-    niri_vk::text::wrap_lines_weighted(text, px, false, max_w, 1, false)
+    synoik_vk::text::wrap_lines_weighted(text, px, false, max_w, 1, false)
         .pop()
         .unwrap_or_default()
 }
@@ -1233,7 +1233,7 @@ impl Entry {
     /// pill's width.
     ///
     /// Caret and selection are placed by re-measuring the text before them
-    /// ([`niri_vk::text::measure_line_width_weighted`], memoized) and adding it to the run's own
+    /// ([`synoik_vk::text::measure_line_width_weighted`], memoized) and adding it to the run's own
     /// pen origin, so they land on advance boundaries the drawn glyphs agree with rather than on
     /// an ink-box estimate.
     #[track_caller]
@@ -1291,7 +1291,7 @@ impl Entry {
         // agree with the glyphs to the pixel.
         let font_px = (crate::ui::pt_to_px(Self::TEXT_PT) * scale) as f32;
         let advance = |upto: usize| {
-            niri_vk::text::measure_line_width_weighted(&display[..upto], font_px, false)
+            synoik_vk::text::measure_line_width_weighted(&display[..upto], font_px, false)
         };
 
         // Scroll just enough to keep the caret in view, and never past the end of the text —
@@ -1403,7 +1403,7 @@ impl Entry {
 /// assumes logical order matches visual order. For a right-to-left or bidi run the glyphs are
 /// laid out in visual order, so the caret lands at the LTR-prefix width rather than at the
 /// insertion point and a selection washes the wrong glyphs. Fixing it needs an index→x mapping
-/// out of the shaper (cosmic-text has the per-glyph byte ranges; `niri_vk::text::ShapedRun`
+/// out of the shaper (cosmic-text has the per-glyph byte ranges; `synoik_vk::text::ShapedRun`
 /// does not expose them yet), not a change here. LTR runs are exact apart from kerning across
 /// the caret boundary.
 #[derive(Debug, Clone, Copy)]
@@ -1446,7 +1446,7 @@ impl CaretMetrics {
     pub fn x_at(&self, text: &str, at: usize) -> f64 {
         let at = at.min(text.len());
         let advance =
-            niri_vk::text::measure_line_width_weighted(&text[..at], self.font_px, self.bold);
+            synoik_vk::text::measure_line_width_weighted(&text[..at], self.font_px, self.bold);
         (self.pen + advance) / self.scale
     }
 }
@@ -2066,7 +2066,7 @@ impl<'a> TextShaper<'a> {
         wrap: f64,
         base_pt: f64,
     ) -> anyhow::Result<ShapedParagraph> {
-        use niri_vk::text::{SpanFamily, TextSpan};
+        use synoik_vk::text::{SpanFamily, TextSpan};
         let to_px = |pt: f64| (crate::ui::pt_to_px(pt) * self.scale) as f32;
         let vk_spans: Vec<TextSpan> = spans
             .iter()

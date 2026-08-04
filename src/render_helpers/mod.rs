@@ -1,7 +1,6 @@
 use std::ptr;
 
 use anyhow::{ensure, Context as _};
-use niri_config::BlockOutFrom;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -15,6 +14,7 @@ use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::shm;
+use synoik_config::BlockOutFrom;
 
 use self::vulkan::VulkanRenderer;
 pub use self::vulkan::NATIVE_FOURCC;

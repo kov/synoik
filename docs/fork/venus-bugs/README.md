@@ -269,9 +269,9 @@ and only *narrowing* by the query when it happened to succeed:
 
 | file | function |
 |---|---|
-| `niri-vk/src/texture.rs` | `Texture::import_dmabuf_render_target` |
-| `niri-vk/src/texture.rs` | `Texture::import_dmabuf_sampled` |
-| `niri-vk/src/dmabuf.rs` | `ImportedImage::import` (the `ForeignBuffer` path) |
+| `synoik-vk/src/texture.rs` | `Texture::import_dmabuf_render_target` |
+| `synoik-vk/src/texture.rs` | `Texture::import_dmabuf_sampled` |
+| `synoik-vk/src/dmabuf.rs` | `ImportedImage::import` (the `ForeignBuffer` path) |
 
 All three now call one helper, `Gpu::dmabuf_memory_type` — query, treat a failure as fatal, mask,
 and fail loudly if nothing survives (reporting both masks, so a future disagreement says which side
@@ -290,10 +290,10 @@ memory type is hiding, the same shape as the `renderer-gaps.md` entries.
 **Verified, not just compiled.** All three sites run in the suite with the query fatal: the client
 sampled-import and scanout-target tests (`vulkan_dmabuf_import_cache_*`,
 `vulkan_composites_a_scene_into_a_scanout_dmabuf`, …) pass without skipping, and `cargo run -p
-niri-vk` reports `OK — foreign dmabuf import (GBM, LINEAR modifier) verified` with correct quadrant
-colours. 845 green, `NIRI_VK_VALIDATION=1` clean.
+synoik-vk` reports `OK — foreign dmabuf import (GBM, LINEAR modifier) verified` with correct quadrant
+colours. 845 green, `SYNOIK_VK_VALIDATION=1` clean.
 
 **Still open from the same pass:** `Gpu::check_modifier_features`' `Unlisted` best-effort path
-(`niri-vk/src/gpu.rs`) was added under the same "the query lies here" assumption and has *not* been
+(`synoik-vk/src/gpu.rs`) was added under the same "the query lies here" assumption and has *not* been
 re-checked. It is a different query (`vkGetPhysicalDeviceFormatProperties2` modifier enumeration),
 so issue 1's fix says nothing about it either way — it needs its own look.

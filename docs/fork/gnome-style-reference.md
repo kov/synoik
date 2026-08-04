@@ -123,7 +123,7 @@ all inherit Cantarell. So matching GNOME's look is not per-widget: **the family 
 choice, and it must be Cantarell.** (Monospace spans — dialog command echoes, keycaps — use
 `monospace-font-name`, default "Source Code Pro 10"; we map those to the generic monospace.)
 
-**Our implementation** (`niri-vk/src/text.rs`):
+**Our implementation** (`synoik-vk/src/text.rs`):
 - `pub const SANS_FAMILY = Family::Name("Cantarell")` — every sans shape/measure names it. Do **not**
   use `Family::SansSerif`: fontconfig resolves the generic to whatever `fc-match sans` returns (Noto
   Sans on this VM), a different typeface whose glyph shapes (the "J"/"l") and metrics differ from

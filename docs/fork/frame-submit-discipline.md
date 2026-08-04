@@ -36,7 +36,7 @@ other.
 ## What makes recording sufficient
 
 `Gpu::submit` chains every submit on a single timeline semaphore, each waiting on the previous
-value (`niri-vk/src/gpu.rs`, gated by `Gpu::orders_submits`). GPU execution order is therefore
+value (`synoik-vk/src/gpu.rs`, gated by `Gpu::orders_submits`). GPU execution order is therefore
 submission order, totally. For a consumer that is itself GPU work, "recorded" is as good as
 "submitted and waited for" — which is why tracked image layouts are advanced at *record* time
 throughout this code. That is not sloppiness; it is the invariant.
@@ -107,7 +107,7 @@ nothing happens; queue one it has dropped and the compositor dies. It shipped, a
 down on a client that did nothing wrong.
 
 Pixel comparisons cannot see any of this — the image survives whenever the cache happens to hold it.
-`NIRI_VK_VALIDATION=1` names it exactly (`VkImage … was destroyed`), which is why it belongs at the
+`SYNOIK_VK_VALIDATION=1` names it exactly (`VkImage … was destroyed`), which is why it belongs at the
 *start* of an investigation, on the live session if that is where the misbehavior is.
 
 ## What still blocks, and why each is fine
@@ -146,7 +146,7 @@ virtio-gpu blob, an shm re-upload happens on every commit of every shm surface, 
 out of blobs two minutes into a live session, after which every `vkAllocateMemory` failed and the
 session did not recover.
 
-So staged pixels go into `niri_vk::staging::StagingPool`: one grow-only, persistently mapped
+So staged pixels go into `synoik_vk::staging::StagingPool`: one grow-only, persistently mapped
 buffer, N offsets, rewound per frame. What decides when it can be rewound is the **reference
 count**, not a fence — an upload holds its chunk from staging until its command buffer retires, so
 a chunk nobody else holds is one the GPU cannot be reading. Sharing means the pool only ever learns

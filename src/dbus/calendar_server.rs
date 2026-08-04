@@ -5,11 +5,11 @@
 //! `DBusEventSource` (`js/ui/calendar.js:207-405`).
 //!
 //! Bidirectional, like the notifications server: the compositor pushes the day
-//! range it wants ([`NiriToCalendar::SetRange`], deduped here like
+//! range it wants ([`SynoikToCalendar::SetRange`], deduped here like
 //! `requestRange`/`_datesEqual`, `js/ui/calendar.js:369-377`) and we forward the
 //! server's `EventsAddedOrUpdated` / `EventsRemoved` / `ClientDisappeared`
 //! signals plus `HasCalendars` back over a calloop channel
-//! ([`CalendarToNiri`]). Name-owner appearance/vanish re-arms the range with a
+//! ([`CalendarToSynoik`]). Name-owner appearance/vanish re-arms the range with a
 //! forced reload / clears the store (`_onNameAppeared`/`_onNameVanished`,
 //! `js/ui/calendar.js:294-303`).
 //!
@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use futures_util::StreamExt;
 use zbus::zvariant;
 
-use crate::calendar_events::{CalendarEvent, CalendarToNiri, NiriToCalendar};
+use crate::calendar_events::{CalendarEvent, CalendarToSynoik, SynoikToCalendar};
 
 const BUS_NAME: &str = "org.gnome.Shell.CalendarServer";
 
@@ -80,7 +80,7 @@ trait CalendarServer {
 
 /// A merged wake source inside the watcher task.
 enum Ev {
-    Request(NiriToCalendar),
+    Request(SynoikToCalendar),
     Added(Vec<CalendarEvent>),
     Removed(Vec<String>),
     Gone(String),
@@ -90,8 +90,8 @@ enum Ev {
 }
 
 pub fn start(
-    to_niri: calloop::channel::Sender<CalendarToNiri>,
-    from_niri: async_channel::Receiver<NiriToCalendar>,
+    to_niri: calloop::channel::Sender<CalendarToSynoik>,
+    from_niri: async_channel::Receiver<SynoikToCalendar>,
 ) -> anyhow::Result<zbus::blocking::Connection> {
     let conn = zbus::blocking::Connection::session()?;
     let async_conn = conn.inner().clone();
@@ -152,7 +152,7 @@ pub fn start(
         // Best-effort initial read; this also activates the service. A timeout
         // is non-fatal — the owner-change wake retries (`js/ui/calendar.js:227-237`).
         if let Ok(v) = proxy.has_calendars().await {
-            let _ = to_niri.send(CalendarToNiri::HasCalendars(v));
+            let _ = to_niri.send(CalendarToSynoik::HasCalendars(v));
         }
 
         // Merge every wake source into one `Ev` stream (all parsing on this side
@@ -202,7 +202,7 @@ pub fn start(
 
         while let Some(ev) = merged.next().await {
             match ev {
-                Ev::Request(NiriToCalendar::SetRange { since, until }) => {
+                Ev::Request(SynoikToCalendar::SetRange { since, until }) => {
                     if last_range != Some((since, until)) {
                         last_range = Some((since, until));
                         // Clear the cache before the new range loads — GNOME's
@@ -210,7 +210,7 @@ pub fn start(
                         // so an event removed while another month was shown (no
                         // signal for it in that range) can't linger. Sent on the
                         // same in-order channel, so it lands before the new events.
-                        if to_niri.send(CalendarToNiri::CacheReset).is_err() {
+                        if to_niri.send(CalendarToSynoik::CacheReset).is_err() {
                             return;
                         }
                         if let Err(err) = proxy.set_time_range(since, until, true).await {
@@ -220,20 +220,20 @@ pub fn start(
                 }
                 Ev::Added(batch) => {
                     if to_niri
-                        .send(CalendarToNiri::EventsAddedOrUpdated(batch))
+                        .send(CalendarToSynoik::EventsAddedOrUpdated(batch))
                         .is_err()
                     {
                         return;
                     }
                 }
                 Ev::Removed(ids) => {
-                    if to_niri.send(CalendarToNiri::EventsRemoved(ids)).is_err() {
+                    if to_niri.send(CalendarToSynoik::EventsRemoved(ids)).is_err() {
                         return;
                     }
                 }
                 Ev::Gone(uid) => {
                     if to_niri
-                        .send(CalendarToNiri::ClientDisappeared(uid))
+                        .send(CalendarToSynoik::ClientDisappeared(uid))
                         .is_err()
                     {
                         return;
@@ -241,14 +241,14 @@ pub fn start(
                 }
                 Ev::HasCalChanged => {
                     if let Ok(v) = proxy.has_calendars().await {
-                        if to_niri.send(CalendarToNiri::HasCalendars(v)).is_err() {
+                        if to_niri.send(CalendarToSynoik::HasCalendars(v)).is_err() {
                             return;
                         }
                     }
                 }
                 Ev::Owner(true) => {
                     // Appeared: reset + re-request forcefully (`_onNameAppeared`).
-                    if to_niri.send(CalendarToNiri::OwnerAppeared).is_err() {
+                    if to_niri.send(CalendarToSynoik::OwnerAppeared).is_err() {
                         return;
                     }
                     if let Some((since, until)) = last_range {
@@ -257,11 +257,11 @@ pub fn start(
                         }
                     }
                     if let Ok(v) = proxy.has_calendars().await {
-                        let _ = to_niri.send(CalendarToNiri::HasCalendars(v));
+                        let _ = to_niri.send(CalendarToSynoik::HasCalendars(v));
                     }
                 }
                 Ev::Owner(false) => {
-                    if to_niri.send(CalendarToNiri::OwnerVanished).is_err() {
+                    if to_niri.send(CalendarToSynoik::OwnerVanished).is_err() {
                         return;
                     }
                 }

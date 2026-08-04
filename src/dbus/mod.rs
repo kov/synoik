@@ -1,7 +1,7 @@
 use zbus::blocking::Connection;
 use zbus::object_server::Interface;
 
-use crate::niri::State;
+use crate::synoik::State;
 
 pub mod accounts_service;
 pub mod bluez;
@@ -107,18 +107,19 @@ impl DBusServers {
         let _span = tracy_client::span!("DBusServers::start");
 
         let backend = &state.backend;
-        let niri = &mut state.niri;
-        let config = niri.config.borrow();
+        let synoik = &mut state.synoik;
+        let config = synoik.config.borrow();
 
         let mut dbus = Self::default();
 
         if is_session_instance {
             let (to_niri, from_service_channel) = calloop::channel::channel();
             let service_channel = ServiceChannel::new(to_niri);
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_service_channel, move |event, _, state| match event {
                     calloop::channel::Event::Msg(new_client) => {
-                        state.niri.insert_client(new_client);
+                        state.synoik.insert_client(new_client);
                     }
                     calloop::channel::Event::Closed => (),
                 })
@@ -129,7 +130,8 @@ impl DBusServers {
         if is_session_instance || config.debug.dbus_interfaces_in_non_session_instances {
             let (to_niri, from_display_config) = calloop::channel::channel();
             let display_config = DisplayConfig::new(to_niri, backend.ipc_outputs());
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_display_config, move |event, _, state| match event {
                     calloop::channel::Event::Msg(new_conf) => {
                         state.apply_display_config(new_conf);
@@ -139,29 +141,31 @@ impl DBusServers {
                 .unwrap();
             dbus.conn_display_config = try_start(display_config);
 
-            let screen_saver = ScreenSaver::new(niri.is_fdo_idle_inhibited.clone());
+            let screen_saver = ScreenSaver::new(synoik.is_fdo_idle_inhibited.clone());
             dbus.conn_screen_saver = try_start(screen_saver);
 
             // The lock half. A separate name and a separate object from the inhibit-only
             // `org.freedesktop.ScreenSaver` above; see `dbus::gnome_screen_saver`.
             let (to_niri, from_screen_saver) = calloop::channel::channel();
             let (to_screen_saver, from_niri) = async_channel::unbounded();
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_screen_saver, move |event, _, state| match event {
                     calloop::channel::Event::Msg(msg) => state.on_screen_saver_msg(msg),
                     calloop::channel::Event::Closed => (),
                 })
                 .unwrap();
-            let shield = GnomeScreenSaver::new(to_niri, from_niri, niri.shield_snapshot.clone());
+            let shield = GnomeScreenSaver::new(to_niri, from_niri, synoik.shield_snapshot.clone());
             if let Some(conn) = try_start(shield) {
                 dbus.conn_screen_shield = Some(conn);
-                niri.screen_saver_emit = Some(to_screen_saver);
+                synoik.screen_saver_emit = Some(to_screen_saver);
             }
 
             // The verifier behind the unlock dialog. This is what decides whether the shield may
             // lock at all — a session where it fails to start gets a screensaver, not a lock.
             let (to_niri, from_gdm) = calloop::channel::channel();
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_gdm, move |event, _, state| match event {
                     calloop::channel::Event::Msg(msg) => state.on_verifier_event(msg),
                     calloop::channel::Event::Closed => (),
@@ -170,7 +174,7 @@ impl DBusServers {
             match gdm::start(to_niri) {
                 Ok((conn, requests)) => {
                     dbus.conn_gdm = Some(conn);
-                    niri.gdm_requests = Some(requests);
+                    synoik.gdm_requests = Some(requests);
                 }
                 Err(err) => warn!("error starting the gdm verifier client: {err:?}"),
             }
@@ -178,7 +182,8 @@ impl DBusServers {
             // gsd-power's way in to brightness: idle dimming and the auto-brightness target.
             let (to_niri, from_brightness) = calloop::channel::channel();
             let (to_brightness, from_niri) = async_channel::unbounded();
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_brightness, move |event, _, state| match event {
                     calloop::channel::Event::Msg(msg) => state.on_brightness_msg(msg),
                     calloop::channel::Event::Closed => (),
@@ -187,12 +192,13 @@ impl DBusServers {
             let brightness = Brightness::new(to_niri, from_niri);
             if let Some(conn) = try_start(brightness) {
                 dbus.conn_brightness = Some(conn);
-                niri.brightness_emit = Some(to_brightness);
+                synoik.brightness_emit = Some(to_brightness);
             }
 
             let (to_niri, from_screenshot) = calloop::channel::channel();
             let (to_screenshot, from_niri) = async_channel::unbounded();
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_screenshot, move |event, _, state| match event {
                     calloop::channel::Event::Msg(msg) => {
                         state.on_screen_shot_msg(&to_screenshot, msg)
@@ -206,10 +212,11 @@ impl DBusServers {
             #[cfg(feature = "xdp-gnome-screencast")]
             {
                 let (to_niri, from_screencast) = calloop::channel::channel();
-                niri.event_loop
+                synoik
+                    .event_loop
                     .insert_source(from_screencast, move |event, _, state| match event {
                         calloop::channel::Event::Msg(msg) => {
-                            state.niri.on_shell_screencast_msg(msg)
+                            state.synoik.on_shell_screencast_msg(msg)
                         }
                         calloop::channel::Event::Closed => (),
                     })
@@ -220,7 +227,8 @@ impl DBusServers {
 
             let (to_niri, from_introspect) = calloop::channel::channel();
             let (to_introspect, from_niri) = async_channel::unbounded();
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_introspect, move |event, _, state| match event {
                     calloop::channel::Event::Msg(msg) => {
                         state.on_introspect_msg(&to_introspect, msg)
@@ -232,7 +240,8 @@ impl DBusServers {
             dbus.conn_introspect = try_start(introspect);
 
             let (to_niri, from_gnome_shell) = calloop::channel::channel();
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_gnome_shell, move |event, _, state| match event {
                     calloop::channel::Event::Msg(msg) => state.on_gnome_shell_msg(msg),
                     calloop::channel::Event::Closed => (),
@@ -242,7 +251,8 @@ impl DBusServers {
             dbus.conn_gnome_shell = try_start(gnome_shell);
 
             let (to_niri, from_idle_monitor) = calloop::channel::channel();
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_idle_monitor, move |event, _, state| match event {
                     calloop::channel::Event::Msg(msg) => state.on_idle_monitor_msg(msg),
                     calloop::channel::Event::Closed => (),
@@ -255,7 +265,8 @@ impl DBusServers {
             // object must live on that same connection (gnome-shell likewise exports it on its own
             // session connection), not a separate one — otherwise the Open lands as UnknownObject.
             let (to_niri, from_end_session) = calloop::channel::channel();
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_end_session, move |event, _, state| match event {
                     calloop::channel::Event::Msg(msg) => state.on_end_session_msg(msg),
                     calloop::channel::Event::Closed => (),
@@ -275,7 +286,8 @@ impl DBusServers {
             #[cfg(feature = "xdp-gnome-screencast")]
             {
                 let (to_niri, from_screen_cast) = calloop::channel::channel();
-                niri.event_loop
+                synoik
+                    .event_loop
                     .insert_source(from_screen_cast, {
                         move |event, _, state| match event {
                             calloop::channel::Event::Msg(msg) => state.on_screen_cast_msg(msg),
@@ -290,12 +302,13 @@ impl DBusServers {
             let keyboard_monitor = KeyboardMonitor::new();
             if let Some(x) = try_start(keyboard_monitor.clone()) {
                 dbus.conn_keyboard_monitor = Some(x);
-                niri.a11y_keyboard_monitor = Some(keyboard_monitor);
+                synoik.a11y_keyboard_monitor = Some(keyboard_monitor);
             }
 
             let (to_niri, from_notifications) = calloop::channel::channel();
             let (to_notifications, from_niri) = async_channel::unbounded();
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_notifications, move |event, _, state| match event {
                     calloop::channel::Event::Msg(msg) => state.on_notifications_msg(msg),
                     calloop::channel::Event::Closed => (),
@@ -304,7 +317,7 @@ impl DBusServers {
             let notifications = Notifications::new(to_niri.clone(), from_niri);
             if let Some(conn) = try_start(notifications) {
                 dbus.conn_notifications = Some(conn);
-                niri.notifications_emit = Some(to_notifications);
+                synoik.notifications_emit = Some(to_notifications);
             }
 
             // The Gtk daemon shares the inbound channel (both front-ends feed
@@ -315,12 +328,13 @@ impl DBusServers {
             let gtk_notifications = GtkNotifications::new(to_niri, gtk_from_niri);
             if let Some(conn) = try_start(gtk_notifications) {
                 dbus.conn_gtk_notifications = Some(conn);
-                niri.gtk_notifications_emit = Some(to_gtk);
+                synoik.gtk_notifications_emit = Some(to_gtk);
             }
         }
 
         let (to_niri, from_login1) = calloop::channel::channel();
-        niri.event_loop
+        synoik
+            .event_loop
             .insert_source(from_login1, move |event, _, state| match event {
                 calloop::channel::Event::Msg(msg) => state.on_login1_msg(msg),
                 calloop::channel::Event::Closed => (),
@@ -330,7 +344,7 @@ impl DBusServers {
             Ok(conn) => {
                 dbus.conn_login1 = Some(conn);
                 // Kept for the backlight write path, which needs to report completions back.
-                niri.login1_tx = Some(to_niri);
+                synoik.login1_tx = Some(to_niri);
             }
             Err(err) => {
                 warn!("error starting login1 watcher: {err:?}");
@@ -349,7 +363,8 @@ impl DBusServers {
         // away from the real shell.
         if is_session_instance {
             let (to_niri, from_polkit) = calloop::channel::channel();
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_polkit, move |event, _, state| match event {
                     calloop::channel::Event::Msg(msg) => state.on_polkit_msg(msg),
                     calloop::channel::Event::Closed => (),
@@ -358,7 +373,7 @@ impl DBusServers {
             match polkit_agent::start(to_niri) {
                 Ok((conn, requests)) => {
                     dbus.conn_polkit = Some(conn);
-                    niri.polkit_requests = Some(requests);
+                    synoik.polkit_requests = Some(requests);
                 }
                 // Loud: the failure mode is silent everywhere else. Every polkit action will fail
                 // with no prompt, and the user has no way to tell that from being denied.
@@ -367,7 +382,8 @@ impl DBusServers {
         }
 
         let (to_niri, from_presence) = calloop::channel::channel();
-        niri.event_loop
+        synoik
+            .event_loop
             .insert_source(from_presence, move |event, _, state| match event {
                 calloop::channel::Event::Msg(msg) => state.on_presence_msg(msg),
                 calloop::channel::Event::Closed => (),
@@ -379,22 +395,24 @@ impl DBusServers {
         }
 
         let (to_niri, from_accounts) = calloop::channel::channel();
-        niri.event_loop
+        synoik
+            .event_loop
             .insert_source(from_accounts, move |event, _, state| match event {
                 calloop::channel::Event::Msg(msg) => state.on_accounts_msg(msg),
                 calloop::channel::Event::Closed => (),
             })
             .unwrap();
-        match accounts_service::start(niri.unlock_dialog.user().name.clone(), to_niri) {
+        match accounts_service::start(synoik.unlock_dialog.user().name.clone(), to_niri) {
             Ok(conn) => dbus.conn_accounts = Some(conn),
             Err(err) => warn!("error starting AccountsService watcher: {err:?}"),
         }
 
         // Only if the user has not turned fingerprint authentication off — the probe can activate
         // fprintd, and activating a service the user has declined is not ours to do.
-        if niri.gnome_settings.shield.enable_fingerprint {
+        if synoik.gnome_settings.shield.enable_fingerprint {
             let (to_niri, from_fprintd) = calloop::channel::channel();
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_fprintd, move |event, _, state| match event {
                     calloop::channel::Event::Msg(reader) => state.on_fingerprint_reader(reader),
                     calloop::channel::Event::Closed => (),
@@ -409,9 +427,10 @@ impl DBusServers {
         // Smartcards, gated the same way — and unlike fprintd this cannot activate anything: gsd's
         // smartcard plugin is either running in the session or it is not.
         {
-            let enabled = niri.gnome_settings.shield.enable_smartcard;
+            let enabled = synoik.gnome_settings.shield.enable_smartcard;
             let (to_niri, from_smartcard) = calloop::channel::channel();
-            niri.event_loop
+            synoik
+                .event_loop
                 .insert_source(from_smartcard, move |event, _, state| match event {
                     calloop::channel::Event::Msg(msg) => state.on_smartcard_msg(msg),
                     calloop::channel::Event::Closed => (),
@@ -424,7 +443,8 @@ impl DBusServers {
         }
 
         let (to_niri, from_locale1) = calloop::channel::channel();
-        niri.event_loop
+        synoik
+            .event_loop
             .insert_source(from_locale1, move |event, _, state| match event {
                 calloop::channel::Event::Msg(msg) => state.on_locale1_msg(msg),
                 calloop::channel::Event::Closed => (),
@@ -440,14 +460,15 @@ impl DBusServers {
         }
 
         let (to_niri, from_system_status) = calloop::channel::channel();
-        niri.event_loop
+        synoik
+            .event_loop
             .insert_source(from_system_status, move |event, _, state| match event {
                 calloop::channel::Event::Msg(msg) => state.on_system_status_msg(msg),
                 calloop::channel::Event::Closed => (),
             })
             .unwrap();
         // The bluez connect/disconnect writer reports completion back through this same channel.
-        niri.system_status_tx = Some(to_niri.clone());
+        synoik.system_status_tx = Some(to_niri.clone());
         match system_status::start(to_niri) {
             Ok(conn) => {
                 dbus.conn_system_status = Some(conn);
@@ -458,7 +479,8 @@ impl DBusServers {
         }
 
         let (to_niri, from_rfkill) = calloop::channel::channel();
-        niri.event_loop
+        synoik
+            .event_loop
             .insert_source(from_rfkill, move |event, _, state| match event {
                 calloop::channel::Event::Msg(msg) => state.on_rfkill_status(msg),
                 calloop::channel::Event::Closed => (),
@@ -477,7 +499,8 @@ impl DBusServers {
         // push the visible day range out and receive event signals back.
         let (to_niri, from_calendar) = calloop::channel::channel();
         let (to_calendar, calendar_from_niri) = async_channel::unbounded();
-        niri.event_loop
+        synoik
+            .event_loop
             .insert_source(from_calendar, move |event, _, state| match event {
                 calloop::channel::Event::Msg(msg) => state.on_calendar_events_msg(msg),
                 calloop::channel::Event::Closed => (),
@@ -486,10 +509,10 @@ impl DBusServers {
         match calendar_server::start(to_niri, calendar_from_niri) {
             Ok(conn) => {
                 dbus.conn_calendar_server = Some(conn);
-                niri.calendar_range_emit = Some(to_calendar);
+                synoik.calendar_range_emit = Some(to_calendar);
                 // Request today's month grid so the service activates and events
                 // are ready before the popover first opens.
-                niri.sync_calendar_range();
+                synoik.sync_calendar_range();
             }
             Err(err) => {
                 warn!("error starting calendar-server watcher: {err:?}");
@@ -499,7 +522,8 @@ impl DBusServers {
         // MPRIS media players: their state comes in, the card's controls go out.
         let (to_niri, from_mpris) = calloop::channel::channel();
         let (to_mpris, mpris_from_niri) = async_channel::unbounded();
-        niri.event_loop
+        synoik
+            .event_loop
             .insert_source(from_mpris, move |event, _, state| match event {
                 calloop::channel::Event::Msg(msg) => state.on_mpris_msg(msg),
                 calloop::channel::Event::Closed => (),
@@ -508,14 +532,14 @@ impl DBusServers {
         match mpris::start(to_niri, mpris_from_niri) {
             Ok(conn) => {
                 dbus.conn_mpris = Some(conn);
-                niri.mpris_emit = Some(to_mpris);
+                synoik.mpris_emit = Some(to_mpris);
             }
             Err(err) => {
                 warn!("error starting MPRIS watcher: {err:?}");
             }
         }
 
-        niri.dbus = Some(dbus);
+        synoik.dbus = Some(dbus);
     }
 }
 

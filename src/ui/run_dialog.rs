@@ -18,10 +18,10 @@ use smithay::backend::renderer::Texture;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Size, Transform};
 
-use crate::niri_render_elements;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
+use crate::synoik_render_elements;
 use crate::ui::text_edit::{EditMods, EditOutcome, KeyTheme, TextEdit};
 use crate::ui::widget::{self, ContentCache, Painter, ParagraphSpan, ShapedParagraph, TextShaper};
 use crate::utils::{output_size, to_physical_precise_round};
@@ -57,7 +57,7 @@ pub struct RunDialog {
     cache: RefCell<ContentCache>,
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     RunDialogRenderElement => {
         // The dialog box, drawn offscreen on the GPU (dark box + one glyph paragraph).
         Texture = TextureRenderElement<VkTexture>,

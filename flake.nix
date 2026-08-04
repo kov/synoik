@@ -1,6 +1,6 @@
 # This flake file is community maintained
 {
-  description = "Niri: A scrollable-tiling Wayland compositor.";
+  description = "Synoik: A scrollable-tiling Wayland compositor.";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
@@ -11,7 +11,7 @@
     }:
     let
       revision = self.shortRev or self.dirtyShortRev or "unknown";
-      niri-package =
+      synoik-package =
         {
           lib,
           cairo,
@@ -36,15 +36,15 @@
         }:
 
         rustPlatform.buildRustPackage {
-          pname = "niri";
+          pname = "synoik";
           version = revision;
 
           src = lib.fileset.toSource {
             root = ./.;
             fileset = lib.fileset.unions [
-              ./niri-config
-              ./niri-ipc
-              ./niri-vk
+              ./synoik-config
+              ./synoik-ipc
+              ./synoik-vk
               ./resources
               ./src
               ./Cargo.toml
@@ -53,9 +53,9 @@
           };
 
           postPatch = ''
-            patchShebangs resources/niri-session
-            substituteInPlace resources/niri.service \
-              --replace-fail 'ExecStart=niri' "ExecStart=$out/bin/niri"
+            patchShebangs resources/synoik-session
+            substituteInPlace resources/synoik.service \
+              --replace-fail 'ExecStart=synoik' "ExecStart=$out/bin/synoik"
           '';
 
           cargoLock = {
@@ -114,18 +114,18 @@
 
           postInstall =
             ''
-              installShellCompletion --cmd niri \
-                --bash <($out/bin/niri completions bash) \
-                --fish <($out/bin/niri completions fish) \
-                --nushell <($out/bin/niri completions nushell) \
-                --zsh <($out/bin/niri completions zsh)
+              installShellCompletion --cmd synoik \
+                --bash <($out/bin/synoik completions bash) \
+                --fish <($out/bin/synoik completions fish) \
+                --nushell <($out/bin/synoik completions nushell) \
+                --zsh <($out/bin/synoik completions zsh)
 
-              install -Dm644 resources/niri.desktop -t $out/share/wayland-sessions
-              install -Dm644 resources/niri-portals.conf -t $out/share/xdg-desktop-portal
+              install -Dm644 resources/synoik.desktop -t $out/share/wayland-sessions
+              install -Dm644 resources/synoik-portals.conf -t $out/share/xdg-desktop-portal
             ''
             + lib.optionalString withSystemd ''
-              install -Dm755 resources/niri-session $out/bin/niri-session
-              install -Dm644 resources/niri{.service,-shutdown.target} -t $out/lib/systemd/user
+              install -Dm755 resources/synoik-session $out/bin/synoik-session
+              install -Dm644 resources/synoik{.service,-shutdown.target} -t $out/lib/systemd/user
             '';
 
           env = {
@@ -139,18 +139,18 @@
                 "-Wl,--pop-state"
               ]
             );
-            NIRI_BUILD_COMMIT = revision;
+            SYNOIK_BUILD_COMMIT = revision;
           };
 
           passthru = {
-            providedSessions = [ "niri" ];
+            providedSessions = [ "synoik" ];
           };
 
           meta = {
             description = "Scrollable-tiling Wayland compositor";
-            homepage = "https://github.com/niri-wm/niri";
+            
             license = lib.licenses.gpl3Only;
-            mainProgram = "niri";
+            mainProgram = "synoik";
             platforms = lib.platforms.linux;
           };
         };
@@ -165,7 +165,7 @@
     {
       checks = forAllSystems (system: {
         # We use the debug build here to save a bit of time
-        inherit (self.packages.${system}) niri-debug;
+        inherit (self.packages.${system}) synoik-debug;
       });
 
       devShells = forAllSystems (
@@ -173,7 +173,7 @@
         let
           pkgs = nixpkgsFor.${system};
           rustfmt' = pkgs.rustfmt.override { asNightly = true; };
-          inherit (self.packages.${system}) niri;
+          inherit (self.packages.${system}) synoik;
         in
         {
           default = pkgs.mkShell {
@@ -192,7 +192,7 @@
               pkgs.pkg-config
             ];
 
-            buildInputs = niri.buildInputs;
+            buildInputs = synoik.buildInputs;
 
             env = {
               # WARN: Do not overwrite this variable in your shell!
@@ -200,7 +200,7 @@
               # in the package expression
               #
               # This should only be set with `RUSTFLAGS="$RUSTFLAGS -C your-flags"`
-              RUSTFLAGS = niri.RUSTFLAGS;
+              RUSTFLAGS = synoik.RUSTFLAGS;
             };
           };
         }
@@ -211,17 +211,17 @@
       packages = forAllSystems (
         system:
         let
-          niri = nixpkgsFor.${system}.callPackage niri-package { };
+          synoik = nixpkgsFor.${system}.callPackage synoik-package { };
         in
         {
-          inherit niri;
+          inherit synoik;
 
           # NOTE: This is for development purposes only
           #
           # It is primarily to help with quickly iterating on
           # changes made to the above expression - though it is
-          # also not stripped in order to better debug niri itself
-          niri-debug = niri.overrideAttrs (
+          # also not stripped in order to better debug synoik itself
+          synoik-debug = synoik.overrideAttrs (
             newAttrs: oldAttrs: {
               pname = oldAttrs.pname + "-debug";
 
@@ -232,12 +232,12 @@
             }
           );
 
-          default = niri;
+          default = synoik;
         }
       );
 
       overlays.default = final: _: {
-        niri = final.callPackage niri-package { };
+        synoik = final.callPackage synoik-package { };
       };
     };
 }

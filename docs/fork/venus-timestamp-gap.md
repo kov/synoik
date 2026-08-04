@@ -22,7 +22,7 @@ write/resolve path**, not a missing GPU clock.
 `cargo run`, no arguments. Run it against Venus and against lavapipe on the same guest for the
 contrast.
 
-**What it costs us:** the compositor's frame logger (`NIRI_FRAME_LOG`, `src/frame_log.rs`) can time
+**What it costs us:** the compositor's frame logger (`SYNOIK_FRAME_LOG`, `src/frame_log.rs`) can time
 everything *except* how long the GPU spent on a pass. Everything else — per-phase CPU cost, dropped
 frames from the DRM vblank sequence, widget bake counts — is unaffected and works here today. See
 §4 before deciding how much this is worth.
@@ -38,7 +38,7 @@ were added to split them (`gpu_timer_begin` / `gpu_timer_end` / `gpu_timer_colle
 the command buffer, write another before ending it, read the pair back after the fence wait the
 renderer already does.
 
-The Khronos validation layer reports nothing against this usage (`NIRI_VK_VALIDATION=1`), and the
+The Khronos validation layer reports nothing against this usage (`SYNOIK_VK_VALIDATION=1`), and the
 same code on lavapipe returns sensible values.
 
 ## 2. Environment
@@ -187,7 +187,7 @@ Run the reproducer under Venus. Fixed looks like the lavapipe output in §3.3: b
 available, two large advancing values, a plausible delta. Then in the compositor:
 
 ```
-NIRI_FRAME_LOG=1,gpu
+SYNOIK_FRAME_LOG=1,gpu
 ```
 
 A working stack logs `(gpu 3.21ms)` inside the frame line and `gpu avg …` in the summary, and never
@@ -329,7 +329,7 @@ nm -a /Applications/limina.app/Contents/Frameworks/libvulkan_kosmickrisp.dylib \
 ```
 
 Then §6's own test applies unchanged: the reproducer should look like the lavapipe output in §3.3 —
-both queries available, two large advancing values, a plausible delta — and `NIRI_FRAME_LOG=1,gpu`
+both queries available, two large advancing values, a plausible delta — and `SYNOIK_FRAME_LOG=1,gpu`
 should log `(gpu N.NNms)` with the warning never firing.
 
 ## 8. Related
@@ -339,6 +339,6 @@ should log `(gpu N.NNms)` with the warning never firing.
   advertised surface" habit that found this.
 - [`venus-bugs/README.md`](./venus-bugs/README.md) — two earlier Venus/gbm findings with the same
   reproducer-crate convention.
-- `src/frame_log.rs` — the consumer, including the `NIRI_FRAME_LOG` grammar.
+- `src/frame_log.rs` — the consumer, including the `SYNOIK_FRAME_LOG` grammar.
 - `src/render_helpers/vulkan/renderer.rs` — `GpuTimer`, the all-zero heuristic, and
   `timestamp_ticks` (the tick arithmetic, unit-tested because this device cannot exercise it).

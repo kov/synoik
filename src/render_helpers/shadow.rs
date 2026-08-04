@@ -1,8 +1,8 @@
-use niri_config::{Color, CornerRadius};
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
+use synoik_config::{Color, CornerRadius};
 
 /// Renders a rounded rectangle shadow.
 ///
@@ -187,21 +187,21 @@ impl ShadowRenderElement {
         &self,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
-    ) -> niri_vk::render::ShadowPush {
+    ) -> synoik_vk::render::ShadowPush {
         let p = &self.params;
         // `v_uv * (size * src.size) - (loc - src.loc * size)` == `(src.loc + v_uv * src.size) *
         // size - loc`, so the crop folds into `area_size` and the two `*_geo_loc` origins with no
         // extra push constants and no shader change.
         let area = [p.size.w * src.size.w, p.size.h * src.size.h];
         let crop_off = [src.loc.x * p.size.w, src.loc.y * p.size.h];
-        niri_vk::render::ShadowPush {
+        synoik_vk::render::ShadowPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
             // proj/target are placeholders; VulkanFrame::render_shadow fills them from the frame.
-            proj: niri_vk::render::IDENTITY_PROJ,
+            proj: synoik_vk::render::IDENTITY_PROJ,
             target: [0.0, 0.0],
             sigma: p.sigma,
-            niri_scale: p.scale,
+            synoik_scale: p.scale,
             shadow_color: p.color.to_array_premul(),
             corner_radius: <[f32; 4]>::from(p.corner_radius),
             window_corner_radius: <[f32; 4]>::from(p.window_corner_radius),
@@ -219,7 +219,7 @@ impl ShadowRenderElement {
                 p.window_geometry.size.w as f32,
                 p.window_geometry.size.h as f32,
             ],
-            niri_alpha: p.alpha,
+            synoik_alpha: p.alpha,
             _pad0: 0.0,
         }
     }
@@ -320,7 +320,7 @@ mod tests {
             Rectangle::from_size(Size::from((1., 1.))),
             Rectangle::from_size(smithay::utils::Size::from((100, 100))),
         );
-        assert_eq!(push.niri_alpha, 0.25, "the draw must see the fade");
+        assert_eq!(push.synoik_alpha, 0.25, "the draw must see the fade");
     }
 
     /// A `CropRenderElement` hands `draw` a sub-rect of the unit `src` together with the shrunken
@@ -358,7 +358,8 @@ mod tests {
 
         // The point that was element-local x = 70 must land at the same element-local coordinate
         // through both mappings: uncropped `v_uv = 0.7`, cropped `v_uv = 0.5`.
-        let coords = |p: &niri_vk::render::ShadowPush, uv: f32| uv * p.area_size[0] - p.geo_loc[0];
+        let coords =
+            |p: &synoik_vk::render::ShadowPush, uv: f32| uv * p.area_size[0] - p.geo_loc[0];
         assert_eq!(coords(&full, 0.7), coords(&cropped, 0.5));
     }
 }

@@ -128,8 +128,8 @@ expensive mistake). This card does not set it.
 
 ### Slice 0 — the audio seam — **LANDED** (`906cb2de`)
 
-`Niri::pw_audio` is a concrete `Option<PwAudio>` behind `#[cfg(feature = "pipewire")]`
-(`src/niri.rs:549-551`), so a headless fixture has no audio at all and **nothing** about the audio
+`Synoik::pw_audio` is a concrete `Option<PwAudio>` behind `#[cfg(feature = "pipewire")]`
+(`src/synoik.rs:549-551`), so a headless fixture has no audio at all and **nothing** about the audio
 wiring is testable. The gap is already recorded and real: deleting the `show_volume_osd` call inside
 `adjust_volume_by_scroll` leaves the whole suite green.
 
@@ -137,7 +137,7 @@ wiring is testable. The gap is already recorded and real: deleting the `show_vol
   signature) covering the surface the compositor actually calls today: `status`, `mic_status`,
   `set_volume`, `adjust_volume`, `set_muted`, `toggle_muted`, `set_input_volume`, `set_input_muted`,
   `toggle_input_muted`, `set_default_sink`, `set_default_source`.
-- `PwAudio` implements it; `Niri::audio_backend: Option<Box<dyn AudioBackend>>` replaces the cfg'd
+- `PwAudio` implements it; `Synoik::audio_backend: Option<Box<dyn AudioBackend>>` replaces the cfg'd
   field, which deletes the six `#[cfg(feature = "pipewire")]` arms and the
   `#[cfg(not(feature = "pipewire"))]` catch-all in `src/input/mod.rs:1204-1266`.
 - Add a `StubAudio` for the fixture: holds an `AudioStatus`/`MicStatus`, records writes, and lets a
@@ -229,7 +229,7 @@ join resolves. `form_factor: None` is correct here; this card does not set one.
 a sink has ports the answer is the port name and nothing else), `default_sink_has_headphones`
 resolves it against the models and returns `Option<bool>` where `None` is "no sink bound, no
 answer". That distinction is load-bearing: an unbound period must not spend the one-time
-suppression. `Niri::headphones: Option<bool>` is `_hasHeadphones`, and is deliberately **not** reset
+suppression. `Synoik::headphones: Option<bool>` is `_hasHeadphones`, and is deliberately **not** reset
 on a sink swap.
 
 Both traps are mutation-checked: dropping the `!initializing` guard fails *"the initial sync must

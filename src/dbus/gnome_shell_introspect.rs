@@ -38,14 +38,14 @@ const APP_ALLOWLIST: [&str; 2] = [
 ];
 
 pub struct Introspect {
-    to_niri: calloop::channel::Sender<IntrospectToNiri>,
-    from_niri: async_channel::Receiver<NiriToIntrospect>,
+    to_niri: calloop::channel::Sender<IntrospectToSynoik>,
+    from_niri: async_channel::Receiver<SynoikToIntrospect>,
     /// Filled in by [`Start`], because the object needs the bus it is served on to resolve the
     /// allowlist's owners.
     conn: Option<zbus::Connection>,
 }
 
-pub enum IntrospectToNiri {
+pub enum IntrospectToSynoik {
     GetWindows,
     GetRunningApplications,
     /// The union bounding box of all outputs — `global.screen_width/height` (`introspect.js:198`).
@@ -53,7 +53,7 @@ pub enum IntrospectToNiri {
     GetAnimationsEnabled,
 }
 
-pub enum NiriToIntrospect {
+pub enum SynoikToIntrospect {
     Windows(HashMap<u64, WindowProperties>),
     RunningApplications(HashMap<String, AppProperties>),
     ScreenSize(i32, i32),
@@ -106,8 +106,8 @@ impl Introspect {
     ) -> fdo::Result<HashMap<u64, WindowProperties>> {
         self.check_sender(&hdr, "GetWindows").await?;
 
-        match self.ask(IntrospectToNiri::GetWindows).await? {
-            NiriToIntrospect::Windows(windows) => Ok(windows),
+        match self.ask(IntrospectToSynoik::GetWindows).await? {
+            SynoikToIntrospect::Windows(windows) => Ok(windows),
             _ => Err(fdo::Error::Failed("internal error".to_owned())),
         }
     }
@@ -118,8 +118,8 @@ impl Introspect {
     ) -> fdo::Result<HashMap<String, AppProperties>> {
         self.check_sender(&hdr, "GetRunningApplications").await?;
 
-        match self.ask(IntrospectToNiri::GetRunningApplications).await? {
-            NiriToIntrospect::RunningApplications(apps) => Ok(apps),
+        match self.ask(IntrospectToSynoik::GetRunningApplications).await? {
+            SynoikToIntrospect::RunningApplications(apps) => Ok(apps),
             _ => Err(fdo::Error::Failed("internal error".to_owned())),
         }
     }
@@ -127,8 +127,8 @@ impl Introspect {
     /// The union bounding box of every output, not one monitor's size (`introspect.js:196-206`).
     #[zbus(property)]
     async fn screen_size(&self) -> fdo::Result<(i32, i32)> {
-        match self.ask(IntrospectToNiri::GetScreenSize).await? {
-            NiriToIntrospect::ScreenSize(w, h) => Ok((w, h)),
+        match self.ask(IntrospectToSynoik::GetScreenSize).await? {
+            SynoikToIntrospect::ScreenSize(w, h) => Ok((w, h)),
             _ => Err(fdo::Error::Failed("internal error".to_owned())),
         }
     }
@@ -137,8 +137,8 @@ impl Introspect {
     /// animate its own dialogs (`introspect.js:184-192`).
     #[zbus(property)]
     async fn animations_enabled(&self) -> fdo::Result<bool> {
-        match self.ask(IntrospectToNiri::GetAnimationsEnabled).await? {
-            NiriToIntrospect::AnimationsEnabled(on) => Ok(on),
+        match self.ask(IntrospectToSynoik::GetAnimationsEnabled).await? {
+            SynoikToIntrospect::AnimationsEnabled(on) => Ok(on),
             _ => Err(fdo::Error::Failed("internal error".to_owned())),
         }
     }
@@ -157,8 +157,8 @@ impl Introspect {
 
 impl Introspect {
     pub fn new(
-        to_niri: calloop::channel::Sender<IntrospectToNiri>,
-        from_niri: async_channel::Receiver<NiriToIntrospect>,
+        to_niri: calloop::channel::Sender<IntrospectToSynoik>,
+        from_niri: async_channel::Receiver<SynoikToIntrospect>,
     ) -> Self {
         Self {
             to_niri,
@@ -174,14 +174,14 @@ impl Introspect {
         super::check_sender(conn, hdr.sender(), &APP_ALLOWLIST, method).await
     }
 
-    async fn ask(&self, msg: IntrospectToNiri) -> fdo::Result<NiriToIntrospect> {
+    async fn ask(&self, msg: IntrospectToSynoik) -> fdo::Result<SynoikToIntrospect> {
         if let Err(err) = self.to_niri.send(msg) {
-            warn!("error sending message to niri: {err:?}");
+            warn!("error sending message to synoik: {err:?}");
             return Err(fdo::Error::Failed("internal error".to_owned()));
         }
 
         self.from_niri.recv().await.map_err(|err| {
-            warn!("error receiving message from niri: {err:?}");
+            warn!("error receiving message from synoik: {err:?}");
             fdo::Error::Failed("internal error".to_owned())
         })
     }

@@ -1,17 +1,17 @@
 use std::sync::{Arc, Mutex};
 
-use niri_config::CornerRadius;
 use smithay::utils::{Logical, Point, Rectangle, Scale};
 use smithay::wayland::compositor::{with_states, SurfaceData};
+use synoik_config::CornerRadius;
 use wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::handlers::background_effect::get_cached_blur_region;
-use crate::niri_render_elements;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
 use crate::render_helpers::xray::{XrayElement, XrayPos};
 use crate::render_helpers::RenderCtx;
+use crate::synoik_render_elements;
 use crate::utils::region::TransformedRegion;
 use crate::utils::surface_geo;
 
@@ -25,7 +25,7 @@ pub struct BackgroundEffect {
     /// Stored here in addition to `RenderParams` to damage when it changes.
     // FIXME: would be good to remove this duplication of radius.
     corner_radius: CornerRadius,
-    blur_config: niri_config::Blur,
+    blur_config: synoik_config::Blur,
     options: Options,
 }
 
@@ -72,7 +72,7 @@ impl RenderParams {
     }
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     BackgroundEffectElement => {
         FramebufferEffect = FramebufferEffectElement,
         Xray = XrayElement,
@@ -86,7 +86,7 @@ impl BackgroundEffect {
             nonxray: FramebufferEffect::new(),
             damage: ExtraDamage::new(),
             corner_radius: CornerRadius::default(),
-            blur_config: niri_config::Blur::default(),
+            blur_config: synoik_config::Blur::default(),
             options: Options::default(),
         }
     }
@@ -97,7 +97,7 @@ impl BackgroundEffect {
         self.nonxray.damage();
     }
 
-    pub fn update_config(&mut self, config: niri_config::Blur) {
+    pub fn update_config(&mut self, config: synoik_config::Blur) {
         if self.blur_config == config {
             return;
         }
@@ -110,7 +110,7 @@ impl BackgroundEffect {
     pub fn update_render_elements(
         &mut self,
         corner_radius: CornerRadius,
-        effect: niri_config::BackgroundEffect,
+        effect: synoik_config::BackgroundEffect,
         has_blur_region: bool,
     ) {
         // If the surface explicitly requests a blur region, default blur to true.
@@ -289,9 +289,9 @@ pub fn render_for_tile(
     surface: &WlSurface,
     surface_off: Point<f64, Logical>,
     surface_anim_scale: Scale<f64>,
-    blur_config: niri_config::Blur,
+    blur_config: synoik_config::Blur,
     radius: CornerRadius,
-    effect: niri_config::BackgroundEffect,
+    effect: synoik_config::BackgroundEffect,
     should_block_out: bool,
     xray_pos: XrayPos,
     push: &mut dyn FnMut(BackgroundEffectElement),

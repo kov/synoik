@@ -206,9 +206,9 @@ impl MetaField {
 }
 
 /// An update pushed from the watcher to the compositor. Defined here, not in the feature-gated
-/// `dbus::mpris`, so `Niri` can name it unconditionally.
+/// `dbus::mpris`, so `Synoik` can name it unconditionally.
 #[derive(Debug, Clone, PartialEq)]
-pub enum MprisToNiri {
+pub enum MprisToSynoik {
     /// A player appeared or changed. Carries the whole state: the watcher re-reads every property
     /// on any `PropertiesChanged`, as gnome-shell's `_updateState` does.
     PlayerUpdated {
@@ -221,7 +221,7 @@ pub enum MprisToNiri {
 
 /// A request from the compositor to the watcher — the card's controls (`mpris.js:73-100`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NiriToMpris {
+pub enum SynoikToMpris {
     PlayPause(String),
     Next(String),
     Previous(String),

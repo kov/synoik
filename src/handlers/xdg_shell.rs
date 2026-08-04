@@ -1,7 +1,6 @@
 use std::cell::Cell;
 
 use calloop::Interest;
-use niri_config::PresetSize;
 use smithay::desktop::{
     find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output, utils, LayerSurface,
     PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy, Window,
@@ -36,6 +35,7 @@ use smithay::wayland::xdg_foreign::{XdgForeignHandler, XdgForeignState};
 use smithay::{
     delegate_kde_decoration, delegate_xdg_decoration, delegate_xdg_foreign, delegate_xdg_shell,
 };
+use synoik_config::PresetSize;
 use tracing::field::Empty;
 
 use crate::input::move_grab::MoveGrab;
@@ -43,7 +43,7 @@ use crate::input::resize_grab::ResizeGrab;
 use crate::input::touch_resize_grab::TouchResizeGrab;
 use crate::input::{PointerOrTouchStartData, DOUBLE_CLICK_TIME};
 use crate::layout::ActivateWindow;
-use crate::niri::{CastTarget, PopupGrabState, State};
+use crate::synoik::{CastTarget, PopupGrabState, State};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
     get_monotonic_time, output_matches_name, send_scale_transform, update_tiled_state, ResizeEdge,
@@ -52,13 +52,13 @@ use crate::window::{InitialConfigureState, ResolvedWindowRules, Unmapped, Window
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
-        &mut self.niri.xdg_shell_state
+        &mut self.synoik.xdg_shell_state
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let wl_surface = surface.wl_surface().clone();
         let unmapped = Unmapped::new(Window::new_wayland_window(surface));
-        let existing = self.niri.unmapped_windows.insert(wl_surface, unmapped);
+        let existing = self.synoik.unmapped_windows.insert(wl_surface, unmapped);
         assert!(existing.is_none());
     }
 
@@ -66,7 +66,7 @@ impl XdgShellHandler for State {
         let popup = PopupKind::Xdg(surface);
         self.unconstrain_popup(&popup);
 
-        if let Err(err) = self.niri.popups.track_popup(popup) {
+        if let Err(err) = self.synoik.popups.track_popup(popup) {
             warn!("error tracking popup: {err:?}");
         }
     }
@@ -77,7 +77,7 @@ impl XdgShellHandler for State {
         let mut grab_start_data = None;
 
         // See if this comes from a pointer grab.
-        let pointer = self.niri.seat.get_pointer().unwrap();
+        let pointer = self.synoik.seat.get_pointer().unwrap();
         pointer.with_grab(|grab_serial, grab| {
             if grab_serial == serial {
                 let start_data = grab.start_data();
@@ -97,7 +97,7 @@ impl XdgShellHandler for State {
         });
 
         // See if this comes from a touch grab.
-        if let Some(touch) = self.niri.seat.get_touch() {
+        if let Some(touch) = self.synoik.seat.get_touch() {
             touch.with_grab(|grab_serial, grab| {
                 if grab_serial == serial {
                     let start_data = grab.start_data();
@@ -121,7 +121,7 @@ impl XdgShellHandler for State {
             return;
         };
 
-        let Some((mapped, output)) = self.niri.layout.find_window_and_output(wl_surface) else {
+        let Some((mapped, output)) = self.synoik.layout.find_window_and_output(wl_surface) else {
             return;
         };
 
@@ -139,14 +139,14 @@ impl XdgShellHandler for State {
                 }
             }
             PointerOrTouchStartData::Touch(_) => {
-                let touch = self.niri.seat.get_touch().unwrap();
+                let touch = self.synoik.seat.get_touch().unwrap();
                 if let Some(grab) = MoveGrab::new(self, start_data, window.clone(), true, None) {
                     touch.set_grab(self, grab, serial);
                 }
             }
         }
 
-        self.niri.queue_redraw(&output);
+        self.synoik.queue_redraw(&output);
     }
 
     fn resize_request(
@@ -161,7 +161,7 @@ impl XdgShellHandler for State {
         let mut grab_start_data = None;
 
         // See if this comes from a pointer grab.
-        let pointer = self.niri.seat.get_pointer().unwrap();
+        let pointer = self.synoik.seat.get_pointer().unwrap();
         if pointer.has_grab(serial) {
             if let Some(start_data) = pointer.grab_start_data() {
                 if let Some((focus, _)) = &start_data.focus {
@@ -173,7 +173,7 @@ impl XdgShellHandler for State {
         }
 
         // See if this comes from a touch grab.
-        if let Some(touch) = self.niri.seat.get_touch() {
+        if let Some(touch) = self.synoik.seat.get_touch() {
             if touch.has_grab(serial) {
                 if let Some(start_data) = touch.grab_start_data() {
                     if let Some((focus, _)) = &start_data.focus {
@@ -189,7 +189,7 @@ impl XdgShellHandler for State {
             return;
         };
 
-        let Some((mapped, _)) = self.niri.layout.find_window_and_output(wl_surface) else {
+        let Some((mapped, _)) = self.synoik.layout.find_window_and_output(wl_surface) else {
             return;
         };
 
@@ -217,22 +217,22 @@ impl XdgShellHandler for State {
                 let intersection = edges.intersection(last_edges);
                 if intersection.intersects(ResizeEdge::LEFT_RIGHT) {
                     // FIXME: don't activate once we can pass specific windows to actions.
-                    self.niri.layout.activate_window(&window);
-                    self.niri.layer_shell_on_demand_focus = None;
-                    self.niri.layout.toggle_full_width();
+                    self.synoik.layout.activate_window(&window);
+                    self.synoik.layer_shell_on_demand_focus = None;
+                    self.synoik.layout.toggle_full_width();
                 }
                 if intersection.intersects(ResizeEdge::TOP_BOTTOM) {
-                    self.niri.layer_shell_on_demand_focus = None;
-                    self.niri.layout.reset_window_height(Some(&window));
+                    self.synoik.layer_shell_on_demand_focus = None;
+                    self.synoik.layout.reset_window_height(Some(&window));
                 }
                 // FIXME: granular.
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
                 return;
             }
         }
 
         if !self
-            .niri
+            .synoik
             .layout
             .interactive_resize_begin(window.clone(), edges)
         {
@@ -245,7 +245,7 @@ impl XdgShellHandler for State {
                 pointer.set_grab(self, grab, serial, Focus::Clear);
             }
             PointerOrTouchStartData::Touch(start_data) => {
-                let touch = self.niri.seat.get_touch().unwrap();
+                let touch = self.synoik.seat.get_touch().unwrap();
                 let grab = TouchResizeGrab::new(start_data, window);
                 touch.set_grab(self, grab, serial);
             }
@@ -277,21 +277,21 @@ impl XdgShellHandler for State {
         // We need to hand out the grab in a way consistent with what update_keyboard_focus()
         // thinks the current focus is, otherwise it will desync and cause weird issues with
         // keyboard focus being at the wrong place.
-        if self.niri.exit_confirm_dialog.is_open() {
+        if self.synoik.exit_confirm_dialog.is_open() {
             trace!("ignoring popup grab because the exit confirm dialog is open");
             let _ = PopupManager::dismiss_popup(&root, &popup);
             return;
-        } else if self.niri.is_locked() {
-            if Some(&root) != self.niri.lock_surface_focus().as_ref() {
+        } else if self.synoik.is_locked() {
+            if Some(&root) != self.synoik.lock_surface_focus().as_ref() {
                 trace!("ignoring popup grab because the session is locked");
                 let _ = PopupManager::dismiss_popup(&root, &popup);
                 return;
             }
-        } else if self.niri.screenshot_ui.is_open() {
+        } else if self.synoik.screenshot_ui.is_open() {
             trace!("ignoring popup grab because the screenshot UI is open");
             let _ = PopupManager::dismiss_popup(&root, &popup);
             return;
-        } else if let Some(output) = self.niri.layout.active_output() {
+        } else if let Some(output) = self.synoik.layout.active_output() {
             let layers = layer_map_for_output(output);
 
             // FIXME: somewhere here we probably need to check is_overview_open to match the logic
@@ -300,7 +300,7 @@ impl XdgShellHandler for State {
             if let Some(layer) = layers.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL) {
                 // This is a grab for a layer surface.
 
-                if let Some(mapped) = self.niri.mapped_layer_surfaces.get(layer) {
+                if let Some(mapped) = self.synoik.mapped_layer_surfaces.get(layer) {
                     if mapped.place_within_backdrop() {
                         trace!("ignoring popup grab for a layer surface within overview backdrop");
                         let _ = PopupManager::dismiss_popup(&root, &popup);
@@ -314,21 +314,21 @@ impl XdgShellHandler for State {
                 if layers.layers_on(Layer::Overlay).any(|l| {
                     (l.cached_state().keyboard_interactivity
                         == wlr_layer::KeyboardInteractivity::Exclusive
-                        || Some(l) == self.niri.layer_shell_on_demand_focus.as_ref())
-                        && self.niri.mapped_layer_surfaces.contains_key(l)
+                        || Some(l) == self.synoik.layer_shell_on_demand_focus.as_ref())
+                        && self.synoik.mapped_layer_surfaces.contains_key(l)
                 }) {
                     trace!("ignoring toplevel popup grab because the overlay layer has focus");
                     let _ = PopupManager::dismiss_popup(&root, &popup);
                     return;
                 }
 
-                let mon = self.niri.layout.monitor_for_output(output).unwrap();
+                let mon = self.synoik.layout.monitor_for_output(output).unwrap();
                 if !mon.render_above_top_layer()
                     && layers.layers_on(Layer::Top).any(|l| {
                         (l.cached_state().keyboard_interactivity
                             == wlr_layer::KeyboardInteractivity::Exclusive
-                            || Some(l) == self.niri.layer_shell_on_demand_focus.as_ref())
-                            && self.niri.mapped_layer_surfaces.contains_key(l)
+                            || Some(l) == self.synoik.layer_shell_on_demand_focus.as_ref())
+                            && self.synoik.mapped_layer_surfaces.contains_key(l)
                     })
                 {
                     trace!("ignoring toplevel popup grab because the top layer has focus");
@@ -336,7 +336,7 @@ impl XdgShellHandler for State {
                     return;
                 }
 
-                let layout_focus = self.niri.layout.focus();
+                let layout_focus = self.synoik.layout.focus();
                 if Some(&root) != layout_focus.map(|win| win.toplevel().wl_surface()) {
                     trace!("ignoring toplevel popup grab because another window has focus");
                     let _ = PopupManager::dismiss_popup(&root, &popup);
@@ -349,9 +349,9 @@ impl XdgShellHandler for State {
             return;
         }
 
-        let seat = &self.niri.seat;
+        let seat = &self.synoik.seat;
         let mut grab = match self
-            .niri
+            .synoik
             .popups
             .grab_popup(root.clone(), popup, seat, serial)
         {
@@ -371,9 +371,9 @@ impl XdgShellHandler for State {
         //
         // The second check is for layer surfaces that can't receive keyboard focus, without it
         // popups don't work properly in Waybar (GTK 3).
-        let can_receive_keyboard_focus = !self.niri.seat.input_method().keyboard_grabbed()
+        let can_receive_keyboard_focus = !self.synoik.seat.input_method().keyboard_grabbed()
             && self
-                .niri
+                .synoik
                 .layout
                 .active_output()
                 .and_then(|output| {
@@ -400,7 +400,7 @@ impl XdgShellHandler for State {
             keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
         }
         pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
-        self.niri.popup_grab = Some(PopupGrabState {
+        self.synoik.popup_grab = Some(PopupGrabState {
             root,
             grab,
             has_keyboard_grab: can_receive_keyboard_focus,
@@ -409,7 +409,7 @@ impl XdgShellHandler for State {
 
     fn maximize_request(&mut self, toplevel: ToplevelSurface) {
         if let Some((mapped, _)) = self
-            .niri
+            .synoik
             .layout
             .find_window_and_output_mut(toplevel.wl_surface())
         {
@@ -418,8 +418,8 @@ impl XdgShellHandler for State {
             mapped.set_needs_configure();
 
             let window = mapped.window.clone();
-            self.niri.layout.set_maximized(&window, true);
-        } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
+            self.synoik.layout.set_maximized(&window, true);
+        } else if let Some(unmapped) = self.synoik.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
                 InitialConfigureState::NotConfigured {
                     wants_maximized, ..
@@ -438,20 +438,22 @@ impl XdgShellHandler for State {
                     // FIXME: deduplicate.
                     let mon = output
                         .as_ref()
-                        .and_then(|o| self.niri.layout.monitor_for_output(o))
+                        .and_then(|o| self.synoik.layout.monitor_for_output(o))
                         .map(|mon| (mon, false))
                         // If not, check if we have a parent with a monitor.
                         .or_else(|| {
                             toplevel
                                 .parent()
-                                .and_then(|parent| self.niri.layout.find_window_and_output(&parent))
+                                .and_then(|parent| {
+                                    self.synoik.layout.find_window_and_output(&parent)
+                                })
                                 .and_then(|(_win, output)| output)
-                                .and_then(|o| self.niri.layout.monitor_for_output(o))
+                                .and_then(|o| self.synoik.layout.monitor_for_output(o))
                                 .map(|mon| (mon, true))
                         })
                         // If not, fall back to the active monitor.
                         .or_else(|| {
-                            self.niri
+                            self.synoik
                                 .layout
                                 .active_monitor_ref()
                                 .map(|mon| (mon, false))
@@ -464,7 +466,7 @@ impl XdgShellHandler for State {
 
                     let ws = mon
                         .map(|mon| mon.active_workspace_ref())
-                        .or_else(|| self.niri.layout.active_workspace());
+                        .or_else(|| self.synoik.layout.active_workspace());
 
                     if let Some(ws) = ws {
                         // If the window is pending fullscreen, then this will do nothing. But
@@ -491,7 +493,7 @@ impl XdgShellHandler for State {
 
     fn unmaximize_request(&mut self, toplevel: ToplevelSurface) {
         if let Some((mapped, _)) = self
-            .niri
+            .synoik
             .layout
             .find_window_and_output_mut(toplevel.wl_surface())
         {
@@ -500,8 +502,8 @@ impl XdgShellHandler for State {
             mapped.set_needs_configure();
 
             let window = mapped.window.clone();
-            self.niri.layout.set_maximized(&window, false);
-        } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
+            self.synoik.layout.set_maximized(&window, false);
+        } else if let Some(unmapped) = self.synoik.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
                 InitialConfigureState::NotConfigured {
                     wants_maximized, ..
@@ -525,28 +527,28 @@ impl XdgShellHandler for State {
                     // FIXME: deduplicate.
                     let mon = workspace_name
                         .as_deref()
-                        .and_then(|name| self.niri.layout.monitor_for_workspace(name))
+                        .and_then(|name| self.synoik.layout.monitor_for_workspace(name))
                         .map(|mon| (mon, false));
 
                     let mon = mon.or_else(|| {
                         output
                             .as_ref()
-                            .and_then(|o| self.niri.layout.monitor_for_output(o))
+                            .and_then(|o| self.synoik.layout.monitor_for_output(o))
                             .map(|mon| (mon, false))
                             // If not, check if we have a parent with a monitor.
                             .or_else(|| {
                                 toplevel
                                     .parent()
                                     .and_then(|parent| {
-                                        self.niri.layout.find_window_and_output(&parent)
+                                        self.synoik.layout.find_window_and_output(&parent)
                                     })
                                     .and_then(|(_win, output)| output)
-                                    .and_then(|o| self.niri.layout.monitor_for_output(o))
+                                    .and_then(|o| self.synoik.layout.monitor_for_output(o))
                                     .map(|mon| (mon, true))
                             })
                             // If not, fall back to the active monitor.
                             .or_else(|| {
-                                self.niri
+                                self.synoik
                                     .layout
                                     .active_monitor_ref()
                                     .map(|mon| (mon, false))
@@ -563,7 +565,7 @@ impl XdgShellHandler for State {
                         .and_then(|name| mon.map(|mon| mon.find_named_workspace(name)))
                         .unwrap_or_else(|| {
                             mon.map(|mon| mon.active_workspace_ref())
-                                .or_else(|| self.niri.layout.active_workspace())
+                                .or_else(|| self.synoik.layout.active_workspace())
                         });
 
                     if let Some(ws) = ws {
@@ -578,7 +580,7 @@ impl XdgShellHandler for State {
 
                         let is_floating = rules.compute_open_floating(
                             &toplevel,
-                            self.niri.config.borrow().layout.windowing_mode,
+                            self.synoik.config.borrow().layout.windowing_mode,
                         );
                         let configure_width = if is_floating {
                             *floating_width
@@ -616,10 +618,10 @@ impl XdgShellHandler for State {
         toplevel: ToplevelSurface,
         wl_output: Option<wl_output::WlOutput>,
     ) {
-        let requested_output = wl_output.and_then(|o| self.niri.output_from_resource(&o));
+        let requested_output = wl_output.and_then(|o| self.synoik.output_from_resource(&o));
 
         if let Some((mapped, current_output)) = self
-            .niri
+            .synoik
             .layout
             .find_window_and_output_mut(toplevel.wl_surface())
         {
@@ -631,7 +633,7 @@ impl XdgShellHandler for State {
 
             if let Some(requested_output) = requested_output {
                 if Some(&requested_output) != current_output {
-                    self.niri.layout.move_to_output(
+                    self.synoik.layout.move_to_output(
                         Some(&window),
                         &requested_output,
                         None,
@@ -640,8 +642,8 @@ impl XdgShellHandler for State {
                 }
             }
 
-            self.niri.layout.set_fullscreen(&window, true);
-        } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
+            self.synoik.layout.set_fullscreen(&window, true);
+        } else if let Some(unmapped) = self.synoik.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
                 InitialConfigureState::NotConfigured {
                     wants_fullscreen, ..
@@ -657,20 +659,22 @@ impl XdgShellHandler for State {
                         .as_ref()
                         // If none requested, try currently configured output.
                         .or(output.as_ref())
-                        .and_then(|o| self.niri.layout.monitor_for_output(o))
+                        .and_then(|o| self.synoik.layout.monitor_for_output(o))
                         .map(|mon| (mon, false))
                         // If not, check if we have a parent with a monitor.
                         .or_else(|| {
                             toplevel
                                 .parent()
-                                .and_then(|parent| self.niri.layout.find_window_and_output(&parent))
+                                .and_then(|parent| {
+                                    self.synoik.layout.find_window_and_output(&parent)
+                                })
                                 .and_then(|(_win, output)| output)
-                                .and_then(|o| self.niri.layout.monitor_for_output(o))
+                                .and_then(|o| self.synoik.layout.monitor_for_output(o))
                                 .map(|mon| (mon, true))
                         })
                         // If not, fall back to the active monitor.
                         .or_else(|| {
-                            self.niri
+                            self.synoik
                                 .layout
                                 .active_monitor_ref()
                                 .map(|mon| (mon, false))
@@ -683,7 +687,7 @@ impl XdgShellHandler for State {
 
                     let ws = mon
                         .map(|mon| mon.active_workspace_ref())
-                        .or_else(|| self.niri.layout.active_workspace());
+                        .or_else(|| self.synoik.layout.active_workspace());
 
                     if let Some(ws) = ws {
                         toplevel.with_pending_state(|state| {
@@ -705,7 +709,7 @@ impl XdgShellHandler for State {
 
     fn unfullscreen_request(&mut self, toplevel: ToplevelSurface) {
         if let Some((mapped, _)) = self
-            .niri
+            .synoik
             .layout
             .find_window_and_output_mut(toplevel.wl_surface())
         {
@@ -714,8 +718,8 @@ impl XdgShellHandler for State {
             mapped.set_needs_configure();
 
             let window = mapped.window.clone();
-            self.niri.layout.set_fullscreen(&window, false);
-        } else if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
+            self.synoik.layout.set_fullscreen(&window, false);
+        } else if let Some(unmapped) = self.synoik.unmapped_windows.get_mut(toplevel.wl_surface()) {
             match &mut unmapped.state {
                 InitialConfigureState::NotConfigured {
                     wants_fullscreen, ..
@@ -739,28 +743,28 @@ impl XdgShellHandler for State {
                     // FIXME: deduplicate.
                     let mon = workspace_name
                         .as_deref()
-                        .and_then(|name| self.niri.layout.monitor_for_workspace(name))
+                        .and_then(|name| self.synoik.layout.monitor_for_workspace(name))
                         .map(|mon| (mon, false));
 
                     let mon = mon.or_else(|| {
                         output
                             .as_ref()
-                            .and_then(|o| self.niri.layout.monitor_for_output(o))
+                            .and_then(|o| self.synoik.layout.monitor_for_output(o))
                             .map(|mon| (mon, false))
                             // If not, check if we have a parent with a monitor.
                             .or_else(|| {
                                 toplevel
                                     .parent()
                                     .and_then(|parent| {
-                                        self.niri.layout.find_window_and_output(&parent)
+                                        self.synoik.layout.find_window_and_output(&parent)
                                     })
                                     .and_then(|(_win, output)| output)
-                                    .and_then(|o| self.niri.layout.monitor_for_output(o))
+                                    .and_then(|o| self.synoik.layout.monitor_for_output(o))
                                     .map(|mon| (mon, true))
                             })
                             // If not, fall back to the active monitor.
                             .or_else(|| {
-                                self.niri
+                                self.synoik
                                     .layout
                                     .active_monitor_ref()
                                     .map(|mon| (mon, false))
@@ -777,7 +781,7 @@ impl XdgShellHandler for State {
                         .and_then(|name| mon.map(|mon| mon.find_named_workspace(name)))
                         .unwrap_or_else(|| {
                             mon.map(|mon| mon.active_workspace_ref())
-                                .or_else(|| self.niri.layout.active_workspace())
+                                .or_else(|| self.synoik.layout.active_workspace())
                         });
 
                     if let Some(ws) = ws {
@@ -791,7 +795,7 @@ impl XdgShellHandler for State {
 
                         let is_floating = rules.compute_open_floating(
                             &toplevel,
-                            self.niri.config.borrow().layout.windowing_mode,
+                            self.synoik.config.borrow().layout.windowing_mode,
                         );
                         let configure_width = if is_floating {
                             *floating_width
@@ -826,7 +830,7 @@ impl XdgShellHandler for State {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         if self
-            .niri
+            .synoik
             .unmapped_windows
             .remove(surface.wl_surface())
             .is_some()
@@ -836,7 +840,7 @@ impl XdgShellHandler for State {
         }
 
         let win_out = self
-            .niri
+            .synoik
             .layout
             .find_window_and_output(surface.wl_surface());
 
@@ -850,7 +854,7 @@ impl XdgShellHandler for State {
         let output = output.cloned();
 
         let id = mapped.id();
-        self.niri
+        self.synoik
             .stop_casts_for_target(CastTarget::Window { id: id.get() });
 
         self.store_unmap_snapshot(&window, output.as_ref());
@@ -859,16 +863,18 @@ impl XdgShellHandler for State {
         let blocker = transaction.blocker();
         // As in `CompositorHandler::commit`: the close snapshot is renderer-neutral, so it starts
         // the animation without a renderer rather than through one it ignores.
-        self.niri
+        self.synoik
             .layout
             .start_close_animation_for_window(&window, blocker);
 
-        let active_window = self.niri.layout.focus().map(|m| &m.window);
+        let active_window = self.synoik.layout.focus().map(|m| &m.window);
         let was_active = active_window == Some(&window);
 
-        let outcome = self.niri.switcher.window_removed(id);
+        let outcome = self.synoik.switcher.window_removed(id);
         self.finish_switcher(outcome);
-        self.niri.layout.remove_window(&window, transaction.clone());
+        self.synoik
+            .layout
+            .remove_window(&window, transaction.clone());
 
         let surface = surface.wl_surface();
         // This check is necessary because implicit resource destruction is done with
@@ -882,7 +888,7 @@ impl XdgShellHandler for State {
         // If this is the only instance, then this transaction will complete immediately, so no
         // need to set the timer.
         if !transaction.is_last() {
-            transaction.register_deadline_timer(&self.niri.event_loop);
+            transaction.register_deadline_timer(&self.synoik.event_loop);
         }
 
         if was_active {
@@ -890,14 +896,14 @@ impl XdgShellHandler for State {
         }
 
         if let Some(output) = output {
-            self.niri.queue_redraw(&output);
-            self.niri.queue_redraw_switcher_output();
+            self.synoik.queue_redraw(&output);
+            self.synoik.queue_redraw_switcher_output();
         }
     }
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
         if let Some(output) = self.output_for_popup(&PopupKind::Xdg(surface)) {
-            self.niri.queue_redraw(&output.clone());
+            self.synoik.queue_redraw(&output.clone());
         }
     }
 
@@ -914,12 +920,12 @@ impl XdgShellHandler for State {
             return;
         };
 
-        if let Some((mapped, output)) = self.niri.layout.find_window_and_output_mut(&parent) {
+        if let Some((mapped, output)) = self.synoik.layout.find_window_and_output_mut(&parent) {
             let output = output.cloned();
             let window = mapped.window.clone();
-            if self.niri.layout.descendants_added(&window) {
+            if self.synoik.layout.descendants_added(&window) {
                 if let Some(output) = output {
-                    self.niri.queue_redraw(&output);
+                    self.synoik.queue_redraw(&output);
                 }
             }
         }
@@ -954,7 +960,7 @@ impl XdgDecorationHandler for State {
         if toplevel.is_initial_configure_sent() {
             // If this is a mapped window, flag it as needs configure to avoid duplicate configures.
             let surface = toplevel.wl_surface();
-            if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
+            if let Some((mapped, _)) = self.synoik.layout.find_window_and_output_mut(surface) {
                 mapped.set_needs_configure();
             } else {
                 toplevel.send_configure();
@@ -973,7 +979,7 @@ impl XdgDecorationHandler for State {
         if toplevel.is_initial_configure_sent() {
             // If this is a mapped window, flag it as needs configure to avoid duplicate configures.
             let surface = toplevel.wl_surface();
-            if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
+            if let Some((mapped, _)) = self.synoik.layout.find_window_and_output_mut(surface) {
                 mapped.set_needs_configure();
             } else {
                 toplevel.send_configure();
@@ -997,7 +1003,7 @@ impl KdeDecorationsModeState {
 
 impl KdeDecorationHandler for State {
     fn kde_decoration_state(&self) -> &KdeDecorationState {
-        &self.niri.kde_decoration_state
+        &self.synoik.kde_decoration_state
     }
 
     fn request_mode(
@@ -1026,7 +1032,7 @@ delegate_kde_decoration!(State);
 
 impl XdgForeignHandler for State {
     fn xdg_foreign_state(&mut self) -> &mut XdgForeignState {
-        &mut self.niri.xdg_foreign_state
+        &mut self.synoik.xdg_foreign_state
     }
 }
 delegate_xdg_foreign!(State);
@@ -1035,16 +1041,16 @@ impl State {
     pub fn send_initial_configure(&mut self, toplevel: &ToplevelSurface) {
         let _span = tracy_client::span!("State::send_initial_configure");
 
-        let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) else {
+        let Some(unmapped) = self.synoik.unmapped_windows.get_mut(toplevel.wl_surface()) else {
             error!("window must be present in unmapped_windows in send_initial_configure()");
             return;
         };
 
-        let config = self.niri.config.borrow();
+        let config = self.synoik.config.borrow();
         let rules = ResolvedWindowRules::compute(
             &config.window_rules,
             WindowRef::Unmapped(unmapped),
-            self.niri.is_at_startup,
+            self.synoik.is_at_startup,
         );
 
         let Unmapped { window, state, .. } = unmapped;
@@ -1062,7 +1068,7 @@ impl State {
         let mon = rules
             .open_on_workspace
             .as_deref()
-            .and_then(|name| self.niri.layout.monitor_for_workspace(name));
+            .and_then(|name| self.synoik.layout.monitor_for_workspace(name));
 
         // If not, check if we had an output set in the window rules.
         let mon = mon.or_else(|| {
@@ -1070,12 +1076,12 @@ impl State {
                 .open_on_output
                 .as_deref()
                 .and_then(|name| {
-                    self.niri
+                    self.synoik
                         .global_space
                         .outputs()
                         .find(|output| output_matches_name(output, name))
                 })
-                .and_then(|o| self.niri.layout.monitor_for_output(o))
+                .and_then(|o| self.synoik.layout.monitor_for_output(o))
         });
 
         // If not, check if the window requested one for fullscreen.
@@ -1084,22 +1090,22 @@ impl State {
                 .as_ref()
                 .and_then(|x| x.as_ref())
                 // The monitor might not exist if the output was disconnected.
-                .and_then(|o| self.niri.layout.monitor_for_output(o))
+                .and_then(|o| self.synoik.layout.monitor_for_output(o))
         });
 
         // If not, check if this is a dialog with a parent, to place it next to the parent.
         let mon = mon.map(|mon| (mon, false)).or_else(|| {
             toplevel
                 .parent()
-                .and_then(|parent| self.niri.layout.find_window_and_output(&parent))
+                .and_then(|parent| self.synoik.layout.find_window_and_output(&parent))
                 .and_then(|(_win, output)| output)
-                .and_then(|o| self.niri.layout.monitor_for_output(o))
+                .and_then(|o| self.synoik.layout.monitor_for_output(o))
                 .map(|mon| (mon, true))
         });
 
         // If not, use the active monitor.
         let mon = mon.or_else(|| {
-            self.niri
+            self.synoik
                 .layout
                 .active_monitor_ref()
                 .map(|mon| (mon, false))
@@ -1117,8 +1123,8 @@ impl State {
         let mut height = None;
         let mut floating_height = None;
         let is_full_width = rules.open_maximized.unwrap_or(false);
-        let is_floating =
-            rules.compute_open_floating(toplevel, self.niri.config.borrow().layout.windowing_mode);
+        let is_floating = rules
+            .compute_open_floating(toplevel, self.synoik.config.borrow().layout.windowing_mode);
 
         // Tell the surface the preferred size and bounds for its likely output.
         let ws = rules
@@ -1127,7 +1133,7 @@ impl State {
             .and_then(|name| mon.map(|mon| mon.find_named_workspace(name)))
             .unwrap_or_else(|| {
                 mon.map(|mon| mon.active_workspace_ref())
-                    .or_else(|| self.niri.layout.active_workspace())
+                    .or_else(|| self.synoik.layout.active_workspace())
             });
 
         let mut is_pending_maximized = false;
@@ -1193,12 +1199,12 @@ impl State {
     pub fn queue_initial_configure(&self, toplevel: ToplevelSurface) {
         // Send the initial configure in an idle, in case the client sent some more info after the
         // initial commit.
-        self.niri.event_loop.insert_idle(move |state| {
+        self.synoik.event_loop.insert_idle(move |state| {
             if !toplevel.alive() {
                 return;
             }
 
-            if let Some(unmapped) = state.niri.unmapped_windows.get(toplevel.wl_surface()) {
+            if let Some(unmapped) = state.synoik.unmapped_windows.get(toplevel.wl_surface()) {
                 if unmapped.needs_initial_configure() {
                     state.send_initial_configure(&toplevel);
                 }
@@ -1208,9 +1214,9 @@ impl State {
 
     /// Should be called on `WlSurface::commit`
     pub fn popups_handle_commit(&mut self, surface: &WlSurface) {
-        self.niri.popups.commit(surface);
+        self.synoik.popups.commit(surface);
 
-        if let Some(popup) = self.niri.popups.find_popup(surface) {
+        if let Some(popup) = self.synoik.popups.find_popup(surface) {
             match popup {
                 PopupKind::Xdg(ref popup) => {
                     if !popup.is_initial_configure_sent() {
@@ -1236,11 +1242,11 @@ impl State {
 
     pub fn output_for_popup(&self, popup: &PopupKind) -> Option<&Output> {
         let root = find_popup_root_surface(popup).ok()?;
-        self.niri.output_for_root(&root)
+        self.synoik.output_for_root(&root)
     }
 
     pub fn unconstrain_popup(&self, popup: &PopupKind) {
-        let _span = tracy_client::span!("Niri::unconstrain_popup");
+        let _span = tracy_client::span!("Synoik::unconstrain_popup");
 
         // Popups with a NULL parent will get repositioned in their respective protocol handlers
         // (i.e. layer-shell).
@@ -1249,9 +1255,9 @@ impl State {
         };
 
         // Figure out if the root is a window or a layer surface.
-        if let Some((mapped, _)) = self.niri.layout.find_window_and_output(&root) {
+        if let Some((mapped, _)) = self.synoik.layout.find_window_and_output(&root) {
             self.unconstrain_window_popup(popup, &mapped.window);
-        } else if let Some((layer_surface, output)) = self.niri.layout.outputs().find_map(|o| {
+        } else if let Some((layer_surface, output)) = self.synoik.layout.outputs().find_map(|o| {
             let map = layer_map_for_output(o);
             let layer_surface = map.layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)?;
             Some((layer_surface.clone(), o))
@@ -1263,7 +1269,7 @@ impl State {
     fn unconstrain_window_popup(&self, popup: &PopupKind, window: &Window) {
         // The target geometry for the positioner should be relative to its parent's geometry, so
         // we will compute that here.
-        let mut target = self.niri.layout.popup_target_rect(window);
+        let mut target = self.synoik.layout.popup_target_rect(window);
         target.loc -= get_popup_toplevel_coords(popup).to_f64();
 
         self.position_popup_within_rect(popup, target, true);
@@ -1275,7 +1281,7 @@ impl State {
         layer_surface: &LayerSurface,
         output: &Output,
     ) {
-        let output_geo = self.niri.global_space.output_geometry(output).unwrap();
+        let output_geo = self.synoik.global_space.output_geometry(output).unwrap();
         let map = layer_map_for_output(output);
         let Some(layer_geo) = map.layer_geometry(layer_surface) else {
             return;
@@ -1354,7 +1360,7 @@ impl State {
     }
 
     pub fn update_reactive_popups(&self, window: &Window) {
-        let _span = tracy_client::span!("Niri::update_reactive_popups");
+        let _span = tracy_client::span!("Synoik::update_reactive_popups");
 
         for (popup, _) in PopupManager::popups_for_surface(
             window.toplevel().expect("no x11 support").wl_surface(),
@@ -1374,31 +1380,31 @@ impl State {
     }
 
     pub fn update_window_rules(&mut self, toplevel: &ToplevelSurface) {
-        let config = self.niri.config.borrow();
+        let config = self.synoik.config.borrow();
         let window_rules = &config.window_rules;
 
-        if let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) {
+        if let Some(unmapped) = self.synoik.unmapped_windows.get_mut(toplevel.wl_surface()) {
             let new_rules = ResolvedWindowRules::compute(
                 window_rules,
                 WindowRef::Unmapped(unmapped),
-                self.niri.is_at_startup,
+                self.synoik.is_at_startup,
             );
             if let InitialConfigureState::Configured { rules, .. } = &mut unmapped.state {
                 *rules = new_rules;
             }
         } else if let Some((mapped, output)) = self
-            .niri
+            .synoik
             .layout
             .find_window_and_output_mut(toplevel.wl_surface())
         {
-            if mapped.recompute_window_rules(window_rules, self.niri.is_at_startup) {
+            if mapped.recompute_window_rules(window_rules, self.synoik.is_at_startup) {
                 drop(config);
                 let output = output.cloned();
                 let window = mapped.window.clone();
-                self.niri.layout.update_window(&window, None);
+                self.synoik.layout.update_window(&window, None);
 
                 if let Some(output) = output {
-                    self.niri.queue_redraw(&output);
+                    self.synoik.queue_redraw(&output);
                 }
             }
         }
@@ -1452,7 +1458,7 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
         let span =
             trace_span!("toplevel pre-commit", surface = %surface.id(), serial = Empty).entered();
 
-        let Some((mapped, output)) = state.niri.layout.find_window_and_output_mut(surface) else {
+        let Some((mapped, output)) = state.synoik.layout.find_window_and_output_mut(surface) else {
             error!("pre-commit hook for mapped surfaces must be removed upon unmapping");
             return;
         };
@@ -1499,11 +1505,11 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
             // trace!("taking pending transaction");
             if let Some(transaction) = mapped.take_pending_transaction(serial) {
                 // Transaction can be already completed if it ran past the deadline.
-                let disable = state.niri.config.borrow().debug.disable_transactions;
+                let disable = state.synoik.config.borrow().debug.disable_transactions;
                 if !transaction.is_completed() && !disable {
                     // Register the deadline even if this is the last pending, since dmabuf
                     // rendering can still run over the deadline.
-                    transaction.register_deadline_timer(&state.niri.event_loop);
+                    transaction.register_deadline_timer(&state.synoik.event_loop);
 
                     let is_last = transaction.is_last();
 
@@ -1516,7 +1522,7 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
                         // transaction blocker.
                         if let Some(client) = surface.client() {
                             transaction.add_notification(
-                                state.niri.blocker_cleared_tx.clone(),
+                                state.synoik.blocker_cleared_tx.clone(),
                                 client.clone(),
                             );
                             add_blocker(surface, transaction.blocker());
@@ -1541,13 +1547,13 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
             // once the buffer is producer-complete.
             if let Some((blocker, source)) = acquire_point.and_then(|p| p.generate_blocker().ok()) {
                 let res = state
-                    .niri
+                    .synoik
                     .event_loop
                     .insert_source(source, move |_, _, state| {
                         // This surface is now ready for the transaction.
                         drop(transaction_for_dmabuf.take());
 
-                        let display_handle = state.niri.display_handle.clone();
+                        let display_handle = state.synoik.display_handle.clone();
                         state
                             .client_compositor_state(&client)
                             .blocker_cleared(state, &display_handle);
@@ -1560,13 +1566,13 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
                 }
             } else if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
                 let res = state
-                    .niri
+                    .synoik
                     .event_loop
                     .insert_source(source, move |_, _, state| {
                         // This surface is now ready for the transaction.
                         drop(transaction_for_dmabuf.take());
 
-                        let display_handle = state.niri.display_handle.clone();
+                        let display_handle = state.synoik.display_handle.clone();
                         state
                             .client_compositor_state(&client)
                             .blocker_cleared(state, &display_handle);
@@ -1603,7 +1609,7 @@ pub fn add_mapped_toplevel_pre_commit_hook(toplevel: &ToplevelSurface) -> HookId
             }
 
             // The toplevel remains mapped; clear any stored unmap snapshot.
-            state.niri.layout.clear_unmap_snapshot(&window);
+            state.synoik.layout.clear_unmap_snapshot(&window);
         }
     })
 }

@@ -3,8 +3,8 @@
 #   git config core.hooksPath .githooks
 #
 # Formatting and clippy cover the WHOLE workspace (--all / --workspace): the
-# root package is `niri`, so a bare `cargo fmt`/`cargo clippy` skips the other
-# crates (niri-config, niri-ipc, niri-vk, …) and lets drift through. rustfmt
+# root package is `synoik`, so a bare `cargo fmt`/`cargo clippy` skips the other
+# crates (synoik-config, synoik-ipc, synoik-vk, …) and lets drift through. rustfmt
 # drift has ridden into commits before (the volume-slider slice); this gate
 # stops it. Clippy is strict: -D warnings across all targets.
 

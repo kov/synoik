@@ -50,7 +50,7 @@ use crate::audio::{
     AudioCards, AudioStatus, MicStatus, PortAvailability, PortDirection, RouteInfo, SinkCard,
     SinkInfo, SinkList, SourceInfo, SourceList, MAX_VOLUME,
 };
-use crate::niri::State;
+use crate::synoik::State;
 
 /// The live audio connection, owned by the compositor for the whole session.
 pub struct PwAudio {

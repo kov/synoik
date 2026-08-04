@@ -11,15 +11,15 @@
 //! now.
 //!
 //! The worker writes its pixels **straight into device-visible memory** when a device is
-//! available ([`niri_vk::staging::HostStaging`]). Moving the decode off the main loop had left one
-//! multi-megabyte host write behind: the upload's own copy from the decoded `Vec` into a staging
-//! buffer, measured at 7–9 ms for a 4K picture — first-touch page faults on a freshly mapped
-//! buffer, no GPU work in it at all (`docs/fork/venus-cost.md` §9.2). Staging on the worker leaves
-//! the render thread with only the image creation and a copy queued for the next frame's command
-//! buffer — no submit of its own, which on a live frame was `first upload 18.62ms` for 48 MiB.
-//! Without a device (headless tests, or before the renderer exists) it falls back to a plain `Vec`
-//! and the ordinary import, which stages into the renderer's pool and queues its copy just the
-//! same.
+//! available ([`synoik_vk::staging::HostStaging`]). Moving the decode off the main loop had left
+//! one multi-megabyte host write behind: the upload's own copy from the decoded `Vec` into a
+//! staging buffer, measured at 7–9 ms for a 4K picture — first-touch page faults on a freshly
+//! mapped buffer, no GPU work in it at all (`docs/fork/venus-cost.md` §9.2). Staging on the worker
+//! leaves the render thread with only the image creation and a copy queued for the next frame's
+//! command buffer — no submit of its own, which on a live frame was `first upload 18.62ms` for 48
+//! MiB. Without a device (headless tests, or before the renderer exists) it falls back to a plain
+//! `Vec` and the ordinary import, which stages into the renderer's pool and queues its copy just
+//! the same.
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -29,12 +29,12 @@ use std::sync::Arc;
 
 use calloop::channel::Sender;
 use image::ImageReader;
-use niri_vk::gpu::Gpu;
-use niri_vk::staging::HostStaging;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer as _};
 use smithay::utils::{Buffer, Logical, Point, Rectangle, Scale, Size, Transform};
+use synoik_vk::gpu::Gpu;
+use synoik_vk::staging::HostStaging;
 
 use crate::gnome::{BackgroundOptions, BackgroundSettings};
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
@@ -674,7 +674,7 @@ mod tests {
         // (`VulkanRenderer::pending_texture_uploads`), so the submit count is zero either way and
         // could no longer tell a cold upload from a cached one. The image is still allocated once
         // per real upload, which is the thing this test is about.
-        let uploads = |_: ()| niri_vk::stats::take_creates().0;
+        let uploads = |_: ()| synoik_vk::stats::take_creates().0;
         let render = |wp: &Wallpaper, vk: &mut VulkanRenderer| {
             wp.render(
                 vk,

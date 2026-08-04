@@ -71,7 +71,7 @@ Ours is one row, `ControlsLayout::workspace_row`, drawn identically in both stat
 
 The picker therefore has nowhere to travel to on the `WINDOW_PICKER → APP_GRID` leg: it keeps its
 own box and simply **fades away** over the row that is already there (`row_alpha` vs
-`picker_alpha` in `Niri::render`). The fit-single ↔ fit-all blend in
+`picker_alpha` in `Synoik::render`). The fit-single ↔ fit-all blend in
 `Monitor::workspaces_strip_axis` went with that trip.
 
 ### The two legs must be traversed in order

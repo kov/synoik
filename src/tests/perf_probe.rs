@@ -11,9 +11,9 @@
 //! # What it found (2026-07-26)
 //!
 //! The live seat was missing one vblank in ~10 during the overview while every frame reported "0
-//! over budget": with `NIRI_VK_ASYNC_SCANOUT=1` the frame's GPU work is invisible to the frame log
-//! and overruns land on the *flip* instead. Forcing a CPU wait before queueing exposed 15-20 ms of
-//! GPU time per overview frame against a 16.67 ms budget.
+//! over budget": with `SYNOIK_VK_ASYNC_SCANOUT=1` the frame's GPU work is invisible to the frame
+//! log and overruns land on the *flip* instead. Forcing a CPU wait before queueing exposed 15-20 ms
+//! of GPU time per overview frame against a 16.67 ms budget.
 //!
 //! Sweeps 1-4 ruled out every structural explanation. A frame of that shape fits
 //! `0.9 ms + 0.112 ms/Mpx`: draw count is nearly free (23 → 34 draws moved nothing), minified
@@ -76,9 +76,9 @@
 
 use std::time::{Duration, Instant};
 
-use niri_config::Action;
 use smithay::backend::allocator::Fourcc;
 use smithay::utils::{Physical, Scale, Size, Transform};
+use synoik_config::Action;
 
 use super::fixture::Fixture;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -108,13 +108,13 @@ fn build(out: (u16, u16), windows: usize) -> Option<Fixture> {
 }
 
 fn build_scene(out: (u16, u16), windows: usize, scene: Scene) -> Option<Fixture> {
-    use niri_config::{BackgroundEffectRule, Config, WindowRule};
+    use synoik_config::{BackgroundEffectRule, Config, WindowRule};
 
     if let Err(e) = VulkanRenderer::new() {
         eprintln!("skipping: no Vulkan device ({e})");
         return None;
     }
-    niri_vk::stats::set_enabled(true);
+    synoik_vk::stats::set_enabled(true);
 
     let mut config = Config::default();
     if scene.blur || scene.xray {
@@ -131,7 +131,7 @@ fn build_scene(out: (u16, u16), windows: usize, scene: Scene) -> Option<Fixture>
     }
 
     let mut f = Fixture::with_config(config);
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -163,13 +163,13 @@ fn build_scene(out: (u16, u16), windows: usize, scene: Scene) -> Option<Fixture>
             options: crate::gnome::BackgroundOptions::default(),
         };
         let gpu = f
-            .niri_state()
+            .synoik_state()
             .backend
             .with_vulkan_renderer(|r| r.gpu().clone());
-        f.niri().wallpaper.update(&settings, gpu.as_ref());
+        f.synoik().wallpaper.update(&settings, gpu.as_ref());
     }
 
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     Some(f)
 }
 
@@ -177,14 +177,14 @@ fn build_scene(out: (u16, u16), windows: usize, scene: Scene) -> Option<Fixture>
 /// includes GPU execution — `finish` fence-waits unless told it may defer), plus the draws and
 /// shaded fragments the renderer counted for it.
 fn render_once(f: &mut Fixture) -> (Duration, u64, u64) {
-    let output = f.niri_output(1);
-    let state = f.niri_state();
+    let output = f.synoik_output(1);
+    let state = f.synoik_state();
     state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| -> anyhow::Result<(Duration, u64, u64)> {
-            let niri = &mut state.niri;
-            niri.update_render_elements(Some(&output));
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
 
             let size: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -193,9 +193,9 @@ fn render_once(f: &mut Fixture) -> (Duration, u64, u64) {
                 target: RenderTarget::Output,
                 xray: None,
             };
-            let elements = niri.render_to_vec(ctx, &output, false);
+            let elements = synoik.render_to_vec(ctx, &output, false);
 
-            let (d0, s0) = (niri_vk::stats::draws(), niri_vk::stats::shaded());
+            let (d0, s0) = (synoik_vk::stats::draws(), synoik_vk::stats::shaded());
             let started = Instant::now();
             let (_tex, _sync) = render_to_texture(
                 vk,
@@ -209,8 +209,8 @@ fn render_once(f: &mut Fixture) -> (Duration, u64, u64) {
 
             Ok((
                 elapsed,
-                niri_vk::stats::draws() - d0,
-                niri_vk::stats::shaded() - s0,
+                synoik_vk::stats::draws() - d0,
+                synoik_vk::stats::shaded() - s0,
             ))
         })
         .expect("headless backend must hold a Vulkan renderer")
@@ -243,14 +243,14 @@ fn render_once_dmabuf(
     use smithay::backend::renderer::element::{Element, RenderElement};
     use smithay::backend::renderer::{Bind, Frame, Renderer};
 
-    let output = f.niri_output(1);
-    let state = f.niri_state();
+    let output = f.synoik_output(1);
+    let state = f.synoik_state();
     state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| -> anyhow::Result<(Duration, u64, u64)> {
-            let niri = &mut state.niri;
-            niri.update_render_elements(Some(&output));
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
 
             let size: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -259,9 +259,9 @@ fn render_once_dmabuf(
                 target: RenderTarget::Output,
                 xray: None,
             };
-            let elements = niri.render_to_vec(ctx, &output, false);
+            let elements = synoik.render_to_vec(ctx, &output, false);
 
-            let (d0, s0) = (niri_vk::stats::draws(), niri_vk::stats::shaded());
+            let (d0, s0) = (synoik_vk::stats::draws(), synoik_vk::stats::shaded());
             let started = Instant::now();
             {
                 let mut fb = vk
@@ -288,8 +288,8 @@ fn render_once_dmabuf(
 
             Ok((
                 elapsed,
-                niri_vk::stats::draws() - d0,
-                niri_vk::stats::shaded() - s0,
+                synoik_vk::stats::draws() - d0,
+                synoik_vk::stats::shaded() - s0,
             ))
         })
         .expect("headless backend must hold a Vulkan renderer")
@@ -420,7 +420,7 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
     let out = (3840u16, 2160u16);
     if let Some(mut f) = build(out, 4) {
         best_of(&mut f, 2); // warm pipelines/descriptors
-        f.niri_state().do_action(Action::OpenOverview, false);
+        f.synoik_state().do_action(Action::OpenOverview, false);
         let samples = f.sample_animation(Duration::from_millis(400), 8, |f| best_of(f, 3));
         for (i, s) in samples.iter().enumerate() {
             row(&format!("  progress {:.2}", i as f64 / 8.), out, *s);
@@ -431,7 +431,7 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
     println!("\n== resolution sweep, 4 windows, overview open ==");
     for out in [(3840u16, 2160u16), (1920, 1080), (960, 540)] {
         if let Some(mut f) = build(out, 4) {
-            f.niri_state().do_action(Action::OpenOverview, false);
+            f.synoik_state().do_action(Action::OpenOverview, false);
             f.settle_animations();
             best_of(&mut f, 2);
             let s = best_of(&mut f, 5);
@@ -444,7 +444,7 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
     let out = (3840u16, 2160u16);
     for n in [1usize, 4, 8, 12] {
         if let Some(mut f) = build(out, n) {
-            f.niri_state().do_action(Action::OpenOverview, false);
+            f.synoik_state().do_action(Action::OpenOverview, false);
             f.settle_animations();
             best_of(&mut f, 2);
             let s = best_of(&mut f, 5);
@@ -484,7 +484,7 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
         ),
     ] {
         if let Some(mut f) = build_scene(out, 4, scene) {
-            f.niri_state().do_action(Action::OpenOverview, false);
+            f.synoik_state().do_action(Action::OpenOverview, false);
             f.settle_animations();
             best_of(&mut f, 2);
             let s = best_of(&mut f, 5);
@@ -509,7 +509,7 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
         for n in [1usize, 4] {
             if let Some(mut f) = build_scene(out, n, blur) {
                 if open {
-                    f.niri_state().do_action(Action::OpenOverview, false);
+                    f.synoik_state().do_action(Action::OpenOverview, false);
                     f.settle_animations();
                 }
                 best_of(&mut f, 2);
@@ -527,7 +527,7 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
     let out = (3840u16, 2160u16);
     for fourcc in [Fourcc::Abgr8888, Fourcc::Argb8888] {
         if let Some(mut f) = build(out, 4) {
-            f.niri_state().do_action(Action::OpenOverview, false);
+            f.synoik_state().do_action(Action::OpenOverview, false);
             f.settle_animations();
             best_of(&mut f, 2);
             match best_of_dmabuf(&mut f, out, fourcc, 5) {
@@ -590,7 +590,7 @@ fn perf_probe_what_does_a_draw_call_cost() {
 
     let Some(mut f) = build(OUT, 0) else { return };
     let timed = f
-        .niri_state()
+        .synoik_state()
         .backend
         .headless()
         .with_vulkan_renderer(VulkanRenderer::enable_gpu_timing)
@@ -704,7 +704,7 @@ fn perf_probe_what_does_a_draw_call_cost() {
             return;
         };
         let timed = f
-            .niri_state()
+            .synoik_state()
             .backend
             .headless()
             .with_vulkan_renderer(VulkanRenderer::enable_gpu_timing)
@@ -712,7 +712,7 @@ fn perf_probe_what_does_a_draw_call_cost() {
         if !timed {
             break;
         }
-        f.niri_state().do_action(Action::OpenOverview, false);
+        f.synoik_state().do_action(Action::OpenOverview, false);
         f.settle_animations();
         let mut samples: Vec<(Duration, u64, u64)> = Vec::new();
         for _ in 0..REPEATS {
@@ -739,14 +739,14 @@ fn perf_probe_what_does_a_draw_call_cost() {
 /// [`render_once`], measured on GPU timestamps instead of wall clock. `None` if the pair came back
 /// unusable. Requires `enable_gpu_timing` on the fixture's renderer.
 fn render_once_gpu(f: &mut Fixture) -> Option<(Duration, u64, u64)> {
-    let output = f.niri_output(1);
-    let state = f.niri_state();
+    let output = f.synoik_output(1);
+    let state = f.synoik_state();
     state
         .backend
         .headless()
         .with_vulkan_renderer(|vk| -> anyhow::Result<Option<(Duration, u64, u64)>> {
-            let niri = &mut state.niri;
-            niri.update_render_elements(Some(&output));
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
 
             let size: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -755,10 +755,10 @@ fn render_once_gpu(f: &mut Fixture) -> Option<(Duration, u64, u64)> {
                 target: RenderTarget::Output,
                 xray: None,
             };
-            let elements = niri.render_to_vec(ctx, &output, false);
+            let elements = synoik.render_to_vec(ctx, &output, false);
 
             let _ = crate::frame_log::take_gpu_samples();
-            let (d0, s0) = (niri_vk::stats::draws(), niri_vk::stats::shaded());
+            let (d0, s0) = (synoik_vk::stats::draws(), synoik_vk::stats::shaded());
             let (_tex, _sync) = render_to_texture(
                 vk,
                 size,
@@ -771,8 +771,8 @@ fn render_once_gpu(f: &mut Fixture) -> Option<(Duration, u64, u64)> {
             // Exactly one, for the reason in `best_gpu_of`.
             Ok((samples.lost == 0 && samples.count == 1).then_some((
                 samples.time,
-                niri_vk::stats::draws() - d0,
-                niri_vk::stats::shaded() - s0,
+                synoik_vk::stats::draws() - d0,
+                synoik_vk::stats::shaded() - s0,
             )))
         })
         .expect("headless backend must hold a Vulkan renderer")
@@ -797,7 +797,7 @@ fn textured_grid(
     const TEX: i32 = 64;
 
     let buffers: Vec<TextureBuffer<_>> = f
-        .niri_state()
+        .synoik_state()
         .backend
         .headless()
         .with_vulkan_renderer(|vk| {
@@ -867,19 +867,19 @@ fn best_gpu_of<E>(f: &mut Fixture, elements: &[E], n: usize) -> Option<(Duration
 where
     E: smithay::backend::renderer::element::RenderElement<VulkanRenderer>,
 {
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let size: Size<i32, Physical> = output.current_mode().unwrap().size;
     let scale = Scale::from(output.current_scale().fractional_scale());
 
     let mut best: Option<(Duration, u64, u64)> = None;
     for _ in 0..n {
         let sample = f
-            .niri_state()
+            .synoik_state()
             .backend
             .headless()
             .with_vulkan_renderer(|vk| -> anyhow::Result<Option<(Duration, u64, u64)>> {
                 let _ = crate::frame_log::take_gpu_samples();
-                let (d0, s0) = (niri_vk::stats::draws(), niri_vk::stats::shaded());
+                let (d0, s0) = (synoik_vk::stats::draws(), synoik_vk::stats::shaded());
                 let (_tex, _sync) = render_to_texture(
                     vk,
                     size,
@@ -889,13 +889,13 @@ where
                     elements.iter(),
                 )?;
                 let samples = crate::frame_log::take_gpu_samples();
-                // Exactly one: with `NIRI_VK_ASYNC_SCANOUT` set in the environment an offscreen
+                // Exactly one: with `SYNOIK_VK_ASYNC_SCANOUT` set in the environment an offscreen
                 // finish defers, its pair resolves during the *next* iteration's retire, and one
                 // window would then hold two renders' summed time.
                 Ok((samples.lost == 0 && samples.count == 1).then_some((
                     samples.time,
-                    niri_vk::stats::draws() - d0,
-                    niri_vk::stats::shaded() - s0,
+                    synoik_vk::stats::draws() - d0,
+                    synoik_vk::stats::shaded() - s0,
                 )))
             })
             .expect("headless backend must hold a Vulkan renderer")

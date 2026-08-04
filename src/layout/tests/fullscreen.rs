@@ -192,7 +192,7 @@ fn unfullscreen_with_large_border() {
     ];
 
     let mut options = scrolling_options();
-    options.layout.border = niri_config::Border {
+    options.layout.border = synoik_config::Border {
         off: false,
         width: 10000.,
         ..Default::default()

@@ -37,7 +37,7 @@ use super::freedesktop_notifications::{decode_bytes_icon, resolve_file_icon};
 use super::Start;
 use crate::notifications::{
     clamp_text, flatten_text, sanitize_text, GtkNotifyRequest, GtkToNotifications,
-    NotificationIcon, NotificationsToNiri, Urgency,
+    NotificationIcon, NotificationsToSynoik, Urgency,
 };
 
 pub const PATH: &str = "/org/gtk/Notifications";
@@ -72,7 +72,7 @@ enum GtkError {
 }
 
 pub struct GtkNotifications {
-    to_niri: calloop::channel::Sender<NotificationsToNiri>,
+    to_niri: calloop::channel::Sender<NotificationsToSynoik>,
     from_niri: async_channel::Receiver<GtkToNotifications>,
     /// Serialize method calls, like the fdo server: zbus dispatches concurrent
     /// tasks, but `Add`/`Remove` for one `(app_id, id)` must stay ordered.
@@ -83,7 +83,7 @@ pub struct GtkNotifications {
 
 impl GtkNotifications {
     pub fn new(
-        to_niri: calloop::channel::Sender<NotificationsToNiri>,
+        to_niri: calloop::channel::Sender<NotificationsToSynoik>,
         from_niri: async_channel::Receiver<GtkToNotifications>,
     ) -> Self {
         Self {
@@ -393,9 +393,9 @@ impl GtkNotifications {
         };
 
         self.to_niri
-            .send(NotificationsToNiri::AddGtk { req })
+            .send(NotificationsToSynoik::AddGtk { req })
             .map_err(|err| {
-                warn!("gtk-notifications: error sending message to niri: {err:?}");
+                warn!("gtk-notifications: error sending message to synoik: {err:?}");
                 GtkError::ZBus(zbus::Error::Failure("internal error".to_owned()))
             })?;
         Ok(())
@@ -409,10 +409,10 @@ impl GtkNotifications {
             .remove(&(app_id.clone(), id.clone()));
         if self
             .to_niri
-            .send(NotificationsToNiri::RemoveGtk { app_id, gtk_id: id })
+            .send(NotificationsToSynoik::RemoveGtk { app_id, gtk_id: id })
             .is_err()
         {
-            warn!("gtk-notifications: error sending RemoveNotification to niri");
+            warn!("gtk-notifications: error sending RemoveNotification to synoik");
         }
     }
 

@@ -151,7 +151,7 @@ pub fn scaled_px(px: f64) -> f64 {
 /// occupies, which is what a container's height is measured from.
 ///
 /// St gets this from Pango's font metrics, and so do we now — see
-/// [`niri_vk::text::line_box_px`] for the rule and its citation. It is deliberately a
+/// [`synoik_vk::text::line_box_px`] for the rule and its citation. It is deliberately a
 /// *typographic* line box, not the glyph ink extents — [`widget::ShapedText`] carries those
 /// for centering within it.
 ///
@@ -161,7 +161,7 @@ pub fn scaled_px(px: f64) -> f64 {
 /// the today card's two rows were *individually* wrong in opposite directions (18+26 where the
 /// shell has 19+25) and their sum came out right.
 pub fn line_height_px(pt: f64) -> f64 {
-    niri_vk::text::line_box_px(pt_to_px(pt))
+    synoik_vk::text::line_box_px(pt_to_px(pt))
 }
 
 #[cfg(test)]

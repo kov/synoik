@@ -24,7 +24,7 @@ const POWER_PROFILES_BUS: &str = "org.freedesktop.UPower.PowerProfiles";
 const POWER_PROFILES_PATH: &str = "/org/freedesktop/UPower/PowerProfiles";
 
 /// A status update from one of the watched services.
-pub enum SystemStatusToNiri {
+pub enum SystemStatusToSynoik {
     /// UPower's aggregate battery, or `None` when no battery is present.
     Battery(Option<BatteryStatus>),
     /// NetworkManager's primary-connection state.
@@ -41,7 +41,7 @@ pub enum SystemStatusToNiri {
 type Props = HashMap<String, zvariant::OwnedValue>;
 
 pub fn start(
-    to_niri: calloop::channel::Sender<SystemStatusToNiri>,
+    to_niri: calloop::channel::Sender<SystemStatusToSynoik>,
 ) -> anyhow::Result<zbus::blocking::Connection> {
     let conn = zbus::blocking::Connection::system()?;
     let async_conn = conn.inner().clone();
@@ -80,7 +80,10 @@ pub fn start(
                     let battery = read_battery(&props);
                     if last.as_ref() != Some(&battery) {
                         last = Some(battery.clone());
-                        if to_niri.send(SystemStatusToNiri::Battery(battery)).is_err() {
+                        if to_niri
+                            .send(SystemStatusToSynoik::Battery(battery))
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -130,7 +133,10 @@ pub fn start(
                     let network = read_network(&props);
                     if last != Some(network) {
                         last = Some(network);
-                        if to_niri.send(SystemStatusToNiri::Network(network)).is_err() {
+                        if to_niri
+                            .send(SystemStatusToSynoik::Network(network))
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -210,7 +216,7 @@ pub fn start(
                 if last.as_ref() != Some(&status) {
                     last = Some(status.clone());
                     if to_niri
-                        .send(SystemStatusToNiri::PowerProfiles(status))
+                        .send(SystemStatusToSynoik::PowerProfiles(status))
                         .is_err()
                     {
                         return;

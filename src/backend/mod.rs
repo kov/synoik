@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use niri_config::{Config, ModKey};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::output::Output;
+use synoik_config::{Config, ModKey};
 
-use crate::niri::Niri;
+use crate::synoik::Synoik;
 use crate::utils::id::IdCounter;
 
 pub mod backlight;
@@ -48,7 +48,7 @@ pub enum RenderResult {
     Skipped,
 }
 
-pub type IpcOutputMap = HashMap<OutputId, niri_ipc::Output>;
+pub type IpcOutputMap = HashMap<OutputId, synoik_ipc::Output>;
 
 static OUTPUT_ID_COUNTER: IdCounter = IdCounter::new();
 
@@ -66,11 +66,11 @@ impl OutputId {
 }
 
 impl Backend {
-    pub fn init(&mut self, niri: &mut Niri) {
+    pub fn init(&mut self, synoik: &mut Synoik) {
         let _span = tracy_client::span!("Backend::init");
         match self {
-            Backend::Tty(tty) => tty.init(niri),
-            Backend::Headless(headless) => headless.init(niri),
+            Backend::Tty(tty) => tty.init(synoik),
+            Backend::Headless(headless) => headless.init(synoik),
         }
     }
 
@@ -98,13 +98,15 @@ impl Backend {
 
     pub fn render(
         &mut self,
-        niri: &mut Niri,
+        synoik: &mut Synoik,
         output: &Output,
         target_presentation_time: Duration,
     ) -> RenderResult {
         match self {
-            Backend::Tty(tty) => tty.render(niri, output, target_presentation_time),
-            Backend::Headless(headless) => headless.render(niri, output, target_presentation_time),
+            Backend::Tty(tty) => tty.render(synoik, output, target_presentation_time),
+            Backend::Headless(headless) => {
+                headless.render(synoik, output, target_presentation_time)
+            }
         }
     }
 
@@ -169,23 +171,28 @@ impl Backend {
         }
     }
 
-    pub fn set_output_on_demand_vrr(&mut self, niri: &mut Niri, output: &Output, enable_vrr: bool) {
+    pub fn set_output_on_demand_vrr(
+        &mut self,
+        synoik: &mut Synoik,
+        output: &Output,
+        enable_vrr: bool,
+    ) {
         match self {
-            Backend::Tty(tty) => tty.set_output_on_demand_vrr(niri, output, enable_vrr),
+            Backend::Tty(tty) => tty.set_output_on_demand_vrr(synoik, output, enable_vrr),
             Backend::Headless(_) => (),
         }
     }
 
-    pub fn update_ignored_nodes_config(&mut self, niri: &mut Niri) {
+    pub fn update_ignored_nodes_config(&mut self, synoik: &mut Synoik) {
         match self {
-            Backend::Tty(tty) => tty.update_ignored_nodes_config(niri),
+            Backend::Tty(tty) => tty.update_ignored_nodes_config(synoik),
             Backend::Headless(_) => (),
         }
     }
 
-    pub fn on_output_config_changed(&mut self, niri: &mut Niri) {
+    pub fn on_output_config_changed(&mut self, synoik: &mut Synoik) {
         match self {
-            Backend::Tty(tty) => tty.on_output_config_changed(niri),
+            Backend::Tty(tty) => tty.on_output_config_changed(synoik),
             Backend::Headless(_) => (),
         }
     }

@@ -15,7 +15,7 @@ use crate::utils::scale::supported_scales;
 use crate::utils::{is_laptop_panel, make_display_name};
 
 pub struct DisplayConfig {
-    to_niri: calloop::channel::Sender<HashMap<String, Option<niri_config::Output>>>,
+    to_niri: calloop::channel::Sender<HashMap<String, Option<synoik_config::Output>>>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
 }
 
@@ -93,7 +93,7 @@ impl DisplayConfig {
                 .modes
                 .iter()
                 .map(|m| {
-                    let niri_ipc::Mode {
+                    let synoik_ipc::Mode {
                         width,
                         height,
                         refresh_rate,
@@ -135,14 +135,14 @@ impl DisplayConfig {
 
             if let Some(logical) = output.logical.as_ref() {
                 let transform = match logical.transform {
-                    niri_ipc::Transform::Normal => 0,
-                    niri_ipc::Transform::_90 => 1,
-                    niri_ipc::Transform::_180 => 2,
-                    niri_ipc::Transform::_270 => 3,
-                    niri_ipc::Transform::Flipped => 4,
-                    niri_ipc::Transform::Flipped90 => 5,
-                    niri_ipc::Transform::Flipped180 => 6,
-                    niri_ipc::Transform::Flipped270 => 7,
+                    synoik_ipc::Transform::Normal => 0,
+                    synoik_ipc::Transform::_90 => 1,
+                    synoik_ipc::Transform::_180 => 2,
+                    synoik_ipc::Transform::_270 => 3,
+                    synoik_ipc::Transform::Flipped => 4,
+                    synoik_ipc::Transform::Flipped90 => 5,
+                    synoik_ipc::Transform::Flipped180 => 6,
+                    synoik_ipc::Transform::Flipped270 => 7,
                 };
 
                 logical_monitors.push(LogicalMonitor {
@@ -211,32 +211,32 @@ impl DisplayConfig {
                 });
                 new_conf.insert(
                     connector.clone(),
-                    Some(niri_config::Output {
+                    Some(synoik_config::Output {
                         off: false,
                         name: connector,
-                        scale: Some(niri_config::FloatOrInt(requested_config.scale)),
+                        scale: Some(synoik_config::FloatOrInt(requested_config.scale)),
                         transform: match requested_config.transform {
-                            0 => niri_ipc::Transform::Normal,
-                            1 => niri_ipc::Transform::_90,
-                            2 => niri_ipc::Transform::_180,
-                            3 => niri_ipc::Transform::_270,
-                            4 => niri_ipc::Transform::Flipped,
-                            5 => niri_ipc::Transform::Flipped90,
-                            6 => niri_ipc::Transform::Flipped180,
-                            7 => niri_ipc::Transform::Flipped270,
+                            0 => synoik_ipc::Transform::Normal,
+                            1 => synoik_ipc::Transform::_90,
+                            2 => synoik_ipc::Transform::_180,
+                            3 => synoik_ipc::Transform::_270,
+                            4 => synoik_ipc::Transform::Flipped,
+                            5 => synoik_ipc::Transform::Flipped90,
+                            6 => synoik_ipc::Transform::Flipped180,
+                            7 => synoik_ipc::Transform::Flipped270,
                             x => {
                                 return Err(zbus::fdo::Error::Failed(format!(
                                     "Unknown transform {x}",
                                 )))
                             }
                         },
-                        position: Some(niri_config::Position {
+                        position: Some(synoik_config::Position {
                             x: requested_config.x,
                             y: requested_config.y,
                         }),
-                        mode: Some(niri_config::output::Mode {
+                        mode: Some(synoik_config::output::Mode {
                             custom: false,
-                            mode: niri_ipc::ConfiguredMode::from_str(&mode).map_err(|e| {
+                            mode: synoik_ipc::ConfiguredMode::from_str(&mode).map_err(|e| {
                                 zbus::fdo::Error::Failed(format!(
                                     "Could not parse mode '{mode}': {e}"
                                 ))
@@ -271,7 +271,7 @@ impl DisplayConfig {
             return Ok(());
         }
         if let Err(err) = self.to_niri.send(new_conf) {
-            warn!("error sending message to niri: {err:?}");
+            warn!("error sending message to synoik: {err:?}");
             return Err(fdo::Error::Failed("internal error".to_owned()));
         }
         // PERSISTENT (2): write GNOME's monitors.xml so the choice survives logout, the way mutter
@@ -317,7 +317,7 @@ impl DisplayConfig {
 
 impl DisplayConfig {
     pub fn new(
-        to_niri: calloop::channel::Sender<HashMap<String, Option<niri_config::Output>>>,
+        to_niri: calloop::channel::Sender<HashMap<String, Option<synoik_config::Output>>>,
         ipc_outputs: Arc<Mutex<IpcOutputMap>>,
     ) -> Self {
         Self {

@@ -15,8 +15,8 @@
 //!
 //! Technically, a "more correct" solution would be to remember the original sigmask and restore it
 //! after the child exits, but that's painful *and* likely to cause issues, because the user almost
-//! never intended to spawn niri with a nonempty sigmask. It indicates a bug in whoever spawned us,
-//! so we may as well clean up after them (which is easier than not doing so).
+//! never intended to spawn synoik with a nonempty sigmask. It indicates a bug in whoever spawned
+//! us, so we may as well clean up after them (which is easier than not doing so).
 
 pub use platform::*;
 
@@ -25,7 +25,7 @@ mod platform {
     use std::io;
 
     // FIXME: implement for FreeBSD. But probably, that should be done in calloop::signals.
-    pub fn listen(_handle: &calloop::LoopHandle<crate::niri::State>) {}
+    pub fn listen(_handle: &calloop::LoopHandle<crate::synoik::State>) {}
 
     // These two actually build as-is on FreeBSD, but without our own signal handling in listen(),
     // they do more harm than good (they block termination signals without actually installing a
@@ -42,7 +42,7 @@ mod platform {
 mod platform {
     use std::{io, mem};
 
-    pub fn listen(handle: &calloop::LoopHandle<crate::niri::State>) {
+    pub fn listen(handle: &calloop::LoopHandle<crate::synoik::State>) {
         use calloop::signals::{Signal, Signals};
 
         handle
@@ -54,19 +54,19 @@ mod platform {
                     // is a bare `g_main_loop_quit` (`meta-context.c:519-530`). Waiting for the
                     // clients instead is what `docs/fork/session-end.md` §6 records as the wrong
                     // shape — systemd is already stopping them, and it is ordered to stop us last.
-                    state.niri.stop_signal.stop();
+                    state.synoik.stop_signal.stop();
                 },
             )
             .unwrap();
 
         // Its own source, because this one must not terminate the session:
-        // SIGUSR1 dumps the frame log's in-memory ring (`NIRI_FRAME_LOG=ring`).
+        // SIGUSR1 dumps the frame log's in-memory ring (`SYNOIK_FRAME_LOG=ring`).
         handle
             .insert_source(
                 Signals::new(&[Signal::SIGUSR1]).unwrap(),
-                |_event, _, state| match state.niri.frame_log.dump() {
+                |_event, _, state| match state.synoik.frame_log.dump() {
                     Ok((path, 0)) => {
-                        info!("frame-log ring is empty (is NIRI_FRAME_LOG=ring set?); {path:?}")
+                        info!("frame-log ring is empty (is SYNOIK_FRAME_LOG=ring set?); {path:?}")
                     }
                     Ok((path, n)) => info!("dumped {n} frame-log entries to {}", path.display()),
                     Err(err) => warn!("error dumping the frame log: {err}"),

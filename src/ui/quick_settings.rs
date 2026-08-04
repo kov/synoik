@@ -4583,7 +4583,7 @@ mod tests {
     }
 
     /// Baking the open shutdown submenu exercises the new header icon pill and the group-separator
-    /// rule; a no-Vulkan environment skips. Under `NIRI_VK_VALIDATION` this checks those draw
+    /// rule; a no-Vulkan environment skips. Under `SYNOIK_VK_VALIDATION` this checks those draw
     /// calls against the spec (a bare geometry test can't see the pill/rule at all).
     #[test]
     fn shutdown_submenu_bakes_with_pill_and_separator() {
@@ -5319,7 +5319,7 @@ mod tests {
                 "Turn on Bluetooth to connect to devices",
                 "No available or connected devices",
             ] {
-                let lines = niri_vk::text::wrap_lines_weighted(
+                let lines = synoik_vk::text::wrap_lines_weighted(
                     text,
                     crate::ui::pt_to_px(DETAIL_PLACEHOLDER_PT) as f32,
                     true,

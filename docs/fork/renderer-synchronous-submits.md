@@ -1,6 +1,6 @@
 # The synchronous-submit ceiling
 
-**Status: built, opt-in, measured on the seat 2026-07-25 — it works.** `NIRI_VK_ASYNC_SCANOUT=1`
+**Status: built, opt-in, measured on the seat 2026-07-25 — it works.** `SYNOIK_VK_ASYNC_SCANOUT=1`
 turns it on; without it the renderer still waits, exactly as before. The measurement, including
 the A/B against the wait forced back on, is [below](#measured-on-the-seat-2026-07-25). Full
 context in [`frame-cost-investigation.md`](./frame-cost-investigation.md).
@@ -22,13 +22,13 @@ every other submit still waits, and so does that one unless the session opts in.
 
 `VulkanFrame::finish_internal` (`src/render_helpers/vulkan/frame.rs`) ends the command buffer,
 submits it, waits on the fence, then frees the buffer. `Gpu::run_commands`
-(`niri-vk/src/gpu.rs`) does the same for every one-shot: texture uploads, glyph-atlas uploads,
+(`synoik-vk/src/gpu.rs`) does the same for every one-shot: texture uploads, glyph-atlas uploads,
 dmabuf import transitions, blur chains, readbacks, layout transitions. The returned `SyncPoint`
 is already signalled, because the wait happened inside.
 
 This was a deliberate simplification when the renderer was built — it makes resource lifetime
 trivial (nothing is ever in flight, so nothing needs deferred destruction) and it is why
-`niri-vk` has no frame-in-flight bookkeeping at all.
+`synoik-vk` has no frame-in-flight bookkeeping at all.
 
 ## Why it is the ceiling
 
@@ -67,7 +67,7 @@ Not a local change. Removing the fence wait means the renderer must track work i
 
 1. **Deferred destruction.** Every resource a submit references — command buffers, staging
    buffers, descriptor pools, images whose owning `Arc` may drop mid-flight — has to outlive
-   the submit. Today the wait guarantees that for free; `RunGuard` in `niri-vk/src/gpu.rs`
+   the submit. Today the wait guarantees that for free; `RunGuard` in `synoik-vk/src/gpu.rs`
    frees on scope exit precisely because nothing can still be reading.
 2. **A real `SyncPoint`.** Smithay's `SyncPoint` is designed for this (it can carry a fence),
    and the compositor already threads sync points through the KMS path. `finish` would return
@@ -81,7 +81,7 @@ Not a local change. Removing the fence wait means the renderer must track work i
 
 Item 1 is the bulk of the work and the only part with real correctness risk: a use-after-free
 here is a GPU fault or silent corruption, not a panic. The validation layer catches a lot of it
-(`NIRI_VK_VALIDATION=1`, see CLAUDE.md) but only for paths a test actually exercises.
+(`SYNOIK_VK_VALIDATION=1`, see CLAUDE.md) but only for paths a test actually exercises.
 
 ## When to do it
 
@@ -112,7 +112,7 @@ and the CRTC carries `OUT_FENCE_PTR`. With an atomic surface and no Nvidia, Smit
 `supports_fencing` (`compositor/mod.rs:1204`) is **true** on the live seat.
 
 **The fence is exportable and real.** `VK_KHR_external_fence_fd` is already enabled on the device
-(`niri-vk/src/gpu.rs:333`), and `niri-vk/src/sync_spike.rs` measured that on Venus a `VkFence`
+(`synoik-vk/src/gpu.rs:333`), and `synoik-vk/src/sync_spike.rs` measured that on Venus a `VkFence`
 `SYNC_FD` export is genuinely pipelined — non-blocking export, unsignalled at export, a real
 `virtio_gpu` `dma_fence`, downstream waits block for the GPU's duration. (`VkSemaphore` export is
 emulated here; that asymmetry is why this rests on fences.)
@@ -128,7 +128,7 @@ buffer belongs to `DrmCompositor`'s swapchain, which will not recycle a queued s
 
 **`run_commands` keeps its wait.** Item 4 above turns out not to be a prerequisite: uploads,
 readbacks, blur chains and layout transitions all keep blocking, so `RunGuard`
-(`niri-vk/src/gpu.rs:585`) is untouched and the general in-flight tracker is not needed. Only the
+(`synoik-vk/src/gpu.rs:585`) is untouched and the general in-flight tracker is not needed. Only the
 one submit that costs 12–14 ms changes. Offscreen frames keep waiting too — their results are
 sampled immediately and there is nothing to hand the fence to.
 
@@ -150,7 +150,7 @@ sampled immediately and there is nothing to hand the fence to.
    consumer that expects it finished. Deferral additionally requires the device to order submits,
    and the session to have asked. **GPU timing used to be a third condition** — a single timestamp
    pair per renderer would have been reset by the next command buffer while an in-flight submit was
-   still writing it. That made measuring the renderer change the renderer: `NIRI_FRAME_LOG=…,gpu`
+   still writing it. That made measuring the renderer change the renderer: `SYNOIK_FRAME_LOG=…,gpu`
    silently put the live seat back on the synchronous finish for the whole session, so every
    reading taken with it described a configuration the seat does not run. `GpuTimer` now keeps a
    ring of pairs, one per outstanding submit, read at retirement instead of after the wait
@@ -158,8 +158,8 @@ sampled immediately and there is nothing to hand the fence to.
 
 ## Measured on the seat (2026-07-25)
 
-One session, `niri[79726]` at `v26.04-573-g6c5a5c10`, `NIRI_VK_ASYNC_SCANOUT=1` +
-`NIRI_FRAME_LOG=1`: 12.2 min of real use (startup, overview open/close, the app grid, workspace
+One session, `niri[79726]` at `v26.04-573-g6c5a5c10`, `SYNOIK_VK_ASYNC_SCANOUT=1` +
+`SYNOIK_FRAME_LOG=1`: 12.2 min of real use (startup, overview open/close, the app grid, workspace
 switches), then the same interactions again for 56 s with
 `debug { wait-for-frame-completion-before-queueing }` written into the live config — which niri
 re-reads on save, so the control ran **in the same process, on the same binary, minutes apart**.
@@ -263,7 +263,7 @@ the existing `held` list defers the release to retirement along with everything 
   which is the entire goal. It is uniform, it needs no per-frame resource pools, and it costs
   nothing on a stack where the GPU is not the bottleneck. `timelineSemaphore` is available here
   (Venus reports Vulkan 1.3 and the feature true) but is **not currently enabled** — the device
-  is created with no feature struct at all (`niri-vk/src/gpu.rs:355`).
+  is created with no feature struct at all (`synoik-vk/src/gpu.rs:355`).
 - **The frame log must not report a fake win.** `stats::submit` used to time the submit *and* the
   wait, so removing the wait would collapse that number to the cost of `vkQueueSubmit` alone and
   read as a 12 ms saving that merely moved. Settled by `7b5f016d`: enqueue and wait are timed
@@ -396,7 +396,7 @@ and every manually torn-down object.
 ### Where the bookkeeping belongs
 
 The in-flight list lives on `VulkanRenderer`, retired by polling the timeline at
-`VulkanFrame::begin`. That does not generalise: `run_commands` is called from inside `niri-vk`
+`VulkanFrame::begin`. That does not generalise: `run_commands` is called from inside `synoik-vk`
 (`texture.rs`, `dmabuf.rs`, `blur.rs`) by code with no renderer to reach. Moving the ring onto
 `Gpu` is the obvious answer — it owns the queue, the timeline and `submit()` — but it is not free,
 and the first draft of this section said none of this:
@@ -459,7 +459,7 @@ and the first draft of this section said none of this:
    no-op it must be here (`renderer.rs` `make_sampleable` early-returns on that layout). Getting it
    wrong would have put a whole extra submit-and-wait back per offscreen.
 
-   Still gated on `NIRI_VK_ASYNC_SCANOUT`, the same opt-in as slice 0, so the suite exercises it
+   Still gated on `SYNOIK_VK_ASYNC_SCANOUT`, the same opt-in as slice 0, so the suite exercises it
    only through the two tests above.
 
    **Severity, corrected 2026-07-25:** the reallocate-every-frame churn used to *abort* the session,
@@ -487,7 +487,7 @@ pin them. The existing cross-check that the timeline advanced exactly once per c
 
 Corruption here is **not** a torn frame — it is a stale or garbled *texture*: a window preview
 showing the previous frame, an icon with another icon's pixels, glyphs from the wrong atlas slot.
-`NIRI_VK_VALIDATION=1` catches the use-after-free half and must be run after every slice. It will
+`SYNOIK_VK_VALIDATION=1` catches the use-after-free half and must be run after every slice. It will
 not catch a staging buffer overwritten while a copy reads it: that is legal Vulkan, and no layer
 will say a word. Only a test that uploads twice without a wait and checks the first result, or eyes
 on the seat, will find that one.
@@ -508,8 +508,8 @@ Two smaller things to write down rather than discover:
   turned into, plus the follow-ups still open.
 - [`frame-cost-investigation.md`](./frame-cost-investigation.md) — how this was arrived at, and
   every hypothesis measured and rejected on the way.
-- `src/frame_log.rs` — the `NIRI_FRAME_LOG` grammar and what each phase covers.
-- `niri-vk/src/stats.rs` — the submit/draw/shape counters.
+- `src/frame_log.rs` — the `SYNOIK_FRAME_LOG` grammar and what each phase covers.
+- `synoik-vk/src/stats.rs` — the submit/draw/shape counters.
 - [`venus-timestamp-gap.md`](./venus-timestamp-gap.md) — why GPU-side timing cannot separate
   "the GPU was busy" from "we waited" on this VM.
 - [`explicit-sync.md`](./explicit-sync.md) — the client-facing sync work, already landed.

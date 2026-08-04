@@ -1,6 +1,6 @@
 //! Window layout logic.
 //!
-//! Niri implements scrollable tiling with dynamic workspaces. The scrollable tiling is mostly
+//! Synoik implements scrollable tiling with dynamic workspaces. The scrollable tiling is mostly
 //! orthogonal to any particular workspace system, though outputs living in separate coordinate
 //! spaces suggest per-output workspaces.
 //!
@@ -12,7 +12,7 @@
 //! workspaces from disconnected outputs will move. Currently, the primary output has no other
 //! distinction from other outputs.
 //!
-//! Where possible, niri tries to follow these principles with regards to outputs:
+//! Where possible, synoik tries to follow these principles with regards to outputs:
 //!
 //! 1. Disconnecting and reconnecting the same output must not change the layout.
 //!    * This includes both secondary outputs and the primary output.
@@ -37,18 +37,18 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use monitor::{InsertHint, InsertPosition, InsertWorkspace, MonitorAddWindowTarget};
-use niri_config::utils::MergeWith as _;
-use niri_config::{
-    Config, CornerRadius, LayoutPart, PresetSize, WindowingMode, Workspace as WorkspaceConfig,
-    WorkspaceReference,
-};
-use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use scrolling::{Column, ColumnWidth};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
+use synoik_config::utils::MergeWith as _;
+use synoik_config::{
+    Config, CornerRadius, LayoutPart, PresetSize, WindowingMode, Workspace as WorkspaceConfig,
+    WorkspaceReference,
+};
+use synoik_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use tile::{SnapshotRenderer, Tile, TileRenderElement};
 use workspace::{WorkspaceAddWindowTarget, WorkspaceId};
 
@@ -59,7 +59,6 @@ use crate::animation::{Animation, Clock};
 use crate::gnome::{EdgeTileTarget, TileSide};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::scrolling::ScrollDirection;
-use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::snapshot::RenderSnapshot;
@@ -68,6 +67,7 @@ use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
+use crate::synoik_render_elements;
 use crate::ui::overview_layout::ControlsLayout;
 use crate::utils::transaction::{Transaction, TransactionBlocker};
 use crate::utils::{
@@ -123,7 +123,7 @@ const OVERVIEW_GESTURE_RUBBER_BAND: RubberBand = RubberBand {
 /// Size-relative units.
 pub struct SizeFrac;
 
-niri_render_elements! {
+synoik_render_elements! {
     LayoutElementRenderElement => {
         Wayland = WaylandSurfaceRenderElement<VulkanRenderer>,
         SolidColor = SolidColorRenderElement,
@@ -148,7 +148,7 @@ pub trait LayoutElement {
     fn id(&self) -> &Self::Id;
 
     /// Updates the config for the element.
-    fn update_config(&mut self, blur_config: niri_config::Blur) {
+    fn update_config(&mut self, blur_config: synoik_config::Blur) {
         let _ = blur_config;
     }
 
@@ -420,11 +420,11 @@ enum MonitorSet<W: LayoutElement> {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Options {
-    pub layout: niri_config::Layout,
-    pub animations: niri_config::Animations,
-    pub gestures: niri_config::Gestures,
-    pub overview: niri_config::Overview,
-    pub blur: niri_config::Blur,
+    pub layout: synoik_config::Layout,
+    pub animations: synoik_config::Animations,
+    pub gestures: synoik_config::Gestures,
+    pub overview: synoik_config::Overview,
+    pub blur: synoik_config::Blur,
     // Debug flags.
     pub disable_resize_throttling: bool,
     pub disable_transactions: bool,
@@ -470,13 +470,13 @@ struct InteractiveMoveData<W: LayoutElement> {
     /// Config overrides for the output where the window is currently located.
     ///
     /// Cached here to be accessible while an output is removed.
-    pub(self) output_config: Option<niri_config::LayoutPart>,
+    pub(self) output_config: Option<synoik_config::LayoutPart>,
     /// Config overrides for the workspace where the window is currently located.
     ///
     /// To avoid sudden window changes when starting an interactive move, it will remember the
     /// config overrides for the workspace where the move originated from. As soon as the window
     /// moves over some different workspace though, this override will reset.
-    pub(self) workspace_config: Option<(WorkspaceId, niri_config::LayoutPart)>,
+    pub(self) workspace_config: Option<(WorkspaceId, synoik_config::LayoutPart)>,
     /// On-screen size of the window's picker preview when it was picked up
     /// in the GNOME overview.
     ///
@@ -735,7 +735,7 @@ impl Options {
         }
     }
 
-    fn with_merged_layout(mut self, part: Option<&niri_config::LayoutPart>) -> Self {
+    fn with_merged_layout(mut self, part: Option<&synoik_config::LayoutPart>) -> Self {
         if let Some(part) = part {
             self.layout.merge_with(part);
         }
@@ -4327,12 +4327,12 @@ impl<W: LayoutElement> Layout<W> {
                             0.,
                             1.,
                             0.,
-                            niri_config::Animation {
+                            synoik_config::Animation {
                                 off: self.options.animations.overview_open_close.0.off,
-                                kind: niri_config::animations::Kind::Easing(
-                                    niri_config::animations::EasingParams {
+                                kind: synoik_config::animations::Kind::Easing(
+                                    synoik_config::animations::EasingParams {
                                         duration_ms: DND_SCALE_ANIMATION_TIME_MS,
-                                        curve: niri_config::animations::Curve::EaseOutQuad,
+                                        curve: synoik_config::animations::Curve::EaseOutQuad,
                                     },
                                 ),
                             },

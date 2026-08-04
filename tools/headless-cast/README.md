@@ -1,10 +1,10 @@
 # headless-cast — a seat-free screencast reproduction
 
 Drives the **real** screencast path — `org.gnome.Mutter.ScreenCast` → PipeWire → a consumer —
-against a headless niri in a fully isolated session. No seat, no relog, no portal, no OBS.
+against a headless synoik in a fully isolated session. No seat, no relog, no portal, no OBS.
 
 ```
-tools/headless-cast/start.sh          # isolated niri + private pipewire + private bus
+tools/headless-cast/start.sh          # isolated synoik + private pipewire + private bus
 tools/headless-cast/cast.sh 25        # cast a monitor, capture 25 frames, report distinct count
 tools/headless-cast/stop.sh           # tear down (only the PIDs we recorded)
 ```
@@ -15,7 +15,7 @@ tools/headless-cast/stop.sh           # tear down (only the PIDs we recorded)
 `videorate` in the pipeline, because `videorate` pads with duplicate frames and would manufacture
 the very symptom being measured.
 
-Everything lands in `$NH_DIR` (default `/tmp/nh`): `niri.log`, `pw.log`, `f_*.png`, `env`, `pids`.
+Everything lands in `$NH_DIR` (default `/tmp/nh`): `synoik.log`, `pw.log`, `f_*.png`, `env`, `pids`.
 
 ## Why this exists
 
@@ -34,19 +34,19 @@ Keep a non-Flatpak consumer in the loop for exactly that reason.
   has happened. Every process appends its PID to `$NH_DIR/pids` and `stop.sh` kills only those.
 - **Keep `$NH_DIR` short.** It is the runtime dir; a long path overflows `sockaddr_un` and the
   sockets fail to bind with nothing obviously wrong in the logs.
-- Rebuild first — `cargo build --bin niri` — since `cargo test` does not relink the binary.
+- Rebuild first — `cargo build --bin synoik` — since `cargo test` does not relink the binary.
 
 ## Requirements
 
 `pipewire`, `wireplumber`, `dbus-daemon`, `gst-launch-1.0` with `pipewiresrc`
-(`gstreamer1-plugin-pipewire`), and a render node. Override with `NH_DIR`, `NIRI_BIN`,
-`NIRI_HEADLESS_RENDER_NODE`.
+(`gstreamer1-plugin-pipewire`), and a render node. Override with `NH_DIR`, `SYNOIK_BIN`,
+`SYNOIK_HEADLESS_RENDER_NODE`.
 
 ## What "no frames" meant, and does not mean
 
 A run that reports `frames: 0` with a node id printed used to look exactly like "the compositor
 never rendered". It was not: a screencast is rendered as a side effect of the redraw
-(`Niri::render_captures_with`), through the same Vulkan renderer the tests use, and the headless
+(`Synoik::render_captures_with`), through the same Vulkan renderer the tests use, and the headless
 backend has had one since `add_renderer`. Two other things were missing, and both failed silently:
 
 - **No session manager.** Nothing links the consumer to our node, so a consumer connects without

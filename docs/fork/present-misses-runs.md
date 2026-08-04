@@ -9,7 +9,7 @@ shape looked right. It happened to land correctly (the slice covered all five ru
 windows) but it was luck, and the run count in the first draft of §19.1 was wrong by one.
 
 **Ring-mode runs are not in the journal, and no longer need to be.** Everything below assumes any
-arm can be recovered after the fact from journald. That holds for `NIRI_FRAME_LOG=all`, which writes
+arm can be recovered after the fact from journald. That holds for `SYNOIK_FRAME_LOG=all`, which writes
 a line per frame. `ring` mode exists precisely so the frame path never writes to journald, so a ring
 dump is the only copy that exists. It used to land in `$XDG_RUNTIME_DIR` — a tmpfs — which meant a
 reboot between taking a run and reading it destroyed it silently. Dumps now go to
@@ -29,8 +29,8 @@ is `5b096dbf` (16:07:22 →).
 
 ## Pre-0051 (boot e9fa4abb, 2026-07-27)
 
-Guest binary: `b7fb8b76`-era `target/debug/niri`, built 11:50. `NIRI_FRAME_LOG=all,gpu`,
-`NIRI_VK_ASYNC_SCANOUT=1`, both from `~gsrs/.config/environment.d`.
+Guest binary: `b7fb8b76`-era `target/debug/synoik`, built 11:50. `SYNOIK_FRAME_LOG=all,gpu`,
+`SYNOIK_VK_ASYNC_SCANOUT=1`, both from `~gsrs/.config/environment.d`.
 
 | when | what | notes |
 |---|---|---|
@@ -143,7 +143,7 @@ the whole draw/gpu range, largest at the heavy end.
 **Queue timing rules out a slow CPU-side guest, and no more.** Of the new VMM's misses,
 1263/1264 were queued an average of **15.13 ms EARLY**; post-0051 had the identical shape (49/50
 at 15.63 ms early), just ~25x less often. Lateness is the same shape on both arms: p50 16.7 ms,
-max 33.3 ms — exactly 1-2 vblanks. But under `NIRI_VK_ASYNC_SCANOUT=1` the flip is queued before
+max 33.3 ms — exactly 1-2 vblanks. But under `SYNOIK_VK_ASYNC_SCANOUT=1` the flip is queued before
 the render fence signals, so an early queue does not prove the pixels were ready — and the new
 binary's scenes ARE heavier (heavy gpu p50 7.16 ms vs 5.53 ms). **Conclusion: OPEN, not
 attributed.** Host-side present regression and guest-side "new overview work × async scanout"
@@ -155,7 +155,7 @@ both fit; the `b808c5bb` binary A/B on this boot (present-misses.md §21.5) deci
 gained the rescale-rounding patch `83175a56` after the §19 arm), seat restarted onto it at
 15:07:12, VT verified active. Built via paired worktrees under `~/Projects/ab-b808/` with
 `CARGO_TARGET_DIR` pointed at the main repo so the binary landed at the seat's `ExecStart`
-path; the `d4c7a61d` binary saved as `target/debug/niri.d4c7a61d`.
+path; the `d4c7a61d` binary saved as `target/debug/synoik.d4c7a61d`.
 
 | when | what |
 |---|---|
@@ -201,7 +201,7 @@ withdrawn in `present-misses.md` §21.2/§21.4.
 ## Async-scanout A/B, new binary (boot 2dd2ea15, 2026-07-29, 16:22-16:28)
 
 Post-wedge reboot; seat auto-started on the same `d4c7a61d` binary (built 13:42), scale 1.5,
-`NIRI_VK_ASYNC_SCANOUT` commented out of `environment.d` → async OFF. 8-kitty populate,
+`SYNOIK_VK_ASYNC_SCANOUT` commented out of `environment.d` → async OFF. 8-kitty populate,
 heavy x2 (16:22:58-16:25:25, 16:25:30-16:27:57).
 
 Result: async OFF is worse — overall 11.92%, draws 200+ 26.67% (vs 7.48% / 17.16% async-on,

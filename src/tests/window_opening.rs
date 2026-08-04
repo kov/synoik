@@ -2,15 +2,15 @@ use std::fmt;
 use std::str::FromStr as _;
 
 use insta::assert_snapshot;
-use niri_config::utils::RegexEq;
-use niri_config::window_rule::Match;
-use niri_config::workspace::WorkspaceName;
-use niri_config::{
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use synoik_config::utils::RegexEq;
+use synoik_config::window_rule::Match;
+use synoik_config::workspace::WorkspaceName;
+use synoik_config::{
     BorderRule, Config, DefaultPresetSize, FloatOrInt, LayoutPart, Output, Outputs, PresetSize,
     WindowRule, Workspace, WorkspaceLayoutPart,
 };
-use niri_ipc::ColumnDisplay;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use synoik_ipc::ColumnDisplay;
 
 use super::*;
 use crate::layout::LayoutElement as _;
@@ -405,8 +405,8 @@ fn check_target_output_and_workspace(
         f.double_roundtrip(id);
     }
 
-    let niri = f.niri();
-    let (mon, ws_idx, ws, mapped) = niri
+    let synoik = f.synoik();
+    let (mon, ws_idx, ws, mapped) = synoik
         .layout
         .workspaces()
         .find_map(|(mon, ws_idx, ws)| {
@@ -432,7 +432,7 @@ fn check_target_output_and_workspace(
     // If the window ended up fullscreen, unfullscreen it and output the configure.
     let mut post_unfullscreen = String::new();
     if is_fullscreen {
-        f.niri().layout.set_fullscreen(&win, false);
+        f.synoik().layout.set_fullscreen(&win, false);
         f.double_roundtrip(id);
 
         let window = f.client(id).window(&surface);
@@ -665,11 +665,11 @@ fn check_target_size(
 
     // If the window ended up fullscreen, unfullscreen it and output the configure.
     let mut post_unfullscreen = String::new();
-    let mapped = f.niri().layout.windows().next().unwrap().1;
+    let mapped = f.synoik().layout.windows().next().unwrap().1;
     let is_fullscreen = mapped.sizing_mode().is_fullscreen();
     let win = mapped.window.clone();
     if is_fullscreen {
-        f.niri().layout.set_fullscreen(&win, false);
+        f.synoik().layout.set_fullscreen(&win, false);
         f.double_roundtrip(id);
 
         let window = f.client(id).window(&surface);
@@ -845,11 +845,11 @@ fn check_fullscreen_maximize(
 
     // If the window ended up fullscreen, unfullscreen it and output the configure.
     let mut post_unfullscreen = String::new();
-    let mapped = f.niri().layout.windows().next().unwrap().1;
+    let mapped = f.synoik().layout.windows().next().unwrap().1;
     let is_fullscreen = mapped.sizing_mode().is_fullscreen();
     let win = mapped.window.clone();
     if is_fullscreen {
-        f.niri().layout.set_fullscreen(&win, false);
+        f.synoik().layout.set_fullscreen(&win, false);
         f.double_roundtrip(id);
 
         let window = f.client(id).window(&surface);
@@ -865,11 +865,11 @@ fn check_fullscreen_maximize(
 
     // If the window ended up maximized, unmaximize it and output the configure.
     let mut post_unmaximize = String::new();
-    let mapped = f.niri().layout.windows().next().unwrap().1;
+    let mapped = f.synoik().layout.windows().next().unwrap().1;
     let is_maximized = mapped.sizing_mode().is_maximized();
     let win = mapped.window.clone();
     if is_maximized {
-        f.niri().layout.set_maximized(&win, false);
+        f.synoik().layout.set_maximized(&win, false);
         f.double_roundtrip(id);
 
         let window = f.client(id).window(&surface);

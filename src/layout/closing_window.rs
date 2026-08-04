@@ -8,12 +8,12 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 use smithay::wayland::compositor::{Blocker, BlockerState};
 
 use crate::animation::Animation;
-use crate::niri_render_elements;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::custom_anim::CustomAnimRenderElement;
 use crate::render_helpers::snapshot::NeutralSnapshot;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::RenderTarget;
+use crate::synoik_render_elements;
 use crate::utils::transaction::TransactionBlocker;
 
 /// The three block-out variants of a neutral snapshot, uploaded to `VkTexture`s on first use.
@@ -50,7 +50,7 @@ pub struct ClosingWindow {
     random_seed: f32,
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     ClosingWindowRenderElement => {
         Texture = RelocateRenderElement<RescaleRenderElement<CapturedTextureRenderElement>>,
         Shader = CustomAnimRenderElement,

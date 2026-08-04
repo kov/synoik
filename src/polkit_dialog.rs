@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use smithay::input::keyboard::Keysym;
 
-use crate::dbus::polkit_agent::{BeginRequest, PolkitRequest, PolkitToNiri};
+use crate::dbus::polkit_agent::{BeginRequest, PolkitRequest, PolkitToSynoik};
 use crate::ui::text_edit::{EditMods, EditOutcome, KeyTheme, TextEdit};
 use crate::unlock_dialog::{clean_question, UserInfo};
 
@@ -309,11 +309,11 @@ impl PolkitDialog {
     }
 
     /// An event from the agent.
-    pub fn on_agent_event(&mut self, event: PolkitToNiri) -> PolkitEffects {
+    pub fn on_agent_event(&mut self, event: PolkitToSynoik) -> PolkitEffects {
         match event {
-            PolkitToNiri::Begin(request) => self.begin(*request),
+            PolkitToSynoik::Begin(request) => self.begin(*request),
 
-            PolkitToNiri::Cancel => {
+            PolkitToSynoik::Cancel => {
                 // polkitd withdrew it; the agent has already answered the call, so this is only a
                 // teardown.
                 self.reset();
@@ -325,7 +325,7 @@ impl PolkitDialog {
             }
 
             // PAM asked something. This is what puts the dialog on screen.
-            PolkitToNiri::Request { prompt, echo_on } => {
+            PolkitToSynoik::Request { prompt, echo_on } => {
                 self.question = Some((clean_question(&prompt), echo_on));
                 self.clear_entry();
                 self.entry_live = true;
@@ -334,21 +334,21 @@ impl PolkitDialog {
                 PolkitEffects::redraw()
             }
 
-            PolkitToNiri::ShowError(text) => {
+            PolkitToSynoik::ShowError(text) => {
                 self.clear_entry();
                 self.message = Some(Message::Error(text));
                 self.open = true;
                 PolkitEffects::redraw()
             }
 
-            PolkitToNiri::ShowInfo(text) => {
+            PolkitToSynoik::ShowInfo(text) => {
                 self.clear_entry();
                 self.message = Some(Message::Info(text));
                 self.open = true;
                 PolkitEffects::redraw()
             }
 
-            PolkitToNiri::Completed(true) => {
+            PolkitToSynoik::Completed(true) => {
                 self.reset();
                 PolkitEffects {
                     request: Some(PolkitRequest::Done { dismissed: false }),
@@ -361,7 +361,7 @@ impl PolkitDialog {
             // PAM refused. GNOME does not give up: it explains, shakes, and starts another
             // conversation (`:252-273`). The explanation is only synthesised when PAM did not
             // provide one — its own error is more specific than ours could be.
-            PolkitToNiri::Completed(false) => {
+            PolkitToSynoik::Completed(false) => {
                 let mut effects = PolkitEffects {
                     request: Some(self.initiate()),
                     redraw: true,
@@ -521,7 +521,7 @@ mod tests {
     }
 
     fn asked(dialog: &mut PolkitDialog) {
-        dialog.on_agent_event(PolkitToNiri::Request {
+        dialog.on_agent_event(PolkitToSynoik::Request {
             prompt: "Password:".to_owned(),
             echo_on: false,
         });
@@ -586,7 +586,7 @@ mod tests {
         dialog.type_char('x');
         dialog.authenticate();
 
-        let effects = dialog.on_agent_event(PolkitToNiri::Completed(false));
+        let effects = dialog.on_agent_event(PolkitToSynoik::Completed(false));
         assert!(
             matches!(effects.request, Some(PolkitRequest::Initiate { .. })),
             "a refusal starts another conversation"
@@ -609,8 +609,8 @@ mod tests {
         dialog.begin(request("root", false));
         asked(&mut dialog);
 
-        dialog.on_agent_event(PolkitToNiri::ShowError("Account expired".to_owned()));
-        let effects = dialog.on_agent_event(PolkitToNiri::Completed(false));
+        dialog.on_agent_event(PolkitToSynoik::ShowError("Account expired".to_owned()));
+        let effects = dialog.on_agent_event(PolkitToSynoik::Completed(false));
 
         assert_eq!(
             dialog.message().map(Message::text),
@@ -641,7 +641,8 @@ mod tests {
         let mut dialog = PolkitDialog::new();
         dialog.begin(request("root", false));
 
-        let effects = dialog.on_agent_event(PolkitToNiri::ShowInfo("Place your finger".to_owned()));
+        let effects =
+            dialog.on_agent_event(PolkitToSynoik::ShowInfo("Place your finger".to_owned()));
 
         assert!(dialog.is_open(), "the reader's turn has to be visible");
         assert!(effects.redraw);
@@ -668,8 +669,8 @@ mod tests {
         dialog.begin(request("root", false));
         asked(&mut dialog);
 
-        dialog.on_agent_event(PolkitToNiri::ShowInfo("Swipe your finger".to_owned()));
-        let effects = dialog.on_agent_event(PolkitToNiri::Completed(false));
+        dialog.on_agent_event(PolkitToSynoik::ShowInfo("Swipe your finger".to_owned()));
+        let effects = dialog.on_agent_event(PolkitToSynoik::Completed(false));
 
         assert_eq!(dialog.message().map(Message::text), Some(GENERIC_FAILURE));
         assert!(effects.wiggle);
@@ -710,7 +711,7 @@ mod tests {
         let mut dialog = PolkitDialog::new();
         dialog.begin(request("root", false));
 
-        dialog.on_agent_event(PolkitToNiri::Request {
+        dialog.on_agent_event(PolkitToSynoik::Request {
             prompt: "Password:".to_owned(),
             echo_on: false,
         });
@@ -719,7 +720,7 @@ mod tests {
         }
         assert_eq!(dialog.entry_display(), "●●●", "echo off is masked");
 
-        dialog.on_agent_event(PolkitToNiri::Request {
+        dialog.on_agent_event(PolkitToSynoik::Request {
             prompt: "Login:".to_owned(),
             echo_on: true,
         });
@@ -756,7 +757,7 @@ mod tests {
         dialog.begin(request("root", false));
         asked(&mut dialog);
 
-        let effects = dialog.on_agent_event(PolkitToNiri::Completed(true));
+        let effects = dialog.on_agent_event(PolkitToSynoik::Completed(true));
         assert!(
             matches!(
                 effects.request,
@@ -786,7 +787,7 @@ mod tests {
         asked(&mut dialog);
         dialog.type_char('x');
         dialog.authenticate();
-        let effects = dialog.on_agent_event(PolkitToNiri::Completed(false));
+        let effects = dialog.on_agent_event(PolkitToSynoik::Completed(false));
         assert!(effects.arm_reset, "the reset timer is armed on a refusal");
 
         // The next conversation asks before the timer fires.
@@ -801,7 +802,7 @@ mod tests {
         // With nothing asking, it does reset.
         dialog.type_char('y');
         dialog.authenticate();
-        dialog.on_agent_event(PolkitToNiri::Completed(false));
+        dialog.on_agent_event(PolkitToSynoik::Completed(false));
         dialog.on_reset_timeout();
         assert!(!dialog.shows_entry(), "nothing asked, so the entry goes");
         assert_eq!(dialog.focus(), Focus::Cancel);

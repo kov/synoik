@@ -12,7 +12,7 @@
 //! on leave — simplified vs GNOME's 20px/600ms heuristics), and a banner shown
 //! while the user is idle waits for their first activity, then expires 2000 ms
 //! later (`:1092-1133`). The deadline is checked against the pinned clock in
-//! `advance_animations` (headless-testable); `Niri` arms a calloop timer as
+//! `advance_animations` (headless-testable); `Synoik` arms a calloop timer as
 //! the idle-machine wake-up. `are_animations_ongoing` is true only while
 //! actually animating — a statically Shown banner must not busy-redraw.
 //!
@@ -36,10 +36,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use niri_config::Config;
 use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Transform};
+use synoik_config::Config;
 
 use crate::animation::{Animation, Clock};
 use crate::render_helpers::icon::{AppIconCache, IconCache};
@@ -92,7 +92,7 @@ pub enum BannerHit {
     Body,
 }
 
-/// What `advance_animations` just did, for `Niri` to act on.
+/// What `advance_animations` just did, for `Synoik` to act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BannerEvent {
     /// The hide animation completed on its own (timeout/hover-out/blocked) —

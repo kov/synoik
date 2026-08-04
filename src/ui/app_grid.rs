@@ -2,7 +2,7 @@
 //! reveals (`js/ui/appDisplay.js` `AppDisplay`). Like the dash ([`crate::ui::dash`])
 //! and the search ([`crate::ui::overview_search`]), this owns only plain state (a
 //! snapshot of grid entries plus the mouse hover); it does NOT own the catalog.
-//! `Niri::sync_app_grid` snapshots the model in and [`Niri`] launches on a click.
+//! `Synoik::sync_app_grid` snapshots the model in and [`Synoik`] launches on a click.
 //!
 //! **Faithful behavior (cited 50.1).** Membership = every installed app that should
 //! show, **minus** the favorites (they live in the dash) and minus parental-control
@@ -11,7 +11,7 @@
 //! (`appDisplay.js:1492-1504`). Order is each app's saved `(page, position)` in
 //! `org.gnome.shell app-picker-layout`, with everything unplaced appended by name
 //! (`_compareItems`, `appDisplay.js:1475-1490`; the sort itself lives in
-//! `Niri::sync_app_grid`). A click launches the app and closes the overview
+//! `Synoik::sync_app_grid`). A click launches the app and closes the overview
 //! (`AppIcon.activate` → `Main.overview.hide`, `appDisplay.js:3060,3077`). A caption
 //! too long for its box is ellipsized, and expands to the whole name wrapped while the
 //! tile is highlighted (`_updateMultiline`, `appDisplay.js:1891-1924`).
@@ -483,7 +483,7 @@ struct GridCache {
     icons: SharedAppIconUploads,
 }
 
-/// The app-grid model. Owned on `Niri`; fed by `sync_app_grid`.
+/// The app-grid model. Owned on `Synoik`; fed by `sync_app_grid`.
 pub struct AppGrid {
     entries: Vec<AppGridEntry>,
     /// The mouse-hovered tile (an absolute entry index) — drives the
@@ -987,7 +987,7 @@ impl AppGrid {
     }
 
     /// Every app entry's icon — for the startup decode prewarm
-    /// (`Niri::prewarm_app_icons`). Folders have none of their own; theirs is
+    /// (`Synoik::prewarm_app_icons`). Folders have none of their own; theirs is
     /// [`Self::folder_icon_refs`], which decodes at a different size.
     pub fn icon_refs(&self) -> impl Iterator<Item = &AppIconRef> {
         self.entries
@@ -2779,7 +2779,7 @@ impl AppGrid {
     /// The grid render elements for `output`, into the `app_display` box, at `alpha`.
     /// Icons are pushed first (topmost within the grid); the tile chrome (wash +
     /// labels) bakes last (below the icons) — the dash/search order. The grid as a
-    /// whole is pushed below the dash and search in `Niri::render`.
+    /// whole is pushed below the dash and search in `Synoik::render`.
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,

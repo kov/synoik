@@ -3,8 +3,8 @@
 //! gnome-settings-daemon's power plugin hard-codes this bus name to drive screen dim, blank, and
 //! auto-suspend: it adds *idle watches* ("tell me when the user has been idle for N ms") and *user-
 //! active watches* ("tell me the moment the user comes back"). The compositor already detects
-//! activity (every input event calls [`crate::niri::Niri::notify_activity`]); this turns that into
-//! the watch/fire bookkeeping the D-Bus interface exposes.
+//! activity (every input event calls [`crate::synoik::Synoik::notify_activity`]); this turns that
+//! into the watch/fire bookkeeping the D-Bus interface exposes.
 //!
 //! Pure and time-in/fired-out so the semantics are unit-testable without a bus or a clock: every
 //! method takes `now` (monotonic, from `Clock::now_unadjusted`) and firing is returned, never a

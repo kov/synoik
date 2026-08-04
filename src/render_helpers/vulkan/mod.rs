@@ -1,4 +1,4 @@
-//! An owned Vulkan (ash) renderer that implements Smithay's renderer trait family, so niri's
+//! An owned Vulkan (ash) renderer that implements Smithay's renderer trait family, so synoik's
 //! `RenderElement`s can draw through it exactly as they do through GLES.
 //!
 //! This is the Stage 2 "walking skeleton" (see `docs/fork/STRATEGY.md` §3.10): it handles only
@@ -10,7 +10,7 @@
 //! niri effects) is deliberately unimplemented and returns an error rather than a wrong picture.
 //!
 //! The low-level Vulkan pieces (device bring-up, pipelines, texture upload, SPIR-V) live in the
-//! [`niri_vk`] workspace library; this module is only the Smithay-trait glue, templated
+//! [`synoik_vk`] workspace library; this module is only the Smithay-trait glue, templated
 //! method-for-method on Smithay's `PixmanRenderer`.
 
 mod backdrop_blur;

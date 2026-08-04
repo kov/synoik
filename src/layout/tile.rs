@@ -1,11 +1,11 @@
 use core::f64;
 use std::rc::Rc;
 
-use niri_config::utils::MergeWith as _;
-use niri_config::{Color, CornerRadius, GradientInterpolation, WindowingMode};
-use niri_ipc::WindowLayout;
 use smithay::backend::renderer::element::{Element, Kind};
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
+use synoik_config::utils::MergeWith as _;
+use synoik_config::{Color, CornerRadius, GradientInterpolation, WindowingMode};
+use synoik_ipc::WindowLayout;
 
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
 use super::opening_window::{OpenAnimation, OpeningWindowRenderElement};
@@ -16,7 +16,6 @@ use super::{
 };
 use crate::animation::{Animation, Clock};
 use crate::layout::SizingMode;
-use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
@@ -31,6 +30,7 @@ use crate::render_helpers::texture::TextureBuffer;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{RenderCtx, RenderTarget};
+use crate::synoik_render_elements;
 use crate::utils::transaction::Transaction;
 use crate::utils::{
     baba_is_float_offset, round_logical_in_physical, round_logical_in_physical_max1,
@@ -138,7 +138,7 @@ pub struct Tile<W: LayoutElement> {
     pub(super) options: Rc<Options>,
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     TileRenderElement => {
         LayoutElement = LayoutElementRenderElement,
         FocusRing = FocusRingRenderElement,
@@ -216,9 +216,9 @@ pub(super) struct AlphaAnimation {
 ///
 /// This zeroes their geometry too — `visual_border_width` returns `None` once the
 /// border is off, so the window keeps the whole tile.
-fn border_config(options: &Options, rules: &ResolvedWindowRules) -> niri_config::Border {
+fn border_config(options: &Options, rules: &ResolvedWindowRules) -> synoik_config::Border {
     if options.layout.windowing_mode == WindowingMode::Floating {
-        return niri_config::Border {
+        return synoik_config::Border {
             off: true,
             ..options.layout.border
         };
@@ -228,9 +228,9 @@ fn border_config(options: &Options, rules: &ResolvedWindowRules) -> niri_config:
 
 /// The `focus-ring` config a window actually gets — off in GNOME mode, for the
 /// reasons on [`border_config`].
-fn focus_ring_config(options: &Options, rules: &ResolvedWindowRules) -> niri_config::FocusRing {
+fn focus_ring_config(options: &Options, rules: &ResolvedWindowRules) -> synoik_config::FocusRing {
     if options.layout.windowing_mode == WindowingMode::Floating {
-        return niri_config::FocusRing {
+        return synoik_config::FocusRing {
             off: true,
             ..options.layout.focus_ring
         };
@@ -642,7 +642,7 @@ impl<W: LayoutElement> Tile<W> {
         self.animate_move_x_from_with_config(from, self.options.animations.window_movement.0);
     }
 
-    pub fn animate_move_x_from_with_config(&mut self, from: f64, config: niri_config::Animation) {
+    pub fn animate_move_x_from_with_config(&mut self, from: f64, config: synoik_config::Animation) {
         let current_offset = self.render_offset().x;
 
         // Preserve the previous config if ongoing.
@@ -661,7 +661,7 @@ impl<W: LayoutElement> Tile<W> {
         self.animate_move_y_from_with_config(from, self.options.animations.window_movement.0);
     }
 
-    pub fn animate_move_y_from_with_config(&mut self, from: f64, config: niri_config::Animation) {
+    pub fn animate_move_y_from_with_config(&mut self, from: f64, config: synoik_config::Animation) {
         let current_offset = self.render_offset().y;
 
         // Preserve the previous config if ongoing.
@@ -692,7 +692,7 @@ impl<W: LayoutElement> Tile<W> {
         self.move_y_animation = None;
     }
 
-    pub fn animate_alpha(&mut self, from: f64, to: f64, config: niri_config::Animation) {
+    pub fn animate_alpha(&mut self, from: f64, to: f64, config: synoik_config::Animation) {
         let from = from.clamp(0., 1.);
         let to = to.clamp(0., 1.);
 

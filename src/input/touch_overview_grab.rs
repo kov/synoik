@@ -10,7 +10,7 @@ use smithay::output::Output;
 use smithay::utils::{IsAlive, Logical, Point, Serial};
 
 use crate::layout::workspace::{Workspace, WorkspaceId};
-use crate::niri::State;
+use crate::synoik::State;
 use crate::window::Mapped;
 
 // When the touch is stationary for this much time, it becomes an interactive move.
@@ -60,7 +60,7 @@ impl TouchOverviewGrab {
     }
 
     fn on_ungrab(&mut self, state: &mut State) {
-        let layout = &mut state.niri.layout;
+        let layout = &mut state.synoik.layout;
         match self.gesture {
             GestureState::Recognizing => {
                 // Tap to activate.
@@ -109,7 +109,7 @@ impl TouchOverviewGrab {
             }
         };
 
-        state.niri.queue_redraw_all();
+        state.synoik.queue_redraw_all();
     }
 }
 
@@ -130,8 +130,8 @@ impl TouchGrab<State> for TouchOverviewGrab {
 
         if matches!(self.gesture, GestureState::InteractiveMove) {
             if let Some(window) = &self.window.as_ref() {
-                data.niri.layout.toggle_window_floating(Some(window));
-                data.niri.queue_redraw_all();
+                data.synoik.layout.toggle_window_floating(Some(window));
+                data.synoik.queue_redraw_all();
             }
         }
     }
@@ -167,7 +167,7 @@ impl TouchGrab<State> for TouchOverviewGrab {
         }
 
         let timestamp = Duration::from_millis(u64::from(event.time));
-        let layout = &mut data.niri.layout;
+        let layout = &mut data.synoik.layout;
 
         // Check if we should become interactive move.
         if matches!(self.gesture, GestureState::Recognizing) {
@@ -225,9 +225,10 @@ impl TouchGrab<State> for TouchOverviewGrab {
                 .is_some(),
             GestureState::InteractiveMove => {
                 let window = self.window.as_ref().unwrap();
-                if let Some((output, pos_within_output)) = data.niri.output_under(event.location) {
+                if let Some((output, pos_within_output)) = data.synoik.output_under(event.location)
+                {
                     let output = output.clone();
-                    data.niri.layout.interactive_move_update(
+                    data.synoik.layout.interactive_move_update(
                         window,
                         delta,
                         output,
@@ -240,7 +241,7 @@ impl TouchGrab<State> for TouchOverviewGrab {
         };
 
         if ongoing {
-            data.niri.queue_redraw_all();
+            data.synoik.queue_redraw_all();
         } else {
             handle.unset_grab(self, data);
         }

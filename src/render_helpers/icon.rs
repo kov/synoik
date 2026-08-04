@@ -1235,7 +1235,7 @@ fn fetch_remote(source: &ImageSource, url: &str) -> anyhow::Result<Vec<u8>> {
     use gio::prelude::*;
 
     if !remote_fetch_enabled() {
-        anyhow::bail!("remote art is disabled (set NIRI_REMOTE_ART=1 to allow fetching {url})");
+        anyhow::bail!("remote art is disabled (set SYNOIK_REMOTE_ART=1 to allow fetching {url})");
     }
     if !remote_is_permitted(source) {
         anyhow::bail!("refusing to fetch {url}: it does not resolve to a public address");
@@ -1771,13 +1771,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Remote art is off unless `NIRI_REMOTE_ART=1`, so by default a remote source never reaches
+    /// Remote art is off unless `SYNOIK_REMOTE_ART=1`, so by default a remote source never reaches
     /// the transport at all — no DNS, no connection. The negative is still cached, so a player
     /// publishing http(s) art cannot make the shell retry it every frame.
     #[test]
     fn remote_art_is_refused_while_the_switch_is_off() {
         if crate::image_source::remote_fetch_enabled() {
-            eprintln!("skipping: NIRI_REMOTE_ART=1 is set");
+            eprintln!("skipping: SYNOIK_REMOTE_ART=1 is set");
             return;
         }
         let cache = ImageCache::new();
@@ -1816,10 +1816,10 @@ mod tests {
     /// cargo test --workspace remote_image -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore = "needs the network, and NIRI_REMOTE_ART=1"]
+    #[ignore = "needs the network, and SYNOIK_REMOTE_ART=1"]
     fn remote_image_fetches_and_decodes() {
         if !crate::image_source::remote_fetch_enabled() {
-            eprintln!("skipping: set NIRI_REMOTE_ART=1 to exercise the fetch");
+            eprintln!("skipping: set SYNOIK_REMOTE_ART=1 to exercise the fetch");
             return;
         }
         let cache = ImageCache::new();

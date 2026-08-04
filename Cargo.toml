@@ -1,17 +1,16 @@
 [workspace]
 members = [
-    "niri-config",
-    "niri-ipc",
-    "niri-vk",
+    "synoik-config",
+    "synoik-ipc",
+    "synoik-vk",
 ]
 
 [workspace.package]
 version = "26.4.0"
-description = "A scrollable-tiling Wayland compositor"
+description = "A GNOME-behaviors Wayland desktop, written in Rust"
 authors = ["Ivan Molodetskikh <yalterz@gmail.com>"]
 license = "GPL-3.0-or-later"
 edition = "2021"
-repository = "https://github.com/niri-wm/niri"
 rust-version = "1.85"
 
 [workspace.dependencies]
@@ -40,13 +39,12 @@ default-features = false
 path = "../smithay/smithay-drm-extras"
 
 [package]
-name = "niri"
+name = "synoik"
 version.workspace = true
 description.workspace = true
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
-repository.workspace = true
 rust-version.workspace = true
 
 readme = "README.md"
@@ -90,9 +88,9 @@ keyframe = { version = "1.1.1", default-features = false }
 libc = "0.2.185"
 libdisplay-info = "0.3.0"
 log = { version = "0.4.29", features = ["max_level_trace", "release_max_level_debug"] }
-niri-config = { version = "26.4.0", path = "niri-config" }
-niri-ipc = { version = "26.4.0", path = "niri-ipc", features = ["clap"] }
-niri-vk = { version = "0.0.0", path = "niri-vk" }
+synoik-config = { version = "26.4.0", path = "synoik-config" }
+synoik-ipc = { version = "26.4.0", path = "synoik-ipc", features = ["clap"] }
+synoik-vk = { version = "0.0.0", path = "synoik-vk" }
 ordered-float = "5.3.0"
 roxmltree = "0.21.1"
 # v0_3_34 for `pw_stream_is_driving`/`pw_stream_trigger_process`, which a DRIVER stream must call
@@ -133,7 +131,7 @@ features = [
     "backend_session_libseat",
     "backend_udev",
     "desktop",
-    # The compositor renders through the owned Vulkan renderer (niri-vk), so smithay's GL renderer
+    # The compositor renders through the owned Vulkan renderer (synoik-vk), so smithay's GL renderer
     # and the EGL backend under it are not built. `renderer_pixman` stays: it is the CPU oracle the
     # Vulkan render tests compare against.
     "renderer_pixman",
@@ -200,7 +198,7 @@ lto = "thin"
 # Debugging that genuinely needs opt-level 0 can drop it here temporarily (Gustavo,
 # 2026-07-26: no session so far has). Note it would take the wallpaper stall back with it.
 [profile.dev]
-# 2.42s -> 0.28s, and the dev loop did NOT get slower: a touch-rebuild of the niri crate
+# 2.42s -> 0.28s, and the dev loop did NOT get slower: a touch-rebuild of the synoik crate
 # went 6.1s -> 4.5s and `cargo test --workspace` stayed at ~17s (rustc emits far less code
 # for the linker to chew at -O3 than at -O0). The one-time full rebuild is ~50s.
 #
@@ -239,12 +237,12 @@ debug-assertions = true
 [package.metadata.generate-rpm]
 version = "26.04"
 assets = [
-    { source = "target/release/niri", dest = "/usr/bin/", mode = "755" },
-    { source = "resources/niri-session", dest = "/usr/bin/", mode = "755" },
-    { source = "resources/niri.desktop", dest = "/usr/share/wayland-sessions/", mode = "644" },
-    { source = "resources/niri-portals.conf", dest = "/usr/share/xdg-desktop-portal/", mode = "644" },
-    { source = "resources/niri.service", dest = "/usr/lib/systemd/user/", mode = "644" },
-    { source = "resources/niri-shutdown.target", dest = "/usr/lib/systemd/user/", mode = "644" },
+    { source = "target/release/synoik", dest = "/usr/bin/", mode = "755" },
+    { source = "resources/synoik-session", dest = "/usr/bin/", mode = "755" },
+    { source = "resources/synoik.desktop", dest = "/usr/share/wayland-sessions/", mode = "644" },
+    { source = "resources/synoik-portals.conf", dest = "/usr/share/xdg-desktop-portal/", mode = "644" },
+    { source = "resources/synoik.service", dest = "/usr/lib/systemd/user/", mode = "644" },
+    { source = "resources/synoik-shutdown.target", dest = "/usr/lib/systemd/user/", mode = "644" },
 ]
 [package.metadata.generate-rpm.requires]
 alacritty = "*"
@@ -253,10 +251,10 @@ fuzzel = "*"
 [package.metadata.deb]
 depends = "alacritty, fuzzel"
 assets = [
-    ["target/release/niri", "usr/bin/", "755"],
-    ["resources/niri-session", "usr/bin/", "755"],
-    ["resources/niri.desktop", "/usr/share/wayland-sessions/", "644"],
-    ["resources/niri-portals.conf", "/usr/share/xdg-desktop-portal/", "644"],
-    ["resources/niri.service", "/usr/lib/systemd/user/", "644"],
-    ["resources/niri-shutdown.target", "/usr/lib/systemd/user/", "644"],
+    ["target/release/synoik", "usr/bin/", "755"],
+    ["resources/synoik-session", "usr/bin/", "755"],
+    ["resources/synoik.desktop", "/usr/share/wayland-sessions/", "644"],
+    ["resources/synoik-portals.conf", "/usr/share/xdg-desktop-portal/", "644"],
+    ["resources/synoik.service", "/usr/lib/systemd/user/", "644"],
+    ["resources/synoik-shutdown.target", "/usr/lib/systemd/user/", "644"],
 ]

@@ -63,7 +63,7 @@ live on this machine, so the path is available.
    stuck session rather than a missing feature. `lockIfWasLocked` was **dropped** — see below.
 5. **The look** — deferred deliberately until the shield *works*, at Gustavo's call (2026-08-01,
    after seat-validating slice 2). **Landed**, in three pieces:
-   - the **blur** (`niri-vk/src/blur.rs`, `render_helpers/vulkan/gaussian_backdrop.rs`,
+   - the **blur** (`synoik-vk/src/blur.rs`, `render_helpers/vulkan/gaussian_backdrop.rs`,
      `Wallpaper::render_blurred`);
    - the **clock↔prompt crossfade** (`PageTransform` in `src/ui/lock_screen.rs`);
    - the **shield's own slide** and the **idle fade to black** (`Curtain` and `fade_alpha`, same

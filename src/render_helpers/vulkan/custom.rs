@@ -4,23 +4,23 @@
 //! niri lets a user drop a GLSL fragment in config; GLES compiles it (wrapped in a prelude +
 //! epilogue) at config load. This module does the Vulkan equivalent: it assembles a **GLSL 450**
 //! vertex + fragment pair (a hand-translated prelude/epilogue around the user's snippet), compiles
-//! both to SPIR-V at runtime with `glslangValidator` — the *same* compiler `niri-vk/build.rs` uses
-//! for the built-in shaders, so the two renderers agree on what GLSL is valid — and hands the
+//! both to SPIR-V at runtime with `glslangValidator` — the *same* compiler `synoik-vk/build.rs`
+//! uses for the built-in shaders, so the two renderers agree on what GLSL is valid — and hands the
 //! SPIR-V back for [`super::renderer::VulkanRenderer::set_custom_shader`] to build a cached
 //! pipeline from. The subprocess sits behind [`compile_spirv`]; swapping to an in-process compiler
 //! (shaderc/naga) later is a one-function change.
 //!
 //! ## GLES-100 → Vulkan-450 translation
 //! niri's snippets are GLSL ES 1.00. Vulkan forbids loose `uniform`s, `varying`, and
-//! `gl_FragColor`, so the prelude puts every `niri_*` uniform in a push-constant block and
+//! `gl_FragColor`, so the prelude puts every `synoik_*` uniform in a push-constant block and
 //! re-exposes the names the snippet expects via `#define`s (plus `#define texture2D texture` /
 //! `texture2DProj textureProj` shims). Each transform matrix niri feeds these shaders is
 //! affine-diagonal (scale + translate, no rotation/shear — verified: they are all built from
 //! `Mat3::from_scale`/`from_translation` in `resize.rs`/`closing_window.rs`/`opening_window.rs`),
 //! so it is transmitted as a single packed `vec4 [sx, sy, tx, ty]` (see [`pack_affine`]) and
-//! rebuilt into a real `mat3` in the shader via `NIRI_AFFINE`, keeping the whole uniform set inside
-//! the push-constant budget with no UBO. The snippet's `niri_geo_to_tex * coords` therefore behaves
-//! exactly as under GLES.
+//! rebuilt into a real `mat3` in the shader via `SYNOIK_AFFINE`, keeping the whole uniform set
+//! inside the push-constant budget with no UBO. The snippet's `synoik_geo_to_tex * coords`
+//! therefore behaves exactly as under GLES.
 //!
 //! Live wiring: config snippets are compiled in via
 //! `VulkanRenderer::set_custom_{resize,close,open}_shader`, and the **resize**, **open** and
@@ -106,9 +106,9 @@ pub(super) struct CompiledCustom {
 }
 
 /// Pack an affine-diagonal `Mat3` (scale + translate, glam column-major) into `[sx, sy, tx, ty]`
-/// for the shader's `NIRI_AFFINE` reconstruction. Debug-asserts the no-rotation/no-shear invariant
-/// the whole packing scheme relies on — every matrix niri feeds these shaders satisfies it, and
-/// this catches a future refactor that silently violates it.
+/// for the shader's `SYNOIK_AFFINE` reconstruction. Debug-asserts the no-rotation/no-shear
+/// invariant the whole packing scheme relies on — every matrix niri feeds these shaders satisfies
+/// it, and this catches a future refactor that silently violates it.
 pub(crate) fn pack_affine(m: Mat3) -> [f32; 4] {
     debug_assert!(
         m.x_axis.y.abs() < 1e-4
@@ -193,12 +193,12 @@ fn push_block(ty: CustomShaderType) -> &'static str {
 }
 
 /// Shared vertex body: emit the unit quad (6 verts from `gl_VertexIndex`) placed by
-/// `origin`/`size`/`target`, and hand the fragment `niri_v_coords` in `[0, 1]` (niri's normalized
+/// `origin`/`size`/`target`, and hand the fragment `synoik_v_coords` in `[0, 1]` (niri's normalized
 /// varying). Every custom vertex stage is identical; only the push block preceding it differs.
 const VERT_BODY: &str = "\
-layout(location = 0) out vec2 niri_v_coords;
+layout(location = 0) out vec2 synoik_v_coords;
 
-vec2 niri_corner(int i) {
+vec2 synoik_corner(int i) {
     if (i == 0) return vec2(0.0, 0.0);
     if (i == 1) return vec2(1.0, 0.0);
     if (i == 2) return vec2(1.0, 1.0);
@@ -208,8 +208,8 @@ vec2 niri_corner(int i) {
 }
 
 void main() {
-    vec2 c = niri_corner(gl_VertexIndex);
-    niri_v_coords = c;
+    vec2 c = synoik_corner(gl_VertexIndex);
+    synoik_v_coords = c;
     vec2 p = pc.origin + c * pc.size;
     // Ortho into y-down NDC (logical space), then rotate into the physical framebuffer via the
     // output-transform 2x2 in pc.proj (same convention as quad.vert / resize.vert).
@@ -257,105 +257,106 @@ layout(push_constant) uniform Push {
 ";
 
 /// The prelude tail bridges GLES-100 snippets to Vulkan 450: `texture2D`/`texture2DProj` name
-/// shims, `NIRI_AFFINE` (rebuild an affine-diagonal `mat3` from a packed `vec4 [sx,sy,tx,ty]`, the
-/// inverse of [`pack_affine`]; column-major so `M * vec3(x,y,1) = (sx*x+tx, sy*y+ty, 1)`), and a
-/// `#define` per `niri_*` name the snippet expects. Kept inline per shader type for readability.
+/// shims, `SYNOIK_AFFINE` (rebuild an affine-diagonal `mat3` from a packed `vec4 [sx,sy,tx,ty]`,
+/// the inverse of [`pack_affine`]; column-major so `M * vec3(x,y,1) = (sx*x+tx, sy*y+ty, 1)`), and
+/// a `#define` per `synoik_*` name the snippet expects. Kept inline per shader type for
+/// readability.
 const RESIZE_PRELUDE_TAIL: &str = "\
-layout(set = 0, binding = 0) uniform sampler2D niri_tex_prev;
-layout(set = 1, binding = 0) uniform sampler2D niri_tex_next;
+layout(set = 0, binding = 0) uniform sampler2D synoik_tex_prev;
+layout(set = 1, binding = 0) uniform sampler2D synoik_tex_next;
 
-layout(location = 0) in vec2 niri_v_coords;
-layout(location = 0) out vec4 niri_out_color;
+layout(location = 0) in vec2 synoik_v_coords;
+layout(location = 0) out vec4 synoik_out_color;
 
 #define texture2D texture
 #define texture2DProj textureProj
 
-#define NIRI_AFFINE(v) mat3(vec3((v).x, 0.0, 0.0), vec3(0.0, (v).y, 0.0), vec3((v).z, (v).w, 1.0))
+#define SYNOIK_AFFINE(v) mat3(vec3((v).x, 0.0, 0.0), vec3(0.0, (v).y, 0.0), vec3((v).z, (v).w, 1.0))
 
-#define niri_size (pc.size)
-#define niri_curr_geo_size (pc.curr_geo_size)
-#define niri_progress (pc.progress)
-#define niri_clamped_progress (pc.clamped_progress)
-#define niri_clip_to_geometry (pc.clip_to_geometry)
-#define niri_corner_radius (pc.corner_radius)
-#define niri_alpha (pc.alpha)
-#define niri_scale (pc.scale)
-#define niri_input_to_curr_geo NIRI_AFFINE(pc.input_to_curr_geo)
-#define niri_curr_geo_to_prev_geo NIRI_AFFINE(pc.curr_geo_to_prev_geo)
-#define niri_curr_geo_to_next_geo NIRI_AFFINE(pc.curr_geo_to_next_geo)
-#define niri_geo_to_tex_prev NIRI_AFFINE(pc.geo_to_tex_prev)
-#define niri_geo_to_tex_next NIRI_AFFINE(pc.geo_to_tex_next)
+#define synoik_size (pc.size)
+#define synoik_curr_geo_size (pc.curr_geo_size)
+#define synoik_progress (pc.progress)
+#define synoik_clamped_progress (pc.clamped_progress)
+#define synoik_clip_to_geometry (pc.clip_to_geometry)
+#define synoik_corner_radius (pc.corner_radius)
+#define synoik_alpha (pc.alpha)
+#define synoik_scale (pc.scale)
+#define synoik_input_to_curr_geo SYNOIK_AFFINE(pc.input_to_curr_geo)
+#define synoik_curr_geo_to_prev_geo SYNOIK_AFFINE(pc.curr_geo_to_prev_geo)
+#define synoik_curr_geo_to_next_geo SYNOIK_AFFINE(pc.curr_geo_to_next_geo)
+#define synoik_geo_to_tex_prev SYNOIK_AFFINE(pc.geo_to_tex_prev)
+#define synoik_geo_to_tex_next SYNOIK_AFFINE(pc.geo_to_tex_next)
 
-float niri_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius);
+float synoik_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius);
 ";
 
 const RESIZE_EPILOGUE: &str = "\
 void main() {
-    vec3 coords_curr_geo = niri_input_to_curr_geo * vec3(niri_v_coords, 1.0);
-    vec3 size_curr_geo = vec3(niri_curr_geo_size, 1.0);
+    vec3 coords_curr_geo = synoik_input_to_curr_geo * vec3(synoik_v_coords, 1.0);
+    vec3 size_curr_geo = vec3(synoik_curr_geo_size, 1.0);
 
     vec4 color = resize_color(coords_curr_geo, size_curr_geo);
 
-    if (niri_clip_to_geometry == 1.0) {
+    if (synoik_clip_to_geometry == 1.0) {
         if (coords_curr_geo.x < 0.0 || 1.0 < coords_curr_geo.x
                 || coords_curr_geo.y < 0.0 || 1.0 < coords_curr_geo.y) {
             color = vec4(0.0);
         } else {
-            color = color * niri_rounding_alpha(coords_curr_geo.xy * size_curr_geo.xy, size_curr_geo.xy, niri_corner_radius);
+            color = color * synoik_rounding_alpha(coords_curr_geo.xy * size_curr_geo.xy, size_curr_geo.xy, synoik_corner_radius);
         }
     }
 
-    color = color * niri_alpha;
-    niri_out_color = color;
+    color = color * synoik_alpha;
+    synoik_out_color = color;
 }
 ";
 
 const ANIM_PRELUDE_TAIL: &str = "\
-layout(set = 0, binding = 0) uniform sampler2D niri_tex;
+layout(set = 0, binding = 0) uniform sampler2D synoik_tex;
 
-layout(location = 0) in vec2 niri_v_coords;
-layout(location = 0) out vec4 niri_out_color;
+layout(location = 0) in vec2 synoik_v_coords;
+layout(location = 0) out vec4 synoik_out_color;
 
 #define texture2D texture
 #define texture2DProj textureProj
 
-#define NIRI_AFFINE(v) mat3(vec3((v).x, 0.0, 0.0), vec3(0.0, (v).y, 0.0), vec3((v).z, (v).w, 1.0))
+#define SYNOIK_AFFINE(v) mat3(vec3((v).x, 0.0, 0.0), vec3(0.0, (v).y, 0.0), vec3((v).z, (v).w, 1.0))
 
-#define niri_size (pc.size)
-#define niri_geo_size (pc.geo_size)
-#define niri_progress (pc.progress)
-#define niri_clamped_progress (pc.clamped_progress)
-#define niri_random_seed (pc.random_seed)
-#define niri_alpha (pc.alpha)
-#define niri_scale (pc.scale)
-#define niri_input_to_geo NIRI_AFFINE(pc.input_to_geo)
-#define niri_geo_to_tex NIRI_AFFINE(pc.geo_to_tex)
+#define synoik_size (pc.size)
+#define synoik_geo_size (pc.geo_size)
+#define synoik_progress (pc.progress)
+#define synoik_clamped_progress (pc.clamped_progress)
+#define synoik_random_seed (pc.random_seed)
+#define synoik_alpha (pc.alpha)
+#define synoik_scale (pc.scale)
+#define synoik_input_to_geo SYNOIK_AFFINE(pc.input_to_geo)
+#define synoik_geo_to_tex SYNOIK_AFFINE(pc.geo_to_tex)
 ";
 
 const CLOSE_EPILOGUE: &str = "\
 void main() {
-    vec3 coords_geo = niri_input_to_geo * vec3(niri_v_coords, 1.0);
-    vec3 size_geo = vec3(niri_geo_size, 1.0);
+    vec3 coords_geo = synoik_input_to_geo * vec3(synoik_v_coords, 1.0);
+    vec3 size_geo = vec3(synoik_geo_size, 1.0);
     vec4 color = close_color(coords_geo, size_geo);
-    color = color * niri_alpha;
-    niri_out_color = color;
+    color = color * synoik_alpha;
+    synoik_out_color = color;
 }
 ";
 
 const OPEN_EPILOGUE: &str = "\
 void main() {
-    vec3 coords_geo = niri_input_to_geo * vec3(niri_v_coords, 1.0);
-    vec3 size_geo = vec3(niri_geo_size, 1.0);
+    vec3 coords_geo = synoik_input_to_geo * vec3(synoik_v_coords, 1.0);
+    vec3 size_geo = vec3(synoik_geo_size, 1.0);
     vec4 color = open_color(coords_geo, size_geo);
-    color = color * niri_alpha;
-    niri_out_color = color;
+    color = color * synoik_alpha;
+    synoik_out_color = color;
 }
 ";
 
 /// SDF rounded-corner coverage, verbatim from `shaders/rounding_alpha.frag` (pure GLSL, uses the
-/// `#define`d `niri_scale`). Appended to resize only.
+/// `#define`d `synoik_scale`). Appended to resize only.
 const ROUNDING_ALPHA: &str = "\
-float niri_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius) {
+float synoik_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius) {
     vec2 center;
     float radius;
 
@@ -376,7 +377,7 @@ float niri_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius) {
     }
 
     float dist = distance(coords, center);
-    float t = clamp((dist - radius) * niri_scale + 0.5, 0.0, 1.0);
+    float t = clamp((dist - radius) * synoik_scale + 0.5, 0.0, 1.0);
     return 1.0 - t * t * (3.0 - 2.0 * t);
 }
 ";
@@ -403,13 +404,13 @@ impl Stage {
 static OUTPUT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Compile one GLSL 450 stage to SPIR-V bytes with `glslangValidator` (Vulkan 1.3 target, matching
-/// `niri-vk/build.rs`). Source is piped on stdin; the SPIR-V is written to a temp file and read
+/// `synoik-vk/build.rs`). Source is piped on stdin; the SPIR-V is written to a temp file and read
 /// back. Any failure — missing binary, compile error — returns a [`VulkanError::CustomShader`] with
 /// the diagnostic log, never a panic.
 fn compile_spirv(stage: Stage, glsl: &str) -> Result<Vec<u8>, VulkanError> {
     let n = OUTPUT_COUNTER.fetch_add(1, Ordering::Relaxed);
     let out_path =
-        std::env::temp_dir().join(format!("niri-vk-custom-{}-{n}.spv", std::process::id()));
+        std::env::temp_dir().join(format!("synoik-vk-custom-{}-{n}.spv", std::process::id()));
 
     let mut child = Command::new("glslangValidator")
         .args([
@@ -492,6 +493,6 @@ mod unit {
         // Guard against accidentally dropping the shims from the assembled prelude tails.
         assert!(RESIZE_PRELUDE_TAIL.contains("#define texture2D texture"));
         assert!(RESIZE_PRELUDE_TAIL.contains("#define texture2DProj textureProj"));
-        assert!(ANIM_PRELUDE_TAIL.contains("NIRI_AFFINE"));
+        assert!(ANIM_PRELUDE_TAIL.contains("SYNOIK_AFFINE"));
     }
 }

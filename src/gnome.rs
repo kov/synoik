@@ -15,9 +15,9 @@ use std::time::Duration;
 use gio::glib;
 use gio::glib::prelude::ObjectExt;
 use gio::prelude::{DBusProxyExt, SettingsExt, SettingsExtManual};
-use niri_config::{Action, Modifiers};
-use niri_ipc::SizeChange;
 use smithay::input::keyboard::{xkb, Keysym};
+use synoik_config::{Action, Modifiers};
+use synoik_ipc::SizeChange;
 
 use crate::input::peripherals::Peripherals;
 use crate::world_clocks::{ResolvedLocation, WorldLocation};
@@ -113,7 +113,7 @@ pub struct GnomeSettings {
     pub base_font_pt: f64,
 
     /// `org.gnome.desktop.interface font-name`'s family — the other half of the same key,
-    /// realized the same way. See [`niri_vk::text::sans_family`].
+    /// realized the same way. See [`synoik_vk::text::sans_family`].
     pub base_font_family: String,
     /// `org.gnome.desktop.interface gtk-key-theme`: which editing bindings text entries
     /// honor. See [`crate::ui::text_edit`] — GNOME Shell itself ignores this key (it is a
@@ -397,7 +397,7 @@ impl Default for GnomeSettings {
             accent_color: ACCENT_BLUE,
             app_picker_layout: HashMap::new(),
             base_font_pt: crate::ui::BASE_FONT_PT,
-            base_font_family: niri_vk::text::DEFAULT_SANS_FAMILY.to_owned(),
+            base_font_family: synoik_vk::text::DEFAULT_SANS_FAMILY.to_owned(),
             key_theme: crate::ui::text_edit::KeyTheme::default(),
             icon_theme: "Adwaita".to_string(),
             clock: ClockFormat::default(),
@@ -839,7 +839,7 @@ impl GnomeSettings {
         mutter_keybindings: Option<&gio::Settings>,
         shell_keybindings: Option<&gio::Settings>,
         wayland_keybindings: Option<&gio::Settings>,
-        niri_keybindings: Option<&gio::Settings>,
+        synoik_keybindings: Option<&gio::Settings>,
     ) {
         let mut keybindings = read_keybinding_table(wm, adopted_wm_keybindings());
         keybindings.extend(read_keybinding_table(
@@ -858,8 +858,8 @@ impl GnomeSettings {
         // resolves to GNOME's. The collision test means that should never happen,
         // but the order is the belt to its braces.
         keybindings.extend(read_keybinding_table(
-            niri_keybindings,
-            adopted_niri_keybindings(),
+            synoik_keybindings,
+            adopted_synoik_keybindings(),
         ));
         self.keybindings = keybindings;
     }
@@ -955,7 +955,7 @@ pub struct GnomeKeybinding {
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeybindingAction {
     Gnome(GnomeKeyAction),
-    Niri(Action),
+    Synoik(Action),
 }
 
 impl From<GnomeKeyAction> for KeybindingAction {
@@ -966,7 +966,7 @@ impl From<GnomeKeyAction> for KeybindingAction {
 
 impl From<Action> for KeybindingAction {
     fn from(action: Action) -> Self {
-        Self::Niri(action)
+        Self::Synoik(action)
     }
 }
 
@@ -976,7 +976,7 @@ impl KeybindingAction {
     pub fn gnome(&self) -> Option<GnomeKeyAction> {
         match self {
             Self::Gnome(action) => Some(*action),
-            Self::Niri(_) => None,
+            Self::Synoik(_) => None,
         }
     }
 }
@@ -1382,7 +1382,7 @@ fn default_keybindings() -> Vec<GnomeKeybinding> {
     keybindings.extend(read_keybinding_table(None, adopted_mutter_keybindings()));
     keybindings.extend(read_keybinding_table(None, adopted_shell_keybindings()));
     keybindings.extend(read_keybinding_table(None, adopted_wayland_keybindings()));
-    keybindings.extend(read_keybinding_table(None, adopted_niri_keybindings()));
+    keybindings.extend(read_keybinding_table(None, adopted_synoik_keybindings()));
     keybindings
 }
 
@@ -1551,7 +1551,7 @@ impl GnomeSettingsWriter {
     /// Persist the last non-Balanced power profile to `org.gnome.shell
     /// last-selected-power-profile` (gnome-shell's `PowerProfilesToggle._sync`). Takes a runtime
     /// `String` (unlike [`set_string`](Self::set_string)'s `&'static str`). Missing store/key is a
-    /// no-op, so the authoritative copy lives on `Niri` and this is best-effort persistence.
+    /// no-op, so the authoritative copy lives on `Synoik` and this is best-effort persistence.
     pub fn set_last_power_profile(&self, profile: String) {
         self.ctx.invoke(move || {
             STORES.with(|stores| {
@@ -2024,30 +2024,30 @@ pub(crate) fn modifiers_from_accel(accel_mods: AccelMods) -> Modifiers {
 ///
 /// `None` for a raw-keycode accelerator (`0x29`, `Above_Tab`): there is no
 /// layout-independent name to show for one.
-pub(crate) fn key_for_accel(accel: &Accel) -> Option<niri_config::Key> {
+pub(crate) fn key_for_accel(accel: &Accel) -> Option<synoik_config::Key> {
     let trigger = match accel.trigger {
-        AccelTrigger::Keysym(keysym) => niri_config::Trigger::Keysym(keysym),
+        AccelTrigger::Keysym(keysym) => synoik_config::Trigger::Keysym(keysym),
         AccelTrigger::Device(trigger) => trigger,
         AccelTrigger::Keycode(_) => return None,
     };
-    Some(niri_config::Key {
+    Some(synoik_config::Key {
         trigger,
         modifiers: modifiers_from_accel(accel.mods),
     })
 }
 
-/// Our own schema, `org.gnome.shell-rs.keybindings`: the scrolling-window-manager
+/// Our own schema, `org.synoik.keybindings`: the scrolling-window-manager
 /// behaviors GNOME has no equivalent for.
 ///
-/// Mirrors `resources/schemas/org.gnome.shell-rs.keybindings.gschema.xml` key for key —
+/// Mirrors `resources/schemas/org.synoik.keybindings.gschema.xml` key for key —
 /// `our_schema_matches_the_table` fails if the two drift apart. Nothing here may
-/// take a chord we adopt from GNOME; `niri_accels_do_not_collide_with_gnome`
+/// take a chord we adopt from GNOME; `synoik_accels_do_not_collide_with_gnome`
 /// checks that, so the fork tenet is enforced rather than remembered.
 ///
 /// Arrow keys are absent throughout: `<Super>` plus an arrow is GNOME's, four
 /// times over (tiling, maximize, unmaximize, move-to-monitor), so this half of
 /// the model is hjkl.
-fn adopted_niri_keybindings() -> Vec<(String, Action, Vec<String>, Option<Duration>)> {
+fn adopted_synoik_keybindings() -> Vec<(String, Action, Vec<String>, Option<Duration>)> {
     use Action::*;
 
     fn key(name: &str, action: Action, accel: &str) -> (String, Action, Vec<String>) {
@@ -2157,7 +2157,7 @@ fn adopted_niri_keybindings() -> Vec<(String, Action, Vec<String>, Option<Durati
         ),
         // The step is compiled in rather than a settings key: mutter's keybinding
         // schema is accelerators only, and an `as` key has nowhere to put the amount.
-        // Arbitrary sizes stay available over IPC (`niri msg action set-column-width`).
+        // Arbitrary sizes stay available over IPC (`synoik msg action set-column-width`).
         key(
             "grow-column-width",
             SetColumnWidth(SizeChange::AdjustProportion(10.)),
@@ -2397,10 +2397,10 @@ struct Stores {
     mutter_keybindings: Option<gio::Settings>,
     /// `org.gnome.mutter.wayland.keybindings` — the two recovery bindings.
     wayland_keybindings: Option<gio::Settings>,
-    /// `org.gnome.shell-rs.keybindings` — our own, for the scrolling-window-manager
+    /// `org.synoik.keybindings` — our own, for the scrolling-window-manager
     /// actions GNOME has no key for. `None` until the schema is installed, which
     /// leaves the compiled-in defaults in charge.
-    niri_keybindings: Option<gio::Settings>,
+    synoik_keybindings: Option<gio::Settings>,
     shell_keybindings: Option<gio::Settings>,
     wm_keybindings: Option<gio::Settings>,
     wm_preferences: Option<gio::Settings>,
@@ -2466,7 +2466,7 @@ impl Stores {
             mutter: gsettings("org.gnome.mutter", b),
             mutter_keybindings: gsettings("org.gnome.mutter.keybindings", b),
             wayland_keybindings: gsettings("org.gnome.mutter.wayland.keybindings", b),
-            niri_keybindings: gsettings("org.gnome.shell-rs.keybindings", b),
+            synoik_keybindings: gsettings("org.synoik.keybindings", b),
             shell_keybindings: gsettings("org.gnome.shell.keybindings", b),
             wm_keybindings: gsettings("org.gnome.desktop.wm.keybindings", b),
             wm_preferences: gsettings("org.gnome.desktop.wm.preferences", b),
@@ -2526,7 +2526,7 @@ impl Stores {
             &self.mutter,
             &self.mutter_keybindings,
             &self.wayland_keybindings,
-            &self.niri_keybindings,
+            &self.synoik_keybindings,
             &self.shell_keybindings,
             &self.wm_keybindings,
             &self.wm_preferences,
@@ -2576,7 +2576,7 @@ impl Stores {
             self.mutter_keybindings.as_ref(),
             self.shell_keybindings.as_ref(),
             self.wayland_keybindings.as_ref(),
-            self.niri_keybindings.as_ref(),
+            self.synoik_keybindings.as_ref(),
         );
         if let Some(wm) = &self.wm_preferences {
             settings.load_wm_preferences(wm);
@@ -3205,7 +3205,7 @@ pub enum AccelTrigger {
     /// because a scrolling window manager binds the scroll wheel, and it would
     /// otherwise be the one part of the model with nowhere to live. Never holds
     /// [`Trigger::Keysym`] — [`Trigger::from_name`] does not produce it.
-    Device(niri_config::Trigger),
+    Device(synoik_config::Trigger),
 }
 
 /// One parsed keyboard accelerator — a single entry of a keybinding's
@@ -3294,7 +3294,7 @@ pub(crate) fn parse_accelerator(accel: &str) -> Result<Option<Accel>, ()> {
         return Ok(None);
     }
 
-    let trigger = if let Some(trigger) = niri_config::Trigger::from_name(rest) {
+    let trigger = if let Some(trigger) = synoik_config::Trigger::from_name(rest) {
         // Checked before the keysym lookup, which is safe because none of these
         // names is a keysym (nor an XF86 one, which is what the retry below would
         // otherwise turn them into).
@@ -3550,7 +3550,7 @@ mod tests {
     /// that silently does nothing — a setting you can change with no effect, which
     /// is worse than one that isn't there.
     #[test]
-    fn niri_accels_do_not_collide_with_gnome() {
+    fn synoik_accels_do_not_collide_with_gnome() {
         let mut gnome: Vec<(Accel, String)> = Vec::new();
         for (key, _, defaults) in adopted_wm_keybindings()
             .into_iter()
@@ -3564,7 +3564,7 @@ mod tests {
         }
 
         let mut clashes = Vec::new();
-        for (key, _, defaults, _) in adopted_niri_keybindings() {
+        for (key, _, defaults, _) in adopted_synoik_keybindings() {
             for accel in parse_accels(&key, defaults) {
                 if let Some((_, theirs)) = gnome.iter().find(|(a, _)| *a == accel) {
                     clashes.push(format!("{key} wants {accel:?}, which is GNOME's {theirs}"));
@@ -3632,7 +3632,7 @@ mod tests {
 
     /// No accelerator of ours may take a chord GNOME *ships*, adopted or not.
     ///
-    /// [`niri_accels_do_not_collide_with_gnome`] only compares against the keys we adopt,
+    /// [`synoik_accels_do_not_collide_with_gnome`] only compares against the keys we adopt,
     /// which leaves two blind spots that both turned out to be real: GNOME keys we
     /// deliberately deferred still have defaults (`minimize` is `<Super>h`), and
     /// gnome-settings-daemon's media keys are not in any table of ours at all
@@ -3643,7 +3643,7 @@ mod tests {
     /// Comparison goes through `parse_accelerator`, so modifier order and spelling
     /// (`<Primary>` vs `<Control>`, `<Alt><Super>` vs `<Super><Alt>`) cannot hide a clash.
     #[test]
-    fn niri_accels_do_not_collide_with_anything_gnome_ships() {
+    fn synoik_accels_do_not_collide_with_anything_gnome_ships() {
         let vendored = [
             (
                 "org.gnome.desktop.wm.keybindings",
@@ -3698,7 +3698,7 @@ mod tests {
         );
 
         let mut clashes = Vec::new();
-        for (key, _, defaults, _) in adopted_niri_keybindings() {
+        for (key, _, defaults, _) in adopted_synoik_keybindings() {
             for accel in parse_accels(&key, defaults) {
                 if let Some((_, theirs)) = theirs.iter().find(|(a, _)| *a == accel) {
                     clashes.push(format!(
@@ -3719,7 +3719,7 @@ mod tests {
     /// nothing. Our own defaults are not user input and have no excuse.
     #[test]
     fn our_defaults_all_parse() {
-        for (key, _, defaults, _) in adopted_niri_keybindings() {
+        for (key, _, defaults, _) in adopted_synoik_keybindings() {
             let want = defaults.len();
             let got = parse_accels(&key, defaults).len();
             assert_eq!(got, want, "{key} has an accelerator that does not parse");
@@ -3735,7 +3735,7 @@ mod tests {
     /// out not to be read, so it is checked rather than trusted.
     #[test]
     fn our_schema_matches_the_table() {
-        let xml = include_str!("../resources/schemas/org.gnome.shell-rs.keybindings.gschema.xml");
+        let xml = include_str!("../resources/schemas/org.synoik.keybindings.gschema.xml");
 
         // A deliberately dumb reader: enough of the file's shape to compare, and no
         // XML dependency for one test.
@@ -3757,15 +3757,15 @@ mod tests {
             in_file.push((name.to_owned(), accels));
         }
 
-        let in_table: Vec<(String, Vec<String>)> = adopted_niri_keybindings()
+        let in_table: Vec<(String, Vec<String>)> = adopted_synoik_keybindings()
             .into_iter()
             .map(|(key, _, defaults, _)| (key, defaults))
             .collect();
 
         assert_eq!(
             in_file, in_table,
-            "resources/schemas/org.gnome.shell-rs.keybindings.gschema.xml and \
-             adopted_niri_keybindings() have drifted apart"
+            "resources/schemas/org.synoik.keybindings.gschema.xml and \
+             adopted_synoik_keybindings() have drifted apart"
         );
     }
 
@@ -3834,7 +3834,7 @@ mod tests {
     /// group carries settings we do not read as keybindings.
     #[test]
     fn override_matches_the_tables() {
-        let text = include_str!("../resources/schemas/gnome-shell-rs.gschema.override");
+        let text = include_str!("../resources/schemas/synoik.gschema.override");
 
         let mut group = "";
         let mut checked = 0;

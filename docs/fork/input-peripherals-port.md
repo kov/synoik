@@ -9,13 +9,13 @@ file's `input {}` block and now come from the schemas GNOME Settings writes, so
 (see `RUNNING.md`), so this is not a second way to do it — it is the only way.
 
 Code: `src/input/peripherals.rs` (the model), `src/gnome.rs` (`Stores` opens the schemas and
-`read()` builds it), `State::apply_peripherals` in `src/niri.rs` (the hand-off).
+`read()` builds it), `State::apply_peripherals` in `src/synoik.rs` (the hand-off).
 Reference: mutter `src/backends/meta-input-settings.c` + `src/backends/native/meta-input-settings-native.c`.
 
 ## Shape
 
-`Peripherals` produces the **existing `niri_config` device structs**, not a new model. That is
-the point: `apply_libinput_settings` already knows how to push a `niri_config::Touchpad` onto a
+`Peripherals` produces the **existing `synoik_config` device structs**, not a new model. That is
+the point: `apply_libinput_settings` already knows how to push a `synoik_config::Touchpad` onto a
 libinput device, the scroll-factor lookups and the key-repeat timer read `config.input` where
 they always did, and a hotplugged device is configured by the same code path as before. The
 GSettings read replaces only where the values *come from*.

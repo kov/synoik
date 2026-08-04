@@ -15,15 +15,15 @@ use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
-use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
-use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
-use crate::niri_render_elements;
+use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToSynoik, StreamTargetId};
 use crate::render_helpers::{RenderCtx, RenderTarget};
+use crate::synoik::{CastTarget, OutputRenderElements, PointerRenderElements, State, Synoik};
+use crate::synoik_render_elements;
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 use crate::window::mapped::{Mapped, MappedId, WindowCastRenderElements};
 
 mod pw_utils;
-use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
+use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToSynoik};
 
 use crate::render_helpers::vulkan::VulkanRenderer;
 
@@ -38,7 +38,7 @@ pub struct Screencasting {
     /// Dynamic-target casts waiting for their first target to start.
     pub pending_dynamic_casts: Vec<PendingCast>,
 
-    pub pw_to_niri: calloop::channel::Sender<PwToNiri>,
+    pub pw_to_niri: calloop::channel::Sender<PwToSynoik>,
 
     /// Screencast output for each mapped window.
     pub mapped_cast_output: HashMap<Window, Output>,
@@ -61,7 +61,7 @@ pub struct ScreenRecording {
 /// How a recording is driven and stopped.
 pub enum RecordingKind {
     /// A screencast started with the `is-recording` property (gnome-shell's recorder path).
-    /// Stopped by tearing down the cast via [`Niri::stop_cast`].
+    /// Stopped by tearing down the cast via [`Synoik::stop_cast`].
     External,
     /// Our own recorder: the compositor captures frames and feeds an encoder. Stopped by
     /// finalizing the encoder.
@@ -137,13 +137,13 @@ impl State {
             .context("no GBM device available")?;
 
         // Ensure PipeWire is initialized.
-        if self.niri.casting.pipewire.is_none() {
+        if self.synoik.casting.pipewire.is_none() {
             let pw = PipeWire::new(
-                self.niri.event_loop.clone(),
-                self.niri.casting.pw_to_niri.clone(),
+                self.synoik.event_loop.clone(),
+                self.synoik.casting.pw_to_niri.clone(),
             )
             .context("error initializing PipeWire")?;
-            self.niri.casting.pipewire = Some(pw);
+            self.synoik.casting.pipewire = Some(pw);
         }
 
         // Offer the formats the renderer that will actually render into the negotiated buffers can
@@ -155,13 +155,13 @@ impl State {
         Ok((gbm, render_formats))
     }
 
-    pub fn on_pw_msg(&mut self, msg: PwToNiri) {
+    pub fn on_pw_msg(&mut self, msg: PwToSynoik) {
         match msg {
-            PwToNiri::StopCast { session_id } => self.niri.stop_cast(session_id),
-            PwToNiri::Redraw { stream_id } => self.redraw_cast(stream_id),
-            PwToNiri::FatalError => {
+            PwToSynoik::StopCast { session_id } => self.synoik.stop_cast(session_id),
+            PwToSynoik::Redraw { stream_id } => self.redraw_cast(stream_id),
+            PwToSynoik::FatalError => {
                 warn!("stopping PipeWire due to fatal error");
-                let casting = &mut self.niri.casting;
+                let casting = &mut self.synoik.casting;
                 if let Some(pw) = casting.pipewire.take() {
                     let mut ids = HashSet::new();
                     for cast in &casting.pending_dynamic_casts {
@@ -171,9 +171,9 @@ impl State {
                         ids.insert(cast.session_id);
                     }
                     for id in ids {
-                        self.niri.stop_cast(id);
+                        self.synoik.stop_cast(id);
                     }
-                    self.niri.event_loop.remove(pw.token);
+                    self.synoik.event_loop.remove(pw.token);
                 }
             }
         }
@@ -182,7 +182,7 @@ impl State {
     fn redraw_cast(&mut self, stream_id: CastStreamId) {
         let _span = tracy_client::span!("State::redraw_cast");
 
-        let casts = &mut self.niri.casting.casts;
+        let casts = &mut self.synoik.casting.casts;
         let Some(idx) = casts.iter().position(|cast| cast.stream_id == stream_id) else {
             warn!("cast to redraw is missing");
             return;
@@ -202,7 +202,7 @@ impl State {
             }
             CastTarget::Output { output, .. } | CastTarget::Area { output, .. } => {
                 if let Some(output) = output.upgrade() {
-                    self.niri.queue_redraw(&output);
+                    self.synoik.queue_redraw(&output);
                 }
                 return;
             }
@@ -210,20 +210,20 @@ impl State {
         };
 
         // Lack of partial borrowing strikes again...
-        let mut casts = mem::take(&mut self.niri.casting.casts);
+        let mut casts = mem::take(&mut self.synoik.casting.casts);
         let cast = &mut casts[idx];
         let mut stop = false;
         // Use a loop {} so we can break instead of early-return.
         #[allow(clippy::never_loop)]
         loop {
-            let mut windows = self.niri.layout.windows();
+            let mut windows = self.synoik.layout.windows();
             let Some((_, mapped)) = windows.find(|(_, mapped)| mapped.id().get() == id) else {
                 break;
             };
 
             // Use the cached output since it will be present even if the output was
             // currently disconnected.
-            let Some(output) = self.niri.casting.mapped_cast_output.get(&mapped.window) else {
+            let Some(output) = self.synoik.casting.mapped_cast_output.get(&mapped.window) else {
                 break;
             };
 
@@ -244,7 +244,7 @@ impl State {
             }
 
             let rendered = self.backend.with_vulkan_renderer(|renderer| {
-                self.niri
+                self.synoik
                     .redraw_window_cast_with(renderer, cast, mapped, output, bbox, scale);
             });
 
@@ -255,10 +255,10 @@ impl State {
             break;
         }
         let session_id = cast.session_id;
-        self.niri.casting.casts = casts;
+        self.synoik.casting.casts = casts;
 
         if stop {
-            self.niri.stop_cast(session_id);
+            self.synoik.stop_cast(session_id);
         }
     }
 
@@ -276,9 +276,10 @@ impl State {
                 }
             }
             CastTarget::Window { id } => {
-                let mut windows = self.niri.layout.windows();
+                let mut windows = self.synoik.layout.windows();
                 if let Some((_, mapped)) = windows.find(|(_, mapped)| mapped.id().get() == *id) {
-                    if let Some(output) = self.niri.casting.mapped_cast_output.get(&mapped.window) {
+                    if let Some(output) = self.synoik.casting.mapped_cast_output.get(&mapped.window)
+                    {
                         refresh = Some(output.current_mode().unwrap().refresh as u32);
                     }
                 }
@@ -287,7 +288,7 @@ impl State {
 
         let mut to_redraw = Vec::new();
         let mut to_stop = Vec::new();
-        for cast in &mut self.niri.casting.casts {
+        for cast in &mut self.synoik.casting.casts {
             if !cast.dynamic_target {
                 continue;
             }
@@ -315,7 +316,7 @@ impl State {
     }
 
     fn start_pending_dynamic_casts(&mut self, target: &CastTarget) {
-        let pending = &self.niri.casting.pending_dynamic_casts;
+        let pending = &self.synoik.casting.pending_dynamic_casts;
         if pending.is_empty() {
             return;
         }
@@ -333,7 +334,7 @@ impl State {
                 cast_params_for_output(&output)
             }
             CastTarget::Window { id } => {
-                let Some((size, refresh)) = self.niri.cast_params_for_window(*id) else {
+                let Some((size, refresh)) = self.synoik.cast_params_for_window(*id) else {
                     return;
                 };
                 (size, refresh)
@@ -347,23 +348,23 @@ impl State {
             Err(err) => {
                 warn!("error starting pending screencasts: {err:?}");
                 let mut ids = HashSet::new();
-                for pending in self.niri.casting.pending_dynamic_casts.drain(..) {
+                for pending in self.synoik.casting.pending_dynamic_casts.drain(..) {
                     ids.insert(pending.session_id);
                 }
                 for id in ids {
-                    self.niri.stop_cast(id);
+                    self.synoik.stop_cast(id);
                 }
                 return;
             }
         };
-        let pw = self.niri.casting.pipewire.as_ref().unwrap();
+        let pw = self.synoik.casting.pipewire.as_ref().unwrap();
 
         // Alpha is always true since the dynamic target can change between window & output.
         let alpha = true;
 
         // Start each pending cast.
         let mut to_stop = HashSet::new();
-        for pending in self.niri.casting.pending_dynamic_casts.drain(..) {
+        for pending in self.synoik.casting.pending_dynamic_casts.drain(..) {
             let res = pw.start_cast(
                 gbm.clone(),
                 render_formats.clone(),
@@ -379,7 +380,7 @@ impl State {
             match res {
                 Ok(mut cast) => {
                     cast.dynamic_target = true;
-                    self.niri.casting.casts.push(cast);
+                    self.synoik.casting.casts.push(cast);
                 }
                 Err(err) => {
                     warn!("error starting pending screencast: {err:?}");
@@ -389,13 +390,13 @@ impl State {
         }
 
         for session_id in to_stop {
-            self.niri.stop_cast(session_id);
+            self.synoik.stop_cast(session_id);
         }
     }
 
-    pub fn on_screen_cast_msg(&mut self, msg: ScreenCastToNiri) {
+    pub fn on_screen_cast_msg(&mut self, msg: ScreenCastToSynoik) {
         match msg {
-            ScreenCastToNiri::StartCast {
+            ScreenCastToSynoik::StartCast {
                 session_id,
                 stream_id,
                 target,
@@ -408,11 +409,11 @@ impl State {
 
                 let (target, size, refresh, alpha) = match target {
                     StreamTargetId::Output { name } => {
-                        let global_space = &self.niri.global_space;
+                        let global_space = &self.synoik.global_space;
                         let output = global_space.outputs().find(|out| out.name() == name);
                         let Some(output) = output else {
                             warn!("error starting screencast: requested output is missing");
-                            self.niri.stop_cast(session_id);
+                            self.synoik.stop_cast(session_id);
                             return;
                         };
 
@@ -420,10 +421,10 @@ impl State {
                         (CastTarget::output(output), size, refresh, false)
                     }
                     StreamTargetId::Window { id }
-                        if id == self.niri.casting.dynamic_cast_id_for_portal.get() =>
+                        if id == self.synoik.casting.dynamic_cast_id_for_portal.get() =>
                     {
                         debug!("delaying dynamic cast until target is set");
-                        self.niri.casting.pending_dynamic_casts.push(PendingCast {
+                        self.synoik.casting.pending_dynamic_casts.push(PendingCast {
                             session_id,
                             stream_id,
                             cursor_mode,
@@ -432,19 +433,19 @@ impl State {
                         return;
                     }
                     StreamTargetId::Window { id } => {
-                        let Some((size, refresh)) = self.niri.cast_params_for_window(id) else {
+                        let Some((size, refresh)) = self.synoik.cast_params_for_window(id) else {
                             warn!("error starting screencast: requested window is missing");
-                            self.niri.stop_cast(session_id);
+                            self.synoik.stop_cast(session_id);
                             return;
                         };
                         (CastTarget::Window { id }, size, refresh, true)
                     }
                     StreamTargetId::Area { x, y, w, h } => {
                         let rect = Rectangle::new(Point::from((x, y)), Size::from((w, h)));
-                        let Some((target, size, refresh)) = self.niri.cast_params_for_area(rect)
+                        let Some((target, size, refresh)) = self.synoik.cast_params_for_area(rect)
                         else {
                             warn!("error starting screencast: requested area is off all outputs");
-                            self.niri.stop_cast(session_id);
+                            self.synoik.stop_cast(session_id);
                             return;
                         };
                         (target, size, refresh, false)
@@ -455,11 +456,11 @@ impl State {
                     Ok(x) => x,
                     Err(err) => {
                         warn!("error starting screencast: {err:?}");
-                        self.niri.stop_cast(session_id);
+                        self.synoik.stop_cast(session_id);
                         return;
                     }
                 };
-                let pw = self.niri.casting.pipewire.as_ref().unwrap();
+                let pw = self.synoik.casting.pipewire.as_ref().unwrap();
 
                 let res = pw.start_cast(
                     gbm,
@@ -475,24 +476,24 @@ impl State {
                 );
                 match res {
                     Ok(cast) => {
-                        self.niri.casting.casts.push(cast);
+                        self.synoik.casting.casts.push(cast);
                         if is_recording {
-                            self.niri.screen_recording_started(session_id);
+                            self.synoik.screen_recording_started(session_id);
                         }
                     }
                     Err(err) => {
                         warn!("error starting screencast: {err:?}");
-                        self.niri.stop_cast(session_id);
+                        self.synoik.stop_cast(session_id);
                     }
                 }
             }
-            ScreenCastToNiri::StopCast { session_id } => self.niri.stop_cast(session_id),
-            ScreenCastToNiri::StopStream { stream_id } => self.niri.stop_stream(stream_id),
+            ScreenCastToSynoik::StopCast { session_id } => self.synoik.stop_cast(session_id),
+            ScreenCastToSynoik::StopStream { stream_id } => self.synoik.stop_stream(stream_id),
         }
     }
 }
 
-impl Niri {
+impl Synoik {
     /// Build the elements for a window cast and push one frame to its PipeWire stream.
     ///
     /// Split out of `State::redraw_cast` so the renderer can be chosen at the call site: a Vulkan
@@ -608,7 +609,7 @@ impl Niri {
         output: &Output,
         target_presentation_time: Duration,
     ) {
-        let _span = tracy_client::span!("Niri::render_for_screen_cast");
+        let _span = tracy_client::span!("Synoik::render_for_screen_cast");
 
         let weak = output.downgrade();
         let size = output.current_mode().unwrap().size;
@@ -708,7 +709,7 @@ impl Niri {
         output: &Output,
         target_presentation_time: Duration,
     ) {
-        let _span = tracy_client::span!("Niri::render_windows_for_screen_cast");
+        let _span = tracy_client::span!("Synoik::render_windows_for_screen_cast");
 
         let scale = Scale::from(output.current_scale().fractional_scale());
 
@@ -800,7 +801,7 @@ impl Niri {
         output: &Output,
         target_presentation_time: Duration,
     ) {
-        let _span = tracy_client::span!("Niri::render_area_for_screen_cast");
+        let _span = tracy_client::span!("Synoik::render_area_for_screen_cast");
 
         let weak = output.downgrade();
         let scale = Scale::from(output.current_scale().fractional_scale());
@@ -900,7 +901,7 @@ impl Niri {
     /// stream ended would kill the others and close the D-Bus session object out from under the
     /// caller.
     pub fn stop_stream(&mut self, stream_id: CastStreamId) {
-        let _span = tracy_client::span!("Niri::stop_stream");
+        let _span = tracy_client::span!("Synoik::stop_stream");
         let _span = debug_span!("stop_stream", %stream_id).entered();
 
         self.casting
@@ -937,7 +938,7 @@ impl Niri {
     }
 
     pub fn stop_cast(&mut self, session_id: CastSessionId) {
-        let _span = tracy_client::span!("Niri::stop_cast");
+        let _span = tracy_client::span!("Synoik::stop_cast");
         let _span = debug_span!("stop_cast", %session_id).entered();
 
         self.casting
@@ -1016,12 +1017,12 @@ impl Niri {
     #[cfg(feature = "xdp-gnome-screencast")]
     pub fn on_shell_screencast_msg(
         &mut self,
-        msg: crate::dbus::gnome_shell_screencast::ScreencastToNiri,
+        msg: crate::dbus::gnome_shell_screencast::ScreencastToSynoik,
     ) {
-        use crate::dbus::gnome_shell_screencast::ScreencastToNiri;
+        use crate::dbus::gnome_shell_screencast::ScreencastToSynoik;
 
         match msg {
-            ScreencastToNiri::Start {
+            ScreencastToSynoik::Start {
                 area,
                 template,
                 draw_cursor,
@@ -1031,7 +1032,7 @@ impl Niri {
                 let result = self.start_shell_screencast(area, &template, draw_cursor, framerate);
                 let _ = reply.send_blocking(result);
             }
-            ScreencastToNiri::Stop { reply } => {
+            ScreencastToSynoik::Stop { reply } => {
                 let was_recording = self
                     .casting
                     .recordings
@@ -1103,7 +1104,7 @@ impl Niri {
 
     /// Start a compositor-driven recording of `output` to `path` (WebM/VP8 via ffmpeg). Returns the
     /// synthetic session id tracking it. Frames are captured on the output's redraws by
-    /// [`Niri::render_for_recorders`]; stop it via [`Niri::stop_screen_recordings`].
+    /// [`Synoik::render_for_recorders`]; stop it via [`Synoik::stop_screen_recordings`].
     pub fn start_native_recording(
         &mut self,
         output: &Output,
@@ -1401,8 +1402,8 @@ impl Niri {
                 let out = output.clone();
                 let token = loop_handle
                     .insert_source(Timer::from_duration(delay), move |_, _, state| {
-                        if state.niri.output_state.contains_key(&out) {
-                            state.niri.queue_redraw(&out);
+                        if state.synoik.output_state.contains_key(&out) {
+                            state.synoik.queue_redraw(&out);
                         }
                         TimeoutAction::Drop
                     })
@@ -1429,12 +1430,12 @@ impl Niri {
                     .insert_source(
                         Timer::from_duration(Duration::from_secs(1)),
                         |_, _, state| {
-                            if state.niri.casting.recordings.is_empty() {
-                                state.niri.recording_tick = None;
+                            if state.synoik.casting.recordings.is_empty() {
+                                state.synoik.recording_tick = None;
                                 return TimeoutAction::Drop;
                             }
-                            if state.niri.panel.update_recording_label() {
-                                state.niri.queue_redraw_all();
+                            if state.synoik.panel.update_recording_label() {
+                                state.synoik.queue_redraw_all();
                             }
                             TimeoutAction::ToDuration(Duration::from_secs(1))
                         },
@@ -1452,7 +1453,7 @@ impl Niri {
     }
 
     pub fn stop_casts_for_target(&mut self, target: CastTarget) {
-        let _span = tracy_client::span!("Niri::stop_casts_for_target");
+        let _span = tracy_client::span!("Synoik::stop_casts_for_target");
 
         // This is O(N^2) but it shouldn't be a problem I think.
         let mut saw_dynamic = false;
@@ -1569,7 +1570,7 @@ fn cast_params_for_output(output: &Output) -> (Size<i32, Physical>, u32) {
     (size, refresh)
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     CastRenderElement => {
         Output = OutputRenderElements,
         Window = WindowCastRenderElements,

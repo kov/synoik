@@ -9,20 +9,20 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use niri_config::{Config, Modifiers};
 use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use synoik_config::{Config, Modifiers};
 
 use crate::animation::{Animation, Clock, Curve};
 use crate::app_system::AppIconRef;
-use crate::niri_render_elements;
 use crate::render_helpers::inset_ring::InsetRing;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::VkTexture;
 use crate::render_helpers::window_thumbnail::{self, WindowThumbnailRenderElement};
 use crate::render_helpers::RenderCtx;
+use crate::synoik_render_elements;
 use crate::ui::switcher::app_switcher::{self, AppItem};
 use crate::ui::switcher::{
     thumbnails, window_switcher, PanelLayout, SwitcherKey, SwitcherKind, SwitcherOutcome,
@@ -47,7 +47,7 @@ pub fn label_height() -> f64 {
     crate::ui::pt_to_px(LABEL_PT)
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     SwitcherRenderElement => {
         // The panel, its labels, and the app icons over it.
         Texture = TextureRenderElement<VkTexture>,
@@ -561,7 +561,7 @@ impl SwitcherUi {
         ring.update(
             rect,
             CYCLER_HIGHLIGHT_BORDER,
-            niri_config::Color::new_unpremul(
+            synoik_config::Color::new_unpremul(
                 f32::from(accent[0]) / 255.,
                 f32::from(accent[1]) / 255.,
                 f32::from(accent[2]) / 255.,
@@ -1078,7 +1078,7 @@ impl SwitcherUi {
     /// Front-to-back, like every other UI `render`.
     pub fn render_output(
         &self,
-        niri: &crate::niri::Niri,
+        synoik: &crate::synoik::Synoik,
         output: &Output,
         mut ctx: RenderCtx,
         push: &mut dyn FnMut(SwitcherRenderElement),
@@ -1099,7 +1099,7 @@ impl SwitcherUi {
 
         let _span = tracy_client::span!("SwitcherUi::render_output");
         let scale = output.current_scale().fractional_scale();
-        let app_icons = &niri.app_icon_cache;
+        let app_icons = &synoik.app_icon_cache;
         let mut elements: Vec<TextureRenderElement<VkTexture>> = Vec::new();
         // Collected rather than pushed as they are drawn: the app badge sits *over* the preview
         // (`WindowIcon` adds the clone and then the icon to one `Clutter.BinLayout`,
@@ -1113,7 +1113,7 @@ impl SwitcherUi {
                 let Some(item) = open.layout.items.get(i) else {
                     continue;
                 };
-                let Some((_, mapped)) = niri.layout.windows().find(|(_, m)| m.id() == *id) else {
+                let Some((_, mapped)) = synoik.layout.windows().find(|(_, m)| m.id() == *id) else {
                     continue;
                 };
                 window_thumbnail::render(
@@ -1138,7 +1138,7 @@ impl SwitcherUi {
                 let Some(bin) = thumbs.layout.thumbs.get(i) else {
                     continue;
                 };
-                let Some((_, mapped)) = niri.layout.windows().find(|(_, m)| m.id() == *id) else {
+                let Some((_, mapped)) = synoik.layout.windows().find(|(_, m)| m.id() == *id) else {
                     continue;
                 };
                 window_thumbnail::render(

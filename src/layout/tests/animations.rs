@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use insta::assert_snapshot;
-use niri_config::animations::{Curve, EasingParams, Kind};
+use synoik_config::animations::{Curve, EasingParams, Kind};
 
 use super::*;
 
@@ -29,12 +29,12 @@ fn make_options() -> Options {
     });
 
     let mut options = Options {
-        layout: niri_config::Layout {
+        layout: synoik_config::Layout {
             gaps: 0.0,
             // These exercise niri's scrolling-column animations; run them in
             // scrolling mode so the GNOME top-panel strut (floating mode only)
             // doesn't offset their geometry.
-            windowing_mode: niri_config::WindowingMode::Scrolling,
+            windowing_mode: synoik_config::WindowingMode::Scrolling,
             ..Default::default()
         },
         ..Options::default()
@@ -128,7 +128,7 @@ fn clientside_height_change_doesnt_animate() {
     ");
 
     let ops = [
-        // The top window shrinks by itself, without a niri-issued resize.
+        // The top window shrinks by itself, without a synoik-issued resize.
         Op::SetForcedSize {
             id: 1,
             size: Some(Size::new(100, 50)),

@@ -16,9 +16,9 @@ that is an architectural dead end and is not needed.**
 
 ---
 
-## Resolution (2026-07-05) — §6 answered by the `niri-vk` sync spike
+## Resolution (2026-07-05) — §6 answered by the `synoik-vk` sync spike
 
-The compositor-side spike `niri-vk/src/sync_spike.rs` (test `explicit_sync_bridge`, run on both
+The compositor-side spike `synoik-vk/src/sync_spike.rs` (test `explicit_sync_bridge`, run on both
 ICDs) has now **measured behaviour**, not just the API surface. Result: **the explicit-sync bridge
 is buildable here — but on `VkFence` export, not `VkSemaphore` export.** An asymmetry §5 below did
 not anticipate:
@@ -92,7 +92,7 @@ data path itself is up. `renderD128` is world-rw; `Seccomp: 0`.
 Measured with `vkGetPhysicalDeviceExternalSemaphoreProperties` for the cross product
 {`OPAQUE_FD`, `SYNC_FD`} × {binary, timeline}, reading
 `externalSemaphoreFeatures & {EXPORTABLE, IMPORTABLE}`. Source lives in this repo at
-`niri-vk/src/probes.rs` (`external_semaphores()`); the timeline variant is requested by
+`synoik-vk/src/probes.rs` (`external_semaphores()`); the timeline variant is requested by
 chaining `VkSemaphoreTypeCreateInfo{ semaphoreType = TIMELINE }` into the query's `pNext`.
 
 **Result (Venus — and byte-for-byte identical on lavapipe):**
@@ -109,9 +109,9 @@ Reproduce (from the guest):
 
 ```sh
 # Venus (default ICD on this VM):
-cargo run -p niri-vk        # prints the "probes" block at the end
+cargo run -p synoik-vk        # prints the "probes" block at the end
 # lavapipe (deterministic CPU baseline — shows the SAME semaphore result):
-VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json cargo run -p niri-vk
+VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json cargo run -p synoik-vk
 ```
 
 `vulkaninfo` in this Mesa build does **not** print an external-semaphore section, so the probe
@@ -290,7 +290,7 @@ confirm the pieces the guest can't see from a capability bit:
 - Prior art to copy (C): `wlroots` `render/vulkan` + `types/wlr_linux_drm_syncobj_v1.c`
   (timeline syncobj ⟷ sync_file ⟷ binary VkSemaphore, exactly §5); Mesa `src/virtio/venus`
   external-sync handling; `virglrenderer` Venus backend fence code.
-- This repo: `niri-vk/src/probes.rs` (the probe), and the memory note
+- This repo: `synoik-vk/src/probes.rs` (the probe), and the memory note
   `render-stack-maturity.md` (Stage 0 / Stage 3 planning) in
   `~/.claude/projects/-home-kov-Projects-gnome-shell-rs/memory/`.
 

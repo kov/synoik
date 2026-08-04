@@ -1,4 +1,3 @@
-use niri_ipc::PickedColor;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::ButtonState;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
@@ -12,10 +11,11 @@ use smithay::input::pointer::{
 use smithay::input::SeatHandler;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Scale, Size, Transform};
+use synoik_ipc::PickedColor;
 
-use crate::niri::{Niri, State};
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{render_and_download, RenderCtx, RenderTarget};
+use crate::synoik::{State, Synoik};
 
 pub struct PickColorGrab {
     start_data: PointerGrabStartData<State>,
@@ -27,21 +27,21 @@ impl PickColorGrab {
     }
 
     fn on_ungrab(&mut self, state: &mut State) {
-        if let Some(tx) = state.niri.pick_color.take() {
+        if let Some(tx) = state.synoik.pick_color.take() {
             let _ = tx.send_blocking(None);
         }
         state
-            .niri
+            .synoik
             .cursor_manager
             .set_cursor_image(CursorImageStatus::default_named());
-        state.niri.queue_redraw_all();
+        state.synoik.queue_redraw_all();
     }
 
     fn pick_color_at_point(location: Point<f64, Logical>, data: &mut State) -> Option<PickedColor> {
-        let (output, pos_within_output) = data.niri.output_under(location)?;
+        let (output, pos_within_output) = data.synoik.output_under(location)?;
         let output = output.clone();
 
-        data.niri.update_render_elements(Some(&output));
+        data.synoik.update_render_elements(Some(&output));
 
         let scale = Scale::from(output.current_scale().fractional_scale());
         // FIXME: perhaps replace floor with round once we figure out the pointer behavior
@@ -50,7 +50,7 @@ impl PickColorGrab {
 
         data.backend
             .with_vulkan_renderer(|renderer| {
-                Self::pick_color_with_renderer(&data.niri, renderer, &output, pos, scale)
+                Self::pick_color_with_renderer(&data.synoik, renderer, &output, pos, scale)
             })
             .flatten()
     }
@@ -59,7 +59,7 @@ impl PickColorGrab {
     /// Renderer-agnostic (GLES or the owned Vulkan renderer): the readback goes through
     /// [`render_and_download`], which is `copy_framebuffer`-based and correct on both.
     pub(crate) fn pick_color_with_renderer(
-        niri: &Niri,
+        synoik: &Synoik,
         renderer: &mut VulkanRenderer,
         output: &Output,
         pos: Point<i32, Physical>,
@@ -73,7 +73,7 @@ impl PickColorGrab {
             target: RenderTarget::Output,
             xray: None,
         };
-        let elements = niri.render_to_vec(ctx, output, false);
+        let elements = synoik.render_to_vec(ctx, output, false);
 
         let mapping = render_and_download(
             renderer,
@@ -138,9 +138,9 @@ impl PointerGrab<State> for PickColorGrab {
         }
 
         // We're handling this press, don't send the release to the window.
-        data.niri.suppressed_buttons.insert(event.button);
+        data.synoik.suppressed_buttons.insert(event.button);
 
-        if let Some(tx) = data.niri.pick_color.take() {
+        if let Some(tx) = data.synoik.pick_color.take() {
             let color = Self::pick_color_at_point(handle.current_location(), data);
             let _ = tx.send_blocking(color);
         }

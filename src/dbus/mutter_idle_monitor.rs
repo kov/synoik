@@ -10,7 +10,7 @@
 //! monitors under an ObjectManager, which nothing in the gsd path consumes; that is a follow-up.
 //!
 //! Like `org.gnome.Shell`'s accelerator signals, `WatchFired` is emitted **unicast** to the client
-//! that owns the watch, from the main loop (`Niri::emit_idle_watch_fired`); the request/reply for
+//! that owns the watch, from the main loop (`Synoik::emit_idle_watch_fired`); the request/reply for
 //! the returning methods and the per-sender bus-name watch mirror `dbus::gnome_shell`.
 
 use std::thread;
@@ -24,10 +24,10 @@ use zbus::names::BusName;
 use super::Start;
 
 pub struct IdleMonitor {
-    to_niri: calloop::channel::Sender<IdleMonitorToNiri>,
+    to_niri: calloop::channel::Sender<IdleMonitorToSynoik>,
 }
 
-pub enum IdleMonitorToNiri {
+pub enum IdleMonitorToSynoik {
     GetIdletime {
         reply: async_channel::Sender<u64>,
     },
@@ -54,28 +54,28 @@ fn sender(hdr: &Header<'_>) -> fdo::Result<String> {
 }
 
 impl IdleMonitor {
-    pub fn new(to_niri: calloop::channel::Sender<IdleMonitorToNiri>) -> Self {
+    pub fn new(to_niri: calloop::channel::Sender<IdleMonitorToSynoik>) -> Self {
         Self { to_niri }
     }
 
     async fn request<T>(
         &self,
-        make: impl FnOnce(async_channel::Sender<T>) -> IdleMonitorToNiri,
+        make: impl FnOnce(async_channel::Sender<T>) -> IdleMonitorToSynoik,
     ) -> fdo::Result<T> {
         let (reply, rx) = async_channel::bounded(1);
         self.to_niri.send(make(reply)).map_err(|err| {
-            warn!("error sending message to niri: {err:?}");
+            warn!("error sending message to synoik: {err:?}");
             fdo::Error::Failed("internal error".to_owned())
         })?;
         rx.recv().await.map_err(|err| {
-            warn!("error receiving message from niri: {err:?}");
+            warn!("error receiving message from synoik: {err:?}");
             fdo::Error::Failed("internal error".to_owned())
         })
     }
 
-    fn notify(&self, msg: IdleMonitorToNiri) -> fdo::Result<()> {
+    fn notify(&self, msg: IdleMonitorToSynoik) -> fdo::Result<()> {
         self.to_niri.send(msg).map_err(|err| {
-            warn!("error sending message to niri: {err:?}");
+            warn!("error sending message to synoik: {err:?}");
             fdo::Error::Failed("internal error".to_owned())
         })
     }
@@ -84,7 +84,7 @@ impl IdleMonitor {
 #[interface(name = "org.gnome.Mutter.IdleMonitor")]
 impl IdleMonitor {
     async fn get_idletime(&self) -> fdo::Result<u64> {
-        self.request(|reply| IdleMonitorToNiri::GetIdletime { reply })
+        self.request(|reply| IdleMonitorToSynoik::GetIdletime { reply })
             .await
     }
 
@@ -94,7 +94,7 @@ impl IdleMonitor {
         interval: u64,
     ) -> fdo::Result<u32> {
         let owner = sender(&hdr)?;
-        self.request(|reply| IdleMonitorToNiri::AddIdleWatch {
+        self.request(|reply| IdleMonitorToSynoik::AddIdleWatch {
             interval,
             owner,
             reply,
@@ -104,20 +104,20 @@ impl IdleMonitor {
 
     async fn add_user_active_watch(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<u32> {
         let owner = sender(&hdr)?;
-        self.request(|reply| IdleMonitorToNiri::AddUserActiveWatch { owner, reply })
+        self.request(|reply| IdleMonitorToSynoik::AddUserActiveWatch { owner, reply })
             .await
     }
 
     async fn remove_watch(&self, id: u32) -> fdo::Result<()> {
-        self.notify(IdleMonitorToNiri::RemoveWatch { id })
+        self.notify(IdleMonitorToSynoik::RemoveWatch { id })
     }
 
     async fn reset_idletime(&self) -> fdo::Result<()> {
-        self.notify(IdleMonitorToNiri::ResetIdletime)
+        self.notify(IdleMonitorToSynoik::ResetIdletime)
     }
 
-    // Emitted unicast to the owning client from the main loop (`Niri::emit_idle_watch_fired`); this
-    // declaration provides the introspection XML.
+    // Emitted unicast to the owning client from the main loop (`Synoik::emit_idle_watch_fired`);
+    // this declaration provides the introspection XML.
     #[zbus(signal)]
     pub async fn watch_fired(
         emitter: &zbus::object_server::SignalEmitter<'_>,
@@ -160,7 +160,7 @@ impl Start for IdleMonitor {
                     let Ok(args) = signal.args() else { continue };
                     if let (BusName::Unique(name), None) = (&args.name, args.new_owner.as_ref()) {
                         if to_niri
-                            .send(IdleMonitorToNiri::SenderVanished(name.to_string()))
+                            .send(IdleMonitorToSynoik::SenderVanished(name.to_string()))
                             .is_err()
                         {
                             return;

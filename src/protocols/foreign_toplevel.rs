@@ -21,7 +21,7 @@ use smithay::wayland::shell::xdg::{
     ToplevelState, ToplevelStateSet, XdgToplevelSurfaceRoleAttributes
 };
 
-use crate::niri::State;
+use crate::synoik::State;
 use crate::window::mapped::MappedId;
 use crate::utils::with_toplevel_role_and_current;
 
@@ -93,11 +93,16 @@ impl ForeignToplevelManagerState {
 pub fn refresh(state: &mut State) {
     let _span = tracy_client::span!("foreign_toplevel::refresh");
 
-    let protocol_state = &mut state.niri.foreign_toplevel_state;
+    let protocol_state = &mut state.synoik.foreign_toplevel_state;
 
     // Handle closed windows.
     protocol_state.toplevels.retain(|surface, data| {
-        if state.niri.layout.find_window_and_output(surface).is_some() {
+        if state
+            .synoik
+            .layout
+            .find_window_and_output(surface)
+            .is_some()
+        {
             return true;
         }
 
@@ -117,7 +122,7 @@ pub fn refresh(state: &mut State) {
     // Save the focused window for last, this way when the focus changes, we will first deactivate
     // the previous window and only then activate the newly focused window.
     let mut focused = None;
-    state.niri.layout.with_windows(|mapped, output, _, _| {
+    state.synoik.layout.with_windows(|mapped, output, _, _| {
         let toplevel = mapped.toplevel();
         let wl_surface = toplevel.wl_surface();
         with_toplevel_role_and_current(toplevel, |role, cur| {
@@ -126,7 +131,7 @@ pub fn refresh(state: &mut State) {
                 return;
             };
 
-            if state.niri.keyboard_focus.surface() == Some(wl_surface) {
+            if state.synoik.keyboard_focus.surface() == Some(wl_surface) {
                 focused = Some((mapped.id(), mapped.window.clone(), output.cloned()));
             } else {
                 refresh_toplevel(
@@ -172,7 +177,7 @@ pub fn on_output_bound(state: &mut State, output: &Output, wl_output: &WlOutput)
         return;
     };
 
-    let protocol_state = &mut state.niri.foreign_toplevel_state;
+    let protocol_state = &mut state.synoik.foreign_toplevel_state;
     for data in protocol_state.toplevels.values_mut() {
         if data.output.as_ref() != Some(output) {
             continue;

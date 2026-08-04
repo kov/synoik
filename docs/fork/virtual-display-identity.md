@@ -179,7 +179,7 @@ asking for a correct EDID makes every guest better.
 
 - Dump what the guest sees: `sudo cat /sys/class/drm/card0/card0-Virtual-1/edid | od -A d -t x1`,
   or `edid-decode` if installed.
-- What we resolved it to: `niri msg outputs` prints physical size, current mode, the advertised
+- What we resolved it to: `synoik msg outputs` prints physical size, current mode, the advertised
   mode list and the scale in force.
 - The decisions that consume all this are pure functions with unit tests —
   `mode_is_available` / `applied_config_is_stale` / `choose_target_mode` in `src/backend/tty.rs`,

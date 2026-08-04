@@ -33,11 +33,11 @@ use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
 use crate::animation::{Animation, Clock, Curve};
 use crate::app_system::AppIconRef;
-use crate::niri_render_elements;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::synoik_render_elements;
 use crate::ui::app_grid::{
     AppGrid, AppGridEntry, FocusDir, GridDropTarget, PageArrow, FOCUS_RING_ALPHA, FOCUS_RING_W,
 };
@@ -86,7 +86,7 @@ pub const POPDOWN_DIALOG_MS: u64 = 500;
 /// `FOLDER_DIALOG_ANIMATION_TIME` (`appDisplay.js:43`) — the whole open/close.
 const ANIMATION_MS: u64 = 200;
 
-niri_render_elements! {
+synoik_render_elements! {
     FolderDialogRenderElement => {
         Texture = TextureRenderElement<VkTexture>,
         SolidColor = SolidColorRenderElement,
@@ -457,7 +457,7 @@ struct OutputData {
     shade: SolidColorBuffer,
 }
 
-/// The app-folder dialog. Owned on `Niri`; opened by a click on a folder tile.
+/// The app-folder dialog. Owned on `Synoik`; opened by a click on a folder tile.
 pub struct FolderDialog {
     /// The shared GPU upload map, kept so the view built on the next `popup` inherits it.
     icon_uploads: Option<crate::ui::widget::SharedAppIconUploads>,
@@ -561,7 +561,7 @@ impl FolderDialog {
         self.open.take().is_some()
     }
 
-    /// Retire a finished close. Called once a frame from `Niri`'s refresh — the dialog
+    /// Retire a finished close. Called once a frame from `Synoik`'s refresh — the dialog
     /// keeps drawing itself until the shrink is over, so it cannot drop its own state.
     pub fn advance(&mut self) {
         if self

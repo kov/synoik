@@ -30,7 +30,7 @@ if [ -z "$terminal" ]; then
     done
 fi
 
-echo "Building niri ($profile)…"
+echo "Building synoik ($profile)…"
 cargo build "${cargo_flags[@]}"
 
 if [ -n "$terminal" ]; then

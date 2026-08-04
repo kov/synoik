@@ -14,9 +14,6 @@ use anyhow::{anyhow, bail, ensure, Context};
 use bytemuck::cast_slice_mut;
 use drm_ffi::drm_mode_modeinfo;
 use libc::dev_t;
-use niri_config::output::{MaxBpc, Modeline};
-use niri_config::{Config, OutputName};
-use niri_ipc::{HSyncPolarity, VSyncPolarity};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmBufferFlags, GbmDevice};
@@ -56,6 +53,9 @@ use smithay::wayland::drm_lease::{
 use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
 use smithay::wayland::presentation::Refresh;
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
+use synoik_config::output::{MaxBpc, Modeline};
+use synoik_config::{Config, OutputName};
+use synoik_ipc::{HSyncPolarity, VSyncPolarity};
 use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
@@ -66,10 +66,10 @@ use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::frame_log::Phase;
 use crate::monitors_xml::{MonitorsConfig, SavedMode};
-use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::{RenderCtx, RenderTarget};
+use crate::synoik::{RedrawState, State, Synoik};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
 const SUPPORTED_COLOR_FORMATS: [Fourcc; 8] = [
@@ -238,7 +238,7 @@ impl OutputDevice {
         cleanup.extend(res_handles.crtcs());
 
         for (conn, info) in self.drm_scanner.connectors() {
-            // We only keep the connector if it has a CRTC and the output isn't off in niri.
+            // We only keep the connector if it has a CRTC and the output isn't off in synoik.
             if let Some(crtc) = self.drm_scanner.crtc_for_connector(conn) {
                 // Verify that the connector's current CRTC matches the CRTC we expect. If not,
                 // clear the CRTC and the connector so that all connectors can get the expected
@@ -411,7 +411,7 @@ impl Tty {
         let _span = tracy_client::span!("Tty::new");
 
         let (session, notifier) = LibSeatSession::new().context(
-            "Error creating a session. This might mean that you're trying to run niri on a TTY \
+            "Error creating a session. This might mean that you're trying to run synoik on a TTY \
              that is already busy, for example if you're running this inside tmux that had been \
              originally started on a different TTY",
         )?;
@@ -420,7 +420,7 @@ impl Tty {
         let udev_backend =
             UdevBackend::new(session.seat()).context("error creating a udev backend")?;
         let udev_dispatcher = Dispatcher::new(udev_backend, move |event, _, state: &mut State| {
-            state.backend.tty().on_udev_event(&mut state.niri, event);
+            state.backend.tty().on_udev_event(&mut state.synoik, event);
         });
         event_loop
             .register_dispatcher(udev_dispatcher.clone())
@@ -434,7 +434,7 @@ impl Tty {
         }
         .map_err(|()| anyhow!("error assigning the seat to libinput"))?;
 
-        // If the session is not active at startup (e.g. niri was launched from a different TTY),
+        // If the session is not active at startup (e.g. synoik was launched from a different TTY),
         // suspend libinput now so that when ActivateSession fires, libinput.resume() performs a
         // full re-enumeration of input devices instead of being a no-op.
         if !session.is_active() {
@@ -452,7 +452,10 @@ impl Tty {
 
         event_loop
             .insert_source(notifier, move |event, _, state| {
-                state.backend.tty().on_session_event(&mut state.niri, event);
+                state
+                    .backend
+                    .tty()
+                    .on_session_event(&mut state.synoik, event);
             })
             .unwrap();
 
@@ -540,11 +543,11 @@ impl Tty {
         })
     }
 
-    pub fn init(&mut self, niri: &mut Niri) {
+    pub fn init(&mut self, synoik: &mut Synoik) {
         // If the session is inactive, skip initialization because we won't be able to do much with
         // the devices anyway. We'll get ActivateSession and add the devices there instead.
         //
-        // This can happen when starting niri while having a different TTY active (e.g. via tmux).
+        // This can happen when starting synoik while having a different TTY active (e.g. via tmux).
         if !self.session.is_active() {
             return;
         }
@@ -561,7 +564,7 @@ impl Tty {
             .device_list()
             .find(|&(device_id, _)| device_id == self.primary_node.dev_id())
         {
-            if let Err(err) = self.device_added(primary_device_id, primary_device_path, niri) {
+            if let Err(err) = self.device_added(primary_device_id, primary_device_path, synoik) {
                 warn!(
                     "error adding primary node device, display-only devices may not work: {err:?}"
                 );
@@ -575,13 +578,13 @@ impl Tty {
                 continue;
             }
 
-            if let Err(err) = self.device_added(device_id, path, niri) {
+            if let Err(err) = self.device_added(device_id, path, synoik) {
                 warn!("error adding device: {err:?}");
             }
         }
     }
 
-    fn on_udev_event(&mut self, niri: &mut Niri, event: UdevEvent) {
+    fn on_udev_event(&mut self, synoik: &mut Synoik, event: UdevEvent) {
         let _span = tracy_client::span!("Tty::on_udev_event");
 
         match event {
@@ -595,7 +598,7 @@ impl Tty {
                 // new underlying device IDs.
                 self.ignored_nodes = self.compute_ignored_nodes();
 
-                if let Err(err) = self.device_added(device_id, &path, niri) {
+                if let Err(err) = self.device_added(device_id, &path, synoik) {
                     warn!("error adding device: {err:?}");
                 }
             }
@@ -605,7 +608,7 @@ impl Tty {
                     return;
                 }
 
-                self.device_changed(device_id, niri, false)
+                self.device_changed(device_id, synoik, false)
             }
             UdevEvent::Removed { device_id } => {
                 if !self.session.is_active() {
@@ -613,12 +616,12 @@ impl Tty {
                     return;
                 }
 
-                self.device_removed(device_id, niri)
+                self.device_removed(device_id, synoik)
             }
         }
     }
 
-    fn on_session_event(&mut self, niri: &mut Niri, event: SessionEvent) {
+    fn on_session_event(&mut self, synoik: &mut Synoik, event: SessionEvent) {
         let _span = tracy_client::span!("Tty::on_session_event");
 
         match event {
@@ -676,7 +679,7 @@ impl Tty {
                 // Remove removed devices.
                 for node in removed_devices {
                     device_list.remove(&node.dev_id());
-                    self.device_removed(node.dev_id(), niri);
+                    self.device_removed(node.dev_id(), synoik);
                 }
 
                 // Update remained devices.
@@ -702,7 +705,7 @@ impl Tty {
                     }
 
                     // Refresh the connectors.
-                    self.device_changed(node.dev_id(), niri, true);
+                    self.device_changed(node.dev_id(), synoik, true);
 
                     // Apply pending gamma changes and restore our existing gamma.
                     let device = self.devices.get_mut(&node).unwrap();
@@ -748,21 +751,21 @@ impl Tty {
                 let primary = primary_device_path.map(|path| (primary_device_id, path));
 
                 for (device_id, path) in primary.into_iter().chain(device_list) {
-                    if let Err(err) = self.device_added(device_id, &path, niri) {
+                    if let Err(err) = self.device_added(device_id, &path, synoik) {
                         warn!("error adding device: {err:?}");
                     }
                 }
 
                 if self.update_output_config_on_resume {
-                    self.on_output_config_changed(niri);
+                    self.on_output_config_changed(synoik);
                 }
 
-                self.refresh_ipc_outputs(niri);
+                self.refresh_ipc_outputs(synoik);
 
-                niri.notify_activity();
-                niri.monitors_active = true;
+                synoik.notify_activity();
+                synoik.monitors_active = true;
                 self.set_monitors_active(true);
-                niri.queue_redraw_all();
+                synoik.queue_redraw_all();
             }
         }
     }
@@ -771,7 +774,7 @@ impl Tty {
         &mut self,
         device_id: dev_t,
         path: &Path,
-        niri: &mut Niri,
+        synoik: &mut Synoik,
     ) -> anyhow::Result<()> {
         debug!("adding device: {device_id} {path:?}");
 
@@ -853,7 +856,7 @@ impl Tty {
             }
             drop(config);
 
-            niri.update_shaders();
+            synoik.update_shaders();
 
             // Create the dmabuf global advertising the owned renderer's importable formats
             // (LINEAR 8888), so clients allocate buffers the Vulkan renderer can actually import.
@@ -862,10 +865,10 @@ impl Tty {
                 DmabufFeedbackBuilder::new(render_node.dev_id(), primary_formats.clone())
                     .build()
                     .context("error building default dmabuf feedback")?;
-            let dmabuf_global = niri
+            let dmabuf_global = synoik
                 .dmabuf_state
                 .create_global_with_default_feedback::<State>(
-                    &niri.display_handle,
+                    &synoik.display_handle,
                     &default_feedback,
                 );
             assert!(self.dmabuf_global.replace(dmabuf_global).is_none());
@@ -877,12 +880,12 @@ impl Tty {
             // CPU-side when the buffer's last reference drops, so no renderer completion fence is
             // needed while `VulkanFrame::finish()` stays synchronous. See
             // docs/fork/explicit-sync.md.
-            if niri.drm_syncobj_state.is_none() {
+            if synoik.drm_syncobj_state.is_none() {
                 let device_fd = drm.device_fd().clone();
                 if supports_syncobj_eventfd(&device_fd) {
                     debug!("exposing linux-drm-syncobj-v1 (explicit sync)");
-                    niri.drm_syncobj_state = Some(DrmSyncobjState::new::<State>(
-                        &niri.display_handle,
+                    synoik.drm_syncobj_state = Some(DrmSyncobjState::new::<State>(
+                        &synoik.display_handle,
                         device_fd,
                     ));
                 } else {
@@ -921,21 +924,21 @@ impl Tty {
         let gbm_flags = GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT;
         let allocator = ScanoutAllocator::new(allocator_gbm, gbm_flags);
 
-        let token = niri
+        let token = synoik
             .event_loop
             .insert_source(drm_notifier, move |event, meta, state| {
                 let tty = state.backend.tty();
                 match event {
                     DrmEvent::VBlank(crtc) => {
                         let meta = meta.expect("VBlank events must have metadata");
-                        tty.on_vblank(&mut state.niri, node, crtc, meta);
+                        tty.on_vblank(&mut state.synoik, node, crtc, meta);
                     }
                     DrmEvent::Error(error) => warn!("DRM error: {error}"),
                 };
             })
             .unwrap();
 
-        let drm_lease_state = DrmLeaseState::new::<State>(&niri.display_handle, &node)
+        let drm_lease_state = DrmLeaseState::new::<State>(&synoik.display_handle, &node)
             .map_err(|err| warn!("error initializing DRM leasing for {node}: {err:?}"))
             .ok();
 
@@ -954,12 +957,12 @@ impl Tty {
         };
         assert!(self.devices.insert(node, device).is_none());
 
-        self.device_changed(device_id, niri, true);
+        self.device_changed(device_id, synoik, true);
 
         Ok(())
     }
 
-    fn device_changed(&mut self, device_id: dev_t, niri: &mut Niri, cleanup: bool) {
+    fn device_changed(&mut self, device_id: dev_t, synoik: &mut Synoik, cleanup: bool) {
         debug!("device changed: {device_id}");
 
         let Ok(node) = DrmNode::from_dev_id(device_id) else {
@@ -981,7 +984,7 @@ impl Tty {
             if let Some(path) = node.dev_path() {
                 warn!("unknown device; trying to add");
 
-                if let Err(err) = self.device_added(device_id, &path, niri) {
+                if let Err(err) = self.device_added(device_id, &path, synoik) {
                     warn!("error adding device: {err:?}");
                 }
             } else {
@@ -1056,7 +1059,7 @@ impl Tty {
         }
 
         for crtc in &removed {
-            self.connector_disconnected(niri, node, *crtc);
+            self.connector_disconnected(synoik, node, *crtc);
         }
 
         let Some(device) = self.devices.get_mut(&node) else {
@@ -1107,7 +1110,7 @@ impl Tty {
             let device = self.devices.get(&node).unwrap();
 
             // Follow the logic in on_output_config_changed().
-            let disable_laptop_panels = self.should_disable_laptop_panels(niri.is_lid_closed);
+            let disable_laptop_panels = self.should_disable_laptop_panels(synoik.is_lid_closed);
             let should_disable = |conn: &str| disable_laptop_panels && is_laptop_panel(conn);
 
             let config = self.config.borrow();
@@ -1146,10 +1149,10 @@ impl Tty {
         //
         // It will also call refresh_ipc_outputs(), which will catch the disconnected connectors
         // above.
-        self.on_output_config_changed(niri);
+        self.on_output_config_changed(synoik);
     }
 
-    fn device_removed(&mut self, device_id: dev_t, niri: &mut Niri) {
+    fn device_removed(&mut self, device_id: dev_t, synoik: &mut Synoik) {
         debug!("removing device: {device_id}");
 
         let Ok(node) = DrmNode::from_dev_id(device_id) else {
@@ -1174,7 +1177,7 @@ impl Tty {
             .collect();
 
         for crtc in crtcs {
-            self.connector_disconnected(niri, node, crtc);
+            self.connector_disconnected(synoik, node, crtc);
         }
 
         let mut device = self.devices.remove(&node).unwrap();
@@ -1198,16 +1201,18 @@ impl Tty {
 
                 // Disable and destroy the dmabuf global.
                 if let Some(global) = self.dmabuf_global.take() {
-                    niri.dmabuf_state
-                        .disable_global::<State>(&niri.display_handle, &global);
-                    niri.event_loop
+                    synoik
+                        .dmabuf_state
+                        .disable_global::<State>(&synoik.display_handle, &global);
+                    synoik
+                        .event_loop
                         .insert_source(
                             Timer::from_duration(Duration::from_secs(10)),
                             move |_, _, state| {
                                 state
-                                    .niri
+                                    .synoik
                                     .dmabuf_state
-                                    .destroy_global::<State>(&state.niri.display_handle, global);
+                                    .destroy_global::<State>(&state.synoik.display_handle, global);
                                 TimeoutAction::Drop
                             },
                         )
@@ -1229,15 +1234,18 @@ impl Tty {
                 // ("fd has unexpected references") and leak the seat fd; it also lets a re-added
                 // primary rebuild the global against the fresh fd (the `is_none()` guard in
                 // `device_added`). Mirrors the dmabuf-global teardown above.
-                if let Some(syncobj_state) = niri.drm_syncobj_state.take() {
+                if let Some(syncobj_state) = synoik.drm_syncobj_state.take() {
                     let global = syncobj_state.into_global();
-                    niri.display_handle.disable_global::<State>(global.clone());
-                    niri.event_loop
+                    synoik
+                        .display_handle
+                        .disable_global::<State>(global.clone());
+                    synoik
+                        .event_loop
                         .insert_source(
                             Timer::from_duration(Duration::from_secs(10)),
                             move |_, _, state| {
                                 state
-                                    .niri
+                                    .synoik
                                     .display_handle
                                     .remove_global::<State>(global.clone());
                                 TimeoutAction::Drop
@@ -1248,9 +1256,9 @@ impl Tty {
             }
         }
 
-        niri.event_loop.remove(device.token);
+        synoik.event_loop.remove(device.token);
 
-        self.refresh_ipc_outputs(niri);
+        self.refresh_ipc_outputs(synoik);
 
         drop(device);
 
@@ -1268,7 +1276,7 @@ impl Tty {
 
     fn connector_connected(
         &mut self,
-        niri: &mut Niri,
+        synoik: &mut Synoik,
         node: DrmNode,
         connector: connector::Info,
         crtc: crtc::Handle,
@@ -1491,7 +1499,7 @@ impl Tty {
 
         // Some buggy monitors replug upon powering off, so powering on here would prevent such
         // monitors from powering off. Therefore, we avoid unconditionally powering on.
-        if !niri.monitors_active {
+        if !synoik.monitors_active {
             if let Err(err) = compositor.clear() {
                 warn!("error clearing drm surface: {err:?}");
             }
@@ -1527,14 +1535,14 @@ impl Tty {
         let res = device.surfaces.insert(crtc, surface);
         assert!(res.is_none(), "crtc must not have already existed");
 
-        niri.add_output(output.clone(), Some(refresh_interval(mode)), vrr_enabled);
+        synoik.add_output(output.clone(), Some(refresh_interval(mode)), vrr_enabled);
 
-        if niri.monitors_active {
+        if synoik.monitors_active {
             // Redraw the new monitor.
-            niri.event_loop.insert_idle(move |state| {
+            synoik.event_loop.insert_idle(move |state| {
                 // Guard against output disconnecting before the idle has a chance to run.
-                if state.niri.output_state.contains_key(&output) {
-                    state.niri.queue_redraw(&output);
+                if state.synoik.output_state.contains_key(&output) {
+                    state.synoik.queue_redraw(&output);
                 }
             });
         }
@@ -1542,7 +1550,7 @@ impl Tty {
         Ok(())
     }
 
-    fn connector_disconnected(&mut self, niri: &mut Niri, node: DrmNode, crtc: crtc::Handle) {
+    fn connector_disconnected(&mut self, synoik: &mut Synoik, node: DrmNode, crtc: crtc::Handle) {
         let Some(device) = self.devices.get_mut(&node) else {
             debug!("disconnecting connector for crtc: {crtc:?}");
             error!("missing device");
@@ -1574,7 +1582,7 @@ impl Tty {
 
         debug!("disconnecting connector: {:?}", surface.name.connector);
 
-        let output = niri
+        let output = synoik
             .global_space
             .outputs()
             .find(|output| {
@@ -1583,7 +1591,7 @@ impl Tty {
             })
             .cloned();
         if let Some(output) = output {
-            niri.remove_output(&output);
+            synoik.remove_output(&output);
         } else {
             error!("missing output for crtc {crtc:?}");
         };
@@ -1591,7 +1599,7 @@ impl Tty {
 
     fn on_vblank(
         &mut self,
-        niri: &mut Niri,
+        synoik: &mut Synoik,
         node: DrmNode,
         crtc: crtc::Handle,
         meta: DrmEventMetadata,
@@ -1627,7 +1635,7 @@ impl Tty {
                 Duration::ZERO
             }
         };
-        let presentation_time = if niri.config.borrow().debug.emulate_zero_presentation_time {
+        let presentation_time = if synoik.config.borrow().debug.emulate_zero_presentation_time {
             Duration::ZERO
         } else {
             presentation_time
@@ -1654,7 +1662,7 @@ impl Tty {
             .unwrap()
             .message(&message, 0);
 
-        let Some(output) = niri
+        let Some(output) = synoik
             .global_space
             .outputs()
             .find(|output| {
@@ -1667,7 +1675,7 @@ impl Tty {
             return;
         };
 
-        let Some(output_state) = niri.output_state.get_mut(&output) else {
+        let Some(output_state) = synoik.output_state.get_mut(&output) else {
             error!("missing output state for {name}");
             return;
         };
@@ -1689,7 +1697,7 @@ impl Tty {
                 };
 
                 let tty = state.backend.tty();
-                tty.on_vblank(&mut state.niri, node, crtc, meta);
+                tty.on_vblank(&mut state.synoik, node, crtc, meta);
             })
         {
             // Throttled.
@@ -1770,12 +1778,13 @@ impl Tty {
 
         output_state.frame_clock.presented(presentation_time);
 
-        // Ends the `output_state` borrow so the frame log (which lives on `niri`)
+        // Ends the `output_state` borrow so the frame log (which lives on `synoik`)
         // can be reached below.
         let unfinished_animations_remain = output_state.unfinished_animations_remain;
 
         if let Some((target, actual)) = missed_deadline {
-            niri.frame_log
+            synoik
+                .frame_log
                 .presented(&output.name(), target, actual, refresh_interval);
         }
 
@@ -1785,19 +1794,19 @@ impl Tty {
                 .non_continuous_frame(surface.vblank_frame_name);
             surface.vblank_frame = Some(vblank_frame);
 
-            niri.queue_redraw(&output);
+            synoik.queue_redraw(&output);
         } else {
-            niri.send_frame_callbacks(&output);
+            synoik.send_frame_callbacks(&output);
         }
     }
 
-    fn on_estimated_vblank_timer(&self, niri: &mut Niri, output: Output) {
+    fn on_estimated_vblank_timer(&self, synoik: &mut Synoik, output: Output) {
         let span = tracy_client::span!("Tty::on_estimated_vblank_timer");
 
         let name = output.name();
         span.emit_text(&name);
 
-        let Some(output_state) = niri.output_state.get_mut(&output) else {
+        let Some(output_state) = synoik.output_state.get_mut(&output) else {
             error!("missing output state for {name}");
             return;
         };
@@ -1818,9 +1827,9 @@ impl Tty {
         }
 
         if output_state.unfinished_animations_remain {
-            niri.queue_redraw(&output);
+            synoik.queue_redraw(&output);
         } else {
-            niri.send_frame_callbacks(&output);
+            synoik.send_frame_callbacks(&output);
         }
     }
 
@@ -1838,7 +1847,7 @@ impl Tty {
 
     pub fn render(
         &mut self,
-        niri: &mut Niri,
+        synoik: &mut Synoik,
         output: &Output,
         target_presentation_time: Duration,
     ) -> RenderResult {
@@ -1903,9 +1912,9 @@ impl Tty {
             // mirror the GLES flags in full. Overlay stays behind `debug.enable_overlay_planes`
             // (off by default, same as GLES); `debug.disable_direct_scanout` drops primary+overlay.
             let flags =
-                compositor_frame_flags(&config, niri, output, /* allow_primary */ true);
+                compositor_frame_flags(&config, synoik, output, /* allow_primary */ true);
             render_surface_with(
-                niri,
+                synoik,
                 output,
                 vk,
                 surface,
@@ -2014,7 +2023,7 @@ impl Tty {
         }
     }
 
-    fn refresh_ipc_outputs(&self, niri: &mut Niri) {
+    fn refresh_ipc_outputs(&self, synoik: &mut Synoik) {
         let _span = tracy_client::span!("Tty::refresh_ipc_outputs");
 
         let mut ipc_outputs = HashMap::new();
@@ -2031,7 +2040,7 @@ impl Tty {
                 let mut current_mode = None;
                 let mut is_custom_mode = false;
 
-                let mut modes: Vec<niri_ipc::Mode> = connector
+                let mut modes: Vec<synoik_ipc::Mode> = connector
                     .modes()
                     .iter()
                     .filter(|m| !m.flags().contains(ModeFlags::INTERLACE))
@@ -2041,7 +2050,7 @@ impl Tty {
                             current_mode = Some(idx);
                         }
 
-                        niri_ipc::Mode {
+                        synoik_ipc::Mode {
                             width: m.size().0,
                             height: m.size().1,
                             refresh_rate: Mode::from(*m).refresh as u32,
@@ -2055,7 +2064,7 @@ impl Tty {
                     if crtc_mode.mode_type().contains(ModeTypeFlags::USERDEF) {
                         modes.insert(
                             0,
-                            niri_ipc::Mode {
+                            synoik_ipc::Mode {
                                 width: crtc_mode.size().0,
                                 height: crtc_mode.size().1,
                                 refresh_rate: Mode::from(crtc_mode).refresh as u32,
@@ -2087,7 +2096,7 @@ impl Tty {
                     });
                 let vrr_enabled = surface.is_some_and(|surface| surface.compositor.vrr_enabled());
 
-                let logical = niri
+                let logical = synoik
                     .global_space
                     .outputs()
                     .find(|output| {
@@ -2111,7 +2120,7 @@ impl Tty {
                         .map(|v| v as u8)
                 });
 
-                let ipc_output = niri_ipc::Output {
+                let ipc_output = synoik_ipc::Output {
                     name: connector_name,
                     make: output_name.make.unwrap_or_else(|| "Unknown".into()),
                     model: output_name.model.unwrap_or_else(|| "Unknown".into()),
@@ -2132,7 +2141,7 @@ impl Tty {
 
         let mut guard = self.ipc_outputs.lock().unwrap();
         *guard = ipc_outputs;
-        niri.ipc_outputs_changed = true;
+        synoik.ipc_outputs_changed = true;
     }
 
     pub fn ipc_outputs(&self) -> Arc<Mutex<IpcOutputMap>> {
@@ -2171,10 +2180,15 @@ impl Tty {
         }
     }
 
-    pub fn set_output_on_demand_vrr(&mut self, niri: &mut Niri, output: &Output, enable_vrr: bool) {
+    pub fn set_output_on_demand_vrr(
+        &mut self,
+        synoik: &mut Synoik,
+        output: &Output,
+        enable_vrr: bool,
+    ) {
         let _span = tracy_client::span!("Tty::set_output_on_demand_vrr");
 
-        let output_state = niri.output_state.get_mut(output).unwrap();
+        let output_state = synoik.output_state.get_mut(output).unwrap();
         output_state.on_demand_vrr_enabled = enable_vrr;
         if output_state.frame_clock.vrr() == enable_vrr {
             return;
@@ -2194,7 +2208,7 @@ impl Tty {
                         .frame_clock
                         .set_vrr(surface.compositor.vrr_enabled());
 
-                    self.refresh_ipc_outputs(niri);
+                    self.refresh_ipc_outputs(synoik);
                     return;
                 }
             }
@@ -2211,7 +2225,7 @@ impl Tty {
         ignored_nodes
     }
 
-    pub fn update_ignored_nodes_config(&mut self, niri: &mut Niri) {
+    pub fn update_ignored_nodes_config(&mut self, synoik: &mut Synoik) {
         let _span = tracy_client::span!("Tty::update_ignored_nodes_config");
 
         // If we're inactive, we can't do anything, but we'll recompute in ActivateSession.
@@ -2243,7 +2257,7 @@ impl Tty {
 
         for node in removed_devices {
             device_list.remove(&node.dev_id());
-            self.device_removed(node.dev_id(), niri);
+            self.device_removed(node.dev_id(), synoik);
         }
 
         for node in self.devices.keys() {
@@ -2251,7 +2265,7 @@ impl Tty {
         }
 
         for (device_id, path) in device_list {
-            if let Err(err) = self.device_added(device_id, &path, niri) {
+            if let Err(err) = self.device_added(device_id, &path, synoik) {
                 warn!("error adding device {path:?}: {err:?}");
             }
         }
@@ -2279,7 +2293,7 @@ impl Tty {
 
     /// Drops a live-applied display config the hardware can no longer satisfy.
     ///
-    /// A config applied this session (GNOME Settings' `ApplyMonitorsConfig`, `niri msg output`,
+    /// A config applied this session (GNOME Settings' `ApplyMonitorsConfig`, `synoik msg output`,
     /// wlr-output-management) outranks everything, which is right while the display it was applied
     /// to is still there — and wrong the moment it isn't. Moving this VM's window from an external
     /// monitor to the laptop panel keeps the connector but changes the mode list, and the external
@@ -2292,11 +2306,11 @@ impl Tty {
     /// point is to leave nothing of the old display behind for the chain to pick up. Only outputs
     /// with a recorded override are touched, so a scale/mode a user wrote in their KDL config by
     /// hand is never cleared.
-    fn forget_inapplicable_applied_config(&mut self, niri: &mut Niri) {
+    fn forget_inapplicable_applied_config(&mut self, synoik: &mut Synoik) {
         let mut stale = vec![];
         for device in self.devices.values() {
             for surface in device.surfaces.values() {
-                if !niri
+                if !synoik
                     .applied_display_config
                     .contains_key(&surface.name.connector)
                 {
@@ -2323,17 +2337,17 @@ impl Tty {
                 "output {:?}: dropping the applied display config, its mode is gone",
                 name.connector
             );
-            niri.applied_display_config.remove(&name.connector);
+            synoik.applied_display_config.remove(&name.connector);
             let mut config = self.config.borrow_mut();
             if let Some(output) = config.outputs.find_mut(&name) {
                 output.mode = None;
                 output.scale = None;
-                output.transform = niri_ipc::Transform::Normal;
+                output.transform = synoik_ipc::Transform::Normal;
             }
         }
     }
 
-    pub fn on_output_config_changed(&mut self, niri: &mut Niri) {
+    pub fn on_output_config_changed(&mut self, synoik: &mut Synoik) {
         let _span = tracy_client::span!("Tty::on_output_config_changed");
 
         // If we're inactive, we can't do anything, so just set a flag for later.
@@ -2343,10 +2357,10 @@ impl Tty {
         }
         self.update_output_config_on_resume = false;
 
-        self.forget_inapplicable_applied_config(niri);
+        self.forget_inapplicable_applied_config(synoik);
 
         // Figure out if we should disable laptop panels.
-        let disable_laptop_panels = self.should_disable_laptop_panels(niri.is_lid_closed);
+        let disable_laptop_panels = self.should_disable_laptop_panels(synoik.is_lid_closed);
         let should_disable = |connector: &str| disable_laptop_panels && is_laptop_panel(connector);
 
         let mut to_disconnect = vec![];
@@ -2416,7 +2430,7 @@ impl Tty {
                     continue;
                 }
 
-                let output = niri
+                let output = synoik
                     .global_space
                     .outputs()
                     .find(|output| {
@@ -2428,7 +2442,7 @@ impl Tty {
                     error!("missing output for crtc: {crtc:?}");
                     continue;
                 };
-                let Some(output_state) = niri.output_state.get_mut(&output) else {
+                let Some(output_state) = synoik.output_state.get_mut(&output) else {
                     error!("missing state for output {:?}", surface.name.connector);
                     continue;
                 };
@@ -2491,7 +2505,7 @@ impl Tty {
                     // `forget_inapplicable_applied_config`.)
                     let monitors_config = MonitorsConfig::load();
                     let (scale, transform) =
-                        niri.derive_output_scale_transform(&output, monitors_config.as_ref());
+                        synoik.derive_output_scale_transform(&output, monitors_config.as_ref());
                     if output.current_scale().fractional_scale() != scale
                         || output.current_transform() != transform
                     {
@@ -2506,10 +2520,10 @@ impl Tty {
                             Some(Scale::Fractional(scale)),
                             None,
                         );
-                        niri.ipc_outputs_changed = true;
+                        synoik.ipc_outputs_changed = true;
                     }
 
-                    niri.output_resized(&output);
+                    synoik.output_resized(&output);
                 }
             }
 
@@ -2546,7 +2560,7 @@ impl Tty {
         }
 
         for (node, crtc) in to_disconnect {
-            self.connector_disconnected(niri, node, crtc);
+            self.connector_disconnected(synoik, node, crtc);
         }
 
         // Sort by output name to get more predictable first focused output at initial compositor
@@ -2554,12 +2568,12 @@ impl Tty {
         to_connect.sort_unstable_by(|a, b| a.3.compare(&b.3));
 
         for (node, connector, crtc, _name) in to_connect {
-            if let Err(err) = self.connector_connected(niri, node, connector, crtc) {
+            if let Err(err) = self.connector_connected(synoik, node, connector, crtc) {
                 warn!("error connecting connector: {err:?}");
             }
         }
 
-        self.refresh_ipc_outputs(niri);
+        self.refresh_ipc_outputs(synoik);
     }
 
     pub fn get_device_from_node(&mut self, node: DrmNode) -> Option<&mut OutputDevice> {
@@ -2809,7 +2823,7 @@ fn owned_vulkan_scanout_formats() -> FormatSet {
     scanout_formats(force_implicit_modifiers())
 }
 
-/// `NIRI_KMS_IMPLICIT_MODIFIERS=1` drops the explicit entries from the scanout set, so the
+/// `SYNOIK_KMS_IMPLICIT_MODIFIERS=1` drops the explicit entries from the scanout set, so the
 /// compositor negotiates INVALID with the plane even on a driver that does name modifiers.
 ///
 /// That is the whole implicit path — implicit gbm allocation, its layout check, a modifier-less
@@ -2819,9 +2833,11 @@ fn owned_vulkan_scanout_formats() -> FormatSet {
 fn force_implicit_modifiers() -> bool {
     static FORCE: OnceLock<bool> = OnceLock::new();
     *FORCE.get_or_init(|| {
-        let force = std::env::var_os("NIRI_KMS_IMPLICIT_MODIFIERS").is_some_and(|x| x == "1");
+        let force = std::env::var_os("SYNOIK_KMS_IMPLICIT_MODIFIERS").is_some_and(|x| x == "1");
         if force {
-            warn!("NIRI_KMS_IMPLICIT_MODIFIERS=1: negotiating scanout without explicit modifiers");
+            warn!(
+                "SYNOIK_KMS_IMPLICIT_MODIFIERS=1: negotiating scanout without explicit modifiers"
+            );
         }
         force
     })
@@ -3001,7 +3017,7 @@ fn suspend() -> anyhow::Result<()> {
 /// `R: Renderer + Bind<Dmabuf>`, which `VulkanRenderer` satisfies.
 #[allow(clippy::too_many_arguments)]
 fn render_surface_with(
-    niri: &mut Niri,
+    synoik: &mut Synoik,
     output: &Output,
     renderer: &mut VulkanRenderer,
     surface: &mut Surface,
@@ -3018,19 +3034,19 @@ fn render_surface_with(
         target: RenderTarget::Output,
         xray: None,
     };
-    niri.frame_log.phase(Phase::Collect);
-    let mut elements = niri.render_to_vec(ctx, output, true);
+    synoik.frame_log.phase(Phase::Collect);
+    let mut elements = synoik.render_to_vec(ctx, output, true);
 
     // Visualize the damage, if enabled.
-    if niri.debug_draw_damage {
-        let output_state = niri.output_state.get_mut(output).unwrap();
+    if synoik.debug_draw_damage {
+        let output_state = synoik.output_state.get_mut(output).unwrap();
         draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
     }
 
     // Give the compositor the current cursor hotspot before it assigns the cursor plane. On
     // para-virtualized drivers (virtio-gpu) this drives the plane's HOTSPOT_X/Y so the host treats
     // our cursor plane as its pointer and stops drawing a second host cursor; a no-op elsewhere.
-    let cursor_hotspot = niri.cursor_plane_hotspot(output);
+    let cursor_hotspot = synoik.cursor_plane_hotspot(output);
 
     // Hand them over to the DRM.
     let drm_compositor = &mut surface.compositor;
@@ -3045,12 +3061,12 @@ fn render_surface_with(
         drm_compositor.reset_buffer_ages();
     }
 
-    if let Some(state) = niri.output_state.get_mut(output) {
+    if let Some(state) = synoik.output_state.get_mut(output) {
         state.last_frame_elements = elements.len();
         state.last_frame_full_damage = force_full_damage;
     }
 
-    niri.frame_log.phase(Phase::Submit);
+    synoik.frame_log.phase(Phase::Submit);
     // This is the one frame whose completion has somewhere to go: `DrmCompositor` puts the sync
     // point on the primary plane and the atomic commit takes it as `IN_FENCE_FD`, so the renderer
     // may leave the submit in flight rather than parking the compositor thread on it. Every other
@@ -3076,25 +3092,26 @@ fn render_surface_with(
                 }
             }
 
-            niri.update_primary_scanout_output(output, &res.states);
+            synoik.update_primary_scanout_output(output, &res.states);
             if let Some(dmabuf_feedback) = surface.dmabuf_feedback.as_ref() {
-                niri.send_dmabuf_feedbacks(output, dmabuf_feedback, &res.states);
+                synoik.send_dmabuf_feedbacks(output, dmabuf_feedback, &res.states);
             }
 
             if !res.is_empty {
-                let presentation_feedbacks = niri.take_presentation_feedbacks(output, &res.states);
+                let presentation_feedbacks =
+                    synoik.take_presentation_feedbacks(output, &res.states);
                 let data = (presentation_feedbacks, target_presentation_time);
 
-                niri.frame_log.phase(Phase::Queue);
+                synoik.frame_log.phase(Phase::Queue);
                 match drm_compositor.queue_frame(data) {
                     Ok(()) => {
-                        niri.frame_log.queued(
+                        synoik.frame_log.queued(
                             &output.name(),
                             target_presentation_time,
                             get_monotonic_time(),
                         );
 
-                        let output_state = niri.output_state.get_mut(output).unwrap();
+                        let output_state = synoik.output_state.get_mut(output).unwrap();
                         let new_state = RedrawState::WaitingForVBlank {
                             redraw_needed: false,
                         };
@@ -3104,7 +3121,7 @@ fn render_surface_with(
                             RedrawState::WaitingForVBlank { .. } => unreachable!(),
                             RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
                             RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
-                                niri.event_loop.remove(token);
+                                synoik.event_loop.remove(token);
                             }
                         };
 
@@ -3134,7 +3151,7 @@ fn render_surface_with(
     drop(surface.vblank_frame.take());
 
     // Queue a timer to fire at the predicted vblank time.
-    queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
+    queue_estimated_vblank_timer(synoik, output.clone(), target_presentation_time);
 
     rv
 }
@@ -3147,7 +3164,7 @@ fn render_surface_with(
 /// (see the Vulkan branch in `Tty::render`).
 fn compositor_frame_flags(
     config: &Rc<RefCell<Config>>,
-    niri: &Niri,
+    synoik: &Synoik,
     output: &Output,
     allow_primary: bool,
 ) -> FrameFlags {
@@ -3175,7 +3192,7 @@ fn compositor_frame_flags(
         flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
     }
     if debug.skip_cursor_only_updates_during_vrr {
-        let output_state = niri.output_state.get(output).unwrap();
+        let output_state = synoik.output_state.get(output).unwrap();
         if output_state.frame_clock.vrr() {
             flags.insert(FrameFlags::SKIP_CURSOR_ONLY_UPDATES);
         }
@@ -3185,11 +3202,11 @@ fn compositor_frame_flags(
 }
 
 fn queue_estimated_vblank_timer(
-    niri: &mut Niri,
+    synoik: &mut Synoik,
     output: Output,
     target_presentation_time: Duration,
 ) {
-    let output_state = niri.output_state.get_mut(&output).unwrap();
+    let output_state = synoik.output_state.get_mut(&output).unwrap();
     match mem::take(&mut output_state.redraw_state) {
         RedrawState::Idle => unreachable!(),
         RedrawState::Queued => (),
@@ -3218,12 +3235,12 @@ fn queue_estimated_vblank_timer(
     trace!("queueing estimated vblank timer to fire in {duration:?}");
 
     let timer = Timer::from_duration(duration);
-    let token = niri
+    let token = synoik
         .event_loop
         .insert_source(timer, move |_, _, data| {
             data.backend
                 .tty()
-                .on_estimated_vblank_timer(&mut data.niri, output.clone());
+                .on_estimated_vblank_timer(&mut data.synoik, output.clone());
             TimeoutAction::Drop
         })
         .unwrap();
@@ -3425,7 +3442,7 @@ impl AdvertisedMode {
 /// Whether `mode` can be assigned on a connector advertising `advertised`, by `pick_mode`'s rules:
 /// the size must be advertised, and a mode that names a refresh rate needs that rate exactly (with
 /// no rate, `pick_mode` takes the highest of that size).
-fn mode_is_available(advertised: &[AdvertisedMode], mode: niri_config::output::Mode) -> bool {
+fn mode_is_available(advertised: &[AdvertisedMode], mode: synoik_config::output::Mode) -> bool {
     // A custom modeline is generated, not chosen from the advertised list.
     if mode.custom {
         return true;
@@ -3447,7 +3464,7 @@ fn mode_is_available(advertised: &[AdvertisedMode], mode: niri_config::output::M
 /// different display and the scale that came with it means nothing here.
 fn applied_config_is_stale(
     advertised: &[AdvertisedMode],
-    config_mode: Option<niri_config::output::Mode>,
+    config_mode: Option<synoik_config::output::Mode>,
 ) -> bool {
     config_mode.is_some_and(|mode| !mode_is_available(advertised, mode))
 }
@@ -3465,9 +3482,9 @@ fn applied_config_is_stale(
 /// never trip `pick_mode`'s "configured mode could not be found" fallback.
 fn choose_target_mode(
     advertised: &[AdvertisedMode],
-    config_mode: Option<niri_config::output::Mode>,
+    config_mode: Option<synoik_config::output::Mode>,
     saved: &[SavedMode],
-) -> Option<niri_config::output::Mode> {
+) -> Option<synoik_config::output::Mode> {
     if let Some(mode) = config_mode {
         if mode_is_available(advertised, mode) {
             return Some(mode);
@@ -3490,9 +3507,9 @@ fn choose_target_mode(
         advertised
             .iter()
             .any(|m| same_size(&m))
-            .then_some(niri_config::output::Mode {
+            .then_some(synoik_config::output::Mode {
                 custom: false,
-                mode: niri_ipc::ConfiguredMode {
+                mode: synoik_ipc::ConfiguredMode {
                     width: saved.width as u16,
                     height: saved.height as u16,
                     refresh,
@@ -3505,8 +3522,8 @@ fn choose_target_mode(
 fn target_mode(
     connector: &connector::Info,
     name: &OutputName,
-    config: &niri_config::Output,
-) -> Option<niri_config::output::Mode> {
+    config: &synoik_config::Output,
+) -> Option<synoik_config::output::Mode> {
     let saved: Vec<_> = MonitorsConfig::load()
         .map(|store| store.saved_modes_for(name).collect())
         .unwrap_or_default();
@@ -3523,7 +3540,7 @@ fn target_mode(
 
 fn pick_mode(
     connector: &connector::Info,
-    target: Option<niri_config::output::Mode>,
+    target: Option<synoik_config::output::Mode>,
 ) -> Option<(control::Mode, bool)> {
     let mut mode = None;
     let mut fallback = false;
@@ -3881,8 +3898,8 @@ unsafe fn init_libinput_plugin_system(libinput: &Libinput) {
 #[cfg(test)]
 mod tests {
     use insta::assert_debug_snapshot;
-    use niri_config::output::Modeline;
-    use niri_ipc::{HSyncPolarity, VSyncPolarity};
+    use synoik_config::output::Modeline;
+    use synoik_ipc::{HSyncPolarity, VSyncPolarity};
 
     use crate::backend::tty::{
         calculate_drm_mode_from_modeline, calculate_mode_cvt, owned_vulkan_dmabuf_formats,
@@ -3917,8 +3934,8 @@ mod tests {
     /// The INVALID entries are for plane negotiation only. Advertising them to clients would
     /// invite buffers whose layout nothing has verified, and `import_dmabuf_as_texture` rejects
     /// those — so the client-facing set stays explicit.
-    /// `NIRI_KMS_IMPLICIT_MODIFIERS=1` has to leave the plane nothing explicit to agree on, or the
-    /// negotiation keeps picking LINEAR and the switch tests nothing.
+    /// `SYNOIK_KMS_IMPLICIT_MODIFIERS=1` has to leave the plane nothing explicit to agree on, or
+    /// the negotiation keeps picking LINEAR and the switch tests nothing.
     #[test]
     fn forced_implicit_scanout_formats_are_invalid_only() {
         let forced = scanout_formats(true);
@@ -4099,10 +4116,10 @@ mod mode_selection_tests {
             .collect()
     }
 
-    fn cfg(width: u16, height: u16, refresh: Option<f64>) -> Option<niri_config::output::Mode> {
-        Some(niri_config::output::Mode {
+    fn cfg(width: u16, height: u16, refresh: Option<f64>) -> Option<synoik_config::output::Mode> {
+        Some(synoik_config::output::Mode {
             custom: false,
-            mode: niri_ipc::ConfiguredMode {
+            mode: synoik_ipc::ConfiguredMode {
                 width,
                 height,
                 refresh,

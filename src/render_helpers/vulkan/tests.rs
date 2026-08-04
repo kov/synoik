@@ -9,8 +9,6 @@
 use std::time::Duration;
 
 use glam::Mat3;
-use niri_config::{Color, CornerRadius, GradientInterpolation};
-use niri_vk::render::{PostprocessPush, ResizePush};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Element, Kind, RenderElement};
 use smithay::backend::renderer::pixman::PixmanRenderer;
@@ -20,10 +18,11 @@ use smithay::backend::renderer::{
 use smithay::utils::{
     Buffer as BufferCoord, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
 };
+use synoik_config::{Color, CornerRadius, GradientInterpolation};
+use synoik_vk::render::{PostprocessPush, ResizePush};
 
 use super::custom::{pack_affine, CustomAnimPush, CustomResizePush, CustomShaderType};
 use super::{VkTexture, VulkanRenderer, NATIVE_FOURCC};
-use crate::niri::OutputRenderElements;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
@@ -35,6 +34,7 @@ use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::synoik::OutputRenderElements;
 
 const W: i32 = 64;
 const H: i32 = 64;
@@ -204,7 +204,7 @@ fn solid_scene() -> Vec<SolidColorRenderElement> {
 /// Render an arbitrary element list into `target` and read it back as tight `Abgr8888` bytes.
 ///
 /// Generic over the element type `E` as well as the renderer, so the exact same clear→draw→readback
-/// path drives either bare [`SolidColorRenderElement`]s (through Pixman) or the niri
+/// path drives either bare [`SolidColorRenderElement`]s (through Pixman) or the synoik
 /// [`OutputRenderElements`] enum (through Vulkan), letting the two be compared pixel-for-pixel.
 fn render_elements_into<R, T, E>(r: &mut R, target: &mut T, elements: &[E]) -> Vec<u8>
 where
@@ -262,7 +262,8 @@ fn vulkan_output_render_elements_match_pixman() {
     };
 
     // Vulkan side: wrap each solid in the OutputRenderElements enum so the draw goes through the
-    // macro-generated `RenderElement<VulkanRenderer>` dispatch, exactly as niri's real render path.
+    // macro-generated `RenderElement<VulkanRenderer>` dispatch, exactly as synoik's real render
+    // path.
     let vk_elements: Vec<OutputRenderElements> = solid_scene()
         .into_iter()
         .map(OutputRenderElements::SolidColor)
@@ -314,7 +315,7 @@ fn vulkan_matches_pixman() {
 
 /// Build a glyph run, draw it into a dark offscreen through `render_glyphs`, read it back, and
 /// assert crisp bright coverage over a still-dark corner. This is the compositor-side counterpart
-/// of niri-vk's `text_context_reuse_rasterizes_coverage`: it proves the text material's pipeline,
+/// of synoik-vk's `text_context_reuse_rasterizes_coverage`: it proves the text material's pipeline,
 /// the R8-atlas descriptor set built by `build_glyph_run`, and the per-glyph push path all compose
 /// through a real `VulkanFrame`. Skips cleanly with no Vulkan device.
 #[test]
@@ -1056,7 +1057,7 @@ fn vulkan_offscreen_snapshot() {
 
 // --- Dual-kawase blur: a hard edge becomes a smooth ramp ----------------------------------------
 
-/// The owned renderer's dual-kawase blur (`render_blur`, driving niri-vk's `BlurChain`) softens a
+/// The owned renderer's dual-kawase blur (`render_blur`, driving synoik-vk's `BlurChain`) softens a
 /// hard black|white split into a monotonic mid-gray ramp localized around the boundary. Structural
 /// invariants (blur has no per-pixel oracle): the boundary column is intermediate gray, the profile
 /// is monotonic left→right, and columns deep in each half keep their extreme (not washed uniform).
@@ -1184,8 +1185,8 @@ fn vulkan_postprocess_clips_and_desaturates() {
                 [0.0, 1.0, 0.0, 0.0],
                 [0.0, 0.0, 1.0, 0.0],
             ],
-            niri_scale: 1.0,
-            niri_alpha: 1.0,
+            synoik_scale: 1.0,
+            synoik_alpha: 1.0,
             saturation: 0.3,
             noise: 0.0,
             // origin/size/target/src_rect are filled by render_postprocess.
@@ -1292,8 +1293,8 @@ fn vulkan_resize_crossfades() {
             corner_radius: [16.0; 4],
             clamped_progress: 0.5,
             clip_to_geometry: 1.0,
-            niri_scale: 1.0,
-            niri_alpha: 1.0,
+            synoik_scale: 1.0,
+            synoik_alpha: 1.0,
             // origin/size/target are filled by render_resize.
             ..Default::default()
         };
@@ -1719,13 +1720,13 @@ fn vulkan_custom_resize_crossfade() {
         )
         .expect("import next");
 
-    // A user snippet using GLES-style texture2D and the niri_* uniform names, exactly as a config
+    // A user snippet using GLES-style texture2D and the synoik_* uniform names, exactly as a config
     // custom shader would (this is niri's built-in resize body, supplied as if by the user).
     let snippet = "\
 vec4 resize_color(vec3 coords_curr_geo, vec3 size_curr_geo) {
-    vec4 prev = texture2D(niri_tex_prev, (niri_geo_to_tex_prev * coords_curr_geo).st);
-    vec4 next = texture2D(niri_tex_next, (niri_geo_to_tex_next * coords_curr_geo).st);
-    return mix(prev, next, niri_clamped_progress);
+    vec4 prev = texture2D(synoik_tex_prev, (synoik_geo_to_tex_prev * coords_curr_geo).st);
+    vec4 next = texture2D(synoik_tex_next, (synoik_geo_to_tex_next * coords_curr_geo).st);
+    return mix(prev, next, synoik_clamped_progress);
 }";
     vk.set_custom_shader(CustomShaderType::Resize, Some(snippet))
         .expect("compile custom resize snippet");
@@ -1870,7 +1871,7 @@ vec4 close_color(vec3 coords_geo, vec3 size_geo) {
         .expect("copy_framebuffer");
     let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
 
-    // At pixel (32, 32) the varying niri_v_coords ≈ (32.5/64, 32.5/64) = (0.5078, 0.5078).
+    // At pixel (32, 32) the varying synoik_v_coords ≈ (32.5/64, 32.5/64) = (0.5078, 0.5078).
     // coords_geo = (0.5*0.5078 + 0.1, 0.25*0.5078 + 0.2) = (0.3539, 0.3270) ⇒ R≈90, G≈83.
     let got = px(&pixels, 32, 32);
     let uv = 32.5 / W as f32;
@@ -2001,8 +2002,8 @@ vec4 close_color(vec3 coords_geo, vec3 size_geo) {
     }
 }
 
-/// A user **open** snippet: samples the snapshot texture and uses the *unclamped* `niri_progress`
-/// (which can overshoot [0,1] under spring animation) distinctly from `niri_clamped_progress`.
+/// A user **open** snippet: samples the snapshot texture and uses the *unclamped* `synoik_progress`
+/// (which can overshoot [0,1] under spring animation) distinctly from `synoik_clamped_progress`.
 /// Proves the open entry point, single-texture sampling through the shim, and that progress is
 /// passed unclamped: with progress = 1.5 and clamped = 1.0, the red channel encodes 1.5 (⇒ ~191,
 /// clamped on write), which a clamped value (1.0 ⇒ 128) could not produce.
@@ -2020,8 +2021,8 @@ fn vulkan_custom_open_samples_and_unclamped_progress() {
 
     let snippet = "\
 vec4 open_color(vec3 coords_geo, vec3 size_geo) {
-    vec4 tex = texture2D(niri_tex, (niri_geo_to_tex * coords_geo).st);
-    return vec4(niri_progress * 0.5, niri_clamped_progress * 0.5, tex.b, 1.0);
+    vec4 tex = texture2D(synoik_tex, (synoik_geo_to_tex * coords_geo).st);
+    return vec4(synoik_progress * 0.5, synoik_clamped_progress * 0.5, tex.b, 1.0);
 }";
     vk.set_custom_shader(CustomShaderType::Open, Some(snippet))
         .expect("compile custom open snippet");
@@ -2263,11 +2264,11 @@ fn vulkan_import_respects_byte_order_and_x_alpha() {
 // --- production render_helpers path through Vulkan (Brick 2)
 // --------------------------------------
 
-/// The generic `render_helpers::render_to_vec` (the same entry `Niri::screenshot` uses) composites
-/// a real `TextureRenderElement` through the owned Vulkan renderer and reads it back — proving the
-/// production render path (create offscreen → bind → draw elements → ExportMem readback) is now
-/// renderer-agnostic, not GLES-only. Uses an imported client-style texture, so the whole
-/// import→composite→download chain runs on Vulkan.
+/// The generic `render_helpers::render_to_vec` (the same entry `Synoik::screenshot` uses)
+/// composites a real `TextureRenderElement` through the owned Vulkan renderer and reads it back —
+/// proving the production render path (create offscreen → bind → draw elements → ExportMem
+/// readback) is now renderer-agnostic, not GLES-only. Uses an imported client-style texture, so the
+/// whole import→composite→download chain runs on Vulkan.
 #[test]
 fn vulkan_render_to_vec_composites_a_texture() {
     let mut vk = match VulkanRenderer::new() {
@@ -2574,9 +2575,9 @@ fn vulkan_dmabuf_import_cache_reuses_and_evicts() {
 /// CPU-writable LINEAR); skips on lavapipe / no GBM.
 #[test]
 fn vulkan_dmabuf_import_cache_defers_reacquire_into_the_frame() {
-    use niri_vk::dmabuf::ForeignBuffer;
     use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
     use smithay::backend::allocator::Modifier;
+    use synoik_vk::dmabuf::ForeignBuffer;
 
     let mut vk = match VulkanRenderer::new() {
         Ok(r) => r,
@@ -2717,9 +2718,9 @@ fn vulkan_dmabuf_import_cache_defers_reacquire_into_the_frame() {
 /// Import the same buffer twice and count: the miss creates, the hit does not.
 #[test]
 fn vulkan_dmabuf_import_cache_hit_is_not_counted_as_a_creation() {
-    use niri_vk::dmabuf::ForeignBuffer;
     use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
     use smithay::backend::allocator::Modifier;
+    use synoik_vk::dmabuf::ForeignBuffer;
 
     let mut vk = match VulkanRenderer::new() {
         Ok(r) => r,
@@ -2749,16 +2750,16 @@ fn vulkan_dmabuf_import_cache_hit_is_not_counted_as_a_creation() {
     ));
     let dmabuf = builder.build().expect("build dmabuf");
 
-    let _ = niri_vk::stats::take_creates();
+    let _ = synoik_vk::stats::take_creates();
     let first = vk.import_dmabuf_as_texture(&dmabuf).expect("import (miss)");
-    let (miss, _) = niri_vk::stats::take_creates();
+    let (miss, _) = synoik_vk::stats::take_creates();
     assert_eq!(
         miss, 1,
         "a cache miss really imports an image, and must count"
     );
 
     let second = vk.import_dmabuf_as_texture(&dmabuf).expect("import (hit)");
-    let (hit, _) = niri_vk::stats::take_creates();
+    let (hit, _) = synoik_vk::stats::take_creates();
     assert!(
         first.same_image(&second),
         "the second import of one buffer must be a cache hit",
@@ -2791,11 +2792,11 @@ fn vulkan_texture_upload_rides_the_frame_instead_of_its_own_submit() {
         }
     };
 
-    let upload_site = niri_vk::stats::SubmitSite::ALL
+    let upload_site = synoik_vk::stats::SubmitSite::ALL
         .iter()
-        .position(|s| *s == niri_vk::stats::SubmitSite::Upload)
+        .position(|s| *s == synoik_vk::stats::SubmitSite::Upload)
         .unwrap();
-    let upload_submits = |_: ()| niri_vk::stats::take_sites()[upload_site].submits;
+    let upload_submits = |_: ()| synoik_vk::stats::take_sites()[upload_site].submits;
 
     // Rendered at the module's W×H so `px` can index the readback.
     let red = [255u8, 0, 0, 255].repeat((W * H) as usize);
@@ -2804,7 +2805,7 @@ fn vulkan_texture_upload_rides_the_frame_instead_of_its_own_submit() {
     // test is about what *one texture* costs, so warm it out of the measured window.
     vk.warm_staging_pool();
     let _ = upload_submits(());
-    let _ = niri_vk::stats::take_creates();
+    let _ = synoik_vk::stats::take_creates();
 
     let buffer = TextureBuffer::from_memory(
         &mut vk,
@@ -2825,7 +2826,7 @@ fn vulkan_texture_upload_rides_the_frame_instead_of_its_own_submit() {
          behind it) this path exists to remove",
     );
     assert_eq!(
-        niri_vk::stats::take_creates().0,
+        synoik_vk::stats::take_creates().0,
         1,
         "the image itself is still allocated exactly once",
     );
@@ -3112,8 +3113,8 @@ fn vulkan_repeated_commits_do_not_grow_the_staging_pool() {
 ///
 /// **This is a validation-layer test.** Recording against a destroyed image is undefined behavior,
 /// not an error return: nothing here can observe it, and the pixels are fine either way (the image
-/// survives whenever some cache happens to hold it). Run it under `NIRI_VK_VALIDATION=1` — that is
-/// what named this class of bug on the live seat after it had presented as
+/// survives whenever some cache happens to hold it). Run it under `SYNOIK_VK_VALIDATION=1` — that
+/// is what named this class of bug on the live seat after it had presented as
 /// `ERROR_OUT_OF_HOST_MEMORY` from every later allocation.
 #[test]
 fn vulkan_queued_upload_holds_its_destination_alive() {
@@ -3567,11 +3568,11 @@ fn a_repeated_glyph_run_is_cached() {
     let first = vk.build_glyph_run("cached", 20.0).expect("glyph run");
     assert!(!first.glyphs().is_empty(), "no glyphs were shaped");
 
-    let shapes = niri_vk::stats::shapes();
-    let submits = niri_vk::stats::submits();
+    let shapes = synoik_vk::stats::shapes();
+    let submits = synoik_vk::stats::submits();
     let again = vk.build_glyph_run("cached", 20.0).expect("glyph run");
     assert_eq!(
-        (niri_vk::stats::shapes(), niri_vk::stats::submits()),
+        (synoik_vk::stats::shapes(), synoik_vk::stats::submits()),
         (shapes, submits),
         "re-shaping an identical run did work instead of hitting the cache"
     );
@@ -3608,8 +3609,8 @@ fn text_of_resident_glyphs_costs_no_submit() {
 
     // Now a run of the same glyphs in a combination never drawn before — a later second.
     for text in ["12:34:56", "12:34:57", "09:58:03"] {
-        let submits = niri_vk::stats::submits();
-        let shapes = niri_vk::stats::shapes();
+        let submits = synoik_vk::stats::submits();
+        let shapes = synoik_vk::stats::shapes();
         let run = vk.build_glyph_run(text, 20.0).expect("glyph run");
         assert_eq!(
             run.glyphs().len(),
@@ -3617,12 +3618,12 @@ fn text_of_resident_glyphs_costs_no_submit() {
             "{text:?} placed the wrong number of glyphs"
         );
         assert_eq!(
-            niri_vk::stats::submits(),
+            synoik_vk::stats::submits(),
             submits,
             "{text:?} cost a GPU round trip despite every glyph being resident"
         );
         assert!(
-            niri_vk::stats::shapes() > shapes,
+            synoik_vk::stats::shapes() > shapes,
             "{text:?} should still have been shaped (only the rasterizing is saved)"
         );
     }
@@ -3630,11 +3631,11 @@ fn text_of_resident_glyphs_costs_no_submit() {
     // A size or weight not yet resident is a genuinely new glyph set and must reach the atlas —
     // but shaping no longer uploads. New glyphs queue and go in one submit at the next
     // `VulkanFrame::begin`, so the round trip is owed to the *frame*, not to the shape.
-    let submits = niri_vk::stats::submits();
+    let submits = synoik_vk::stats::submits();
     vk.build_glyph_run_weighted("12:34:56", 20.0, true)
         .expect("glyph run");
     assert_eq!(
-        niri_vk::stats::submits(),
+        synoik_vk::stats::submits(),
         submits,
         "shaping uploaded on the spot; that is the per-line round trip coalescing exists to \
          remove (see VulkanRenderer::flush_glyph_uploads)"
@@ -3649,10 +3650,10 @@ fn text_of_resident_glyphs_costs_no_submit() {
             .render(&mut fb, Size::from((16, 16)), Transform::Normal)
             .expect("render");
     }
-    let sites = niri_vk::stats::take_sites();
-    let glyph_uploads = sites[niri_vk::stats::SubmitSite::ALL
+    let sites = synoik_vk::stats::take_sites();
+    let glyph_uploads = sites[synoik_vk::stats::SubmitSite::ALL
         .iter()
-        .position(|s| *s == niri_vk::stats::SubmitSite::UploadGlyphs)
+        .position(|s| *s == synoik_vk::stats::SubmitSite::UploadGlyphs)
         .unwrap()]
     .submits;
     assert_eq!(
@@ -3696,7 +3697,7 @@ fn a_repeated_symbolic_icon_uploads_once() {
     // (`VulkanRenderer::pending_texture_uploads`), so the submit count is zero either way and
     // could no longer tell a cold icon from a cached one. The image is still allocated once per
     // real upload, which is what the cache is here to avoid.
-    let uploads = |_: ()| niri_vk::stats::take_creates().0;
+    let uploads = |_: ()| synoik_vk::stats::take_creates().0;
 
     // The shared staging chunk is created once per renderer and counts as a resource; warm it so
     // the counts below are the icons' own.
@@ -3839,7 +3840,7 @@ fn every_submit_is_chained_on_the_queue_timeline() {
         eprintln!("skipping every_submit_is_chained_on_the_queue_timeline: no timeline semaphore");
         return;
     };
-    let submits_before = niri_vk::stats::submits();
+    let submits_before = synoik_vk::stats::submits();
 
     // Work that submits through more than one path: a glyph upload (`run_commands`) and a render
     // pass (`VulkanFrame::finish`).
@@ -3861,7 +3862,7 @@ fn every_submit_is_chained_on_the_queue_timeline() {
         let _sync = frame.finish().expect("finish");
     }
 
-    let submits = niri_vk::stats::submits() - submits_before;
+    let submits = synoik_vk::stats::submits() - submits_before;
     assert!(submits > 0, "the work under test submitted nothing");
     let timeline = vk.gpu.submit_order_value().expect("timeline value") - timeline_before;
     assert_eq!(
@@ -3883,7 +3884,7 @@ fn every_submit_is_chained_on_the_queue_timeline() {
 /// submit, and the glyphs actually drew.
 #[test]
 fn a_frames_new_glyphs_upload_in_one_submit() {
-    use niri_vk::stats::SubmitSite;
+    use synoik_vk::stats::SubmitSite;
 
     let mut vk = match VulkanRenderer::new() {
         Ok(r) => r,
@@ -3893,14 +3894,14 @@ fn a_frames_new_glyphs_upload_in_one_submit() {
         }
     };
     let glyph_submits = || {
-        let sites = niri_vk::stats::take_sites();
+        let sites = synoik_vk::stats::take_sites();
         sites[SubmitSite::ALL
             .iter()
             .position(|s| *s == SubmitSite::UploadGlyphs)
             .unwrap()]
         .submits
     };
-    let _ = niri_vk::stats::take_sites();
+    let _ = synoik_vk::stats::take_sites();
 
     // Thirteen runs that cannot share a glyph: a `CacheKey` folds in the size, so the same text at
     // thirteen distinct sizes rasterizes thirteen distinct sets. Sizes kept small so the atlas
@@ -3977,7 +3978,7 @@ fn a_frames_new_glyphs_upload_in_one_submit() {
 /// Asserting the counts is the only option — a misattributed submit renders identically.
 #[test]
 fn a_submit_is_counted_at_the_site_that_made_it() {
-    use niri_vk::stats::SubmitSite;
+    use synoik_vk::stats::SubmitSite;
 
     let mut vk = match VulkanRenderer::new() {
         Ok(r) => r,
@@ -3986,16 +3987,16 @@ fn a_submit_is_counted_at_the_site_that_made_it() {
             return;
         }
     };
-    let at = |sites: &[niri_vk::stats::SiteTotals], site: SubmitSite| {
+    let at = |sites: &[synoik_vk::stats::SiteTotals], site: SubmitSite| {
         sites[SubmitSite::ALL.iter().position(|s| *s == site).unwrap()].submits
     };
 
     // Clear whatever this thread has accumulated (renderer construction submits).
-    let _ = niri_vk::stats::take_sites();
+    let _ = synoik_vk::stats::take_sites();
 
     // Shaping queues glyphs; it no longer submits anything at all.
     vk.build_glyph_run("sited", 20.0).expect("glyph run");
-    let sites = niri_vk::stats::take_sites();
+    let sites = synoik_vk::stats::take_sites();
     assert_eq!(
         at(&sites, SubmitSite::UploadGlyphs),
         0,
@@ -4017,7 +4018,7 @@ fn a_submit_is_counted_at_the_site_that_made_it() {
         !vk.has_pending_glyphs(),
         "beginning a frame left the glyphs queued"
     );
-    let sites = niri_vk::stats::take_sites();
+    let sites = synoik_vk::stats::take_sites();
     assert_eq!(
         at(&sites, SubmitSite::UploadGlyphs),
         0,
@@ -4046,7 +4047,7 @@ fn a_submit_is_counted_at_the_site_that_made_it() {
             .expect("clear");
         let _sync = frame.finish().expect("finish");
     }
-    let sites = niri_vk::stats::take_sites();
+    let sites = synoik_vk::stats::take_sites();
     assert_eq!(
         at(&sites, SubmitSite::OffscreenFrame),
         1,
@@ -4080,7 +4081,7 @@ fn a_submit_is_counted_at_the_site_that_made_it() {
             .expect("clear");
         let _sync = frame.finish().expect("finish");
     }
-    let sites = niri_vk::stats::take_sites();
+    let sites = synoik_vk::stats::take_sites();
     assert_eq!(
         at(&sites, SubmitSite::DmabufFrame),
         1,
@@ -4401,7 +4402,7 @@ fn a_deferred_present_blit_holds_both_the_shadow_and_the_scanout_buffer() {
 ///
 /// **Known limit, measured rather than assumed.** Freeing the staging on the frame's own scope was
 /// injected as a mutation and this test still *passed* — the freed buffer had not been reused, so
-/// the copy read plausible bytes and the ink was there. What caught it was `NIRI_VK_VALIDATION=1`
+/// the copy read plausible bytes and the ink was there. What caught it was `SYNOIK_VK_VALIDATION=1`
 /// (exit 101, one error). So this test pins the wiring, and the validation run is what pins the
 /// lifetime; the two are only a real gate together. Do not read a green run of this test alone as
 /// proof the staging is held long enough.
@@ -4509,9 +4510,9 @@ fn creating_a_render_target_counts_as_a_gpu_resource_creation() {
     };
     let size = Size::<i32, BufferCoord>::from((32, 32));
 
-    let _ = niri_vk::stats::take_creates();
+    let _ = synoik_vk::stats::take_creates();
     let mut target = vk.create_buffer(NATIVE_FOURCC, size).expect("target");
-    let (n, _) = niri_vk::stats::take_creates();
+    let (n, _) = synoik_vk::stats::take_creates();
     assert_eq!(n, 1, "creating an offscreen render target went uncounted");
 
     // Binding and rendering into the one we already have allocates nothing.
@@ -4528,7 +4529,7 @@ fn creating_a_render_target_counts_as_a_gpu_resource_creation() {
             .expect("clear");
         let _sync = frame.finish().expect("finish");
     }
-    let (n, _) = niri_vk::stats::take_creates();
+    let (n, _) = synoik_vk::stats::take_creates();
     assert_eq!(
         n, 0,
         "rendering into an existing target counted {n} creations — the counter cannot then tell \
@@ -4589,11 +4590,11 @@ fn a_shared_staging_batch_keeps_each_textures_pixels_its_own() {
         .collect();
 
     vk.warm_staging_pool();
-    let submits_before = niri_vk::stats::submits();
+    let submits_before = synoik_vk::stats::submits();
     let textures = vk.import_memory_batch(&items).expect("batch import");
     assert_eq!(textures.len(), 3, "batch dropped a texture");
     assert_eq!(
-        niri_vk::stats::submits() - submits_before,
+        synoik_vk::stats::submits() - submits_before,
         0,
         "importing a page of icons submitted; the copies must ride the next frame's command buffer",
     );
@@ -4663,7 +4664,7 @@ fn a_texture_staged_off_thread_reads_back_the_bytes_that_were_written() {
     const H: i32 = 7;
     let want = [17u8, 200, 99, 255];
 
-    let mut staging = niri_vk::staging::HostStaging::new(vk.gpu(), (W * H * 4) as usize)
+    let mut staging = synoik_vk::staging::HostStaging::new(vk.gpu(), (W * H * 4) as usize)
         .expect("host staging buffer");
     for px in staging.as_mut_slice().chunks_exact_mut(4) {
         px.copy_from_slice(&want);
@@ -4672,7 +4673,7 @@ fn a_texture_staged_off_thread_reads_back_the_bytes_that_were_written() {
     // frame, so the bytes have to outlive this scope.
     let staging = std::sync::Arc::new(staging);
 
-    let submits_before = niri_vk::stats::submits();
+    let submits_before = synoik_vk::stats::submits();
     let tex = vk
         .import_host_staging(
             &staging,
@@ -4684,7 +4685,7 @@ fn a_texture_staged_off_thread_reads_back_the_bytes_that_were_written() {
     // the copy — `first upload 18.62ms` for 48 MiB of wallpaper on a live frame. It rides the next
     // frame's command buffer now.
     assert_eq!(
-        niri_vk::stats::submits() - submits_before,
+        synoik_vk::stats::submits() - submits_before,
         0,
         "importing already-staged pixels submitted a command buffer of its own",
     );
@@ -4737,7 +4738,7 @@ fn staged_pixels_are_refused_by_a_renderer_that_did_not_allocate_them() {
     };
 
     let staging = std::sync::Arc::new(
-        niri_vk::staging::HostStaging::new(vk_a.gpu(), 4 * 4 * 4).expect("staging"),
+        synoik_vk::staging::HostStaging::new(vk_a.gpu(), 4 * 4 * 4).expect("staging"),
     );
     assert!(staging.belongs_to(vk_a.gpu()));
     assert!(!staging.belongs_to(vk_b.gpu()));
@@ -4838,7 +4839,7 @@ fn an_offscreen_finish_defers_without_the_kms_bracket() {
 /// GPU timing and deferral used to be mutually exclusive: a single timestamp pair per renderer
 /// would have been reset by the next command buffer while an in-flight submit was still writing
 /// it, so both deferral predicates required `gpu_timer.is_none()`. The cost was not the missing
-/// number — it was that `NIRI_FRAME_LOG=…,gpu` silently pushed the live seat back onto the
+/// number — it was that `SYNOIK_FRAME_LOG=…,gpu` silently pushed the live seat back onto the
 /// synchronous path, so every reading taken with it described a configuration the seat does not
 /// run. A whole session's worth of "async scanout does not gain much" was measured that way.
 ///
@@ -5054,13 +5055,13 @@ fn retirement_lets_a_deferred_offscreen_be_reused_instead_of_reallocated() {
     // has completed — this makes the completion real without pre-freeing the record.
     unsafe { vk.gpu.device.device_wait_idle() }.expect("wait idle");
 
-    let _ = niri_vk::stats::take_creates();
+    let _ = synoik_vk::stats::take_creates();
     assert!(
         vk.offscreen_is_reusable(&mut target),
         "the renderer called its own keep-alive a foreign reference: the caller now throws this \
          texture away and allocates a new one on every single frame"
     );
-    let (created, _) = niri_vk::stats::take_creates();
+    let (created, _) = synoik_vk::stats::take_creates();
     assert_eq!(
         created, 0,
         "answering the reuse question allocated {created} GPU resources"
@@ -5101,9 +5102,9 @@ fn retirement_lets_a_deferred_offscreen_be_reused_instead_of_reallocated() {
 /// require the frame to be keeping the image alive. Needs a Venus + GBM stack; skips without.
 #[test]
 fn vulkan_a_deferred_acquire_outlives_the_frame_that_records_it() {
-    use niri_vk::dmabuf::ForeignBuffer;
     use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
     use smithay::backend::allocator::Modifier;
+    use synoik_vk::dmabuf::ForeignBuffer;
 
     let mut vk = match VulkanRenderer::new() {
         Ok(r) => r,
@@ -5178,7 +5179,7 @@ fn vulkan_a_deferred_acquire_outlives_the_frame_that_records_it() {
 /// perfectly healthy.
 #[test]
 fn submit_site_names_the_frame_not_the_target() {
-    use niri_vk::stats::SubmitSite;
+    use synoik_vk::stats::SubmitSite;
 
     use super::frame::submit_site_of;
 
@@ -5204,7 +5205,7 @@ fn submit_site_names_the_frame_not_the_target() {
 /// to price the blit.
 #[test]
 fn vulkan_gpu_phases_subdivide_the_frame_they_belong_to() {
-    use niri_vk::stats::GpuPhase;
+    use synoik_vk::stats::GpuPhase;
 
     let skip = |why: &str| eprintln!("skipping vulkan_gpu_phases_subdivide_...: {why}");
     let mut vk = match VulkanRenderer::new() {

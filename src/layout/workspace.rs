@@ -2,12 +2,6 @@ use std::cmp::max;
 use std::rc::Rc;
 use std::time::Duration;
 
-use niri_config::utils::MergeWith as _;
-use niri_config::{
-    CenterFocusedColumn, CornerRadius, OutputName, PresetSize, WindowingMode,
-    Workspace as WorkspaceConfig,
-};
-use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::desktop::{layer_map_for_output, Window};
@@ -17,6 +11,12 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Serial, Size, Transform};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::SurfaceCachedState;
+use synoik_config::utils::MergeWith as _;
+use synoik_config::{
+    CenterFocusedColumn, CornerRadius, OutputName, PresetSize, WindowingMode,
+    Workspace as WorkspaceConfig,
+};
+use synoik_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 
 use super::floating::{FloatingSpace, FloatingSpaceRenderElement};
 use super::scrolling::{
@@ -30,11 +30,11 @@ use super::{
 };
 use crate::animation::{Animation, Clock};
 use crate::gnome::{EdgeTileTarget, TileSide};
-use crate::niri_render_elements;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::RenderCtx;
+use crate::synoik_render_elements;
 use crate::utils::id::IdCounter;
 use crate::utils::transaction::{Transaction, TransactionBlocker};
 use crate::utils::{
@@ -108,7 +108,7 @@ pub struct Workspace<W: LayoutElement> {
     pub(super) name: Option<String>,
 
     /// Layout config overrides for this workspace.
-    layout_config: Option<niri_config::LayoutPart>,
+    layout_config: Option<synoik_config::LayoutPart>,
 
     /// Picker slots held in place while an overview drag is in flight
     /// (gnome-shell's frozen workspace layout), keyed by window.
@@ -180,11 +180,11 @@ const WINDOW_SCALE_TIME_MS: u32 = 200;
 
 /// The hover ease itself — see [`WINDOW_SCALE_TIME_MS`].
 fn ease_hover(clock: &Clock, from: f64, to: f64, options: &Options) -> Animation {
-    let config = niri_config::Animation {
+    let config = synoik_config::Animation {
         off: options.animations.overview_open_close.0.off,
-        kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+        kind: synoik_config::animations::Kind::Easing(synoik_config::animations::EasingParams {
             duration_ms: WINDOW_SCALE_TIME_MS,
-            curve: niri_config::animations::Curve::EaseOutQuad,
+            curve: synoik_config::animations::Curve::EaseOutQuad,
         }),
     };
     Animation::new(clock.clone(), from, to, 0., config)
@@ -276,7 +276,7 @@ fn expose_tile_placement(
     (pos, tile_scale, xray_pos)
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     WorkspaceRenderElement => {
         Scrolling = ScrollingSpaceRenderElement,
         Floating = FloatingSpaceRenderElement,
@@ -574,7 +574,7 @@ impl<W: LayoutElement> Workspace<W> {
         self.options = options;
     }
 
-    pub fn update_layout_config(&mut self, layout_config: Option<niri_config::LayoutPart>) {
+    pub fn update_layout_config(&mut self, layout_config: Option<synoik_config::LayoutPart>) {
         if self.layout_config == layout_config {
             return;
         }
@@ -2623,7 +2623,7 @@ impl<W: LayoutElement> Workspace<W> {
         self.working_area
     }
 
-    pub fn layout_config(&self) -> Option<&niri_config::LayoutPart> {
+    pub fn layout_config(&self) -> Option<&synoik_config::LayoutPart> {
         self.layout_config.as_ref()
     }
 
@@ -2737,10 +2737,10 @@ pub(super) fn compute_working_area(output: &Output, options: &Options) -> Rectan
 /// geometry and alpha to the plain one — it is the *same* shadow, only colored. Turning it
 /// up as well read as too much.
 pub(super) fn accent_workspace_shadow_config(
-    config: niri_config::WorkspaceShadow,
+    config: synoik_config::WorkspaceShadow,
     view_size: Size<f64, Logical>,
     [r, g, b]: [u8; 3],
-) -> niri_config::Shadow {
+) -> synoik_config::Shadow {
     let mut config = compute_workspace_shadow_config(config, view_size);
     // Colors are stored unpremultiplied, so the alpha carries over untouched.
     config.color.r = f32::from(r) / 255.;
@@ -2750,14 +2750,14 @@ pub(super) fn accent_workspace_shadow_config(
 }
 
 pub(super) fn compute_workspace_shadow_config(
-    config: niri_config::WorkspaceShadow,
+    config: synoik_config::WorkspaceShadow,
     view_size: Size<f64, Logical>,
-) -> niri_config::Shadow {
+) -> synoik_config::Shadow {
     // Gaps between workspaces are a multiple of the view height, so shadow settings should also be
     // normalized to the view height to prevent them from overlapping on lower resolutions.
     let norm = view_size.h / 1080.;
 
-    let mut config = niri_config::Shadow::from(config);
+    let mut config = synoik_config::Shadow::from(config);
     config.softness *= norm;
     config.spread *= norm;
     config.offset.x.0 *= norm;

@@ -9,7 +9,7 @@ use accesskit_unix::Adapter;
 use calloop::LoopHandle;
 
 use crate::layout::workspace::WorkspaceId;
-use crate::niri::{KeyboardFocus, Niri, State};
+use crate::synoik::{KeyboardFocus, State, Synoik};
 
 const ID_ROOT: NodeId = NodeId(0);
 const ID_ANNOUNCEMENT: NodeId = NodeId(1);
@@ -77,7 +77,7 @@ impl A11y {
 
         self.event_loop
             .insert_source(rx, |e, _, state| match e {
-                calloop::channel::Event::Msg(msg) => state.niri.on_a11y_msg(msg),
+                calloop::channel::Event::Msg(msg) => state.synoik.on_a11y_msg(msg),
                 calloop::channel::Event::Closed => (),
             })
             .unwrap();
@@ -106,7 +106,7 @@ impl A11y {
     }
 }
 
-impl Niri {
+impl Synoik {
     pub fn refresh_a11y(&mut self) {
         if self.a11y.to_accesskit.is_none() {
             return;
@@ -171,7 +171,7 @@ impl Niri {
         }
 
         if focus == ID_SWITCHER {
-            // Ideally this would be a Group with a child Button per item, but niri found two
+            // Ideally this would be a Group with a child Button per item, but synoik found two
             // problems with that shape and neither has an explanation: Alt-Tab would always start
             // by reading the group's own label instead of the selected item, and once the list
             // went empty Orca stopped reading any child button for the rest of the session. So
@@ -299,7 +299,7 @@ impl Niri {
 
         let tree = Tree {
             root: ID_ROOT,
-            toolkit_name: Some(String::from("niri")),
+            toolkit_name: Some(String::from("synoik")),
             toolkit_version: None,
         };
 

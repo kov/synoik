@@ -3,12 +3,12 @@ use std::iter::zip;
 use std::rc::Rc;
 use std::time::Duration;
 
-use niri_config::{CornerRadius, LayoutPart, WindowingMode};
 use smithay::backend::renderer::element::utils::{
     CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement,
 };
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
+use synoik_config::{CornerRadius, LayoutPart, WindowingMode};
 
 use super::focus_ring::FocusRing;
 use super::insert_hint_element::{InsertHintElement, InsertHintRenderElement};
@@ -24,7 +24,6 @@ use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Optio
 use crate::animation::{Animation, Clock};
 use crate::gnome::EdgeTileTarget;
 use crate::input::swipe_tracker::SwipeTracker;
-use crate::niri_render_elements;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
@@ -32,6 +31,7 @@ use crate::render_helpers::vulkan::VkTexture;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
 use crate::rubber_band::RubberBand;
+use crate::synoik_render_elements;
 use crate::ui::overview_layout::{self, ControlsLayout};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
@@ -180,7 +180,7 @@ pub struct Monitor<W: LayoutElement> {
     /// Configurable properties of the layout.
     pub(super) options: Rc<Options>,
     /// Layout config overrides for this monitor.
-    layout_config: Option<niri_config::LayoutPart>,
+    layout_config: Option<synoik_config::LayoutPart>,
 }
 
 #[derive(Debug)]
@@ -336,7 +336,7 @@ impl<'a, W: LayoutElement> Clone for MonitorAddWindowTarget<'a, W> {
     }
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     MonitorInnerRenderElement => {
         Workspace = CropRenderElement<WorkspaceRenderElement>,
         // The insert hint, and the thumbnail-strip rings clipped to their band.
@@ -413,7 +413,7 @@ impl WorkspaceSwitchGesture {
         }
     }
 
-    fn animate_from(&mut self, from: f64, clock: Clock, config: niri_config::Animation) {
+    fn animate_from(&mut self, from: f64, clock: Clock, config: synoik_config::Animation) {
         let current = self.animation.as_ref().map_or(0., Animation::value);
         self.animation = Some(Animation::new(clock, from + current, 0., 0., config));
     }
@@ -635,7 +635,7 @@ impl<W: LayoutElement> Monitor<W> {
     pub fn activate_workspace_with_anim_config(
         &mut self,
         idx: usize,
-        config: Option<niri_config::Animation>,
+        config: Option<synoik_config::Animation>,
     ) {
         // FIXME: also compute and use current velocity.
         let current_idx = self.workspace_render_idx();
@@ -895,12 +895,14 @@ impl<W: LayoutElement> Monitor<W> {
         // (250ms, EASE_OUT_QUAD, `overviewControls.js:360-366`) — a fixed duration, not the
         // configurable overview open/close one. Only whether animations run at all is
         // inherited from the config.
-        let config = niri_config::Animation {
+        let config = synoik_config::Animation {
             off: self.options.animations.overview_open_close.0.off,
-            kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
-                duration_ms: 250,
-                curve: niri_config::animations::Curve::EaseOutQuad,
-            }),
+            kind: synoik_config::animations::Kind::Easing(
+                synoik_config::animations::EasingParams {
+                    duration_ms: 250,
+                    curve: synoik_config::animations::Curve::EaseOutQuad,
+                },
+            ),
         };
         self.thumb_close_slide = Some(CloseSlide {
             removed_idx: idx,
@@ -1561,7 +1563,10 @@ impl<W: LayoutElement> Monitor<W> {
         self.options = options;
     }
 
-    pub fn update_layout_config(&mut self, layout_config: Option<niri_config::LayoutPart>) -> bool {
+    pub fn update_layout_config(
+        &mut self,
+        layout_config: Option<synoik_config::LayoutPart>,
+    ) -> bool {
         if self.layout_config == layout_config {
             return false;
         }
@@ -1956,12 +1961,14 @@ impl<W: LayoutElement> Monitor<W> {
         }
         let from = self.app_grid_fraction();
         self.app_grid_shown = shown;
-        let config = niri_config::Animation {
+        let config = synoik_config::Animation {
             off: self.options.animations.overview_open_close.0.off,
-            kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
-                duration_ms: 250,
-                curve: niri_config::animations::Curve::CubicBezier(0.39, 0.575, 0.565, 1.),
-            }),
+            kind: synoik_config::animations::Kind::Easing(
+                synoik_config::animations::EasingParams {
+                    duration_ms: 250,
+                    curve: synoik_config::animations::Curve::CubicBezier(0.39, 0.575, 0.565, 1.),
+                },
+            ),
         };
         self.app_grid_expand = Some(Animation::new(
             self.clock.clone(),
@@ -3382,7 +3389,7 @@ impl<W: LayoutElement> Monitor<W> {
         self.working_area
     }
 
-    pub fn layout_config(&self) -> Option<&niri_config::LayoutPart> {
+    pub fn layout_config(&self) -> Option<&synoik_config::LayoutPart> {
         self.layout_config.as_ref()
     }
 
@@ -3552,9 +3559,9 @@ pub(super) fn center_on_focus(span: f64, focus: f64) -> f64 {
 
 /// The strip's drop placeholder: a translucent pill marking where the new
 /// workspace goes (gnome-shell's workspace-placeholder asset).
-fn thumbnail_placeholder_config() -> niri_config::FocusRing {
-    let color = niri_config::Color::from_rgba8_unpremul(0xff, 0xff, 0xff, 0x66);
-    niri_config::FocusRing {
+fn thumbnail_placeholder_config() -> synoik_config::FocusRing {
+    let color = synoik_config::Color::from_rgba8_unpremul(0xff, 0xff, 0xff, 0x66);
+    synoik_config::FocusRing {
         off: false,
         width: 0.,
         active_color: color,

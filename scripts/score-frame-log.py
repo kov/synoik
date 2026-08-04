@@ -16,7 +16,7 @@ lands a cycle late by construction, so bucketing by landing makes the
 back-to-back bucket definitionally miss-free (§14).
 
 Usage:
-  journalctl _COMM=niri --since ... -o short-precise > arm.log     (per arm)
+  journalctl _COMM=synoik --since ... -o short-precise > arm.log     (per arm)
   scripts/score-frame-log.py A.log B.log --labels ON OFF \
       --phases 12:58:21 12:59:01 12:59:22 12:59:43 13:00:03 13:00:33 \
       --phases 12:54:34 12:55:14 12:55:35 12:55:56 12:56:16 12:56:46

@@ -14,12 +14,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use insta::assert_snapshot;
-use niri_config::{Action, Config};
 use smithay::backend::input::ButtonState;
 use smithay::input::keyboard::Keysym;
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel;
 use smithay::utils::user_data::UserDataMap;
 use smithay::wayland::xdg_activation::XdgActivationTokenData;
+use synoik_config::{Action, Config};
 use wayland_client::protocol::wl_keyboard::KeyState as WlKeyState;
 use wayland_client::protocol::wl_surface::WlSurface;
 
@@ -108,29 +108,29 @@ fn overview_opens_and_closes_via_action() {
     f.add_output(1, (1920, 1080));
 
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "overview must start closed"
     );
 
-    f.niri_state().do_action(Action::OpenOverview, false);
-    f.niri_complete_animations();
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik_complete_animations();
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "OpenOverview must open the overview"
     );
 
     // Opening an already-open overview is a no-op, not a toggle.
-    f.niri_state().do_action(Action::OpenOverview, false);
-    f.niri_complete_animations();
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik_complete_animations();
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "OpenOverview must be idempotent"
     );
 
-    f.niri_state().do_action(Action::CloseOverview, false);
-    f.niri_complete_animations();
+    f.synoik_state().do_action(Action::CloseOverview, false);
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "CloseOverview must close the overview"
     );
 }
@@ -141,15 +141,18 @@ fn toggle_overview_flips_state() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    assert!(!f.niri().layout.is_overview_open());
+    assert!(!f.synoik().layout.is_overview_open());
 
-    f.niri_state().do_action(Action::ToggleOverview, false);
-    f.niri_complete_animations();
-    assert!(f.niri().layout.is_overview_open(), "first toggle opens");
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.synoik_complete_animations();
+    assert!(f.synoik().layout.is_overview_open(), "first toggle opens");
 
-    f.niri_state().do_action(Action::ToggleOverview, false);
-    f.niri_complete_animations();
-    assert!(!f.niri().layout.is_overview_open(), "second toggle closes");
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.synoik_complete_animations();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "second toggle closes"
+    );
 }
 
 /// GNOME's "overlay key": tapping Super on its own — pressed and released with
@@ -163,23 +166,23 @@ fn super_tap_toggles_overview() {
     f.add_output(1, (1920, 1080));
 
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "overview must start closed"
     );
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "a lone Super tap opens the overview"
     );
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "a second Super tap closes it"
     );
 }
@@ -198,7 +201,7 @@ fn double_super_tap_opens_the_app_grid() {
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "the first tap opens the overview"
     );
 
@@ -206,11 +209,11 @@ fn double_super_tap_opens_the_app_grid() {
     f.key_release(KEY_LEFTMETA);
     f.settle_animations();
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "a second tap during the open animation must not close the overview"
     );
     assert!(
-        f.niri().layout.is_app_grid_open(),
+        f.synoik().layout.is_app_grid_open(),
         "it must shift a state up, into the app grid"
     );
 
@@ -220,7 +223,7 @@ fn double_super_tap_opens_the_app_grid() {
     f.key_release(KEY_LEFTMETA);
     f.settle_animations();
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "a tap after the animation settles closes the overview"
     );
 }
@@ -240,11 +243,11 @@ fn slow_second_super_tap_closes_the_overview() {
     f.key_release(KEY_LEFTMETA);
     f.settle_animations();
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "a second tap after the open animation closes the overview"
     );
     assert!(
-        !f.niri().layout.is_app_grid_open(),
+        !f.synoik().layout.is_app_grid_open(),
         "and must not have shifted into the app grid"
     );
 }
@@ -265,7 +268,7 @@ fn double_super_tap_opens_the_app_grid_without_animations() {
     f.key_release(KEY_LEFTMETA);
     f.settle_animations();
     assert!(
-        f.niri().layout.is_app_grid_open(),
+        f.synoik().layout.is_app_grid_open(),
         "two taps within 250 ms must reach the app grid with animations off"
     );
 
@@ -275,7 +278,7 @@ fn double_super_tap_opens_the_app_grid_without_animations() {
     f.key_release(KEY_LEFTMETA);
     f.settle_animations();
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "a tap more than 250 ms later closes the overview"
     );
 }
@@ -289,10 +292,10 @@ fn right_super_tap_toggles_overview_by_default() {
 
     f.key_press(KEY_RIGHTMETA);
     f.key_release(KEY_RIGHTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "a lone right Super tap opens the overview by default"
     );
 }
@@ -312,10 +315,10 @@ fn super_plus_key_does_not_toggle_overview() {
     f.key_press(KEY_Z);
     f.key_release(KEY_Z);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "Super+key must not trigger the overlay key"
     );
 }
@@ -335,10 +338,10 @@ fn super_then_click_does_not_toggle_overview() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "a click between Super press and release must cancel the tap"
     );
 }
@@ -381,10 +384,10 @@ fn overlay_key_firing_release_is_not_sent_to_the_client() {
     // A firing tap: the press is delivered, the release is swallowed.
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "the lone tap must have fired"
     );
     assert_eq!(
@@ -400,14 +403,14 @@ fn overlay_key_firing_release_is_not_sent_to_the_client() {
 fn overlay_key_setting_can_disable() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().gnome_settings.overlay_keys.clear();
+    f.synoik().gnome_settings.overlay_keys.clear();
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "a disabled overlay key must not open the overview"
     );
 }
@@ -424,10 +427,10 @@ fn super_tap_with_pointer_motion_still_toggles() {
     f.key_press(KEY_LEFTMETA);
     f.pointer_motion(5.0, 5.0);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "pointer motion must not cancel a pending Super tap"
     );
 }
@@ -442,10 +445,10 @@ fn super_then_scroll_does_not_toggle_overview() {
     f.key_press(KEY_LEFTMETA);
     f.scroll_wheel();
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "a scroll between Super press and release must cancel the tap"
     );
 }
@@ -461,10 +464,10 @@ fn super_then_touch_does_not_toggle_overview() {
     f.touch_down(100.0, 100.0);
     f.touch_up();
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "a touch between Super press and release must cancel the tap"
     );
 }
@@ -481,10 +484,10 @@ fn shift_held_super_tap_does_not_toggle_overview() {
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
     f.key_release(KEY_LEFTSHIFT);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "Super tapped with Shift held must not trigger the overlay key"
     );
 }
@@ -507,9 +510,9 @@ fn shortcuts_inhibit_disables_overlay_key() {
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "the overlay key must be inert while the focused window inhibits shortcuts"
     );
 
@@ -518,9 +521,9 @@ fn shortcuts_inhibit_disables_overlay_key() {
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "releasing the inhibitor must restore the overlay key"
     );
 }
@@ -562,7 +565,7 @@ fn numbered_workspace_switches_follow_the_settings() {
     let id = f.add_client();
     let _surface = map_focused_window(&mut f, id);
     assert_eq!(
-        f.niri()
+        f.synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -574,9 +577,9 @@ fn numbered_workspace_switches_follow_the_settings() {
     f.key_press(KEY_2);
     f.key_release(KEY_2);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
-        f.niri()
+        f.synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -586,7 +589,7 @@ fn numbered_workspace_switches_follow_the_settings() {
     );
 
     let switch_2 = f
-        .niri()
+        .synoik()
         .gnome_settings
         .keybindings
         .iter_mut()
@@ -601,9 +604,9 @@ fn numbered_workspace_switches_follow_the_settings() {
     f.key_press(KEY_2);
     f.key_release(KEY_2);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
-        f.niri()
+        f.synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -612,7 +615,7 @@ fn numbered_workspace_switches_follow_the_settings() {
         "the bound <Super>2 must focus the second workspace"
     );
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "using Super as a modifier must not have fired the overlay key"
     );
 
@@ -620,9 +623,9 @@ fn numbered_workspace_switches_follow_the_settings() {
     f.key_press(KEY_1);
     f.key_release(KEY_1);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
-        f.niri()
+        f.synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -635,9 +638,9 @@ fn numbered_workspace_switches_follow_the_settings() {
     f.key_press(KEY_HOME);
     f.key_release(KEY_HOME);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
-        f.niri()
+        f.synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -663,9 +666,9 @@ fn ctrl_alt_arrows_switch_workspaces() {
     f.key_press(KEY_LEFTALT);
     f.key_press(KEY_DOWN);
     f.key_release(KEY_DOWN);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
-        f.niri()
+        f.synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -678,9 +681,9 @@ fn ctrl_alt_arrows_switch_workspaces() {
     f.key_release(KEY_UP);
     f.key_release(KEY_LEFTALT);
     f.key_release(KEY_LEFTCTRL);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
-        f.niri()
+        f.synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -709,9 +712,9 @@ fn super_shift_page_down_moves_window_to_next_workspace() {
     f.key_release(KEY_PAGEDOWN);
     f.key_release(KEY_LEFTSHIFT);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
-    let monitor = f.niri().layout.active_monitor_ref().unwrap();
+    let monitor = f.synoik().layout.active_monitor_ref().unwrap();
     assert_eq!(
         monitor.active_workspace_idx(),
         1,
@@ -736,7 +739,7 @@ fn keybindings_follow_the_settings_model() {
     let surface = map_focused_window(&mut f, id);
 
     let close = f
-        .niri()
+        .synoik()
         .gnome_settings
         .keybindings
         .iter_mut()
@@ -825,7 +828,7 @@ fn a_wheel_notch_resolves_through_the_settings_model() {
     let _surface = map_focused_window(&mut f, id);
     f.pointer_motion(960., 540.);
     let active = |f: &mut Fixture| {
-        f.niri()
+        f.synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -835,7 +838,7 @@ fn a_wheel_notch_resolves_through_the_settings_model() {
 
     // Without the modifier it is an ordinary scroll, not a binding.
     f.scroll_wheel();
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
         active(&mut f),
         0,
@@ -845,7 +848,7 @@ fn a_wheel_notch_resolves_through_the_settings_model() {
     f.key_press(KEY_LEFTMETA);
     f.scroll_wheel();
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
         active(&mut f),
         1,
@@ -859,7 +862,7 @@ fn a_wheel_notch_resolves_through_the_settings_model() {
 /// `<Super>k`/`<Super>j` walk the windows in a column — the arrows can't, since
 /// `<Super>` plus an arrow is GNOME's four times over (tiling, maximize,
 /// unmaximize, move-to-monitor), which is exactly the sort of collision
-/// `niri_accels_do_not_collide_with_gnome` exists to keep out.
+/// `synoik_accels_do_not_collide_with_gnome` exists to keep out.
 #[test]
 fn our_own_keybindings_resolve_too() {
     let mut f = Fixture::new();
@@ -870,8 +873,8 @@ fn our_own_keybindings_resolve_too() {
     let right = f.add_client();
     let right_surface = map_focused_window(&mut f, right);
 
-    let focused = |f: &mut Fixture| f.niri().layout.focus().map(|m| m.id());
-    let newest = f.niri().layout.focus().map(|m| m.id());
+    let focused = |f: &mut Fixture| f.synoik().layout.focus().map(|m| m.id());
+    let newest = f.synoik().layout.focus().map(|m| m.id());
 
     // <Super><Alt>, not bare <Super>: bare <Super>h is GNOME's `minimize` and <Super>l is
     // gnome-settings-daemon's lock key, and ours would win both.
@@ -880,7 +883,7 @@ fn our_own_keybindings_resolve_too() {
     tap(&mut f, KEY_K);
     f.key_release(KEY_LEFTALT);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_ne!(
         focused(&mut f),
         newest,
@@ -892,16 +895,16 @@ fn our_own_keybindings_resolve_too() {
     tap(&mut f, KEY_J);
     f.key_release(KEY_LEFTALT);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(focused(&mut f), newest, "<Super><Alt>j must come back down");
 
     // And rebinding one in the model takes effect, like any other key.
     let binding = f
-        .niri()
+        .synoik()
         .gnome_settings
         .keybindings
         .iter_mut()
-        .find(|kb| kb.action == KeybindingAction::Niri(Action::FocusWindowUp))
+        .find(|kb| kb.action == KeybindingAction::Synoik(Action::FocusWindowUp))
         .expect("our schema's keys are in the model");
     binding.accels = vec![Accel {
         trigger: AccelTrigger::Keysym(Keysym::z),
@@ -911,7 +914,7 @@ fn our_own_keybindings_resolve_too() {
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_Z);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_ne!(
         focused(&mut f),
         newest,
@@ -941,11 +944,11 @@ fn a_grab_outranks_our_own_keybinding() {
 
     // Point one of our own keys at a free chord, then let a "gsd" grab take the same one.
     let binding = f
-        .niri()
+        .synoik()
         .gnome_settings
         .keybindings
         .iter_mut()
-        .find(|kb| kb.action == KeybindingAction::Niri(Action::FocusWindowUp))
+        .find(|kb| kb.action == KeybindingAction::Synoik(Action::FocusWindowUp))
         .expect("our schema's keys are in the model");
     binding.accels = vec![Accel {
         trigger: AccelTrigger::Keysym(Keysym::z),
@@ -953,30 +956,30 @@ fn a_grab_outranks_our_own_keybinding() {
     }];
 
     let action = f
-        .niri_state()
+        .synoik_state()
         .grab_accelerator("<Super>z", 1, 0, ":1.10".to_owned());
     assert_ne!(action, 0, "ours must not block the grab");
 
-    let newest = f.niri().layout.focus().map(|m| m.id());
+    let newest = f.synoik().layout.focus().map(|m| m.id());
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_Z);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert_eq!(
-        f.niri().layout.focus().map(|m| m.id()),
+        f.synoik().layout.focus().map(|m| m.id()),
         newest,
         "the grab wins the keypress, so our focus-window-up must not have run"
     );
 
     // And with the grab gone, our key works again — the chord was yielded, not lost.
-    assert!(f.niri_state().ungrab_accelerator(action, ":1.10"));
+    assert!(f.synoik_state().ungrab_accelerator(action, ":1.10"));
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_Z);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_ne!(
-        f.niri().layout.focus().map(|m| m.id()),
+        f.synoik().layout.focus().map(|m| m.id()),
         newest,
         "after the ungrab our key resolves again"
     );
@@ -995,7 +998,7 @@ fn super_number_activates_the_nth_favorite() {
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_2);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1, "exactly one favorite launched");
@@ -1007,7 +1010,7 @@ fn super_number_activates_the_nth_favorite() {
     drop(calls);
 
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "_switchToApplication hides the overview before activating"
     );
 }
@@ -1022,17 +1025,17 @@ fn super_number_counts_the_favorites_the_dash_shows() {
 
     // A stored favorite for an app that isn't installed: the dash skips it, so the
     // second *tile* is the third stored id.
-    f.niri().app_system.set_favorites(vec![
+    f.synoik().app_system.set_favorites(vec![
         "a.desktop".to_owned(),
         "ghost.desktop".to_owned(),
         "b.desktop".to_owned(),
     ]);
-    f.niri().sync_dash_favorites();
+    f.synoik().sync_dash_favorites();
 
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_2);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1, "exactly one favorite launched");
@@ -1055,7 +1058,7 @@ fn super_ctrl_number_asks_for_a_new_window() {
     tap(&mut f, KEY_1);
     f.key_release(KEY_LEFTCTRL);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert_eq!(
         recorder.calls.borrow().len(),
@@ -1063,7 +1066,7 @@ fn super_ctrl_number_asks_for_a_new_window() {
         "<Super><Ctrl>1 must reach the launcher"
     );
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "opening a new window must not close the overview"
     );
 }
@@ -1122,15 +1125,21 @@ fn super_end_focuses_the_last_workspace() {
     // A mapped window gives an occupied workspace plus the trailing empty one.
     let id = f.add_client();
     let _surface = map_focused_window(&mut f, id);
-    let last = f.niri().layout.active_monitor_ref().unwrap().n_workspaces() - 1;
+    let last = f
+        .synoik()
+        .layout
+        .active_monitor_ref()
+        .unwrap()
+        .n_workspaces()
+        - 1;
     assert!(last > 0, "there must be a workspace to go to");
 
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_END);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
-        f.niri()
+        f.synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -1150,16 +1159,16 @@ fn super_shift_right_moves_the_window_to_the_next_monitor() {
 
     let id = f.add_client();
     let _surface = map_focused_window(&mut f, id);
-    let first = f.niri().layout.active_output().unwrap().clone();
+    let first = f.synoik().layout.active_output().unwrap().clone();
 
     f.key_press(KEY_LEFTMETA);
     f.key_press(KEY_LEFTSHIFT);
     tap(&mut f, KEY_RIGHT);
     f.key_release(KEY_LEFTSHIFT);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
-    let now = f.niri().layout.active_output().unwrap().clone();
+    let now = f.synoik().layout.active_output().unwrap().clone();
     assert_ne!(
         now, first,
         "<Super><Shift>Right must move the window to the monitor on the right, focus following"
@@ -1167,7 +1176,7 @@ fn super_shift_right_moves_the_window_to_the_next_monitor() {
     // Focus landing on the other monitor is not enough — a *focus*-monitor action
     // would do that too, leaving the window behind on an now-unfocused output.
     assert!(
-        f.niri().layout.focus().is_some(),
+        f.synoik().layout.focus().is_some(),
         "the window must have come along, not just the focus"
     );
 }
@@ -1186,8 +1195,8 @@ fn super_space_switches_the_input_source() {
     f.add_output(1, (1920, 1080));
 
     let layout_index = |f: &mut Fixture| {
-        let keyboard = f.niri_state().niri.seat.get_keyboard().unwrap();
-        keyboard.with_xkb_state(f.niri_state(), |context| {
+        let keyboard = f.synoik_state().synoik.seat.get_keyboard().unwrap();
+        keyboard.with_xkb_state(f.synoik_state(), |context| {
             context.xkb().lock().unwrap().active_layout().0
         })
     };
@@ -1222,22 +1231,22 @@ fn super_a_toggles_the_app_grid() {
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_A);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        f.niri().layout.is_app_grid_open(),
+        f.synoik().layout.is_app_grid_open(),
         "from closed, <Super>a must open the overview at the app grid"
     );
 
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_A);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().layout.is_app_grid_open(),
+        !f.synoik().layout.is_app_grid_open(),
         "pressing it again must fall back to the window picker"
     );
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "...without leaving the overview — that is what the show-apps button does"
     );
 }
@@ -1255,7 +1264,7 @@ fn super_v_and_super_s_open_the_panel_menus() {
     tap(&mut f, KEY_V);
     f.key_release(KEY_LEFTMETA);
     assert_eq!(
-        f.niri().panel_popover.open_role(),
+        f.synoik().panel_popover.open_role(),
         Some(crate::ui::panel::ROLE_DATE_MENU),
         "<Super>v must open the date menu"
     );
@@ -1265,7 +1274,7 @@ fn super_v_and_super_s_open_the_panel_menus() {
     tap(&mut f, KEY_V);
     f.key_release(KEY_LEFTMETA);
     assert_eq!(
-        f.niri().panel_popover.open_role(),
+        f.synoik().panel_popover.open_role(),
         None,
         "<Super>v must toggle the date menu back closed"
     );
@@ -1274,7 +1283,7 @@ fn super_v_and_super_s_open_the_panel_menus() {
     tap(&mut f, KEY_S);
     f.key_release(KEY_LEFTMETA);
     assert_eq!(
-        f.niri().panel_popover.open_role(),
+        f.synoik().panel_popover.open_role(),
         Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
         "<Super>s must open quick settings"
     );
@@ -1361,7 +1370,7 @@ fn switch_to_session_beats_the_inhibitor() {
     let surface = map_focused_window(&mut f, id);
 
     let session_3 = f
-        .niri()
+        .synoik()
         .gnome_settings
         .keybindings
         .iter_mut()
@@ -1381,7 +1390,7 @@ fn switch_to_session_beats_the_inhibitor() {
     f.double_roundtrip(id);
 
     assert_eq!(
-        f.niri_state().backend.headless().last_vt(),
+        f.synoik_state().backend.headless().last_vt(),
         Some(3),
         "an inhibitor must not be able to swallow the VT switch"
     );
@@ -1402,7 +1411,7 @@ fn gnome_keybindings_are_the_only_keybindings() {
     f.key_press(KEY_F4);
     f.key_release(KEY_F4);
     f.key_release(KEY_LEFTALT);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     assert!(
@@ -1426,25 +1435,25 @@ fn alt_tab_switches_to_previous_window() {
     let id = f.add_client();
     let _first = map_focused_window(&mut f, id);
     let _second = map_focused_window(&mut f, id);
-    let second_focused = f.niri().layout.focus().unwrap().id();
+    let second_focused = f.synoik().layout.focus().unwrap().id();
 
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_TAB);
     assert!(
-        f.niri().switcher.is_open(),
+        f.synoik().switcher.is_open(),
         "Alt+Tab must open the window switcher"
     );
     f.key_release(KEY_LEFTALT);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     // Let the focus change go through a refresh cycle, like in a real event
     // loop iteration, so the MRU bookkeeping sees it.
     f.double_roundtrip(id);
 
     assert!(
-        !f.niri().switcher.is_open(),
+        !f.synoik().switcher.is_open(),
         "releasing Alt must commit and close the switcher"
     );
-    let now_focused = f.niri().layout.focus().unwrap().id();
+    let now_focused = f.synoik().layout.focus().unwrap().id();
     assert_ne!(
         now_focused, second_focused,
         "Alt+Tab must move focus to the previous window"
@@ -1453,9 +1462,9 @@ fn alt_tab_switches_to_previous_window() {
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_TAB);
     f.key_release(KEY_LEFTALT);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
-        f.niri().layout.focus().unwrap().id(),
+        f.synoik().layout.focus().unwrap().id(),
         second_focused,
         "a second Alt+Tab must switch back"
     );
@@ -1479,13 +1488,13 @@ fn alt_f2_opens_run_dialog_and_swallows_keys() {
     tap(&mut f, KEY_F2);
     f.key_release(KEY_LEFTALT);
     assert!(
-        f.niri().run_dialog.is_open(),
+        f.synoik().run_dialog.is_open(),
         "<Alt>F2 must open the run dialog"
     );
 
     tap(&mut f, KEY_Z);
     assert_eq!(
-        f.niri().run_dialog.entry(),
+        f.synoik().run_dialog.entry(),
         "z",
         "typing must edit the entry"
     );
@@ -1508,12 +1517,12 @@ fn run_dialog_escape_closes() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state().do_action(Action::ShowRunDialog, false);
-    assert!(f.niri().run_dialog.is_open());
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+    assert!(f.synoik().run_dialog.is_open());
 
     tap(&mut f, KEY_ESC);
     assert!(
-        !f.niri().run_dialog.is_open(),
+        !f.synoik().run_dialog.is_open(),
         "an Escape tap must close the run dialog"
     );
 }
@@ -1527,7 +1536,7 @@ fn run_dialog_ctrl_enter_still_runs() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state().do_action(Action::ShowRunDialog, false);
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
     tap(&mut f, KEY_Z);
     tap(&mut f, KEY_Z);
     f.key_press(KEY_LEFTCTRL);
@@ -1535,7 +1544,7 @@ fn run_dialog_ctrl_enter_still_runs() {
     f.key_release(KEY_LEFTCTRL);
 
     assert_eq!(
-        f.niri().run_dialog.error(),
+        f.synoik().run_dialog.error(),
         Some("Command not found"),
         "Ctrl+Enter must have attempted the run, not been eaten by the entry"
     );
@@ -1549,38 +1558,38 @@ fn run_dialog_unknown_command_shows_error_and_stays_open() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state().do_action(Action::ShowRunDialog, false);
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
     tap(&mut f, KEY_Z);
     tap(&mut f, KEY_Z);
     tap(&mut f, KEY_ENTER);
 
     assert!(
-        f.niri().run_dialog.is_open(),
+        f.synoik().run_dialog.is_open(),
         "a failed command must keep the dialog open"
     );
     assert_eq!(
-        f.niri().run_dialog.entry(),
+        f.synoik().run_dialog.entry(),
         "zz",
         "the entry must be intact"
     );
     assert_eq!(
-        f.niri().run_dialog.error(),
+        f.synoik().run_dialog.error(),
         Some("Command not found"),
         "the error must show in-dialog"
     );
     assert_eq!(
-        f.niri().gnome_settings.command_history,
+        f.synoik().gnome_settings.command_history,
         vec!["zz".to_owned()],
         "even a failed command enters the history"
     );
 
     // Enter on an empty entry is also an error (the tokenizer rejects it),
     // not a close; and empty input never enters the history.
-    f.niri_state().do_action(Action::ShowRunDialog, false);
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
     tap(&mut f, KEY_ENTER);
-    assert!(f.niri().run_dialog.is_open());
+    assert!(f.synoik().run_dialog.is_open());
     assert_eq!(
-        f.niri().gnome_settings.command_history,
+        f.synoik().gnome_settings.command_history,
         vec!["zz".to_owned()]
     );
 }
@@ -1592,36 +1601,36 @@ fn run_dialog_runs_command_and_records_history() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state().do_action(Action::ShowRunDialog, false);
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
     for key in [KEY_T, KEY_R, KEY_U, KEY_E] {
         tap(&mut f, key);
     }
     tap(&mut f, KEY_ENTER);
 
     assert!(
-        !f.niri().run_dialog.is_open(),
+        !f.synoik().run_dialog.is_open(),
         "a successful run must close the dialog"
     );
     assert_eq!(
-        f.niri().gnome_settings.command_history,
+        f.synoik().gnome_settings.command_history,
         vec!["true".to_owned()]
     );
 
-    f.niri_state().do_action(Action::ShowRunDialog, false);
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
     assert_eq!(
-        f.niri().run_dialog.entry(),
+        f.synoik().run_dialog.entry(),
         "",
         "the entry must open cleared"
     );
     tap(&mut f, KEY_UP);
     assert_eq!(
-        f.niri().run_dialog.entry(),
+        f.synoik().run_dialog.entry(),
         "true",
         "Up must recall the last history entry"
     );
     tap(&mut f, KEY_DOWN);
     assert_eq!(
-        f.niri().run_dialog.entry(),
+        f.synoik().run_dialog.entry(),
         "",
         "Down past the end must clear the entry again"
     );
@@ -1633,19 +1642,19 @@ fn run_dialog_runs_command_and_records_history() {
 fn run_dialog_lockdown_disables() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().gnome_settings.disable_command_line = true;
+    f.synoik().gnome_settings.disable_command_line = true;
 
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_F2);
     f.key_release(KEY_LEFTALT);
     assert!(
-        !f.niri().run_dialog.is_open(),
+        !f.synoik().run_dialog.is_open(),
         "the lockdown key must disable the run dialog"
     );
 
-    f.niri_state().do_action(Action::ShowRunDialog, false);
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
     assert!(
-        !f.niri().run_dialog.is_open(),
+        !f.synoik().run_dialog.is_open(),
         "the lockdown applies to the action itself, not just the keybinding"
     );
 }
@@ -1667,18 +1676,18 @@ fn accelerator_grabs_intercept_conflict_and_ungrab() {
     let _ = f.client(id).take_key_events();
 
     let action = f
-        .niri_state()
+        .synoik_state()
         .grab_accelerator("<Super>z", 1, 0, ":1.10".to_owned());
     assert_ne!(action, 0, "a free combo must be grabbable");
 
     assert_eq!(
-        f.niri_state()
+        f.synoik_state()
             .grab_accelerator("<Super>z", 1, 0, ":1.11".to_owned()),
         0,
         "a combo held by another grab must be refused"
     );
     assert_eq!(
-        f.niri_state()
+        f.synoik_state()
             .grab_accelerator("<Alt>F4", 1, 0, ":1.11".to_owned()),
         0,
         "a combo held by a GNOME keybinding must be refused"
@@ -1688,13 +1697,13 @@ fn accelerator_grabs_intercept_conflict_and_ungrab() {
     // always exist before anything can connect to D-Bus, so first-come-first-served would
     // hand every contest to us. Inherited-from-niri capability yields instead.
     assert_ne!(
-        f.niri_state()
+        f.synoik_state()
             .grab_accelerator("<Super><Alt>l", 1, 0, ":1.11".to_owned()),
         0,
         "a combo held only by our own schema must not block a grab"
     );
     assert_eq!(
-        f.niri_state()
+        f.synoik_state()
             .grab_accelerator("no such key", 1, 0, ":1.11".to_owned()),
         0,
         "an unparseable accelerator must be refused"
@@ -1712,15 +1721,15 @@ fn accelerator_grabs_intercept_conflict_and_ungrab() {
         "a grabbed accelerator must not reach the client"
     );
     assert!(
-        f.niri().accel_grab_release_pending.is_empty(),
+        f.synoik().accel_grab_release_pending.is_empty(),
         "the release must have cleared the pending deactivation"
     );
 
     assert!(
-        !f.niri_state().ungrab_accelerator(action, ":1.11"),
+        !f.synoik_state().ungrab_accelerator(action, ":1.11"),
         "only the owner may ungrab"
     );
-    assert!(f.niri_state().ungrab_accelerator(action, ":1.10"));
+    assert!(f.synoik_state().ungrab_accelerator(action, ":1.10"));
 
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_Z);
@@ -1741,23 +1750,23 @@ fn accelerator_grabs_intercept_conflict_and_ungrab() {
 fn overlay_key_setting_rebinds() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().gnome_settings.overlay_keys = vec![Keysym::Super_R];
+    f.synoik().gnome_settings.overlay_keys = vec![Keysym::Super_R];
 
     // Left Super is no longer the overlay key.
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "left Super must be inert once the overlay key is Super_R"
     );
 
     // Right Super now toggles the overview.
     f.key_press(KEY_RIGHTMETA);
     f.key_release(KEY_RIGHTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "a right Super tap must open the overview when it is the overlay key"
     );
 }
@@ -1783,16 +1792,16 @@ fn map_window_sized(
     window.set_size(size.0, size.1);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     surface
 }
 
 /// The focused window's position within the workspace view.
 fn focused_window_pos(f: &mut Fixture) -> (f64, f64) {
-    let niri = f.niri();
-    let focused = niri.layout.focus().unwrap().id();
-    let ws = niri.layout.active_workspace().unwrap();
+    let synoik = f.synoik();
+    let focused = synoik.layout.focus().unwrap().id();
+    let ws = synoik.layout.active_workspace().unwrap();
     let (_, pos, _) = ws
         .tiles_with_render_positions()
         .find(|(tile, _, _)| tile.window().id() == focused)
@@ -1822,9 +1831,9 @@ fn windows_open_floating_by_default() {
     let id = f.add_client();
     let _surface = map_window_sized(&mut f, id, (100, 100), None);
 
-    let niri = f.niri();
-    let focused = niri.layout.focus().unwrap().window.clone();
-    let ws = niri.layout.active_workspace().unwrap();
+    let synoik = f.synoik();
+    let focused = synoik.layout.focus().unwrap().window.clone();
+    let ws = synoik.layout.active_workspace().unwrap();
     assert!(
         ws.is_floating(&focused),
         "a new window must open floating by default"
@@ -1835,12 +1844,12 @@ fn windows_open_floating_by_default() {
     let id = f.add_client();
     let _surface = map_window_sized(&mut f, id, (100, 100), None);
 
-    let niri = f.niri();
-    let focused = niri.layout.focus().unwrap().window.clone();
-    let ws = niri.layout.active_workspace().unwrap();
+    let synoik = f.synoik();
+    let focused = synoik.layout.focus().unwrap().window.clone();
+    let ws = synoik.layout.active_workspace().unwrap();
     assert!(
         !ws.is_floating(&focused),
-        "windowing-mode scrolling must keep niri's tiled-by-default behavior"
+        "windowing-mode scrolling must keep synoik's tiled-by-default behavior"
     );
 }
 
@@ -1949,14 +1958,14 @@ fn new_window_without_launch_time_takes_focus() {
     let id = f.add_client();
 
     let _a = map_window_sized(&mut f, id, (100, 100), None);
-    let a_id = f.niri().layout.focus().unwrap().id();
+    let a_id = f.synoik().layout.focus().unwrap().id();
 
     // Interacting with the focused window must not block a token-less window:
     // with no launch time there is nothing to compare against.
     tap(&mut f, KEY_A);
 
     let _b = map_window_sized(&mut f, id, (100, 100), None);
-    let b_id = f.niri().layout.focus().unwrap().id();
+    let b_id = f.synoik().layout.focus().unwrap().id();
     assert_ne!(
         a_id, b_id,
         "a new window with no launch information must take focus"
@@ -1973,7 +1982,7 @@ fn stale_launch_denied_focus_and_marked_urgent() {
     let id = f.add_client();
 
     let _a = map_window_sized(&mut f, id, (100, 100), None);
-    let a_id = f.niri().layout.focus().unwrap().id();
+    let a_id = f.synoik().layout.focus().unwrap().id();
 
     // Start mapping B; its launch token is minted now.
     let window = f.client(id).create_window();
@@ -1982,9 +1991,9 @@ fn stale_launch_denied_focus_and_marked_urgent() {
     f.roundtrip(id);
 
     {
-        let niri = f.niri();
-        assert_eq!(niri.unmapped_windows.len(), 1);
-        let unmapped = niri.unmapped_windows.values_mut().next().unwrap();
+        let synoik = f.synoik();
+        assert_eq!(synoik.unmapped_windows.len(), 1);
+        let unmapped = synoik.unmapped_windows.values_mut().next().unwrap();
         unmapped.activation_token_data = Some(XdgActivationTokenData {
             client_id: None,
             serial: None,
@@ -2005,16 +2014,16 @@ fn stale_launch_denied_focus_and_marked_urgent() {
     window.set_size(100, 100);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
-    let niri = f.niri();
+    let synoik = f.synoik();
     assert_eq!(
-        niri.layout.focus().unwrap().id(),
+        synoik.layout.focus().unwrap().id(),
         a_id,
         "focus must stay on the interacted-with window"
     );
 
-    let ws = niri.layout.active_workspace().unwrap();
+    let ws = synoik.layout.active_workspace().unwrap();
     let b = ws.windows().find(|w| w.id() != a_id).unwrap();
     assert!(
         b.is_urgent(),
@@ -2035,31 +2044,31 @@ fn stale_launch_denied_focus_and_marked_urgent() {
 fn strict_focus_new_windows_denies_all_but_transients() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().gnome_settings.focus_new_windows = FocusNewWindows::Strict;
+    f.synoik().gnome_settings.focus_new_windows = FocusNewWindows::Strict;
     let id = f.add_client();
 
-    // The first window still becomes active: niri ties workspace state to
+    // The first window still becomes active: synoik ties workspace state to
     // focus with nothing else focused. (mutter would literally leave it
     // unfocused; accepted divergence.)
     let a = map_window_sized(&mut f, id, (600, 400), None);
-    let a_id = f.niri().layout.focus().unwrap().id();
+    let a_id = f.synoik().layout.focus().unwrap().id();
 
     let _b = map_window_sized(&mut f, id, (100, 100), None);
     {
-        let niri = f.niri();
+        let synoik = f.synoik();
         assert_eq!(
-            niri.layout.focus().unwrap().id(),
+            synoik.layout.focus().unwrap().id(),
             a_id,
             "strict mode must deny focus to a new non-transient window"
         );
-        let ws = niri.layout.active_workspace().unwrap();
+        let ws = synoik.layout.active_workspace().unwrap();
         let b = ws.windows().find(|w| w.id() != a_id).unwrap();
         assert!(b.is_urgent(), "the denied window must be marked urgent");
     }
 
     let _c = map_window_sized(&mut f, id, (200, 100), Some(&a));
     assert_ne!(
-        f.niri().layout.focus().unwrap().id(),
+        f.synoik().layout.focus().unwrap().id(),
         a_id,
         "a transient of the focused window must take focus even in strict mode"
     );
@@ -2096,7 +2105,7 @@ fn super_left_tiles_and_toggles() {
     window.set_size(960, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
         (0., 32.),
@@ -2118,7 +2127,7 @@ fn super_left_tiles_and_toggles() {
     window.set_size(800, 600);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
         original_pos,
@@ -2183,7 +2192,7 @@ fn super_up_maximizes_super_down_restores() {
     window.set_size(800, 600);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
         original_pos,
@@ -2202,7 +2211,7 @@ fn maximize_focused(f: &mut Fixture, id: ClientId, surface: &WlSurface, size: (u
     window.set_size(size.0, size.1);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 }
 
 /// A GNOME workspace is a stack, not a strip: two maximized windows sit on top of each other at
@@ -2218,9 +2227,9 @@ fn maximized_windows_stack_instead_of_sitting_side_by_side() {
     let id = f.add_client();
 
     let first = map_window_sized(&mut f, id, (800, 600), None);
-    let first_id = f.niri().layout.focus().unwrap().id();
+    let first_id = f.synoik().layout.focus().unwrap().id();
     let second = map_window_sized(&mut f, id, (800, 600), None);
-    let second_id = f.niri().layout.focus().unwrap().id();
+    let second_id = f.synoik().layout.focus().unwrap().id();
 
     // Maximize the second, then the first (Alt+Tab back to it first).
     maximize_focused(&mut f, id, &second, (1920, 1080));
@@ -2228,11 +2237,11 @@ fn maximized_windows_stack_instead_of_sitting_side_by_side() {
     tap(&mut f, KEY_TAB);
     f.key_release(KEY_LEFTALT);
     f.double_roundtrip(id);
-    assert_eq!(f.niri().layout.focus().unwrap().id(), first_id);
+    assert_eq!(f.synoik().layout.focus().unwrap().id(), first_id);
     maximize_focused(&mut f, id, &first, (1920, 1080));
 
     let window_pos = |f: &mut Fixture, wanted| {
-        let ws = f.niri().layout.active_workspace().unwrap();
+        let ws = f.synoik().layout.active_workspace().unwrap();
         let (_, pos, _) = ws
             .tiles_with_render_positions()
             .find(|(tile, _, _)| tile.window().id() == wanted)
@@ -2252,9 +2261,9 @@ fn maximized_windows_stack_instead_of_sitting_side_by_side() {
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_TAB);
     f.key_release(KEY_LEFTALT);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
-    assert_eq!(f.niri().layout.focus().unwrap().id(), second_id);
+    assert_eq!(f.synoik().layout.focus().unwrap().id(), second_id);
 
     assert_pos_eq(
         window_pos(&mut f, first_id),
@@ -2280,8 +2289,8 @@ fn unfullscreen_returns_a_maximized_window_to_maximized() {
     maximize_focused(&mut f, id, &surface, (1920, 1080));
     let _ = f.client(id).window(&surface).recent_configures();
 
-    let window_id = f.niri().layout.focus().unwrap().window.clone();
-    f.niri().layout.toggle_fullscreen(&window_id);
+    let window_id = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik().layout.toggle_fullscreen(&window_id);
     f.double_roundtrip(id);
     let configures = f.client(id).window(&surface).format_recent_configures();
     assert!(
@@ -2295,7 +2304,7 @@ fn unfullscreen_returns_a_maximized_window_to_maximized() {
     f.double_roundtrip(id);
     let _ = f.client(id).window(&surface).recent_configures();
 
-    f.niri().layout.toggle_fullscreen(&window_id);
+    f.synoik().layout.toggle_fullscreen(&window_id);
     f.double_roundtrip(id);
 
     let configures = f.client(id).window(&surface).format_recent_configures();
@@ -2316,9 +2325,9 @@ fn fullscreen_window_covers_the_top_layer() {
     let id = f.add_client();
 
     let surface = map_window_sized(&mut f, id, (800, 600), None);
-    let window_id = f.niri().layout.focus().unwrap().window.clone();
+    let window_id = f.synoik().layout.focus().unwrap().window.clone();
     assert!(
-        !f.niri()
+        !f.synoik()
             .layout
             .active_workspace()
             .unwrap()
@@ -2326,16 +2335,16 @@ fn fullscreen_window_covers_the_top_layer() {
         "an ordinary window must not cover the panel"
     );
 
-    f.niri().layout.toggle_fullscreen(&window_id);
+    f.synoik().layout.toggle_fullscreen(&window_id);
     f.double_roundtrip(id);
     let window = f.client(id).window(&surface);
     window.set_size(1920, 1080);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        f.niri()
+        f.synoik()
             .layout
             .active_workspace()
             .unwrap()
@@ -2400,13 +2409,13 @@ fn active_maximized_window_covers_floating() {
     let id = f.add_client();
 
     let first = map_window_sized(&mut f, id, (800, 600), None);
-    let first_id = f.niri().layout.focus().unwrap().id();
+    let first_id = f.synoik().layout.focus().unwrap().id();
     let _second = map_window_sized(&mut f, id, (800, 600), None);
-    let second_id = f.niri().layout.focus().unwrap().id();
+    let second_id = f.synoik().layout.focus().unwrap().id();
     f.double_roundtrip(id);
 
     let window_pos = |f: &mut Fixture, wanted| {
-        let ws = f.niri().layout.active_workspace().unwrap();
+        let ws = f.synoik().layout.active_workspace().unwrap();
         let (_, pos, _) = ws
             .tiles_with_render_positions()
             .find(|(tile, _, _)| tile.window().id() == wanted)
@@ -2414,7 +2423,7 @@ fn active_maximized_window_covers_floating() {
         (pos.x, pos.y)
     };
     let window_under = |f: &mut Fixture, pos: (f64, f64)| {
-        let ws = f.niri().layout.active_workspace().unwrap();
+        let ws = f.synoik().layout.active_workspace().unwrap();
         ws.window_under(pos.into()).map(|(w, _)| w.id())
     };
 
@@ -2424,7 +2433,7 @@ fn active_maximized_window_covers_floating() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.double_roundtrip(id);
-    assert_eq!(f.niri().layout.focus().unwrap().id(), first_id);
+    assert_eq!(f.synoik().layout.focus().unwrap().id(), first_id);
 
     // Maximize it and ack the full-size configure.
     f.key_press(KEY_LEFTMETA);
@@ -2435,7 +2444,7 @@ fn active_maximized_window_covers_floating() {
     window.set_size(1920, 1080);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     // The maximized window is active: it must cover the floating window,
     // map order notwithstanding.
@@ -2451,9 +2460,9 @@ fn active_maximized_window_covers_floating() {
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_TAB);
     f.key_release(KEY_LEFTALT);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
-    assert_eq!(f.niri().layout.focus().unwrap().id(), second_id);
+    assert_eq!(f.synoik().layout.focus().unwrap().id(), second_id);
     assert_eq!(
         window_under(&mut f, over_second),
         Some(second_id),
@@ -2476,7 +2485,7 @@ fn super_drag_to(f: &mut Fixture, id: ClientId, grab_offset: (f64, f64), drop_po
     f.pointer_motion(drop_pos.0 - grab.0, drop_pos.1 - grab.1 - 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 }
 
@@ -2506,7 +2515,7 @@ fn drag_to_left_edge_tiles() {
     window.set_size(960, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
         (0., 32.),
@@ -2529,7 +2538,7 @@ fn drag_to_left_edge_tiles() {
     window.set_size(800, 600);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
         original_pos,
@@ -2578,7 +2587,7 @@ fn drag_to_top_edge_maximizes() {
     window.set_size(800, 600);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
         original_pos,
@@ -2597,7 +2606,7 @@ fn edge_tiling_can_be_disabled() {
     let surface = map_window_sized(&mut f, id, (800, 600), None);
     let _ = f.client(id).window(&surface).recent_configures();
 
-    f.niri().layout.set_gnome_edge_tiling(false);
+    f.synoik().layout.set_gnome_edge_tiling(false);
     super_drag_to(&mut f, id, (100., 100.), (20., 500.));
 
     let configures = f.client(id).window(&surface).format_recent_configures();
@@ -2605,9 +2614,9 @@ fn edge_tiling_can_be_disabled() {
         !configures.contains("TiledLeft"),
         "with edge-tiling off an edge drop must not tile, got: {configures}"
     );
-    let niri = f.niri();
-    let focused = niri.layout.focus().unwrap().window.clone();
-    let ws = niri.layout.active_workspace().unwrap();
+    let synoik = f.synoik();
+    let focused = synoik.layout.focus().unwrap().window.clone();
+    let ws = synoik.layout.active_workspace().unwrap();
     assert!(
         ws.is_floating(&focused),
         "with edge-tiling off the window must stay floating"
@@ -2634,7 +2643,7 @@ fn dragging_maximized_window_shakes_loose_after_threshold() {
     window.set_size(1920, 1080);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     let _ = f.client(id).window(&surface).recent_configures();
 
     // Grab it and drag: sideways and a little down — still maximized.
@@ -2663,11 +2672,11 @@ fn dragging_maximized_window_shakes_loose_after_threshold() {
     f.pointer_motion(0., 400.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
-    let niri = f.niri();
-    let focused = niri.layout.focus().unwrap().window.clone();
-    let ws = niri.layout.active_workspace().unwrap();
+    let synoik = f.synoik();
+    let focused = synoik.layout.focus().unwrap().window.clone();
+    let ws = synoik.layout.active_workspace().unwrap();
     assert!(
         ws.is_floating(&focused),
         "the shaken-loose window must land floating"
@@ -2685,23 +2694,23 @@ fn overview_spreads_windows_into_picker_slots() {
     let id = f.add_client();
 
     let _first = map_window_sized(&mut f, id, (800, 600), None);
-    let first_id = f.niri().layout.focus().unwrap().id();
-    let first_win = f.niri().layout.focus().unwrap().window.clone();
+    let first_id = f.synoik().layout.focus().unwrap().id();
+    let first_win = f.synoik().layout.focus().unwrap().window.clone();
     let _second = map_window_sized(&mut f, id, (800, 600), None);
-    let second_win = f.niri().layout.focus().unwrap().window.clone();
+    let second_win = f.synoik().layout.focus().unwrap().window.clone();
 
     // A lone Super tap opens the picker.
     tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
-    assert!(f.niri().layout.is_overview_open());
+    f.synoik_complete_animations();
+    assert!(f.synoik().layout.is_overview_open());
 
     // Every window has a picker slot, and slots don't overlap.
     let first_rect = f
-        .niri()
+        .synoik()
         .layout
         .expose_target_rect(&first_win)
         .expect("windows must have picker slots in the overview");
-    let second_rect = f.niri().layout.expose_target_rect(&second_win).unwrap();
+    let second_rect = f.synoik().layout.expose_target_rect(&second_win).unwrap();
     let disjoint = first_rect.loc.x + first_rect.size.w <= second_rect.loc.x
         || second_rect.loc.x + second_rect.size.w <= first_rect.loc.x
         || first_rect.loc.y + first_rect.size.h <= second_rect.loc.y
@@ -2719,15 +2728,15 @@ fn overview_spreads_windows_into_picker_slots() {
     );
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "clicking a preview must leave the overview"
     );
     assert_eq!(
-        f.niri().layout.focus().unwrap().id(),
+        f.synoik().layout.focus().unwrap().id(),
         first_id,
         "clicking a preview must activate that window"
     );
@@ -2736,7 +2745,7 @@ fn overview_spreads_windows_into_picker_slots() {
 /// Every workspace's render rect on output 1 — the geometry the overview's row
 /// tests measure, settled.
 fn workspace_geo(f: &mut Fixture) -> Vec<smithay::utils::Rectangle<f64, smithay::utils::Logical>> {
-    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     mon.expect("workspaces must be on a monitor")
         .workspaces_render_geo()
         .collect()
@@ -2824,7 +2833,7 @@ fn overview_grid_transition_moves_the_row_monotonically() {
     let picker = workspace_geo(&mut f);
 
     // Into the app grid.
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     let samples = f.sample_workspace_geo(1, Duration::from_millis(400), 32);
     assert_geo_eq(
         &samples[0],
@@ -2841,7 +2850,7 @@ fn overview_grid_transition_moves_the_row_monotonically() {
     );
 
     // And back out of it.
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     let samples = f.sample_workspace_geo(1, Duration::from_millis(400), 32);
     assert_geo_eq(&samples[0], &grid, "the way back starts where the grid was");
     assert_row_travels_monotonically(&samples, "app grid -> picker");
@@ -2871,10 +2880,10 @@ fn overview_close_from_the_app_grid_lands_on_the_desktop() {
 
     tap(&mut f, KEY_LEFTMETA);
     f.settle_animations();
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     f.settle_animations();
 
-    f.niri_state().do_action(Action::CloseOverview, false);
+    f.synoik_state().do_action(Action::CloseOverview, false);
     let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 48);
     assert_row_travels_monotonically(&samples, "app grid -> desktop");
     assert_geo_eq(
@@ -2904,20 +2913,20 @@ fn overview_hovering_a_preview_grows_it() {
     let id = f.add_client();
 
     let _first = map_window_sized(&mut f, id, (800, 600), None);
-    let first_win = f.niri().layout.focus().unwrap().window.clone();
+    let first_win = f.synoik().layout.focus().unwrap().window.clone();
     let _second = map_window_sized(&mut f, id, (800, 600), None);
 
     tap(&mut f, KEY_LEFTMETA);
     f.settle_animations();
 
     let rest = f
-        .niri()
+        .synoik()
         .layout
         .expose_drawn_rect(&first_win)
         .expect("a preview draws in the overview");
     assert_eq!(
         rest,
-        f.niri().layout.expose_target_rect(&first_win).unwrap(),
+        f.synoik().layout.expose_target_rect(&first_win).unwrap(),
         "un-hovered, a preview draws exactly in its slot"
     );
 
@@ -2925,7 +2934,7 @@ fn overview_hovering_a_preview_grows_it() {
     pointer_motion_to(&mut f, center.x, center.y);
     f.settle_animations();
 
-    let grown = f.niri().layout.expose_drawn_rect(&first_win).unwrap();
+    let grown = f.synoik().layout.expose_drawn_rect(&first_win).unwrap();
     assert!(
         grown.size.w > rest.size.w && grown.size.h > rest.size.h,
         "hovering must grow the preview, got {grown:?} from {rest:?}"
@@ -2949,7 +2958,7 @@ fn overview_hovering_a_preview_grows_it() {
     pointer_motion_to(&mut f, 5., 5.);
     f.settle_animations();
     assert_eq!(
-        f.niri().layout.expose_drawn_rect(&first_win).unwrap(),
+        f.synoik().layout.expose_drawn_rect(&first_win).unwrap(),
         rest,
         "leaving a preview eases it back into its slot"
     );
@@ -2972,15 +2981,15 @@ fn overview_picker_slots_clear_both_workspace_edges_evenly() {
 
     // A maximized window: the case where the slot comes closest to the edges.
     let _w = map_window_sized(&mut f, id, (1920, 1048), None);
-    let win = f.niri().layout.focus().unwrap().window.clone();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
     f.settle_animations();
 
-    let output = f.niri_output(1);
-    let slot = f.niri().layout.expose_target_rect(&win).unwrap();
+    let output = f.synoik_output(1);
+    let slot = f.synoik().layout.expose_target_rect(&win).unwrap();
     let bg = f
-        .niri()
+        .synoik()
         .layout
         .monitor_for_output(&output)
         .unwrap()
@@ -3042,15 +3051,15 @@ fn overview_picker_slots_stay_out_of_a_bottom_strut() {
     f.double_roundtrip(id);
 
     let _w = map_window_sized(&mut f, id, (1920, 800), None);
-    let win = f.niri().layout.focus().unwrap().window.clone();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
     f.settle_animations();
 
-    let output = f.niri_output(1);
-    let slot = f.niri().layout.expose_target_rect(&win).unwrap();
+    let output = f.synoik_output(1);
+    let slot = f.synoik().layout.expose_target_rect(&win).unwrap();
     let bg = f
-        .niri()
+        .synoik()
         .layout
         .monitor_for_output(&output)
         .unwrap()
@@ -3086,16 +3095,16 @@ fn overview_preview_icon_scales_out_into_the_app_grid() {
     let _surface = map_window_sized(&mut f, id, (800, 600), None);
 
     let icon_scale = |f: &mut Fixture| -> f64 {
-        let output = f.niri_output(1);
-        f.niri()
+        let output = f.synoik_output(1);
+        f.synoik()
             .layout
             .monitor_for_output(&output)
             .unwrap()
             .preview_icon_scale()
     };
     let previews = |f: &mut Fixture| -> usize {
-        let output = f.niri_output(1);
-        f.niri()
+        let output = f.synoik_output(1);
+        f.synoik()
             .layout
             .monitor_for_output(&output)
             .unwrap()
@@ -3110,7 +3119,7 @@ fn overview_preview_icon_scales_out_into_the_app_grid() {
     assert_eq!(icon_scale(&mut f), 1., "full size in the window picker");
     assert_eq!(previews(&mut f), 1);
 
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     f.settle_animations();
     assert_eq!(
         icon_scale(&mut f),
@@ -3122,9 +3131,9 @@ fn overview_preview_icon_scales_out_into_the_app_grid() {
         1,
         "but the preview is still drawn — the icon shrinks, it is not dropped"
     );
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     assert!(
-        f.niri()
+        f.synoik()
             .layout
             .monitor_for_output(&output)
             .unwrap()
@@ -3150,14 +3159,14 @@ fn overview_preview_stays_hovered_over_the_close_button_overhang() {
     let id = f.add_client();
 
     let surface = map_window_sized(&mut f, id, (800, 600), None);
-    let win = f.niri().layout.focus().unwrap().window.clone();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
     f.settle_animations();
 
     let overlay_alpha = |f: &mut Fixture| -> f64 {
-        let output = f.niri_output(1);
-        let mon = f.niri().layout.monitor_for_output(&output).unwrap();
+        let output = f.synoik_output(1);
+        let mon = f.synoik().layout.monitor_for_output(&output).unwrap();
         mon.preview_overlays()
             .into_iter()
             .find(|(w, _, _)| *w == win)
@@ -3165,7 +3174,7 @@ fn overview_preview_stays_hovered_over_the_close_button_overhang() {
     };
 
     // Hover the preview and let the overlay fade all the way in.
-    let slot = f.niri().layout.expose_target_rect(&win).unwrap();
+    let slot = f.synoik().layout.expose_target_rect(&win).unwrap();
     let inside = slot.loc + slot.size.downscale(2.).to_point();
     pointer_motion_to(&mut f, inside.x, inside.y);
     f.settle_animations();
@@ -3173,7 +3182,7 @@ fn overview_preview_stays_hovered_over_the_close_button_overhang() {
 
     // Now move onto the overhanging half of the button — outside the slot on both axes —
     // and let everything settle, which is what a human aiming at it does.
-    let drawn = f.niri().layout.expose_drawn_rect(&win).unwrap();
+    let drawn = f.synoik().layout.expose_drawn_rect(&win).unwrap();
     let button = close_rect(drawn);
     let overhang = button.loc + smithay::utils::Point::from((CLOSE_SIZE * 0.75, CLOSE_SIZE * 0.25));
     assert!(
@@ -3212,7 +3221,7 @@ fn overview_preview_close_button_closes_the_window() {
     let id = f.add_client();
 
     let surface = map_window_sized(&mut f, id, (800, 600), None);
-    let win = f.niri().layout.focus().unwrap().window.clone();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
     f.settle_animations();
@@ -3220,7 +3229,7 @@ fn overview_preview_close_button_closes_the_window() {
     // Un-hovered there is no button: clicking where it would be — the half of its
     // box that overhangs the preview's corner, clear of the preview itself —
     // closes nothing.
-    let slot = f.niri().layout.expose_target_rect(&win).unwrap();
+    let slot = f.synoik().layout.expose_target_rect(&win).unwrap();
     let button = close_rect(slot);
     let outside = button.loc + smithay::utils::Point::from((CLOSE_SIZE * 0.75, CLOSE_SIZE * 0.25));
     pointer_motion_to(&mut f, outside.x, outside.y);
@@ -3233,7 +3242,7 @@ fn overview_preview_close_button_closes_the_window() {
     );
 
     // That click landed on the overview backdrop, which leaves the overview.
-    if !f.niri().layout.is_overview_open() {
+    if !f.synoik().layout.is_overview_open() {
         tap(&mut f, KEY_LEFTMETA);
     }
     f.settle_animations();
@@ -3244,7 +3253,7 @@ fn overview_preview_close_button_closes_the_window() {
     pointer_motion_to(&mut f, inside.x, inside.y);
     f.settle_animations();
 
-    let drawn = f.niri().layout.expose_drawn_rect(&win).unwrap();
+    let drawn = f.synoik().layout.expose_drawn_rect(&win).unwrap();
     let button = close_rect(drawn);
     let center = button.loc + button.size.downscale(2.).to_point();
     pointer_motion_to(&mut f, center.x, center.y);
@@ -3257,7 +3266,7 @@ fn overview_preview_close_button_closes_the_window() {
         "clicking the close button must ask the window to close"
     );
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "and must leave the overview open"
     );
 }
@@ -3273,10 +3282,10 @@ fn overview_workspace_fills_its_allocated_picker_box() {
     let id = f.add_client();
 
     let _w = map_window_sized(&mut f, id, (800, 600), None);
-    let win = f.niri().layout.focus().unwrap().window.clone();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     // The small workspace row is always reserved (divergence, see
     // `docs/fork/dynamic-workspaces-divergence.md`), and it is one app-grid workspace
@@ -3299,7 +3308,7 @@ fn overview_workspace_fills_its_allocated_picker_box() {
     // which is the work area symmetrized about the view — the 32px panel strut is applied
     // at both edges, giving 1920×1016 at y = 32, so the slot sits at
     // (580, 32 + (1016−570)/2) = (580, 255), scaled into the picker box at y = 227.
-    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
     assert_pos_eq(
         (rect.loc.x, rect.loc.y),
         (offset_x + 580. * zoom, 254. + 255. * zoom),
@@ -3330,7 +3339,7 @@ fn overview_workspace_shadow_shares_the_background_radius() {
     let _ = map_window_sized(&mut f, id, (800, 600), None);
 
     let radius = |f: &mut Fixture| {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.expect("workspaces must be on a monitor")
             .workspace_background_radius()
     };
@@ -3346,7 +3355,7 @@ fn overview_workspace_shadow_shares_the_background_radius() {
 
     // 30 pre-zoom units divided by the zoom, so it lands at 30 on screen.
     let zoom = {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.unwrap().overview_zoom()
     };
     let open = radius(&mut f);
@@ -3367,22 +3376,22 @@ fn overview_workspace_shadow_shares_the_background_radius() {
 fn gnome_mode_draws_no_border_or_focus_ring() {
     let mut config = Config::default();
     // Everything a user could turn them on with, at once.
-    config.layout.border = niri_config::Border {
+    config.layout.border = synoik_config::Border {
         off: false,
         width: 8.,
         ..Default::default()
     };
-    config.layout.focus_ring = niri_config::FocusRing {
+    config.layout.focus_ring = synoik_config::FocusRing {
         off: false,
         width: 8.,
         ..Default::default()
     };
     // A rule that explicitly turns the border back on: the case that must still
     // lose to GNOME mode.
-    config.window_rules.push(niri_config::WindowRule {
-        border: niri_config::BorderRule {
+    config.window_rules.push(synoik_config::WindowRule {
+        border: synoik_config::BorderRule {
             on: true,
-            width: Some(niri_config::FloatOrInt(6.)),
+            width: Some(synoik_config::FloatOrInt(6.)),
             ..Default::default()
         },
         ..Default::default()
@@ -3393,7 +3402,7 @@ fn gnome_mode_draws_no_border_or_focus_ring() {
     let id = f.add_client();
     let _ = map_window_sized(&mut f, id, (800, 600), None);
 
-    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     let tile = mon
         .expect("workspaces must be on a monitor")
         .active_workspace_ref()
@@ -3426,7 +3435,7 @@ fn overview_workspace_offset_interpolates_out_of_the_desktop() {
     let _w = map_window_sized(&mut f, id, (800, 600), None);
 
     let row_y = |f: &mut Fixture| {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.expect("workspaces must be on a monitor")
             .workspaces_render_geo()
             .next()
@@ -3441,10 +3450,10 @@ fn overview_workspace_offset_interpolates_out_of_the_desktop() {
     tap(&mut f, KEY_LEFTMETA);
     // Mid-animation: strictly between the desktop and the picker box.
     {
-        let niri = f.niri();
-        let now = niri.clock.now_unadjusted();
-        niri.clock.set_unadjusted(now + Duration::from_millis(60));
-        niri.advance_animations();
+        let synoik = f.synoik();
+        let now = synoik.clock.now_unadjusted();
+        synoik.clock.set_unadjusted(now + Duration::from_millis(60));
+        synoik.advance_animations();
     }
     let box_y = overview_controls(&mut f).workspaces.loc.y;
     let mid = row_y(&mut f);
@@ -3479,10 +3488,10 @@ fn overview_entry_floats_over_an_app_grid_sized_workspace_row() {
         f.settle_animations();
 
         let controls = overview_controls(&mut f);
-        let pill = f.niri().overview_search.entry_pill(controls.into());
+        let pill = f.synoik().overview_search.entry_pill(controls.into());
         let band = controls.workspace_row;
         let view_w = f64::from(size.0);
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         let strip = mon
             .expect("workspaces must be on a monitor")
             .thumbnail_strip()
@@ -3550,7 +3559,7 @@ fn the_workspace_row_is_the_same_in_both_overview_states() {
     f.settle_animations();
 
     let row = |f: &mut Fixture| {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.expect("workspaces must be on a monitor")
             .thumbnail_strip()
             .expect("the row is always shown in the overview")
@@ -3560,9 +3569,9 @@ fn the_workspace_row_is_the_same_in_both_overview_states() {
     let picker = row(&mut f);
     assert!(picker.len() >= 3, "three workspaces must be laid out");
 
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     f.settle_animations();
-    assert!(f.niri().layout.is_app_grid_open(), "app grid must open");
+    assert!(f.synoik().layout.is_app_grid_open(), "app grid must open");
 
     assert_eq!(
         row(&mut f),
@@ -3573,7 +3582,7 @@ fn the_workspace_row_is_the_same_in_both_overview_states() {
     // And the picker behind it does not travel into the row either — it fades away in
     // place, so nothing is left to reconcile with the row that is already there.
     let controls = overview_controls(&mut f);
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     f.settle_animations();
     assert_eq!(
         overview_controls(&mut f).workspaces,
@@ -3595,15 +3604,15 @@ fn overview_thumbnail_strip_scrolls_instead_of_shrinking() {
     let id = f.add_client();
     setup_n_desktops(&mut f, id, 12);
 
-    f.niri_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().do_action(Action::OpenOverview, false);
     f.settle_animations();
 
     let controls = overview_controls(&mut f);
-    let pill = f.niri().overview_search.entry_pill(controls.into());
+    let pill = f.synoik().overview_search.entry_pill(controls.into());
     let band = controls.workspace_row;
 
     let strip_now = |f: &mut Fixture| {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.expect("workspaces must be on a monitor")
             .thumbnail_strip()
             .expect("many workspaces must show the strip")
@@ -3640,7 +3649,7 @@ fn overview_thumbnail_strip_scrolls_instead_of_shrinking() {
     );
     for _ in 0..n {
         let active = f
-            .niri()
+            .synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -3659,7 +3668,8 @@ fn overview_thumbnail_strip_scrolls_instead_of_shrinking() {
         ));
         assert_eq!(strip.thumb_under(center), Some(active));
 
-        f.niri_state().do_action(Action::FocusWorkspaceDown, false);
+        f.synoik_state()
+            .do_action(Action::FocusWorkspaceDown, false);
         f.settle_animations();
     }
 }
@@ -3681,7 +3691,7 @@ fn overview_thumbnail_strip_fills_its_allocated_band() {
     // Full width, in both overview states.
     assert_eq!((band.loc.x, band.size.w), (0., 1920.));
 
-    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     let strip = mon
         .expect("workspaces must be on a monitor")
         .thumbnail_strip()
@@ -3719,13 +3729,13 @@ fn overview_picker_box_does_not_move_with_the_workspace_count() {
 
     // Populate a second desktop. Sample mid-transition too: an eased band would be
     // caught here, and a popped one would show a different box on the next frame.
-    f.niri().layout.move_to_workspace_down(true);
-    f.niri().advance_animations();
+    f.synoik().layout.move_to_workspace_down(true);
+    f.synoik().advance_animations();
     {
-        let niri = f.niri();
-        let now = niri.clock.now_unadjusted();
-        niri.clock.set_unadjusted(now + Duration::from_millis(60));
-        niri.advance_animations();
+        let synoik = f.synoik();
+        let now = synoik.clock.now_unadjusted();
+        synoik.clock.set_unadjusted(now + Duration::from_millis(60));
+        synoik.advance_animations();
     }
     let mid = overview_controls(&mut f).workspaces;
     assert_eq!((mid.loc.y, mid.size.h), (254., 693.));
@@ -3735,12 +3745,12 @@ fn overview_picker_box_does_not_move_with_the_workspace_count() {
     assert_eq!((two.loc.y, two.size.h), (254., 693.));
 
     // …and back. The emptied desktop is not reaped, so this is now three workspaces.
-    f.niri().layout.move_to_workspace_up(true);
+    f.synoik().layout.move_to_workspace_up(true);
     f.settle_animations();
     let back = overview_controls(&mut f).workspaces;
     assert_eq!((back.loc.y, back.size.h), (254., 693.));
 
-    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     let mon = mon.expect("workspaces must be on a monitor");
     assert!(
         mon.thumbnails_visible(),
@@ -3759,10 +3769,10 @@ fn overview_click_neighbor_switches_and_stays() {
     let id = f.add_client();
 
     let _w = map_window_sized(&mut f, id, (800, 600), None);
-    let ws1_id = f.niri().layout.active_workspace().unwrap().id();
+    let ws1_id = f.synoik().layout.active_workspace().unwrap().id();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     // The trailing empty workspace peeks at the right edge of the row:
     // the active workspace spans 161..1760 and the neighbor, drawn a touch
@@ -3771,13 +3781,13 @@ fn overview_click_neighbor_switches_and_stays() {
     f.pointer_motion(1850., 540.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "clicking a neighbor workspace must not leave the overview"
     );
-    let active = f.niri().layout.active_workspace().unwrap().id();
+    let active = f.synoik().layout.active_workspace().unwrap().id();
     assert_ne!(
         active, ws1_id,
         "clicking a neighbor workspace must switch to it"
@@ -3788,14 +3798,14 @@ fn overview_click_neighbor_switches_and_stays() {
     f.pointer_motion(-940., 0.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "clicking the active workspace's empty area must leave the overview"
     );
     assert_eq!(
-        f.niri().layout.active_workspace().unwrap().id(),
+        f.synoik().layout.active_workspace().unwrap().id(),
         active,
         "leaving the overview must keep the clicked workspace active"
     );
@@ -3811,29 +3821,29 @@ fn overview_drag_within_workspace_keeps_desktop_position() {
     let id = f.add_client();
 
     let _w = map_window_sized(&mut f, id, (800, 600), None);
-    let win = f.niri().layout.focus().unwrap().window.clone();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
     let original_pos = focused_window_pos(&mut f);
 
     tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     // Drag the preview towards the workspace's top-left corner and drop it.
-    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
     f.pointer_motion(rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_motion(0., 10.);
     f.pointer_motion(-400., -300.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "dropping a preview must not leave the overview"
     );
 
     tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
         original_pos,
@@ -3853,12 +3863,12 @@ fn overview_dragged_preview_shrinks_to_the_dnd_size() {
     let id = f.add_client();
 
     let _w = map_window_sized(&mut f, id, (800, 600), None);
-    let win = f.niri().layout.focus().unwrap().window.clone();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
     f.settle_animations();
 
-    let slot = f.niri().layout.expose_target_rect(&win).unwrap();
+    let slot = f.synoik().layout.expose_target_rect(&win).unwrap();
     assert!(
         f64::max(slot.size.w, slot.size.h) > 256.,
         "the preview must start bigger than WINDOW_DND_SIZE for this to test anything"
@@ -3872,7 +3882,7 @@ fn overview_dragged_preview_shrinks_to_the_dnd_size() {
     f.pointer_motion(-100., -100.);
 
     let picked = f
-        .niri()
+        .synoik()
         .layout
         .interactive_move_drawn_size()
         .expect("the drag must be in flight");
@@ -3883,7 +3893,7 @@ fn overview_dragged_preview_shrinks_to_the_dnd_size() {
     );
 
     f.settle_animations();
-    let shrunk = f.niri().layout.interactive_move_drawn_size().unwrap();
+    let shrunk = f.synoik().layout.interactive_move_drawn_size().unwrap();
     assert!(
         (f64::max(shrunk.w, shrunk.h) - 256.).abs() <= 1.,
         "the dragged preview must shrink to 256px on its longest side, got {shrunk:?}"
@@ -3894,7 +3904,7 @@ fn overview_dragged_preview_shrinks_to_the_dnd_size() {
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 }
 
@@ -3908,32 +3918,32 @@ fn overview_drag_to_neighbor_keeps_position() {
     let id = f.add_client();
 
     let _w = map_window_sized(&mut f, id, (800, 600), None);
-    let win = f.niri().layout.focus().unwrap().window.clone();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
     let original_pos = focused_window_pos(&mut f);
-    let ws1_id = f.niri().layout.active_workspace().unwrap().id();
+    let ws1_id = f.synoik().layout.active_workspace().unwrap().id();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     // Drag the preview onto the trailing workspace peeking at the right
     // screen edge (visible from 1752 on; see the neighbor click test).
-    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
     let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
     f.pointer_motion(grab.0, grab.1);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_motion(0., 10.);
     f.pointer_motion(1800. - grab.0, 540. - grab.1 - 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "dropping a preview on a neighbor must not leave the overview"
     );
 
-    let niri = f.niri();
-    let (_, _, ws) = niri
+    let synoik = f.synoik();
+    let (_, _, ws) = synoik
         .layout
         .workspaces()
         .find(|(_, _, ws)| ws.has_window(&win))
@@ -3975,28 +3985,28 @@ fn the_workspace_row_fits_all_of_the_workspaces() {
 
     // Back to the first workspace, so the active one is off-center in the row.
     while f
-        .niri()
+        .synoik()
         .layout
         .active_monitor_ref()
         .unwrap()
         .active_workspace_idx()
         != 0
     {
-        f.niri_state().do_action(Action::FocusWorkspaceUp, false);
+        f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
     }
     f.settle_animations();
 
     use smithay::utils::{Logical, Rectangle};
 
     let picker_row = |f: &mut Fixture| -> Vec<Rectangle<f64, Logical>> {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.expect("workspaces must be on a monitor")
             .workspaces_render_geo()
             .take(3)
             .collect()
     };
     let row = |f: &mut Fixture| -> Vec<Rectangle<f64, Logical>> {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.expect("workspaces must be on a monitor")
             .thumbnail_strip()
             .expect("the row is always shown in the overview")
@@ -4027,9 +4037,9 @@ fn the_workspace_row_fits_all_of_the_workspaces() {
     // The row: fit-all, so the run is centered and the active workspace is wherever its
     // index puts it — and the same before and after the app grid opens.
     let before = row(&mut f);
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     f.settle_animations();
-    assert!(f.niri().layout.is_app_grid_open(), "app grid must open");
+    assert!(f.synoik().layout.is_app_grid_open(), "app grid must open");
     let grid = row(&mut f);
     assert_eq!(
         grid, before,
@@ -4061,9 +4071,10 @@ fn the_workspace_row_fits_all_of_the_workspaces() {
 fn setup_n_desktops(f: &mut Fixture, id: ClientId, n: usize) {
     for _ in 0..n {
         let _ = map_window_sized(f, id, (800, 600), None);
-        f.niri_state().do_action(Action::FocusWorkspaceDown, false);
+        f.synoik_state()
+            .do_action(Action::FocusWorkspaceDown, false);
     }
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 }
 
 /// With enough workspaces the fitted row no longer fits, and every workspace past the edge
@@ -4086,14 +4097,14 @@ fn app_grid_scrolls_an_overflowing_workspace_row_into_view() {
     // packed at the 24px minimum spacing) with room to spare.
     setup_n_desktops(&mut f, id, 8);
 
-    f.niri_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().do_action(Action::OpenOverview, false);
     f.settle_animations();
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     f.settle_animations();
-    assert!(f.niri().layout.is_app_grid_open(), "app grid must open");
+    assert!(f.synoik().layout.is_app_grid_open(), "app grid must open");
 
     let row = |f: &mut Fixture| -> Vec<Rectangle<f64, Logical>> {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.expect("workspaces must be on a monitor")
             .thumbnail_strip()
             .expect("the row is always shown in the overview")
@@ -4116,21 +4127,21 @@ fn app_grid_scrolls_an_overflowing_workspace_row_into_view() {
     // Walk the whole row from the top. Whichever workspace is active is fully on
     // screen — that is the property the report was about.
     while f
-        .niri()
+        .synoik()
         .layout
         .active_monitor_ref()
         .unwrap()
         .active_workspace_idx()
         != 0
     {
-        f.niri_state().do_action(Action::FocusWorkspaceUp, false);
+        f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
     }
     f.settle_animations();
 
     let mut visited = 0;
     loop {
         let active = f
-            .niri()
+            .synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -4152,10 +4163,11 @@ fn app_grid_scrolls_an_overflowing_workspace_row_into_view() {
                 "the row must stay uniform at active={active}, got {geo:?}"
             );
         }
-        f.niri_state().do_action(Action::FocusWorkspaceDown, false);
+        f.synoik_state()
+            .do_action(Action::FocusWorkspaceDown, false);
         f.settle_animations();
         let moved = f
-            .niri()
+            .synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -4186,21 +4198,21 @@ fn overview_shrinks_the_inactive_workspaces() {
     let _ = setup_two_desktops_in_overview(&mut f, id);
 
     while f
-        .niri()
+        .synoik()
         .layout
         .active_monitor_ref()
         .unwrap()
         .active_workspace_idx()
         != 0
     {
-        f.niri_state().do_action(Action::FocusWorkspaceUp, false);
+        f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
     }
     f.settle_animations();
 
     use crate::layout::monitor::WORKSPACE_INACTIVE_SCALE;
 
     let scales = |f: &mut Fixture| -> Vec<f64> {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         let mon = mon.expect("workspaces must be on a monitor");
         (0..3).map(|i| mon.workspace_render_scale(i)).collect()
     };
@@ -4217,7 +4229,7 @@ fn overview_shrinks_the_inactive_workspaces() {
     // puts it.
     {
         use smithay::utils::{Logical, Rectangle};
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         let row: Vec<Rectangle<f64, Logical>> =
             mon.unwrap().workspaces_render_geo().take(2).collect();
         assert!(
@@ -4238,7 +4250,7 @@ fn overview_shrinks_the_inactive_workspaces() {
     }
 
     // Closed: the row is the live desktop, so nothing is scaled.
-    f.niri_state().do_action(Action::CloseOverview, false);
+    f.synoik_state().do_action(Action::CloseOverview, false);
     f.settle_animations();
     assert_eq!(
         scales(&mut f),
@@ -4266,22 +4278,22 @@ fn setup_two_desktops_in_overview_on(
 ) -> (smithay::desktop::Window, smithay::desktop::Window) {
     let (drop_x, drop_y) = (f64::from(size.0) - 20., f64::from(size.1) / 2.);
     let _a = map_window_sized(f, id, (800, 600), None);
-    let win_a = f.niri().layout.focus().unwrap().window.clone();
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
     let _b = map_window_sized(f, id, (640, 480), None);
-    let win_b = f.niri().layout.focus().unwrap().window.clone();
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(f, KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     // Drag B's preview onto the trailing workspace peeking at the right.
-    let rect = f.niri().layout.expose_target_rect(&win_b).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win_b).unwrap();
     let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
     f.pointer_motion(grab.0, grab.1);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_motion(0., 10.);
     f.pointer_motion(drop_x - grab.0, drop_y - grab.1 - 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     (win_a, win_b)
@@ -4289,7 +4301,7 @@ fn setup_two_desktops_in_overview_on(
 
 /// Absolute pointer motion: `Fixture::pointer_motion` takes deltas.
 pub(super) fn pointer_motion_to(f: &mut Fixture, x: f64, y: f64) {
-    let cur = f.niri().seat.get_pointer().unwrap().current_location();
+    let cur = f.synoik().seat.get_pointer().unwrap().current_location();
     f.pointer_motion(x - cur.x, y - cur.y);
 }
 
@@ -4299,7 +4311,7 @@ pub(super) fn pointer_motion_to(f: &mut Fixture, x: f64, y: f64) {
 /// on the label's width and on whether the messages dot is showing, so a literal
 /// screen-centre would just click the wallpaper.
 fn clock_center_x(f: &mut Fixture, output_w: f64) -> f64 {
-    let rect = f.niri().panel.date_menu_rect(output_w);
+    let rect = f.synoik().panel.date_menu_rect(output_w);
     rect.loc.x + rect.size.w / 2.
 }
 
@@ -4307,7 +4319,7 @@ fn clock_center_x(f: &mut Fixture, output_w: f64) -> f64 {
 /// longer owns the top-right corner: the dateMenu was moved past it (see
 /// [`crate::ui::panel`]), so the cluster starts wherever the clock's box ends.
 pub(super) fn qs_center_x(f: &mut Fixture, output_w: f64) -> f64 {
-    let rect = f.niri().panel.quick_settings_rect(output_w);
+    let rect = f.synoik().panel.quick_settings_rect(output_w);
     rect.loc.x + rect.size.w / 2.
 }
 
@@ -4318,13 +4330,13 @@ pub(super) fn qs_center_x(f: &mut Fixture, output_w: f64) -> f64 {
 pub(super) fn popover_origin(
     f: &mut Fixture,
 ) -> smithay::utils::Point<f64, smithay::utils::Logical> {
-    let output = f.niri_output(1);
-    f.niri().panel_popover.location(&output)
+    let output = f.synoik_output(1);
+    f.synoik().panel_popover.location(&output)
 }
 
 /// The center of the given strip thumbnail, for pointer input.
 fn thumbnail_center(f: &mut Fixture, idx: usize) -> (f64, f64) {
-    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     let strip = mon
         .expect("workspaces must be on a monitor")
         .thumbnail_strip()
@@ -4338,7 +4350,7 @@ fn thumbnail_close_rect(
     f: &mut Fixture,
     idx: usize,
 ) -> Option<smithay::utils::Rectangle<f64, smithay::utils::Logical>> {
-    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     let mon = mon.expect("workspaces must be on a monitor");
     let id = mon.workspace_at(idx).expect("a workspace at idx").id();
     mon.thumbnail_close_rects()
@@ -4361,11 +4373,11 @@ fn dismissable_desktop_fixture(
     crate::layout::workspace::WorkspaceId,
 ) {
     setup_n_desktops(f, id, 2);
-    f.niri_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().do_action(Action::OpenOverview, false);
     f.settle_animations();
 
     let win = {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.unwrap()
             .workspace_at(0)
             .unwrap()
@@ -4375,12 +4387,12 @@ fn dismissable_desktop_fixture(
             .window
             .clone()
     };
-    f.niri()
+    f.synoik()
         .layout
         .remove_window(&win, crate::utils::transaction::Transaction::new());
     f.settle_animations();
 
-    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     let mon = mon.unwrap();
     assert_eq!(mon.workspace_count(), 3);
     (
@@ -4414,7 +4426,7 @@ fn thumbnail_close_button_only_on_dismissable_desktops() {
     let rect = thumbnail_close_rect(&mut f, 0).expect("the emptied desktop must be dismissable");
     // Inside its thumbnail: the strip clips to its band, so an overhanging button would be
     // sliced in half along the band's top edge.
-    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     let strip = mon.unwrap().thumbnail_strip().unwrap();
     let thumb = strip.thumbs[0];
     assert!(
@@ -4427,9 +4439,9 @@ fn thumbnail_close_button_only_on_dismissable_desktops() {
 
     // Naming a workspace is how you say you want it kept — that is already what makes one
     // un-reapable, and it takes the close button away too.
-    f.niri().layout.set_workspace_name(
+    f.synoik().layout.set_workspace_name(
         String::from("kept"),
-        Some(niri_config::WorkspaceReference::Id(empty_id.get())),
+        Some(synoik_config::WorkspaceReference::Id(empty_id.get())),
     );
     f.settle_animations();
     assert!(
@@ -4458,7 +4470,7 @@ fn thumbnail_close_button_dismisses_the_desktop() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.settle_animations();
 
-    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     let mon = mon.unwrap();
     assert_eq!(mon.workspace_count(), 2, "the desktop must be gone");
     assert_eq!(
@@ -4467,7 +4479,7 @@ fn thumbnail_close_button_dismisses_the_desktop() {
         "the desktop below it must have moved up into the gap"
     );
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "dismissing a desktop must leave the overview open"
     );
 }
@@ -4488,8 +4500,8 @@ fn thumbnail_close_button_follows_the_pointer() {
     // workspace to the band's centre, so the left part of the first thumbnail is scrolled
     // out of the band and, being undrawn, is deliberately un-hittable.
     pointer_motion_to(&mut f, rect.loc.x - 10., rect.loc.y + rect.size.h / 2.);
-    assert_eq!(f.niri().thumbnail_hovered, Some(empty_id));
-    assert_eq!(f.niri().thumbnail_close_hovered, None);
+    assert_eq!(f.synoik().thumbnail_hovered, Some(empty_id));
+    assert_eq!(f.synoik().thumbnail_close_hovered, None);
 
     // On the button: lit.
     pointer_motion_to(
@@ -4497,13 +4509,13 @@ fn thumbnail_close_button_follows_the_pointer() {
         rect.loc.x + rect.size.w / 2.,
         rect.loc.y + rect.size.h / 2.,
     );
-    assert_eq!(f.niri().thumbnail_hovered, Some(empty_id));
-    assert_eq!(f.niri().thumbnail_close_hovered, Some(empty_id));
+    assert_eq!(f.synoik().thumbnail_hovered, Some(empty_id));
+    assert_eq!(f.synoik().thumbnail_close_hovered, Some(empty_id));
 
     // Off the strip entirely: neither.
     pointer_motion_to(&mut f, 960., 900.);
-    assert_eq!(f.niri().thumbnail_hovered, None);
-    assert_eq!(f.niri().thumbnail_close_hovered, None);
+    assert_eq!(f.synoik().thumbnail_hovered, None);
+    assert_eq!(f.synoik().thumbnail_close_hovered, None);
 }
 
 /// Dismissing a desktop slides the survivors into the gap rather than teleporting them:
@@ -4524,12 +4536,12 @@ fn dismissing_a_desktop_slides_the_strip_closed() {
     let id = f.add_client();
 
     setup_n_desktops(&mut f, id, 3);
-    f.niri_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().do_action(Action::OpenOverview, false);
     f.settle_animations();
 
     // Empty desktop 1 and focus desktop 0: [window, empty, window, trailing empty].
     let win = {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.unwrap()
             .workspace_at(1)
             .unwrap()
@@ -4539,15 +4551,15 @@ fn dismissing_a_desktop_slides_the_strip_closed() {
             .window
             .clone()
     };
-    f.niri()
+    f.synoik()
         .layout
         .remove_window(&win, crate::utils::transaction::Transaction::new());
     for _ in 0..3 {
-        f.niri_state().do_action(Action::FocusWorkspaceUp, false);
+        f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
     }
     f.settle_animations();
     let survivor = {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         let mon = mon.unwrap();
         assert_eq!(mon.workspace_count(), 4);
         mon.workspace_at(2).unwrap().id()
@@ -4557,7 +4569,7 @@ fn dismissing_a_desktop_slides_the_strip_closed() {
     // workspace renumbers everything below it, so an index would track two different
     // thumbnails on either side of the close.
     let survivor_x = |f: &mut Fixture| {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         let mon = mon.unwrap();
         let idx = (0..mon.workspace_count())
             .find(|i| mon.workspace_at(*i).unwrap().id() == survivor)
@@ -4577,10 +4589,10 @@ fn dismissing_a_desktop_slides_the_strip_closed() {
     // At t = 0 the row is still drawn exactly as it stood before the close.
     let start = survivor_x(&mut f);
     {
-        let niri = f.niri();
-        let now = niri.clock.now_unadjusted();
-        niri.clock.set_unadjusted(now + Duration::from_millis(60));
-        niri.advance_animations();
+        let synoik = f.synoik();
+        let now = synoik.clock.now_unadjusted();
+        synoik.clock.set_unadjusted(now + Duration::from_millis(60));
+        synoik.advance_animations();
     }
     let mid = survivor_x(&mut f);
     f.settle_animations();
@@ -4613,12 +4625,12 @@ fn the_workspace_row_closes_and_reorders_in_the_app_grid_too() {
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let (win_a, win_b) = setup_two_desktops_in_overview(&mut f, id);
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     f.settle_animations();
-    assert!(f.niri().layout.is_app_grid_open(), "app grid must open");
+    assert!(f.synoik().layout.is_app_grid_open(), "app grid must open");
 
     let ws_idx_of = |f: &mut Fixture, win: &smithay::desktop::Window| {
-        f.niri()
+        f.synoik()
             .layout
             .workspaces()
             .find(|(_, _, ws)| ws.has_window(win))
@@ -4637,11 +4649,11 @@ fn the_workspace_row_closes_and_reorders_in_the_app_grid_too() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, t1x + 1., t0y);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     assert!(
-        f.niri().layout.is_app_grid_open(),
+        f.synoik().layout.is_app_grid_open(),
         "reordering must not drop out of the app grid"
     );
     assert_eq!(
@@ -4652,15 +4664,15 @@ fn the_workspace_row_closes_and_reorders_in_the_app_grid_too() {
 
     // And an emptied desktop can still be dismissed from here. Empty the one that is now
     // first, then aim at its close button.
-    let win = f.niri().layout.focus().unwrap().window.clone();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
     let empty_idx = ws_idx_of(&mut f, &win_b);
-    f.niri()
+    f.synoik()
         .layout
         .remove_window(&win_b, crate::utils::transaction::Transaction::new());
     let _ = win;
     f.settle_animations();
 
-    let before = f.niri().layout.workspaces().count();
+    let before = f.synoik().layout.workspaces().count();
     let rect = thumbnail_close_rect(&mut f, empty_idx)
         .expect("an emptied desktop must be dismissable from the app grid");
     pointer_motion_to(
@@ -4673,12 +4685,12 @@ fn the_workspace_row_closes_and_reorders_in_the_app_grid_too() {
     f.settle_animations();
 
     assert_eq!(
-        f.niri().layout.workspaces().count(),
+        f.synoik().layout.workspaces().count(),
         before - 1,
         "the close button must dismiss the desktop in the app grid too"
     );
     assert!(
-        f.niri().layout.is_app_grid_open(),
+        f.synoik().layout.is_app_grid_open(),
         "dismissing must not drop out of the app grid"
     );
 }
@@ -4701,7 +4713,7 @@ fn thumbnail_close_press_beats_the_reorder_grab() {
     );
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         assert!(
             !mon.unwrap().thumb_drag_active(),
             "a press on the close button must not arm a reorder drag"
@@ -4710,7 +4722,7 @@ fn thumbnail_close_press_beats_the_reorder_grab() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.settle_animations();
 
-    let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     assert_eq!(mon.unwrap().workspace_count(), 2);
 }
 
@@ -4727,7 +4739,7 @@ fn overview_dragging_a_thumbnail_reorders_the_workspaces() {
     f.settle_animations();
 
     let ws_idx_of = |f: &mut Fixture, win: &smithay::desktop::Window| {
-        f.niri()
+        f.synoik()
             .layout
             .workspaces()
             .find(|(_, _, ws)| ws.has_window(win))
@@ -4751,7 +4763,7 @@ fn overview_dragging_a_thumbnail_reorders_the_workspaces() {
     // Mid-drag the row parts: the dragged thumbnail follows the pointer, and the one it
     // passed has closed up into the slot it left.
     {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         let strip = mon.unwrap().thumbnail_strip().unwrap();
         assert_eq!(
             strip.thumbs[0].loc.x + strip.thumbs[0].size.w / 2.,
@@ -4766,7 +4778,7 @@ fn overview_dragging_a_thumbnail_reorders_the_workspaces() {
     }
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     assert_eq!(
@@ -4775,12 +4787,12 @@ fn overview_dragging_a_thumbnail_reorders_the_workspaces() {
         "dropping a thumbnail past its neighbour must swap the workspaces"
     );
     assert_eq!(
-        f.niri().layout.workspaces().count(),
+        f.synoik().layout.workspaces().count(),
         3,
         "reordering must not add or drop a workspace"
     );
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "reordering must not leave the overview"
     );
 }
@@ -4795,9 +4807,9 @@ fn overview_a_short_thumbnail_press_still_activates_the_workspace() {
     let (win_a, win_b) = setup_two_desktops_in_overview(&mut f, id);
     f.settle_animations();
 
-    let active = |f: &mut Fixture| f.niri().layout.active_workspace().unwrap().id();
+    let active = |f: &mut Fixture| f.synoik().layout.active_workspace().unwrap().id();
     let ws_of = |f: &mut Fixture, win: &smithay::desktop::Window| {
-        f.niri()
+        f.synoik()
             .layout
             .workspaces()
             .find(|(_, _, ws)| ws.has_window(win))
@@ -4814,7 +4826,7 @@ fn overview_a_short_thumbnail_press_still_activates_the_workspace() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_motion(3., 0.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert_eq!(
         active(&mut f),
@@ -4822,7 +4834,7 @@ fn overview_a_short_thumbnail_press_still_activates_the_workspace() {
         "a click on a thumbnail must switch to its workspace"
     );
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "…and stay in the overview, as clicking a non-active workspace does"
     );
     assert_eq!(
@@ -4844,31 +4856,31 @@ fn thumbnail_strip_is_shown_at_every_workspace_count() {
     let id = f.add_client();
 
     let visible = |f: &mut Fixture| {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.unwrap().thumbnails_visible()
     };
     let count = |f: &mut Fixture| {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.unwrap().workspace_count()
     };
 
     // A bare session: MIN_NUM_WORKSPACES empties, and the strip already showing.
     tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(count(&mut f), 2, "a fresh monitor shows two desktops");
     assert!(visible(&mut f), "an empty session must show the strip");
     tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     let _a = map_window_sized(&mut f, id, (800, 600), None);
     tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
         visible(&mut f),
         "one populated desktop must show the strip too"
     );
     tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     let (_a, _b) = setup_two_desktops_in_overview(&mut f, id);
     assert!(visible(&mut f), "…and so must two");
@@ -4884,20 +4896,20 @@ fn thumbnail_click_switches_workspace_and_stays() {
     let id = f.add_client();
 
     let (_a, _b) = setup_two_desktops_in_overview(&mut f, id);
-    let ws1_id = f.niri().layout.active_workspace().unwrap().id();
+    let ws1_id = f.synoik().layout.active_workspace().unwrap().id();
 
     // Click the second desktop's thumbnail: switch, stay in the overview.
     let (x, y) = thumbnail_center(&mut f, 1);
     pointer_motion_to(&mut f, x, y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "clicking a non-active thumbnail must stay in the overview"
     );
-    let active = f.niri().layout.active_workspace().unwrap().id();
+    let active = f.synoik().layout.active_workspace().unwrap().id();
     assert_ne!(active, ws1_id, "clicking a thumbnail must switch to it");
 
     // Click it again (now active): leave the overview. The pointer has to be re-aimed —
@@ -4907,12 +4919,12 @@ fn thumbnail_click_switches_workspace_and_stays() {
     pointer_motion_to(&mut f, x, y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "clicking the active thumbnail must leave the overview"
     );
-    assert_eq!(f.niri().layout.active_workspace().unwrap().id(), active);
+    assert_eq!(f.synoik().layout.active_workspace().unwrap().id(), active);
 }
 
 /// Dropping a window preview on a strip thumbnail moves the window to that
@@ -4925,11 +4937,11 @@ fn thumbnail_drop_moves_window_keeping_position() {
     let id = f.add_client();
 
     let (win_a, _b) = setup_two_desktops_in_overview(&mut f, id);
-    let ws1_id = f.niri().layout.active_workspace().unwrap().id();
+    let ws1_id = f.synoik().layout.active_workspace().unwrap().id();
     let original_pos = focused_window_pos(&mut f);
 
     // Drag A's preview onto the second desktop's thumbnail.
-    let rect = f.niri().layout.expose_target_rect(&win_a).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win_a).unwrap();
     let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
     let (tx, ty) = thumbnail_center(&mut f, 1);
     pointer_motion_to(&mut f, grab.0, grab.1);
@@ -4937,16 +4949,16 @@ fn thumbnail_drop_moves_window_keeping_position() {
     f.pointer_motion(0., 10.);
     pointer_motion_to(&mut f, tx, ty);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "dropping on a thumbnail must not leave the overview"
     );
 
-    let niri = f.niri();
-    let (_, _, ws) = niri
+    let synoik = f.synoik();
+    let (_, _, ws) = synoik
         .layout
         .workspaces()
         .find(|(_, _, ws)| ws.has_window(&win_a))
@@ -4977,11 +4989,11 @@ fn thumbnail_gap_drop_inserts_workspace() {
     let id = f.add_client();
 
     let (win_a, _b) = setup_two_desktops_in_overview(&mut f, id);
-    let workspace_count = |f: &mut Fixture| f.niri().layout.workspaces().count();
+    let workspace_count = |f: &mut Fixture| f.synoik().layout.workspaces().count();
     assert_eq!(workspace_count(&mut f), 3);
 
     // Drag A's preview into the gap between the first two thumbnails.
-    let rect = f.niri().layout.expose_target_rect(&win_a).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win_a).unwrap();
     let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
     let (t1x, t1y) = thumbnail_center(&mut f, 1);
     let (t0x, _) = thumbnail_center(&mut f, 0);
@@ -4994,9 +5006,9 @@ fn thumbnail_gap_drop_inserts_workspace() {
     // While hovering the gap, the strip makes room for the drop placeholder
     // (gnome-shell's placeholder affordance). The insert hint updates on
     // render; drive that like a frame would.
-    f.niri().layout.update_render_elements(None);
+    f.synoik().layout.update_render_elements(None);
     {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         let strip = mon.unwrap().thumbnail_strip().unwrap();
         assert!(
             strip.placeholder.is_some(),
@@ -5005,7 +5017,7 @@ fn thumbnail_gap_drop_inserts_workspace() {
     }
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     assert_eq!(
@@ -5013,8 +5025,8 @@ fn thumbnail_gap_drop_inserts_workspace() {
         4,
         "dropping into a thumbnail gap must insert a workspace"
     );
-    let niri = f.niri();
-    let (_, ws_idx, _) = niri
+    let synoik = f.synoik();
+    let (_, ws_idx, _) = synoik
         .layout
         .workspaces()
         .find(|(_, _, ws)| ws.has_window(&win_a))
@@ -5035,8 +5047,8 @@ fn overview_drag_of_edge_tiled_window_stays_tiled() {
     let id = f.add_client();
 
     let surface = map_window_sized(&mut f, id, (800, 600), None);
-    let win = f.niri().layout.focus().unwrap().window.clone();
-    let ws1_id = f.niri().layout.active_workspace().unwrap().id();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let ws1_id = f.synoik().layout.active_workspace().unwrap().id();
 
     // Tile left and ack the half-width configure.
     f.key_press(KEY_LEFTMETA);
@@ -5047,16 +5059,16 @@ fn overview_drag_of_edge_tiled_window_stays_tiled() {
     window.set_size(960, 1080);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     let _ = f.client(id).window(&surface).recent_configures();
 
     // Drag the preview onto the trailing workspace's peeking edge. The real
     // window is never touched (gnome-shell drags the preview), so the client
     // must not see any untile/resize along the way.
-    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
     let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
     pointer_motion_to(&mut f, grab.0, grab.1);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
@@ -5064,7 +5076,7 @@ fn overview_drag_of_edge_tiled_window_stays_tiled() {
     f.double_roundtrip(id);
     pointer_motion_to(&mut f, 1800., 540.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     for configure in f.client(id).window(&surface).recent_configures() {
@@ -5075,8 +5087,8 @@ fn overview_drag_of_edge_tiled_window_stays_tiled() {
         );
     }
 
-    let niri = f.niri();
-    let (_, _, ws) = niri
+    let synoik = f.synoik();
+    let (_, _, ws) = synoik
         .layout
         .workspaces()
         .find(|(_, _, ws)| ws.has_window(&win))
@@ -5105,8 +5117,8 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     let id = f.add_client();
 
     let surface = map_window_sized(&mut f, id, (800, 600), None);
-    let win = f.niri().layout.focus().unwrap().window.clone();
-    let ws1_id = f.niri().layout.active_workspace().unwrap().id();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let ws1_id = f.synoik().layout.active_workspace().unwrap().id();
 
     // Maximize and ack the full-size configure.
     f.key_press(KEY_LEFTMETA);
@@ -5117,21 +5129,21 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     window.set_size(1920, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     let _ = f.client(id).window(&surface).recent_configures();
 
     // A 20px drag is well under the 48px shake threshold, yet the preview
     // must already be moving (picked out of its workspace).
-    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
     let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
     f.pointer_motion(grab.0, grab.1);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_motion(0., 20.);
     assert!(
-        f.niri()
+        f.synoik()
             .layout
             .workspaces()
             .all(|(_, _, ws)| !ws.has_window(&win)),
@@ -5141,7 +5153,7 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     // Drop it on the neighbor workspace peeking at the right edge.
     f.pointer_motion(1800. - grab.0, 540. - grab.1 - 20.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
 
     for configure in f.client(id).window(&surface).recent_configures() {
@@ -5156,8 +5168,8 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
         );
     }
 
-    let niri = f.niri();
-    let (_, _, ws) = niri
+    let synoik = f.synoik();
+    let (_, _, ws) = synoik
         .layout
         .workspaces()
         .find(|(_, _, ws)| ws.has_window(&win))
@@ -5184,24 +5196,24 @@ fn overview_drag_freezes_the_other_previews() {
     let id = f.add_client();
 
     let _a = map_window_sized(&mut f, id, (800, 600), None);
-    let win_a = f.niri().layout.focus().unwrap().window.clone();
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
     let _b = map_window_sized(&mut f, id, (640, 480), None);
-    let win_b = f.niri().layout.focus().unwrap().window.clone();
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
-    let slot_a = f.niri().layout.expose_target_rect(&win_a).unwrap();
+    let slot_a = f.synoik().layout.expose_target_rect(&win_a).unwrap();
 
     // Pick up B's preview and move it away from its slot.
-    let rect = f.niri().layout.expose_target_rect(&win_b).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win_b).unwrap();
     let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
     pointer_motion_to(&mut f, grab.0, grab.1);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_motion(0., 100.);
 
     assert_eq!(
-        f.niri().layout.expose_target_rect(&win_a),
+        f.synoik().layout.expose_target_rect(&win_a),
         Some(slot_a),
         "the other previews must hold their slots while the drag is in flight"
     );
@@ -5209,10 +5221,10 @@ fn overview_drag_freezes_the_other_previews() {
     // Drop B on the trailing workspace: A, now alone, re-layouts.
     pointer_motion_to(&mut f, 1800., 540.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert_ne!(
-        f.niri().layout.expose_target_rect(&win_a),
+        f.synoik().layout.expose_target_rect(&win_a),
         Some(slot_a),
         "the drop must let the source desktop's picker layout recompute"
     );
@@ -5234,12 +5246,12 @@ fn overview_drag_edge_scroll_snaps_one_desktop_at_a_time() {
     let (win_a, _win_b) = setup_two_desktops_in_overview(&mut f, id);
     {
         tap(&mut f, KEY_LEFTMETA);
-        f.niri_complete_animations();
+        f.synoik_complete_animations();
         let _c = map_window_sized(&mut f, id, (500, 400), None);
-        let win_c = f.niri().layout.focus().unwrap().window.clone();
+        let win_c = f.synoik().layout.focus().unwrap().window.clone();
         tap(&mut f, KEY_LEFTMETA);
-        f.niri_complete_animations();
-        let rect = f.niri().layout.expose_target_rect(&win_c).unwrap();
+        f.synoik_complete_animations();
+        let rect = f.synoik().layout.expose_target_rect(&win_c).unwrap();
         let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
         pointer_motion_to(&mut f, grab.0, grab.1);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
@@ -5247,14 +5259,14 @@ fn overview_drag_edge_scroll_snaps_one_desktop_at_a_time() {
         let (tx, ty) = thumbnail_center(&mut f, 2);
         pointer_motion_to(&mut f, tx, ty);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
-        f.niri_complete_animations();
+        f.synoik_complete_animations();
         f.double_roundtrip(id);
     }
-    assert!(f.niri().layout.is_overview_open());
+    assert!(f.synoik().layout.is_overview_open());
 
     let active_idx = |f: &mut Fixture| {
-        let active = f.niri().layout.active_workspace().unwrap().id();
-        f.niri()
+        let active = f.synoik().layout.active_workspace().unwrap().id();
+        f.synoik()
             .layout
             .workspaces()
             .position(|(_, _, ws)| ws.id() == active)
@@ -5264,13 +5276,13 @@ fn overview_drag_edge_scroll_snaps_one_desktop_at_a_time() {
 
     // Pick up A's preview and hold it against the right screen edge,
     // driving the DnD scroll by hand with a pinned clock.
-    let rect = f.niri().layout.expose_target_rect(&win_a).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win_a).unwrap();
     let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
     pointer_motion_to(&mut f, grab.0, grab.1);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_motion(0., 10.);
     assert!(
-        f.niri()
+        f.synoik()
             .layout
             .workspaces()
             .all(|(_, _, ws)| !ws.has_window(&win_a)),
@@ -5278,11 +5290,11 @@ fn overview_drag_edge_scroll_snaps_one_desktop_at_a_time() {
     );
     pointer_motion_to(&mut f, 1919., 540.);
 
-    let base = f.niri().clock.now_unadjusted() + Duration::from_millis(200);
+    let base = f.synoik().clock.now_unadjusted() + Duration::from_millis(200);
     let at = |f: &mut Fixture, offset_ms: u64| {
-        let mut clock = f.niri().clock.clone();
+        let mut clock = f.synoik().clock.clone();
         clock.set_unadjusted(base + Duration::from_millis(offset_ms));
-        f.niri().layout.advance_animations();
+        f.synoik().layout.advance_animations();
     };
 
     // The first frame on the edge arms the anti-flicker delay (100ms); the
@@ -5309,9 +5321,9 @@ fn overview_drag_edge_scroll_snaps_one_desktop_at_a_time() {
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "the edge snaps must not leave the overview"
     );
 }
@@ -5341,7 +5353,7 @@ fn panel_reserves_top_strut() {
     window.set_size(1920, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_pos_eq(
         focused_window_pos(&mut f),
         (0., 32.),
@@ -5354,7 +5366,7 @@ fn panel_reserves_top_strut() {
 fn panel_clock_is_hh_mm() {
     let mut panel = crate::ui::panel::Panel::new(
         crate::animation::Clock::default(),
-        std::rc::Rc::new(std::cell::RefCell::new(niri_config::Config::default())),
+        std::rc::Rc::new(std::cell::RefCell::new(synoik_config::Config::default())),
     );
 
     // Epoch 0 and one hour later differ by exactly one hour in any timezone.
@@ -5395,12 +5407,12 @@ fn panel_clock_is_hh_mm() {
 fn panel_clock_label_sits_24px_inside_its_button() {
     let mut panel = crate::ui::panel::Panel::new(
         crate::animation::Clock::default(),
-        std::rc::Rc::new(std::cell::RefCell::new(niri_config::Config::default())),
+        std::rc::Rc::new(std::cell::RefCell::new(synoik_config::Config::default())),
     );
     panel.update_clock_at(0);
 
     let rect = panel.date_menu_rect(2560.);
-    let text_w = niri_vk::text::measure_line_width_weighted(
+    let text_w = synoik_vk::text::measure_line_width_weighted(
         panel.clock_text(),
         crate::ui::pt_to_px(11.) as f32,
         true,
@@ -5421,10 +5433,10 @@ fn panel_activities_click_toggles_overview() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    assert!(!f.niri().layout.is_overview_open());
-    f.niri().update_render_elements(None);
+    assert!(!f.synoik().layout.is_overview_open());
+    f.synoik().update_render_elements(None);
     assert!(
-        !f.niri().panel.activities_checked(),
+        !f.synoik().panel.activities_checked(),
         "Activities starts unchecked"
     );
 
@@ -5432,29 +5444,29 @@ fn panel_activities_click_toggles_overview() {
     f.pointer_motion(10., 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "clicking Activities must open the overview"
     );
-    f.niri().update_render_elements(None);
+    f.synoik().update_render_elements(None);
     assert!(
-        f.niri().panel.activities_checked(),
+        f.synoik().panel.activities_checked(),
         "Activities must be checked while the overview is open"
     );
 
     // A second click toggles it back.
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "clicking Activities again must close the overview"
     );
-    f.niri().update_render_elements(None);
+    f.synoik().update_render_elements(None);
     assert!(
-        !f.niri().panel.activities_checked(),
+        !f.synoik().panel.activities_checked(),
         "Activities must be unchecked once the overview closes"
     );
 }
@@ -5471,7 +5483,7 @@ fn panel_scroll_over_indicator_switches_workspace() {
     let id = f.add_client();
     let _surface = map_focused_window(&mut f, id);
     assert_eq!(
-        f.niri()
+        f.synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -5482,9 +5494,9 @@ fn panel_scroll_over_indicator_switches_workspace() {
     // Park the pointer over the indicator (top-left of the panel) and scroll down.
     pointer_motion_to(&mut f, 10., 10.);
     f.scroll_wheel();
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
-        f.niri()
+        f.synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -5496,9 +5508,9 @@ fn panel_scroll_over_indicator_switches_workspace() {
     // A scroll far from the indicator (mid-screen) must NOT switch workspaces.
     pointer_motion_to(&mut f, 960., 540.);
     f.scroll_wheel();
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
-        f.niri()
+        f.synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -5514,7 +5526,7 @@ fn panel_scroll_over_indicator_switches_workspace() {
 fn panel_date_menu_click_opens_and_dismisses_calendar() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    assert!(!f.niri().panel_popover.is_open());
+    assert!(!f.synoik().panel_popover.is_open());
 
     // Click the clock, wherever the panel put it.
     let open = |f: &mut Fixture| {
@@ -5526,7 +5538,7 @@ fn panel_date_menu_click_opens_and_dismisses_calendar() {
 
     open(&mut f);
     assert!(
-        f.niri().panel_popover.is_open(),
+        f.synoik().panel_popover.is_open(),
         "clicking the clock must open the calendar popover"
     );
 
@@ -5536,19 +5548,19 @@ fn panel_date_menu_click_opens_and_dismisses_calendar() {
     f.key_release(KEY_ESC);
     f.settle_animations();
     assert!(
-        !f.niri().panel_popover.is_open(),
+        !f.synoik().panel_popover.is_open(),
         "Escape must close the popover"
     );
 
     // Reopen, then a click well outside the popover dismisses it.
     open(&mut f);
-    assert!(f.niri().panel_popover.is_open());
+    assert!(f.synoik().panel_popover.is_open());
     pointer_motion_to(&mut f, 10., 700.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.settle_animations();
     assert!(
-        !f.niri().panel_popover.is_open(),
+        !f.synoik().panel_popover.is_open(),
         "a click outside the popover must dismiss it"
     );
 }
@@ -5568,10 +5580,10 @@ fn panel_date_menu_click_opens_and_dismisses_calendar() {
 fn panel_clock_sits_right_of_the_status_indicators() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().update_render_elements(None);
+    f.synoik().update_render_elements(None);
 
-    let clock = f.niri().panel.date_menu_rect(1920.);
-    let qs = f.niri().panel.quick_settings_rect(1920.);
+    let clock = f.synoik().panel.date_menu_rect(1920.);
+    let qs = f.synoik().panel.quick_settings_rect(1920.);
     assert_eq!(
         clock.loc.x + clock.size.w,
         1920.,
@@ -5591,7 +5603,7 @@ fn panel_clock_sits_right_of_the_status_indicators() {
     // The right corner is the clock.
     click(&mut f, 1919.);
     assert_eq!(
-        f.niri().panel_popover.open_role(),
+        f.synoik().panel_popover.open_role(),
         Some(crate::ui::panel::ROLE_DATE_MENU),
         "the panel's right corner must open the calendar"
     );
@@ -5605,9 +5617,9 @@ fn panel_clock_sits_right_of_the_status_indicators() {
     // lining those two up is the actual intent (`PANEL_EDGE_INSET`) — a menu that stopped
     // 2px short of its own button read as a misalignment, and would again if the clamp
     // ever drifted back onto `POPOVER_MARGIN`.
-    let output = f.niri_output(1);
-    let origin = f.niri().panel_popover.location(&output);
-    let size = f.niri().panel_popover.content_size().expect("open");
+    let output = f.synoik_output(1);
+    let origin = f.synoik().panel_popover.location(&output);
+    let size = f.synoik().panel_popover.content_size().expect("open");
     assert!(
         origin.x > 960.,
         "the calendar must follow the clock to the right half, got x={}",
@@ -5627,7 +5639,7 @@ fn panel_clock_sits_right_of_the_status_indicators() {
     // The centre of the panel — GNOME's clock — is now bare bar.
     click(&mut f, 960.);
     assert!(
-        !f.niri().panel_popover.is_open(),
+        !f.synoik().panel_popover.is_open(),
         "nothing lives in the centre box any more"
     );
 
@@ -5635,7 +5647,7 @@ fn panel_clock_sits_right_of_the_status_indicators() {
     let x = qs_center_x(&mut f, 1920.);
     click(&mut f, x);
     assert_eq!(
-        f.niri().panel_popover.open_role(),
+        f.synoik().panel_popover.open_role(),
         Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
         "the status cluster must still open quick settings from its new place"
     );
@@ -5649,9 +5661,9 @@ fn panel_popover_stays_open_in_overview() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state().do_action(Action::ToggleOverview, false);
-    f.niri().update_render_elements(None);
-    assert!(f.niri().layout.is_overview_open());
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.synoik().update_render_elements(None);
+    assert!(f.synoik().layout.is_overview_open());
 
     // Click the clock: the calendar popover opens.
     let x = clock_center_x(&mut f, 1920.);
@@ -5659,21 +5671,21 @@ fn panel_popover_stays_open_in_overview() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert!(
-        f.niri().panel_popover.is_open(),
+        f.synoik().panel_popover.is_open(),
         "clicking the clock in the overview must open the calendar popover"
     );
 
     // Subsequent frames must not dismiss it (a level-triggered overview check
     // once closed the popover on the render update right after it opened).
-    f.niri().update_render_elements(None);
-    f.niri().update_render_elements(None);
+    f.synoik().update_render_elements(None);
+    f.synoik().update_render_elements(None);
     f.settle_animations();
     assert!(
-        f.niri().panel_popover.is_open(),
+        f.synoik().panel_popover.is_open(),
         "a popover opened in the overview must stay open across frames"
     );
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "the overview stays open under the popover"
     );
 }
@@ -5685,22 +5697,22 @@ fn panel_popover_stays_open_in_overview() {
 fn overview_open_dismisses_open_panel_popover() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().update_render_elements(None);
+    f.synoik().update_render_elements(None);
 
     let x = clock_center_x(&mut f, 1920.);
     pointer_motion_to(&mut f, x, 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    assert!(f.niri().panel_popover.is_open());
+    assert!(f.synoik().panel_popover.is_open());
 
-    f.niri_state().do_action(Action::ToggleOverview, false);
-    f.niri().update_render_elements(None);
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.synoik().update_render_elements(None);
     f.settle_animations();
     assert!(
-        !f.niri().panel_popover.is_open(),
+        !f.synoik().panel_popover.is_open(),
         "opening the overview must dismiss an already-open popover"
     );
-    assert!(f.niri().layout.is_overview_open());
+    assert!(f.synoik().layout.is_overview_open());
 }
 
 /// Clicking the right-box quick-settings indicator opens its popover; Escape and
@@ -5710,7 +5722,7 @@ fn overview_open_dismisses_open_panel_popover() {
 fn panel_quick_settings_click_opens_toggles_and_dismisses() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    assert!(!f.niri().panel_popover.is_open());
+    assert!(!f.synoik().panel_popover.is_open());
 
     // The indicator sits at the right end of the status cluster, just left of the clock;
     // with the default toggles it's a single anchor icon. Click it.
@@ -5723,7 +5735,7 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
 
     open(&mut f);
     assert!(
-        f.niri().panel_popover.is_open(),
+        f.synoik().panel_popover.is_open(),
         "clicking the quick-settings indicator must open its popover"
     );
 
@@ -5739,11 +5751,11 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert!(
-        f.niri().panel_popover.is_open(),
+        f.synoik().panel_popover.is_open(),
         "a tile click must not close the quick-settings menu"
     );
     assert!(
-        f.niri().gnome_settings.quick_toggles.do_not_disturb,
+        f.synoik().gnome_settings.quick_toggles.do_not_disturb,
         "clicking the Do Not Disturb tile must flip its state on"
     );
 
@@ -5752,19 +5764,19 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
     f.key_release(KEY_ESC);
     f.settle_animations();
     assert!(
-        !f.niri().panel_popover.is_open(),
+        !f.synoik().panel_popover.is_open(),
         "Escape must close the quick-settings popover"
     );
 
     // Reopen, then a click well outside dismisses it.
     open(&mut f);
-    assert!(f.niri().panel_popover.is_open());
+    assert!(f.synoik().panel_popover.is_open());
     pointer_motion_to(&mut f, 960., 700.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.settle_animations();
     assert!(
-        !f.niri().panel_popover.is_open(),
+        !f.synoik().panel_popover.is_open(),
         "a click outside the quick-settings popover must dismiss it"
     );
 }
@@ -5783,7 +5795,7 @@ fn messages_indicator_toggles_with_dnd_tile() {
     let mut low = banner_req("app", ":1.1");
     low.urgency = crate::notifications::Urgency::Low;
     banner_notify(&mut f, low);
-    assert!(f.niri().panel.messages_indicator_visible());
+    assert!(f.synoik().panel.messages_indicator_visible());
 
     // The DND tile center, computed the way `panel_quick_settings_*` does — and
     // re-derived per click, because toggling DND toggles the messages dot, which moves
@@ -5808,17 +5820,17 @@ fn messages_indicator_toggles_with_dnd_tile() {
     // Enable DND → the dot clears even though the notification is still unseen.
     open_qs(&mut f);
     click_dnd(&mut f);
-    assert!(f.niri().gnome_settings.quick_toggles.do_not_disturb);
+    assert!(f.synoik().gnome_settings.quick_toggles.do_not_disturb);
     assert!(
-        !f.niri().panel.messages_indicator_visible(),
+        !f.synoik().panel.messages_indicator_visible(),
         "DND hides the dot with no new notification"
     );
 
     // Disable DND again → the dot re-lights (the notification is still unseen).
     click_dnd(&mut f);
-    assert!(!f.niri().gnome_settings.quick_toggles.do_not_disturb);
+    assert!(!f.synoik().gnome_settings.quick_toggles.do_not_disturb);
     assert!(
-        f.niri().panel.messages_indicator_visible(),
+        f.synoik().panel.messages_indicator_visible(),
         "clearing DND re-lights the dot"
     );
 }
@@ -5849,31 +5861,31 @@ fn brightness_card_rows_drive_the_scale_algebra() {
             backlight("DP-2", "Dell 24\u{2033}", 50),
         ],
     };
-    let _ = f.niri().brightness.monitors_changed(&snapshot);
-    f.niri().backlight = snapshot;
+    let _ = f.synoik().brightness.monitors_changed(&snapshot);
+    f.synoik().backlight = snapshot;
 
     // The first sync adopts the hardware, so the global slider sits at the maximum.
-    assert_eq!(f.niri().brightness.global_scale().unwrap().value(), 1.0);
-    assert_eq!(f.niri().brightness.scales()[1].value(), 0.5);
+    assert_eq!(f.synoik().brightness.global_scale().unwrap().value(), 1.0);
+    assert_eq!(f.synoik().brightness.scales()[1].value(), 0.5);
 
     // A card row: pushing the external monitor to full makes IT the maximum, so the global scale
     // follows it and the two are now in step.
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::SetMonitorBrightness("DP-2".into(), 1.0));
-    assert_eq!(f.niri().brightness.global_scale().unwrap().value(), 1.0);
-    assert_eq!(f.niri().brightness.scales()[0].value(), 1.0);
-    assert_eq!(f.niri().brightness.scales()[1].value(), 1.0);
+    assert_eq!(f.synoik().brightness.global_scale().unwrap().value(), 1.0);
+    assert_eq!(f.synoik().brightness.scales()[0].value(), 1.0);
+    assert_eq!(f.synoik().brightness.scales()[1].value(), 1.0);
 
     // The top-level slider now moves both together, through the re-derived factors.
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::SetBrightness(0.4));
-    assert_eq!(f.niri().brightness.scales()[0].value(), 0.4);
-    assert_eq!(f.niri().brightness.scales()[1].value(), 0.4);
+    assert_eq!(f.synoik().brightness.scales()[0].value(), 0.4);
+    assert_eq!(f.synoik().brightness.scales()[1].value(), 0.4);
 
     // An unknown connector is a no-op, not a panic.
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::SetMonitorBrightness("HDMI-A-1".into(), 0.9));
-    assert_eq!(f.niri().brightness.scales()[0].value(), 0.4);
+    assert_eq!(f.synoik().brightness.scales()[0].value(), 0.4);
 }
 
 /// The brightness keys (`org.gnome.shell.keybindings screen-brightness-*`) step the shell's
@@ -5907,36 +5919,36 @@ fn brightness_keys_step_the_scales() {
             backlight("headless-2", "Dell 24\u{2033}", 100),
         ],
     };
-    let _ = f.niri().brightness.monitors_changed(&snapshot);
-    f.niri().backlight = snapshot;
+    let _ = f.synoik().brightness.monitors_changed(&snapshot);
+    f.synoik().backlight = snapshot;
 
     // A plain brightness-down key: one step of 1/20 off the global scale, fanned out to both.
-    f.niri_state().step_brightness(Step::Down, false);
+    f.synoik_state().step_brightness(Step::Down, false);
     assert!(close(
-        f.niri().brightness.global_scale().unwrap().value(),
+        f.synoik().brightness.global_scale().unwrap().value(),
         0.95
     ));
-    assert!(close(f.niri().brightness.scales()[0].value(), 0.95));
-    assert!(close(f.niri().brightness.scales()[1].value(), 0.95));
+    assert!(close(f.synoik().brightness.scales()[0].value(), 0.95));
+    assert!(close(f.synoik().brightness.scales()[1].value(), 0.95));
 
     // The `-monitor` variant follows the pointer. Park it on the second output.
     pointer_motion_to(&mut f, 1920. + 100., 100.);
-    f.niri_state().step_brightness(Step::Down, true);
+    f.synoik_state().step_brightness(Step::Down, true);
     assert!(
-        close(f.niri().brightness.scales()[0].value(), 0.95),
+        close(f.synoik().brightness.scales()[0].value(), 0.95),
         "the other monitor must not move"
     );
-    assert!(close(f.niri().brightness.scales()[1].value(), 0.9));
+    assert!(close(f.synoik().brightness.scales()[1].value(), 0.9));
 
     // Cycle wraps at the top rather than stopping there -- the single-key control.
-    f.niri_state().step_brightness(Step::Up, false);
+    f.synoik_state().step_brightness(Step::Up, false);
     assert!(close(
-        f.niri().brightness.global_scale().unwrap().value(),
+        f.synoik().brightness.global_scale().unwrap().value(),
         1.0
     ));
-    f.niri_state().step_brightness(Step::Cycle, false);
+    f.synoik_state().step_brightness(Step::Cycle, false);
     assert!(close(
-        f.niri().brightness.global_scale().unwrap().value(),
+        f.synoik().brightness.global_scale().unwrap().value(),
         0.0
     ));
 }
@@ -5954,8 +5966,8 @@ fn brightness_changes_show_the_osd() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     f.add_output(2, (1920, 1080));
-    let one = f.niri_output(1);
-    let two = f.niri_output(2);
+    let one = f.synoik_output(1);
+    let two = f.synoik_output(2);
 
     let backlight = |connector: &str, name: &str| crate::backlight::OutputBacklight {
         connector: connector.to_owned(),
@@ -5970,50 +5982,54 @@ fn brightness_changes_show_the_osd() {
         ],
     };
     // The hotplug pass re-derives every scale, and asks for no OSD for any of them.
-    let update = f.niri().brightness.monitors_changed(&snapshot);
+    let update = f.synoik().brightness.monitors_changed(&snapshot);
     assert!(
         update.osd.is_empty(),
         "a monitors-changed pass must not put an OSD on screen"
     );
-    f.niri().backlight = snapshot;
-    assert!(!f.niri().osd.is_visible());
+    f.synoik().backlight = snapshot;
+    assert!(!f.synoik().osd.is_visible());
 
     // A plain brightness key moves the global scale, which fans out to every monitor -- so every
     // monitor shows the bar, at its own (here identical) level.
-    f.niri_state().step_brightness(Step::Down, false);
-    let content = f.niri().osd.content(&one).expect("output 1 shows the OSD");
+    f.synoik_state().step_brightness(Step::Down, false);
+    let content = f
+        .synoik()
+        .osd
+        .content(&one)
+        .expect("output 1 shows the OSD");
     assert_eq!(content.icon, vec!["display-brightness-symbolic"]);
     assert_eq!(content.label, None, "the brightness OSD carries no label");
     assert_eq!(content.max_level, 1.0, "brightness tops out at 1.0");
     assert!((content.level.unwrap() - 0.95).abs() < 1e-9);
-    assert!(f.niri().osd.content(&two).is_some());
+    assert!(f.synoik().osd.content(&two).is_some());
 
     // The `-monitor` variant moves one scale, so only that monitor shows one and the other's is
     // cancelled -- the behavior `osdWindowManager.show`'s level map exists for.
     pointer_motion_to(&mut f, 1920. + 100., 100.);
-    f.niri_state().step_brightness(Step::Down, true);
+    f.synoik_state().step_brightness(Step::Down, true);
     // A cancel is a fade-out, not an instant hide, so let it finish before looking.
     tick(&mut f, 200);
     assert!(
-        f.niri().osd.content(&one).is_none(),
+        f.synoik().osd.content(&one).is_none(),
         "the monitor that did not move must have its OSD cancelled"
     );
-    let content = f.niri().osd.content(&two).unwrap();
+    let content = f.synoik().osd.content(&two).unwrap();
     assert!((content.level.unwrap() - 0.9).abs() < 1e-9);
 
     // The quick-settings slider is the global scale too, so it is back to both.
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(crate::ui::popover::PopoverAction::SetBrightness(0.5));
-    assert!(f.niri().osd.content(&one).is_some());
-    assert!(f.niri().osd.content(&two).is_some());
+    assert!(f.synoik().osd.content(&one).is_some());
+    assert!(f.synoik().osd.content(&two).is_some());
 
     // Idle dimming clamps the hardware without moving a scale, so neither branch runs: whatever is
     // on screen is left to expire on its own deadline rather than being replaced or cancelled.
-    let before = f.niri().osd.content(&two);
-    let snapshot = f.niri().backlight.clone();
-    let update = f.niri().brightness.set_dimming(true, &snapshot);
+    let before = f.synoik().osd.content(&two);
+    let snapshot = f.synoik().backlight.clone();
+    let update = f.synoik().brightness.set_dimming(true, &snapshot);
     assert!(update.osd.is_empty(), "dimming moves no scale");
-    assert_eq!(f.niri().osd.content(&two), before);
+    assert_eq!(f.synoik().osd.content(&two), before);
 }
 
 /// `org.gnome.Shell.Brightness` is gsd-power's way in (`js/ui/shellDBus.js:595-637`): idle dimming
@@ -6024,7 +6040,7 @@ fn brightness_changes_show_the_osd() {
 #[cfg(feature = "dbus")]
 #[test]
 fn brightness_dbus_dims_without_moving_the_scales() {
-    use crate::dbus::gnome_shell_brightness::{BrightnessToNiri, NiriToBrightness};
+    use crate::dbus::gnome_shell_brightness::{BrightnessToSynoik, SynoikToBrightness};
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
@@ -6037,61 +6053,61 @@ fn brightness_dbus_dims_without_moving_the_scales() {
             brightness: 100,
         }],
     };
-    let _ = f.niri().brightness.monitors_changed(&snapshot);
-    f.niri().backlight = snapshot;
+    let _ = f.synoik().brightness.monitors_changed(&snapshot);
+    f.synoik().backlight = snapshot;
 
     // Stand in for the D-Bus service's outbound half so the emissions are observable.
     let (tx, rx) = async_channel::unbounded();
-    f.niri().brightness_emit = Some(tx);
+    f.synoik().brightness_emit = Some(tx);
 
     // gsd-power dims: the scale stays where the user put it; only the written brightness drops.
-    f.niri_state()
-        .on_brightness_msg(BrightnessToNiri::SetDimming(true));
-    assert!(f.niri().brightness.dimming());
-    assert_eq!(f.niri().brightness.global_scale().unwrap().value(), 1.0);
+    f.synoik_state()
+        .on_brightness_msg(BrightnessToSynoik::SetDimming(true));
+    assert!(f.synoik().brightness.dimming());
+    assert_eq!(f.synoik().brightness.global_scale().unwrap().value(), 1.0);
 
     // ... and none of that is a user change.
     let emitted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(
         !emitted
             .iter()
-            .any(|m| matches!(m, NiriToBrightness::UserChanged)),
+            .any(|m| matches!(m, SynoikToBrightness::UserChanged)),
         "gsd-power's own request must not come back as BrightnessChanged"
     );
     // The property is pushed (the service dedups it), and it is true: we have a backlight.
     assert!(emitted
         .iter()
-        .any(|m| matches!(m, NiriToBrightness::HasControl(true))));
+        .any(|m| matches!(m, SynoikToBrightness::HasControl(true))));
 
     // An auto-brightness target biases around the scale's midpoint, still not a user change.
-    f.niri_state()
-        .on_brightness_msg(BrightnessToNiri::SetAutoBrightnessTarget(0.6));
+    f.synoik_state()
+        .on_brightness_msg(BrightnessToSynoik::SetAutoBrightnessTarget(0.6));
     let emitted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(!emitted
         .iter()
-        .any(|m| matches!(m, NiriToBrightness::UserChanged)));
+        .any(|m| matches!(m, SynoikToBrightness::UserChanged)));
 
     // A brightness KEY is a user change, so it does emit.
-    f.niri_state()
+    f.synoik_state()
         .step_brightness(crate::brightness::Step::Down, false);
     let emitted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(
         emitted
             .iter()
-            .any(|m| matches!(m, NiriToBrightness::UserChanged)),
+            .any(|m| matches!(m, SynoikToBrightness::UserChanged)),
         "a brightness key is a user change"
     );
 
     // Losing the backlight clears HasBrightnessControl.
-    f.niri().backlight = crate::backlight::BacklightSnapshot::default();
-    let snapshot = f.niri().backlight.clone();
-    let _ = f.niri().brightness.monitors_changed(&snapshot);
-    f.niri_state()
-        .on_brightness_msg(BrightnessToNiri::SetDimming(false));
+    f.synoik().backlight = crate::backlight::BacklightSnapshot::default();
+    let snapshot = f.synoik().backlight.clone();
+    let _ = f.synoik().brightness.monitors_changed(&snapshot);
+    f.synoik_state()
+        .on_brightness_msg(BrightnessToSynoik::SetDimming(false));
     let emitted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(emitted
         .iter()
-        .any(|m| matches!(m, NiriToBrightness::HasControl(false))));
+        .any(|m| matches!(m, SynoikToBrightness::HasControl(false))));
 }
 
 /// gnome-shell registers the brightness keys with `Shell.ActionMode.ALL`
@@ -6099,7 +6115,7 @@ fn brightness_dbus_dims_without_moving_the_scales() {
 /// when you need them most, gsd-power having dimmed the panel -- and while the screenshot UI is up.
 #[test]
 fn brightness_keys_work_when_locked() {
-    use niri_config::Action;
+    use synoik_config::Action;
 
     for action in [
         Action::ScreenBrightnessUp(false),
@@ -6125,22 +6141,25 @@ fn brightness_keys_work_when_locked() {
 #[cfg(feature = "dbus")]
 #[test]
 fn a_brightness_key_with_no_backlight_is_silent() {
-    use crate::dbus::gnome_shell_brightness::NiriToBrightness;
+    use crate::dbus::gnome_shell_brightness::SynoikToBrightness;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
     let (tx, rx) = async_channel::unbounded();
-    f.niri().brightness_emit = Some(tx);
-    assert!(f.niri().brightness.global_scale().is_none(), "no backlight");
+    f.synoik().brightness_emit = Some(tx);
+    assert!(
+        f.synoik().brightness.global_scale().is_none(),
+        "no backlight"
+    );
 
-    f.niri_state()
+    f.synoik_state()
         .step_brightness(crate::brightness::Step::Up, false);
     let emitted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(
         !emitted
             .iter()
-            .any(|m| matches!(m, NiriToBrightness::UserChanged)),
+            .any(|m| matches!(m, SynoikToBrightness::UserChanged)),
         "a key press with nothing to move must not emit BrightnessChanged"
     );
 
@@ -6154,19 +6173,19 @@ fn a_brightness_key_with_no_backlight_is_silent() {
             brightness: 100,
         }],
     };
-    let _ = f.niri().brightness.monitors_changed(&snapshot);
-    f.niri().backlight = snapshot;
+    let _ = f.synoik().brightness.monitors_changed(&snapshot);
+    f.synoik().backlight = snapshot;
     f.add_output(2, (1920, 1080));
     pointer_motion_to(&mut f, 1920. + 100., 100.);
     let _: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
 
-    f.niri_state()
+    f.synoik_state()
         .step_brightness(crate::brightness::Step::Up, true);
     let emitted: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(
         !emitted
             .iter()
-            .any(|m| matches!(m, NiriToBrightness::UserChanged)),
+            .any(|m| matches!(m, SynoikToBrightness::UserChanged)),
         "the -monitor key on a monitor without a backlight must not emit"
     );
 }
@@ -6184,34 +6203,34 @@ fn panel_popover_open_and_close_are_animated() {
     pointer_motion_to(&mut f, x, 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    assert!(f.niri().panel_popover.is_open());
+    assert!(f.synoik().panel_popover.is_open());
     assert!(
-        f.niri().panel_popover.are_animations_ongoing(),
+        f.synoik().panel_popover.are_animations_ongoing(),
         "opening must start a fade animation"
     );
 
     // Once settled, it's still open but no longer animating.
     f.settle_animations();
-    assert!(f.niri().panel_popover.is_open());
-    assert!(!f.niri().panel_popover.are_animations_ongoing());
+    assert!(f.synoik().panel_popover.is_open());
+    assert!(!f.synoik().panel_popover.are_animations_ongoing());
 
     // Dismiss with Escape: the popover must NOT vanish instantly — it stays visible,
     // fading out, with an ongoing animation.
     f.key_press(KEY_ESC);
     f.key_release(KEY_ESC);
     assert!(
-        f.niri().panel_popover.is_open(),
+        f.synoik().panel_popover.is_open(),
         "the close must be animated, not instant — the popover stays visible while fading"
     );
     assert!(
-        f.niri().panel_popover.are_animations_ongoing(),
+        f.synoik().panel_popover.are_animations_ongoing(),
         "closing must run a fade-out animation"
     );
 
     // After the fade-out settles, it's gone.
     f.settle_animations();
-    assert!(!f.niri().panel_popover.is_open());
-    assert!(!f.niri().panel_popover.are_animations_ongoing());
+    assert!(!f.synoik().panel_popover.is_open());
+    assert!(!f.synoik().panel_popover.are_animations_ongoing());
 }
 
 /// A client must not be able to kill the compositor with a malformed `wl_region`.
@@ -6247,7 +6266,7 @@ fn negative_wl_region_does_not_kill_the_compositor() {
 
     // Still alive, still serving this client, and the window is still mapped.
     assert_eq!(
-        f.niri().layout.windows().count(),
+        f.synoik().layout.windows().count(),
         1,
         "the window must survive a negative opaque region",
     );
@@ -6267,22 +6286,22 @@ fn idle_monitor_input_activity_resets_idle_time() {
     f.add_output(1, (1920, 1080));
 
     // With no input since construction, idle time grows with elapsed monotonic time.
-    let base = f.niri().clock.now_unadjusted();
+    let base = f.synoik().clock.now_unadjusted();
     assert!(
-        f.niri()
+        f.synoik()
             .idle_monitor
             .idletime_ms(base + Duration::from_secs(600))
             >= 600_000,
         "idle time must grow while the user is inactive",
     );
 
-    // Any input resets it (input `should_notify_activity` -> `Niri::notify_activity`).
+    // Any input resets it (input `should_notify_activity` -> `Synoik::notify_activity`).
     f.key_press(KEY_A);
     f.key_release(KEY_A);
 
-    let now = f.niri().clock.now_unadjusted();
+    let now = f.synoik().clock.now_unadjusted();
     assert!(
-        f.niri().idle_monitor.idletime_ms(now) < 1000,
+        f.synoik().idle_monitor.idletime_ms(now) < 1000,
         "input activity must reset the idle time to near zero",
     );
 }
@@ -6297,20 +6316,20 @@ fn idle_monitor_input_activity_resets_idle_time() {
 #[cfg(feature = "dbus")]
 #[test]
 fn idle_monitor_dbus_idle_watch_fires_and_rearms() {
-    use crate::dbus::mutter_idle_monitor::IdleMonitorToNiri;
+    use crate::dbus::mutter_idle_monitor::IdleMonitorToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
     // Pin the idle clock to a known instant via ResetIdletime, then register a 5s watch.
     let t0 = Duration::from_secs(10_000);
-    f.niri().clock.set_unadjusted(t0);
-    f.niri_state()
-        .on_idle_monitor_msg(IdleMonitorToNiri::ResetIdletime);
+    f.synoik().clock.set_unadjusted(t0);
+    f.synoik_state()
+        .on_idle_monitor_msg(IdleMonitorToSynoik::ResetIdletime);
 
     let (reply, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_idle_monitor_msg(IdleMonitorToNiri::AddIdleWatch {
+    f.synoik_state()
+        .on_idle_monitor_msg(IdleMonitorToSynoik::AddIdleWatch {
             interval: 5000,
             owner: ":1.gsd".to_owned(),
             reply,
@@ -6319,14 +6338,14 @@ fn idle_monitor_dbus_idle_watch_fires_and_rearms() {
     assert!(id > 0, "watch ids are greater than zero");
 
     assert!(
-        f.niri()
+        f.synoik()
             .idle_monitor
             .refresh(t0 + Duration::from_millis(4999))
             .is_empty(),
         "must not fire before the interval elapses",
     );
     let fired = f
-        .niri()
+        .synoik()
         .idle_monitor
         .refresh(t0 + Duration::from_millis(5000));
     assert_eq!(fired.len(), 1, "fires once at the interval");
@@ -6338,18 +6357,18 @@ fn idle_monitor_dbus_idle_watch_fires_and_rearms() {
 
     // A ResetIdletime (gsd's "user is active") re-arms it for the next idle period.
     let t1 = t0 + Duration::from_secs(20);
-    f.niri().clock.set_unadjusted(t1);
-    f.niri_state()
-        .on_idle_monitor_msg(IdleMonitorToNiri::ResetIdletime);
+    f.synoik().clock.set_unadjusted(t1);
+    f.synoik_state()
+        .on_idle_monitor_msg(IdleMonitorToSynoik::ResetIdletime);
     assert!(
-        f.niri()
+        f.synoik()
             .idle_monitor
             .refresh(t1 + Duration::from_millis(4999))
             .is_empty(),
         "the just-reset watch must not fire early",
     );
     assert_eq!(
-        f.niri()
+        f.synoik()
             .idle_monitor
             .refresh(t1 + Duration::from_millis(5000))
             .len(),
@@ -6367,58 +6386,61 @@ fn idle_monitor_dbus_idle_watch_fires_and_rearms() {
 #[cfg(feature = "dbus")]
 #[test]
 fn end_session_dialog_open_confirm_and_cancel() {
-    use crate::dbus::gnome_session::EndSessionDialogToNiri;
+    use crate::dbus::gnome_session::EndSessionDialogToSynoik;
     use crate::end_session::EndSessionType;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
     // gnome-session raises the shutdown dialog with a 60s countdown.
-    f.niri_state()
-        .on_end_session_msg(EndSessionDialogToNiri::Open {
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
             kind: 1,
             seconds: 60,
         });
     assert!(
-        f.niri().end_session.is_open(),
+        f.synoik().end_session.is_open(),
         "Open must raise the end-session lifecycle",
     );
     assert!(
-        f.niri().end_session_dialog.is_open(),
+        f.synoik().end_session_dialog.is_open(),
         "Open must raise the visible dialog too",
     );
-    assert_eq!(f.niri().end_session.kind(), Some(EndSessionType::Shutdown));
     assert_eq!(
-        f.niri().end_session.kind().unwrap().confirmed_signal(),
+        f.synoik().end_session.kind(),
+        Some(EndSessionType::Shutdown)
+    );
+    assert_eq!(
+        f.synoik().end_session.kind().unwrap().confirmed_signal(),
         "ConfirmedShutdown",
         "confirming a shutdown dialog must emit ConfirmedShutdown",
     );
 
     // Confirming (Enter / clicking Power Off) closes the dialog; gnome-session then powers off.
-    f.niri_state().niri.confirm_end_session();
-    assert!(!f.niri().end_session.is_open(), "confirm must close it");
-    assert!(!f.niri().end_session_dialog.is_open());
+    f.synoik_state().synoik.confirm_end_session();
+    assert!(!f.synoik().end_session.is_open(), "confirm must close it");
+    assert!(!f.synoik().end_session_dialog.is_open());
 
     // A fresh dialog can be cancelled (Esc / Cancel), which aborts the request.
-    f.niri_state()
-        .on_end_session_msg(EndSessionDialogToNiri::Open {
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
             kind: 0,
             seconds: 60,
         });
-    assert_eq!(f.niri().end_session.kind(), Some(EndSessionType::Logout));
-    f.niri_state().niri.cancel_end_session();
-    assert!(!f.niri().end_session.is_open(), "cancel must close it");
+    assert_eq!(f.synoik().end_session.kind(), Some(EndSessionType::Logout));
+    f.synoik_state().synoik.cancel_end_session();
+    assert!(!f.synoik().end_session.is_open(), "cancel must close it");
 
     // gnome-session withdrawing the request (Close) also dismisses the dialog.
-    f.niri_state()
-        .on_end_session_msg(EndSessionDialogToNiri::Open {
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
             kind: 2,
             seconds: 60,
         });
-    f.niri_state()
-        .on_end_session_msg(EndSessionDialogToNiri::Close);
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Close);
     assert!(
-        !f.niri().end_session.is_open(),
+        !f.synoik().end_session.is_open(),
         "gnome-session's Close must dismiss the dialog",
     );
 }
@@ -6430,16 +6452,16 @@ fn end_session_dialog_open_confirm_and_cancel() {
 fn screencast_area_resolves_to_the_containing_output() {
     use smithay::utils::{Point, Rectangle, Size};
 
-    use crate::niri::CastTarget;
+    use crate::synoik::CastTarget;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let out = f.niri_output(1);
+    let out = f.synoik_output(1);
 
     // A rect fully inside the output resolves to it, at 1:1 physical size (headless scale 1).
     let rect = Rectangle::new(Point::from((100, 100)), Size::from((300, 200)));
     let (target, size, _refresh) = f
-        .niri()
+        .synoik()
         .cast_params_for_area(rect)
         .expect("a rect inside an output must resolve");
     assert_eq!(size, Size::from((300, 200)));
@@ -6457,23 +6479,23 @@ fn screencast_area_resolves_to_the_containing_output() {
 
     // A rect off every output resolves to nothing (mutter fails the stream likewise).
     let off = Rectangle::new(Point::from((10_000, 10_000)), Size::from((100, 100)));
-    assert!(f.niri().cast_params_for_area(off).is_none());
+    assert!(f.synoik().cast_params_for_area(off).is_none());
 }
 
 #[test]
 fn screencast_area_picks_the_largest_intersection_output() {
     use smithay::utils::{Point, Rectangle, Size};
 
-    use crate::niri::CastTarget;
+    use crate::synoik::CastTarget;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     f.add_output(2, (1920, 1080));
 
     // Order the two outputs left→right by their global position.
-    let mut outs = [f.niri_output(1), f.niri_output(2)];
-    outs.sort_by_key(|o| f.niri().global_space.output_geometry(o).unwrap().loc.x);
-    let right_geo = f.niri().global_space.output_geometry(&outs[1]).unwrap();
+    let mut outs = [f.synoik_output(1), f.synoik_output(2)];
+    outs.sort_by_key(|o| f.synoik().global_space.output_geometry(o).unwrap().loc.x);
+    let right_geo = f.synoik().global_space.output_geometry(&outs[1]).unwrap();
     let seam = right_geo.loc.x;
 
     // Straddle the seam: 40px on the left output, 200px on the right → the right output wins.
@@ -6482,7 +6504,7 @@ fn screencast_area_picks_the_largest_intersection_output() {
         Size::from((240, 100)),
     );
     let (target, _, _) = f
-        .niri()
+        .synoik()
         .cast_params_for_area(rect)
         .expect("a straddling rect still resolves");
     let CastTarget::Area { name, .. } = target else {
@@ -6528,7 +6550,7 @@ fn screen_recording_indicator_appears_and_ticks() {
     f.add_output(1, (1920, 1080));
 
     // Pin the clock so the elapsed label is deterministic (avoids the clock-trap).
-    let mut clock = f.niri().clock.clone();
+    let mut clock = f.synoik().clock.clone();
     let t0 = clock.now_unadjusted();
     clock.set_unadjusted(t0);
 
@@ -6540,19 +6562,19 @@ fn screen_recording_indicator_appears_and_ticks() {
 
     // Nothing recording → no indicator.
     assert!(f
-        .niri()
+        .synoik()
         .panel
         .items(ow, ws)
         .iter()
         .all(|i| i.role != ROLE_SCREEN_RECORDING));
 
     let id = CastSessionId::next();
-    f.niri().screen_recording_started(id);
+    f.synoik().screen_recording_started(id);
 
     // Shows at 0:00, as a right-box item.
-    assert_eq!(f.niri().panel.recording_label(), Some("0:00"));
+    assert_eq!(f.synoik().panel.recording_label(), Some("0:00"));
     assert!(f
-        .niri()
+        .synoik()
         .panel
         .items(ow, ws)
         .iter()
@@ -6560,12 +6582,12 @@ fn screen_recording_indicator_appears_and_ticks() {
 
     // Re-ticking the label (the seam the 1 s recording timer calls) tracks elapsed time.
     clock.set_unadjusted(t0 + Duration::from_secs(65));
-    assert!(f.niri().panel.update_recording_label());
-    assert_eq!(f.niri().panel.recording_label(), Some("1:05"));
+    assert!(f.synoik().panel.update_recording_label());
+    assert_eq!(f.synoik().panel.recording_label(), Some("1:05"));
 
     clock.set_unadjusted(t0 + Duration::from_secs(600));
-    assert!(f.niri().panel.update_recording_label());
-    assert_eq!(f.niri().panel.recording_label(), Some("10:00"));
+    assert!(f.synoik().panel.update_recording_label());
+    assert_eq!(f.synoik().panel.recording_label(), Some("10:00"));
 }
 
 #[test]
@@ -6576,16 +6598,16 @@ fn screen_recording_indicator_click_stops_the_recording() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    let mut clock = f.niri().clock.clone();
+    let mut clock = f.synoik().clock.clone();
     let t0 = clock.now_unadjusted();
     clock.set_unadjusted(t0);
 
     let id = CastSessionId::next();
-    f.niri().screen_recording_started(id);
-    assert!(!f.niri().casting.recordings.is_empty());
+    f.synoik().screen_recording_started(id);
+    assert!(!f.synoik().casting.recordings.is_empty());
 
     // Click the indicator's center (top panel band).
-    let r1 = f.niri().panel.screen_recording_rect(1920.);
+    let r1 = f.synoik().panel.screen_recording_rect(1920.);
     let cx = r1.loc.x + r1.size.w / 2.;
     f.pointer_motion(cx, 16.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
@@ -6594,7 +6616,7 @@ fn screen_recording_indicator_click_stops_the_recording() {
     // Clicking it stops the recording through the real hit-test → stop_cast path, and the
     // indicator disappears.
     assert!(
-        f.niri().casting.recordings.is_empty(),
+        f.synoik().casting.recordings.is_empty(),
         "clicking the indicator stops the recording",
     );
     let ws = WorkspaceState {
@@ -6602,7 +6624,7 @@ fn screen_recording_indicator_click_stops_the_recording() {
         active: 0,
     };
     assert!(f
-        .niri()
+        .synoik()
         .panel
         .items(1920., ws)
         .iter()
@@ -6629,19 +6651,19 @@ fn native_screen_recording_registers_and_stops() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let mut clock = f.niri().clock.clone();
+    let mut clock = f.synoik().clock.clone();
     let t0 = clock.now_unadjusted();
     clock.set_unadjusted(t0);
 
-    let output = f.niri().global_space.outputs().next().cloned().unwrap();
-    let path = std::env::temp_dir().join(format!("niri-native-rec-{}.webm", std::process::id()));
+    let output = f.synoik().global_space.outputs().next().cloned().unwrap();
+    let path = std::env::temp_dir().join(format!("synoik-native-rec-{}.webm", std::process::id()));
 
     // Starting registers a Native recording and shows the R1 pill.
-    f.niri()
+    f.synoik()
         .start_native_recording(&output, path.clone(), 30, true, None)
         .unwrap();
     assert!(f
-        .niri()
+        .synoik()
         .casting
         .recordings
         .iter()
@@ -6651,7 +6673,7 @@ fn native_screen_recording_registers_and_stops() {
         active: 0,
     };
     assert!(f
-        .niri()
+        .synoik()
         .panel
         .items(1920., ws)
         .iter()
@@ -6659,18 +6681,18 @@ fn native_screen_recording_registers_and_stops() {
 
     // Clicking the pill runs the real hit-test → stop_screen_recordings → finalize-encoder path;
     // the ledger clears and the indicator disappears (regardless of the zero-frame file).
-    let r1 = f.niri().panel.screen_recording_rect(1920.);
+    let r1 = f.synoik().panel.screen_recording_rect(1920.);
     let cx = r1.loc.x + r1.size.w / 2.;
     f.pointer_motion(cx, 16.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     assert!(
-        f.niri().casting.recordings.is_empty(),
+        f.synoik().casting.recordings.is_empty(),
         "clicking the indicator stops the native recording",
     );
     assert!(f
-        .niri()
+        .synoik()
         .panel
         .items(1920., ws)
         .iter()
@@ -6682,7 +6704,7 @@ fn native_screen_recording_registers_and_stops() {
 #[cfg(feature = "xdp-gnome-screencast")]
 #[test]
 fn shell_screencast_dbus_start_and_stop() {
-    use crate::dbus::gnome_shell_screencast::ScreencastToNiri;
+    use crate::dbus::gnome_shell_screencast::ScreencastToSynoik;
     use crate::screencasting::RecordingKind;
 
     let ffmpeg = std::process::Command::new("ffmpeg")
@@ -6701,18 +6723,19 @@ fn shell_screencast_dbus_start_and_stop() {
     f.add_output(1, (1920, 1080));
 
     // Land the recording under a temp dir via an absolute template (no XDG env dependency).
-    let dir = std::env::temp_dir().join(format!("niri-shell-sc-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("synoik-shell-sc-{}", std::process::id()));
     let template = dir.join("clip %%").to_string_lossy().into_owned();
 
     let start = |f: &mut Fixture, template: String| {
         let (reply, rx) = async_channel::bounded(1);
-        f.niri().on_shell_screencast_msg(ScreencastToNiri::Start {
-            area: None,
-            template,
-            draw_cursor: true,
-            framerate: 30,
-            reply,
-        });
+        f.synoik()
+            .on_shell_screencast_msg(ScreencastToSynoik::Start {
+                area: None,
+                template,
+                draw_cursor: true,
+                framerate: 30,
+                reply,
+            });
         rx.recv_blocking().unwrap()
     };
 
@@ -6720,7 +6743,7 @@ fn shell_screencast_dbus_start_and_stop() {
     let path = start(&mut f, template.clone()).expect("start should succeed");
     assert_eq!(path, dir.join("clip %.webm").to_string_lossy());
     assert!(f
-        .niri()
+        .synoik()
         .casting
         .recordings
         .iter()
@@ -6734,32 +6757,33 @@ fn shell_screencast_dbus_start_and_stop() {
 
     // Stop reports that a recording was torn down and clears the ledger.
     let (reply, rx) = async_channel::bounded(1);
-    f.niri()
-        .on_shell_screencast_msg(ScreencastToNiri::Stop { reply });
+    f.synoik()
+        .on_shell_screencast_msg(ScreencastToSynoik::Stop { reply });
     assert!(rx.recv_blocking().unwrap(), "stop found a live recording");
-    assert!(f.niri().casting.recordings.is_empty());
+    assert!(f.synoik().casting.recordings.is_empty());
 
     // A ScreencastArea request records a region of the output (a later slice used to decline it).
     let (reply, rx) = async_channel::bounded(1);
-    f.niri().on_shell_screencast_msg(ScreencastToNiri::Start {
-        area: Some((100, 100, 640, 480)),
-        template: dir.join("area %%").to_string_lossy().into_owned(),
-        draw_cursor: false,
-        framerate: 30,
-        reply,
-    });
+    f.synoik()
+        .on_shell_screencast_msg(ScreencastToSynoik::Start {
+            area: Some((100, 100, 640, 480)),
+            template: dir.join("area %%").to_string_lossy().into_owned(),
+            draw_cursor: false,
+            framerate: 30,
+            reply,
+        });
     let area_path = rx.recv_blocking().unwrap().expect("area recording starts");
     assert_eq!(area_path, dir.join("area %.webm").to_string_lossy());
     assert!(f
-        .niri()
+        .synoik()
         .casting
         .recordings
         .iter()
         .any(|r| matches!(r.kind, RecordingKind::Native(_))));
 
     let (reply, rx) = async_channel::bounded(1);
-    f.niri()
-        .on_shell_screencast_msg(ScreencastToNiri::Stop { reply });
+    f.synoik()
+        .on_shell_screencast_msg(ScreencastToSynoik::Stop { reply });
     assert!(rx.recv_blocking().unwrap());
 
     std::fs::remove_dir_all(&dir).ok();
@@ -6779,14 +6803,14 @@ fn shell_screencast_dbus_start_and_stop() {
 #[test]
 fn a_notification_takes_its_source_identity_from_the_resolved_app() {
     use crate::app_system::{AppEntry, AppIconRef, AppSystem, FakeCatalog};
-    use crate::notifications::{NotificationsToNiri, NotifyRequest, Urgency};
+    use crate::notifications::{NotificationsToSynoik, NotifyRequest, Urgency};
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
     let mut entry = AppEntry::fake("firefox.desktop", "Firefox");
     entry.icon = AppIconRef::Themed(vec!["firefox".to_owned()]);
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![entry])),
         Box::new(crate::app_system::RecordingLauncher::default()),
     );
@@ -6811,14 +6835,14 @@ fn a_notification_takes_its_source_identity_from_the_resolved_app() {
     };
 
     let (reply, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::Notify {
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::Notify {
             req: web_notification("Firefox", Some("firefox")),
             reply,
         });
     assert_eq!(rx.recv_blocking().unwrap(), Ok(1));
 
-    let source = &f.niri().notifications.sources[0];
+    let source = &f.synoik().notifications.sources[0];
     assert_eq!(
         source.app_icon,
         Some(AppIconRef::Themed(vec!["firefox".to_owned()])),
@@ -6832,14 +6856,14 @@ fn a_notification_takes_its_source_identity_from_the_resolved_app() {
     // An app that does not resolve leaves the source on the call parameters — the source is then
     // whatever the sender claimed, and the header falls back to the executable glyph.
     let (reply, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::Notify {
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::Notify {
             req: web_notification("Some Unknown App", Some("not-installed")),
             reply,
         });
     assert_eq!(rx.recv_blocking().unwrap(), Ok(2));
     let unresolved = f
-        .niri()
+        .synoik()
         .notifications
         .sources
         .iter()
@@ -6854,7 +6878,7 @@ fn a_notification_takes_its_source_identity_from_the_resolved_app() {
 /// through `on_notifications_msg` the way the calloop channel would deliver it.
 #[test]
 fn notifications_notify_replace_and_close_via_handler() {
-    use crate::notifications::{NotificationsToNiri, NotifyRequest, Urgency};
+    use crate::notifications::{NotificationsToSynoik, NotifyRequest, Urgency};
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
@@ -6879,30 +6903,30 @@ fn notifications_notify_replace_and_close_via_handler() {
 
     // Notify allocates ids from 1 and stores the notification.
     let (reply, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::Notify {
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::Notify {
             req: req("app", ":1.7", 0),
             reply,
         });
     assert_eq!(rx.recv_blocking().unwrap(), Ok(1));
-    assert_eq!(f.niri().notifications.sources.len(), 1);
-    assert_eq!(f.niri().notifications.find(1).unwrap().title, "title");
+    assert_eq!(f.synoik().notifications.sources.len(), 1);
+    assert_eq!(f.synoik().notifications.find(1).unwrap().title, "title");
 
     // Replace (same sender) mutates in place, same id, no new notification.
     let mut update = req("app", ":1.7", 1);
     update.title = "updated".to_owned();
     let (reply, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::Notify { req: update, reply });
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::Notify { req: update, reply });
     assert_eq!(rx.recv_blocking().unwrap(), Ok(1));
-    assert_eq!(f.niri().notifications.sources[0].notifications.len(), 1);
-    assert_eq!(f.niri().notifications.find(1).unwrap().title, "updated");
+    assert_eq!(f.synoik().notifications.sources[0].notifications.len(), 1);
+    assert_eq!(f.synoik().notifications.find(1).unwrap().title, "updated");
 
     // Replace from a different sender is rejected (the fdo proxy's
     // "Invalid notification ID").
     let (reply, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::Notify {
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::Notify {
             req: req("evil", ":1.66", 1),
             reply,
         });
@@ -6912,33 +6936,33 @@ fn notifications_notify_replace_and_close_via_handler() {
     // owed NotificationClosed emission (reason 3 = the app asked) reaches the
     // server's emit channel.
     let (to_notifications, emitted) = async_channel::unbounded();
-    f.niri_state().niri.notifications_emit = Some(to_notifications);
+    f.synoik_state().synoik.notifications_emit = Some(to_notifications);
 
     let (reply, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::Close {
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::Close {
             id: 1,
             sender: ":1.66".to_owned(),
             reply,
         });
     assert!(rx.recv_blocking().unwrap().is_err());
-    assert!(f.niri().notifications.find(1).is_some());
+    assert!(f.synoik().notifications.find(1).is_some());
 
     let (reply, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::Close {
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::Close {
             id: 1,
             sender: ":1.7".to_owned(),
             reply,
         });
     assert_eq!(rx.recv_blocking().unwrap(), Ok(()));
-    assert!(f.niri().notifications.find(1).is_none());
+    assert!(f.synoik().notifications.find(1).is_none());
     assert!(
-        f.niri().notifications.sources.is_empty(),
+        f.synoik().notifications.sources.is_empty(),
         "a source with zero notifications removes itself",
     );
     match emitted.recv_blocking().unwrap() {
-        crate::notifications::NiriToNotifications::Closed { id, reason, sender } => {
+        crate::notifications::SynoikToNotifications::Closed { id, reason, sender } => {
             assert_eq!(id, 1);
             assert_eq!(reason.wire_code(), 3);
             assert_eq!(sender.as_deref(), Some(":1.7"));
@@ -6952,7 +6976,7 @@ fn notifications_notify_replace_and_close_via_handler() {
 /// `notify-send`-style sources survive.
 #[test]
 fn notifications_sender_vanish_via_handler() {
-    use crate::notifications::{NotificationsToNiri, NotifyRequest, SourceKey, Urgency};
+    use crate::notifications::{NotificationsToSynoik, NotifyRequest, SourceKey, Urgency};
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
@@ -6975,8 +6999,8 @@ fn notifications_sender_vanish_via_handler() {
         transient: false,
     };
     let (reply, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::Notify {
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::Notify {
             req: app.clone(),
             reply,
         });
@@ -6985,13 +7009,13 @@ fn notifications_sender_vanish_via_handler() {
     app.desktop_entry = None;
     app.app_name = "notify-send".to_owned();
     let (reply, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::Notify { req: app, reply });
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::Notify { req: app, reply });
     rx.recv_blocking().unwrap().unwrap();
 
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::SenderVanished(":1.9".to_owned()));
-    let sources = &f.niri().notifications.sources;
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::SenderVanished(":1.9".to_owned()));
+    let sources = &f.synoik().notifications.sources;
     assert_eq!(sources.len(), 1);
     assert!(matches!(sources[0].key, SourceKey::PidName(..)));
 }
@@ -7004,7 +7028,7 @@ fn notifications_sender_vanish_via_handler() {
 #[test]
 fn notifications_gtk_add_action_and_remove_via_handler() {
     use crate::notifications::{
-        GtkNotifyRequest, GtkToNotifications, NotificationsToNiri, SourceKey, Urgency,
+        GtkNotifyRequest, GtkToNotifications, NotificationsToSynoik, SourceKey, Urgency,
     };
 
     let mut f = Fixture::new();
@@ -7025,12 +7049,12 @@ fn notifications_gtk_add_action_and_remove_via_handler() {
 
     // Add: a GtkApp source appears, keyed by application-id, with the
     // server-resolved display name.
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::AddGtk {
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::AddGtk {
             req: gtk_req("msg-1"),
         });
-    assert_eq!(f.niri().notifications.sources.len(), 1);
-    let source = &f.niri().notifications.sources[0];
+    assert_eq!(f.synoik().notifications.sources.len(), 1);
+    let source = &f.synoik().notifications.sources[0];
     assert!(matches!(&source.key, SourceKey::GtkApp(a) if a == "org.example.Chat"));
     assert_eq!(source.title, "Chat");
     let id = source.notifications[0].id;
@@ -7038,20 +7062,20 @@ fn notifications_gtk_add_action_and_remove_via_handler() {
     // Add with the same (app_id, gtk_id) replaces in place — no second card.
     let mut update = gtk_req("msg-1");
     update.title = "updated".to_owned();
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::AddGtk { req: update });
-    assert_eq!(f.niri().notifications.sources[0].notifications.len(), 1);
-    assert_eq!(f.niri().notifications.find(id).unwrap().title, "updated");
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::AddGtk { req: update });
+    assert_eq!(f.synoik().notifications.sources[0].notifications.len(), 1);
+    assert_eq!(f.synoik().notifications.find(id).unwrap().title, "updated");
 
     // A non-`app.` action routes to the Gtk emit channel (NOT the fdo one).
     let (to_gtk, gtk_emitted) = async_channel::unbounded();
-    f.niri_state().niri.gtk_notifications_emit = Some(to_gtk);
+    f.synoik_state().synoik.gtk_notifications_emit = Some(to_gtk);
     let (to_fdo, fdo_emitted) = async_channel::unbounded();
-    f.niri_state().niri.notifications_emit = Some(to_fdo);
+    f.synoik_state().synoik.notifications_emit = Some(to_fdo);
 
     assert!(
-        f.niri_state()
-            .niri
+        f.synoik_state()
+            .synoik
             .emit_notification_action(id, "reply".to_owned()),
         "the shell activates the app itself on the Gtk path, so it reports the overview should go"
     );
@@ -7075,8 +7099,8 @@ fn notifications_gtk_add_action_and_remove_via_handler() {
 
     // The body-click pseudo-key resolves to the payload's default-action.
     assert!(f
-        .niri_state()
-        .niri
+        .synoik_state()
+        .synoik
         .emit_notification_action(id, "default".to_owned()));
     match gtk_emitted.recv_blocking().unwrap() {
         GtkToNotifications::ActionInvoked { action, .. } => assert_eq!(action, "app.open"),
@@ -7084,13 +7108,13 @@ fn notifications_gtk_add_action_and_remove_via_handler() {
     }
 
     // Remove destroys it and emits no fdo NotificationClosed (no sender).
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::RemoveGtk {
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::RemoveGtk {
             app_id: "org.example.Chat".to_owned(),
             gtk_id: "msg-1".to_owned(),
         });
-    assert!(f.niri().notifications.find(id).is_none());
-    assert!(f.niri().notifications.sources.is_empty());
+    assert!(f.synoik().notifications.find(id).is_none());
+    assert!(f.synoik().notifications.sources.is_empty());
     assert!(
         fdo_emitted.try_recv().is_err(),
         "removing a Gtk notification emits no NotificationClosed"
@@ -7102,13 +7126,13 @@ fn notifications_gtk_add_action_and_remove_via_handler() {
 #[test]
 fn notifications_gtk_body_click_without_default_activates_app() {
     use crate::notifications::{
-        GtkNotifyRequest, GtkToNotifications, NotificationsToNiri, Urgency,
+        GtkNotifyRequest, GtkToNotifications, NotificationsToSynoik, Urgency,
     };
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri_state()
-        .on_notifications_msg(NotificationsToNiri::AddGtk {
+    f.synoik_state()
+        .on_notifications_msg(NotificationsToSynoik::AddGtk {
             req: GtkNotifyRequest {
                 app_id: "org.example.App".to_owned(),
                 gtk_id: "n1".to_owned(),
@@ -7122,11 +7146,11 @@ fn notifications_gtk_body_click_without_default_activates_app() {
                 urgency: Urgency::Normal,
             },
         });
-    let id = f.niri().notifications.sources[0].notifications[0].id;
+    let id = f.synoik().notifications.sources[0].notifications[0].id;
 
     let (to_gtk, gtk_emitted) = async_channel::unbounded();
-    f.niri_state().niri.gtk_notifications_emit = Some(to_gtk);
-    assert!(f.niri_state().niri.open_notification_app(id));
+    f.synoik_state().synoik.gtk_notifications_emit = Some(to_gtk);
+    assert!(f.synoik_state().synoik.open_notification_app(id));
     match gtk_emitted.recv_blocking().unwrap() {
         GtkToNotifications::Activate { app_id, .. } => assert_eq!(app_id, "org.example.App"),
         _ => panic!("expected Activate"),
@@ -7154,18 +7178,18 @@ fn quick_settings_system_rows_call_gnome_session_directly() {
     f.add_output(1, (1920, 1080));
 
     let open_overview = |f: &mut Fixture| {
-        f.niri_state().do_action(Action::OpenOverview, false);
-        f.niri_complete_animations();
-        assert!(f.niri().layout.is_overview_open());
+        f.synoik_state().do_action(Action::OpenOverview, false);
+        f.synoik_complete_animations();
+        assert!(f.synoik().layout.is_overview_open());
     };
 
     // Logout hides it.
     open_overview(&mut f);
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::SessionRequest(SessionRequest::Logout));
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "the Log Out row must hide the overview first"
     );
 
@@ -7176,11 +7200,11 @@ fn quick_settings_system_rows_call_gnome_session_directly() {
         SessionRequest::Suspend,
     ] {
         open_overview(&mut f);
-        f.niri_state()
+        f.synoik_state()
             .apply_popover_action(PopoverAction::SessionRequest(request));
-        f.niri_complete_animations();
+        f.synoik_complete_animations();
         assert!(
-            f.niri().layout.is_overview_open(),
+            f.synoik().layout.is_overview_open(),
             "{request:?} must leave the overview alone, as gnome-shell does"
         );
     }
@@ -7205,43 +7229,43 @@ fn overview_closes_when_a_panel_button_launches_an_app() {
     f.add_output(1, (1920, 1080));
 
     let open_overview = |f: &mut Fixture| {
-        f.niri_state().do_action(Action::OpenOverview, false);
-        f.niri_complete_animations();
-        assert!(f.niri().layout.is_overview_open());
+        f.synoik_state().do_action(Action::OpenOverview, false);
+        f.synoik_complete_animations();
+        assert!(f.synoik().layout.is_overview_open());
     };
 
     // An *empty* command: `spawn` returns early on it (`utils::spawning`), so this
     // exercises the choke point without a test really launching gnome-control-center.
     open_overview(&mut f);
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::Spawn(Vec::new()));
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "a panel/quick-settings button that starts an app must leave the overview"
     );
 
     // A toggle that changes a setting stays put — GNOME hides only for the rows that
     // raise a window.
     open_overview(&mut f);
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::SetDarkStyle(true));
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "a quick-settings toggle must not close the overview"
     );
 
     // An fdo notification action is a signal to the app, not an activation by us.
     let id = banner_notify(&mut f, banner_req("app", ":1.1"));
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::InvokeNotificationAction {
             id,
             key: "reply".to_owned(),
         });
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "the fdo path only emits ActionInvoked, so the overview stays up"
     );
 }
@@ -7270,18 +7294,18 @@ fn banner_req(app: &str, sender: &str) -> crate::notifications::NotifyRequest {
 
 fn banner_notify(f: &mut Fixture, req: crate::notifications::NotifyRequest) -> u32 {
     let (reply, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_notifications_msg(crate::notifications::NotificationsToNiri::Notify { req, reply });
+    f.synoik_state()
+        .on_notifications_msg(crate::notifications::NotificationsToSynoik::Notify { req, reply });
     rx.recv_blocking().unwrap().unwrap()
 }
 
 /// Pin the clock forward and advance — the banner's deadline authority is the
 /// pinned clock, not the wake-up timer (see the headless-animation-clock trap).
 fn tick(f: &mut Fixture, ms: u64) {
-    let niri = f.niri();
-    let now = niri.clock.now_unadjusted();
-    niri.clock.set_unadjusted(now + Duration::from_millis(ms));
-    niri.advance_animations();
+    let synoik = f.synoik();
+    let now = synoik.clock.now_unadjusted();
+    synoik.clock.set_unadjusted(now + Duration::from_millis(ms));
+    synoik.advance_animations();
 }
 
 /// A grab owns the cursor until it ends. Nothing that merely *reacts* to pointer motion may take
@@ -7300,23 +7324,23 @@ fn a_resize_grab_keeps_its_cursor_under_a_banner() {
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let surface = map_focused_window(&mut f, id);
-    let window = f.niri().layout.windows().next().unwrap().1.window.clone();
+    let window = f.synoik().layout.windows().next().unwrap().1.window.clone();
 
     // Park the pointer somewhere harmless and put a banner up.
     pointer_motion_to(&mut f, 600., 600.);
     banner_notify(&mut f, banner_req("app", ":1.1"));
     f.settle_animations();
-    assert!(f.niri().notification_banner.is_visible());
+    assert!(f.synoik().notification_banner.is_visible());
 
     // Start a real interactive resize on the bottom-right corner, the way the button handler does.
     let edges = ResizeEdge::BOTTOM_RIGHT;
     assert!(f
-        .niri_state()
-        .niri
+        .synoik_state()
+        .synoik
         .layout
         .interactive_resize_begin(window.clone(), edges));
-    let state = f.niri_state();
-    let pointer = state.niri.seat.get_pointer().unwrap();
+    let state = f.synoik_state();
+    let pointer = state.synoik.seat.get_pointer().unwrap();
     let start_data = PointerGrabStartData {
         focus: None,
         button: 0x110,
@@ -7326,26 +7350,26 @@ fn a_resize_grab_keeps_its_cursor_under_a_banner() {
     let grab = crate::input::resize_grab::ResizeGrab::new(start_data, window);
     pointer.set_grab(state, grab, serial, smithay::input::pointer::Focus::Clear);
     state
-        .niri
+        .synoik
         .cursor_manager
         .set_cursor_image(CursorImageStatus::Named(edges.cursor_icon()));
     assert_eq!(
-        *f.niri().cursor_manager.cursor_image(),
+        *f.synoik().cursor_manager.cursor_image(),
         CursorImageStatus::Named(CursorIcon::SeResize),
         "the grab starts by advertising what it is resizing"
     );
 
     // Drag up into the banner's own rect, which is where the arrow used to take over.
     pointer_motion_to(&mut f, 960., 40.);
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     assert!(
-        f.niri()
+        f.synoik()
             .notification_banner
             .pointer_inside(&output, Point::from((960., 40.))),
         "the sample point must really be under the banner, or this proves nothing"
     );
     assert_eq!(
-        *f.niri().cursor_manager.cursor_image(),
+        *f.synoik().cursor_manager.cursor_image(),
         CursorImageStatus::Named(CursorIcon::SeResize),
         "the resize grab still owns the cursor; a banner the pointer passed under must not \
          replace it with an arrow mid-drag"
@@ -7364,21 +7388,21 @@ fn notification_banner_shows_and_expires() {
     f.pointer_motion(1., 1.);
 
     let id = banner_notify(&mut f, banner_req("app", ":1.1"));
-    assert!(f.niri().notification_banner.is_visible());
+    assert!(f.synoik().notification_banner.is_visible());
     f.settle_animations();
-    assert_eq!(f.niri().notification_banner.content_id(), Some(id));
+    assert_eq!(f.synoik().notification_banner.content_id(), Some(id));
     // Showing acknowledged it (`js/ui/messageTray.js:1167`).
-    assert!(f.niri().notifications.find(id).unwrap().acknowledged);
+    assert!(f.synoik().notifications.find(id).unwrap().acknowledged);
     // The deadline is armed at the Showing->Shown transition inside
     // advance_animations — the wake-up timer must be re-armed there too, or a
     // banner over a damage-free desktop would never wake the loop to expire.
-    assert!(f.niri().notification_banner_timer.is_some());
+    assert!(f.synoik().notification_banner_timer.is_some());
 
     // The 4 s timeout elapses -> hide -> the notification SURVIVES in the store.
     tick(&mut f, 4100);
     f.settle_animations();
-    assert!(!f.niri().notification_banner.is_visible());
-    assert!(f.niri().notifications.find(id).is_some());
+    assert!(!f.synoik().notification_banner.is_visible());
+    assert!(f.synoik().notifications.find(id).is_some());
 
     // A transient notification is destroyed by its banner hiding (EXPIRED).
     // Fresh activity first: the pinned clock has drifted past the idle
@@ -7386,7 +7410,7 @@ fn notification_banner_shows_and_expires() {
     // pinned by `notification_banner_idle_gates_expiry`). `notify_activity`
     // runs once per event-loop iteration; clear the guard by hand since no
     // real iteration boundary passes in this test.
-    f.niri().notified_activity_this_iteration = false;
+    f.synoik().notified_activity_this_iteration = false;
     f.pointer_motion(1., 1.);
     let mut transient = banner_req("app", ":1.1");
     transient.transient = true;
@@ -7394,8 +7418,8 @@ fn notification_banner_shows_and_expires() {
     f.settle_animations();
     tick(&mut f, 4100);
     f.settle_animations();
-    assert!(!f.niri().notification_banner.is_visible());
-    assert!(f.niri().notifications.find(tid).is_none());
+    assert!(!f.synoik().notification_banner.is_visible());
+    assert!(f.synoik().notifications.find(tid).is_none());
 }
 
 /// LOW never banners; DND suppresses all but CRITICAL, and CRITICAL never
@@ -7409,21 +7433,21 @@ fn notification_banner_policy_low_dnd_critical() {
     let mut low = banner_req("app", ":1.1");
     low.urgency = crate::notifications::Urgency::Low;
     banner_notify(&mut f, low);
-    assert!(!f.niri().notification_banner.is_visible());
+    assert!(!f.synoik().notification_banner.is_visible());
 
-    f.niri().gnome_settings.quick_toggles.do_not_disturb = true;
+    f.synoik().gnome_settings.quick_toggles.do_not_disturb = true;
     banner_notify(&mut f, banner_req("app", ":1.1"));
-    assert!(!f.niri().notification_banner.is_visible());
+    assert!(!f.synoik().notification_banner.is_visible());
 
     let mut critical = banner_req("app", ":1.1");
     critical.urgency = crate::notifications::Urgency::Critical;
     let cid = banner_notify(&mut f, critical);
-    assert!(f.niri().notification_banner.is_visible());
+    assert!(f.synoik().notification_banner.is_visible());
     f.settle_animations();
     // No deadline: still up long past the normal timeout.
     tick(&mut f, 60_000);
     f.settle_animations();
-    assert_eq!(f.niri().notification_banner.content_id(), Some(cid));
+    assert_eq!(f.synoik().notification_banner.content_id(), Some(cid));
 }
 
 /// The queue drains highest-urgency-first once the current banner expires
@@ -7441,11 +7465,11 @@ fn notification_banner_queue_drains_urgency_first() {
     let crit = banner_notify(&mut f, critical);
 
     f.settle_animations();
-    assert_eq!(f.niri().notification_banner.content_id(), Some(first));
+    assert_eq!(f.synoik().notification_banner.content_id(), Some(first));
     tick(&mut f, 4100);
     f.settle_animations();
     // The critical one jumped the queue.
-    assert_eq!(f.niri().notification_banner.content_id(), Some(crit));
+    assert_eq!(f.synoik().notification_banner.content_id(), Some(crit));
 }
 
 /// A replace re-enters banner admission: a dismissed-and-acked notification
@@ -7461,39 +7485,39 @@ fn notification_banner_replace_rebanners() {
     f.settle_animations();
     tick(&mut f, 4100);
     f.settle_animations();
-    assert!(!f.niri().notification_banner.is_visible());
+    assert!(!f.synoik().notification_banner.is_visible());
 
     // Replace the now-hidden, acked notification: it banners again.
     let mut update = banner_req("app", ":1.1");
     update.replaces_id = id;
     assert_eq!(banner_notify(&mut f, update), id);
-    assert!(f.niri().notification_banner.is_visible());
+    assert!(f.synoik().notification_banner.is_visible());
     f.settle_animations();
-    assert_eq!(f.niri().notification_banner.content_id(), Some(id));
+    assert_eq!(f.synoik().notification_banner.content_id(), Some(id));
 
     // Replace while showing: stays visible, re-acked (never counts unseen).
     let mut update = banner_req("app", ":1.1");
     update.replaces_id = id;
     update.title = "updated".to_owned();
     assert_eq!(banner_notify(&mut f, update), id);
-    assert!(f.niri().notification_banner.is_visible());
-    assert!(f.niri().notifications.find(id).unwrap().acknowledged);
-    assert_eq!(f.niri().notifications.unseen_count(), 0);
+    assert!(f.synoik().notification_banner.is_visible());
+    assert!(f.synoik().notifications.find(id).unwrap().acknowledged);
+    assert_eq!(f.synoik().notifications.unseen_count(), 0);
 
     // Replace while the banner is mid-hide: "we stop hiding it and show it
     // again" (`js/ui/messageTray.js:938-943`). Fresh activity first so the
     // deadline is armed, then let it lapse to start the hide animation.
-    f.niri().notified_activity_this_iteration = false;
+    f.synoik().notified_activity_this_iteration = false;
     f.pointer_motion(1., 1.);
     tick(&mut f, 2100);
-    assert!(f.niri().notification_banner.is_visible()); // Hiding, not yet gone
+    assert!(f.synoik().notification_banner.is_visible()); // Hiding, not yet gone
     let mut update = banner_req("app", ":1.1");
     update.replaces_id = id;
     update.title = "updated again".to_owned();
     assert_eq!(banner_notify(&mut f, update), id);
     f.settle_animations();
-    assert!(f.niri().notification_banner.is_visible());
-    assert_eq!(f.niri().notification_banner.content_id(), Some(id));
+    assert!(f.synoik().notification_banner.is_visible());
+    assert_eq!(f.synoik().notification_banner.content_id(), Some(id));
 }
 
 /// Clicking the close button destroys DISMISSED and the owed NotificationClosed
@@ -7504,7 +7528,7 @@ fn notification_banner_close_click_dismisses() {
     f.add_output(1, (1920, 1080));
     f.pointer_motion(1., 1.);
     let (tx, emitted) = async_channel::unbounded();
-    f.niri().notifications_emit = Some(tx);
+    f.synoik().notifications_emit = Some(tx);
 
     let id = banner_notify(&mut f, banner_req("app", ":1.1"));
     f.settle_animations();
@@ -7521,10 +7545,10 @@ fn notification_banner_close_click_dismisses() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
-    assert!(!f.niri().notification_banner.is_visible());
-    assert!(f.niri().notifications.find(id).is_none());
+    assert!(!f.synoik().notification_banner.is_visible());
+    assert!(f.synoik().notifications.find(id).is_none());
     match emitted.recv_blocking().unwrap() {
-        crate::notifications::NiriToNotifications::Closed {
+        crate::notifications::SynoikToNotifications::Closed {
             id: cid, reason, ..
         } => {
             assert_eq!(cid, id);
@@ -7545,17 +7569,17 @@ fn notification_banner_action_click_emits_and_dismisses() {
     f.add_output(1, (1920, 1080));
     f.pointer_motion(1., 1.);
     let (tx, emitted) = async_channel::unbounded();
-    f.niri().notifications_emit = Some(tx);
+    f.synoik().notifications_emit = Some(tx);
 
     let mut req = banner_req("app", ":1.1");
     req.actions = vec![("ok".to_owned(), "OK".to_owned())];
     let id = banner_notify(&mut f, req);
     f.settle_animations();
-    assert!(!f.niri().notification_banner.is_expanded());
+    assert!(!f.synoik().notification_banner.is_expanded());
 
     // Hovering the shown banner expands it, revealing the action row.
     pointer_motion_to(&mut f, 960., 80.);
-    assert!(f.niri().notification_banner.is_expanded());
+    assert!(f.synoik().notification_banner.is_expanded());
 
     // Single action button: centered in the action row below the body block.
     let action_y = 36. + 6. + 24. + 6. + 48. + 6. + 14.;
@@ -7563,9 +7587,9 @@ fn notification_banner_action_click_emits_and_dismisses() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
-    assert!(f.niri().notifications.find(id).is_none());
+    assert!(f.synoik().notifications.find(id).is_none());
     match emitted.recv_blocking().unwrap() {
-        crate::notifications::NiriToNotifications::ActionInvoked {
+        crate::notifications::SynoikToNotifications::ActionInvoked {
             id: aid,
             action,
             token,
@@ -7579,7 +7603,7 @@ fn notification_banner_action_click_emits_and_dismisses() {
         _ => panic!("expected an ActionInvoked emission"),
     }
     match emitted.recv_blocking().unwrap() {
-        crate::notifications::NiriToNotifications::Closed { reason, .. } => {
+        crate::notifications::SynoikToNotifications::Closed { reason, .. } => {
             assert_eq!(reason.wire_code(), 2);
         }
         _ => panic!("expected a Closed emission"),
@@ -7597,31 +7621,31 @@ fn notification_banner_blocked_by_open_popover() {
 
     banner_notify(&mut f, banner_req("app", ":1.1"));
     f.settle_animations();
-    assert!(f.niri().notification_banner.is_visible());
+    assert!(f.synoik().notification_banner.is_visible());
 
     // Open the calendar via a clock click (panel y < banner y: no overlap).
     let x = clock_center_x(&mut f, 1920.);
     pointer_motion_to(&mut f, x, 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    assert!(f.niri().panel_popover.is_open());
+    assert!(f.synoik().panel_popover.is_open());
     f.settle_animations();
     f.settle_animations();
     assert!(
-        !f.niri().notification_banner.is_visible(),
+        !f.synoik().notification_banner.is_visible(),
         "banners are blocked while a popover is open"
     );
 
     // A notification arriving while blocked stays queued.
     let queued = banner_notify(&mut f, banner_req("other", ":1.2"));
-    assert!(!f.niri().notification_banner.is_visible());
+    assert!(!f.synoik().notification_banner.is_visible());
 
     // Closing the popover drains the queue.
     f.key_press(KEY_ESC);
     f.key_release(KEY_ESC);
     f.settle_animations();
     f.settle_animations();
-    assert_eq!(f.niri().notification_banner.content_id(), Some(queued));
+    assert_eq!(f.synoik().notification_banner.content_id(), Some(queued));
 }
 
 /// A banner shown while the user is idle never expires until their first
@@ -7635,19 +7659,19 @@ fn notification_banner_idle_gates_expiry() {
     tick(&mut f, 5000);
     let id = banner_notify(&mut f, banner_req("app", ":1.1"));
     f.settle_animations();
-    assert_eq!(f.niri().notification_banner.content_id(), Some(id));
+    assert_eq!(f.synoik().notification_banner.content_id(), Some(id));
 
     // Long past the normal timeout, still up: waiting for the user.
     tick(&mut f, 30_000);
     f.settle_animations();
-    assert!(f.niri().notification_banner.is_visible());
+    assert!(f.synoik().notification_banner.is_visible());
 
     // First activity arms the 2 s deadline.
     f.pointer_motion(1., 1.);
     tick(&mut f, 2500);
     f.settle_animations();
-    assert!(!f.niri().notification_banner.is_visible());
-    assert!(f.niri().notifications.find(id).is_some());
+    assert!(!f.synoik().notification_banner.is_visible());
+    assert!(f.synoik().notifications.find(id).is_some());
 }
 
 /// Activity while the banner is still sliding in also resolves the idle gate:
@@ -7662,15 +7686,15 @@ fn notification_banner_activity_during_show_arms_short_timeout() {
     // Idle at show time; activity arrives while the banner is still Showing.
     tick(&mut f, 5000);
     let id = banner_notify(&mut f, banner_req("app", ":1.1"));
-    assert!(f.niri().notification_banner.is_visible());
+    assert!(f.synoik().notification_banner.is_visible());
     f.pointer_motion(1., 1.);
     f.settle_animations();
-    assert_eq!(f.niri().notification_banner.content_id(), Some(id));
+    assert_eq!(f.synoik().notification_banner.content_id(), Some(id));
 
     // The short timeout applies — without the fix this waited forever.
     tick(&mut f, 2500);
     f.settle_animations();
-    assert!(!f.niri().notification_banner.is_visible());
+    assert!(!f.synoik().notification_banner.is_visible());
 }
 
 /// Open the calendar popover with a clock click.
@@ -7679,7 +7703,7 @@ fn open_calendar(f: &mut Fixture) {
     pointer_motion_to(f, x, 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    assert!(f.niri().panel_popover.is_open());
+    assert!(f.synoik().panel_popover.is_open());
 }
 
 /// Calendar events flow into the store through `on_calendar_events_msg`, the way
@@ -7688,7 +7712,7 @@ fn open_calendar(f: &mut Fixture) {
 /// `js/ui/calendar.js`, `js/ui/dateMenu.js`).
 #[test]
 fn calendar_events_flow_into_the_store() {
-    use crate::calendar_events::{CalendarEvent, CalendarToNiri};
+    use crate::calendar_events::{CalendarEvent, CalendarToSynoik};
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
@@ -7700,36 +7724,36 @@ fn calendar_events_flow_into_the_store() {
     };
 
     // No calendars yet → section hidden.
-    assert!(!f.niri().calendar_events.has_calendars());
-    f.niri_state()
-        .on_calendar_events_msg(CalendarToNiri::HasCalendars(true));
-    assert!(f.niri().calendar_events.has_calendars());
+    assert!(!f.synoik().calendar_events.has_calendars());
+    f.synoik_state()
+        .on_calendar_events_msg(CalendarToSynoik::HasCalendars(true));
+    assert!(f.synoik().calendar_events.has_calendars());
 
     // A batch lands in the store.
-    f.niri_state()
-        .on_calendar_events_msg(CalendarToNiri::EventsAddedOrUpdated(vec![
+    f.synoik_state()
+        .on_calendar_events_msg(CalendarToSynoik::EventsAddedOrUpdated(vec![
             ev("uid\n1", 100, 200),
             ev("uid\n2", 300, 400),
         ]));
-    assert_eq!(f.niri().calendar_events.events_for(0, 1000).len(), 2);
+    assert_eq!(f.synoik().calendar_events.events_for(0, 1000).len(), 2);
 
     // A removal is a prefix delete.
-    f.niri_state()
-        .on_calendar_events_msg(CalendarToNiri::EventsRemoved(vec!["uid\n1".into()]));
-    assert_eq!(f.niri().calendar_events.events_for(0, 1000).len(), 1);
+    f.synoik_state()
+        .on_calendar_events_msg(CalendarToSynoik::EventsRemoved(vec!["uid\n1".into()]));
+    assert_eq!(f.synoik().calendar_events.events_for(0, 1000).len(), 1);
 
     // A range change wipes the cache (the watcher sends this before the new
     // range loads) but keeps `has_calendars`.
-    f.niri_state()
-        .on_calendar_events_msg(CalendarToNiri::CacheReset);
-    assert!(f.niri().calendar_events.events_for(0, 1000).is_empty());
-    assert!(f.niri().calendar_events.has_calendars());
+    f.synoik_state()
+        .on_calendar_events_msg(CalendarToSynoik::CacheReset);
+    assert!(f.synoik().calendar_events.events_for(0, 1000).is_empty());
+    assert!(f.synoik().calendar_events.has_calendars());
 
     // The server vanishing clears the store and hides the section.
-    f.niri_state()
-        .on_calendar_events_msg(CalendarToNiri::OwnerVanished);
-    assert!(!f.niri().calendar_events.has_calendars());
-    assert!(f.niri().calendar_events.events_for(0, 1000).is_empty());
+    f.synoik_state()
+        .on_calendar_events_msg(CalendarToSynoik::OwnerVanished);
+    assert!(!f.synoik().calendar_events.has_calendars());
+    assert!(f.synoik().calendar_events.events_for(0, 1000).is_empty());
 }
 
 /// Opening the calendar asks the CalendarServer watcher to load exactly the
@@ -7737,18 +7761,18 @@ fn calendar_events_flow_into_the_store() {
 /// `requestRange`; paging re-runs the same `sync_calendar_range`).
 #[test]
 fn opening_the_calendar_requests_its_grid_range() {
-    use crate::calendar_events::NiriToCalendar;
+    use crate::calendar_events::SynoikToCalendar;
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     f.pointer_motion(1., 1.);
 
     let (tx, rx) = async_channel::unbounded();
-    f.niri_state().niri.calendar_range_emit = Some(tx);
+    f.synoik_state().synoik.calendar_range_emit = Some(tx);
 
     open_calendar(&mut f);
 
     let expected = f
-        .niri()
+        .synoik()
         .panel_popover
         .date_menu()
         .unwrap()
@@ -7756,7 +7780,7 @@ fn opening_the_calendar_requests_its_grid_range() {
         .grid_range();
     // The open path issued a range request for the shown grid.
     let mut last = None;
-    while let Ok(NiriToCalendar::SetRange { since, until }) = rx.try_recv() {
+    while let Ok(SynoikToCalendar::SetRange { since, until }) = rx.try_recv() {
         last = Some((since, until));
     }
     assert_eq!(
@@ -7780,30 +7804,33 @@ fn calendar_message_list_acks_on_open_once() {
     banner_notify(&mut f, banner_req("app-b", ":1.2"));
     f.settle_animations();
     // The first banner showed (acked); the second sits queued, unseen.
-    assert_eq!(f.niri().notifications.unseen_count(), 1);
-    assert!(!f.niri().notifications.banner_queue.is_empty());
+    assert_eq!(f.synoik().notifications.unseen_count(), 1);
+    assert!(!f.synoik().notifications.banner_queue.is_empty());
 
     open_calendar(&mut f);
     assert_eq!(
-        f.niri().notifications.unseen_count(),
+        f.synoik().notifications.unseen_count(),
         0,
         "opening the list acknowledges everything"
     );
     assert!(
-        f.niri().notifications.banner_queue.is_empty(),
+        f.synoik().notifications.banner_queue.is_empty(),
         "acked notifications drop out of the banner queue"
     );
     assert_eq!(
-        f.niri().panel_popover.date_menu().unwrap().list().len(),
+        f.synoik().panel_popover.date_menu().unwrap().list().len(),
         2,
         "the list snapshots the whole store"
     );
 
     // A notification arriving while open lands in the list WITHOUT an ack.
     let id3 = banner_notify(&mut f, banner_req("app-c", ":1.3"));
-    assert_eq!(f.niri().panel_popover.date_menu().unwrap().list().len(), 3);
     assert_eq!(
-        f.niri().notifications.unseen_count(),
+        f.synoik().panel_popover.date_menu().unwrap().list().len(),
+        3
+    );
+    assert_eq!(
+        f.synoik().notifications.unseen_count(),
         1,
         "arrivals while open stay unseen"
     );
@@ -7814,9 +7841,9 @@ fn calendar_message_list_acks_on_open_once() {
     f.key_release(KEY_ESC);
     f.settle_animations();
     f.settle_animations();
-    assert!(!f.niri().panel_popover.is_open());
+    assert!(!f.synoik().panel_popover.is_open());
     assert_eq!(
-        f.niri().notification_banner.content_id(),
+        f.synoik().notification_banner.content_id(),
         Some(id3),
         "the unseen notification banners after close"
     );
@@ -7833,7 +7860,7 @@ fn open_popover_suppresses_underlying_pointer_focus() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let id = f.add_client();
     // A large floating window covering the top-center where the popover opens.
     let _w = map_window_sized(&mut f, id, (1800, 1000), None);
@@ -7842,11 +7869,11 @@ fn open_popover_suppresses_underlying_pointer_focus() {
     let over_window = Point::<f64, Logical>::from((900., 120.));
     pointer_motion_to(&mut f, over_window.x, over_window.y);
     assert!(
-        f.niri().contents_under(over_window).surface.is_some(),
+        f.synoik().contents_under(over_window).surface.is_some(),
         "the window under the pointer normally receives pointer focus"
     );
     assert!(
-        f.niri()
+        f.synoik()
             .seat
             .get_pointer()
             .unwrap()
@@ -7859,19 +7886,19 @@ fn open_popover_suppresses_underlying_pointer_focus() {
 
     // A point over the open popover (which sits over the window) must NOT focus
     // the window, so the app can't set the cursor image there.
-    let origin = f.niri().panel_popover.content_location(&output);
+    let origin = f.synoik().panel_popover.content_location(&output);
     let over_popover = origin + Point::from((50., 50.));
     assert!(
-        f.niri().panel_popover.contains(&output, over_popover),
+        f.synoik().panel_popover.contains(&output, over_popover),
         "the sampled point is inside the popover content"
     );
     pointer_motion_to(&mut f, over_popover.x, over_popover.y);
     assert!(
-        f.niri().contents_under(over_popover).surface.is_none(),
+        f.synoik().contents_under(over_popover).surface.is_none(),
         "no window under the open popover receives pointer focus"
     );
     assert!(
-        f.niri()
+        f.synoik()
             .seat
             .get_pointer()
             .unwrap()
@@ -7896,16 +7923,16 @@ fn messages_indicator_reflects_unseen_and_dnd() {
     let mut low = banner_req("app", ":1.1");
     low.urgency = crate::notifications::Urgency::Low;
     banner_notify(&mut f, low);
-    assert!(!f.niri().notification_banner.is_visible());
+    assert!(!f.synoik().notification_banner.is_visible());
     assert!(
-        f.niri().panel.messages_indicator_visible(),
+        f.synoik().panel.messages_indicator_visible(),
         "an unseen low notification lights the dot"
     );
 
     // Opening the calendar acknowledges everything → the dot clears.
     open_calendar(&mut f);
     assert!(
-        !f.niri().panel.messages_indicator_visible(),
+        !f.synoik().panel.messages_indicator_visible(),
         "opening the list clears the dot"
     );
     f.key_press(KEY_ESC);
@@ -7914,11 +7941,11 @@ fn messages_indicator_reflects_unseen_and_dnd() {
 
     // Under DND, an unseen notification does NOT light the dot — GNOME gates the
     // indicator on `show-banners` (`js/ui/dateMenu.js:796-797`).
-    f.niri().gnome_settings.quick_toggles.do_not_disturb = true;
+    f.synoik().gnome_settings.quick_toggles.do_not_disturb = true;
     banner_notify(&mut f, banner_req("app", ":1.1"));
-    assert!(f.niri().notifications.unseen_count() > 0);
+    assert!(f.synoik().notifications.unseen_count() > 0);
     assert!(
-        !f.niri().panel.messages_indicator_visible(),
+        !f.synoik().panel.messages_indicator_visible(),
         "DND hides the dot even with unseen notifications"
     );
 }
@@ -7934,7 +7961,7 @@ fn calendar_message_list_click_close_body_and_clear() {
     f.add_output(1, (1920, 1080));
     f.pointer_motion(1., 1.);
     let (tx, emitted) = async_channel::unbounded();
-    f.niri().notifications_emit = Some(tx);
+    f.synoik().notifications_emit = Some(tx);
 
     // Three sources with distinct timestamps: a resident one, one with a
     // default action, one plain (newest).
@@ -7950,18 +7977,18 @@ fn calendar_message_list_click_close_body_and_clear() {
     f.settle_animations();
 
     open_calendar(&mut f);
-    let output = f.niri_output(1);
-    let origin = f.niri().panel_popover.content_location(&output);
+    let output = f.synoik_output(1);
+    let origin = f.synoik().panel_popover.content_location(&output);
     // All three cards are reachable now (the list scrolls); they render
     // newest-first.
-    let cards = f.niri().panel_popover.date_menu().unwrap().card_rects();
+    let cards = f.synoik().panel_popover.date_menu().unwrap().card_rects();
     assert_eq!(
         cards.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
         vec![pid, did, rid],
         "sources render newest-first; scrolling keeps every card reachable"
     );
     assert_eq!(
-        f.niri().panel_popover.date_menu().unwrap().list().len(),
+        f.synoik().panel_popover.date_menu().unwrap().list().len(),
         3,
         "the snapshot still holds everything"
     );
@@ -7978,11 +8005,14 @@ fn calendar_message_list_click_close_body_and_clear() {
     // Close the newest card: dismissed, gone from store and list; still open.
     let (_, _, close_rect) = cards[0];
     click(&mut f, rect_center(close_rect));
-    assert!(f.niri().notifications.find(pid).is_none());
-    assert_eq!(f.niri().panel_popover.date_menu().unwrap().list().len(), 2);
-    assert!(f.niri().panel_popover.is_open(), "the popover stays open");
+    assert!(f.synoik().notifications.find(pid).is_none());
+    assert_eq!(
+        f.synoik().panel_popover.date_menu().unwrap().list().len(),
+        2
+    );
+    assert!(f.synoik().panel_popover.is_open(), "the popover stays open");
     match emitted.recv_blocking().unwrap() {
-        crate::notifications::NiriToNotifications::Closed { id, reason, .. } => {
+        crate::notifications::SynoikToNotifications::Closed { id, reason, .. } => {
             assert_eq!((id, reason.wire_code()), (pid, 2), "Dismissed on the wire");
         }
         _ => panic!("expected a Closed emission"),
@@ -7991,15 +8021,15 @@ fn calendar_message_list_click_close_body_and_clear() {
     // Body-click the default-action card: ActionInvoked('default') unicast +
     // destroyed (non-resident) — and the popover CLOSES (activation drops the
     // menu, `js/ui/notificationDaemon.js:370-382`).
-    let cards = f.niri().panel_popover.date_menu().unwrap().card_rects();
+    let cards = f.synoik().panel_popover.date_menu().unwrap().card_rects();
     let (_, card, _) = cards[0];
     click(
         &mut f,
         smithay::utils::Point::from((card.loc.x + 30., card.loc.y + card.size.h - 10.)),
     );
-    assert!(f.niri().notifications.find(did).is_none());
+    assert!(f.synoik().notifications.find(did).is_none());
     match emitted.recv_blocking().unwrap() {
-        crate::notifications::NiriToNotifications::ActionInvoked {
+        crate::notifications::SynoikToNotifications::ActionInvoked {
             id, action, sender, ..
         } => {
             assert_eq!(id, did);
@@ -8011,7 +8041,7 @@ fn calendar_message_list_click_close_body_and_clear() {
     let _ = emitted.recv_blocking().unwrap(); // its Closed
     f.settle_animations();
     assert!(
-        !f.niri().panel_popover.is_open(),
+        !f.synoik().panel_popover.is_open(),
         "activating a notification closes the calendar"
     );
 
@@ -8019,45 +8049,45 @@ fn calendar_message_list_click_close_body_and_clear() {
     // destroys only non-resident notifications — it survives; the popover
     // closes here too.
     open_calendar(&mut f);
-    let origin = f.niri().panel_popover.content_location(&output);
+    let origin = f.synoik().panel_popover.content_location(&output);
     let click = |f: &mut Fixture, pos: smithay::utils::Point<f64, smithay::utils::Logical>| {
         pointer_motion_to(f, origin.x + pos.x, origin.y + pos.y);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
     };
-    let cards = f.niri().panel_popover.date_menu().unwrap().card_rects();
+    let cards = f.synoik().panel_popover.date_menu().unwrap().card_rects();
     let (_, card, _) = cards[0];
     click(
         &mut f,
         smithay::utils::Point::from((card.loc.x + 30., card.loc.y + card.size.h - 10.)),
     );
     assert!(
-        f.niri().notifications.find(rid).is_some(),
+        f.synoik().notifications.find(rid).is_some(),
         "a resident notification survives activation"
     );
     f.settle_animations();
-    assert!(!f.niri().panel_popover.is_open());
+    assert!(!f.synoik().panel_popover.is_open());
 
     // Clear: everything (resident included) closes; the placeholder is up.
     open_calendar(&mut f);
     let pill = f
-        .niri()
+        .synoik()
         .panel_popover
         .date_menu()
         .unwrap()
         .clear_pill_rect()
         .unwrap();
     click(&mut f, rect_center(pill));
-    assert!(f.niri().notifications.sources.is_empty());
+    assert!(f.synoik().notifications.sources.is_empty());
     assert!(f
-        .niri()
+        .synoik()
         .panel_popover
         .date_menu()
         .unwrap()
         .list()
         .is_empty());
     assert!(
-        f.niri().panel_popover.is_open(),
+        f.synoik().panel_popover.is_open(),
         "Clear keeps the popover open"
     );
 }
@@ -8075,7 +8105,7 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
     f.add_output(1, (1920, 1080));
     f.pointer_motion(1., 1.);
     let (tx, emitted) = async_channel::unbounded();
-    f.niri().notifications_emit = Some(tx);
+    f.synoik().notifications_emit = Some(tx);
 
     let mut req = banner_req("app-a", ":1.1");
     req.body = "a long body ".repeat(40).trim_end().to_owned();
@@ -8087,8 +8117,8 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
     f.settle_animations();
 
     open_calendar(&mut f);
-    let output = f.niri_output(1);
-    let origin = f.niri().panel_popover.content_location(&output);
+    let output = f.synoik_output(1);
+    let origin = f.synoik().panel_popover.content_location(&output);
     let click = |f: &mut Fixture, pos: smithay::utils::Point<f64, smithay::utils::Logical>| {
         pointer_motion_to(f, origin.x + pos.x, origin.y + pos.y);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
@@ -8098,15 +8128,15 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
         smithay::utils::Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.))
     };
     let dm = |f: &mut Fixture| {
-        let card = f.niri().panel_popover.date_menu().unwrap().card_rects()[0];
+        let card = f.synoik().panel_popover.date_menu().unwrap().card_rects()[0];
         let expand = f
-            .niri()
+            .synoik()
             .panel_popover
             .date_menu()
             .unwrap()
             .card_expand_rect(card.0);
         let actions = f
-            .niri()
+            .synoik()
             .panel_popover
             .date_menu()
             .unwrap()
@@ -8129,8 +8159,8 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
     // Caret click: the body wraps to its six-line budget and the action row
     // appears; the popover stays open, the store is untouched.
     click(&mut f, rect_center(caret));
-    assert!(f.niri().panel_popover.is_open());
-    assert!(f.niri().notifications.find(id).is_some());
+    assert!(f.synoik().panel_popover.is_open());
+    assert!(f.synoik().notifications.find(id).is_some());
     let ((_, card, _), expand, actions) = dm(&mut f);
     assert_eq!(
         card.size.h,
@@ -8143,7 +8173,7 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
     // A snapshot push while open (new notification) keeps the card expanded at
     // its full budget — the list scrolls to fit rather than clamping the body.
     banner_notify(&mut f, banner_req("app-b", ":1.2"));
-    let rects = f.niri().panel_popover.date_menu().unwrap().card_rects();
+    let rects = f.synoik().panel_popover.date_menu().unwrap().card_rects();
     assert_eq!(rects.len(), 2, "both cards visible");
     let (aid, a_card, _) = rects[1];
     assert_eq!(aid, id);
@@ -8155,17 +8185,17 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
 
     // Caret click again: collapse back to the flat card.
     let caret = f
-        .niri()
+        .synoik()
         .panel_popover
         .date_menu()
         .unwrap()
         .card_expand_rect(id)
         .unwrap();
     click(&mut f, rect_center(caret));
-    let rects = f.niri().panel_popover.date_menu().unwrap().card_rects();
+    let rects = f.synoik().panel_popover.date_menu().unwrap().card_rects();
     assert_eq!(rects[1].1.size.h, collapsed_h);
     assert!(f
-        .niri()
+        .synoik()
         .panel_popover
         .date_menu()
         .unwrap()
@@ -8176,7 +8206,7 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
     // unicast with a real token, the notification destroyed (non-resident),
     // and the popover closes (the app it raised takes over).
     let caret = f
-        .niri()
+        .synoik()
         .panel_popover
         .date_menu()
         .unwrap()
@@ -8185,21 +8215,21 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
     click(&mut f, rect_center(caret));
     // The expanded card's action row now sits below the second card, past the
     // fold — scroll the list down to bring it into view (as a user would).
-    f.niri().panel_popover.pointer_scroll(
+    f.synoik().panel_popover.pointer_scroll(
         &output,
         origin + smithay::utils::Point::from((30., 30.)),
         1000.,
     );
     let actions = f
-        .niri()
+        .synoik()
         .panel_popover
         .date_menu()
         .unwrap()
         .card_action_rects(id);
     click(&mut f, rect_center(actions[1]));
-    assert!(f.niri().notifications.find(id).is_none());
+    assert!(f.synoik().notifications.find(id).is_none());
     match emitted.recv_blocking().unwrap() {
-        crate::notifications::NiriToNotifications::ActionInvoked {
+        crate::notifications::SynoikToNotifications::ActionInvoked {
             id: aid,
             action,
             token,
@@ -8213,14 +8243,14 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
         _ => panic!("expected an ActionInvoked emission"),
     }
     match emitted.recv_blocking().unwrap() {
-        crate::notifications::NiriToNotifications::Closed { reason, .. } => {
+        crate::notifications::SynoikToNotifications::Closed { reason, .. } => {
             assert_eq!(reason.wire_code(), 2);
         }
         _ => panic!("expected a Closed emission"),
     }
     f.settle_animations();
     assert!(
-        !f.niri().panel_popover.is_open(),
+        !f.synoik().panel_popover.is_open(),
         "invoking an action closes the calendar"
     );
 }
@@ -8244,8 +8274,8 @@ fn calendar_message_list_groups_and_group_close() {
     f.settle_animations();
 
     open_calendar(&mut f);
-    let output = f.niri_output(1);
-    let origin = f.niri().panel_popover.content_location(&output);
+    let output = f.synoik_output(1);
+    let origin = f.synoik().panel_popover.content_location(&output);
     let click = |f: &mut Fixture, pos: Point<f64, Logical>| {
         pointer_motion_to(f, origin.x + pos.x, origin.y + pos.y);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
@@ -8254,14 +8284,14 @@ fn calendar_message_list_groups_and_group_close() {
     let rect_center = |r: Rectangle<f64, Logical>| {
         Point::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
     };
-    let groups = |f: &mut Fixture| f.niri().panel_popover.date_menu().unwrap().group_rects();
+    let groups = |f: &mut Fixture| f.synoik().panel_popover.date_menu().unwrap().group_rects();
 
     // Collapsed: one group, not expanded, no per-card interactive rects.
     let g = groups(&mut f);
     assert_eq!(g.len(), 1, "both notifications collapse into one stack");
     assert!(!g[0].2, "the stack starts collapsed");
     assert!(f
-        .niri()
+        .synoik()
         .panel_popover
         .date_menu()
         .unwrap()
@@ -8274,10 +8304,10 @@ fn calendar_message_list_groups_and_group_close() {
         &mut f,
         Point::from((bounds.loc.x + 20., bounds.loc.y + bounds.size.h - 6.)),
     );
-    assert!(f.niri().panel_popover.is_open());
+    assert!(f.synoik().panel_popover.is_open());
     assert!(groups(&mut f)[0].2, "clicking the stack expanded it");
     assert_eq!(
-        f.niri()
+        f.synoik()
             .panel_popover
             .date_menu()
             .unwrap()
@@ -8287,13 +8317,13 @@ fn calendar_message_list_groups_and_group_close() {
         "expanded: both cards individually interactive"
     );
     // Expanding is pure UI — the store is untouched.
-    assert!(f.niri().notifications.find(id1).is_some());
-    assert!(f.niri().notifications.find(id2).is_some());
+    assert!(f.synoik().notifications.find(id1).is_some());
+    assert!(f.synoik().notifications.find(id2).is_some());
 
     // The header collapse button fans it back to a stack.
     let key = groups(&mut f)[0].0.clone();
     let collapse = f
-        .niri()
+        .synoik()
         .panel_popover
         .date_menu()
         .unwrap()
@@ -8308,17 +8338,17 @@ fn calendar_message_list_groups_and_group_close() {
     // Closing the collapsed stack closes the WHOLE group.
     let key = groups(&mut f)[0].0.clone();
     let stack_close = f
-        .niri()
+        .synoik()
         .panel_popover
         .date_menu()
         .unwrap()
         .stack_close_rect(&key)
         .expect("collapsed stack has a top-card close");
     click(&mut f, rect_center(stack_close));
-    assert!(f.niri().notifications.find(id1).is_none());
-    assert!(f.niri().notifications.find(id2).is_none());
+    assert!(f.synoik().notifications.find(id1).is_none());
+    assert!(f.synoik().notifications.find(id2).is_none());
     assert!(
-        f.niri()
+        f.synoik()
             .panel_popover
             .date_menu()
             .unwrap()
@@ -8327,7 +8357,7 @@ fn calendar_message_list_groups_and_group_close() {
         "closing the group empties the list"
     );
     assert!(
-        f.niri().panel_popover.is_open(),
+        f.synoik().panel_popover.is_open(),
         "a group close keeps the popover open"
     );
 }
@@ -8345,19 +8375,19 @@ fn notification_banner_hover_expand_and_under_pointer_guard() {
     pointer_motion_to(&mut f, 960., 80.);
     banner_notify(&mut f, banner_req("app", ":1.1"));
     f.settle_animations();
-    assert!(!f.niri().notification_banner.is_expanded());
+    assert!(!f.synoik().notification_banner.is_expanded());
 
     // Hovering in place (it popped up under us) must NOT expand.
     pointer_motion_to(&mut f, 961., 80.);
     assert!(
-        !f.niri().notification_banner.is_expanded(),
+        !f.synoik().notification_banner.is_expanded(),
         "popped-under-pointer: hover without leaving first doesn't expand"
     );
 
     // Leave, come back: now it expands.
     pointer_motion_to(&mut f, 960., 400.);
     pointer_motion_to(&mut f, 960., 80.);
-    assert!(f.niri().notification_banner.is_expanded());
+    assert!(f.synoik().notification_banner.is_expanded());
 }
 
 /// A pointer that moves onto the banner DURING the slide-in registers as
@@ -8372,11 +8402,11 @@ fn notification_banner_hover_during_slide_expands_when_shown() {
     banner_notify(&mut f, banner_req("app", ":1.1"));
     // Mid-slide: move onto the banner's area and stop.
     pointer_motion_to(&mut f, 960., 80.);
-    assert!(!f.niri().notification_banner.is_expanded());
+    assert!(!f.synoik().notification_banner.is_expanded());
 
     f.settle_animations();
     assert!(
-        f.niri().notification_banner.is_expanded(),
+        f.synoik().notification_banner.is_expanded(),
         "the settled pointer expands the banner at the Showing→Shown transition"
     );
 }
@@ -8394,17 +8424,17 @@ fn notification_banner_critical_auto_expands() {
     req.actions = vec![("ok".to_owned(), "OK".to_owned())];
     banner_notify(&mut f, req);
     assert!(
-        f.niri().notification_banner.is_expanded(),
+        f.synoik().notification_banner.is_expanded(),
         "critical expands at show, before any hover"
     );
     f.settle_animations();
 
     // The action row is present in the hit-test (short body: one line, so the
     // row sits right below the 48px body block).
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let action_pos = smithay::utils::Point::from((960., 36. + 6. + 24. + 6. + 48. + 6. + 14.));
     assert_eq!(
-        f.niri().notification_banner.hit_test(&output, action_pos),
+        f.synoik().notification_banner.hit_test(&output, action_pos),
         Some(crate::ui::notification_banner::BannerHit::Action(0))
     );
 }
@@ -8422,17 +8452,17 @@ fn app_system_is_disconnected_and_injectable_headless() {
 
     let mut f = Fixture::new();
     assert_eq!(
-        f.niri().app_system.installed().count(),
+        f.synoik().app_system.installed().count(),
         0,
         "headless AppSystem must be inert"
     );
-    assert!(f.niri().app_system.favorites().is_empty());
+    assert!(f.synoik().app_system.favorites().is_empty());
 
     let recorder = RecordingLauncher::default();
     let catalog = FakeCatalog::new(vec![AppEntry::fake("org.example.App.desktop", "App")]);
-    f.niri().app_system = AppSystem::with_parts(Box::new(catalog), Box::new(recorder.clone()));
+    f.synoik().app_system = AppSystem::with_parts(Box::new(catalog), Box::new(recorder.clone()));
 
-    f.niri()
+    f.synoik()
         .app_system
         .launch(
             "org.example.App.desktop",
@@ -8463,15 +8493,15 @@ fn dash_fixture(favorites: &[&str]) -> (Fixture, crate::app_system::RecordingLau
         .iter()
         .map(|id| AppEntry::fake(id, id))
         .collect::<Vec<_>>();
-    f.niri().app_system =
+    f.synoik().app_system =
         AppSystem::with_parts(Box::new(FakeCatalog::new(apps)), Box::new(recorder.clone()));
-    f.niri()
+    f.synoik()
         .app_system
         .set_favorites(favorites.iter().map(|s| s.to_string()).collect());
-    f.niri().sync_dash_favorites();
+    f.synoik().sync_dash_favorites();
 
-    f.niri_state().do_action(Action::OpenOverview, false);
-    assert!(f.niri().layout.is_overview_open(), "overview must open");
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    assert!(f.synoik().layout.is_overview_open(), "overview must open");
 
     (f, recorder)
 }
@@ -8479,8 +8509,8 @@ fn dash_fixture(favorites: &[&str]) -> (Fixture, crate::app_system::RecordingLau
 /// The overview chrome's allocated boxes on output 1 — the same
 /// `ControlsManagerLayout` the render and input paths consume.
 fn overview_controls(f: &mut Fixture) -> crate::ui::overview_layout::ControlsLayout {
-    let output = f.niri_output(1);
-    f.niri()
+    let output = f.synoik_output(1);
+    f.synoik()
         .layout
         .controls_layout_for_output(&output)
         .expect("output 1 has a monitor")
@@ -8492,7 +8522,7 @@ fn dash_tile_center(
     i: usize,
 ) -> smithay::utils::Point<f64, smithay::utils::Logical> {
     let area = overview_controls(f).dash;
-    f.niri()
+    f.synoik()
         .dash
         .tile_center(i, area)
         .expect("tile index in range")
@@ -8508,50 +8538,53 @@ fn dash_tile_center(
 /// (`screenShield.js:586-616`), which is what a blanked screen with `lock-enabled = false` is.
 #[test]
 fn the_screen_saver_bus_calls_drive_the_shield() {
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    assert!(!f.niri().screen_shield.is_active(), "starts up");
+    assert!(!f.synoik().screen_shield.is_active(), "starts up");
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(true));
-    assert!(f.niri().screen_shield.is_active(), "SetActive(true) blanks");
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
     assert!(
-        !f.niri().screen_shield.is_locked(),
+        f.synoik().screen_shield.is_active(),
+        "SetActive(true) blanks"
+    );
+    assert!(
+        !f.synoik().screen_shield.is_locked(),
         "...but the screensaver is not a lock"
     );
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(false));
-    assert!(!f.niri().screen_shield.is_active());
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(false));
+    assert!(!f.synoik().screen_shield.is_active());
 
     // `Lock` also puts the shield down — the difference is what it takes to raise it.
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    assert!(f.niri().screen_shield.is_active(), "Lock blanks too");
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    assert!(f.synoik().screen_shield.is_active(), "Lock blanks too");
 
     // The snapshot the bus reads deliberately lags the model: `active` is not published until the
     // curtain has landed, so the slide is not replaced by whatever gsd-power does on
     // `ActiveChanged` (our divergence from GNOME's beat — see `lock-screen-backlog.md` item H).
     assert!(
-        !f.niri().shield_snapshot.lock().unwrap().active,
+        !f.synoik().shield_snapshot.lock().unwrap().active,
         "GetActive must not claim the screensaver is up while the curtain is still sliding"
     );
 
-    f.niri().lock_screen.settle();
-    f.niri().publish_shield_active();
+    f.synoik().lock_screen.settle();
+    f.synoik().publish_shield_active();
     assert!(
-        f.niri().shield_snapshot.lock().unwrap().active,
+        f.synoik().shield_snapshot.lock().unwrap().active,
         "...and must say so the moment it lands, or gsd never blanks at all"
     );
 
     // Raising it publishes at once — there is nothing to wait for on the way out.
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(false));
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(false));
     assert!(
-        !f.niri().shield_snapshot.lock().unwrap().active,
+        !f.synoik().shield_snapshot.lock().unwrap().active,
         "unlocking must stop claiming the screensaver is on immediately"
     );
 }
@@ -8566,28 +8599,31 @@ fn the_screen_saver_bus_calls_drive_the_shield() {
 /// exactly the bug that locks a desktop the user is sitting at.
 #[test]
 fn going_idle_arms_the_lock_and_coming_back_disarms_it() {
-    use crate::dbus::gnome_session_presence::{PresenceStatus, PresenceToNiri};
+    use crate::dbus::gnome_session_presence::{PresenceStatus, PresenceToSynoik};
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state()
-        .on_presence_msg(PresenceToNiri::StatusChanged(PresenceStatus::Idle));
+    f.synoik_state()
+        .on_presence_msg(PresenceToSynoik::StatusChanged(PresenceStatus::Idle));
     assert!(
-        !f.niri().screen_shield.is_active(),
+        !f.synoik().screen_shield.is_active(),
         "idle fades to black first; it does not cover"
     );
-    assert!(f.niri().fade_timer.is_some(), "the fade is running");
-    assert!(f.niri().lock_timer.is_some(), "and so is the grace period");
-
-    f.niri_state()
-        .on_presence_msg(PresenceToNiri::StatusChanged(PresenceStatus::Available));
+    assert!(f.synoik().fade_timer.is_some(), "the fade is running");
     assert!(
-        f.niri().fade_timer.is_none(),
+        f.synoik().lock_timer.is_some(),
+        "and so is the grace period"
+    );
+
+    f.synoik_state()
+        .on_presence_msg(PresenceToSynoik::StatusChanged(PresenceStatus::Available));
+    assert!(
+        f.synoik().fade_timer.is_none(),
         "coming back drops the fade..."
     );
     assert!(
-        f.niri().lock_timer.is_none(),
+        f.synoik().lock_timer.is_none(),
         "...and the pending lock with it, or the desktop locks under the user"
     );
 }
@@ -8600,19 +8636,22 @@ fn going_idle_arms_the_lock_and_coming_back_disarms_it() {
 /// D-Bus or a gdm that failed to start.
 #[test]
 fn a_lock_with_no_verifier_to_ask_stays_a_screensaver() {
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     // What a build without D-Bus, or a gdm client that failed to start, actually looks like.
-    f.niri_state().niri.gdm_requests = None;
+    f.synoik_state().synoik.gdm_requests = None;
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    assert!(f.niri().screen_shield.is_active(), "the screen is covered");
-    assert!(!f.niri().screen_shield.is_locked(), "but never locked");
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
     assert!(
-        f.niri().screen_shield.is_dismissible(),
+        f.synoik().screen_shield.is_active(),
+        "the screen is covered"
+    );
+    assert!(!f.synoik().screen_shield.is_locked(), "but never locked");
+    assert!(
+        f.synoik().screen_shield.is_dismissible(),
         "and raising it must not wait on an answer nobody will send"
     );
 }
@@ -8623,16 +8662,16 @@ fn a_lock_with_no_verifier_to_ask_stays_a_screensaver() {
 /// the screen for a reason nobody chose.
 #[test]
 fn an_unknown_presence_status_does_not_blank_the_screen() {
-    use crate::dbus::gnome_session_presence::{PresenceStatus, PresenceToNiri};
+    use crate::dbus::gnome_session_presence::{PresenceStatus, PresenceToSynoik};
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state()
-        .on_presence_msg(PresenceToNiri::StatusChanged(PresenceStatus::Unknown(42)));
-    assert!(!f.niri().screen_shield.is_active());
-    assert!(f.niri().lock_timer.is_none());
-    assert!(f.niri().fade_timer.is_none(), "and nothing starts fading");
+    f.synoik_state()
+        .on_presence_msg(PresenceToSynoik::StatusChanged(PresenceStatus::Unknown(42)));
+    assert!(!f.synoik().screen_shield.is_active());
+    assert!(f.synoik().lock_timer.is_none());
+    assert!(f.synoik().fade_timer.is_none(), "and nothing starts fading");
 }
 
 /// logind's `PrepareForSleep(true)` locks before the machine goes down, with no grace period.
@@ -8642,23 +8681,23 @@ fn an_unknown_presence_status_does_not_blank_the_screen() {
 /// deferred to a timer would run after the suspend.
 #[test]
 fn suspending_covers_the_screen_immediately() {
-    use crate::dbus::freedesktop_login1::Login1ToNiri;
+    use crate::dbus::freedesktop_login1::Login1ToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state()
-        .on_login1_msg(Login1ToNiri::PrepareForSleep(true));
-    assert!(f.niri().screen_shield.is_active());
+    f.synoik_state()
+        .on_login1_msg(Login1ToSynoik::PrepareForSleep(true));
+    assert!(f.synoik().screen_shield.is_active());
     assert!(
-        f.niri().lock_timer.is_none(),
+        f.synoik().lock_timer.is_none(),
         "a suspend has no grace period"
     );
 
     // Resuming wakes the screen but leaves the shield where it is.
-    f.niri_state()
-        .on_login1_msg(Login1ToNiri::PrepareForSleep(false));
-    assert!(f.niri().screen_shield.is_active());
+    f.synoik_state()
+        .on_login1_msg(Login1ToSynoik::PrepareForSleep(false));
+    assert!(f.synoik().screen_shield.is_active());
 }
 
 /// `disable-lock-screen` makes `Lock` a no-op — the shield does not even go down.
@@ -8668,27 +8707,27 @@ fn suspending_covers_the_screen_immediately() {
 /// whose administrator disabled locking.
 #[test]
 fn lockdown_makes_the_screen_saver_lock_a_no_op() {
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri()
+    f.synoik()
         .screen_shield
         .set_settings(crate::screen_shield::ShieldSettings {
             disable_lock_screen: true,
             ..Default::default()
         });
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    assert!(!f.niri().screen_shield.is_active());
-    assert!(!f.niri().shield_snapshot.lock().unwrap().active);
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    assert!(!f.synoik().screen_shield.is_active());
+    assert!(!f.synoik().shield_snapshot.lock().unwrap().active);
 
     // `SetActive` is a different call and is *not* gated by lockdown — the screensaver still
     // blanks, it just never becomes a lock.
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(true));
-    assert!(f.niri().screen_shield.is_active());
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
+    assert!(f.synoik().screen_shield.is_active());
 }
 
 /// Input while the shield is down raises it, and goes no further.
@@ -8700,38 +8739,38 @@ fn lockdown_makes_the_screen_saver_lock_a_no_op() {
 /// the Super tap did not open the overview".
 #[test]
 fn input_raises_the_shield_instead_of_reaching_the_desktop() {
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(true));
-    assert!(f.niri().screen_shield.is_active());
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
+    assert!(f.synoik().screen_shield.is_active());
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        !f.niri().screen_shield.is_active(),
+        !f.synoik().screen_shield.is_active(),
         "a key press raises the shield"
     );
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "and the key that raised it must not also have reached the desktop's binds"
     );
     assert!(
-        !f.niri().shield_snapshot.lock().unwrap().active,
+        !f.synoik().shield_snapshot.lock().unwrap().active,
         "GetActive follows the dismissal too"
     );
 
     // A second tap now behaves normally — the shield is not swallowing input forever.
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "with the shield up, Super works again"
     );
 }
@@ -8742,7 +8781,7 @@ fn input_raises_the_shield_instead_of_reaching_the_desktop() {
 /// pressed — which is how a dismissing click ends up activating a panel button behind the curtain.
 #[test]
 fn a_click_raises_the_shield_and_neither_edge_reaches_the_desktop() {
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
@@ -8750,19 +8789,19 @@ fn a_click_raises_the_shield_and_neither_edge_reaches_the_desktop() {
     // Park the pointer over the panel's Activities corner, whose click opens the overview — the
     // observable thing a leaked edge would trigger.
     pointer_motion_to(&mut f, 10., 10.);
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::SetActive(true));
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
 
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        !f.niri().screen_shield.is_active(),
+        !f.synoik().screen_shield.is_active(),
         "a click raises the shield"
     );
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "and neither the press nor the release reached the panel behind it"
     );
 }
@@ -8775,7 +8814,7 @@ fn a_click_raises_the_shield_and_neither_edge_reaches_the_desktop() {
 #[test]
 fn a_locked_shield_takes_a_password_and_gdm_decides() {
     use crate::dbus::gdm::{VerifierEvent, VerifierRequest};
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
     use crate::unlock_dialog::{Page, Status};
 
     let mut f = Fixture::new();
@@ -8783,69 +8822,72 @@ fn a_locked_shield_takes_a_password_and_gdm_decides() {
 
     // `Lock` covers the screen at once, but must NOT claim to be locked — nothing can unlock it
     // until gdm answers.
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    assert!(f.niri().screen_shield.is_active(), "the screen is covered");
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
     assert!(
-        !f.niri().screen_shield.is_locked(),
+        f.synoik().screen_shield.is_active(),
+        "the screen is covered"
+    );
+    assert!(
+        !f.synoik().screen_shield.is_locked(),
         "not locked until a verifier exists"
     );
 
     // gdm opens the channel. `epoch` is whatever the shield asked under; the model owns it, so
     // read it back rather than assuming 1.
     let epoch = 1;
-    f.niri_state()
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::Ready(epoch));
     assert!(
-        f.niri().screen_shield.is_locked(),
+        f.synoik().screen_shield.is_locked(),
         "a live channel is what locks it"
     );
 
     // ...and it asks for the password.
-    f.niri_state()
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
             question: "Password:".to_owned(),
             secret: true,
         });
 
     // A key on the clock page raises the prompt AND is kept.
-    assert_eq!(f.niri().unlock_dialog.page(), Page::Clock);
+    assert_eq!(f.synoik().unlock_dialog.page(), Page::Clock);
     tap(&mut f, KEY_A);
-    assert_eq!(f.niri().unlock_dialog.page(), Page::Prompt);
+    assert_eq!(f.synoik().unlock_dialog.page(), Page::Prompt);
     assert_eq!(
-        f.niri().unlock_dialog.entry_display(),
+        f.synoik().unlock_dialog.entry_display(),
         "\u{25cf}",
         "the first keystroke is not eaten by the page flip, and it is masked"
     );
 
     tap(&mut f, KEY_T);
-    assert_eq!(f.niri().unlock_dialog.entry_display(), "\u{25cf}\u{25cf}");
+    assert_eq!(f.synoik().unlock_dialog.entry_display(), "\u{25cf}\u{25cf}");
 
     // Backspace, then Return sends the answer.
     tap(&mut f, KEY_BACKSPACE);
-    assert_eq!(f.niri().unlock_dialog.entry_display(), "\u{25cf}");
+    assert_eq!(f.synoik().unlock_dialog.entry_display(), "\u{25cf}");
     tap(&mut f, KEY_ENTER);
-    assert_eq!(f.niri().unlock_dialog.status(), Status::Answered);
+    assert_eq!(f.synoik().unlock_dialog.status(), Status::Answered);
     assert_eq!(
-        f.niri().unlock_dialog.entry_display(),
+        f.synoik().unlock_dialog.entry_display(),
         "",
         "the buffer does not outlive the answer"
     );
 
     // A refusal keeps the shield down and lets the user try again.
-    f.niri_state().on_verifier_event(VerifierEvent::Failed);
-    assert!(f.niri().screen_shield.is_locked(), "still locked");
-    f.niri_state()
+    f.synoik_state().on_verifier_event(VerifierEvent::Failed);
+    assert!(f.synoik().screen_shield.is_locked(), "still locked");
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
             question: "Password:".to_owned(),
             secret: true,
         });
-    assert!(f.niri().unlock_dialog.is_entry_live(), "and can retry");
+    assert!(f.synoik().unlock_dialog.is_entry_live(), "and can retry");
 
     // Only gdm's verdict raises it.
-    f.niri_state().on_verifier_event(VerifierEvent::Complete);
-    assert!(!f.niri().screen_shield.is_locked());
-    assert!(!f.niri().screen_shield.is_active(), "the shield is up");
+    f.synoik_state().on_verifier_event(VerifierEvent::Complete);
+    assert!(!f.synoik().screen_shield.is_locked());
+    assert!(!f.synoik().screen_shield.is_active(), "the shield is up");
     let _ = VerifierRequest::Cancel;
 }
 
@@ -8863,16 +8905,16 @@ fn a_locked_shield_takes_a_password_and_gdm_decides() {
 #[test]
 fn leaving_the_prompt_animates_and_survives_the_unlock() {
     use crate::dbus::gdm::VerifierEvent;
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
     use crate::unlock_dialog::Page;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    f.niri_state()
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
             question: "Password:".to_owned(),
             secret: true,
@@ -8880,20 +8922,24 @@ fn leaving_the_prompt_animates_and_survives_the_unlock() {
 
     // Onto the prompt, and let the crossfade finish so the return trip starts from a clean 1.
     tap(&mut f, KEY_A);
-    assert_eq!(f.niri().unlock_dialog.page(), Page::Prompt);
-    f.niri().lock_screen.settle_page();
+    assert_eq!(f.synoik().unlock_dialog.page(), Page::Prompt);
+    f.synoik().lock_screen.settle_page();
     let now = crate::utils::get_monotonic_time();
-    assert_eq!(f.niri().lock_screen.page_progress(now), 1., "on the prompt");
+    assert_eq!(
+        f.synoik().lock_screen.page_progress(now),
+        1.,
+        "on the prompt"
+    );
 
     // Escape goes back to the clock — as an animation, not a jump.
     tap(&mut f, KEY_ESC);
-    assert_eq!(f.niri().unlock_dialog.page(), Page::Clock);
+    assert_eq!(f.synoik().unlock_dialog.page(), Page::Clock);
     let now = crate::utils::get_monotonic_time();
     assert!(
-        f.niri().lock_screen.page_is_animating(now),
+        f.synoik().lock_screen.page_is_animating(now),
         "the way back owes frames"
     );
-    let back = f.niri().lock_screen.page_progress(now);
+    let back = f.synoik().lock_screen.page_progress(now);
     assert!(
         back > 0.,
         "the clock fades in from where the prompt was, it does not cut: {back}"
@@ -8901,18 +8947,18 @@ fn leaving_the_prompt_animates_and_survives_the_unlock() {
 
     // Now unlock from the prompt. The page must stay put: the curtain carries it out.
     tap(&mut f, KEY_A);
-    assert_eq!(f.niri().unlock_dialog.page(), Page::Prompt);
-    f.niri().lock_screen.settle_page();
-    f.niri_state().on_verifier_event(VerifierEvent::Complete);
-    assert!(!f.niri().screen_shield.is_active(), "the shield is up");
+    assert_eq!(f.synoik().unlock_dialog.page(), Page::Prompt);
+    f.synoik().lock_screen.settle_page();
+    f.synoik_state().on_verifier_event(VerifierEvent::Complete);
+    assert!(!f.synoik().screen_shield.is_active(), "the shield is up");
 
     let now = crate::utils::get_monotonic_time();
     assert!(
-        f.niri().lock_screen.is_covering(now),
+        f.synoik().lock_screen.is_covering(now),
         "but the curtain is still sliding away"
     );
     assert_eq!(
-        f.niri().lock_screen.page_progress(now),
+        f.synoik().lock_screen.page_progress(now),
         1.,
         "and it takes the prompt with it, rather than flipping to the clock mid-slide"
     );
@@ -8927,7 +8973,7 @@ fn leaving_the_prompt_animates_and_survives_the_unlock() {
 /// (`:440-445`) and a refused lock never reaches the emit.
 #[test]
 fn lock_answers_its_caller_only_once_the_shield_is_up() {
-    use crate::dbus::gnome_screen_saver::{LockReply, ScreenSaverToNiri};
+    use crate::dbus::gnome_screen_saver::{LockReply, ScreenSaverToSynoik};
 
     /// Poll the caller's side of the reply channel without blocking.
     fn answered(rx: &async_channel::Receiver<()>) -> bool {
@@ -8939,16 +8985,16 @@ fn lock_answers_its_caller_only_once_the_shield_is_up() {
 
     // --- A lock from a bare screen waits for the curtain to land. ---
     let (tx, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(Some(LockReply::for_test(tx))));
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(Some(LockReply::for_test(tx))));
     assert!(
         !answered(&rx),
         "answered while the curtain was still on its way down"
     );
 
     // The slide finishing is what answers. Settling stands in for the 250 ms.
-    f.niri().lock_screen.settle();
-    f.niri().settle_lock_replies();
+    f.synoik().lock_screen.settle();
+    f.synoik().settle_lock_replies();
     assert!(
         answered(&rx),
         "the shield is up and the caller is still waiting"
@@ -8956,8 +9002,8 @@ fn lock_answers_its_caller_only_once_the_shield_is_up() {
 
     // --- A second lock, with the screen already covered, answers at once. ---
     let (tx2, rx2) = async_channel::bounded(1);
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(Some(LockReply::for_test(tx2))));
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(Some(LockReply::for_test(tx2))));
     assert!(
         answered(&rx2),
         "a lock at an already-covered screen must not wait for an edge that cannot come"
@@ -8966,14 +9012,14 @@ fn lock_answers_its_caller_only_once_the_shield_is_up() {
     // --- A refused lock answers rather than hanging. ---
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let mut settings = f.niri().screen_shield.settings();
+    let mut settings = f.synoik().screen_shield.settings();
     settings.disable_lock_screen = true;
-    f.niri().screen_shield.set_settings(settings);
+    f.synoik().screen_shield.set_settings(settings);
 
     let (tx3, rx3) = async_channel::bounded(1);
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(Some(LockReply::for_test(tx3))));
-    assert!(!f.niri().screen_shield.is_active(), "lockdown refused it");
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(Some(LockReply::for_test(tx3))));
+    assert!(!f.synoik().screen_shield.is_active(), "lockdown refused it");
     assert!(
         answered(&rx3),
         "a refused lock left its caller waiting for a screen that will never be covered"
@@ -8993,15 +9039,15 @@ fn lock_answers_its_caller_only_once_the_shield_is_up() {
 #[test]
 fn caps_lock_warns_on_the_password_prompt_only() {
     use crate::dbus::gdm::VerifierEvent;
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    f.niri_state()
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
             question: "Password:".to_owned(),
             secret: true,
@@ -9009,10 +9055,10 @@ fn caps_lock_warns_on_the_password_prompt_only() {
 
     // Caps lock on the *clock* page warns about nothing: there is no entry yet.
     tap(&mut f, KEY_CAPSLOCK);
-    f.niri().lock_screen.settle_caps();
+    f.synoik().lock_screen.settle_caps();
     let now = get_monotonic_time();
     assert_eq!(
-        f.niri().lock_screen.caps_alpha(now),
+        f.synoik().lock_screen.caps_alpha(now),
         0.,
         "no warning on the clock page"
     );
@@ -9021,34 +9067,38 @@ fn caps_lock_warns_on_the_password_prompt_only() {
     // the state is already on, and GNOME reads the keymap rather than waiting for an event.
     tap(&mut f, KEY_A);
     assert_eq!(
-        f.niri().unlock_dialog.page(),
+        f.synoik().unlock_dialog.page(),
         crate::unlock_dialog::Page::Prompt
     );
-    f.niri().lock_screen.settle_caps();
+    f.synoik().lock_screen.settle_caps();
     let now = get_monotonic_time();
     assert_eq!(
-        f.niri().lock_screen.caps_alpha(now),
+        f.synoik().lock_screen.caps_alpha(now),
         1.,
         "caps is on and the question is secret"
     );
 
     // Turning it off takes the warning with it.
     tap(&mut f, KEY_CAPSLOCK);
-    f.niri().lock_screen.settle_caps();
+    f.synoik().lock_screen.settle_caps();
     let now = get_monotonic_time();
-    assert_eq!(f.niri().lock_screen.caps_alpha(now), 0., "caps lock is off");
+    assert_eq!(
+        f.synoik().lock_screen.caps_alpha(now),
+        0.,
+        "caps lock is off"
+    );
 
     // A non-secret question gets no warning even with caps on.
     tap(&mut f, KEY_CAPSLOCK);
-    f.niri_state()
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
             question: "Username:".to_owned(),
             secret: false,
         });
-    f.niri().lock_screen.settle_caps();
+    f.synoik().lock_screen.settle_caps();
     let now = get_monotonic_time();
     assert_eq!(
-        f.niri().lock_screen.caps_alpha(now),
+        f.synoik().lock_screen.caps_alpha(now),
         0.,
         "a username question cannot be mangled by caps lock"
     );
@@ -9064,7 +9114,7 @@ fn caps_lock_warns_on_the_password_prompt_only() {
 #[test]
 fn the_caps_warning_is_right_without_a_keystroke() {
     use crate::dbus::gdm::VerifierEvent;
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
@@ -9072,49 +9122,49 @@ fn the_caps_warning_is_right_without_a_keystroke() {
     // Caps lock goes on while the session is *unlocked*, so the shield never sees the key.
     tap(&mut f, KEY_CAPSLOCK);
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    f.niri_state()
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
             question: "Password:".to_owned(),
             secret: true,
         });
 
     // Raise the prompt by clicking, not typing.
-    f.niri_state()
+    f.synoik_state()
         .on_shield_click(smithay::utils::Point::from((960., 540.)));
     assert_eq!(
-        f.niri().unlock_dialog.page(),
+        f.synoik().unlock_dialog.page(),
         crate::unlock_dialog::Page::Prompt
     );
-    f.niri().lock_screen.settle_caps();
+    f.synoik().lock_screen.settle_caps();
     let now = get_monotonic_time();
     assert_eq!(
-        f.niri().lock_screen.caps_alpha(now),
+        f.synoik().lock_screen.caps_alpha(now),
         1.,
         "caps was on before the shield existed, and clicking is not a keystroke"
     );
 
     // Unlock, turn caps off while unlocked, lock again, and click.
-    f.niri_state().on_verifier_event(VerifierEvent::Complete);
-    assert!(!f.niri().screen_shield.is_active());
+    f.synoik_state().on_verifier_event(VerifierEvent::Complete);
+    assert!(!f.synoik().screen_shield.is_active());
     tap(&mut f, KEY_CAPSLOCK);
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(2));
-    f.niri_state()
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(2));
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
             question: "Password:".to_owned(),
             secret: true,
         });
-    f.niri_state()
+    f.synoik_state()
         .on_shield_click(smithay::utils::Point::from((960., 540.)));
-    f.niri().lock_screen.settle_caps();
+    f.synoik().lock_screen.settle_caps();
     let now = get_monotonic_time();
     assert_eq!(
-        f.niri().lock_screen.caps_alpha(now),
+        f.synoik().lock_screen.caps_alpha(now),
         0.,
         "caps went off while unlocked; a warning here is a lie"
     );
@@ -9128,29 +9178,29 @@ fn the_caps_warning_is_right_without_a_keystroke() {
 #[test]
 fn shift_and_caps_do_not_wake_the_prompt() {
     use crate::dbus::gdm::VerifierEvent;
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
     use crate::unlock_dialog::Page;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    f.niri_state()
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
         .on_verifier_event(VerifierEvent::AskQuestion {
             question: "Password:".to_owned(),
             secret: true,
         });
 
     tap(&mut f, KEY_LEFTSHIFT);
-    assert_eq!(f.niri().unlock_dialog.page(), Page::Clock, "shift waits");
+    assert_eq!(f.synoik().unlock_dialog.page(), Page::Clock, "shift waits");
     tap(&mut f, KEY_CAPSLOCK);
-    assert_eq!(f.niri().unlock_dialog.page(), Page::Clock, "so does caps");
+    assert_eq!(f.synoik().unlock_dialog.page(), Page::Clock, "so does caps");
 
     // Ctrl is not in GNOME's list: it raises the prompt like any other key.
     tap(&mut f, KEY_LEFTCTRL);
     assert_eq!(
-        f.niri().unlock_dialog.page(),
+        f.synoik().unlock_dialog.page(),
         Page::Prompt,
         "ctrl is not one of the four, so it wakes the prompt"
     );
@@ -9164,26 +9214,26 @@ fn shift_and_caps_do_not_wake_the_prompt() {
 #[test]
 fn a_locked_shield_swallows_keys_instead_of_raising() {
     use crate::dbus::gdm::VerifierEvent;
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    assert!(f.niri().screen_shield.is_locked());
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    assert!(f.synoik().screen_shield.is_locked());
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        f.niri().screen_shield.is_active(),
+        f.synoik().screen_shield.is_active(),
         "a locked shield does not raise on a keypress"
     );
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "and the key did not reach the desktop behind it"
     );
 }
@@ -9200,16 +9250,16 @@ fn a_locked_shield_swallows_keys_instead_of_raising() {
 #[test]
 fn a_locked_shield_still_lets_ctrl_alt_fn_through() {
     use crate::dbus::gdm::VerifierEvent;
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
     use crate::unlock_dialog::Page;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    assert!(f.niri().screen_shield.is_locked());
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    assert!(f.synoik().screen_shield.is_locked());
 
     f.key_press(KEY_LEFTCTRL);
     f.key_press(KEY_LEFTALT);
@@ -9218,11 +9268,11 @@ fn a_locked_shield_still_lets_ctrl_alt_fn_through() {
     f.key_release(KEY_LEFTCTRL);
 
     assert!(
-        f.niri().screen_shield.is_locked(),
+        f.synoik().screen_shield.is_locked(),
         "still locked, of course"
     );
     assert_eq!(
-        f.niri_state().backend.headless().last_vt(),
+        f.synoik_state().backend.headless().last_vt(),
         Some(2),
         "Ctrl+Alt+F2 must reach the VT switch from behind the curtain"
     );
@@ -9231,7 +9281,7 @@ fn a_locked_shield_still_lets_ctrl_alt_fn_through() {
     // Without this the assertion above would pass for a shield that forwarded everything.
     tap(&mut f, KEY_A);
     assert_eq!(
-        f.niri().unlock_dialog.page(),
+        f.synoik().unlock_dialog.page(),
         Page::Prompt,
         "an ordinary key is still swallowed by the shield"
     );
@@ -9244,26 +9294,32 @@ fn a_locked_shield_still_lets_ctrl_alt_fn_through() {
 /// happened. `loginctl lock-session` / `unlock-session` are the same two signals by hand.
 #[test]
 fn logind_lock_and_unlock_drive_the_shield() {
-    use crate::dbus::freedesktop_login1::Login1ToNiri;
+    use crate::dbus::freedesktop_login1::Login1ToSynoik;
     use crate::dbus::gdm::VerifierEvent;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state()
-        .on_login1_msg(Login1ToNiri::SessionLock(true));
-    assert!(f.niri().screen_shield.is_active(), "Lock covers the screen");
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    assert!(f.niri().screen_shield.is_locked());
+    f.synoik_state()
+        .on_login1_msg(Login1ToSynoik::SessionLock(true));
+    assert!(
+        f.synoik().screen_shield.is_active(),
+        "Lock covers the screen"
+    );
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    assert!(f.synoik().screen_shield.is_locked());
 
     // ...and gdm, having authenticated on its own VT, unlocks us.
-    f.niri_state()
-        .on_login1_msg(Login1ToNiri::SessionLock(false));
+    f.synoik_state()
+        .on_login1_msg(Login1ToSynoik::SessionLock(false));
     assert!(
-        !f.niri().screen_shield.is_locked(),
+        !f.synoik().screen_shield.is_locked(),
         "Unlock must actually unlock — otherwise gdm authenticates you into a locked screen"
     );
-    assert!(!f.niri().screen_shield.is_active(), "and raise the shield");
+    assert!(
+        !f.synoik().screen_shield.is_active(),
+        "and raise the shield"
+    );
 }
 
 /// If the unlock channel dies, the lock drops to a dismissible screensaver rather than trapping
@@ -9276,26 +9332,26 @@ fn logind_lock_and_unlock_drive_the_shield() {
 #[test]
 fn losing_the_unlock_channel_does_not_trap_the_session() {
     use crate::dbus::gdm::VerifierEvent;
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    assert!(f.niri().screen_shield.is_locked());
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    assert!(f.synoik().screen_shield.is_locked());
 
-    f.niri_state().on_verifier_event(VerifierEvent::Lost);
-    assert!(!f.niri().screen_shield.is_locked(), "the lock is dropped");
+    f.synoik_state().on_verifier_event(VerifierEvent::Lost);
+    assert!(!f.synoik().screen_shield.is_locked(), "the lock is dropped");
     assert!(
-        f.niri().screen_shield.is_active(),
+        f.synoik().screen_shield.is_active(),
         "the screen stays covered"
     );
 
     // ...and it can now be dismissed, which is the whole point.
     tap(&mut f, KEY_A);
-    assert!(!f.niri().screen_shield.is_active());
+    assert!(!f.synoik().screen_shield.is_active());
 }
 
 /// A dash click does three different things depending on the app's state, and only one of them
@@ -9328,26 +9384,26 @@ fn a_dash_click_launches_focuses_or_opens_a_new_window_by_state() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     let recorder = RecordingLauncher::default();
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![files, calc])),
         Box::new(recorder.clone()),
     );
-    f.niri().app_system.set_favorites(vec![
+    f.synoik().app_system.set_favorites(vec![
         "org.example.Files.desktop".to_owned(),
         "org.example.Calc.desktop".to_owned(),
     ]);
-    f.niri().sync_dash_favorites();
+    f.synoik().sync_dash_favorites();
 
     // Files runs with two windows; Calc stays stopped.
     let client = f.add_client();
     map_window_for_app(&mut f, client, "org.example.Files");
-    let older = f.niri().layout.focus().unwrap().id();
+    let older = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.Files");
-    let newer = f.niri().layout.focus().unwrap().id();
-    f.niri_complete_animations();
+    let newer = f.synoik().layout.focus().unwrap().id();
+    f.synoik_complete_animations();
 
     let click = |f: &mut Fixture, i: usize| {
-        f.niri_state().do_action(Action::OpenOverview, false);
+        f.synoik_state().do_action(Action::OpenOverview, false);
         let c = dash_tile_center(f, i);
         pointer_motion_to(f, c.x, c.y);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
@@ -9365,28 +9421,28 @@ fn a_dash_click_launches_focuses_or_opens_a_new_window_by_state() {
     // that happens to be focused".
     // The focus *timestamp* is what orders the tab list, and it is stamped when the seat's
     // keyboard focus actually moves — so this needs a real focus round trip, not just a call.
-    let older_window = f.niri().find_window_by_id(older).unwrap();
-    f.niri_state().focus_window(&older_window);
-    f.niri_state().update_keyboard_focus();
+    let older_window = f.synoik().find_window_by_id(older).unwrap();
+    f.synoik_state().focus_window(&older_window);
+    f.synoik_state().update_keyboard_focus();
     f.double_roundtrip(client);
-    f.niri_complete_animations();
-    assert_eq!(f.niri().layout.focus().unwrap().id(), older);
+    f.synoik_complete_animations();
+    assert_eq!(f.synoik().layout.focus().unwrap().id(), older);
     let _ = newer;
 
     // RUNNING, no modifier: focus its most recent window, and *do not launch*.
     click(&mut f, 0);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
         recorder.calls.borrow().is_empty(),
         "a running app must not be relaunched — that is what opens the spurious startup sequence"
     );
     assert_eq!(
-        f.niri().layout.focus().unwrap().id(),
+        f.synoik().layout.focus().unwrap().id(),
         older,
         "it activates the app's most recently used window"
     );
     assert_eq!(
-        f.niri().app_system.app_state("org.example.Files.desktop"),
+        f.synoik().app_system.app_state("org.example.Files.desktop"),
         crate::app_system::AppState::Running,
         "and leaves it RUNNING, not STARTING — no busy cursor"
     );
@@ -9421,7 +9477,7 @@ fn a_dash_click_launches_focuses_or_opens_a_new_window_by_state() {
 
     // STARTING: nothing at all. Calc is mid-launch after the click above.
     assert_eq!(
-        f.niri().app_system.app_state("org.example.Calc.desktop"),
+        f.synoik().app_system.app_state("org.example.Calc.desktop"),
         crate::app_system::AppState::Starting
     );
     click(&mut f, 1);
@@ -9460,7 +9516,7 @@ fn a_single_window_app_cannot_be_asked_for_a_new_window() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![single, declared_multi, silent])),
         Box::new(RecordingLauncher::default()),
     );
@@ -9473,9 +9529,9 @@ fn a_single_window_app_cannot_be_asked_for_a_new_window() {
     ] {
         map_window_for_app(&mut f, client, app);
     }
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
-    let can = |f: &mut Fixture, id: &str| f.niri().app_system.can_open_new_window(id);
+    let can = |f: &mut Fixture, id: &str| f.synoik().app_system.can_open_new_window(id);
     assert!(
         !can(&mut f, "org.example.Single.desktop"),
         "SingleMainWindow=true is a declaration that there is no new window to open"
@@ -9504,14 +9560,14 @@ fn overview_dash_favorite_click_launches_and_closes() {
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1, "exactly one favorite launched");
     assert_eq!(calls[0].0.id, "b.desktop", "the clicked favorite launched");
     assert_eq!(calls[0].1, ResolvedLaunch::Default);
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "launching a favorite closes the overview"
     );
 }
@@ -9528,24 +9584,24 @@ fn overview_dash_favorite_launches_on_release_not_press() {
 
     pointer_motion_to(&mut f, center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
         recorder.calls.borrow().is_empty(),
         "the press alone must not launch"
     );
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "and must not close the overview"
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
         recorder.calls.borrow().len(),
         1,
         "the release completes the click"
     );
-    assert!(!f.niri().layout.is_overview_open());
+    assert!(!f.synoik().layout.is_overview_open());
 }
 
 /// ...and the release only counts if it lands on the same widget: lift the button
@@ -9561,14 +9617,14 @@ fn overview_dash_release_off_the_icon_does_not_launch() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, other.x, other.y);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
         recorder.calls.borrow().is_empty(),
         "releasing over a different icon launches nothing"
     );
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "and leaves the overview open"
     );
 }
@@ -9589,17 +9645,17 @@ fn favorites_and_grid_fixture(
         .iter()
         .map(|id| AppEntry::fake(id, id))
         .collect::<Vec<_>>();
-    f.niri().app_system =
+    f.synoik().app_system =
         AppSystem::with_parts(Box::new(FakeCatalog::new(apps)), Box::new(recorder.clone()));
-    f.niri()
+    f.synoik()
         .app_system
         .set_favorites(favorites.iter().map(|s| s.to_string()).collect());
-    f.niri().sync_dash_favorites();
-    f.niri().sync_app_grid();
+    f.synoik().sync_dash_favorites();
+    f.synoik().sync_app_grid();
 
-    f.niri_state().do_action(Action::OpenOverview, false);
-    f.niri().layout.toggle_app_grid();
-    assert!(f.niri().layout.is_app_grid_open(), "app grid must open");
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik().layout.toggle_app_grid();
+    assert!(f.synoik().layout.is_app_grid_open(), "app grid must open");
     f.settle_animations();
 
     (f, recorder)
@@ -9607,7 +9663,7 @@ fn favorites_and_grid_fixture(
 
 /// The favourites, in dash order — what `favorite-apps` would be written as.
 fn dash_favorites(f: &mut Fixture) -> Vec<String> {
-    f.niri()
+    f.synoik()
         .app_system
         .favorite_ids()
         .iter()
@@ -9626,14 +9682,14 @@ fn overview_dragging_a_grid_icon_onto_the_dash_pins_it_at_that_slot() {
     );
     // The grid holds exactly the non-favourite.
     assert_eq!(
-        f.niri().app_grid.entry_id(0),
+        f.synoik().app_grid.entry_id(0),
         Some("c.desktop"),
         "the grid should hold the one app that is not pinned"
     );
 
     let grid_area = overview_controls(&mut f).app_display;
     let from = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_center(0, grid_area)
         .expect("grid tile 0");
@@ -9643,17 +9699,17 @@ fn overview_dragging_a_grid_icon_onto_the_dash_pins_it_at_that_slot() {
     // Drag onto the *first* dash tile: dropping on its left half aims at slot 0.
     let first = dash_tile_center(&mut f, 0);
     pointer_motion_to(&mut f, first.x - 20., first.y);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     assert_eq!(
-        f.niri().dash.drop_slot(),
+        f.synoik().dash.drop_slot(),
         Some(0),
         "hovering the front of the dash must open the gap at slot 0"
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
-    assert_eq!(f.niri().dash.drop_slot(), None, "the drop closes the gap");
+    assert_eq!(f.synoik().dash.drop_slot(), None, "the drop closes the gap");
     assert_eq!(
         dash_favorites(&mut f),
         vec!["c.desktop", "a.desktop", "b.desktop"],
@@ -9674,25 +9730,25 @@ fn overview_dragging_a_search_result_onto_the_dash_pins_it() {
         AppEntry::fake("c.desktop", "c.desktop"),
     ]);
     *catalog.search_result.borrow_mut() = vec![vec!["c.desktop".to_owned()]];
-    f.niri().app_system = AppSystem::with_parts(Box::new(catalog), Box::new(recorder));
-    f.niri()
+    f.synoik().app_system = AppSystem::with_parts(Box::new(catalog), Box::new(recorder));
+    f.synoik()
         .app_system
         .set_favorites(vec!["a.desktop".to_owned()]);
-    f.niri().sync_dash_favorites();
+    f.synoik().sync_dash_favorites();
 
-    f.niri_state().do_action(Action::OpenOverview, false);
-    f.niri_state().update_keyboard_focus();
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().update_keyboard_focus();
     tap(&mut f, KEY_A);
     f.settle_animations();
     assert_eq!(
-        f.niri().overview_search.result_id(0),
+        f.synoik().overview_search.result_id(0),
         Some("c.desktop"),
         "the search must list the app we are about to drag"
     );
 
     let area = overview_controls(&mut f).into();
     let from = f
-        .niri()
+        .synoik()
         .overview_search
         .result_center(0, area)
         .expect("result tile 0");
@@ -9702,12 +9758,12 @@ fn overview_dragging_a_search_result_onto_the_dash_pins_it() {
     let first = dash_tile_center(&mut f, 0);
     pointer_motion_to(&mut f, first.x - 20., first.y);
     assert!(
-        f.niri().app_drag.is_some(),
+        f.synoik().app_drag.is_some(),
         "a search result must be draggable — it was not a drag source at all before"
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
         dash_favorites(&mut f),
         vec!["c.desktop", "a.desktop"],
@@ -9728,15 +9784,15 @@ fn overview_dropping_a_favorite_next_to_itself_changes_nothing() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     // Move enough to start the drag, but stay over its own tile.
     pointer_motion_to(&mut f, first.x + 20., first.y);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     assert_eq!(
-        f.niri().dash.drop_slot(),
+        f.synoik().dash.drop_slot(),
         None,
         "no gap opens before or after the dragged favourite itself"
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
         dash_favorites(&mut f),
         before,
@@ -9768,9 +9824,9 @@ fn overview_dragging_a_favorite_across_the_dash_reorders_it() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     let middle = dash_tile_center(&mut f, 2);
     pointer_motion_to(&mut f, middle.x, middle.y);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     assert_eq!(
-        f.niri().dash.drop_slot(),
+        f.synoik().dash.drop_slot(),
         Some(2),
         "hovering the third tile opens the gap before it"
     );
@@ -9781,17 +9837,17 @@ fn overview_dragging_a_favorite_across_the_dash_reorders_it() {
     // pill, and a centered pill grows both ways, so everything slid half a tile left.
     pointer_motion_to(&mut f, past_end.x - 20., past_end.y);
     assert_eq!(
-        f.niri().dash.drop_slot(),
+        f.synoik().dash.drop_slot(),
         Some(3),
         "past the last favourite clamps to the end of them, not into the running zone"
     );
     assert!(
-        !f.niri().app_drag.as_ref().unwrap().unpin,
+        !f.synoik().app_drag.as_ref().unwrap().unpin,
         "the open gap pushed the show-apps button right, so this is the strip, not it"
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert_eq!(
         dash_favorites(&mut f),
@@ -9807,7 +9863,7 @@ fn overview_dragging_a_favorite_across_the_dash_reorders_it() {
     let middle = dash_tile_center(&mut f, 2);
     pointer_motion_to(&mut f, middle.x - 10., middle.y);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
         dash_favorites(&mut f),
         vec!["c.desktop", "b.desktop", "a.desktop"],
@@ -9832,17 +9888,17 @@ fn overview_right_clicking_an_icon_opens_its_context_menu() {
     pointer_motion_to(&mut f, first.x, first.y);
     f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
     assert!(
-        f.niri().panel_popover.is_app_menu(),
+        f.synoik().panel_popover.is_app_menu(),
         "a right-click must open the menu on the PRESS, not wait for the release \
          (`recognize_on_press: true`, `appDisplay.js:2981-2986`)"
     );
     assert_eq!(
-        f.niri().panel_popover.app_menu().unwrap().labels(),
+        f.synoik().panel_popover.app_menu().unwrap().labels(),
         vec!["New Window", "Unpin"],
     );
     f.pointer_button(BTN_RIGHT, ButtonState::Released);
     assert!(
-        f.niri().panel_popover.is_app_menu(),
+        f.synoik().panel_popover.is_app_menu(),
         "and the release must not take it away again"
     );
 
@@ -9851,7 +9907,7 @@ fn overview_right_clicking_an_icon_opens_its_context_menu() {
     let second = dash_tile_center(&mut f, 1);
     pointer_motion_to(&mut f, second.x, second.y);
     assert_eq!(
-        f.niri().dash.hovered_for_test(),
+        f.synoik().dash.hovered_for_test(),
         Some(DashHit::App(0)),
         "the icon whose menu is open keeps its highlight, and the icon the pointer \
          moved to must NOT take it (the menu holds a grab)"
@@ -9859,11 +9915,17 @@ fn overview_right_clicking_an_icon_opens_its_context_menu() {
 
     // A dash icon's menu opens *upward* — the dash is at the bottom of the screen, so
     // `popupMenuSide: St.Side.BOTTOM` (`dash.js:27`) puts the arrow under the box.
-    let output = f.niri().global_space.outputs().next().unwrap().clone();
-    let menu = f.niri().panel_popover.content_location(&output);
-    let menu_h = f.niri().panel_popover.app_menu().unwrap().logical_size().h;
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let menu = f.synoik().panel_popover.content_location(&output);
+    let menu_h = f
+        .synoik()
+        .panel_popover
+        .app_menu()
+        .unwrap()
+        .logical_size()
+        .h;
     let dash_area = overview_controls(&mut f).dash;
-    let tile = f.niri().dash.tile_rect(0, dash_area).unwrap();
+    let tile = f.synoik().dash.tile_rect(0, dash_area).unwrap();
     assert!(
         menu.y + menu_h <= tile.loc.y,
         "the dash menu must sit entirely above its icon (bottom {}, icon top {})",
@@ -9874,26 +9936,26 @@ fn overview_right_clicking_an_icon_opens_its_context_menu() {
     // Dismiss, then the same on an app that is not pinned. The settle matters: a
     // popover stays `is_open` while it fades out, and a press during that window is a
     // dismissal (it lands on the still-grabbing menu), not a new menu.
-    f.niri().panel_popover.close();
+    f.synoik().panel_popover.close();
     f.settle_animations();
     let grid_area = overview_controls(&mut f).app_display;
     let unpinned = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_center(0, grid_area)
         .expect("grid tile 0");
     pointer_motion_to(&mut f, unpinned.x, unpinned.y);
     f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
     assert_eq!(
-        f.niri().panel_popover.app_menu().unwrap().labels(),
+        f.synoik().panel_popover.app_menu().unwrap().labels(),
         vec!["New Window", "Pin to Dash"],
         "an app that is not pinned is offered the pin"
     );
 
     // A grid icon takes `AppIcon`'s default `St.Side.LEFT`, so its menu opens to the
     // icon's right instead (`appDisplay.js:2928`).
-    let menu = f.niri().panel_popover.content_location(&output);
-    let tile = f.niri().app_grid.entry_rect(0, grid_area).unwrap();
+    let menu = f.synoik().panel_popover.content_location(&output);
+    let tile = f.synoik().app_grid.entry_rect(0, grid_area).unwrap();
     assert!(
         menu.x >= tile.loc.x + tile.size.w,
         "the grid menu must sit to the right of its icon (menu left {}, icon right {})",
@@ -9916,7 +9978,7 @@ fn overview_the_context_menu_of_a_running_app_lists_its_windows_and_offers_quit(
     f.add_output(1, (1920, 1080));
     let client = f.add_client();
 
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
             "a.desktop",
             "A",
@@ -9924,8 +9986,10 @@ fn overview_the_context_menu_of_a_running_app_lists_its_windows_and_offers_quit(
         )])),
         Box::new(RecordingLauncher::default()),
     );
-    f.niri().app_system.set_favorites(vec!["a.desktop".into()]);
-    f.niri().sync_dash_favorites();
+    f.synoik()
+        .app_system
+        .set_favorites(vec!["a.desktop".into()]);
+    f.synoik().sync_dash_favorites();
 
     // Two windows of the app, the second titled.
     let mut surfaces = Vec::new();
@@ -9945,9 +10009,9 @@ fn overview_the_context_menu_of_a_running_app_lists_its_windows_and_offers_quit(
         f.double_roundtrip(client);
         surfaces.push(surface);
     }
-    assert_eq!(f.niri().app_system.running()[0].n_windows(), 2);
+    assert_eq!(f.synoik().app_system.running()[0].n_windows(), 2);
 
-    f.niri_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().do_action(Action::OpenOverview, false);
     f.settle_animations();
 
     let first = dash_tile_center(&mut f, 0);
@@ -9955,7 +10019,7 @@ fn overview_the_context_menu_of_a_running_app_lists_its_windows_and_offers_quit(
     f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
     f.pointer_button(BTN_RIGHT, ButtonState::Released);
 
-    let labels = f.niri().panel_popover.app_menu().unwrap().labels();
+    let labels = f.synoik().panel_popover.app_menu().unwrap().labels();
     assert_eq!(
         labels[0], "Open Windows",
         "the window section leads the menu, headed by its labelled separator"
@@ -9975,10 +10039,10 @@ fn overview_the_context_menu_of_a_running_app_lists_its_windows_and_offers_quit(
     );
 
     // Quit closes every window of the app, and stays in the overview.
-    let output = f.niri().global_space.outputs().next().unwrap().clone();
-    let origin = f.niri().panel_popover.content_location(&output);
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let origin = f.synoik().panel_popover.content_location(&output);
     let row = f
-        .niri()
+        .synoik()
         .panel_popover
         .app_menu()
         .unwrap()
@@ -9997,7 +10061,7 @@ fn overview_the_context_menu_of_a_running_app_lists_its_windows_and_offers_quit(
         );
     }
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "Quit does not leave the overview — gnome-shell's handler has no hide()"
     );
 }
@@ -10013,7 +10077,7 @@ fn overview_the_context_menu_raises_the_window_row_you_pick() {
     f.add_output(1, (1920, 1080));
     let client = f.add_client();
 
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
             "a.desktop",
             "A",
@@ -10021,8 +10085,10 @@ fn overview_the_context_menu_raises_the_window_row_you_pick() {
         )])),
         Box::new(RecordingLauncher::default()),
     );
-    f.niri().app_system.set_favorites(vec!["a.desktop".into()]);
-    f.niri().sync_dash_favorites();
+    f.synoik()
+        .app_system
+        .set_favorites(vec!["a.desktop".into()]);
+    f.synoik().sync_dash_favorites();
 
     let mut windows = Vec::new();
     for title in ["First doc", "Second doc"] {
@@ -10037,22 +10103,22 @@ fn overview_the_context_menu_raises_the_window_row_you_pick() {
         window.set_size(400, 300);
         window.ack_last_and_commit();
         f.double_roundtrip(client);
-        windows.push(f.niri().layout.focus().unwrap().window.clone());
+        windows.push(f.synoik().layout.focus().unwrap().window.clone());
     }
     // The second one is focused; the row must move focus to the first.
-    assert_eq!(f.niri().layout.focus().unwrap().window, windows[1]);
+    assert_eq!(f.synoik().layout.focus().unwrap().window, windows[1]);
 
-    f.niri_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().do_action(Action::OpenOverview, false);
     f.settle_animations();
     let first = dash_tile_center(&mut f, 0);
     pointer_motion_to(&mut f, first.x, first.y);
     f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
     f.pointer_button(BTN_RIGHT, ButtonState::Released);
 
-    let output = f.niri().global_space.outputs().next().unwrap().clone();
-    let origin = f.niri().panel_popover.content_location(&output);
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let origin = f.synoik().panel_popover.content_location(&output);
     let row = f
-        .niri()
+        .synoik()
         .panel_popover
         .app_menu()
         .unwrap()
@@ -10065,12 +10131,12 @@ fn overview_the_context_menu_raises_the_window_row_you_pick() {
     f.settle_animations();
 
     assert_eq!(
-        f.niri().layout.focus().unwrap().window,
+        f.synoik().layout.focus().unwrap().window,
         windows[0],
         "the row must raise the window it names"
     );
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "raising a window leaves the overview"
     );
 }
@@ -10086,7 +10152,7 @@ fn overview_the_context_menu_of_a_stopped_app_has_no_windows_and_no_quit() {
     f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
     f.pointer_button(BTN_RIGHT, ButtonState::Released);
 
-    let labels = f.niri().panel_popover.app_menu().unwrap().labels();
+    let labels = f.synoik().panel_popover.app_menu().unwrap().labels();
     assert!(
         !labels.contains(&"Open Windows"),
         "a stopped app has no window section, got {labels:?}"
@@ -10105,16 +10171,16 @@ fn overview_the_context_menu_pins_and_unpins() {
         &["a.desktop", "b.desktop", "c.desktop"],
         &["a.desktop", "b.desktop"],
     );
-    let output = f.niri().global_space.outputs().next().unwrap().clone();
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
 
     let first = dash_tile_center(&mut f, 0);
     pointer_motion_to(&mut f, first.x, first.y);
     f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
     f.pointer_button(BTN_RIGHT, ButtonState::Released);
 
-    let origin = f.niri().panel_popover.content_location(&output);
+    let origin = f.synoik().panel_popover.content_location(&output);
     let row = f
-        .niri()
+        .synoik()
         .panel_popover
         .app_menu()
         .unwrap()
@@ -10124,7 +10190,7 @@ fn overview_the_context_menu_pins_and_unpins() {
     pointer_motion_to(&mut f, at.x, at.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert_eq!(
         dash_favorites(&mut f),
@@ -10132,11 +10198,11 @@ fn overview_the_context_menu_pins_and_unpins() {
         "the row must unpin the app"
     );
     assert!(
-        !f.niri().panel_popover.is_open(),
+        !f.synoik().panel_popover.is_open(),
         "activating any popup-menu item closes the menu"
     );
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "but pinning must not leave the overview — only the launch rows do that"
     );
 }
@@ -10150,26 +10216,26 @@ fn overview_the_context_menu_pins_and_unpins() {
 fn overview_an_empty_dash_reserves_a_drop_target_while_dragging() {
     let (mut f, _recorder) = favorites_and_grid_fixture(&["a.desktop"], &[]);
     assert_eq!(
-        f.niri().dash.item_id(0),
+        f.synoik().dash.item_id(0),
         None,
         "the dash must start empty for this to be the empty-dash path"
     );
 
     let area = overview_controls(&mut f).dash;
-    let idle_w = f.niri().dash.pill_box(area).size.w;
+    let idle_w = f.synoik().dash.pill_box(area).size.w;
 
     let grid_area = overview_controls(&mut f).app_display;
     let from = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_center(0, grid_area)
         .expect("grid tile 0");
     pointer_motion_to(&mut f, from.x, from.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, from.x, from.y + 40.);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
 
-    let pill = f.niri().dash.pill_box(area);
+    let pill = f.synoik().dash.pill_box(area);
     assert_eq!(
         pill.size.w - idle_w,
         32.,
@@ -10179,13 +10245,13 @@ fn overview_an_empty_dash_reserves_a_drop_target_while_dragging() {
     // Anywhere in that reserved run is slot 0.
     pointer_motion_to(&mut f, pill.loc.x + 15., pill.loc.y + 50.);
     assert_eq!(
-        f.niri().dash.drop_slot(),
+        f.synoik().dash.drop_slot(),
         Some(0),
         "an empty dash always drops at the start"
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert_eq!(
         dash_favorites(&mut f),
@@ -10193,7 +10259,7 @@ fn overview_an_empty_dash_reserves_a_drop_target_while_dragging() {
         "the drop must pin the first favourite"
     );
     assert_eq!(
-        f.niri().dash.pill_box(area).size.w,
+        f.synoik().dash.pill_box(area).size.w,
         idle_w + 80.,
         "and the target must be released, leaving the pill one tile wider than empty"
     );
@@ -10219,24 +10285,24 @@ fn overview_dropping_a_favorite_on_the_show_apps_button_unpins_it() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, show_apps.x, show_apps.y);
 
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     assert!(
-        f.niri().app_drag.as_ref().unwrap().unpin,
+        f.synoik().app_drag.as_ref().unwrap().unpin,
         "the show-apps button must arm as the unpin target"
     );
     assert_eq!(
-        f.niri().dash.drop_slot(),
+        f.synoik().dash.drop_slot(),
         None,
         "the dash must not offer to pin and to unpin at once (`dash.js:444-445`)"
     );
     assert_eq!(
-        f.niri().dash.hovered_for_test(),
+        f.synoik().dash.hovered_for_test(),
         Some(DashHit::ShowApps),
         "the armed button lights up, which is the only feedback that it will remove"
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert_eq!(
         dash_favorites(&mut f),
@@ -10244,7 +10310,7 @@ fn overview_dropping_a_favorite_on_the_show_apps_button_unpins_it() {
         "the drop must unpin the dragged app"
     );
     assert!(
-        (0..3).any(|i| f.niri().app_grid.entry_id(i) == Some("a.desktop")),
+        (0..3).any(|i| f.synoik().app_grid.entry_id(i) == Some("a.desktop")),
         "and the unpinned app must come back to the grid"
     );
 }
@@ -10262,7 +10328,7 @@ fn overview_dropping_a_grid_app_on_the_show_apps_button_does_nothing() {
 
     let grid_area = overview_controls(&mut f).app_display;
     let from = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_center(0, grid_area)
         .expect("grid tile 0");
@@ -10271,20 +10337,20 @@ fn overview_dropping_a_grid_app_on_the_show_apps_button_does_nothing() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, show_apps.x, show_apps.y);
 
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     assert!(
-        !f.niri().app_drag.as_ref().unwrap().unpin,
+        !f.synoik().app_drag.as_ref().unwrap().unpin,
         "an app that is not pinned cannot be unpinned"
     );
     assert_eq!(
-        f.niri().dash.hovered_for_test(),
+        f.synoik().dash.hovered_for_test(),
         None,
         "so the button must not light up either — a drag grabs the pointer, and only \
          the unpin arming lights anything up (`dash.js:447-450`)"
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
         dash_favorites(&mut f),
         before,
@@ -10310,7 +10376,7 @@ fn overview_dragging_a_dash_icon_to_a_workspace_launches_it_there() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, center.x, center.y - 40.);
     assert!(
-        f.niri().app_drag.is_some(),
+        f.synoik().app_drag.is_some(),
         "leaving the press box must start the drag"
     );
     assert!(
@@ -10318,12 +10384,12 @@ fn overview_dragging_a_dash_icon_to_a_workspace_launches_it_there() {
         "dragging must not launch on the way"
     );
 
-    let ws = f.niri().layout.active_workspace().unwrap().id();
+    let ws = f.synoik().layout.active_workspace().unwrap().id();
     pointer_motion_to(&mut f, 960., 400.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
-    assert!(f.niri().app_drag.is_none(), "the drop ends the drag");
+    assert!(f.synoik().app_drag.is_none(), "the drop ends the drag");
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1, "the drop launches the app");
     assert_eq!(calls[0].0.id, "a.desktop");
@@ -10338,7 +10404,7 @@ fn overview_dragging_a_dash_icon_to_a_workspace_launches_it_there() {
     // And the app's first window opens on the workspace it was dropped on: the
     // drop opened a startup sequence carrying that workspace.
     assert_eq!(
-        f.niri()
+        f.synoik()
             .app_system
             .complete_startup(Some("a"), None, Duration::ZERO),
         Some(ws),
@@ -10357,26 +10423,27 @@ fn overview_launch_on_workspace_places_the_first_window() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake("a.desktop", "A")])),
         Box::new(RecordingLauncher::default()),
     );
 
     // A second workspace, and the target is *not* the active one.
     let _first = map_window_sized(&mut f, id, (800, 600), None);
-    let first_win = f.niri().layout.focus().unwrap().window.clone();
-    f.niri_state().do_action(Action::FocusWorkspaceDown, false);
-    f.niri_complete_animations();
-    let target = f.niri().layout.active_workspace().unwrap().id();
-    f.niri_state().do_action(Action::FocusWorkspaceUp, false);
-    f.niri_complete_animations();
+    let first_win = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.synoik_complete_animations();
+    let target = f.synoik().layout.active_workspace().unwrap().id();
+    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    f.synoik_complete_animations();
     assert_ne!(
-        f.niri().layout.active_workspace().unwrap().id(),
+        f.synoik().layout.active_workspace().unwrap().id(),
         target,
         "the target workspace must not be the active one"
     );
 
-    f.niri()
+    f.synoik()
         .app_system
         .begin_startup("a.desktop", None, Some(target), get_monotonic_time());
 
@@ -10390,17 +10457,17 @@ fn overview_launch_on_workspace_places_the_first_window() {
     window.set_size(400, 300);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     let win = f
-        .niri()
+        .synoik()
         .layout
         .windows()
         .map(|(_, m)| m.window.clone())
         .find(|w| *w != first_win)
         .expect("the second window must be mapped");
     let landed = f
-        .niri()
+        .synoik()
         .layout
         .workspaces()
         .find(|(_, _, ws)| ws.has_window(&win))
@@ -10414,7 +10481,7 @@ fn overview_launch_on_workspace_places_the_first_window() {
     // The sequence is one-shot: a second window of the same app opens wherever it
     // would have anyway.
     assert_eq!(
-        f.niri()
+        f.synoik()
             .app_system
             .complete_startup(Some("a"), None, get_monotonic_time()),
         None
@@ -10435,13 +10502,13 @@ fn overview_dropping_an_icon_on_the_dash_launches_nothing() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, onto.x, onto.y);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
         recorder.calls.borrow().is_empty(),
         "a drop on the dash itself launches nothing"
     );
-    assert!(f.niri().layout.is_overview_open());
+    assert!(f.synoik().layout.is_overview_open());
 }
 
 /// A middle-click on a favorite also launches it (still `Activate`: `open_new_window`
@@ -10454,10 +10521,10 @@ fn overview_dash_favorite_middle_click_launches() {
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_MIDDLE, ButtonState::Pressed);
     f.pointer_button(BTN_MIDDLE, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert_eq!(recorder.calls.borrow().len(), 1, "middle-click launches");
-    assert!(!f.niri().layout.is_overview_open());
+    assert!(!f.synoik().layout.is_overview_open());
 }
 
 /// A right-click on a favorite is *consumed* — no launch, and critically it must
@@ -10477,11 +10544,11 @@ fn overview_dash_favorite_right_click_consumed() {
         "right-click must not launch"
     );
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "right-click on the dash leaves the overview open"
     );
     assert!(
-        !f.niri().seat.get_pointer().unwrap().is_grabbed(),
+        !f.synoik().seat.get_pointer().unwrap().is_grabbed(),
         "a right-click on the dash must not begin the overview pan grab"
     );
 }
@@ -10495,7 +10562,7 @@ fn overview_dash_favorite_right_click_consumed() {
 #[test]
 fn overview_show_apps_toggles_the_app_grid() {
     let (mut f, recorder) = dash_fixture(&["a.desktop"]);
-    let i = f.niri().dash.show_apps_index();
+    let i = f.synoik().dash.show_apps_index();
     let center = dash_tile_center(&mut f, i);
     // `pointer_motion` is relative; move onto the button once (from the origin) and
     // leave the pointer there — keyboard/actions below don't move it, so later
@@ -10504,7 +10571,7 @@ fn overview_show_apps_toggles_the_app_grid() {
     let click = |f: &mut Fixture| {
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
-        f.niri_complete_animations();
+        f.synoik_complete_animations();
     };
 
     // Click show-apps → the app grid opens (no launch, overview stays open).
@@ -10514,11 +10581,11 @@ fn overview_show_apps_toggles_the_app_grid() {
         "show-apps must not launch an app"
     );
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "show-apps keeps the overview open"
     );
     assert!(
-        f.niri().layout.is_app_grid_open(),
+        f.synoik().layout.is_app_grid_open(),
         "show-apps opens the app grid"
     );
     // The app grid slid on-screen (parked below the work area at 1080 otherwise).
@@ -10530,15 +10597,15 @@ fn overview_show_apps_toggles_the_app_grid() {
     // Escape returns to the picker without closing the overview, and the grid parks.
     // (The harness only sets overview keyboard focus on demand — the live loop does
     // it every iteration.)
-    f.niri_state().update_keyboard_focus();
+    f.synoik_state().update_keyboard_focus();
     tap(&mut f, KEY_ESC);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().layout.is_app_grid_open(),
+        !f.synoik().layout.is_app_grid_open(),
         "Escape returns to the window picker"
     );
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "…without closing the overview"
     );
     assert!(
@@ -10549,16 +10616,16 @@ fn overview_show_apps_toggles_the_app_grid() {
     // Reopen the grid, then close the overview from it → the state resets on hide,
     // so reopening the overview starts in the window picker.
     click(&mut f);
-    assert!(f.niri().layout.is_app_grid_open());
+    assert!(f.synoik().layout.is_app_grid_open());
 
-    f.niri_state().do_action(Action::CloseOverview, false);
-    f.niri_complete_animations();
-    assert!(!f.niri().layout.is_overview_open());
+    f.synoik_state().do_action(Action::CloseOverview, false);
+    f.synoik_complete_animations();
+    assert!(!f.synoik().layout.is_overview_open());
 
-    f.niri_state().do_action(Action::OpenOverview, false);
-    f.niri_complete_animations();
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().layout.is_app_grid_open(),
+        !f.synoik().layout.is_app_grid_open(),
         "reopening the overview starts in the window picker, not the app grid"
     );
 }
@@ -10581,19 +10648,19 @@ fn app_grid_fixture(
         .chain(others)
         .map(|id| AppEntry::fake(id, id))
         .collect::<Vec<_>>();
-    f.niri().app_system =
+    f.synoik().app_system =
         AppSystem::with_parts(Box::new(FakeCatalog::new(apps)), Box::new(recorder.clone()));
-    f.niri()
+    f.synoik()
         .app_system
         .set_favorites(favorites.iter().map(|s| s.to_string()).collect());
-    f.niri().sync_dash_favorites();
-    f.niri().sync_app_grid();
+    f.synoik().sync_dash_favorites();
+    f.synoik().sync_app_grid();
 
-    f.niri_state().do_action(Action::OpenOverview, false);
-    assert!(f.niri().layout.is_overview_open(), "overview must open");
-    f.niri().layout.toggle_app_grid();
-    f.niri_complete_animations();
-    assert!(f.niri().layout.is_app_grid_open(), "app grid must open");
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    assert!(f.synoik().layout.is_overview_open(), "overview must open");
+    f.synoik().layout.toggle_app_grid();
+    f.synoik_complete_animations();
+    assert!(f.synoik().layout.is_app_grid_open(), "app grid must open");
 
     (f, recorder)
 }
@@ -10612,7 +10679,7 @@ fn overview_app_grid_follows_the_saved_arrangement() {
     let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
     let ids = |f: &mut Fixture| -> Vec<String> {
         (0..3)
-            .filter_map(|i| f.niri().app_grid.entry_id(i).map(str::to_owned))
+            .filter_map(|i| f.synoik().app_grid.entry_id(i).map(str::to_owned))
             .collect()
     };
     assert_eq!(
@@ -10622,11 +10689,11 @@ fn overview_app_grid_follows_the_saved_arrangement() {
     );
 
     // Place two of them, out of name order and on separate pages; leave one unplaced.
-    f.niri().gnome_settings.app_picker_layout = HashMap::from([
+    f.synoik().gnome_settings.app_picker_layout = HashMap::from([
         ("z.desktop".to_owned(), (0, 7)),
         ("m.desktop".to_owned(), (1, 0)),
     ]);
-    f.niri().sync_app_grid();
+    f.synoik().sync_app_grid();
     assert_eq!(
         ids(&mut f),
         vec!["z.desktop", "m.desktop", "a.desktop"],
@@ -10647,20 +10714,20 @@ fn overview_dragging_a_grid_icon_reorders_the_grid() {
     let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
     let ids = |f: &mut Fixture| -> Vec<String> {
         (0..3)
-            .filter_map(|i| f.niri().app_grid.entry_id(i).map(str::to_owned))
+            .filter_map(|i| f.synoik().app_grid.entry_id(i).map(str::to_owned))
             .collect()
     };
     assert_eq!(ids(&mut f), vec!["a.desktop", "m.desktop", "z.desktop"]);
 
     let area = overview_controls(&mut f).app_display;
-    let start = f.niri().app_grid.entry_center(0, area).expect("tile 0");
-    let third = f.niri().app_grid.entry_rect(2, area).expect("tile 2");
+    let start = f.synoik().app_grid.entry_center(0, area).expect("tile 0");
+    let third = f.synoik().app_grid.entry_rect(2, area).expect("tile 2");
     pointer_motion_to(&mut f, start.x, start.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     // Aim just inside the leading edge of the third tile — within the 20px divider
     // leeway, so it is an insertion point and not the icon's body.
     pointer_motion_to(&mut f, third.loc.x + 5., third.loc.y + third.size.h / 2.);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     assert_eq!(
@@ -10683,22 +10750,22 @@ fn overview_dropping_a_grid_icon_on_another_makes_a_folder() {
     let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
 
     let area = overview_controls(&mut f).app_display;
-    let start = f.niri().app_grid.entry_center(0, area).expect("tile 0");
-    let third = f.niri().app_grid.entry_center(2, area).expect("tile 2");
+    let start = f.synoik().app_grid.entry_center(0, area).expect("tile 0");
+    let third = f.synoik().app_grid.entry_center(2, area).expect("tile 2");
     pointer_motion_to(&mut f, start.x, start.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     // The centre of the third tile: its body, not the divider a reorder would take.
     pointer_motion_to(&mut f, third.x, third.y);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     assert_eq!(
-        f.niri().app_grid.entry_id(0),
+        f.synoik().app_grid.entry_id(0),
         Some("m.desktop"),
         "the app that took no part stays where it was"
     );
     let members: Vec<&str> = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_folder(1)
         .expect("the folder took the hovered icon's slot, less the source pulled out ahead of it")
@@ -10710,9 +10777,9 @@ fn overview_dropping_a_grid_icon_on_another_makes_a_folder() {
         vec!["z.desktop", "a.desktop"],
         "the hovered app comes first, then the dragged one (`[this.id, source.id]`)"
     );
-    assert_eq!(f.niri().app_grid.entry_name(1), Some("Unnamed Folder"));
+    assert_eq!(f.synoik().app_grid.entry_name(1), Some("Unnamed Folder"));
     assert_eq!(
-        f.niri().app_grid.entry_id(2),
+        f.synoik().app_grid.entry_id(2),
         None,
         "both apps left the top level"
     );
@@ -10731,47 +10798,47 @@ fn overview_dropping_a_grid_icon_on_a_folder_joins_it() {
     use crate::gnome::AppFolder;
 
     let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
-    f.niri().gnome_settings.app_folders = vec![AppFolder {
+    f.synoik().gnome_settings.app_folders = vec![AppFolder {
         id: "Utilities".to_owned(),
         name: "Utilities".to_owned(),
         apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
         ..Default::default()
     }];
-    f.niri().sync_app_grid();
-    assert_eq!(f.niri().app_grid.entry_id(0), Some("a.desktop"));
-    assert_eq!(f.niri().app_grid.entry_id(1), Some("Utilities"));
+    f.synoik().sync_app_grid();
+    assert_eq!(f.synoik().app_grid.entry_id(0), Some("a.desktop"));
+    assert_eq!(f.synoik().app_grid.entry_id(1), Some("Utilities"));
 
     let area = overview_controls(&mut f).app_display;
-    let app = f.niri().app_grid.entry_center(0, area).expect("tile 0");
-    let folder = f.niri().app_grid.entry_center(1, area).expect("tile 1");
+    let app = f.synoik().app_grid.entry_center(0, area).expect("tile 0");
+    let folder = f.synoik().app_grid.entry_center(1, area).expect("tile 1");
 
     // The folder onto the app: no drop, no reorder, nothing.
     pointer_motion_to(&mut f, folder.x, folder.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, app.x, app.y);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     assert_eq!(
-        f.niri().app_grid.drop_hover(),
+        f.synoik().app_grid.drop_hover(),
         None,
         "a folder is not something another icon can swallow"
     );
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    assert_eq!(f.niri().app_grid.entry_id(0), Some("a.desktop"));
-    assert_eq!(f.niri().app_grid.entry_id(1), Some("Utilities"));
+    assert_eq!(f.synoik().app_grid.entry_id(0), Some("a.desktop"));
+    assert_eq!(f.synoik().app_grid.entry_id(1), Some("Utilities"));
 
     // The app onto the folder: a join.
     pointer_motion_to(&mut f, app.x, app.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, folder.x, folder.y);
     assert_eq!(
-        f.niri().app_grid.drop_hover(),
+        f.synoik().app_grid.drop_hover(),
         Some(1),
         "a folder lights up the moment the drag reaches it — no 500 ms preview"
     );
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     let members: Vec<&str> = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_folder(0)
         .expect("the folder took the slot the app left")
@@ -10784,7 +10851,7 @@ fn overview_dropping_a_grid_icon_on_a_folder_joins_it() {
         "the joined app appends, as `addApp` pushes onto `apps`"
     );
     assert_eq!(
-        f.niri().app_grid.entry_id(1),
+        f.synoik().app_grid.entry_id(1),
         None,
         "and it is gone from the top level"
     );
@@ -10800,10 +10867,10 @@ fn overview_dropping_a_grid_icon_on_a_preview_band_changes_its_page() {
     let (mut f, _recorder) = app_grid_fixture(&[], &refs);
 
     let area = overview_controls(&mut f).app_display;
-    assert_eq!(f.niri().app_grid.page_count(area), 2, "30 apps paginate");
-    assert_eq!(f.niri().app_grid.entry_id(0), Some("app00.desktop"));
+    assert_eq!(f.synoik().app_grid.page_count(area), 2, "30 apps paginate");
+    assert_eq!(f.synoik().app_grid.entry_id(0), Some("app00.desktop"));
 
-    let start = f.niri().app_grid.entry_center(0, area).expect("tile 0");
+    let start = f.synoik().app_grid.entry_center(0, area).expect("tile 0");
     pointer_motion_to(&mut f, start.x, start.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     // Out to the right band. It only becomes a target once the previews have slid in.
@@ -10814,12 +10881,12 @@ fn overview_dropping_a_grid_icon_on_a_preview_band_changes_its_page() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     assert_eq!(
-        f.niri().app_grid.current_page(),
+        f.synoik().app_grid.current_page(),
         1,
         "the view must follow the app to its new page"
     );
     assert_eq!(
-        f.niri().app_grid.entry_id(29),
+        f.synoik().app_grid.entry_id(29),
         Some("app00.desktop"),
         "the app appends to the page it was dropped onto"
     );
@@ -10833,7 +10900,7 @@ fn overview_app_grid_click_launches_and_closes() {
     // Tile 0 is the first non-favorite in name order ("m.desktop"); "a.desktop" is a
     // favorite and lives in the dash, not the grid.
     let center = f
-        .niri()
+        .synoik()
         .app_grid
         .tile_center(0, area)
         .expect("grid tile 0 in range");
@@ -10841,13 +10908,13 @@ fn overview_app_grid_click_launches_and_closes() {
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1, "exactly one app launched");
     assert_eq!(calls[0].0.id, "m.desktop", "the clicked grid app launched");
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "launching from the grid closes the overview"
     );
 }
@@ -10869,11 +10936,11 @@ fn overview_app_grid_folds_a_folders_apps_out_of_the_top_level() {
     let (mut f, recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
     let ids = |f: &mut Fixture| -> Vec<String> {
         (0..4)
-            .filter_map(|i| f.niri().app_grid.entry_id(i).map(str::to_owned))
+            .filter_map(|i| f.synoik().app_grid.entry_id(i).map(str::to_owned))
             .collect()
     };
 
-    f.niri().gnome_settings.app_folders = vec![
+    f.synoik().gnome_settings.app_folders = vec![
         AppFolder {
             id: "Utilities".to_owned(),
             name: "Utilities".to_owned(),
@@ -10887,7 +10954,7 @@ fn overview_app_grid_folds_a_folders_apps_out_of_the_top_level() {
             ..Default::default()
         },
     ];
-    f.niri().sync_app_grid();
+    f.synoik().sync_app_grid();
 
     assert_eq!(
         ids(&mut f),
@@ -10896,7 +10963,7 @@ fn overview_app_grid_folds_a_folders_apps_out_of_the_top_level() {
          folder that resolved to nothing is not displayed"
     );
     assert_eq!(
-        f.niri()
+        f.synoik()
             .app_grid
             .entry_folder(1)
             .expect("tile 1 is the folder")
@@ -10907,37 +10974,37 @@ fn overview_app_grid_folds_a_folders_apps_out_of_the_top_level() {
         "the folder carries its members, in the order it lists them"
     );
     assert!(
-        f.niri().app_grid.entry_folder(0).is_none(),
+        f.synoik().app_grid.entry_folder(0).is_none(),
         "an app tile is not a folder"
     );
 
     // The folder id sorts through the same saved arrangement as a desktop id.
-    f.niri().gnome_settings.app_picker_layout = HashMap::from([("Utilities".to_owned(), (0, 0))]);
-    f.niri().sync_app_grid();
+    f.synoik().gnome_settings.app_picker_layout = HashMap::from([("Utilities".to_owned(), (0, 0))]);
+    f.synoik().sync_app_grid();
     assert_eq!(ids(&mut f), vec!["Utilities", "a.desktop"]);
 
     // Clicking it launches nothing and leaves the overview up — it opens instead.
     let area = overview_controls(&mut f).app_display;
     let center = f
-        .niri()
+        .synoik()
         .app_grid
         .tile_center(0, area)
         .expect("the folder tile is in range");
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
         recorder.calls.borrow().is_empty(),
         "a folder launches nothing"
     );
     assert!(
-        f.niri().layout.is_app_grid_open(),
+        f.synoik().layout.is_app_grid_open(),
         "clicking a folder must not close the overview"
     );
     assert_eq!(
-        f.niri().folder_dialog.folder_id(),
+        f.synoik().folder_dialog.folder_id(),
         Some("Utilities"),
         "clicking a folder opens its dialog (`FolderIcon.vfunc_clicked`)"
     );
@@ -10955,23 +11022,27 @@ fn overview_folder_dialog_renames_the_folder() {
     use crate::gnome::AppFolder;
 
     let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
-    f.niri().gnome_settings.app_folders = vec![AppFolder {
+    f.synoik().gnome_settings.app_folders = vec![AppFolder {
         id: "Utilities".to_owned(),
         name: "Utilities".to_owned(),
         apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
         ..Default::default()
     }];
-    f.niri().sync_app_grid();
+    f.synoik().sync_app_grid();
 
     let view: Rectangle<f64, smithay::utils::Logical> =
         Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
     let area = overview_controls(&mut f).app_display;
-    let center = f.niri().app_grid.tile_center(1, area).expect("folder tile");
+    let center = f
+        .synoik()
+        .app_grid
+        .tile_center(1, area)
+        .expect("folder tile");
     pointer_motion_to(&mut f, center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
-    assert_eq!(f.niri().folder_dialog.folder_id(), Some("Utilities"));
+    f.synoik_complete_animations();
+    assert_eq!(f.synoik().folder_dialog.folder_id(), Some("Utilities"));
 
     // The edit button opens the entry, with the name selected whole.
     let edit = crate::ui::folder_dialog::layout(view).edit_button;
@@ -10980,27 +11051,27 @@ fn overview_folder_dialog_renames_the_folder() {
     pointer_motion_to(&mut f, edit_center.x, edit_center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    assert!(f.niri().folder_dialog.is_renaming());
-    assert_eq!(f.niri().folder_dialog.rename_text(), Some("Utilities"));
+    assert!(f.synoik().folder_dialog.is_renaming());
+    assert_eq!(f.synoik().folder_dialog.rename_text(), Some("Utilities"));
     // Without this the overview never holds the key focus and the whole ladder is dead.
-    f.niri_state().update_keyboard_focus();
+    f.synoik_state().update_keyboard_focus();
 
     // Typing over the selection replaces the whole name, and the keys never reach the
     // search entry behind.
     tap(&mut f, KEY_T);
     tap(&mut f, KEY_O);
-    assert_eq!(f.niri().folder_dialog.rename_text(), Some("to"));
+    assert_eq!(f.synoik().folder_dialog.rename_text(), Some("to"));
     assert!(
-        !f.niri().overview_search.is_active(),
+        !f.synoik().overview_search.is_active(),
         "the rename entry holds the key focus, so the search never engages"
     );
 
     // Enter commits: the label follows immediately.
     tap(&mut f, KEY_ENTER);
-    assert!(!f.niri().folder_dialog.is_renaming());
-    assert_eq!(f.niri().app_grid.entry_name(1), Some("Utilities"));
+    assert!(!f.synoik().folder_dialog.is_renaming());
+    assert_eq!(f.synoik().app_grid.entry_name(1), Some("Utilities"));
     assert_eq!(
-        f.niri().folder_dialog.folder_name(),
+        f.synoik().folder_dialog.folder_name(),
         Some("to"),
         "the dialog shows the new name at once; the grid tile follows the settings reload"
     );
@@ -11022,23 +11093,27 @@ fn overview_dragging_an_app_out_of_a_folder_removes_it() {
     use crate::gnome::AppFolder;
 
     let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
-    f.niri().gnome_settings.app_folders = vec![AppFolder {
+    f.synoik().gnome_settings.app_folders = vec![AppFolder {
         id: "Utilities".to_owned(),
         name: "Utilities".to_owned(),
         apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
         ..Default::default()
     }];
-    f.niri().sync_app_grid();
+    f.synoik().sync_app_grid();
 
     let view: Rectangle<f64, smithay::utils::Logical> =
         Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
     let open_it = |f: &mut Fixture| {
         let area = overview_controls(f).app_display;
-        let center = f.niri().app_grid.tile_center(1, area).expect("folder tile");
+        let center = f
+            .synoik()
+            .app_grid
+            .tile_center(1, area)
+            .expect("folder tile");
         pointer_motion_to(f, center.x, center.y);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
-        f.niri_complete_animations();
+        f.synoik_complete_animations();
     };
     let panel = crate::ui::folder_dialog::layout(view).panel;
     let outside: Point<f64, smithay::utils::Logical> =
@@ -11047,27 +11122,27 @@ fn overview_dragging_an_app_out_of_a_folder_removes_it() {
     // First, a drag that ends back inside the panel: nothing moves.
     open_it(&mut f);
     let member = f
-        .niri()
+        .synoik()
         .folder_dialog
         .entry_center(0, view)
         .expect("member tile 0");
     pointer_motion_to(&mut f, member.x, member.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, outside.x, outside.y);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     assert_eq!(
-        f.niri().app_grid.index_of("m.desktop"),
+        f.synoik().app_grid.index_of("m.desktop"),
         Some(2),
         "the placeholder joins the grid for the duration of the drag"
     );
     pointer_motion_to(&mut f, member.x, member.y);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert_eq!(
-        f.niri().app_grid.index_of("m.desktop"),
+        f.synoik().app_grid.index_of("m.desktop"),
         None,
         "a drop back inside the folder withdraws the placeholder"
     );
-    assert_eq!(f.niri().folder_dialog.member_count(), 2);
+    assert_eq!(f.synoik().folder_dialog.member_count(), 2);
 
     // Then the real thing.
     pointer_motion_to(&mut f, member.x, member.y);
@@ -11076,21 +11151,21 @@ fn overview_dragging_an_app_out_of_a_folder_removes_it() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     assert!(
-        !f.niri().folder_dialog.is_open(),
+        !f.synoik().folder_dialog.is_open(),
         "the dialog takes the drop and pops down"
     );
     assert_eq!(
-        f.niri().app_grid.index_of("m.desktop"),
+        f.synoik().app_grid.index_of("m.desktop"),
         Some(2),
         "the app is a top-level tile now, where its placeholder sat"
     );
     assert_eq!(
-        f.niri().app_grid.focused(),
+        f.synoik().app_grid.focused(),
         Some(2),
         "and it takes the key focus (`selectApp`)"
     );
     let members: Vec<&str> = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_folder(1)
         .expect("the folder is still there with what is left")
@@ -11102,7 +11177,7 @@ fn overview_dragging_an_app_out_of_a_folder_removes_it() {
     // Taking the last app out takes the folder with it (`removeApp`'s empty branch).
     open_it(&mut f);
     let member = f
-        .niri()
+        .synoik()
         .folder_dialog
         .entry_center(0, view)
         .expect("the one member left");
@@ -11112,11 +11187,11 @@ fn overview_dragging_an_app_out_of_a_folder_removes_it() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     assert_eq!(
-        f.niri().app_grid.index_of("Utilities"),
+        f.synoik().app_grid.index_of("Utilities"),
         None,
         "an emptied folder is deleted, not shown empty"
     );
-    assert_eq!(f.niri().app_grid.index_of("z.desktop"), Some(2));
+    assert_eq!(f.synoik().app_grid.index_of("z.desktop"), Some(2));
 }
 
 /// A drag that stays inside the folder reorders its members: `FolderView` is a
@@ -11139,7 +11214,7 @@ fn overview_dragging_inside_a_folder_reorders_its_members() {
             "z.desktop",
         ],
     );
-    f.niri().gnome_settings.app_folders = vec![AppFolder {
+    f.synoik().gnome_settings.app_folders = vec![AppFolder {
         id: "Utilities".to_owned(),
         name: "Utilities".to_owned(),
         apps: vec![
@@ -11150,23 +11225,27 @@ fn overview_dragging_inside_a_folder_reorders_its_members() {
         ],
         ..Default::default()
     }];
-    f.niri().sync_app_grid();
+    f.synoik().sync_app_grid();
 
     let view: Rectangle<f64, smithay::utils::Logical> =
         Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
     let area = overview_controls(&mut f).app_display;
-    let center = f.niri().app_grid.tile_center(1, area).expect("folder tile");
+    let center = f
+        .synoik()
+        .app_grid
+        .tile_center(1, area)
+        .expect("folder tile");
     pointer_motion_to(&mut f, center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
-        f.niri().folder_dialog.member_ids(),
+        f.synoik().folder_dialog.member_ids(),
         vec!["m.desktop", "n.desktop", "o.desktop", "z.desktop"]
     );
 
     let at = |f: &mut Fixture, i: usize| {
-        f.niri()
+        f.synoik()
             .folder_dialog
             .entry_center(i, view)
             .expect("member tile")
@@ -11178,25 +11257,25 @@ fn overview_dragging_inside_a_folder_reorders_its_members() {
     pointer_motion_to(&mut f, first.x, first.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, third.x + pitch * 0.4, third.y);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     assert!(
-        f.niri().folder_pending_move.is_some(),
+        f.synoik().folder_pending_move.is_some(),
         "the folder arms the same delayed move the grid does"
     );
     // A drop that beats the 200 ms timer still commits the move, as it does in the grid.
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     assert!(
-        f.niri().folder_dialog.is_open(),
+        f.synoik().folder_dialog.is_open(),
         "a drop inside the panel is the folder's, so the dialog stays up"
     );
     assert_eq!(
-        f.niri().folder_dialog.member_ids(),
+        f.synoik().folder_dialog.member_ids(),
         vec!["n.desktop", "o.desktop", "m.desktop", "z.desktop"],
         "the dragged member took its new place"
     );
     assert_eq!(
-        f.niri().app_grid.index_of("m.desktop"),
+        f.synoik().app_grid.index_of("m.desktop"),
         None,
         "and the drag placeholder is gone from the grid behind"
     );
@@ -11209,7 +11288,7 @@ fn overview_dragging_inside_a_folder_reorders_its_members() {
     pointer_motion_to(&mut f, first.x, first.y);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert_eq!(
-        f.niri().folder_dialog.member_ids(),
+        f.synoik().folder_dialog.member_ids(),
         vec!["n.desktop", "o.desktop", "m.desktop", "z.desktop"],
         "a drag back to where it started changes nothing"
     );
@@ -11223,7 +11302,7 @@ fn overview_dragging_inside_a_folder_reorders_its_members() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, third.x + pitch * 0.4, third.y);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    let after_first = f.niri().folder_dialog.member_ids();
+    let after_first = f.synoik().folder_dialog.member_ids();
 
     // Wait out most of that timer's delay, so its firing lands *inside* the window the
     // second drag is watched over.
@@ -11231,15 +11310,15 @@ fn overview_dragging_inside_a_folder_reorders_its_members() {
     pointer_motion_to(&mut f, first.x, first.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, third.x + pitch * 0.4, third.y);
-    assert!(f.niri().folder_pending_move.is_some(), "a move is armed");
+    assert!(f.synoik().folder_pending_move.is_some(), "a move is armed");
     let moved_early = f.dispatch_until(Duration::from_millis(100), |state| {
-        state.niri.folder_dialog.member_ids() != after_first
+        state.synoik.folder_dialog.member_ids() != after_first
     });
     assert!(
         !moved_early,
         "nothing moves before the delay is out: {:?} became {:?}",
         after_first,
-        f.niri().folder_dialog.member_ids()
+        f.synoik().folder_dialog.member_ids()
     );
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 }
@@ -11263,12 +11342,12 @@ fn overview_chrome_ramps_down_on_a_small_canvas() {
     let measure = |size: (u16, u16)| -> (f64, f64, f64, f64) {
         let mut f = Fixture::new();
         f.add_output(1, size);
-        let output = f.niri_output(1);
-        f.niri_state().do_action(Action::OpenOverview, false);
-        f.niri_complete_animations();
+        let output = f.synoik_output(1);
+        f.synoik_state().do_action(Action::OpenOverview, false);
+        f.synoik_complete_animations();
 
         let controls = f
-            .niri()
+            .synoik()
             .layout
             .controls_layout_for_output(&output)
             .expect("the output has a monitor");
@@ -11276,13 +11355,13 @@ fn overview_chrome_ramps_down_on_a_small_canvas() {
         // The ramp sizes the *open* pill; at rest the entry is a collapsed puck whose width
         // is a fixed circle and would ramp with nothing.
         let entry = f
-            .niri()
+            .synoik()
             .overview_search
             .expanded_entry_pill(controls.into())
             .size
             .w;
         let mon = f
-            .niri()
+            .synoik()
             .layout
             .monitor_for_output(&output)
             .expect("the output has a monitor");
@@ -11345,46 +11424,50 @@ fn overview_dropping_a_favourite_on_the_grid_unpins_it() {
         &["m.desktop", "z.desktop"],
     );
     assert!(
-        f.niri().app_system.is_favorite("a.desktop"),
+        f.synoik().app_system.is_favorite("a.desktop"),
         "a.desktop starts pinned"
     );
     assert_eq!(
-        f.niri().app_grid.index_of("a.desktop"),
+        f.synoik().app_grid.index_of("a.desktop"),
         None,
         "…and so is not in the grid"
     );
 
     let controls = overview_controls(&mut f);
     let (area, dash) = (controls.app_display, controls.dash);
-    let from = f.niri().dash.tile_center(0, dash).expect("the dash tile");
-    let onto = f.niri().app_grid.entry_rect(1, area).expect("grid tile 1");
+    let from = f.synoik().dash.tile_center(0, dash).expect("the dash tile");
+    let onto = f
+        .synoik()
+        .app_grid
+        .entry_rect(1, area)
+        .expect("grid tile 1");
 
     pointer_motion_to(&mut f, from.x, from.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     // The leading edge of a tile: an insertion point, not the body a fold would take.
     pointer_motion_to(&mut f, onto.loc.x + 5., onto.loc.y + onto.size.h / 2.);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     assert!(
-        f.niri().app_grid.index_of("a.desktop").is_some(),
+        f.synoik().app_grid.index_of("a.desktop").is_some(),
         "a placeholder joins the grid for the duration of the drag"
     );
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     assert!(
-        !f.niri().app_system.is_favorite("a.desktop"),
+        !f.synoik().app_system.is_favorite("a.desktop"),
         "the drop unpinned it"
     );
     assert_eq!(
-        f.niri().app_grid.index_of("a.desktop"),
+        f.synoik().app_grid.index_of("a.desktop"),
         Some(1),
         "and it stays in the slot it was dropped in, not at the name-ordered tail"
     );
 
     // Folding a favourite into a new folder unpins it too (`AppIcon.acceptDrop` reaches
     // the same `removeFavorite` via `AppDisplay.createFolder`, `appDisplay.js:1699-1751`).
-    let from = f.niri().dash.tile_center(0, dash).expect("the dash tile");
+    let from = f.synoik().dash.tile_center(0, dash).expect("the dash tile");
     let onto = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_center(0, area)
         .expect("grid tile 0");
@@ -11393,7 +11476,7 @@ fn overview_dropping_a_favourite_on_the_grid_unpins_it() {
     pointer_motion_to(&mut f, onto.x, onto.y);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert!(
-        !f.niri().app_system.is_favorite("b.desktop"),
+        !f.synoik().app_system.is_favorite("b.desktop"),
         "the fold unpinned it"
     );
     // Only the unpin is asserted here: unpinning re-derives the grid from the settings
@@ -11401,18 +11484,23 @@ fn overview_dropping_a_favourite_on_the_grid_unpins_it() {
     // from. The fold itself is pinned by `overview_dropping_a_grid_icon_on_another_…`.
 
     // A drag that ends nowhere leaves the dash alone and withdraws the placeholder.
-    let from = f.niri().dash.tile_center(0, dash).expect("the dash tile");
-    let pinned = f.niri().dash.item_id(0).map(str::to_owned).expect("a tile");
+    let from = f.synoik().dash.tile_center(0, dash).expect("the dash tile");
+    let pinned = f
+        .synoik()
+        .dash
+        .item_id(0)
+        .map(str::to_owned)
+        .expect("a tile");
     pointer_motion_to(&mut f, from.x, from.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, 4., 4.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert!(
-        f.niri().app_system.is_favorite(&pinned),
+        f.synoik().app_system.is_favorite(&pinned),
         "a drop on nothing keeps it pinned: {pinned}"
     );
     assert_eq!(
-        f.niri().app_grid.index_of(&pinned),
+        f.synoik().app_grid.index_of(&pinned),
         None,
         "…and its placeholder is withdrawn"
     );
@@ -11427,24 +11515,24 @@ fn overview_escape_during_a_drag_cancels_the_drag() {
     let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
     let area = overview_controls(&mut f).app_display;
     let before: Vec<String> = (0..3)
-        .filter_map(|i| f.niri().app_grid.entry_id(i).map(str::to_owned))
+        .filter_map(|i| f.synoik().app_grid.entry_id(i).map(str::to_owned))
         .collect();
 
-    let first = f.niri().app_grid.entry_center(0, area).expect("tile 0");
-    let third = f.niri().app_grid.entry_center(2, area).expect("tile 2");
+    let first = f.synoik().app_grid.entry_center(0, area).expect("tile 0");
+    let third = f.synoik().app_grid.entry_center(2, area).expect("tile 2");
     pointer_motion_to(&mut f, first.x, first.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, third.x, third.y);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
 
     tap(&mut f, KEY_ESC);
-    assert!(f.niri().app_drag.is_none(), "the drag is cancelled");
+    assert!(f.synoik().app_drag.is_none(), "the drag is cancelled");
     assert!(
-        f.niri().layout.is_app_grid_open(),
+        f.synoik().layout.is_app_grid_open(),
         "…and the grid it was over stays open — Escape went no further"
     );
     let after: Vec<String> = (0..3)
-        .filter_map(|i| f.niri().app_grid.entry_id(i).map(str::to_owned))
+        .filter_map(|i| f.synoik().app_grid.entry_id(i).map(str::to_owned))
         .collect();
     assert_eq!(
         after, before,
@@ -11454,7 +11542,7 @@ fn overview_escape_during_a_drag_cancels_the_drag() {
     // The button is still down; releasing it must not now act as a drop.
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     let after: Vec<String> = (0..3)
-        .filter_map(|i| f.niri().app_grid.entry_id(i).map(str::to_owned))
+        .filter_map(|i| f.synoik().app_grid.entry_id(i).map(str::to_owned))
         .collect();
     assert_eq!(after, before, "and the release that follows is not a drop");
 }
@@ -11470,12 +11558,12 @@ fn overview_escape_during_a_drag_cancels_the_drag() {
 #[test]
 fn overview_app_icon_uploads_are_one_shared_map() {
     let (mut f, _recorder) = app_grid_fixture(&["a.desktop"], &["m.desktop"]);
-    let niri = f.niri();
-    let dash = niri.dash.icon_uploads();
+    let synoik = f.synoik();
+    let dash = synoik.dash.icon_uploads();
     for (name, other) in [
-        ("the app grid", niri.app_grid.icon_uploads()),
-        ("the search results", niri.overview_search.icon_uploads()),
-        ("the drag proxy", niri.app_icon_uploads.clone()),
+        ("the app grid", synoik.app_grid.icon_uploads()),
+        ("the search results", synoik.overview_search.icon_uploads()),
+        ("the drag proxy", synoik.app_icon_uploads.clone()),
     ] {
         assert!(
             std::rc::Rc::ptr_eq(&dash, &other),
@@ -11485,9 +11573,10 @@ fn overview_app_icon_uploads_are_one_shared_map() {
 
     // A folder's view is built when it opens, so it can only inherit the map if the
     // dialog was told about it — the one path that is not wired at construction.
-    niri.folder_dialog
+    synoik
+        .folder_dialog
         .popup("Utilities", "Utilities", Vec::new());
-    let folder = niri
+    let folder = synoik
         .folder_dialog
         .icon_uploads()
         .expect("an open folder has a view");
@@ -11524,15 +11613,15 @@ fn overview_app_grid_sorts_names_by_collation() {
             .iter()
             .map(|(id, name)| AppEntry::fake(id, name))
             .collect();
-        f.niri().app_system = AppSystem::with_parts(
+        f.synoik().app_system = AppSystem::with_parts(
             Box::new(FakeCatalog::new(apps)),
             Box::new(RecordingLauncher::default()),
         );
-        f.niri().sync_app_grid();
+        f.synoik().sync_app_grid();
     }
 
     let order: Vec<String> = (0..4)
-        .filter_map(|i| f.niri().app_grid.entry_name(i).map(str::to_owned))
+        .filter_map(|i| f.synoik().app_grid.entry_name(i).map(str::to_owned))
         .collect();
     assert_eq!(
         order,
@@ -11555,31 +11644,35 @@ fn overview_dragging_a_member_onto_a_folder_page_band_moves_it_there() {
     let apps: Vec<String> = (0..12).map(|i| format!("m{i:02}.desktop")).collect();
     let refs: Vec<&str> = apps.iter().map(String::as_str).collect();
     let (mut f, _recorder) = app_grid_fixture(&[], &refs);
-    f.niri().gnome_settings.app_folders = vec![AppFolder {
+    f.synoik().gnome_settings.app_folders = vec![AppFolder {
         id: "Utilities".to_owned(),
         name: "Utilities".to_owned(),
         apps: apps.clone(),
         ..Default::default()
     }];
-    f.niri().sync_app_grid();
+    f.synoik().sync_app_grid();
 
     let view: Rectangle<f64, smithay::utils::Logical> =
         Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
     let area = overview_controls(&mut f).app_display;
-    let center = f.niri().app_grid.tile_center(0, area).expect("folder tile");
+    let center = f
+        .synoik()
+        .app_grid
+        .tile_center(0, area)
+        .expect("folder tile");
     pointer_motion_to(&mut f, center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
-        f.niri().folder_dialog.page_count(view),
+        f.synoik().folder_dialog.page_count(view),
         2,
         "twelve members make two pages of the 3x3 folder grid"
     );
 
     // Pick the first member up and hold it over the next-page band.
     let member = f
-        .niri()
+        .synoik()
         .folder_dialog
         .entry_center(0, view)
         .expect("tile 0");
@@ -11593,29 +11686,29 @@ fn overview_dragging_a_member_onto_a_folder_page_band_moves_it_there() {
         grid.loc.y + grid.size.h / 2.,
     ));
     pointer_motion_to(&mut f, band.x, band.y);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     // The bands slide in over 150 ms and are not a drop target until they are there
-    // (`hint_at` reads the peek). `niri_complete_animations` will not do: it flips the
+    // (`hint_at` reads the peek). `synoik_complete_animations` will not do: it flips the
     // clock's complete-instantly flag back off, so the peek reads 0 again the moment it
     // returns — the animation clock has to really move.
     f.settle_animations();
     assert_eq!(
-        f.niri().folder_dialog.current_page(),
+        f.synoik().folder_dialog.current_page(),
         0,
         "hovering a band does not switch the page on its own — that takes a beat"
     );
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     assert!(
-        f.niri().folder_dialog.is_open(),
+        f.synoik().folder_dialog.is_open(),
         "the folder took the drop, so the dialog stays up"
     );
     assert_eq!(
-        f.niri().folder_dialog.current_page(),
+        f.synoik().folder_dialog.current_page(),
         1,
         "and follows the member to the page it was sent to"
     );
-    let members = f.niri().folder_dialog.member_ids();
+    let members = f.synoik().folder_dialog.member_ids();
     assert_eq!(
         members.last().map(String::as_str),
         Some("m00.desktop"),
@@ -11634,22 +11727,26 @@ fn overview_dropping_a_member_on_the_folder_name_row_takes_it_out() {
     use crate::gnome::AppFolder;
 
     let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
-    f.niri().gnome_settings.app_folders = vec![AppFolder {
+    f.synoik().gnome_settings.app_folders = vec![AppFolder {
         id: "Utilities".to_owned(),
         name: "Utilities".to_owned(),
         apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
         ..Default::default()
     }];
-    f.niri().sync_app_grid();
+    f.synoik().sync_app_grid();
 
     let view: Rectangle<f64, smithay::utils::Logical> =
         Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
     let area = overview_controls(&mut f).app_display;
-    let center = f.niri().app_grid.tile_center(1, area).expect("folder tile");
+    let center = f
+        .synoik()
+        .app_grid
+        .tile_center(1, area)
+        .expect("folder tile");
     pointer_motion_to(&mut f, center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     let l = crate::ui::folder_dialog::layout(view);
     let name = Point::from((
@@ -11662,7 +11759,7 @@ fn overview_dropping_a_member_on_the_folder_name_row_takes_it_out() {
     );
 
     let member = f
-        .niri()
+        .synoik()
         .folder_dialog
         .entry_center(0, view)
         .expect("tile 0");
@@ -11672,11 +11769,11 @@ fn overview_dropping_a_member_on_the_folder_name_row_takes_it_out() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     assert!(
-        !f.niri().folder_dialog.is_open(),
+        !f.synoik().folder_dialog.is_open(),
         "the dialog takes the drop and pops down"
     );
     assert_eq!(
-        f.niri().app_grid.index_of("m.desktop"),
+        f.synoik().app_grid.index_of("m.desktop"),
         Some(2),
         "the app is a top-level tile now"
     );
@@ -11694,48 +11791,52 @@ fn overview_a_drag_inside_the_folder_leaves_the_grid_behind_alone() {
     use crate::gnome::AppFolder;
 
     let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
-    f.niri().gnome_settings.app_folders = vec![AppFolder {
+    f.synoik().gnome_settings.app_folders = vec![AppFolder {
         id: "Utilities".to_owned(),
         name: "Utilities".to_owned(),
         apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
         ..Default::default()
     }];
-    f.niri().sync_app_grid();
+    f.synoik().sync_app_grid();
 
     let view: Rectangle<f64, smithay::utils::Logical> =
         Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
     let area = overview_controls(&mut f).app_display;
-    let center = f.niri().app_grid.tile_center(1, area).expect("folder tile");
+    let center = f
+        .synoik()
+        .app_grid
+        .tile_center(1, area)
+        .expect("folder tile");
     pointer_motion_to(&mut f, center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     // Pick a member up and cross the drag threshold *inside* the panel.
     let from = f
-        .niri()
+        .synoik()
         .folder_dialog
         .entry_center(0, view)
         .expect("tile 0");
     let to = f
-        .niri()
+        .synoik()
         .folder_dialog
         .entry_center(1, view)
         .expect("tile 1");
     pointer_motion_to(&mut f, from.x, from.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, to.x, to.y);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     assert!(
-        f.niri().folder_dialog.is_open(),
+        f.synoik().folder_dialog.is_open(),
         "and the dialog is still up"
     );
     assert!(
-        f.niri().grid_pending_move.is_none(),
+        f.synoik().grid_pending_move.is_none(),
         "the covered grid arms no move"
     );
     assert_eq!(
-        f.niri().app_grid.drop_hover(),
+        f.synoik().app_grid.drop_hover(),
         None,
         "and offers no folder of its own"
     );
@@ -11758,7 +11859,7 @@ fn overview_dragging_an_app_between_folders_moves_it() {
 
     let (mut f, _recorder) =
         app_grid_fixture(&[], &["a.desktop", "m.desktop", "q.desktop", "z.desktop"]);
-    f.niri().gnome_settings.app_folders = vec![
+    f.synoik().gnome_settings.app_folders = vec![
         AppFolder {
             id: "Utilities".to_owned(),
             name: "Utilities".to_owned(),
@@ -11772,28 +11873,32 @@ fn overview_dragging_an_app_between_folders_moves_it() {
             ..Default::default()
         },
     ];
-    f.niri().sync_app_grid();
-    assert_eq!(f.niri().app_grid.entry_id(0), Some("a.desktop"));
-    assert_eq!(f.niri().app_grid.entry_id(1), Some("Office"));
-    assert_eq!(f.niri().app_grid.entry_id(2), Some("Utilities"));
+    f.synoik().sync_app_grid();
+    assert_eq!(f.synoik().app_grid.entry_id(0), Some("a.desktop"));
+    assert_eq!(f.synoik().app_grid.entry_id(1), Some("Office"));
+    assert_eq!(f.synoik().app_grid.entry_id(2), Some("Utilities"));
 
     let view: Rectangle<f64, smithay::utils::Logical> =
         Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
     let area = overview_controls(&mut f).app_display;
     let office = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_center(1, area)
         .expect("Office tile");
 
     // Open Utilities and pick its first member up.
-    let center = f.niri().app_grid.tile_center(2, area).expect("folder tile");
+    let center = f
+        .synoik()
+        .app_grid
+        .tile_center(2, area)
+        .expect("folder tile");
     pointer_motion_to(&mut f, center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     let member = f
-        .niri()
+        .synoik()
         .folder_dialog
         .entry_center(0, view)
         .expect("member tile 0");
@@ -11802,9 +11907,9 @@ fn overview_dragging_an_app_between_folders_moves_it() {
 
     // Out of the panel, and hold there until the dialog gives up and pops down.
     pointer_motion_to(&mut f, office.x, office.y);
-    assert!(f.niri().app_drag.is_some(), "the drag must have started");
+    assert!(f.synoik().app_drag.is_some(), "the drag must have started");
     let popped = f.dispatch_until(Duration::from_millis(2000), |state| {
-        !state.niri.folder_dialog.is_open()
+        !state.synoik.folder_dialog.is_open()
     });
     assert!(
         popped,
@@ -11814,15 +11919,19 @@ fn overview_dragging_an_app_between_folders_moves_it() {
     // has been ignoring.
     pointer_motion_to(&mut f, office.x, office.y);
     assert_eq!(
-        f.niri().app_grid.drop_hover(),
-        f.niri().app_grid.index_of("Office"),
+        f.synoik().app_grid.drop_hover(),
+        f.synoik().app_grid.index_of("Office"),
         "Office is armed as the drop target"
     );
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     let members = |f: &mut Fixture, id: &str| -> Vec<String> {
-        let i = f.niri().app_grid.index_of(id).expect("the folder is there");
-        f.niri()
+        let i = f
+            .synoik()
+            .app_grid
+            .index_of(id)
+            .expect("the folder is there");
+        f.synoik()
             .app_grid
             .entry_folder(i)
             .expect("…and it is a folder")
@@ -11841,7 +11950,7 @@ fn overview_dragging_an_app_between_folders_moves_it() {
         "and left the one it came out of — a move, not a copy"
     );
     assert_eq!(
-        f.niri().app_grid.index_of("m.desktop"),
+        f.synoik().app_grid.index_of("m.desktop"),
         None,
         "the placeholder is gone from the top level too"
     );
@@ -11858,13 +11967,13 @@ fn overview_folder_dialog_opens_launches_and_pops_down() {
     use crate::gnome::AppFolder;
 
     let (mut f, recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
-    f.niri().gnome_settings.app_folders = vec![AppFolder {
+    f.synoik().gnome_settings.app_folders = vec![AppFolder {
         id: "Utilities".to_owned(),
         name: "Utilities".to_owned(),
         apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
         ..Default::default()
     }];
-    f.niri().sync_app_grid();
+    f.synoik().sync_app_grid();
 
     let view: Rectangle<f64, smithay::utils::Logical> =
         Rectangle::new(Point::from((0., 0.)), Size::from((1920., 1080.)));
@@ -11872,21 +11981,21 @@ fn overview_folder_dialog_opens_launches_and_pops_down() {
         let area = overview_controls(f).app_display;
         // The folder sorts after "a.desktop" by name, so it is tile 1.
         let center = f
-            .niri()
+            .synoik()
             .app_grid
             .tile_center(1, area)
             .expect("the folder tile is in range");
         pointer_motion_to(f, center.x, center.y);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
-        f.niri_complete_animations();
+        f.synoik_complete_animations();
     };
 
     open_it(&mut f);
-    assert_eq!(f.niri().folder_dialog.folder_id(), Some("Utilities"));
+    assert_eq!(f.synoik().folder_dialog.folder_id(), Some("Utilities"));
     assert_eq!(
         (0..2)
-            .filter_map(|i| f.niri().folder_dialog.entry_id(i).map(str::to_owned))
+            .filter_map(|i| f.synoik().folder_dialog.entry_id(i).map(str::to_owned))
             .collect::<Vec<_>>(),
         vec!["m.desktop", "z.desktop"],
         "the dialog shows the folder's members"
@@ -11900,9 +12009,9 @@ fn overview_folder_dialog_opens_launches_and_pops_down() {
     pointer_motion_to(&mut f, outside.x, outside.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().folder_dialog.is_open(),
+        !f.synoik().folder_dialog.is_open(),
         "a click outside pops down"
     );
     assert!(
@@ -11910,7 +12019,7 @@ fn overview_folder_dialog_opens_launches_and_pops_down() {
         "the modal swallowed the click; nothing under it launched"
     );
     assert!(
-        f.niri().layout.is_app_grid_open(),
+        f.synoik().layout.is_app_grid_open(),
         "the grid is still there"
     );
 
@@ -11918,15 +12027,15 @@ fn overview_folder_dialog_opens_launches_and_pops_down() {
     // overview's Escape ladder. (The overview has to actually hold keyboard focus for the
     // ladder to be reachable at all.)
     open_it(&mut f);
-    f.niri_state().update_keyboard_focus();
-    assert!(f.niri().keyboard_focus.is_overview());
+    f.synoik_state().update_keyboard_focus();
+    assert!(f.synoik().keyboard_focus.is_overview());
     tap(&mut f, KEY_ESC);
     assert!(
-        !f.niri().folder_dialog.is_open(),
+        !f.synoik().folder_dialog.is_open(),
         "Escape pops the folder down"
     );
     assert!(
-        f.niri().layout.is_app_grid_open(),
+        f.synoik().layout.is_app_grid_open(),
         "…and stops there rather than also leaving the grid"
     );
 
@@ -11934,14 +12043,14 @@ fn overview_folder_dialog_opens_launches_and_pops_down() {
     open_it(&mut f);
     let grid_area = crate::ui::folder_dialog::layout(view).grid_area;
     let member = f
-        .niri()
+        .synoik()
         .folder_dialog
         .tile_center(1, grid_area)
         .expect("the second member is in range");
     pointer_motion_to(&mut f, member.x, member.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1, "exactly one app launched");
@@ -11952,10 +12061,10 @@ fn overview_folder_dialog_opens_launches_and_pops_down() {
     assert_eq!(calls[0].1, crate::app_system::ResolvedLaunch::Default);
     drop(calls);
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "and the overview closed"
     );
-    assert!(!f.niri().folder_dialog.is_open(), "with the folder");
+    assert!(!f.synoik().folder_dialog.is_open(), "with the folder");
 }
 
 /// Dragging a folder tile carries the *folder*, not one of the apps inside it.
@@ -11968,17 +12077,17 @@ fn overview_dragging_a_folder_carries_the_folder_not_its_first_app() {
     use crate::gnome::AppFolder;
 
     let (mut f, _recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
-    f.niri().gnome_settings.app_folders = vec![AppFolder {
+    f.synoik().gnome_settings.app_folders = vec![AppFolder {
         id: "Utilities".to_owned(),
         name: "Utilities".to_owned(),
         apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
         ..Default::default()
     }];
-    f.niri().sync_app_grid();
+    f.synoik().sync_app_grid();
 
     let grid_area = overview_controls(&mut f).app_display;
     let members: Vec<crate::app_system::AppIconRef> = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_folder(1)
         .expect("tile 1 is the folder")
@@ -11989,7 +12098,7 @@ fn overview_dragging_a_folder_carries_the_folder_not_its_first_app() {
 
     // Pick the folder tile up and move far enough to pass the drag threshold.
     let from = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_center(1, grid_area)
         .expect("the folder tile");
@@ -11997,7 +12106,7 @@ fn overview_dragging_a_folder_carries_the_folder_not_its_first_app() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, from.x + 120., from.y);
     let drag = f
-        .niri()
+        .synoik()
         .app_drag
         .as_ref()
         .expect("the drag must have started");
@@ -12011,7 +12120,7 @@ fn overview_dragging_a_folder_carries_the_folder_not_its_first_app() {
     // An ordinary app tile stays a plain single icon.
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     let from = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_center(0, grid_area)
         .expect("the app tile");
@@ -12019,7 +12128,7 @@ fn overview_dragging_a_folder_carries_the_folder_not_its_first_app() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, from.x + 120., from.y);
     let drag = f
-        .niri()
+        .synoik()
         .app_drag
         .as_ref()
         .expect("the drag must have started");
@@ -12036,50 +12145,50 @@ fn overview_folder_dialog_navigates_with_the_keyboard() {
     use crate::gnome::AppFolder;
 
     let (mut f, recorder) = app_grid_fixture(&[], &["a.desktop", "m.desktop", "z.desktop"]);
-    f.niri().gnome_settings.app_folders = vec![AppFolder {
+    f.synoik().gnome_settings.app_folders = vec![AppFolder {
         id: "Utilities".to_owned(),
         name: "Utilities".to_owned(),
         apps: vec!["m.desktop".to_owned(), "z.desktop".to_owned()],
         ..Default::default()
     }];
-    f.niri().sync_app_grid();
-    f.niri_state().update_keyboard_focus();
-    assert!(f.niri().keyboard_focus.is_overview());
+    f.synoik().sync_app_grid();
+    f.synoik_state().update_keyboard_focus();
+    assert!(f.synoik().keyboard_focus.is_overview());
 
     // Reach the folder tile by keyboard too: it sorts after "a.desktop", so one Right
     // from the first tile lands on it, and Enter opens it rather than launching.
     tap(&mut f, KEY_RIGHT);
     tap(&mut f, KEY_RIGHT);
-    assert_eq!(f.niri().app_grid.focused(), Some(1));
+    assert_eq!(f.synoik().app_grid.focused(), Some(1));
     tap(&mut f, KEY_ENTER);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
-        f.niri().folder_dialog.folder_id(),
+        f.synoik().folder_dialog.folder_id(),
         Some("Utilities"),
         "Enter on a folder tile opens it"
     );
     assert!(recorder.calls.borrow().is_empty(), "…and launches nothing");
 
     // The arrows now belong to the dialog: the grid behind keeps the focus it had.
-    let before = f.niri().app_grid.focused();
+    let before = f.synoik().app_grid.focused();
     tap(&mut f, KEY_RIGHT);
-    assert_eq!(f.niri().folder_dialog.focused(), Some(0));
+    assert_eq!(f.synoik().folder_dialog.focused(), Some(0));
     tap(&mut f, KEY_RIGHT);
-    assert_eq!(f.niri().folder_dialog.focused(), Some(1));
+    assert_eq!(f.synoik().folder_dialog.focused(), Some(1));
     assert_eq!(
-        f.niri().app_grid.focused(),
+        f.synoik().app_grid.focused(),
         before,
         "the grid behind the modal did not move"
     );
     // Enter launches the focused member and takes the overview with it.
     tap(&mut f, KEY_ENTER);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1, "exactly one app launched");
     assert_eq!(calls[0].0.id, "z.desktop", "the focused member launched");
     drop(calls);
-    assert!(!f.niri().layout.is_overview_open());
-    assert!(!f.niri().folder_dialog.is_open());
+    assert!(!f.synoik().layout.is_overview_open());
+    assert!(!f.synoik().folder_dialog.is_open());
 }
 
 /// The app grid navigates by keyboard. gnome-shell has no keynav code of its own here:
@@ -12095,16 +12204,16 @@ fn overview_app_grid_navigates_with_the_keyboard() {
     let others: Vec<&str> = ids.iter().map(String::as_str).collect();
     let (mut f, recorder) = app_grid_fixture(&[], &others);
     // The overview must actually hold keyboard focus or none of its key tiers run.
-    f.niri_state().update_keyboard_focus();
-    assert!(f.niri().keyboard_focus.is_overview());
+    f.synoik_state().update_keyboard_focus();
+    assert!(f.synoik().keyboard_focus.is_overview());
     let area = overview_controls(&mut f).app_display;
     assert_eq!(
-        f.niri().app_grid.page_count(area),
+        f.synoik().app_grid.page_count(area),
         2,
         "30 apps span two pages"
     );
     let center = |f: &mut Fixture, i: usize| {
-        f.niri()
+        f.synoik()
             .app_grid
             .entry_center(i, area)
             .expect("the tile is on the visible page")
@@ -12113,13 +12222,17 @@ fn overview_app_grid_navigates_with_the_keyboard() {
     // Nothing is lit until a key asks for it, and the first arrow takes the page's first
     // tile whichever way it points — our divergence: GNOME reaches the grid from the
     // search entry through a stage-wide focus chain we do not have.
-    assert_eq!(f.niri().app_grid.focused(), None);
+    assert_eq!(f.synoik().app_grid.focused(), None);
     tap(&mut f, KEY_RIGHT);
-    assert_eq!(f.niri().app_grid.focused(), Some(0));
+    assert_eq!(f.synoik().app_grid.focused(), Some(0));
 
     // Right moves along the row; Down drops a row in the same column.
     tap(&mut f, KEY_RIGHT);
-    let right = f.niri().app_grid.focused().expect("Right moved the focus");
+    let right = f
+        .synoik()
+        .app_grid
+        .focused()
+        .expect("Right moved the focus");
     assert!(right > 0);
     assert_eq!(
         center(&mut f, right).y,
@@ -12129,7 +12242,7 @@ fn overview_app_grid_navigates_with_the_keyboard() {
     assert!(center(&mut f, right).x > center(&mut f, 0).x);
 
     tap(&mut f, KEY_DOWN);
-    let down = f.niri().app_grid.focused().expect("Down moved the focus");
+    let down = f.synoik().app_grid.focused().expect("Down moved the focus");
     assert_eq!(
         center(&mut f, down).x,
         center(&mut f, right).x,
@@ -12139,14 +12252,14 @@ fn overview_app_grid_navigates_with_the_keyboard() {
 
     // …and back the way we came.
     tap(&mut f, KEY_UP);
-    assert_eq!(f.niri().app_grid.focused(), Some(right));
+    assert_eq!(f.synoik().app_grid.focused(), Some(right));
     tap(&mut f, KEY_LEFT);
-    assert_eq!(f.niri().app_grid.focused(), Some(0));
+    assert_eq!(f.synoik().app_grid.focused(), Some(0));
     // Nothing lies left of the first column of the first page. The key is still consumed
     // — it must not fall through to the window binds behind the grid.
     tap(&mut f, KEY_LEFT);
-    assert_eq!(f.niri().app_grid.focused(), Some(0));
-    assert!(f.niri().layout.is_app_grid_open());
+    assert_eq!(f.synoik().app_grid.focused(), Some(0));
+    assert!(f.synoik().layout.is_app_grid_open());
 
     // Right off the end of a row crosses to the next page in the *same row*: the pages
     // sit side by side in one viewport, so that tile really is the nearest one to the
@@ -12154,30 +12267,30 @@ fn overview_app_grid_navigates_with_the_keyboard() {
     let row_y = center(&mut f, 0).y;
     for _ in 0..12 {
         tap(&mut f, KEY_RIGHT);
-        if f.niri().app_grid.current_page() == 1 {
+        if f.synoik().app_grid.current_page() == 1 {
             break;
         }
     }
     assert_eq!(
-        f.niri().app_grid.current_page(),
+        f.synoik().app_grid.current_page(),
         1,
         "the page followed the focus across"
     );
-    let crossed = f.niri().app_grid.focused().unwrap();
-    let per_page = f.niri().app_grid.items_per_page(area);
+    let crossed = f.synoik().app_grid.focused().unwrap();
+    let per_page = f.synoik().app_grid.items_per_page(area);
     assert!(crossed >= per_page, "…onto the second page");
     assert_eq!(center(&mut f, crossed).y, row_y, "…staying in its row");
 
     // The paging keys move the page and leave the focus where it was.
     tap(&mut f, KEY_PAGEUP);
-    assert_eq!(f.niri().app_grid.current_page(), 0);
-    assert_eq!(f.niri().app_grid.focused(), Some(crossed));
+    assert_eq!(f.synoik().app_grid.current_page(), 0);
+    assert_eq!(f.synoik().app_grid.focused(), Some(crossed));
     tap(&mut f, KEY_END);
-    assert_eq!(f.niri().app_grid.current_page(), 1);
+    assert_eq!(f.synoik().app_grid.current_page(), 1);
     tap(&mut f, KEY_HOME);
-    assert_eq!(f.niri().app_grid.current_page(), 0);
+    assert_eq!(f.synoik().app_grid.current_page(), 0);
     tap(&mut f, KEY_PAGEDOWN);
-    assert_eq!(f.niri().app_grid.current_page(), 1);
+    assert_eq!(f.synoik().app_grid.current_page(), 1);
 
     // Enter launches the focused tile and closes the overview, exactly as a click does.
     tap(&mut f, KEY_ENTER);
@@ -12186,7 +12299,7 @@ fn overview_app_grid_navigates_with_the_keyboard() {
     assert_eq!(calls[0].0.id, ids[crossed], "the focused app launched");
     drop(calls);
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "and the overview closed"
     );
 }
@@ -12201,29 +12314,29 @@ fn overview_app_grid_paginates_and_navigates() {
     let (mut f, _recorder) = app_grid_fixture(&["a.desktop"], &others);
     let area = overview_controls(&mut f).app_display;
     assert_eq!(
-        f.niri().app_grid.page_count(area),
+        f.synoik().app_grid.page_count(area),
         2,
         "30 apps span two pages"
     );
-    assert_eq!(f.niri().app_grid.current_page(), 0);
+    assert_eq!(f.synoik().app_grid.current_page(), 0);
 
     // A wheel notch over the grid pages forward.
-    let tile = f.niri().app_grid.tile_center(0, area).unwrap();
+    let tile = f.synoik().app_grid.tile_center(0, area).unwrap();
     f.pointer_motion(tile.x, tile.y);
     f.scroll_wheel();
     assert_eq!(
-        f.niri().app_grid.current_page(),
+        f.synoik().app_grid.current_page(),
         1,
         "a wheel notch pages the grid forward"
     );
 
     // Clicking the first page-indicator dot returns to page 0.
-    let dot0 = f.niri().app_grid.indicator_center(0, area).unwrap();
+    let dot0 = f.synoik().app_grid.indicator_center(0, area).unwrap();
     f.pointer_motion(dot0.x - tile.x, dot0.y - tile.y); // relative from the tile
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert_eq!(
-        f.niri().app_grid.current_page(),
+        f.synoik().app_grid.current_page(),
         0,
         "clicking a dot jumps to its page"
     );
@@ -12231,7 +12344,7 @@ fn overview_app_grid_paginates_and_navigates() {
     // Clicking the next navigation arrow steps forward one page.
     use crate::ui::app_grid::PageArrow;
     let next = f
-        .niri()
+        .synoik()
         .app_grid
         .arrow_center(PageArrow::Next, area)
         .unwrap();
@@ -12239,13 +12352,13 @@ fn overview_app_grid_paginates_and_navigates() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert_eq!(
-        f.niri().app_grid.current_page(),
+        f.synoik().app_grid.current_page(),
         1,
         "clicking the next arrow advances a page"
     );
     // On page 1 the previous arrow exists; clicking it steps back to page 0.
     let prev = f
-        .niri()
+        .synoik()
         .app_grid
         .arrow_center(PageArrow::Prev, area)
         .unwrap();
@@ -12253,20 +12366,20 @@ fn overview_app_grid_paginates_and_navigates() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert_eq!(
-        f.niri().app_grid.current_page(),
+        f.synoik().app_grid.current_page(),
         0,
         "clicking the previous arrow steps back a page"
     );
 
     // A fresh overview open resets to page 0.
-    f.niri().app_grid.set_page(1, area);
-    f.niri_state().do_action(Action::CloseOverview, false);
-    f.niri_complete_animations();
-    f.niri().refresh_overview_search_state(); // falling edge
-    f.niri_state().do_action(Action::OpenOverview, false);
-    f.niri().refresh_overview_search_state(); // rising edge → reset
+    f.synoik().app_grid.set_page(1, area);
+    f.synoik_state().do_action(Action::CloseOverview, false);
+    f.synoik_complete_animations();
+    f.synoik().refresh_overview_search_state(); // falling edge
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik().refresh_overview_search_state(); // rising edge → reset
     assert_eq!(
-        f.niri().app_grid.current_page(),
+        f.synoik().app_grid.current_page(),
         0,
         "a fresh overview open starts on page 0"
     );
@@ -12281,15 +12394,15 @@ fn overview_prewarm_requests_dash_and_grid_icon_decodes() {
 
     // Without a worker wired, prewarm must be a no-op (else it would decode inline on
     // the main thread — the stall it exists to avoid).
-    assert!(!f.niri().app_icon_cache.has_worker());
-    f.niri().prewarm_app_icons(); // no panic, nothing to observe
+    assert!(!f.synoik().app_icon_cache.has_worker());
+    f.synoik().prewarm_app_icons(); // no panic, nothing to observe
 
     // Wire the async path to a test channel and prewarm: every fake app icon is
     // `Fallback`, so the requests dedup to one per surface size — the dash's 64px and
     // the grid's 96px.
-    let rx = f.niri().app_icon_cache.wire_test_channel();
-    assert!(f.niri().app_icon_cache.has_worker());
-    f.niri().prewarm_app_icons();
+    let rx = f.synoik().app_icon_cache.wire_test_channel();
+    assert!(f.synoik().app_icon_cache.has_worker());
+    f.synoik().prewarm_app_icons();
 
     let mut sizes: Vec<u32> = rx
         .try_iter()
@@ -12304,7 +12417,7 @@ fn overview_prewarm_requests_dash_and_grid_icon_decodes() {
 
     // A second prewarm enqueues nothing new — the keys are in flight (nothing was
     // applied to resolve them).
-    f.niri().prewarm_app_icons();
+    f.synoik().prewarm_app_icons();
     assert_eq!(
         rx.try_iter().count(),
         0,
@@ -12322,20 +12435,20 @@ fn overview_prewarm_requests_dash_and_grid_icon_decodes() {
 fn overview_prewarm_follows_a_scale_change() {
     let (mut f, _r) = app_grid_fixture(&["fav.desktop"], &["a.desktop", "b.desktop"]);
 
-    let rx = f.niri().app_icon_cache.wire_test_channel();
-    f.niri().prewarm_app_icons();
+    let rx = f.synoik().app_icon_cache.wire_test_channel();
+    f.synoik().prewarm_app_icons();
     let warmed: Vec<f64> = rx.try_iter().map(|req| req.scale()).collect();
     assert!(!warmed.is_empty(), "the fixture warms at its own scale");
     assert!(warmed.iter().all(|scale| *scale == 1.));
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     output.change_current_state(
         None,
         None,
         Some(smithay::output::Scale::Fractional(2.)),
         None,
     );
-    f.niri().output_resized(&output);
+    f.synoik().output_resized(&output);
 
     let rewarmed: Vec<f64> = rx.try_iter().map(|req| req.scale()).collect();
     assert!(
@@ -12356,9 +12469,9 @@ fn overview_dash_ignored_when_overview_closed() {
     let (mut f, recorder) = dash_fixture(&["a.desktop"]);
     let center = dash_tile_center(&mut f, 0);
 
-    f.niri_state().do_action(Action::CloseOverview, false);
-    f.niri_complete_animations();
-    assert!(!f.niri().layout.is_overview_open());
+    f.synoik_state().do_action(Action::CloseOverview, false);
+    f.synoik_complete_animations();
+    assert!(!f.synoik().layout.is_overview_open());
 
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
@@ -12386,7 +12499,7 @@ fn overview_dash_inert_behind_screenshot_ui() {
     }
 
     let (mut f, recorder) = dash_fixture(&["a.desktop"]);
-    f.niri_state()
+    f.synoik_state()
         .backend
         .headless()
         .add_renderer()
@@ -12397,10 +12510,13 @@ fn overview_dash_inert_behind_screenshot_ui() {
     // of the dash so no hover is set yet.
     f.pointer_motion(960., 540.);
     // Raise the screenshot UI over the open overview (it doesn't close the overview).
-    f.niri_state().open_screenshot_ui(false, None);
-    assert!(f.niri().screenshot_ui.is_open(), "screenshot UI must open");
+    f.synoik_state().open_screenshot_ui(false, None);
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().screenshot_ui.is_open(),
+        "screenshot UI must open"
+    );
+    assert!(
+        f.synoik().layout.is_overview_open(),
         "the overview stays open behind the screenshot UI"
     );
 
@@ -12413,7 +12529,7 @@ fn overview_dash_inert_behind_screenshot_ui() {
         "the dash is hidden behind the screenshot UI — its click must not launch an app"
     );
     // And the hover tracker leaves the tile unhovered while the dash is hidden.
-    assert_eq!(f.niri().dash.hovered_for_test(), None);
+    assert_eq!(f.synoik().dash.hovered_for_test(), None);
 }
 
 /// Pointer motion over the dash tracks the hovered tile (the `.overview-icon:hover`
@@ -12427,7 +12543,7 @@ fn overview_dash_hover_tracks_tile() {
 
     f.pointer_motion(center.x, center.y);
     assert_eq!(
-        f.niri().dash.hovered_for_test(),
+        f.synoik().dash.hovered_for_test(),
         Some(DashHit::App(0)),
         "hovering a favorite marks it hovered"
     );
@@ -12435,7 +12551,7 @@ fn overview_dash_hover_tracks_tile() {
     // Move well clear of the dash (top-left corner): hover clears.
     f.pointer_motion(-center.x + 5., -center.y + 5.);
     assert_eq!(
-        f.niri().dash.hovered_for_test(),
+        f.synoik().dash.hovered_for_test(),
         None,
         "leaving the dash clears the hover"
     );
@@ -12464,12 +12580,12 @@ fn search_overview(groups: &[&[&str]]) -> (Fixture, crate::app_system::Recording
         .iter()
         .map(|g| g.iter().map(|s| s.to_string()).collect())
         .collect();
-    f.niri().app_system = AppSystem::with_parts(Box::new(catalog), Box::new(recorder.clone()));
+    f.synoik().app_system = AppSystem::with_parts(Box::new(catalog), Box::new(recorder.clone()));
 
-    f.niri_state().do_action(Action::OpenOverview, false);
-    f.niri_state().update_keyboard_focus();
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().update_keyboard_focus();
     assert!(
-        f.niri().keyboard_focus.is_overview(),
+        f.synoik().keyboard_focus.is_overview(),
         "the overview must hold keyboard focus so typing engages search"
     );
     (f, recorder)
@@ -12482,18 +12598,18 @@ fn overview_search_entry_rests_collapsed_and_expands_on_typing() {
     let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
 
     assert!(
-        !f.niri().overview_search.is_expanded(),
+        !f.synoik().overview_search.is_expanded(),
         "the entry rests as a puck until something asks for it"
     );
     tap(&mut f, KEY_A);
     assert!(
-        f.niri().overview_search.is_expanded(),
+        f.synoik().overview_search.is_expanded(),
         "the first keystroke grows it into the pill"
     );
 
     tap(&mut f, KEY_ESC);
     assert!(
-        !f.niri().overview_search.is_expanded(),
+        !f.synoik().overview_search.is_expanded(),
         "clearing collapses it again — an empty open pill is a state with no meaning"
     );
 }
@@ -12508,13 +12624,13 @@ fn overview_search_ctrl_backspace_deletes_a_word() {
     for key in [KEY_A, KEY_W, KEY_SPACE, KEY_E, KEY_R] {
         tap(&mut f, key);
     }
-    assert_eq!(f.niri().overview_search.query(), "aw er");
+    assert_eq!(f.synoik().overview_search.query(), "aw er");
 
     f.key_press(KEY_LEFTCTRL);
     tap(&mut f, KEY_BACKSPACE);
     f.key_release(KEY_LEFTCTRL);
     assert_eq!(
-        f.niri().overview_search.query(),
+        f.synoik().overview_search.query(),
         "aw ",
         "Ctrl-BackSpace deletes the previous word, not one character"
     );
@@ -12528,11 +12644,11 @@ fn overview_search_caret_moves_and_types_mid_string() {
     for key in [KEY_A, KEY_W] {
         tap(&mut f, key);
     }
-    assert_eq!(f.niri().overview_search.query(), "aw");
+    assert_eq!(f.synoik().overview_search.query(), "aw");
     tap(&mut f, KEY_HOME);
     tap(&mut f, KEY_Z);
     assert_eq!(
-        f.niri().overview_search.query(),
+        f.synoik().overview_search.query(),
         "zaw",
         "Home put the caret at the start; the key typed there"
     );
@@ -12544,15 +12660,15 @@ fn overview_search_caret_moves_and_types_mid_string() {
 fn overview_search_types_query_and_lists_results() {
     let (mut f, _rec) = search_overview(&[&["a.desktop", "b.desktop"]]);
 
-    assert!(!f.niri().overview_search.is_active());
+    assert!(!f.synoik().overview_search.is_active());
     tap(&mut f, KEY_A);
     assert!(
-        f.niri().overview_search.is_active(),
+        f.synoik().overview_search.is_active(),
         "a printable key must start a search"
     );
-    assert_eq!(f.niri().overview_search.result_id(0), Some("a.desktop"));
-    assert_eq!(f.niri().overview_search.result_id(1), Some("b.desktop"));
-    assert_eq!(f.niri().overview_search.result_id(2), None);
+    assert_eq!(f.synoik().overview_search.result_id(0), Some("a.desktop"));
+    assert_eq!(f.synoik().overview_search.result_id(1), Some("b.desktop"));
+    assert_eq!(f.synoik().overview_search.result_id(2), None);
 }
 
 /// Results are filtered to `should_show` apps and capped at `MAX_RESULTS`.
@@ -12575,20 +12691,26 @@ fn overview_search_filters_hidden_and_caps_results() {
     group.extend((0..8).map(|i| format!("app{i}.desktop")));
     let catalog = FakeCatalog::new(apps);
     *catalog.search_result.borrow_mut() = vec![group];
-    f.niri().app_system =
+    f.synoik().app_system =
         AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
-    f.niri_state().do_action(Action::OpenOverview, false);
-    f.niri_state().update_keyboard_focus();
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().update_keyboard_focus();
 
     tap(&mut f, KEY_A);
     // hidden.desktop filtered → first result is app0; capped at 6.
-    assert_eq!(f.niri().overview_search.result_id(0), Some("app0.desktop"));
     assert_eq!(
-        f.niri().overview_search.result_id(6),
+        f.synoik().overview_search.result_id(0),
+        Some("app0.desktop")
+    );
+    assert_eq!(
+        f.synoik().overview_search.result_id(6),
         None,
         "results are capped at MAX_RESULTS (6)"
     );
-    assert_eq!(f.niri().overview_search.result_id(5), Some("app5.desktop"));
+    assert_eq!(
+        f.synoik().overview_search.result_id(5),
+        Some("app5.desktop")
+    );
 }
 
 /// Enter launches the default (first) result and closes the overview, clearing search.
@@ -12598,7 +12720,7 @@ fn overview_search_enter_launches_selected_and_closes() {
 
     tap(&mut f, KEY_A);
     tap(&mut f, KEY_ENTER);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1);
@@ -12607,11 +12729,11 @@ fn overview_search_enter_launches_selected_and_closes() {
         "Enter launches the first result"
     );
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "launching from search closes the overview"
     );
     assert!(
-        !f.niri().overview_search.is_active(),
+        !f.synoik().overview_search.is_active(),
         "the search is cleared on activate"
     );
 }
@@ -12668,14 +12790,14 @@ fn overview_search_click_result_launches() {
 
     let area = overview_controls(&mut f).into();
     let center = f
-        .niri()
+        .synoik()
         .overview_search
         .result_center(1, area)
         .expect("result tile 1");
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1);
@@ -12683,7 +12805,7 @@ fn overview_search_click_result_launches() {
         calls[0].0.id, "b.desktop",
         "clicking a tile launches that app"
     );
-    assert!(!f.niri().layout.is_overview_open());
+    assert!(!f.synoik().layout.is_overview_open());
 }
 
 /// Enter with an active query but zero results is consumed — it must NOT fall through
@@ -12693,13 +12815,13 @@ fn overview_search_enter_with_no_results_keeps_overview_open() {
     let (mut f, recorder) = search_overview(&[]); // no groups → no results
 
     tap(&mut f, KEY_A);
-    assert!(f.niri().overview_search.is_active());
-    assert_eq!(f.niri().overview_search.result_id(0), None);
+    assert!(f.synoik().overview_search.is_active());
+    assert_eq!(f.synoik().overview_search.result_id(0), None);
     tap(&mut f, KEY_ENTER);
 
     assert!(recorder.calls.borrow().is_empty(), "nothing to launch");
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "Enter with no results must not close the overview"
     );
 }
@@ -12711,19 +12833,22 @@ fn overview_search_escape_clears_then_closes() {
     let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
 
     tap(&mut f, KEY_A);
-    assert!(f.niri().overview_search.is_active());
+    assert!(f.synoik().overview_search.is_active());
 
     tap(&mut f, KEY_ESC);
-    assert!(!f.niri().overview_search.is_active(), "first Escape clears");
     assert!(
-        f.niri().layout.is_overview_open(),
+        !f.synoik().overview_search.is_active(),
+        "first Escape clears"
+    );
+    assert!(
+        f.synoik().layout.is_overview_open(),
         "clearing the search leaves the overview open"
     );
 
     tap(&mut f, KEY_ESC);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "a second Escape (inactive) closes the overview via the hardcoded bind"
     );
 }
@@ -12734,10 +12859,10 @@ fn overview_search_backspace_empties_deactivates() {
     let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
 
     tap(&mut f, KEY_A);
-    assert!(f.niri().overview_search.is_active());
+    assert!(f.synoik().overview_search.is_active());
     tap(&mut f, KEY_BACKSPACE);
-    assert!(!f.niri().overview_search.is_active());
-    assert_eq!(f.niri().overview_search.result_id(0), None);
+    assert!(!f.synoik().overview_search.is_active());
+    assert_eq!(f.synoik().overview_search.result_id(0), None);
 }
 
 /// A space as the first key does not engage search (the query tokenizes to empty),
@@ -12748,7 +12873,7 @@ fn overview_search_space_first_stays_inactive() {
 
     tap(&mut f, KEY_SPACE);
     assert!(
-        !f.niri().overview_search.is_active(),
+        !f.synoik().overview_search.is_active(),
         "a leading space must not start a search"
     );
 }
@@ -12765,69 +12890,69 @@ fn overview_search_makes_the_picker_inert() {
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let _w = map_window_sized(&mut f, id, (800, 600), None);
-    let win = f.niri().layout.focus().unwrap().window.clone();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
 
     let catalog = FakeCatalog::new(vec![AppEntry::fake("a.desktop", "a.desktop")]);
     *catalog.search_result.borrow_mut() = vec![vec!["a.desktop".to_string()]];
-    f.niri().app_system =
+    f.synoik().app_system =
         AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
 
-    f.niri_state().do_action(Action::OpenOverview, false);
-    f.niri_state().update_keyboard_focus();
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik_state().update_keyboard_focus();
     f.settle_animations();
 
-    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
     let center = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
 
     // Not searching: the preview is live and the fade is fully off.
-    assert_eq!(f.niri().overview_search_fade(), 0.);
+    assert_eq!(f.synoik().overview_search_fade(), 0.);
     pointer_motion_to(&mut f, center.0, center.1);
     assert!(
-        f.niri().window_under_cursor().is_some(),
+        f.synoik().window_under_cursor().is_some(),
         "a preview must be clickable while not searching"
     );
 
     tap(&mut f, KEY_A);
-    assert!(f.niri().overview_search.is_active());
+    assert!(f.synoik().overview_search.is_active());
     assert!(
-        f.niri().window_under_cursor().is_none(),
+        f.synoik().window_under_cursor().is_none(),
         "a preview under the search results must not activate"
     );
 
     // The fade eases rather than snapping: armed on one frame, mid-way on the next.
-    f.niri().advance_animations();
+    f.synoik().advance_animations();
     {
-        let niri = f.niri();
-        let now = niri.clock.now_unadjusted();
-        niri.clock.set_unadjusted(now + Duration::from_millis(60));
-        niri.advance_animations();
+        let synoik = f.synoik();
+        let now = synoik.clock.now_unadjusted();
+        synoik.clock.set_unadjusted(now + Duration::from_millis(60));
+        synoik.advance_animations();
     }
-    let mid = f.niri().overview_search_fade();
+    let mid = f.synoik().overview_search_fade();
     assert!(mid > 0. && mid < 1., "the search fade must ease, got {mid}");
     f.settle_animations();
-    assert_eq!(f.niri().overview_search_fade(), 1.);
+    assert_eq!(f.synoik().overview_search_fade(), 1.);
 
     // A click out on the covered picker (the pointer has not moved) is consumed by
     // the results strip.
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "clicking the covered picker must not leave the overview"
     );
     assert!(
-        f.niri().overview_search.is_active(),
+        f.synoik().overview_search.is_active(),
         "and must not discard the search"
     );
 
     // Clearing brings the picker back — and its reactivity with it.
     tap(&mut f, KEY_ESC);
     f.settle_animations();
-    assert!(!f.niri().overview_search.is_active());
-    assert_eq!(f.niri().overview_search_fade(), 0.);
+    assert!(!f.synoik().overview_search.is_active());
+    assert_eq!(f.synoik().overview_search_fade(), 0.);
     assert!(
-        f.niri().window_under_cursor().is_some(),
+        f.synoik().window_under_cursor().is_some(),
         "clearing the search must make the picker live again"
     );
 }
@@ -12846,35 +12971,35 @@ fn overview_search_makes_the_thumbnail_strip_inert() {
 
     let catalog = FakeCatalog::new(vec![AppEntry::fake("a.desktop", "a.desktop")]);
     *catalog.search_result.borrow_mut() = vec![vec!["a.desktop".to_string()]];
-    f.niri().app_system =
+    f.synoik().app_system =
         AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
-    f.niri_state().update_keyboard_focus();
+    f.synoik_state().update_keyboard_focus();
     f.settle_animations();
 
     let (tx, ty) = thumbnail_center(&mut f, 0);
-    let active = f.niri().layout.active_workspace().unwrap().id();
+    let active = f.synoik().layout.active_workspace().unwrap().id();
 
     // Sanity: the same click switches workspace when nothing covers the strip —
     // otherwise this test could pass by simply missing the thumbnail.
     pointer_motion_to(&mut f, tx, ty);
     assert!(
-        f.niri().thumbnail_workspace_under_cursor().is_some(),
+        f.synoik().thumbnail_workspace_under_cursor().is_some(),
         "the probe must actually be over a thumbnail"
     );
 
     tap(&mut f, KEY_A);
-    assert!(f.niri().overview_search.is_active());
+    assert!(f.synoik().overview_search.is_active());
 
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert_eq!(
-        f.niri().layout.active_workspace().unwrap().id(),
+        f.synoik().layout.active_workspace().unwrap().id(),
         active,
         "a thumbnail under the search results must not switch workspace"
     );
-    assert!(f.niri().layout.is_overview_open());
+    assert!(f.synoik().layout.is_overview_open());
 }
 
 /// The idle entry pill is drawn too, so it consumes its clicks the same way: a
@@ -12884,19 +13009,19 @@ fn overview_search_makes_the_thumbnail_strip_inert() {
 #[test]
 fn overview_search_idle_entry_body_consumes_clicks() {
     let (mut f, recorder) = search_overview(&[&["a.desktop"]]);
-    assert!(!f.niri().overview_search.is_active());
+    assert!(!f.synoik().overview_search.is_active());
 
     let area = overview_controls(&mut f).into();
-    let pill = f.niri().overview_search.entry_pill(area);
+    let pill = f.synoik().overview_search.entry_pill(area);
     let center = (pill.loc.x + pill.size.w / 2., pill.loc.y + pill.size.h / 2.);
 
     f.pointer_motion(center.0, center.1);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "a click on the idle entry must not fall through and close the overview"
     );
     assert!(
@@ -12912,10 +13037,10 @@ fn overview_search_idle_entry_body_consumes_clicks() {
 fn overview_search_active_entry_body_consumes_clicks() {
     let (mut f, recorder) = search_overview(&[&["a.desktop"]]);
     tap(&mut f, KEY_A);
-    assert!(f.niri().overview_search.is_active());
+    assert!(f.synoik().overview_search.is_active());
 
     let area = overview_controls(&mut f).into();
-    let pill = f.niri().overview_search.entry_pill(area);
+    let pill = f.synoik().overview_search.entry_pill(area);
     let center = (pill.loc.x + pill.size.w / 2., pill.loc.y + pill.size.h / 2.);
 
     f.pointer_motion(center.0, center.1);
@@ -12923,11 +13048,11 @@ fn overview_search_active_entry_body_consumes_clicks() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
     assert!(
-        f.niri().layout.is_overview_open(),
+        f.synoik().layout.is_overview_open(),
         "a click on the active entry must not fall through and close the overview"
     );
     assert!(
-        f.niri().overview_search.is_active(),
+        f.synoik().overview_search.is_active(),
         "the query must survive a click on the entry"
     );
     assert!(
@@ -12946,14 +13071,14 @@ fn overview_search_inert_when_overview_closed() {
     f.add_output(1, (1920, 1080));
     let catalog = FakeCatalog::new(vec![AppEntry::fake("a.desktop", "A")]);
     *catalog.search_result.borrow_mut() = vec![vec!["a.desktop".to_owned()]];
-    f.niri().app_system =
+    f.synoik().app_system =
         AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
-    f.niri_state().update_keyboard_focus();
-    assert!(!f.niri().keyboard_focus.is_overview());
+    f.synoik_state().update_keyboard_focus();
+    assert!(!f.synoik().keyboard_focus.is_overview());
 
     tap(&mut f, KEY_A);
     assert!(
-        !f.niri().overview_search.is_active(),
+        !f.synoik().overview_search.is_active(),
         "typing outside the overview must not start a search"
     );
 }
@@ -12968,21 +13093,21 @@ fn overview_search_closing_the_overview_drops_the_search() {
     let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
     // Prime the edge detector for the open state *before* typing: the rising edge is
     // itself a clear, and it has not been seen yet in this fixture.
-    f.niri().refresh_overview_search_state();
+    f.synoik().refresh_overview_search_state();
     tap(&mut f, KEY_A);
-    assert!(f.niri().overview_search.is_active());
+    assert!(f.synoik().overview_search.is_active());
 
-    f.niri_state().do_action(Action::ToggleOverview, false);
-    f.niri().refresh_overview_search_state(); // falling edge → clear
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.synoik().refresh_overview_search_state(); // falling edge → clear
     assert!(
-        !f.niri().overview_search.is_active(),
+        !f.synoik().overview_search.is_active(),
         "the search does not outlive the overview"
     );
 
-    f.niri_complete_animations();
-    f.niri().advance_animations();
+    f.synoik_complete_animations();
+    f.synoik().advance_animations();
     assert_eq!(
-        f.niri().overview_search_fade(),
+        f.synoik().overview_search_fade(),
         0.,
         "…so the window picker is at full alpha again, not hidden behind the shade"
     );
@@ -12994,18 +13119,18 @@ fn overview_search_closing_the_overview_drops_the_search() {
 fn overview_search_resets_on_reopen() {
     let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
     tap(&mut f, KEY_A);
-    assert!(f.niri().overview_search.is_active());
+    assert!(f.synoik().overview_search.is_active());
 
     // Prime the edge detector for the open state, then close and re-open.
-    f.niri().refresh_overview_search_state();
-    f.niri_state().do_action(Action::CloseOverview, false);
-    f.niri_complete_animations();
-    f.niri().refresh_overview_search_state(); // falling edge
-    f.niri_state().do_action(Action::OpenOverview, false);
-    f.niri().refresh_overview_search_state(); // rising edge → clear
+    f.synoik().refresh_overview_search_state();
+    f.synoik_state().do_action(Action::CloseOverview, false);
+    f.synoik_complete_animations();
+    f.synoik().refresh_overview_search_state(); // falling edge
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    f.synoik().refresh_overview_search_state(); // rising edge → clear
 
     assert!(
-        !f.niri().overview_search.is_active(),
+        !f.synoik().overview_search.is_active(),
         "a re-opened overview starts with an empty search"
     );
 }
@@ -13028,7 +13153,7 @@ fn launching_an_app_marks_it_starting_until_its_window_maps() {
     let id = f.add_client();
 
     let recorder = RecordingLauncher::default();
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
             "a.desktop",
             "A",
@@ -13037,12 +13162,12 @@ fn launching_an_app_marks_it_starting_until_its_window_maps() {
         Box::new(recorder.clone()),
     );
     assert_eq!(
-        f.niri().app_system.app_state("a.desktop"),
+        f.synoik().app_system.app_state("a.desktop"),
         AppState::Stopped
     );
-    assert!(f.niri().app_system.can_open_new_window("a.desktop"));
+    assert!(f.synoik().app_system.can_open_new_window("a.desktop"));
 
-    f.niri()
+    f.synoik()
         .app_system
         .launch(
             "a.desktop",
@@ -13056,16 +13181,16 @@ fn launching_an_app_marks_it_starting_until_its_window_maps() {
         .expect("launch");
 
     assert_eq!(
-        f.niri().app_system.app_state("a.desktop"),
+        f.synoik().app_system.app_state("a.desktop"),
         AppState::Starting,
         "a launch opens a startup sequence"
     );
     assert!(
-        f.niri().app_system.shows_running_dot("a.desktop"),
+        f.synoik().app_system.shows_running_dot("a.desktop"),
         "a starting app already shows the running dot (`appDisplay.js:3007`)"
     );
     assert!(
-        !f.niri().app_system.can_open_new_window("a.desktop"),
+        !f.synoik().app_system.can_open_new_window("a.desktop"),
         "a starting app cannot be asked for another window (`shell-app.c:606-611`)"
     );
     assert_eq!(
@@ -13087,12 +13212,12 @@ fn launching_an_app_marks_it_starting_until_its_window_maps() {
     f.double_roundtrip(id);
 
     assert_eq!(
-        f.niri().app_system.app_state("a.desktop"),
+        f.synoik().app_system.app_state("a.desktop"),
         AppState::Running,
         "the mapping window completes the sequence"
     );
     assert_eq!(
-        f.niri().app_system.starting_apps().count(),
+        f.synoik().app_system.starting_apps().count(),
         0,
         "the sequence is consumed, not left open"
     );
@@ -13113,7 +13238,7 @@ fn a_launching_favorite_shows_its_running_dot_before_its_window_maps() {
     f.add_output(1, (1920, 1080));
     let client = f.add_client();
 
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
             "a.desktop",
             "A",
@@ -13121,13 +13246,15 @@ fn a_launching_favorite_shows_its_running_dot_before_its_window_maps() {
         )])),
         Box::new(RecordingLauncher::default()),
     );
-    f.niri().app_system.set_favorites(vec!["a.desktop".into()]);
-    f.niri().sync_dash_favorites();
+    f.synoik()
+        .app_system
+        .set_favorites(vec!["a.desktop".into()]);
+    f.synoik().sync_dash_favorites();
 
-    let dot = |f: &mut Fixture| f.niri().dash.item_shows_running_dot(0).unwrap();
+    let dot = |f: &mut Fixture| f.synoik().dash.item_shows_running_dot(0).unwrap();
     assert!(!dot(&mut f), "a stopped favorite shows no dot");
 
-    f.niri()
+    f.synoik()
         .app_system
         .launch(
             "a.desktop",
@@ -13136,10 +13263,10 @@ fn a_launching_favorite_shows_its_running_dot_before_its_window_maps() {
         )
         .expect("launch");
     assert!(
-        f.niri().sync_running_apps(),
+        f.synoik().sync_running_apps(),
         "a state change must report as a change, or the dash never redisplays"
     );
-    f.niri().sync_dash_favorites();
+    f.synoik().sync_dash_favorites();
     assert!(
         dot(&mut f),
         "a STARTING favorite already shows the dot, before any window exists"
@@ -13177,7 +13304,7 @@ fn a_starting_app_puts_a_wait_cursor_on_the_whole_compositor() {
     f.add_output(1, (1920, 1080));
     let client = f.add_client();
 
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
             "a.desktop",
             "A",
@@ -13186,11 +13313,11 @@ fn a_starting_app_puts_a_wait_cursor_on_the_whole_compositor() {
         Box::new(RecordingLauncher::default()),
     );
 
-    let cursor = |f: &mut Fixture| f.niri().cursor_manager.global_override();
-    f.niri().sync_running_apps();
+    let cursor = |f: &mut Fixture| f.synoik().cursor_manager.global_override();
+    f.synoik().sync_running_apps();
     assert_eq!(cursor(&mut f), None, "nothing starting, no override");
 
-    f.niri()
+    f.synoik()
         .app_system
         .launch(
             "a.desktop",
@@ -13198,7 +13325,7 @@ fn a_starting_app_puts_a_wait_cursor_on_the_whole_compositor() {
             &LaunchContext::bare(get_monotonic_time()),
         )
         .expect("launch");
-    f.niri().sync_running_apps();
+    f.synoik().sync_running_apps();
     assert_eq!(
         cursor(&mut f),
         Some(CursorIcon::Wait),
@@ -13216,7 +13343,7 @@ fn a_starting_app_puts_a_wait_cursor_on_the_whole_compositor() {
     window.set_size(100, 100);
     window.ack_last_and_commit();
     f.double_roundtrip(client);
-    f.niri().sync_running_apps();
+    f.synoik().sync_running_apps();
     assert_eq!(
         cursor(&mut f),
         None,
@@ -13226,15 +13353,15 @@ fn a_starting_app_puts_a_wait_cursor_on_the_whole_compositor() {
     // And a launch that never maps clears it on the timeout, rather than leaving the
     // pointer stuck as a watch forever.
     let now = get_monotonic_time();
-    f.niri()
+    f.synoik()
         .app_system
         .begin_startup("a.desktop", None, None, now);
-    f.niri().sync_running_apps();
+    f.synoik().sync_running_apps();
     assert_eq!(cursor(&mut f), Some(CursorIcon::Wait));
-    f.niri()
+    f.synoik()
         .app_system
         .expire_startups(now + STARTUP_TIMEOUT + Duration::from_millis(1));
-    f.niri().sync_running_apps();
+    f.synoik().sync_running_apps();
     assert_eq!(
         cursor(&mut f),
         None,
@@ -13253,32 +13380,32 @@ fn a_startup_sequence_that_never_maps_expires() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake("a.desktop", "A")])),
         Box::new(RecordingLauncher::default()),
     );
 
     let now = get_monotonic_time();
-    f.niri()
+    f.synoik()
         .app_system
         .begin_startup("a.desktop", None, None, now);
     assert_eq!(
-        f.niri().app_system.app_state("a.desktop"),
+        f.synoik().app_system.app_state("a.desktop"),
         AppState::Starting
     );
 
     assert!(
-        !f.niri()
+        !f.synoik()
             .app_system
             .expire_startups(now + STARTUP_TIMEOUT - Duration::from_millis(1)),
         "the sequence outlives everything up to the timeout"
     );
     assert!(f
-        .niri()
+        .synoik()
         .app_system
         .expire_startups(now + STARTUP_TIMEOUT + Duration::from_millis(1)));
     assert_eq!(
-        f.niri().app_system.app_state("a.desktop"),
+        f.synoik().app_system.app_state("a.desktop"),
         AppState::Stopped,
         "an expired sequence leaves the app stopped, not starting forever"
     );
@@ -13303,7 +13430,7 @@ fn overview_mapped_window_marks_its_app_running() {
 
     // An installed app that claims the window's app_id via StartupWMClass — the
     // rung that must beat a basename lookup (there is no `editor-instance.desktop`).
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
             "org.example.Editor.desktop",
             "Editor",
@@ -13312,7 +13439,7 @@ fn overview_mapped_window_marks_its_app_running() {
         Box::new(RecordingLauncher::default()),
     );
     assert!(
-        f.niri().app_system.running().is_empty(),
+        f.synoik().app_system.running().is_empty(),
         "nothing runs before a window maps"
     );
 
@@ -13329,7 +13456,7 @@ fn overview_mapped_window_marks_its_app_running() {
     f.double_roundtrip(id);
 
     let running: Vec<String> = f
-        .niri()
+        .synoik()
         .app_system
         .running()
         .iter()
@@ -13340,8 +13467,11 @@ fn overview_mapped_window_marks_its_app_running() {
         ["org.example.Editor.desktop"],
         "the mapped window's app_id resolved through StartupWMClass"
     );
-    assert_eq!(f.niri().app_system.running()[0].n_windows(), 1);
-    assert!(f.niri().app_system.is_running("org.example.Editor.desktop"));
+    assert_eq!(f.synoik().app_system.running()[0].n_windows(), 1);
+    assert!(f
+        .synoik()
+        .app_system
+        .is_running("org.example.Editor.desktop"));
 
     // Unmap: the app stops running.
     let window = f.client(id).window(&surface);
@@ -13350,10 +13480,13 @@ fn overview_mapped_window_marks_its_app_running() {
     f.double_roundtrip(id);
 
     assert!(
-        f.niri().app_system.running().is_empty(),
+        f.synoik().app_system.running().is_empty(),
         "unmapping the last window stops the app"
     );
-    assert!(!f.niri().app_system.is_running("org.example.Editor.desktop"));
+    assert!(!f
+        .synoik()
+        .app_system
+        .is_running("org.example.Editor.desktop"));
 }
 
 /// **S6 — running apps in the dash.** A running non-favorite joins the dash after
@@ -13375,21 +13508,21 @@ fn overview_dash_shows_running_apps_after_a_separator() {
         AppEntry::fake("fav.desktop", "Favorite"),
         AppEntry::fake_with_wm_class("runner.desktop", "Runner", "runner"),
     ];
-    f.niri().app_system =
+    f.synoik().app_system =
         AppSystem::with_parts(Box::new(FakeCatalog::new(apps)), Box::new(recorder.clone()));
-    f.niri()
+    f.synoik()
         .app_system
         .set_favorites(vec!["fav.desktop".to_owned()]);
-    f.niri().sync_dash_favorites();
-    f.niri_state().do_action(Action::OpenOverview, false);
+    f.synoik().sync_dash_favorites();
+    f.synoik_state().do_action(Action::OpenOverview, false);
 
     let area = overview_controls(&mut f).dash;
     assert!(
-        f.niri().dash.separator_box(area).is_none(),
+        f.synoik().dash.separator_box(area).is_none(),
         "one favorite and nothing running draws no divider"
     );
     assert_eq!(
-        f.niri().dash.item_id(1),
+        f.synoik().dash.item_id(1),
         None,
         "only the favorite is listed"
     );
@@ -13407,20 +13540,20 @@ fn overview_dash_shows_running_apps_after_a_separator() {
     f.double_roundtrip(client);
 
     assert_eq!(
-        f.niri().dash.item_id(1),
+        f.synoik().dash.item_id(1),
         Some("runner.desktop"),
         "the running non-favorite joins the dash after the favorites"
     );
     let area = overview_controls(&mut f).dash;
     let sep = f
-        .niri()
+        .synoik()
         .dash
         .separator_box(area)
         .expect("a favorite plus a running non-favorite draws the divider");
 
     // The divider sits between the two tiles and is itself inert.
-    let fav = f.niri().dash.tile_center(0, area).unwrap();
-    let run = f.niri().dash.tile_center(1, area).unwrap();
+    let fav = f.synoik().dash.tile_center(0, area).unwrap();
+    let run = f.synoik().dash.tile_center(1, area).unwrap();
     assert!(sep.loc.x > fav.x && sep.loc.x < run.x);
 
     // Clicking the running app's tile is a live target — but it *activates* rather than
@@ -13428,7 +13561,7 @@ fn overview_dash_shows_running_apps_after_a_separator() {
     // This assertion used to expect a launch, which was the bug behind the busy cursor on every
     // dash click of an already-open app.
     pointer_motion_to(&mut f, run.x, run.y);
-    assert_eq!(f.niri().dash.hovered_for_test(), Some(DashHit::App(1)));
+    assert_eq!(f.synoik().dash.hovered_for_test(), Some(DashHit::App(1)));
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert!(
@@ -13436,7 +13569,7 @@ fn overview_dash_shows_running_apps_after_a_separator() {
         "a running app is activated, not relaunched"
     );
     assert!(
-        !f.niri().layout.is_overview_open(),
+        !f.synoik().layout.is_overview_open(),
         "and the click still took, closing the overview"
     );
 
@@ -13446,9 +13579,9 @@ fn overview_dash_shows_running_apps_after_a_separator() {
     window.commit();
     f.double_roundtrip(client);
 
-    assert_eq!(f.niri().dash.item_id(1), None);
+    assert_eq!(f.synoik().dash.item_id(1), None);
     let area = overview_controls(&mut f).dash;
-    assert!(f.niri().dash.separator_box(area).is_none());
+    assert!(f.synoik().dash.separator_box(area).is_none());
 }
 
 // Display config: live applies vs the monitors.xml store ---------------------------------------
@@ -13469,7 +13602,7 @@ struct MonitorsXmlGuard {
 impl MonitorsXmlGuard {
     fn install(xml: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "gnome-shell-rs-test-monitors-{}-{:?}.xml",
+            "synoik-test-monitors-{}-{:?}.xml",
             std::process::id(),
             std::thread::current().id(),
         ));
@@ -13505,18 +13638,18 @@ fn monitors_xml_with_scale(scale: f64) -> String {
 }
 
 fn output_scale(f: &Fixture) -> f64 {
-    f.niri_output(1).current_scale().fractional_scale()
+    f.synoik_output(1).current_scale().fractional_scale()
 }
 
 /// The `ApplyMonitorsConfig` config for headless-1 at `scale`, the way the DBus handler builds it.
-fn dbus_scale_config(scale: f64) -> HashMap<String, Option<niri_config::Output>> {
+fn dbus_scale_config(scale: f64) -> HashMap<String, Option<synoik_config::Output>> {
     HashMap::from([(
         "headless-1".to_owned(),
-        Some(niri_config::Output {
+        Some(synoik_config::Output {
             off: false,
             name: "headless-1".to_owned(),
-            scale: Some(niri_config::FloatOrInt(scale)),
-            position: Some(niri_config::Position { x: 0, y: 0 }),
+            scale: Some(synoik_config::FloatOrInt(scale)),
+            position: Some(synoik_config::Position { x: 0, y: 0 }),
             ..Default::default()
         }),
     )])
@@ -13550,7 +13683,8 @@ fn settings_scale_apply_takes_effect_immediately() {
 
     // First apply: the store still holds the old value (TEMPORARY applies never write it, and a
     // PERSISTENT write lands on the DBus thread after this runs). The new scale must win anyway.
-    f.niri_state().apply_display_config(dbus_scale_config(2.0));
+    f.synoik_state()
+        .apply_display_config(dbus_scale_config(2.0));
     assert_eq!(
         output_scale(&f),
         2.0,
@@ -13558,7 +13692,7 @@ fn settings_scale_apply_takes_effect_immediately() {
     );
 
     // Any later reload keeps the live-applied value; the store never overrides it.
-    f.niri_state().reload_output_config();
+    f.synoik_state().reload_output_config();
     assert_eq!(
         output_scale(&f),
         2.0,
@@ -13567,7 +13701,8 @@ fn settings_scale_apply_takes_effect_immediately() {
 
     // Second apply after the first one persisted: what applies is THIS value, not the file's.
     store.write(&monitors_xml_with_scale(2.0));
-    f.niri_state().apply_display_config(dbus_scale_config(1.5));
+    f.synoik_state()
+        .apply_display_config(dbus_scale_config(1.5));
     assert_eq!(
         output_scale(&f),
         1.5,
@@ -13575,7 +13710,7 @@ fn settings_scale_apply_takes_effect_immediately() {
     );
 }
 
-/// `niri msg output set-scale` also outranks the store; `set-scale automatic` falls back to it.
+/// `synoik msg output set-scale` also outranks the store; `set-scale automatic` falls back to it.
 #[test]
 fn ipc_scale_beats_store_and_automatic_returns_to_it() {
     let _store = MonitorsXmlGuard::install(&monitors_xml_with_scale(2.0));
@@ -13584,10 +13719,10 @@ fn ipc_scale_beats_store_and_automatic_returns_to_it() {
     f.add_output(1, (1920, 1080));
     assert_eq!(output_scale(&f), 2.0);
 
-    f.niri_state().apply_transient_output_config(
+    f.synoik_state().apply_transient_output_config(
         "headless-1",
-        niri_ipc::OutputAction::Scale {
-            scale: niri_ipc::ScaleToSet::Specific(1.5),
+        synoik_ipc::OutputAction::Scale {
+            scale: synoik_ipc::ScaleToSet::Specific(1.5),
         },
     );
     assert_eq!(
@@ -13596,10 +13731,10 @@ fn ipc_scale_beats_store_and_automatic_returns_to_it() {
         "a live IPC apply beats the saved store scale"
     );
 
-    f.niri_state().apply_transient_output_config(
+    f.synoik_state().apply_transient_output_config(
         "headless-1",
-        niri_ipc::OutputAction::Scale {
-            scale: niri_ipc::ScaleToSet::Automatic,
+        synoik_ipc::OutputAction::Scale {
+            scale: synoik_ipc::ScaleToSet::Automatic,
         },
     );
     assert_eq!(
@@ -13626,7 +13761,8 @@ fn overview_grid_transitions_are_monotonic_with_the_active_workspace_in_the_midd
     // Two populated workspaces plus the trailing empty one, focused on the
     // middle: `[win] [win, active] [empty]`.
     let _first = map_window_sized(&mut f, id, (800, 600), None);
-    f.niri_state().do_action(Action::FocusWorkspaceDown, false);
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
     f.settle_animations();
     let _second = map_window_sized(&mut f, id, (800, 600), None);
     f.settle_animations();
@@ -13640,7 +13776,7 @@ fn overview_grid_transitions_are_monotonic_with_the_active_workspace_in_the_midd
     tap(&mut f, KEY_LEFTMETA);
     f.settle_animations();
 
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 32);
     assert_row_travels_monotonically(&samples, "picker -> app grid (middle active)");
 
@@ -13649,7 +13785,7 @@ fn overview_grid_transitions_are_monotonic_with_the_active_workspace_in_the_midd
 
     // ...and back down the same leg, which is the direction that used to swing
     // left before settling right.
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 32);
     assert_row_travels_monotonically(&samples, "app grid -> picker (middle active)");
     f.settle_animations();
@@ -13661,9 +13797,9 @@ fn overview_grid_transitions_are_monotonic_with_the_active_workspace_in_the_midd
          not travel (divergence, 2026-08-03)",
     );
 
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     f.settle_animations();
-    f.niri_state().do_action(Action::CloseOverview, false);
+    f.synoik_state().do_action(Action::CloseOverview, false);
     let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 32);
     assert_row_travels_monotonically(&samples, "app grid -> desktop (middle active)");
     assert_geo_eq(
@@ -13699,16 +13835,16 @@ fn overview_close_from_the_app_grid_unwinds_the_grid_before_it_zooms() {
     tap(&mut f, KEY_LEFTMETA);
     f.settle_animations();
     let picker_zoom = {
-        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.unwrap().overview_zoom()
     };
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     f.settle_animations();
 
-    let output = f.niri_output(1);
-    f.niri_state().do_action(Action::CloseOverview, false);
+    let output = f.synoik_output(1);
+    f.synoik_state().do_action(Action::CloseOverview, false);
     let samples = f.sample_animation(Duration::from_millis(600), 48, |f| {
-        let mon = f.niri().layout.monitor_for_output(&output).unwrap();
+        let mon = f.synoik().layout.monitor_for_output(&output).unwrap();
         (mon.app_grid_leg(), mon.overview_zoom())
     });
 
@@ -13774,11 +13910,11 @@ fn overview_close_from_the_app_grid_never_folds_the_row() {
 
     tap(&mut f, KEY_LEFTMETA);
     f.settle_animations();
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     f.settle_animations();
     let grid = workspace_geo(&mut f);
 
-    f.niri_state().do_action(Action::CloseOverview, false);
+    f.synoik_state().do_action(Action::CloseOverview, false);
     let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 32);
 
     // The active workspace never overlaps its neighbour: the row's pitch stays at
@@ -13826,7 +13962,7 @@ fn an_installed_changed_burst_does_not_reload_the_catalog_per_ping() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![
             AppEntry::fake("a.desktop", "A"),
             AppEntry::fake("b.desktop", "B"),
@@ -13834,28 +13970,28 @@ fn an_installed_changed_burst_does_not_reload_the_catalog_per_ping() {
         Box::new(RecordingLauncher::default()),
     );
     assert!(
-        f.niri().app_grid.entry_id(0).is_none(),
+        f.synoik().app_grid.entry_id(0).is_none(),
         "the grid must start empty, or a reload proves nothing"
     );
 
     for _ in 0..8 {
-        f.niri().queue_app_catalog_reload();
+        f.synoik().queue_app_catalog_reload();
     }
     f.dispatch();
 
     assert!(
-        f.niri().app_grid.entry_id(0).is_none(),
+        f.synoik().app_grid.entry_id(0).is_none(),
         "a ping reloaded the catalog inline instead of coalescing"
     );
     let first = f
-        .niri()
+        .synoik()
         .app_catalog_reload_at
         .expect("the burst queued no reload at all — the change would be lost");
 
     // A later ping pushes the deadline out rather than arming a second timer: the reload
     // lands once the writes stop, not once the first one starts.
-    f.niri().queue_app_catalog_reload();
-    let second = f.niri().app_catalog_reload_at.expect("still pending");
+    f.synoik().queue_app_catalog_reload();
+    let second = f.synoik().app_catalog_reload_at.expect("still pending");
     assert!(
         second >= first,
         "a ping mid-wait must move the deadline forward, not backward"
@@ -13876,17 +14012,17 @@ fn overview_app_icon_prewarm_uses_the_size_the_grid_will_render() {
     for (mode, expect_default) in [((1920, 1080), true), ((1280, 800), false)] {
         let mut f = Fixture::new();
         f.add_output(1, mode);
-        f.niri().app_system = AppSystem::with_parts(
+        f.synoik().app_system = AppSystem::with_parts(
             Box::new(FakeCatalog::new(vec![AppEntry::fake("a.desktop", "a")])),
             Box::new(RecordingLauncher::default()),
         );
-        f.niri().sync_app_grid();
-        f.niri_state().do_action(Action::OpenOverview, false);
-        f.niri().layout.toggle_app_grid();
-        f.niri_complete_animations();
+        f.synoik().sync_app_grid();
+        f.synoik_state().do_action(Action::OpenOverview, false);
+        f.synoik().layout.toggle_app_grid();
+        f.synoik_complete_animations();
 
         let area = overview_controls(&mut f).app_display;
-        let rendered = f.niri().app_grid.metrics_for(area).icon_px;
+        let rendered = f.synoik().app_grid.metrics_for(area).icon_px;
         let default = crate::ui::widget::TileMetrics::overview().icon_px;
         assert_eq!(
             rendered == default,
@@ -13895,7 +14031,7 @@ fn overview_app_icon_prewarm_uses_the_size_the_grid_will_render() {
             if expect_default { "" } else { " NOT" }
         );
 
-        let variants = f.niri().prewarm_variants();
+        let variants = f.synoik().prewarm_variants();
         assert_eq!(variants.len(), 1, "one output, one variant: {variants:?}");
         assert_eq!(
             variants[0].1, rendered,
@@ -13917,11 +14053,11 @@ fn overview_app_grid_swipes_between_pages() {
     let others: Vec<&str> = ids.iter().map(String::as_str).collect();
     let (mut f, _recorder) = app_grid_fixture(&[], &others);
     let area = overview_controls(&mut f).app_display;
-    assert_eq!(f.niri().app_grid.page_count(area), 2);
+    assert_eq!(f.synoik().app_grid.page_count(area), 2);
 
     // Park the pointer over the grid — the swipe is only live there.
     let center = f
-        .niri()
+        .synoik()
         .app_grid
         .entry_center(0, area)
         .expect("the first tile");
@@ -13943,27 +14079,31 @@ fn overview_app_grid_swipes_between_pages() {
     // A slow drag: 8 notches of 2 is 160 px of travel (×10), two fifths of a page. The
     // view follows it 1:1 rather than snapping — that is the point of a 1:1 gesture.
     swipe(&mut f, 8, 2., 50);
-    let dragged = f.niri().app_grid.page_pos();
+    let dragged = f.synoik().app_grid.page_pos();
     assert!(
         (dragged - 0.4).abs() < 0.01,
         "the pages follow the finger 1:1 (160 px of 400), got {dragged}"
     );
     assert_eq!(
-        f.niri().app_grid.current_page(),
+        f.synoik().app_grid.current_page(),
         0,
         "…without committing to a page yet"
     );
 
     // Released slowly, it falls back to the page it is nearest.
     lift(&mut f);
-    assert_eq!(f.niri().app_grid.current_page(), 0, "two fifths snaps back");
-    assert_eq!(f.niri().app_grid.page_pos(), 0.);
+    assert_eq!(
+        f.synoik().app_grid.current_page(),
+        0,
+        "two fifths snaps back"
+    );
+    assert_eq!(f.synoik().app_grid.page_pos(), 0.);
 
     // Dragged past halfway just as slowly, it falls forward instead.
     swipe(&mut f, 13, 2., 50);
     lift(&mut f);
     assert_eq!(
-        f.niri().app_grid.current_page(),
+        f.synoik().app_grid.current_page(),
         1,
         "past halfway, the nearest page is the next one"
     );
@@ -13973,11 +14113,11 @@ fn overview_app_grid_swipes_between_pages() {
     swipe(&mut f, 4, -2., 1);
     lift(&mut f);
     assert_eq!(
-        f.niri().app_grid.current_page(),
+        f.synoik().app_grid.current_page(),
         0,
         "a flick advances a page the drag never reached"
     );
-    assert_eq!(f.niri().app_grid.page_pos(), 0.);
+    assert_eq!(f.synoik().app_grid.page_pos(), 0.);
 
     // A vertical two-finger scroll is swallowed and moves nothing: GNOME's tracker is
     // horizontal, and letting it through would page the workspaces behind the grid.
@@ -13986,8 +14126,8 @@ fn overview_app_grid_swipes_between_pages() {
         f.advance_input_time(20);
         f.scroll_finger(0., 4.);
     }
-    assert_eq!(f.niri().app_grid.page_pos(), 0.);
-    assert_eq!(f.niri().app_grid.current_page(), 0);
+    assert_eq!(f.synoik().app_grid.page_pos(), 0.);
+    assert_eq!(f.synoik().app_grid.current_page(), 0);
 }
 
 /// Dragging the app grid's background with the mouse pages it. gnome-shell's swipe
@@ -14002,7 +14142,7 @@ fn overview_app_grid_pages_by_dragging_its_background() {
     let others: Vec<&str> = ids.iter().map(String::as_str).collect();
     let (mut f, recorder) = app_grid_fixture(&[], &others);
     let area = overview_controls(&mut f).app_display;
-    assert_eq!(f.niri().app_grid.page_count(area), 2);
+    assert_eq!(f.synoik().app_grid.page_count(area), 2);
 
     // Grab the band well below the tiles — the background, not an icon: a press on an
     // icon belongs to that icon's own drag.
@@ -14011,7 +14151,7 @@ fn overview_app_grid_pages_by_dragging_its_background() {
     let start_x = area.loc.x + area.size.w - 20.;
     let start_y = area.loc.y + area.size.h - 6.;
     assert!(
-        f.niri()
+        f.synoik()
             .app_grid
             .hit_test((start_x, start_y).into(), area)
             .is_none(),
@@ -14030,7 +14170,7 @@ fn overview_app_grid_pages_by_dragging_its_background() {
         f.advance_input_time(50);
         pointer_motion_to(&mut f, start_x - travel / 10. * f64::from(i), start_y);
     }
-    let dragged = f.niri().app_grid.page_pos();
+    let dragged = f.synoik().app_grid.page_pos();
     let expected = travel / area.size.w;
     assert!(
         (dragged - expected).abs() < 0.01,
@@ -14042,14 +14182,14 @@ fn overview_app_grid_pages_by_dragging_its_background() {
     // Released past halfway, it settles on the next page.
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.settle_animations();
-    assert_eq!(f.niri().app_grid.current_page(), 1);
-    assert_eq!(f.niri().app_grid.page_pos(), 1.);
+    assert_eq!(f.synoik().app_grid.current_page(), 1);
+    assert_eq!(f.synoik().app_grid.page_pos(), 1.);
     assert!(
         recorder.calls.borrow().is_empty(),
         "a drag on the background launches nothing"
     );
     assert!(
-        f.niri().layout.is_app_grid_open(),
+        f.synoik().layout.is_app_grid_open(),
         "…and does not dismiss the grid"
     );
 
@@ -14059,11 +14199,11 @@ fn overview_app_grid_pages_by_dragging_its_background() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.settle_animations();
     assert_eq!(
-        f.niri().app_grid.current_page(),
+        f.synoik().app_grid.current_page(),
         1,
         "a click on the background does not page"
     );
-    assert!(f.niri().layout.is_app_grid_open());
+    assert!(f.synoik().layout.is_app_grid_open());
 }
 
 /// Tab walks the app grid's icons in **child order**, wrapping — a different traversal
@@ -14079,53 +14219,53 @@ fn overview_app_grid_tab_walks_the_icons_in_order() {
     let ids: Vec<String> = (0..30).map(|i| format!("o{i:02}.desktop")).collect();
     let others: Vec<&str> = ids.iter().map(String::as_str).collect();
     let (mut f, _recorder) = app_grid_fixture(&[], &others);
-    f.niri_state().update_keyboard_focus();
-    assert!(f.niri().keyboard_focus.is_overview());
+    f.synoik_state().update_keyboard_focus();
+    assert!(f.synoik().keyboard_focus.is_overview());
     let area = overview_controls(&mut f).app_display;
-    let per_page = f.niri().app_grid.items_per_page(area);
-    assert_eq!(f.niri().app_grid.page_count(area), 2);
+    let per_page = f.synoik().app_grid.items_per_page(area);
+    assert_eq!(f.synoik().app_grid.page_count(area), 2);
 
     // Nothing focused: Tab enters at the very first icon.
-    assert_eq!(f.niri().app_grid.focused(), None);
+    assert_eq!(f.synoik().app_grid.focused(), None);
     tap(&mut f, KEY_TAB);
     assert_eq!(
-        f.niri().app_grid.focused(),
+        f.synoik().app_grid.focused(),
         Some(0),
         "Tab enters at the start"
     );
 
     // …then steps one at a time, in catalog order — not spatially.
     tap(&mut f, KEY_TAB);
-    assert_eq!(f.niri().app_grid.focused(), Some(1));
+    assert_eq!(f.synoik().app_grid.focused(), Some(1));
 
     // Entering is from the *start of the grid*, not of the page you happen to be looking
     // at: `navigate_focus(null, TAB_FORWARD)` walks the focus chain from its beginning,
     // and the page then follows the focus back.
-    f.niri().app_grid.set_focused(None);
-    assert!(f.niri().app_grid.set_page(1, area));
+    f.synoik().app_grid.set_focused(None);
+    assert!(f.synoik().app_grid.set_page(1, area));
     tap(&mut f, KEY_TAB);
     assert_eq!(
-        f.niri().app_grid.focused(),
+        f.synoik().app_grid.focused(),
         Some(0),
         "Tab enters at the grid's first icon even from another page"
     );
-    assert_eq!(f.niri().app_grid.current_page(), 0, "…paging back to it");
+    assert_eq!(f.synoik().app_grid.current_page(), 0, "…paging back to it");
 
     // Entering *backwards* takes the other end — `TAB_BACKWARD` reverses the focus chain
     // before taking its first entry (`st-widget.c:2089-2090`).
-    f.niri().app_grid.set_focused(None);
+    f.synoik().app_grid.set_focused(None);
     f.key_press(KEY_LEFTSHIFT);
     tap(&mut f, KEY_TAB);
     f.key_release(KEY_LEFTSHIFT);
     assert_eq!(
-        f.niri().app_grid.focused(),
+        f.synoik().app_grid.focused(),
         Some(29),
         "Shift+Tab enters at the grid's last icon"
     );
 
     // Back to the front for the wrap checks below.
-    f.niri().app_grid.set_focused(Some(0));
-    assert!(f.niri().app_grid.set_page(0, area));
+    f.synoik().app_grid.set_focused(Some(0));
+    assert!(f.synoik().app_grid.set_page(0, area));
 
     // Shift+Tab steps back, and off the front it wraps to the very last icon — which
     // pages the view with it. (Focus is on the first icon after the entry above.)
@@ -14133,12 +14273,12 @@ fn overview_app_grid_tab_walks_the_icons_in_order() {
     tap(&mut f, KEY_TAB);
     f.key_release(KEY_LEFTSHIFT);
     assert_eq!(
-        f.niri().app_grid.focused(),
+        f.synoik().app_grid.focused(),
         Some(29),
         "Shift+Tab off the front wraps to the last icon"
     );
     assert_eq!(
-        f.niri().app_grid.current_page(),
+        f.synoik().app_grid.current_page(),
         29 / per_page,
         "…and the page follows the focus there"
     );
@@ -14146,72 +14286,72 @@ fn overview_app_grid_tab_walks_the_icons_in_order() {
     // Forward off the end wraps back to the start, paging back with it.
     tap(&mut f, KEY_TAB);
     assert_eq!(
-        f.niri().app_grid.focused(),
+        f.synoik().app_grid.focused(),
         Some(0),
         "and forward wraps too"
     );
-    assert_eq!(f.niri().app_grid.current_page(), 0);
+    assert_eq!(f.synoik().app_grid.current_page(), 0);
 
     // An open folder is its own focus group (`appDisplay.js:2516`), so Tab cycles inside
     // it and the grid behind keeps whatever focus it had.
-    f.niri().app_grid.set_focused(Some(0));
-    f.niri().gnome_settings.app_folders = vec![crate::gnome::AppFolder {
+    f.synoik().app_grid.set_focused(Some(0));
+    f.synoik().gnome_settings.app_folders = vec![crate::gnome::AppFolder {
         id: "Utilities".to_owned(),
         name: "Utilities".to_owned(),
         apps: vec![ids[1].clone(), ids[2].clone()],
         ..Default::default()
     }];
-    f.niri().sync_app_grid();
+    f.synoik().sync_app_grid();
     let folder = f
-        .niri()
+        .synoik()
         .app_grid
         .index_of("Utilities")
         .expect("the folder tile");
-    f.niri().app_grid.set_focused(Some(folder));
+    f.synoik().app_grid.set_focused(Some(folder));
     tap(&mut f, KEY_ENTER);
-    f.niri_complete_animations();
-    assert!(f.niri().folder_dialog.is_open());
+    f.synoik_complete_animations();
+    assert!(f.synoik().folder_dialog.is_open());
 
     tap(&mut f, KEY_TAB);
-    assert_eq!(f.niri().folder_dialog.focused(), Some(0));
+    assert_eq!(f.synoik().folder_dialog.focused(), Some(0));
     tap(&mut f, KEY_TAB);
-    assert_eq!(f.niri().folder_dialog.focused(), Some(1));
+    assert_eq!(f.synoik().folder_dialog.focused(), Some(1));
     tap(&mut f, KEY_TAB);
     assert_eq!(
-        f.niri().folder_dialog.focused(),
+        f.synoik().folder_dialog.focused(),
         Some(0),
         "Tab wraps inside the folder — it does not escape into the grid"
     );
     assert_eq!(
-        f.niri().app_grid.focused(),
+        f.synoik().app_grid.focused(),
         Some(folder),
         "…and the grid behind the modal kept its own focus"
     );
     tap(&mut f, KEY_ESC);
-    assert!(!f.niri().folder_dialog.is_open());
+    assert!(!f.synoik().folder_dialog.is_open());
 
     // Tab is a genuinely *different* traversal from the arrows, and the end of a row is
     // where they part: Tab takes the next icon in order (the row below), where Right
     // leaves for the same row of the next page.
-    let row0_y = f.niri().app_grid.entry_center(0, area).unwrap().y;
+    let row0_y = f.synoik().app_grid.entry_center(0, area).unwrap().y;
     let cols = (1..per_page)
-        .find(|&i| f.niri().app_grid.entry_center(i, area).unwrap().y != row0_y)
+        .find(|&i| f.synoik().app_grid.entry_center(i, area).unwrap().y != row0_y)
         .expect("the page has more than one row");
     let row_end = cols - 1;
 
-    f.niri().app_grid.set_focused(Some(row_end));
+    f.synoik().app_grid.set_focused(Some(row_end));
     tap(&mut f, KEY_TAB);
     assert_eq!(
-        f.niri().app_grid.focused(),
+        f.synoik().app_grid.focused(),
         Some(row_end + 1),
         "Tab wraps onto the next row"
     );
 
-    f.niri().app_grid.set_focused(Some(row_end));
-    f.niri().app_grid.set_page(0, area);
+    f.synoik().app_grid.set_focused(Some(row_end));
+    f.synoik().app_grid.set_page(0, area);
     tap(&mut f, KEY_RIGHT);
     assert_eq!(
-        f.niri().app_grid.focused(),
+        f.synoik().app_grid.focused(),
         Some(per_page),
         "…where Right from the same icon crosses to the next page instead"
     );
@@ -14226,10 +14366,10 @@ fn overview_app_grid_tab_walks_the_icons_in_order() {
 /// in `Tty::on_output_config_changed` now does.
 #[test]
 fn output_scale_is_derived_from_the_current_mode() {
-    use niri_config::OutputName;
     use smithay::output::{Output, PhysicalProperties, Subpixel};
+    use synoik_config::OutputName;
 
-    use crate::niri::AppliedDisplayConfig;
+    use crate::synoik::AppliedDisplayConfig;
 
     let mut f = Fixture::new();
 
@@ -14239,7 +14379,7 @@ fn output_scale_is_derived_from_the_current_mode() {
         PhysicalProperties {
             size: (344, 215).into(),
             subpixel: Subpixel::Unknown,
-            make: "niri".to_owned(),
+            make: "synoik".to_owned(),
             model: "test".to_owned(),
             serial_number: "1".to_owned(),
         },
@@ -14264,10 +14404,10 @@ fn output_scale_is_derived_from_the_current_mode() {
     };
 
     set_mode((2048, 1330));
-    let (hidpi, _) = f.niri().derive_output_scale_transform(&output, None);
+    let (hidpi, _) = f.synoik().derive_output_scale_transform(&output, None);
 
     set_mode((3840, 2160));
-    let (uhd, _) = f.niri().derive_output_scale_transform(&output, None);
+    let (uhd, _) = f.synoik().derive_output_scale_transform(&output, None);
 
     assert!(
         uhd > hidpi,
@@ -14276,19 +14416,19 @@ fn output_scale_is_derived_from_the_current_mode() {
 
     // The live-applied config (GNOME Settings' ApplyMonitorsConfig) still outranks the guess —
     // it is dropped on a *hardware* mode change, not consulted-and-ignored.
-    f.niri().applied_display_config.insert(
+    f.synoik().applied_display_config.insert(
         "Virtual-1".to_owned(),
         AppliedDisplayConfig {
             scale: Some(1.),
             transform: None,
         },
     );
-    let (applied, _) = f.niri().derive_output_scale_transform(&output, None);
+    let (applied, _) = f.synoik().derive_output_scale_transform(&output, None);
     assert_eq!(applied, 1.);
 
-    f.niri().applied_display_config.remove("Virtual-1");
+    f.synoik().applied_display_config.remove("Virtual-1");
     set_mode((2048, 1330));
-    let (back, _) = f.niri().derive_output_scale_transform(&output, None);
+    let (back, _) = f.synoik().derive_output_scale_transform(&output, None);
     assert_eq!(back, hidpi, "dropping the override re-derives for the mode");
 }
 
@@ -14305,26 +14445,26 @@ fn app_grid_makes_the_shrunken_workspaces_inert() {
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let _win = map_window_sized(&mut f, id, (800, 600), None);
-    let win = f.niri().layout.focus().unwrap().window.clone();
+    let win = f.synoik().layout.focus().unwrap().window.clone();
 
-    f.niri_state().do_action(Action::ToggleOverview, false);
-    f.niri_state().update_keyboard_focus();
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.synoik_state().update_keyboard_focus();
     f.settle_animations();
 
     // In the picker, hovering a preview is live: it hovers, and a click would activate it.
-    let rect = f.niri().layout.expose_target_rect(&win).unwrap();
+    let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
     let center = rect.loc + rect.size.downscale(2.).to_point();
     pointer_motion_to(&mut f, center.x, center.y);
     assert!(
-        f.niri().window_under_cursor().is_some(),
+        f.synoik().window_under_cursor().is_some(),
         "the picker must be live before the app grid opens"
     );
     // The overlay fades in, so it is only on screen once its animation has run — and settling has
     // to come after the last input roundtrip (the headless animation-clock trap).
     f.settle_animations();
     let hovered = |f: &mut Fixture| {
-        let out = f.niri_output(1);
-        f.niri()
+        let out = f.synoik_output(1);
+        f.synoik()
             .layout
             .monitor_for_output(&out)
             .unwrap()
@@ -14335,20 +14475,20 @@ fn app_grid_makes_the_shrunken_workspaces_inert() {
     };
     assert_eq!(hovered(&mut f), 1, "the hovered preview shows its overlay");
 
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     f.settle_animations();
 
     // Sample where the preview *now* is. The picker no longer travels into the app-grid
     // row — it fades away in place (divergence, 2026-08-03) — so this is very nearly where
     // it was, and the point is that it is inert rather than gone. The hover and the click
-    // both resolve through `Layout::window_under` — not through `Niri::window_under`, which
+    // both resolve through `Layout::window_under` — not through `Synoik::window_under`, which
     // would answer None here anyway because the app grid covers the layout. This is the
     // path that was still handing a window over.
-    let small = f.niri().layout.expose_drawn_rect(&win).unwrap();
+    let small = f.synoik().layout.expose_drawn_rect(&win).unwrap();
     let small_center = small.loc + small.size.downscale(2.).to_point();
-    let out = f.niri_output(1);
+    let out = f.synoik_output(1);
     assert!(
-        f.niri().layout.window_under(&out, small_center).is_none(),
+        f.synoik().layout.window_under(&out, small_center).is_none(),
         "a faded-out workspace must not hand a window to the pointer"
     );
     assert_eq!(
@@ -14358,12 +14498,12 @@ fn app_grid_makes_the_shrunken_workspaces_inert() {
     );
 
     // …and it comes back when the app grid closes.
-    f.niri().layout.toggle_app_grid();
+    f.synoik().layout.toggle_app_grid();
     f.settle_animations();
     pointer_motion_to(&mut f, center.x, center.y);
-    let out = f.niri_output(1);
+    let out = f.synoik_output(1);
     assert!(
-        f.niri().layout.window_under(&out, center).is_some(),
+        f.synoik().layout.window_under(&out, center).is_some(),
         "closing the app grid makes the picker live again"
     );
 }
@@ -14382,12 +14522,12 @@ fn a11y_menu_row_toggles_the_setting_and_closes() {
     let ow = 1920.0_f64;
 
     // Pin the indicator on so it's clickable with nothing enabled.
-    let mut a11y = f.niri().gnome_settings.a11y;
+    let mut a11y = f.synoik().gnome_settings.a11y;
     a11y.always_show = true;
-    f.niri().gnome_settings.a11y = a11y;
-    f.niri().panel.set_a11y(a11y);
+    f.synoik().gnome_settings.a11y = a11y;
+    f.synoik().panel.set_a11y(a11y);
 
-    let anchor = f.niri().panel.a11y_rect(ow).expect("indicator present");
+    let anchor = f.synoik().panel.a11y_rect(ow).expect("indicator present");
     let click = |f: &mut Fixture, x: f64, y: f64| {
         pointer_motion_to(f, x, y);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
@@ -14400,21 +14540,21 @@ fn a11y_menu_row_toggles_the_setting_and_closes() {
         anchor.loc.y + anchor.size.h / 2.,
     );
     assert!(
-        f.niri().panel_popover.is_open(),
+        f.synoik().panel_popover.is_open(),
         "clicking the a11y indicator opens its menu"
     );
-    assert_eq!(f.niri().panel_popover.open_role(), Some(ROLE_A11Y));
+    assert_eq!(f.synoik().panel_popover.open_role(), Some(ROLE_A11Y));
 
     // The first row is High Contrast (`accessibility.js:45-46`). Its center comes from the
     // menu itself rather than a copy of its metrics, so changing the padding can't
     // silently retarget this click at a different row.
-    let out = f.niri().global_space.outputs().next().unwrap().clone();
-    let origin = f.niri().panel_popover.content_location(&out);
-    let row0 = f.niri().panel_popover.a11y_row_center(0).unwrap();
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let origin = f.synoik().panel_popover.content_location(&out);
+    let row0 = f.synoik().panel_popover.a11y_row_center(0).unwrap();
     click(&mut f, origin.x + row0.x, origin.y + row0.y);
 
     assert!(
-        f.niri().gnome_settings.a11y.get(A11yToggle::HighContrast),
+        f.synoik().gnome_settings.a11y.get(A11yToggle::HighContrast),
         "the row must flip the backing a11y state"
     );
     // Before the fade finishes, the clicked switch must already show its NEW state:
@@ -14422,24 +14562,24 @@ fn a11y_menu_row_toggles_the_setting_and_closes() {
     // rather than fading out still showing the old position. The gsettings echo cannot
     // do this — it arrives after the close has begun.
     assert_eq!(
-        f.niri().panel_popover.a11y_row_state(0),
+        f.synoik().panel_popover.a11y_row_state(0),
         Some(true),
         "the clicked switch must flip before the menu finishes closing"
     );
 
     f.settle_animations();
     assert!(
-        !f.niri().panel_popover.is_open(),
+        !f.synoik().panel_popover.is_open(),
         "a switch row closes the menu (popupMenu.js:539-550)"
     );
 
     // And the indicator's own predicate now holds without the pin.
-    let mut a11y = f.niri().gnome_settings.a11y;
+    let mut a11y = f.synoik().gnome_settings.a11y;
     a11y.always_show = false;
-    f.niri().gnome_settings.a11y = a11y;
-    f.niri().panel.set_a11y(a11y);
+    f.synoik().gnome_settings.a11y = a11y;
+    f.synoik().panel.set_a11y(a11y);
     assert!(
-        f.niri().panel.a11y_rect(ow).is_some(),
+        f.synoik().panel.a11y_rect(ow).is_some(),
         "High Contrast alone keeps the indicator up"
     );
 }
@@ -14457,35 +14597,35 @@ const VOL_ICON: &[&str] = &["audio-volume-high-symbolic"];
 fn osd_shows_and_expires() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let out = f.niri_output(1);
+    let out = f.synoik_output(1);
 
     // No icon -> nothing at all.
-    f.niri()
+    f.synoik()
         .osd
         .show_one(&out, &[], Some("Volume"), OsdLevel::new(0.5, 1.));
-    assert!(f.niri().osd.content(&out).is_none());
+    assert!(f.synoik().osd.content(&out).is_none());
 
-    f.niri()
+    f.synoik()
         .osd
         .show_one(&out, VOL_ICON, None, OsdLevel::new(0.5, 1.));
-    assert!(f.niri().osd.content(&out).is_some());
+    assert!(f.synoik().osd.content(&out).is_some());
     // The 100 ms fade is running, so it is not yet opaque.
-    assert!(f.niri().osd.alpha(&out) < 1.);
-    assert!(f.niri().osd.are_animations_ongoing());
+    assert!(f.synoik().osd.alpha(&out) < 1.);
+    assert!(f.synoik().osd.are_animations_ongoing());
 
     tick(&mut f, 120);
-    assert_eq!(f.niri().osd.alpha(&out), 1.);
+    assert_eq!(f.synoik().osd.alpha(&out), 1.);
     // The deadline is armed at the Showing->Shown transition inside
     // advance_animations; the wake-up must be armed from the same place.
-    assert!(f.niri().osd_timer.is_some());
+    assert!(f.synoik().osd_timer.is_some());
 
     // Still up just before the timeout — which started at `show()`, concurrently
     // with the fade (`osdWindow.js:107-110`) — and gone after it plus the fade out.
     tick(&mut f, 1300);
-    assert!(f.niri().osd.content(&out).is_some());
+    assert!(f.synoik().osd.content(&out).is_some());
     tick(&mut f, 200);
     tick(&mut f, 200);
-    assert!(f.niri().osd.content(&out).is_none());
+    assert!(f.synoik().osd.content(&out).is_none());
 }
 
 /// A second OSD while one is up replaces its content in place and re-arms the
@@ -14495,21 +14635,21 @@ fn osd_shows_and_expires() {
 fn osd_replace_in_place_never_refades() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let out = f.niri_output(1);
+    let out = f.synoik_output(1);
 
-    f.niri()
+    f.synoik()
         .osd
         .show_one(&out, VOL_ICON, None, OsdLevel::new(0.3, 1.));
     tick(&mut f, 120);
-    assert_eq!(f.niri().osd.alpha(&out), 1.);
+    assert_eq!(f.synoik().osd.alpha(&out), 1.);
 
     // Just short of expiry, a new level arrives.
     tick(&mut f, 1300);
-    f.niri()
+    f.synoik()
         .osd
         .show_one(&out, VOL_ICON, None, OsdLevel::new(0.6, 1.));
     assert_eq!(
-        f.niri().osd.alpha(&out),
+        f.synoik().osd.alpha(&out),
         1.,
         "replacing content must not restart the fade"
     );
@@ -14518,11 +14658,11 @@ fn osd_replace_in_place_never_refades() {
     // it, so the wake-up has to be re-armed against what the timer is actually set
     // to — otherwise the old timer fires early, drops itself, and the OSD hangs on a
     // damage-free desktop until unrelated damage happens by.
-    let armed = f.niri().osd_timer_at;
+    let armed = f.synoik().osd_timer_at;
     tick(&mut f, 0);
     let (now_armed, deadline) = {
-        let niri = f.niri();
-        (niri.osd_timer_at, niri.osd.next_wakeup())
+        let synoik = f.synoik();
+        (synoik.osd_timer_at, synoik.osd.next_wakeup())
     };
     assert_eq!(
         now_armed, deadline,
@@ -14532,10 +14672,10 @@ fn osd_replace_in_place_never_refades() {
 
     // The re-arm bought another full 1500 ms from *now*.
     tick(&mut f, 1300);
-    assert!(f.niri().osd.content(&out).is_some());
+    assert!(f.synoik().osd.content(&out).is_some());
     tick(&mut f, 200);
     tick(&mut f, 200);
-    assert!(f.niri().osd.content(&out).is_none());
+    assert!(f.synoik().osd.content(&out).is_none());
 }
 
 /// The level *eases* when the OSD is already visible and *snaps* when it is not
@@ -14545,43 +14685,43 @@ fn osd_replace_in_place_never_refades() {
 fn osd_level_eases_only_when_already_visible() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let out = f.niri_output(1);
+    let out = f.synoik_output(1);
 
     // First show: no ease, the bar is already at its value.
-    f.niri()
+    f.synoik()
         .osd
         .show_one(&out, VOL_ICON, None, OsdLevel::new(0.2, 1.));
-    assert_eq!(f.niri().osd.displayed_level(&out), Some(0.2));
+    assert_eq!(f.synoik().osd.displayed_level(&out), Some(0.2));
     tick(&mut f, 120);
 
     // A step up while visible eases across 100 ms. Sampled *mid-flight*: read at zero
     // elapsed time it would still be exactly 0.2, which an implementation that just
     // applies the new value one frame later would also pass.
-    f.niri()
+    f.synoik()
         .osd
         .show_one(&out, VOL_ICON, None, OsdLevel::new(0.8, 1.));
     tick(&mut f, 50);
-    let mid = f.niri().osd.displayed_level(&out).unwrap();
+    let mid = f.synoik().osd.displayed_level(&out).unwrap();
     assert!(
         mid > 0.2 && mid < 0.8,
         "the bar should be strictly in flight at 50 ms, was at {mid}"
     );
     tick(&mut f, 120);
-    assert_eq!(f.niri().osd.displayed_level(&out), Some(0.8));
-    assert!(!f.niri().osd.are_animations_ongoing());
+    assert_eq!(f.synoik().osd.displayed_level(&out), Some(0.8));
+    assert!(!f.synoik().osd.are_animations_ongoing());
 
     // Up then straight back down inside one frame: the new target equals the value
     // the (stale) ease started from, so nothing new is armed — and if the old ease is
     // left running the bar climbs to 0.8 and then snaps back to 0.2.
-    f.niri()
+    f.synoik()
         .osd
         .show_one(&out, VOL_ICON, None, OsdLevel::new(0.3, 1.));
-    f.niri()
+    f.synoik()
         .osd
         .show_one(&out, VOL_ICON, None, OsdLevel::new(0.8, 1.));
     tick(&mut f, 50);
     assert_eq!(
-        f.niri().osd.displayed_level(&out),
+        f.synoik().osd.displayed_level(&out),
         Some(0.8),
         "a superseded level ease must not keep running"
     );
@@ -14595,23 +14735,23 @@ fn osd_level_eases_only_when_already_visible() {
 fn osd_show_during_the_fade_neither_snaps_nor_refades() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let out = f.niri_output(1);
+    let out = f.synoik_output(1);
 
-    f.niri()
+    f.synoik()
         .osd
         .show_one(&out, VOL_ICON, None, OsdLevel::new(0.4, 1.));
     tick(&mut f, 40);
-    let mid = f.niri().osd.alpha(&out);
+    let mid = f.synoik().osd.alpha(&out);
     assert!(mid > 0. && mid < 1., "still fading in, alpha was {mid}");
 
-    f.niri()
+    f.synoik()
         .osd
         .show_one(&out, VOL_ICON, None, OsdLevel::new(0.5, 1.));
-    let after = f.niri().osd.alpha(&out);
+    let after = f.synoik().osd.alpha(&out);
     assert_eq!(after, mid, "a show mid-fade must not snap the pill opaque");
     // ...and the fade still lands.
     tick(&mut f, 80);
-    assert_eq!(f.niri().osd.alpha(&out), 1.);
+    assert_eq!(f.synoik().osd.alpha(&out), 1.);
 }
 
 /// The alt-tab switcher becoming visible hides every OSD
@@ -14621,22 +14761,22 @@ fn osd_show_during_the_fade_neither_snaps_nor_refades() {
 fn osd_hidden_by_the_window_switcher() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let out = f.niri_output(1);
+    let out = f.synoik_output(1);
     let id = f.add_client();
     let _first = map_focused_window(&mut f, id);
     let _second = map_focused_window(&mut f, id);
 
-    f.niri()
+    f.synoik()
         .osd
         .show_one(&out, VOL_ICON, None, OsdLevel::new(0.5, 1.));
     tick(&mut f, 120);
-    assert!(f.niri().osd.is_visible());
+    assert!(f.synoik().osd.is_visible());
 
     // The real keybind, not a hand-call to `hide_all` — the wiring is the thing
     // under test.
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_TAB);
-    assert!(f.niri().switcher.is_open(), "Alt+Tab opened it");
+    assert!(f.synoik().switcher.is_open(), "Alt+Tab opened it");
 
     // The OSD goes when the popup *appears*, not when the key is pressed: `_showImmediately`
     // calls `osdWindowManager.hideAll()` (`switcherPopup.js:178`), and that is 150 ms after the
@@ -14644,12 +14784,12 @@ fn osd_hidden_by_the_window_switcher() {
     // the fade finish. (niri's MRU hid it at keypress, which is why this used to need one tick.)
     tick(&mut f, 200);
     assert!(
-        f.niri().switcher.is_visible(),
+        f.synoik().switcher.is_visible(),
         "the popup is past its delay"
     );
     tick(&mut f, 200);
     assert!(
-        !f.niri().osd.is_visible(),
+        !f.synoik().osd.is_visible(),
         "the switcher becoming visible hides the OSD"
     );
     f.key_release(KEY_LEFTALT);
@@ -14663,31 +14803,31 @@ fn osd_show_cancels_outputs_absent_from_the_level_map() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     f.add_output(2, (1920, 1080));
-    let a = f.niri_output(1);
-    let b = f.niri_output(2);
+    let a = f.synoik_output(1);
+    let b = f.synoik_output(2);
 
-    f.niri()
+    f.synoik()
         .osd
         .show_all(VOL_ICON, None, OsdLevel::new(0.5, 1.));
     tick(&mut f, 120);
-    assert!(f.niri().osd.content(&a).is_some());
-    assert!(f.niri().osd.content(&b).is_some());
+    assert!(f.synoik().osd.content(&a).is_some());
+    assert!(f.synoik().osd.content(&b).is_some());
 
     // Now show on `a` alone: `b` is cancelled, not left behind.
-    f.niri()
+    f.synoik()
         .osd
         .show_one(&a, VOL_ICON, None, OsdLevel::new(0.9, 1.));
     tick(&mut f, 200);
-    assert!(f.niri().osd.content(&a).is_some());
+    assert!(f.synoik().osd.content(&a).is_some());
     assert!(
-        f.niri().osd.content(&b).is_none(),
+        f.synoik().osd.content(&b).is_none(),
         "an output missing from the level map must be cancelled"
     );
 
     // hideAll takes the rest (`switcherPopup.js:178`).
-    f.niri().osd.hide_all();
+    f.synoik().osd.hide_all();
     tick(&mut f, 200);
-    assert!(!f.niri().osd.is_visible());
+    assert!(!f.synoik().osd.is_visible());
 }
 
 /// An output that goes away takes its OSD with it (`js/ui/osdWindow.js:157-160`);
@@ -14696,23 +14836,23 @@ fn osd_show_cancels_outputs_absent_from_the_level_map() {
 fn osd_follows_outputs() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let a = f.niri_output(1);
-    f.niri()
+    let a = f.synoik_output(1);
+    f.synoik()
         .osd
         .show_all(VOL_ICON, None, OsdLevel::new(0.5, 1.));
     tick(&mut f, 120);
-    assert!(f.niri().osd.is_visible());
+    assert!(f.synoik().osd.is_visible());
 
     f.add_output(2, (1280, 720));
-    let b = f.niri_output(2);
+    let b = f.synoik_output(2);
     assert!(
-        f.niri().osd.content(&b).is_none(),
+        f.synoik().osd.content(&b).is_none(),
         "a new output starts with a hidden OSD, it does not inherit one"
     );
 
     f.remove_output(1);
-    assert!(f.niri().osd.content(&a).is_none());
-    assert!(!f.niri().osd.is_visible());
+    assert!(f.synoik().osd.content(&a).is_none());
+    assert!(!f.synoik().osd.is_visible());
 }
 
 /// A serialized `GIcon` is not a bare icon name (`js/ui/shellDBus.js:140-142` runs
@@ -14745,18 +14885,18 @@ fn osd_icon_candidates_parse_serialized_gicons() {
 #[cfg(feature = "dbus")]
 #[test]
 fn osd_show_osd_routes_by_connector() {
-    use crate::dbus::gnome_shell::GnomeShellToNiri;
+    use crate::dbus::gnome_shell::GnomeShellToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     f.add_output(2, (1280, 720));
-    let a = f.niri_output(1);
-    let b = f.niri_output(2);
+    let a = f.synoik_output(1);
+    let b = f.synoik_output(2);
     let a_name = a.name();
 
     let show = |f: &mut Fixture, connector: Option<&str>, level: Option<f64>, max: Option<f64>| {
-        f.niri_state()
-            .on_gnome_shell_msg(GnomeShellToNiri::ShowOsd {
+        f.synoik_state()
+            .on_gnome_shell_msg(GnomeShellToSynoik::ShowOsd {
                 connector: connector.map(str::to_owned),
                 label: None,
                 level,
@@ -14768,9 +14908,9 @@ fn osd_show_osd_routes_by_connector() {
 
     // No connector -> every monitor.
     show(&mut f, None, Some(0.5), None);
-    assert!(f.niri().osd.content(&a).is_some());
-    assert!(f.niri().osd.content(&b).is_some());
-    let content = f.niri().osd.content(&a).unwrap();
+    assert!(f.synoik().osd.content(&a).is_some());
+    assert!(f.synoik().osd.content(&b).is_some());
+    let content = f.synoik().osd.content(&a).unwrap();
     assert_eq!(
         content.icon,
         vec!["audio-volume-high-symbolic", "audio-volume-high"],
@@ -14781,29 +14921,29 @@ fn osd_show_osd_routes_by_connector() {
     // A connector routes to that output alone, and cancels the other.
     show(&mut f, Some(&a_name), Some(0.5), None);
     tick(&mut f, 200);
-    assert!(f.niri().osd.content(&a).is_some());
+    assert!(f.synoik().osd.content(&a).is_some());
     assert!(
-        f.niri().osd.content(&b).is_none(),
+        f.synoik().osd.content(&b).is_none(),
         "showOne cancels the monitors it did not name"
     );
 
     // An unknown connector is skipped, not applied to everything.
-    f.niri().osd.hide_all();
+    f.synoik().osd.hide_all();
     tick(&mut f, 200);
     show(&mut f, Some("does-not-exist"), Some(0.5), None);
-    assert!(!f.niri().osd.is_visible());
+    assert!(!f.synoik().osd.is_visible());
 
     // Amplified volume: max_level > 1 is carried through.
     show(&mut f, None, Some(1.4), Some(1.5));
-    assert_eq!(f.niri().osd.content(&a).unwrap().max_level, 1.5);
+    assert_eq!(f.synoik().osd.content(&a).unwrap().max_level, 1.5);
 
     // No level at all -> the OSD shows, but with no bar.
-    f.niri().osd.hide_all();
+    f.synoik().osd.hide_all();
     tick(&mut f, 200);
     show(&mut f, None, None, None);
-    let content = f.niri().osd.content(&a).unwrap();
+    let content = f.synoik().osd.content(&a).unwrap();
     assert!(content.level.is_none(), "an absent level means no bar");
-    assert!(f.niri().osd.level_rect(&a).is_none());
+    assert!(f.synoik().osd.level_rect(&a).is_none());
 }
 
 /// An icon that is not a theme name leaves no candidates, and `show()` refuses
@@ -14812,14 +14952,14 @@ fn osd_show_osd_routes_by_connector() {
 #[cfg(feature = "dbus")]
 #[test]
 fn osd_show_osd_without_a_resolvable_icon_draws_nothing() {
-    use crate::dbus::gnome_shell::GnomeShellToNiri;
+    use crate::dbus::gnome_shell::GnomeShellToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let out = f.niri_output(1);
+    let out = f.synoik_output(1);
 
-    f.niri_state()
-        .on_gnome_shell_msg(GnomeShellToNiri::ShowOsd {
+    f.synoik_state()
+        .on_gnome_shell_msg(GnomeShellToSynoik::ShowOsd {
             connector: None,
             label: Some("Volume".to_owned()),
             level: Some(0.5),
@@ -14827,11 +14967,11 @@ fn osd_show_osd_without_a_resolvable_icon_draws_nothing() {
             icon: Some("/usr/share/pixmaps/whatever.png".to_owned()),
         });
     tick(&mut f, 120);
-    assert!(f.niri().osd.content(&out).is_none());
+    assert!(f.synoik().osd.content(&out).is_none());
 
     // ...and with no icon key at all.
-    f.niri_state()
-        .on_gnome_shell_msg(GnomeShellToNiri::ShowOsd {
+    f.synoik_state()
+        .on_gnome_shell_msg(GnomeShellToSynoik::ShowOsd {
             connector: None,
             label: Some("Volume".to_owned()),
             level: Some(0.5),
@@ -14839,7 +14979,7 @@ fn osd_show_osd_without_a_resolvable_icon_draws_nothing() {
             icon: None,
         });
     tick(&mut f, 120);
-    assert!(f.niri().osd.content(&out).is_none());
+    assert!(f.synoik().osd.content(&out).is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -14858,8 +14998,8 @@ fn mpris_state(identity: &str, desktop_entry: Option<&str>) -> crate::mpris::Pla
     }
 }
 
-fn mpris_update(bus_name: &str, state: crate::mpris::PlayerState) -> crate::mpris::MprisToNiri {
-    crate::mpris::MprisToNiri::PlayerUpdated {
+fn mpris_update(bus_name: &str, state: crate::mpris::PlayerState) -> crate::mpris::MprisToSynoik {
+    crate::mpris::MprisToSynoik::PlayerUpdated {
         bus_name: bus_name.to_owned(),
         state: Box::new(state),
     }
@@ -14895,15 +15035,15 @@ fn album_art_is_loaded_when_the_player_appears() {
 
     let mut state = mpris_state("Rhythmbox", None);
     state.art = Some(first_src.clone());
-    f.niri_state()
+    f.synoik_state()
         .on_mpris_msg(mpris_update("org.mpris.MediaPlayer2.rb", state));
 
     assert!(
-        !f.niri().panel_popover.is_open(),
+        !f.synoik().panel_popover.is_open(),
         "the point of this test is that nothing has been opened"
     );
     assert!(
-        f.niri().image_cache.is_loaded(
+        f.synoik().image_cache.is_loaded(
             &first_src,
             crate::render_helpers::icon::ImageFit::Contain,
             BODY_ICON,
@@ -14917,11 +15057,11 @@ fn album_art_is_loaded_when_the_player_appears() {
     let mut next = mpris_state("Rhythmbox", None);
     next.title = "Blue in Green".into();
     next.art = Some(second_src.clone());
-    f.niri_state()
+    f.synoik_state()
         .on_mpris_msg(mpris_update("org.mpris.MediaPlayer2.rb", next));
 
     assert!(
-        f.niri().image_cache.is_loaded(
+        f.synoik().image_cache.is_loaded(
             &second_src,
             crate::render_helpers::icon::ImageFit::Contain,
             BODY_ICON,
@@ -14930,7 +15070,7 @@ fn album_art_is_loaded_when_the_player_appears() {
         "the new cover must load"
     );
     assert!(
-        !f.niri().image_cache.is_loaded(
+        !f.synoik().image_cache.is_loaded(
             &first_src,
             crate::render_helpers::icon::ImageFit::Contain,
             BODY_ICON,
@@ -14940,12 +15080,12 @@ fn album_art_is_loaded_when_the_player_appears() {
     );
 
     // And a player going away takes its cover with it.
-    f.niri_state()
-        .on_mpris_msg(crate::mpris::MprisToNiri::PlayerRemoved {
+    f.synoik_state()
+        .on_mpris_msg(crate::mpris::MprisToSynoik::PlayerRemoved {
             bus_name: "org.mpris.MediaPlayer2.rb".to_owned(),
         });
     assert!(
-        !f.niri().image_cache.is_loaded(
+        !f.synoik().image_cache.is_loaded(
             &second_src,
             crate::render_helpers::icon::ImageFit::Contain,
             BODY_ICON,
@@ -14971,7 +15111,7 @@ fn album_art_is_loaded_when_the_player_appears() {
 #[cfg(feature = "dbus")]
 #[test]
 fn the_account_picture_is_decoded_up_front_and_outlives_a_track_change() {
-    use crate::dbus::accounts_service::{AccountIcon, AccountsToNiri, UserAccount};
+    use crate::dbus::accounts_service::{AccountIcon, AccountsToSynoik, UserAccount};
     use crate::image_source::ImageSource;
     use crate::render_helpers::icon::ImageFit;
     use crate::ui::lock_screen::AVATAR_PX;
@@ -14990,8 +15130,8 @@ fn the_account_picture_is_decoded_up_front_and_outlives_a_track_change() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::UserChanged(UserAccount {
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::UserChanged(UserAccount {
             real_name: "Test User".to_owned(),
             icon_file: AccountIcon::read(face.clone()),
             ..Default::default()
@@ -14999,7 +15139,7 @@ fn the_account_picture_is_decoded_up_front_and_outlives_a_track_change() {
 
     let face_src = ImageSource::File(face.clone());
     assert!(
-        f.niri()
+        f.synoik()
             .image_cache
             .is_loaded(&face_src, ImageFit::Cover, AVATAR_PX, 1.0),
         "the picture must decode as AccountsService answers, not on the frame that draws it"
@@ -15008,16 +15148,16 @@ fn the_account_picture_is_decoded_up_front_and_outlives_a_track_change() {
     // A player appears and then changes track: two `retain` passes over the shared cache.
     let mut state = mpris_state("Rhythmbox", None);
     state.art = Some(ImageSource::File(cover.clone()));
-    f.niri_state()
+    f.synoik_state()
         .on_mpris_msg(mpris_update("org.mpris.MediaPlayer2.rb", state));
     let mut next = mpris_state("Rhythmbox", None);
     next.title = "Blue in Green".into();
     next.art = None;
-    f.niri_state()
+    f.synoik_state()
         .on_mpris_msg(mpris_update("org.mpris.MediaPlayer2.rb", next));
 
     assert!(
-        !f.niri().image_cache.is_loaded(
+        !f.synoik().image_cache.is_loaded(
             &ImageSource::File(cover.clone()),
             ImageFit::Contain,
             BODY_ICON,
@@ -15026,7 +15166,7 @@ fn the_account_picture_is_decoded_up_front_and_outlives_a_track_change() {
         "the cover no player claims must still be evicted — the bound has to keep working"
     );
     assert!(
-        f.niri()
+        f.synoik()
             .image_cache
             .is_loaded(&face_src, ImageFit::Cover, AVATAR_PX, 1.0),
         "the account picture was evicted by a track change"
@@ -15046,7 +15186,7 @@ fn the_account_picture_is_decoded_up_front_and_outlives_a_track_change() {
 #[cfg(feature = "dbus")]
 #[test]
 fn changing_the_account_picture_in_place_replaces_it() {
-    use crate::dbus::accounts_service::{AccountIcon, AccountsToNiri, UserAccount};
+    use crate::dbus::accounts_service::{AccountIcon, AccountsToSynoik, UserAccount};
     use crate::image_source::ImageSource;
     use crate::render_helpers::icon::ImageFit;
     use crate::ui::lock_screen::AVATAR_PX;
@@ -15062,8 +15202,8 @@ fn changing_the_account_picture_in_place_replaces_it() {
             .unwrap();
     };
     let announce = |f: &mut Fixture| {
-        f.niri_state()
-            .on_accounts_msg(AccountsToNiri::UserChanged(UserAccount {
+        f.synoik_state()
+            .on_accounts_msg(AccountsToSynoik::UserChanged(UserAccount {
                 real_name: "Test User".to_owned(),
                 icon_file: AccountIcon::read(face.clone()),
                 ..Default::default()
@@ -15078,7 +15218,7 @@ fn changing_the_account_picture_in_place_replaces_it() {
 
     let source = ImageSource::File(face.clone());
     let red = f
-        .niri()
+        .synoik()
         .image_cache
         .buffer(&source, ImageFit::Cover, AVATAR_PX, 1.0)
         .expect("the first picture decodes");
@@ -15094,7 +15234,7 @@ fn changing_the_account_picture_in_place_replaces_it() {
     announce(&mut f);
 
     let now = f
-        .niri()
+        .synoik()
         .image_cache
         .buffer(&source, ImageFit::Cover, AVATAR_PX, 1.0)
         .expect("the new picture decodes");
@@ -15118,7 +15258,7 @@ fn changing_the_account_picture_in_place_replaces_it() {
 #[cfg(feature = "dbus")]
 #[test]
 fn each_condition_alone_hides_the_switch_user_button() {
-    use crate::dbus::accounts_service::AccountsToNiri;
+    use crate::dbus::accounts_service::AccountsToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
@@ -15126,54 +15266,57 @@ fn each_condition_alone_hides_the_switch_user_button() {
     // Nothing has answered yet: the fail-closed direction is hidden, since a button offering a
     // switch we have not established is possible is the one that does nothing.
     assert!(
-        !f.niri().switch_user_visible(),
+        !f.synoik().switch_user_visible(),
         "the button must not appear before anything has said it can work"
     );
 
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::CanSwitch(true));
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::MultipleUsers(true));
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::CanSwitch(true));
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::MultipleUsers(true));
     assert!(
-        f.niri().switch_user_visible(),
+        f.synoik().switch_user_visible(),
         "with a seat, another user, and default settings, the button shows"
     );
 
     // ...and each condition, alone, takes it away again.
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::CanSwitch(false));
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::CanSwitch(false));
     assert!(
-        !f.niri().switch_user_visible(),
+        !f.synoik().switch_user_visible(),
         "a seat that cannot host another session"
     );
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::CanSwitch(true));
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::CanSwitch(true));
 
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::MultipleUsers(false));
-    assert!(!f.niri().switch_user_visible(), "nobody else to log in as");
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::MultipleUsers(true));
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::MultipleUsers(false));
+    assert!(
+        !f.synoik().switch_user_visible(),
+        "nobody else to log in as"
+    );
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::MultipleUsers(true));
 
-    let base = f.niri().screen_shield.settings();
+    let base = f.synoik().screen_shield.settings();
     let mut settings = base;
     settings.user_switch_enabled = false;
-    f.niri().screen_shield.set_settings(settings);
+    f.synoik().screen_shield.set_settings(settings);
     assert!(
-        !f.niri().switch_user_visible(),
+        !f.synoik().switch_user_visible(),
         "org.gnome.desktop.screensaver user-switch-enabled = false"
     );
 
     let mut settings = base;
     settings.disable_user_switching = true;
-    f.niri().screen_shield.set_settings(settings);
+    f.synoik().screen_shield.set_settings(settings);
     assert!(
-        !f.niri().switch_user_visible(),
+        !f.synoik().switch_user_visible(),
         "org.gnome.desktop.lockdown disable-user-switching = true"
     );
 
-    f.niri().screen_shield.set_settings(base);
-    assert!(f.niri().switch_user_visible(), "and back");
+    f.synoik().screen_shield.set_settings(base);
+    assert!(f.synoik().switch_user_visible(), "and back");
 }
 
 /// The switch-user button is clickable exactly while it is on screen — both edges of that.
@@ -15192,48 +15335,51 @@ fn each_condition_alone_hides_the_switch_user_button() {
 fn the_switch_user_button_is_clickable_exactly_while_it_is_drawn() {
     use std::time::Duration;
 
-    use crate::dbus::accounts_service::AccountsToNiri;
+    use crate::dbus::accounts_service::AccountsToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::CanSwitch(true));
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::MultipleUsers(true));
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::CanSwitch(true));
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::MultipleUsers(true));
 
     let t0 = Duration::from_secs(1_000);
     let mid = t0 + Duration::from_millis(150);
     let after = t0 + Duration::from_millis(400);
 
     // Resting on the clock: nothing drawn, nothing to click.
-    f.niri().lock_screen.set_page(false, t0);
-    f.niri().lock_screen.settle();
+    f.synoik().lock_screen.set_page(false, t0);
+    f.synoik().lock_screen.settle();
     assert!(
-        !f.niri().switch_user_reactive(t0),
+        !f.synoik().switch_user_reactive(t0),
         "the button must not be reactive with the clock up"
     );
 
     // The instant the prompt starts coming up, the button is still at alpha 0.
-    f.niri().lock_screen.set_page(true, t0);
+    f.synoik().lock_screen.set_page(true, t0);
     assert!(
-        !f.niri().switch_user_reactive(t0),
+        !f.synoik().switch_user_reactive(t0),
         "a click landed on the button on the frame it was still invisible"
     );
     assert!(
-        f.niri().switch_user_reactive(mid),
+        f.synoik().switch_user_reactive(mid),
         "mid-crossfade the button is on screen and must take a click"
     );
-    assert!(f.niri().switch_user_reactive(after), "and once it settles");
+    assert!(
+        f.synoik().switch_user_reactive(after),
+        "and once it settles"
+    );
 
     // Going back: the page is already the clock, but the button is still fading out.
-    f.niri().lock_screen.set_page(false, after);
+    f.synoik().lock_screen.set_page(false, after);
     assert!(
-        f.niri()
+        f.synoik()
             .switch_user_reactive(after + Duration::from_millis(150)),
         "the button was still drawn but had stopped taking clicks"
     );
     assert!(
-        !f.niri()
+        !f.synoik()
             .switch_user_reactive(after + Duration::from_millis(400)),
         "and once it is gone it must stop"
     );
@@ -15252,32 +15398,32 @@ fn the_switch_user_button_is_clickable_exactly_while_it_is_drawn() {
 fn clicking_the_switch_user_button_cancels_the_prompt() {
     use smithay::utils::{Point, Rectangle, Size};
 
-    use crate::dbus::accounts_service::AccountsToNiri;
+    use crate::dbus::accounts_service::AccountsToSynoik;
     use crate::dbus::gdm::VerifierEvent;
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::CanSwitch(true));
-    f.niri_state()
-        .on_accounts_msg(AccountsToNiri::MultipleUsers(true));
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::CanSwitch(true));
+    f.synoik_state()
+        .on_accounts_msg(AccountsToSynoik::MultipleUsers(true));
 
     let raise = |f: &mut Fixture| {
-        f.niri_state()
-            .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-        f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-        f.niri_state()
+        f.synoik_state()
+            .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+        f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+        f.synoik_state()
             .on_verifier_event(VerifierEvent::AskQuestion {
                 question: "Password:".to_owned(),
                 secret: true,
             });
-        f.niri_state()
+        f.synoik_state()
             .on_shield_key(None, Some('a'), Default::default());
     };
     raise(&mut f);
     assert_eq!(
-        f.niri().unlock_dialog.page(),
+        f.synoik().unlock_dialog.page(),
         crate::unlock_dialog::Page::Prompt,
         "the fixture is on the prompt page"
     );
@@ -15287,22 +15433,22 @@ fn clicking_the_switch_user_button_cancels_the_prompt() {
     let centre = Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.));
 
     // A click just outside the circle but inside its box: the corner of the bounding square.
-    f.niri_state().on_shield_click(rect.loc);
+    f.synoik_state().on_shield_click(rect.loc);
     assert_eq!(
-        f.niri().unlock_dialog.page(),
+        f.synoik().unlock_dialog.page(),
         crate::unlock_dialog::Page::Prompt,
         "a click in the button's corner must not have counted as the button"
     );
 
     // ...and one on the button itself drops back to the clock, the prompt cancelled.
-    f.niri_state().on_shield_click(centre);
+    f.synoik_state().on_shield_click(centre);
     assert_eq!(
-        f.niri().unlock_dialog.page(),
+        f.synoik().unlock_dialog.page(),
         crate::unlock_dialog::Page::Clock,
         "the click did not cancel the authentication in flight"
     );
     assert!(
-        f.niri().screen_shield.is_active(),
+        f.synoik().screen_shield.is_active(),
         "and it must certainly not have unlocked the screen"
     );
 }
@@ -15316,7 +15462,7 @@ fn mpris_players_resolve_their_app() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake(
             "org.gnome.Rhythmbox3.desktop",
             "Rhythmbox",
@@ -15327,11 +15473,16 @@ fn mpris_players_resolve_their_app() {
     // `DesktopEntry` is the id WITHOUT `.desktop`, which is what gnome-shell appends
     // (`mpris.js:168`).
     let bus = "org.mpris.MediaPlayer2.rhythmbox";
-    f.niri_state().on_mpris_msg(mpris_update(
+    f.synoik_state().on_mpris_msg(mpris_update(
         bus,
         mpris_state("Rhythmbox 3", Some("org.gnome.Rhythmbox3")),
     ));
-    let player = f.niri().mpris.get(bus).expect("player is tracked").clone();
+    let player = f
+        .synoik()
+        .mpris
+        .get(bus)
+        .expect("player is tracked")
+        .clone();
     assert_eq!(
         player.app.as_ref().map(|a| a.id.as_str()),
         Some("org.gnome.Rhythmbox3.desktop")
@@ -15342,20 +15493,20 @@ fn mpris_players_resolve_their_app() {
     // A player whose DesktopEntry matches nothing installed -- or that sends none at all -- falls
     // back to Identity, and is still shown.
     let other = "org.mpris.MediaPlayer2.mystery";
-    f.niri_state()
+    f.synoik_state()
         .on_mpris_msg(mpris_update(other, mpris_state("Mystery Player", None)));
-    let player = f.niri().mpris.get(other).unwrap().clone();
+    let player = f.synoik().mpris.get(other).unwrap().clone();
     assert!(player.app.is_none());
     assert_eq!(player.source_name(), "Mystery Player");
-    assert_eq!(f.niri().mpris.visible().count(), 2);
+    assert_eq!(f.synoik().mpris.visible().count(), 2);
 
     // A vanished bus name takes its player with it (`mpris.js:242-249`).
-    f.niri_state()
-        .on_mpris_msg(crate::mpris::MprisToNiri::PlayerRemoved {
+    f.synoik_state()
+        .on_mpris_msg(crate::mpris::MprisToSynoik::PlayerRemoved {
             bus_name: bus.to_owned(),
         });
-    assert!(f.niri().mpris.get(bus).is_none());
-    assert_eq!(f.niri().mpris.visible().count(), 1);
+    assert!(f.synoik().mpris.get(bus).is_none());
+    assert_eq!(f.synoik().mpris.visible().count(), 1);
 }
 
 /// `raise()` (`mpris.js:93-100`) prefers the app over the remote `Raise()`, because a remote raise
@@ -15364,12 +15515,12 @@ fn mpris_players_resolve_their_app() {
 #[test]
 fn mpris_raise_prefers_the_app() {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
-    use crate::mpris::NiriToMpris;
+    use crate::mpris::SynoikToMpris;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     let recorder = RecordingLauncher::default();
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake(
             "org.gnome.Rhythmbox3.desktop",
             "Rhythmbox",
@@ -15379,15 +15530,15 @@ fn mpris_raise_prefers_the_app() {
 
     // Stand in for the watcher's inbound half so the calls we would make are observable.
     let (tx, rx) = async_channel::unbounded();
-    f.niri().mpris_emit = Some(tx);
+    f.synoik().mpris_emit = Some(tx);
 
     // A resolvable app that is not running: activating it is a launch, and NOTHING goes on the bus.
     let bus = "org.mpris.MediaPlayer2.rhythmbox";
-    f.niri_state().on_mpris_msg(mpris_update(
+    f.synoik_state().on_mpris_msg(mpris_update(
         bus,
         mpris_state("Rhythmbox 3", Some("org.gnome.Rhythmbox3")),
     ));
-    f.niri_state().raise_mpris_player(bus);
+    f.synoik_state().raise_mpris_player(bus);
     assert_eq!(recorder.calls.borrow().len(), 1);
     assert_eq!(
         recorder.calls.borrow()[0].0.id,
@@ -15399,22 +15550,22 @@ fn mpris_raise_prefers_the_app() {
     let other = "org.mpris.MediaPlayer2.mystery";
     let mut state = mpris_state("Mystery Player", None);
     state.can_raise = true;
-    f.niri_state().on_mpris_msg(mpris_update(other, state));
-    f.niri_state().raise_mpris_player(other);
+    f.synoik_state().on_mpris_msg(mpris_update(other, state));
+    f.synoik_state().raise_mpris_player(other);
     assert_eq!(
         rx.try_recv().ok(),
-        Some(NiriToMpris::Raise(other.to_owned()))
+        Some(SynoikToMpris::Raise(other.to_owned()))
     );
 
     // No app and no CanRaise: there is nothing to do, and we must not invent a launch.
-    f.niri_state()
+    f.synoik_state()
         .on_mpris_msg(mpris_update(other, mpris_state("Mystery Player", None)));
-    f.niri_state().raise_mpris_player(other);
+    f.synoik_state().raise_mpris_player(other);
     assert!(rx.try_recv().is_err());
     assert_eq!(recorder.calls.borrow().len(), 1);
 
     // A player that is not tracked at all is a no-op, not a panic -- the card can outlive it.
-    f.niri_state()
+    f.synoik_state()
         .raise_mpris_player("org.mpris.MediaPlayer2.gone");
     assert!(rx.try_recv().is_err());
 }
@@ -15432,13 +15583,13 @@ fn media_cards_sit_above_the_notification_groups() {
 
     // A player, then a notification, so their orders would disagree if the list appended.
     let bus = "org.mpris.MediaPlayer2.rhythmbox";
-    f.niri_state()
+    f.synoik_state()
         .on_mpris_msg(mpris_update(bus, mpris_state("Rhythmbox", None)));
     let nid = banner_notify(&mut f, banner_req("app-a", ":1.1"));
     f.settle_animations();
 
     open_calendar(&mut f);
-    let dm = f.niri().panel_popover.date_menu().unwrap();
+    let dm = f.synoik().panel_popover.date_menu().unwrap();
     let media = dm.media_card_rects();
     let cards = dm.card_rects();
     assert_eq!(media.len(), 1, "one card per player");
@@ -15453,9 +15604,9 @@ fn media_cards_sit_above_the_notification_groups() {
     assert!(dm.clear_pill_rect().is_some());
 
     // ... and with it gone, a list holding only the player has no pill and no placeholder.
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(crate::ui::popover::PopoverAction::ClearNotifications);
-    let dm = f.niri().panel_popover.date_menu().unwrap();
+    let dm = f.synoik().panel_popover.date_menu().unwrap();
     assert!(dm.card_rects().is_empty());
     assert_eq!(
         dm.media_card_rects().len(),
@@ -15474,8 +15625,8 @@ fn media_cards_sit_above_the_notification_groups() {
     // A player that stops being playable takes its card with it (`mpris.js:217-223`).
     let mut stopped = mpris_state("Rhythmbox", None);
     stopped.can_play = false;
-    f.niri_state().on_mpris_msg(mpris_update(bus, stopped));
-    let dm = f.niri().panel_popover.date_menu().unwrap();
+    f.synoik_state().on_mpris_msg(mpris_update(bus, stopped));
+    let dm = f.synoik().panel_popover.date_menu().unwrap();
     assert!(dm.media_card_rects().is_empty());
     assert!(dm.list().is_empty(), "now the placeholder is back");
 }
@@ -15486,13 +15637,13 @@ fn media_cards_sit_above_the_notification_groups() {
 /// (`:836-838`) — so a click on it falls through to the body rather than being swallowed.
 #[test]
 fn media_card_controls_drive_the_player() {
-    use crate::mpris::NiriToMpris;
+    use crate::mpris::SynoikToMpris;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     f.pointer_motion(1., 1.);
     let (tx, rx) = async_channel::unbounded();
-    f.niri().mpris_emit = Some(tx);
+    f.synoik().mpris_emit = Some(tx);
 
     // Next is allowed, Previous is not — the state the fall-through case needs.
     let bus = "org.mpris.MediaPlayer2.rhythmbox";
@@ -15500,13 +15651,13 @@ fn media_card_controls_drive_the_player() {
     state.can_go_next = true;
     state.can_go_previous = false;
     state.can_raise = true;
-    f.niri_state().on_mpris_msg(mpris_update(bus, state));
+    f.synoik_state().on_mpris_msg(mpris_update(bus, state));
 
     open_calendar(&mut f);
-    let output = f.niri_output(1);
-    let origin = f.niri().panel_popover.content_location(&output);
+    let output = f.synoik_output(1);
+    let origin = f.synoik().panel_popover.content_location(&output);
     let (_, card, controls) = f
-        .niri()
+        .synoik()
         .panel_popover
         .date_menu()
         .unwrap()
@@ -15525,23 +15676,29 @@ fn media_card_controls_drive_the_player() {
     click(&mut f, controls[1]);
     assert_eq!(
         rx.try_recv().ok(),
-        Some(NiriToMpris::PlayPause(bus.to_owned()))
+        Some(SynoikToMpris::PlayPause(bus.to_owned()))
     );
     assert!(
-        f.niri().panel_popover.is_open(),
+        f.synoik().panel_popover.is_open(),
         "a control is not a menu item"
     );
     click(&mut f, controls[2]);
-    assert_eq!(rx.try_recv().ok(), Some(NiriToMpris::Next(bus.to_owned())));
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(SynoikToMpris::Next(bus.to_owned()))
+    );
 
     // Previous is insensitive: the click reaches the message, which raises the player. With no
     // app resolved and CanRaise set, raising is the remote `Raise()`.
     click(&mut f, controls[0]);
-    assert_eq!(rx.try_recv().ok(), Some(NiriToMpris::Raise(bus.to_owned())));
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(SynoikToMpris::Raise(bus.to_owned()))
+    );
     // `close()` starts the fade; the popover is open until it finishes.
     f.settle_animations();
     assert!(
-        !f.niri().panel_popover.is_open(),
+        !f.synoik().panel_popover.is_open(),
         "raising the player closes the calendar"
     );
 
@@ -15551,9 +15708,12 @@ fn media_card_controls_drive_the_player() {
         &mut f,
         smithay::utils::Rectangle::new(card.loc, smithay::utils::Size::from((80., card.size.h))),
     );
-    assert_eq!(rx.try_recv().ok(), Some(NiriToMpris::Raise(bus.to_owned())));
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(SynoikToMpris::Raise(bus.to_owned()))
+    );
     f.settle_animations();
-    assert!(!f.niri().panel_popover.is_open());
+    assert!(!f.synoik().panel_popover.is_open());
 }
 
 /// Only the VOLUME icon takes the scroll. gnome-shell connects `scroll-event` to that one
@@ -15562,7 +15722,7 @@ fn media_card_controls_drive_the_player() {
 /// wants it — here, a plain wheel bind.
 #[test]
 fn only_the_volume_icon_consumes_a_panel_scroll() {
-    use niri_config::Trigger;
+    use synoik_config::Trigger;
 
     use crate::gnome::GnomeKeybinding;
 
@@ -15571,32 +15731,32 @@ fn only_the_volume_icon_consumes_a_panel_scroll() {
 
     // No-modifier scroll bindings, so "was the event consumed?" is observable without PipeWire.
     let bind = |trigger, action| GnomeKeybinding {
-        action: KeybindingAction::Niri(action),
+        action: KeybindingAction::Synoik(action),
         accels: vec![Accel {
             trigger: AccelTrigger::Device(trigger),
             mods: AccelMods::empty(),
         }],
         cooldown: None,
     };
-    f.niri().gnome_settings.keybindings = vec![
+    f.synoik().gnome_settings.keybindings = vec![
         bind(Trigger::WheelScrollDown, Action::FocusWorkspaceDown),
         // Up, so it is observable from where the wheel bind leaves us: with one window there are
         // only two workspaces, and workspace 1 is the last.
         bind(Trigger::TouchpadScrollDown, Action::FocusWorkspaceUp),
     ];
     // Without this the modifier fast path never lets the lookup happen at all.
-    f.niri().refresh_keybinding_state();
+    f.synoik().refresh_keybinding_state();
 
     // Two workspaces to move between, and a volume icon in the cluster to aim at.
     let id = f.add_client();
     let _surface = map_focused_window(&mut f, id);
-    f.niri_state()
+    f.synoik_state()
         .on_audio_status(Some(crate::audio::AudioStatus {
             volume: 0.5,
             muted: false,
         }));
     let active = |f: &mut Fixture| {
-        f.niri()
+        f.synoik()
             .layout
             .active_monitor_ref()
             .unwrap()
@@ -15604,14 +15764,14 @@ fn only_the_volume_icon_consumes_a_panel_scroll() {
     };
     assert_eq!(active(&mut f), 0);
 
-    let volume = f.niri().panel.volume_indicator_rect(1920.).unwrap();
+    let volume = f.synoik().panel.volume_indicator_rect(1920.).unwrap();
     let centre_x = volume.loc.x + volume.size.w / 2.;
 
     // Over the volume icon: consumed, so the bind never runs. (Changing the volume itself needs a
     // PipeWire connection, which a headless fixture has none of -- see the OSD test below.)
     pointer_motion_to(&mut f, centre_x, 10.);
     f.scroll_wheel();
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
         active(&mut f),
         0,
@@ -15621,7 +15781,7 @@ fn only_the_volume_icon_consumes_a_panel_scroll() {
     // Just outside it -- still on the panel, still on the status cluster -- the bind fires.
     pointer_motion_to(&mut f, volume.loc.x + volume.size.w + 4., 10.);
     f.scroll_wheel();
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
         active(&mut f),
         1,
@@ -15632,7 +15792,7 @@ fn only_the_volume_icon_consumes_a_panel_scroll() {
     // into fractional steps (`volume.js:452-458`), where ours used to ignore anything but a wheel.
     pointer_motion_to(&mut f, centre_x, 10.);
     f.scroll_finger(0., 120.);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
         active(&mut f),
         1,
@@ -15643,7 +15803,7 @@ fn only_the_volume_icon_consumes_a_panel_scroll() {
     // fire it and the assertion above is not vacuous.
     pointer_motion_to(&mut f, volume.loc.x + volume.size.w + 4., 10.);
     f.scroll_finger(0., 120.);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(active(&mut f), 0, "off the icon, the touchpad bind runs");
 }
 
@@ -15678,14 +15838,19 @@ fn a_panel_volume_change_shows_the_osd_everywhere() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     f.add_output(2, (1920, 1080));
-    let one = f.niri_output(1);
-    let two = f.niri_output(2);
+    let one = f.synoik_output(1);
+    let two = f.synoik_output(2);
 
-    f.niri_state().show_volume_osd(&crate::audio::AudioStatus {
-        volume: 0.5,
-        muted: false,
-    });
-    let content = f.niri().osd.content(&one).expect("output 1 shows the OSD");
+    f.synoik_state()
+        .show_volume_osd(&crate::audio::AudioStatus {
+            volume: 0.5,
+            muted: false,
+        });
+    let content = f
+        .synoik()
+        .osd
+        .content(&one)
+        .expect("output 1 shows the OSD");
     assert_eq!(content.icon, vec!["audio-volume-medium-symbolic"]);
     assert_eq!(content.label, None);
     assert_eq!(content.level, Some(0.5));
@@ -15695,28 +15860,29 @@ fn a_panel_volume_change_shows_the_osd_everywhere() {
         "the bar is scaled to the volume ceiling, not to 1.0 by accident"
     );
     assert!(
-        f.niri().osd.content(&two).is_some(),
+        f.synoik().osd.content(&two).is_some(),
         "showAll, not showOne: every monitor gets it"
     );
 
     // Muting swaps the glyph, as the indicator's own icon does.
-    f.niri_state().show_volume_osd(&crate::audio::AudioStatus {
-        volume: 0.5,
-        muted: true,
-    });
+    f.synoik_state()
+        .show_volume_osd(&crate::audio::AudioStatus {
+            volume: 0.5,
+            muted: true,
+        });
     assert_eq!(
-        f.niri().osd.content(&one).unwrap().icon,
+        f.synoik().osd.content(&one).unwrap().icon,
         vec!["audio-volume-muted-symbolic"]
     );
 
     // The QS slider path is silent: it goes through `apply_popover_action`, which never asks for
     // an OSD.
-    f.niri().osd.hide_all();
+    f.synoik().osd.hide_all();
     f.settle_animations();
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(crate::ui::popover::PopoverAction::SetVolume(0.8));
     assert!(
-        !f.niri().osd.is_visible(),
+        !f.synoik().osd.is_visible(),
         "dragging the visible slider must not also raise an OSD"
     );
 }
@@ -15725,38 +15891,38 @@ fn a_panel_volume_change_shows_the_osd_everywhere() {
 /// write reaching the backend, and the OSD (`js/ui/status/volume.js:452-458`).
 ///
 /// This is what the [`crate::audio::AudioBackend`] seam bought: with a concrete PipeWire handle on
-/// `Niri` the headless fixture had no backend at all, so the scroll path returned early and none of
-/// this was observable — deleting the `show_volume_osd` call left the suite green.
+/// `Synoik` the headless fixture had no backend at all, so the scroll path returned early and none
+/// of this was observable — deleting the `show_volume_osd` call left the suite green.
 #[test]
 fn a_scroll_over_the_volume_icon_steps_the_backend_and_shows_the_osd() {
     use crate::audio::AudioWrite;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let audio = f.install_stub_audio(0.5);
 
-    let volume = f.niri().panel.volume_indicator_rect(1920.).unwrap();
+    let volume = f.synoik().panel.volume_indicator_rect(1920.).unwrap();
     let centre_x = volume.loc.x + volume.size.w / 2.;
     pointer_motion_to(&mut f, centre_x, 10.);
 
     // One notch down: a write of exactly one slider step, and an OSD saying so.
     f.scroll_wheel();
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
         audio.writes(),
         vec![AudioWrite::Volume(0.5 - crate::audio::SCROLL_STEP)],
         "a wheel notch is one SLIDER_SCROLL_STEP, written to the backend"
     );
     let content = f
-        .niri()
+        .synoik()
         .osd
         .content(&output)
         .expect("the scroll shows an OSD");
     assert_eq!(content.level, Some(0.5 - crate::audio::SCROLL_STEP));
     assert_eq!(content.icon, vec!["audio-volume-medium-symbolic"]);
     assert_eq!(
-        f.niri().audio.unwrap().volume,
+        f.synoik().audio.unwrap().volume,
         0.5 - crate::audio::SCROLL_STEP,
         "the model the panel icon reads follows the write, without waiting for an echo"
     );
@@ -15764,18 +15930,18 @@ fn a_scroll_over_the_volume_icon_steps_the_backend_and_shows_the_osd() {
     // At the ceiling the write still happens, but the value cannot move -- and GNOME gates the OSD
     // on `slider.step()` having returned true (`volume.js:457`), so a scroll that changes nothing
     // must not re-arm an OSD that says the same thing.
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(crate::ui::popover::PopoverAction::SetVolume(
             crate::audio::MAX_VOLUME,
         ));
-    f.niri().osd.hide_all();
+    f.synoik().osd.hide_all();
     f.settle_animations();
     audio.clear_writes();
 
     f.scroll_wheel_up();
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert!(
-        !f.niri().osd.is_visible(),
+        !f.synoik().osd.is_visible(),
         "scrolling up at the ceiling must not keep re-arming the OSD"
     );
 
@@ -15787,23 +15953,23 @@ fn a_scroll_over_the_volume_icon_steps_the_backend_and_shows_the_osd() {
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.settle_animations();
     assert_eq!(
-        f.niri().panel_popover.open_role(),
+        f.synoik().panel_popover.open_role(),
         Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
         "the volume icon is part of the quick-settings button"
     );
-    f.niri().osd.hide_all();
+    f.synoik().osd.hide_all();
     f.settle_animations();
     audio.clear_writes();
 
     f.scroll_wheel();
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     assert_eq!(
         audio.writes(),
         vec![],
         "with its slider on screen, the scroll must not change the volume"
     );
     assert!(
-        f.niri().osd.is_visible(),
+        f.synoik().osd.is_visible(),
         "...but it still says what the volume is"
     );
 }
@@ -15822,7 +15988,7 @@ fn picking_an_output_port_writes_the_route_then_the_default() {
 
     // Headphones on the same node as the current default: the route write is the whole switch, and
     // re-asserting the default is harmless (gvc does the same).
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::SetOutputDevice(AudioDeviceKey::Port {
             card_id: 42,
             route_index: 1,
@@ -15845,7 +16011,7 @@ fn picking_an_output_port_writes_the_route_then_the_default() {
 
     // A port with no node behind it still selects the route rather than doing nothing.
     audio.clear_writes();
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::SetOutputDevice(AudioDeviceKey::Port {
             card_id: 42,
             route_index: 2,
@@ -15863,7 +16029,7 @@ fn picking_an_output_port_writes_the_route_then_the_default() {
 
     // A portless device (bluetooth): default only, no route.
     audio.clear_writes();
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::SetOutputDevice(AudioDeviceKey::Node(
             "bluez_output.AA".to_owned(),
         )));
@@ -15874,7 +16040,7 @@ fn picking_an_output_port_writes_the_route_then_the_default() {
 
     // The input side takes the same two shapes, against the source setters.
     audio.clear_writes();
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::SetInputDevice(AudioDeviceKey::Port {
             card_id: 42,
             route_index: 3,
@@ -15906,7 +16072,7 @@ fn a_port_change_to_headphones_shows_the_osd_but_the_first_answer_is_silent() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     f.install_stub_audio(0.5);
 
     // One card whose active output route is `port`.
@@ -15940,21 +16106,21 @@ fn a_port_change_to_headphones_shows_the_osd_but_the_first_answer_is_silent() {
     };
 
     // FIRST answer — speakers. The state is recorded, and NOTHING is shown.
-    f.niri_state().on_sink_list(sinks.clone());
-    f.niri_state().on_audio_cards(cards("analog-output"));
-    assert_eq!(f.niri().headphones, Some(false));
+    f.synoik_state().on_sink_list(sinks.clone());
+    f.synoik_state().on_audio_cards(cards("analog-output"));
+    assert_eq!(f.synoik().headphones, Some(false));
     assert!(
-        !f.niri().osd.is_visible(),
+        !f.synoik().osd.is_visible(),
         "the initial sync must not raise an OSD (`initializing`)"
     );
 
     // Plug headphones in: a change, so the OSD comes up — showing the LEVEL glyph, never the
     // headphone one (`showOSD` uses `getIcon()`, `volume.js:283-288`).
-    f.niri_state()
+    f.synoik_state()
         .on_audio_cards(cards("analog-output-headphones"));
-    assert_eq!(f.niri().headphones, Some(true));
+    assert_eq!(f.synoik().headphones, Some(true));
     let content = f
-        .niri()
+        .synoik()
         .osd
         .content(&output)
         .expect("plugging headphones in shows the volume OSD");
@@ -15966,25 +16132,25 @@ fn a_port_change_to_headphones_shows_the_osd_but_the_first_answer_is_silent() {
     assert_eq!(content.level, Some(0.5));
 
     // Re-publishing the same port is not a change: no second OSD.
-    f.niri().osd.hide_all();
+    f.synoik().osd.hide_all();
     f.settle_animations();
-    f.niri_state()
+    f.synoik_state()
         .on_audio_cards(cards("analog-output-headphones"));
     assert!(
-        !f.niri().osd.is_visible(),
+        !f.synoik().osd.is_visible(),
         "an unchanged port must not re-arm the OSD"
     );
 
     // Unplugging is a change too, and the first answer's silence is long spent.
-    f.niri_state().on_audio_cards(cards("analog-output"));
-    assert_eq!(f.niri().headphones, Some(false));
-    assert!(f.niri().osd.is_visible(), "unplugging speaks up as well");
+    f.synoik_state().on_audio_cards(cards("analog-output"));
+    assert_eq!(f.synoik().headphones, Some(false));
+    assert!(f.synoik().osd.is_visible(), "unplugging speaks up as well");
 
     // A bluetooth headset arriving as the new default: no card, but a form factor. GNOME does not
     // reset `_hasHeadphones` across a stream swap, so this is a change and shows the OSD.
-    f.niri().osd.hide_all();
+    f.synoik().osd.hide_all();
     f.settle_animations();
-    f.niri_state().on_sink_list(crate::audio::SinkList {
+    f.synoik_state().on_sink_list(crate::audio::SinkList {
         sinks: vec![SinkInfo {
             name: "bluez".to_owned(),
             description: "Bluetooth Headset".to_owned(),
@@ -15993,9 +16159,9 @@ fn a_port_change_to_headphones_shows_the_osd_but_the_first_answer_is_silent() {
         }],
         default_name: Some("bluez".to_owned()),
     });
-    assert_eq!(f.niri().headphones, Some(true));
+    assert_eq!(f.synoik().headphones, Some(true));
     assert!(
-        f.niri().osd.is_visible(),
+        f.synoik().osd.is_visible(),
         "a default-sink swap that changes the answer shows the OSD -- \
          `_hasHeadphones` is not reset per stream"
     );
@@ -16015,11 +16181,11 @@ fn the_quick_settings_audio_controls_reach_the_backend() {
     f.add_output(1, (1920, 1080));
     let audio = f.install_stub_audio(0.5);
 
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::SetVolume(0.8));
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::ToggleMute);
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::SetOutputDevice(
             crate::audio::AudioDeviceKey::Node(
                 "alsa_output.pci-0000_00_1f.3.analog-stereo".to_owned(),
@@ -16034,11 +16200,11 @@ fn the_quick_settings_audio_controls_reach_the_backend() {
         ]
     );
     assert!(
-        f.niri().audio.unwrap().muted,
+        f.synoik().audio.unwrap().muted,
         "the mute toggle updates the model the panel icon reads"
     );
     assert_eq!(
-        f.niri().sink_list.default_name,
+        f.synoik().sink_list.default_name,
         None,
         "the picker's check waits for the backend's echo -- a rejected write has none"
     );
@@ -16046,7 +16212,7 @@ fn the_quick_settings_audio_controls_reach_the_backend() {
     // The input side needs a bound source, exactly as the live backend does: with none, the mic
     // controls return None and the compositor leaves its model alone.
     audio.clear_writes();
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::ToggleInputMute);
     assert_eq!(
         audio.writes(),
@@ -16061,12 +16227,12 @@ fn the_quick_settings_audio_controls_reach_the_backend() {
         volume: 0.4,
         source_present: true,
     });
-    f.niri().audio_backend = Some(Box::new(audio.clone()));
-    f.niri_state()
+    f.synoik().audio_backend = Some(Box::new(audio.clone()));
+    f.synoik_state()
         .apply_popover_action(PopoverAction::SetInputVolume(0.6));
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::ToggleInputMute);
-    f.niri_state()
+    f.synoik_state()
         .apply_popover_action(PopoverAction::SetInputDevice(
             crate::audio::AudioDeviceKey::Node("alsa_input.usb".to_owned()),
         ));
@@ -16079,7 +16245,7 @@ fn the_quick_settings_audio_controls_reach_the_backend() {
         ]
     );
     assert!(
-        f.niri().mic.muted,
+        f.synoik().mic.muted,
         "the mic mute updates the model the privacy indicator reads"
     );
 }
@@ -16115,7 +16281,7 @@ fn super_tab_opens_the_app_switcher_on_the_previous_app() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![
             AppEntry::fake("org.example.One.desktop", "One"),
             AppEntry::fake("org.example.Two.desktop", "Two"),
@@ -16126,14 +16292,17 @@ fn super_tab_opens_the_app_switcher_on_the_previous_app() {
     let client = f.add_client();
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.Two");
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
-    f.niri_state()
+    f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
 
-    assert!(f.niri().switcher.is_open(), "Super-Tab raises the switcher");
+    assert!(
+        f.synoik().switcher.is_open(),
+        "Super-Tab raises the switcher"
+    );
     assert_eq!(
-        f.niri().switcher.selected(),
+        f.synoik().switcher.selected(),
         Some(1),
         "a forward switcher starts on the previous app, not the current one"
     );
@@ -16150,7 +16319,7 @@ fn a_quick_super_tab_switches_without_showing_the_popup() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![
             AppEntry::fake("org.example.One.desktop", "One"),
             AppEntry::fake("org.example.Two.desktop", "Two"),
@@ -16160,9 +16329,9 @@ fn a_quick_super_tab_switches_without_showing_the_popup() {
 
     let client = f.add_client();
     map_window_for_app(&mut f, client, "org.example.One");
-    let first = f.niri().layout.focus().unwrap().id();
+    let first = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.Two");
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     // Hold Super for real, so the popup gets a modifier to commit on: driving the action with
     // nothing held makes it a *no-modifier* switcher, which commits on a timeout instead and
@@ -16170,11 +16339,11 @@ fn a_quick_super_tab_switches_without_showing_the_popup() {
     const KEY_LEFTMETA: u32 = 125;
     f.key_press(KEY_LEFTMETA);
 
-    f.niri_state()
+    f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
-    assert!(f.niri().switcher.is_open());
+    assert!(f.synoik().switcher.is_open());
     assert!(
-        !f.niri().switcher.is_visible(),
+        !f.synoik().switcher.is_visible(),
         "nothing is drawn inside the open delay"
     );
 
@@ -16182,9 +16351,12 @@ fn a_quick_super_tab_switches_without_showing_the_popup() {
     // the release reaches us because the grab was taken at open rather than at reveal.
     f.key_release(KEY_LEFTMETA);
 
-    assert!(!f.niri().switcher.is_open(), "the release ends the session");
+    assert!(
+        !f.synoik().switcher.is_open(),
+        "the release ends the session"
+    );
     assert_eq!(
-        f.niri().layout.focus().unwrap().id(),
+        f.synoik().layout.focus().unwrap().id(),
         first,
         "the tap moved focus to the previously used app's window"
     );
@@ -16207,7 +16379,7 @@ fn super_tab_pops_up_an_apps_windows_and_commits_to_the_one_it_picks() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![
             AppEntry::fake("org.example.One.desktop", "One"),
             AppEntry::fake("org.example.Two.desktop", "Two"),
@@ -16219,48 +16391,48 @@ fn super_tab_pops_up_an_apps_windows_and_commits_to_the_one_it_picks() {
     // "One" gets two windows, so it has a sub-list; "Two" is the app the switcher starts on.
     // Each window maps focused, so the focus right after is that window's id.
     map_window_for_app(&mut f, client, "org.example.One");
-    let a = f.niri().layout.focus().unwrap().id();
+    let a = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.One");
-    let b = f.niri().layout.focus().unwrap().id();
+    let b = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.Two");
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     // Rest on "One" (item 1) and let the popup timer run out.
     let open_on_one = |f: &mut Fixture| {
         f.key_press(KEY_LEFTMETA);
-        f.niri_state()
+        f.synoik_state()
             .do_action(Action::SwitchApplications { backward: false }, false);
-        assert_eq!(f.niri().switcher.selected(), Some(1), "opens on \"One\"");
+        assert_eq!(f.synoik().switcher.selected(), Some(1), "opens on \"One\"");
     };
     let rest = |f: &mut Fixture, by: Duration| {
-        let mut clock = f.niri().clock.clone();
+        let mut clock = f.synoik().clock.clone();
         let now = clock.now_unadjusted();
         clock.set_unadjusted(now + by);
-        f.niri().advance_animations();
+        f.synoik().advance_animations();
     };
 
     open_on_one(&mut f);
     assert!(
-        !f.niri().switcher.thumbnails_open(),
+        !f.synoik().switcher.thumbnails_open(),
         "the sub-list is not instant — tabbing through a multi-window app must not flash it"
     );
     rest(&mut f, crate::ui::switcher::thumbnails::POPUP_TIME * 2);
     assert!(
-        f.niri().switcher.thumbnails_open(),
+        f.synoik().switcher.thumbnails_open(),
         "resting on a multi-window app pops its windows up"
     );
     assert_eq!(
-        f.niri().switcher.thumbnail_selected(),
+        f.synoik().switcher.thumbnail_selected(),
         None,
         "...with nothing picked in it"
     );
 
     // So the release still activates the app's most recent window.
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(client);
     assert_eq!(
-        f.niri().layout.focus().unwrap().id(),
+        f.synoik().layout.focus().unwrap().id(),
         b,
         "a sub-list nobody picked from commits to the app's first window"
     );
@@ -16269,28 +16441,28 @@ fn super_tab_pops_up_an_apps_windows_and_commits_to_the_one_it_picks() {
     open_on_one(&mut f);
     tap(&mut f, KEY_DOWN);
     assert!(
-        f.niri().switcher.thumbnails_open(),
+        f.synoik().switcher.thumbnails_open(),
         "Down opens the sub-list at once"
     );
-    assert_eq!(f.niri().switcher.thumbnail_selected(), Some(0));
+    assert_eq!(f.synoik().switcher.thumbnail_selected(), Some(0));
 
     tap(&mut f, KEY_RIGHT);
     assert_eq!(
-        f.niri().switcher.thumbnail_selected(),
+        f.synoik().switcher.thumbnail_selected(),
         Some(1),
         "Right walks the previews, not the app row"
     );
     assert_eq!(
-        f.niri().switcher.selected(),
+        f.synoik().switcher.selected(),
         Some(1),
         "and the app row stays where it was"
     );
 
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(client);
     assert_eq!(
-        f.niri().layout.focus().unwrap().id(),
+        f.synoik().layout.focus().unwrap().id(),
         a,
         "committing with a preview picked activates that window"
     );
@@ -16307,7 +16479,7 @@ fn the_window_sublist_closes_on_up_and_on_moving_to_another_app() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![
             AppEntry::fake("org.example.One.desktop", "One"),
             AppEntry::fake("org.example.Two.desktop", "Two"),
@@ -16319,40 +16491,40 @@ fn the_window_sublist_closes_on_up_and_on_moving_to_another_app() {
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.Two");
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     f.key_press(KEY_LEFTMETA);
-    f.niri_state()
+    f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
     tap(&mut f, KEY_DOWN);
-    assert!(f.niri().switcher.thumbnails_open());
+    assert!(f.synoik().switcher.thumbnails_open());
 
     // Up hands the arrows back to the app row and does *not* re-open the sub-list on the timer.
     tap(&mut f, KEY_UP);
-    assert!(!f.niri().switcher.thumbnails_open(), "Up closes it");
+    assert!(!f.synoik().switcher.thumbnails_open(), "Up closes it");
 
-    let mut clock = f.niri().clock.clone();
+    let mut clock = f.synoik().clock.clone();
     let now = clock.now_unadjusted();
     clock.set_unadjusted(now + crate::ui::switcher::thumbnails::POPUP_TIME * 2);
-    f.niri().advance_animations();
+    f.synoik().advance_animations();
     assert!(
-        !f.niri().switcher.thumbnails_open(),
+        !f.synoik().switcher.thumbnails_open(),
         "and it stays closed — `forceAppFocus` does not re-arm the timer"
     );
 
     // With the arrows back on the row, Left/Right move apps again...
     tap(&mut f, KEY_LEFT);
     assert_eq!(
-        f.niri().switcher.selected(),
+        f.synoik().switcher.selected(),
         Some(0),
         "the arrows are back on the app row"
     );
 
     // ...and landing on the single-window app arms nothing at all.
     clock.set_unadjusted(clock.now_unadjusted() + crate::ui::switcher::thumbnails::POPUP_TIME * 2);
-    f.niri().advance_animations();
+    f.synoik().advance_animations();
     assert!(
-        !f.niri().switcher.thumbnails_open(),
+        !f.synoik().switcher.thumbnails_open(),
         "a one-window app has no sub-list to show"
     );
 
@@ -16378,7 +16550,7 @@ fn switch_group_opens_inside_the_current_app_on_its_second_window() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![
             AppEntry::fake("org.example.One.desktop", "One"),
             AppEntry::fake("org.example.Two.desktop", "Two"),
@@ -16391,43 +16563,50 @@ fn switch_group_opens_inside_the_current_app_on_its_second_window() {
     // Each maps focused, so within "One" the MRU order ends up [c, b, a].
     map_window_for_app(&mut f, client, "org.example.Two");
     map_window_for_app(&mut f, client, "org.example.One");
-    let a = f.niri().layout.focus().unwrap().id();
+    let a = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.One");
-    let b = f.niri().layout.focus().unwrap().id();
+    let b = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.One");
-    let c = f.niri().layout.focus().unwrap().id();
-    f.niri_complete_animations();
+    let c = f.synoik().layout.focus().unwrap().id();
+    f.synoik_complete_animations();
 
     // Super + the key above Tab, held.
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_GRAVE);
 
-    assert!(f.niri().switcher.is_open(), "Above_Tab raises the switcher");
+    assert!(
+        f.synoik().switcher.is_open(),
+        "Above_Tab raises the switcher"
+    );
     assert_eq!(
-        f.niri().switcher.selected(),
+        f.synoik().switcher.selected(),
         Some(0),
         "pinned to the app you are already in, not the previous one"
     );
     assert!(
-        f.niri().switcher.thumbnails_open(),
+        f.synoik().switcher.thumbnails_open(),
         "with its windows already up — no waiting for the popup timer"
     );
     assert_eq!(
-        f.niri().switcher.thumbnail_selected(),
+        f.synoik().switcher.thumbnail_selected(),
         Some(1),
         "starting on the app's *second* window — the one you are not in"
     );
 
     // A second press walks that app's windows rather than moving to the next app.
     tap(&mut f, KEY_GRAVE);
-    assert_eq!(f.niri().switcher.selected(), Some(0), "still the same app");
-    assert_eq!(f.niri().switcher.thumbnail_selected(), Some(2));
+    assert_eq!(
+        f.synoik().switcher.selected(),
+        Some(0),
+        "still the same app"
+    );
+    assert_eq!(f.synoik().switcher.thumbnail_selected(), Some(2));
 
     // And releasing commits to the window the sub-list had picked.
     f.key_release(KEY_LEFTMETA);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(client);
-    let focused = f.niri().layout.focus().unwrap().id();
+    let focused = f.synoik().layout.focus().unwrap().id();
     assert_eq!(focused, a, "committed to the picked window");
     assert_ne!(focused, b);
     assert_ne!(focused, c);
@@ -16436,8 +16615,8 @@ fn switch_group_opens_inside_the_current_app_on_its_second_window() {
     f.key_press(KEY_LEFTSHIFT);
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_GRAVE);
-    assert_eq!(f.niri().switcher.selected(), Some(0));
-    assert_eq!(f.niri().switcher.thumbnail_selected(), Some(2));
+    assert_eq!(f.synoik().switcher.selected(), Some(0));
+    assert_eq!(f.synoik().switcher.thumbnail_selected(), Some(2));
     f.key_release(KEY_LEFTMETA);
     f.key_release(KEY_LEFTSHIFT);
 }
@@ -16457,22 +16636,22 @@ fn alt_escape_cycles_windows_in_place_with_no_popup() {
 
     let client = f.add_client();
     map_window_for_app(&mut f, client, "org.example.A");
-    let a = f.niri().layout.focus().unwrap().id();
+    let a = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.B");
-    let b = f.niri().layout.focus().unwrap().id();
-    f.niri_complete_animations();
+    let b = f.synoik().layout.focus().unwrap().id();
+    f.synoik_complete_animations();
 
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_ESC);
 
-    assert!(f.niri().switcher.is_open(), "Alt+Escape opens a cycler");
+    assert!(f.synoik().switcher.is_open(), "Alt+Escape opens a cycler");
     assert!(
-        f.niri().switcher.item_rect(0).is_none() && f.niri().switcher.footer_rect().is_none(),
+        f.synoik().switcher.item_rect(0).is_none() && f.synoik().switcher.footer_rect().is_none(),
         "...which has no list, so it measures no panel to hit-test or draw"
     );
     // `_initialSelection`: forward starts at 1, the window you are *not* on.
-    assert_eq!(f.niri().switcher.cycler_window(), Some(a));
-    let highlight = f.niri().cycler_highlight.expect("the window is framed");
+    assert_eq!(f.synoik().switcher.cycler_window(), Some(a));
+    let highlight = f.synoik().cycler_highlight.expect("the window is framed");
     assert!(
         highlight.size.w > 0. && highlight.size.h > 0.,
         "and framed somewhere real: {highlight:?}"
@@ -16482,23 +16661,23 @@ fn alt_escape_cycles_windows_in_place_with_no_popup() {
     // propagates the rest, so it does not cross-drive this one.
     tap(&mut f, KEY_F6);
     assert_eq!(
-        f.niri().switcher.cycler_window(),
+        f.synoik().switcher.cycler_window(),
         Some(a),
         "the group cycler's key does not drive the window cycler"
     );
 
     // A second press of its own key walks on; the frame follows.
     tap(&mut f, KEY_ESC);
-    assert_eq!(f.niri().switcher.cycler_window(), Some(b));
-    assert_ne!(f.niri().cycler_highlight, Some(highlight));
+    assert_eq!(f.synoik().switcher.cycler_window(), Some(b));
+    assert_ne!(f.synoik().cycler_highlight, Some(highlight));
 
     // Releasing the modifier commits, like any other switcher.
     f.key_release(KEY_LEFTALT);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(client);
-    assert_eq!(f.niri().layout.focus().unwrap().id(), b);
+    assert_eq!(f.synoik().layout.focus().unwrap().id(), b);
     assert!(
-        f.niri().cycler_highlight.is_none(),
+        f.synoik().cycler_highlight.is_none(),
         "and the frame goes with the session"
     );
 }
@@ -16514,7 +16693,7 @@ fn alt_f6_cycles_only_the_focused_apps_windows() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![
             AppEntry::fake("org.example.One.desktop", "One"),
             AppEntry::fake("org.example.Two.desktop", "Two"),
@@ -16524,33 +16703,33 @@ fn alt_f6_cycles_only_the_focused_apps_windows() {
 
     let client = f.add_client();
     map_window_for_app(&mut f, client, "org.example.Two");
-    let other = f.niri().layout.focus().unwrap().id();
+    let other = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.One");
-    let a = f.niri().layout.focus().unwrap().id();
+    let a = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.One");
-    let b = f.niri().layout.focus().unwrap().id();
-    f.niri_complete_animations();
+    let b = f.synoik().layout.focus().unwrap().id();
+    f.synoik_complete_animations();
 
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_F6);
-    assert!(f.niri().switcher.is_open());
-    assert_eq!(f.niri().switcher.cycler_window(), Some(a));
+    assert!(f.synoik().switcher.is_open());
+    assert_eq!(f.synoik().switcher.cycler_window(), Some(a));
 
     // "One" has exactly two windows, so any number of presses stays inside them.
     for expected in [b, a, b] {
         tap(&mut f, KEY_F6);
-        assert_eq!(f.niri().switcher.cycler_window(), Some(expected));
+        assert_eq!(f.synoik().switcher.cycler_window(), Some(expected));
         assert_ne!(
-            f.niri().switcher.cycler_window(),
+            f.synoik().switcher.cycler_window(),
             Some(other),
             "the other app's window is not in this cycler at all"
         );
     }
 
     f.key_release(KEY_LEFTALT);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(client);
-    assert_eq!(f.niri().layout.focus().unwrap().id(), b);
+    assert_eq!(f.synoik().layout.focus().unwrap().id(), b);
 }
 
 /// An action the running cycler does not match falls through to the base — so `<Alt>Escape`
@@ -16568,7 +16747,7 @@ fn a_key_the_cycler_does_not_match_falls_through_and_abandons_it() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake(
             "org.example.A.desktop",
             "A",
@@ -16579,27 +16758,27 @@ fn a_key_the_cycler_does_not_match_falls_through_and_abandons_it() {
     let client = f.add_client();
     map_window_for_app(&mut f, client, "org.example.A");
     map_window_for_app(&mut f, client, "org.example.A");
-    let before = f.niri().layout.focus().unwrap().id();
-    f.niri_complete_animations();
+    let before = f.synoik().layout.focus().unwrap().id();
+    f.synoik_complete_animations();
 
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_F6);
-    assert!(f.niri().switcher.is_open(), "the group cycler is up");
-    assert_ne!(f.niri().switcher.cycler_window(), Some(before));
+    assert!(f.synoik().switcher.is_open(), "the group cycler is up");
+    assert_ne!(f.synoik().switcher.cycler_window(), Some(before));
 
     // Still holding Alt: `<Alt>Escape` is `cycle-windows`, which this popup does not match.
     tap(&mut f, KEY_ESC);
     assert!(
-        !f.niri().switcher.is_open(),
+        !f.synoik().switcher.is_open(),
         "it abandons rather than cycles"
     );
-    assert!(f.niri().cycler_highlight.is_none());
+    assert!(f.synoik().cycler_highlight.is_none());
 
     f.key_release(KEY_LEFTALT);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(client);
     assert_eq!(
-        f.niri().layout.focus().unwrap().id(),
+        f.synoik().layout.focus().unwrap().id(),
         before,
         "an abandoned cycler leaves the focus where it was"
     );
@@ -16622,7 +16801,7 @@ fn descending_into_an_open_sublist_moves_the_highlight_without_rebuilding_it() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![
             AppEntry::fake("org.example.One.desktop", "One"),
             AppEntry::fake("org.example.Two.desktop", "Two"),
@@ -16634,21 +16813,21 @@ fn descending_into_an_open_sublist_moves_the_highlight_without_rebuilding_it() {
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.Two");
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
-    let mut clock = f.niri().clock.clone();
+    let mut clock = f.synoik().clock.clone();
     let rest = |f: &mut Fixture, clock: &mut crate::animation::Clock, by: Duration| {
         let now = clock.now_unadjusted();
         clock.set_unadjusted(now + by);
-        f.niri().advance_animations();
+        f.synoik().advance_animations();
     };
 
     // Rest on the multi-window app until its sub-list pops up on the timer, then let the fade
     // finish so "still animating" below can only mean a *new* fade.
     f.key_press(KEY_LEFTMETA);
-    f.niri_state()
+    f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
-    assert_eq!(f.niri().switcher.selected(), Some(1), "opens on \"One\"");
+    assert_eq!(f.synoik().switcher.selected(), Some(1), "opens on \"One\"");
     rest(
         &mut f,
         &mut clock,
@@ -16659,22 +16838,22 @@ fn descending_into_an_open_sublist_moves_the_highlight_without_rebuilding_it() {
         &mut clock,
         crate::ui::switcher::thumbnails::FADE_TIME * 2,
     );
-    assert!(f.niri().switcher.thumbnails_open());
-    assert_eq!(f.niri().switcher.thumbnail_selected(), None);
+    assert!(f.synoik().switcher.thumbnails_open());
+    assert_eq!(f.synoik().switcher.thumbnail_selected(), None);
     assert!(
-        !f.niri().switcher.are_animations_ongoing(),
+        !f.synoik().switcher.are_animations_ongoing(),
         "the timer-opened list has finished fading in"
     );
 
     tap(&mut f, KEY_DOWN);
 
     assert_eq!(
-        f.niri().switcher.thumbnail_selected(),
+        f.synoik().switcher.thumbnail_selected(),
         Some(0),
         "Down picks the app's first window"
     );
     assert!(
-        !f.niri().switcher.are_animations_ongoing(),
+        !f.synoik().switcher.are_animations_ongoing(),
         "and does it in place: a list already on screen must not fade in again"
     );
 
@@ -16695,7 +16874,7 @@ fn the_window_sublist_fades_in() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake(
             "org.example.One.desktop",
             "One",
@@ -16706,16 +16885,16 @@ fn the_window_sublist_fades_in() {
     let client = f.add_client();
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.One");
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     f.key_press(KEY_LEFTMETA);
-    f.niri_state()
+    f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
     tap(&mut f, KEY_DOWN);
 
-    assert!(f.niri().switcher.thumbnails_open());
+    assert!(f.synoik().switcher.thumbnails_open());
     let alpha = f
-        .niri()
+        .synoik()
         .switcher
         .thumbnail_alpha()
         .expect("an open sub-list");
@@ -16724,15 +16903,15 @@ fn the_window_sublist_fades_in() {
         "the sub-list starts transparent and eases in, got {alpha}"
     );
     assert!(
-        f.niri().switcher.are_animations_ongoing(),
+        f.synoik().switcher.are_animations_ongoing(),
         "and it must keep the redraw loop alive, or the fade never runs"
     );
 
     // Past the fade, it is fully drawn and asks for nothing more.
-    let mut clock = f.niri().clock.clone();
+    let mut clock = f.synoik().clock.clone();
     clock.set_unadjusted(clock.now_unadjusted() + crate::ui::switcher::thumbnails::FADE_TIME * 2);
-    assert_eq!(f.niri().switcher.thumbnail_alpha(), Some(1.));
-    assert!(!f.niri().switcher.are_animations_ongoing());
+    assert_eq!(f.synoik().switcher.thumbnail_alpha(), Some(1.));
+    assert!(!f.synoik().switcher.are_animations_ongoing());
 
     f.key_release(KEY_LEFTMETA);
 }
@@ -16754,7 +16933,7 @@ fn the_switchers_close_and_quit_keys_act_without_ending_the_session() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![
             AppEntry::fake("org.example.One.desktop", "One"),
             AppEntry::fake("org.example.Two.desktop", "Two"),
@@ -16766,7 +16945,7 @@ fn the_switchers_close_and_quit_keys_act_without_ending_the_session() {
     let one_a = map_window_for_app(&mut f, client, "org.example.One");
     let one_b = map_window_for_app(&mut f, client, "org.example.One");
     let two = map_window_for_app(&mut f, client, "org.example.Two");
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     // How many of "One"'s windows have been asked to close, and whether "Two" ever was.
     let asked = |f: &mut Fixture| {
@@ -16781,9 +16960,9 @@ fn the_switchers_close_and_quit_keys_act_without_ending_the_session() {
 
     // Super-Tab, resting on the two-window app.
     f.key_press(KEY_LEFTMETA);
-    f.niri_state()
+    f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
-    assert_eq!(f.niri().switcher.selected(), Some(1), "opens on \"One\"");
+    assert_eq!(f.synoik().switcher.selected(), Some(1), "opens on \"One\"");
 
     // `w` on the app row is a no-op: nothing is picked, so there is nothing to close.
     tap(&mut f, KEY_W);
@@ -16793,17 +16972,17 @@ fn the_switchers_close_and_quit_keys_act_without_ending_the_session() {
         "`w` on the app row must not close anything — the key belongs to the sub-list"
     );
     assert!(
-        f.niri().switcher.is_open(),
+        f.synoik().switcher.is_open(),
         "and it certainly must not end the session"
     );
 
     // Nor does it once the sub-list has merely *popped up* on its timer: it is up with nothing
     // picked, and there is still no window the key names.
-    let mut clock = f.niri().clock.clone();
+    let mut clock = f.synoik().clock.clone();
     clock.set_unadjusted(clock.now_unadjusted() + crate::ui::switcher::thumbnails::POPUP_TIME * 2);
-    f.niri().advance_animations();
-    assert!(f.niri().switcher.thumbnails_open());
-    assert_eq!(f.niri().switcher.thumbnail_selected(), None);
+    f.synoik().advance_animations();
+    assert!(f.synoik().switcher.thumbnails_open());
+    assert_eq!(f.synoik().switcher.thumbnail_selected(), None);
     tap(&mut f, KEY_W);
     assert_eq!(
         asked(&mut f),
@@ -16819,7 +16998,7 @@ fn the_switchers_close_and_quit_keys_act_without_ending_the_session() {
         (1, false),
         "`w` in the sub-list closes the one picked window"
     );
-    assert!(f.niri().switcher.is_open(), "without ending the session");
+    assert!(f.synoik().switcher.is_open(), "without ending the session");
 
     // `q` quits the app: every window of it is asked to close, and no other app's.
     tap(&mut f, KEY_Q);
@@ -16828,7 +17007,7 @@ fn the_switchers_close_and_quit_keys_act_without_ending_the_session() {
         (2, false),
         "`q` asks every window of the selected app to close, and only that app's"
     );
-    assert!(f.niri().switcher.is_open(), "still without ending it");
+    assert!(f.synoik().switcher.is_open(), "still without ending it");
 
     f.key_release(KEY_LEFTMETA);
 }
@@ -16854,26 +17033,26 @@ fn an_open_switcher_suppresses_underlying_pointer_focus() {
     let over_window = Point::<f64, Logical>::from((900., 500.));
     pointer_motion_to(&mut f, over_window.x, over_window.y);
     assert!(
-        f.niri().contents_under(over_window).surface.is_some(),
+        f.synoik().contents_under(over_window).surface.is_some(),
         "the window under the pointer normally receives pointer focus"
     );
 
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_TAB);
-    assert!(f.niri().switcher.is_open());
+    assert!(f.synoik().switcher.is_open());
 
     // Still inside the popup's delay: the grab is already up, so the window is already cut off.
     assert!(
-        !f.niri().switcher.is_visible(),
+        !f.synoik().switcher.is_visible(),
         "sampled inside the open delay, where the popup draws nothing"
     );
     pointer_motion_to(&mut f, over_window.x, over_window.y);
     assert!(
-        f.niri().contents_under(over_window).surface.is_none(),
+        f.synoik().contents_under(over_window).surface.is_none(),
         "no window under an open switcher receives pointer focus"
     );
     assert!(
-        f.niri()
+        f.synoik()
             .seat
             .get_pointer()
             .unwrap()
@@ -16883,12 +17062,12 @@ fn an_open_switcher_suppresses_underlying_pointer_focus() {
     );
 
     f.key_release(KEY_LEFTALT);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     // ...and it comes back when the session ends.
     pointer_motion_to(&mut f, over_window.x, over_window.y);
     assert!(
-        f.niri().contents_under(over_window).surface.is_some(),
+        f.synoik().contents_under(over_window).surface.is_some(),
         "the window takes the pointer back once the switcher is gone"
     );
 }
@@ -16909,31 +17088,31 @@ fn the_switchers_arrows_walk_it_escape_abandons_it_and_return_takes_it() {
     let _first = map_focused_window(&mut f, id);
     let _second = map_focused_window(&mut f, id);
     let _third = map_focused_window(&mut f, id);
-    let before = f.niri().layout.focus().unwrap().id();
+    let before = f.synoik().layout.focus().unwrap().id();
 
     // Open on item 1 (the previously used window), then walk right and back.
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_TAB);
     assert_eq!(
-        f.niri().switcher.selected(),
+        f.synoik().switcher.selected(),
         Some(1),
         "opens on the previous"
     );
 
     tap(&mut f, KEY_RIGHT);
-    assert_eq!(f.niri().switcher.selected(), Some(2), "Right is _next");
+    assert_eq!(f.synoik().switcher.selected(), Some(2), "Right is _next");
     tap(&mut f, KEY_LEFT);
     tap(&mut f, KEY_LEFT);
-    assert_eq!(f.niri().switcher.selected(), Some(0), "Left is _previous");
+    assert_eq!(f.synoik().switcher.selected(), Some(0), "Left is _previous");
 
     // Escape abandons: the popup goes away and focus has not moved.
     tap(&mut f, KEY_ESC);
-    assert!(!f.niri().switcher.is_open(), "Escape destroys the popup");
+    assert!(!f.synoik().switcher.is_open(), "Escape destroys the popup");
     f.key_release(KEY_LEFTALT);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
     assert_eq!(
-        f.niri().layout.focus().unwrap().id(),
+        f.synoik().layout.focus().unwrap().id(),
         before,
         "a cancelled switcher leaves focus where it was"
     );
@@ -16942,14 +17121,14 @@ fn the_switchers_arrows_walk_it_escape_abandons_it_and_return_takes_it() {
     // usable at all.
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_TAB);
-    assert!(f.niri().switcher.is_open());
+    assert!(f.synoik().switcher.is_open());
     tap(&mut f, KEY_ENTER);
-    assert!(!f.niri().switcher.is_open(), "Return finishes the popup");
+    assert!(!f.synoik().switcher.is_open(), "Return finishes the popup");
     f.key_release(KEY_LEFTALT);
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
     f.double_roundtrip(id);
     assert_ne!(
-        f.niri().layout.focus().unwrap().id(),
+        f.synoik().layout.focus().unwrap().id(),
         before,
         "Return activated the selection"
     );
@@ -16973,7 +17152,7 @@ fn alt_tab_titles_the_selection_across_the_panel_and_super_tab_labels_each_item(
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![AppEntry::fake(
             "org.example.One.desktop",
             "One",
@@ -16984,21 +17163,21 @@ fn alt_tab_titles_the_selection_across_the_panel_and_super_tab_labels_each_item(
     let client = f.add_client();
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.One");
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     const KEY_LEFTALT: u32 = 56;
     const KEY_LEFTMETA: u32 = 125;
 
     f.key_press(KEY_LEFTALT);
-    f.niri_state()
+    f.synoik_state()
         .do_action(Action::SwitchWindows { backward: false }, false);
-    let item = f.niri().switcher.item_rect(0).expect("an item");
+    let item = f.synoik().switcher.item_rect(0).expect("an item");
     let footer = f
-        .niri()
+        .synoik()
         .switcher
         .footer_rect()
         .expect("the window switcher has a title band");
-    let panel = f.niri().switcher.panel_rect().expect("a panel");
+    let panel = f.synoik().switcher.panel_rect().expect("a panel");
     f.key_release(KEY_LEFTALT);
 
     // The preview slot carries no label strip of its own: it is exactly the 128px preview plus
@@ -17030,9 +17209,9 @@ fn alt_tab_titles_the_selection_across_the_panel_and_super_tab_labels_each_item(
 
     // The app switcher is the other arrangement: label per item, no band.
     f.key_press(KEY_LEFTMETA);
-    f.niri_state()
+    f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
-    let app_footer = f.niri().switcher.footer_rect();
+    let app_footer = f.synoik().switcher.footer_rect();
     f.key_release(KEY_LEFTMETA);
 
     assert!(
@@ -17054,7 +17233,7 @@ fn alt_tab_stays_on_this_workspace_and_super_tab_does_not() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         Box::new(FakeCatalog::new(vec![
             AppEntry::fake("org.example.One.desktop", "One"),
             AppEntry::fake("org.example.Two.desktop", "Two"),
@@ -17066,13 +17245,14 @@ fn alt_tab_stays_on_this_workspace_and_super_tab_does_not() {
     map_window_for_app(&mut f, client, "org.example.One");
 
     // A second window on the next workspace down.
-    f.niri_state().do_action(Action::FocusWorkspaceDown, false);
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
     map_window_for_app(&mut f, client, "org.example.Two");
-    f.niri_complete_animations();
+    f.synoik_complete_animations();
 
     // Sanity: the two really are on different workspaces, so the assertions below can differ.
     assert_eq!(
-        f.niri().switcher_tab_list(false).len(),
+        f.synoik().switcher_tab_list(false).len(),
         2,
         "both windows exist when nothing is filtered"
     );
@@ -17081,15 +17261,15 @@ fn alt_tab_stays_on_this_workspace_and_super_tab_does_not() {
     const KEY_LEFTMETA: u32 = 125;
 
     f.key_press(KEY_LEFTALT);
-    f.niri_state()
+    f.synoik_state()
         .do_action(Action::SwitchWindows { backward: false }, false);
-    let alt_tab_items = f.niri().switcher.item_count();
+    let alt_tab_items = f.synoik().switcher.item_count();
     f.key_release(KEY_LEFTALT);
 
     f.key_press(KEY_LEFTMETA);
-    f.niri_state()
+    f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
-    let super_tab_items = f.niri().switcher.item_count();
+    let super_tab_items = f.synoik().switcher.item_count();
     f.key_release(KEY_LEFTMETA);
 
     assert_eq!(
@@ -17110,19 +17290,19 @@ fn alt_tab_stays_on_this_workspace_and_super_tab_does_not() {
 /// dismissal.
 #[test]
 fn a_polkit_request_becomes_a_prompt_and_polkitd_decides() {
-    use crate::dbus::polkit_agent::{BeginRequest, PolkitRequest, PolkitToNiri};
-    use crate::niri::KeyboardFocus;
+    use crate::dbus::polkit_agent::{BeginRequest, PolkitRequest, PolkitToSynoik};
+    use crate::synoik::KeyboardFocus;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
     // Stand in for the agent, so what the dialog *sends* can be read back rather than assumed.
     let (to_agent, from_dialog) = async_channel::unbounded();
-    f.niri().polkit_requests = Some(to_agent);
+    f.synoik().polkit_requests = Some(to_agent);
     let sent = move || from_dialog.try_recv().ok();
 
     let begin = |user: &str| {
-        PolkitToNiri::Begin(Box::new(BeginRequest {
+        PolkitToSynoik::Begin(Box::new(BeginRequest {
             action_id: "org.freedesktop.test.frobnicate".to_owned(),
             message: "Authentication is required to frobnicate".to_owned(),
             user_name: user.to_owned(),
@@ -17132,9 +17312,9 @@ fn a_polkit_request_becomes_a_prompt_and_polkitd_decides() {
     };
 
     // polkitd asks. Nothing is on screen yet — PAM has not said it wants anything.
-    f.niri_state().on_polkit_msg(begin("root"));
+    f.synoik_state().on_polkit_msg(begin("root"));
     assert!(
-        !f.niri().polkit_is_open(),
+        !f.synoik().polkit_is_open(),
         "the dialog must not appear before PAM asks"
     );
     assert!(
@@ -17143,23 +17323,23 @@ fn a_polkit_request_becomes_a_prompt_and_polkitd_decides() {
     );
 
     // PAM asks, and now it is on screen and holds the keyboard.
-    f.niri_state().on_polkit_msg(PolkitToNiri::Request {
+    f.synoik_state().on_polkit_msg(PolkitToSynoik::Request {
         prompt: "Password:".to_owned(),
         echo_on: false,
     });
-    f.niri().polkit_ui.settle();
-    assert!(f.niri().polkit_is_open());
-    f.niri_state().refresh_and_flush_clients();
+    f.synoik().polkit_ui.settle();
+    assert!(f.synoik().polkit_is_open());
+    f.synoik_state().refresh_and_flush_clients();
     assert!(
-        matches!(f.niri().keyboard_focus, KeyboardFocus::PolkitDialog),
+        matches!(f.synoik().keyboard_focus, KeyboardFocus::PolkitDialog),
         "the dialog is modal, so it owns the keyboard: {:?}",
-        f.niri().keyboard_focus,
+        f.synoik().keyboard_focus,
     );
 
     // A real password off a real keyboard, masked on the way in.
     tap(&mut f, KEY_A);
     tap(&mut f, KEY_T);
-    assert_eq!(f.niri().polkit_dialog.entry_display(), "\u{25cf}\u{25cf}");
+    assert_eq!(f.synoik().polkit_dialog.entry_display(), "\u{25cf}\u{25cf}");
     tap(&mut f, KEY_BACKSPACE);
     tap(&mut f, KEY_E);
 
@@ -17171,14 +17351,15 @@ fn a_polkit_request_becomes_a_prompt_and_polkitd_decides() {
         other => panic!("expected a response, got {other:?}"),
     }
     assert_eq!(
-        f.niri().polkit_dialog.entry_display(),
+        f.synoik().polkit_dialog.entry_display(),
         "",
         "the buffer does not outlive the answer"
     );
 
     // PAM refuses. The dialog stays up and another conversation starts.
-    f.niri_state().on_polkit_msg(PolkitToNiri::Completed(false));
-    assert!(f.niri().polkit_is_open(), "a refusal is not the end");
+    f.synoik_state()
+        .on_polkit_msg(PolkitToSynoik::Completed(false));
+    assert!(f.synoik().polkit_is_open(), "a refusal is not the end");
     assert!(matches!(sent(), Some(PolkitRequest::Initiate { .. })));
 
     // Escape is a dismissal, which is a different answer from a failure: it tells the program that
@@ -17188,8 +17369,8 @@ fn a_polkit_request_becomes_a_prompt_and_polkitd_decides() {
         matches!(sent(), Some(PolkitRequest::Done { dismissed: true })),
         "Escape must reach polkitd as a dismissal"
     );
-    f.niri().polkit_ui.settle();
-    assert!(!f.niri().polkit_is_open());
+    f.synoik().polkit_ui.settle();
+    assert!(!f.synoik().polkit_is_open());
 }
 
 /// A request that arrives while the screen is locked waits for it, rather than drawing a password
@@ -17201,47 +17382,47 @@ fn a_polkit_request_becomes_a_prompt_and_polkitd_decides() {
 #[test]
 fn a_request_that_arrives_locked_waits_for_the_unlock() {
     use crate::dbus::gdm::VerifierEvent;
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
-    use crate::dbus::polkit_agent::{BeginRequest, PolkitRequest, PolkitToNiri};
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+    use crate::dbus::polkit_agent::{BeginRequest, PolkitRequest, PolkitToSynoik};
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
     let (to_agent, from_dialog) = async_channel::unbounded();
-    f.niri().polkit_requests = Some(to_agent);
+    f.synoik().polkit_requests = Some(to_agent);
     let sent = move || from_dialog.try_recv().ok();
 
     // Lock, with a live verifier behind it.
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
-    f.niri_state().on_verifier_event(VerifierEvent::Ready(1));
-    assert!(f.niri().screen_shield.is_locked());
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    assert!(f.synoik().screen_shield.is_locked());
 
-    f.niri_state()
-        .on_polkit_msg(PolkitToNiri::Begin(Box::new(BeginRequest {
+    f.synoik_state()
+        .on_polkit_msg(PolkitToSynoik::Begin(Box::new(BeginRequest {
             action_id: "org.freedesktop.test.frobnicate".to_owned(),
             message: "Authentication is required to frobnicate".to_owned(),
             user_name: "root".to_owned(),
             passwordless: false,
             avatar: None,
         })));
-    assert!(!f.niri().polkit_is_open(), "not over a lock screen");
+    assert!(!f.synoik().polkit_is_open(), "not over a lock screen");
     assert!(
         sent().is_none(),
         "and no conversation is started behind it either"
     );
     assert!(
-        f.niri().polkit_deferred.is_some(),
+        f.synoik().polkit_deferred.is_some(),
         "the request is held, not dropped -- polkitd is still waiting on it"
     );
 
     // gdm accepts; the shield goes, and the held request gets its turn on the next refresh (which
     // a live compositor runs constantly).
-    f.niri_state().on_verifier_event(VerifierEvent::Complete);
-    assert!(!f.niri().screen_shield.is_active());
-    f.niri_state().refresh_and_flush_clients();
+    f.synoik_state().on_verifier_event(VerifierEvent::Complete);
+    assert!(!f.synoik().screen_shield.is_active());
+    f.synoik_state().refresh_and_flush_clients();
     assert!(
-        f.niri().polkit_deferred.is_none(),
+        f.synoik().polkit_deferred.is_none(),
         "the held request has been run"
     );
     assert!(
@@ -17261,13 +17442,13 @@ fn a_request_that_arrives_locked_waits_for_the_unlock() {
 #[test]
 fn the_portal_window_list_carries_what_its_chooser_reads() {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
-    use crate::dbus::gnome_shell_introspect::{IntrospectToNiri, NiriToIntrospect};
+    use crate::dbus::gnome_shell_introspect::{IntrospectToSynoik, SynoikToIntrospect};
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     let client = f.add_client();
 
-    f.niri().app_system = AppSystem::with_parts(
+    f.synoik().app_system = AppSystem::with_parts(
         // The desktop id deliberately is *not* `{app_id}.desktop`: that is the only shape that
         // tells the resolved id apart from the string concatenation this used to do.
         Box::new(FakeCatalog::new(vec![AppEntry::fake_with_wm_class(
@@ -17279,12 +17460,12 @@ fn the_portal_window_list_carries_what_its_chooser_reads() {
     );
 
     map_window_for_app(&mut f, client, "a");
-    f.niri().sync_running_apps();
+    f.synoik().sync_running_apps();
 
     let (tx, rx) = async_channel::unbounded();
-    f.niri_state()
-        .on_introspect_msg(&tx, IntrospectToNiri::GetWindows);
-    let NiriToIntrospect::Windows(windows) = rx.try_recv().expect("a reply") else {
+    f.synoik_state()
+        .on_introspect_msg(&tx, IntrospectToSynoik::GetWindows);
+    let SynoikToIntrospect::Windows(windows) = rx.try_recv().expect("a reply") else {
         panic!("wrong reply");
     };
 
@@ -17297,7 +17478,7 @@ fn the_portal_window_list_carries_what_its_chooser_reads() {
             .expect("the dynamic-cast entry");
         assert_eq!(
             synthetic.title.as_deref(),
-            Some(crate::niri::DYNAMIC_CAST_TARGET_LABEL),
+            Some(crate::synoik::DYNAMIC_CAST_TARGET_LABEL),
             "the picker's label says what it does, not who made it"
         );
         assert_eq!(
@@ -17325,9 +17506,9 @@ fn the_portal_window_list_carries_what_its_chooser_reads() {
     assert_eq!((props.width, props.height), (100, 100));
 
     // ...and the app list agrees about which app is active.
-    f.niri_state()
-        .on_introspect_msg(&tx, IntrospectToNiri::GetRunningApplications);
-    let NiriToIntrospect::RunningApplications(apps) = rx.try_recv().expect("a reply") else {
+    f.synoik_state()
+        .on_introspect_msg(&tx, IntrospectToSynoik::GetRunningApplications);
+    let SynoikToIntrospect::RunningApplications(apps) = rx.try_recv().expect("a reply") else {
         panic!("wrong reply");
     };
     assert_eq!(
@@ -17363,7 +17544,7 @@ fn open_picker_headless(f: &mut Fixture) {
     use crate::render_helpers::RenderTarget;
     use crate::ui::screenshot_ui::{CaptionMetrics, ScreenshotNeutral};
 
-    let outputs: Vec<_> = f.niri().global_space.outputs().cloned().collect();
+    let outputs: Vec<_> = f.synoik().global_space.outputs().cloned().collect();
     let neutrals = outputs
         .into_iter()
         .map(|output| {
@@ -17388,13 +17569,13 @@ fn open_picker_headless(f: &mut Fixture) {
 
     // Window mode picks from frozen per-window copies, which are `MemoryBuffer` pixels too, so the
     // corpus can supply those as well rather than leave the Window button permanently insensitive.
-    let outputs: Vec<_> = f.niri().global_space.outputs().cloned().collect();
+    let outputs: Vec<_> = f.synoik().global_space.outputs().cloned().collect();
     let window_shots = outputs
         .into_iter()
         .map(|output| {
             let scale = output.current_scale().fractional_scale();
             let shots = f
-                .niri()
+                .synoik()
                 .layout
                 .active_workspace_windows_for_output(&output)
                 .into_iter()
@@ -17416,13 +17597,15 @@ fn open_picker_headless(f: &mut Fixture) {
         })
         .collect();
 
-    f.niri_state()
+    f.synoik_state()
         .open_screenshot_ui_with(neutrals, window_shots, false, None);
     assert!(
-        f.niri().screenshot_ui.is_open(),
+        f.synoik().screenshot_ui.is_open(),
         "the picker must open from hand-built neutrals; a renderer is not what opens it"
     );
-    f.niri().screenshot_ui.lay_out_panels(CaptionMetrics::TEST);
+    f.synoik()
+        .screenshot_ui
+        .lay_out_panels(CaptionMetrics::TEST);
 }
 
 /// Click a panel control by the rect the layout published for it, on output 1.
@@ -17432,9 +17615,9 @@ fn click_picker_control(
 ) -> crate::ui::screenshot_ui::PointerUp {
     use smithay::utils::{Logical, Point};
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let panel = f
-        .niri()
+        .synoik()
         .screenshot_ui
         .panel_rect(&output)
         .expect("an open, laid-out picker has a panel rect");
@@ -17445,7 +17628,7 @@ fn click_picker_control(
             .to_i32_round::<i32>()
             + panel.loc;
 
-    let ui = &mut f.niri_state().niri.screenshot_ui;
+    let ui = &mut f.synoik_state().synoik.screenshot_ui;
     ui.pointer_motion(point, None);
     assert!(ui.pointer_down(output, point, None, false).is_some());
     ui.pointer_up(None)
@@ -17464,29 +17647,33 @@ fn arming_a_delayed_capture_does_not_answer_its_caller() {
     f.add_output(1, (1920, 1080));
 
     let (tx, rx) = async_channel::bounded(1);
-    f.niri().interactive_screenshot_reply = Some(tx);
+    f.synoik().interactive_screenshot_reply = Some(tx);
     open_picker_headless(&mut f);
 
-    let output = f.niri_output(1);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
-    assert_eq!(f.niri().screenshot_ui.delay(), None, "the delay starts off");
+    let output = f.synoik_output(1);
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
+    assert_eq!(
+        f.synoik().screenshot_ui.delay(),
+        None,
+        "the delay starts off"
+    );
 
     // Off -> 3s -> 10s -> off. The layout does not move as it cycles (the number replaces a glyph
     // inside the same circle), so one read of it is enough.
     click_picker_control(&mut f, layout.delay);
     assert_eq!(
-        f.niri().screenshot_ui.delay(),
+        f.synoik().screenshot_ui.delay(),
         Some(Duration::from_secs(3)),
         "one click must arm the first stop"
     );
     click_picker_control(&mut f, layout.delay);
     assert_eq!(
-        f.niri().screenshot_ui.delay(),
+        f.synoik().screenshot_ui.delay(),
         Some(Duration::from_secs(10))
     );
     click_picker_control(&mut f, layout.delay);
     assert_eq!(
-        f.niri().screenshot_ui.delay(),
+        f.synoik().screenshot_ui.delay(),
         None,
         "the third click must wrap back to off"
     );
@@ -17497,15 +17684,15 @@ fn arming_a_delayed_capture_does_not_answer_its_caller() {
         click_picker_control(&mut f, layout.capture),
         PointerUp::Capture
     );
-    f.niri_state()
+    f.synoik_state()
         .handle_screenshot_ui_pointer_up(PointerUp::Capture);
 
     assert!(
-        !f.niri().screenshot_ui.is_open(),
+        !f.synoik().screenshot_ui.is_open(),
         "arming must dismiss the picker — the delay exists to get the shell out of the shot"
     );
     assert!(
-        f.niri().pending_capture.is_some(),
+        f.synoik().pending_capture.is_some(),
         "the capture must survive the picker that armed it"
     );
     assert_eq!(
@@ -17517,8 +17704,8 @@ fn arming_a_delayed_capture_does_not_answer_its_caller() {
 
     // Escape has no bind to reach with the picker gone, so `cancel_pending_capture` is its route —
     // and cancelling *is* the dismissal the caller was spared above.
-    assert!(f.niri_state().cancel_pending_capture());
-    assert!(f.niri().pending_capture.is_none());
+    assert!(f.synoik_state().cancel_pending_capture());
+    assert!(f.synoik().pending_capture.is_none());
     assert_eq!(
         rx.try_recv(),
         Ok(None),
@@ -17531,39 +17718,39 @@ fn arming_a_delayed_capture_does_not_answer_its_caller() {
 #[cfg(feature = "dbus")]
 #[test]
 fn a_lock_mid_countdown_cancels_the_delayed_capture() {
-    use crate::dbus::gnome_screen_saver::ScreenSaverToNiri;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
     use crate::ui::screenshot_ui::PointerUp;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
     let (tx, rx) = async_channel::bounded(1);
-    f.niri().interactive_screenshot_reply = Some(tx);
+    f.synoik().interactive_screenshot_reply = Some(tx);
     open_picker_headless(&mut f);
 
-    let output = f.niri_output(1);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let output = f.synoik_output(1);
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     click_picker_control(&mut f, layout.delay);
     click_picker_control(&mut f, layout.capture);
-    f.niri_state()
+    f.synoik_state()
         .handle_screenshot_ui_pointer_up(PointerUp::Capture);
-    assert!(f.niri().pending_capture.is_some());
+    assert!(f.synoik().pending_capture.is_some());
 
     // A tick before the lock keeps counting — otherwise this would pass for the wrong reason.
     assert!(matches!(
-        f.niri_state().tick_pending_capture(),
+        f.synoik_state().tick_pending_capture(),
         calloop::timer::TimeoutAction::ToDuration(_)
     ));
-    assert!(f.niri().pending_capture.is_some());
+    assert!(f.synoik().pending_capture.is_some());
 
-    f.niri_state()
-        .on_screen_saver_msg(ScreenSaverToNiri::Lock(None));
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
     assert!(matches!(
-        f.niri_state().tick_pending_capture(),
+        f.synoik_state().tick_pending_capture(),
         calloop::timer::TimeoutAction::Drop
     ));
     assert!(
-        f.niri().pending_capture.is_none(),
+        f.synoik().pending_capture.is_none(),
         "the locked screen must not be shot"
     );
     assert_eq!(
@@ -17577,18 +17764,18 @@ fn a_lock_mid_countdown_cancels_the_delayed_capture() {
 fn drag_selection(f: &mut Fixture, from: (i32, i32), to: (i32, i32)) {
     use smithay::utils::{Physical, Point};
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let from = Point::<i32, Physical>::from(from);
-    f.niri_state()
+    f.synoik_state()
         .handle_screenshot_ui_pointer_down(output, from, None, false);
     // From wherever the press left the pointer — a resize warps it onto the side it grabbed.
-    f.niri_state()
+    f.synoik_state()
         .handle_screenshot_ui_motion(Point::from(to), None);
-    f.niri_state().niri.screenshot_ui.pointer_up(None);
+    f.synoik_state().synoik.screenshot_ui.pointer_up(None);
 }
 
 fn selection_of(f: &mut Fixture) -> smithay::utils::Rectangle<i32, smithay::utils::Logical> {
-    f.niri()
+    f.synoik()
         .screenshot_ui
         .selection_rect_global()
         .expect("an open picker in Selection mode has a selection")
@@ -17640,34 +17827,38 @@ fn a_handle_dragged_past_the_far_side_flips() {
     open_picker_headless(&mut f);
     drag_selection(&mut f, (400, 400), (599, 599));
 
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     // The pointer arrives on the handle before it presses, as a real one does.
-    f.niri_state()
+    f.synoik_state()
         .handle_screenshot_ui_motion(Point::from((400, 400)), None);
     assert_eq!(
-        f.niri().screenshot_ui.cursor_icon(),
+        f.synoik().screenshot_ui.cursor_icon(),
         CursorIcon::NwResize,
         "hovering the handle already advertises the grab"
     );
     // Grab it...
-    f.niri_state()
-        .handle_screenshot_ui_pointer_down(output, Point::from((400, 400)), None, false);
+    f.synoik_state().handle_screenshot_ui_pointer_down(
+        output,
+        Point::from((400, 400)),
+        None,
+        false,
+    );
     assert_eq!(
-        f.niri().screenshot_ui.cursor_icon(),
+        f.synoik().screenshot_ui.cursor_icon(),
         CursorIcon::NwResize,
         "and holding it keeps it, with no motion in between"
     );
 
     // ...and drag it beyond the bottom-right one.
-    f.niri_state()
+    f.synoik_state()
         .handle_screenshot_ui_motion(Point::from((800, 800)), None);
     assert_eq!(
-        f.niri().screenshot_ui.cursor_icon(),
+        f.synoik().screenshot_ui.cursor_icon(),
         CursorIcon::SeResize,
         "past the far corner it is the south-east handle now, not a north-west one dragging \
          backwards"
     );
-    f.niri_state().niri.screenshot_ui.pointer_up(None);
+    f.synoik_state().synoik.screenshot_ui.pointer_up(None);
 
     assert_eq!(
         selection_of(&mut f),
@@ -17740,8 +17931,8 @@ fn the_area_selection_survives_a_trip_through_screen_mode() {
     let area = Rectangle::new(Point::from((300, 300)), Size::from((400, 300)));
     assert_eq!(selection_of(&mut f), area);
 
-    f.niri_state()
-        .niri
+    f.synoik_state()
+        .synoik
         .screenshot_ui
         .set_capture_type(CaptureType::Screen);
     assert_eq!(
@@ -17750,8 +17941,8 @@ fn the_area_selection_survives_a_trip_through_screen_mode() {
         "Screen mode still captures the whole output"
     );
 
-    f.niri_state()
-        .niri
+    f.synoik_state()
+        .synoik
         .screenshot_ui
         .set_capture_type(CaptureType::Selection);
     assert_eq!(
@@ -17780,10 +17971,10 @@ fn the_crosshair_is_only_over_the_selectable_area() {
     map_focused_window(&mut f, id);
 
     open_picker_headless(&mut f);
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
     let scale = output.current_scale().fractional_scale();
-    let panel = f.niri().screenshot_ui.panel_rect(&output).unwrap();
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let panel = f.synoik().screenshot_ui.panel_rect(&output).unwrap();
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
 
     let physical = |r: Rectangle<f64, Logical>| {
         Point::<f64, Logical>::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
@@ -17792,8 +17983,8 @@ fn the_crosshair_is_only_over_the_selectable_area() {
             + panel.loc
     };
     let move_to = |f: &mut Fixture, p: Point<i32, Physical>| {
-        f.niri_state().handle_screenshot_ui_motion(p, None);
-        f.niri().screenshot_ui.cursor_icon()
+        f.synoik_state().handle_screenshot_ui_motion(p, None);
+        f.synoik().screenshot_ui.cursor_icon()
     };
 
     // Over the free screen: this is the selectable area.
@@ -17818,7 +18009,7 @@ fn the_crosshair_is_only_over_the_selectable_area() {
         layout.capture.loc.y + layout.capture.size.h / 2.,
     ));
     assert_eq!(
-        f.niri()
+        f.synoik()
             .screenshot_ui
             .panel_layout(&output)
             .unwrap()
@@ -17839,16 +18030,16 @@ fn the_crosshair_is_only_over_the_selectable_area() {
     let at_40 = Point::from((40, 40));
     move_to(&mut f, at_40);
     click_picker_control(&mut f, layout.type_buttons[1]);
-    assert_eq!(f.niri().screenshot_ui.capture_type(), CaptureType::Screen);
+    assert_eq!(f.synoik().screenshot_ui.capture_type(), CaptureType::Screen);
     assert_eq!(
-        f.niri().screenshot_ui.cursor_icon(),
+        f.synoik().screenshot_ui.cursor_icon(),
         CursorIcon::Default,
         "switching out of Selection must drop the crosshair where the pointer already is"
     );
 
     // And Window mode likewise.
     click_picker_control(&mut f, layout.type_buttons[2]);
-    assert_eq!(f.niri().screenshot_ui.capture_type(), CaptureType::Window);
+    assert_eq!(f.synoik().screenshot_ui.capture_type(), CaptureType::Window);
     assert_eq!(move_to(&mut f, at_40), CursorIcon::Default);
 
     // Back to Selection, and it returns.
@@ -17869,42 +18060,42 @@ fn cast_mode_refuses_window_capture() {
     map_focused_window(&mut f, id);
 
     open_picker_headless(&mut f);
-    assert_eq!(f.niri().screenshot_ui.mode(), CaptureMode::Shot);
+    assert_eq!(f.synoik().screenshot_ui.mode(), CaptureMode::Shot);
     assert!(
-        f.niri().screenshot_ui.window_enabled(),
+        f.synoik().screenshot_ui.window_enabled(),
         "there is a window, so Window mode is available in Shot mode"
     );
 
-    let output = f.niri_output(1);
-    let layout = f.niri().screenshot_ui.panel_layout(&output).unwrap();
+    let output = f.synoik_output(1);
+    let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
     click_picker_control(&mut f, layout.type_buttons[2]);
-    assert_eq!(f.niri().screenshot_ui.capture_type(), CaptureType::Window);
+    assert_eq!(f.synoik().screenshot_ui.capture_type(), CaptureType::Window);
 
     let cast = crate::ui::widget::Segmented::segment_rect(layout.shot_cast, 1);
     click_picker_control(&mut f, cast);
-    assert_eq!(f.niri().screenshot_ui.mode(), CaptureMode::Cast);
+    assert_eq!(f.synoik().screenshot_ui.mode(), CaptureMode::Cast);
     assert_eq!(
-        f.niri().screenshot_ui.capture_type(),
+        f.synoik().screenshot_ui.capture_type(),
         CaptureType::Selection,
         "cast mode must move off Window rather than leave a mode it will not act on"
     );
     assert!(
-        !f.niri().screenshot_ui.window_enabled(),
+        !f.synoik().screenshot_ui.window_enabled(),
         "and it must stay unavailable while cast is checked, window or no window"
     );
 
     // A click that reaches the insensitive button anyway must still be refused.
     click_picker_control(&mut f, layout.type_buttons[2]);
     assert_eq!(
-        f.niri().screenshot_ui.capture_type(),
+        f.synoik().screenshot_ui.capture_type(),
         CaptureType::Selection
     );
 
     let shot = crate::ui::widget::Segmented::segment_rect(layout.shot_cast, 0);
     click_picker_control(&mut f, shot);
-    assert_eq!(f.niri().screenshot_ui.mode(), CaptureMode::Shot);
+    assert_eq!(f.synoik().screenshot_ui.mode(), CaptureMode::Shot);
     assert!(
-        f.niri().screenshot_ui.window_enabled(),
+        f.synoik().screenshot_ui.window_enabled(),
         "and switching back must give it up again"
     );
 }
@@ -17922,14 +18113,14 @@ fn a_running_area_recording_shades_what_it_leaves_out() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let output = f.niri_output(1);
+    let output = f.synoik_output(1);
 
     let recorded = Rectangle::<i32, Physical>::new((100, 200).into(), (800, 600).into());
-    f.niri().cast_area_indicator.set(output.clone(), recorded);
+    f.synoik().cast_area_indicator.set(output.clone(), recorded);
 
     let shades = |f: &mut Fixture, target| {
         let mut geo = Vec::new();
-        f.niri()
+        f.synoik()
             .cast_area_indicator
             .push(target, &output, |elem| geo.push(elem.geometry(1.0.into())));
         geo
@@ -17970,7 +18161,7 @@ fn a_running_area_recording_shades_what_it_leaves_out() {
     }
 
     // And it stops the moment the recording does.
-    f.niri().cast_area_indicator.clear();
+    f.synoik().cast_area_indicator.clear();
     assert!(shades(&mut f, RenderTarget::Output).is_empty());
 }
 
@@ -17993,7 +18184,7 @@ fn single_keys_pick_the_capture_type_and_mode() {
 
     open_picker_headless(&mut f);
     assert_eq!(
-        f.niri().screenshot_ui.capture_type(),
+        f.synoik().screenshot_ui.capture_type(),
         CaptureType::Selection
     );
 
@@ -18003,38 +18194,38 @@ fn single_keys_pick_the_capture_type_and_mode() {
     };
 
     tap(&mut f, KEY_C);
-    assert_eq!(f.niri().screenshot_ui.capture_type(), CaptureType::Screen);
+    assert_eq!(f.synoik().screenshot_ui.capture_type(), CaptureType::Screen);
     tap(&mut f, KEY_W);
-    assert_eq!(f.niri().screenshot_ui.capture_type(), CaptureType::Window);
+    assert_eq!(f.synoik().screenshot_ui.capture_type(), CaptureType::Window);
     tap(&mut f, KEY_S);
     assert_eq!(
-        f.niri().screenshot_ui.capture_type(),
+        f.synoik().screenshot_ui.capture_type(),
         CaptureType::Selection
     );
 
     tap(&mut f, KEY_V);
-    assert_eq!(f.niri().screenshot_ui.mode(), CaptureMode::Cast);
+    assert_eq!(f.synoik().screenshot_ui.mode(), CaptureMode::Cast);
     tap(&mut f, KEY_W);
     assert_eq!(
-        f.niri().screenshot_ui.capture_type(),
+        f.synoik().screenshot_ui.capture_type(),
         CaptureType::Selection,
         "Window is insensitive under cast, and its key must be refused like its button"
     );
     tap(&mut f, KEY_V);
-    assert_eq!(f.niri().screenshot_ui.mode(), CaptureMode::Shot);
+    assert_eq!(f.synoik().screenshot_ui.mode(), CaptureMode::Shot);
 
     // And none of it leaked out to the compositor underneath.
-    assert!(f.niri().screenshot_ui.is_open());
+    assert!(f.synoik().screenshot_ui.is_open());
 }
 
 /// The headless corpus has no renderer, so the picker cannot freeze the screen and open here —
 /// which makes this fixture exactly the refusal case, driven through the real
-/// `State::on_screen_shot_msg`. The dismissal is driven through `Niri::close_screenshot_ui`, the
+/// `State::on_screen_shot_msg`. The dismissal is driven through `Synoik::close_screenshot_ui`, the
 /// one seam every dismissal path goes through.
 #[cfg(feature = "dbus")]
 #[test]
 fn select_area_always_answers_its_caller() {
-    use crate::dbus::gnome_shell_screenshot::ScreenshotToNiri;
+    use crate::dbus::gnome_shell_screenshot::ScreenshotToSynoik;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
@@ -18043,10 +18234,10 @@ fn select_area_always_answers_its_caller() {
 
     // The picker never opens: the caller is answered anyway rather than left pending.
     let (tx, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_screen_shot_msg(&to_screenshot, ScreenshotToNiri::SelectArea(tx));
+    f.synoik_state()
+        .on_screen_shot_msg(&to_screenshot, ScreenshotToSynoik::SelectArea(tx));
     assert!(
-        !f.niri().screenshot_ui.is_open(),
+        !f.synoik().screenshot_ui.is_open(),
         "no renderer here, so the picker cannot open"
     );
     // `try_recv`, not a blocking wait: the answer is synchronous, and a test that *hangs* when
@@ -18059,15 +18250,15 @@ fn select_area_always_answers_its_caller() {
 
     // A dismissal reaches the caller too.
     let (tx, rx) = async_channel::bounded(1);
-    f.niri().select_area_reply = Some(tx);
-    f.niri().close_screenshot_ui();
+    f.synoik().select_area_reply = Some(tx);
+    f.synoik().close_screenshot_ui();
     assert_eq!(rx.try_recv(), Ok(None), "a dismissal must reach the caller");
 
     // `InteractiveScreenshot` shares both exits, and its dismissal is a `None` URI rather than an
     // error — the portal reads the boolean instead of catching a fault.
     let (tx, rx) = async_channel::bounded(1);
-    f.niri_state()
-        .on_screen_shot_msg(&to_screenshot, ScreenshotToNiri::Interactive(tx));
+    f.synoik_state()
+        .on_screen_shot_msg(&to_screenshot, ScreenshotToSynoik::Interactive(tx));
     assert_eq!(
         rx.try_recv(),
         Ok(None),
@@ -18075,8 +18266,8 @@ fn select_area_always_answers_its_caller() {
     );
 
     let (tx, rx) = async_channel::bounded(1);
-    f.niri().interactive_screenshot_reply = Some(tx);
-    f.niri().close_screenshot_ui();
+    f.synoik().interactive_screenshot_reply = Some(tx);
+    f.synoik().close_screenshot_ui();
     assert_eq!(rx.try_recv(), Ok(None), "and a dismissal must reach it too");
 
     // NOT covered here: the save/close race on the *confirm* path. `save_screenshot` takes the
@@ -18102,7 +18293,7 @@ fn the_screenshot_keys_come_from_gnome_settings() {
 
     // The four keys are adopted with GNOME's own defaults.
     let adopted: Vec<_> = f
-        .niri()
+        .synoik()
         .gnome_settings
         .keybindings
         .iter()
@@ -18121,7 +18312,7 @@ fn the_screenshot_keys_come_from_gnome_settings() {
 
     // ...with GNOME's own accelerators, and mapped to the actions those keys mean.
     let screenshot_accels = f
-        .niri()
+        .synoik()
         .gnome_settings
         .keybindings
         .iter()
@@ -18177,10 +18368,10 @@ fn a_saved_screenshot_notifies_with_the_image_and_a_show_in_files_button() {
         height: 2,
         rgba: vec![255; 16],
     });
-    f.niri_state()
+    f.synoik_state()
         .show_screenshot_notification(Some(path.clone()), Some(thumbnail.clone()));
 
-    let store = &f.niri().notifications;
+    let store = &f.synoik().notifications;
     let source = store
         .sources
         .iter()
@@ -18238,11 +18429,11 @@ fn a_clipboard_only_screenshot_notifies_without_a_file_button() {
         height: 2,
         rgba: vec![255; 16],
     });
-    f.niri_state()
+    f.synoik_state()
         .show_screenshot_notification(None, Some(thumbnail));
 
     let n = f
-        .niri()
+        .synoik()
         .notifications
         .sources
         .iter()
@@ -18277,20 +18468,20 @@ fn peripherals_settings_reach_the_input_config() {
     f.add_output(1, (1920, 1080));
 
     assert!(
-        f.niri().config.borrow().input.touchpad.tap,
+        f.synoik().config.borrow().input.touchpad.tap,
         "the default is GNOME's tap-to-click"
     );
 
-    let p = &mut f.niri().gnome_settings.peripherals;
+    let p = &mut f.synoik().gnome_settings.peripherals;
     p.touchpad.tap = false;
     p.touchpad.natural_scroll = false;
     p.mouse.left_handed = true;
     p.repeat_delay = 250;
     p.repeat_rate = 10;
 
-    f.niri_state().apply_peripherals();
+    f.synoik_state().apply_peripherals();
 
-    let config = f.niri().config.borrow();
+    let config = f.synoik().config.borrow();
     let input = &config.input;
     assert!(!input.touchpad.tap);
     assert!(!input.touchpad.natural_scroll);

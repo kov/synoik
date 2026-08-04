@@ -16,10 +16,10 @@ use std::cell::RefCell;
 use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Logical, Rectangle, Size};
 
-use crate::niri_render_elements;
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::synoik_render_elements;
 use crate::ui::widget::{self, style, BakeCache, Painter, Rgba};
 
 /// The glyph inside the button. The same one the window picker's close button uses, so the
@@ -134,7 +134,7 @@ impl ThumbnailChrome {
     }
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     ThumbnailChromeRenderElement => {
         Texture = TextureRenderElement<VkTexture>,
     }

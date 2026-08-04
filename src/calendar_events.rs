@@ -29,9 +29,9 @@ const MAX_STORED_EVENTS: usize = 4096;
 
 /// A calendar update pushed from the watcher to the compositor
 /// (`State::on_calendar_events_msg`). Defined here (not in the feature-gated
-/// `dbus::calendar_server`) so `Niri` can name it unconditionally.
+/// `dbus::calendar_server`) so `Synoik` can name it unconditionally.
 #[derive(Debug)]
-pub enum CalendarToNiri {
+pub enum CalendarToSynoik {
     /// Sanitized `EventsAddedOrUpdated` batch.
     EventsAddedOrUpdated(Vec<CalendarEvent>),
     /// `EventsRemoved` ids (prefix deletes).
@@ -54,7 +54,7 @@ pub enum CalendarToNiri {
 
 /// A range request from the compositor to the watcher.
 #[derive(Debug, Clone, Copy)]
-pub enum NiriToCalendar {
+pub enum SynoikToCalendar {
     /// Set the visible day range, `[since, until)` Unix seconds.
     SetRange { since: i64, until: i64 },
 }

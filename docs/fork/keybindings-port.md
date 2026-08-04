@@ -5,7 +5,7 @@ Keybindings are a dogfood blocker. The fork currently carries **two** keybinding
 1. **GNOME's GSettings keybindings** — `src/gnome.rs` holds a port of mutter's accelerator
    parser (`parse_accelerator`, with `Above_Tab`, the implicit `XF86` retry and `0x` keycode
    forms), the `GnomeKeybinding { action, accels }` model, the adopted tables, and the live
-   re-read that swaps `Niri::gnome_settings` wholesale (`src/niri.rs:1633`) so a
+   re-read that swaps `Synoik::gnome_settings` wholesale (`src/synoik.rs:1633`) so a
    `gsettings set` takes effect with no restart.
 2. **niri's KDL `binds{}`** — `resources/default-config.kdl`, consulted **last** by
    `find_bind` (`src/input/mod.rs`), so GNOME already wins every conflict.
@@ -45,7 +45,7 @@ An adopted key with no mapping would return `None` and **fall through** — beni
 layer caught it, but after the prune it means the key reaches the client instead. The audit is
 now structural rather than a checklist: `action_for_gnome` is `Some(match action { … })` over
 `GnomeKeyAction` with **no wildcard arm**, so a variant without a mapping does not compile, and
-our own schema speaks niri actions directly (`KeybindingAction::Niri(a) => Some(a)`), which
+our own schema speaks niri actions directly (`KeybindingAction::Synoik(a) => Some(a)`), which
 cannot fail to map at all.
 
 ## Ownership split (GNOME 50.3)
@@ -80,7 +80,7 @@ shape as the alt-tab switchers and belongs with them.
 `toggle-maximized` maps onto the existing `Action::MaximizeWindowToEdges`, which already calls
 `layout.toggle_maximized` — mutter's `handle_toggle_maximized` exactly (maximized →
 unmaximize, anything else → maximize; an edge-tiled window is not `maximized_vertically &&
-horizontally`, so it maximizes). Only the *name* is niri's, and it reaches into niri-ipc, so
+horizontally`, so it maximizes). Only the *name* is niri's, and it reaches into synoik-ipc, so
 renaming it is left for whenever that surface is revisited rather than done here.
 
 `org.gnome.mutter.keybindings` — `toggle-tiled-left`, `toggle-tiled-right`.
@@ -142,7 +142,7 @@ Three divergences from upstream have been found:
 GNOME has no key for: column focus and movement, monitor focus, consume/expel, the preset
 width and height cycles, centring, tabbed display, floating, and the session keys.
 
-`GnomeKeybinding.action` is a `KeybindingAction { Gnome(GnomeKeyAction), Niri(Action) }` rather
+`GnomeKeybinding.action` is a `KeybindingAction { Gnome(GnomeKeyAction), Synoik(Action) }` rather
 than a `GnomeKeyAction` grown into a mirror of niri's ~200 actions. `read_keybinding_table` is
 generic over `Into<KeybindingAction>`, so the GNOME tables were not touched by the change.
 
@@ -162,11 +162,11 @@ GNOME and gsd, apart from `<Alt><Super>s` (screen reader) and `<Alt><Super>8` (m
 
 Three unit tests keep it honest, each covering a failure that is otherwise silent:
 
-- `niri_accels_do_not_collide_with_gnome` — no accelerator of ours may take a chord we adopt
+- `synoik_accels_do_not_collide_with_gnome` — no accelerator of ours may take a chord we adopt
   from GNOME. This is the fork tenet made mechanical: GNOME wins, so ours must not ask. A
   collision would leave a settings key that changes nothing, which is worse than one that
   isn't there.
-- `niri_accels_do_not_collide_with_anything_gnome_ships` — the same question against every
+- `synoik_accels_do_not_collide_with_anything_gnome_ships` — the same question against every
   *default* in the vendored schemas plus gnome-settings-daemon's media keys, adopted or not.
   The narrower test above has two blind spots and both were real: a GNOME key we deliberately
   **deferred** still ships a default (`minimize` = `<Super>h`), and **gsd's keys are in no
@@ -176,7 +176,7 @@ Three unit tests keep it honest, each covering a failure that is otherwise silen
   failure mode of a hand-rolled XML reader is silently seeing fewer keys — the first draft
   parsed 96 of 197, having missed that `org.gnome.desktop.wm.keybindings` wraps every default
   in `<![CDATA[…]]>` while gnome-shell uses `"…"` and mutter uses `'…'`.
-- `our_schema_matches_the_table` — the XML and `adopted_niri_keybindings()` are two hand-written
+- `our_schema_matches_the_table` — the XML and `adopted_synoik_keybindings()` are two hand-written
   copies of one list (the table runs where the schema isn't installed, the XML is what
   `gsettings` and Settings see). Drift shows up as a key nobody reads.
 - `our_defaults_all_parse` — `parse_accels` is deliberately forgiving, mirroring mutter's
@@ -200,7 +200,7 @@ workspaces.
 `mods_with_*_binds` — sets of the modifier combinations any binding uses — before doing any
 lookup, so an unmodified scroll costs nothing. They were built from `config.binds` alone, which
 means a binding in the settings model was not merely slow to find but *never found at all*.
-`Niri::refresh_keybinding_state` now rebuilds them from both sources, and runs wherever either
+`Synoik::refresh_keybinding_state` now rebuilds them from both sources, and runs wherever either
 changes: config reload, the initial settings read, and every live settings change. Construction
 builds them from the compiled-in model, which is what the headless tests run on.
 
@@ -211,7 +211,7 @@ accelerators with nowhere to put one. Rather than drop the capability with the K
 the four `<Super>`+`minus`/`equal` binds got keys with the step **compiled in** at niri's
 default 10% of the working area: `grow-column-width`, `shrink-column-width`,
 `grow-window-height`, `shrink-window-height`. The accelerators are configurable, the step is
-not; an arbitrary size is still reachable over IPC (`niri msg action set-column-width 25%`) or
+not; an arbitrary size is still reachable over IPC (`synoik msg action set-column-width 25%`) or
 from a `binds{}` block.
 
 ### Packaging
@@ -365,11 +365,11 @@ pins it.
 
 Then the block itself went, along with `find_configured_bind`, the `Bind`/`Binds` config
 types, the `Mod+Key` accelerator syntax and the per-bind properties (`repeat`, `cooldown-ms`,
-`allow-when-locked`, `allow-inhibiting`, `hotkey-overlay-title`). `niri-config` keeps `Key`,
+`allow-when-locked`, `allow-inhibiting`, `hotkey-overlay-title`). `synoik-config` keeps `Key`,
 `Trigger` and `Modifiers`, which is what a GSettings accelerator parses into, and `Trigger`
 keeps `from_name` for the trigger tokens our schema spells.
 
-An action that takes an argument now reaches the compositor over IPC (`niri msg action
+An action that takes an argument now reaches the compositor over IPC (`synoik msg action
 set-column-width 25%`); spawning a command is Settings → Keyboard → Custom Shortcuts, which
 arrives through `GrabAccelerator` with no code of ours involved.
 
@@ -418,9 +418,9 @@ Id `org.gnome.shell-rs.keybindings`, path `/org/gnome/shell-rs/keybindings/`, ev
 `as` — mutter-style, so `gsettings`, dconf-editor and the existing parse/watch machinery work
 unchanged. Key names are the kebab-case niri action names.
 
-`GnomeKeybinding.action` becomes `enum KeybindingAction { Gnome(GnomeKeyAction), Niri(Action) }`
+`GnomeKeybinding.action` becomes `enum KeybindingAction { Gnome(GnomeKeyAction), Synoik(Action) }`
 rather than growing `GnomeKeyAction` into a mirror of niri's ~200 actions; `action_for_gnome`
-maps `Niri(a) => Some(a)` and `SwitcherGrab::resolves` only inspects the `Gnome` arm. The table
+maps `Synoik(a) => Some(a)` and `SwitcherGrab::resolves` only inspects the `Gnome` arm. The table
 is curated by hand, not reflected off the `Action` enum: argument-carrying actions can't be
 encoded in an `as` key, the XML has to enumerate keys anyway, and the curation *is* the
 filtering the fork tenet asks for.

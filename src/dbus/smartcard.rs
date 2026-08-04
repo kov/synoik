@@ -41,7 +41,7 @@ const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
 /// What the watcher tells the compositor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SmartcardToNiri {
+pub enum SmartcardToSynoik {
     /// Whether a card the shell would authenticate with is present, already reduced by
     /// [`Tokens::detected`]. A `bool` rather than the token list because the list is nobody else's
     /// business: the shell's whole interest is "is there one".
@@ -152,7 +152,7 @@ fn token_state(props: &HashMap<String, zbus::zvariant::OwnedValue>) -> TokenStat
 /// costs one failed round trip at startup.
 pub fn start(
     enabled: bool,
-    to_niri: calloop::channel::Sender<SmartcardToNiri>,
+    to_niri: calloop::channel::Sender<SmartcardToSynoik>,
 ) -> anyhow::Result<zbus::blocking::Connection> {
     let conn = zbus::blocking::Connection::session()?;
     let async_conn = conn.inner().clone();
@@ -171,7 +171,7 @@ pub fn start(
 async fn watch(
     conn: &zbus::Connection,
     enabled: bool,
-    to_niri: calloop::channel::Sender<SmartcardToNiri>,
+    to_niri: calloop::channel::Sender<SmartcardToSynoik>,
 ) {
     use futures_util::StreamExt;
 
@@ -240,7 +240,7 @@ async fn watch(
                 "smartcard: a login token is {}",
                 if detected { "present" } else { "absent" }
             );
-            return to_niri.send(SmartcardToNiri::Detected(detected)).is_ok();
+            return to_niri.send(SmartcardToSynoik::Detected(detected)).is_ok();
         }
         true
     };

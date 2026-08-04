@@ -2,10 +2,10 @@ use std::cmp::max;
 use std::iter::zip;
 use std::rc::Rc;
 
-use niri_config::utils::MergeWith as _;
-use niri_config::{PresetSize, RelativeTo, WindowingMode};
-use niri_ipc::{PositionChange, SizeChange, WindowLayout};
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
+use synoik_config::utils::MergeWith as _;
+use synoik_config::{PresetSize, RelativeTo, WindowingMode};
+use synoik_ipc::{PositionChange, SizeChange, WindowLayout};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::scrolling::ColumnWidth;
@@ -17,9 +17,9 @@ use super::{
 };
 use crate::animation::{Animation, Clock};
 use crate::gnome::TileSide;
-use crate::niri_render_elements;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::RenderCtx;
+use crate::synoik_render_elements;
 use crate::utils::transaction::TransactionBlocker;
 use crate::utils::{
     center_preferring_top_left_in_area, clamp_preferring_top_left_in_area, ensure_min_max_size,
@@ -79,7 +79,7 @@ pub struct FloatingSpace<W: LayoutElement> {
     options: Rc<Options>,
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     FloatingSpaceRenderElement => {
         Tile = TileRenderElement,
         ClosingWindow = ClosingWindowRenderElement,
@@ -1906,7 +1906,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
 }
 
 fn compute_toplevel_bounds(
-    border_config: niri_config::Border,
+    border_config: synoik_config::Border,
     working_area_size: Size<f64, Logical>,
 ) -> Size<i32, Logical> {
     let mut border = 0.;

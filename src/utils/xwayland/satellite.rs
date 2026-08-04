@@ -10,7 +10,7 @@ use calloop::generic::Generic;
 use calloop::{Interest, Mode, PostAction, RegistrationToken};
 use smithay::reexports::rustix::io::{fcntl_setfd, FdFlags};
 
-use crate::niri::State;
+use crate::synoik::State;
 use crate::utils::expand_home;
 use crate::utils::xwayland::X11Connection;
 
@@ -32,11 +32,11 @@ impl Satellite {
 }
 
 pub fn setup(state: &mut State) {
-    if state.niri.satellite.is_some() {
+    if state.synoik.satellite.is_some() {
         return;
     }
 
-    let config = state.niri.config.borrow();
+    let config = state.synoik.config.borrow();
     let xwls_config = &config.xwayland_satellite;
     if xwls_config.off {
         return;
@@ -55,7 +55,7 @@ pub fn setup(state: &mut State) {
         }
     };
 
-    let event_loop = &state.niri.event_loop;
+    let event_loop = &state.synoik.event_loop;
     let (to_main, rx) = calloop::channel::channel();
     event_loop
         .insert_source(rx, move |event, _, state| match event {
@@ -66,7 +66,7 @@ pub fn setup(state: &mut State) {
         })
         .unwrap();
 
-    state.niri.satellite = Some(Satellite {
+    state.synoik.satellite = Some(Satellite {
         x11,
         abstract_token: None,
         unix_token: None,
@@ -148,11 +148,11 @@ fn clear_out_pending_connections(fd: OwnedFd) -> OwnedFd {
 }
 
 fn setup_watch(state: &mut State) {
-    let Some(satellite) = state.niri.satellite.as_mut() else {
+    let Some(satellite) = state.synoik.satellite.as_mut() else {
         return;
     };
 
-    let event_loop = &state.niri.event_loop;
+    let event_loop = &state.synoik.event_loop;
 
     if let Some(token) = satellite.abstract_token.take() {
         error!("abstract_token must be None in setup_watch()");
@@ -169,16 +169,16 @@ fn setup_watch(state: &mut State) {
         let source = Generic::new(fd, Interest::READ, Mode::Level);
         let token = event_loop
             .insert_source(source, move |_, _, state| {
-                if let Some(satellite) = &mut state.niri.satellite {
+                if let Some(satellite) = &mut state.synoik.satellite {
                     // Remove the other source.
                     if let Some(token) = satellite.unix_token.take() {
-                        state.niri.event_loop.remove(token);
+                        state.synoik.event_loop.remove(token);
                     }
                     // Clear this source.
                     satellite.abstract_token = None;
 
                     debug!("connection to X11 abstract socket; spawning xwayland-satellite");
-                    let path = state.niri.config.borrow().xwayland_satellite.path.clone();
+                    let path = state.synoik.config.borrow().xwayland_satellite.path.clone();
                     spawn(path, satellite);
                 }
                 Ok(PostAction::Remove)
@@ -192,16 +192,16 @@ fn setup_watch(state: &mut State) {
     let source = Generic::new(fd, Interest::READ, Mode::Level);
     let token = event_loop
         .insert_source(source, move |_, _, state| {
-            if let Some(satellite) = &mut state.niri.satellite {
+            if let Some(satellite) = &mut state.synoik.satellite {
                 // Remove the other source.
                 if let Some(token) = satellite.abstract_token.take() {
-                    state.niri.event_loop.remove(token);
+                    state.synoik.event_loop.remove(token);
                 }
                 // Clear this source.
                 satellite.unix_token = None;
 
                 debug!("connection to X11 unix socket; spawning xwayland-satellite");
-                let path = state.niri.config.borrow().xwayland_satellite.path.clone();
+                let path = state.synoik.config.borrow().xwayland_satellite.path.clone();
                 spawn(path, satellite);
             }
             Ok(PostAction::Remove)
@@ -235,7 +235,7 @@ fn spawn(path: String, xwl: &Satellite) {
     let mut process = Command::new(&path);
     process.arg(&xwl.x11.display_name).env_remove("DISPLAY");
 
-    // We don't want it spamming the niri output.
+    // We don't want it spamming the synoik output.
     process
         .env_remove("RUST_BACKTRACE")
         .env_remove("RUST_LIB_BACKTRACE");

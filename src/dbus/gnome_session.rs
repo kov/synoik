@@ -1,6 +1,6 @@
 //! The `org.gnome.SessionManager.EndSessionDialog` interface, and the client calls that trigger it.
 //!
-//! niri runs as the `org.gnome.Shell` component of a real gnome-session (systemd-managed, so no
+//! synoik runs as the `org.gnome.Shell` component of a real gnome-session (systemd-managed, so no
 //! `RegisterClient` handshake is needed — gnome-shell 50.1 doesn't register either). The one piece
 //! of the session lifecycle the shell owns is the logout/shutdown/restart confirmation dialog:
 //!
@@ -11,7 +11,7 @@
 //!   gnome-session calls `Open(type, timestamp, seconds, inhibitors)` on us to raise the dialog and
 //!   waits for us to emit `ConfirmedLogout` / `ConfirmedReboot` / `ConfirmedShutdown` (proceed) or
 //!   `Canceled` (abort). Those signals are broadcast (gnome-session listens on the object), and
-//!   emitted from the main loop by [`crate::niri::Niri::emit_end_session_signal`]; the
+//!   emitted from the main loop by [`crate::synoik::Synoik::emit_end_session_signal`]; the
 //!   [`crate::end_session::EndSession`] state machine holds the dialog lifecycle.
 //! - **We call** `org.gnome.SessionManager.{Logout,Shutdown,Reboot}` to *start* that flow, from the
 //!   `Logout` / `PowerOff` / `Reboot` actions — the same methods gnome-shell's systemActions.js
@@ -26,10 +26,10 @@ use zbus::zvariant::OwnedObjectPath;
 use crate::end_session::SessionRequest;
 
 pub struct EndSessionDialog {
-    to_niri: calloop::channel::Sender<EndSessionDialogToNiri>,
+    to_niri: calloop::channel::Sender<EndSessionDialogToSynoik>,
 }
 
-pub enum EndSessionDialogToNiri {
+pub enum EndSessionDialogToSynoik {
     /// `Open`: raise the dialog for `kind` (0 logout / 1 shutdown / 2 restart), auto-confirming
     /// after `seconds` (0 = no countdown).
     Open { kind: u32, seconds: u64 },
@@ -38,13 +38,13 @@ pub enum EndSessionDialogToNiri {
 }
 
 impl EndSessionDialog {
-    pub fn new(to_niri: calloop::channel::Sender<EndSessionDialogToNiri>) -> Self {
+    pub fn new(to_niri: calloop::channel::Sender<EndSessionDialogToSynoik>) -> Self {
         Self { to_niri }
     }
 
-    fn notify(&self, msg: EndSessionDialogToNiri) {
+    fn notify(&self, msg: EndSessionDialogToSynoik) {
         if let Err(err) = self.to_niri.send(msg) {
-            warn!("error sending message to niri: {err:?}");
+            warn!("error sending message to synoik: {err:?}");
         }
     }
 }
@@ -58,19 +58,19 @@ impl EndSessionDialog {
         seconds_to_stay_open: u32,
         _inhibitor_object_paths: Vec<OwnedObjectPath>,
     ) {
-        self.notify(EndSessionDialogToNiri::Open {
+        self.notify(EndSessionDialogToSynoik::Open {
             kind: r#type,
             seconds: u64::from(seconds_to_stay_open),
         });
     }
 
     async fn close(&self) {
-        self.notify(EndSessionDialogToNiri::Close);
+        self.notify(EndSessionDialogToSynoik::Close);
     }
 
-    // Emitted (broadcast) from the main loop by `Niri::emit_end_session_signal`; these declarations
-    // just provide the introspection XML. Names map to `ConfirmedLogout` / `ConfirmedReboot` /
-    // `ConfirmedShutdown` / `Canceled` / `Closed`.
+    // Emitted (broadcast) from the main loop by `Synoik::emit_end_session_signal`; these
+    // declarations just provide the introspection XML. Names map to `ConfirmedLogout` /
+    // `ConfirmedReboot` / `ConfirmedShutdown` / `Canceled` / `Closed`.
     #[zbus(signal)]
     pub async fn confirmed_logout(
         emitter: &zbus::object_server::SignalEmitter<'_>,

@@ -3,13 +3,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use glam::{Mat3, Vec2};
-use niri_config::CornerRadius;
-use niri_vk::render::PostprocessPush;
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::backend::renderer::{Color32F, Texture as _};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use synoik_config::CornerRadius;
+use synoik_vk::render::PostprocessPush;
 
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::effect_buffer::EffectBuffer;
@@ -168,7 +168,7 @@ impl Xray {
                 // covered.
                 //
                 // FIXME: also implement some way to check if the background elements are fully
-                // covered in opaque regions, and not just the niri background color is opaque
+                // covered in opaque regions, and not just the synoik background color is opaque
                 let crop = if bg_color.is_opaque() && ws_geo.contains_rect(geo_in_backdrop) {
                     skip_backdrop = true;
                     // No need to intersect, we know it's fully covered.
@@ -458,8 +458,8 @@ impl RenderElement<VulkanRenderer> for XrayElement {
             input_to_geo: pack_mat3(input_to_geo),
             // The offscreen is Normal-oriented and unflipped, so sampling needs no re-orientation.
             sample_transform: pack_mat3(Mat3::IDENTITY),
-            niri_scale: self.scale,
-            niri_alpha: 1.,
+            synoik_scale: self.scale,
+            synoik_alpha: 1.,
             saturation: self.saturation,
             noise: self.noise,
         };

@@ -2,12 +2,12 @@ use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::rc::Rc;
 
-use niri_config::{Action, Config, Key, ModKey, Modifiers, Trigger};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::Texture;
 use smithay::input::keyboard::xkb::keysym_get_name;
 use smithay::output::Output;
 use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
+use synoik_config::{Action, Config, Key, ModKey, Modifiers, Trigger};
 
 use crate::gnome::{key_for_accel, GnomeKeybinding};
 use crate::input::action_for_keybinding;
@@ -539,7 +539,7 @@ fn paint(
 
 fn action_name(action: &Action) -> String {
     match action {
-        Action::Quit(_) => String::from("Exit niri"),
+        Action::Quit(_) => String::from("Exit synoik"),
         Action::ShowHotkeyOverlay => String::from("Show Important Hotkeys"),
         Action::CloseWindow => String::from("Close Focused Window"),
         Action::FocusColumnLeft => String::from("Focus Column to the Left"),
@@ -735,7 +735,7 @@ mod tests {
     fn hide_not_bound_still_sees_the_settings_model() {
         let keybindings = crate::gnome::GnomeSettings::default().keybindings;
         let config = Config {
-            hotkey_overlay: niri_config::HotkeyOverlay {
+            hotkey_overlay: synoik_config::HotkeyOverlay {
                 hide_not_bound: true,
             },
             ..Default::default()

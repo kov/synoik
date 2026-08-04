@@ -42,7 +42,7 @@ are **not** — so slices 4 and 6 carry schema-adoption work of their own, not j
 
 So this is not a new divergence to negotiate — it is a debt already written down.
 
-niri's own config surface (`niri-config/src/recent_windows.rs`: `recent-windows` with
+niri's own config surface (`synoik-config/src/recent_windows.rs`: `recent-windows` with
 `debounce-ms`, `open-delay-ms`, `highlight`, `previews`, `binds`) is "niri's way" for a thing GNOME
 does differently, so per the fork tenet it goes. GNOME's equivalents are fixed constants plus one
 gsetting (below).
@@ -321,7 +321,7 @@ is wrong on inspection, for two reasons that point the same way:
 - slice 1 deliberately has no item art, so deleting `mru.rs` there lands a commit where every
   `switch-*` binding opens an empty panel;
 - `mru.rs` is the donor for the preview sandwich slice 3 has to extract, and
-  `niri-config/src/recent_windows.rs` is what *parameterizes* `mru.rs` — so the config block cannot
+  `synoik-config/src/recent_windows.rs` is what *parameterizes* `mru.rs` — so the config block cannot
   go before `mru.rs` either without stranding it on hardcoded defaults.
 
 Both moves go **after slice 3**, together, when both replacements exist.

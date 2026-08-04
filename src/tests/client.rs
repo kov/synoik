@@ -370,7 +370,7 @@ impl Client {
         let stride = w * 4;
         let len = (stride * h) as usize;
 
-        let fd = memfd_create("niri-test-screencopy", MemfdFlags::CLOEXEC).expect("memfd_create");
+        let fd = memfd_create("synoik-test-screencopy", MemfdFlags::CLOEXEC).expect("memfd_create");
         ftruncate(&fd, len as u64).expect("ftruncate");
         let file = std::fs::File::from(fd);
 
@@ -589,7 +589,7 @@ impl Window {
         let stride = w * 4;
         let size = (stride * h) as usize;
 
-        let fd = memfd_create("niri-test-shm", MemfdFlags::CLOEXEC).expect("memfd_create");
+        let fd = memfd_create("synoik-test-shm", MemfdFlags::CLOEXEC).expect("memfd_create");
         ftruncate(&fd, size as u64).expect("ftruncate");
 
         let data: Vec<u8> = texel.iter().copied().cycle().take(size).collect();

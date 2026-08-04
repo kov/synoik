@@ -13,25 +13,25 @@ use calloop::EventLoop;
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use clap_complete_nushell::Nushell;
-use niri::backend::BackendMode;
-use niri::cli::{Cli, CompletionShell, Sub};
+use sd_notify::NotifyState;
+use smithay::reexports::wayland_server::Display;
+use synoik::backend::BackendMode;
+use synoik::cli::{Cli, CompletionShell, Sub};
 #[cfg(feature = "dbus")]
-use niri::dbus;
-use niri::frame_log;
-use niri::ipc::client::handle_msg;
-use niri::niri::State;
-use niri::utils::spawning::{
+use synoik::dbus;
+use synoik::frame_log;
+use synoik::ipc::client::handle_msg;
+use synoik::synoik::State;
+use synoik::utils::spawning::{
     spawn, spawn_sh, store_and_increase_nofile_rlimit, CHILD_DISPLAY, CHILD_ENV,
     REMOVE_ENV_RUST_BACKTRACE, REMOVE_ENV_RUST_LIB_BACKTRACE,
 };
-use niri::utils::{cause_panic, version, xwayland, IS_SYSTEMD_SERVICE};
-use niri_config::Config;
-use niri_ipc::socket::SOCKET_PATH_ENV;
-use sd_notify::NotifyState;
-use smithay::reexports::wayland_server::Display;
+use synoik::utils::{cause_panic, version, xwayland, IS_SYSTEMD_SERVICE};
+use synoik_config::Config;
+use synoik_ipc::socket::SOCKET_PATH_ENV;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_LOG_FILTER: &str = "niri=debug,smithay::backend::renderer::gles=error";
+const DEFAULT_LOG_FILTER: &str = "synoik=debug,smithay::backend::renderer::gles=error";
 
 #[cfg(feature = "profile-with-tracy-allocations")]
 #[global_allocator]
@@ -39,7 +39,7 @@ static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(std::alloc::System, 100);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    niri::gnome::init_collation();
+    synoik::gnome::init_collation();
 
     // Set backtrace defaults if not set.
     if env::var_os("RUST_BACKTRACE").is_none() {
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // swallowed SIGUSR1 (the frame-log dump) straight into a silent exit. The same
     // race applied to SIGINT/SIGTERM, where it would have skipped the clean
     // shutdown path.
-    niri::utils::signals::block_early().unwrap();
+    synoik::utils::signals::block_early().unwrap();
 
     // Log through a writer thread, so emitting a line is a channel send instead of a `write(2)`.
     //
@@ -67,14 +67,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 60 Hz it is only ~26 µs (p99 112 µs, worst 714 µs over 30 s), so this is not about the
     // steady-state cost; it is that the cost is *unbounded* under backpressure, and that the
     // `io::stderr()` lock serializes the compositor thread against every service thread we
-    // deliberately moved off it. `NIRI_FRAME_LOG` also makes this per-frame, which means the
+    // deliberately moved off it. `SYNOIK_FRAME_LOG` also makes this per-frame, which means the
     // instrument was perturbing the very runs we take decisions from.
     //
     // Lossy: on overflow a line is dropped rather than the compositor stalled. Drops are counted
     // and reported by the frame-log summary (`frame_log::watch_dropped_lines`) — a hole in this
     // log has to announce itself, or an absent frame line reads as a frame that never happened.
-    // `NIRI_LOG_BLOCKING=1` swaps in backpressure for when a run must not lose anything.
-    let blocking = env::var_os("NIRI_LOG_BLOCKING").is_some();
+    // `SYNOIK_LOG_BLOCKING=1` swaps in backpressure for when a run must not lose anything.
+    let blocking = env::var_os("SYNOIK_LOG_BLOCKING").is_some();
     let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
         // ~16k lines of slack. At the ~120 lines/s a fully instrumented session produces that is
         // over two minutes of buffer, which is far more journald hiccup than we have ever seen;
@@ -149,9 +149,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // These are short-lived clients, not the compositor: they spawn no threads,
         // install no signalfd, and have no clean-shutdown path to protect. Leaving
         // them under the compositor's mask makes Ctrl-C do nothing at all — which
-        // matters most in exactly the case you would use it, a `niri msg` blocked
+        // matters most in exactly the case you would use it, a `synoik msg` blocked
         // on the socket of a wedged compositor.
-        niri::utils::signals::unblock_all().unwrap();
+        synoik::utils::signals::unblock_all().unwrap();
 
         match subcommand {
             Sub::Msg { msg, json } => {
@@ -165,7 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         clap_complete::generate(
                             Nushell,
                             &mut Cli::command(),
-                            "niri",
+                            "synoik",
                             &mut io::stdout(),
                         );
                     }
@@ -174,7 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         clap_complete::generate(
                             generator,
                             &mut Cli::command(),
-                            "niri",
+                            "synoik",
                             &mut io::stdout(),
                         );
                     }
@@ -184,7 +184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Avoid starting Tracy for the `niri msg` code path since starting/stopping Tracy is a bit
+    // Avoid starting Tracy for the `synoik msg` code path since starting/stopping Tracy is a bit
     // slow.
     tracy_client::Client::start();
 
@@ -194,7 +194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // GSettings (see `src/gnome.rs`), and the rest is compiled in. The exception is the debug
     // toggles, which the `debug {}` block used to carry and which now come from the environment.
     let mut config = Config {
-        debug: niri_config::Debug::from_env(),
+        debug: synoik_config::Debug::from_env(),
         ..Config::default()
     };
 
@@ -211,7 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // thread instead moved 310ms into time-to-first-frame on the live seat.
     thread::Builder::new()
         .name("font prewarm".to_owned())
-        .spawn(niri_vk::text::prewarm)
+        .spawn(synoik_vk::text::prewarm)
         .map_err(|err| warn!("error spawning the font prewarm thread: {err:?}"))
         .ok();
 
@@ -219,7 +219,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop = EventLoop::<State>::try_new().unwrap();
 
     // Handle Ctrl+C and other signals.
-    niri::utils::signals::listen(&event_loop.handle());
+    synoik::utils::signals::listen(&event_loop.handle());
 
     // Create the compositor.
     let display = Display::new().unwrap();
@@ -249,31 +249,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(err) = state.backend.headless().add_renderer() {
             warn!("error creating headless renderer, running without one: {err:?}");
         }
-        // `NIRI_HEADLESS_MODE=WxH` sizes the virtual output. The headless backend
-        // advertises exactly one (custom) mode, so `niri msg output … mode` cannot reach
+        // `SYNOIK_HEADLESS_MODE=WxH` sizes the virtual output. The headless backend
+        // advertises exactly one (custom) mode, so `synoik msg output … mode` cannot reach
         // any other shape — and chrome that adapts to the canvas has to be judged on a
         // canvas, at the mode+scale of the display being reproduced.
-        let size = env::var("NIRI_HEADLESS_MODE")
+        let size = env::var("SYNOIK_HEADLESS_MODE")
             .ok()
             .and_then(|s| {
                 let (w, h) = s.split_once(['x', 'X'])?;
                 Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
             })
             .unwrap_or((1920, 1080));
-        let niri = &mut state.niri;
-        state.backend.headless().add_output(niri, 1, size);
+        let synoik = &mut state.synoik;
+        state.backend.headless().add_output(synoik, 1, size);
     }
 
     // Set WAYLAND_DISPLAY for children.
-    let socket_name = state.niri.socket_name.as_deref().unwrap();
+    let socket_name = state.synoik.socket_name.as_deref().unwrap();
     env::set_var("WAYLAND_DISPLAY", socket_name);
     info!(
         "listening on Wayland socket: {}",
         socket_name.to_string_lossy()
     );
 
-    // Set NIRI_SOCKET for children.
-    if let Some(ipc) = &state.niri.ipc_server {
+    // Set SYNOIK_SOCKET for children.
+    if let Some(ipc) = &state.synoik.ipc_server {
         let socket_path = ipc.socket_path.as_deref().unwrap();
         env::set_var(SOCKET_PATH_ENV, socket_path);
         info!("IPC listening on: {}", socket_path.to_string_lossy());
@@ -281,7 +281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Setup xwayland-satellite integration.
     xwayland::satellite::setup(&mut state);
-    if let Some(satellite) = &state.niri.satellite {
+    if let Some(satellite) = &state.synoik.satellite {
         let name = satellite.display_name();
         *CHILD_DISPLAY.write().unwrap() = Some(name.to_owned());
         env::set_var("DISPLAY", name);
@@ -297,8 +297,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Inhibit power key handling so we can suspend on it.
         #[cfg(feature = "dbus")]
-        if !state.niri.config.borrow().input.disable_power_key_handling {
-            if let Err(err) = state.niri.inhibit_power_key() {
+        if !state
+            .synoik
+            .config
+            .borrow()
+            .input
+            .disable_power_key_handling
+        {
+            if let Err(err) = state.synoik.inhibit_power_key() {
                 warn!("error inhibiting power key: {err:?}");
             }
         }
@@ -312,10 +318,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (IPC-only) runs.
     #[cfg(feature = "pipewire")]
     if !cli.headless {
-        match niri::pipewire_audio::start(&event_loop.handle()) {
+        match synoik::pipewire_audio::start(&event_loop.handle()) {
             Ok(pw) => {
                 pw.pump();
-                state.niri.audio_backend = Some(Box::new(pw));
+                state.synoik.audio_backend = Some(Box::new(pw));
             }
             Err(err) => warn!("error starting PipeWire audio watcher: {err:?}"),
         }
@@ -323,10 +329,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "dbus")]
     if cli.session {
-        state.niri.a11y.start();
+        state.synoik.a11y.start();
     }
 
-    if env::var_os("NIRI_DISABLE_SYSTEM_MANAGER_NOTIFY").is_none_or(|x| x != "1") {
+    if env::var_os("SYNOIK_DISABLE_SYSTEM_MANAGER_NOTIFY").is_none_or(|x| x != "1") {
         // Notify systemd we're ready.
         if let Err(err) = sd_notify::notify(&[NotifyState::Ready]) {
             warn!("error notifying systemd: {err:?}");

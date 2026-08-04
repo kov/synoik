@@ -8,7 +8,7 @@
 //! isn't code-derived (an `xkb.file` keymap, or a count mismatch), we fall back to abbreviating
 //! each layout's full xkb name. Either way, colliding labels are disambiguated (GNOME dedups too).
 
-use niri_config::Xkb;
+use synoik_config::Xkb;
 
 /// GNOME's fallback layout when `org.gnome.desktop.input-sources` is empty
 /// (`js/ui/status/keyboard.js` `KeyboardManager.DEFAULT_LAYOUT`).

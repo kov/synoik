@@ -43,7 +43,7 @@ impl EffectBlur {
         source: &VkTexture,
         passes: usize,
     ) -> Result<Self, VulkanError> {
-        let chain = SharedBlurChain::new(&renderer.gpu, source.niri_texture(), passes)?;
+        let chain = SharedBlurChain::new(&renderer.gpu, source.synoik_texture(), passes)?;
         let output = renderer.create_buffer(NATIVE_FOURCC, source.size())?;
         Ok(Self {
             passes,

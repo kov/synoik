@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn resolve_appends_extension_and_keeps_absolute_paths() {
-        let dir = std::env::temp_dir().join(format!("niri-tmpl-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("synoik-tmpl-{}", std::process::id()));
         let template = dir.join("rec %%").to_string_lossy().into_owned();
         let path = resolve_file_template(&template, "webm").unwrap();
         // Absolute template is kept; `%%` collapses to `%`; the real extension is appended.
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn resolve_strips_a_trailing_dot_webm_from_the_template() {
-        let dir = std::env::temp_dir().join(format!("niri-tmpl2-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("synoik-tmpl2-{}", std::process::id()));
         let template = format!("{}.webm", dir.join("clip").to_string_lossy());
         let path = resolve_file_template(&template, "webm").unwrap();
         assert_eq!(path, dir.join("clip.webm"));

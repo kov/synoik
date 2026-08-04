@@ -16,19 +16,19 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Mutex;
 
-use niri_config::Config;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::Texture;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use synoik_config::Config;
 
 use crate::animation::{Animation, Clock};
 use crate::end_session::EndSessionType;
-use crate::niri_render_elements;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
+use crate::synoik_render_elements;
 use crate::ui::widget::{
     self, style, BakeCache, Painter, ParagraphSpan, Rgba, ShapedParagraph, ShapedText, TextShaper,
     TextStyle,
@@ -119,7 +119,7 @@ pub struct EndSessionDialog {
     config: Rc<RefCell<Config>>,
 }
 
-niri_render_elements! {
+synoik_render_elements! {
     EndSessionDialogRenderElement => {
         Texture = RescaleRenderElement<TextureRenderElement<VkTexture>>,
         SolidColor = SolidColorRenderElement,

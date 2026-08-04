@@ -7,9 +7,9 @@
 //! backend `src/backends/native/meta-input-settings-native.c`, which is where each GSettings enum
 //! is turned into a libinput value.
 //!
-//! The output is deliberately the existing [`niri_config`] device structs rather than a new model:
-//! [`super::apply_libinput_settings`] already knows how to push those onto a device, and the rest
-//! of the compositor (scroll factors, the repeat timer) reads them where it always did.
+//! The output is deliberately the existing [`synoik_config`] device structs rather than a new
+//! model: [`super::apply_libinput_settings`] already knows how to push those onto a device, and the
+//! rest of the compositor (scroll factors, the repeat timer) reads them where it always did.
 //!
 //! Known gaps, all of them a setting GNOME has and libinput-as-we-drive-it does not express:
 //! `click-method='none'` (the `input` crate's `ClickMethod` has no `None`), the touchpad's
@@ -17,15 +17,15 @@
 //! toolkit-level in GNOME and never reach the compositor.
 
 use gio::prelude::SettingsExt;
-use niri_config::input::{
+use synoik_config::input::{
     AccelProfile, ClickMethod, Mouse, TapButtonMap, Touchpad, Trackball, Trackpoint,
 };
-use niri_config::ScrollMethod;
+use synoik_config::ScrollMethod;
 
 /// The device settings read from `org.gnome.desktop.peripherals.*`.
 ///
-/// [`Default`] is what the compositor runs on with no schemas installed: the `niri_config`
-/// defaults, which are themselves GNOME's schema defaults (see `niri-config/src/input.rs`).
+/// [`Default`] is what the compositor runs on with no schemas installed: the `synoik_config`
+/// defaults, which are themselves GNOME's schema defaults (see `synoik-config/src/input.rs`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Peripherals {
     pub touchpad: Touchpad,
@@ -47,7 +47,7 @@ impl Default for Peripherals {
     fn default() -> Self {
         // Not `#[derive(Default)]`: a zero `repeat_rate` means *no key repeat at all*, which
         // is a very quiet way for a box with no GNOME schemas to lose key repeat entirely.
-        let keyboard = niri_config::input::Keyboard::default();
+        let keyboard = synoik_config::input::Keyboard::default();
         Self {
             touchpad: Touchpad::default(),
             mouse: Mouse::default(),
@@ -97,7 +97,7 @@ impl Peripherals {
         c.left_handed = s.boolean("left-handed");
         c.natural_scroll = s.boolean("natural-scroll");
         c.middle_emulation = s.boolean("middle-click-emulation");
-        c.accel_speed = niri_config::FloatOrInt(s.double("speed"));
+        c.accel_speed = synoik_config::FloatOrInt(s.double("speed"));
         c.accel_profile = accel_profile(s);
     }
 
@@ -123,7 +123,7 @@ impl Peripherals {
         c.dwt = s.boolean("disable-while-typing");
         c.natural_scroll = s.boolean("natural-scroll");
         c.middle_emulation = s.boolean("middle-click-emulation");
-        c.accel_speed = niri_config::FloatOrInt(s.double("speed"));
+        c.accel_speed = synoik_config::FloatOrInt(s.double("speed"));
         c.accel_profile = accel_profile(s);
 
         c.left_handed = match s.string("left-handed").as_str() {
@@ -217,7 +217,7 @@ impl Peripherals {
 
     fn load_pointingstick(&mut self, s: &gio::Settings) {
         let c = &mut self.trackpoint;
-        c.accel_speed = niri_config::FloatOrInt(s.double("speed"));
+        c.accel_speed = synoik_config::FloatOrInt(s.double("speed"));
         c.accel_profile = accel_profile(s);
         c.scroll_method = match s.string("scroll-method").as_str() {
             "default" => None,

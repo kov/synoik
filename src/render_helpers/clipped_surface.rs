@@ -1,9 +1,9 @@
-use niri_config::CornerRadius;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use synoik_config::CornerRadius;
 
 use super::damage::ExtraDamage;
 
@@ -260,7 +260,7 @@ impl RenderElement<VulkanRenderer> for ClippedSurfaceRenderElement {
             // Logical geometry size = the rounding coordinate space (matches `compute_uniforms`).
             geo_size: [self.geometry.size.w as f32, self.geometry.size.h as f32],
             corner_radius: <[f32; 4]>::from(self.corner_radius),
-            niri_scale: self.scale,
+            synoik_scale: self.scale,
         };
         // Arm the clip, draw the inner surface, then disarm unconditionally (even on error) so a
         // later unclipped surface on the same frame isn't clipped by a stale override.

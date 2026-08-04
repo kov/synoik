@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use futures_util::StreamExt;
 use zbus::{fdo, zvariant};
 
-use super::system_status::SystemStatusToNiri;
+use super::system_status::SystemStatusToSynoik;
 use crate::system_status::{BluetoothDevice, BluetoothStatus, BtAdapterState};
 
 const BLUEZ_BUS: &str = "org.bluez";
@@ -56,7 +56,7 @@ type Props = HashMap<String, zvariant::OwnedValue>;
 /// Spawn the BlueZ monitor task on the shared system-bus connection.
 pub(super) fn spawn(
     conn: &zbus::blocking::Connection,
-    to_niri: calloop::channel::Sender<SystemStatusToNiri>,
+    to_niri: calloop::channel::Sender<SystemStatusToSynoik>,
 ) {
     let async_conn = conn.inner().clone();
     let future = async move {
@@ -154,7 +154,10 @@ pub(super) fn spawn(
             };
             if last.as_ref() != Some(&status) {
                 last = Some(status.clone());
-                if to_niri.send(SystemStatusToNiri::Bluetooth(status)).is_err() {
+                if to_niri
+                    .send(SystemStatusToSynoik::Bluetooth(status))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -196,14 +199,14 @@ pub fn set_adapter_powered(conn: &zbus::blocking::Connection, path: String, powe
 
 /// Connect or disconnect a device (`Device1.Connect`/`Disconnect`, gnome-bluetooth's
 /// `bluetooth_client_connect_service`). The call blocks until BlueZ finishes either way, so the
-/// spawned future awaits it and reports [`SystemStatusToNiri::BluetoothConnectDone`] back — the
+/// spawned future awaits it and reports [`SystemStatusToSynoik::BluetoothConnectDone`] back — the
 /// GObject-free stand-in for the `await` around gnome-shell's row spinner
 /// (`bluetooth.js:257-261`).
 pub fn connect_device(
     conn: &zbus::blocking::Connection,
     path: String,
     connect: bool,
-    done: calloop::channel::Sender<SystemStatusToNiri>,
+    done: calloop::channel::Sender<SystemStatusToSynoik>,
 ) {
     let async_conn = conn.inner().clone();
     let future = async move {
@@ -220,7 +223,7 @@ pub fn connect_device(
         {
             warn!("error calling BlueZ Device1.{method} on {path}: {err:?}");
         }
-        let _ = done.send(SystemStatusToNiri::BluetoothConnectDone(path));
+        let _ = done.send(SystemStatusToSynoik::BluetoothConnectDone(path));
     };
     conn.inner()
         .executor()

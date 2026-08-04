@@ -1,10 +1,10 @@
 use std::cell::OnceCell;
 
-use niri_config::BlockOutFrom;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use synoik_config::BlockOutFrom;
 
 use super::memory::MemoryBuffer;
 use super::{encompassing_geo, render_to_vec};

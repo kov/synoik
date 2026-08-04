@@ -19,7 +19,7 @@ use zbus::object_server::SignalEmitter;
 use zbus::zvariant::NoneValue;
 
 use super::Start;
-use crate::niri::State;
+use crate::synoik::State;
 
 #[derive(Debug, Default)]
 struct Data {
@@ -453,11 +453,11 @@ impl State {
         keycode: Keycode,
         state: KeyState,
     ) -> KbMonBlock {
-        if self.niri.a11y_keyboard_monitor.is_none() {
+        if self.synoik.a11y_keyboard_monitor.is_none() {
             return KbMonBlock::Pass;
         }
 
-        let keyboard = self.niri.seat.get_keyboard().unwrap();
+        let keyboard = self.synoik.seat.get_keyboard().unwrap();
 
         let (mods, keysym, unichar) = keyboard.with_xkb_state(self, |context| {
             let xkb = context.xkb().lock().unwrap();
@@ -471,11 +471,11 @@ impl State {
             (mods, keysym, unichar)
         });
 
-        let config = self.niri.config.borrow();
+        let config = self.synoik.config.borrow();
         let repeat_delay = Duration::from_millis(u64::from(config.input.keyboard.repeat_delay));
         let released = state == KeyState::Released;
 
-        let Some(monitor) = &self.niri.a11y_keyboard_monitor else {
+        let Some(monitor) = &self.synoik.a11y_keyboard_monitor else {
             return KbMonBlock::Pass;
         };
         monitor.process_key(repeat_delay, time, keycode, released, mods, keysym, unichar)

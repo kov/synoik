@@ -13,8 +13,8 @@
 
 use std::path::PathBuf;
 
-use niri_config::OutputName;
 use smithay::utils::Transform;
+use synoik_config::OutputName;
 
 /// One saved logical-monitor setting for a single physical monitor, flattened out of the
 /// `<logicalmonitor>`/`<monitor>` nesting. We keep what we apply today (scale + transform) plus
@@ -63,7 +63,7 @@ impl SavedMode {
 impl MonitorSetting {
     /// Whether product AND serial both corroborate `name` (both sides present and equal). Used only
     /// to *disambiguate* several saved entries that share one connector — not as a veto, because
-    /// the serial/product we persist (from `niri_ipc::Output`, EDID PNP id for vendor,
+    /// the serial/product we persist (from `synoik_ipc::Output`, EDID PNP id for vendor,
     /// connector-fallback serial) does not always match the representation the reader sees in
     /// `OutputName` (e.g. a headless output reports serial `1` but persists `headless-1`).
     /// mutter keys on the full `<monitorspec>`, but its `<vendor>` is the PNP id (`RHT`) while

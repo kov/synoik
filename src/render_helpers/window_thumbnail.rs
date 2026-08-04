@@ -18,21 +18,21 @@
 //! for that it should be rendered through an offscreen"). Whether it is visible enough to be worth
 //! an offscreen is a measurement on a text-heavy window, not a guess.
 
-use niri_config::{Color, CornerRadius, GradientInterpolation};
 use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
+use synoik_config::{Color, CornerRadius, GradientInterpolation};
 
 use crate::layout::{LayoutElement, LayoutElementRenderElement};
-use crate::niri_render_elements;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::ClippedSurfaceRenderElement;
 use crate::render_helpers::RenderCtx;
+use crate::synoik_render_elements;
 use crate::window::mapped::Mapped;
 
 // The window's own content, clipped to its geometry.
-niri_render_elements! {
+synoik_render_elements! {
     WindowThumbnailInner => {
         LayoutElement = LayoutElementRenderElement,
         ClippedSurface = ClippedSurfaceRenderElement,

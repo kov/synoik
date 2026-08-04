@@ -8,7 +8,7 @@ use std::time::Duration;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop::{LoopHandle, RegistrationToken};
 
-use crate::niri::State;
+use crate::synoik::State;
 
 #[derive(Debug)]
 pub struct VBlankThrottle {

@@ -1493,7 +1493,8 @@ impl CalendarMessageList {
 
     /// The Clear pill's popover-local rect (only meaningful when non-empty).
     fn clear_rect(&self, height: f64) -> Rectangle<f64, Logical> {
-        let label_w = niri_vk::text::measure_line_width_weighted("Clear", clear_px() as f32, true);
+        let label_w =
+            synoik_vk::text::measure_line_width_weighted("Clear", clear_px() as f32, true);
         Rectangle::new(
             Point::from((LIST_PAD + CONTROLS_PAD, height - CONTROLS_PAD_B - CLEAR_H)),
             Size::from((label_w + 2. * CLEAR_PAD_X, CLEAR_H)),
@@ -3559,7 +3560,7 @@ impl DateMenu {
 fn placeholder_centers(height: f64) -> (f64, f64) {
     // Through the shared line box, not a second copy of the old factor: `placeholder_px` is
     // already px, so it skips the pt conversion.
-    let label_h = niri_vk::text::line_box_px(placeholder_px());
+    let label_h = synoik_vk::text::line_box_px(placeholder_px());
     let total = PLACEHOLDER_ICON + PLACEHOLDER_GAP + label_h;
     let top = (height - total) / 2.;
     (

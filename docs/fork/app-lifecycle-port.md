@@ -17,7 +17,7 @@ up from 50.1 during this port; every citation below was re-read there).
 | App menu **App Details** (`appMenu.js:84-95`) | an `org.gtk.Actions` call into `org.gnome.Software` |
 | Overview preview **icon + caption** (`windowPreview.js:133-191`) | window→app resolution *per preview* (the model has it; the picker doesn't ask) |
 | Dash/grid **running dot** for `STARTING` (`appDisplay.js:3007-3012`) | the state machine |
-| Launching onto a workspace | currently a bespoke `Niri::pending_launches` hack, not a startup sequence |
+| Launching onto a workspace | currently a bespoke `Synoik::pending_launches` hack, not a startup sequence |
 | `Ctrl`/middle-click = new window (`appDisplay.js:3060-3075`) | `state == RUNNING` + `can_open_new_window` |
 
 ## 2. The reference model
@@ -58,7 +58,7 @@ A sequence ends on any of:
 - **15 s timeout** (`STARTUP_TIMEOUT_MS`, `startup-notification.c:38`, swept in
   `startup_sequence_timeout`).
 
-Our `Niri::pending_launches` (`niri.rs:301-311, 9088-9133`) is already a degenerate version of this —
+Our `Synoik::pending_launches` (`synoik.rs:301-311, 9088-9133`) is already a degenerate version of this —
 app-id keyed, 15 s expiry, claimed by the first matching window — with a comment saying so. The port
 is to **promote it to a real sequence table** keyed by token, and let the app state read off it.
 
@@ -153,7 +153,7 @@ RUNNING here, which is what the assertion enforces anyway.
 
 ### 3.2 Startup sequences — promote `pending_launches`
 
-Move the table from `Niri` into `AppSystem` (it is app-model state, and the state machine needs it),
+Move the table from `Synoik` into `AppSystem` (it is app-model state, and the state machine needs it),
 keyed by desktop id as today, and additionally carry the **activation token**:
 
 - `AppSystem::begin_startup(id, token, workspace) -> ()` — called by `launch()`.
@@ -162,8 +162,8 @@ keyed by desktop id as today, and additionally carry the **activation token**:
   fallback, `find_startup_sequence_by_wmclass`).
 - `AppSystem::expire_startups(now)` — the 15 s sweep.
 
-`GioLauncher` mints the token: `Niri::activation_state.create_external_token(None)` (the call
-`niri.rs:9460` already makes for notifications), then `context.setenv("XDG_ACTIVATION_TOKEN", tok)`
+`GioLauncher` mints the token: `Synoik::activation_state.create_external_token(None)` (the call
+`synoik.rs:9460` already makes for notifications), then `context.setenv("XDG_ACTIVATION_TOKEN", tok)`
 and `setenv("DESKTOP_STARTUP_ID", tok)` — GIO's own `get_startup_notify_id` is a no-op on a plain
 `GAppLaunchContext`, so we set the env directly, which is what GIO would have done with the id
 mutter returns. This is a **new capability**, not just a refactor: today our launched apps get no
@@ -202,7 +202,7 @@ the dash label and the screenshot UI (`_dash.scss:104`, `_screenshot.scss:200`),
   `sync_running_apps` feeds ids and titles.
 - **L2 — startup notification. ✅ DONE** (same commit). Token minted per launch in
   `State::launch_app` and exported by `GioLauncher` as `XDG_ACTIVATION_TOKEN`/`DESKTOP_STARTUP_ID`;
-  sequence completed by the mapping window (token first, then app id); `Niri::pending_launches`
+  sequence completed by the mapping window (token first, then app id); `Synoik::pending_launches`
   deleted in favour of the table; expiry swept from `sync_running_apps`.
 - **L3 — preview icon + caption. ✅ DONE** (`112fff5c`). `widget::Tooltip`, `Monitor::preview_rects`
   (every drawn preview, not just the hovered ones) + `preview_icon_scale`, the icon uploaded once and

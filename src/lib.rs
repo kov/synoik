@@ -28,7 +28,6 @@ pub mod layer;
 pub mod layout;
 pub mod monitors_xml;
 pub mod mpris;
-pub mod niri;
 pub mod notifications;
 #[cfg(feature = "pipewire")]
 pub mod pipewire_audio;
@@ -43,6 +42,7 @@ pub mod rubber_band;
 pub mod screen_shield;
 #[cfg(feature = "xdp-gnome-screencast")]
 pub mod screencasting;
+pub mod synoik;
 pub mod system_status;
 pub mod ui;
 pub mod unlock_dialog;

@@ -1,7 +1,7 @@
 use std::iter::zip;
 
-use niri_config::CornerRadius;
 use smithay::utils::{Logical, Point, Rectangle, Size};
+use synoik_config::CornerRadius;
 
 use crate::render_helpers::shadow::ShadowRenderElement;
 
@@ -9,11 +9,11 @@ use crate::render_helpers::shadow::ShadowRenderElement;
 pub struct Shadow {
     shader_rects: Vec<Rectangle<f64, Logical>>,
     shaders: Vec<ShadowRenderElement>,
-    config: niri_config::Shadow,
+    config: synoik_config::Shadow,
 }
 
 impl Shadow {
-    pub fn new(config: niri_config::Shadow) -> Self {
+    pub fn new(config: synoik_config::Shadow) -> Self {
         Self {
             shader_rects: Vec::new(),
             shaders: Vec::new(),
@@ -21,7 +21,7 @@ impl Shadow {
         }
     }
 
-    pub fn update_config(&mut self, config: niri_config::Shadow) {
+    pub fn update_config(&mut self, config: synoik_config::Shadow) {
         self.config = config;
     }
 

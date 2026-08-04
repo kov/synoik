@@ -1,4 +1,4 @@
-//! The niri-side renderer trait impls for [`VulkanRenderer`]: the client buffer imports
+//! The synoik-side renderer trait impls for [`VulkanRenderer`]: the client buffer imports
 //! ([`ImportMemWl`]/[`ImportDma`]) and dmabuf-target [`Bind`].
 //!
 //! shm ([`ImportMemWl`]) and single-plane LINEAR dmabuf ([`ImportDma`]) client buffers import for

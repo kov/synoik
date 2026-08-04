@@ -53,7 +53,7 @@ Two consequences:
 New `src/ui/osd.rs`: an `OsdManager` with one slot per output. Model it on
 `src/ui/notification_banner.rs` — the existing timed, auto-hiding, non-interactive overlay
 (its `Hidden/Showing/Shown{deadline}/Hiding` state machine, `next_wakeup`/`advance_animations`/
-`render` seams, and the calloop timer wiring in `src/niri.rs`).
+`render` seams, and the calloop timer wiring in `src/synoik.rs`).
 
 Spec, cited:
 - **Structure** (`js/ui/osdWindow.js:28-49`): hbox = [icon | vbox[label?, level?]]; the vbox hides
@@ -86,7 +86,7 @@ not a one-off in the OSD. The quick-settings sliders should eventually share it.
 adversarial review changed, both worth remembering: the hide deadline is armed in `show()`, not at
 the fade's end — GNOME's timeout runs concurrently with the fade-in (`osdWindow.js:107-110`), so a
 still-fading OSD can expire and a `show()` mid-fade must not restart the fade; and because `show()`
-can set that deadline *between* frames, `Niri` re-arms the calloop wake-up against **what the timer
+can set that deadline *between* frames, `Synoik` re-arms the calloop wake-up against **what the timer
 is armed for** (`osd_timer_at`), not against a before/after-`advance_animations` diff, which is
 always equal and would let a replaced OSD hang on a damage-free desktop.
 
@@ -239,7 +239,7 @@ the content. So a decode landing has to bump the list revision (`note_art_decode
 `IconDecoded` handler); without it the first frame's fallback stays baked in until something
 unrelated moves the revision.
 
-**Remote art: LANDED 2026-07-31, but OFF BY DEFAULT** (`NIRI_REMOTE_ART=1` to enable). `http(s)`
+**Remote art: LANDED 2026-07-31, but OFF BY DEFAULT** (`SYNOIK_REMOTE_ART=1` to enable). `http(s)`
 covers can be fetched, as GNOME does by handing the URI to gvfs — but nothing we have found needs
 it: both browsers on this machine download the artwork themselves and publish a `file://` path (see
 the table below). Fetching means the shell issues a request an arbitrary app chose the target of,
@@ -324,7 +324,7 @@ the rest wants a stub audio backend behind a seam, which is the same refactor th
 port-level model (below) will want.
 
 1. **The OSD on our own volume change** — small. Nothing shows one for a change *we* make;
-   `on_audio_status` (`src/niri.rs:3527`) only refreshes the panel and popover. `show_osd` is
+   `on_audio_status` (`src/synoik.rs:3527`) only refreshes the panel and popover. `show_osd` is
    reachable from the same `&mut self`, and `audio::volume_icon` already picks the icon. Follow
    `ed26af2e` (brightness): have the audio path *return* an OSD request rather than reach into the
    OSD manager. Note the feature gating — the audio path is `pipewire`, the OSD's caller `dbus`.

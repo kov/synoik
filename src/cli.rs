@@ -2,7 +2,7 @@ use std::ffi::OsString;
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
-use niri_ipc::{Action, InjectedEvent, OutputAction};
+use synoik_ipc::{Action, InjectedEvent, OutputAction};
 
 use crate::utils::version;
 
@@ -22,7 +22,7 @@ pub struct Cli {
     /// Run with a headless backend: no display or input devices, one virtual
     /// output.
     ///
-    /// The compositor is fully driveable over IPC (`niri msg`), which is the
+    /// The compositor is fully driveable over IPC (`synoik msg`), which is the
     /// point: it allows exercising the real compositor — spawning clients,
     /// invoking actions, watching the event stream — without a Wayland
     /// session or a free VT.
@@ -38,7 +38,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Sub {
-    /// Communicate with the running niri instance.
+    /// Communicate with the running synoik instance.
     Msg {
         #[command(subcommand)]
         msg: Msg,
@@ -85,7 +85,7 @@ pub enum Msg {
     Output {
         /// Output name.
         ///
-        /// Run `niri msg outputs` to see the output names.
+        /// Run `synoik msg outputs` to see the output names.
         #[arg()]
         output: String,
         /// Configuration to apply.
@@ -104,9 +104,9 @@ pub enum Msg {
     },
     /// Start continuously receiving events from the compositor.
     EventStream,
-    /// Print the version of the running niri instance.
+    /// Print the version of the running synoik instance.
     Version,
-    /// Request an error from the running niri instance.
+    /// Request an error from the running synoik instance.
     RequestError,
     /// Print the overview state.
     OverviewState,
@@ -114,7 +114,7 @@ pub enum Msg {
     Casts,
 }
 
-/// One `niri msg input` invocation, turned into a batch of [`InjectedEvent`]s.
+/// One `synoik msg input` invocation, turned into a batch of [`InjectedEvent`]s.
 ///
 /// Keys are Linux evdev keycodes in decimal (e.g. `125` for `KEY_LEFTMETA`)
 /// or XKB keysym names (case-insensitive: `Super_L`, `F2`, `a`), resolved

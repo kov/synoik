@@ -16,7 +16,7 @@ const SESSION_IFACE: &str = "org.freedesktop.login1.Session";
 const MANAGER_PATH: &str = "/org/freedesktop/login1";
 const MANAGER_IFACE: &str = "org.freedesktop.login1.Manager";
 
-pub enum Login1ToNiri {
+pub enum Login1ToSynoik {
     LidClosedChanged(bool),
     /// `Session.Lock` / `Session.Unlock` — logind asking the session to raise or lower its shield.
     ///
@@ -95,7 +95,7 @@ fn resolve_session_path(conn: &zbus::blocking::Connection) -> anyhow::Result<Own
 }
 
 pub fn start(
-    to_niri: calloop::channel::Sender<Login1ToNiri>,
+    to_niri: calloop::channel::Sender<Login1ToSynoik>,
 ) -> anyhow::Result<zbus::blocking::Connection> {
     let conn = zbus::blocking::Connection::system()?;
 
@@ -154,8 +154,8 @@ pub fn start(
             .and_then(|value| bool::try_from(value).ok())
             .unwrap_or_default();
 
-        if let Err(err) = to_niri.send(Login1ToNiri::LidClosedChanged(lid_closed)) {
-            warn!("error sending initial lid state to niri: {err:?}");
+        if let Err(err) = to_niri.send(Login1ToSynoik::LidClosedChanged(lid_closed)) {
+            warn!("error sending initial lid state to synoik: {err:?}");
             return;
         };
 
@@ -189,8 +189,8 @@ pub fn start(
             }
 
             lid_closed = new_lid_closed;
-            if let Err(err) = to_niri.send(Login1ToNiri::LidClosedChanged(lid_closed)) {
-                warn!("error sending message to niri: {err:?}");
+            if let Err(err) = to_niri.send(Login1ToSynoik::LidClosedChanged(lid_closed)) {
+                warn!("error sending message to synoik: {err:?}");
                 return;
             };
         }
@@ -258,7 +258,7 @@ pub fn start(
                 Ok(mut all) => {
                     if let Some(active) = all.remove("Active").and_then(|v| bool::try_from(v).ok())
                     {
-                        let _ = to_niri.send(Login1ToNiri::SessionActive(active));
+                        let _ = to_niri.send(Login1ToSynoik::SessionActive(active));
                     }
                 }
                 Err(err) => warn!("error reading the initial logind session Active: {err:?}"),
@@ -270,8 +270,8 @@ pub fn start(
                         let Some(signal) = signal else { break };
                         let member = signal.header().member().map(|m| m.as_str().to_owned());
                         match member.as_deref() {
-                            Some("Lock") => Login1ToNiri::SessionLock(true),
-                            Some("Unlock") => Login1ToNiri::SessionLock(false),
+                            Some("Lock") => Login1ToSynoik::SessionLock(true),
+                            Some("Unlock") => Login1ToSynoik::SessionLock(false),
                             _ => continue,
                         }
                     }
@@ -284,7 +284,7 @@ pub fn start(
                             .find(|(name, _)| **name == "Active")
                             .and_then(|(_, value)| bool::try_from(value).ok());
                         let Some(active) = active else { continue };
-                        Login1ToNiri::SessionActive(active)
+                        Login1ToSynoik::SessionActive(active)
                     }
                 };
                 if to_niri.send(msg).is_err() {
@@ -336,7 +336,7 @@ pub fn start(
                 continue;
             };
             if to_niri
-                .send(Login1ToNiri::PrepareForSleep(about_to_suspend))
+                .send(Login1ToSynoik::PrepareForSleep(about_to_suspend))
                 .is_err()
             {
                 break;
@@ -370,12 +370,7 @@ pub fn take_sleep_inhibitor(conn: &zbus::blocking::Connection) -> Option<zbus::z
             "Inhibit",
             // `sleep` only. GNOME asks for exactly this (`_syncInhibitor`, `:219-221`); adding
             // `shutdown` or `idle` here would delay things we have nothing to do about.
-            &(
-                "sleep",
-                "gnome-shell-rs",
-                "GNOME needs to lock the screen",
-                "delay",
-            ),
+            &("sleep", "synoik", "GNOME needs to lock the screen", "delay"),
         )
         .inspect_err(|err| warn!("failed to inhibit suspend: {err:?}"))
         .ok()?;
@@ -392,7 +387,7 @@ pub fn take_sleep_inhibitor(conn: &zbus::blocking::Connection) -> Option<zbus::z
 ///
 /// Spawned on the connection's executor rather than called synchronously — a slider drag would
 /// otherwise stall the compositor thread for the D-Bus timeout whenever logind is slow. The
-/// completion comes back as [`Login1ToNiri::BrightnessWriteDone`] because the write serializer
+/// completion comes back as [`Login1ToSynoik::BrightnessWriteDone`] because the write serializer
 /// needs it: it is what releases the next write of a drag.
 ///
 /// **Divergence (D1):** mutter falls back to a `pkexec mutter-backlight-helper` subprocess when
@@ -400,7 +395,7 @@ pub fn take_sleep_inhibitor(conn: &zbus::blocking::Connection) -> Option<zbus::z
 /// so a failing write is warned about and dropped.
 pub fn set_brightness(
     conn: &zbus::blocking::Connection,
-    done: calloop::channel::Sender<Login1ToNiri>,
+    done: calloop::channel::Sender<Login1ToSynoik>,
     connector: String,
     device_name: String,
     brightness: i32,
@@ -430,7 +425,7 @@ pub fn set_brightness(
             }
         };
 
-        let _ = done.send(Login1ToNiri::BrightnessWriteDone { connector, outcome });
+        let _ = done.send(Login1ToSynoik::BrightnessWriteDone { connector, outcome });
     };
 
     conn.inner()

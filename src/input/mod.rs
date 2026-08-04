@@ -5,8 +5,6 @@ use std::time::Duration;
 
 use calloop::timer::{TimeoutAction, Timer};
 use input::event::gesture::GestureEventCoordinates as _;
-use niri_config::{Action, Key, Modifiers, SwitchBinds, Trigger, WorkspaceReference};
-use niri_ipc::LayoutSwitchTarget;
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Device, DeviceCapability, Event,
     GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent as _, GestureSwipeUpdateEvent as _,
@@ -35,6 +33,8 @@ use smithay::utils::{Logical, Point, Rectangle, Transform, SERIAL_COUNTER};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitor;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
+use synoik_config::{Action, Key, Modifiers, SwitchBinds, Trigger, WorkspaceReference};
+use synoik_ipc::LayoutSwitchTarget;
 use touch_overview_grab::TouchOverviewGrab;
 
 use self::move_grab::MoveGrab;
@@ -53,7 +53,7 @@ use crate::gnome::{
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::workspace::WorkspaceId;
 use crate::layout::{ActivateWindow, LayoutElement};
-use crate::niri::{AppDrag, CastTarget, PointerVisibility, State};
+use crate::synoik::{AppDrag, CastTarget, PointerVisibility, State};
 use crate::ui::app_grid::{
     AppGridEntry, DragLocation, FocusDir, PageArrow, SwipeSource, DELAYED_MOVE_MS, EDGE_BUMP_PX,
     FOLDER_PREVIEW_MS, PAGE_SWITCH_INITIAL_MS, PAGE_SWITCH_REPEAT_MS,
@@ -85,7 +85,7 @@ pub mod thumb_grab;
 pub mod touch_overview_grab;
 pub mod touch_resize_grab;
 
-use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
+use backend_ext::{SynoikInputBackend as InputBackend, SynoikInputDevice as _};
 
 pub const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
 
@@ -238,24 +238,24 @@ impl State {
         // have focus, because inside a focused entry they are caret motion — which is what
         // GNOME's real StEntry does with them.
         let effects = match raw {
-            Some(Keysym::Escape) => self.niri.polkit_dialog.cancel(),
+            Some(Keysym::Escape) => self.synoik.polkit_dialog.cancel(),
             Some(Keysym::Return | Keysym::KP_Enter | Keysym::ISO_Enter) => {
-                match self.niri.polkit_dialog.focus() {
-                    Focus::Cancel => self.niri.polkit_dialog.cancel(),
+                match self.synoik.polkit_dialog.focus() {
+                    Focus::Cancel => self.synoik.polkit_dialog.cancel(),
                     // Enter in the entry is the same as pressing Authenticate — GNOME connects
                     // both to the same handler (`polkitAgent.js:101`, `:150`).
-                    Focus::Entry | Focus::Authenticate => self.niri.polkit_dialog.authenticate(),
+                    Focus::Entry | Focus::Authenticate => self.synoik.polkit_dialog.authenticate(),
                 }
             }
-            Some(Keysym::Tab) => self.niri.polkit_dialog.cycle_focus(true),
-            Some(Keysym::ISO_Left_Tab) => self.niri.polkit_dialog.cycle_focus(false),
-            Some(Keysym::Down) => self.niri.polkit_dialog.cycle_focus(true),
-            Some(Keysym::Up) => self.niri.polkit_dialog.cycle_focus(false),
-            _ => match self.niri.polkit_dialog.entry_key(raw, text, mods, theme) {
+            Some(Keysym::Tab) => self.synoik.polkit_dialog.cycle_focus(true),
+            Some(Keysym::ISO_Left_Tab) => self.synoik.polkit_dialog.cycle_focus(false),
+            Some(Keysym::Down) => self.synoik.polkit_dialog.cycle_focus(true),
+            Some(Keysym::Up) => self.synoik.polkit_dialog.cycle_focus(false),
+            _ => match self.synoik.polkit_dialog.entry_key(raw, text, mods, theme) {
                 Some(effects) => effects,
                 None => match raw {
-                    Some(Keysym::Right) => self.niri.polkit_dialog.cycle_focus(true),
-                    Some(Keysym::Left) => self.niri.polkit_dialog.cycle_focus(false),
+                    Some(Keysym::Right) => self.synoik.polkit_dialog.cycle_focus(true),
+                    Some(Keysym::Left) => self.synoik.polkit_dialog.cycle_focus(false),
                     _ => return,
                 },
             },
@@ -271,13 +271,13 @@ impl State {
         pos: Point<f64, Logical>,
     ) {
         let Some(focus) = self
-            .niri
+            .synoik
             .polkit_ui
-            .hit(&self.niri.polkit_dialog, output_size, pos)
+            .hit(&self.synoik.polkit_dialog, output_size, pos)
         else {
             return;
         };
-        let effects = self.niri.polkit_dialog.set_focus(focus);
+        let effects = self.synoik.polkit_dialog.set_focus(focus);
         self.apply_polkit_effects(effects);
     }
 
@@ -291,18 +291,18 @@ impl State {
         use crate::polkit_dialog::Focus;
 
         let Some(focus) = self
-            .niri
+            .synoik
             .polkit_ui
-            .hit(&self.niri.polkit_dialog, output_size, pos)
+            .hit(&self.synoik.polkit_dialog, output_size, pos)
         else {
             return;
         };
         let effects = match focus {
-            Focus::Cancel => self.niri.polkit_dialog.cancel(),
-            Focus::Authenticate => self.niri.polkit_dialog.authenticate(),
+            Focus::Cancel => self.synoik.polkit_dialog.cancel(),
+            Focus::Authenticate => self.synoik.polkit_dialog.authenticate(),
             // Clicking the entry only moves focus there; there is nothing else a click in a text
             // field does yet (no caret placement, no selection).
-            Focus::Entry => self.niri.polkit_dialog.set_focus(Focus::Entry),
+            Focus::Entry => self.synoik.polkit_dialog.set_focus(Focus::Entry),
         };
         self.apply_polkit_effects(effects);
     }
@@ -314,40 +314,40 @@ impl State {
         let _span = tracy_client::span!("process_input_event");
 
         // Make sure some logic like workspace clean-up has a chance to run before doing actions.
-        self.niri.advance_animations();
+        self.synoik.advance_animations();
 
-        if self.niri.monitors_active {
+        if self.synoik.monitors_active {
             // Notify the idle-notifier of activity.
             if should_notify_activity(&event) {
-                self.niri.notify_activity();
+                self.synoik.notify_activity();
             }
         } else {
             // Power on monitors if they were off.
             if should_activate_monitors(&event) {
-                self.niri.activate_monitors(&mut self.backend);
+                self.synoik.activate_monitors(&mut self.backend);
 
                 // Notify the idle-notifier of activity only if we're also powering on the
                 // monitors.
-                self.niri.notify_activity();
+                self.synoik.notify_activity();
             }
         }
 
         if should_reset_pointer_inactivity_timer(&event) {
-            self.niri.reset_pointer_inactivity_timer();
+            self.synoik.reset_pointer_inactivity_timer();
         }
 
         let hide_hotkey_overlay =
-            self.niri.hotkey_overlay.is_open() && should_hide_hotkey_overlay(&event);
+            self.synoik.hotkey_overlay.is_open() && should_hide_hotkey_overlay(&event);
 
         let hide_exit_confirm_dialog =
-            self.niri.exit_confirm_dialog.is_open() && should_hide_exit_confirm_dialog(&event);
+            self.synoik.exit_confirm_dialog.is_open() && should_hide_exit_confirm_dialog(&event);
 
         // GNOME overlay key: pointer button, scroll, and touch begin/end cancel a
         // pending Super tap, matching mutter's meta_keybindings_process_event (it
         // clears overlay_key_only_pressed for exactly these event types). Plain
         // pointer motion deliberately does not cancel it.
         if event_cancels_overlay_key(&event) {
-            self.niri.overlay_key_armed = None;
+            self.synoik.overlay_key_armed = None;
         }
 
         let mut consumed_by_a11y = false;
@@ -388,12 +388,12 @@ impl State {
         }
 
         // Do this last so that screenshot still gets it.
-        if hide_hotkey_overlay && self.niri.hotkey_overlay.hide() {
-            self.niri.queue_redraw_all();
+        if hide_hotkey_overlay && self.synoik.hotkey_overlay.hide() {
+            self.synoik.queue_redraw_all();
         }
 
-        if hide_exit_confirm_dialog && self.niri.exit_confirm_dialog.hide() {
-            self.niri.queue_redraw_all();
+        if hide_exit_confirm_dialog && self.synoik.exit_confirm_dialog.hide() {
+            self.synoik.queue_redraw_all();
         }
     }
 
@@ -402,14 +402,14 @@ impl State {
 
         match event {
             InputEvent::DeviceAdded { device } => {
-                self.niri.devices.insert(device.clone());
+                self.synoik.devices.insert(device.clone());
 
                 if device.has_capability(input::DeviceCapability::TabletTool) {
                     match device.size() {
                         Some((w, h)) => {
                             let aspect_ratio = w / h;
                             let data = TabletData { aspect_ratio };
-                            self.niri.tablets.insert(device.clone(), data);
+                            self.synoik.tablets.insert(device.clone(), data);
                         }
                         None => {
                             warn!("tablet tool device has no size");
@@ -419,7 +419,7 @@ impl State {
 
                 if device.has_capability(input::DeviceCapability::Keyboard) {
                     if let Some(led_state) = self
-                        .niri
+                        .synoik
                         .seat
                         .get_keyboard()
                         .map(|keyboard| keyboard.led_state())
@@ -429,15 +429,15 @@ impl State {
                 }
 
                 if device.has_capability(input::DeviceCapability::Touch) {
-                    self.niri.touch.insert(device.clone());
+                    self.synoik.touch.insert(device.clone());
                 }
 
-                apply_libinput_settings(&self.niri.config.borrow().input, device);
+                apply_libinput_settings(&self.synoik.config.borrow().input, device);
             }
             InputEvent::DeviceRemoved { device } => {
-                self.niri.touch.remove(device);
-                self.niri.tablets.remove(device);
-                self.niri.devices.remove(device);
+                self.synoik.touch.remove(device);
+                self.synoik.tablets.remove(device);
+                self.synoik.devices.remove(device);
             }
             _ => (),
         }
@@ -445,19 +445,20 @@ impl State {
 
     fn on_device_added(&mut self, device: impl Device) {
         if device.has_capability(DeviceCapability::TabletTool) {
-            let tablet_seat = self.niri.seat.tablet_seat();
+            let tablet_seat = self.synoik.seat.tablet_seat();
 
             let desc = TabletDescriptor::from(&device);
-            tablet_seat.add_tablet::<Self>(&self.niri.display_handle, &desc);
+            tablet_seat.add_tablet::<Self>(&self.synoik.display_handle, &desc);
         }
-        if device.has_capability(DeviceCapability::Touch) && self.niri.seat.get_touch().is_none() {
-            self.niri.seat.add_touch();
+        if device.has_capability(DeviceCapability::Touch) && self.synoik.seat.get_touch().is_none()
+        {
+            self.synoik.seat.add_touch();
         }
     }
 
     fn on_device_removed(&mut self, device: impl Device) {
         if device.has_capability(DeviceCapability::TabletTool) {
-            let tablet_seat = self.niri.seat.tablet_seat();
+            let tablet_seat = self.synoik.seat.tablet_seat();
 
             let desc = TabletDescriptor::from(&device);
             tablet_seat.remove_tablet(&desc);
@@ -467,17 +468,17 @@ impl State {
                 tablet_seat.clear_tools();
             }
         }
-        if device.has_capability(DeviceCapability::Touch) && self.niri.touch.is_empty() {
-            self.niri.seat.remove_touch();
+        if device.has_capability(DeviceCapability::Touch) && self.synoik.touch.is_empty() {
+            self.synoik.seat.remove_touch();
         }
     }
 
     /// Computes the rectangle that covers all outputs in global space.
     fn global_bounding_rectangle(&self) -> Option<Rectangle<i32, Logical>> {
-        self.niri.global_space.outputs().fold(
+        self.synoik.global_space.outputs().fold(
             None,
             |acc: Option<Rectangle<i32, Logical>>, output| {
-                self.niri
+                self.synoik
                     .global_space
                     .output_geometry(output)
                     .map(|geo| acc.map(|acc| acc.merge(geo)).unwrap_or(geo))
@@ -497,21 +498,27 @@ impl State {
         I::Device: 'static,
     {
         let device_output = event.device().output(self);
-        let device_output = device_output.filter(|output| self.niri.output_exists(output));
+        let device_output = device_output.filter(|output| self.synoik.output_exists(output));
         let device_output = device_output.as_ref();
-        let mapped_output = device_output.or_else(|| self.niri.output_for_tablet());
+        let mapped_output = device_output.or_else(|| self.synoik.output_for_tablet());
 
         // If the tablet is configured to map to the focused window, use that window's geometry on
         // the mapped output (or on the focused output if no specific output is mapped).
-        let map_to_focused_window = self.niri.config.borrow().input.tablet.map_to_focused_window;
+        let map_to_focused_window = self
+            .synoik
+            .config
+            .borrow()
+            .input
+            .tablet
+            .map_to_focused_window;
         // But only if the keyboard focus is on the layout, so that it doesn't trigger on the lock
         // screen and such.
-        let window_target = if map_to_focused_window && self.niri.keyboard_focus.is_layout() {
-            let output = mapped_output.or_else(|| self.niri.layout.active_output());
+        let window_target = if map_to_focused_window && self.synoik.keyboard_focus.is_layout() {
+            let output = mapped_output.or_else(|| self.synoik.layout.active_output());
             output.and_then(|output| {
-                let monitor = self.niri.layout.monitor_for_output(output)?;
+                let monitor = self.synoik.layout.monitor_for_output(output)?;
                 let mut rect = monitor.active_window_visual_rectangle()?;
-                let output_geo = self.niri.global_space.output_geometry(output)?;
+                let output_geo = self.synoik.global_space.output_geometry(output)?;
                 rect.loc += output_geo.loc.to_f64();
                 Some((rect, output))
             })
@@ -527,7 +534,7 @@ impl State {
                 output.current_transform(),
             )
         } else if let Some(output) = mapped_output {
-            let geo = self.niri.global_space.output_geometry(output).unwrap();
+            let geo = self.synoik.global_space.output_geometry(output).unwrap();
             (
                 geo.to_f64(),
                 true,
@@ -539,7 +546,7 @@ impl State {
 
             // FIXME: this 1 px size should ideally somehow be computed for the rightmost output
             // corresponding to the position on the right when clamping.
-            let output = self.niri.global_space.outputs().next().unwrap();
+            let output = self.synoik.global_space.outputs().next().unwrap();
             let scale = output.current_scale().fractional_scale();
 
             // Do not keep ratio for the unified mode as this is what OpenTabletDriver expects.
@@ -557,7 +564,7 @@ impl State {
 
             let device = event.device();
             if let Some(device) = (&device as &dyn Any).downcast_ref::<input::Device>() {
-                if let Some(data) = self.niri.tablets.get(device) {
+                if let Some(data) = self.synoik.tablets.get(device) {
                     // This code does the same thing as mutter with "keep aspect ratio" enabled.
                     let size = transform.invert().transform_size(target_geo.size);
                     let output_aspect_ratio = size.w / size.h;
@@ -587,16 +594,16 @@ impl State {
     /// 1-based because that is what [`WorkspaceReference::Index`] speaks, matching
     /// the `switch-to-workspace-N` settings keys.
     fn last_workspace_index(&self) -> Option<u8> {
-        let n = self.niri.layout.active_monitor_ref()?.n_workspaces();
+        let n = self.synoik.layout.active_monitor_ref()?.n_workspaces();
         u8::try_from(n).ok().filter(|n| *n > 0)
     }
 
     fn is_inhibiting_shortcuts(&self) -> bool {
-        self.niri
+        self.synoik
             .keyboard_focus
             .surface()
             .and_then(|surface| {
-                self.niri
+                self.synoik
                     .keyboard_shortcuts_inhibiting_surfaces
                     .get(surface)
             })
@@ -620,8 +627,8 @@ impl State {
         // But it's good enough for now.
         // FIXME: handle this properly.
         if !pressed {
-            if let Some(token) = self.niri.bind_repeat_timer.take() {
-                self.niri.event_loop.remove(token);
+            if let Some(token) = self.synoik.bind_repeat_timer.take() {
+                self.synoik.event_loop.remove(token);
             }
         }
 
@@ -632,8 +639,8 @@ impl State {
             // focus-stealing-prevention clocks (mutter's `last_user_time` and
             // the focused window's `net_wm_user_time`).
             let now = get_monotonic_time();
-            self.niri.last_user_action_time = Some(now);
-            if let Some(mapped) = self.niri.layout.focus_mut() {
+            self.synoik.last_user_action_time = Some(now);
+            if let Some(mapped) = self.synoik.layout.focus_mut() {
                 mapped.bump_user_time(now);
             }
         }
@@ -665,7 +672,7 @@ impl State {
         #[cfg(not(feature = "dbus"))]
         let _ = consumed_by_a11y;
 
-        let filtered = self.niri.seat.get_keyboard().unwrap().input(
+        let filtered = self.synoik.seat.get_keyboard().unwrap().input(
             self,
             event.key_code(),
             event.state(),
@@ -719,7 +726,7 @@ impl State {
                 // behind it may see a key. This lives *inside* the keyboard filter rather than
                 // ahead of `keyboard.input()` so xkb state still tracks — otherwise Shift would
                 // never register and the unlock entry could not type a capital letter.
-                if this.niri.screen_shield.is_active() {
+                if this.synoik.screen_shield.is_active() {
                     // ...with the same exceptions the `ext-session-lock` path already makes.
                     // **Ctrl+Alt+F<n> above all**: a VT switch is the escape hatch from a lock
                     // screen that has gone wrong, and swallowing it means a compositor bug becomes
@@ -727,10 +734,10 @@ impl State {
                     // the check is a plain bind lookup ahead of the dialog, not a special case
                     // inside it.
                     let escape = {
-                        let config = this.niri.config.borrow();
+                        let config = this.synoik.config.borrow();
                         find_bind(
-                            &this.niri.gnome_settings.keybindings,
-                            &this.niri.accel_grabs,
+                            &this.synoik.gnome_settings.keybindings,
+                            &this.synoik.accel_grabs,
                             SwitcherGrab::Closed,
                             key_code,
                             modified,
@@ -742,9 +749,9 @@ impl State {
                     };
                     if let Some(bind) = escape {
                         if pressed {
-                            this.niri.suppressed_keys.insert(key_code);
+                            this.synoik.suppressed_keys.insert(key_code);
                             return FilterResult::Intercept(Some(bind));
-                        } else if this.niri.suppressed_keys.remove(&key_code) {
+                        } else if this.synoik.suppressed_keys.remove(&key_code) {
                             return FilterResult::Intercept(None);
                         }
                         return FilterResult::Forward;
@@ -758,9 +765,9 @@ impl State {
                     }
 
                     if pressed {
-                        this.niri.suppressed_keys.insert(key_code);
+                        this.synoik.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);
-                    } else if this.niri.suppressed_keys.remove(&key_code) {
+                    } else if this.synoik.suppressed_keys.remove(&key_code) {
                         return FilterResult::Intercept(None);
                     } else {
                         // A release of a key pressed before the shield came down. The client saw
@@ -783,15 +790,15 @@ impl State {
                 // settings but approximate for other keys.
                 if pressed {
                     let is_overlay_key = raw
-                        .is_some_and(|raw| this.niri.gnome_settings.overlay_keys.contains(&raw))
+                        .is_some_and(|raw| this.synoik.gnome_settings.overlay_keys.contains(&raw))
                         && !is_inhibiting_shortcuts
                         && !mods.ctrl
                         && !mods.shift
                         && !mods.alt
                         && !mods.iso_level3_shift
                         && !mods.iso_level5_shift;
-                    this.niri.overlay_key_armed = is_overlay_key.then_some(key_code);
-                } else if this.niri.overlay_key_armed.take() == Some(key_code) {
+                    this.synoik.overlay_key_armed = is_overlay_key.then_some(key_code);
+                } else if this.synoik.overlay_key_armed.take() == Some(key_code) {
                     // A second tap that comes quickly enough shifts a state *up* —
                     // window picker → app grid — instead of toggling the overview
                     // back shut (`overviewControls.js:419-438`).
@@ -804,60 +811,60 @@ impl State {
                     // less than ANIMATION_TIME ago" (`overview.js:12`, 250 ms). Miss
                     // the window either way and Super closes the overview as always.
                     let now = Duration::from_millis(u64::from(time));
-                    let prev = this.niri.overlay_key_last_fired.replace(now);
-                    let should_shift = if this.niri.config.borrow().animations.off {
-                        this.niri.layout.is_overview_open()
+                    let prev = this.synoik.overlay_key_last_fired.replace(now);
+                    let should_shift = if this.synoik.config.borrow().animations.off {
+                        this.synoik.layout.is_overview_open()
                             && prev.is_some_and(|prev| {
                                 now.saturating_sub(prev) < OVERLAY_KEY_SHIFT_WINDOW
                             })
                     } else {
-                        this.niri.layout.is_overview_opening()
+                        this.synoik.layout.is_overview_opening()
                     };
 
                     if should_shift {
-                        this.niri.layout.open_app_grid();
+                        this.synoik.layout.open_app_grid();
                     } else {
                         this.do_action(Action::ToggleOverview, false);
                     }
                     return FilterResult::Intercept(None);
                 }
 
-                if this.niri.exit_confirm_dialog.is_open() && pressed {
+                if this.synoik.exit_confirm_dialog.is_open() && pressed {
                     if raw == Some(Keysym::Return) {
                         info!("quitting after confirming exit dialog");
-                        this.niri.stop_signal.stop();
+                        this.synoik.stop_signal.stop();
                     }
 
                     // Don't send this press to any clients.
-                    this.niri.suppressed_keys.insert(key_code);
+                    this.synoik.suppressed_keys.insert(key_code);
                     return FilterResult::Intercept(None);
                 }
 
                 // The run dialog is modal: while open, every key goes to it
                 // and none reach the clients (gnome-shell holds a modal grab).
-                if this.niri.run_dialog.is_open() {
+                if this.synoik.run_dialog.is_open() {
                     let text = modified
                         .key_char()
                         .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
-                    let outcome = this.niri.run_dialog.handle_key(
+                    let outcome = this.synoik.run_dialog.handle_key(
                         raw,
                         text,
                         edit_mods(mods),
-                        this.niri.gnome_settings.key_theme,
+                        this.synoik.gnome_settings.key_theme,
                         pressed,
-                        &this.niri.gnome_settings.command_history,
+                        &this.synoik.gnome_settings.command_history,
                     );
                     match outcome {
                         KeyOutcome::Handled => {}
-                        KeyOutcome::Close => this.niri.run_dialog.close(),
+                        KeyOutcome::Close => this.synoik.run_dialog.close(),
                         KeyOutcome::Run(input) => this.run_dialog_execute(&input),
                     }
-                    this.niri.queue_redraw_all();
+                    this.synoik.queue_redraw_all();
 
                     if pressed {
-                        this.niri.suppressed_keys.insert(key_code);
+                        this.synoik.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);
-                    } else if this.niri.suppressed_keys.remove(&key_code) {
+                    } else if this.synoik.suppressed_keys.remove(&key_code) {
                         return FilterResult::Intercept(None);
                     } else {
                         // Release of a key pressed before the dialog opened;
@@ -868,17 +875,17 @@ impl State {
 
                 // The end-session (logout/shutdown/restart) confirmation is modal like the run
                 // dialog: while open, every key goes to it and none reach the clients.
-                if this.niri.end_session_dialog.is_open() {
-                    match this.niri.end_session_dialog.handle_key(raw, pressed) {
-                        DialogOutcome::Handled => this.niri.queue_redraw_all(),
-                        DialogOutcome::Confirm => this.niri.confirm_end_session(),
-                        DialogOutcome::Cancel => this.niri.cancel_end_session(),
+                if this.synoik.end_session_dialog.is_open() {
+                    match this.synoik.end_session_dialog.handle_key(raw, pressed) {
+                        DialogOutcome::Handled => this.synoik.queue_redraw_all(),
+                        DialogOutcome::Confirm => this.synoik.confirm_end_session(),
+                        DialogOutcome::Cancel => this.synoik.cancel_end_session(),
                     }
 
                     if pressed {
-                        this.niri.suppressed_keys.insert(key_code);
+                        this.synoik.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);
-                    } else if this.niri.suppressed_keys.remove(&key_code) {
+                    } else if this.synoik.suppressed_keys.remove(&key_code) {
                         return FilterResult::Intercept(None);
                     } else {
                         // Release of a key pressed before the dialog opened; the client saw the
@@ -891,17 +898,17 @@ impl State {
                 // the one that matters most: it is a password box, so a key that leaked past it
                 // would be a character of somebody's password delivered to a window.
                 #[cfg(feature = "dbus")]
-                if this.niri.polkit_is_open() {
+                if this.synoik.polkit_is_open() {
                     let text = modified
                         .key_char()
                         .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
-                    let theme = this.niri.gnome_settings.key_theme;
+                    let theme = this.synoik.gnome_settings.key_theme;
                     this.handle_polkit_key(raw, text, edit_mods(mods), theme, pressed);
 
                     if pressed {
-                        this.niri.suppressed_keys.insert(key_code);
+                        this.synoik.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);
-                    } else if this.niri.suppressed_keys.remove(&key_code) {
+                    } else if this.synoik.suppressed_keys.remove(&key_code) {
                         return FilterResult::Intercept(None);
                     } else {
                         // Release of a key pressed before the dialog opened; the client saw the
@@ -915,7 +922,7 @@ impl State {
                 // is the hardcoded VT-switch chord (Ctrl+Alt+F1..F12): switching to a text console
                 // must never be blocked by an in-compositor overlay, so let it through to the
                 // backend even while the popover holds the grab.
-                if this.niri.panel_popover.is_open() {
+                if this.synoik.panel_popover.is_open() {
                     #[allow(non_upper_case_globals)]
                     if let keysyms::KEY_XF86Switch_VT_1..=keysyms::KEY_XF86Switch_VT_12 =
                         modified.raw()
@@ -923,9 +930,9 @@ impl State {
                         if pressed {
                             let vt = (modified.raw() - keysyms::KEY_XF86Switch_VT_1 + 1) as i32;
                             this.backend.change_vt(vt);
-                            this.niri.suppressed_keys.insert(key_code);
+                            this.synoik.suppressed_keys.insert(key_code);
                             return FilterResult::Intercept(None);
-                        } else if this.niri.suppressed_keys.remove(&key_code) {
+                        } else if this.synoik.suppressed_keys.remove(&key_code) {
                             return FilterResult::Intercept(None);
                         } else {
                             return FilterResult::Forward;
@@ -937,10 +944,10 @@ impl State {
                     // `ShellActionMode.POPUP` for exactly this
                     // (`windowManager.js:747-760`).
                     let popup_bind = {
-                        let config = this.niri.config.borrow();
+                        let config = this.synoik.config.borrow();
                         find_bind(
-                            &this.niri.gnome_settings.keybindings,
-                            &this.niri.accel_grabs,
+                            &this.synoik.gnome_settings.keybindings,
+                            &this.synoik.accel_grabs,
                             SwitcherGrab::Closed,
                             key_code,
                             modified,
@@ -952,22 +959,22 @@ impl State {
                     };
                     if let Some(bind) = popup_bind {
                         if pressed {
-                            this.niri.suppressed_keys.insert(key_code);
+                            this.synoik.suppressed_keys.insert(key_code);
                             return FilterResult::Intercept(Some(bind));
-                        } else if this.niri.suppressed_keys.remove(&key_code) {
+                        } else if this.synoik.suppressed_keys.remove(&key_code) {
                             return FilterResult::Intercept(None);
                         } else {
                             return FilterResult::Forward;
                         }
                     }
 
-                    this.niri.panel_popover.handle_key(raw, pressed);
-                    this.niri.queue_redraw_all();
+                    this.synoik.panel_popover.handle_key(raw, pressed);
+                    this.synoik.queue_redraw_all();
 
                     if pressed {
-                        this.niri.suppressed_keys.insert(key_code);
+                        this.synoik.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);
-                    } else if this.niri.suppressed_keys.remove(&key_code) {
+                    } else if this.synoik.suppressed_keys.remove(&key_code) {
                         return FilterResult::Intercept(None);
                     } else {
                         return FilterResult::Forward;
@@ -977,56 +984,56 @@ impl State {
                 // A delayed capture counts down with the picker gone, so Escape has no bind to
                 // reach: it needs its own route, or an armed capture could only be waited out.
                 if pressed && raw == Some(Keysym::Escape) && this.cancel_pending_capture() {
-                    this.niri.suppressed_keys.insert(key_code);
+                    this.synoik.suppressed_keys.insert(key_code);
                     return FilterResult::Intercept(None);
                 }
 
                 if pressed && raw == Some(Keysym::Escape) {
                     // Cancel certain grabs on Escape.
-                    let pointer = this.niri.seat.get_pointer().unwrap();
+                    let pointer = this.synoik.seat.get_pointer().unwrap();
                     if pointer
                         .with_grab(|_, grab| Self::grab_can_be_cancelled_with_esc(grab))
                         .unwrap_or(false)
                     {
                         pointer.unset_grab(this, serial, time);
-                        this.niri.suppressed_keys.insert(key_code);
+                        this.synoik.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);
                     }
                 }
 
                 if let Some(Keysym::space) = raw {
-                    this.niri.screenshot_ui.set_space_down(pressed);
+                    this.synoik.screenshot_ui.set_space_down(pressed);
                 }
 
                 // A grabbed accelerator's release notifies the grabber; the
                 // release itself stays suppressed through the normal path.
                 if !pressed {
-                    if let Some(action) = this.niri.accel_grab_release_pending.remove(&key_code) {
-                        this.niri.emit_accelerator_signal(action, false);
+                    if let Some(action) = this.synoik.accel_grab_release_pending.remove(&key_code) {
+                        this.synoik.emit_accelerator_signal(action, false);
                     }
                 }
 
                 let res = {
                     // The switcher holds a modal grab, so while it is up nothing but the switch
                     // bindings resolves.
-                    let switcher = match this.niri.switcher.cycler_is_group() {
+                    let switcher = match this.synoik.switcher.cycler_is_group() {
                         Some(group) => SwitcherGrab::Cycler { group },
-                        None if this.niri.switcher.is_open() => SwitcherGrab::Popup,
+                        None if this.synoik.switcher.is_open() => SwitcherGrab::Popup,
                         None => SwitcherGrab::Closed,
                     };
 
                     should_intercept_key(
-                        &mut this.niri.suppressed_keys,
-                        &this.niri.gnome_settings.keybindings,
-                        &this.niri.accel_grabs,
+                        &mut this.synoik.suppressed_keys,
+                        &this.synoik.gnome_settings.keybindings,
+                        &this.synoik.accel_grabs,
                         switcher,
                         key_code,
                         modified,
                         raw,
                         pressed,
                         *mods,
-                        &this.niri.screenshot_ui,
-                        this.niri.config.borrow().input.disable_power_key_handling,
+                        &this.synoik.screenshot_ui,
+                        this.synoik.config.borrow().input.disable_power_key_handling,
                         is_inhibiting_shortcuts,
                     )
                 };
@@ -1042,11 +1049,11 @@ impl State {
                     // `should_intercept_key` already owns releases globally through
                     // `suppressed_keys`, and the modifier release must reach the commit check
                     // after `input()` returns.
-                    if this.niri.switcher.is_open() && pressed {
+                    if this.synoik.switcher.is_open() && pressed {
                         if let Some(key) = raw.and_then(switcher_key_for) {
                             this.switcher_key(key);
                         }
-                        this.niri.suppressed_keys.insert(key_code);
+                        this.synoik.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);
                     }
 
@@ -1056,12 +1063,12 @@ impl State {
                     // on because gnome-shell's drag holds a stage grab, so the key never
                     // reaches the overview's own Escape either — and cancelling a drag is
                     // a whole intent, not a step toward closing the grid.
-                    if pressed && raw == Some(Keysym::Escape) && this.niri.app_drag.is_some() {
+                    if pressed && raw == Some(Keysym::Escape) && this.synoik.app_drag.is_some() {
                         this.cancel_app_drag();
-                        this.niri.suppressed_keys.insert(key_code);
+                        this.synoik.suppressed_keys.insert(key_code);
                         return FilterResult::Intercept(None);
                     }
-                    if this.niri.keyboard_focus.is_overview() && pressed {
+                    if this.synoik.keyboard_focus.is_overview() && pressed {
                         // Overview search: typing engages the search entry (GNOME's
                         // `_onStageKeyPress`/`_shouldTriggerSearch`, searchController.js:145-236).
                         // Press-only + shared `suppressed_keys`: `should_intercept_key` above
@@ -1072,7 +1079,7 @@ impl State {
                         // suppressed and swallowed before the new window sees it).
                         //
                         // `keyboard_focus == Overview` is only reached when nothing above
-                        // (lock/screenshot/dialogs/popover) claimed focus (niri.rs
+                        // (lock/screenshot/dialogs/popover) claimed focus (synoik.rs
                         // update_keyboard_focus), so the search can't engage while invisible.
                         let text = modified
                             .key_char()
@@ -1080,10 +1087,10 @@ impl State {
                         // The folder rename entry comes first: while it is up it holds the
                         // key focus, so the search never sees a keystroke
                         // (`_showFolderEntry`'s `grab_key_focus`, `appDisplay.js:2643-2648`).
-                        if this.niri.folder_dialog.is_renaming() {
+                        if this.synoik.folder_dialog.is_renaming() {
                             use crate::ui::folder_dialog::RenameKey;
-                            let theme = this.niri.gnome_settings.key_theme;
-                            match this.niri.folder_dialog.rename_key(
+                            let theme = this.synoik.gnome_settings.key_theme;
+                            match this.synoik.folder_dialog.rename_key(
                                 raw,
                                 text,
                                 edit_mods(mods),
@@ -1091,33 +1098,33 @@ impl State {
                             ) {
                                 RenameKey::Ignored => {}
                                 RenameKey::Took => {
-                                    this.niri.suppressed_keys.insert(key_code);
-                                    this.niri.queue_redraw_all();
+                                    this.synoik.suppressed_keys.insert(key_code);
+                                    this.synoik.queue_redraw_all();
                                     return FilterResult::Intercept(None);
                                 }
                                 RenameKey::Commit => {
                                     if let Some((folder, name)) =
-                                        this.niri.folder_dialog.finish_rename()
+                                        this.synoik.folder_dialog.finish_rename()
                                     {
                                         this.rename_folder(&folder, &name);
                                     }
-                                    this.niri.suppressed_keys.insert(key_code);
-                                    this.niri.queue_redraw_all();
+                                    this.synoik.suppressed_keys.insert(key_code);
+                                    this.synoik.queue_redraw_all();
                                     return FilterResult::Intercept(None);
                                 }
                             }
                         }
-                        let active = this.niri.overview_search.is_active();
+                        let active = this.synoik.overview_search.is_active();
                         // A non-whitespace printable starts a search; once active — or once the
                         // entry has been clicked open with no query yet — every key routes to
                         // the entry (editing/nav/Escape). Modifiers/Tab/arrows while the entry
                         // is closed and empty fall through to the overview binds below.
-                        let expanded = this.niri.overview_search.is_expanded();
+                        let expanded = this.synoik.overview_search.is_expanded();
                         let starts = text.is_some_and(|c| !c.is_whitespace() && !c.is_control());
                         if active || expanded || starts {
                             use crate::ui::overview_search::SearchOutcome;
-                            let theme = this.niri.gnome_settings.key_theme;
-                            let outcome = this.niri.overview_search.handle_key(
+                            let theme = this.synoik.gnome_settings.key_theme;
+                            let outcome = this.synoik.overview_search.handle_key(
                                 raw,
                                 text,
                                 edit_mods(mods),
@@ -1129,7 +1136,7 @@ impl State {
                                 match outcome {
                                     SearchOutcome::Handled | SearchOutcome::Ignored => {}
                                     SearchOutcome::QueryChanged | SearchOutcome::Cleared => {
-                                        this.niri.sync_overview_search();
+                                        this.synoik.sync_overview_search();
                                     }
                                     SearchOutcome::Activate(id) => {
                                         this.launch_app(
@@ -1138,29 +1145,29 @@ impl State {
                                             None,
                                             "search",
                                         );
-                                        this.niri.overview_search.clear();
-                                        this.niri.layout.close_overview();
+                                        this.synoik.overview_search.clear();
+                                        this.synoik.layout.close_overview();
                                     }
                                     SearchOutcome::Close => {
-                                        this.niri.overview_search.clear();
+                                        this.synoik.overview_search.clear();
                                         // Escape tiers (`searchController.js:153-159`):
                                         // search → grid → hide. The entry only returns
                                         // Close with no query, so fall through to the
                                         // app grid, then the overview.
-                                        if !this.niri.layout.close_app_grid() {
-                                            this.niri.layout.close_overview();
+                                        if !this.synoik.layout.close_app_grid() {
+                                            this.synoik.layout.close_overview();
                                         }
                                     }
                                 }
-                                this.niri.queue_redraw_all();
-                                this.niri.suppressed_keys.insert(key_code);
+                                this.synoik.queue_redraw_all();
+                                this.synoik.suppressed_keys.insert(key_code);
                                 return FilterResult::Intercept(None);
                             }
                         }
                     }
 
                     // If we didn't find any bind, try other hardcoded keys.
-                    if this.niri.keyboard_focus.is_overview() && pressed {
+                    if this.synoik.keyboard_focus.is_overview() && pressed {
                         // Escape closes an open folder first — the dialog holds a
                         // `GrabHelper` grab whose `onUngrab` pops it down
                         // (`appDisplay.js:2879-2883`), so it is the innermost tier of
@@ -1168,27 +1175,27 @@ impl State {
                         // window picker (`searchController.js:153-159`); only when
                         // already in the picker does it fall through to the
                         // CloseOverview bind below.
-                        if raw == Some(Keysym::Escape) && this.niri.folder_dialog.popdown() {
-                            this.niri.suppressed_keys.insert(key_code);
-                            this.niri.queue_redraw_all();
+                        if raw == Some(Keysym::Escape) && this.synoik.folder_dialog.popdown() {
+                            this.synoik.suppressed_keys.insert(key_code);
+                            this.synoik.queue_redraw_all();
                             return FilterResult::Intercept(None);
                         }
-                        if raw == Some(Keysym::Escape) && this.niri.layout.close_app_grid() {
-                            this.niri.suppressed_keys.insert(key_code);
-                            this.niri.queue_redraw_all();
+                        if raw == Some(Keysym::Escape) && this.synoik.layout.close_app_grid() {
+                            this.synoik.suppressed_keys.insert(key_code);
+                            this.synoik.queue_redraw_all();
                             return FilterResult::Intercept(None);
                         }
                         // Then the app grid's own keyboard navigation, which has to come
                         // before the arrow binds below: those move *window* focus behind
                         // the grid.
                         if raw.is_some_and(|raw| this.overview_grid_key(raw, *mods)) {
-                            this.niri.suppressed_keys.insert(key_code);
-                            this.niri.queue_redraw_all();
+                            this.synoik.suppressed_keys.insert(key_code);
+                            this.synoik.queue_redraw_all();
                             return FilterResult::Intercept(None);
                         }
                         if let Some(bind) = raw.and_then(|raw| hardcoded_overview_bind(raw, *mods))
                         {
-                            this.niri.suppressed_keys.insert(key_code);
+                            this.synoik.suppressed_keys.insert(key_code);
                             return FilterResult::Intercept(Some(bind));
                         }
                     }
@@ -1201,8 +1208,8 @@ impl State {
         // The caps-lock warning, for the same reason and read the same way: at the *press* of
         // Caps Lock the event's mask still describes the lock state the key is about to change, so
         // trusting it means the warning never goes away again. Sampled live after `input()`.
-        if self.niri.screen_shield.is_active() && self.sync_caps_warning() {
-            self.niri.queue_redraw_all();
+        if self.synoik.screen_shield.is_active() && self.sync_caps_warning() {
+            self.synoik.queue_redraw_all();
         }
 
         // The switcher commits when its *primary* modifier comes up — not when every modifier
@@ -1214,13 +1221,13 @@ impl State {
         // see its own modifier go up and would hang until the no-mods timeout. GNOME has the same
         // problem and solves it the same way, by sampling live state (`global.get_pointer()`,
         // `switcherPopup.js:223-227`) instead of trusting the event.
-        if !pressed && self.niri.switcher.is_open() {
+        if !pressed && self.synoik.switcher.is_open() {
             let held =
-                modifiers_from_state(self.niri.seat.get_keyboard().unwrap().modifier_state());
-            let now = self.niri.clock.now_unadjusted();
-            let outcome = self.niri.switcher.key_release(held, now);
+                modifiers_from_state(self.synoik.seat.get_keyboard().unwrap().modifier_state());
+            let now = self.synoik.clock.now_unadjusted();
+            let outcome = self.synoik.switcher.key_release(held, now);
             self.finish_switcher(outcome);
-            self.niri.queue_redraw_switcher_output();
+            self.synoik.queue_redraw_switcher_output();
         }
 
         let Some(Some(bind)) = filtered else {
@@ -1235,7 +1242,7 @@ impl State {
         // send AcceleratorDeactivated (mutter's external-grab handler is
         // TRIGGER_RELEASE: press activates, release deactivates).
         if let Action::ActivateAcceleratorGrab(action) = bind.action {
-            self.niri
+            self.synoik
                 .accel_grab_release_pending
                 .insert(event.key_code(), action);
         }
@@ -1251,11 +1258,11 @@ impl State {
         }
 
         // Stop the previous key repeat if any.
-        if let Some(token) = self.niri.bind_repeat_timer.take() {
-            self.niri.event_loop.remove(token);
+        if let Some(token) = self.synoik.bind_repeat_timer.take() {
+            self.synoik.event_loop.remove(token);
         }
 
-        let config = self.niri.config.borrow();
+        let config = self.synoik.config.borrow();
         let config = &config.input.keyboard;
 
         let repeat_rate = config.repeat_rate;
@@ -1268,7 +1275,7 @@ impl State {
             Timer::from_duration(Duration::from_millis(u64::from(config.repeat_delay)));
 
         let token = self
-            .niri
+            .synoik
             .event_loop
             .insert_source(repeat_timer, move |_, _, state| {
                 state.handle_bind(bind.clone());
@@ -1276,29 +1283,29 @@ impl State {
             })
             .unwrap();
 
-        self.niri.bind_repeat_timer = Some(token);
+        self.synoik.bind_repeat_timer = Some(token);
     }
 
     fn hide_cursor_if_needed(&mut self) {
         // If the pointer is already invisible, don't reset it back to Hidden causing one frame
         // of hover.
-        if !self.niri.pointer_visibility.is_visible() {
+        if !self.synoik.pointer_visibility.is_visible() {
             return;
         }
 
-        if !self.niri.config.borrow().cursor.hide_when_typing {
+        if !self.synoik.config.borrow().cursor.hide_when_typing {
             return;
         }
 
-        // niri keeps this set only while actively using a tablet, which means the cursor position
+        // synoik keeps this set only while actively using a tablet, which means the cursor position
         // is likely to change almost immediately, causing pointer_visibility to just flicker back
         // and forth.
-        if self.niri.tablet_cursor_location.is_some() {
+        if self.synoik.tablet_cursor_location.is_some() {
             return;
         }
 
-        self.niri.pointer_visibility = PointerVisibility::Hidden;
-        self.niri.queue_redraw_all();
+        self.synoik.pointer_visibility = PointerVisibility::Hidden;
+        self.synoik.queue_redraw_all();
     }
 
     pub fn handle_bind(&mut self, bind: ResolvedBind) {
@@ -1308,20 +1315,26 @@ impl State {
         };
 
         // Check this first so that it doesn't trigger the cooldown.
-        if self.niri.is_locked() && !(bind.allow_when_locked || allowed_when_locked(&bind.action)) {
+        if self.synoik.is_locked() && !(bind.allow_when_locked || allowed_when_locked(&bind.action))
+        {
             return;
         }
 
-        match self.niri.bind_cooldown_timers.entry(bind.key) {
+        match self.synoik.bind_cooldown_timers.entry(bind.key) {
             // The bind is on cooldown.
             Entry::Occupied(_) => (),
             Entry::Vacant(entry) => {
                 let timer = Timer::from_duration(cooldown);
                 let token = self
-                    .niri
+                    .synoik
                     .event_loop
                     .insert_source(timer, move |_, _, state| {
-                        if state.niri.bind_cooldown_timers.remove(&bind.key).is_none() {
+                        if state
+                            .synoik
+                            .bind_cooldown_timers
+                            .remove(&bind.key)
+                            .is_none()
+                        {
                             error!("bind cooldown timer entry disappeared");
                         }
                         TimeoutAction::Drop
@@ -1339,19 +1352,20 @@ impl State {
     /// GSettings), then either spawns and closes the dialog, or shows the
     /// error in-dialog and leaves it open.
     fn run_dialog_execute(&mut self, input: &str) {
-        let trimmed = run_dialog::history_add(&mut self.niri.gnome_settings.command_history, input);
-        if let Some(writer) = &self.niri.gnome_settings_writer {
-            writer.set_command_history(self.niri.gnome_settings.command_history.clone());
+        let trimmed =
+            run_dialog::history_add(&mut self.synoik.gnome_settings.command_history, input);
+        if let Some(writer) = &self.synoik.gnome_settings_writer {
+            writer.set_command_history(self.synoik.gnome_settings.command_history.clone());
         }
 
         match run_dialog::resolve_command_line(&trimmed) {
             Ok(argv) => {
                 spawn(argv, None);
-                self.niri.run_dialog.close();
+                self.synoik.run_dialog.close();
             }
-            Err(message) => self.niri.run_dialog.set_error(message),
+            Err(message) => self.synoik.run_dialog.set_error(message),
         }
-        self.niri.queue_redraw_all();
+        self.synoik.queue_redraw_all();
     }
 
     /// Apply a quick-settings popover click outcome: write the backing gsettings
@@ -1368,33 +1382,35 @@ impl State {
         use crate::notifications::CloseReason;
         use crate::ui::notification_banner::BannerHit;
 
-        let Some(id) = self.niri.notification_banner.content_id() else {
+        let Some(id) = self.synoik.notification_banner.content_id() else {
             return;
         };
         let mut activated = false;
         let effects = match hit {
-            BannerHit::Close => self.niri.notifications.close(id, CloseReason::Dismissed),
+            BannerHit::Close => self.synoik.notifications.close(id, CloseReason::Dismissed),
             BannerHit::Action(idx) => {
-                let Some(action) = self.niri.notification_banner.action_key(idx) else {
+                let Some(action) = self.synoik.notification_banner.action_key(idx) else {
                     return;
                 };
-                activated = self.niri.emit_notification_action(id, action);
-                self.niri.notifications.activate(id)
+                activated = self.synoik.emit_notification_action(id, action);
+                self.synoik.notifications.activate(id)
             }
             BannerHit::Body => {
-                if self.niri.notification_banner.has_default_action() {
-                    activated = self.niri.emit_notification_action(id, "default".to_owned());
-                    self.niri.notifications.activate(id)
+                if self.synoik.notification_banner.has_default_action() {
+                    activated = self
+                        .synoik
+                        .emit_notification_action(id, "default".to_owned());
+                    self.synoik.notifications.activate(id)
                 } else {
-                    activated = self.niri.open_notification_app(id);
-                    self.niri.notifications.activate_source(id)
+                    activated = self.synoik.open_notification_app(id);
+                    self.synoik.notifications.activate_source(id)
                 }
             }
         };
         if activated {
-            self.niri.layout.close_overview();
+            self.synoik.layout.close_overview();
         }
-        self.niri.apply_notification_effects(effects);
+        self.synoik.apply_notification_effects(effects);
     }
 
     /// `pub(crate)` so the corpus can drive an action straight in: several of them are
@@ -1403,23 +1419,23 @@ impl State {
         use crate::ui::popover::PopoverAction;
 
         let set_toggle = |state: &mut Self, f: fn(&mut crate::gnome::QuickToggles, bool), v| {
-            f(&mut state.niri.gnome_settings.quick_toggles, v);
+            f(&mut state.synoik.gnome_settings.quick_toggles, v);
             state
-                .niri
+                .synoik
                 .panel
-                .set_quick_toggles(state.niri.gnome_settings.quick_toggles);
+                .set_quick_toggles(state.synoik.gnome_settings.quick_toggles);
         };
 
         match action {
             PopoverAction::Consumed => {}
             PopoverAction::SetDarkStyle(v) => {
-                if let Some(w) = &self.niri.gnome_settings_writer {
+                if let Some(w) = &self.synoik.gnome_settings_writer {
                     w.set_dark_style(v);
                 }
                 set_toggle(self, |t, v| t.dark_style = v, v);
             }
             PopoverAction::SetDoNotDisturb(v) => {
-                if let Some(w) = &self.niri.gnome_settings_writer {
+                if let Some(w) = &self.synoik.gnome_settings_writer {
                     w.set_do_not_disturb(v);
                 }
                 set_toggle(self, |t, v| t.do_not_disturb = v, v);
@@ -1428,31 +1444,31 @@ impl State {
                 // from it now so the toggle reflects immediately even without a
                 // gsettings writer (the settings round-trip is the only other path,
                 // and it's absent headless).
-                self.niri.update_messages_indicator();
+                self.synoik.update_messages_indicator();
             }
             PopoverAction::SetNightLight(v) => {
-                if let Some(w) = &self.niri.gnome_settings_writer {
+                if let Some(w) = &self.synoik.gnome_settings_writer {
                     w.set_night_light(v);
                 }
                 set_toggle(self, |t, v| t.night_light = v, v);
             }
             PopoverAction::SetA11yToggle { toggle, on } => {
-                if let Some(w) = &self.niri.gnome_settings_writer {
+                if let Some(w) = &self.synoik.gnome_settings_writer {
                     w.set_a11y_toggle(toggle, on);
                 }
                 // Update the model optimistically like the quick-settings tiles do: the
                 // gsettings round-trip is the only other path and it's absent headless,
                 // and the indicator's *presence* hangs off this state.
-                self.niri.gnome_settings.a11y.set(toggle, on);
-                self.niri.panel.set_a11y(self.niri.gnome_settings.a11y);
+                self.synoik.gnome_settings.a11y.set(toggle, on);
+                self.synoik.panel.set_a11y(self.synoik.gnome_settings.a11y);
                 // The clicked row also closes the menu, but GNOME's `settings.bind` moves
                 // the switch synchronously — so it flips while the menu fades out rather
                 // than fading away still showing the old state. The gsettings echo can't
                 // do this for us: it arrives after the close has begun.
-                self.niri
+                self.synoik
                     .panel_popover
-                    .set_a11y(self.niri.gnome_settings.a11y);
-                self.niri.queue_redraw_all();
+                    .set_a11y(self.synoik.gnome_settings.a11y);
+                self.synoik.queue_redraw_all();
             }
             // The screenshot UI deliberately does NOT leave the overview: gnome-shell's
             // screenshot button only closes the quick-settings menu and calls
@@ -1465,7 +1481,7 @@ impl State {
                 // with `PopupAnimation.NONE` and defers the open to a `BEFORE_REDRAW` later
                 // (`js/ui/status/system.js:121-128`); dropping the popover outright before the
                 // capture is the same ordering without the later.
-                self.niri.panel_popover.close_immediately();
+                self.synoik.panel_popover.close_immediately();
                 self.open_screenshot_ui(true, None);
             }
             // Every shell surface that starts an app leaves the overview first —
@@ -1476,7 +1492,7 @@ impl State {
             // `Spawn`, so this one call covers them.
             PopoverAction::Spawn(command) => {
                 spawn(command, None);
-                self.niri.layout.close_overview();
+                self.synoik.layout.close_overview();
             }
             // Straight to `org.gnome.SessionManager`, as gnome-shell does
             // (`systemActions.js:483-501`) — not the `gnome-session-quit` helper we used to
@@ -1486,18 +1502,18 @@ impl State {
             // `activatePowerOff` and `activateRestart` deliberately do not, so neither do we.
             PopoverAction::SessionRequest(request) => {
                 if request == crate::end_session::SessionRequest::Logout {
-                    self.niri.layout.close_overview();
+                    self.synoik.layout.close_overview();
                 }
-                self.niri.request_session_action(request);
+                self.synoik.request_session_action(request);
             }
             PopoverAction::SetVolume(volume) => {
-                if let Some(audio) = self.niri.audio_backend.as_ref() {
+                if let Some(audio) = self.synoik.audio_backend.as_ref() {
                     let status = audio.set_volume(volume);
                     self.on_audio_status(status);
                 }
             }
             PopoverAction::ToggleMute => {
-                if let Some(audio) = self.niri.audio_backend.as_ref() {
+                if let Some(audio) = self.synoik.audio_backend.as_ref() {
                     let status = audio.toggle_muted();
                     self.on_audio_status(status);
                 }
@@ -1508,7 +1524,7 @@ impl State {
             PopoverAction::SetOutputDevice(key) => self.activate_audio_device(key, true),
             PopoverAction::SetInputVolume(volume) => {
                 if let Some(status) = self
-                    .niri
+                    .synoik
                     .audio_backend
                     .as_ref()
                     .and_then(|audio| audio.set_input_volume(volume))
@@ -1518,7 +1534,7 @@ impl State {
             }
             PopoverAction::ToggleInputMute => {
                 if let Some(status) = self
-                    .niri
+                    .synoik
                     .audio_backend
                     .as_ref()
                     .and_then(|audio| audio.toggle_input_muted())
@@ -1539,7 +1555,12 @@ impl State {
             // blocking Set on this thread); the tile updates when gsd echoes `PropertiesChanged`.
             #[cfg(feature = "dbus")]
             PopoverAction::SetAirplaneMode(active) => {
-                if let Some(conn) = self.niri.dbus.as_ref().and_then(|d| d.conn_rfkill.as_ref()) {
+                if let Some(conn) = self
+                    .synoik
+                    .dbus
+                    .as_ref()
+                    .and_then(|d| d.conn_rfkill.as_ref())
+                {
                     crate::dbus::rfkill::set_airplane_mode(conn, active);
                 }
             }
@@ -1550,13 +1571,13 @@ impl State {
             // tile updates on the daemon's echo.
             #[cfg(feature = "dbus")]
             PopoverAction::TogglePowerProfile => {
-                let target = if self.niri.system_status.power.is_active() {
+                let target = if self.synoik.system_status.power.is_active() {
                     "balanced".to_string()
                 } else {
-                    self.niri.last_power_profile.clone()
+                    self.synoik.last_power_profile.clone()
                 };
                 if let Some(conn) = self
-                    .niri
+                    .synoik
                     .dbus
                     .as_ref()
                     .and_then(|d| d.conn_system_status.as_ref())
@@ -1568,7 +1589,7 @@ impl State {
             #[cfg(feature = "dbus")]
             PopoverAction::SetPowerProfile(profile) => {
                 if let Some(conn) = self
-                    .niri
+                    .synoik
                     .dbus
                     .as_ref()
                     .and_then(|d| d.conn_system_status.as_ref())
@@ -1583,14 +1604,19 @@ impl State {
             // failsafe (`bluetooth.js:27,131-136`) in case no state change ever echoes back.
             #[cfg(feature = "dbus")]
             PopoverAction::ToggleBluetooth => {
-                let was_active = self.niri.system_status.bluetooth.powered;
-                if let Some(conn) = self.niri.dbus.as_ref().and_then(|d| d.conn_rfkill.as_ref()) {
+                let was_active = self.synoik.system_status.bluetooth.powered;
+                if let Some(conn) = self
+                    .synoik
+                    .dbus
+                    .as_ref()
+                    .and_then(|d| d.conn_rfkill.as_ref())
+                {
                     crate::dbus::rfkill::set_bluetooth_airplane_mode(conn, was_active);
                 }
                 if !was_active {
                     if let (Some(path), Some(conn)) = (
-                        self.niri.system_status.bluetooth.adapter.clone(),
-                        self.niri
+                        self.synoik.system_status.bluetooth.adapter.clone(),
+                        self.synoik
                             .dbus
                             .as_ref()
                             .and_then(|d| d.conn_system_status.as_ref()),
@@ -1600,11 +1626,11 @@ impl State {
                 }
                 let timer =
                     calloop::timer::Timer::from_duration(std::time::Duration::from_secs(30));
-                self.niri
+                self.synoik
                     .event_loop
                     .insert_source(timer, |_, _, state| {
-                        if state.niri.panel_popover.clear_bluetooth_prediction() {
-                            state.niri.queue_redraw_all();
+                        if state.synoik.panel_popover.clear_bluetooth_prediction() {
+                            state.synoik.queue_redraw_all();
                         }
                         calloop::timer::TimeoutAction::Drop
                     })
@@ -1615,11 +1641,11 @@ impl State {
             #[cfg(feature = "dbus")]
             PopoverAction::ConnectBluetoothDevice { path, connect } => {
                 if let (Some(conn), Some(done)) = (
-                    self.niri
+                    self.synoik
                         .dbus
                         .as_ref()
                         .and_then(|d| d.conn_system_status.as_ref()),
-                    self.niri.system_status_tx.clone(),
+                    self.synoik.system_status_tx.clone(),
                 ) {
                     crate::dbus::bluez::connect_device(conn, path, connect, done);
                 }
@@ -1634,10 +1660,10 @@ impl State {
             // pushes the shrunk snapshot back into the open popover.
             PopoverAction::CloseNotification(id) => {
                 let effects = self
-                    .niri
+                    .synoik
                     .notifications
                     .close(id, crate::notifications::CloseReason::Dismissed);
-                self.niri.apply_notification_effects(effects);
+                self.synoik.apply_notification_effects(effects);
             }
             PopoverAction::CloseNotificationGroup(ids) => {
                 // Closing a collapsed group closes every notification in it
@@ -1645,53 +1671,55 @@ impl State {
                 let mut effects = crate::notifications::Effects::default();
                 for id in ids {
                     let e = self
-                        .niri
+                        .synoik
                         .notifications
                         .close(id, crate::notifications::CloseReason::Dismissed);
                     effects.merge(e);
                 }
-                self.niri.apply_notification_effects(effects);
+                self.synoik.apply_notification_effects(effects);
             }
             PopoverAction::ActivateNotification { id, has_default } => {
                 let (activated, effects) = if has_default {
-                    let activated = self.niri.emit_notification_action(id, "default".to_owned());
-                    (activated, self.niri.notifications.activate(id))
+                    let activated = self
+                        .synoik
+                        .emit_notification_action(id, "default".to_owned());
+                    (activated, self.synoik.notifications.activate(id))
                 } else {
-                    let activated = self.niri.open_notification_app(id);
-                    (activated, self.niri.notifications.activate_source(id))
+                    let activated = self.synoik.open_notification_app(id);
+                    (activated, self.synoik.notifications.activate_source(id))
                 };
                 if activated {
-                    self.niri.layout.close_overview();
+                    self.synoik.layout.close_overview();
                 }
-                self.niri.apply_notification_effects(effects);
+                self.synoik.apply_notification_effects(effects);
             }
             PopoverAction::InvokeNotificationAction { id, key } => {
-                if self.niri.emit_notification_action(id, key) {
-                    self.niri.layout.close_overview();
+                if self.synoik.emit_notification_action(id, key) {
+                    self.synoik.layout.close_overview();
                 }
-                let effects = self.niri.notifications.activate(id);
-                self.niri.apply_notification_effects(effects);
+                let effects = self.synoik.notifications.activate(id);
+                self.synoik.apply_notification_effects(effects);
             }
             PopoverAction::ClearNotifications => {
-                let effects = self.niri.notifications.clear_all();
-                self.niri.apply_notification_effects(effects);
+                let effects = self.synoik.notifications.clear_all();
+                self.synoik.apply_notification_effects(effects);
             }
             // A media card's transport buttons and its body (`js/ui/mpris.js:73-100`). The card is
             // addressed by bus name, so a player that vanished between the click and the call is
             // simply dropped by the watcher.
             PopoverAction::MediaControl { bus_name, control } => {
-                use crate::mpris::NiriToMpris;
+                use crate::mpris::SynoikToMpris;
                 use crate::ui::media_card::MediaControl;
 
                 self.mpris_control(match control {
-                    MediaControl::Previous => NiriToMpris::Previous(bus_name),
-                    MediaControl::PlayPause => NiriToMpris::PlayPause(bus_name),
-                    MediaControl::Next => NiriToMpris::Next(bus_name),
+                    MediaControl::Previous => SynoikToMpris::Previous(bus_name),
+                    MediaControl::PlayPause => SynoikToMpris::PlayPause(bus_name),
+                    MediaControl::Next => SynoikToMpris::Next(bus_name),
                 });
             }
             PopoverAction::RaiseMediaPlayer(bus_name) => {
                 self.raise_mpris_player(&bus_name);
-                self.niri.layout.close_overview();
+                self.synoik.layout.close_overview();
             }
             PopoverAction::SetInputSource(idx) => self.set_input_source(idx),
 
@@ -1707,7 +1735,7 @@ impl State {
             // which leaves the overview.
             PopoverAction::AppActivateWindow(window) => {
                 self.activate_window_by_id(window);
-                self.niri.layout.close_overview();
+                self.synoik.layout.close_overview();
             }
             // `shell_app_request_quit` (`shell-app.c:1210-1243`) minus its first
             // branch: we have no `org.gtk.Application` action muxer, so an app that
@@ -1719,9 +1747,9 @@ impl State {
             // Pinning does *not* leave the overview — gnome-shell hides it only for
             // the rows that raise a window.
             PopoverAction::AppToggleFavorite(id) => {
-                if self.niri.app_system.is_favorite(&id) {
+                if self.synoik.app_system.is_favorite(&id) {
                     self.unpin_app(&id);
-                } else if self.niri.app_system.add_favorite(&id) {
+                } else if self.synoik.app_system.add_favorite(&id) {
                     self.commit_favorites();
                 }
             }
@@ -1737,23 +1765,23 @@ impl State {
     /// the bottom of the screen, while a grid or search icon takes `AppIcon`'s default
     /// `St.Side.LEFT` and opens to the icon's right (`appDisplay.js:2928`).
     fn open_app_menu_for(&mut self, output: &Output, hit: OverviewHit) -> bool {
-        let Some(controls) = self.niri.layout.controls_layout_for_output(output) else {
+        let Some(controls) = self.synoik.layout.controls_layout_for_output(output) else {
             return false;
         };
         let (id, anchor, side) = match hit {
             OverviewHit::Dash(DashHit::App(i)) => (
-                self.niri.dash.item_id(i).map(str::to_owned),
-                self.niri.dash.tile_rect(i, controls.dash),
+                self.synoik.dash.item_id(i).map(str::to_owned),
+                self.synoik.dash.tile_rect(i, controls.dash),
                 PopoverSide::Bottom,
             ),
             OverviewHit::GridApp(i) => (
-                self.niri.app_grid.entry_id(i).map(str::to_owned),
-                self.niri.app_grid.entry_rect(i, controls.app_display),
+                self.synoik.app_grid.entry_id(i).map(str::to_owned),
+                self.synoik.app_grid.entry_rect(i, controls.app_display),
                 PopoverSide::Left,
             ),
             OverviewHit::Search(SearchHit::Result(i)) => (
-                self.niri.overview_search.result_id(i).map(str::to_owned),
-                self.niri.overview_search.result_rect(i, controls.into()),
+                self.synoik.overview_search.result_id(i).map(str::to_owned),
+                self.synoik.overview_search.result_rect(i, controls.into()),
                 PopoverSide::Left,
             ),
             _ => return false,
@@ -1763,22 +1791,22 @@ impl State {
         };
         // The menu is built from the catalog entry, not from the surface's snapshot:
         // the `.desktop` actions it lists live on the entry (`AppMenu.setApp`).
-        let Some(entry) = self.niri.app_system.lookup(&id) else {
+        let Some(entry) = self.synoik.app_system.lookup(&id) else {
             return false;
         };
-        let is_favorite = self.niri.app_system.is_favorite(&id);
-        let state = self.niri.app_system.app_state(&id);
+        let is_favorite = self.synoik.app_system.is_favorite(&id);
+        let state = self.synoik.app_system.app_state(&id);
         // `showSingleWindows: true` for an app-grid / dash icon
         // (`appDisplay.js:3033`), so one window is already a section.
         let windows = self
-            .niri
+            .synoik
             .app_system
             .running_app(&id)
             .map(|a| a.windows.clone())
             .unwrap_or_default();
         // `_updateDetailsVisibility` (`appMenu.js:182-185`).
         let has_software = self
-            .niri
+            .synoik
             .app_system
             .lookup("org.gnome.Software.desktop")
             .is_some();
@@ -1789,18 +1817,18 @@ impl State {
             windows: &windows,
             has_software,
         };
-        self.niri
+        self.synoik
             .panel_popover
             .open_app_menu(output.clone(), anchor, side, &ctx);
         // Remembered so the icon can stay highlighted for as long as its menu is up.
-        self.niri.app_menu_source = Some(hit);
+        self.synoik.app_menu_source = Some(hit);
         true
     }
 
     /// Raise a window by id — `Main.activateWindow(window)` (`appMenu.js:285`).
     fn activate_window_by_id(&mut self, id: crate::window::mapped::MappedId) {
         let window = self
-            .niri
+            .synoik
             .layout
             .windows()
             .find(|(_, m)| m.id() == id)
@@ -1815,20 +1843,20 @@ impl State {
     /// most recently used window, which is what `shell_app_activate` does. Only a player with no
     /// resolvable app falls back to `Raise()`, and only if it says `CanRaise`.
     pub fn raise_mpris_player(&mut self, bus_name: &str) {
-        let Some(player) = self.niri.mpris.get(bus_name) else {
+        let Some(player) = self.synoik.mpris.get(bus_name) else {
             return;
         };
         let can_raise = player.state.can_raise;
 
         let Some(app) = player.app.as_ref().map(|app| app.id.clone()) else {
             if can_raise {
-                self.mpris_control(crate::mpris::NiriToMpris::Raise(bus_name.to_owned()));
+                self.mpris_control(crate::mpris::SynoikToMpris::Raise(bus_name.to_owned()));
             }
             return;
         };
 
         let window = self
-            .niri
+            .synoik
             .app_system
             .running_app(&app)
             .and_then(|running| running.windows.first())
@@ -1849,13 +1877,13 @@ impl State {
     /// Not running is a no-op, matching the early return at `:1216`; the menu row is
     /// hidden in that case anyway.
     pub(crate) fn request_app_quit(&mut self, id: &str) {
-        let Some(app) = self.niri.app_system.running_app(id) else {
+        let Some(app) = self.synoik.app_system.running_app(id) else {
             return;
         };
         let ids: Vec<_> = app.windows.iter().map(|w| w.id).collect();
         for window_id in ids {
             let window = self
-                .niri
+                .synoik
                 .layout
                 .windows()
                 .find(|(_, m)| m.id() == window_id);
@@ -1869,13 +1897,13 @@ impl State {
     /// action over `org.gtk.Actions`, then leave the overview.
     fn show_app_details(&mut self, id: &str) {
         crate::dbus::show_app_details(id.to_owned());
-        self.niri.layout.close_overview();
+        self.synoik.layout.close_overview();
     }
 
     /// Launch `id` from a context-menu row and leave the overview.
     fn launch_from_app_menu(&mut self, id: &str, mode: LaunchMode) {
         self.launch_app(id, mode, None, "app-menu");
-        self.niri.layout.close_overview();
+        self.synoik.layout.close_overview();
     }
 
     /// The one place an app is launched — our `shell_app_launch`
@@ -1910,7 +1938,13 @@ impl State {
     fn activate_app_icon(&mut self, id: &str, button: Option<MouseButton>, origin: &str) {
         // An icon reads the intent off the input: Ctrl or a middle-click asks for a new
         // window (`AppIcon._onButtonPress` / `activate`). Keyboard callers state it.
-        let ctrl = self.niri.seat.get_keyboard().unwrap().modifier_state().ctrl;
+        let ctrl = self
+            .synoik
+            .seat
+            .get_keyboard()
+            .unwrap()
+            .modifier_state()
+            .ctrl;
         let wants_new = ctrl || button == Some(MouseButton::Middle);
         self.activate_app(id, wants_new, origin);
     }
@@ -1919,7 +1953,7 @@ impl State {
     /// apps are left alone, and a running app raises its most recently used window
     /// — unless `wants_new`, which asks for another window instead.
     fn activate_app(&mut self, id: &str, wants_new: bool, origin: &str) {
-        match self.niri.app_system.app_state(id) {
+        match self.synoik.app_system.app_state(id) {
             AppState::Stopped => {
                 // `wants_new` makes no difference here: gnome-shell's
                 // `shell_app_open_new_window` on a stopped app falls through to
@@ -1928,7 +1962,7 @@ impl State {
             }
             AppState::Starting => {}
             AppState::Running => {
-                if wants_new && self.niri.app_system.can_open_new_window(id) {
+                if wants_new && self.synoik.app_system.can_open_new_window(id) {
                     self.launch_app(id, LaunchMode::NewWindow, None, origin);
                 } else if let Some(window) = self.most_recent_window_of(id) {
                     self.update_keyboard_focus();
@@ -1947,7 +1981,7 @@ impl State {
     /// one goes missing.
     fn nth_favorite_app(&self, n: u8) -> Option<String> {
         let index = usize::from(n).checked_sub(1)?;
-        self.niri
+        self.synoik
             .app_system
             .favorites()
             .get(index)
@@ -1961,7 +1995,7 @@ impl State {
     /// switcher's own list filtered to the app (the same pairing `app_items` does).
     fn most_recent_window_of(&self, id: &str) -> Option<smithay::desktop::Window> {
         let owned: Vec<_> = self
-            .niri
+            .synoik
             .app_system
             .running_app(id)?
             .windows
@@ -1969,11 +2003,11 @@ impl State {
             .map(|w| w.id)
             .collect();
         let first = self
-            .niri
+            .synoik
             .switcher_tab_list(false)
             .into_iter()
             .find(|id| owned.contains(id))?;
-        self.niri.find_window_by_id(first)
+        self.synoik.find_window_by_id(first)
     }
 
     fn launch_app(
@@ -1983,13 +2017,13 @@ impl State {
         workspace: Option<crate::layout::workspace::WorkspaceId>,
         origin: &str,
     ) -> bool {
-        let (token, _) = self.niri.activation_state.create_external_token(None);
+        let (token, _) = self.synoik.activation_state.create_external_token(None);
         let ctx = crate::app_system::LaunchContext {
             token: Some(token.as_str().to_owned()),
             workspace,
             now: get_monotonic_time(),
         };
-        match self.niri.app_system.launch(id, mode, &ctx) {
+        match self.synoik.app_system.launch(id, mode, &ctx) {
             Ok(()) => true,
             Err(err) => {
                 tracing::warn!("{origin} launch of {id} failed: {err:?}");
@@ -2016,7 +2050,7 @@ impl State {
     /// picker's check optimistically.
     fn activate_audio_device(&mut self, key: crate::audio::AudioDeviceKey, output: bool) {
         use crate::audio::AudioDeviceKey;
-        let Some(audio) = self.niri.audio_backend.as_ref() else {
+        let Some(audio) = self.synoik.audio_backend.as_ref() else {
             return;
         };
         match key {
@@ -2047,14 +2081,14 @@ impl State {
 
     fn adjust_volume_by_scroll(&mut self, steps: f64) {
         let qs_open =
-            self.niri.panel_popover.open_role() == Some(crate::ui::panel::ROLE_QUICK_SETTINGS);
+            self.synoik.panel_popover.open_role() == Some(crate::ui::panel::ROLE_QUICK_SETTINGS);
         let action = volume_scroll_action(qs_open, steps);
 
         let steps = match action {
             VolumeScroll::Ignore => return,
             // The slider is on screen: say what the volume is, change nothing.
             VolumeScroll::OsdOnly => {
-                if let Some(status) = self.niri.audio {
+                if let Some(status) = self.synoik.audio {
                     self.show_volume_osd(&status);
                 }
                 return;
@@ -2062,10 +2096,10 @@ impl State {
             VolumeScroll::Step(steps) => steps,
         };
 
-        let before = self.niri.audio.map(|status| status.volume);
+        let before = self.synoik.audio.map(|status| status.volume);
         let delta = steps * crate::audio::SCROLL_STEP;
         let Some(status) = self
-            .niri
+            .synoik
             .audio_backend
             .as_ref()
             .and_then(|audio| audio.adjust_volume(delta))
@@ -2086,8 +2120,8 @@ impl State {
     pub fn show_volume_osd(&mut self, status: &crate::audio::AudioStatus) {
         let icon = crate::audio::volume_icon(status);
         let level = crate::ui::osd::OsdLevel::new(status.volume, crate::audio::MAX_VOLUME);
-        self.niri.osd.show_all(&[icon], None, level);
-        self.niri.queue_redraw_all();
+        self.synoik.osd.show_all(&[icon], None, level);
+        self.synoik.queue_redraw_all();
     }
 
     /// Start recording the active output, or stop if one is already running (the
@@ -2097,19 +2131,19 @@ impl State {
         use crate::screencasting::RecordingKind;
 
         let recording = self
-            .niri
+            .synoik
             .casting
             .recordings
             .iter()
             .any(|r| matches!(r.kind, RecordingKind::Native(_)));
         if recording {
             self.stop_screen_recordings();
-        } else if let Some(output) = self.niri.layout.active_output().cloned() {
+        } else if let Some(output) = self.synoik.layout.active_output().cloned() {
             match crate::recording::default_recording_path() {
                 Ok(path) => {
                     // The keybind/pill records the whole active output at 30fps, cursor drawn.
                     if let Err(err) = self
-                        .niri
+                        .synoik
                         .start_native_recording(&output, path, 30, true, None)
                     {
                         warn!("could not start screen recording: {err:?}");
@@ -2118,87 +2152,87 @@ impl State {
                 Err(err) => warn!("could not choose a recording path: {err:?}"),
             }
         }
-        self.niri.queue_redraw_all();
+        self.synoik.queue_redraw_all();
     }
 
     pub fn do_action(&mut self, action: Action, allow_when_locked: bool) {
-        if self.niri.is_locked() && !(allow_when_locked || allowed_when_locked(&action)) {
+        if self.synoik.is_locked() && !(allow_when_locked || allowed_when_locked(&action)) {
             return;
         }
 
-        if let Some(touch) = self.niri.seat.get_touch() {
+        if let Some(touch) = self.synoik.seat.get_touch() {
             touch.cancel(self);
         }
 
         match action {
             Action::Quit(skip_confirmation) => {
-                if !skip_confirmation && self.niri.exit_confirm_dialog.show() {
-                    self.niri.queue_redraw_all();
+                if !skip_confirmation && self.synoik.exit_confirm_dialog.show() {
+                    self.synoik.queue_redraw_all();
                     return;
                 }
 
                 info!("quitting as requested");
-                self.niri.stop_signal.stop();
+                self.synoik.stop_signal.stop();
             }
             Action::ChangeVt(vt) => {
                 self.backend.change_vt(vt);
                 // Changing VT may not deliver the key releases, so clear the state.
-                self.niri.suppressed_keys.clear();
+                self.synoik.suppressed_keys.clear();
             }
             Action::Suspend => {
                 self.backend.suspend();
                 // Suspend may not deliver the key releases, so clear the state.
-                self.niri.suppressed_keys.clear();
+                self.synoik.suppressed_keys.clear();
             }
             Action::PowerOffMonitors => {
-                self.niri.deactivate_monitors(&mut self.backend);
+                self.synoik.deactivate_monitors(&mut self.backend);
             }
             Action::PowerOnMonitors => {
-                self.niri.activate_monitors(&mut self.backend);
+                self.synoik.activate_monitors(&mut self.backend);
             }
             Action::Logout => self
-                .niri
+                .synoik
                 .request_session_action(crate::end_session::SessionRequest::Logout),
             Action::PowerOff => self
-                .niri
+                .synoik
                 .request_session_action(crate::end_session::SessionRequest::PowerOff),
             Action::Reboot => self
-                .niri
+                .synoik
                 .request_session_action(crate::end_session::SessionRequest::Reboot),
             Action::ToggleDebugTint => {
                 self.backend.toggle_debug_tint();
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::DebugToggleOpaqueRegions => {
-                self.niri.debug_draw_opaque_regions = !self.niri.debug_draw_opaque_regions;
-                self.niri.queue_redraw_all();
+                self.synoik.debug_draw_opaque_regions = !self.synoik.debug_draw_opaque_regions;
+                self.synoik.queue_redraw_all();
             }
             Action::DebugToggleDamage => {
-                self.niri.debug_toggle_damage();
+                self.synoik.debug_toggle_damage();
             }
             Action::Spawn(command) => {
-                let (token, _) = self.niri.activation_state.create_external_token(None);
+                let (token, _) = self.synoik.activation_state.create_external_token(None);
                 spawn(command, Some(token.clone()));
             }
             Action::SpawnSh(command) => {
-                let (token, _) = self.niri.activation_state.create_external_token(None);
+                let (token, _) = self.synoik.activation_state.create_external_token(None);
                 spawn_sh(command, Some(token.clone()));
             }
             Action::DoScreenTransition(delay_ms) => {
                 // Capture the Output-target neutral buffers through the owned renderer first.
                 let neutrals = self
                     .backend
-                    .with_vulkan_renderer(|vk| self.niri.capture_screen_transition_neutrals(vk))
+                    .with_vulkan_renderer(|vk| self.synoik.capture_screen_transition_neutrals(vk))
                     .unwrap_or_default();
                 // The neutrals are already captured, so the transition must not depend on a
                 // renderer being available here, or it would silently never run.
-                self.niri.do_screen_transition(neutrals, delay_ms);
+                self.synoik.do_screen_transition(neutrals, delay_ms);
             }
             Action::ScreenshotScreen(write_to_disk, show_pointer, path) => {
-                let active = self.niri.layout.active_output().cloned();
+                let active = self.synoik.layout.active_output().cloned();
                 if let Some(active) = active {
                     let res = self.backend.with_vulkan_renderer(|renderer| {
-                        self.niri
+                        self.synoik
                             .screenshot(renderer, &active, write_to_disk, show_pointer, path)
                     });
                     match res {
@@ -2215,8 +2249,8 @@ impl State {
                 self.cancel_screenshot();
             }
             Action::ScreenshotTogglePointer => {
-                self.niri.screenshot_ui.toggle_pointer();
-                self.niri.queue_redraw_all();
+                self.synoik.screenshot_ui.toggle_pointer();
+                self.synoik.queue_redraw_all();
             }
             Action::ScreenshotTypeSelection => {
                 self.set_screenshot_capture_type(CaptureType::Selection);
@@ -2232,13 +2266,13 @@ impl State {
             }
             Action::Screenshot(show_cursor, path) => {
                 self.open_screenshot_ui(show_cursor, path);
-                self.niri.switcher.cancel();
+                self.synoik.switcher.cancel();
             }
             Action::ScreenshotWindow(write_to_disk, show_pointer, path) => {
-                let focus = self.niri.layout.focus_with_output();
+                let focus = self.synoik.layout.focus_with_output();
                 if let Some((mapped, output)) = focus {
                     let res = self.backend.with_vulkan_renderer(|renderer| {
-                        self.niri.screenshot_window(
+                        self.synoik.screenshot_window(
                             renderer,
                             output,
                             mapped,
@@ -2262,12 +2296,12 @@ impl State {
                 show_pointer,
                 path,
             } => {
-                let mut windows = self.niri.layout.windows();
+                let mut windows = self.synoik.layout.windows();
                 let window = windows.find(|(_, m)| m.id().get() == id);
                 if let Some((Some(monitor), mapped)) = window {
                     let output = monitor.output();
                     let res = self.backend.with_vulkan_renderer(|renderer| {
-                        self.niri.screenshot_window(
+                        self.synoik.screenshot_window(
                             renderer,
                             output,
                             mapped,
@@ -2286,8 +2320,8 @@ impl State {
                 }
             }
             Action::ToggleKeyboardShortcutsInhibit => {
-                if let Some(inhibitor) = self.niri.keyboard_focus.surface().and_then(|surface| {
-                    self.niri
+                if let Some(inhibitor) = self.synoik.keyboard_focus.surface().and_then(|surface| {
+                    self.synoik
                         .keyboard_shortcuts_inhibiting_surfaces
                         .get(surface)
                 }) {
@@ -2302,8 +2336,8 @@ impl State {
                 // Only ever restores. mutter bails when the focus isn't inhibiting
                 // (`meta_wayland_compositor_restore_shortcuts`), and so must we: this is
                 // the key that gets you *out*, so it can never put you in.
-                if let Some(inhibitor) = self.niri.keyboard_focus.surface().and_then(|surface| {
-                    self.niri
+                if let Some(inhibitor) = self.synoik.keyboard_focus.surface().and_then(|surface| {
+                    self.synoik
                         .keyboard_shortcuts_inhibiting_surfaces
                         .get(surface)
                 }) {
@@ -2313,68 +2347,84 @@ impl State {
                 }
             }
             Action::CloseWindow => {
-                if let Some(mapped) = self.niri.layout.focus() {
+                if let Some(mapped) = self.synoik.layout.focus() {
                     mapped.toplevel().send_close();
                 }
             }
             Action::CloseWindowById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 if let Some((_, mapped)) = window {
                     mapped.toplevel().send_close();
                 }
             }
             Action::FullscreenWindow => {
-                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                let focus = self.synoik.layout.focus().map(|m| m.window.clone());
                 if let Some(window) = focus {
-                    self.niri.layout.toggle_fullscreen(&window);
+                    self.synoik.layout.toggle_fullscreen(&window);
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::FullscreenWindowById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.toggle_fullscreen(&window);
+                    self.synoik.layout.toggle_fullscreen(&window);
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::ToggleWindowedFullscreen => {
-                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                let focus = self.synoik.layout.focus().map(|m| m.window.clone());
                 if let Some(window) = focus {
-                    self.niri.layout.toggle_windowed_fullscreen(&window);
+                    self.synoik.layout.toggle_windowed_fullscreen(&window);
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::ToggleWindowedFullscreenById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.toggle_windowed_fullscreen(&window);
+                    self.synoik.layout.toggle_windowed_fullscreen(&window);
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::FocusWindow(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
                     self.focus_window(&window);
                 }
             }
             Action::FocusWindowInColumn(index) => {
-                self.niri.layout.focus_window_in_column(index);
+                self.synoik.layout.focus_window_in_column(index);
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowPrevious => {
-                let current = self.niri.layout.focus().map(|win| win.id());
+                let current = self.synoik.layout.focus().map(|win| win.id());
                 if let Some(window) = self
-                    .niri
+                    .synoik
                     .layout
                     .windows()
                     .map(|(_, win)| win)
@@ -2386,7 +2436,7 @@ impl State {
                 }
             }
             Action::SwitchLayout(action) => {
-                let keyboard = &self.niri.seat.get_keyboard().unwrap();
+                let keyboard = &self.synoik.seat.get_keyboard().unwrap();
                 keyboard.with_xkb_state(self, |mut state| match action {
                     LayoutSwitchTarget::Next => state.cycle_next_layout(),
                     LayoutSwitchTarget::Prev => state.cycle_prev_layout(),
@@ -2401,44 +2451,44 @@ impl State {
                 });
             }
             Action::MoveColumnLeft => {
-                if self.niri.screenshot_ui.is_open() {
-                    self.niri.screenshot_ui.move_left();
+                if self.synoik.screenshot_ui.is_open() {
+                    self.synoik.screenshot_ui.move_left();
                 } else {
-                    self.niri.layout.move_left();
+                    self.synoik.layout.move_left();
                     self.maybe_warp_cursor_to_focus();
                 }
 
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveColumnRight => {
-                if self.niri.screenshot_ui.is_open() {
-                    self.niri.screenshot_ui.move_right();
+                if self.synoik.screenshot_ui.is_open() {
+                    self.synoik.screenshot_ui.move_right();
                 } else {
-                    self.niri.layout.move_right();
+                    self.synoik.layout.move_right();
                     self.maybe_warp_cursor_to_focus();
                 }
 
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveColumnToFirst => {
-                self.niri.layout.move_column_to_first();
+                self.synoik.layout.move_column_to_first();
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveColumnToLast => {
-                self.niri.layout.move_column_to_last();
+                self.synoik.layout.move_column_to_last();
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveColumnLeftOrToMonitorLeft => {
-                if self.niri.screenshot_ui.is_open() {
-                    self.niri.screenshot_ui.move_left();
-                } else if let Some(output) = self.niri.output_left() {
-                    if self.niri.layout.move_column_left_or_to_output(&output)
+                if self.synoik.screenshot_ui.is_open() {
+                    self.synoik.screenshot_ui.move_left();
+                } else if let Some(output) = self.synoik.output_left() {
+                    if self.synoik.layout.move_column_left_or_to_output(&output)
                         && !self.maybe_warp_cursor_to_focus_centered()
                     {
                         self.move_cursor_to_output(&output);
@@ -2446,18 +2496,18 @@ impl State {
                         self.maybe_warp_cursor_to_focus();
                     }
                 } else {
-                    self.niri.layout.move_left();
+                    self.synoik.layout.move_left();
                     self.maybe_warp_cursor_to_focus();
                 }
 
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveColumnRightOrToMonitorRight => {
-                if self.niri.screenshot_ui.is_open() {
-                    self.niri.screenshot_ui.move_right();
-                } else if let Some(output) = self.niri.output_right() {
-                    if self.niri.layout.move_column_right_or_to_output(&output)
+                if self.synoik.screenshot_ui.is_open() {
+                    self.synoik.screenshot_ui.move_right();
+                } else if let Some(output) = self.synoik.output_right() {
+                    if self.synoik.layout.move_column_right_or_to_output(&output)
                         && !self.maybe_warp_cursor_to_focus_centered()
                     {
                         self.move_cursor_to_output(&output);
@@ -2465,167 +2515,177 @@ impl State {
                         self.maybe_warp_cursor_to_focus();
                     }
                 } else {
-                    self.niri.layout.move_right();
+                    self.synoik.layout.move_right();
                     self.maybe_warp_cursor_to_focus();
                 }
 
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveWindowDown => {
-                if self.niri.screenshot_ui.is_open() {
-                    self.niri.screenshot_ui.move_down();
+                if self.synoik.screenshot_ui.is_open() {
+                    self.synoik.screenshot_ui.move_down();
                 } else {
-                    self.niri.layout.move_down();
+                    self.synoik.layout.move_down();
                     self.maybe_warp_cursor_to_focus();
                 }
 
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveWindowUp => {
-                if self.niri.screenshot_ui.is_open() {
-                    self.niri.screenshot_ui.move_up();
+                if self.synoik.screenshot_ui.is_open() {
+                    self.synoik.screenshot_ui.move_up();
                 } else {
-                    self.niri.layout.move_up();
+                    self.synoik.layout.move_up();
                     self.maybe_warp_cursor_to_focus();
                 }
 
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveWindowDownOrToWorkspaceDown => {
-                if self.niri.screenshot_ui.is_open() {
-                    self.niri.screenshot_ui.move_down();
+                if self.synoik.screenshot_ui.is_open() {
+                    self.synoik.screenshot_ui.move_down();
                 } else {
-                    self.niri.layout.move_down_or_to_workspace_down();
+                    self.synoik.layout.move_down_or_to_workspace_down();
                     self.maybe_warp_cursor_to_focus();
                 }
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveWindowUpOrToWorkspaceUp => {
-                if self.niri.screenshot_ui.is_open() {
-                    self.niri.screenshot_ui.move_up();
+                if self.synoik.screenshot_ui.is_open() {
+                    self.synoik.screenshot_ui.move_up();
                 } else {
-                    self.niri.layout.move_up_or_to_workspace_up();
+                    self.synoik.layout.move_up_or_to_workspace_up();
                     self.maybe_warp_cursor_to_focus();
                 }
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::ConsumeOrExpelWindowLeft => {
-                self.niri.layout.consume_or_expel_window_left(None);
+                self.synoik.layout.consume_or_expel_window_left(None);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::ConsumeOrExpelWindowLeftById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.consume_or_expel_window_left(Some(&window));
+                    self.synoik
+                        .layout
+                        .consume_or_expel_window_left(Some(&window));
                     self.maybe_warp_cursor_to_focus();
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::ConsumeOrExpelWindowRight => {
-                self.niri.layout.consume_or_expel_window_right(None);
+                self.synoik.layout.consume_or_expel_window_right(None);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::ConsumeOrExpelWindowRightById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri
+                    self.synoik
                         .layout
                         .consume_or_expel_window_right(Some(&window));
                     self.maybe_warp_cursor_to_focus();
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::FocusColumnLeft => {
-                self.niri.layout.focus_left();
+                self.synoik.layout.focus_left();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusColumnLeftUnderMouse => {
-                if let Some((output, ws)) = self.niri.workspace_under_cursor(true) {
+                if let Some((output, ws)) = self.synoik.workspace_under_cursor(true) {
                     let ws_id = ws.id();
                     let ws = {
-                        let mut workspaces = self.niri.layout.workspaces_mut();
+                        let mut workspaces = self.synoik.layout.workspaces_mut();
                         workspaces.find(|ws| ws.id() == ws_id).unwrap()
                     };
                     ws.focus_left();
                     self.maybe_warp_cursor_to_focus();
-                    self.niri.layer_shell_on_demand_focus = None;
-                    self.niri.queue_redraw(&output);
+                    self.synoik.layer_shell_on_demand_focus = None;
+                    self.synoik.queue_redraw(&output);
                 }
             }
             Action::FocusColumnRight => {
-                self.niri.layout.focus_right();
+                self.synoik.layout.focus_right();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusColumnRightUnderMouse => {
-                if let Some((output, ws)) = self.niri.workspace_under_cursor(true) {
+                if let Some((output, ws)) = self.synoik.workspace_under_cursor(true) {
                     let ws_id = ws.id();
                     let ws = {
-                        let mut workspaces = self.niri.layout.workspaces_mut();
+                        let mut workspaces = self.synoik.layout.workspaces_mut();
                         workspaces.find(|ws| ws.id() == ws_id).unwrap()
                     };
                     ws.focus_right();
                     self.maybe_warp_cursor_to_focus();
-                    self.niri.layer_shell_on_demand_focus = None;
-                    self.niri.queue_redraw(&output);
+                    self.synoik.layer_shell_on_demand_focus = None;
+                    self.synoik.queue_redraw(&output);
                 }
             }
             Action::FocusColumnFirst => {
-                self.niri.layout.focus_column_first();
+                self.synoik.layout.focus_column_first();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusColumnLast => {
-                self.niri.layout.focus_column_last();
+                self.synoik.layout.focus_column_last();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusColumnRightOrFirst => {
-                self.niri.layout.focus_column_right_or_first();
+                self.synoik.layout.focus_column_right_or_first();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusColumnLeftOrLast => {
-                self.niri.layout.focus_column_left_or_last();
+                self.synoik.layout.focus_column_left_or_last();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusColumn(index) => {
-                self.niri.layout.focus_column(index);
+                self.synoik.layout.focus_column(index);
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowOrMonitorUp => {
-                if let Some(output) = self.niri.output_up() {
-                    if self.niri.layout.focus_window_up_or_output(&output)
+                if let Some(output) = self.synoik.output_up() {
+                    if self.synoik.layout.focus_window_up_or_output(&output)
                         && !self.maybe_warp_cursor_to_focus_centered()
                     {
                         self.move_cursor_to_output(&output);
@@ -2633,17 +2693,17 @@ impl State {
                         self.maybe_warp_cursor_to_focus();
                     }
                 } else {
-                    self.niri.layout.focus_up();
+                    self.synoik.layout.focus_up();
                     self.maybe_warp_cursor_to_focus();
                 }
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
 
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowOrMonitorDown => {
-                if let Some(output) = self.niri.output_down() {
-                    if self.niri.layout.focus_window_down_or_output(&output)
+                if let Some(output) = self.synoik.output_down() {
+                    if self.synoik.layout.focus_window_down_or_output(&output)
                         && !self.maybe_warp_cursor_to_focus_centered()
                     {
                         self.move_cursor_to_output(&output);
@@ -2651,17 +2711,17 @@ impl State {
                         self.maybe_warp_cursor_to_focus();
                     }
                 } else {
-                    self.niri.layout.focus_down();
+                    self.synoik.layout.focus_down();
                     self.maybe_warp_cursor_to_focus();
                 }
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
 
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusColumnOrMonitorLeft => {
-                if let Some(output) = self.niri.output_left() {
-                    if self.niri.layout.focus_column_left_or_output(&output)
+                if let Some(output) = self.synoik.output_left() {
+                    if self.synoik.layout.focus_column_left_or_output(&output)
                         && !self.maybe_warp_cursor_to_focus_centered()
                     {
                         self.move_cursor_to_output(&output);
@@ -2669,17 +2729,17 @@ impl State {
                         self.maybe_warp_cursor_to_focus();
                     }
                 } else {
-                    self.niri.layout.focus_left();
+                    self.synoik.layout.focus_left();
                     self.maybe_warp_cursor_to_focus();
                 }
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
 
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusColumnOrMonitorRight => {
-                if let Some(output) = self.niri.output_right() {
-                    if self.niri.layout.focus_column_right_or_output(&output)
+                if let Some(output) = self.synoik.output_right() {
+                    if self.synoik.layout.focus_column_right_or_output(&output)
                         && !self.maybe_warp_cursor_to_focus_centered()
                     {
                         self.move_cursor_to_output(&output);
@@ -2687,117 +2747,117 @@ impl State {
                         self.maybe_warp_cursor_to_focus();
                     }
                 } else {
-                    self.niri.layout.focus_right();
+                    self.synoik.layout.focus_right();
                     self.maybe_warp_cursor_to_focus();
                 }
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
 
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowDown => {
-                self.niri.layout.focus_down();
+                self.synoik.layout.focus_down();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowUp => {
-                self.niri.layout.focus_up();
+                self.synoik.layout.focus_up();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowDownOrColumnLeft => {
-                self.niri.layout.focus_down_or_left();
+                self.synoik.layout.focus_down_or_left();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowDownOrColumnRight => {
-                self.niri.layout.focus_down_or_right();
+                self.synoik.layout.focus_down_or_right();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowUpOrColumnLeft => {
-                self.niri.layout.focus_up_or_left();
+                self.synoik.layout.focus_up_or_left();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowUpOrColumnRight => {
-                self.niri.layout.focus_up_or_right();
+                self.synoik.layout.focus_up_or_right();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowOrWorkspaceDown => {
-                self.niri.layout.focus_window_or_workspace_down();
+                self.synoik.layout.focus_window_or_workspace_down();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowOrWorkspaceUp => {
-                self.niri.layout.focus_window_or_workspace_up();
+                self.synoik.layout.focus_window_or_workspace_up();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowTop => {
-                self.niri.layout.focus_window_top();
+                self.synoik.layout.focus_window_top();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowBottom => {
-                self.niri.layout.focus_window_bottom();
+                self.synoik.layout.focus_window_bottom();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowDownOrTop => {
-                self.niri.layout.focus_window_down_or_top();
+                self.synoik.layout.focus_window_down_or_top();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWindowUpOrBottom => {
-                self.niri.layout.focus_window_up_or_bottom();
+                self.synoik.layout.focus_window_up_or_bottom();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveWindowToWorkspaceDown(focus) => {
-                self.niri.layout.move_to_workspace_down(focus);
+                self.synoik.layout.move_to_workspace_down(focus);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveWindowToWorkspaceUp(focus) => {
-                self.niri.layout.move_to_workspace_up(focus);
+                self.synoik.layout.move_to_workspace_up(focus);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveWindowToWorkspace(reference, focus) => {
                 if let Some((mut output, index)) =
-                    self.niri.find_output_and_workspace_index(reference)
+                    self.synoik.find_output_and_workspace_index(reference)
                 {
                     // The source output is always the active output, so if the target output is
                     // also the active output, we don't need to use move_to_output().
-                    if let Some(active) = self.niri.layout.active_output() {
+                    if let Some(active) = self.synoik.layout.active_output() {
                         if output.as_ref() == Some(active) {
                             output = None;
                         }
@@ -2810,7 +2870,7 @@ impl State {
                     };
 
                     if let Some(output) = output {
-                        self.niri
+                        self.synoik
                             .layout
                             .move_to_output(None, &output, Some(index), activate);
 
@@ -2822,12 +2882,12 @@ impl State {
                             self.maybe_warp_cursor_to_focus();
                         }
                     } else {
-                        self.niri.layout.move_to_workspace(None, index, activate);
+                        self.synoik.layout.move_to_workspace(None, index, activate);
                         self.maybe_warp_cursor_to_focus();
                     }
 
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::MoveWindowToWorkspaceById {
@@ -2835,14 +2895,18 @@ impl State {
                 reference,
                 focus,
             } => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
                     if let Some((output, index)) =
-                        self.niri.find_output_and_workspace_index(reference)
+                        self.synoik.find_output_and_workspace_index(reference)
                     {
                         let target_was_active = self
-                            .niri
+                            .synoik
                             .layout
                             .active_output()
                             .is_some_and(|active| output.as_ref() == Some(active));
@@ -2854,7 +2918,7 @@ impl State {
                         };
 
                         if let Some(output) = output {
-                            self.niri.layout.move_to_output(
+                            self.synoik.layout.move_to_output(
                                 Some(&window),
                                 &output,
                                 Some(index),
@@ -2864,311 +2928,335 @@ impl State {
                             // If the active output changed (window was moved and focused).
                             #[allow(clippy::collapsible_if)]
                             if !target_was_active
-                                && self.niri.layout.active_output() == Some(&output)
+                                && self.synoik.layout.active_output() == Some(&output)
                             {
                                 if !self.maybe_warp_cursor_to_focus_centered() {
                                     self.move_cursor_to_output(&output);
                                 }
                             }
                         } else {
-                            self.niri
+                            self.synoik
                                 .layout
                                 .move_to_workspace(Some(&window), index, activate);
 
                             // If we focused the target window.
-                            let new_focus = self.niri.layout.focus();
+                            let new_focus = self.synoik.layout.focus();
                             if new_focus.is_some_and(|win| win.window == window) {
                                 self.maybe_warp_cursor_to_focus();
                             }
                         }
 
                         // FIXME: granular
-                        self.niri.queue_redraw_all();
+                        self.synoik.queue_redraw_all();
                     }
                 }
             }
             Action::MoveColumnToWorkspaceDown(focus) => {
-                self.niri.layout.move_column_to_workspace_down(focus);
+                self.synoik.layout.move_column_to_workspace_down(focus);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveColumnToWorkspaceUp(focus) => {
-                self.niri.layout.move_column_to_workspace_up(focus);
+                self.synoik.layout.move_column_to_workspace_up(focus);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveColumnToWorkspace(reference, focus) => {
                 if let Some((mut output, index)) =
-                    self.niri.find_output_and_workspace_index(reference)
+                    self.synoik.find_output_and_workspace_index(reference)
                 {
-                    if let Some(active) = self.niri.layout.active_output() {
+                    if let Some(active) = self.synoik.layout.active_output() {
                         if output.as_ref() == Some(active) {
                             output = None;
                         }
                     }
 
                     if let Some(output) = output {
-                        self.niri
+                        self.synoik
                             .layout
                             .move_column_to_output(&output, Some(index), focus);
                         if focus && !self.maybe_warp_cursor_to_focus_centered() {
                             self.move_cursor_to_output(&output);
                         }
                     } else {
-                        self.niri.layout.move_column_to_workspace(index, focus);
+                        self.synoik.layout.move_column_to_workspace(index, focus);
                         if focus {
                             self.maybe_warp_cursor_to_focus();
                         }
                     }
 
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::MoveColumnToIndex(idx) => {
-                self.niri.layout.move_column_to_index(idx);
+                self.synoik.layout.move_column_to_index(idx);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWorkspaceDown => {
-                self.niri.layout.switch_workspace_down();
+                self.synoik.layout.switch_workspace_down();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWorkspaceDownUnderMouse => {
-                if let Some(output) = self.niri.output_under_cursor() {
-                    if let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) {
+                if let Some(output) = self.synoik.output_under_cursor() {
+                    if let Some(mon) = self.synoik.layout.monitor_for_output_mut(&output) {
                         mon.switch_workspace_down();
                         self.maybe_warp_cursor_to_focus();
-                        self.niri.layer_shell_on_demand_focus = None;
-                        self.niri.queue_redraw(&output);
+                        self.synoik.layer_shell_on_demand_focus = None;
+                        self.synoik.queue_redraw(&output);
                     }
                 }
             }
             Action::FocusWorkspaceUp => {
-                self.niri.layout.switch_workspace_up();
+                self.synoik.layout.switch_workspace_up();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusWorkspaceUpUnderMouse => {
-                if let Some(output) = self.niri.output_under_cursor() {
-                    if let Some(mon) = self.niri.layout.monitor_for_output_mut(&output) {
+                if let Some(output) = self.synoik.output_under_cursor() {
+                    if let Some(mon) = self.synoik.layout.monitor_for_output_mut(&output) {
                         mon.switch_workspace_up();
                         self.maybe_warp_cursor_to_focus();
-                        self.niri.layer_shell_on_demand_focus = None;
-                        self.niri.queue_redraw(&output);
+                        self.synoik.layer_shell_on_demand_focus = None;
+                        self.synoik.queue_redraw(&output);
                     }
                 }
             }
             Action::FocusWorkspace(reference) => {
                 if let Some((mut output, index)) =
-                    self.niri.find_output_and_workspace_index(reference)
+                    self.synoik.find_output_and_workspace_index(reference)
                 {
-                    if let Some(active) = self.niri.layout.active_output() {
+                    if let Some(active) = self.synoik.layout.active_output() {
                         if output.as_ref() == Some(active) {
                             output = None;
                         }
                     }
 
                     if let Some(output) = output {
-                        self.niri.layout.focus_output(&output);
-                        self.niri.layout.switch_workspace(index);
+                        self.synoik.layout.focus_output(&output);
+                        self.synoik.layout.switch_workspace(index);
                         if !self.maybe_warp_cursor_to_focus_centered() {
                             self.move_cursor_to_output(&output);
                         }
                     } else {
-                        let config = &self.niri.config;
+                        let config = &self.synoik.config;
                         if config.borrow().input.workspace_auto_back_and_forth {
-                            self.niri.layout.switch_workspace_auto_back_and_forth(index);
+                            self.synoik
+                                .layout
+                                .switch_workspace_auto_back_and_forth(index);
                         } else {
-                            self.niri.layout.switch_workspace(index);
+                            self.synoik.layout.switch_workspace(index);
                         }
                         self.maybe_warp_cursor_to_focus();
                     }
-                    self.niri.layer_shell_on_demand_focus = None;
+                    self.synoik.layer_shell_on_demand_focus = None;
 
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::FocusWorkspacePrevious => {
-                self.niri.layout.switch_workspace_previous();
+                self.synoik.layout.switch_workspace_previous();
                 self.maybe_warp_cursor_to_focus();
-                self.niri.layer_shell_on_demand_focus = None;
+                self.synoik.layer_shell_on_demand_focus = None;
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveWorkspaceDown => {
-                self.niri.layout.move_workspace_down();
+                self.synoik.layout.move_workspace_down();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveWorkspaceUp => {
-                self.niri.layout.move_workspace_up();
+                self.synoik.layout.move_workspace_up();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveWorkspaceToIndex(new_idx) => {
                 let new_idx = new_idx.saturating_sub(1);
-                self.niri.layout.move_workspace_to_idx(None, new_idx);
+                self.synoik.layout.move_workspace_to_idx(None, new_idx);
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveWorkspaceToIndexByRef { new_idx, reference } => {
-                if let Some(res) = self.niri.find_output_and_workspace_index(reference) {
+                if let Some(res) = self.synoik.find_output_and_workspace_index(reference) {
                     let new_idx = new_idx.saturating_sub(1);
-                    self.niri.layout.move_workspace_to_idx(Some(res), new_idx);
+                    self.synoik.layout.move_workspace_to_idx(Some(res), new_idx);
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::SetWorkspaceName(name) => {
-                self.niri.layout.set_workspace_name(name, None);
+                self.synoik.layout.set_workspace_name(name, None);
             }
             Action::SetWorkspaceNameByRef { name, reference } => {
-                self.niri.layout.set_workspace_name(name, Some(reference));
+                self.synoik.layout.set_workspace_name(name, Some(reference));
             }
             Action::UnsetWorkspaceName => {
-                self.niri.layout.unset_workspace_name(None);
+                self.synoik.layout.unset_workspace_name(None);
             }
             Action::UnsetWorkSpaceNameByRef(reference) => {
-                self.niri.layout.unset_workspace_name(Some(reference));
+                self.synoik.layout.unset_workspace_name(Some(reference));
             }
             Action::ConsumeWindowIntoColumn => {
-                self.niri.layout.consume_into_column();
+                self.synoik.layout.consume_into_column();
                 // This does not cause immediate focus or window size change, so warping mouse to
                 // focus won't do anything here.
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::ExpelWindowFromColumn => {
-                self.niri.layout.expel_from_column();
+                self.synoik.layout.expel_from_column();
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::SwapWindowRight => {
-                self.niri
+                self.synoik
                     .layout
                     .swap_window_in_direction(ScrollDirection::Right);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::SwapWindowLeft => {
-                self.niri
+                self.synoik
                     .layout
                     .swap_window_in_direction(ScrollDirection::Left);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::ToggleColumnTabbedDisplay => {
-                self.niri.layout.toggle_column_tabbed_display();
+                self.synoik.layout.toggle_column_tabbed_display();
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::SetColumnDisplay(display) => {
-                self.niri.layout.set_column_display(display);
+                self.synoik.layout.set_column_display(display);
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::SwitchPresetColumnWidth => {
-                self.niri.layout.toggle_width(true);
+                self.synoik.layout.toggle_width(true);
             }
             Action::SwitchPresetColumnWidthBack => {
-                self.niri.layout.toggle_width(false);
+                self.synoik.layout.toggle_width(false);
             }
             Action::SwitchPresetWindowWidth => {
-                self.niri.layout.toggle_window_width(None, true);
+                self.synoik.layout.toggle_window_width(None, true);
             }
             Action::SwitchPresetWindowWidthBack => {
-                self.niri.layout.toggle_window_width(None, false);
+                self.synoik.layout.toggle_window_width(None, false);
             }
             Action::SwitchPresetWindowWidthById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.toggle_window_width(Some(&window), true);
+                    self.synoik.layout.toggle_window_width(Some(&window), true);
                 }
             }
             Action::SwitchPresetWindowWidthBackById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.toggle_window_width(Some(&window), false);
+                    self.synoik.layout.toggle_window_width(Some(&window), false);
                 }
             }
             Action::SwitchPresetWindowHeight => {
-                self.niri.layout.toggle_window_height(None, true);
+                self.synoik.layout.toggle_window_height(None, true);
             }
             Action::SwitchPresetWindowHeightBack => {
-                self.niri.layout.toggle_window_height(None, false);
+                self.synoik.layout.toggle_window_height(None, false);
             }
             Action::SwitchPresetWindowHeightById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.toggle_window_height(Some(&window), true);
+                    self.synoik.layout.toggle_window_height(Some(&window), true);
                 }
             }
             Action::SwitchPresetWindowHeightBackById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.toggle_window_height(Some(&window), false);
+                    self.synoik
+                        .layout
+                        .toggle_window_height(Some(&window), false);
                 }
             }
             Action::CenterColumn => {
-                self.niri.layout.center_column();
+                self.synoik.layout.center_column();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::CenterWindow => {
-                self.niri.layout.center_window(None);
+                self.synoik.layout.center_window(None);
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::CenterWindowById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.center_window(Some(&window));
+                    self.synoik.layout.center_window(Some(&window));
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::CenterVisibleColumns => {
-                self.niri.layout.center_visible_columns();
+                self.synoik.layout.center_visible_columns();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MaximizeColumn => {
-                self.niri.layout.toggle_full_width();
+                self.synoik.layout.toggle_full_width();
             }
             Action::Maximize => {
-                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                let focus = self.synoik.layout.focus().map(|m| m.window.clone());
                 if let Some(window) = focus {
-                    self.niri.layout.set_maximized(&window, true);
+                    self.synoik.layout.set_maximized(&window, true);
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::Unmaximize => {
-                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                let focus = self.synoik.layout.focus().map(|m| m.window.clone());
                 if let Some(window) = focus {
-                    self.niri.layout.set_maximized(&window, false);
+                    self.synoik.layout.set_maximized(&window, false);
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::ScreenBrightnessUp(current_monitor) => {
@@ -3181,207 +3269,214 @@ impl State {
                 self.step_brightness(crate::brightness::Step::Cycle, current_monitor);
             }
             Action::ToggleTiledLeft => {
-                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                let focus = self.synoik.layout.focus().map(|m| m.window.clone());
                 if let Some(window) = focus {
-                    self.niri.layout.toggle_tiled(&window, TileSide::Left);
+                    self.synoik.layout.toggle_tiled(&window, TileSide::Left);
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::ToggleTiledRight => {
-                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                let focus = self.synoik.layout.focus().map(|m| m.window.clone());
                 if let Some(window) = focus {
-                    self.niri.layout.toggle_tiled(&window, TileSide::Right);
+                    self.synoik.layout.toggle_tiled(&window, TileSide::Right);
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::MaximizeWindowToEdges => {
-                let focus = self.niri.layout.focus().map(|m| m.window.clone());
+                let focus = self.synoik.layout.focus().map(|m| m.window.clone());
                 if let Some(window) = focus {
-                    self.niri.layout.toggle_maximized(&window);
+                    self.synoik.layout.toggle_maximized(&window);
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::MaximizeWindowToEdgesById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.toggle_maximized(&window);
+                    self.synoik.layout.toggle_maximized(&window);
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::FocusMonitorLeft => {
-                if let Some(output) = self.niri.output_left() {
-                    self.niri.layout.focus_output(&output);
+                if let Some(output) = self.synoik.output_left() {
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
-                    self.niri.layer_shell_on_demand_focus = None;
+                    self.synoik.layer_shell_on_demand_focus = None;
                 }
             }
             Action::FocusMonitorRight => {
-                if let Some(output) = self.niri.output_right() {
-                    self.niri.layout.focus_output(&output);
+                if let Some(output) = self.synoik.output_right() {
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
-                    self.niri.layer_shell_on_demand_focus = None;
+                    self.synoik.layer_shell_on_demand_focus = None;
                 }
             }
             Action::FocusMonitorDown => {
-                if let Some(output) = self.niri.output_down() {
-                    self.niri.layout.focus_output(&output);
+                if let Some(output) = self.synoik.output_down() {
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
-                    self.niri.layer_shell_on_demand_focus = None;
+                    self.synoik.layer_shell_on_demand_focus = None;
                 }
             }
             Action::FocusMonitorUp => {
-                if let Some(output) = self.niri.output_up() {
-                    self.niri.layout.focus_output(&output);
+                if let Some(output) = self.synoik.output_up() {
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
-                    self.niri.layer_shell_on_demand_focus = None;
+                    self.synoik.layer_shell_on_demand_focus = None;
                 }
             }
             Action::FocusMonitorPrevious => {
-                if let Some(output) = self.niri.output_previous() {
-                    self.niri.layout.focus_output(&output);
+                if let Some(output) = self.synoik.output_previous() {
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
-                    self.niri.layer_shell_on_demand_focus = None;
+                    self.synoik.layer_shell_on_demand_focus = None;
                 }
             }
             Action::FocusMonitorNext => {
-                if let Some(output) = self.niri.output_next() {
-                    self.niri.layout.focus_output(&output);
+                if let Some(output) = self.synoik.output_next() {
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
-                    self.niri.layer_shell_on_demand_focus = None;
+                    self.synoik.layer_shell_on_demand_focus = None;
                 }
             }
             Action::FocusMonitor(output) => {
-                if let Some(output) = self.niri.output_by_name_match(&output).cloned() {
-                    self.niri.layout.focus_output(&output);
+                if let Some(output) = self.synoik.output_by_name_match(&output).cloned() {
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
-                    self.niri.layer_shell_on_demand_focus = None;
+                    self.synoik.layer_shell_on_demand_focus = None;
                 }
             }
             Action::MoveWindowToMonitorLeft => {
-                if let Some(current_output) = self.niri.screenshot_ui.selection_output() {
-                    if let Some(target_output) = self.niri.output_left_of(current_output) {
+                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                    if let Some(target_output) = self.synoik.output_left_of(current_output) {
                         self.move_cursor_to_output(&target_output);
-                        self.niri.screenshot_ui.move_to_output(target_output);
+                        self.synoik.screenshot_ui.move_to_output(target_output);
                     }
-                } else if let Some(output) = self.niri.output_left() {
-                    self.niri
+                } else if let Some(output) = self.synoik.output_left() {
+                    self.synoik
                         .layout
                         .move_to_output(None, &output, None, ActivateWindow::Smart);
-                    self.niri.layout.focus_output(&output);
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveWindowToMonitorRight => {
-                if let Some(current_output) = self.niri.screenshot_ui.selection_output() {
-                    if let Some(target_output) = self.niri.output_right_of(current_output) {
+                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                    if let Some(target_output) = self.synoik.output_right_of(current_output) {
                         self.move_cursor_to_output(&target_output);
-                        self.niri.screenshot_ui.move_to_output(target_output);
+                        self.synoik.screenshot_ui.move_to_output(target_output);
                     }
-                } else if let Some(output) = self.niri.output_right() {
-                    self.niri
+                } else if let Some(output) = self.synoik.output_right() {
+                    self.synoik
                         .layout
                         .move_to_output(None, &output, None, ActivateWindow::Smart);
-                    self.niri.layout.focus_output(&output);
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveWindowToMonitorDown => {
-                if let Some(current_output) = self.niri.screenshot_ui.selection_output() {
-                    if let Some(target_output) = self.niri.output_down_of(current_output) {
+                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                    if let Some(target_output) = self.synoik.output_down_of(current_output) {
                         self.move_cursor_to_output(&target_output);
-                        self.niri.screenshot_ui.move_to_output(target_output);
+                        self.synoik.screenshot_ui.move_to_output(target_output);
                     }
-                } else if let Some(output) = self.niri.output_down() {
-                    self.niri
+                } else if let Some(output) = self.synoik.output_down() {
+                    self.synoik
                         .layout
                         .move_to_output(None, &output, None, ActivateWindow::Smart);
-                    self.niri.layout.focus_output(&output);
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveWindowToMonitorUp => {
-                if let Some(current_output) = self.niri.screenshot_ui.selection_output() {
-                    if let Some(target_output) = self.niri.output_up_of(current_output) {
+                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                    if let Some(target_output) = self.synoik.output_up_of(current_output) {
                         self.move_cursor_to_output(&target_output);
-                        self.niri.screenshot_ui.move_to_output(target_output);
+                        self.synoik.screenshot_ui.move_to_output(target_output);
                     }
-                } else if let Some(output) = self.niri.output_up() {
-                    self.niri
+                } else if let Some(output) = self.synoik.output_up() {
+                    self.synoik
                         .layout
                         .move_to_output(None, &output, None, ActivateWindow::Smart);
-                    self.niri.layout.focus_output(&output);
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveWindowToMonitorPrevious => {
-                if let Some(current_output) = self.niri.screenshot_ui.selection_output() {
-                    if let Some(target_output) = self.niri.output_previous_of(current_output) {
+                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                    if let Some(target_output) = self.synoik.output_previous_of(current_output) {
                         self.move_cursor_to_output(&target_output);
-                        self.niri.screenshot_ui.move_to_output(target_output);
+                        self.synoik.screenshot_ui.move_to_output(target_output);
                     }
-                } else if let Some(output) = self.niri.output_previous() {
-                    self.niri
+                } else if let Some(output) = self.synoik.output_previous() {
+                    self.synoik
                         .layout
                         .move_to_output(None, &output, None, ActivateWindow::Smart);
-                    self.niri.layout.focus_output(&output);
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveWindowToMonitorNext => {
-                if let Some(current_output) = self.niri.screenshot_ui.selection_output() {
-                    if let Some(target_output) = self.niri.output_next_of(current_output) {
+                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                    if let Some(target_output) = self.synoik.output_next_of(current_output) {
                         self.move_cursor_to_output(&target_output);
-                        self.niri.screenshot_ui.move_to_output(target_output);
+                        self.synoik.screenshot_ui.move_to_output(target_output);
                     }
-                } else if let Some(output) = self.niri.output_next() {
-                    self.niri
+                } else if let Some(output) = self.synoik.output_next() {
+                    self.synoik
                         .layout
                         .move_to_output(None, &output, None, ActivateWindow::Smart);
-                    self.niri.layout.focus_output(&output);
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveWindowToMonitor(output) => {
-                if let Some(output) = self.niri.output_by_name_match(&output).cloned() {
-                    if self.niri.screenshot_ui.is_open() {
+                if let Some(output) = self.synoik.output_by_name_match(&output).cloned() {
+                    if self.synoik.screenshot_ui.is_open() {
                         self.move_cursor_to_output(&output);
-                        self.niri.screenshot_ui.move_to_output(output);
+                        self.synoik.screenshot_ui.move_to_output(output);
                     } else {
-                        self.niri
-                            .layout
-                            .move_to_output(None, &output, None, ActivateWindow::Smart);
-                        self.niri.layout.focus_output(&output);
+                        self.synoik.layout.move_to_output(
+                            None,
+                            &output,
+                            None,
+                            ActivateWindow::Smart,
+                        );
+                        self.synoik.layout.focus_output(&output);
                         if !self.maybe_warp_cursor_to_focus_centered() {
                             self.move_cursor_to_output(&output);
                         }
@@ -3389,18 +3484,22 @@ impl State {
                 }
             }
             Action::MoveWindowToMonitorById { id, output } => {
-                if let Some(output) = self.niri.output_by_name_match(&output).cloned() {
-                    let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                if let Some(output) = self.synoik.output_by_name_match(&output).cloned() {
+                    let window = self
+                        .synoik
+                        .layout
+                        .windows()
+                        .find(|(_, m)| m.id().get() == id);
                     let window = window.map(|(_, m)| m.window.clone());
 
                     if let Some(window) = window {
                         let target_was_active = self
-                            .niri
+                            .synoik
                             .layout
                             .active_output()
                             .is_some_and(|active| output == *active);
 
-                        self.niri.layout.move_to_output(
+                        self.synoik.layout.move_to_output(
                             Some(&window),
                             &output,
                             None,
@@ -3409,7 +3508,8 @@ impl State {
 
                         // If the active output changed (window was moved and focused).
                         #[allow(clippy::collapsible_if)]
-                        if !target_was_active && self.niri.layout.active_output() == Some(&output) {
+                        if !target_was_active && self.synoik.layout.active_output() == Some(&output)
+                        {
                             if !self.maybe_warp_cursor_to_focus_centered() {
                                 self.move_cursor_to_output(&output);
                             }
@@ -3418,97 +3518,111 @@ impl State {
                 }
             }
             Action::MoveColumnToMonitorLeft => {
-                if let Some(current_output) = self.niri.screenshot_ui.selection_output() {
-                    if let Some(target_output) = self.niri.output_left_of(current_output) {
+                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                    if let Some(target_output) = self.synoik.output_left_of(current_output) {
                         self.move_cursor_to_output(&target_output);
-                        self.niri.screenshot_ui.move_to_output(target_output);
+                        self.synoik.screenshot_ui.move_to_output(target_output);
                     }
-                } else if let Some(output) = self.niri.output_left() {
-                    self.niri.layout.move_column_to_output(&output, None, true);
-                    self.niri.layout.focus_output(&output);
+                } else if let Some(output) = self.synoik.output_left() {
+                    self.synoik
+                        .layout
+                        .move_column_to_output(&output, None, true);
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveColumnToMonitorRight => {
-                if let Some(current_output) = self.niri.screenshot_ui.selection_output() {
-                    if let Some(target_output) = self.niri.output_right_of(current_output) {
+                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                    if let Some(target_output) = self.synoik.output_right_of(current_output) {
                         self.move_cursor_to_output(&target_output);
-                        self.niri.screenshot_ui.move_to_output(target_output);
+                        self.synoik.screenshot_ui.move_to_output(target_output);
                     }
-                } else if let Some(output) = self.niri.output_right() {
-                    self.niri.layout.move_column_to_output(&output, None, true);
-                    self.niri.layout.focus_output(&output);
+                } else if let Some(output) = self.synoik.output_right() {
+                    self.synoik
+                        .layout
+                        .move_column_to_output(&output, None, true);
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveColumnToMonitorDown => {
-                if let Some(current_output) = self.niri.screenshot_ui.selection_output() {
-                    if let Some(target_output) = self.niri.output_down_of(current_output) {
+                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                    if let Some(target_output) = self.synoik.output_down_of(current_output) {
                         self.move_cursor_to_output(&target_output);
-                        self.niri.screenshot_ui.move_to_output(target_output);
+                        self.synoik.screenshot_ui.move_to_output(target_output);
                     }
-                } else if let Some(output) = self.niri.output_down() {
-                    self.niri.layout.move_column_to_output(&output, None, true);
-                    self.niri.layout.focus_output(&output);
+                } else if let Some(output) = self.synoik.output_down() {
+                    self.synoik
+                        .layout
+                        .move_column_to_output(&output, None, true);
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveColumnToMonitorUp => {
-                if let Some(current_output) = self.niri.screenshot_ui.selection_output() {
-                    if let Some(target_output) = self.niri.output_up_of(current_output) {
+                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                    if let Some(target_output) = self.synoik.output_up_of(current_output) {
                         self.move_cursor_to_output(&target_output);
-                        self.niri.screenshot_ui.move_to_output(target_output);
+                        self.synoik.screenshot_ui.move_to_output(target_output);
                     }
-                } else if let Some(output) = self.niri.output_up() {
-                    self.niri.layout.move_column_to_output(&output, None, true);
-                    self.niri.layout.focus_output(&output);
+                } else if let Some(output) = self.synoik.output_up() {
+                    self.synoik
+                        .layout
+                        .move_column_to_output(&output, None, true);
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveColumnToMonitorPrevious => {
-                if let Some(current_output) = self.niri.screenshot_ui.selection_output() {
-                    if let Some(target_output) = self.niri.output_previous_of(current_output) {
+                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                    if let Some(target_output) = self.synoik.output_previous_of(current_output) {
                         self.move_cursor_to_output(&target_output);
-                        self.niri.screenshot_ui.move_to_output(target_output);
+                        self.synoik.screenshot_ui.move_to_output(target_output);
                     }
-                } else if let Some(output) = self.niri.output_previous() {
-                    self.niri.layout.move_column_to_output(&output, None, true);
-                    self.niri.layout.focus_output(&output);
+                } else if let Some(output) = self.synoik.output_previous() {
+                    self.synoik
+                        .layout
+                        .move_column_to_output(&output, None, true);
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveColumnToMonitorNext => {
-                if let Some(current_output) = self.niri.screenshot_ui.selection_output() {
-                    if let Some(target_output) = self.niri.output_next_of(current_output) {
+                if let Some(current_output) = self.synoik.screenshot_ui.selection_output() {
+                    if let Some(target_output) = self.synoik.output_next_of(current_output) {
                         self.move_cursor_to_output(&target_output);
-                        self.niri.screenshot_ui.move_to_output(target_output);
+                        self.synoik.screenshot_ui.move_to_output(target_output);
                     }
-                } else if let Some(output) = self.niri.output_next() {
-                    self.niri.layout.move_column_to_output(&output, None, true);
-                    self.niri.layout.focus_output(&output);
+                } else if let Some(output) = self.synoik.output_next() {
+                    self.synoik
+                        .layout
+                        .move_column_to_output(&output, None, true);
+                    self.synoik.layout.focus_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveColumnToMonitor(output) => {
-                if let Some(output) = self.niri.output_by_name_match(&output).cloned() {
-                    if self.niri.screenshot_ui.is_open() {
+                if let Some(output) = self.synoik.output_by_name_match(&output).cloned() {
+                    if self.synoik.screenshot_ui.is_open() {
                         self.move_cursor_to_output(&output);
-                        self.niri.screenshot_ui.move_to_output(output);
+                        self.synoik.screenshot_ui.move_to_output(output);
                     } else {
-                        self.niri.layout.move_column_to_output(&output, None, true);
-                        self.niri.layout.focus_output(&output);
+                        self.synoik
+                            .layout
+                            .move_column_to_output(&output, None, true);
+                        self.synoik.layout.focus_output(&output);
                         if !self.maybe_warp_cursor_to_focus_centered() {
                             self.move_cursor_to_output(&output);
                         }
@@ -3516,121 +3630,133 @@ impl State {
                 }
             }
             Action::SetColumnWidth(change) => {
-                if self.niri.screenshot_ui.is_open() {
-                    self.niri.screenshot_ui.set_width(change);
+                if self.synoik.screenshot_ui.is_open() {
+                    self.synoik.screenshot_ui.set_width(change);
 
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 } else {
-                    self.niri.layout.set_column_width(change);
+                    self.synoik.layout.set_column_width(change);
                 }
             }
             Action::SetWindowWidth(change) => {
-                if self.niri.screenshot_ui.is_open() {
-                    self.niri.screenshot_ui.set_width(change);
+                if self.synoik.screenshot_ui.is_open() {
+                    self.synoik.screenshot_ui.set_width(change);
 
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 } else {
-                    self.niri.layout.set_window_width(None, change);
+                    self.synoik.layout.set_window_width(None, change);
                 }
             }
             Action::SetWindowWidthById { id, change } => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.set_window_width(Some(&window), change);
+                    self.synoik.layout.set_window_width(Some(&window), change);
                 }
             }
             Action::SetWindowHeight(change) => {
-                if self.niri.screenshot_ui.is_open() {
-                    self.niri.screenshot_ui.set_height(change);
+                if self.synoik.screenshot_ui.is_open() {
+                    self.synoik.screenshot_ui.set_height(change);
 
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 } else {
-                    self.niri.layout.set_window_height(None, change);
+                    self.synoik.layout.set_window_height(None, change);
                 }
             }
             Action::SetWindowHeightById { id, change } => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.set_window_height(Some(&window), change);
+                    self.synoik.layout.set_window_height(Some(&window), change);
                 }
             }
             Action::ResetWindowHeight => {
-                self.niri.layout.reset_window_height(None);
+                self.synoik.layout.reset_window_height(None);
             }
             Action::ResetWindowHeightById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.reset_window_height(Some(&window));
+                    self.synoik.layout.reset_window_height(Some(&window));
                 }
             }
             Action::ExpandColumnToAvailableWidth => {
-                self.niri.layout.expand_column_to_available_width();
+                self.synoik.layout.expand_column_to_available_width();
             }
             Action::ShowHotkeyOverlay => {
-                if self.niri.hotkey_overlay.show() {
-                    self.niri.queue_redraw_all();
+                if self.synoik.hotkey_overlay.show() {
+                    self.synoik.queue_redraw_all();
 
                     #[cfg(feature = "dbus")]
-                    self.niri.a11y_announce_hotkey_overlay();
+                    self.synoik.a11y_announce_hotkey_overlay();
                 }
             }
             Action::MoveWorkspaceToMonitorLeft => {
-                if let Some(output) = self.niri.output_left() {
-                    self.niri.layout.move_workspace_to_output(&output);
+                if let Some(output) = self.synoik.output_left() {
+                    self.synoik.layout.move_workspace_to_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveWorkspaceToMonitorRight => {
-                if let Some(output) = self.niri.output_right() {
-                    self.niri.layout.move_workspace_to_output(&output);
+                if let Some(output) = self.synoik.output_right() {
+                    self.synoik.layout.move_workspace_to_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveWorkspaceToMonitorDown => {
-                if let Some(output) = self.niri.output_down() {
-                    self.niri.layout.move_workspace_to_output(&output);
+                if let Some(output) = self.synoik.output_down() {
+                    self.synoik.layout.move_workspace_to_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveWorkspaceToMonitorUp => {
-                if let Some(output) = self.niri.output_up() {
-                    self.niri.layout.move_workspace_to_output(&output);
+                if let Some(output) = self.synoik.output_up() {
+                    self.synoik.layout.move_workspace_to_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveWorkspaceToMonitorPrevious => {
-                if let Some(output) = self.niri.output_previous() {
-                    self.niri.layout.move_workspace_to_output(&output);
+                if let Some(output) = self.synoik.output_previous() {
+                    self.synoik.layout.move_workspace_to_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveWorkspaceToMonitorNext => {
-                if let Some(output) = self.niri.output_next() {
-                    self.niri.layout.move_workspace_to_output(&output);
+                if let Some(output) = self.synoik.output_next() {
+                    self.synoik.layout.move_workspace_to_output(&output);
                     if !self.maybe_warp_cursor_to_focus_centered() {
                         self.move_cursor_to_output(&output);
                     }
                 }
             }
             Action::MoveWorkspaceToMonitor(new_output) => {
-                if let Some(new_output) = self.niri.output_by_name_match(&new_output).cloned() {
-                    if self.niri.layout.move_workspace_to_output(&new_output)
+                if let Some(new_output) = self.synoik.output_by_name_match(&new_output).cloned() {
+                    if self.synoik.layout.move_workspace_to_output(&new_output)
                         && !self.maybe_warp_cursor_to_focus_centered()
                     {
                         self.move_cursor_to_output(&new_output);
@@ -3642,11 +3768,12 @@ impl State {
                 reference,
             } => {
                 if let Some((output, old_idx)) =
-                    self.niri.find_output_and_workspace_index(reference)
+                    self.synoik.find_output_and_workspace_index(reference)
                 {
-                    if let Some(new_output) = self.niri.output_by_name_match(&output_name).cloned()
+                    if let Some(new_output) =
+                        self.synoik.output_by_name_match(&output_name).cloned()
                     {
-                        if self.niri.layout.move_workspace_to_output_by_id(
+                        if self.synoik.layout.move_workspace_to_output_by_id(
                             old_idx,
                             output,
                             &new_output,
@@ -3660,68 +3787,84 @@ impl State {
                 }
             }
             Action::ToggleWindowFloating => {
-                self.niri.layout.toggle_window_floating(None);
+                self.synoik.layout.toggle_window_floating(None);
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::ToggleWindowFloatingById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.toggle_window_floating(Some(&window));
+                    self.synoik.layout.toggle_window_floating(Some(&window));
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::MoveWindowToFloating => {
-                self.niri.layout.set_window_floating(None, true);
+                self.synoik.layout.set_window_floating(None, true);
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveWindowToFloatingById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.set_window_floating(Some(&window), true);
+                    self.synoik.layout.set_window_floating(Some(&window), true);
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::MoveWindowToTiling => {
-                self.niri.layout.set_window_floating(None, false);
+                self.synoik.layout.set_window_floating(None, false);
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveWindowToTilingById(id) => {
-                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = self
+                    .synoik
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id);
                 let window = window.map(|(_, m)| m.window.clone());
                 if let Some(window) = window {
-                    self.niri.layout.set_window_floating(Some(&window), false);
+                    self.synoik.layout.set_window_floating(Some(&window), false);
                     // FIXME: granular
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::FocusFloating => {
-                self.niri.layout.focus_floating();
+                self.synoik.layout.focus_floating();
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::FocusTiling => {
-                self.niri.layout.focus_tiling();
+                self.synoik.layout.focus_tiling();
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::SwitchFocusBetweenFloatingAndTiling => {
-                self.niri.layout.switch_focus_floating_tiling();
+                self.synoik.layout.switch_focus_floating_tiling();
                 self.maybe_warp_cursor_to_focus();
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::MoveFloatingWindowById { id, x, y } => {
                 let window = if let Some(id) = id {
-                    let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                    let window = self
+                        .synoik
+                        .layout
+                        .windows()
+                        .find(|(_, m)| m.id().get() == id);
                     let window = window.map(|(_, m)| m.window.clone());
                     if window.is_none() {
                         return;
@@ -3731,15 +3874,15 @@ impl State {
                     None
                 };
 
-                self.niri
+                self.synoik
                     .layout
                     .move_floating_window(window.as_ref(), x, y, true);
                 // FIXME: granular
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::ToggleWindowRuleOpacity => {
                 let active_window = self
-                    .niri
+                    .synoik
                     .layout
                     .active_workspace_mut()
                     .and_then(|ws| ws.active_window_mut());
@@ -3747,13 +3890,13 @@ impl State {
                     if window.rules().opacity.is_some_and(|o| o != 1.) {
                         window.toggle_ignore_opacity_window_rule();
                         // FIXME: granular
-                        self.niri.queue_redraw_all();
+                        self.synoik.queue_redraw_all();
                     }
                 }
             }
             Action::ToggleWindowRuleOpacityById(id) => {
                 let window = self
-                    .niri
+                    .synoik
                     .layout
                     .workspaces_mut()
                     .find_map(|ws| ws.windows_mut().find(|w| w.id().get() == id));
@@ -3761,13 +3904,13 @@ impl State {
                     if window.rules().opacity.is_some_and(|o| o != 1.) {
                         window.toggle_ignore_opacity_window_rule();
                         // FIXME: granular
-                        self.niri.queue_redraw_all();
+                        self.synoik.queue_redraw_all();
                     }
                 }
             }
             Action::SetDynamicCastWindow => {
                 let id = self
-                    .niri
+                    .synoik
                     .layout
                     .active_workspace()
                     .and_then(|ws| ws.active_window())
@@ -3777,15 +3920,15 @@ impl State {
                 }
             }
             Action::SetDynamicCastWindowById(id) => {
-                let layout = &self.niri.layout;
+                let layout = &self.synoik.layout;
                 if layout.windows().any(|(_, mapped)| mapped.id().get() == id) {
                     self.set_dynamic_cast_target(CastTarget::Window { id });
                 }
             }
             Action::SetDynamicCastMonitor(output) => {
                 let output = match output {
-                    None => self.niri.layout.active_output(),
-                    Some(name) => self.niri.output_by_name_match(&name),
+                    None => self.synoik.layout.active_output(),
+                    Some(name) => self.synoik.output_by_name_match(&name),
                 };
                 if let Some(output) = output {
                     self.set_dynamic_cast_target(CastTarget::output(output));
@@ -3795,7 +3938,7 @@ impl State {
                 self.set_dynamic_cast_target(CastTarget::Nothing);
             }
             Action::StopCast(session_id) => {
-                self.niri.stop_cast(CastSessionId::from(session_id));
+                self.synoik.stop_cast(CastSessionId::from(session_id));
             }
             Action::FocusWorkspaceLast => {
                 if let Some(last) = self.last_workspace_index() {
@@ -3817,9 +3960,9 @@ impl State {
                 if let Some(id) = self.nth_favorite_app(n) {
                     // `_switchToApplication` hides the overview before activating, so the
                     // key works the same whether or not you are looking at the overview.
-                    self.niri.layout.close_overview();
+                    self.synoik.layout.close_overview();
                     self.activate_app(&id, false, "keybinding");
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::OpenNewWindowApplication(n) => {
@@ -3829,29 +3972,29 @@ impl State {
                 }
             }
             Action::ToggleOverview => {
-                self.niri.layout.toggle_overview();
-                self.niri.queue_redraw_all();
+                self.synoik.layout.toggle_overview();
+                self.synoik.queue_redraw_all();
             }
             Action::ToggleApplicationView => {
                 // `_toggleAppsPage` (`overviewControls.js:660-667`): with the overview
                 // up this is the show-apps button, flipping between the window picker
                 // and the grid; with it down it opens the overview *at* the grid rather
                 // than at the picker.
-                if self.niri.layout.is_overview_open() {
-                    self.niri.layout.toggle_app_grid();
+                if self.synoik.layout.is_overview_open() {
+                    self.synoik.layout.toggle_app_grid();
                 } else {
-                    self.niri.layout.open_overview();
-                    self.niri.layout.open_app_grid();
+                    self.synoik.layout.open_overview();
+                    self.synoik.layout.open_app_grid();
                 }
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::ToggleMessageTray => {
-                if let Some(output) = self.niri.layout.active_output().cloned() {
+                if let Some(output) = self.synoik.layout.active_output().cloned() {
                     self.toggle_date_menu(output);
                 }
             }
             Action::ToggleQuickSettings => {
-                if let Some(output) = self.niri.layout.active_output().cloned() {
+                if let Some(output) = self.synoik.layout.active_output().cloned() {
                     self.toggle_quick_settings_menu(output);
                 }
             }
@@ -3864,31 +4007,31 @@ impl State {
                 warn!("screen recording requires the xdp-gnome-screencast feature");
             }
             Action::OpenOverview => {
-                if self.niri.layout.open_overview() {
-                    self.niri.queue_redraw_all();
+                if self.synoik.layout.open_overview() {
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::CloseOverview => {
-                if self.niri.layout.close_overview() {
-                    self.niri.queue_redraw_all();
+                if self.synoik.layout.close_overview() {
+                    self.synoik.queue_redraw_all();
                 }
             }
             Action::ShowRunDialog => {
                 // gnome-shell refuses to open the run dialog when the lockdown
                 // key is set (`RunDialog.open`), and outside the unlocked user
                 // session (`sessionMode.hasRunDialog`).
-                if self.niri.gnome_settings.disable_command_line || self.niri.is_locked() {
+                if self.synoik.gnome_settings.disable_command_line || self.synoik.is_locked() {
                     return;
                 }
-                self.niri.run_dialog.open();
-                self.niri.queue_redraw_all();
+                self.synoik.run_dialog.open();
+                self.synoik.queue_redraw_all();
             }
             Action::ActivateAcceleratorGrab(action) => {
-                self.niri.emit_accelerator_signal(action, true);
+                self.synoik.emit_accelerator_signal(action, true);
             }
             Action::ToggleWindowUrgent(id) => {
                 let window = self
-                    .niri
+                    .synoik
                     .layout
                     .workspaces_mut()
                     .find_map(|ws| ws.windows_mut().find(|w| w.id().get() == id));
@@ -3896,29 +4039,29 @@ impl State {
                     let urgent = window.is_urgent();
                     window.set_urgent(!urgent);
                 }
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::SetWindowUrgent(id) => {
                 let window = self
-                    .niri
+                    .synoik
                     .layout
                     .workspaces_mut()
                     .find_map(|ws| ws.windows_mut().find(|w| w.id().get() == id));
                 if let Some(window) = window {
                     window.set_urgent(true);
                 }
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::UnsetWindowUrgent(id) => {
                 let window = self
-                    .niri
+                    .synoik
                     .layout
                     .workspaces_mut()
                     .find_map(|ws| ws.windows_mut().find(|w| w.id().get() == id));
                 if let Some(window) = window {
                     window.set_urgent(false);
                 }
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             Action::SwitchApplications { backward } => {
                 self.switch_applications(backward);
@@ -3948,52 +4091,52 @@ impl State {
         // cursor under our chrome; a compositor grab is not a client, and stomping it mid-drag
         // replaces the resize cursor with an arrow while the user is still resizing.
         let grabbed = self
-            .niri
+            .synoik
             .seat
             .get_pointer()
             .is_some_and(|pointer| pointer.is_grabbed());
         // The shield is over everything, so while it is down the only thing that tracks `:hover` is
         // its own chrome. Falling through to the panel and overview below would light up buttons
         // nobody can see, and redraw for each one.
-        if self.niri.screen_shield.is_active() {
+        if self.synoik.screen_shield.is_active() {
             let now = crate::utils::get_monotonic_time();
-            let on_button = self.niri.switch_user_reactive(now)
+            let on_button = self.synoik.switch_user_reactive(now)
                 && self
-                    .niri
+                    .synoik
                     .output_under(pos)
-                    .and_then(|(output, _)| self.niri.global_space.output_geometry(output))
+                    .and_then(|(output, _)| self.synoik.global_space.output_geometry(output))
                     .is_some_and(|geo| crate::ui::lock_screen::switch_user_hit(geo.to_f64(), pos));
-            if self.niri.switch_user_hovered != on_button {
-                self.niri.switch_user_hovered = on_button;
-                self.niri.queue_redraw_all();
+            if self.synoik.switch_user_hovered != on_button {
+                self.synoik.switch_user_hovered = on_button;
+                self.synoik.queue_redraw_all();
             }
             return;
         }
-        if self.niri.switch_user_hovered {
-            self.niri.switch_user_hovered = false;
+        if self.synoik.switch_user_hovered {
+            self.synoik.switch_user_hovered = false;
         }
 
-        let role = if self.niri.layout.is_gnome_mode() {
-            self.niri.output_under(pos).and_then(|(output, p)| {
-                let ws = self.niri.workspace_state_for(output);
+        let role = if self.synoik.layout.is_gnome_mode() {
+            self.synoik.output_under(pos).and_then(|(output, p)| {
+                let ws = self.synoik.workspace_state_for(output);
                 let output_w = output_size(output).w;
-                self.niri.panel.hit_test(p, output_w, ws)
+                self.synoik.panel.hit_test(p, output_w, ws)
             })
         } else {
             None
         };
-        if self.niri.panel.set_hovered_role(role) {
-            self.niri.queue_redraw_all();
+        if self.synoik.panel.set_hovered_role(role) {
+            self.synoik.queue_redraw_all();
         }
 
         // The overview dash + search track their hovered element so they can paint its
         // hover fill (`.overview-icon:hover` / `.overview-tile:hover`). Only when the
-        // overview UI is actually on screen — see `Niri::overview_ui_visible` (matches
+        // overview UI is actually on screen — see `Synoik::overview_ui_visible` (matches
         // the render gate); otherwise this is churn (redraws) over UI nobody sees.
-        let overview_visible = self.niri.overview_ui_visible();
+        let overview_visible = self.synoik.overview_ui_visible();
         // The grid is reactive only while it's open and no search is covering it.
         let grid_reactive =
-            self.niri.layout.is_app_grid_open() && !self.niri.overview_search.is_active();
+            self.synoik.layout.is_app_grid_open() && !self.synoik.overview_search.is_active();
         // An app-icon drag grabs the pointer, so nothing under it tracks `:hover`:
         // gnome-shell's DND routes motion to the drag monitor instead of to the actors,
         // and the one thing that lights up is the show-apps button while it is offering
@@ -4001,12 +4144,12 @@ impl State {
         // called from `_onItemDragMotion`, `dash.js:447-450`).
         // An open app-folder dialog is modal over the overview, so nothing beneath it
         // tracks `:hover` either — its own view does, below.
-        let folder_open = self.niri.folder_dialog.is_open();
+        let folder_open = self.synoik.folder_dialog.is_open();
         let (dash_hit, search_hit, grid_hit, arrow_hit) = if folder_open {
             (None, None, None, None)
-        } else if let Some(drag) = &self.niri.app_drag {
+        } else if let Some(drag) = &self.synoik.app_drag {
             (drag.unpin.then_some(DashHit::ShowApps), None, None, None)
-        } else if self.niri.panel_popover.is_open() {
+        } else if self.synoik.panel_popover.is_open() {
             // An open menu holds a `Clutter.Grab` (`PopupMenuManager`), so motion never
             // reaches the actors beneath it — not the icon under the box, and not the
             // ones beside it either. Without this an app's own context menu lights up
@@ -4016,10 +4159,10 @@ impl State {
             // `setForcedHighlight(true)` (`appDisplay.js:3028`) and only releases it when
             // the menu pops down (`_onMenuPoppedDown`, `appDisplay.js:3055-3058`), so the
             // menu visibly belongs to something for as long as it is up.
-            match self.niri.app_menu_source.as_ref().filter(|_| {
+            match self.synoik.app_menu_source.as_ref().filter(|_| {
                 // Read only while an app menu is actually up: the source is left behind
                 // when the menu closes rather than cleared from every close path.
-                self.niri.panel_popover.is_app_menu()
+                self.synoik.panel_popover.is_app_menu()
             }) {
                 Some(OverviewHit::Dash(hit)) => (Some(*hit), None, None, None),
                 Some(OverviewHit::GridApp(i)) => (None, None, Some(*i), None),
@@ -4027,16 +4170,16 @@ impl State {
                 _ => (None, None, None, None),
             }
         } else if overview_visible {
-            match self.niri.output_under(pos) {
-                Some((output, p)) => match self.niri.layout.controls_layout_for_output(output) {
+            match self.synoik.output_under(pos) {
+                Some((output, p)) => match self.synoik.layout.controls_layout_for_output(output) {
                     Some(controls) => (
-                        self.niri.dash.hit_test(p, controls.dash),
-                        self.niri.overview_search.hit_test(p, controls.into()),
+                        self.synoik.dash.hit_test(p, controls.dash),
+                        self.synoik.overview_search.hit_test(p, controls.into()),
                         grid_reactive
-                            .then(|| self.niri.app_grid.hit_test(p, controls.app_display))
+                            .then(|| self.synoik.app_grid.hit_test(p, controls.app_display))
                             .flatten(),
                         grid_reactive
-                            .then(|| self.niri.app_grid.arrow_hit(p, controls.app_display))
+                            .then(|| self.synoik.app_grid.arrow_hit(p, controls.app_display))
                             .flatten(),
                     ),
                     None => (None, None, None, None),
@@ -4046,29 +4189,29 @@ impl State {
         } else {
             (None, None, None, None)
         };
-        if self.niri.dash.set_hovered(dash_hit) {
-            self.niri.queue_redraw_all();
+        if self.synoik.dash.set_hovered(dash_hit) {
+            self.synoik.queue_redraw_all();
         }
-        if self.niri.overview_search.set_hovered(search_hit) {
-            self.niri.queue_redraw_all();
+        if self.synoik.overview_search.set_hovered(search_hit) {
+            self.synoik.queue_redraw_all();
         }
-        if self.niri.app_grid.set_hovered(grid_hit) {
-            self.niri.queue_redraw_all();
+        if self.synoik.app_grid.set_hovered(grid_hit) {
+            self.synoik.queue_redraw_all();
         }
-        if self.niri.app_grid.set_arrow_hovered(arrow_hit) {
-            self.niri.queue_redraw_all();
+        if self.synoik.app_grid.set_arrow_hovered(arrow_hit) {
+            self.synoik.queue_redraw_all();
         }
         if folder_open {
             let under = self
-                .niri
+                .synoik
                 .output_under(pos)
                 .map(|(output, p)| (output_size(output), p));
             let (view, p) = match under {
                 Some((size, p)) => (Rectangle::from_size(size), Some(p)),
                 None => (Rectangle::default(), None),
             };
-            if self.niri.folder_dialog.set_pointer(p, view) {
-                self.niri.queue_redraw_all();
+            if self.synoik.folder_dialog.set_pointer(p, view) {
+                self.synoik.queue_redraw_all();
             }
         }
 
@@ -4079,70 +4222,69 @@ impl State {
         // pointer is on, which is what keeps the close button from fading out from
         // under a pointer that has left the slot to reach its overhanging half.
         let hovered = self
-            .niri
+            .synoik
             .layout
             .is_overview_open()
             .then(|| {
-                let (output, p) = self.niri.output_under(pos)?;
+                let (output, p) = self.synoik.output_under(pos)?;
                 let output = output.clone();
-                match self.niri.layout.window_under(&output, p) {
+                match self.synoik.layout.window_under(&output, p) {
                     Some((window, _)) => Some(LayoutElement::id(window).clone()),
                     // `preview_overlays` already yields the layout id.
                     None => self.preview_hover_under(&output, p),
                 }
             })
             .flatten();
-        if self.niri.layout.set_expose_hover(hovered.as_ref()) {
-            self.niri.queue_redraw_all();
+        if self.synoik.layout.set_expose_hover(hovered.as_ref()) {
+            self.synoik.queue_redraw_all();
         }
 
         // ...and its close button lightens under the pointer (`.window-close:hover`,
         // `_window-picker.scss:46-48`).
         let close_hovered = self
-            .niri
+            .synoik
             .output_under(pos)
             .map(|(output, p)| (output.clone(), p))
             .and_then(|(output, p)| self.preview_close_under(&output, p));
-        if self.niri.preview_close_hovered != close_hovered {
-            self.niri.preview_close_hovered = close_hovered;
-            self.niri.queue_redraw_all();
+        if self.synoik.preview_close_hovered != close_hovered {
+            self.synoik.preview_close_hovered = close_hovered;
+            self.synoik.queue_redraw_all();
         }
 
         // A strip thumbnail standing for an empty workspace shows its close button while
         // the pointer is on it, and that button lightens when the pointer is on the button
         // (divergence, `docs/fork/dynamic-workspaces-divergence.md`).
         let thumb_hovered = self
-            .niri
+            .synoik
             .thumbnail_workspace_under(pos)
             .map(|(_, ws)| ws.id());
-        let thumb_close_hovered = self.niri.thumbnail_close_under(pos);
-        if self.niri.thumbnail_hovered != thumb_hovered
-            || self.niri.thumbnail_close_hovered != thumb_close_hovered
+        let thumb_close_hovered = self.synoik.thumbnail_close_under(pos);
+        if self.synoik.thumbnail_hovered != thumb_hovered
+            || self.synoik.thumbnail_close_hovered != thumb_close_hovered
         {
-            self.niri.thumbnail_hovered = thumb_hovered;
-            self.niri.thumbnail_close_hovered = thumb_close_hovered;
-            self.niri.queue_redraw_all();
+            self.synoik.thumbnail_hovered = thumb_hovered;
+            self.synoik.thumbnail_close_hovered = thumb_close_hovered;
+            self.synoik.queue_redraw_all();
         }
 
         // Hovering the notification banner holds its expiry and expands the
         // banner; leaving restarts the countdown
         // (`js/ui/messageTray.js:970-1050,1102-1105`, simplified).
-        if self.niri.layout.is_gnome_mode() {
-            let inside = self
-                .niri
-                .output_under(pos)
-                .is_some_and(|(output, p)| self.niri.notification_banner.pointer_inside(output, p));
-            if self.niri.notification_banner.set_hovered(inside) {
-                self.niri.reschedule_notification_banner_timer();
+        if self.synoik.layout.is_gnome_mode() {
+            let inside = self.synoik.output_under(pos).is_some_and(|(output, p)| {
+                self.synoik.notification_banner.pointer_inside(output, p)
+            });
+            if self.synoik.notification_banner.set_hovered(inside) {
+                self.synoik.reschedule_notification_banner_timer();
                 // Hover-expand changes the banner's layout.
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             // The banner takes the pointer (`contents_under` suppresses the window
             // beneath it), so force the arrow — the app can no longer paint its
             // own cursor (e.g. an I-beam) under the banner. Not while a grab owns
             // the cursor: see `grabbed` above.
             if inside && !grabbed {
-                self.niri
+                self.synoik
                     .cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());
             }
@@ -4152,41 +4294,41 @@ impl State {
         // (see `contents_under`), so the app can't set the cursor image while we're open.
         // Force the default arrow so a stale client cursor (e.g. a terminal's I-beam that was
         // showing when the popover opened) doesn't linger over the popover.
-        if self.niri.panel_popover.is_open() {
+        if self.synoik.panel_popover.is_open() {
             if !grabbed {
-                self.niri
+                self.synoik
                     .cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());
             }
 
-            if let Some((output, p)) = self.niri.output_under(pos).map(|(o, p)| (o.clone(), p)) {
+            if let Some((output, p)) = self.synoik.output_under(pos).map(|(o, p)| (o.clone(), p)) {
                 // Highlight the control under the pointer (or clear it when the
                 // pointer leaves the popover content).
-                if self.niri.panel_popover.pointer_hover(&output, p) {
-                    self.niri.queue_redraw_all();
+                if self.synoik.panel_popover.pointer_hover(&output, p) {
+                    self.synoik.queue_redraw_all();
                 }
                 // While a quick-settings slider is being dragged, route motion to it.
-                if let Some(action) = self.niri.panel_popover.pointer_drag(&output, p) {
+                if let Some(action) = self.synoik.panel_popover.pointer_drag(&output, p) {
                     self.apply_popover_action(action);
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
         }
     }
 
     fn on_pointer_motion<I: InputBackend>(&mut self, event: I::PointerMotionEvent) {
-        let was_inside_hot_corner = self.niri.pointer_inside_hot_corner;
+        let was_inside_hot_corner = self.synoik.pointer_inside_hot_corner;
         // Any of the early returns here mean that the pointer is not inside the hot corner.
-        self.niri.pointer_inside_hot_corner = false;
+        self.synoik.pointer_inside_hot_corner = false;
 
         // We need an output to be able to move the pointer.
-        if self.niri.global_space.outputs().next().is_none() {
+        if self.synoik.global_space.outputs().next().is_none() {
             return;
         }
 
         let serial = SERIAL_COUNTER.next_serial();
 
-        let pointer = self.niri.seat.get_pointer().unwrap();
+        let pointer = self.synoik.seat.get_pointer().unwrap();
 
         let pos = pointer.current_location();
 
@@ -4194,14 +4336,14 @@ impl State {
         let mut new_pos = pos + event.delta();
 
         // We received an event for the regular pointer, so show it now.
-        self.niri.pointer_visibility = PointerVisibility::Visible;
-        self.niri.tablet_cursor_location = None;
+        self.synoik.pointer_visibility = PointerVisibility::Visible;
+        self.synoik.tablet_cursor_location = None;
 
         // Check if we have an active pointer constraint.
         //
         // FIXME: ideally this should use the pointer focus with up-to-date global location.
         let mut pointer_confined = None;
-        if let Some(under) = &self.niri.pointer_contents.surface {
+        if let Some(under) = &self.synoik.pointer_contents.surface {
             // No need to check if the pointer focus surface matches, because here we're checking
             // for an already-active constraint, and the constraint is deactivated when the focused
             // surface changes.
@@ -4268,7 +4410,7 @@ impl State {
             None
         });
         if let Some((output, horizontal)) = spatial_grab.flatten() {
-            if let Some(geo) = self.niri.global_space.output_geometry(&output) {
+            if let Some(geo) = self.synoik.global_space.output_geometry(&output) {
                 let geo = geo.to_f64();
                 if horizontal {
                     new_pos.x = (new_pos.x - geo.loc.x).rem_euclid(geo.size.w) + geo.loc.x;
@@ -4281,17 +4423,17 @@ impl State {
         }
 
         if self
-            .niri
+            .synoik
             .global_space
             .output_under(new_pos)
             .next()
             .is_none()
         {
             // We ended up outside the outputs and need to clip the movement.
-            if let Some(output) = self.niri.global_space.output_under(pos).next() {
+            if let Some(output) = self.synoik.global_space.output_under(pos).next() {
                 // The pointer was previously on some output. Clip the movement against its
                 // boundaries.
-                let geom = self.niri.global_space.output_geometry(output).unwrap();
+                let geom = self.synoik.global_space.output_geometry(output).unwrap();
                 new_pos.x = new_pos
                     .x
                     .clamp(geom.loc.x as f64, (geom.loc.x + geom.size.w - 1) as f64);
@@ -4301,47 +4443,47 @@ impl State {
             } else {
                 // The pointer was not on any output in the first place. Find one for it.
                 // Let's do the simple thing and just put it on the first output.
-                let output = self.niri.global_space.outputs().next().unwrap();
-                let geom = self.niri.global_space.output_geometry(output).unwrap();
+                let output = self.synoik.global_space.outputs().next().unwrap();
+                let geom = self.synoik.global_space.output_geometry(output).unwrap();
                 new_pos = center(geom).to_f64();
             }
         }
 
-        if let Some(output) = self.niri.screenshot_ui.selection_output() {
-            let geom = self.niri.global_space.output_geometry(output).unwrap();
+        if let Some(output) = self.synoik.screenshot_ui.selection_output() {
+            let geom = self.synoik.global_space.output_geometry(output).unwrap();
             let point = (new_pos - geom.loc.to_f64())
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
             if self.handle_screenshot_ui_motion(point, None) {
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
         }
 
         // Hovering an item moves the switcher's selection -- but only once the pointer is live
         // again, which it is not for DISABLE_HOVER_TIMEOUT after any keypress.
-        if let Some(switcher_output) = self.niri.switcher.output().cloned() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(new_pos) {
+        if let Some(switcher_output) = self.synoik.switcher.output().cloned() {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(new_pos) {
                 if switcher_output == *output
                     && self
-                        .niri
+                        .synoik
                         .switcher
-                        .pointer_motion(pos_within_output, self.niri.clock.now_unadjusted())
+                        .pointer_motion(pos_within_output, self.synoik.clock.now_unadjusted())
                 {
-                    self.niri.queue_redraw_switcher_output();
+                    self.synoik.queue_redraw_switcher_output();
                 }
             }
         }
 
-        if self.niri.end_session_dialog.is_open() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(new_pos) {
+        if self.synoik.end_session_dialog.is_open() {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(new_pos) {
                 let output_size = output_size(output);
                 if self
-                    .niri
+                    .synoik
                     .end_session_dialog
                     .pointer_motion(output_size, pos_within_output)
                 {
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
         }
@@ -4349,8 +4491,8 @@ impl State {
         // Hovering a polkit control focuses it, so the pointer and the keyboard agree about which
         // button Enter would press.
         #[cfg(feature = "dbus")]
-        if self.niri.polkit_is_open() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(new_pos) {
+        if self.synoik.polkit_is_open() {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(new_pos) {
                 let output_size = output_size(output);
                 self.polkit_pointer_motion(output_size, pos_within_output);
             }
@@ -4361,7 +4503,7 @@ impl State {
         self.update_app_drag(new_pos);
         self.update_panel_hover(new_pos);
 
-        let under = self.niri.contents_under(new_pos);
+        let under = self.synoik.contents_under(new_pos);
 
         // Handle confined pointer.
         if let Some((focus_surface, region)) = pointer_confined {
@@ -4397,9 +4539,9 @@ impl State {
             }
         }
 
-        self.niri.handle_focus_follows_mouse(&under);
+        self.synoik.handle_focus_follows_mouse(&under);
 
-        self.niri.pointer_contents.clone_from(&under);
+        self.synoik.pointer_contents.clone_from(&under);
 
         pointer.motion(
             self,
@@ -4431,37 +4573,37 @@ impl State {
                     .with_grab(|_, grab| grab_allows_hot_corner(grab))
                     .unwrap_or(true)
             {
-                self.niri.layout.toggle_overview();
+                self.synoik.layout.toggle_overview();
             }
-            self.niri.pointer_inside_hot_corner = true;
+            self.synoik.pointer_inside_hot_corner = true;
         }
 
         // Activate a new confinement if necessary.
-        self.niri.maybe_activate_pointer_constraint();
+        self.synoik.maybe_activate_pointer_constraint();
 
         // Inform the layout of an ongoing DnD operation.
         let is_dnd_grab = pointer
             .with_grab(|_, grab| Self::is_dnd_grab(grab.as_any()))
             .unwrap_or(false);
         if is_dnd_grab {
-            if let Some((output, pos_within_output)) = self.niri.output_under(new_pos) {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(new_pos) {
                 let output = output.clone();
-                self.niri.layout.dnd_update(output, pos_within_output);
+                self.synoik.layout.dnd_update(output, pos_within_output);
             }
         }
 
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
-        self.niri.queue_redraw_all();
+        self.synoik.queue_redraw_all();
     }
 
     fn on_pointer_motion_absolute<I: InputBackend>(
         &mut self,
         event: I::PointerMotionAbsoluteEvent,
     ) {
-        let was_inside_hot_corner = self.niri.pointer_inside_hot_corner;
+        let was_inside_hot_corner = self.synoik.pointer_inside_hot_corner;
         // Any of the early returns here mean that the pointer is not inside the hot corner.
-        self.niri.pointer_inside_hot_corner = false;
+        self.synoik.pointer_inside_hot_corner = false;
 
         let Some(pos) = self.compute_absolute_location(&event, None).or_else(|| {
             self.global_bounding_rectangle().map(|output_geo| {
@@ -4473,41 +4615,41 @@ impl State {
 
         let serial = SERIAL_COUNTER.next_serial();
 
-        let pointer = self.niri.seat.get_pointer().unwrap();
+        let pointer = self.synoik.seat.get_pointer().unwrap();
 
-        if let Some(output) = self.niri.screenshot_ui.selection_output() {
-            let geom = self.niri.global_space.output_geometry(output).unwrap();
+        if let Some(output) = self.synoik.screenshot_ui.selection_output() {
+            let geom = self.synoik.global_space.output_geometry(output).unwrap();
             let point = (pos - geom.loc.to_f64())
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
             if self.handle_screenshot_ui_motion(point, None) {
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
         }
 
-        if let Some(switcher_output) = self.niri.switcher.output().cloned() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+        if let Some(switcher_output) = self.synoik.switcher.output().cloned() {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                 if switcher_output == *output
                     && self
-                        .niri
+                        .synoik
                         .switcher
-                        .pointer_motion(pos_within_output, self.niri.clock.now_unadjusted())
+                        .pointer_motion(pos_within_output, self.synoik.clock.now_unadjusted())
                 {
-                    self.niri.queue_redraw_switcher_output();
+                    self.synoik.queue_redraw_switcher_output();
                 }
             }
         }
 
-        if self.niri.end_session_dialog.is_open() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+        if self.synoik.end_session_dialog.is_open() {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                 let output_size = output_size(output);
                 if self
-                    .niri
+                    .synoik
                     .end_session_dialog
                     .pointer_motion(output_size, pos_within_output)
                 {
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
         }
@@ -4515,8 +4657,8 @@ impl State {
         // Hovering a polkit control focuses it, so the pointer and the keyboard agree about which
         // button Enter would press.
         #[cfg(feature = "dbus")]
-        if self.niri.polkit_is_open() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+        if self.synoik.polkit_is_open() {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                 let output_size = output_size(output);
                 self.polkit_pointer_motion(output_size, pos_within_output);
             }
@@ -4525,11 +4667,11 @@ impl State {
         self.update_app_drag(pos);
         self.update_panel_hover(pos);
 
-        let under = self.niri.contents_under(pos);
+        let under = self.synoik.contents_under(pos);
 
-        self.niri.handle_focus_follows_mouse(&under);
+        self.synoik.handle_focus_follows_mouse(&under);
 
-        self.niri.pointer_contents.clone_from(&under);
+        self.synoik.pointer_contents.clone_from(&under);
 
         pointer.motion(
             self,
@@ -4551,33 +4693,33 @@ impl State {
                     .with_grab(|_, grab| grab_allows_hot_corner(grab))
                     .unwrap_or(true)
             {
-                self.niri.layout.toggle_overview();
+                self.synoik.layout.toggle_overview();
             }
-            self.niri.pointer_inside_hot_corner = true;
+            self.synoik.pointer_inside_hot_corner = true;
         }
 
-        self.niri.maybe_activate_pointer_constraint();
+        self.synoik.maybe_activate_pointer_constraint();
 
         // We moved the pointer, show it.
-        self.niri.pointer_visibility = PointerVisibility::Visible;
+        self.synoik.pointer_visibility = PointerVisibility::Visible;
 
         // We moved the regular pointer, so show it now.
-        self.niri.tablet_cursor_location = None;
+        self.synoik.tablet_cursor_location = None;
 
         // Inform the layout of an ongoing DnD operation.
         let is_dnd_grab = pointer
             .with_grab(|_, grab| Self::is_dnd_grab(grab.as_any()))
             .unwrap_or(false);
         if is_dnd_grab {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                 let output = output.clone();
-                self.niri.layout.dnd_update(output, pos_within_output);
+                self.synoik.layout.dnd_update(output, pos_within_output);
             }
         }
 
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
-        self.niri.queue_redraw_all();
+        self.synoik.queue_redraw_all();
     }
 
     /// Drive an app-icon drag: start one when a press on a dash or app-grid icon
@@ -4589,26 +4731,26 @@ impl State {
     /// icon's own activation is on the release.
     fn update_app_drag(&mut self, pos: Point<f64, Logical>) {
         let Some((output, pos_within_output)) = self
-            .niri
+            .synoik
             .output_under(pos)
             .map(|(output, p)| (output.clone(), p))
         else {
             return;
         };
 
-        if let Some(drag) = &mut self.niri.app_drag {
+        if let Some(drag) = &mut self.synoik.app_drag {
             drag.output = output;
             drag.pos = pos_within_output;
             // While the folder dialog is up it owns the drag: the grid underneath it is
             // covered and takes no target (`AppDisplay._onDragMotion` returns CONTINUE
             // when `_currentDialog`, `appDisplay.js:1658-1663`).
-            if self.niri.folder_dialog.is_open() {
+            if self.synoik.folder_dialog.is_open() {
                 self.update_folder_dialog_drag();
             } else {
                 self.update_dash_drop_slot();
                 self.update_grid_drag();
             }
-            self.niri.queue_redraw_all();
+            self.synoik.queue_redraw_all();
             return;
         }
 
@@ -4616,7 +4758,7 @@ impl State {
         // pages follow the pointer, so the travel is the *negation* of it —
         // `_getGestureDirFactor` is -1 for LTR (`swipeTracker.js:689-695`), which is the
         // opposite sign to the scroll path.
-        if let Some(pan) = &mut self.niri.app_grid_pan {
+        if let Some(pan) = &mut self.synoik.app_grid_pan {
             if pan.output == output {
                 let dx = pos_within_output.x - pan.last.x;
                 pan.last = pos_within_output;
@@ -4626,24 +4768,31 @@ impl State {
                 {
                     pan.dragging = true;
                     if let Some(area) = self
-                        .niri
+                        .synoik
                         .layout
                         .controls_layout_for_output(&output)
                         .map(|c| c.app_display)
                     {
-                        self.niri.app_grid.gesture_begin(SwipeSource::Pointer, area);
+                        self.synoik
+                            .app_grid
+                            .gesture_begin(SwipeSource::Pointer, area);
                     }
                 }
-                if self.niri.app_grid_pan.as_ref().is_some_and(|p| p.dragging) {
+                if self
+                    .synoik
+                    .app_grid_pan
+                    .as_ref()
+                    .is_some_and(|p| p.dragging)
+                {
                     let area = self
-                        .niri
+                        .synoik
                         .layout
                         .controls_layout_for_output(&output)
                         .map(|c| c.app_display);
                     if let Some(area) = area {
-                        let now = self.niri.clock.now_unadjusted();
-                        if self.niri.app_grid.gesture_update(-dx, now, area) {
-                            self.niri.queue_redraw_all();
+                        let now = self.synoik.clock.now_unadjusted();
+                        if self.synoik.app_grid.gesture_update(-dx, now, area) {
+                            self.synoik.queue_redraw_all();
                         }
                     }
                     return;
@@ -4651,7 +4800,7 @@ impl State {
             }
         }
 
-        let Some((_, hit, origin)) = &self.niri.overview_pressed else {
+        let Some((_, hit, origin)) = &self.synoik.overview_pressed else {
             return;
         };
         if (pos_within_output.x - origin.x).abs() <= DRAG_THRESHOLD
@@ -4662,12 +4811,12 @@ impl State {
 
         // Only the app icons are drag sources; the show-apps button, the page
         // controls and the search card are not.
-        let controls = self.niri.layout.controls_layout_for_output(&output);
+        let controls = self.synoik.layout.controls_layout_for_output(&output);
         // A dragged folder carries its whole composed tile, not one member's icon
         // (`FolderIcon.getDragActor`, `appDisplay.js:2368-2379`).
         let folder = match hit {
             OverviewHit::GridApp(i) => self
-                .niri
+                .synoik
                 .app_grid
                 .entry_folder(*i)
                 .map(|members| members.iter().map(|m| m.icon.clone()).collect()),
@@ -4675,30 +4824,30 @@ impl State {
         };
         let (id, icon, tile_center) = match hit {
             OverviewHit::Dash(DashHit::App(i)) => (
-                self.niri.dash.item_id(*i).map(str::to_owned),
-                self.niri.dash.item_icon(*i).cloned(),
-                controls.and_then(|c| self.niri.dash.tile_center(*i, c.dash)),
+                self.synoik.dash.item_id(*i).map(str::to_owned),
+                self.synoik.dash.item_icon(*i).cloned(),
+                controls.and_then(|c| self.synoik.dash.tile_center(*i, c.dash)),
             ),
             OverviewHit::GridApp(i) => (
-                self.niri.app_grid.entry_id(*i).map(str::to_owned),
-                self.niri.app_grid.entry_icon(*i).cloned(),
-                controls.and_then(|c| self.niri.app_grid.entry_center(*i, c.app_display)),
+                self.synoik.app_grid.entry_id(*i).map(str::to_owned),
+                self.synoik.app_grid.entry_icon(*i).cloned(),
+                controls.and_then(|c| self.synoik.app_grid.entry_center(*i, c.app_display)),
             ),
             // A search result is a `SearchResult` actor wrapping the same `AppIcon` the
             // grid uses, so it is draggable for the same reasons (`appDisplay.js`
             // `AppSearchProvider` results are `AppIcon`s).
             OverviewHit::Search(SearchHit::Result(i)) => (
-                self.niri.overview_search.result_id(*i).map(str::to_owned),
-                self.niri.overview_search.result_icon(*i).cloned(),
-                controls.and_then(|c| self.niri.overview_search.result_center(*i, c.into())),
+                self.synoik.overview_search.result_id(*i).map(str::to_owned),
+                self.synoik.overview_search.result_icon(*i).cloned(),
+                controls.and_then(|c| self.synoik.overview_search.result_center(*i, c.into())),
             ),
             // A member of the open folder: the same `AppIcon`, living in a `FolderView`.
             OverviewHit::Folder(DialogHit::App(i)) => {
                 let view = Rectangle::from_size(output_size(&output));
                 (
-                    self.niri.folder_dialog.entry_id(*i).map(str::to_owned),
-                    self.niri.folder_dialog.entry_icon(*i).cloned(),
-                    self.niri.folder_dialog.entry_center(*i, view),
+                    self.synoik.folder_dialog.entry_id(*i).map(str::to_owned),
+                    self.synoik.folder_dialog.entry_icon(*i).cloned(),
+                    self.synoik.folder_dialog.entry_center(*i, view),
                 )
             }
             _ => return,
@@ -4708,7 +4857,7 @@ impl State {
         // nowhere, and the real thing if it is dropped (`_ensurePlaceholder`,
         // `appDisplay.js:1434-1448,1646-1656`).
         let from_folder = matches!(hit, OverviewHit::Folder(DialogHit::App(_)))
-            .then(|| self.niri.folder_dialog.folder_id().map(str::to_owned))
+            .then(|| self.synoik.folder_dialog.folder_id().map(str::to_owned))
             .flatten();
         let (Some(id), Some(icon)) = (id, icon) else {
             return;
@@ -4716,29 +4865,29 @@ impl State {
         // A **favourite** needs the same placeholder and for the same reason: the grid
         // excludes pinned apps, so a dash icon dragged into it has nothing there to
         // reorder either (`_onDragBegin`'s second arm, `appDisplay.js:1646-1656`).
-        let from_dash = self.niri.app_system.is_favorite(&id);
+        let from_dash = self.synoik.app_system.is_favorite(&id);
 
         // The icon keeps the point it was grabbed by: gnome-shell positions its drag
         // actor at the pointer plus the offset the press had inside it
         // (`dnd.js:257-259`), so the icon doesn't jump under the cursor.
         let grab_offset = tile_center.map_or_else(Point::default, |center| center - *origin);
-        self.niri.overview_pressed = None;
+        self.synoik.overview_pressed = None;
         if let Some(entry) = (from_folder.is_some() || from_dash)
             .then(|| AppGridEntry {
                 id: id.clone(),
-                name: self.niri.app_system.lookup(&id).map_or_else(
+                name: self.synoik.app_system.lookup(&id).map_or_else(
                     || id.clone(),
                     |e: crate::app_system::AppEntry| e.name.clone(),
                 ),
                 icon: icon.clone(),
                 folder: None,
             })
-            .filter(|e| self.niri.app_grid.index_of(&e.id).is_none())
+            .filter(|e| self.synoik.app_grid.index_of(&e.id).is_none())
         {
-            self.niri.app_grid.add_placeholder(entry);
+            self.synoik.app_grid.add_placeholder(entry);
         }
         let drag_id = id.clone();
-        self.niri.app_drag = Some(AppDrag {
+        self.synoik.app_drag = Some(AppDrag {
             id,
             icon,
             folder,
@@ -4751,20 +4900,20 @@ impl State {
         // An empty dash reserves its drop target for the duration of the drag, before
         // any slot is computed — with nothing in the run there would otherwise be
         // nothing to aim at (`_onItemDragBegin`, `dash.js:410-414`).
-        self.niri.dash.set_drag_active(true);
-        self.niri.app_grid.set_drag_active(true);
-        self.niri.folder_dialog.set_drag_active(true);
+        self.synoik.dash.set_drag_active(true);
+        self.synoik.app_grid.set_drag_active(true);
+        self.synoik.folder_dialog.set_drag_active(true);
         // The live grid reflow is provisional: remember where everything was, so a drag
         // that ends nowhere puts it back (`_onDragCancelled` → `_redisplay`). The open
         // folder's view reorders on the same terms, and takes the same snapshot.
-        self.niri.app_grid.begin_reorder();
-        self.niri.folder_dialog.begin_reorder();
+        self.synoik.app_grid.begin_reorder();
+        self.synoik.folder_dialog.begin_reorder();
         // The tile the drag picked up scales to half and fades away where it sits, so the
         // slot it still occupies reads as empty while the drag is in flight
         // (`_onDragBegin` → `scaleAndFade`, `appDisplay.js:1930-1934`). For a drag out of
         // a folder that is the placeholder just added (`:1446`), which is the same call.
-        self.niri.app_grid.set_dragged(Some(&drag_id));
-        self.niri.folder_dialog.set_dragged(Some(&drag_id));
+        self.synoik.app_grid.set_dragged(Some(&drag_id));
+        self.synoik.folder_dialog.set_dragged(Some(&drag_id));
         // The drag can begin with the pointer already over the dash (picking an icon up
         // off it, or crossing the threshold inside it), and the gap has to be open by
         // then: it is what the drop reads.
@@ -4772,13 +4921,13 @@ impl State {
         // Same gate as the motion path above: a drag that *starts* inside the open folder
         // belongs to the dialog. Driving the grid here reflowed the icons behind the
         // dialog under a pointer that never left it.
-        if self.niri.folder_dialog.is_open() {
+        if self.synoik.folder_dialog.is_open() {
             self.update_folder_dialog_drag();
         } else {
             self.update_dash_drop_slot();
             self.update_grid_drag();
         }
-        self.niri.queue_redraw_all();
+        self.synoik.queue_redraw_all();
     }
 
     /// Drive the open folder dialog's side of a drag out of it: the backdrop lightens and
@@ -4786,12 +4935,13 @@ impl State {
     /// panel, and both are undone if it comes back (`handleDragOver` +
     /// `_setupDragMonitor`, `appDisplay.js:2812-2853`).
     fn update_folder_dialog_drag(&mut self) {
-        let Some(drag) = &self.niri.app_drag else {
+        let Some(drag) = &self.synoik.app_drag else {
             return;
         };
         let view = Rectangle::from_size(output_size(&drag.output));
-        let outside = self.niri.folder_dialog.hit_test(drag.pos, view) == Some(DialogHit::Outside);
-        self.niri.folder_dialog.set_drag_outside(outside);
+        let outside =
+            self.synoik.folder_dialog.hit_test(drag.pos, view) == Some(DialogHit::Outside);
+        self.synoik.folder_dialog.set_drag_outside(outside);
         if !outside {
             self.clear_folder_popdown_timer();
             self.update_folder_drop_target();
@@ -4800,30 +4950,30 @@ impl State {
         // Out over the shade the members stop rearranging, but they stay where the drag
         // has already left them — the reorder is only undone by a cancel.
         self.clear_folder_pending_move();
-        if self.niri.folder_popdown_timer.is_some() {
+        if self.synoik.folder_popdown_timer.is_some() {
             return;
         }
         let timer = Timer::from_duration(Duration::from_millis(POPDOWN_DIALOG_MS));
         let token = self
-            .niri
+            .synoik
             .event_loop
             .insert_source(timer, move |_, _, state| {
-                state.niri.folder_popdown_timer = None;
-                if state.niri.folder_dialog.popdown() {
+                state.synoik.folder_popdown_timer = None;
+                if state.synoik.folder_dialog.popdown() {
                     // The drag carries on over the grid, which has been ignoring it.
                     state.update_dash_drop_slot();
                     state.update_grid_drag();
-                    state.niri.queue_redraw_all();
+                    state.synoik.queue_redraw_all();
                 }
                 TimeoutAction::Drop
             })
             .unwrap();
-        self.niri.folder_popdown_timer = Some(token);
+        self.synoik.folder_popdown_timer = Some(token);
     }
 
     fn clear_folder_popdown_timer(&mut self) {
-        if let Some(token) = self.niri.folder_popdown_timer.take() {
-            self.niri.event_loop.remove(token);
+        if let Some(token) = self.synoik.folder_popdown_timer.take() {
+            self.synoik.event_loop.remove(token);
         }
     }
 
@@ -4835,34 +4985,34 @@ impl State {
     /// click rules): clicking the *active* workspace's empty area leaves the overview,
     /// clicking another one switches to it and stays.
     fn activate_overview_workspace(&mut self, output: &Output, ws_id: WorkspaceId) {
-        let Some((ws_idx, _)) = self.niri.layout.find_workspace_by_id(ws_id) else {
+        let Some((ws_idx, _)) = self.synoik.layout.find_workspace_by_id(ws_id) else {
             return;
         };
 
-        self.niri.layout.focus_output(output);
+        self.synoik.layout.focus_output(output);
 
-        let gnome_mode =
-            self.niri.config.borrow().layout.windowing_mode == niri_config::WindowingMode::Floating;
+        let gnome_mode = self.synoik.config.borrow().layout.windowing_mode
+            == synoik_config::WindowingMode::Floating;
         let is_active = self
-            .niri
+            .synoik
             .layout
             .active_workspace()
             .is_some_and(|active| active.id() == ws_id);
         if gnome_mode && !is_active {
-            self.niri.layout.switch_workspace(ws_idx);
+            self.synoik.layout.switch_workspace(ws_idx);
         } else {
-            self.niri.layout.toggle_overview_to_workspace(ws_idx);
+            self.synoik.layout.toggle_overview_to_workspace(ws_idx);
         }
 
         // FIXME: granular.
-        self.niri.queue_redraw_all();
+        self.synoik.queue_redraw_all();
     }
 
     /// The same, addressed by position along the thumbnails strip — what a click on a
     /// thumbnail resolves to once [`ThumbGrab`] has decided it was not a drag.
     pub fn activate_overview_workspace_at(&mut self, output: &Output, idx: usize) {
         let Some(ws_id) = self
-            .niri
+            .synoik
             .layout
             .monitor_for_output(output)
             .and_then(|mon| mon.workspace_at(idx))
@@ -4874,13 +5024,13 @@ impl State {
     }
 
     fn update_folder_drop_target(&mut self) {
-        let Some(drag) = &self.niri.app_drag else {
+        let Some(drag) = &self.synoik.app_drag else {
             return;
         };
         let (id, pos, output) = (drag.id.clone(), drag.pos, drag.output.clone());
         // Only a member of *this* folder reorders it. An icon dragged in from elsewhere
         // cannot be here anyway — the dialog is modal and the grid is covered.
-        if drag.from_folder.as_deref() != self.niri.folder_dialog.folder_id() {
+        if drag.from_folder.as_deref() != self.synoik.folder_dialog.folder_id() {
             self.clear_folder_pending_move();
             return;
         }
@@ -4890,19 +5040,19 @@ impl State {
         // switch changes which page a target would even mean.
         let area = crate::ui::folder_dialog::FolderDialog::view_area(view);
         if !self.drag_maybe_switch_page_immediately(area, pos) {
-            let hint = self.niri.folder_dialog.hint_at(pos, view);
-            self.niri.folder_dialog.set_hint_hovered(hint);
+            let hint = self.synoik.folder_dialog.hint_at(pos, view);
+            self.synoik.folder_dialog.set_hint_hovered(hint);
             match hint {
                 Some(direction) => self.arm_drag_page_switch(direction),
                 None => self.reset_drag_page_switch(),
             }
         }
-        let Some(per_page) = self.niri.folder_dialog.items_per_page(view) else {
+        let Some(per_page) = self.synoik.folder_dialog.items_per_page(view) else {
             self.clear_folder_pending_move();
             return;
         };
         let target = self
-            .niri
+            .synoik
             .folder_dialog
             .drop_target_at(pos, view, &id)
             // Over the body of an icon, or over the dragged icon's own slot, there is
@@ -4913,30 +5063,30 @@ impl State {
             self.clear_folder_pending_move();
             return;
         };
-        if self.niri.folder_pending_move == Some((target, per_page)) {
+        if self.synoik.folder_pending_move == Some((target, per_page)) {
             return; // unchanged — let the armed timer run out
         }
 
         self.clear_folder_pending_move();
-        self.niri.folder_pending_move = Some((target, per_page));
+        self.synoik.folder_pending_move = Some((target, per_page));
         let timer = Timer::from_duration(Duration::from_millis(DELAYED_MOVE_MS));
         let token = self
-            .niri
+            .synoik
             .event_loop
             .insert_source(timer, move |_, _, state| {
-                state.niri.folder_move_timer = None;
+                state.synoik.folder_move_timer = None;
                 state.apply_folder_pending_move();
                 TimeoutAction::Drop
             })
             .unwrap();
-        self.niri.folder_move_timer = Some(token);
+        self.synoik.folder_move_timer = Some(token);
     }
 
     /// Forget any armed move inside the folder.
     fn clear_folder_pending_move(&mut self) {
-        self.niri.folder_pending_move = None;
-        if let Some(token) = self.niri.folder_move_timer.take() {
-            self.niri.event_loop.remove(token);
+        self.synoik.folder_pending_move = None;
+        if let Some(token) = self.synoik.folder_move_timer.take() {
+            self.synoik.event_loop.remove(token);
         }
     }
 
@@ -4948,20 +5098,20 @@ impl State {
     /// that it is not immediate. (The timer path nulls the token before calling in, so this
     /// never removes a source from inside its own callback.)
     fn apply_folder_pending_move(&mut self) {
-        let Some((target, per_page)) = self.niri.folder_pending_move else {
+        let Some((target, per_page)) = self.synoik.folder_pending_move else {
             return;
         };
         self.clear_folder_pending_move();
-        let Some(id) = self.niri.app_drag.as_ref().map(|d| d.id.clone()) else {
+        let Some(id) = self.synoik.app_drag.as_ref().map(|d| d.id.clone()) else {
             return;
         };
         // Escape pops the dialog down without ending the drag, so a timer armed a moment
         // earlier can land on a folder that is already shrinking.
-        if !self.niri.folder_dialog.is_open() {
+        if !self.synoik.folder_dialog.is_open() {
             return;
         }
-        if self.niri.folder_dialog.move_entry(&id, target, per_page) {
-            self.niri.queue_redraw_all();
+        if self.synoik.folder_dialog.move_entry(&id, target, per_page) {
+            self.synoik.queue_redraw_all();
         }
     }
 
@@ -4969,30 +5119,30 @@ impl State {
     /// (`_onDragMotion`, `appDisplay.js:932-959` — that order, because a switch changes
     /// which page a target would even mean).
     fn update_grid_drag(&mut self) {
-        let Some(drag) = &self.niri.app_drag else {
+        let Some(drag) = &self.synoik.app_drag else {
             return;
         };
         let (output, pos) = (drag.output.clone(), drag.pos);
         let area = self
-            .niri
+            .synoik
             .layout
             .controls_layout_for_output(&output)
             .map(|c| c.app_display)
-            .filter(|_| self.niri.layout.is_app_grid_open());
+            .filter(|_| self.synoik.layout.is_app_grid_open());
 
         if let Some(area) = area {
             // Two ways to switch pages mid-drag: bumping the screen edge switches at
             // once, and hovering a preview band switches after a beat.
             if !self.drag_maybe_switch_page_immediately(area, pos) {
-                let hint = self.niri.app_grid.hint_at(pos, area);
-                self.niri.app_grid.set_hint_hovered(hint);
+                let hint = self.synoik.app_grid.hint_at(pos, area);
+                self.synoik.app_grid.set_hint_hovered(hint);
                 match hint {
                     Some(direction) => self.arm_drag_page_switch(direction),
                     None => self.reset_drag_page_switch(),
                 }
             }
         } else {
-            self.niri.app_grid.set_hint_hovered(None);
+            self.synoik.app_grid.set_hint_hovered(None);
             self.reset_drag_page_switch();
         }
 
@@ -5011,14 +5161,14 @@ impl State {
         area: Rectangle<f64, Logical>,
         pos: Point<f64, Logical>,
     ) -> bool {
-        if self.niri.global_space.outputs().count() > 1 {
+        if self.synoik.global_space.outputs().count() > 1 {
             return false;
         }
         let start = area.loc.x + EDGE_BUMP_PX;
         let end = area.loc.x + area.size.w - EDGE_BUMP_PX;
         if pos.x > start && pos.x < end {
             let moved_back = self
-                .niri
+                .synoik
                 .grid_page_switch_overshoot
                 .is_some_and(|last| (last - pos.x).abs() > EDGE_BUMP_PX);
             if moved_back {
@@ -5027,7 +5177,7 @@ impl State {
             return false;
         }
         // Still sitting in the overshoot region the last bump fired from.
-        if self.niri.grid_page_switch_overshoot.is_some() {
+        if self.synoik.grid_page_switch_overshoot.is_some() {
             return false;
         }
 
@@ -5038,7 +5188,7 @@ impl State {
         };
         self.step_grid_page(direction);
         self.setup_drag_page_switch_repeat(direction);
-        self.niri.grid_page_switch_overshoot = Some(pos.x);
+        self.synoik.grid_page_switch_overshoot = Some(pos.x);
         true
     }
 
@@ -5046,23 +5196,23 @@ impl State {
     /// and the repeat takes over (`_maybeSetupDragPageSwitchInitialTimeout`,
     /// `appDisplay.js:906-921`). A timer already running is left alone.
     fn arm_drag_page_switch(&mut self, direction: PageArrow) {
-        if self.niri.grid_page_switch_timer.is_some() {
+        if self.synoik.grid_page_switch_timer.is_some() {
             return;
         }
         let timer = Timer::from_duration(Duration::from_millis(PAGE_SWITCH_INITIAL_MS));
         let token = self
-            .niri
+            .synoik
             .event_loop
             .insert_source(timer, move |_, _, state| {
                 // Clear the slot first: this source is mid-dispatch and about to be
                 // dropped, and the repeat setup would otherwise try to remove it.
-                state.niri.grid_page_switch_timer = None;
+                state.synoik.grid_page_switch_timer = None;
                 state.step_grid_page(direction);
                 state.setup_drag_page_switch_repeat(direction);
                 TimeoutAction::Drop
             })
             .unwrap();
-        self.niri.grid_page_switch_timer = Some(token);
+        self.synoik.grid_page_switch_timer = Some(token);
     }
 
     /// Keep flipping the page every [`PAGE_SWITCH_REPEAT_MS`] for as long as the drag
@@ -5071,23 +5221,23 @@ impl State {
         self.reset_drag_page_switch();
         let repeat = Duration::from_millis(PAGE_SWITCH_REPEAT_MS);
         let token = self
-            .niri
+            .synoik
             .event_loop
             .insert_source(Timer::from_duration(repeat), move |_, _, state| {
                 state.step_grid_page(direction);
                 TimeoutAction::ToDuration(repeat)
             })
             .unwrap();
-        self.niri.grid_page_switch_timer = Some(token);
+        self.synoik.grid_page_switch_timer = Some(token);
     }
 
     /// Cancel any armed page switch and the edge-bump latch with it
     /// (`_resetDragPageSwitch`, `appDisplay.js:827-839`).
     fn reset_drag_page_switch(&mut self) {
-        if let Some(token) = self.niri.grid_page_switch_timer.take() {
-            self.niri.event_loop.remove(token);
+        if let Some(token) = self.synoik.grid_page_switch_timer.take() {
+            self.synoik.event_loop.remove(token);
         }
-        self.niri.grid_page_switch_overshoot = None;
+        self.synoik.grid_page_switch_overshoot = None;
     }
 
     /// Step one page in `direction`, on the output the drag is over — of the open folder's
@@ -5095,39 +5245,39 @@ impl State {
     /// the whole page-switch machinery from `BaseAppView`, so a member can be dragged onto
     /// the folder's other page exactly as an app can onto the grid's.
     fn step_grid_page(&mut self, direction: PageArrow) {
-        let Some(output) = self.niri.app_drag.as_ref().map(|d| d.output.clone()) else {
+        let Some(output) = self.synoik.app_drag.as_ref().map(|d| d.output.clone()) else {
             return;
         };
-        if self.niri.folder_dialog.is_open() {
+        if self.synoik.folder_dialog.is_open() {
             let view = Rectangle::from_size(output_size(&output));
-            let page = self.niri.folder_dialog.current_page();
+            let page = self.synoik.folder_dialog.current_page();
             let page = match direction {
                 PageArrow::Prev => page.saturating_sub(1),
                 PageArrow::Next => page + 1,
             };
-            if self.niri.folder_dialog.set_page(page, view) {
+            if self.synoik.folder_dialog.set_page(page, view) {
                 self.clear_folder_pending_move();
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             return;
         }
         let Some(area) = self
-            .niri
+            .synoik
             .layout
             .controls_layout_for_output(&output)
             .map(|c| c.app_display)
         else {
             return;
         };
-        let page = self.niri.app_grid.current_page();
+        let page = self.synoik.app_grid.current_page();
         let page = match direction {
             PageArrow::Prev => page.saturating_sub(1),
             PageArrow::Next => page + 1,
         };
-        if self.niri.app_grid.set_page(page, area) {
+        if self.synoik.app_grid.set_page(page, area) {
             // The target was resolved against the page that just left.
             self.clear_grid_pending_move();
-            self.niri.queue_redraw_all();
+            self.synoik.queue_redraw_all();
         }
     }
 
@@ -5139,19 +5289,19 @@ impl State {
     /// page does not shuffle every icon on the way. A pointer that stops still has to
     /// fire it, which is why this is a real timer and not a per-frame check.
     fn update_grid_drop_target(&mut self) {
-        let Some(drag) = &self.niri.app_drag else {
+        let Some(drag) = &self.synoik.app_drag else {
             return;
         };
         // The dash speaks first: while its gap is open or the unpin target is armed,
         // the drop belongs to it, exactly as the drag monitor's ordering has it.
-        if drag.unpin || self.niri.dash.drop_slot().is_some() {
+        if drag.unpin || self.synoik.dash.drop_slot().is_some() {
             self.clear_grid_pending_move();
             self.clear_grid_drop_hover();
             return;
         }
         let (id, output, pos) = (drag.id.clone(), drag.output.clone(), drag.pos);
         let Some(area) = self
-            .niri
+            .synoik
             .layout
             .controls_layout_for_output(&output)
             .map(|c| c.app_display)
@@ -5160,14 +5310,14 @@ impl State {
             self.clear_grid_drop_hover();
             return;
         };
-        if !self.niri.layout.is_app_grid_open() {
+        if !self.synoik.layout.is_app_grid_open() {
             self.clear_grid_pending_move();
             self.clear_grid_drop_hover();
             return;
         }
 
-        let per_page = self.niri.app_grid.items_per_page(area);
-        let target = self.niri.app_grid.drop_target_at(pos, area, &id);
+        let per_page = self.synoik.app_grid.items_per_page(area);
+        let target = self.synoik.app_grid.drop_target_at(pos, area, &id);
 
         // Resting on the *body* of another icon is a drop of its own: onto an app it
         // offers to fold the two into a folder (`AppIcon._setHoveringByDnd`,
@@ -5175,19 +5325,19 @@ impl State {
         // (`FolderIcon._setHoveringByDnd`, `:2350-2360`). Either way the dragged item has
         // to be a plain app — both `_canAccept`s take only another `AppIcon`.
         let source_is_app = self
-            .niri
+            .synoik
             .app_grid
             .index_of(&id)
-            .is_some_and(|i| self.niri.app_grid.entry_folder(i).is_none());
+            .is_some_and(|i| self.synoik.app_grid.entry_folder(i).is_none());
         let over = target
             .filter(|t| source_is_app && t.location == DragLocation::OnIcon)
             .and_then(|t| {
-                let over = self.niri.app_grid.entry_id_at(t, per_page)?;
-                (over != id).then(|| self.niri.app_grid.index_of(over))?
+                let over = self.synoik.app_grid.entry_id_at(t, per_page)?;
+                (over != id).then(|| self.synoik.app_grid.index_of(over))?
             })
             // A folder that already holds the app takes no drop (`_canAccept`, `:2391-2394`).
             .filter(|&i| {
-                self.niri
+                self.synoik
                     .app_grid
                     .entry_folder(i)
                     .is_none_or(|members| members.iter().all(|m| m.id != id))
@@ -5198,29 +5348,29 @@ impl State {
         // nothing to reflow around.
         let target = target.filter(|t| {
             t.location != DragLocation::OnIcon
-                && self.niri.app_grid.entry_id_at(*t, per_page) != Some(id.as_str())
+                && self.synoik.app_grid.entry_id_at(*t, per_page) != Some(id.as_str())
         });
         let Some(target) = target else {
             self.clear_grid_pending_move();
             return;
         };
-        if self.niri.grid_pending_move == Some((target, per_page)) {
+        if self.synoik.grid_pending_move == Some((target, per_page)) {
             return; // unchanged — let the armed timer run out
         }
 
         self.clear_grid_pending_move();
-        self.niri.grid_pending_move = Some((target, per_page));
+        self.synoik.grid_pending_move = Some((target, per_page));
         let timer = Timer::from_duration(Duration::from_millis(DELAYED_MOVE_MS));
         let token = self
-            .niri
+            .synoik
             .event_loop
             .insert_source(timer, move |_, _, state| {
-                state.niri.grid_move_timer = None;
+                state.synoik.grid_move_timer = None;
                 state.apply_grid_pending_move();
                 TimeoutAction::Drop
             })
             .unwrap();
-        self.niri.grid_move_timer = Some(token);
+        self.synoik.grid_move_timer = Some(token);
     }
 
     /// Point the `:drop` state at `target`, or take it away. Moving to a different icon
@@ -5231,31 +5381,31 @@ impl State {
     /// offer to make a folder, and offering that to every icon a drag merely crosses
     /// would be noise (`GLib.timeout_add_once(…, 500, …)`, `appDisplay.js:3136-3142`).
     fn arm_grid_drop_hover(&mut self, target: Option<usize>) {
-        if self.niri.grid_drop_target == target {
+        if self.synoik.grid_drop_target == target {
             return; // unchanged — let any armed timer run out
         }
         self.clear_grid_drop_hover();
         let Some(target) = target else { return };
-        self.niri.grid_drop_target = Some(target);
-        if self.niri.app_grid.entry_folder(target).is_some() {
-            if self.niri.app_grid.set_drop_hover(Some(target)) {
-                self.niri.queue_redraw_all();
+        self.synoik.grid_drop_target = Some(target);
+        if self.synoik.app_grid.entry_folder(target).is_some() {
+            if self.synoik.app_grid.set_drop_hover(Some(target)) {
+                self.synoik.queue_redraw_all();
             }
             return;
         }
         let timer = Timer::from_duration(Duration::from_millis(FOLDER_PREVIEW_MS));
         let token = self
-            .niri
+            .synoik
             .event_loop
             .insert_source(timer, move |_, _, state| {
-                state.niri.grid_drop_timer = None;
-                if state.niri.app_grid.set_drop_hover(Some(target)) {
-                    state.niri.queue_redraw_all();
+                state.synoik.grid_drop_timer = None;
+                if state.synoik.app_grid.set_drop_hover(Some(target)) {
+                    state.synoik.queue_redraw_all();
                 }
                 TimeoutAction::Drop
             })
             .unwrap();
-        self.niri.grid_drop_timer = Some(token);
+        self.synoik.grid_drop_timer = Some(token);
     }
 
     /// Take a drop that landed on the body of another icon: onto an app it folds the two
@@ -5268,10 +5418,10 @@ impl State {
     /// icon this drag can drop into — so, as in GNOME, the 500 ms preview is an
     /// affordance and not a condition: a quick drop onto an app still makes the folder.
     fn accept_grid_icon_drop(&mut self) -> bool {
-        let Some(target) = self.niri.grid_drop_target else {
+        let Some(target) = self.synoik.grid_drop_target else {
             return false;
         };
-        let Some(drag) = &self.niri.app_drag else {
+        let Some(drag) = &self.synoik.app_drag else {
             return false;
         };
         let (source_id, output) = (drag.id.clone(), drag.output.clone());
@@ -5289,11 +5439,11 @@ impl State {
         // visible offer that silently does something else is worse than the divergence.
         let from_folder = drag.from_folder.clone();
 
-        if self.niri.app_grid.entry_folder(target).is_some() {
-            let Some(folder) = self.niri.app_grid.join_folder(target, &source_id) else {
+        if self.synoik.app_grid.entry_folder(target).is_some() {
+            let Some(folder) = self.synoik.app_grid.join_folder(target, &source_id) else {
                 return false;
             };
-            if let Some(writer) = &self.niri.gnome_settings_writer {
+            if let Some(writer) = &self.synoik.gnome_settings_writer {
                 writer.add_to_app_folder(&folder, &source_id);
             }
             // No `_savePages` for the join itself: `addApp` writes only the folder's
@@ -5303,7 +5453,7 @@ impl State {
                 self.leave_folder(from, &source_id);
                 output.clone()
             });
-            if self.niri.app_system.is_favorite(&source_id) {
+            if self.synoik.app_system.is_favorite(&source_id) {
                 self.unpin_app(&source_id);
                 save = Some(output.clone());
             }
@@ -5311,14 +5461,14 @@ impl State {
             return true;
         }
 
-        let Some(over_id) = self.niri.app_grid.entry_id(target).map(str::to_owned) else {
+        let Some(over_id) = self.synoik.app_grid.entry_id(target).map(str::to_owned) else {
             return false;
         };
 
         // The hovered icon is the folder's first app, and so the one whose category list
         // is walked for the name (`createFolder` passes `[this.id, source.id]`).
         let categories = |id: &str| {
-            self.niri
+            self.synoik
                 .app_system
                 .lookup(id)
                 .map(|e| e.categories)
@@ -5332,19 +5482,19 @@ impl State {
         // order is what `_savePages` then persists — which is how the folder keeps the
         // hovered icon's slot across the reload that brings it back from gsettings.
         let Some(apps) =
-            self.niri
+            self.synoik
                 .app_grid
                 .fold_into_folder(target, &source_id, id.clone(), name.clone())
         else {
             return false;
         };
-        if let Some(writer) = &self.niri.gnome_settings_writer {
+        if let Some(writer) = &self.synoik.gnome_settings_writer {
             writer.create_app_folder(&id, name, apps);
         }
         if let Some(from) = &from_folder {
             self.leave_folder(from, &source_id);
         }
-        if self.niri.app_system.is_favorite(&source_id) {
+        if self.synoik.app_system.is_favorite(&source_id) {
             self.unpin_app(&source_id);
         }
         self.finish_grid_icon_drop(Some(&output));
@@ -5357,37 +5507,37 @@ impl State {
         self.clear_grid_pending_move();
         self.clear_grid_drop_hover();
         self.reset_drag_page_switch();
-        self.niri.app_drag = None;
-        self.niri.dash.set_drop_slot(None);
-        self.niri.dash.set_drag_active(false);
-        self.niri.app_grid.set_drag_active(false);
-        self.niri.folder_dialog.set_drag_active(false);
+        self.synoik.app_drag = None;
+        self.synoik.dash.set_drop_slot(None);
+        self.synoik.dash.set_drag_active(false);
+        self.synoik.app_grid.set_drag_active(false);
+        self.synoik.folder_dialog.set_drag_active(false);
         // …and the tile it took eases back to full size (`undoScaleAndFade`).
-        self.niri.app_grid.set_dragged(None);
-        self.niri.folder_dialog.set_dragged(None);
-        self.niri.app_grid.finish_reorder();
+        self.synoik.app_grid.set_dragged(None);
+        self.synoik.folder_dialog.set_dragged(None);
+        self.synoik.app_grid.finish_reorder();
         if let Some(output) = save {
             self.save_app_picker_layout(output);
         }
-        self.niri.queue_redraw_all();
+        self.synoik.queue_redraw_all();
     }
 
     /// Drop the armed target, its countdown, and any `:drop` state it produced.
     fn clear_grid_drop_hover(&mut self) {
-        self.niri.grid_drop_target = None;
-        if let Some(token) = self.niri.grid_drop_timer.take() {
-            self.niri.event_loop.remove(token);
+        self.synoik.grid_drop_target = None;
+        if let Some(token) = self.synoik.grid_drop_timer.take() {
+            self.synoik.event_loop.remove(token);
         }
-        if self.niri.app_grid.set_drop_hover(None) {
-            self.niri.queue_redraw_all();
+        if self.synoik.app_grid.set_drop_hover(None) {
+            self.synoik.queue_redraw_all();
         }
     }
 
     /// Forget any armed move (the target left the grid, or the drag ended).
     fn clear_grid_pending_move(&mut self) {
-        self.niri.grid_pending_move = None;
-        if let Some(token) = self.niri.grid_move_timer.take() {
-            self.niri.event_loop.remove(token);
+        self.synoik.grid_pending_move = None;
+        if let Some(token) = self.synoik.grid_move_timer.take() {
+            self.synoik.event_loop.remove(token);
         }
     }
 
@@ -5397,15 +5547,15 @@ impl State {
     /// Clears rather than forgets, for the reason [`Self::apply_folder_pending_move`]
     /// spells out: a one-shot the drop beat is still registered.
     fn apply_grid_pending_move(&mut self) {
-        let Some((target, per_page)) = self.niri.grid_pending_move else {
+        let Some((target, per_page)) = self.synoik.grid_pending_move else {
             return;
         };
         self.clear_grid_pending_move();
-        let Some(id) = self.niri.app_drag.as_ref().map(|d| d.id.clone()) else {
+        let Some(id) = self.synoik.app_drag.as_ref().map(|d| d.id.clone()) else {
             return;
         };
-        if self.niri.app_grid.move_entry(&id, target, per_page) {
-            self.niri.queue_redraw_all();
+        if self.synoik.app_grid.move_entry(&id, target, per_page) {
+            self.synoik.queue_redraw_all();
         }
     }
 
@@ -5416,26 +5566,26 @@ impl State {
     /// *first* and clears the placeholder when it is hovered (`dash.js:441-450`), so
     /// the dash never offers to pin and to unpin at the same time.
     fn update_dash_drop_slot(&mut self) {
-        let Some(drag) = &self.niri.app_drag else {
+        let Some(drag) = &self.synoik.app_drag else {
             return;
         };
         let (id, output, pos) = (drag.id.clone(), drag.output.clone(), drag.pos);
         let Some(dash_area) = self
-            .niri
+            .synoik
             .layout
             .controls_layout_for_output(&output)
             .map(|c| c.dash)
         else {
-            self.niri.dash.set_drop_slot(None);
+            self.synoik.dash.set_drop_slot(None);
             return;
         };
 
-        let unpin = self.niri.dash.unpin_target_at(pos, dash_area, &id);
+        let unpin = self.synoik.dash.unpin_target_at(pos, dash_area, &id);
         let slot = (!unpin)
-            .then(|| self.niri.dash.drop_slot_at(pos, dash_area, &id))
+            .then(|| self.synoik.dash.drop_slot_at(pos, dash_area, &id))
             .flatten();
-        self.niri.dash.set_drop_slot(slot);
-        if let Some(drag) = &mut self.niri.app_drag {
+        self.synoik.dash.set_drop_slot(slot);
+        if let Some(drag) = &mut self.synoik.app_drag {
             drag.unpin = unpin;
         }
     }
@@ -5450,29 +5600,29 @@ impl State {
         self.clear_grid_pending_move();
         self.clear_grid_drop_hover();
         self.reset_drag_page_switch();
-        self.niri.folder_dialog.set_drag_outside(false);
-        self.niri.folder_dialog.set_hint_hovered(None);
-        self.niri.app_grid.set_hint_hovered(None);
+        self.synoik.folder_dialog.set_drag_outside(false);
+        self.synoik.folder_dialog.set_hint_hovered(None);
+        self.synoik.app_grid.set_hint_hovered(None);
 
-        let Some(drag) = self.niri.app_drag.take() else {
+        let Some(drag) = self.synoik.app_drag.take() else {
             return;
         };
-        self.niri.dash.set_drop_slot(None);
-        self.niri.dash.set_drag_active(false);
-        self.niri.app_grid.set_drag_active(false);
-        self.niri.folder_dialog.set_drag_active(false);
-        self.niri.app_grid.set_dragged(None);
-        self.niri.folder_dialog.set_dragged(None);
+        self.synoik.dash.set_drop_slot(None);
+        self.synoik.dash.set_drag_active(false);
+        self.synoik.app_grid.set_drag_active(false);
+        self.synoik.folder_dialog.set_drag_active(false);
+        self.synoik.app_grid.set_dragged(None);
+        self.synoik.folder_dialog.set_dragged(None);
 
-        self.niri.app_grid.cancel_reorder();
-        self.niri.folder_dialog.cancel_reorder();
+        self.synoik.app_grid.cancel_reorder();
+        self.synoik.folder_dialog.cancel_reorder();
         // The placeholder the drag added — for a folder member or for a favourite — is
         // withdrawn, exactly as it is for a drop nobody took (`_removePlaceholder`,
         // `appDisplay.js:1450-1456`).
-        if drag.from_folder.is_some() || self.niri.app_system.is_favorite(&drag.id) {
-            self.niri.app_grid.remove_entry(&drag.id);
+        if drag.from_folder.is_some() || self.synoik.app_system.is_favorite(&drag.id) {
+            self.synoik.app_grid.remove_entry(&drag.id);
         }
-        self.niri.queue_redraw_all();
+        self.synoik.queue_redraw_all();
     }
 
     /// Finish an app-icon drag. A drop on a workspace — in the picker or on a
@@ -5484,10 +5634,10 @@ impl State {
     /// the saved layout (`_onDragCancelled`, `appDisplay.js:979-984`).
     fn end_app_drag(&mut self) {
         self.clear_folder_popdown_timer();
-        self.niri.folder_dialog.set_drag_outside(false);
+        self.synoik.folder_dialog.set_drag_outside(false);
         // A drag out of the open folder is the dialog's to take while it is still up: it
         // covers the monitor, so nothing underneath ever sees the drop.
-        if self.niri.folder_dialog.is_open() && self.niri.app_drag.is_some() {
+        if self.synoik.folder_dialog.is_open() && self.synoik.app_drag.is_some() {
             self.end_folder_dialog_drag();
             return;
         }
@@ -5508,8 +5658,8 @@ impl State {
         self.clear_grid_drop_hover();
         self.reset_drag_page_switch();
 
-        let Some(drag) = self.niri.app_drag.take() else {
-            self.niri.app_grid.cancel_reorder();
+        let Some(drag) = self.synoik.app_drag.take() else {
+            self.synoik.app_grid.cancel_reorder();
             return;
         };
         // Whether this app came out of a folder, and its id — `drag` is consumed by the
@@ -5520,34 +5670,34 @@ impl State {
         // within this one (`acceptDrop`, `appDisplay.js:1004-1013`). Read before the
         // previews are told to slide away, since that is what makes a band a target.
         let grid_area = self
-            .niri
+            .synoik
             .layout
             .controls_layout_for_output(&drag.output)
             .map(|c| c.app_display)
-            .filter(|_| self.niri.layout.is_app_grid_open());
-        let hint = grid_area.and_then(|area| self.niri.app_grid.hint_at(drag.pos, area));
+            .filter(|_| self.synoik.layout.is_app_grid_open());
+        let hint = grid_area.and_then(|area| self.synoik.app_grid.hint_at(drag.pos, area));
 
         // A drop on the dash pins the app there, or moves it if it was already pinned
         // (`Dash.acceptDrop`, `dash.js:942-987`). The gap that was tracking the pointer
         // *is* the drop position, so take it before clearing.
-        let slot = self.niri.dash.drop_slot();
-        self.niri.dash.set_drop_slot(None);
-        self.niri.dash.set_drag_active(false);
-        self.niri.app_grid.set_drag_active(false);
-        self.niri.folder_dialog.set_drag_active(false);
+        let slot = self.synoik.dash.drop_slot();
+        self.synoik.dash.set_drop_slot(None);
+        self.synoik.dash.set_drag_active(false);
+        self.synoik.app_grid.set_drag_active(false);
+        self.synoik.folder_dialog.set_drag_active(false);
         // …and the tile it took eases back to full size (`undoScaleAndFade`).
-        self.niri.app_grid.set_dragged(None);
-        self.niri.folder_dialog.set_dragged(None);
+        self.synoik.app_grid.set_dragged(None);
+        self.synoik.folder_dialog.set_dragged(None);
 
         if let (Some(direction), Some(area)) = (hint, grid_area) {
             self.drop_onto_page(&drag.id, direction, area);
             if let Some(folder) = &from_folder {
                 self.leave_folder(folder, &drag_id);
             }
-            if self.niri.app_grid.finish_reorder() || from_folder.is_some() {
+            if self.synoik.app_grid.finish_reorder() || from_folder.is_some() {
                 self.save_app_picker_layout(&drag.output);
             }
-            self.niri.queue_redraw_all();
+            self.synoik.queue_redraw_all();
             return;
         }
 
@@ -5570,7 +5720,7 @@ impl State {
             // that never left them just goes back where it came from.
             let over_chrome = self.overview_hit(&drag.output, drag.pos).is_some();
             let target = (!over_chrome)
-                .then(|| self.niri.layout.drop_workspace_at(&drag.output, drag.pos))
+                .then(|| self.synoik.layout.drop_workspace_at(&drag.output, drag.pos))
                 .flatten();
 
             if let Some(workspace) = target {
@@ -5582,9 +5732,9 @@ impl State {
                 // The app display accepts any app icon dropped anywhere inside it
                 // (`_canAccept` + `handleDragOver`, `appDisplay.js:986-995`) — that is
                 // what makes a reorder stick even when the pointer ended between tiles.
-                grid_took = self.niri.layout.is_app_grid_open()
+                grid_took = self.synoik.layout.is_app_grid_open()
                     && self
-                        .niri
+                        .synoik
                         .layout
                         .controls_layout_for_output(&drag.output)
                         .is_some_and(|c| c.app_display.contains(drag.pos));
@@ -5593,18 +5743,18 @@ impl State {
         };
 
         if accepted {
-            if self.niri.app_grid.finish_reorder() {
+            if self.synoik.app_grid.finish_reorder() {
                 self.save_app_picker_layout(&drag.output);
             }
         } else {
-            self.niri.app_grid.cancel_reorder();
+            self.synoik.app_grid.cancel_reorder();
         }
         // The placeholder either becomes the real icon — and the app leaves wherever it
         // was excluded from the grid *by* — or it is withdrawn (`_removePlaceholder`,
         // `appDisplay.js:1450-1456`). A folder member leaves its folder; a favourite is
         // unpinned, which is the same `AppDisplay.acceptDrop` line for both
         // (`view.removeApp` / `removeFavorite`, `:1688-1694`).
-        let was_favorite = self.niri.app_system.is_favorite(&drag_id);
+        let was_favorite = self.synoik.app_system.is_favorite(&drag_id);
         if from_folder.is_some() || was_favorite {
             if grid_took {
                 if let Some(folder) = &from_folder {
@@ -5618,11 +5768,11 @@ impl State {
                     self.unpin_app(&drag_id);
                 }
             } else {
-                self.niri.app_grid.remove_entry(&drag_id);
+                self.synoik.app_grid.remove_entry(&drag_id);
             }
         }
 
-        self.niri.queue_redraw_all();
+        self.synoik.queue_redraw_all();
     }
 
     /// Finish a drag that ended while the folder dialog was still up.
@@ -5637,7 +5787,7 @@ impl State {
     fn end_folder_dialog_drag(&mut self) {
         // A drop that beat the delayed-move timer still commits the move, as it does in
         // the grid. Before `app_drag` is taken — that is where the id comes from.
-        let over_view = self.niri.app_drag.as_ref().is_some_and(|drag| {
+        let over_view = self.synoik.app_drag.as_ref().is_some_and(|drag| {
             let view = Rectangle::from_size(output_size(&drag.output));
             crate::ui::folder_dialog::layout(view)
                 .grid_area
@@ -5646,68 +5796,68 @@ impl State {
         // A drop *on* a preview band sends the member to that page rather than reordering
         // within this one (`acceptDrop`, `appDisplay.js:1004-1013`). Read before the
         // previews are told to slide away, since that is what makes a band a target.
-        let hint = self.niri.app_drag.as_ref().and_then(|drag| {
+        let hint = self.synoik.app_drag.as_ref().and_then(|drag| {
             let view = Rectangle::from_size(output_size(&drag.output));
-            self.niri.folder_dialog.hint_at(drag.pos, view)
+            self.synoik.folder_dialog.hint_at(drag.pos, view)
         });
-        if let (Some(direction), Some(drag)) = (hint, self.niri.app_drag.as_ref()) {
+        if let (Some(direction), Some(drag)) = (hint, self.synoik.app_drag.as_ref()) {
             let (id, output) = (drag.id.clone(), drag.output.clone());
             self.drop_member_onto_page(&id, direction, &output);
         } else if over_view {
             self.apply_folder_pending_move();
         }
         self.clear_folder_pending_move();
-        self.niri.folder_dialog.set_hint_hovered(None);
+        self.synoik.folder_dialog.set_hint_hovered(None);
         self.reset_drag_page_switch();
 
-        let Some(drag) = self.niri.app_drag.take() else {
+        let Some(drag) = self.synoik.app_drag.take() else {
             return;
         };
-        self.niri.dash.set_drop_slot(None);
-        self.niri.dash.set_drag_active(false);
-        self.niri.app_grid.set_drag_active(false);
-        self.niri.folder_dialog.set_drag_active(false);
+        self.synoik.dash.set_drop_slot(None);
+        self.synoik.dash.set_drag_active(false);
+        self.synoik.app_grid.set_drag_active(false);
+        self.synoik.folder_dialog.set_drag_active(false);
         // …and the tile it took eases back to full size (`undoScaleAndFade`).
-        self.niri.app_grid.set_dragged(None);
-        self.niri.folder_dialog.set_dragged(None);
+        self.synoik.app_grid.set_dragged(None);
+        self.synoik.folder_dialog.set_dragged(None);
 
         let from_folder = drag.from_folder.clone();
         match drag.from_folder.filter(|_| !over_view) {
             Some(folder) => {
-                self.niri.folder_dialog.cancel_reorder();
-                self.niri.folder_dialog.popdown();
+                self.synoik.folder_dialog.cancel_reorder();
+                self.synoik.folder_dialog.popdown();
                 self.leave_folder(&folder, &drag.id);
-                self.niri.app_grid.finish_reorder();
+                self.synoik.app_grid.finish_reorder();
                 // `selectApp(appId)`: the app the drop released takes the key focus in
                 // the grid it just landed in.
-                let i = self.niri.app_grid.index_of(&drag.id);
-                self.niri.app_grid.set_focused(i);
+                let i = self.synoik.app_grid.index_of(&drag.id);
+                self.synoik.app_grid.set_focused(i);
                 self.save_app_picker_layout(&drag.output);
             }
             None => {
-                self.niri.app_grid.cancel_reorder();
+                self.synoik.app_grid.cancel_reorder();
                 if from_folder.is_some() {
-                    self.niri.app_grid.remove_entry(&drag.id);
+                    self.synoik.app_grid.remove_entry(&drag.id);
                 }
                 // The folder keeps whatever order the drag left, and writes it back.
-                if self.niri.folder_dialog.finish_reorder() {
-                    if let Some(folder) = self.niri.folder_dialog.folder_id().map(str::to_owned) {
-                        let apps = self.niri.folder_dialog.member_ids();
-                        if let Some(writer) = &self.niri.gnome_settings_writer {
+                if self.synoik.folder_dialog.finish_reorder() {
+                    if let Some(folder) = self.synoik.folder_dialog.folder_id().map(str::to_owned) {
+                        let apps = self.synoik.folder_dialog.member_ids();
+                        if let Some(writer) = &self.synoik.gnome_settings_writer {
                             writer.set_app_folder_apps(&folder, apps);
                         }
                     }
                 }
             }
         }
-        self.niri.queue_redraw_all();
+        self.synoik.queue_redraw_all();
     }
 
     /// Write a renamed folder's `name`, with `translate` off — the name is now a literal
     /// to show, not a `.directory` basename to look up (`_maybeUpdateFolderName`,
     /// `appDisplay.js:2650-2657`).
     fn rename_folder(&mut self, folder: &str, name: &str) {
-        if let Some(writer) = &self.niri.gnome_settings_writer {
+        if let Some(writer) = &self.synoik.gnome_settings_writer {
             writer.rename_app_folder(folder, name.to_owned());
         }
     }
@@ -5722,9 +5872,9 @@ impl State {
     /// when the folder has no *members* left, which is the same thing for every
     /// explicit-apps folder and is what the user is actually doing.
     fn leave_folder(&mut self, folder: &str, app: &str) {
-        self.niri.folder_dialog.remove_member(app);
-        let left = self.niri.app_grid.remove_folder_member(folder, app);
-        let Some(writer) = &self.niri.gnome_settings_writer else {
+        self.synoik.folder_dialog.remove_member(app);
+        let left = self.synoik.app_grid.remove_folder_member(folder, app);
+        let Some(writer) = &self.synoik.gnome_settings_writer else {
             return;
         };
         if left == Some(0) {
@@ -5738,9 +5888,9 @@ impl State {
     /// `appDisplay.js:1004-1013`): it appends to an existing page, and stepping past the
     /// last one makes a new page with the app first on it.
     fn drop_onto_page(&mut self, id: &str, direction: PageArrow, area: Rectangle<f64, Logical>) {
-        let per_page = self.niri.app_grid.items_per_page(area);
-        let n_pages = self.niri.app_grid.page_count(area);
-        let current = self.niri.app_grid.current_page();
+        let per_page = self.synoik.app_grid.items_per_page(area);
+        let n_pages = self.synoik.app_grid.page_count(area);
+        let current = self.synoik.app_grid.current_page();
         let page = match direction {
             PageArrow::Prev => current.saturating_sub(1),
             PageArrow::Next => (current + 1).min(n_pages),
@@ -5750,21 +5900,21 @@ impl State {
             position: if page < n_pages { None } else { Some(0) },
             location: DragLocation::EmptySpace,
         };
-        self.niri.app_grid.move_entry(id, target, per_page);
+        self.synoik.app_grid.move_entry(id, target, per_page);
         // Where it actually landed: a full page pushes it on to the next one.
-        let page = page.min(self.niri.app_grid.page_count(area).saturating_sub(1));
-        self.niri.app_grid.set_page(page, area);
+        let page = page.min(self.synoik.app_grid.page_count(area).saturating_sub(1));
+        self.synoik.app_grid.set_page(page, area);
     }
 
     /// Send a folder member to the page a preview band leads to, and follow it there —
     /// the folder's half of `acceptDrop`'s hint branch (`appDisplay.js:1004-1013`).
     fn drop_member_onto_page(&mut self, id: &str, direction: PageArrow, output: &Output) {
         let view = Rectangle::from_size(output_size(output));
-        let Some(per_page) = self.niri.folder_dialog.items_per_page(view) else {
+        let Some(per_page) = self.synoik.folder_dialog.items_per_page(view) else {
             return;
         };
-        let n_pages = self.niri.folder_dialog.page_count(view);
-        let current = self.niri.folder_dialog.current_page();
+        let n_pages = self.synoik.folder_dialog.page_count(view);
+        let current = self.synoik.folder_dialog.current_page();
         let page = match direction {
             PageArrow::Prev => current.saturating_sub(1),
             PageArrow::Next => (current + 1).min(n_pages),
@@ -5774,10 +5924,10 @@ impl State {
             position: if page < n_pages { None } else { Some(0) },
             location: DragLocation::EmptySpace,
         };
-        self.niri.folder_dialog.move_entry(id, target, per_page);
+        self.synoik.folder_dialog.move_entry(id, target, per_page);
         // Where it actually landed: a full page pushes it on to the next one.
-        let page = page.min(self.niri.folder_dialog.page_count(view).saturating_sub(1));
-        self.niri.folder_dialog.set_page(page, view);
+        let page = page.min(self.synoik.folder_dialog.page_count(view).saturating_sub(1));
+        self.synoik.folder_dialog.set_page(page, view);
     }
 
     /// Persist the grid arrangement (`AppDisplay._savePages`, `appDisplay.js:1387-1404`).
@@ -5785,22 +5935,22 @@ impl State {
     /// geometry, and that is the one the user was looking at.
     fn save_app_picker_layout(&mut self, output: &Output) {
         let Some(area) = self
-            .niri
+            .synoik
             .layout
             .controls_layout_for_output(output)
             .map(|c| c.app_display)
         else {
             return;
         };
-        let per_page = self.niri.app_grid.items_per_page(area);
-        let pages = self.niri.app_grid.pages(per_page);
+        let per_page = self.synoik.app_grid.items_per_page(area);
+        let pages = self.synoik.app_grid.pages(per_page);
         // Step the in-memory model too. The write hops to the settings thread and only
         // comes back through `changed`, but anything that re-derives the grid in between
         // sorts from *this* map — and an app missing from it falls in after every placed
         // app, by name (`_compareItems`, `appDisplay.js:1475-1490`). That is the tail an
         // unpinned dash favourite used to snap to, since `commit_favorites` re-syncs the
         // grid synchronously, one line after the drop placed it.
-        self.niri.gnome_settings.app_picker_layout = pages
+        self.synoik.gnome_settings.app_picker_layout = pages
             .iter()
             .enumerate()
             .flat_map(|(page, ids)| {
@@ -5809,7 +5959,7 @@ impl State {
                     .map(move |(i, id)| (id.clone(), (page, i as i32)))
             })
             .collect();
-        if let Some(writer) = &self.niri.gnome_settings_writer {
+        if let Some(writer) = &self.synoik.gnome_settings_writer {
             writer.set_app_picker_layout(pages);
         }
     }
@@ -5822,17 +5972,17 @@ impl State {
         // first shifts everything after it down one, so a move to a later slot lands one
         // short — gnome-shell gets this by counting favourites before the placeholder and
         // skipping the dragged one (`dash.js:960-970`).
-        let changed = match self.niri.dash.favorite_index(id) {
+        let changed = match self.synoik.dash.favorite_index(id) {
             Some(from) => {
                 let to = if from < slot { slot - 1 } else { slot };
                 if to == from {
                     false
                 } else {
-                    self.niri.app_system.move_favorite_to_pos(id, to);
+                    self.synoik.app_system.move_favorite_to_pos(id, to);
                     true
                 }
             }
-            None => self.niri.app_system.add_favorite_at_pos(id, Some(slot)),
+            None => self.synoik.app_system.add_favorite_at_pos(id, Some(slot)),
         };
         if changed {
             self.commit_favorites();
@@ -5847,7 +5997,7 @@ impl State {
     /// final. Noted here rather than in the module docs because it is one line to add
     /// once the notification's action buttons can carry a callback.
     fn unpin_app(&mut self, id: &str) {
-        if self.niri.app_system.remove_favorite(id) {
+        if self.synoik.app_system.remove_favorite(id) {
             self.commit_favorites();
         }
     }
@@ -5855,12 +6005,12 @@ impl State {
     /// Persist the favourites and re-derive every surface that shows them: an app
     /// pinned or unpinned moves between the dash and the grid.
     fn commit_favorites(&mut self) {
-        if let Some(writer) = &self.niri.gnome_settings_writer {
-            writer.set_favorite_apps(self.niri.app_system.favorite_ids().to_vec());
+        if let Some(writer) = &self.synoik.gnome_settings_writer {
+            writer.set_favorite_apps(self.synoik.app_system.favorite_ids().to_vec());
         }
-        self.niri.sync_dash_favorites();
-        self.niri.sync_app_grid();
-        self.niri.prewarm_app_icons();
+        self.synoik.sync_dash_favorites();
+        self.synoik.sync_app_grid();
+        self.synoik.prewarm_app_icons();
     }
 
     /// Which of the overview's widgets is at `pos` on `output`, if the overview
@@ -5868,7 +6018,7 @@ impl State {
     /// dash, then the search card, then the app grid (reactive only while open and
     /// not covered by a search — the same gate the hover tracking uses).
     fn overview_hit(&self, output: &Output, pos: Point<f64, Logical>) -> Option<OverviewHit> {
-        if !self.niri.overview_ui_visible() {
+        if !self.synoik.overview_ui_visible() {
             return None;
         }
 
@@ -5881,30 +6031,30 @@ impl State {
         // An open folder dialog is modal: it covers the monitor, so once it is up every
         // point on the output belongs to it (`grabHelper.grab`, `appDisplay.js:2879`).
         if let Some(hit) = self
-            .niri
+            .synoik
             .folder_dialog
             .hit_test(pos, Rectangle::from_size(output_size(output)))
         {
             return Some(OverviewHit::Folder(hit));
         }
 
-        let controls = self.niri.layout.controls_layout_for_output(output)?;
+        let controls = self.synoik.layout.controls_layout_for_output(output)?;
 
-        if let Some(hit) = self.niri.dash.hit_test(pos, controls.dash) {
+        if let Some(hit) = self.synoik.dash.hit_test(pos, controls.dash) {
             return Some(OverviewHit::Dash(hit));
         }
-        if let Some(hit) = self.niri.overview_search.hit_test(pos, controls.into()) {
+        if let Some(hit) = self.synoik.overview_search.hit_test(pos, controls.into()) {
             return Some(OverviewHit::Search(hit));
         }
-        if self.niri.layout.is_app_grid_open() && !self.niri.overview_search.is_active() {
+        if self.synoik.layout.is_app_grid_open() && !self.synoik.overview_search.is_active() {
             let area = controls.app_display;
-            if let Some(i) = self.niri.app_grid.hit_test(pos, area) {
+            if let Some(i) = self.synoik.app_grid.hit_test(pos, area) {
                 return Some(OverviewHit::GridApp(i));
             }
-            if let Some(page) = self.niri.app_grid.indicator_hit(pos, area) {
+            if let Some(page) = self.synoik.app_grid.indicator_hit(pos, area) {
                 return Some(OverviewHit::GridPage(page));
             }
-            if let Some(arrow) = self.niri.app_grid.arrow_hit(pos, area) {
+            if let Some(arrow) = self.synoik.app_grid.arrow_hit(pos, area) {
                 return Some(OverviewHit::GridArrow(arrow));
             }
         }
@@ -5924,7 +6074,7 @@ impl State {
         output: &Output,
         pos: Point<f64, Logical>,
     ) -> Option<smithay::desktop::Window> {
-        let mon = self.niri.layout.monitor_for_output(output)?;
+        let mon = self.synoik.layout.monitor_for_output(output)?;
         mon.preview_overlays()
             .into_iter()
             .find(|(_, preview, _)| window_preview::hover_rect(*preview).contains(pos))
@@ -5940,7 +6090,7 @@ impl State {
         output: &Output,
         pos: Point<f64, Logical>,
     ) -> Option<smithay::desktop::Window> {
-        let mon = self.niri.layout.monitor_for_output(output)?;
+        let mon = self.synoik.layout.monitor_for_output(output)?;
         mon.preview_overlays()
             .into_iter()
             .find(|(_, preview, _)| window_preview::close_rect(*preview).contains(pos))
@@ -5963,18 +6113,18 @@ impl State {
     /// The caller has already given the search entry its shot at the key, so an active
     /// search never reaches this.
     fn overview_grid_key(&mut self, raw: Keysym, mods: ModifiersState) -> bool {
-        let folder_open = self.niri.folder_dialog.is_open();
+        let folder_open = self.synoik.folder_dialog.is_open();
         let grid_open =
-            self.niri.layout.is_app_grid_open() && !self.niri.overview_search.is_active();
+            self.synoik.layout.is_app_grid_open() && !self.synoik.overview_search.is_active();
         if !folder_open && !grid_open {
             return false;
         }
-        let Some(output) = self.niri.layout.active_output().cloned() else {
+        let Some(output) = self.synoik.layout.active_output().cloned() else {
             return false;
         };
         let view = Rectangle::from_size(output_size(&output));
         let area = self
-            .niri
+            .synoik
             .layout
             .controls_layout_for_output(&output)
             .map(|c| c.app_display);
@@ -5988,10 +6138,10 @@ impl State {
         if matches!(raw, Keysym::Tab | Keysym::ISO_Left_Tab) {
             let forward = !mods.shift && raw != Keysym::ISO_Left_Tab;
             if folder_open {
-                return self.niri.folder_dialog.focus_tab(forward, view);
+                return self.synoik.folder_dialog.focus_tab(forward, view);
             }
             let Some(area) = area else { return false };
-            self.niri.app_grid.focus_tab(forward, area);
+            self.synoik.app_grid.focus_tab(forward, area);
             return true;
         }
 
@@ -6006,12 +6156,12 @@ impl State {
             // While the dialog is up it is its own focus group, so the arrows stay inside
             // it and never reach the grid behind (`appDisplay.js:2516,2788-2789`).
             if folder_open {
-                return self.niri.folder_dialog.focus_navigate(dir, view);
+                return self.synoik.folder_dialog.focus_navigate(dir, view);
             }
             let Some(area) = area else { return false };
             // Consume the arrow either way: a move that finds no candidate (Down on the
             // last row) is still swallowed by the grid, not passed to the window binds.
-            self.niri.app_grid.focus_navigate(dir, area);
+            self.synoik.app_grid.focus_navigate(dir, area);
             return true;
         }
 
@@ -6030,15 +6180,15 @@ impl State {
                 return true;
             }
             let Some(area) = area else { return false };
-            let cur = self.niri.app_grid.current_page();
-            let last = self.niri.app_grid.page_count(area).saturating_sub(1);
+            let cur = self.synoik.app_grid.current_page();
+            let last = self.synoik.app_grid.page_count(area).saturating_sub(1);
             let page = match raw {
                 Keysym::Page_Up => cur.saturating_sub(1),
                 Keysym::Page_Down => cur + 1,
                 Keysym::Home => 0,
                 _ => last,
             };
-            self.niri.app_grid.set_page(page, area);
+            self.synoik.app_grid.set_page(page, area);
             return true;
         }
 
@@ -6046,12 +6196,12 @@ impl State {
             return false;
         }
         let hit = if folder_open {
-            let Some(i) = self.niri.folder_dialog.focused() else {
+            let Some(i) = self.synoik.folder_dialog.focused() else {
                 return false;
             };
             OverviewHit::Folder(DialogHit::App(i))
         } else {
-            let Some(i) = self.niri.app_grid.focused() else {
+            let Some(i) = self.synoik.app_grid.focused() else {
                 return false;
             };
             OverviewHit::GridApp(i)
@@ -6077,7 +6227,7 @@ impl State {
             // `_deleteAll` (`windowPreview.js:218`), and leaves the overview open.
             OverviewHit::PreviewClose(window) if primary => {
                 if let Some((_, mapped)) = self
-                    .niri
+                    .synoik
                     .layout
                     .windows()
                     .find(|(_, mapped)| mapped.window == window)
@@ -6089,107 +6239,109 @@ impl State {
             // (`DashIcon`, `dash.js:130`), so Ctrl- and middle-click ask it for a new
             // window — see [`app_click_mode`](Self::app_click_mode).
             OverviewHit::Dash(DashHit::App(i)) if launches => {
-                if let Some(id) = self.niri.dash.item_id(i).map(str::to_owned) {
+                if let Some(id) = self.synoik.dash.item_id(i).map(str::to_owned) {
                     self.activate_app_icon(&id, button, "dash");
-                    self.niri.layout.close_overview();
+                    self.synoik.layout.close_overview();
                 }
             }
             // The show-apps button toggles the app grid (`ShowAppsIcon`,
             // `dash.js:189-213`).
             OverviewHit::Dash(DashHit::ShowApps) if primary => {
-                self.niri.layout.toggle_app_grid();
+                self.synoik.layout.toggle_app_grid();
             }
             OverviewHit::Search(SearchHit::Result(i)) if launches => {
-                if let Some(id) = self.niri.overview_search.result_id(i).map(str::to_owned) {
+                if let Some(id) = self.synoik.overview_search.result_id(i).map(str::to_owned) {
                     // An app search result *is* an `AppIcon`
                     // (`AppSearchProvider.createResultObject`, `appDisplay.js:1835-1839`),
                     // so it takes the same two modifiers as the grid.
                     self.activate_app_icon(&id, button, "search");
-                    self.niri.overview_search.clear();
-                    self.niri.layout.close_overview();
+                    self.synoik.overview_search.clear();
+                    self.synoik.layout.close_overview();
                 }
             }
             OverviewHit::Search(SearchHit::Clear) if primary => {
-                self.niri.overview_search.clear();
-                self.niri.sync_overview_search();
+                self.synoik.overview_search.clear();
+                self.synoik.sync_overview_search();
             }
             // Clicking the entry focuses it, which is what grows the resting puck into
             // GNOME's pill. Already-open is a no-op (but still consumes, so the click never
             // reaches the picker behind it).
             OverviewHit::Search(SearchHit::Field) if primary => {
-                self.niri.overview_search.expand();
+                self.synoik.overview_search.expand();
             }
             // An app inside an open folder launches exactly like a top-level one, and
             // the dialog goes down with the overview.
             OverviewHit::Folder(DialogHit::App(i)) if launches => {
-                if let Some(id) = self.niri.folder_dialog.entry_id(i).map(str::to_owned) {
+                if let Some(id) = self.synoik.folder_dialog.entry_id(i).map(str::to_owned) {
                     self.activate_app_icon(&id, button, "folder");
                     // The overview is going with it, which is GNOME's source-unmapped
                     // path — no shrink to watch.
-                    self.niri.folder_dialog.hide();
-                    self.niri.layout.close_overview();
+                    self.synoik.folder_dialog.hide();
+                    self.synoik.layout.close_overview();
                 }
             }
             // A click that misses the panel pops the dialog down (`clickGesture`,
             // `appDisplay.js:2480-2487`); one that lands on it and hits no control is
             // simply swallowed by the modal.
             OverviewHit::Folder(DialogHit::Outside) if primary => {
-                self.niri.folder_dialog.popdown();
+                self.synoik.folder_dialog.popdown();
             }
             // The edit button toggles the rename entry (`notify::checked`,
             // `appDisplay.js:2591-2596`); turning it back off commits the name.
             OverviewHit::Folder(DialogHit::Edit) if primary => {
-                if let Some((folder, name)) = self.niri.folder_dialog.toggle_rename() {
+                if let Some((folder, name)) = self.synoik.folder_dialog.toggle_rename() {
                     self.rename_folder(&folder, &name);
                 }
             }
             OverviewHit::Folder(DialogHit::Page(page)) if primary => {
                 let view = Rectangle::from_size(output_size(output));
-                self.niri.folder_dialog.set_page(page, view);
+                self.synoik.folder_dialog.set_page(page, view);
             }
             OverviewHit::Folder(DialogHit::Arrow(arrow)) if primary => {
                 let view = Rectangle::from_size(output_size(output));
-                self.niri.folder_dialog.step_page(arrow, view);
+                self.synoik.folder_dialog.step_page(arrow, view);
             }
             // An app grid tile launches the app and closes the overview
             // (`AppIcon.activate`, `appDisplay.js:3060,3077`).
             // A folder tile opens its dialog instead of launching
             // (`FolderIcon.vfunc_clicked` → `open()`, `appDisplay.js:2334-2343,2456`).
-            OverviewHit::GridApp(i) if launches && self.niri.app_grid.entry_folder(i).is_some() => {
-                let Some(members) = self.niri.app_grid.entry_folder(i).map(<[_]>::to_vec) else {
+            OverviewHit::GridApp(i)
+                if launches && self.synoik.app_grid.entry_folder(i).is_some() =>
+            {
+                let Some(members) = self.synoik.app_grid.entry_folder(i).map(<[_]>::to_vec) else {
                     return;
                 };
-                let Some(id) = self.niri.app_grid.entry_id(i).map(str::to_owned) else {
+                let Some(id) = self.synoik.app_grid.entry_id(i).map(str::to_owned) else {
                     return;
                 };
                 let name = self
-                    .niri
+                    .synoik
                     .app_grid
                     .entry_name(i)
                     .map(str::to_owned)
                     .unwrap_or_else(|| id.clone());
-                self.niri.folder_dialog.popup(&id, &name, members);
+                self.synoik.folder_dialog.popup(&id, &name, members);
             }
             OverviewHit::GridApp(i) if launches => {
-                if let Some(id) = self.niri.app_grid.entry_id(i).map(str::to_owned) {
+                if let Some(id) = self.synoik.app_grid.entry_id(i).map(str::to_owned) {
                     self.activate_app_icon(&id, button, "app grid");
-                    self.niri.layout.close_overview();
+                    self.synoik.layout.close_overview();
                 }
             }
             // A page-indicator dot jumps to that page; a navigation arrow steps one.
             OverviewHit::GridPage(page) if primary => {
-                if let Some(controls) = self.niri.layout.controls_layout_for_output(output) {
-                    self.niri.app_grid.set_page(page, controls.app_display);
+                if let Some(controls) = self.synoik.layout.controls_layout_for_output(output) {
+                    self.synoik.app_grid.set_page(page, controls.app_display);
                 }
             }
             OverviewHit::GridArrow(arrow) if primary => {
-                if let Some(controls) = self.niri.layout.controls_layout_for_output(output) {
-                    let cur = self.niri.app_grid.current_page();
+                if let Some(controls) = self.synoik.layout.controls_layout_for_output(output) {
+                    let cur = self.synoik.app_grid.current_page();
                     let target = match arrow {
                         PageArrow::Prev => cur.saturating_sub(1),
                         PageArrow::Next => cur + 1,
                     };
-                    self.niri.app_grid.set_page(target, controls.app_display);
+                    self.synoik.app_grid.set_page(target, controls.app_display);
                 }
             }
             _ => {}
@@ -6197,8 +6349,8 @@ impl State {
     }
 
     fn on_pointer_button<I: InputBackend>(&mut self, event: I::PointerButtonEvent) {
-        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
-        let pointer = self.niri.seat.get_pointer().unwrap();
+        let mod_key = self.backend.mod_key(&self.synoik.config.borrow());
+        let pointer = self.synoik.seat.get_pointer().unwrap();
 
         let serial = SERIAL_COUNTER.next_serial();
 
@@ -6211,9 +6363,9 @@ impl State {
         // A click while the shield is down raises it. Both edges are swallowed, not just the
         // press: leaking the release alone would give whatever is underneath a button-up it never
         // saw pressed.
-        if self.niri.screen_shield.is_active() {
+        if self.synoik.screen_shield.is_active() {
             if button_state == ButtonState::Pressed {
-                let pos = self.niri.seat.get_pointer().unwrap().current_location();
+                let pos = self.synoik.seat.get_pointer().unwrap().current_location();
                 self.on_shield_click(pos);
             }
             return;
@@ -6221,14 +6373,14 @@ impl State {
 
         // End any quick-settings volume-slider drag on button release (the press that
         // started it is suppressed below, so handle it before that early return).
-        if button_state == ButtonState::Released && self.niri.panel_popover.end_drag() {
-            self.niri.queue_redraw_all();
+        if button_state == ButtonState::Released && self.synoik.panel_popover.end_drag() {
+            self.synoik.queue_redraw_all();
         }
 
         // A drag beats a click: once an icon has left the press box, the release
         // drops it rather than activating anything.
-        if button_state == ButtonState::Released && self.niri.app_drag.is_some() {
-            self.niri.suppressed_buttons.remove(&button_code);
+        if button_state == ButtonState::Released && self.synoik.app_drag.is_some() {
+            self.synoik.suppressed_buttons.remove(&button_code);
             self.end_app_drag();
             return;
         }
@@ -6241,34 +6393,34 @@ impl State {
         // Releasing a grid page drag settles it on a page; a press that never moved is
         // simply dropped (a click on the grid background does nothing, as in GNOME).
         if button_state == ButtonState::Released {
-            if let Some(pan) = self.niri.app_grid_pan.take() {
+            if let Some(pan) = self.synoik.app_grid_pan.take() {
                 if pan.button == button_code {
-                    self.niri.suppressed_buttons.remove(&button_code);
+                    self.synoik.suppressed_buttons.remove(&button_code);
                     if pan.dragging {
                         let area = self
-                            .niri
+                            .synoik
                             .layout
                             .controls_layout_for_output(&pan.output)
                             .map(|c| c.app_display);
                         if let Some(area) = area {
-                            self.niri.app_grid.gesture_end(area);
+                            self.synoik.app_grid.gesture_end(area);
                         }
                     }
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                     return;
                 }
-                self.niri.app_grid_pan = Some(pan);
+                self.synoik.app_grid_pan = Some(pan);
             }
         }
 
         if button_state == ButtonState::Released {
-            if let Some((code, hit, origin)) = self.niri.overview_pressed.take() {
+            if let Some((code, hit, origin)) = self.synoik.overview_pressed.take() {
                 if code == button_code {
-                    self.niri.suppressed_buttons.remove(&button_code);
+                    self.synoik.suppressed_buttons.remove(&button_code);
 
                     let location = pointer.current_location();
                     let under = self
-                        .niri
+                        .synoik
                         .output_under(location)
                         .map(|(o, p)| (o.clone(), p));
                     if let Some((output, pos)) = under {
@@ -6277,64 +6429,64 @@ impl State {
                         }
                     }
 
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                     return;
                 }
 
-                self.niri.overview_pressed = Some((code, hit, origin));
+                self.synoik.overview_pressed = Some((code, hit, origin));
             }
         }
 
         // Ignore release events for mouse clicks that triggered a bind.
-        if self.niri.suppressed_buttons.remove(&button_code) {
+        if self.synoik.suppressed_buttons.remove(&button_code) {
             return;
         }
 
-        let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
+        let mods = self.synoik.seat.get_keyboard().unwrap().modifier_state();
         let modifiers = modifiers_from_state(mods);
         let mod_down = modifiers.contains(mod_key.to_modifiers());
 
         if ButtonState::Pressed == button_state {
             let mut is_switcher_open = false;
-            if let Some(switcher_output) = self.niri.switcher.output().cloned() {
+            if let Some(switcher_output) = self.synoik.switcher.output().cloned() {
                 is_switcher_open = true;
                 if let Some(MouseButton::Left) = button {
                     let location = pointer.current_location();
-                    let (output, pos_within_output) = self.niri.output_under(location).unwrap();
+                    let (output, pos_within_output) = self.synoik.output_under(location).unwrap();
                     // A click on an item activates it; anywhere else -- including another output
                     // -- dismisses without committing.
                     let outcome = if switcher_output == *output {
-                        self.niri.switcher.pointer_click(pos_within_output)
+                        self.synoik.switcher.pointer_click(pos_within_output)
                     } else {
-                        self.niri.switcher.pointer_click(Point::from((-1., -1.)))
+                        self.synoik.switcher.pointer_click(Point::from((-1., -1.)))
                     };
                     self.finish_switcher(outcome);
 
-                    self.niri.suppressed_buttons.insert(button_code);
+                    self.synoik.suppressed_buttons.insert(button_code);
                     return;
                 }
             }
 
             // The end-session dialog is modal: a left-click activates the button under the cursor,
             // and every button is swallowed so nothing reaches the windows behind it.
-            if self.niri.end_session_dialog.is_open() {
+            if self.synoik.end_session_dialog.is_open() {
                 if button == Some(MouseButton::Left) {
                     let location = pointer.current_location();
-                    if let Some((output, pos_within_output)) = self.niri.output_under(location) {
+                    if let Some((output, pos_within_output)) = self.synoik.output_under(location) {
                         let output_size = output_size(output);
                         match self
-                            .niri
+                            .synoik
                             .end_session_dialog
                             .pointer_click(output_size, pos_within_output)
                         {
                             DialogOutcome::Handled => {}
-                            DialogOutcome::Confirm => self.niri.confirm_end_session(),
-                            DialogOutcome::Cancel => self.niri.cancel_end_session(),
+                            DialogOutcome::Confirm => self.synoik.confirm_end_session(),
+                            DialogOutcome::Cancel => self.synoik.cancel_end_session(),
                         }
                     }
                 }
 
-                self.niri.suppressed_buttons.insert(button_code);
+                self.synoik.suppressed_buttons.insert(button_code);
                 return;
             }
 
@@ -6342,49 +6494,49 @@ impl State {
             // every button is swallowed, and a click on the card's background does nothing rather
             // than dismissing it (polkit's ModalDialog has no click-outside-to-close either).
             #[cfg(feature = "dbus")]
-            if self.niri.polkit_is_open() {
+            if self.synoik.polkit_is_open() {
                 if button == Some(MouseButton::Left) {
                     let location = pointer.current_location();
-                    if let Some((output, pos_within_output)) = self.niri.output_under(location) {
+                    if let Some((output, pos_within_output)) = self.synoik.output_under(location) {
                         let output_size = output_size(output);
                         self.polkit_pointer_click(output_size, pos_within_output);
                     }
                 }
 
-                self.niri.suppressed_buttons.insert(button_code);
+                self.synoik.suppressed_buttons.insert(button_code);
                 return;
             }
 
             // GNOME top panel + its popovers.
-            if self.niri.layout.is_gnome_mode() {
+            if self.synoik.layout.is_gnome_mode() {
                 let location = pointer.current_location();
                 let under = self
-                    .niri
+                    .synoik
                     .output_under(location)
                     .map(|(o, p)| (o.clone(), p));
 
                 // An open popover (dateMenu calendar, quick settings, …) grabs pointer clicks: a
                 // click inside routes to it (a quick-settings tile/button returns an action we
                 // apply), anywhere else dismisses it. Either way the click is consumed.
-                if self.niri.panel_popover.is_open() {
-                    self.niri.suppressed_buttons.insert(button_code);
+                if self.synoik.panel_popover.is_open() {
+                    self.synoik.suppressed_buttons.insert(button_code);
                     match under {
                         Some((output, pos)) => {
                             if let Some(action) =
-                                self.niri.panel_popover.pointer_click(&output, pos)
+                                self.synoik.panel_popover.pointer_click(&output, pos)
                             {
                                 self.apply_popover_action(action);
                             }
                         }
-                        None => self.niri.panel_popover.close(),
+                        None => self.synoik.panel_popover.close(),
                     }
                     // A click may have paged the calendar month (nav arrows) —
                     // reload the events for the now-shown grid, like GNOME's
                     // per-rebuild `requestRange` (`js/ui/calendar.js:748`).
-                    self.niri.sync_calendar_range();
-                    self.niri.refresh_popover_calendar_events();
-                    self.niri.refresh_popover_world_clocks();
-                    self.niri.queue_redraw_all();
+                    self.synoik.sync_calendar_range();
+                    self.synoik.refresh_popover_calendar_events();
+                    self.synoik.refresh_popover_world_clocks();
+                    self.synoik.queue_redraw_all();
                     return;
                 }
 
@@ -6396,10 +6548,10 @@ impl State {
                 // GNOME's banner actor would swallow them. Recorded in the plan.
                 if button == Some(MouseButton::Left) {
                     if let Some((output, pos)) = &under {
-                        if let Some(hit) = self.niri.notification_banner.hit_test(output, *pos) {
-                            self.niri.suppressed_buttons.insert(button_code);
+                        if let Some(hit) = self.synoik.notification_banner.hit_test(output, *pos) {
+                            self.synoik.suppressed_buttons.insert(button_code);
                             self.on_banner_hit(hit);
-                            self.niri.queue_redraw_all();
+                            self.synoik.queue_redraw_all();
                             return;
                         }
                     }
@@ -6429,7 +6581,7 @@ impl State {
                     .as_ref()
                     .and_then(|(output, pos)| self.overview_hit(output, *pos))
                 {
-                    self.niri.suppressed_buttons.insert(button_code);
+                    self.synoik.suppressed_buttons.insert(button_code);
 
                     // ...with one exception: the context menu is the one overview
                     // gesture that fires on the *press*. gnome-shell gives each
@@ -6440,15 +6592,15 @@ impl State {
                         if let Some((output, _)) = &under {
                             let output = output.clone();
                             if self.open_app_menu_for(&output, hit.clone()) {
-                                self.niri.queue_redraw_all();
+                                self.synoik.queue_redraw_all();
                                 return;
                             }
                         }
                     }
 
                     let origin = under.as_ref().map(|(_, pos)| *pos).unwrap_or_default();
-                    self.niri.overview_pressed = Some((button_code, hit, origin));
-                    self.niri.queue_redraw_all();
+                    self.synoik.overview_pressed = Some((button_code, hit, origin));
+                    self.synoik.queue_redraw_all();
                     return;
                 }
 
@@ -6458,20 +6610,20 @@ impl State {
                 // (`swipeTracker.js:383-404`), and a press that lands on an icon is taken
                 // by the icon's own DND instead, which is the case handled above.
                 if button == Some(MouseButton::Left)
-                    && self.niri.layout.is_app_grid_open()
-                    && !self.niri.overview_search.is_active()
-                    && !self.niri.folder_dialog.is_open()
+                    && self.synoik.layout.is_app_grid_open()
+                    && !self.synoik.overview_search.is_active()
+                    && !self.synoik.folder_dialog.is_open()
                 {
                     let over_grid = under.as_ref().and_then(|(output, pos)| {
-                        let controls = self.niri.layout.controls_layout_for_output(output)?;
+                        let controls = self.synoik.layout.controls_layout_for_output(output)?;
                         controls
                             .app_display
                             .contains(*pos)
                             .then(|| (output.clone(), *pos))
                     });
                     if let Some((output, pos)) = over_grid {
-                        self.niri.suppressed_buttons.insert(button_code);
-                        self.niri.app_grid_pan = Some(crate::niri::AppGridPan {
+                        self.synoik.suppressed_buttons.insert(button_code);
+                        self.synoik.app_grid_pan = Some(crate::synoik::AppGridPan {
                             button: button_code,
                             output,
                             origin: pos,
@@ -6486,57 +6638,57 @@ impl State {
                 // (the mouse counterpart of the Super-tap); the clock opens the calendar popover.
                 if button == Some(MouseButton::Left) {
                     if let Some((output, pos)) = under {
-                        let ws = self.niri.workspace_state_for(&output);
+                        let ws = self.synoik.workspace_state_for(&output);
                         let output_w = output_size(&output).w;
-                        match self.niri.panel.hit_test(pos, output_w, ws) {
+                        match self.synoik.panel.hit_test(pos, output_w, ws) {
                             Some(crate::ui::panel::ROLE_ACTIVITIES) => {
-                                self.niri.suppressed_buttons.insert(button_code);
+                                self.synoik.suppressed_buttons.insert(button_code);
                                 self.do_action(Action::ToggleOverview, false);
                                 return;
                             }
                             Some(crate::ui::panel::ROLE_DATE_MENU) => {
                                 self.toggle_date_menu(output);
-                                self.niri.suppressed_buttons.insert(button_code);
+                                self.synoik.suppressed_buttons.insert(button_code);
                                 return;
                             }
                             Some(crate::ui::panel::ROLE_QUICK_SETTINGS) => {
                                 self.toggle_quick_settings_menu(output);
-                                self.niri.suppressed_buttons.insert(button_code);
+                                self.synoik.suppressed_buttons.insert(button_code);
                                 return;
                             }
                             Some(crate::ui::panel::ROLE_SCREEN_RECORDING) => {
                                 // Recognize on press (GNOME's `ScreenRecordingIndicator`):
                                 // clicking the indicator stops the recording(s).
-                                self.niri.suppressed_buttons.insert(button_code);
+                                self.synoik.suppressed_buttons.insert(button_code);
                                 self.stop_screen_recordings();
-                                self.niri.queue_redraw_all();
+                                self.synoik.queue_redraw_all();
                                 return;
                             }
                             Some(crate::ui::panel::ROLE_KEYBOARD) => {
                                 // Open the input-source (keyboard-layout) menu, anchored on the
                                 // indicator (gnome-shell's `InputSourceIndicator` popup).
-                                if let Some(anchor) = self.niri.panel.keyboard_rect(output_w) {
+                                if let Some(anchor) = self.synoik.panel.keyboard_rect(output_w) {
                                     let (items, active) = self.input_source_menu_snapshot();
-                                    self.niri
+                                    self.synoik
                                         .panel_popover
                                         .toggle_input_sources(output, anchor, items, active);
                                 }
-                                self.niri.suppressed_buttons.insert(button_code);
-                                self.niri.queue_redraw_all();
+                                self.synoik.suppressed_buttons.insert(button_code);
+                                self.synoik.queue_redraw_all();
                                 return;
                             }
                             Some(crate::ui::panel::ROLE_A11Y) => {
                                 // Open the accessibility menu, anchored on the indicator
                                 // (gnome-shell's `ATIndicator`).
-                                if let Some(anchor) = self.niri.panel.a11y_rect(output_w) {
-                                    let a11y = self.niri.gnome_settings.a11y;
-                                    let accent = self.niri.gnome_settings.accent_color;
-                                    self.niri
+                                if let Some(anchor) = self.synoik.panel.a11y_rect(output_w) {
+                                    let a11y = self.synoik.gnome_settings.a11y;
+                                    let accent = self.synoik.gnome_settings.accent_color;
+                                    self.synoik
                                         .panel_popover
                                         .toggle_a11y(output, anchor, a11y, accent);
                                 }
-                                self.niri.suppressed_buttons.insert(button_code);
-                                self.niri.queue_redraw_all();
+                                self.synoik.suppressed_buttons.insert(button_code);
+                                self.synoik.queue_redraw_all();
                                 return;
                             }
                             _ => {}
@@ -6545,7 +6697,7 @@ impl State {
                 }
             }
 
-            if is_switcher_open || self.niri.mods_with_mouse_binds.contains(&modifiers) {
+            if is_switcher_open || self.synoik.mods_with_mouse_binds.contains(&modifiers) {
                 if let Some(bind) = match button {
                     Some(MouseButton::Left) => Some(Trigger::MouseLeft),
                     Some(MouseButton::Right) => Some(Trigger::MouseRight),
@@ -6555,29 +6707,29 @@ impl State {
                     _ => None,
                 }
                 .and_then(|trigger| {
-                    find_trigger_bind(&self.niri.gnome_settings.keybindings, trigger, mods)
+                    find_trigger_bind(&self.synoik.gnome_settings.keybindings, trigger, mods)
                 })
                 .filter(|bind| {
-                    !self.niri.screenshot_ui.is_open() || allowed_during_screenshot(&bind.action)
+                    !self.synoik.screenshot_ui.is_open() || allowed_during_screenshot(&bind.action)
                 }) {
-                    self.niri.suppressed_buttons.insert(button_code);
+                    self.synoik.suppressed_buttons.insert(button_code);
                     self.handle_bind(bind.clone());
                     return;
                 };
             }
 
             // We received an event for the regular pointer, so show it now.
-            self.niri.pointer_visibility = PointerVisibility::Visible;
-            self.niri.tablet_cursor_location = None;
+            self.synoik.pointer_visibility = PointerVisibility::Visible;
+            self.synoik.tablet_cursor_location = None;
 
-            let is_overview_open = self.niri.layout.is_overview_open();
+            let is_overview_open = self.synoik.layout.is_overview_open();
 
             if is_overview_open && !pointer.is_grabbed() && button == Some(MouseButton::Right) {
-                if let Some((output, ws)) = self.niri.workspace_under_cursor(true) {
+                if let Some((output, ws)) = self.synoik.workspace_under_cursor(true) {
                     let ws_id = ws.id();
-                    let ws_idx = self.niri.layout.find_workspace_by_id(ws_id).unwrap().0;
+                    let ws_idx = self.synoik.layout.find_workspace_by_id(ws_id).unwrap().0;
 
-                    self.niri.layout.focus_output(&output);
+                    self.synoik.layout.focus_output(&output);
 
                     let location = pointer.current_location();
                     let start_data = PointerGrabStartData {
@@ -6585,29 +6737,29 @@ impl State {
                         button: button_code,
                         location,
                     };
-                    self.niri
+                    self.synoik
                         .layout
                         .view_offset_gesture_begin(&output, Some(ws_idx), false);
                     let grab = SpatialMovementGrab::new(start_data, output, ws_id, true);
                     pointer.set_grab(self, grab, serial, Focus::Clear);
-                    self.niri
+                    self.synoik
                         .cursor_manager
                         .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
 
                     // FIXME: granular.
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                     return;
                 }
             }
 
             if button == Some(MouseButton::Middle) && !pointer.is_grabbed() && mod_down {
                 let output_ws = if is_overview_open {
-                    self.niri.workspace_under_cursor(true)
+                    self.synoik.workspace_under_cursor(true)
                 } else {
                     // We don't want to accidentally "catch" the wrong workspace during
                     // animations.
-                    self.niri.output_under_cursor().and_then(|output| {
-                        let mon = self.niri.layout.monitor_for_output(&output)?;
+                    self.synoik.output_under_cursor().and_then(|output| {
+                        let mon = self.synoik.layout.monitor_for_output(&output)?;
                         Some((output, mon.active_workspace_ref()))
                     })
                 };
@@ -6615,7 +6767,7 @@ impl State {
                 if let Some((output, ws)) = output_ws {
                     let ws_id = ws.id();
 
-                    self.niri.layout.focus_output(&output);
+                    self.synoik.layout.focus_output(&output);
 
                     let location = pointer.current_location();
                     let start_data = PointerGrabStartData {
@@ -6625,12 +6777,12 @@ impl State {
                     };
                     let grab = SpatialMovementGrab::new(start_data, output, ws_id, false);
                     pointer.set_grab(self, grab, serial, Focus::Clear);
-                    self.niri
+                    self.synoik
                         .cursor_manager
                         .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
 
                     // FIXME: granular.
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
 
                     // Don't activate the window under the cursor to avoid unnecessary
                     // scrolling when e.g. Mod+MMB clicking on a partially off-screen window.
@@ -6645,20 +6797,23 @@ impl State {
             // The close button sits *inside* its thumbnail's body, so it has to be tested
             // before the grab or the reorder drag swallows every press aimed at it.
             if button == Some(MouseButton::Left) && !pointer.is_grabbed() && is_overview_open {
-                if let Some(ws_id) = self.niri.thumbnail_close_under(pointer.current_location()) {
-                    if self.niri.layout.close_workspace(ws_id) {
+                if let Some(ws_id) = self
+                    .synoik
+                    .thumbnail_close_under(pointer.current_location())
+                {
+                    if self.synoik.layout.close_workspace(ws_id) {
                         // The strip re-lays around the gap; nothing is under the pointer
                         // where the button was, so drop both hovers rather than leaving a
                         // button lit over a workspace that is gone.
-                        self.niri.thumbnail_hovered = None;
-                        self.niri.thumbnail_close_hovered = None;
-                        self.niri.queue_redraw_all();
+                        self.synoik.thumbnail_hovered = None;
+                        self.synoik.thumbnail_close_hovered = None;
+                        self.synoik.queue_redraw_all();
                     }
                     return;
                 }
 
                 let hit = self
-                    .niri
+                    .synoik
                     .thumbnail_under(pointer.current_location())
                     .map(|(output, _, idx)| (output, idx));
                 if let Some((output, idx)) = hit {
@@ -6673,7 +6828,7 @@ impl State {
                 }
             }
 
-            if let Some(mapped) = self.niri.window_under_cursor() {
+            if let Some(mapped) = self.synoik.window_under_cursor() {
                 let window = mapped.window.clone();
 
                 // Check if we need to start an interactive move.
@@ -6682,7 +6837,7 @@ impl State {
                         let location = pointer.current_location();
 
                         if !is_overview_open {
-                            self.niri.layout.activate_window(&window);
+                            self.synoik.layout.activate_window(&window);
                         }
 
                         let start_data = PointerGrabStartData {
@@ -6703,7 +6858,7 @@ impl State {
                             // In the overview, we click to activate window and close the overview,
                             // in this case setting the cursor right away would be distracting.
                             if !is_overview_open {
-                                self.niri
+                                self.synoik
                                     .cursor_manager
                                     .set_cursor_image(CursorImageStatus::Named(icon));
                             }
@@ -6713,9 +6868,9 @@ impl State {
                 // Check if we need to start an interactive resize.
                 else if button == Some(MouseButton::Right) && !pointer.is_grabbed() && mod_down {
                     let location = pointer.current_location();
-                    let (output, pos_within_output) = self.niri.output_under(location).unwrap();
+                    let (output, pos_within_output) = self.synoik.output_under(location).unwrap();
                     let edges = self
-                        .niri
+                        .synoik
                         .layout
                         .resize_edges_under(output, pos_within_output)
                         .unwrap_or(ResizeEdge::empty());
@@ -6744,23 +6899,23 @@ impl State {
                                 if intersection.intersects(ResizeEdge::LEFT_RIGHT) {
                                     // FIXME: don't activate once we can pass specific windows
                                     // to actions.
-                                    self.niri.layout.activate_window(&window);
-                                    self.niri.layout.toggle_full_width();
+                                    self.synoik.layout.activate_window(&window);
+                                    self.synoik.layout.toggle_full_width();
                                 }
                                 if intersection.intersects(ResizeEdge::TOP_BOTTOM) {
-                                    self.niri.layout.activate_window(&window);
-                                    self.niri.layout.reset_window_height(Some(&window));
+                                    self.synoik.layout.activate_window(&window);
+                                    self.synoik.layout.reset_window_height(Some(&window));
                                 }
                                 // FIXME: granular.
-                                self.niri.queue_redraw_all();
+                                self.synoik.queue_redraw_all();
                                 return;
                             }
                         }
 
-                        self.niri.layout.activate_window(&window);
+                        self.synoik.layout.activate_window(&window);
 
                         if self
-                            .niri
+                            .synoik
                             .layout
                             .interactive_resize_begin(window.clone(), edges)
                         {
@@ -6771,7 +6926,7 @@ impl State {
                             };
                             let grab = ResizeGrab::new(start_data, window.clone());
                             pointer.set_grab(self, grab, serial, Focus::Clear);
-                            self.niri
+                            self.synoik
                                 .cursor_manager
                                 .set_cursor_image(CursorImageStatus::Named(edges.cursor_icon()));
                         }
@@ -6779,28 +6934,28 @@ impl State {
                 }
 
                 if !is_overview_open {
-                    self.niri.layout.activate_window(&window);
+                    self.synoik.layout.activate_window(&window);
                 }
 
                 // FIXME: granular.
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             } else if let Some((output, ws)) = is_overview_open
                 .then(|| {
                     // A strip thumbnail counts as its workspace: gnome-shell's
                     // WorkspaceThumbnail.activate has the same click rules.
-                    self.niri
+                    self.synoik
                         .thumbnail_workspace_under_cursor()
-                        .or_else(|| self.niri.workspace_under_cursor(false))
+                        .or_else(|| self.synoik.workspace_under_cursor(false))
                 })
                 .flatten()
             {
                 let ws_id = ws.id();
                 self.activate_overview_workspace(&output, ws_id);
-            } else if let Some(output) = self.niri.output_under_cursor() {
-                self.niri.layout.focus_output(&output);
+            } else if let Some(output) = self.synoik.output_under_cursor() {
+                self.synoik.layout.focus_output(&output);
 
                 // FIXME: granular.
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
         };
 
@@ -6811,37 +6966,37 @@ impl State {
             // focus-stealing-prevention clocks. This runs after
             // click-to-focus, so the stamp lands on the newly focused window.
             let now = get_monotonic_time();
-            self.niri.last_user_action_time = Some(now);
-            if let Some(mapped) = self.niri.layout.focus_mut() {
+            self.synoik.last_user_action_time = Some(now);
+            if let Some(mapped) = self.synoik.layout.focus_mut() {
                 mapped.bump_user_time(now);
             }
 
-            let layer_under = self.niri.pointer_contents.layer.clone();
-            self.niri.focus_layer_surface_if_on_demand(layer_under);
+            let layer_under = self.synoik.pointer_contents.layer.clone();
+            self.synoik.focus_layer_surface_if_on_demand(layer_under);
         }
 
-        if button == Some(MouseButton::Left) && self.niri.screenshot_ui.is_open() {
+        if button == Some(MouseButton::Left) && self.synoik.screenshot_ui.is_open() {
             if button_state == ButtonState::Pressed {
                 let pos = pointer.current_location();
 
                 // If we'll be moving the existing selection, use the selection output.
                 let output = if mod_down {
-                    self.niri.screenshot_ui.selection_output()
+                    self.synoik.screenshot_ui.selection_output()
                 } else {
-                    self.niri.output_under(pos).map(|(out, _)| out)
+                    self.synoik.output_under(pos).map(|(out, _)| out)
                 };
 
                 if let Some(output) = output.cloned() {
-                    let geom = self.niri.global_space.output_geometry(&output).unwrap();
+                    let geom = self.synoik.global_space.output_geometry(&output).unwrap();
                     let point = (pos - geom.loc.to_f64())
                         .to_physical(output.current_scale().fractional_scale())
                         .to_i32_round();
 
                     if self.handle_screenshot_ui_pointer_down(output, point, None, mod_down) {
-                        self.niri.queue_redraw_all();
+                        self.synoik.queue_redraw_all();
                     }
                 }
-            } else if let Some(up) = self.niri.screenshot_ui.pointer_up(None) {
+            } else if let Some(up) = self.synoik.screenshot_ui.pointer_up(None) {
                 self.handle_screenshot_ui_pointer_up(up);
             }
         }
@@ -6862,22 +7017,22 @@ impl State {
     where
         I::Device: 'static, // Needed for downcasting, to read natural-scroll off the device.
     {
-        let pointer = &self.niri.seat.get_pointer().unwrap();
+        let pointer = &self.synoik.seat.get_pointer().unwrap();
 
         let source = event.source();
 
         // We received an event for the regular pointer, so show it now. This is also needed for
         // update_pointer_contents() below to return the real contents, necessary for the pointer
         // axis event to reach the window.
-        self.niri.pointer_visibility = PointerVisibility::Visible;
-        self.niri.tablet_cursor_location = None;
+        self.synoik.pointer_visibility = PointerVisibility::Visible;
+        self.synoik.tablet_cursor_location = None;
 
         let timestamp = Duration::from_micros(event.time());
 
         let horizontal_amount_v120 = event.amount_v120(Axis::Horizontal);
         let vertical_amount_v120 = event.amount_v120(Axis::Vertical);
 
-        let is_overview_open = self.niri.layout.is_overview_open();
+        let is_overview_open = self.synoik.layout.is_overview_open();
 
         // We should only handle scrolling in the overview if the pointer is not over a (top or
         // overlay) layer surface.
@@ -6887,10 +7042,10 @@ impl State {
             // updating the pointer contents.
             pointer
                 .current_focus()
-                .map(|surface| self.niri.find_root_shell_surface(&surface))
+                .map(|surface| self.synoik.find_root_shell_surface(&surface))
                 .is_none_or(|root| {
                     !self
-                        .niri
+                        .synoik
                         .mapped_layer_surfaces
                         .keys()
                         .any(|layer| *layer.wl_surface() == root)
@@ -6899,7 +7054,7 @@ impl State {
             false
         };
 
-        let is_switcher_open = self.niri.switcher.is_open();
+        let is_switcher_open = self.synoik.switcher.is_open();
 
         // A scroll OVER an open panel popover is grabbed by it: the dateMenu
         // scrolls its message list (or pages the calendar month), gnome-shell's
@@ -6907,26 +7062,26 @@ impl State {
         // never leaks to workspace switching underneath. A scroll elsewhere
         // (the panel indicators, a window) still falls through to the handlers
         // below. Wheel notches move a fixed step; touchpad pixels pass as-is.
-        if self.niri.panel_popover.is_open() {
+        if self.synoik.panel_popover.is_open() {
             let location = pointer.current_location();
             let target = self
-                .niri
+                .synoik
                 .output_under(location)
                 .map(|(output, pos)| (output.clone(), pos));
             if let Some((output, pos)) = target {
-                if self.niri.panel_popover.contains(&output, pos) {
+                if self.synoik.panel_popover.contains(&output, pos) {
                     // ~60 px per wheel notch (120 v120 units), else touchpad pixels.
                     let step = vertical_amount_v120
                         .map(|v| v / 120. * 60.)
                         .or_else(|| event.amount(Axis::Vertical))
                         .unwrap_or(0.);
-                    if self.niri.panel_popover.pointer_scroll(&output, pos, step) {
+                    if self.synoik.panel_popover.pointer_scroll(&output, pos, step) {
                         // A scroll over the calendar column pages the month —
                         // reload events for the new grid (`js/ui/calendar.js:748`).
-                        self.niri.sync_calendar_range();
-                        self.niri.refresh_popover_calendar_events();
-                        self.niri.refresh_popover_world_clocks();
-                        self.niri.queue_redraw_all();
+                        self.synoik.sync_calendar_range();
+                        self.synoik.refresh_popover_calendar_events();
+                        self.synoik.refresh_popover_world_clocks();
+                        self.synoik.queue_redraw_all();
                     }
                     return;
                 }
@@ -6941,35 +7096,35 @@ impl State {
         // is consumed here but does nothing.
         if is_overview_open
             && should_handle_in_overview
-            && self.niri.layout.is_app_grid_open()
-            && !self.niri.overview_search.is_active()
+            && self.synoik.layout.is_app_grid_open()
+            && !self.synoik.overview_search.is_active()
         {
             let target = self
-                .niri
+                .synoik
                 .output_under(pointer.current_location())
                 .map(|(output, pos)| (output.clone(), pos));
             if let Some((output, pos)) = target {
-                if let Some(controls) = self.niri.layout.controls_layout_for_output(&output) {
+                if let Some(controls) = self.synoik.layout.controls_layout_for_output(&output) {
                     let area = controls.app_display;
                     if area.contains(pos) {
                         if source == AxisSource::Wheel {
                             let v = vertical_amount_v120
                                 .or(horizontal_amount_v120)
                                 .unwrap_or(0.);
-                            let debounced = self.niri.app_grid_last_page_flip.is_some_and(|t| {
+                            let debounced = self.synoik.app_grid_last_page_flip.is_some_and(|t| {
                                 timestamp.saturating_sub(t) < Duration::from_millis(150)
                             });
                             if v != 0. && !debounced {
-                                let n = self.niri.app_grid.page_count(area);
-                                let cur = self.niri.app_grid.current_page();
+                                let n = self.synoik.app_grid.page_count(area);
+                                let cur = self.synoik.app_grid.current_page();
                                 let target_page = if v > 0. {
                                     (cur + 1).min(n.saturating_sub(1))
                                 } else {
                                     cur.saturating_sub(1)
                                 };
-                                if self.niri.app_grid.set_page(target_page, area) {
-                                    self.niri.app_grid_last_page_flip = Some(timestamp);
-                                    self.niri.queue_redraw_all();
+                                if self.synoik.app_grid.set_page(target_page, area) {
+                                    self.synoik.app_grid_last_page_flip = Some(timestamp);
+                                    self.synoik.queue_redraw_all();
                                 }
                             }
                         } else {
@@ -6979,24 +7134,24 @@ impl State {
                             // is swallowed all the same.
                             let dx = event.amount(Axis::Horizontal).unwrap_or(0.);
                             let dy = event.amount(Axis::Vertical).unwrap_or(0.);
-                            let action = self.niri.app_grid_scroll_swipe.update(dx, dy);
+                            let action = self.synoik.app_grid_scroll_swipe.update(dx, dy);
                             let mut redraw = false;
                             if action.end() {
-                                redraw |= self.niri.app_grid.gesture_end(area);
+                                redraw |= self.synoik.app_grid.gesture_end(area);
                             } else {
                                 if action.begin() {
-                                    self.niri
+                                    self.synoik
                                         .app_grid
                                         .gesture_begin(SwipeSource::Touchpad, area);
                                 }
-                                redraw |= self.niri.app_grid.gesture_update(
+                                redraw |= self.synoik.app_grid.gesture_update(
                                     dx * crate::ui::app_grid::SWIPE_SCROLL_MULTIPLIER,
                                     timestamp,
                                     area,
                                 );
                             }
                             if redraw {
-                                self.niri.queue_redraw_all();
+                                self.synoik.queue_redraw_all();
                             }
                         }
                         // Consume all scroll over the grid.
@@ -7008,17 +7163,17 @@ impl State {
 
         // A scroll that did not reach the grid ends any swipe it had going — the pointer
         // left the band, or the grid closed under it.
-        if self.niri.app_grid_scroll_swipe.reset() {
+        if self.synoik.app_grid_scroll_swipe.reset() {
             let area = self
-                .niri
+                .synoik
                 .layout
                 .active_output()
                 .cloned()
-                .and_then(|o| self.niri.layout.controls_layout_for_output(&o))
+                .and_then(|o| self.synoik.layout.controls_layout_for_output(&o))
                 .map(|c| c.app_display);
             if let Some(area) = area {
-                if self.niri.app_grid.gesture_cancel(area) {
-                    self.niri.queue_redraw_all();
+                if self.synoik.app_grid.gesture_cancel(area) {
+                    self.synoik.queue_redraw_all();
                 }
             }
         }
@@ -7026,21 +7181,21 @@ impl State {
         // GNOME top panel: a wheel scroll over the workspace indicator switches
         // workspaces (gnome-shell handleWorkspaceScroll). Handle it before the
         // generic wheel binds so it works with no modifier, and consume the event.
-        if source == AxisSource::Wheel && self.niri.layout.is_gnome_mode() {
+        if source == AxisSource::Wheel && self.synoik.layout.is_gnome_mode() {
             let location = pointer.current_location();
             let over_indicator = self
-                .niri
+                .synoik
                 .output_under(location)
                 .map(|(output, pos)| {
-                    let ws = self.niri.workspace_state_for(output);
+                    let ws = self.synoik.workspace_state_for(output);
                     let output_w = output_size(output).w;
-                    self.niri.panel.hit_test(pos, output_w, ws)
+                    self.synoik.panel.hit_test(pos, output_w, ws)
                         == Some(crate::ui::panel::ROLE_ACTIVITIES)
                 })
                 .unwrap_or(false);
             if over_indicator {
                 let vertical = vertical_amount_v120.unwrap_or(0.);
-                let ticks = self.niri.vertical_wheel_tracker.accumulate(vertical);
+                let ticks = self.synoik.vertical_wheel_tracker.accumulate(vertical);
                 if ticks > 0 {
                     for _ in 0..ticks {
                         self.do_action(Action::FocusWorkspaceDownUnderMouse, false);
@@ -7064,17 +7219,17 @@ impl State {
         // Locked or under the screenshot UI there is no reachable indicator in GNOME — the lock
         // screen has no status area and the screenshot UI is a modal grab — so neither may steer
         // the volume here.
-        if self.niri.layout.is_gnome_mode()
-            && !self.niri.is_locked()
-            && !self.niri.screenshot_ui.is_open()
+        if self.synoik.layout.is_gnome_mode()
+            && !self.synoik.is_locked()
+            && !self.synoik.screenshot_ui.is_open()
         {
             let location = pointer.current_location();
             let over_volume = self
-                .niri
+                .synoik
                 .output_under(location)
                 .and_then(|(output, pos)| {
                     let output_w = output_size(output).w;
-                    self.niri
+                    self.synoik
                         .panel
                         .volume_indicator_rect(output_w)?
                         .contains(pos)
@@ -7086,7 +7241,7 @@ impl State {
                 // `nSteps = -dy` is for GNOME's SMOOTH branch (`volume.js:452-458`). Wheels are
                 // accumulated in v120 units so a high-resolution wheel does not over-step.
                 let steps = match vertical_amount_v120 {
-                    Some(v120) => f64::from(self.niri.vertical_wheel_tracker.accumulate(v120)),
+                    Some(v120) => f64::from(self.synoik.vertical_wheel_tracker.accumulate(v120)),
                     None => {
                         // GNOME un-inverts smooth deltas to "match physical direction"
                         // (`volume.js:452-454`: mutter tags the event `CLUTTER_SCROLL_INVERTED`
@@ -7115,22 +7270,22 @@ impl State {
         if source == AxisSource::Wheel {
             // If we have a scroll bind with current modifiers, then accumulate and don't pass to
             // Wayland. If there's no bind, reset the accumulator.
-            let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
+            let mods = self.synoik.seat.get_keyboard().unwrap().modifier_state();
             let modifiers = modifiers_from_state(mods);
             let should_handle = should_handle_in_overview
                 || is_switcher_open
-                || self.niri.mods_with_wheel_binds.contains(&modifiers);
+                || self.synoik.mods_with_wheel_binds.contains(&modifiers);
             if should_handle {
                 let horizontal = horizontal_amount_v120.unwrap_or(0.);
-                let ticks = self.niri.horizontal_wheel_tracker.accumulate(horizontal);
+                let ticks = self.synoik.horizontal_wheel_tracker.accumulate(horizontal);
                 if ticks != 0 {
                     let (bind_left, bind_right) =
                         if should_handle_in_overview && modifiers.is_empty() {
                             // In GNOME windowing mode the overview workspaces
                             // form a horizontal row: horizontal wheel scrolls
                             // through them (gnome-shell handleWorkspaceScroll).
-                            let gnome_mode = self.niri.config.borrow().layout.windowing_mode
-                                == niri_config::WindowingMode::Floating;
+                            let gnome_mode = self.synoik.config.borrow().layout.windowing_mode
+                                == synoik_config::WindowingMode::Floating;
                             let (action_left, action_right, cooldown) = if gnome_mode {
                                 (
                                     Action::FocusWorkspaceUpUnderMouse,
@@ -7169,21 +7324,21 @@ impl State {
                             (bind_left, bind_right)
                         } else {
                             let bind_left = find_trigger_bind(
-                                &self.niri.gnome_settings.keybindings,
+                                &self.synoik.gnome_settings.keybindings,
                                 Trigger::WheelScrollLeft,
                                 mods,
                             )
                             .filter(|bind| {
-                                !self.niri.screenshot_ui.is_open()
+                                !self.synoik.screenshot_ui.is_open()
                                     || allowed_during_screenshot(&bind.action)
                             });
                             let bind_right = find_trigger_bind(
-                                &self.niri.gnome_settings.keybindings,
+                                &self.synoik.gnome_settings.keybindings,
                                 Trigger::WheelScrollRight,
                                 mods,
                             )
                             .filter(|bind| {
-                                !self.niri.screenshot_ui.is_open()
+                                !self.synoik.screenshot_ui.is_open()
                                     || allowed_during_screenshot(&bind.action)
                             });
                             (bind_left, bind_right)
@@ -7202,7 +7357,7 @@ impl State {
                 }
 
                 let vertical = vertical_amount_v120.unwrap_or(0.);
-                let ticks = self.niri.vertical_wheel_tracker.accumulate(vertical);
+                let ticks = self.synoik.vertical_wheel_tracker.accumulate(vertical);
                 if ticks != 0 {
                     let (bind_up, bind_down) = if should_handle_in_overview && modifiers.is_empty()
                     {
@@ -7255,21 +7410,21 @@ impl State {
                         (bind_up, bind_down)
                     } else {
                         let bind_up = find_trigger_bind(
-                            &self.niri.gnome_settings.keybindings,
+                            &self.synoik.gnome_settings.keybindings,
                             Trigger::WheelScrollUp,
                             mods,
                         )
                         .filter(|bind| {
-                            !self.niri.screenshot_ui.is_open()
+                            !self.synoik.screenshot_ui.is_open()
                                 || allowed_during_screenshot(&bind.action)
                         });
                         let bind_down = find_trigger_bind(
-                            &self.niri.gnome_settings.keybindings,
+                            &self.synoik.gnome_settings.keybindings,
                             Trigger::WheelScrollDown,
                             mods,
                         )
                         .filter(|bind| {
-                            !self.niri.screenshot_ui.is_open()
+                            !self.synoik.screenshot_ui.is_open()
                                 || allowed_during_screenshot(&bind.action)
                         });
                         (bind_up, bind_down)
@@ -7289,8 +7444,8 @@ impl State {
 
                 return;
             } else {
-                self.niri.horizontal_wheel_tracker.reset();
-                self.niri.vertical_wheel_tracker.reset();
+                self.synoik.horizontal_wheel_tracker.reset();
+                self.synoik.vertical_wheel_tracker.reset();
             }
         }
 
@@ -7299,7 +7454,7 @@ impl State {
 
         // Handle touchpad and continuous scroll bindings.
         if source == AxisSource::Finger || source == AxisSource::Continuous {
-            let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
+            let mods = self.synoik.seat.get_keyboard().unwrap().modifier_state();
             let modifiers = modifiers_from_state(mods);
 
             let horizontal = horizontal_amount.unwrap_or(0.);
@@ -7309,21 +7464,21 @@ impl State {
                 let mut redraw = false;
 
                 let action = self
-                    .niri
+                    .synoik
                     .overview_scroll_swipe_gesture
                     .update(horizontal, vertical);
-                let is_vertical = self.niri.overview_scroll_swipe_gesture.is_vertical();
+                let is_vertical = self.synoik.overview_scroll_swipe_gesture.is_vertical();
 
                 if action.end() {
                     if is_vertical {
                         redraw |= self
-                            .niri
+                            .synoik
                             .layout
                             .workspace_switch_gesture_end(Some(true))
                             .is_some();
                     } else {
                         redraw |= self
-                            .niri
+                            .synoik
                             .layout
                             .view_offset_gesture_end(Some(true))
                             .is_some();
@@ -7332,8 +7487,8 @@ impl State {
                     // Maybe begin, then update.
                     if is_vertical {
                         if action.begin() {
-                            if let Some(output) = self.niri.output_under_cursor() {
-                                self.niri
+                            if let Some(output) = self.synoik.output_under_cursor() {
+                                self.synoik
                                     .layout
                                     .workspace_switch_gesture_begin(&output, true);
                                 redraw = true;
@@ -7341,7 +7496,7 @@ impl State {
                         }
 
                         let res = self
-                            .niri
+                            .synoik
                             .layout
                             .workspace_switch_gesture_update(vertical, timestamp, true);
                         if let Some(Some(_)) = res {
@@ -7349,12 +7504,12 @@ impl State {
                         }
                     } else {
                         if action.begin() {
-                            if let Some((output, ws)) = self.niri.workspace_under_cursor(true) {
+                            if let Some((output, ws)) = self.synoik.workspace_under_cursor(true) {
                                 let ws_id = ws.id();
                                 let ws_idx =
-                                    self.niri.layout.find_workspace_by_id(ws_id).unwrap().0;
+                                    self.synoik.layout.find_workspace_by_id(ws_id).unwrap().0;
 
-                                self.niri.layout.view_offset_gesture_begin(
+                                self.synoik.layout.view_offset_gesture_begin(
                                     &output,
                                     Some(ws_idx),
                                     true,
@@ -7364,7 +7519,7 @@ impl State {
                         }
 
                         let res = self
-                            .niri
+                            .synoik
                             .layout
                             .view_offset_gesture_update(horizontal, timestamp, true);
                         if let Some(Some(_)) = res {
@@ -7374,54 +7529,59 @@ impl State {
                 }
 
                 if redraw {
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
 
                 return;
             } else {
                 let mut redraw = false;
-                if self.niri.overview_scroll_swipe_gesture.reset() {
-                    if self.niri.overview_scroll_swipe_gesture.is_vertical() {
+                if self.synoik.overview_scroll_swipe_gesture.reset() {
+                    if self.synoik.overview_scroll_swipe_gesture.is_vertical() {
                         redraw |= self
-                            .niri
+                            .synoik
                             .layout
                             .workspace_switch_gesture_end(Some(true))
                             .is_some();
                     } else {
                         redraw |= self
-                            .niri
+                            .synoik
                             .layout
                             .view_offset_gesture_end(Some(true))
                             .is_some();
                     }
                 }
                 if redraw {
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
 
-            if is_switcher_open || self.niri.mods_with_finger_scroll_binds.contains(&modifiers) {
+            if is_switcher_open
+                || self
+                    .synoik
+                    .mods_with_finger_scroll_binds
+                    .contains(&modifiers)
+            {
                 let ticks = self
-                    .niri
+                    .synoik
                     .horizontal_finger_scroll_tracker
                     .accumulate(horizontal);
                 if ticks != 0 {
                     let bind_left = find_trigger_bind(
-                        &self.niri.gnome_settings.keybindings,
+                        &self.synoik.gnome_settings.keybindings,
                         Trigger::TouchpadScrollLeft,
                         mods,
                     )
                     .filter(|bind| {
-                        !self.niri.screenshot_ui.is_open()
+                        !self.synoik.screenshot_ui.is_open()
                             || allowed_during_screenshot(&bind.action)
                     });
                     let bind_right = find_trigger_bind(
-                        &self.niri.gnome_settings.keybindings,
+                        &self.synoik.gnome_settings.keybindings,
                         Trigger::TouchpadScrollRight,
                         mods,
                     )
                     .filter(|bind| {
-                        !self.niri.screenshot_ui.is_open()
+                        !self.synoik.screenshot_ui.is_open()
                             || allowed_during_screenshot(&bind.action)
                     });
 
@@ -7438,26 +7598,26 @@ impl State {
                 }
 
                 let ticks = self
-                    .niri
+                    .synoik
                     .vertical_finger_scroll_tracker
                     .accumulate(vertical);
                 if ticks != 0 {
                     let bind_up = find_trigger_bind(
-                        &self.niri.gnome_settings.keybindings,
+                        &self.synoik.gnome_settings.keybindings,
                         Trigger::TouchpadScrollUp,
                         mods,
                     )
                     .filter(|bind| {
-                        !self.niri.screenshot_ui.is_open()
+                        !self.synoik.screenshot_ui.is_open()
                             || allowed_during_screenshot(&bind.action)
                     });
                     let bind_down = find_trigger_bind(
-                        &self.niri.gnome_settings.keybindings,
+                        &self.synoik.gnome_settings.keybindings,
                         Trigger::TouchpadScrollDown,
                         mods,
                     )
                     .filter(|bind| {
-                        !self.niri.screenshot_ui.is_open()
+                        !self.synoik.screenshot_ui.is_open()
                             || allowed_during_screenshot(&bind.action)
                     });
 
@@ -7475,15 +7635,15 @@ impl State {
 
                 return;
             } else {
-                self.niri.horizontal_finger_scroll_tracker.reset();
-                self.niri.vertical_finger_scroll_tracker.reset();
+                self.synoik.horizontal_finger_scroll_tracker.reset();
+                self.synoik.vertical_finger_scroll_tracker.reset();
             }
         }
 
         self.update_pointer_contents();
 
         let device_scroll_factor = {
-            let config = self.niri.config.borrow();
+            let config = self.synoik.config.borrow();
             match source {
                 AxisSource::Wheel => config.input.mouse.scroll_factor,
                 AxisSource::Finger => config.input.touchpad.scroll_factor,
@@ -7494,8 +7654,8 @@ impl State {
         // Get window-specific scroll factor
         let window_scroll_factor = pointer
             .current_focus()
-            .map(|focused| self.niri.find_root_shell_surface(&focused))
-            .and_then(|root| self.niri.layout.find_window_and_output(&root).unzip().0)
+            .map(|focused| self.synoik.find_root_shell_surface(&focused))
+            .and_then(|root| self.synoik.layout.find_window_and_output(&root).unzip().0)
             .and_then(|window| window.rules().scroll_factor)
             .unwrap_or(1.);
 
@@ -7560,39 +7720,39 @@ impl State {
             return;
         };
 
-        if let Some(output) = self.niri.screenshot_ui.selection_output() {
-            let geom = self.niri.global_space.output_geometry(output).unwrap();
+        if let Some(output) = self.synoik.screenshot_ui.selection_output() {
+            let geom = self.synoik.global_space.output_geometry(output).unwrap();
             let point = (pos - geom.loc.to_f64())
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
             if self.handle_screenshot_ui_motion(point, None) {
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
         }
 
-        if let Some(switcher_output) = self.niri.switcher.output().cloned() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+        if let Some(switcher_output) = self.synoik.switcher.output().cloned() {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                 if switcher_output == *output
                     && self
-                        .niri
+                        .synoik
                         .switcher
-                        .pointer_motion(pos_within_output, self.niri.clock.now_unadjusted())
+                        .pointer_motion(pos_within_output, self.synoik.clock.now_unadjusted())
                 {
-                    self.niri.queue_redraw_switcher_output();
+                    self.synoik.queue_redraw_switcher_output();
                 }
             }
         }
 
-        if self.niri.end_session_dialog.is_open() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+        if self.synoik.end_session_dialog.is_open() {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                 let output_size = output_size(output);
                 if self
-                    .niri
+                    .synoik
                     .end_session_dialog
                     .pointer_motion(output_size, pos_within_output)
                 {
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
         }
@@ -7600,16 +7760,16 @@ impl State {
         // Hovering a polkit control focuses it, so the pointer and the keyboard agree about which
         // button Enter would press.
         #[cfg(feature = "dbus")]
-        if self.niri.polkit_is_open() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+        if self.synoik.polkit_is_open() {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                 let output_size = output_size(output);
                 self.polkit_pointer_motion(output_size, pos_within_output);
             }
         }
 
-        let under = self.niri.contents_under(pos);
+        let under = self.synoik.contents_under(pos);
 
-        let tablet_seat = self.niri.seat.tablet_seat();
+        let tablet_seat = self.synoik.seat.tablet_seat();
         let tablet = tablet_seat.get_tablet(&TabletDescriptor::from(&event.device()));
         let tool = tablet_seat.get_tool(&event.tool());
         if let (Some(tablet), Some(tool)) = (tablet, tool) {
@@ -7640,123 +7800,123 @@ impl State {
                 event.time_msec(),
             );
 
-            self.niri.pointer_visibility = PointerVisibility::Visible;
-            self.niri.tablet_cursor_location = Some(pos);
+            self.synoik.pointer_visibility = PointerVisibility::Visible;
+            self.synoik.tablet_cursor_location = Some(pos);
         }
 
         // Redraw to update the cursor position.
         // FIXME: redraw only outputs overlapping the cursor.
-        self.niri.queue_redraw_all();
+        self.synoik.queue_redraw_all();
     }
 
     fn on_tablet_tool_tip<I: InputBackend>(&mut self, event: I::TabletToolTipEvent) {
-        let tool = self.niri.seat.tablet_seat().get_tool(&event.tool());
+        let tool = self.synoik.seat.tablet_seat().get_tool(&event.tool());
 
         let Some(tool) = tool else {
             return;
         };
         let tip_state = event.tip_state();
 
-        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
-        let is_overview_open = self.niri.layout.is_overview_open();
+        let mod_key = self.backend.mod_key(&self.synoik.config.borrow());
+        let is_overview_open = self.synoik.layout.is_overview_open();
 
         match tip_state {
             TabletToolTipState::Down => {
                 let serial = SERIAL_COUNTER.next_serial();
                 tool.tip_down(serial, event.time_msec());
 
-                if let Some(pos) = self.niri.tablet_cursor_location {
-                    let under = self.niri.contents_under(pos);
+                if let Some(pos) = self.synoik.tablet_cursor_location {
+                    let under = self.synoik.contents_under(pos);
 
-                    if self.niri.screenshot_ui.is_open() {
-                        let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
+                    if self.synoik.screenshot_ui.is_open() {
+                        let mods = self.synoik.seat.get_keyboard().unwrap().modifier_state();
                         let modifiers = modifiers_from_state(mods);
                         let mod_down = modifiers.contains(mod_key.to_modifiers());
 
                         // If we'll be moving the existing selection, use the selection output.
                         let output = if mod_down {
-                            self.niri.screenshot_ui.selection_output()
+                            self.synoik.screenshot_ui.selection_output()
                         } else {
                             under.output.as_ref()
                         };
 
                         if let Some(output) = output.cloned() {
-                            let geom = self.niri.global_space.output_geometry(&output).unwrap();
+                            let geom = self.synoik.global_space.output_geometry(&output).unwrap();
                             let point = (pos - geom.loc.to_f64())
                                 .to_physical(output.current_scale().fractional_scale())
                                 .to_i32_round();
 
                             if self.handle_screenshot_ui_pointer_down(output, point, None, mod_down)
                             {
-                                self.niri.queue_redraw_all();
+                                self.synoik.queue_redraw_all();
                             }
                         }
-                    } else if let Some(switcher_output) = self.niri.switcher.output().cloned() {
-                        if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+                    } else if let Some(switcher_output) = self.synoik.switcher.output().cloned() {
+                        if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                             let outcome = if switcher_output == *output {
-                                self.niri.switcher.pointer_click(pos_within_output)
+                                self.synoik.switcher.pointer_click(pos_within_output)
                             } else {
-                                self.niri.switcher.pointer_click(Point::from((-1., -1.)))
+                                self.synoik.switcher.pointer_click(Point::from((-1., -1.)))
                             };
                             self.finish_switcher(outcome);
                         }
                     } else if let Some((window, _)) = under.window {
                         if let Some(output) = is_overview_open.then_some(under.output).flatten() {
-                            let mut workspaces = self.niri.layout.workspaces();
+                            let mut workspaces = self.synoik.layout.workspaces();
                             if let Some(ws_idx) = workspaces.find_map(|(_, ws_idx, ws)| {
                                 ws.windows().any(|w| w.window == window).then_some(ws_idx)
                             }) {
                                 drop(workspaces);
-                                self.niri.layout.focus_output(&output);
-                                self.niri.layout.toggle_overview_to_workspace(ws_idx);
+                                self.synoik.layout.focus_output(&output);
+                                self.synoik.layout.toggle_overview_to_workspace(ws_idx);
                             }
                         }
 
-                        self.niri.layout.activate_window(&window);
+                        self.synoik.layout.activate_window(&window);
 
                         // FIXME: granular.
-                        self.niri.queue_redraw_all();
+                        self.synoik.queue_redraw_all();
                     } else if let Some((output, ws)) = is_overview_open
                         .then(|| {
-                            self.niri
+                            self.synoik
                                 .thumbnail_workspace_under(pos)
-                                .or_else(|| self.niri.workspace_under(false, pos))
+                                .or_else(|| self.synoik.workspace_under(false, pos))
                         })
                         .flatten()
                     {
                         let ws_id = ws.id();
-                        let ws_idx = self.niri.layout.find_workspace_by_id(ws_id).unwrap().0;
+                        let ws_idx = self.synoik.layout.find_workspace_by_id(ws_id).unwrap().0;
 
-                        self.niri.layout.focus_output(&output);
+                        self.synoik.layout.focus_output(&output);
 
                         // Same GNOME semantics as the pointer path: only the
                         // active workspace's empty area leaves the overview.
-                        let gnome_mode = self.niri.config.borrow().layout.windowing_mode
-                            == niri_config::WindowingMode::Floating;
+                        let gnome_mode = self.synoik.config.borrow().layout.windowing_mode
+                            == synoik_config::WindowingMode::Floating;
                         let is_active = self
-                            .niri
+                            .synoik
                             .layout
                             .active_workspace()
                             .is_some_and(|active| active.id() == ws_id);
                         if gnome_mode && !is_active {
-                            self.niri.layout.switch_workspace(ws_idx);
+                            self.synoik.layout.switch_workspace(ws_idx);
                         } else {
-                            self.niri.layout.toggle_overview_to_workspace(ws_idx);
+                            self.synoik.layout.toggle_overview_to_workspace(ws_idx);
                         }
 
                         // FIXME: granular.
-                        self.niri.queue_redraw_all();
+                        self.synoik.queue_redraw_all();
                     } else if let Some(output) = under.output {
-                        self.niri.layout.focus_output(&output);
+                        self.synoik.layout.focus_output(&output);
 
                         // FIXME: granular.
-                        self.niri.queue_redraw_all();
+                        self.synoik.queue_redraw_all();
                     }
-                    self.niri.focus_layer_surface_if_on_demand(under.layer);
+                    self.synoik.focus_layer_surface_if_on_demand(under.layer);
                 }
             }
             TabletToolTipState::Up => {
-                if let Some(up) = self.niri.screenshot_ui.pointer_up(None) {
+                if let Some(up) = self.synoik.screenshot_ui.pointer_up(None) {
                     self.handle_screenshot_ui_pointer_up(up);
                 }
 
@@ -7773,10 +7933,10 @@ impl State {
             return;
         };
 
-        let under = self.niri.contents_under(pos);
+        let under = self.synoik.contents_under(pos);
 
-        let tablet_seat = self.niri.seat.tablet_seat();
-        let display_handle = self.niri.display_handle.clone();
+        let tablet_seat = self.synoik.seat.tablet_seat();
+        let display_handle = self.synoik.display_handle.clone();
         let tool = tablet_seat.add_tool::<Self>(self, &display_handle, &event.tool());
         let tablet = tablet_seat.get_tablet(&TabletDescriptor::from(&event.device()));
         if let Some(tablet) = tablet {
@@ -7791,8 +7951,8 @@ impl State {
                             event.time_msec(),
                         );
                     }
-                    self.niri.pointer_visibility = PointerVisibility::Visible;
-                    self.niri.tablet_cursor_location = Some(pos);
+                    self.synoik.pointer_visibility = PointerVisibility::Visible;
+                    self.synoik.tablet_cursor_location = Some(pos);
                 }
                 ProximityState::Out => {
                     tool.proximity_out(event.time_msec());
@@ -7801,17 +7961,17 @@ impl State {
                     //
                     // Plus, Wayland SDL2 currently warps the pointer into some weird
                     // location on proximity out, so this should help it a little.
-                    if let Some(pos) = self.niri.tablet_cursor_location {
+                    if let Some(pos) = self.synoik.tablet_cursor_location {
                         self.move_cursor(pos);
                     }
 
-                    self.niri.pointer_visibility = PointerVisibility::Visible;
-                    self.niri.tablet_cursor_location = None;
+                    self.synoik.pointer_visibility = PointerVisibility::Visible;
+                    self.synoik.tablet_cursor_location = None;
                 }
             }
 
             // FIXME: granular.
-            self.niri.queue_redraw_all();
+            self.synoik.queue_redraw_all();
         }
     }
 
@@ -7820,12 +7980,12 @@ impl State {
         const BTN_STYLUS: u32 = 0x14b;
         const BTN_STYLUS2: u32 = 0x14c;
 
-        let tool = self.niri.seat.tablet_seat().get_tool(&event.tool());
+        let tool = self.synoik.seat.tablet_seat().get_tool(&event.tool());
 
         if let Some(tool) = tool {
             let button = event.button();
 
-            if self.niri.suppressed_buttons.remove(&button) {
+            if self.synoik.suppressed_buttons.remove(&button) {
                 return;
             }
 
@@ -7838,18 +7998,25 @@ impl State {
 
             if let Some(trigger) = trigger {
                 if event.button_state() == ButtonState::Pressed {
-                    let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
+                    let mods = self.synoik.seat.get_keyboard().unwrap().modifier_state();
                     let modifiers = modifiers_from_state(mods);
 
-                    if self.niri.mods_with_tablet_stylus_binds.contains(&modifiers) {
-                        let bind =
-                            find_trigger_bind(&self.niri.gnome_settings.keybindings, trigger, mods)
-                                .filter(|bind| {
-                                    !self.niri.screenshot_ui.is_open()
-                                        || allowed_during_screenshot(&bind.action)
-                                });
+                    if self
+                        .synoik
+                        .mods_with_tablet_stylus_binds
+                        .contains(&modifiers)
+                    {
+                        let bind = find_trigger_bind(
+                            &self.synoik.gnome_settings.keybindings,
+                            trigger,
+                            mods,
+                        )
+                        .filter(|bind| {
+                            !self.synoik.screenshot_ui.is_open()
+                                || allowed_during_screenshot(&bind.action)
+                        });
                         if let Some(bind) = bind {
-                            self.niri.suppressed_buttons.insert(button);
+                            self.synoik.suppressed_buttons.insert(button);
                             self.handle_bind(bind.clone());
                             return;
                         }
@@ -7867,26 +8034,26 @@ impl State {
     }
 
     fn on_gesture_swipe_begin<I: InputBackend>(&mut self, event: I::GestureSwipeBeginEvent) {
-        if self.niri.switcher.is_open() {
+        if self.synoik.switcher.is_open() {
             // The switcher holds a modal grab, so no gesture starts under it.
             return;
         }
 
         if event.fingers() == 3 {
-            self.niri.gesture_swipe_3f_cumulative = Some((0., 0.));
+            self.synoik.gesture_swipe_3f_cumulative = Some((0., 0.));
 
             // We handled this event.
             return;
         } else if event.fingers() == 4 {
-            self.niri.layout.overview_gesture_begin();
-            self.niri.queue_redraw_all();
+            self.synoik.layout.overview_gesture_begin();
+            self.synoik.queue_redraw_all();
 
             // We handled this event.
             return;
         }
 
         let serial = SERIAL_COUNTER.next_serial();
-        let pointer = self.niri.seat.get_pointer().unwrap();
+        let pointer = self.synoik.seat.get_pointer().unwrap();
 
         if self.update_pointer_contents() {
             pointer.frame(self);
@@ -7928,38 +8095,41 @@ impl State {
             }
         }
 
-        let is_overview_open = self.niri.layout.is_overview_open();
+        let is_overview_open = self.synoik.layout.is_overview_open();
 
-        if let Some((cx, cy)) = &mut self.niri.gesture_swipe_3f_cumulative {
+        if let Some((cx, cy)) = &mut self.synoik.gesture_swipe_3f_cumulative {
             *cx += delta_x;
             *cy += delta_y;
 
             // Check if the gesture moved far enough to decide. Threshold copied from GNOME Shell.
             let (cx, cy) = (*cx, *cy);
             if cx * cx + cy * cy >= 16. * 16. {
-                self.niri.gesture_swipe_3f_cumulative = None;
+                self.synoik.gesture_swipe_3f_cumulative = None;
 
-                if let Some(output) = self.niri.output_under_cursor() {
+                if let Some(output) = self.synoik.output_under_cursor() {
                     if cx.abs() > cy.abs() {
                         let output_ws = if is_overview_open {
-                            self.niri.workspace_under_cursor(true)
+                            self.synoik.workspace_under_cursor(true)
                         } else {
                             // We don't want to accidentally "catch" the wrong workspace during
                             // animations.
-                            self.niri.output_under_cursor().and_then(|output| {
-                                let mon = self.niri.layout.monitor_for_output(&output)?;
+                            self.synoik.output_under_cursor().and_then(|output| {
+                                let mon = self.synoik.layout.monitor_for_output(&output)?;
                                 Some((output, mon.active_workspace_ref()))
                             })
                         };
 
                         if let Some((output, ws)) = output_ws {
-                            let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
-                            self.niri
-                                .layout
-                                .view_offset_gesture_begin(&output, Some(ws_idx), true);
+                            let ws_idx =
+                                self.synoik.layout.find_workspace_by_id(ws.id()).unwrap().0;
+                            self.synoik.layout.view_offset_gesture_begin(
+                                &output,
+                                Some(ws_idx),
+                                true,
+                            );
                         }
                     } else {
-                        self.niri
+                        self.synoik
                             .layout
                             .workspace_switch_gesture_begin(&output, true);
                     }
@@ -7971,34 +8141,34 @@ impl State {
 
         let mut handled = false;
         let res = self
-            .niri
+            .synoik
             .layout
             .workspace_switch_gesture_update(delta_y, timestamp, true);
         if let Some(output) = res {
             if let Some(output) = output {
-                self.niri.queue_redraw(&output);
+                self.synoik.queue_redraw(&output);
             }
             handled = true;
         }
 
         let res = self
-            .niri
+            .synoik
             .layout
             .view_offset_gesture_update(delta_x, timestamp, true);
         if let Some(output) = res {
             if let Some(output) = output {
-                self.niri.queue_redraw(&output);
+                self.synoik.queue_redraw(&output);
             }
             handled = true;
         }
 
         let res = self
-            .niri
+            .synoik
             .layout
             .overview_gesture_update(-uninverted_delta_y, timestamp);
         if let Some(redraw) = res {
             if redraw {
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
             handled = true;
         }
@@ -8008,7 +8178,7 @@ impl State {
             return;
         }
 
-        let pointer = self.niri.seat.get_pointer().unwrap();
+        let pointer = self.synoik.seat.get_pointer().unwrap();
 
         if self.update_pointer_contents() {
             pointer.frame(self);
@@ -8024,24 +8194,24 @@ impl State {
     }
 
     fn on_gesture_swipe_end<I: InputBackend>(&mut self, event: I::GestureSwipeEndEvent) {
-        self.niri.gesture_swipe_3f_cumulative = None;
+        self.synoik.gesture_swipe_3f_cumulative = None;
 
         let mut handled = false;
-        let res = self.niri.layout.workspace_switch_gesture_end(Some(true));
+        let res = self.synoik.layout.workspace_switch_gesture_end(Some(true));
         if let Some(output) = res {
-            self.niri.queue_redraw(&output);
+            self.synoik.queue_redraw(&output);
             handled = true;
         }
 
-        let res = self.niri.layout.view_offset_gesture_end(Some(true));
+        let res = self.synoik.layout.view_offset_gesture_end(Some(true));
         if let Some(output) = res {
-            self.niri.queue_redraw(&output);
+            self.synoik.queue_redraw(&output);
             handled = true;
         }
 
-        let res = self.niri.layout.overview_gesture_end();
+        let res = self.synoik.layout.overview_gesture_end();
         if res {
-            self.niri.queue_redraw_all();
+            self.synoik.queue_redraw_all();
             handled = true;
         }
 
@@ -8051,7 +8221,7 @@ impl State {
         }
 
         let serial = SERIAL_COUNTER.next_serial();
-        let pointer = self.niri.seat.get_pointer().unwrap();
+        let pointer = self.synoik.seat.get_pointer().unwrap();
 
         if self.update_pointer_contents() {
             pointer.frame(self);
@@ -8069,7 +8239,7 @@ impl State {
 
     fn on_gesture_pinch_begin<I: InputBackend>(&mut self, event: I::GesturePinchBeginEvent) {
         let serial = SERIAL_COUNTER.next_serial();
-        let pointer = self.niri.seat.get_pointer().unwrap();
+        let pointer = self.synoik.seat.get_pointer().unwrap();
 
         if self.update_pointer_contents() {
             pointer.frame(self);
@@ -8086,7 +8256,7 @@ impl State {
     }
 
     fn on_gesture_pinch_update<I: InputBackend>(&mut self, event: I::GesturePinchUpdateEvent) {
-        let pointer = self.niri.seat.get_pointer().unwrap();
+        let pointer = self.synoik.seat.get_pointer().unwrap();
 
         if self.update_pointer_contents() {
             pointer.frame(self);
@@ -8105,7 +8275,7 @@ impl State {
 
     fn on_gesture_pinch_end<I: InputBackend>(&mut self, event: I::GesturePinchEndEvent) {
         let serial = SERIAL_COUNTER.next_serial();
-        let pointer = self.niri.seat.get_pointer().unwrap();
+        let pointer = self.synoik.seat.get_pointer().unwrap();
 
         if self.update_pointer_contents() {
             pointer.frame(self);
@@ -8123,7 +8293,7 @@ impl State {
 
     fn on_gesture_hold_begin<I: InputBackend>(&mut self, event: I::GestureHoldBeginEvent) {
         let serial = SERIAL_COUNTER.next_serial();
-        let pointer = self.niri.seat.get_pointer().unwrap();
+        let pointer = self.synoik.seat.get_pointer().unwrap();
 
         if self.update_pointer_contents() {
             pointer.frame(self);
@@ -8141,7 +8311,7 @@ impl State {
 
     fn on_gesture_hold_end<I: InputBackend>(&mut self, event: I::GestureHoldEndEvent) {
         let serial = SERIAL_COUNTER.next_serial();
-        let pointer = self.niri.seat.get_pointer().unwrap();
+        let pointer = self.synoik.seat.get_pointer().unwrap();
 
         if self.update_pointer_contents() {
             pointer.frame(self);
@@ -8163,9 +8333,9 @@ impl State {
         fallback_output: Option<&Output>,
     ) -> Option<Point<f64, Logical>> {
         let output = evt.device().output(self);
-        let output = output.filter(|output| self.niri.output_exists(output));
+        let output = output.filter(|output| self.synoik.output_exists(output));
         let output = output.as_ref().or(fallback_output)?;
-        let output_geo = self.niri.global_space.output_geometry(output).unwrap();
+        let output_geo = self.synoik.global_space.output_geometry(output).unwrap();
         let transform = output.current_transform();
         let size = transform.invert().transform_size(output_geo.size);
         Some(
@@ -8181,12 +8351,12 @@ impl State {
         &self,
         evt: &impl AbsolutePositionEvent<I>,
     ) -> Option<Point<f64, Logical>> {
-        self.compute_absolute_location(evt, self.niri.output_for_touch())
+        self.compute_absolute_location(evt, self.synoik.output_for_touch())
     }
 
     fn on_touch_down<I: InputBackend>(&mut self, evt: I::TouchDownEvent) {
-        let mod_key = self.backend.mod_key(&self.niri.config.borrow());
-        let Some(handle) = self.niri.seat.get_touch() else {
+        let mod_key = self.backend.mod_key(&self.synoik.config.borrow());
+        let Some(handle) = self.synoik.seat.get_touch() else {
             return;
         };
         let Some(pos) = self.compute_touch_location(&evt) else {
@@ -8196,57 +8366,57 @@ impl State {
 
         let serial = SERIAL_COUNTER.next_serial();
 
-        let under = self.niri.contents_under(pos);
+        let under = self.synoik.contents_under(pos);
 
-        let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
+        let mods = self.synoik.seat.get_keyboard().unwrap().modifier_state();
         let mods = modifiers_from_state(mods);
         let mod_down = mods.contains(mod_key.to_modifiers());
 
-        if self.niri.screenshot_ui.is_open() {
+        if self.synoik.screenshot_ui.is_open() {
             // If we'll be moving the existing selection, use the selection output.
             let output = if mod_down {
-                self.niri.screenshot_ui.selection_output()
+                self.synoik.screenshot_ui.selection_output()
             } else {
                 under.output.as_ref()
             };
 
             if let Some(output) = output.cloned() {
-                let geom = self.niri.global_space.output_geometry(&output).unwrap();
+                let geom = self.synoik.global_space.output_geometry(&output).unwrap();
                 let point = (pos - geom.loc.to_f64())
                     .to_physical(output.current_scale().fractional_scale())
                     .to_i32_round();
 
                 if self.handle_screenshot_ui_pointer_down(output, point, Some(slot), mod_down) {
-                    self.niri.queue_redraw_all();
+                    self.synoik.queue_redraw_all();
                 }
             }
-        } else if let Some(switcher_output) = self.niri.switcher.output().cloned() {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+        } else if let Some(switcher_output) = self.synoik.switcher.output().cloned() {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                 let outcome = if switcher_output == *output {
-                    self.niri.switcher.pointer_click(pos_within_output)
+                    self.synoik.switcher.pointer_click(pos_within_output)
                 } else {
-                    self.niri.switcher.pointer_click(Point::from((-1., -1.)))
+                    self.synoik.switcher.pointer_click(Point::from((-1., -1.)))
                 };
                 self.finish_switcher(outcome);
             }
         } else if !handle.is_grabbed() {
-            if self.niri.layout.is_overview_open()
+            if self.synoik.layout.is_overview_open()
                 && !mod_down
                 && under.layer.is_none()
                 && under.output.is_some()
             {
-                let (output, pos_within_output) = self.niri.output_under(pos).unwrap();
+                let (output, pos_within_output) = self.synoik.output_under(pos).unwrap();
                 let output = output.clone();
 
                 let mut matched_narrow = true;
-                let mut ws = self.niri.workspace_under(false, pos);
+                let mut ws = self.synoik.workspace_under(false, pos);
                 if ws.is_none() {
                     matched_narrow = false;
-                    ws = self.niri.workspace_under(true, pos);
+                    ws = self.synoik.workspace_under(true, pos);
                 }
                 let ws_id = ws.map(|(_, ws)| ws.id());
 
-                let mapped = self.niri.window_under(pos);
+                let mapped = self.synoik.window_under(pos);
                 let window = mapped.map(|mapped| mapped.window.clone());
 
                 let start_data = TouchGrabStartData {
@@ -8266,7 +8436,7 @@ impl State {
                 );
                 handle.set_grab(self, grab, serial);
             } else if let Some((window, _)) = under.window {
-                self.niri.layout.activate_window(&window);
+                self.synoik.layout.activate_window(&window);
 
                 // Check if we need to start a touch move grab.
                 if mod_down {
@@ -8283,14 +8453,14 @@ impl State {
                 }
 
                 // FIXME: granular.
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             } else if let Some(output) = under.output {
-                self.niri.layout.focus_output(&output);
+                self.synoik.layout.focus_output(&output);
 
                 // FIXME: granular.
-                self.niri.queue_redraw_all();
+                self.synoik.queue_redraw_all();
             }
-            self.niri.focus_layer_surface_if_on_demand(under.layer);
+            self.synoik.focus_layer_surface_if_on_demand(under.layer);
         };
 
         handle.down(
@@ -8305,15 +8475,15 @@ impl State {
         );
 
         // We're using touch, hide the pointer.
-        self.niri.pointer_visibility = PointerVisibility::Disabled;
+        self.synoik.pointer_visibility = PointerVisibility::Disabled;
     }
     fn on_touch_up<I: InputBackend>(&mut self, evt: I::TouchUpEvent) {
-        let Some(handle) = self.niri.seat.get_touch() else {
+        let Some(handle) = self.synoik.seat.get_touch() else {
             return;
         };
         let slot = evt.slot();
 
-        if let Some(up) = self.niri.screenshot_ui.pointer_up(Some(slot)) {
+        if let Some(up) = self.synoik.screenshot_ui.pointer_up(Some(slot)) {
             self.handle_screenshot_ui_pointer_up(up);
         }
 
@@ -8328,7 +8498,7 @@ impl State {
         )
     }
     fn on_touch_motion<I: InputBackend>(&mut self, evt: I::TouchMotionEvent) {
-        let Some(handle) = self.niri.seat.get_touch() else {
+        let Some(handle) = self.synoik.seat.get_touch() else {
             return;
         };
         let Some(pos) = self.compute_touch_location(&evt) else {
@@ -8336,18 +8506,18 @@ impl State {
         };
         let slot = evt.slot();
 
-        if let Some(output) = self.niri.screenshot_ui.selection_output().cloned() {
-            let geom = self.niri.global_space.output_geometry(&output).unwrap();
+        if let Some(output) = self.synoik.screenshot_ui.selection_output().cloned() {
+            let geom = self.synoik.global_space.output_geometry(&output).unwrap();
             let point = (pos - geom.loc.to_f64())
                 .to_physical(output.current_scale().fractional_scale())
                 .to_i32_round::<i32>();
 
             if self.handle_screenshot_ui_motion(point, Some(slot)) {
-                self.niri.queue_redraw(&output);
+                self.synoik.queue_redraw(&output);
             }
         }
 
-        let under = self.niri.contents_under(pos);
+        let under = self.synoik.contents_under(pos);
         handle.motion(
             self,
             under.surface,
@@ -8363,20 +8533,20 @@ impl State {
             .with_grab(|_, grab| Self::is_dnd_grab(grab.as_any()))
             .unwrap_or(false);
         if is_dnd_grab {
-            if let Some((output, pos_within_output)) = self.niri.output_under(pos) {
+            if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                 let output = output.clone();
-                self.niri.layout.dnd_update(output, pos_within_output);
+                self.synoik.layout.dnd_update(output, pos_within_output);
             }
         }
     }
     fn on_touch_frame<I: InputBackend>(&mut self, _evt: I::TouchFrameEvent) {
-        let Some(handle) = self.niri.seat.get_touch() else {
+        let Some(handle) = self.synoik.seat.get_touch() else {
             return;
         };
         handle.frame(self);
     }
     fn on_touch_cancel<I: InputBackend>(&mut self, _evt: I::TouchCancelEvent) {
-        let Some(handle) = self.niri.seat.get_touch() else {
+        let Some(handle) = self.synoik.seat.get_touch() else {
             return;
         };
         handle.cancel(self);
@@ -8394,7 +8564,7 @@ impl State {
         }
 
         let action = {
-            let bindings = &self.niri.config.borrow().switch_events;
+            let bindings = &self.synoik.config.borrow().switch_events;
             find_configured_switch_action(bindings, switch, evt.state())
         };
 
@@ -8642,7 +8812,7 @@ fn find_bind(
     // equivalent tier, because it has no keys of this kind.
     find_gnome_bind(
         gnome_keybindings,
-        KeybindingSource::Niri,
+        KeybindingSource::Synoik,
         switcher,
         key_code,
         raw,
@@ -8658,15 +8828,15 @@ fn find_bind(
 pub enum KeybindingSource {
     /// Keys GNOME itself names, from its own schemas.
     Gnome,
-    /// Keys only we have, from `org.gnome.shell-rs.keybindings`.
-    Niri,
+    /// Keys only we have, from `org.synoik.keybindings`.
+    Synoik,
 }
 
 impl KeybindingSource {
     fn matches(self, action: &KeybindingAction) -> bool {
         match self {
             Self::Gnome => matches!(action, KeybindingAction::Gnome(_)),
-            Self::Niri => matches!(action, KeybindingAction::Niri(_)),
+            Self::Synoik => matches!(action, KeybindingAction::Synoik(_)),
         }
     }
 }
@@ -8877,7 +9047,7 @@ pub(crate) fn action_for_keybinding(action: &KeybindingAction) -> Option<Action>
     match action {
         KeybindingAction::Gnome(action) => action_for_gnome(*action),
         // Our own schema speaks niri actions directly; there is nothing to map.
-        KeybindingAction::Niri(action) => Some(action.clone()),
+        KeybindingAction::Synoik(action) => Some(action.clone()),
     }
 }
 
@@ -8897,7 +9067,7 @@ pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
         // niri's name for the same thing: it already calls `layout.toggle_maximized`,
         // which is mutter's `handle_toggle_maximized` (maximized → unmaximize, anything
         // else → maximize). The name is niri's and outlives its binding; renaming it
-        // reaches into niri-ipc, so it is left for whenever that surface is revisited.
+        // reaches into synoik-ipc, so it is left for whenever that surface is revisited.
         GnomeKeyAction::ToggleMaximized => Action::MaximizeWindowToEdges,
         GnomeKeyAction::SwitchToWorkspaceLast => Action::FocusWorkspaceLast,
         GnomeKeyAction::MoveToWorkspaceLast => Action::MoveWindowToWorkspaceLast(true),
@@ -9189,7 +9359,7 @@ fn hardcoded_overview_bind(raw: Keysym, mods: ModifiersState) -> Option<Resolved
     })
 }
 
-pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::Device) {
+pub fn apply_libinput_settings(config: &synoik_config::Input, device: &mut input::Device) {
     // According to Mutter code, this setting is specific to touchpads.
     let is_touchpad = device.config_tap_finger_count() > 0;
     if is_touchpad {
@@ -9230,7 +9400,7 @@ pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::
         if let Some(method) = c.scroll_method {
             let _ = device.config_scroll_set_method(method.into());
 
-            if method == niri_config::ScrollMethod::OnButtonDown {
+            if method == synoik_config::ScrollMethod::OnButtonDown {
                 if let Some(button) = c.scroll_button {
                     let _ = device.config_scroll_set_button(button);
                 }
@@ -9308,7 +9478,7 @@ pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::
         if let Some(method) = c.scroll_method {
             let _ = device.config_scroll_set_method(method.into());
 
-            if method == niri_config::ScrollMethod::OnButtonDown {
+            if method == synoik_config::ScrollMethod::OnButtonDown {
                 if let Some(button) = c.scroll_button {
                     let _ = device.config_scroll_set_button(button);
                 }
@@ -9355,7 +9525,7 @@ pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::
         if let Some(method) = c.scroll_method {
             let _ = device.config_scroll_set_method(method.into());
 
-            if method == niri_config::ScrollMethod::OnButtonDown {
+            if method == synoik_config::ScrollMethod::OnButtonDown {
                 if let Some(button) = c.scroll_button {
                     let _ = device.config_scroll_set_button(button);
                 }
@@ -9402,7 +9572,7 @@ pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::
         if let Some(method) = c.scroll_method {
             let _ = device.config_scroll_set_method(method.into());
 
-            if method == niri_config::ScrollMethod::OnButtonDown {
+            if method == synoik_config::ScrollMethod::OnButtonDown {
                 if let Some(button) = c.scroll_button {
                     let _ = device.config_scroll_set_button(button);
                 }
@@ -9485,7 +9655,7 @@ pub fn apply_libinput_settings(config: &niri_config::Input, device: &mut input::
 /// before doing any lookup, so an unmodified scroll costs nothing. That makes it
 /// a **trap** — a binding whose modifiers are missing here is not merely slow to
 /// find, it is never found at all. It has to be recomputed whenever the keybindings
-/// change ([`Niri::refresh_keybinding_state`]).
+/// change ([`Synoik::refresh_keybinding_state`]).
 pub fn mods_with_binds(
     keybindings: &[GnomeKeybinding],
     triggers: &[Trigger],

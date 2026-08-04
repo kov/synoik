@@ -16,12 +16,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use niri_config::Config;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::Texture as _;
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use synoik_config::Config;
 
 use crate::animation::{Animation, Clock};
 use crate::image_source::ImageSource;
@@ -294,7 +294,7 @@ pub enum PopoverSide {
     Left,
 }
 
-/// A single panel popover, owned on `Niri` alongside the other overlays.
+/// A single panel popover, owned on `Synoik` alongside the other overlays.
 pub struct PanelPopover {
     open: bool,
     /// The output the popover is anchored on (drawn/hit-tested only there).

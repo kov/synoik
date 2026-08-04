@@ -331,7 +331,7 @@ pub fn layout(
 /// This is not pure arithmetic — a non-empty body is wrapped and measured, and
 /// callers re-layout per hit-test and per render-element collection, so a pointer
 /// crossing the message list runs this over every visible card on every motion
-/// event. Both text calls are memoized in `niri_vk::text` on their full argument
+/// event. Both text calls are memoized in `synoik_vk::text` on their full argument
 /// lists (`wrap_cache`, `measure_cache`), so a repeat layout of an unchanged card
 /// shapes nothing; what is left here is arithmetic and a few small allocations.
 pub fn layout_clamped(
@@ -390,7 +390,7 @@ pub fn layout_clamped(
         };
         // A body is prose: GNOME wraps it `WORD_CHAR` (`_bodyLabel`), so a long word
         // breaks across lines rather than being cut.
-        niri_vk::text::wrap_lines_weighted(
+        synoik_vk::text::wrap_lines_weighted(
             &content.body,
             title_px() as f32,
             false,
@@ -403,7 +403,7 @@ pub fn layout_clamped(
         && (expanded
             || !content.actions.is_empty()
             || (!content.body.is_empty()
-                && niri_vk::text::measure_line_width_weighted(
+                && synoik_vk::text::measure_line_width_weighted(
                     &content.body,
                     title_px() as f32,
                     false,
@@ -1310,7 +1310,7 @@ mod live_shell_tests {
             "no-notifications-symbolic"
         );
         // No symbolic either way, and nothing full-colour either: St's fallback.
-        assert_eq!(with(Some("gnome-shell-rs-no-such-icon")), SOURCE_FALLBACK);
+        assert_eq!(with(Some("synoik-no-such-icon")), SOURCE_FALLBACK);
         assert_eq!(with(None), SOURCE_FALLBACK);
 
         // The resolved app's icon WINS over the `app_icon` parameter, and takes the same
@@ -1348,7 +1348,7 @@ mod live_shell_tests {
         // FORCE_SYMBOLIC tries `-symbolic` for EVERY name before ANY bare name, so a later name
         // with a symbolic variant beats an earlier one without (`st-icon-theme.c:1489-1503`).
         assert_eq!(
-            with_app(&["gnome-shell-rs-no-such-icon", "group-collapse"], None),
+            with_app(&["synoik-no-such-icon", "group-collapse"], None),
             "group-collapse-symbolic"
         );
 

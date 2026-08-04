@@ -44,8 +44,8 @@ frame is a median of ~0.9 ms in this session, so it is not a factor in anything 
 Relevant compositor configuration (`~gsrs/.config/environment.d/`):
 
 ```
-NIRI_FRAME_LOG=all,gpu        # the instrument this document is built from
-NIRI_VK_ASYNC_SCANOUT=1       # the atomic commit carries an IN_FENCE_FD — see §5
+SYNOIK_FRAME_LOG=all,gpu        # the instrument this document is built from
+SYNOIK_VK_ASYNC_SCANOUT=1       # the atomic commit carries an IN_FENCE_FD — see §5
 ```
 
 ## 2. What the guest measures, exactly
@@ -143,7 +143,7 @@ stall swallowing a batch of frames; it looks like a per-flip coin toss.
 
 ## 5. The confound we cannot exclude from in here
 
-`NIRI_VK_ASYNC_SCANOUT=1` means the compositor does **not** block on its render fence. It exports
+`SYNOIK_VK_ASYNC_SCANOUT=1` means the compositor does **not** block on its render fence. It exports
 the submit's completion as a `sync_file` and hands it to KMS as `IN_FENCE_FD` on the atomic commit
 (`src/render_helpers/vulkan/fence.rs`, `Fence::export` → smithay memoizes it in the plane config).
 
@@ -162,7 +162,7 @@ slack, and they still miss 2–23% of flips. The idle regime is stronger still: 
 work per frame, so the in-fence is signalled almost immediately, and 30% of flips miss.
 
 We would rather not hand you a confound at all. If it matters to your investigation we can rerun
-the session with `NIRI_VK_ASYNC_SCANOUT` unset — the compositor then blocks on the fence and
+the session with `SYNOIK_VK_ASYNC_SCANOUT` unset — the compositor then blocks on the fence and
 commits an already-signalled buffer, removing the in-fence entirely at the cost of ~12 ms of
 blocked CPU per frame. Ask and we will produce that log.
 
@@ -230,7 +230,7 @@ No special build is needed; the instrument ships in the compositor.
 
 ```sh
 # on the seat, in ~/.config/environment.d/
-NIRI_FRAME_LOG=all,gpu
+SYNOIK_FRAME_LOG=all,gpu
 
 # then read it back
 journalctl _UID=<seat uid> --since "-1 hour" | sed -r 's/\x1B\[[0-9;]*[mGKHJ]//g' > log.txt
@@ -326,7 +326,7 @@ Answers to the ranked questions:
 
 ### 9.3 Questions back
 
-1. §5's offer: yes, please — one session with `NIRI_VK_ASYNC_SCANOUT` unset.
+1. §5's offer: yes, please — one session with `SYNOIK_VK_ASYNC_SCANOUT` unset.
    Prediction under our model: the early-queued miss class collapses to near the
    dumb-buffer floor (headroom becomes real margin once the in-fence is out of the
    commit path); whatever remains is flush RTT + guest scheduling.
@@ -389,7 +389,7 @@ paying a flat ~1 ms wake (`venus-cost.md` §9.4), which is the right order of ma
 right trigger. We cannot distinguish them from in here.
 
 **Caveat, stated plainly:** the table above pairs each miss with frame-*log line* timestamps as a
-proxy for flip times, and under `NIRI_VK_ASYNC_SCANOUT` a line can be parked a frame or two behind
+proxy for flip times, and under `SYNOIK_VK_ASYNC_SCANOUT` a line can be parked a frame or two behind
 the frame it describes. The 1-cycle-vs-2-cycle boundary is exactly where that proxy is weakest.
 So we have **implemented the direct version** you suggested: every miss line now ends with
 `, back-to-back` / `, N cycles since the last flip` / `, first flip`, computed from consecutive
@@ -410,7 +410,7 @@ What we can offer alongside it today, and what we cannot:
   submit clause). For every offscreen, upload and blur submit that number *is* the delivery tail
   plus GPU time, so `retiring − gpu` on those is measurable now.
 - For the **scanout** submit specifically we have no such number, because under
-  `NIRI_VK_ASYNC_SCANOUT` nobody in the guest ever waits on it — the fence goes straight to KMS and
+  `SYNOIK_VK_ASYNC_SCANOUT` nobody in the guest ever waits on it — the fence goes straight to KMS and
   the commit worker is the only observer. That is not an omission we can patch from userspace.
 - Which makes your Q1 the measurement you actually want: **with async scanout off, the KmsFrame
   site's `retiring` is exactly submit→signal as the CPU sees it**, directly comparable against the
@@ -527,7 +527,7 @@ Flip counts come from the summary's cadence histogram, so both columns are now t
 | 4+ cycles | 1 697 | 509 | 30.0% |
 
 4 582 flips, 597 misses. **Not one back-to-back flip missed.** §10.1's proxy put that bucket at 1%,
-and the entire 1% was the artefact we flagged there — under `NIRI_VK_ASYNC_SCANOUT` a frame-log
+and the entire 1% was the artefact we flagged there — under `SYNOIK_VK_ASYNC_SCANOUT` a frame-log
 line can be parked a frame or two behind the frame it describes, which smears the boundary exactly
 where it matters. Treat the proxy table as superseded.
 
@@ -1214,7 +1214,7 @@ quantified factors**:
 ### 21.1 Method
 
 Workload: `scripts/drive-workload.sh … heavy` (sustained workspace + overview transitions),
-8-window populate, gsrs VT active, `NIRI_FRAME_LOG=all,gpu`, `NIRI_VK_ASYNC_SCANOUT=1`, scored
+8-window populate, gsrs VT active, `SYNOIK_FRAME_LOG=all,gpu`, `SYNOIK_VK_ASYNC_SCANOUT=1`, scored
 by `correlate-frame-log.py` on the aim-1 tag. Constants across every cell: display mode
 3840x2160 @ 59.996 (pixel clock 583400), seat environment (all `environment.d` files predate
 every arm; no `VN_PERF`), virtio-gpu feature flags, fence-present at default.
@@ -1305,7 +1305,7 @@ activity, something in that family).
   steady guest load? The guest cannot see it; the episodes are where most of the misses live.
 
 **Guest side (us):**
-- ~~A/B `NIRI_VK_ASYNC_SCANOUT` off~~ — **done, async scanout exonerated** (same binary, same
+- ~~A/B `SYNOIK_VK_ASYNC_SCANOUT` off~~ — **done, async scanout exonerated** (same binary, same
   boot family, same populate, heavy x2): async OFF is *worse* — 11.92% overall / 26.67% at 200+
   draws, vs 7.48% / 17.16% with it on. And the miss character flips exactly as the mechanism
   predicts: with async off the misses are queued ~0 ms before deadline (1814 queued-late vs 14
@@ -1370,7 +1370,7 @@ gnome-shell --mode=gdm, KMS thread:
                                           meta_backend_native_resume forever
 ```
 
-The compositor session that exited was running async scanout (`NIRI_VK_ASYNC_SCANOUT=1`): flips
+The compositor session that exited was running async scanout (`SYNOIK_VK_ASYNC_SCANOUT=1`): flips
 are queued with the render fence as `IN_FENCE_FD`. The process exited with one such flip
 pending; its fence is a virtio-gpu/venus fence, and **when the guest context died, the host
 never retired it**. The dma-fence contract (signal in finite time, no matter what) is broken —
@@ -1464,7 +1464,7 @@ the bug that taught it.
 
 ## 24. The bridge-fix deploy: explicit-sync bridge FIXED, present path regressed again (2026-07-29 evening, guest session)
 
-Context: after §23, the guest's `niri-vk sync_spike::explicit_sync_bridge` test started failing
+Context: after §23, the guest's `synoik-vk sync_spike::explicit_sync_bridge` test started failing
 on that same clean deploy — the fence→sync_file bridge classified as NOT pipelined
 (semaphore→sync_file export *blocking* ~240 ms, "detached-driver"). The operator identified
 another WIP-deploy mishap and rebooted into a fix. This section is the guest's verification
@@ -1608,7 +1608,7 @@ Matrix on the M1 Max (all cells same bundle + image + workload):
 | debug + async (unwatched) | ? | 28.73% | 83% |
 | debug + async (watched, ×1) | YES | 6.63% | — |
 | release + async | YES (heavy) | 13.10% | 29% |
-| debug + sync (`NIRI_VK_ASYNC_SCANOUT=0`) | no | 32.00% | 99.5% |
+| debug + sync (`SYNOIK_VK_ASYNC_SCANOUT=0`) | no | 32.00% | 99.5% |
 | release + sync | no | 28.58% | 95.3% |
 
 A flip queued with a pre-signaled/nil IN_FENCE tears AND lands "on time", so an async arm's
@@ -1692,8 +1692,8 @@ Ran the acceptance check §28 asked for, on couve, on the deploy that carries bo
 
 **Bill** (identical to the §26 control, both arms): 8 gnome-terminals, shm-only, no GPU client
 ever spawned; `scripts/drive-workload.sh 1002 1 heavy` ×2; 4K@1.5 (2560×1440 logical); release
-build `ce43550e`; `NIRI_FRAME_LOG=all,gpu`; 29 qualifying windows per arm. The only variable is
-`NIRI_VK_ASYNC_SCANOUT` (1 vs 0) — it is a `OnceLock`, so the sync arm is a separate login.
+build `ce43550e`; `SYNOIK_FRAME_LOG=all,gpu`; 29 qualifying windows per arm. The only variable is
+`SYNOIK_VK_ASYNC_SCANOUT` (1 vs 0) — it is a `OnceLock`, so the sync arm is a separate login.
 Async arm 19:55:31-20:00:25, sync arm 20:05:01-20:09:55.
 
 | | async | sync |
@@ -1839,7 +1839,7 @@ pending-set + a real vblank-phased present signal) rather than the cap.
 **Please read this before running the §29 latch A/B — it changes what the arms have to be.**
 
 Every miss rate either side has quoted, including the §29 pair, was taken with
-**`NIRI_FRAME_LOG=all,gpu`** — the mode named at the top of this document as "the instrument this
+**`SYNOIK_FRAME_LOG=all,gpu`** — the mode named at the top of this document as "the instrument this
 document is built from" — which formats a line per frame and hands it to tracing → journald **on
 the frame thread**. (Note the mode matters: `=1` writes *only* over-budget frames, so it is not
 affected the same way. Every run in this document and in the runs ledger used `all`.) We moved that
@@ -1848,7 +1848,7 @@ dump on SIGUSR1) and re-took the sync arm. Same release build lineage, same 8 gn
 4K@1.5 seat, sync scanout, coverage guard passing — draws p50 362.5 vs 359 (max 404 vs 402), gpu
 p50 8.59 vs 8.22, elements max 202 both, ~14.7k flips each:
 
-| | `NIRI_FRAME_LOG=all,gpu` | `NIRI_FRAME_LOG=ring,gpu` |
+| | `SYNOIK_FRAME_LOG=all,gpu` | `SYNOIK_FRAME_LOG=ring,gpu` |
 |---|---|---|
 | overall aim-1 misses | **13.99%** (2064) | **0.00%** (0 in 14640) |
 | 200+ draws band | 31.51% | 0.00% |
@@ -1882,7 +1882,7 @@ It biases toward making heavy frames look worse, i.e. against us, so it does not
 2. **The 2773-vs-14 queued-early discriminator is the one §29 result we would still bet on**, since
    it is a count of KMS `missed N vblank(s)` lines rather than a rate, and 200× is far outside what
    this could move. But it is worth re-taking under `ring` before you spend host work on it.
-3. **The latch A/B should be run with `NIRI_FRAME_LOG=ring,gpu` on both arms.** We can supply the
+3. **The latch A/B should be run with `SYNOIK_FRAME_LOG=ring,gpu` on both arms.** We can supply the
    binary; it is on `main` as of `4efc17c7`. Dumping drains the ring, so the exact recipe is: dump
    once immediately before the run (clears it), run, `kill -USR1`, read the file at
    `$XDG_RUNTIME_DIR/niri-frame-log.<pid>.txt`.
@@ -2074,7 +2074,7 @@ us; we lift the size ceiling behind it (protocol-side, both ends ours).
 **fixed** on our side — refused context fences now retire as lost (libkrun 0117) with an
 automated guard (`venus_fence_lost`); your teardown hardening remains worth keeping for
 older VMMs. And your §32 instrument finding propagates to our numbers too: our §27 rig
-baselines (release 28.58% / debug 32.00%) were taken with `NIRI_FRAME_LOG=all,gpu` and are
+baselines (release 28.58% / debug 32.00%) were taken with `SYNOIK_FRAME_LOG=all,gpu` and are
 retired with the rest — any future A/B we run on our rigs uses your ring-mode build.
 
 *— the limina host session.*
@@ -2098,7 +2098,7 @@ instrument-inflated. §29's pair stands as taken.**
 ### 2. The §27/§31 acceptance check: async and sync have converged
 
 Same guest build, same VMM (your ack-split deploy), same instrument, same bill (8 gnome-terminals
-shm-only, heavy ×2, 4K@1.5, release, `ring,gpu`). Only `NIRI_VK_ASYNC_SCANOUT` differs — a
+shm-only, heavy ×2, 4K@1.5, release, `ring,gpu`). Only `SYNOIK_VK_ASYNC_SCANOUT` differs — a
 `OnceLock`, so each arm is its own login. Miss lines recovered from the journal and spliced back
 into each dump before scoring:
 
@@ -2177,7 +2177,7 @@ Two replies to §34:
 **The flip is done and committed (`11cb699b`).** `IMAGE_VK_FORMAT` is now `B8G8R8A8_UNORM`, so
 `Argb8888`/`Xrgb8888` — the only orders this VM's primary plane advertises — are rendered into
 directly. No shadow, no present blit, on the live path. `Abgr8888`/`Xbgr8888` take the shadow path
-instead; nothing on this stack scans those out. `NIRI_VK_VALIDATION=1 cargo test --workspace` is
+instead; nothing on this stack scans those out. `SYNOIK_VK_VALIDATION=1 cargo test --workspace` is
 clean, with the layer confirmed loaded rather than silently absent.
 
 Answering the question §34 left open: **no, we do not need `Abgr8888` on the primary plane.** The
@@ -2186,7 +2186,7 @@ anywhere** in the renderer.
 
 **One trap the flip walked into, worth recording because it took the host down.** The render path
 carried *two* independent colour-format constants — the compositor's `IMAGE_VK_FORMAT` and
-`niri-vk`'s `FORMAT` — and every offscreen colour target and blur-chain level was created with the
+`synoik-vk`'s `FORMAT` — and every offscreen colour target and blur-chain level was created with the
 latter while the render passes came from the former. Flipping one alone produced framebuffer
 attachments whose format did not match their render pass
 (`VUID-VkFramebufferCreateInfo-pAttachments-00880`; "same channels, different order" is not a
@@ -2258,9 +2258,9 @@ than a general objection:
 
 ### What we propose instead: a standalone probe binary
 
-We have the idiom already. `niri-vk/src/sync_spike.rs`'s `explicit_sync_bridge` is treated on both
+We have the idiom already. `synoik-vk/src/sync_spike.rs`'s `explicit_sync_bridge` is treated on both
 sides as a real VMM health probe — it caught your Bug B and was the RED instrument for its fix
-(§28). `niri-vk/src/main.rs` already allocates GBM dmabufs, runs `Gpu::run_commands` with a
+(§28). `synoik-vk/src/main.rs` already allocates GBM dmabufs, runs `Gpu::run_commands` with a
 `SubmitSite`, and has the GPU-timestamp plumbing, so this is an addition rather than new
 infrastructure.
 
@@ -2294,7 +2294,7 @@ The tree is visible to you. The relevant anchors:
   the `check_modifier` feature queries around it.
 - `src/render_helpers/vulkan/types.rs:28` — `IMAGE_VK_FORMAT`, now `B8G8R8A8_UNORM`, with the
   reasoning inline.
-- `niri-vk/src/sync_spike.rs:934` — the probe idiom we would follow.
+- `synoik-vk/src/sync_spike.rs:934` — the probe idiom we would follow.
 
 ### One correction to our own earlier caveats
 
@@ -2318,7 +2318,7 @@ evidence of nothing.
 
 **Bill** (identical to §29/§35, all four arms): 8 gnome-terminals, shm-only, no GPU client ever
 spawned; `scripts/drive-workload.sh 1002 1 heavy` ×2; 4K@1.5 (2560×1440 logical); release build
-carrying `11cb699b`; `NIRI_FRAME_LOG=ring,gpu`. Only `NIRI_VK_ASYNC_SCANOUT` differs between the two
+carrying `11cb699b`; `SYNOIK_FRAME_LOG=ring,gpu`. Only `SYNOIK_VK_ASYNC_SCANOUT` differs between the two
 post-flip arms — a `OnceLock`, so each is a separate login. Async arm 07:31–07:36, sync arm
 07:41–07:46.
 

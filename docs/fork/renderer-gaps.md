@@ -65,7 +65,7 @@ readable in the read-only checkouts.
 Shallowly. There is no global/static state in the Vulkan renderer; each `Gpu` owns its instance and
 device, each `VulkanRenderer` carries its own `ContextId` (which is what Smithay's texture caches key
 on), and every cache (`dmabuf_target_cache`, `dmabuf_import_cache`, `present_blit_shadows`) is a
-per-instance field. `NiriRenderer` is a generic blanket impl, not a singleton. **`VulkanRenderer`
+per-instance field. `SynoikRenderer` is a generic blanket impl, not a singleton. **`VulkanRenderer`
 could be instantiated once per DRM render node today without a refactor.**
 
 What's missing is that `Gpu::new()` enumerates physical devices and picks the best by device-type
@@ -263,13 +263,13 @@ unpatched virtio-gpu. Cursor-plane scanout survives via smithay's legacy `AddFB`
 implicit allocation gives the driver's best layout, which here is the same LINEAR we asked for
 before.
 
-**Testing it without a kernel rebuild:** `NIRI_KMS_IMPLICIT_MODIFIERS=1` drops the explicit entries
+**Testing it without a kernel rebuild:** `SYNOIK_KMS_IMPLICIT_MODIFIERS=1` drops the explicit entries
 from the scanout set, so negotiation lands on INVALID even on a driver that does name modifiers.
 Seat run 2026-08-04: session came up clean, validation layer silent, picture correct.
 
 Be careful what that proves. It covers negotiation, implicit allocation, keeping gbm's modifier, and
 the import — **all carrying a LINEAR buffer**, because while the patches are in, several layers force
-LINEAR and Venus enumerates no other modifier for these formats (`cargo run -p niri-vk` probes: one
+LINEAR and Venus enumerates no other modifier for these formats (`cargo run -p synoik-vk` probes: one
 modifier, `0x0`). It does *not* cover the modifier-less `AddFB2` fallback, which never engages while
 the driver still accepts modifiers, and it says nothing about what gbm picks once those layers stop
 forcing linear. Both only get a real check on the deployed VMM/mesa/kernel.

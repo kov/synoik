@@ -126,7 +126,7 @@ impl InputSourceMenu {
 
     pub fn logical_size(&self) -> Size<f64, Logical> {
         let measure =
-            |s: &str| niri_vk::text::measure_line_width_weighted(s, text_px() as f32, false);
+            |s: &str| synoik_vk::text::measure_line_width_weighted(s, text_px() as f32, false);
         let w_display = self
             .items
             .iter()

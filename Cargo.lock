@@ -2282,123 +2282,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
-name = "niri"
-version = "26.4.0"
-dependencies = [
- "accesskit",
- "accesskit_unix",
- "anyhow",
- "approx 0.5.1",
- "arrayvec",
- "ash",
- "async-channel",
- "async-io",
- "atomic",
- "bitflags 2.11.1",
- "bytemuck",
- "calloop",
- "calloop-wayland-source",
- "clap",
- "clap_complete",
- "clap_complete_nushell",
- "directories",
- "drm-ffi",
- "fastrand",
- "freedesktop-icons",
- "futures-util",
- "gio",
- "gio-unix",
- "git-version",
- "glam",
- "image",
- "input",
- "insta",
- "jiff",
- "jxl-oxide",
- "keyframe",
- "libc",
- "libdisplay-info",
- "log",
- "matroska-demuxer",
- "niri-config",
- "niri-ipc",
- "niri-vk",
- "ordered-float",
- "pipewire",
- "pkg-config",
- "png",
- "profiling",
- "proptest",
- "proptest-derive",
- "rayon",
- "resvg",
- "roxmltree 0.21.1",
- "sd-notify",
- "serde",
- "serde_json",
- "smithay",
- "smithay-drm-extras",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "tracy-client",
- "tzf-rs",
- "udev",
- "unicode-segmentation",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols",
- "wayland-protocols-wlr",
- "wayland-scanner",
- "wayland-server",
- "xcursor",
- "xshell",
- "zbus",
-]
-
-[[package]]
-name = "niri-config"
-version = "26.4.0"
-dependencies = [
- "bitflags 2.11.1",
- "csscolorparser",
- "insta",
- "miette",
- "niri-ipc",
- "regex",
- "smithay",
- "tracing",
-]
-
-[[package]]
-name = "niri-ipc"
-version = "26.4.0"
-dependencies = [
- "clap",
- "schemars",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "niri-vk"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "ash",
- "cairo-rs",
- "cosmic-text",
- "drm-ffi",
- "etagere",
- "gbm",
- "libc",
- "pango",
- "pangocairo",
- "png",
- "swash",
-]
-
-[[package]]
 name = "nix"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3612,6 +3495,123 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "synoik"
+version = "26.4.0"
+dependencies = [
+ "accesskit",
+ "accesskit_unix",
+ "anyhow",
+ "approx 0.5.1",
+ "arrayvec",
+ "ash",
+ "async-channel",
+ "async-io",
+ "atomic",
+ "bitflags 2.11.1",
+ "bytemuck",
+ "calloop",
+ "calloop-wayland-source",
+ "clap",
+ "clap_complete",
+ "clap_complete_nushell",
+ "directories",
+ "drm-ffi",
+ "fastrand",
+ "freedesktop-icons",
+ "futures-util",
+ "gio",
+ "gio-unix",
+ "git-version",
+ "glam",
+ "image",
+ "input",
+ "insta",
+ "jiff",
+ "jxl-oxide",
+ "keyframe",
+ "libc",
+ "libdisplay-info",
+ "log",
+ "matroska-demuxer",
+ "ordered-float",
+ "pipewire",
+ "pkg-config",
+ "png",
+ "profiling",
+ "proptest",
+ "proptest-derive",
+ "rayon",
+ "resvg",
+ "roxmltree 0.21.1",
+ "sd-notify",
+ "serde",
+ "serde_json",
+ "smithay",
+ "smithay-drm-extras",
+ "synoik-config",
+ "synoik-ipc",
+ "synoik-vk",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "tracy-client",
+ "tzf-rs",
+ "udev",
+ "unicode-segmentation",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
+ "wayland-scanner",
+ "wayland-server",
+ "xcursor",
+ "xshell",
+ "zbus",
+]
+
+[[package]]
+name = "synoik-config"
+version = "26.4.0"
+dependencies = [
+ "bitflags 2.11.1",
+ "csscolorparser",
+ "insta",
+ "miette",
+ "regex",
+ "smithay",
+ "synoik-ipc",
+ "tracing",
+]
+
+[[package]]
+name = "synoik-ipc"
+version = "26.4.0"
+dependencies = [
+ "clap",
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "synoik-vk"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "cairo-rs",
+ "cosmic-text",
+ "drm-ffi",
+ "etagere",
+ "gbm",
+ "libc",
+ "pango",
+ "pangocairo",
+ "png",
+ "swash",
 ]
 
 [[package]]

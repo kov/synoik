@@ -32,7 +32,7 @@ call --object-path "$SP" --method $SC.Session.Start > /dev/null
 sleep 2
 
 NODE=$(grep -oE "PipeWireStreamAdded \(uint32 [0-9]+" "$R/mon.log" | grep -oE "[0-9]+$" | head -1)
-[ -n "$NODE" ] || { echo "no node id; see $R/niri.log"; exit 1; }
+[ -n "$NODE" ] || { echo "no node id; see $R/synoik.log"; exit 1; }
 echo "node=$NODE session=$SP"
 echo "$SP" > "$R/sess"
 
@@ -43,7 +43,7 @@ rm -f "$R"/f_*.png
 # No videorate in the pipeline: it pads with duplicates and would fake exactly that.
 churn() {
     while :; do
-        NIRI_SOCKET=$NIRI_SOCKET "$NIRI_BIN" msg action "$ACTION" >/dev/null 2>&1
+        SYNOIK_SOCKET=$SYNOIK_SOCKET "$SYNOIK_BIN" msg action "$ACTION" >/dev/null 2>&1
         sleep "${CHURN_INTERVAL:-0.4}"
     done
 }

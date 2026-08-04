@@ -1,7 +1,7 @@
-use niri_config::CornerRadius;
 use smithay::backend::renderer::element::{Element, Id};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
+use synoik_config::CornerRadius;
 
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::blur::BlurOptions;
@@ -110,10 +110,10 @@ mod vulkan_impl {
     use std::cell::RefCell;
 
     use glam::{Mat3, Vec2, Vec3};
-    use niri_vk::render::PostprocessPush;
     use smithay::backend::renderer::element::{RenderElement, UnderlyingStorage};
     use smithay::utils::user_data::UserDataMap;
     use smithay::utils::{Buffer, Logical, Physical, Rectangle, Transform};
+    use synoik_vk::render::PostprocessPush;
 
     use super::FramebufferEffectElement;
     use crate::render_helpers::vulkan::{BackdropBlur, VulkanError, VulkanFrame, VulkanRenderer};
@@ -160,8 +160,8 @@ mod vulkan_impl {
                 bg_color: [0.0; 4],
                 input_to_geo: pack_mat3(input_to_geo),
                 sample_transform: pack_mat3(sample_transform),
-                niri_scale: self.scale,
-                niri_alpha: 1.0,
+                synoik_scale: self.scale,
+                synoik_alpha: 1.0,
                 saturation: self.saturation,
                 noise: self.noise,
                 // origin/size/target/src_rect are filled by render_postprocess.

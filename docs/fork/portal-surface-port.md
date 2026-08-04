@@ -128,16 +128,16 @@ Ordered by what unblocks the portal soonest, not by interface.
    `ui::flashspot`, and the `filename` argument honoured. `ScreenshotWindow` deliberately bypasses
    `save_screenshot`, which also replaces the clipboard and raises a notification — those belong to
    a keypress, not to a portal call the user never sees.
-3. **`SelectArea`.** — **DONE**. The picker opens with `Niri::select_area_reply` armed; confirming
+3. **`SelectArea`.** — **DONE**. The picker opens with `Synoik::select_area_reply` armed; confirming
    answers with the rect in global logical coordinates and saves nothing, and **every** close
    answers, because a D-Bus caller that is not answered hangs until its timeout rather than
    failing. That is why all the `ScreenshotUi::close` call sites now route through
-   `Niri::close_screenshot_ui`, and why it answers unconditionally rather than only when the picker
+   `Synoik::close_screenshot_ui`, and why it answers unconditionally rather than only when the picker
    was open. Pinned by `select_area_always_answers_its_caller`.
 4. **ScreenCast completion.** — **PART DONE.** `Stream.Start`/`Stop` are in. `Stream.Stop` is
    deliberately *not* a wrapper around session stop: one session can carry several streams (a
    browser sharing two monitors), so tearing the session down when one stream ends would kill the
-   others and close the session object out from under the caller. That is why `Niri::stop_stream`
+   others and close the session object out from under the caller. That is why `Synoik::stop_stream`
    exists beside `stop_cast`.
 
    **Left: `RecordVirtual`**, and it is bigger than it looks. It asks the compositor to *create a

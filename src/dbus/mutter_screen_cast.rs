@@ -16,7 +16,7 @@ use crate::utils::{CastSessionId, CastStreamId};
 #[derive(Clone)]
 pub struct ScreenCast {
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
-    to_niri: calloop::channel::Sender<ScreenCastToNiri>,
+    to_niri: calloop::channel::Sender<ScreenCastToSynoik>,
     #[allow(clippy::type_complexity)]
     sessions: Arc<Mutex<Vec<(Session, InterfaceRef<Session>)>>>,
 }
@@ -25,7 +25,7 @@ pub struct ScreenCast {
 pub struct Session {
     id: CastSessionId,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
-    to_niri: calloop::channel::Sender<ScreenCastToNiri>,
+    to_niri: calloop::channel::Sender<ScreenCastToSynoik>,
     #[allow(clippy::type_complexity)]
     streams: Arc<Mutex<Vec<(Stream, InterfaceRef<Stream>)>>>,
     stopped: Arc<AtomicBool>,
@@ -79,13 +79,13 @@ pub struct Stream {
     /// screencast (portal capture, remote view).
     is_recording: bool,
     was_started: Arc<AtomicBool>,
-    to_niri: calloop::channel::Sender<ScreenCastToNiri>,
+    to_niri: calloop::channel::Sender<ScreenCastToSynoik>,
 }
 
 #[derive(Clone)]
 enum StreamTarget {
     // FIXME: update on scale changes and whatnot.
-    Output(niri_ipc::Output),
+    Output(synoik_ipc::Output),
     Window {
         id: u64,
     },
@@ -124,7 +124,7 @@ struct StreamParameters {
     size: (i32, i32),
 }
 
-pub enum ScreenCastToNiri {
+pub enum ScreenCastToSynoik {
     StartCast {
         session_id: CastSessionId,
         stream_id: CastStreamId,
@@ -136,7 +136,7 @@ pub enum ScreenCastToNiri {
     StopCast {
         session_id: CastSessionId,
     },
-    /// One stream of a session, not the whole session — see `Niri::stop_stream`.
+    /// One stream of a session, not the whole session — see `Synoik::stop_stream`.
     StopStream {
         stream_id: CastStreamId,
     },
@@ -206,10 +206,10 @@ impl Session {
 
         Session::closed(&ctxt).await.unwrap();
 
-        if let Err(err) = self.to_niri.send(ScreenCastToNiri::StopCast {
+        if let Err(err) = self.to_niri.send(ScreenCastToSynoik::StopCast {
             session_id: self.id,
         }) {
-            warn!("error sending StopCast to niri: {err:?}");
+            warn!("error sending StopCast to synoik: {err:?}");
         }
 
         let streams = mem::take(&mut *self.streams.lock().unwrap());
@@ -386,9 +386,9 @@ impl Stream {
     async fn stop_stream(&self) {
         if let Err(err) = self
             .to_niri
-            .send(ScreenCastToNiri::StopStream { stream_id: self.id })
+            .send(ScreenCastToSynoik::StopStream { stream_id: self.id })
         {
-            warn!("error sending StopStream to niri: {err:?}");
+            warn!("error sending StopStream to synoik: {err:?}");
         }
     }
 
@@ -424,7 +424,7 @@ impl Stream {
 impl ScreenCast {
     pub fn new(
         ipc_outputs: Arc<Mutex<IpcOutputMap>>,
-        to_niri: calloop::channel::Sender<ScreenCastToNiri>,
+        to_niri: calloop::channel::Sender<ScreenCastToSynoik>,
     ) -> Self {
         Self {
             ipc_outputs,
@@ -453,7 +453,7 @@ impl Session {
     pub fn new(
         id: CastSessionId,
         ipc_outputs: Arc<Mutex<IpcOutputMap>>,
-        to_niri: calloop::channel::Sender<ScreenCastToNiri>,
+        to_niri: calloop::channel::Sender<ScreenCastToSynoik>,
     ) -> Self {
         Self {
             id,
@@ -467,7 +467,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.to_niri.send(ScreenCastToNiri::StopCast {
+        let _ = self.to_niri.send(ScreenCastToSynoik::StopCast {
             session_id: self.id,
         });
     }
@@ -480,7 +480,7 @@ impl Stream {
         target: StreamTarget,
         cursor_mode: CursorMode,
         is_recording: bool,
-        to_niri: calloop::channel::Sender<ScreenCastToNiri>,
+        to_niri: calloop::channel::Sender<ScreenCastToSynoik>,
     ) -> Self {
         Self {
             id,
@@ -498,7 +498,7 @@ impl Stream {
             return;
         }
 
-        let msg = ScreenCastToNiri::StartCast {
+        let msg = ScreenCastToSynoik::StartCast {
             session_id: self.session_id,
             stream_id: self.id,
             target: self.target.make_id(),
@@ -508,7 +508,7 @@ impl Stream {
         };
 
         if let Err(err) = self.to_niri.send(msg) {
-            warn!("error sending StartCast to niri: {err:?}");
+            warn!("error sending StartCast to synoik: {err:?}");
         }
     }
 }
