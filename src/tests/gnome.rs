@@ -2191,6 +2191,159 @@ fn super_up_maximizes_super_down_restores() {
     );
 }
 
+/// Maximizes the focused window and acks a work-area-sized configure for it.
+fn maximize_focused(f: &mut Fixture, id: ClientId, surface: &WlSurface, size: (u16, u16)) {
+    f.key_press(KEY_LEFTMETA);
+    tap(f, KEY_UP);
+    f.key_release(KEY_LEFTMETA);
+    f.double_roundtrip(id);
+
+    let window = f.client(id).window(surface);
+    window.set_size(size.0, size.1);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+}
+
+/// A GNOME workspace is a stack, not a strip: two maximized windows sit on top of each other at
+/// the work area origin, and focusing between them does not slide the view sideways.
+///
+/// niri would give each maximized window its own column and pan horizontally between them. On this
+/// desktop the horizontal axis belongs to workspaces — what lies to the side of a workspace is
+/// another workspace — so nothing on a workspace is ever placed beside anything else.
+#[test]
+fn maximized_windows_stack_instead_of_sitting_side_by_side() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let first = map_window_sized(&mut f, id, (800, 600), None);
+    let first_id = f.niri().layout.focus().unwrap().id();
+    let second = map_window_sized(&mut f, id, (800, 600), None);
+    let second_id = f.niri().layout.focus().unwrap().id();
+
+    // Maximize the second, then the first (Alt+Tab back to it first).
+    maximize_focused(&mut f, id, &second, (1920, 1080));
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_TAB);
+    f.key_release(KEY_LEFTALT);
+    f.double_roundtrip(id);
+    assert_eq!(f.niri().layout.focus().unwrap().id(), first_id);
+    maximize_focused(&mut f, id, &first, (1920, 1080));
+
+    let window_pos = |f: &mut Fixture, wanted| {
+        let ws = f.niri().layout.active_workspace().unwrap();
+        let (_, pos, _) = ws
+            .tiles_with_render_positions()
+            .find(|(tile, _, _)| tile.window().id() == wanted)
+            .unwrap();
+        (pos.x, pos.y)
+    };
+
+    let first_pos = window_pos(&mut f, first_id);
+    let second_pos = window_pos(&mut f, second_id);
+    assert_pos_eq(
+        second_pos,
+        first_pos,
+        "two maximized windows must occupy the same rect, not sit side by side",
+    );
+
+    // Focusing across them is a raise, not a horizontal pan.
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_TAB);
+    f.key_release(KEY_LEFTALT);
+    f.niri_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(f.niri().layout.focus().unwrap().id(), second_id);
+
+    assert_pos_eq(
+        window_pos(&mut f, first_id),
+        first_pos,
+        "switching focus between maximized windows must not move them",
+    );
+    assert_pos_eq(
+        window_pos(&mut f, second_id),
+        second_pos,
+        "switching focus between maximized windows must not move them",
+    );
+}
+
+/// Fullscreening a maximized window and unfullscreening it comes back to maximized, not to the
+/// pre-maximize rect (mutter's `saved_maximize`, meta_window_unmake_fullscreen).
+#[test]
+fn unfullscreen_returns_a_maximized_window_to_maximized() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    maximize_focused(&mut f, id, &surface, (1920, 1080));
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    let window_id = f.niri().layout.focus().unwrap().window.clone();
+    f.niri().layout.toggle_fullscreen(&window_id);
+    f.double_roundtrip(id);
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("Fullscreen"),
+        "fullscreen must send the xdg Fullscreen state, got: {configures}"
+    );
+
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    f.niri().layout.toggle_fullscreen(&window_id);
+    f.double_roundtrip(id);
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("Maximized") && !configures.contains("Fullscreen"),
+        "unfullscreening a window that was maximized must return it to maximized, \
+         got: {configures}"
+    );
+}
+
+/// A fullscreen window covers the panel: mutter puts fullscreen windows above the top layer
+/// (`meta_window_is_fullscreen` feeds the layer computation in `meta_window_update_layer`).
+/// Ours live in the floating layout, so that is where the check has to look.
+#[test]
+fn fullscreen_window_covers_the_top_layer() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window_id = f.niri().layout.focus().unwrap().window.clone();
+    assert!(
+        !f.niri()
+            .layout
+            .active_workspace()
+            .unwrap()
+            .render_above_top_layer(),
+        "an ordinary window must not cover the panel"
+    );
+
+    f.niri().layout.toggle_fullscreen(&window_id);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.niri_complete_animations();
+
+    assert!(
+        f.niri()
+            .layout
+            .active_workspace()
+            .unwrap()
+            .render_above_top_layer(),
+        "a fullscreen window must render above the top layer"
+    );
+}
+
 /// mutter's auto-maximize: a window covering more than 80% of the work area
 /// opens maximized; unmaximizing restores a size clamped to sqrt(0.8) of the
 /// work area, aspect preserved (place.c / window.c).
@@ -2238,9 +2391,8 @@ fn oversized_window_auto_maximizes_with_clamped_restore() {
 }
 
 /// GNOME stacking: mutter raises on click/activation, so the focused window
-/// stays visually topmost even though maximizing moves it into the scrolling
-/// layer, which niri renders below the floating one. Switching back to a
-/// floating window puts the floating layer back on top.
+/// stays visually topmost after being maximized, map order notwithstanding.
+/// Switching back to the other window puts that one on top again.
 #[test]
 fn active_maximized_window_covers_floating() {
     let mut f = Fixture::new();

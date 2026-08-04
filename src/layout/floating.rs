@@ -13,6 +13,7 @@ use super::tile::{Tile, TileRenderElement, TileUnmapSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, Options, RemovedTile, SizeFrac,
+    SizingMode,
 };
 use crate::animation::{Animation, Clock};
 use crate::gnome::TileSide;
@@ -85,11 +86,45 @@ niri_render_elements! {
     }
 }
 
+/// Where a tile's position comes from.
+///
+/// Maximized and fullscreen windows do not have a position of their own: theirs is derived from
+/// the work area / output, and must not be clamped like a free-floating one (a fullscreen tile is
+/// larger than the work area, so the off-screen clamp does not even apply to it). Anchoring is a
+/// *view* on the position — `pos` keeps holding the free-floating one underneath, so unmaximizing
+/// a window that never had a saved rect still lands where it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Anchor {
+    /// Free-floating: the stored size-fraction position, clamped to stay mostly on-screen.
+    Free,
+    /// Pinned to the work area origin (maximized).
+    WorkArea,
+    /// Pinned to the output origin (fullscreen).
+    Output,
+}
+
+/// The anchor a tile's pending sizing mode calls for.
+///
+/// Keyed off the *pending* mode rather than the tile's committed one so the tile travels together
+/// with the resize it was just asked for, instead of jumping once the client catches up.
+fn anchor_for<W: LayoutElement>(tile: &Tile<W>) -> Anchor {
+    match tile.window().pending_sizing_mode() {
+        SizingMode::Fullscreen => Anchor::Output,
+        SizingMode::Maximized => Anchor::WorkArea,
+        SizingMode::Normal => Anchor::Free,
+    }
+}
+
 /// Extra per-tile data.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Data {
     /// Position relative to the working area.
+    ///
+    /// Retained while the tile is anchored, as the position to fall back to when it unanchors.
     pos: Point<f64, SizeFrac>,
+
+    /// What `logical_pos` is derived from.
+    anchor: Anchor,
 
     /// Cached position in logical coordinates.
     ///
@@ -111,12 +146,14 @@ impl Data {
     ) -> Self {
         let mut rv = Self {
             pos: Point::default(),
+            anchor: Anchor::Free,
             logical_pos: Point::default(),
             size: Size::default(),
             working_area,
         };
         rv.update(tile);
         rv.set_logical_pos(logical_pos);
+        rv.set_anchor(anchor_for(tile));
         rv
     }
 
@@ -143,6 +180,18 @@ impl Data {
     }
 
     fn recompute_logical_pos(&mut self) {
+        match self.anchor {
+            Anchor::WorkArea => {
+                self.logical_pos = self.working_area.loc;
+                return;
+            }
+            Anchor::Output => {
+                self.logical_pos = Point::from((0., 0.));
+                return;
+            }
+            Anchor::Free => (),
+        }
+
         let mut logical_pos = Self::scale_by_working_area(self.working_area, self.pos);
 
         // Make sure the window doesn't go too much off-screen. Numbers taken from Mutter.
@@ -190,6 +239,15 @@ impl Data {
         self.pos = Self::logical_to_size_frac_in_working_area(self.working_area, logical_pos);
 
         // This will clamp the logical position to the current working area.
+        self.recompute_logical_pos();
+    }
+
+    pub fn set_anchor(&mut self, anchor: Anchor) {
+        if self.anchor == anchor {
+            return;
+        }
+
+        self.anchor = anchor;
         self.recompute_logical_pos();
     }
 
@@ -436,29 +494,46 @@ impl<W: LayoutElement> FloatingSpace<W> {
     fn add_tile_at(&mut self, mut idx: usize, mut tile: Tile<W>, activate: bool) {
         tile.update_config(self.view_size, self.scale, self.options.clone());
 
-        // Restore the previous floating window size, and in case the tile is fullscreen,
-        // unfullscreen it.
-        let floating_size = tile.floating_window_size;
+        let gnome_mode = self.options.layout.windowing_mode == WindowingMode::Floating;
+        match tile.window().pending_sizing_mode() {
+            // GNOME mode: this space holds maximized and fullscreen windows itself. The state
+            // survives, but is re-applied against *this* space — the tile may be arriving from a
+            // workspace on another output, or from one with different struts.
+            SizingMode::Fullscreen if gnome_mode => tile.request_fullscreen(true, None),
+            SizingMode::Maximized if gnome_mode => {
+                let size = self.working_area.size;
+                tile.request_maximized(size, true, None);
+            }
+            // In niri's scrolling mode only the scrolling layout can size a window to the screen,
+            // so a window arriving here leaves those states behind. Restore the previous floating
+            // window size, and in case the tile is fullscreen, unfullscreen it.
+            mode => {
+                let floating_size = tile.floating_window_size;
+                let win = tile.window_mut();
+                let mut size = if mode.is_normal() {
+                    // If the window wasn't fullscreen without a floating size (e.g. it was tiled
+                    // before), ask for the current size. If the current size is unknown (the
+                    // window was only ever fullscreen until now), fall back to (0, 0).
+                    floating_size.unwrap_or_else(|| win.expected_size().unwrap_or_default())
+                } else {
+                    // If the window was fullscreen or maximized without a floating size, ask for
+                    // (0, 0).
+                    floating_size.unwrap_or_default()
+                };
+
+                // Apply min/max size window rules. If requesting a concrete size, apply
+                // completely; if requesting (0, 0), apply only when min/max results in a fixed
+                // size.
+                let min_size = win.min_size();
+                let max_size = win.max_size();
+                size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
+                size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
+
+                win.request_size_once(size, true);
+            }
+        }
+
         let win = tile.window_mut();
-        let mut size = if !win.pending_sizing_mode().is_normal() {
-            // If the window was fullscreen or maximized without a floating size, ask for (0, 0).
-            floating_size.unwrap_or_default()
-        } else {
-            // If the window wasn't fullscreen without a floating size (e.g. it was tiled before),
-            // ask for the current size. If the current size is unknown (the window was only ever
-            // fullscreen until now), fall back to (0, 0).
-            floating_size.unwrap_or_else(|| win.expected_size().unwrap_or_default())
-        };
-
-        // Apply min/max size window rules. If requesting a concrete size, apply completely; if
-        // requesting (0, 0), apply only when min/max results in a fixed size.
-        let min_size = win.min_size();
-        let max_size = win.max_size();
-        size.w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
-        size.h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
-
-        win.request_size_once(size, true);
-
         if activate || self.tiles.is_empty() {
             self.active_window_id = Some(win.id().clone());
         }
@@ -1085,21 +1160,17 @@ impl<W: LayoutElement> FloatingSpace<W> {
     /// side's edge.
     fn tile_to(&mut self, idx: usize, side: TileSide) {
         let area = self.working_area;
-        let current_pos = self.data[idx].logical_pos;
+
+        // First tile from floating: save the restore rect (mutter's `meta_window_save_rect`).
+        // Re-tiling to the other side keeps it, and so does tiling a maximized or fullscreen
+        // window, which already saved one on its way there (mutter clears the maximization and
+        // tiles from the pre-maximize rect).
+        if self.tiles[idx].window().pending_sizing_mode().is_normal() {
+            self.save_restore_rect(idx);
+        }
 
         let tile = &mut self.tiles[idx];
-
-        // First tile from floating: save the restore rect (mutter's
-        // `meta_window_save_rect`). Re-tiling to the other side keeps it.
-        if tile.window().edge_tiled_side().is_none() {
-            let win = tile.window();
-            let size = win.expected_size().unwrap_or_else(|| win.size());
-            tile.tiled_restore_size = Some(size);
-            tile.tiled_restore_pos = Some(Data::logical_to_size_frac_in_working_area(
-                area,
-                current_pos,
-            ));
-        }
+        tile.saved_maximize = false;
 
         let tile_width = (area.size.w / 2.).round();
         let win_width = tile.window_width_for_tile_width(tile_width);
@@ -1113,16 +1184,164 @@ impl<W: LayoutElement> FloatingSpace<W> {
         win.request_size_once(Size::from((win_width, win_height)), true);
         win.set_edge_tiled(Some(side));
 
+        // An edge-tiled window is positioned like a free-floating one, so drop any maximize or
+        // fullscreen anchor before moving it.
         let x = match side {
             TileSide::Left => area.loc.x,
             TileSide::Right => area.loc.x + area.size.w - tile_width,
         };
-        self.move_to(idx, Point::from((x, area.loc.y)), true);
+        let prev_pos = self.data[idx].logical_pos;
+        self.data[idx].set_logical_pos(Point::from((x, area.loc.y)));
+        self.data[idx].set_anchor(Anchor::Free);
+        self.animate_move_from(idx, prev_pos);
+        self.interactive_resize_end(None);
     }
 
     fn untile(&mut self, idx: usize) {
+        self.restore_normal(idx);
+    }
+
+    /// Maximizes or unmaximizes the window (mutter's `meta_window_maximize` /
+    /// `meta_window_unmaximize`). Returns whether anything changed.
+    pub fn set_maximized(&mut self, id: &W::Id, maximize: bool) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+
+        let mode = self.tiles[idx].window().pending_sizing_mode();
+
+        // Under fullscreen, maximizing only records where unfullscreening should land (mutter's
+        // `saved_maximize`); the window itself stays fullscreen.
+        if mode.is_fullscreen() {
+            let changed = self.tiles[idx].saved_maximize != maximize;
+            self.tiles[idx].saved_maximize = maximize;
+            return changed;
+        }
+
+        if mode.is_maximized() == maximize {
+            // An edge-tiled window counts as maximized for mutter's handle_unmaximize, which
+            // untiles it.
+            if !maximize && self.tiles[idx].window().edge_tiled_side().is_some() {
+                self.untile(idx);
+                return true;
+            }
+            return false;
+        }
+
+        if maximize {
+            self.save_restore_rect(idx);
+            self.apply_maximized(idx);
+        } else {
+            self.restore_normal(idx);
+        }
+
+        true
+    }
+
+    /// Whether the active window is fullscreen and should therefore cover the top layer (the
+    /// panel). Keyed off the tile's *committed* sizing mode, like the scrolling layer's version:
+    /// hiding the panel before the client has actually resized would flash the desktop.
+    pub fn render_above_top_layer(&self) -> bool {
+        let Some(idx) = self
+            .active_window_id
+            .as_ref()
+            .and_then(|id| self.idx_of(id))
+        else {
+            return false;
+        };
+
+        self.tiles[idx].sizing_mode().is_fullscreen()
+    }
+
+    /// Whether the window is maximized, counting the maximization held underneath a fullscreen
+    /// (mutter's `saved_maximize`) — the same bit a scrolling `Column` tracks separately from its
+    /// fullscreen state.
+    pub fn is_maximized(&self, id: &W::Id) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+
+        let tile = &self.tiles[idx];
+        let mode = tile.window().pending_sizing_mode();
+        if mode.is_fullscreen() {
+            tile.saved_maximize
+        } else {
+            mode.is_maximized()
+        }
+    }
+
+    /// Fullscreens or unfullscreens the window. Returns whether anything changed.
+    pub fn set_fullscreen(&mut self, id: &W::Id, is_fullscreen: bool) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+
+        let mode = self.tiles[idx].window().pending_sizing_mode();
+        if mode.is_fullscreen() == is_fullscreen {
+            return false;
+        }
+
+        if is_fullscreen {
+            if mode.is_maximized() {
+                // Come back to maximized rather than to the saved rect, which stays as it was
+                // saved on the way into maximized.
+                self.tiles[idx].saved_maximize = true;
+            } else {
+                self.save_restore_rect(idx);
+            }
+
+            let prev_pos = self.data[idx].logical_pos;
+            self.tiles[idx].request_fullscreen(true, None);
+            self.data[idx].set_anchor(Anchor::Output);
+            self.animate_move_from(idx, prev_pos);
+        } else if self.tiles[idx].saved_maximize {
+            self.tiles[idx].saved_maximize = false;
+            self.apply_maximized(idx);
+        } else {
+            self.restore_normal(idx);
+        }
+
+        true
+    }
+
+    /// mutter's `meta_window_save_rect`: remembers the geometry to come back to.
+    ///
+    /// A window that is already edge-tiled has one saved from before the tile and keeps it — the
+    /// restore target is the pre-tile rect, not the tiled one (mutter's `saved_rect` flows from
+    /// tile into maximize). Only ever called on a window that is currently normal-sized.
+    fn save_restore_rect(&mut self, idx: usize) {
+        let area = self.working_area;
+        let current_pos = self.data[idx].logical_pos;
+        let tile = &mut self.tiles[idx];
+
+        if tile.window().edge_tiled_side().is_some() {
+            tile.window_mut().set_edge_tiled(None);
+            return;
+        }
+
+        let win = tile.window();
+        let size = win.expected_size().unwrap_or_else(|| win.size());
+        tile.tiled_restore_size = Some(size);
+        tile.tiled_restore_pos = Some(Data::logical_to_size_frac_in_working_area(
+            area,
+            current_pos,
+        ));
+    }
+
+    /// Sizes the tile to the work area and pins it there.
+    fn apply_maximized(&mut self, idx: usize) {
+        let prev_pos = self.data[idx].logical_pos;
+        let size = self.working_area.size;
+        self.tiles[idx].request_maximized(size, true, None);
+        self.data[idx].set_anchor(Anchor::WorkArea);
+        self.animate_move_from(idx, prev_pos);
+    }
+
+    /// Returns the tile to normal sizing on its saved rect, from maximized, fullscreen or tiled.
+    fn restore_normal(&mut self, idx: usize) {
         let tile = &mut self.tiles[idx];
         tile.window_mut().set_edge_tiled(None);
+        tile.saved_maximize = false;
 
         let size = tile.tiled_restore_size.take().unwrap_or_default();
         let restore_pos = tile.tiled_restore_pos.take();
@@ -1134,10 +1353,15 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
         win.request_size_once(Size::from((w, h)), true);
 
+        let prev_pos = self.data[idx].logical_pos;
         if let Some(pos) = restore_pos {
             let pos = self.scale_by_working_area(pos);
-            self.move_to(idx, pos, true);
+            self.data[idx].set_logical_pos(pos);
         }
+        self.data[idx].set_anchor(Anchor::Free);
+        self.animate_move_from(idx, prev_pos);
+
+        self.interactive_resize_end(None);
     }
 
     pub fn center_window(&mut self, id: Option<&W::Id>) {
@@ -1257,6 +1481,12 @@ impl<W: LayoutElement> FloatingSpace<W> {
             .iter_mut()
             .find(|tile| tile.window().id() == &window)
             .unwrap();
+
+        // A maximized or fullscreen window owns its geometry; mutter refuses the resize grab
+        // outright (`meta_window_begin_grab_op` -> `has_resize_func`).
+        if !tile.window().pending_sizing_mode().is_normal() {
+            return false;
+        }
 
         let original_window_size = tile.window_size();
 
@@ -1386,19 +1616,19 @@ impl<W: LayoutElement> FloatingSpace<W> {
     }
 
     fn move_and_animate(&mut self, idx: usize, new_pos: Point<f64, Logical>) {
+        let prev_pos = self.data[idx].logical_pos;
+        self.data[idx].set_logical_pos(new_pos);
+        self.animate_move_from(idx, prev_pos);
+    }
+
+    /// Animates the tile in from where it used to be, after its position has already changed.
+    fn animate_move_from(&mut self, idx: usize, prev_pos: Point<f64, Logical>) {
         // Moves up to this logical pixel distance are not animated.
         const ANIMATION_THRESHOLD_SQ: f64 = 10. * 10.;
 
-        let tile = &mut self.tiles[idx];
-        let data = &mut self.data[idx];
-
-        let prev_pos = data.logical_pos;
-        data.set_logical_pos(new_pos);
-        let new_pos = data.logical_pos;
-
-        let diff = prev_pos - new_pos;
+        let diff = prev_pos - self.data[idx].logical_pos;
         if diff.x * diff.x + diff.y * diff.y > ANIMATION_THRESHOLD_SQ {
-            tile.animate_move_from(prev_pos - new_pos);
+            self.tiles[idx].animate_move_from(diff);
         }
     }
 

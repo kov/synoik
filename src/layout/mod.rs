@@ -4167,6 +4167,7 @@ impl<W: LayoutElement> Layout<W> {
                     .unwrap();
                 tile.interactive_move_offset = pointer_delta.upscale(factor);
                 let is_edge_tiled = tile.window().edge_tiled_side().is_some();
+                let is_expanded = !tile.window().pending_sizing_mode().is_normal();
 
                 // Put it back to be able to easily return.
                 self.interactive_move = Some(InteractiveMoveState::Starting {
@@ -4179,8 +4180,10 @@ impl<W: LayoutElement> Layout<W> {
                 // px of *vertical* movement (dragging along the top edge keeps
                 // it maximized, e.g. towards another monitor), and an
                 // edge-tiled one after that much movement on either axis
-                // (meta-window-drag.c, update_move). In GNOME windowing mode
-                // the scrolling layer holds the maximized/fullscreen windows.
+                // (meta-window-drag.c, update_move). What shakes loose is a
+                // property of the window's sizing mode, not of the layer it
+                // sits in — in GNOME mode every window is floating, maximized
+                // ones included.
                 let gnome_mode = self.options.layout.windowing_mode == WindowingMode::Floating;
                 // In the overview the drag grabs a picker preview, which
                 // starts moving right away — there's nothing to shake loose
@@ -4188,12 +4191,10 @@ impl<W: LayoutElement> Layout<W> {
                 let in_expose = gnome_mode && self.overview_open;
                 let started = if in_expose {
                     true
+                } else if gnome_mode && is_expanded {
+                    pointer_delta.y.abs() >= crate::gnome::SHAKE_THRESHOLD
                 } else if !is_floating {
-                    if gnome_mode {
-                        pointer_delta.y.abs() >= crate::gnome::SHAKE_THRESHOLD
-                    } else {
-                        sq_dist >= INTERACTIVE_MOVE_START_THRESHOLD
-                    }
+                    sq_dist >= INTERACTIVE_MOVE_START_THRESHOLD
                 } else if gnome_mode && is_edge_tiled {
                     f64::max(pointer_delta.x.abs(), pointer_delta.y.abs())
                         >= crate::gnome::SHAKE_THRESHOLD

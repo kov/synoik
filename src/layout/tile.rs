@@ -86,6 +86,13 @@ pub struct Tile<W: LayoutElement> {
     /// The position to restore when untiling (mutter's `saved_rect`).
     pub(super) tiled_restore_pos: Option<Point<f64, SizeFrac>>,
 
+    /// Whether the window was maximized when it went fullscreen (mutter's `saved_maximize`).
+    ///
+    /// A window's `SizingMode` is a single value with fullscreen on top, so this is the only place
+    /// the maximized state underneath it survives; unfullscreening consults it to decide whether
+    /// to land on maximized or on the saved rect.
+    pub(super) saved_maximize: bool,
+
     /// Currently selected preset width index when this tile is floating.
     pub(super) floating_preset_width_idx: Option<usize>,
 
@@ -257,6 +264,7 @@ impl<W: LayoutElement> Tile<W> {
             floating_pos: None,
             tiled_restore_size: None,
             tiled_restore_pos: None,
+            saved_maximize: false,
             floating_preset_width_idx: None,
             floating_preset_height_idx: None,
             open_animation: None,

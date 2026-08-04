@@ -1,5 +1,9 @@
 use insta::assert_snapshot;
 
+// Every test here is about a fullscreen *column*: which column the window is extracted into,
+// and where the horizontal view offset lands afterwards. That is niri's model — GNOME mode has
+// neither — so the whole module runs in scrolling mode. See `super::scrolling_options`.
+use super::check_ops_scrolling as check_ops;
 use super::*;
 
 #[test]
@@ -187,15 +191,10 @@ fn unfullscreen_with_large_border() {
         Op::FullscreenWindow(0),
     ];
 
-    let options = Options {
-        layout: niri_config::Layout {
-            border: niri_config::Border {
-                off: false,
-                width: 10000.,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
+    let mut options = scrolling_options();
+    options.layout.border = niri_config::Border {
+        off: false,
+        width: 10000.,
         ..Default::default()
     };
     check_ops_with_options(options, ops);

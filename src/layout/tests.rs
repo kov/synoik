@@ -1639,6 +1639,27 @@ fn check_ops(ops: impl IntoIterator<Item = Op>) -> Layout<TestWindow> {
     layout
 }
 
+/// Options in niri's scrolling mode.
+///
+/// The inherited niri corpus pins the scrolling layer: columns, the horizontal view offset, tabbed
+/// columns, and maximize/fullscreen sizing a *column* to the screen. None of that exists in GNOME
+/// mode — the default — where windows simply stack, so those tests opt into the mode they were
+/// written against.
+fn scrolling_options() -> Options {
+    Options {
+        layout: niri_config::Layout {
+            windowing_mode: WindowingMode::Scrolling,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[track_caller]
+fn check_ops_scrolling(ops: impl IntoIterator<Item = Op>) -> Layout<TestWindow> {
+    check_ops_with_options(scrolling_options(), ops)
+}
+
 #[track_caller]
 fn check_ops_with_options(
     options: Options,
@@ -2310,7 +2331,7 @@ fn open_right_of_on_different_workspace() {
         },
     ];
 
-    let layout = check_ops(ops);
+    let layout = check_ops_scrolling(ops);
 
     let MonitorSet::Normal { monitors, .. } = layout.monitor_set else {
         unreachable!()
@@ -3096,7 +3117,7 @@ fn removing_window_above_preserves_focused_window() {
         Op::CloseWindow(0),
     ];
 
-    let layout = check_ops(ops);
+    let layout = check_ops_scrolling(ops);
     let win = layout.focus().unwrap();
     assert_eq!(win.0.id, 1);
 }
@@ -3218,7 +3239,7 @@ fn move_column_to_workspace_unfocused_with_multiple_monitors() {
         Op::FocusOutput(1),
     ];
 
-    let layout = check_ops(ops);
+    let layout = check_ops_scrolling(ops);
 
     assert_eq!(layout.active_workspace().unwrap().name().unwrap(), "ws102");
 
@@ -3303,7 +3324,7 @@ fn restore_to_floating_persists_across_fullscreen_maximize() {
         Op::FullscreenWindow(1),
     ];
 
-    let mut layout = check_ops(ops);
+    let mut layout = check_ops_scrolling(ops);
 
     // Unfullscreening should return the window to the maximized state.
     let scrolling = layout.active_workspace().unwrap().scrolling();
@@ -3335,7 +3356,7 @@ fn unmaximize_during_fullscreen_does_not_float() {
         Op::MaximizeWindowToEdges { id: None },
     ];
 
-    let mut layout = check_ops(ops);
+    let mut layout = check_ops_scrolling(ops);
 
     // Unmaximize shouldn't have changed the window state since it's fullscreen.
     let scrolling = layout.active_workspace().unwrap().scrolling();
@@ -3365,7 +3386,7 @@ fn move_column_to_workspace_maximize_and_fullscreen() {
         Op::FullscreenWindow(1),
     ];
 
-    let layout = check_ops(ops);
+    let layout = check_ops_scrolling(ops);
     let (_, win) = layout.windows().next().unwrap();
 
     // Unfullscreening should return to maximized because the window was maximized before.
@@ -3385,7 +3406,7 @@ fn move_window_to_workspace_maximize_and_fullscreen() {
         Op::FullscreenWindow(1),
     ];
 
-    let layout = check_ops(ops);
+    let layout = check_ops_scrolling(ops);
     let (_, win) = layout.windows().next().unwrap();
 
     // Unfullscreening should return to maximized because the window was maximized before.
@@ -3461,7 +3482,7 @@ fn expel_pending_left_from_fullscreen_tabbed_column() {
         Op::ConsumeOrExpelWindowLeft { id: None },
     ];
 
-    check_ops(ops);
+    check_ops_scrolling(ops);
 }
 
 #[test]

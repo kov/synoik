@@ -762,6 +762,20 @@ impl<W: LayoutElement> Workspace<W> {
         is_floating: bool,
     ) {
         self.enter_output_for_window(tile.window());
+
+        // GNOME windowing has a single layer: windows stack, they never tile into columns. Its
+        // maximized and fullscreen windows are sized by the floating space itself (see
+        // `FloatingSpace::set_maximized`), so nothing is ever routed into the scrolling layout —
+        // side-by-side columns and the horizontal view pan between them are niri's model, and on
+        // this desktop what lies to the side of a workspace is another workspace.
+        //
+        // In niri's scrolling mode only the scrolling layout can size a window to the screen, so a
+        // window that opens maximized or fullscreen goes there regardless of `is_floating`.
+        let gnome_mode = self.options.layout.windowing_mode == WindowingMode::Floating;
+        let is_floating = is_floating || gnome_mode;
+        let opens_floating =
+            is_floating && (gnome_mode || tile.window().pending_sizing_mode().is_normal());
+
         tile.restore_to_floating = is_floating;
 
         match target {
@@ -769,9 +783,7 @@ impl<W: LayoutElement> Workspace<W> {
                 // Don't steal focus from an active fullscreen window.
                 let activate = activate.map_smart(|| !self.is_active_pending_fullscreen());
 
-                // If the tile is pending maximized or fullscreen, open it in the scrolling layout
-                // where it can do that.
-                if is_floating && tile.window().pending_sizing_mode().is_normal() {
+                if opens_floating {
                     self.floating.add_tile(tile, activate);
 
                     if activate || self.scrolling.is_empty() {
@@ -784,6 +796,16 @@ impl<W: LayoutElement> Workspace<W> {
                     if activate {
                         self.floating_is_active = FloatingActive::No;
                     }
+                }
+            }
+            // Placing a window in a specific column is a scrolling-layout notion; in GNOME mode
+            // there are no columns, so it just opens on the stack.
+            WorkspaceAddWindowTarget::NewColumnAt(_) if gnome_mode => {
+                let activate = activate.map_smart(|| false);
+                self.floating.add_tile(tile, activate);
+
+                if activate {
+                    self.floating_is_active = FloatingActive::Yes;
                 }
             }
             WorkspaceAddWindowTarget::NewColumnAt(col_idx) => {
@@ -800,7 +822,7 @@ impl<W: LayoutElement> Workspace<W> {
 
                 let floating_has_window = self.floating.has_window(next_to);
 
-                if is_floating && tile.window().pending_sizing_mode().is_normal() {
+                if opens_floating {
                     if floating_has_window {
                         self.floating.add_tile_above(next_to, tile, activate);
                     } else {
@@ -1410,6 +1432,13 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn set_fullscreen(&mut self, window: &W::Id, is_fullscreen: bool) {
+        // GNOME mode: every window lives in the floating layout, which sizes fullscreen windows
+        // itself. No migration into a scrolling column, so no column to be side by side with.
+        if self.options.layout.windowing_mode == WindowingMode::Floating {
+            self.floating.set_fullscreen(window, is_fullscreen);
+            return;
+        }
+
         let mut restore_to_floating = false;
         // Like maximize: fullscreening an edge-tiled window carries the
         // pre-tile rect as the restore rect.
@@ -1496,15 +1525,17 @@ impl<W: LayoutElement> Workspace<W> {
             return;
         };
 
+        // A maximized window tiles from its maximized state (mutter clears the maximization and
+        // tiles from the pre-maximize rect); in GNOME mode it never left the floating layout, so
+        // `toggle_tiled` handles it directly.
         if self.floating.has_window(&id) {
             self.floating.toggle_tiled(Some(&id), side);
             return;
         }
 
-        // A maximized window tiles from its maximized state (mutter clears
-        // the maximization and tiles). Ours lives in the scrolling layout:
-        // bring it back to floating, then tile. (mutter would remember to
-        // restore to maximized on untile — saved_maximize — which we don't.)
+        // In scrolling mode a maximized window lives in the scrolling layout: bring it back to
+        // floating, then tile. (mutter would remember to restore to maximized on untile —
+        // saved_maximize — which we don't.)
         let is_maximized_floater = self
             .scrolling
             .tiles()
@@ -1571,9 +1602,16 @@ impl<W: LayoutElement> Workspace<W> {
 
         self.set_maximized(window, true);
 
-        // Clamp the restore size on the (now scrolling) tile; the move above
-        // stored the live near-work-area size.
+        // Clamp the restore size; maximizing stored the live near-work-area size as the rect to
+        // come back to. In GNOME mode the tile stays put and that rect is `tiled_restore_size`; in
+        // scrolling mode the tile moved to the scrolling layout and it is `floating_window_size`.
         if let Some(tile) = self
+            .floating
+            .tiles_mut()
+            .find(|tile| tile.window().id() == window)
+        {
+            tile.tiled_restore_size = Some(restore);
+        } else if let Some(tile) = self
             .scrolling
             .tiles_mut()
             .find(|tile| tile.window().id() == window)
@@ -1584,6 +1622,12 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn set_maximized(&mut self, window: &W::Id, maximize: bool) {
+        // GNOME mode: see `set_fullscreen`.
+        if self.options.layout.windowing_mode == WindowingMode::Floating {
+            self.floating.set_maximized(window, maximize);
+            return;
+        }
+
         let mut restore_to_floating = false;
         // The pre-tile rect of an edge-tiled window; it becomes the maximize
         // restore rect (mutter's saved_rect flows from tile to maximize).
@@ -1650,21 +1694,26 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn toggle_maximized(&mut self, window: &W::Id) {
-        let mut current = false;
-
         // We have to check the column property in case the window is in the scrolling layout and
         // both maximized and fullscreen. In this case, only the column knows whether it's
-        // maximized.
-        //
-        // In the floating layout, windows cannot be maximized.
-        if let Some(col) = self.scrolling.columns().find(|col| col.contains(window)) {
-            current = col.is_pending_maximized();
-        }
+        // maximized. The floating layout keeps the same bit per tile (`saved_maximize`).
+        let current = match self.scrolling.columns().find(|col| col.contains(window)) {
+            Some(col) => col.is_pending_maximized(),
+            None => self.floating.is_maximized(window),
+        };
 
         self.set_maximized(window, !current);
     }
 
     pub fn toggle_window_floating(&mut self, id: Option<&W::Id>) {
+        // GNOME mode has only the floating layout, so there is nothing to toggle to. This is the
+        // one gate for every entry point — the `<Super>G` bind, the pointer and touch move grabs,
+        // and the IPC action — all of which would otherwise put a window into a scrolling column
+        // and bring back the side-by-side placement that mode exists to be rid of.
+        if self.options.layout.windowing_mode == WindowingMode::Floating {
+            return;
+        }
+
         let active_id = self.active_window().map(|win| win.id().clone());
         let target_is_active = id.is_none_or(|id| Some(id) == active_id.as_ref());
         let Some(id) = id.cloned().or(active_id) else {
@@ -2215,6 +2264,11 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn render_above_top_layer(&self) -> bool {
+        // GNOME mode keeps fullscreen windows in the floating layout, so that is where to ask.
+        if self.options.layout.windowing_mode == WindowingMode::Floating {
+            return self.floating.render_above_top_layer();
+        }
+
         self.scrolling.render_above_top_layer()
     }
 
