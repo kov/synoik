@@ -173,10 +173,27 @@ impl Element for ShadowRenderElement {
 use crate::render_helpers::vulkan::{VulkanError, VulkanFrame, VulkanRenderer};
 
 impl ShadowRenderElement {
-    /// Build the shadow material's push constants from `params`, with the quad placed at `dst`.
-    /// (`proj`/`target` are filled by `VulkanFrame::render_shadow`.)
-    fn vulkan_push(&self, dst: Rectangle<i32, Physical>) -> niri_vk::render::ShadowPush {
+    /// Build the shadow material's push constants from `params`, with the quad placed at `dst`
+    /// showing the `src` sub-rect of the element. (`proj`/`target` are filled by
+    /// `VulkanFrame::render_shadow`.)
+    ///
+    /// The shader gets `v_uv` running 0..1 across `dst` and turns it into element-local logical
+    /// coordinates with `v_uv * area_size - geo_loc`. A `CropRenderElement` shrinks `dst` to the
+    /// visible sub-rect and reports the matching sub-rect of the unit `src`, so `src` has to be
+    /// folded into that mapping — otherwise the whole gradient is squeezed into whatever survived
+    /// the crop, which is what put a hard dark line down the overview workspace edge next to any
+    /// window whose shadow reached it.
+    fn vulkan_push(
+        &self,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+    ) -> niri_vk::render::ShadowPush {
         let p = &self.params;
+        // `v_uv * (size * src.size) - (loc - src.loc * size)` == `(src.loc + v_uv * src.size) *
+        // size - loc`, so the crop folds into `area_size` and the two `*_geo_loc` origins with no
+        // extra push constants and no shader change.
+        let area = [p.size.w * src.size.w, p.size.h * src.size.h];
+        let crop_off = [src.loc.x * p.size.w, src.loc.y * p.size.h];
         niri_vk::render::ShadowPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
@@ -188,12 +205,15 @@ impl ShadowRenderElement {
             shadow_color: p.color.to_array_premul(),
             corner_radius: <[f32; 4]>::from(p.corner_radius),
             window_corner_radius: <[f32; 4]>::from(p.window_corner_radius),
-            area_size: [p.size.w as f32, p.size.h as f32],
-            geo_loc: [p.geometry.loc.x as f32, p.geometry.loc.y as f32],
+            area_size: [area[0] as f32, area[1] as f32],
+            geo_loc: [
+                (p.geometry.loc.x - crop_off[0]) as f32,
+                (p.geometry.loc.y - crop_off[1]) as f32,
+            ],
             geo_size: [p.geometry.size.w as f32, p.geometry.size.h as f32],
             window_geo_loc: [
-                p.window_geometry.loc.x as f32,
-                p.window_geometry.loc.y as f32,
+                (p.window_geometry.loc.x - crop_off[0]) as f32,
+                (p.window_geometry.loc.y - crop_off[1]) as f32,
             ],
             window_geo_size: [
                 p.window_geometry.size.w as f32,
@@ -209,13 +229,13 @@ impl RenderElement<VulkanRenderer> for ShadowRenderElement {
     fn draw(
         &self,
         frame: &mut VulkanFrame<'_, '_>,
-        _src: Rectangle<f64, Buffer>,
+        src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), VulkanError> {
-        frame.render_shadow(self.vulkan_push(dst), dst, damage)
+        frame.render_shadow(self.vulkan_push(src, dst), dst, damage)
     }
 
     fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
@@ -296,7 +316,49 @@ mod tests {
     fn with_alpha_reaches_both_the_draw_and_the_element() {
         let e = elem(1.).with_alpha(0.25);
         assert_eq!(e.alpha(), 0.25, "Element::alpha must see the fade");
-        let push = e.vulkan_push(Rectangle::from_size(smithay::utils::Size::from((100, 100))));
+        let push = e.vulkan_push(
+            Rectangle::from_size(Size::from((1., 1.))),
+            Rectangle::from_size(smithay::utils::Size::from((100, 100))),
+        );
         assert_eq!(push.niri_alpha, 0.25, "the draw must see the fade");
+    }
+
+    /// A `CropRenderElement` hands `draw` a sub-rect of the unit `src` together with the shrunken
+    /// `dst`. The shader maps `v_uv` (0..1 over `dst`) through `area_size`/`geo_loc`, so the crop
+    /// has to be folded into those — otherwise the whole shadow gradient is squeezed into the
+    /// surviving strip, which is the hard dark line the overview showed along a workspace edge.
+    #[test]
+    fn a_cropped_draw_keeps_the_shadow_anchored() {
+        let e = elem(1.);
+
+        // Uncropped: the mapping is the identity on the element's own logical space.
+        let full = e.vulkan_push(
+            Rectangle::from_size(Size::from((1., 1.))),
+            Rectangle::from_size(smithay::utils::Size::from((100, 100))),
+        );
+        assert_eq!(full.area_size, [100., 100.]);
+        assert_eq!(full.geo_loc, [0., 0.]);
+
+        // Crop away the left 40%: `v_uv = 0` is now element-local x = 40, so the geometry (and the
+        // window cutout) must move 40 logical pixels to the left of the quad's origin, and one unit
+        // of `v_uv` must still cover 60 logical pixels rather than the full 100.
+        let cropped = e.vulkan_push(
+            Rectangle::new(Point::from((0.4, 0.)), Size::from((0.6, 1.))),
+            Rectangle::new(
+                smithay::utils::Point::from((40, 0)),
+                smithay::utils::Size::from((60, 100)),
+            ),
+        );
+        assert_eq!(cropped.area_size, [60., 100.]);
+        assert_eq!(cropped.geo_loc, [-40., 0.]);
+        assert_eq!(cropped.window_geo_loc, [-40., 0.]);
+        // The extents describe the window, not the visible strip, so the crop must not touch them.
+        assert_eq!(cropped.geo_size, full.geo_size);
+        assert_eq!(cropped.window_geo_size, full.window_geo_size);
+
+        // The point that was element-local x = 70 must land at the same element-local coordinate
+        // through both mappings: uncropped `v_uv = 0.7`, cropped `v_uv = 0.5`.
+        let coords = |p: &niri_vk::render::ShadowPush, uv: f32| uv * p.area_size[0] - p.geo_loc[0];
+        assert_eq!(coords(&full, 0.7), coords(&cropped, 0.5));
     }
 }

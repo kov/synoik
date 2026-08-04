@@ -60,6 +60,29 @@ impl ClippedSurfaceRenderElement {
         }
     }
 
+    /// Where the draw-time `src` sits inside the element's own [`Element::src`], as a fraction of
+    /// the element in *element* orientation (`(0,0)+(1,1)` when nothing cropped it).
+    ///
+    /// `src` arrives in buffer space, so the buffer transform has to be undone before the fraction
+    /// means anything on the element's axes — [`Rectangle::to_logical`] is the exact inverse of the
+    /// `to_buffer` that `CropRenderElement::from_element` used to derive it.
+    fn crop_fraction(&self, src: Rectangle<f64, Buffer>) -> Rectangle<f64, Logical> {
+        let full = self.src();
+        let whole = Rectangle::from_size(Size::from((1., 1.)));
+        if full.size.w <= 0. || full.size.h <= 0. {
+            return whole;
+        }
+
+        let unit = Rectangle::new(
+            Point::from((
+                (src.loc.x - full.loc.x) / full.size.w,
+                (src.loc.y - full.loc.y) / full.size.h,
+            )),
+            Size::from((src.size.w / full.size.w, src.size.h / full.size.h)),
+        );
+        Rectangle::<f64, Buffer>::to_logical(unit, 1., self.transform(), &Size::from((1., 1.)))
+    }
+
     fn rounded_corners(
         geo: Rectangle<f64, Logical>,
         corner_radius: CornerRadius,
@@ -169,6 +192,34 @@ impl Element for ClippedSurfaceRenderElement {
 // (`render_texture_from_to`) picks up the clip and swaps to the clipped pipeline.
 use crate::render_helpers::vulkan::{ClipParams, VulkanError, VulkanFrame, VulkanRenderer};
 
+/// The `clipped_texture` pipeline's `v_uv` → geometry-space matrix, packed as 3 `vec4` columns
+/// (`.xyz` used) for the shader's `mat3(i2g...) * vec3(v_uv, 1)`:
+///
+/// `coords_geo = (elem_geo.loc + (crop.loc + v_uv * crop.size) * elem_geo.size - geo.loc)
+/// / geo.size`
+///
+/// `crop` is where `v_uv` sits inside the element (see
+/// [`ClippedSurfaceRenderElement::crop_fraction`]); it is `(0,0)+(1,1)` unless a
+/// `CropRenderElement` narrowed the draw.
+fn input_to_geo(
+    elem_geo: Rectangle<i32, Physical>,
+    geo: Rectangle<i32, Physical>,
+    crop: Rectangle<f64, Logical>,
+) -> [[f32; 4]; 3] {
+    let (gw, gh) = (geo.size.w as f32, geo.size.h as f32);
+    let (ew, eh) = (elem_geo.size.w as f32, elem_geo.size.h as f32);
+    [
+        [ew * crop.size.w as f32 / gw, 0., 0., 0.],
+        [0., eh * crop.size.h as f32 / gh, 0., 0.],
+        [
+            (elem_geo.loc.x as f32 + crop.loc.x as f32 * ew - geo.loc.x as f32) / gw,
+            (elem_geo.loc.y as f32 + crop.loc.y as f32 * eh - geo.loc.y as f32) / gh,
+            1.,
+            0.,
+        ],
+    ]
+}
+
 impl RenderElement<VulkanRenderer> for ClippedSurfaceRenderElement {
     fn draw(
         &self,
@@ -189,6 +240,12 @@ impl RenderElement<VulkanRenderer> for ClippedSurfaceRenderElement {
         // `compute_uniforms` derives its `input_to_geo` from `self.inner.geometry(scale)`, not
         // `dst`. The buffer transform / y-invert stay in the sampling `tex_transform`, so
         // this geometric mapping needs only a scale + translate (no rotation/flip terms).
+        //
+        // `CropRenderElement` is the one wrapper that does *not* leave `v_uv` spanning the whole
+        // element: it shrinks `dst` to the visible sub-rect and narrows `src` to match, so `v_uv`
+        // then spans only that sub-rect. Fold the `src`-vs-`self.src()` fraction in, or the clip
+        // mask is squeezed into the surviving strip — which is what smeared a window's CSD-shadow
+        // margin into a hard dark line along the overview workspace edge.
         let elem_geo: Rectangle<i32, Physical> = self.inner.geometry(scale);
         let geo: Rectangle<i32, Physical> = self.geometry.to_physical_precise_round(scale);
         let (gw, gh) = (geo.size.w as f32, geo.size.h as f32);
@@ -197,18 +254,7 @@ impl RenderElement<VulkanRenderer> for ClippedSurfaceRenderElement {
         if gw <= 0. || gh <= 0. {
             return Ok(());
         }
-        // coords_geo = (elem_geo.loc + v_uv * elem_geo.size - geo.loc) / geo.size, packed as 3
-        // `vec4` columns (`.xyz` used) for the shader's `mat3(i2g...) * vec3(v_uv, 1)`.
-        let input_to_geo = [
-            [elem_geo.size.w as f32 / gw, 0., 0., 0.],
-            [0., elem_geo.size.h as f32 / gh, 0., 0.],
-            [
-                (elem_geo.loc.x - geo.loc.x) as f32 / gw,
-                (elem_geo.loc.y - geo.loc.y) as f32 / gh,
-                1.,
-                0.,
-            ],
-        ];
+        let input_to_geo = input_to_geo(elem_geo, geo, self.crop_fraction(src));
         let clip = ClipParams {
             input_to_geo,
             // Logical geometry size = the rounding coordinate space (matches `compute_uniforms`).
@@ -250,5 +296,75 @@ impl RoundedCornerDamage {
 
     pub fn render(&self, geometry: Rectangle<f64, Logical>) -> ExtraDamage {
         self.damage.render(geometry)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `v_uv` maps to the same geometry-space point whether the element is drawn whole or as the
+    /// sub-rect a `CropRenderElement` left behind. Before the `crop` term existed, a cropped draw
+    /// squeezed the whole clip mask into the surviving strip, which let a window's CSD-shadow
+    /// margin survive as a hard dark line along the overview workspace edge.
+    #[test]
+    fn the_clip_mask_survives_a_crop() {
+        // Element 200 wide sitting at x = -20 relative to a 160-wide geometry: the 20px on each
+        // side are the CSD margins the clip is there to cut away.
+        let elem_geo = Rectangle::new(Point::from((-20, 0)), Size::from((200, 100)));
+        let geo = Rectangle::from_size(Size::from((160, 100)));
+        let whole = Rectangle::from_size(Size::from((1., 1.)));
+
+        // Where `v_uv` lands in geometry space (x only; the shader divides by geo.size).
+        let at = |m: [[f32; 4]; 3], uv: f32| (m[0][0] * uv + m[2][0]) * geo.size.w as f32;
+
+        let full = input_to_geo(elem_geo, geo, whole);
+        assert!(
+            (at(full, 0.) - -20.).abs() < 1e-3,
+            "uv 0 is the element's left"
+        );
+        assert!(
+            (at(full, 1.) - 180.).abs() < 1e-3,
+            "uv 1 is the element's right"
+        );
+
+        // Crop away the left quarter of the element: `v_uv = 0` is now element-x 50, i.e. geometry
+        // x = 30, and `v_uv = 1` still reaches the element's right edge.
+        let crop = Rectangle::new(Point::from((0.25, 0.)), Size::from((0.75, 1.)));
+        let cropped = input_to_geo(elem_geo, geo, crop);
+        assert!((at(cropped, 0.) - 30.).abs() < 1e-3);
+        assert!((at(cropped, 1.) - 180.).abs() < 1e-3);
+
+        // The same physical point must land on the same geometry coordinate through both.
+        assert!((at(full, 0.5) - at(cropped, 1. / 3.)).abs() < 1e-3);
+    }
+
+    /// `crop_fraction` reads the draw-time `src` against the element's own `src`, both in buffer
+    /// space. The identity case has to stay exactly `(0,0)+(1,1)` so an uncropped draw is
+    /// untouched.
+    #[test]
+    fn crop_fraction_is_the_identity_when_nothing_cropped() {
+        // A buffer sub-rect that is not the unit rect, to catch a hardcoded `src` assumption.
+        let full = Rectangle::new(Point::from((10., 20.)), Size::from((100., 200.)));
+
+        let frac = |src: Rectangle<f64, Buffer>| {
+            let unit = Rectangle::new(
+                Point::from((
+                    (src.loc.x - full.loc.x) / full.size.w,
+                    (src.loc.y - full.loc.y) / full.size.h,
+                )),
+                Size::from((src.size.w / full.size.w, src.size.h / full.size.h)),
+            );
+            Rectangle::<f64, Buffer>::to_logical(unit, 1., Transform::Normal, &Size::from((1., 1.)))
+        };
+
+        assert_eq!(frac(full), Rectangle::from_size(Size::from((1., 1.))));
+
+        // The right half of the element.
+        let half = Rectangle::new(Point::from((60., 20.)), Size::from((50., 200.)));
+        assert_eq!(
+            frac(half),
+            Rectangle::new(Point::from((0.5, 0.)), Size::from((0.5, 1.)))
+        );
     }
 }

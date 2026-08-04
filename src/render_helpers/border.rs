@@ -258,11 +258,31 @@ impl Element for BorderRenderElement {
 use crate::render_helpers::vulkan::{VulkanError, VulkanFrame, VulkanRenderer};
 
 impl BorderRenderElement {
-    /// Build the border material's push constants from `params`, with the quad placed at `dst`.
-    /// (`target` is filled by `VulkanFrame::render_border`.)
-    fn vulkan_push(&self, dst: Rectangle<i32, Physical>) -> niri_vk::render::BorderPush {
+    /// Build the border material's push constants from `params`, with the quad placed at `dst`
+    /// showing the `src` sub-rect of the element. (`target` is filled by
+    /// `VulkanFrame::render_border`.)
+    ///
+    /// Like the shadow material, the shader gets `v_uv` running 0..1 across `dst` and derives every
+    /// coordinate from `v_uv * area_size - geo_loc`. A `CropRenderElement` shrinks `dst` and
+    /// reports the matching sub-rect of the unit `src`, so the crop has to be folded in here or
+    /// the whole border — rounding, gradient and all — is squeezed into the surviving strip.
+    fn vulkan_push(
+        &self,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+    ) -> niri_vk::render::BorderPush {
         let c = self.computed();
         let p = &self.params;
+        // `v_uv * (size * src.size) - (loc - src.loc * size)` == `(src.loc + v_uv * src.size) *
+        // size - loc`, so the crop folds into `area_size` and `geo_loc` alone.
+        let area = [
+            c.area_size.x * src.size.w as f32,
+            c.area_size.y * src.size.h as f32,
+        ];
+        let crop_off = [
+            src.loc.x as f32 * c.area_size.x,
+            src.loc.y as f32 * c.area_size.y,
+        ];
         niri_vk::render::BorderPush {
             origin: [dst.loc.x as f32, dst.loc.y as f32],
             size: [dst.size.w as f32, dst.size.h as f32],
@@ -276,8 +296,8 @@ impl BorderRenderElement {
             outer_radius: <[f32; 4]>::from(p.corner_radius),
             grad_offset: c.grad_offset.to_array(),
             grad_vec: c.grad_vec.to_array(),
-            area_size: c.area_size.to_array(),
-            geo_loc: c.geo_loc.to_array(),
+            area_size: area,
+            geo_loc: [c.geo_loc.x - crop_off[0], c.geo_loc.y - crop_off[1]],
             geo_size: c.geo_size.to_array(),
             grad_width: c.grad_width,
             hue_interpolation: c.hue_interpolation,
@@ -291,13 +311,13 @@ impl RenderElement<VulkanRenderer> for BorderRenderElement {
     fn draw(
         &self,
         frame: &mut VulkanFrame<'_, '_>,
-        _src: Rectangle<f64, Buffer>,
+        src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), VulkanError> {
-        frame.render_border(self.vulkan_push(dst), dst, damage)
+        frame.render_border(self.vulkan_push(src, dst), dst, damage)
     }
 
     fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
@@ -403,7 +423,46 @@ mod tests {
     fn element_alpha_matches_the_draw_alpha() {
         let e = elem(0.25);
         assert_eq!(e.alpha(), 0.25);
-        let push = e.vulkan_push(Rectangle::from_size(smithay::utils::Size::from((100, 100))));
+        let push = e.vulkan_push(
+            Rectangle::from_size(Size::from((1., 1.))),
+            Rectangle::from_size(smithay::utils::Size::from((100, 100))),
+        );
         assert_eq!(push.niri_alpha, 0.25);
+    }
+
+    /// Same crop trap as `ShadowRenderElement`: a `CropRenderElement` shrinks `dst` and reports a
+    /// sub-rect of the unit `src`, and the shader's `v_uv * area_size - geo_loc` has to follow it
+    /// or the rounding and the gradient get squeezed into the surviving strip.
+    #[test]
+    fn a_cropped_draw_keeps_the_border_anchored() {
+        let e = elem(1.);
+
+        let full = e.vulkan_push(
+            Rectangle::from_size(Size::from((1., 1.))),
+            Rectangle::from_size(smithay::utils::Size::from((100, 100))),
+        );
+        assert_eq!(full.area_size, [100., 100.]);
+        assert_eq!(full.geo_loc, [0., 0.]);
+
+        // Crop away the left 40%.
+        let cropped = e.vulkan_push(
+            Rectangle::new(Point::from((0.4, 0.)), Size::from((0.6, 1.))),
+            Rectangle::new(
+                smithay::utils::Point::from((40, 0)),
+                smithay::utils::Size::from((60, 100)),
+            ),
+        );
+        let close = |a: [f32; 2], b: [f32; 2]| {
+            assert!(
+                (a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3,
+                "{a:?} != {b:?}"
+            );
+        };
+        close(cropped.area_size, [60., 100.]);
+        close(cropped.geo_loc, [-40., 0.]);
+        assert_eq!(cropped.geo_size, full.geo_size);
+
+        let coords = |p: &niri_vk::render::BorderPush, uv: f32| uv * p.area_size[0] - p.geo_loc[0];
+        assert!((coords(&full, 0.7) - coords(&cropped, 0.5)).abs() < 1e-3);
     }
 }
