@@ -1,7 +1,7 @@
 # StatusNotifierItem / AppIndicator support
 
-**Status: S1 (`efcf7245`) and S2 (`56f6d138`) landed — indicators register and draw.** The
-rest of this document is the plan.
+**Status: S1–S3 landed (`efcf7245`, `185bd399`, `990d60c0`) — indicators register and draw, in
+all three icon forms.** The rest of this document is the plan.
 
 ## Why this one has no GNOME reference
 
@@ -117,16 +117,24 @@ shape `quickSettings` already uses for its icons — the panel addresses roles b
 indicators are dynamic in count. It leads the right box, so a session that accumulates a dozen
 grows leftward and never displaces the clock or the status cluster.
 
-### S3 — Pixmap and out-of-theme icons
+### S3 — Pixmap and out-of-theme icons ✅ (`990d60c0`)
 `IconPixmap` is `a(iiay)`: ARGB32, **network byte order**, one entry per size. Pick the smallest
 entry ≥ the target size, else the largest available (`pixmapsUtils.js:32-67`), then byte-swap to
 RGBA (`:17-30`) and upload as a texture — this bypasses themed lookup entirely.
-`IconThemePath` adds a per-item directory to the search path, which our icon loader currently has
-no way to express: `IconCache` (`src/render_helpers/icon.rs:75`) is one theme plus a rasterizer
-worker, set globally by `set_theme` (`:787`). Per-item search paths are a **structural** change to
-that type, not a parameter — this slice is bigger than its length here suggests. Decode of
-client-supplied pixels (pixmaps, and `icon-data`'s PNG bytes in S5) is untrusted content and must
-run where the other image decoding runs, behind the plain-data seam.
+`IconThemePath` adds a per-item directory to the search path. **The estimate above was wrong about
+where this lands**: `IconCache` is the *symbolic* cache, and none of this is symbolic. A file — an
+absolute path sent as a name, or a name found inside the client's own directory — is an app-supplied
+picture, which is what `ImageSource::File` + `ImageCache` already exist for, worker and eviction
+included. So no structural change to `IconCache` was needed; the per-item search became a small
+resolver on the watcher's side (`icon_from_name`), which is also where the filesystem check belongs,
+off the frame thread.
+
+What `IconCache` did grow is `texture_for_buffer`: pixels the *caller* owns still need
+upload-once-then-reuse and the dead-device guard, or every frame pays a submit + fence-wait.
+
+`ImageFit::Contain` settles the multiload question with an existing verb — the strip keeps its
+aspect and is letterboxed in the slot, no special case. And a themed name stays tinted to the panel
+foreground while a pixmap or file keeps the client's colours: it is the app's artwork, not a glyph.
 
 ### S4 — The data-driven menu widget
 `widget::Menu`: rows from a model, separators, submenus, checkmark/radio state, per-row icon,
