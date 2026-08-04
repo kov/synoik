@@ -2706,6 +2706,111 @@ fn vulkan_composites_a_recolored_icon() {
     );
 }
 
+/// An app indicator's icon reaches actual pixels in the panel's own slot.
+///
+/// The seat cannot answer this cheaply: a headless screenshot serves whatever frame it last
+/// rendered, and the symbolic rasterizer is asynchronous, so a `grim` capture taken right after
+/// an indicator registers legitimately shows nothing. This drives `Panel::render` directly and
+/// reads back the cluster's rect, which is the only oracle that cannot lie about it.
+///
+/// GNOME has no equivalent — see `docs/fork/status-notifier-port.md`.
+#[test]
+fn vulkan_draws_an_app_indicator_icon() {
+    use crate::ui::panel::PanelIndicator;
+
+    let Some(mut f) = window_fixture(GREEN) else {
+        return;
+    };
+    let output = f.synoik_output(1);
+    let scale = Scale::from(output.current_scale().fractional_scale());
+    let width = to_physical_precise_round(scale.x, output_size(&output).w);
+    let bar_h = to_physical_precise_round(scale.x, crate::ui::panel::panel_height());
+
+    let themes = vec!["Adwaita".to_string(), "hicolor".to_string()];
+    let Some(name) = ["dialog-warning-symbolic", "night-light-symbolic"]
+        .into_iter()
+        .find(|n| crate::render_helpers::icon::resolve_symbolic(n, &themes).is_some())
+    else {
+        eprintln!("skipping vulkan_draws_an_app_indicator_icon: no symbolic icons installed");
+        return;
+    };
+
+    let state = f.synoik_state();
+    let ws = state.synoik.workspace_state_for(&output);
+    let position = state.synoik.workspace_position_for(&output);
+
+    // The rect the icon must land in — the cluster's own slot, which only exists once an
+    // indicator is set.
+    assert_eq!(
+        state
+            .synoik
+            .panel
+            .app_indicators_rect(output_size(&output).w),
+        None,
+        "no indicators, no slot"
+    );
+    state.synoik.panel.set_app_indicators(vec![PanelIndicator {
+        id: "test".to_owned(),
+        icon_name: Some(name.to_owned()),
+    }]);
+    let rect = state
+        .synoik
+        .panel
+        .app_indicators_rect(output_size(&output).w)
+        .expect("the cluster takes a slot once an indicator is shown");
+
+    let lit = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            // Render twice: the first pass queues the rasterize and legitimately draws nothing,
+            // the second finds it cached. This is the same two-step the live panel goes through,
+            // and asserting on one pass would pin the wrong behavior.
+            for _ in 0..2 {
+                let elems = state.synoik.panel.render(
+                    vk,
+                    &output,
+                    ws,
+                    position,
+                    0.,
+                    &state.synoik.icon_cache,
+                );
+                let pixels = composite_ui(
+                    vk,
+                    elems,
+                    Size::<i32, Physical>::from((width, bar_h)),
+                    scale,
+                );
+
+                // Count non-background pixels inside the cluster's rect only, so a stray clock
+                // glyph or the bar's own gradient cannot pass for an icon.
+                let x0: i32 = to_physical_precise_round(scale.x, rect.loc.x);
+                let x1: i32 = to_physical_precise_round(scale.x, rect.loc.x + rect.size.w);
+                let mut lit = 0usize;
+                for y in 0..bar_h {
+                    for x in x0.max(0)..x1.min(width) {
+                        let p = &pixels[((y * width + x) as usize) * 4..][..4];
+                        // The bar is near-black; a symbolic icon is drawn in the light text
+                        // colour, so its glyph pixels are unmistakably brighter.
+                        if p[0] > 140 && p[3] > 120 {
+                            lit += 1;
+                        }
+                    }
+                }
+                if lit > 0 {
+                    return lit;
+                }
+            }
+            0
+        })
+        .expect("vulkan renderer");
+
+    assert!(
+        lit > 20,
+        "the app indicator's icon must composite inside its own slot ({rect:?}), got {lit} lit px"
+    );
+}
+
 /// The dateMenu calendar popover renders on the owned Vulkan renderer when open:
 /// the calendar box is drawn offscreen and composited as a positioned element.
 /// Assert `render` yields an element that composites opaque (the dark box) pixels.

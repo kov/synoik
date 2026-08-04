@@ -284,6 +284,14 @@ pub const ROLE_KEYBOARD: &str = "keyboard";
 /// when a11y is pinned on or some a11y feature is enabled (`accessibility.js:90-97`).
 pub const ROLE_A11Y: &str = "a11y";
 
+/// Role of the app-indicator cluster — every registered StatusNotifierItem, in one slot.
+///
+/// **Not a GNOME role**: GNOME has no StatusNotifier support, so this name is ours (see
+/// `docs/fork/status-notifier-port.md`). It is one role rather than one per item because the panel
+/// addresses roles by `&'static str`; the cluster sub-hit-tests internally, exactly as
+/// `quickSettings` does for its icons ([`Panel::app_indicator_at`]).
+pub const ROLE_APP_INDICATORS: &str = "appIndicators";
+
 /// Right-box role order, mirroring `js/ui/sessionMode.js:99`. The remaining unbuilt
 /// standalone indicators are commented out; adding one is a new entry here plus a
 /// presence/width case in [`Panel::right_box_role_width`]. The last entry anchors the
@@ -297,6 +305,9 @@ pub const ROLE_A11Y: &str = "a11y";
 /// the screen edge by [`crate::ui::popover::PanelPopover::location`]). The center box is
 /// consequently empty, so [`PanelBox::Center`] no longer has an occupant.
 const RIGHT_BOX_ORDER: &[&str] = &[
+    // App indicators lead the right box, so a session that gathers a dozen of them grows
+    // leftward and never displaces the clock or the status cluster.
+    ROLE_APP_INDICATORS,
     ROLE_SCREEN_RECORDING,
     // screenSharing, dwellClick,
     ROLE_A11Y,
@@ -461,18 +472,38 @@ fn qs_icon_x(rect_x: f64, i: usize) -> f64 {
     rect_x + INDICATOR_H_PADDING + QS_ICON_MARGIN + i as f64 * (QS_ICON + QS_ICON_GAP)
 }
 
-/// Logical width of the right-box quick-settings indicator (padding + icons +
-/// gaps). Depends on how many status icons are currently shown.
+/// Logical width of a right-box cluster of `n` `.system-status-icon`s (padding + icons + gaps).
+///
+/// The box's outer icons keep their facing margin too, so the cluster carries one
+/// `QS_ICON_MARGIN` of breathing room at each end inside the button padding. Shared by the
+/// quick-settings cluster and the app indicators so both measure the same as
+/// [`qs_icon_x`] places.
+fn qs_cluster_width(n: f64) -> f64 {
+    2. * INDICATOR_H_PADDING + 2. * QS_ICON_MARGIN + n * QS_ICON + (n - 1.) * QS_ICON_GAP
+}
+
+/// Logical width of the right-box quick-settings indicator. Depends on how many status
+/// icons are currently shown.
 fn qs_indicator_width(
     toggles: QuickToggles,
     status: &SystemStatus,
     audio: Option<AudioStatus>,
     mic: MicStatus,
 ) -> f64 {
-    let n = qs_indicator_icons(toggles, status, audio, mic).len() as f64;
-    // The box's outer icons keep their facing margin too, so the cluster carries
-    // one `QS_ICON_MARGIN` of breathing room at each end inside the button padding.
-    2. * INDICATOR_H_PADDING + 2. * QS_ICON_MARGIN + n * QS_ICON + (n - 1.) * QS_ICON_GAP
+    qs_cluster_width(qs_indicator_icons(toggles, status, audio, mic).len() as f64)
+}
+
+/// One app indicator as the panel draws it: an id to act on and the icon name to resolve.
+///
+/// Deliberately not the whole [`crate::status_notifier::Indicator`] — the panel needs a name and a
+/// handle, and keeping the untrusted item state out of the draw path keeps the seam honest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelIndicator {
+    /// The item's public id, for routing a click back to the right item.
+    pub id: String,
+    /// The themed icon name to draw, already normalized. `None` while the client has offered
+    /// nothing a themed lookup can use (a pixmap-only item, until S3).
+    pub icon_name: Option<String>,
 }
 
 /// A live screen recording as the panel sees it: when it started (monotonic, for the
@@ -658,6 +689,8 @@ pub struct Panel {
     /// layouts are configured. Drives the `keyboard` right-box indicator (GNOME's
     /// `InputSourceIndicator`); computed by the compositor from xkb state.
     keyboard_layout: Option<String>,
+    /// The app indicators currently shown, in the order the watcher registered them.
+    app_indicators: Vec<PanelIndicator>,
     /// The dateMenu unread-messages dot (GNOME's `MessagesIndicator`): shown when
     /// `show-banners && unseen − queued > 0` (`js/ui/dateMenu.js:787-798`). The
     /// compositor recomputes it from the notification store. It trails the clock inside
@@ -712,6 +745,7 @@ impl Panel {
             mic: MicStatus::default(),
             recording: None,
             keyboard_layout: None,
+            app_indicators: Vec::new(),
             messages_indicator: false,
             a11y: A11ySettings::default(),
             clock,
@@ -1155,6 +1189,60 @@ impl Panel {
         2. * INDICATOR_H_PADDING + QS_ICON
     }
 
+    /// The app-indicator cluster's rect, or `None` when no indicator is shown.
+    pub fn app_indicators_rect(&self, output_width: f64) -> Option<Rectangle<f64, Logical>> {
+        self.right_box_rect(ROLE_APP_INDICATORS, output_width)
+    }
+
+    /// Logical width of the app-indicator cluster: the same padding-plus-icons arithmetic the
+    /// quick-settings cluster uses, so one indicator is exactly as wide as one status icon.
+    /// Zero when there is nothing to show.
+    fn app_indicators_width(&self) -> f64 {
+        if self.app_indicators.is_empty() {
+            return 0.;
+        }
+        qs_cluster_width(self.app_indicators.len() as f64)
+    }
+
+    /// The rect of the `i`-th app indicator, for hit-testing a click at one of several icons
+    /// sharing the cluster's slot. Mirrors [`Self::volume_indicator_rect`]'s shape.
+    pub fn app_indicator_rect(
+        &self,
+        i: usize,
+        output_width: f64,
+    ) -> Option<Rectangle<f64, Logical>> {
+        if i >= self.app_indicators.len() {
+            return None;
+        }
+        let rect = self.app_indicators_rect(output_width)?;
+        let x = qs_icon_x(rect.loc.x, i) - QS_ICON_MARGIN;
+        Some(Rectangle::new(
+            Point::from((x, 0.)),
+            Size::from((QS_ICON + 2. * QS_ICON_MARGIN, panel_height())),
+        ))
+    }
+
+    /// Which indicator, if any, sits at an output-local position — the id a click should act on
+    /// once there is something to act with (S6).
+    pub fn app_indicator_at(&self, pos: Point<f64, Logical>, output_width: f64) -> Option<&str> {
+        (0..self.app_indicators.len()).find_map(|i| {
+            self.app_indicator_rect(i, output_width)
+                .filter(|rect| rect.contains(pos))
+                .map(|_| self.app_indicators[i].id.as_str())
+        })
+    }
+
+    /// Adopt the indicators the StatusNotifier watcher currently has. Returns whether the panel
+    /// changed, so the caller can queue a redraw.
+    pub fn set_app_indicators(&mut self, indicators: Vec<PanelIndicator>) -> bool {
+        if indicators == self.app_indicators {
+            return false;
+        }
+        self.app_indicators = indicators;
+        self.cache.borrow_mut().clear();
+        true
+    }
+
     /// The logical width a right-box role currently occupies, `0` when the role is absent
     /// (quickSettings is always present, the others come and go). The single source of
     /// truth for right-box presence, folded by [`Self::right_box_rect`] into placement.
@@ -1163,6 +1251,7 @@ impl Panel {
             ROLE_QUICK_SETTINGS => {
                 qs_indicator_width(self.toggles, &self.system_status, self.audio, self.mic)
             }
+            ROLE_APP_INDICATORS => self.app_indicators_width(),
             ROLE_SCREEN_RECORDING => self.recording_width(),
             ROLE_KEYBOARD => self.keyboard_width(),
             ROLE_A11Y => self.a11y_width(),
@@ -1322,6 +1411,7 @@ impl Panel {
         // first-topmost (the list is consumed in reverse). The workspace dots are now
         // drawn into the bar texture itself (rounded rects), not composited separately.
         self.qs_indicator_elements(renderer, scale, width, &mut elements, icons);
+        self.app_indicator_elements(renderer, scale, width, &mut elements, icons);
 
         // The screen-recording indicator's stop glyph, composited on top of its red pill
         // (which is drawn into the bar below). Same upload/caching as the QS cluster icons.
@@ -1554,6 +1644,46 @@ impl Panel {
     /// Push the right-box quick-settings status icons onto `elements`, laid out in
     /// a right-anchored cluster and composited on top of the bar. Each icon is
     /// resolved from its candidate list; the upload itself is the [`IconCache`]'s.
+    /// The app-indicator cluster's icons, laid out exactly as the quick-settings cluster's are.
+    ///
+    /// An indicator whose icon does not resolve still keeps its slot: the alternative is icons
+    /// that shuffle sideways whenever a client changes to a name the theme lacks, and the slot is
+    /// what a click is aimed at.
+    fn app_indicator_elements(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+        output_width: f64,
+        elements: &mut Vec<PanelElement>,
+        icons: &IconCache,
+    ) {
+        let Some(rect) = self.app_indicators_rect(output_width) else {
+            return;
+        };
+
+        for (i, indicator) in self.app_indicators.iter().enumerate() {
+            let Some(name) = indicator.icon_name.as_deref() else {
+                continue;
+            };
+            let Some(tb) = icons.texture(renderer, name, QS_ICON, scale, TEXT) else {
+                continue;
+            };
+            let logical = tb.logical_size();
+            let location =
+                Point::from((qs_icon_x(rect.loc.x, i), (panel_height() - logical.h) / 2.));
+            elements.push(PanelElement::Texture(
+                TextureRenderElement::from_texture_buffer(
+                    tb,
+                    location,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ),
+            ));
+        }
+    }
+
     fn qs_indicator_elements(
         &self,
         renderer: &mut VulkanRenderer,
@@ -1987,6 +2117,114 @@ mod tests {
         });
         let moved = panel.volume_indicator_rect(output_width).unwrap();
         assert_ne!(moved, rect, "a shorter cluster re-places the volume icon");
+    }
+
+    fn indicator(id: &str, icon: Option<&str>) -> PanelIndicator {
+        PanelIndicator {
+            id: id.to_owned(),
+            icon_name: icon.map(str::to_owned),
+        }
+    }
+
+    /// With no indicators the cluster takes no room at all — an empty slot would push every other
+    /// right-box role leftward for nothing.
+    #[test]
+    fn an_empty_app_indicator_cluster_occupies_nothing() {
+        let output_width = 1920.;
+        let mut panel = test_panel();
+        assert_eq!(panel.app_indicators_rect(output_width), None);
+
+        let before = panel.quick_settings_rect(output_width);
+        assert!(panel.set_app_indicators(vec![indicator("a", Some("foo"))]));
+        assert!(panel.app_indicators_rect(output_width).is_some());
+        assert_eq!(
+            panel.quick_settings_rect(output_width),
+            before,
+            "app indicators lead the right box, so nothing to their right may move"
+        );
+    }
+
+    /// Each indicator gets its own hit box inside the shared slot, and they do not overlap —
+    /// the cluster is one panel *role* but several click targets, like the QS status icons.
+    #[test]
+    fn each_app_indicator_has_its_own_hit_box() {
+        let output_width = 1920.;
+        let mut panel = test_panel();
+        panel.set_app_indicators(vec![
+            indicator("first", Some("a")),
+            indicator("second", Some("b")),
+            indicator("third", None),
+        ]);
+
+        let rects: Vec<_> = (0..3)
+            .map(|i| panel.app_indicator_rect(i, output_width).unwrap())
+            .collect();
+        assert_eq!(panel.app_indicator_rect(3, output_width), None);
+
+        for pair in rects.windows(2) {
+            assert!(
+                pair[0].loc.x + pair[0].size.w <= pair[1].loc.x,
+                "indicator boxes must not overlap: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // The whole cluster's slot contains all three, and a click in each lands on its own id.
+        let cluster = panel.app_indicators_rect(output_width).unwrap();
+        for (rect, id) in rects.iter().zip(["first", "second", "third"]) {
+            let center = Point::from((rect.loc.x + rect.size.w / 2., panel_height() / 2.));
+            assert!(cluster.contains(center));
+            assert_eq!(panel.app_indicator_at(center, output_width), Some(id));
+            assert_eq!(
+                panel.hit_test(
+                    center,
+                    output_width,
+                    WorkspaceState {
+                        count: 2,
+                        active: 0
+                    }
+                ),
+                Some(ROLE_APP_INDICATORS)
+            );
+        }
+
+        // An icon that failed to resolve still holds its slot, or its neighbours would slide
+        // sideways whenever a client picked a name the theme lacks.
+        assert!(rects[2].size.w > 0.);
+    }
+
+    /// The cluster grows leftward as indicators arrive: the roles to its right keep their place.
+    #[test]
+    fn the_app_indicator_cluster_grows_leftward() {
+        let output_width = 1920.;
+        let mut panel = test_panel();
+        panel.set_app_indicators(vec![indicator("a", Some("a"))]);
+        let one = panel.app_indicators_rect(output_width).unwrap();
+        let qs = panel.quick_settings_rect(output_width);
+
+        panel.set_app_indicators(vec![indicator("a", Some("a")), indicator("b", Some("b"))]);
+        let two = panel.app_indicators_rect(output_width).unwrap();
+
+        assert!(two.size.w > one.size.w);
+        assert!(two.loc.x < one.loc.x, "the cluster extends to the left");
+        assert_eq!(
+            two.loc.x + two.size.w,
+            one.loc.x + one.size.w,
+            "its right edge is anchored"
+        );
+        assert_eq!(panel.quick_settings_rect(output_width), qs);
+    }
+
+    /// Setting the same list twice is not a change, so a client repainting an unchanged icon
+    /// cannot drive a redraw per property signal.
+    #[test]
+    fn re_setting_identical_indicators_is_not_a_change() {
+        let mut panel = test_panel();
+        let list = vec![indicator("a", Some("foo"))];
+        assert!(panel.set_app_indicators(list.clone()));
+        assert!(!panel.set_app_indicators(list));
+        assert!(panel.set_app_indicators(vec![indicator("a", Some("bar"))]));
     }
 
     /// The indicator button widens as workspaces are added (structural — no GPU).

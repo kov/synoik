@@ -235,12 +235,234 @@ impl ItemRegistry {
     }
 }
 
-/// What the watcher tells the compositor. S1 carries lifetime only; the item's contents
-/// (icon, status, menu) arrive in later slices.
+/// An item's `Status` (`appIndicator.js:54-58`). Drives visibility and which icon is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ItemStatus {
+    /// The item exists but wants no room in the panel. The default before the first read, so an
+    /// item cannot flash into the panel while its properties are still being fetched
+    /// (`appIndicator.js:115-116`).
+    #[default]
+    Passive,
+    Active,
+    NeedsAttention,
+}
+
+impl ItemStatus {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "Active" => Self::Active,
+            "NeedsAttention" => Self::NeedsAttention,
+            _ => Self::Passive,
+        }
+    }
+
+    /// Whether an item in this state occupies the panel (`indicatorStatusIcon.js:321`).
+    pub fn is_visible(self) -> bool {
+        self != Self::Passive
+    }
+}
+
+/// An item's `Category` (`appIndicator.js:47-52`). Carried for ordering and introspection; it does
+/// not affect drawing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ItemCategory {
+    #[default]
+    ApplicationStatus,
+    Communications,
+    SystemServices,
+    Hardware,
+}
+
+impl ItemCategory {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "Communications" => Self::Communications,
+            "SystemServices" => Self::SystemServices,
+            "Hardware" => Self::Hardware,
+            _ => Self::ApplicationStatus,
+        }
+    }
+}
+
+/// Cap for one untrusted display string, as [`crate::mpris`] caps track text: enough for any real
+/// title, small enough that a hostile client cannot buy a multi-megabyte glyph run.
+const MAX_TEXT_BYTES: usize = 1024;
+
+/// An icon name longer than this is not one.
+const MAX_ICON_NAME_BYTES: usize = 255;
+
+/// One item's properties, as the model holds them: validated, bounded, and free of anything the
+/// bus layer knows about. Every string here was chosen by the client.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ItemProps {
+    /// The client's own `Id` — an application identifier, not a display string. Its presence is
+    /// what makes an item showable (see [`ItemProps::is_ready`]).
+    pub app_id: String,
+    /// `Title`, for the accessible name and tooltip-ish uses. Display text: validated.
+    pub title: String,
+    pub status: ItemStatus,
+    pub category: ItemCategory,
+    /// `IconName`, normalized by [`normalize_icon_name`]. `None` when absent or not something the
+    /// themed lookup can use — a path or a pixmap-only item waits for S3.
+    pub icon_name: Option<String>,
+    /// `AttentionIconName`, shown instead while [`ItemStatus::NeedsAttention`].
+    pub attention_icon_name: Option<String>,
+    /// `IconThemePath`: an extra directory the icon may live in. Carried but not yet honoured
+    /// (S3).
+    pub icon_theme_path: Option<String>,
+    /// The `Menu` object path, or `None` when the client has no menu — including the explicit
+    /// `/NO_DBUSMENU` sentinel (`appIndicator.js:576-580`).
+    pub menu_path: Option<String>,
+    /// `ItemIsMenu`: the client says a primary click should open the menu rather than activate.
+    pub item_is_menu: bool,
+    /// Whether the item's interface actually declares `Activate` (`appIndicator.js:446-457`).
+    /// Defaults to true so an item is not written off before it has been introspected.
+    pub supports_activation: bool,
+    /// Whether it declares the Ayatana spelling of secondary activation.
+    pub has_ayatana_secondary_activate: bool,
+}
+
+impl ItemProps {
+    /// Whether the item may be shown.
+    ///
+    /// **Divergence.** The extension additionally requires a menu — `isReady` is
+    /// `hasNameOwner && this.id && this.menuPath` (`appIndicator.js:476-486`), and `menuPath` is
+    /// null for `/NO_DBUSMENU` — so an activate-only item never appears in it at all. That is not
+    /// what the spec says and not what Plasma does: a menu is optional, and an item with none is
+    /// simply one where a click activates. We gate on `Id` alone, which is the part that is
+    /// actually about "has the client finished exporting itself".
+    pub fn is_ready(&self) -> bool {
+        !self.app_id.is_empty()
+    }
+
+    /// The icon to draw right now: the attention icon while asking for attention, falling back to
+    /// the normal one when the client set a status but no separate icon for it
+    /// (`appIndicator.js:1501`).
+    pub fn effective_icon(&self) -> Option<&str> {
+        if self.status == ItemStatus::NeedsAttention {
+            if let Some(name) = self.attention_icon_name.as_deref() {
+                return Some(name);
+            }
+        }
+        self.icon_name.as_deref()
+    }
+}
+
+/// Reduce a client's `IconName` to something the themed lookup can take, or `None`.
+///
+/// Two out-of-spec habits are common enough that the extension handles both
+/// (`appIndicator.js:1247-1265`): sending an absolute **path**, and sending a **file name** with a
+/// `.png`/`.svg` extension. The extension resolves paths by loading the file; that is S3's job
+/// (it needs a decode of client-supplied pixels), so here a path yields `None` and the item simply
+/// has no icon yet rather than a lookup for a name that cannot exist.
+pub fn normalize_icon_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > MAX_ICON_NAME_BYTES || name.starts_with('/') {
+        return None;
+    }
+
+    // An icon *name* has no path separators, and a themed lookup for one would be a lookup for a
+    // file we were never asked to load.
+    if name.contains('/') {
+        return None;
+    }
+
+    let stem = match name.rsplit_once('.') {
+        Some((stem, "png" | "svg" | "xpm")) if !stem.is_empty() => stem,
+        _ => name,
+    };
+    Some(stem.to_owned())
+}
+
+/// Clamp and flatten an untrusted display string, as notification and MPRIS text are.
+pub fn clean_text(text: &str) -> String {
+    crate::notifications::clamp_text(crate::notifications::flatten_text(text), MAX_TEXT_BYTES)
+}
+
+/// One item as the UI sees it: its identity plus its current properties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Indicator {
+    pub item: RegisteredItem,
+    pub props: ItemProps,
+}
+
+impl Indicator {
+    /// Whether this indicator currently takes a slot in the panel: ready, and not `Passive`.
+    pub fn is_shown(&self) -> bool {
+        self.props.is_ready() && self.props.status.is_visible()
+    }
+}
+
+/// The indicators the shell knows about, in registration order.
+///
+/// Ordering is registration order for now — see the open question in
+/// `docs/fork/status-notifier-port.md`. It is stable within a session, which is what matters for
+/// not having icons swap places under the pointer; across boots it is not, and neither is any
+/// other candidate we have (`Id` embeds a pid for most Qt clients).
+#[derive(Debug, Default)]
+pub struct IndicatorStore {
+    items: Vec<Indicator>,
+}
+
+impl IndicatorStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add or replace an item's entry. Returns whether anything the UI draws changed.
+    pub fn upsert(&mut self, item: RegisteredItem, props: ItemProps) -> bool {
+        if let Some(existing) = self.items.iter_mut().find(|i| {
+            i.item.unique_name == item.unique_name && i.item.object_path == item.object_path
+        }) {
+            if existing.item == item && existing.props == props {
+                return false;
+            }
+            let was_shown = existing.is_shown();
+            existing.item = item;
+            existing.props = props;
+            return was_shown || existing.is_shown();
+        }
+
+        let indicator = Indicator { item, props };
+        let shown = indicator.is_shown();
+        self.items.push(indicator);
+        shown
+    }
+
+    /// Drop an item by its public id. Returns whether the panel changed.
+    pub fn remove(&mut self, id: &str) -> bool {
+        let Some(idx) = self.items.iter().position(|i| i.item.id == id) else {
+            return false;
+        };
+        self.items.remove(idx).is_shown()
+    }
+
+    /// The indicators to draw, in order.
+    pub fn shown(&self) -> impl Iterator<Item = &Indicator> {
+        self.items.iter().filter(|i| i.is_shown())
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// What the watcher tells the compositor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusNotifierToSynoik {
-    ItemRegistered(RegisteredItem),
-    ItemUnregistered { id: String },
+    /// An item registered, or its properties changed. Carries the whole state: the watcher
+    /// re-reads every property on any `New*` signal, as the extension's proxy does.
+    ItemUpdated {
+        item: RegisteredItem,
+        props: Box<ItemProps>,
+    },
+    ItemUnregistered {
+        id: String,
+    },
 }
 
 #[cfg(test)]
@@ -382,6 +604,106 @@ mod tests {
         assert_eq!(registry.remove_item(":1.5", "/one"), Some("a".to_owned()));
         assert_eq!(registry.ids(), vec!["b".to_owned()]);
         assert_eq!(registry.remove_item(":1.5", "/one"), None);
+    }
+
+    #[test]
+    fn an_icon_name_survives_the_two_common_malformations() {
+        // A plain name is left alone.
+        assert_eq!(
+            normalize_icon_name("nextcloud"),
+            Some("nextcloud".to_owned())
+        );
+        // A file name loses its extension, which is what the lookup wants.
+        assert_eq!(normalize_icon_name("foo.png"), Some("foo".to_owned()));
+        assert_eq!(normalize_icon_name("foo.svg"), Some("foo".to_owned()));
+        // A dot that is not an extension is part of the name (`org.kde.foo` is a real icon name).
+        assert_eq!(
+            normalize_icon_name("org.kde.foo"),
+            Some("org.kde.foo".to_owned())
+        );
+        // A path is not a name: S3 loads those, and a themed lookup for one finds nothing.
+        assert_eq!(normalize_icon_name("/usr/share/pixmaps/foo.png"), None);
+        assert_eq!(normalize_icon_name("sub/dir"), None);
+        assert_eq!(normalize_icon_name("   "), None);
+    }
+
+    #[test]
+    fn an_item_is_not_shown_until_it_is_ready_and_active() {
+        let mut props = ItemProps::default();
+        // Nothing fetched yet: no Id, and Passive by default. Both must keep it out of the panel.
+        assert!(!props.is_ready());
+        props.status = ItemStatus::Active;
+        assert!(!props.is_ready());
+
+        props.app_id = "nextcloud".to_owned();
+        assert!(props.is_ready());
+
+        // A menu is *not* required — the extension demands one and so hides activate-only items.
+        assert_eq!(props.menu_path, None);
+        let indicator = Indicator {
+            item: item("x", ":1.1", "/StatusNotifierItem"),
+            props: props.clone(),
+        };
+        assert!(indicator.is_shown());
+
+        props.status = ItemStatus::Passive;
+        let indicator = Indicator {
+            item: item("x", ":1.1", "/StatusNotifierItem"),
+            props,
+        };
+        assert!(!indicator.is_shown());
+    }
+
+    #[test]
+    fn the_attention_icon_wins_only_while_asking_for_attention() {
+        let mut props = ItemProps {
+            app_id: "chat".to_owned(),
+            status: ItemStatus::Active,
+            icon_name: Some("chat".to_owned()),
+            attention_icon_name: Some("chat-urgent".to_owned()),
+            ..ItemProps::default()
+        };
+        assert_eq!(props.effective_icon(), Some("chat"));
+
+        props.status = ItemStatus::NeedsAttention;
+        assert_eq!(props.effective_icon(), Some("chat-urgent"));
+
+        // A client that flips the status without providing a second icon keeps the first one,
+        // rather than losing its icon at the moment it wants to be noticed.
+        props.attention_icon_name = None;
+        assert_eq!(props.effective_icon(), Some("chat"));
+    }
+
+    #[test]
+    fn the_store_reports_only_changes_the_panel_would_show() {
+        let mut store = IndicatorStore::new();
+        let it = item("a", ":1.1", "/StatusNotifierItem");
+        let passive = ItemProps {
+            app_id: "a".to_owned(),
+            ..ItemProps::default()
+        };
+
+        // A passive item is tracked but draws nothing, so adding it changes no pixels.
+        assert!(!store.upsert(it.clone(), passive.clone()));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.shown().count(), 0);
+
+        // Going Active does.
+        let active = ItemProps {
+            status: ItemStatus::Active,
+            ..passive.clone()
+        };
+        assert!(store.upsert(it.clone(), active.clone()));
+        assert_eq!(store.shown().count(), 1);
+
+        // Re-sending the identical state does not.
+        assert!(!store.upsert(it.clone(), active));
+        // Going back to Passive does, because something was on screen and now is not.
+        assert!(store.upsert(it.clone(), passive));
+        assert_eq!(store.shown().count(), 0);
+        // And removing a hidden item changes nothing either.
+        assert!(!store.remove("a"));
+        assert!(store.is_empty());
     }
 
     #[test]
