@@ -139,6 +139,14 @@ pub enum PopoverAction {
     Screenshot,
     /// Spawn a command (a system-row button / the battery pill); popover closes.
     Spawn(Vec<String>),
+    /// Ask gnome-session to start a logout / power-off / restart (the quick-settings system
+    /// rows). Popover closes.
+    ///
+    /// gnome-shell calls `org.gnome.SessionManager` directly for these —
+    /// `this._session.LogoutAsync(0)` / `ShutdownAsync(0)` / `RebootAsync()`
+    /// (`systemActions.js:483-501`) — rather than running the `gnome-session-quit` helper, which
+    /// is what we used to do: a whole GTK process start on the logout path.
+    SessionRequest(crate::end_session::SessionRequest),
     /// Close this notification, reason Dismissed (a message-list card's close
     /// button). The popover stays open.
     CloseNotification(u32),
@@ -213,6 +221,7 @@ impl PopoverAction {
             self,
             PopoverAction::Screenshot
                 | PopoverAction::Spawn(_)
+                | PopoverAction::SessionRequest(_)
                 | PopoverAction::ActivateNotification { .. }
                 | PopoverAction::InvokeNotificationAction { .. }
                 // Picking a layout closes the popup, like gnome-shell's popup menu.

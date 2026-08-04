@@ -62,7 +62,7 @@ impl EndSessionType {
 /// `Reboot` actions. Maps to the like-named method on `org.gnome.SessionManager`, which then calls
 /// `EndSessionDialog.Open` back on us. (This is the trigger side; [`EndSession`] is the dialog
 /// side.)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionRequest {
     Logout,
     PowerOff,
@@ -201,6 +201,9 @@ pub struct SessionDrain {
     /// When the window count last reached zero, i.e. when the [`DRAIN_SETTLE`] wait started.
     /// Cleared if a window comes back, so the settle always covers the most recent one.
     empty_since: Option<Duration>,
+    /// Whether this drain has ever seen a window. **The settle is only owed if it has** — see
+    /// [`Self::poll`].
+    saw_windows: bool,
 }
 
 impl SessionDrain {
@@ -209,6 +212,7 @@ impl SessionDrain {
         Self {
             deadline: now + DRAIN_TIMEOUT,
             empty_since: None,
+            saw_windows: false,
         }
     }
 
@@ -219,14 +223,33 @@ impl SessionDrain {
 
     /// Is the drain over? `windows_left` is the number of client toplevels still mapped.
     ///
-    /// Reaching zero windows starts the [`DRAIN_SETTLE`] wait rather than ending the drain; see
-    /// that constant for why unmap is not the same as done. Hitting the deadline while settling
-    /// still reports [`DrainOutcome::ClientsGone`] — the windows *are* gone, and warning about
-    /// clients that overstayed would point at the wrong thing.
+    /// Windows *going away* starts the [`DRAIN_SETTLE`] wait rather than ending the drain; see that
+    /// constant for why unmap is not the same as done. Hitting the deadline while settling still
+    /// reports [`DrainOutcome::ClientsGone`] — the windows *are* gone, and warning about clients
+    /// that overstayed would point at the wrong thing.
+    ///
+    /// **A drain that never sees a window owes no settle and finishes at once.** The settle exists
+    /// to outlive a toolkit that unmapped its toplevel and is still using the socket; if nothing
+    /// ever unmapped there is no such toolkit, and waiting is 500 ms spent on a client that was
+    /// never there. That is most of a logout from an empty desktop, and — because the confirm drain
+    /// has already emptied the desktop by the time the stopping drain starts — half a second of
+    /// *every* logout: measured on the seat (journal, 2026-08-03 22:44:27) at 475 ms and 501 ms,
+    /// back to back, on a session that never had a client window. `Niri::start_session_drain`
+    /// already assumes this ("on an empty desktop that poll can take us all the way to process
+    /// exit"); the unconditional settle quietly made it untrue.
+    ///
+    /// The residual risk is an app launched moments before the logout that has not mapped yet: it
+    /// used to get whatever was left of one settle, and now gets nothing. Its scope is still
+    /// SIGTERMed either way, and 500 ms was never a guarantee for it.
     pub fn poll(&mut self, now: Duration, windows_left: usize) -> Option<DrainOutcome> {
         if windows_left > 0 {
+            self.saw_windows = true;
             self.empty_since = None;
             return (now >= self.deadline).then_some(DrainOutcome::TimedOut);
+        }
+
+        if !self.saw_windows {
+            return Some(DrainOutcome::ClientsGone);
         }
 
         let settled_at = *self.empty_since.get_or_insert(now) + DRAIN_SETTLE;
@@ -385,7 +408,9 @@ mod tests {
     #[test]
     fn a_window_reappearing_restarts_the_settle() {
         let mut drain = SessionDrain::new(s(0));
-        assert_eq!(drain.poll(ms(0), 0), None);
+        // A window was up, so a settle is owed once it goes.
+        assert_eq!(drain.poll(ms(0), 1), None);
+        assert_eq!(drain.poll(ms(1), 0), None);
         // Something mapped again part-way through the settle.
         assert_eq!(drain.poll(ms(200), 1), None);
         // The old settle must not carry over and fire early.
@@ -414,6 +439,7 @@ mod tests {
     fn the_deadline_during_a_settle_is_not_a_timeout() {
         let mut drain = SessionDrain::new(s(0));
         let just_before = drain.deadline() - ms(1);
+        assert_eq!(drain.poll(s(0), 1), None, "a window, so a settle is owed");
         assert_eq!(drain.poll(just_before, 0), None, "settle has not elapsed");
         assert_eq!(
             drain.poll(drain.deadline(), 0),
@@ -421,12 +447,28 @@ mod tests {
         );
     }
 
-    /// Nothing open when the stop arrives — the drain must not hold the session up for five
-    /// seconds on an empty desktop. It still pays the settle, which is bounded and small.
+    /// Nothing open when the stop arrives: the drain is over on the first poll, with **no**
+    /// settle. The settle outlives a toolkit that unmapped and is still on the socket; nothing
+    /// unmapped here, so there is nobody to outlive.
+    ///
+    /// This is worth half a second on every logout, not just an empty one — by the time the
+    /// *stopping* drain starts, the confirm drain has already emptied the desktop, so it too
+    /// begins at zero. Measured on the seat before the fix (journal, 2026-08-03 22:44:27): 475 ms
+    /// then 501 ms, back to back, on a session that never had a client window.
     #[test]
-    fn drain_with_no_windows_is_over_after_the_settle() {
+    fn a_drain_that_never_sees_a_window_is_over_at_once() {
         let mut drain = SessionDrain::new(s(0));
-        assert_eq!(drain.poll(s(0), 0), None);
+        assert_eq!(drain.poll(s(0), 0), Some(DrainOutcome::ClientsGone));
+
+        // ...but one that *did* see a window still pays the settle when it goes, even if the
+        // window is gone by the very next poll.
+        let mut drain = SessionDrain::new(s(0));
+        assert_eq!(drain.poll(s(0), 1), None);
+        assert_eq!(
+            drain.poll(s(0), 0),
+            None,
+            "the settle is owed once a window unmaps"
+        );
         assert_eq!(drain.poll(DRAIN_SETTLE, 0), Some(DrainOutcome::ClientsGone));
     }
 

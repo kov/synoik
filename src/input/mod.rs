@@ -1478,6 +1478,18 @@ impl State {
                 spawn(command, None);
                 self.niri.layout.close_overview();
             }
+            // Straight to `org.gnome.SessionManager`, as gnome-shell does
+            // (`systemActions.js:483-501`) — not the `gnome-session-quit` helper we used to
+            // spawn, whose process start was ~700 ms of the logout path on this machine.
+            //
+            // Only `Logout` hides the overview first (`activateLogout`, `:483-489`);
+            // `activatePowerOff` and `activateRestart` deliberately do not, so neither do we.
+            PopoverAction::SessionRequest(request) => {
+                if request == crate::end_session::SessionRequest::Logout {
+                    self.niri.layout.close_overview();
+                }
+                self.niri.request_session_action(request);
+            }
             PopoverAction::SetVolume(volume) => {
                 if let Some(audio) = self.niri.audio_backend.as_ref() {
                     let status = audio.set_volume(volume);

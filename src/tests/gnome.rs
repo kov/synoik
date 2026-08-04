@@ -7289,6 +7289,54 @@ fn notifications_gtk_body_click_without_default_activates_app() {
     }
 }
 
+/// The quick-settings system rows ask `org.gnome.SessionManager` **directly** — gnome-shell's
+/// `activateLogout` / `activatePowerOff` / `activateRestart` are `LogoutAsync(0)` /
+/// `ShutdownAsync(0)` / `RebootAsync()` on the session proxy (`systemActions.js:483-501`). We used
+/// to spawn `gnome-session-quit` instead, which put a whole GTK process start in front of every
+/// logout: measured on the seat (journal, 2026-08-03) at 0.69-1.54 s before the session even began
+/// to end.
+///
+/// The asymmetry is gnome-shell's and is the reason this is pinned: **only logout hides the
+/// overview** (`Main.overview.hide()` at `:487`). Power-off and restart do not — the machine is
+/// going away, so there is nothing to reveal, and hiding it would only put a frame of desktop on
+/// screen on the way out.
+#[test]
+fn quick_settings_system_rows_call_gnome_session_directly() {
+    use crate::end_session::SessionRequest;
+    use crate::ui::popover::PopoverAction;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let open_overview = |f: &mut Fixture| {
+        f.niri_state().do_action(Action::OpenOverview, false);
+        f.niri_complete_animations();
+        assert!(f.niri().layout.is_overview_open());
+    };
+
+    // Logout hides it.
+    open_overview(&mut f);
+    f.niri_state()
+        .apply_popover_action(PopoverAction::SessionRequest(SessionRequest::Logout));
+    f.niri_complete_animations();
+    assert!(
+        !f.niri().layout.is_overview_open(),
+        "the Log Out row must hide the overview first"
+    );
+
+    // The other two do not.
+    for request in [SessionRequest::PowerOff, SessionRequest::Reboot] {
+        open_overview(&mut f);
+        f.niri_state()
+            .apply_popover_action(PopoverAction::SessionRequest(request));
+        f.niri_complete_animations();
+        assert!(
+            f.niri().layout.is_overview_open(),
+            "{request:?} must leave the overview alone, as gnome-shell does"
+        );
+    }
+}
+
 /// Every shell surface that starts an app leaves the overview first. gnome-shell
 /// writes `Main.overview.hide()` into each such handler by hand — the quick-settings
 /// system rows (`js/ui/status/system.js:53-57,150-154`), `addSettingsAction`

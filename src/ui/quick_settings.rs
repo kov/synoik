@@ -37,6 +37,7 @@ use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::audio::{AudioStatus, MicStatus, SinkList, SourceList};
+use crate::end_session::SessionRequest;
 use crate::gnome::QuickToggles;
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -492,6 +493,22 @@ impl Sliders {
 }
 
 /// A spawn `DetailRow` from a command's words.
+/// A system row that asks gnome-session to end the session, the way gnome-shell does: a direct
+/// `org.gnome.SessionManager` call (`systemActions.js:483-501`). We used to spawn
+/// `gnome-session-quit` for these, which put a GTK process start in front of every logout.
+fn session_row(label: &str, request: SessionRequest, separator_before: bool) -> DetailRow {
+    ItemRow {
+        label: label.to_string(),
+        icons: Vec::new(),
+        action: PopoverAction::SessionRequest(request),
+        separator_before,
+        selected: false,
+        trailing: None,
+        placeholder: false,
+    }
+    .into()
+}
+
 fn spawn_row(label: &str, cmd: &[&str], separator_before: bool) -> DetailRow {
     ItemRow {
         label: label.to_string(),
@@ -661,9 +678,9 @@ impl DetailOwner {
             // straight to logind via systemctl. Switch User is deferred (needs a greeter jump).
             DetailOwner::Power => vec![
                 spawn_row("Suspend", &["systemctl", "suspend"], false),
-                spawn_row("Restart…", &["gnome-session-quit", "--reboot"], false),
-                spawn_row("Power Off…", &["gnome-session-quit", "--power-off"], false),
-                spawn_row("Log Out…", &["gnome-session-quit", "--logout"], true),
+                session_row("Restart…", SessionRequest::Reboot, false),
+                session_row("Power Off…", SessionRequest::PowerOff, false),
+                session_row("Log Out…", SessionRequest::Logout, true),
             ],
             // gnome-shell's power-profile list: one row per KNOWN profile (already reversed to
             // performance→power-saver), the active one carrying a trailing check, clicking sets it;
@@ -4557,7 +4574,9 @@ mod tests {
         // The "Power Off…" row (index 2) spawns the shutdown command.
         let row = detail_row_rect(2, qs.layout()).expect("the power-off row");
         match qs.pointer_click(center(row)) {
-            PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-session-quit", "--power-off"]),
+            PopoverAction::SessionRequest(request) => {
+                assert_eq!(request, SessionRequest::PowerOff)
+            }
             other => panic!("expected the power-off spawn, got {other:?}"),
         }
     }

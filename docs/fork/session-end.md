@@ -108,8 +108,8 @@ Every path that ends the compositor now goes through **`Niri::begin_session_drai
 unwinding, we stay in the event loop — still dispatching, still rendering, still flushing — until
 the last client window is gone or `DRAIN_TIMEOUT` (5 s) expires.
 
-- **The oracle is the window count**, `layout.with_windows` — plus a settle. Zero windows starts a
-  500 ms `DRAIN_SETTLE` rather than ending the drain, because unmap is not "done": a toolkit that
+- **The oracle is the window count**, `layout.with_windows` — plus a settle. Windows *going away*
+  starts a 500 ms `DRAIN_SETTLE` rather than ending the drain, because unmap is not "done": a toolkit that
   *handles* SIGTERM destroys its toplevels near the start of shutdown and keeps using the socket
   afterwards (GL contexts, dmabuf feedback, the registry). Leaving at unmap would reopen the same
   `Broken pipe` on a shorter fuse, and precisely for the apps that shut down gracefully rather than
@@ -121,6 +121,16 @@ the last client window is gone or `DRAIN_TIMEOUT` (5 s) expires.
   clients that are ours: xwayland-satellite holds a connection for as long as it runs, so waiting
   on it would push every logout with an X app to the full timeout. Not worth the machinery for the
   residual risk; noted here so the option is on record.
+
+  **A drain that never sees a window owes no settle and ends on its first poll** (fixed
+  2026-08-03). The settle exists to outlive a toolkit that unmapped and is still on the socket; if
+  nothing ever unmapped there is nobody to outlive, and the wait is half a second spent on a client
+  that was never there. It cost that on *every* logout, not only an empty one — by the time the
+  stopping drain runs, the confirm drain has already emptied the desktop, so it too starts at zero.
+  Measured before the fix (journal, 22:44:27 on an empty session): 475 ms then 501 ms, back to
+  back, inside a 1.81 s logout. The residual risk is an app launched moments before the logout that
+  has not mapped yet; its scope is SIGTERMed either way, and one settle was never a guarantee for
+  it.
 - **The poll runs after `flush_clients`** in `refresh_and_flush_clients`, plus once on a deadline
   timer. The first point is what makes the drain end the instant the last window goes; the timer is
   what wakes an otherwise idle desktop to give up.
@@ -179,9 +189,10 @@ means gnome-session's phases only ever run on a desktop with no app windows left
 version of the head start above — which, as §1 shows, was not a margin we were winning anyway.
 
 This drain does **not** stop us. gnome-session still drives the teardown exactly as before; its
-SIGTERM just lands on an empty session, where the follow-up drain has only its settle left to pay.
-Expect a ~500 ms tail on every logout for that reason: it is `DRAIN_SETTLE`, not a stall. A SIGTERM
-arriving *during* a confirm drain folds into it rather than restarting the clock or being dropped.
+SIGTERM just lands on an empty session, where the follow-up drain now has nothing left to pay — it
+starts at zero windows and ends on its first poll (see §2.2). Before that fix this cost a ~500 ms
+tail on every logout, on top of the confirm drain's own. A SIGTERM arriving *during* a confirm drain
+folds into it rather than restarting the clock or being dropped.
 
 ### 2.4 Not in a session, not draining
 
@@ -396,3 +407,25 @@ is holding the drain open, is a different proposition and has not been explored.
 
 Do not read "the app has no scope" as "the app is unprotected"; read it as "the drain has no
 lever on this one", which is the conclusion this section now exists to record.
+
+## 5. Starting the session action: D-Bus, not `gnome-session-quit`
+
+The quick-settings **Restart… / Power Off… / Log Out…** rows call `org.gnome.SessionManager`
+directly (`PopoverAction::SessionRequest` → `Niri::request_session_action` →
+`dbus::gnome_session::request_session_action`). That is what gnome-shell does:
+`this._session.LogoutAsync(0)`, `ShutdownAsync(0)`, `RebootAsync()`
+(`js/misc/systemActions.js:483-501`).
+
+They used to spawn `gnome-session-quit --logout` / `--reboot` / `--power-off`. The helper does the
+same D-Bus call, but from a fresh GTK process, and that start was on the logout path: measured
+across ten logouts on the seat (2026-08-03), 0.69–1.54 s between the scope starting and the session
+beginning to end. The keyboard actions (`Action::Logout` and friends) had always used the direct
+call; only the menu rows went the long way round.
+
+**One asymmetry is gnome-shell's and is pinned by
+`quick_settings_system_rows_call_gnome_session_directly`:** logout hides the overview first
+(`Main.overview.hide()`, `:487`), power-off and restart do not.
+
+Still a spawn: **Suspend**, which runs `systemctl suspend`. `Action::Suspend` already goes to
+logind through the backend, so the row could use it; left alone because it is a different
+mechanism from the three above and was not what the latency was about.
