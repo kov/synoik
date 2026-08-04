@@ -1253,7 +1253,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// Capture the backdrop into `slot`'s cache and blur it (when enabled) — the orchestration
     /// behind `FramebufferEffectElement`'s Vulkan `capture_framebuffer`. (Re)builds the cached
     /// [`BackdropBlur`] when the intermediate `size`/`passes` change (kept across frames otherwise
-    /// — per-frame allocation is Venus blob churn), captures `src_region` of the target into it
+    /// — per-frame allocation is Venus blob churn, costly on the host), captures `src_region` of
+    /// the target into it
     /// via [`Self::capture_region`], then records the blur. The element then composites
     /// [`BackdropBlur::intermediate`] with [`Self::render_postprocess`] in its `draw`.
     pub(crate) fn capture_backdrop(

@@ -2655,7 +2655,7 @@ impl VulkanRenderer {
         if matches_render_order(fourcc) {
             // Direct: the dmabuf's byte order matches the render pass, render into it in place.
             // Reuse the cached import for this buffer if we already made one (re-importing every
-            // frame aborts Venus — see `dmabuf_target_cache`).
+            // frame is host-resource churn — see `dmabuf_target_cache`).
             let buffer = match self.cached_dmabuf_target(dmabuf) {
                 Some(buffer) => buffer,
                 None => {
@@ -3124,8 +3124,10 @@ impl VulkanRenderer {
     /// and the renderer's cache the other, so dropping the frame does not free the image — it is
     /// reused next frame, and an eviction here cannot pull an image out from under a live frame.
     ///
-    /// This keeps `bind` from allocating a target-sized device image every frame (the memory churn
-    /// that aborts Venus under sustained rendering). Safe because rendering is synchronous
+    /// This keeps `bind` from allocating a target-sized device image every frame — the memory
+    /// churn that exhausts host memory on Venus under sustained rendering (it used to abort the
+    /// session; that was fixed at the VMM level in 2026-07, see [`Self::readback_staging_buffer`]).
+    /// Safe because rendering is synchronous
     /// (`finish` CPU-waits), so no shadow is read or written by two frames at once — including
     /// the shadow two *different* consumers of the same size share. See
     /// [`Self::present_blit_shadows`].

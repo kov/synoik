@@ -5,9 +5,11 @@
 //! Cached backdrop-blur state for the owned Vulkan renderer's `FramebufferEffectElement` path
 //! (niri's GNOME-style backdrop blur). Owns the mid-frame capture plus, when blur is enabled, the
 //! dual-Kawase [`SharedBlurChain`] and its blurred output. Held across frames in the effect
-//! element's `UserDataMap` so nothing is allocated per frame — per-frame `VkTexture` creation is
-//! the virtio-gpu blob churn that aborts Venus live, so this MUST be cached; it is recreated only
-//! when the intermediate size or the blur pass-count changes.
+//! element's `UserDataMap` so nothing is allocated per frame — on Venus a `VkTexture` is a
+//! virtio-gpu blob, and creating one per frame costs real host time and host pool pressure
+//! (`VulkanRenderer::readback_staging_buffer` has the history: this used to *abort* the session
+//! until the VMM-level fix in 2026-07, so it is now a cost argument, not a stability one). It is
+//! recreated only when the intermediate size or the blur pass-count changes.
 
 use std::sync::Arc;
 

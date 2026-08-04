@@ -10,9 +10,10 @@
 //! effect buffer's offscreen) rather than owning a capture of the scene. It is held *inside* the
 //! effect buffer's Vulkan offscreen so it is rebuilt **atomically** with that texture — the chain
 //! binds the source's image view at construction, so a chain left over a recreated offscreen would
-//! sample a dangling descriptor. Per-frame `VkTexture` allocation is the virtio-gpu blob churn that
-//! aborts Venus live, so `output` is created once and the chain is reused across frames (the source
-//! view is stable; only its contents change, which [`Self::queue`] re-blurs).
+//! sample a dangling descriptor. Per-frame `VkTexture` allocation is virtio-gpu blob churn — host
+//! time and host pool pressure, see `VulkanRenderer::readback_staging_buffer` — so `output` is
+//! created once and the chain is reused across frames (the source view is stable; only its
+//! contents change, which [`Self::queue`] re-blurs).
 
 use std::sync::Arc;
 
