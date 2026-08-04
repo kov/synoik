@@ -2312,6 +2312,92 @@ fn vulkan_renders_the_top_panel() {
     );
 }
 
+/// A `Painter` rect that hangs off the buffer's **top-left** still fills everything of it that
+/// lands inside — the toolkit's way of spelling a per-corner `border-radius` (let the corners that
+/// must stay square fall outside the bake buffer).
+///
+/// This is a regression test for a silent one: `VulkanFrame`'s damage argument is element-local,
+/// `Painter` was handing it a buffer-space rect, and the two only agree while the rect starts
+/// inside the buffer. A rect 52 px off the top-left had its scissor shrunk to a 6 px sliver, so the
+/// shape simply wasn't there — no error, no warning, just a nearly-empty texture. The overflow is
+/// swept because the failure scales with it: at 1 px it was invisible.
+#[test]
+fn vulkan_fills_a_rect_that_overhangs_the_bake_buffer() {
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+
+    const BUF: i32 = 58;
+    let scale = Scale::from(1.);
+
+    for overhang in [1., 10., 52.] {
+        let lit = f
+            .synoik_state()
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| {
+                let size = Size::<f64, Logical>::from((f64::from(BUF), f64::from(BUF)));
+                let tex = crate::ui::widget::bake_uncached(vk, 1., size, |frame, phys| {
+                    let mut p = crate::ui::widget::Painter::new(frame, 1., phys);
+                    p.clear([0., 0., 0., 0.])?;
+                    // A square (radius 0) so this measures the scissor, not the rounding, and
+                    // overhanging on every side so no antialiased edge lands inside the buffer:
+                    // every pixel of it should come out fully opaque.
+                    let span = overhang * 2. + f64::from(BUF);
+                    p.fill_rounded(
+                        Rectangle::new(
+                            Point::from((-overhang, -overhang)),
+                            Size::from((span, span)),
+                        ),
+                        0.,
+                        [1., 1., 1., 1.],
+                    )?;
+                    Ok(())
+                })
+                .expect("bake");
+
+                let buffer = crate::render_helpers::texture::TextureBuffer::from_texture(
+                    vk,
+                    tex,
+                    1.,
+                    Transform::Normal,
+                    Vec::new(),
+                );
+                let pixels = composite_ui(
+                    vk,
+                    vec![
+                        crate::render_helpers::texture::TextureRenderElement::from_texture_buffer(
+                            buffer,
+                            Point::from((0., 0.)),
+                            1.,
+                            None,
+                            None,
+                            smithay::backend::renderer::element::Kind::Unspecified,
+                        ),
+                    ],
+                    Size::<i32, Physical>::from((BUF, BUF)),
+                    scale,
+                );
+                pixels.chunks_exact(4).filter(|p| p[3] == 255).count()
+            })
+            .expect("vulkan renderer");
+
+        let total = (BUF * BUF) as usize;
+        assert_eq!(
+            lit, total,
+            "a rect overhanging the buffer by {overhang} px filled {lit} of {total} px — its \
+             scissor was clipped by the overhang"
+        );
+    }
+}
+
 /// The dateMenu messages-indicator dot composites into the clock button's trailing
 /// padding when shown, and nothing does there when it's hidden (`js/ui/dateMenu.js:871-886`).
 /// The differential doubles as the check that the padding really is empty in the hidden

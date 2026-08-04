@@ -2715,6 +2715,22 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         )
     }
 
+    /// Damage covering all of `dst` — what a `Painter` draw always wants, since it paints the
+    /// whole shape and lets the buffer bound it.
+    ///
+    /// `VulkanFrame`'s damage argument is **element-local** (smithay's convention): it is clipped
+    /// to `dst`'s size and only then translated by `dst`'s origin. A `Painter` states its clip in
+    /// *buffer* coordinates, so passing `self.full` reads as "the whole buffer" — which coincides
+    /// with element-local coverage only while `dst` starts at or after the buffer's origin. A rect
+    /// that runs past the **top or left** edge — which is exactly how the toolkit expresses a
+    /// per-corner `border-radius`, letting the corners that should stay square fall outside — has
+    /// its scissor silently shrunk by the overflow, so a shape hanging 52 px off the top-left
+    /// drew into a 6 px sliver. Cover the element and let `damage_scissors` clamp to the
+    /// framebuffer, which is the clip that was meant all along.
+    fn damage_of(dst: Rectangle<i32, Physical>) -> [Rectangle<i32, Physical>; 1] {
+        [Rectangle::from_size(dst.size)]
+    }
+
     /// Clear the whole buffer to `color` (a transparent clear for rounded popovers,
     /// a border color for square dialogs).
     pub fn clear(&mut self, color: Rgba) -> anyhow::Result<()> {
@@ -2722,8 +2738,10 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         // buffer's own (premultiplied) convention, not the toolkit's straight one. Every clear
         // color in the tree today is opaque or fully transparent, where the two agree; this keeps a
         // future translucent clear from silently storing straight alpha.
-        self.frame
-            .clear(Color32F::from(premultiply(color)), &[self.full])?;
+        self.frame.clear(
+            Color32F::from(premultiply(color)),
+            &Self::damage_of(self.full),
+        )?;
         Ok(())
     }
 
@@ -2733,7 +2751,7 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     pub fn fill_rounded_full(&mut self, radius: f64, color: Rgba) -> anyhow::Result<()> {
         let r = (radius * self.scale) as f32;
         self.frame
-            .render_rounded_rect(color, r, self.full, &[self.full])?;
+            .render_rounded_rect(color, r, self.full, &Self::damage_of(self.full))?;
         Ok(())
     }
 
@@ -2749,7 +2767,7 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         let r = (radius * self.scale) as f32;
         let w = (width * self.scale) as f32;
         self.frame
-            .stroke_rounded_rect(color, r, w, self.full, &[self.full])?;
+            .stroke_rounded_rect(color, r, w, self.full, &Self::damage_of(self.full))?;
         Ok(())
     }
 
@@ -2765,8 +2783,9 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     ) -> anyhow::Result<()> {
         let r = (radius * self.scale) as f32;
         let w = (width * self.scale) as f32;
+        let dst = self.rect_px(rect);
         self.frame
-            .stroke_rounded_rect(color, r, w, self.rect_px(rect), &[self.full])?;
+            .stroke_rounded_rect(color, r, w, dst, &Self::damage_of(dst))?;
         Ok(())
     }
 
@@ -2785,8 +2804,9 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         side: Side,
         color: Rgba,
     ) -> anyhow::Result<()> {
+        let dst = self.rect_px(rect);
         self.frame
-            .render_triangle(color, side as u8, self.rect_px(rect), &[self.full])?;
+            .render_triangle(color, side as u8, dst, &Self::damage_of(dst))?;
         Ok(())
     }
 
@@ -2799,8 +2819,9 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         color: Rgba,
     ) -> anyhow::Result<()> {
         let r = (radius * self.scale) as f32;
+        let dst = self.rect_px(rect);
         self.frame
-            .render_rounded_rect(color, r, self.rect_px(rect), &[self.full])?;
+            .render_rounded_rect(color, r, dst, &Self::damage_of(dst))?;
         Ok(())
     }
 
@@ -2822,11 +2843,12 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         to: f64,
     ) -> anyhow::Result<()> {
         let r = (radius * self.scale) as f32;
+        let dst = self.rect_px(rect);
         self.frame.render_rounded_rect_faded(
             color,
             r,
-            self.rect_px(rect),
-            &[self.full],
+            dst,
+            &Self::damage_of(dst),
             (from as f32, to as f32),
         )?;
         Ok(())
@@ -2929,8 +2951,14 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         box_dst.loc.x += self.px(offset.0);
         box_dst.loc.y += self.px(offset.1);
         let r = (radius * self.scale) as f32;
-        self.frame
-            .render_drop_shadow(color, r, sigma, self.scale as f32, box_dst, &[self.full])?;
+        self.frame.render_drop_shadow(
+            color,
+            r,
+            sigma,
+            self.scale as f32,
+            box_dst,
+            &Self::damage_of(box_dst),
+        )?;
         Ok(())
     }
 
@@ -2992,7 +3020,7 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             Point::from((ox, oy)),
             color,
             clip,
-            &[self.full],
+            &Self::damage_of(clip),
         )?;
         Ok(())
     }
@@ -3028,7 +3056,7 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             Point::from((ox, oy)),
             color,
             clip,
-            &[self.full],
+            &Self::damage_of(clip),
         )?;
         Ok(())
     }
@@ -3045,8 +3073,13 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         origin: Point<i32, Physical>,
         color: Rgba,
     ) -> anyhow::Result<()> {
-        self.frame
-            .render_glyphs(&shaped.run, origin, color, self.full, &[self.full])?;
+        self.frame.render_glyphs(
+            &shaped.run,
+            origin,
+            color,
+            self.full,
+            &Self::damage_of(self.full),
+        )?;
         Ok(())
     }
 
@@ -3131,8 +3164,13 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         origin: Point<i32, Physical>,
         color: Rgba,
     ) -> anyhow::Result<()> {
-        self.frame
-            .render_glyphs(&shaped.run, origin, color, self.full, &[self.full])?;
+        self.frame.render_glyphs(
+            &shaped.run,
+            origin,
+            color,
+            self.full,
+            &Self::damage_of(self.full),
+        )?;
         Ok(())
     }
 
@@ -3145,8 +3183,13 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         origin: Point<i32, Physical>,
         colors: &[Rgba],
     ) -> anyhow::Result<()> {
-        self.frame
-            .render_glyphs_spans(&shaped.run, origin, colors, self.full, &[self.full])?;
+        self.frame.render_glyphs_spans(
+            &shaped.run,
+            origin,
+            colors,
+            self.full,
+            &Self::damage_of(self.full),
+        )?;
         Ok(())
     }
 

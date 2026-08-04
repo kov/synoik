@@ -969,7 +969,19 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             synoik_alpha: 1.0,
             _pad0: 0.0,
         };
-        self.render_shadow(push, area, damage)
+        // `damage` arrives local to `box_dst` — the box the caller named — but the draw, and so
+        // the scissor, is `area`: that box grown by the blur margin. Grow the damage to match, or
+        // the fringe (the entire point of a shadow) is scissored away by exactly the margin.
+        let damage: Vec<_> = damage
+            .iter()
+            .map(|r| {
+                Rectangle::new(
+                    r.loc,
+                    Size::from((r.size.w + margin * 2, r.size.h + margin * 2)),
+                )
+            })
+            .collect();
+        self.render_shadow(push, area, &damage)
     }
 
     /// Draw the postprocess-and-clip material: sample `texture` (from `src`) into `dst`, applying
