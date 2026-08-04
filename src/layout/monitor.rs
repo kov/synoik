@@ -1781,17 +1781,26 @@ impl<W: LayoutElement> Monitor<W> {
         (state > 0.).then_some(state)
     }
 
-    /// How far the overview is open, as the *zoom* blend wants it: the raw open
-    /// progress, overshoot included — the open is a spring, and clamping it here would
-    /// quietly flatten the bounce. [`Self::overview_state`] stays clamped instead: an
-    /// overshoot past 1 there would read as "starting to show the apps".
+    /// The `HIDDEN` → `WINDOW_PICKER` leg of [`Self::overview_state`], which is what the
+    /// zoom and the exposé spread ride: 0 on the desktop, 1 at the picker, and **1 for the
+    /// whole app-grid leg above it**.
     ///
-    /// This used to saturate at 1 across the whole app-grid leg, to park the zoom while
-    /// the picker row re-fitted into the app-grid box. The picker no longer makes that
-    /// trip (see [`Self::workspaces_strip_axis`]), so there is nothing to park for, and
-    /// the saturation only bought a dead zone at the top of a close from the grid.
+    /// That saturation is the ordering gnome-shell's single adjustment gives for free. A
+    /// close from the app grid travels 2 → 0 *through* `WINDOW_PICKER`, so the grid goes
+    /// away first, at a parked zoom, and only then does the overview zoom into the active
+    /// workspace. Blending both at once instead — which is what the raw progress does —
+    /// runs the entire return-to-the-desktop behind an app grid that is still on screen.
+    ///
+    /// With no app grid in play this is the raw progress, **overshoot included**: the open
+    /// is a spring, and clamping it here would quietly flatten the bounce.
+    /// [`Self::overview_state`] must stay clamped instead — an overshoot past 1 there would
+    /// read as "starting to show the apps".
     fn open_fraction(&self) -> f64 {
-        self.overview_progress.as_ref().map_or(0., |p| p.value())
+        if self.app_grid_fraction() > 0. {
+            self.overview_state().min(1.)
+        } else {
+            self.overview_progress.as_ref().map_or(0., |p| p.value())
+        }
     }
 
     /// Where the row currently sits on the workspace axis — gnome-shell's
@@ -1875,9 +1884,17 @@ impl<W: LayoutElement> Monitor<W> {
         self.controls_layout_at(overview_layout::state::WINDOW_PICKER + self.app_grid_leg())
     }
 
-    /// How far along the `WINDOW_PICKER` → `APP_GRID` leg we are, which is what the
-    /// *chrome* follows in either windowing mode. Only the app-grid box moves on it now.
-    fn app_grid_leg(&self) -> f64 {
+    /// The `WINDOW_PICKER` → `APP_GRID` leg of [`Self::overview_state`]: 0 at the picker,
+    /// 1 at the grid.
+    ///
+    /// **This, not [`Self::app_grid_fraction`], is what every app-grid blend consumes** —
+    /// the grid's own opacity and box, the picker's fade behind it, and the inertness of
+    /// the previews. The raw scalar is *frozen* across a close (the overview must not
+    /// animate the grid shut and close at the same time), so reading it directly leaves the
+    /// grid "fully in" for the whole close: the picker stays at alpha 0 and the return to
+    /// the desktop happens invisibly behind it. Going through the state axis is what makes
+    /// the close unwind in gnome-shell's order — see [`Self::open_fraction`].
+    pub fn app_grid_leg(&self) -> f64 {
         (self.overview_state() - overview_layout::state::WINDOW_PICKER).clamp(0., 1.)
     }
 
@@ -2040,8 +2057,11 @@ impl<W: LayoutElement> Monitor<W> {
         if self.options.layout.windowing_mode != WindowingMode::Floating {
             return None;
         }
-        let progress = self.overview_progress.as_ref()?;
-        let progress = progress.clamped_value().clamp(0., 1.);
+        self.overview_progress.as_ref()?;
+        // The `HIDDEN` → `WINDOW_PICKER` leg, so the spread is *parked* across the app-grid
+        // leg rather than unwinding underneath it: a close from the grid must not collapse
+        // the previews back to their desktop positions while the grid is still on screen.
+        let progress = self.open_fraction().clamp(0., 1.);
         (progress > 0.).then_some(progress)
     }
 
@@ -2448,7 +2468,7 @@ impl<W: LayoutElement> Monitor<W> {
         // Overlays are a property of the state, not of the last pointer motion: opening the app
         // grid drops them even if the pointer never moves (`_syncOverlay`, `workspace.js:775-777`
         // — see `window_under`).
-        if self.app_grid_fraction() > 0. {
+        if self.app_grid_leg() > 0. {
             return Vec::new();
         }
         // Only previews actually *showing* an overlay: two hit tests rely on that
@@ -2465,7 +2485,7 @@ impl<W: LayoutElement> Monitor<W> {
     /// draws no icon, which is also the reference's "the transition never touches
     /// WINDOW_PICKER" case.
     pub fn preview_icon_scale(&self) -> f64 {
-        self.expose_progress().unwrap_or(0.) * (1. - self.app_grid_fraction())
+        self.expose_progress().unwrap_or(0.) * (1. - self.app_grid_leg())
     }
 
     /// Every drawn window preview and its hover alpha — the shared source of
@@ -2507,8 +2527,9 @@ impl<W: LayoutElement> Monitor<W> {
         // (`workspacesView.js:236`), and a preview's overlay — the hover growth, the close button,
         // the title — is enabled only at mode 1 (`workspace.js:775-777` `_syncOverlay`), with the
         // keyboard focus chain empty there too (`workspace.js:889-891`). The comparison is against
-        // exactly 1, so the row goes inert the moment the transition starts.
-        if self.app_grid_fraction() > 0. {
+        // exactly 1, so the row goes inert the moment the transition starts — and comes back
+        // live as the leg unwinds on the way out, which is the same comparison read backwards.
+        if self.app_grid_leg() > 0. {
             return None;
         }
 

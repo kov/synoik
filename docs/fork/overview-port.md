@@ -1668,3 +1668,15 @@ the entry's reserved height.
 Two items above are affected: §12.5's edge fade now applies to a full-width row (and §12.4's
 "centering leaves a partial thumbnail at the edge" no longer holds — fit-all centers the run, so a
 run that fits ends on whole thumbnails at both ends, and only an overflowing one is cut).
+
+### 12.8 Closing from the app grid unwinds in order (landed 2026-08-03)
+
+Gustavo: "going out of the app grid back to normal desktop, the animation is a bit jarring; going
+into the app grid we fade out the big pickers and slide in the icons, we should do the opposite
+transition as well as zoom into the selected workspace."
+
+Both halves were the same root cause and are fixed in
+`docs/fork/dynamic-workspaces-divergence.md` §2b ("The two legs must be traversed in order"): the
+app-grid blends now read the state-derived leg rather than the frozen show-apps scalar, and the
+zoom/exposé leg saturates across the app-grid leg so the two run in sequence rather than on top of
+each other. Seat-validated frame by frame.

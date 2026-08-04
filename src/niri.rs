@@ -9538,18 +9538,23 @@ impl Niri {
                 }
                 // The app grid sits in the `app_display` band, below the dash and the
                 // search (child order `overviewControls.js:374-379`) — pushed after
-                // them so they draw on top. GNOME's grid slides up from off-screen and
-                // does not fade with the state axis (its opacity only rides the search
-                // cross-fade, `overviewControls.js:582-627`), so the alpha is the
-                // overview fade times the inverse search fade; the slide is the moving
-                // `app_display` box. Gated on the show-apps fraction so it isn't drawn
-                // while parked below the work area.
-                if self
+                // them so they draw on top. It slides up from off-screen on the moving
+                // `app_display` box, and cross-fades with the window picker behind it:
+                // its alpha is the app-grid leg, the picker's is what is left of it.
+                //
+                // **Divergence.** GNOME's grid does not fade on the state axis at all
+                // (its opacity only rides the search cross-fade,
+                // `overviewControls.js:582-627`) — it does not need to, because there the
+                // picker *becomes* the app-grid row and there is nothing behind the grid to
+                // reveal. Ours fades because the picker stays put and fades back in, which
+                // only reads as one movement if the two are a true cross-fade.
+                let app_grid_leg = self
                     .layout
                     .monitor_for_output(output)
-                    .is_some_and(|mon| mon.app_grid_fraction() > 0.)
-                {
-                    let alpha = (progress * (1. - self.overview_search_fade())) as f32;
+                    .map_or(0., |mon| mon.app_grid_leg());
+                if app_grid_leg > 0. {
+                    let alpha =
+                        (app_grid_leg * progress * (1. - self.overview_search_fade())) as f32;
                     for element in self.app_grid.render(
                         ctx.renderer,
                         &self.app_icon_cache,
@@ -9573,12 +9578,14 @@ impl Niri {
         // them; outside the overview the fade is 0, so this is a plain pass-through.
         let fade_scale = output.current_scale().fractional_scale();
         let row_alpha = (1. - self.overview_search_fade()) as f32;
-        // The picker *also* fades away as the app grid opens — see below.
+        // The picker *also* fades away as the app grid opens — see below. Off the *leg*,
+        // not the raw show-apps scalar: the scalar is frozen across a close, so reading it
+        // here kept the picker at alpha 0 for the whole way back to the desktop.
         let picker_alpha = row_alpha
             * self
                 .layout
                 .monitor_for_output(output)
-                .map_or(1., |mon| 1. - mon.app_grid_fraction()) as f32;
+                .map_or(1., |mon| 1. - mon.app_grid_leg()) as f32;
 
         // Get monitor elements.
         let mon = self.layout.monitor_for_output(output).unwrap();

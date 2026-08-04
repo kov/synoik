@@ -71,9 +71,28 @@ Ours is one row, `ControlsLayout::workspace_row`, drawn identically in both stat
 
 The picker therefore has nowhere to travel to on the `WINDOW_PICKER → APP_GRID` leg: it keeps its
 own box and simply **fades away** over the row that is already there (`row_alpha` vs
-`picker_alpha` in `Niri::render`). Two pieces of machinery went with that trip — the fit-single ↔
-fit-all blend in `Monitor::workspaces_strip_axis`, and `open_fraction`'s saturation across the
-app-grid leg, which existed only to park the zoom while the row re-fitted.
+`picker_alpha` in `Niri::render`). The fit-single ↔ fit-all blend in
+`Monitor::workspaces_strip_axis` went with that trip.
+
+### The two legs must be traversed in order
+
+Every app-grid blend reads `Monitor::app_grid_leg` — the state-derived
+`WINDOW_PICKER → APP_GRID` leg — and **not** the raw `app_grid_fraction`. The raw scalar is
+deliberately *frozen* across a close (the overview must not animate the grid shut and close at the
+same time), so a blend that reads it directly sees "grid fully in" for the entire close.
+
+That was the shape of the jarring close Gustavo reported on 2026-08-03: the grid stayed up, the
+picker behind it stayed at `alpha 0`, and the whole return to the desktop — the previews
+un-spreading, the workspace zooming out — ran invisibly behind it before the desktop popped in.
+
+The other half is ordering. `Monitor::open_fraction` **saturates at 1 across the app-grid leg**,
+so a close from the grid parks the zoom while the grid slides out and only zooms into the active
+workspace once it is gone; `expose_progress` rides the same leg, so the previews stay spread until
+then. This is what gnome-shell's single 2 → 0 adjustment gives for free by passing *through*
+`WINDOW_PICKER`. (The saturation was briefly removed earlier the same day, when the picker still
+travelled on this leg and it bought a dead zone; with the picker parked there is nothing to bend,
+and the ordering is the whole point.) Pinned by
+`overview_close_from_the_app_grid_unwinds_the_grid_before_it_zooms`.
 
 The point is a UX one, Gustavo's: *the user cannot tell the strip and the app-grid workspaces
 apart*, because there is nothing to tell apart.

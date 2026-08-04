@@ -13776,6 +13776,89 @@ fn overview_grid_transitions_are_monotonic_with_the_active_workspace_in_the_midd
     );
 }
 
+/// Closing the overview **from the app grid** unwinds in gnome-shell's order: the grid goes
+/// away first, at a parked zoom, and only then does the overview zoom into the active
+/// workspace. gnome-shell gets that for free from one adjustment travelling 2 -> 0 *through*
+/// `WINDOW_PICKER` (`overviewControls.js:278-308`); we carry two scalars and reconstruct the
+/// axis in `Monitor::overview_state`.
+///
+/// Gustavo, 2026-08-03: "going out of the app grid back to normal desktop, the animation is a
+/// bit jarring". It was reading both blends off the *raw* show-apps scalar, which is frozen
+/// across a close — so the grid stayed "fully in" for the whole animation, the window picker
+/// behind it stayed at alpha 0, and the entire return to the desktop (the previews
+/// un-spreading, the workspace zooming out) happened invisibly behind it before the desktop
+/// popped in.
+///
+/// Pinned on the ordering rather than on the alphas, because the ordering is what was wrong:
+/// while the grid is on its way out nothing else may move, and nothing may still be on its way
+/// out once the zoom starts.
+#[test]
+fn overview_close_from_the_app_grid_unwinds_the_grid_before_it_zooms() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+    let picker_zoom = {
+        let (mon, _, _) = f.niri().layout.workspaces().next().unwrap();
+        mon.unwrap().overview_zoom()
+    };
+    f.niri().layout.toggle_app_grid();
+    f.settle_animations();
+
+    let output = f.niri_output(1);
+    f.niri_state().do_action(Action::CloseOverview, false);
+    let samples = f.sample_animation(Duration::from_millis(600), 48, |f| {
+        let mon = f.niri().layout.monitor_for_output(&output).unwrap();
+        (mon.app_grid_leg(), mon.overview_zoom())
+    });
+
+    // Premise: the close really does start with the grid still up.
+    assert!(
+        samples[0].0 > 0.5,
+        "the close must start from the app grid, got leg {}",
+        samples[0].0
+    );
+
+    // The grid only ever goes away, and it is gone before the end.
+    for pair in samples.windows(2) {
+        assert!(
+            pair[1].0 <= pair[0].0 + 1e-9,
+            "the app grid must not come back mid-close: {:?} -> {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+    let gone = samples
+        .iter()
+        .position(|(leg, _)| *leg <= 0.)
+        .expect("the app grid must finish unwinding before the close does");
+
+    // Nothing zooms while it is on its way out: the workspace sits at the picker's zoom for
+    // every frame the grid is still visible. This is the assertion that fails if the two
+    // blends are read off the same raw progress.
+    for (i, (leg, zoom)) in samples.iter().enumerate().take(gone) {
+        assert!(
+            (zoom - picker_zoom).abs() <= 1e-6,
+            "sample {i}: the zoom must be parked while the grid unwinds \
+             (leg {leg}, zoom {zoom}, picker zoom {picker_zoom})"
+        );
+    }
+
+    // ...and once it is gone, the zoom is what carries the rest of the way to the desktop.
+    let end = samples.last().unwrap().1;
+    assert!(
+        end > picker_zoom,
+        "the close must zoom out after the grid is gone, got {end} from {picker_zoom}"
+    );
+    assert!(
+        samples[gone..].iter().any(|(_, zoom)| *zoom > picker_zoom),
+        "the zoom must actually run during the second leg, not snap at the end"
+    );
+}
+
 /// Closing from the app grid unwinds the picker cleanly, with the row never folding in on
 /// itself.
 ///
