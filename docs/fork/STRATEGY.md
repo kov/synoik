@@ -605,11 +605,57 @@ The control-plane event model (§3.4) makes most of this *record/replay* rather 
 
 ## 9. Licensing
 
-cosmic-comp is **GPL-3.0-only**; mutter/gnome-shell are **GPL-2.0-or-later** (upgrades
-cleanly to GPL-3.0). So importing GNOME code into a cosmic-comp-derived fork is **legal**;
-the combined work is **GPL-3.0-only** and **not re-mergeable upstream into mutter** —
-acceptable since upstreaming isn't a goal. libcosmic (MPL-2.0), iced (MIT), libcroco
-(LGPL) are all GPL-3.0-compatible. niri is GPL-3.0. Document this clearly for contributors.
+> Settled 2026-08-04. This section predates D1 and used to reason about a cosmic-comp base
+> and about importing GNOME code; both premises are gone. Rewritten to describe what we
+> actually took.
+
+### What we took, and under what terms
+
+- **niri — GPL-3.0-or-later.** The base, and the *only* code we import from anyone. Every
+  file in the tree that is not ours outright derives from it.
+- **gnome-shell icons — GPL-2.0-or-later.** `resources/icons/` carries 12 symbolic SVGs
+  taken from `gnome-shell/data/icons/scalable/actions/`: 11 byte-identical, plus
+  `notification-collapse-symbolic.svg`, which is their expand icon wrapped in a 180°
+  rotation. Artwork rather than code, but copyrightable expression all the same. The
+  or-later grant upgrades cleanly to GPLv3, so it sits inside our aggregate legitimately.
+- **Crates** — MIT / Apache-2.0 / MPL-2.0 / BSD / ISC / Zlib, per the aggregate expression
+  in `synoik.spec.rpkg`. All GPL-3.0-compatible. Worth knowing that Apache-2.0 is
+  compatible with GPLv3 and *not* with GPLv2, so our choice of v3 is what makes the
+  dependency graph legal in the first place.
+
+### What we did not take
+
+**gnome-shell and mutter source is behavioral reference only.** We read it to learn what
+the shell does, then reimplement in Rust. Nothing is transcribed and no GObject is ported,
+which is why no GNOME code copyright attaches to this tree — the icons above are the sole
+GNOME material in it.
+
+That is what the reference-first rule in `CLAUDE.md` encodes, and it has a licensing
+purpose on top of the fidelity one. Behavior, layout arithmetic, D-Bus interfaces and
+protocol shapes are not the copyrightable part; verbatim or near-verbatim transcription
+would be. So: cite the reference file, port the behavior, write the code. The conformance
+corpus (§8) is the enforcement mechanism as much as the specification — it pins *observable
+behavior*, which is precisely the thing we are free to reproduce.
+
+### What we distribute under
+
+Our contributions are **GPL-3.0-only**. Combined with niri's or-later grant the aggregate
+conveys as **GPLv3 exactly**, and that is what the package metadata says (`Cargo.toml`,
+`synoik-vk/Cargo.toml`, the RPM spec, `flake.nix`).
+
+Per-file SPDX tags describe the *file*, not the aggregate, so they differ on purpose: files
+we never touched keep `GPL-3.0-or-later`, because that grant is niri's to give and
+narrowing it is not ours to do. Four header variants, assigned by measuring each file
+against the fork point — see `99af7bd9`.
+
+### What this forecloses, and what it doesn't
+
+- **Not re-mergeable into mutter or gnome-shell** — GPL-2.0-or-later cannot absorb
+  GPL-3.0-only. Acceptable: upstreaming was never a goal (§0).
+- **Not re-mergeable into niri by third parties**, for the same reason.
+- **But the author is not locked out.** Gustavo holds the copyright on his own
+  contributions and can offer any of them to niri under or-later whenever he wants.
+  GPL-3.0-only binds everyone downstream; it does not bind the person who wrote the code.
 
 ---
 
@@ -639,7 +685,7 @@ acceptable since upstreaming isn't a goal. libcosmic (MPL-2.0), iced (MIT), libc
 - cosmic-comp v1.0: ~65k LOC Rust; backend ~9.9k (KEEP), `src/shell` ~32k (COSMIC policy,
   REPLACE), GPL-3.0-only, RON config, near-empty D-Bus.
 - niri: single-process, in-compositor live overview (`RescaleRenderElement`), implements
-  GNOME/Mutter D-Bus, pango/pangocairo UI text. GPL-3.0.
+  GNOME/Mutter D-Bus, pango/pangocairo UI text. GPL-3.0-or-later.
 - Key crates: smithay, drm-rs/gbm/input/libseat/calloop, zbus, parley/fontique 0.11/
   harfrust 0.10/swash 0.2/skrifa/icu_* 2.x, Taffy, Vello, AccessKit, cssparser/selectors,
   rquickjs. Reference compositors: niri, cosmic-comp, anvil.
