@@ -67,7 +67,7 @@ bytes), `toggle-type` (`checkmark` | `radio`), `toggle-state`.
 | Item model the UI renders from (icon, status, menu tree) | `src/status_notifier.rs` (new) |
 | Panel indicators + hit-testing | `src/ui/panel.rs` — new `PanelItem` roles in `PanelBox::Right` |
 | The menu itself | `src/ui/widget.rs` + a new `PopoverContent` variant |
-| Icon decode (pixmap → texture, extra theme search path) | icon cache in `src/synoik.rs` / `app_system.rs` |
+| Icon decode (pixmap → texture, extra theme search path) | `src/render_helpers/icon.rs` + its rasterizer worker |
 
 The menu is the part with real design weight. Every popup we have today
 (`quick_settings.rs`, `app_menu.rs`, `input_source_menu.rs`, `a11y_menu.rs`) is built from
@@ -83,21 +83,38 @@ with submenus, checkmarks, radio groups and per-row icons. Per the toolkit-first
 
 ### S1 — The watcher and the item registry
 Own `org.kde.StatusNotifierWatcher`, export the object, accept registrations, track item
-lifetime by bus-name owner, emit the four signals. No UI: assert registration through
-`synoik-ipc` and a synthetic client in the corpus. Gets us the property that makes clients stop
-hiding their tray affordance, which several check at startup.
+lifetime by bus-name owner, emit the four signals. No UI. Gets us the property that makes clients
+stop hiding their tray affordance, which several check at startup.
+
+**Decide the test seam before writing this**, because S5's tests inherit the answer. The headless
+harness runs no session bus, and standing one up inside a parallel test binary collides with the
+dconf/`dbus-run-session` isolation trap. Every other bus feature here is pinned at a **channel
+seam** — the corpus drives the model with the messages the bus layer would have delivered
+(`src/tests/server.rs`, the gdm/accounts pattern). Do the same: the wire code stays thin enough to
+eyeball, the registry/model logic gets the tests, and the bus itself is proved in S7.
 
 ### S2 — The item model and one panel icon
 Proxy `org.kde.StatusNotifierItem`, resolve `IconName` through our existing icon lookup, place
 it in the panel's right box left of the status cluster, honour `Status` (`Passive` hides —
 `indicatorStatusIcon.js:321`). Themed icons only.
 
+Two things that are part of *this* slice and are easy to defer by accident: **readiness gating**
+(see the trap below — an item is not showable the moment it registers) and **capability
+introspection**. The extension calls `org.freedesktop.DBus.Introspectable.Introspect` on the item
+once at setup and records whether `Activate` and `XAyatanaSecondaryActivate` exist
+(`appIndicator.js:446-457`); S6's click ladder is built on that answer, so the probe belongs here
+with the rest of the item model.
+
 ### S3 — Pixmap and out-of-theme icons
 `IconPixmap` is `a(iiay)`: ARGB32, **network byte order**, one entry per size. Pick the smallest
 entry ≥ the target size, else the largest available (`pixmapsUtils.js:32-67`), then byte-swap to
 RGBA (`:17-30`) and upload as a texture — this bypasses themed lookup entirely.
 `IconThemePath` adds a per-item directory to the search path, which our icon loader currently has
-no way to express; that API change is part of this slice.
+no way to express: `IconCache` (`src/render_helpers/icon.rs:75`) is one theme plus a rasterizer
+worker, set globally by `set_theme` (`:787`). Per-item search paths are a **structural** change to
+that type, not a parameter — this slice is bigger than its length here suggests. Decode of
+client-supplied pixels (pixmaps, and `icon-data`'s PNG bytes in S5) is untrusted content and must
+run where the other image decoding runs, behind the plain-data seam.
 
 ### S4 — The data-driven menu widget
 `widget::Menu`: rows from a model, separators, submenus, checkmark/radio state, per-row icon,
@@ -105,16 +122,27 @@ insensitive rows, keyboard navigation. Rendered inside the existing `PanelPopove
 `PopoverContent` variant. No D-Bus in this slice — drive it from a fixture tree so the widget is
 testable on its own, then port `app_menu.rs` onto it as proof the abstraction holds.
 
+**The open design question is the submenu model, and it should be settled first.** The extension
+renders a submenu as GNOME's inline-expanding `PopupSubMenuMenuItem` (`dbusMenu.js:590-591`,
+`:616-620`) — one surface that grows. The alternative is a cascading child surface. That choice
+decides whether `widget::Menu` needs several popover surfaces and a grab that spans them, or one
+surface with a dynamic height and therefore a scroll clip. Keyboard navigation across submenus
+falls out of the same decision. Both belong in this slice's cost.
+
 ### S5 — The DBusMenu client
-`GetLayout` at depth −1 for the initial tree, `AboutToShow` before opening any submenu,
-`Event("clicked")` on activation, `opened`/`closed` on menu open/close
+`GetLayout` at depth −1 for the initial tree, `AboutToShow` before opening any submenu **and on
+the root**, `Event("clicked")` on activation, `opened`/`closed` on menu open/close
 (`dbusMenu.js:664-673`), and live re-fetch on `LayoutUpdated` / `ItemsPropertiesUpdated`. Wire
-S4 to it.
+S4 to it. `AboutToShow`'s reply is not decoration: `needUpdate = true` means re-fetch the layout
+before showing, and the reply must be accepted in both signatures (see the traps).
 
 ### S6 — Interaction semantics
-Click, middle-click, right-click, scroll (see the trap on the click ladder below), plus
-`ProvideXdgActivationToken` before `Activate` — we already mint xdg-activation tokens, so unlike
-the extension we can hand out a real one and let the app raise itself properly.
+Click, middle-click, right-click, scroll (see the click ladder below), plus
+`ProvideXdgActivationToken`. The token goes out before `Activate` *and* before a menu item's
+`clicked` event (`dbusMenu.js:677-684`) — a menu entry that opens a window needs it just as much.
+The extension already mints a genuine token, by faking an `AppInfo` to get a startup-notify id out
+of `create_app_launch_context` (`appIndicator.js:766-773`); our advantage is only that we mint
+ours natively, with no fake `AppInfo` in the way.
 
 ### S7 — Live validation on the seat
 The corpus can prove the wire and the widget; it cannot prove that Steam's menu is usable. Run
@@ -139,6 +167,23 @@ name; otherwise name-owner transfer and item identity come apart.
 **Do not destroy an item the instant its owner vanishes.** Apps that re-register during their own
 restart flicker the panel; the extension waits 500 ms and re-checks (`:104-116`).
 
+**An item that keeps its bus name is not necessarily alive.** Electron apps *remove the SNI
+object* when hiding the indicator and leave the bus name owned, so owner-tracking alone leaves a
+ghost icon in the panel forever — from exactly the client class that motivates this whole port.
+The extension probes `Get(Status)` after a 10 s delay and destroys the item on any of
+`NameHasNoOwner`, `ServiceUnknown`, `UnknownObject`, `UnknownInterface`, `UnknownMethod`,
+`UnknownProperty` (`appIndicator.js:623-666` — the "hey electron!" comment). Ping is deliberately
+*not* used: it is unreachable inside snap confinement.
+
+**An item is not showable the moment it registers.** Clients routinely register before exporting
+their properties. The extension gates on `Id` *and* `Menu` being present, retrying three times a
+second apart before giving up (`appIndicator.js:406-408`, `:498-529`). Showing an icon straight
+off registration produces items that render broken or never populate.
+
+**`Menu == "/NO_DBUSMENU"` means there is no menu** (`appIndicator.js:576-580`), and some items
+have no menu at all. The click ladder needs defined behavior for a menu-less item — not a popover
+containing nothing.
+
 **`Status` must default to `Passive` before the first fetch** (`appIndicator.js:115-116`), or
 every item flashes into the panel during startup and some never should have appeared at all.
 
@@ -148,8 +193,9 @@ have its extension stripped before lookup. Both are out-of-spec and both are com
 
 **Some "icons" are not square.** `indicator-multiload` sends a wide strip and expects it drawn at
 its natural aspect ratio; the extension special-cases `width >= height * 1.5`
-(`appIndicator.js:1174`). Decide
-deliberately whether we letterbox or scale-to-fit, and pin it.
+(`appIndicator.js:1174`) — note this applies only to icons that resolved to a *file path* in a
+user-writable area, not to pixmaps or themed lookups. Decide deliberately whether we letterbox or
+scale-to-fit, and pin it.
 
 **`SecondaryActivate` has an Ayatana-only spelling.** Try `XAyatanaSecondaryActivate(timestamp)`
 first, fall back to `SecondaryActivate(x, y)` on `UnknownMethod`, and cache which one worked
@@ -157,10 +203,12 @@ first, fall back to `SecondaryActivate(x, y)` on `UnknownMethod`, and cache whic
 (`:804-810`) and to `AboutToShow` (`dbusMenu.js:508-528`) — clients omit methods they declare.
 
 **Dropbox needs `AboutToShow(0)` before the root menu is valid** (`dbusMenu.js:893-894`). Call it
-on the root, not just on submenus.
+on the root, not just on submenus — and it replies with `()` instead of the specified `(b)`, so
+the reply handling must accept an empty tuple as "yes, re-fetch" (`dbusMenu.js:508-524`).
 
 **Labels carry GTK mnemonics.** `_Quit` must have the underscore stripped for display
-(`dbusMenu.js:735`).
+(`dbusMenu.js:735` — which is a first-match, non-global replace; doing it properly means handling
+`__` as a literal underscore too).
 
 **Property updates arrive fast enough to matter.** The extension rate-limits icon rebuilds to
 30 ms (`appIndicator.js:43`); some clients repaint a progress icon per frame. Our equivalent
@@ -176,19 +224,32 @@ losing the open submenu or the pointer's row.
 ## Divergences we are choosing
 
 - **`ItemIsMenu` is honoured; the extension ignores it.** The extension never reads the property
-  and instead builds a click ladder around a double-click timeout: single primary click waits
-  `doubleClickTime` and *then* opens the menu, a double click calls `Activate`
-  (`indicatorStatusIcon.js:375-445`). That delay is felt on every single click, and it exists
-  only because the extension can't tell a menu-only item from an activatable one. `ItemIsMenu`
-  is exactly that signal. Our ladder: left click opens the menu when `ItemIsMenu` or when the
-  item exposes no `Activate`, otherwise `Activate`; right click always opens the menu; middle
-  click is `SecondaryActivate`; scroll forwards `Scroll` with an axis name. Clients that set
-  neither get menu-on-left-click, which is what users expect and what the timeout was
-  approximating anyway.
-- **A real activation token.** `ProvideXdgActivationToken` with a token we actually minted, so
-  activation raises the window instead of flagging it as demanding attention.
-- **No tooltips.** The extension disables `ToolTip` in its IDL and so do we; we have no
-  tooltip surface at all yet.
+  and instead builds a click ladder around a double-click timeout: on an `Activate`-capable item,
+  a single primary click waits `doubleClickTime` and *then* opens the menu, while a double click
+  calls `Activate` (`indicatorStatusIcon.js:375-445`; an item with no menu items skips the wait,
+  `:437-442`). The delay exists only because the extension can't tell a menu-first item from an
+  activatable one. `ItemIsMenu` is exactly that signal, and honouring it is what Plasma does —
+  which is what SNI clients are actually written and tested against.
+
+  Our ladder: left click opens the menu when `ItemIsMenu` is set or the item exposes no
+  `Activate`, otherwise `Activate`; right click always opens the menu; middle click is
+  `SecondaryActivate`; scroll forwards `Scroll` with an axis name. `Activate` answering
+  `UnknownMethod` at call time demotes the item to menu-first for the rest of its life, the way
+  the extension's `supportsActivation` does (`appIndicator.js:804-810`).
+
+  **The class this serves worse**: a client that declares `Activate` in introspection, leaves
+  `ItemIsMenu` unset, and then no-ops the call. Under the extension the user gets the menu after
+  the timeout; under us, left click appears to do nothing and the menu is only reachable by right
+  click. It cannot be detected in principle — a successful no-op is indistinguishable from a
+  successful activation. Accepted, but S7 checks for it explicitly (Dropbox is the likely
+  candidate).
+- **A real activation token.** `ProvideXdgActivationToken` with a token we minted natively, rather
+  than the extension's fabricated `AppInfo` (`appIndicator.js:766-773`).
+- **No tooltips.** A choice, not a gap: `widget::Tooltip` exists (`src/ui/widget.rs:685`) and the
+  dash, window previews and the screenshot UI use it. The extension disables `ToolTip` in its IDL
+  and we follow, because the property is `(sa(iiay)ss)` — icon, title and *markup* body — and
+  honouring it properly means a second rich-text surface for content we don't control. Revisit
+  when a client is demonstrably unusable without it.
 - **No `XAyatanaLabel` text beside the icon.** A per-item text label in the panel is an Ubuntu
   extension to the spec and would fight the panel's width budget. Revisit only if a real client
   proves unusable without it.
@@ -213,3 +274,6 @@ losing the open submenu or the pointer's row.
   panel width budget when a user has eight of them.
 - Ordering: registration order, `Category`, or `XAyatanaOrderingIndex`? Registration order is
   non-deterministic across boots, which reads as icons that move around.
+- Submenus: inline-expanding (one surface, like the extension and like GNOME's own menus) or
+  cascading child surfaces (like Plasma, and like every toolkit menu these clients were designed
+  against)? Decides the shape of `widget::Menu` and how far the grab has to reach. See S4.
