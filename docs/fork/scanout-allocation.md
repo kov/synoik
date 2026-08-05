@@ -142,6 +142,40 @@ Note also that `Environment=` on the compositor's unit is *not* compositor-scope
 launched from the shell are spawned by the compositor and inherit it, which is how the client
 failure below was found.
 
+## The screen decayed between damages (fixed 2026-08-05)
+
+Hours after this landed, the desktop started accumulating trails: black rings at every size a
+window had been, stripes at a terminal's text-line pitch running off past its edge, growing
+wherever the scene *stopped* repainting. A VT switch (which forces a full redraw) wiped it clean and
+it grew straight back. Our own `screenshot-screen` never saw it. Two changes had landed together —
+this one and a new VMM — so attribution was the whole problem.
+
+**The bug was ours, and older than this commit.** `matches_render_order` (`11cb699b`, 2026-07-31)
+gave `Argb8888`/`Xrgb8888` scanout buffers a **direct** render path: the imported dmabuf *is* the
+render-pass attachment, no present-blit shadow. But `VulkanFrame::begin` still decided whether to
+preserve the target with `fb.present.is_some()` — a test for the *shadow* arm. So the direct arm
+took the `DONT_CARE` base pass and discarded the whole scanout buffer every frame, while the tty
+backend redrew only `DrmCompositor`'s buffer-age damage. Everything outside the damage was, by the
+spec, undefined. The fix is one condition (`!fb.offscreen`, i.e. *any* scanout target that already
+holds a valid frame), because a cycled dmabuf holds exactly its own age-N-ago presentation — the
+frame that damage was computed against. Preserving it is not an approximation.
+
+Worth keeping from how it was found:
+
+- **The screenshot exonerating the scene is the clue, not a dead end.** A capture that re-renders
+  everything cannot see a partial-repaint bug. "Invisible to a full redraw" localised it to the
+  presented framebuffer before a single line of code was read.
+- **An instrument that never fires can be the answer.** `SYNOIK_VK_FULL_PRESENT_BLIT=1` (a
+  temporary arm) produced *zero* log lines. That was not a null result: it proved the present-blit
+  path never runs for KMS on this stack, which is what pointed at the direct arm.
+- **The pixels cannot test this.** `DONT_CARE` leaves contents *undefined*, and venus happens to
+  keep them for a LINEAR image — a pixel-level test passes on the broken code here and would fail
+  on some other driver, some other day. `vulkan_partial_redraw_into_a_scanout_dmabuf_preserves_the_rest`
+  asserts the **pass choice** (`VulkanFrame::preserves_target`), which fails on the old code.
+- `SYNOIK_VK_FULL_DAMAGE=1` (kept, `backend::tty`) turns the whole partial-damage chain off: the
+  diagnostic that separates "we are drawing the wrong thing" from "what we drew did not survive",
+  and a stopgap while that is decided.
+
 ## The other half: client buffers, still open
 
 Our own scanout buffers are fixed. A **client's** are not ours to allocate, and the same failure

@@ -14,6 +14,7 @@ use synoik_vk::render::{
     as_bytes, BorderPush, ClippedTexturePush, PostprocessPush, QuadPush, ResizePush, ShadowPush,
     TextPush, IDENTITY_PROJ,
 };
+use tracing::warn;
 
 use super::backdrop_blur::BackdropBlur;
 use super::blur_chain::SharedBlurChain;
@@ -102,6 +103,17 @@ pub struct VulkanFrame<'frame, 'buffer> {
     /// retirement (when nobody waited).
     gpu_slot: Option<GpuTimerSlot>,
     finished: bool,
+    /// Whether this frame's render pass PRESERVED the target's prior contents (LOAD) instead of
+    /// discarding them (DONT_CARE) — see the decision in [`Self::begin`].
+    ///
+    /// Exposed through [`Self::preserves_target`] because the choice cannot be checked from the
+    /// pixels: DONT_CARE leaves them *undefined*, and a driver that happens to keep them (this
+    /// stack does, for a LINEAR image) makes a broken partial-damage frame read as correct right
+    /// up until the one that doesn't. The decision is the contract; assert on it.
+    // Only the test reads it, and it stays out of `cfg(test)` deliberately: a seam that exists
+    // only under test is a seam that can drift from what ships.
+    #[allow(dead_code)]
+    preserve: bool,
 }
 
 impl fmt::Debug for VulkanFrame<'_, '_> {
@@ -136,19 +148,34 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             .expect("bound VkFramebuffer wraps an offscreen texture");
 
         // Preserve the previous frame's contents (render-pass LOAD) instead of discarding them
-        // (DONT_CARE) when this is a present-blit scanout target that already holds a valid prior
-        // frame — the basis for damage-preserving (partial-damage) rendering. The present-blit
-        // shadow is a single buffer reused across frames, so from its perspective its buffer-age is
-        // always 1; DrmCompositor's per-dmabuf damage (age ≥ 1) is a superset of what the shadow
-        // needs preloaded, so LOAD + redrawing that damage always lands a fully-correct frame. A
-        // fresh (just-reallocated) shadow is `UNDEFINED` (nothing to preserve) so it discards
-        // (DONT_CARE) — aligned with the swapchain realloc that makes DrmCompositor full-damage.
-        // `finish_internal` only records `TRANSFER_SRC_OPTIMAL` after a successful submit, so an
-        // errored frame never leaves a "valid" layout over undefined content. The LOAD pass is
-        // render-pass-compatible with the base pass (identical attachment/subpass layout), so
-        // `framebuffer` (built against the base pass) and every pipeline bind unchanged.
-        let preserve =
-            fb.present.is_some() && fb.buffer.layout() == vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        // (DONT_CARE) whenever this is a SCANOUT target that already holds a valid prior frame —
+        // the basis for damage-preserving (partial-damage) rendering. A caller that redraws only
+        // the damage needs everything else to survive the pass, and that is true of both scanout
+        // arms:
+        //
+        // - **Present-blit** (`present.is_some()`): `buffer` is the shadow, a single image reused
+        //   across frames, so from its perspective its buffer-age is always 1; DrmCompositor's
+        //   per-dmabuf damage (age ≥ 1) is a superset of what it needs preloaded.
+        // - **Direct** (`!offscreen`, `present.is_none()`): `buffer` IS the cycled scanout dmabuf,
+        //   and it holds exactly its own age-N-ago presentation — which is the frame DrmCompositor
+        //   computed this damage against. Preserving is not an approximation here.
+        //
+        // A fresh image is `UNDEFINED` (nothing to preserve) so it discards, which lines up with
+        // the age-0 full-damage frame that redraws it whole; `finish_internal` only records
+        // `TRANSFER_SRC_OPTIMAL` after a successful submit, so an errored frame never leaves a
+        // "valid" layout over undefined content. The LOAD pass is render-pass-compatible with the
+        // base pass (identical attachment/subpass layout), so `framebuffer` (built against the base
+        // pass) and every pipeline bind unchanged.
+        //
+        // Offscreens are excluded, and not just because they end their frame in
+        // `SHADER_READ_ONLY_OPTIMAL`: a bake target is handed to its caller as a blank canvas, and
+        // one that happened to be left in `TRANSFER_SRC_OPTIMAL` by a readback would otherwise come
+        // back carrying the previous bake.
+        //
+        // Getting this wrong is invisible to every test that renders one frame and to every
+        // screenshot (both full-damage): the direct arm silently discarded, so the parts of the
+        // screen the scene had stopped repainting decayed into whatever the driver left behind.
+        let preserve = !fb.offscreen && fb.buffer.layout() == vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
         let render_pass = if preserve {
             renderer.continuation_render_pass
         } else {
@@ -273,7 +300,16 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             blur_chains,
             gpu_slot,
             finished: false,
+            preserve,
         })
+    }
+
+    /// Whether this frame preserves the target's prior contents rather than discarding them, i.e.
+    /// whether a caller that redraws only its damage will land a correct frame. See
+    /// [`Self::preserve`].
+    #[allow(dead_code)]
+    pub(crate) fn preserves_target(&self) -> bool {
+        self.preserve
     }
 
     /// The `target` for the vertex ortho: the **logical** output size in pixels, as `[w, h]`
@@ -1598,6 +1634,27 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // copies the whole shadow anyway.
         let old_layout = present.layout();
 
+        // That coincidence is the whole load-bearing assumption, and it is invisible when it
+        // breaks: an `UNDEFINED` source layout lets the driver throw the image's contents away, so
+        // a *partial* copy over one leaves the rest of the frame as whatever the driver felt like
+        // — trails, in exactly the regions the scene is not repainting. It breaks the moment this
+        // buffer is imported *again* under a fresh `Dmabuf` identity (the import is cached as
+        // `HashMap<WeakDmabuf, VkTexture>`, and layout is tracked on the `VkTexture`), because the
+        // re-import starts at `UNDEFINED` while `DrmCompositor` still counts the slot as aged.
+        // Say so out loud rather than discarding silently: at most one per swapchain slot per
+        // mode-set is expected, and anything more is the bug.
+        if old_layout == vk::ImageLayout::UNDEFINED && rects != [full_rect(w, h)] {
+            warn!(
+                "present blit discarding a scanout buffer it is only partly overwriting: \
+                 {}x{} target, tracked layout UNDEFINED but only {} rect(s) copied. \
+                 Either this is the buffer's first use (once per swapchain slot) or its import \
+                 was re-created and DrmCompositor's buffer age is now a lie.",
+                w,
+                h,
+                rects.len(),
+            );
+        }
+
         unsafe {
             let to_dst = vk::ImageMemoryBarrier::default()
                 .old_layout(old_layout)
@@ -2152,5 +2209,16 @@ pub(super) fn submit_site_of(offscreen: bool, for_kms: bool) -> synoik_vk::stats
         synoik_vk::stats::SubmitSite::KmsFrame
     } else {
         synoik_vk::stats::SubmitSite::DmabufFrame
+    }
+}
+
+/// The whole-image rect for a `w`×`h` target.
+fn full_rect(w: u32, h: u32) -> vk::Rect2D {
+    vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: vk::Extent2D {
+            width: w,
+            height: h,
+        },
     }
 }

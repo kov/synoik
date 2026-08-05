@@ -12,7 +12,7 @@ use std::num::NonZeroU64;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::{io, mem};
 
@@ -1875,6 +1875,10 @@ impl Tty {
             .sum::<usize>()
             == 1;
 
+        // `SYNOIK_VK_FULL_DAMAGE=1` takes the whole partial-damage chain out of the picture. See
+        // `full_damage_requested`.
+        let force_full_damage = !single_scanout_surface || full_damage_requested();
+
         let Some(device) = self.devices.get_mut(&tty_state.node) else {
             error!("missing output device");
             return rv;
@@ -1926,10 +1930,11 @@ impl Tty {
                 &config,
                 flags,
                 // Partial-damage rendering works when there's a single scanout surface (see
-                // `single_scanout_surface`): the Vulkan renderer preserves the present-blit shadow
-                // (render-pass LOAD) so DrmCompositor's buffer-age damage is enough. With multiple
-                // surfaces the shared shadow makes that unsafe, so force a full redraw there.
-                !single_scanout_surface,
+                // `single_scanout_surface`): the Vulkan renderer preserves the target across
+                // frames (render-pass LOAD) so DrmCompositor's buffer-age damage
+                // is enough. With multiple surfaces the shared shadow makes that
+                // unsafe, so force a full redraw there.
+                force_full_damage,
                 target_presentation_time,
             )
         }
@@ -2965,6 +2970,24 @@ fn suspend() -> anyhow::Result<()> {
     .context("error suspending")?;
 
     Ok(())
+}
+
+/// Whether the session asked every scanout frame to be a full redraw, via
+/// `SYNOIK_VK_FULL_DAMAGE=1`. Read once — it must answer the same way for the whole process.
+///
+/// Partial damage rests on "these bytes survive until I overwrite them", of the scanout target
+/// itself and of anything between it and glass. Nothing inside the compositor can check that, and
+/// the symptom when it stops being true is not a crash or a log line — it is the screen decaying
+/// into stale content everywhere the scene has stopped repainting, while every screenshot (a full
+/// redraw) comes out clean. Turning the chain off in one env var is what lets that be attributed on
+/// a live seat without a rebuild; it is also a usable stopgap, at the cost of a full redraw per
+/// frame. It earned its keep on 2026-08-05 — see `docs/fork/scanout-allocation.md`.
+fn full_damage_requested() -> bool {
+    static REQUESTED: OnceLock<bool> = OnceLock::new();
+    *REQUESTED.get_or_init(|| {
+        std::env::var("SYNOIK_VK_FULL_DAMAGE")
+            .is_ok_and(|v| matches!(v.trim(), "1" | "on" | "true"))
+    })
 }
 
 /// Composite `output`'s render elements through `renderer` and hand the frame to `surface`'s

@@ -44,7 +44,7 @@ use smithay::reexports::drm::control::{framebuffer, Device as ControlDevice, FbC
 use smithay::utils::{Buffer as BufferCoords, Size};
 use synoik_vk::gpu::Gpu;
 use synoik_vk::texture::{ScanoutExport, Texture};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::render_helpers::vulkan::scanout_spec;
 
@@ -211,6 +211,18 @@ impl AsDmabuf for VulkanScanoutBuffer {
 
     fn export(&self) -> Result<Dmabuf, Self::Error> {
         let inner = &self.0;
+        // Every call mints a fresh `Dmabuf` identity, and the renderer keys its scanout import (and
+        // therefore the tracked image layout the present blit preserves content from) on that
+        // identity. `Slot::export` caches the result in slot userdata, so in the swapchain path
+        // this runs once per slot — count it anyway, because "once per slot" is the assumption, not
+        // a guarantee, and a re-export silently costs the buffer its content.
+        static EXPORTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = EXPORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        debug!(
+            n,
+            size = ?inner.size,
+            "exporting a scanout buffer as a fresh dmabuf identity"
+        );
         // A dup, not the original: the `Dmabuf` owns whatever fd it is given, and this buffer may
         // be exported more than once (smithay caches per swapchain slot, but nothing guarantees
         // it).

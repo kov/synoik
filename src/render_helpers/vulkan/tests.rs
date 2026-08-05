@@ -5543,3 +5543,116 @@ fn vulkan_gpu_phases_subdivide_the_frame_they_belong_to() {
         elements.len(),
     );
 }
+
+/// **Partial redraw into a scanout dmabuf must preserve what it does not redraw.**
+///
+/// This is the contract every frame on the live seat depends on and no other test states: the tty
+/// backend redraws only `DrmCompositor`'s buffer-age damage, so whatever the render pass does to
+/// the rest of the target is the rest of the screen. `VulkanFrame::begin` picks the LOAD
+/// continuation pass over the DONT_CARE base pass for exactly this, and it is invisible when it
+/// picks wrong: a single-frame test and a screenshot both redraw everything.
+///
+/// It went wrong in precisely that invisible way. `matches_render_order` (2026-07-31) gave
+/// `Argb8888`/`Xrgb8888` scanout buffers a *direct* render path with no present-blit shadow, and
+/// the preserve test still asked `present.is_some()` — so the whole KMS path silently discarded its
+/// target every frame while only the damage was redrawn. On glass: the desktop decayed into trails
+/// everywhere the scene had stopped repainting, cleared by anything that forced a full redraw (a VT
+/// switch), and perfectly clean in every screenshot.
+///
+/// Frame 1 paints the buffer red. Frame 2 clears a 16×16 corner to blue and touches nothing else.
+#[test]
+fn vulkan_partial_redraw_into_a_scanout_dmabuf_preserves_the_rest() {
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::{Allocator, Modifier};
+
+    use crate::backend::vulkan_scanout::VulkanScanoutAllocator;
+
+    const NAME: &str = "vulkan_partial_redraw_into_a_scanout_dmabuf_preserves_the_rest";
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping {NAME}: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let mut alloc = match VulkanScanoutAllocator::new(vk.gpu().clone(), None) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("skipping {NAME}: {e:#}");
+            return;
+        }
+    };
+    let buffer = match alloc.create_buffer(W as u32, H as u32, NATIVE_FOURCC, &[Modifier::Linear]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping {NAME}: cannot allocate {NATIVE_FOURCC:?} LINEAR ({e})");
+            return;
+        }
+    };
+    let mut dmabuf = buffer
+        .export()
+        .expect("export the scanout buffer as a dmabuf");
+
+    let size = Size::<i32, Physical>::from((W, H));
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+    const PATCH: i32 = 16;
+
+    // Frame 1: the whole buffer, as an age-0 full-damage frame would paint it. Nothing to
+    // preserve yet — the image is fresh, which is exactly why DrmCompositor calls it age 0.
+    let mut fb = vk.bind(&mut dmabuf).expect("bind the scanout dmabuf");
+    {
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        assert!(
+            !frame.preserves_target(),
+            "a scanout buffer with no prior frame in it has nothing to preserve",
+        );
+        frame
+            .clear(Color32F::from(RED), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    // Frame 2: only the damage. Same dmabuf, re-bound exactly as the next frame on the seat would
+    // — the import is cached, so this is the same image carrying frame 1's pixels.
+    let mut fb = vk.bind(&mut dmabuf).expect("re-bind the scanout dmabuf");
+    let patch = Rectangle::<i32, Physical>::from_size(Size::from((PATCH, PATCH)));
+    {
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        // THE assertion. Everything below it is a bonus: `DONT_CARE` leaves the untouched pixels
+        // *undefined*, so a driver that happens to keep them (venus does, on a LINEAR image) makes
+        // the pixel checks pass over a broken frame. The pass choice is the contract.
+        assert!(
+            frame.preserves_target(),
+            "the second frame into a scanout buffer that already holds one must LOAD it, not              discard it — the seat redraws only the damage, so a DONT_CARE pass here is the rest              of the screen going undefined every frame",
+        );
+        frame
+            .clear(Color32F::from(BLUE), &[patch])
+            .expect("clear the damage");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    let red = [255, 0, 0, 255];
+    let blue = [0, 0, 255, 255];
+    assert!(
+        close_px(px(&pixels, PATCH / 2, PATCH / 2), blue, 3),
+        "the redrawn damage should be the second frame's blue, got {:?}",
+        px(&pixels, PATCH / 2, PATCH / 2),
+    );
+    for (x, y) in [(W / 2, H / 2), (W - 1, 0), (0, H - 1), (W - 1, H - 1)] {
+        assert!(
+            close_px(px(&pixels, x, y), red, 3),
+            "({x},{y}) was not redrawn by the second frame, so it must still hold the first \
+             frame's red — a DONT_CARE pass here is the whole screen decaying between damages; \
+             got {:?}",
+            px(&pixels, x, y),
+        );
+    }
+}
