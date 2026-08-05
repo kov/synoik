@@ -29,6 +29,7 @@ pub mod handlers;
 pub mod idle_monitor;
 pub mod image_source;
 pub mod input;
+pub mod input_method;
 pub mod ipc;
 pub mod keyboard_layout;
 pub mod layer;

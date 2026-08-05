@@ -3049,6 +3049,107 @@ fn an_internal_input_method_receives_client_text_input_state() {
     );
 }
 
+/// The outbound half of the input method: what an engine produces reaches the client as
+/// preedit and commit strings.
+///
+/// Driven by injecting [`ImEvent`]s rather than by a live ibus-daemon — the daemon round trip is
+/// covered by `examples/ibus_probe.rs`, and what needs pinning here is the translation, above all
+/// the character→byte cursor conversion that only misbehaves on the accented text this feature
+/// exists for.
+#[test]
+fn engine_output_reaches_the_client_as_preedit_then_commit() {
+    use std::sync::{Arc, Mutex};
+
+    use smithay::wayland::text_input::{TextInputEvent as Ev, TextInputSeat};
+
+    use crate::dbus::ibus::{ImEvent, PreeditMode};
+    use crate::input_method::{ImUpdate, InputMethod};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (to_worker, requests) = async_channel::unbounded();
+    f.synoik().input_method = Some(InputMethod::new(to_worker));
+
+    let seen: Arc<Mutex<Vec<Ev>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    f.synoik()
+        .seat
+        .text_input()
+        .set_internal_input_method(Some(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        })));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).create_text_input();
+    f.double_roundtrip(id);
+    f.client(id).enable_text_input();
+    f.double_roundtrip(id);
+
+    // Feed the client's state through, as the real sink would.
+    for event in seen.lock().unwrap().drain(..).collect::<Vec<_>>() {
+        f.synoik_state().on_text_input_event(event);
+    }
+    assert_eq!(
+        requests.try_recv(),
+        Ok(crate::input_method::ImRequest::FocusIn),
+        "enabling text input must focus the engine in"
+    );
+    let _ = f.client(id).text_input_events();
+
+    // The engine shows a composition. Cursor 2 is *characters* into "héllo" — byte 3.
+    f.synoik_state()
+        .on_im_update(ImUpdate::Event(ImEvent::Preedit {
+            text: Some("héllo".to_owned()),
+            cursor: 2,
+            visible: true,
+            mode: PreeditMode::Clear,
+        }));
+    f.double_roundtrip(id);
+
+    let events = f.client(id).text_input_events();
+    assert!(
+        events.contains(&ClientEv::PreeditString {
+            text: Some("héllo".to_owned()),
+            cursor_begin: 3,
+            cursor_end: 3,
+        }),
+        "preedit cursor must be a byte offset, got: {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(ClientEv::Done(_))),
+        "a preedit must be followed by done, got: {events:?}"
+    );
+
+    // Then it commits. The preedit must be cleared first or the composition stays on screen
+    // beside the text it became (mutter sends preedit_string(NULL) before commit_string).
+    f.synoik_state()
+        .on_im_update(ImUpdate::Event(ImEvent::Commit("héllo".to_owned())));
+    f.double_roundtrip(id);
+
+    let events = f.client(id).text_input_events();
+    let preedit_cleared = events.iter().position(|e| {
+        *e == ClientEv::PreeditString {
+            text: None,
+            cursor_begin: 0,
+            cursor_end: 0,
+        }
+    });
+    let committed = events
+        .iter()
+        .position(|e| *e == ClientEv::CommitString(Some("héllo".to_owned())));
+    assert!(
+        preedit_cleared.is_some() && committed.is_some() && preedit_cleared < committed,
+        "the preedit must be cleared before the commit, got: {events:?}"
+    );
+    assert_eq!(
+        f.synoik().input_method.as_ref().unwrap().preedit(),
+        None,
+        "committing clears the tracked preedit"
+    );
+}
+
 /// mutter's three passive window button grabs are Mod+LMB to move, Mod+MMB to
 /// resize and Mod+RMB for the window menu (`window.c:7743-7844`;
 /// `meta_prefs_get_mouse_button_resize` returns 2 unless `resize-with-right-button`).
