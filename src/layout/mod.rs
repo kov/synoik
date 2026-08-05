@@ -399,9 +399,6 @@ pub struct Layout<W: LayoutElement> {
     /// edge tiles/maximizes it (GNOME windowing mode only). Pushed in from the
     /// GSettings model.
     gnome_edge_tiling: bool,
-    /// `org.gnome.desktop.interface accent-color`, resolved to RGB. Pushed in
-    /// from the GSettings model; colors the overview thumbnail indicator.
-    gnome_accent_color: [u8; 3],
     /// Configurable properties of the layout.
     options: Rc<Options>,
 }
@@ -786,7 +783,6 @@ impl<W: LayoutElement> Layout<W> {
             app_grid_open: false,
             overview_progress: None,
             gnome_edge_tiling: true,
-            gnome_accent_color: crate::gnome::ACCENT_BLUE,
             options: Rc::new(options),
         }
     }
@@ -814,7 +810,6 @@ impl<W: LayoutElement> Layout<W> {
             app_grid_open: false,
             overview_progress: None,
             gnome_edge_tiling: true,
-            gnome_accent_color: crate::gnome::ACCENT_BLUE,
             options: opts,
         }
     }
@@ -822,14 +817,6 @@ impl<W: LayoutElement> Layout<W> {
     /// Pushes `org.gnome.mutter edge-tiling` in from the GSettings model.
     pub fn set_gnome_edge_tiling(&mut self, edge_tiling: bool) {
         self.gnome_edge_tiling = edge_tiling;
-    }
-
-    /// Pushes the resolved `accent-color` in from the GSettings model.
-    pub fn set_gnome_accent_color(&mut self, accent: [u8; 3]) {
-        self.gnome_accent_color = accent;
-        for mon in self.monitors_mut() {
-            mon.set_gnome_accent_color(accent);
-        }
     }
 
     pub fn add_output(&mut self, output: Output, layout_config: Option<LayoutPart>) {
@@ -889,7 +876,6 @@ impl<W: LayoutElement> Layout<W> {
                 );
                 monitor.overview_open = self.overview_open;
                 monitor.set_overview_progress(self.overview_progress.as_ref());
-                monitor.set_gnome_accent_color(self.gnome_accent_color);
                 monitors.push(monitor);
 
                 MonitorSet::Normal {
@@ -911,7 +897,6 @@ impl<W: LayoutElement> Layout<W> {
                 );
                 monitor.overview_open = self.overview_open;
                 monitor.set_overview_progress(self.overview_progress.as_ref());
-                monitor.set_gnome_accent_color(self.gnome_accent_color);
 
                 MonitorSet::Normal {
                     monitors: vec![monitor],

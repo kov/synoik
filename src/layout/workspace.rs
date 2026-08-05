@@ -2736,24 +2736,42 @@ pub(super) fn compute_working_area(output: &Output, options: &Options) -> Rectan
     area
 }
 
-/// [`compute_workspace_shadow_config`] in the system accent color — the **active**
-/// workspace's shadow, in both overview rows.
+/// How much further the active workspace's shadow is thrown than its neighbours'.
+const ACTIVE_SHADOW_REACH: f64 = 2.1;
+/// …and how much denser. Clamped at fully opaque, which it does not reach at the default
+/// `0x50`.
+const ACTIVE_SHADOW_ALPHA: f32 = 2.;
+
+/// [`compute_workspace_shadow_config`] thrown further and darker — the **active** workspace's
+/// shadow in the thumbnail strip.
 ///
-/// **Divergence (approved 2026-07-29, extended to the picker row 2026-08-03).** gnome-shell
-/// marks the active workspace with a border ring on the thumbnail
-/// (`.workspace-thumbnail-indicator`); Gustavo asked for an accent glow instead. Identical
-/// geometry and alpha to the plain one — it is the *same* shadow, only colored. Turning it
-/// up as well read as too much.
-pub(super) fn accent_workspace_shadow_config(
+/// **Divergence (approved 2026-07-29; the accent dropped 2026-08-05).** gnome-shell marks the
+/// active workspace with a border ring on the thumbnail (`.workspace-thumbnail-indicator`);
+/// Gustavo asked for a shadow treatment instead.
+///
+/// It was the *accent* colour until now, and that was the wrong instinct — mine as much as
+/// anyone's. A drop shadow says "this is above the surface" because it is darker than what it
+/// falls on. Recolouring it to the accent keeps the shape and throws away the reason: with a
+/// light accent (`yellow`, say) the halo comes out *brighter* than the backdrop, so the one
+/// thumbnail that is supposed to be raised is the only one not casting a shadow. It read as
+/// pushed back, which is exactly backwards, and no tint fraction fixes it — the top edge shows
+/// only the softness bleed, where there is no shadow shape for a colour to live in, so any
+/// accent strong enough to be recognisable turns that edge into an outline. Four intermediate
+/// treatments were rendered and compared before settling here.
+///
+/// So the cue is depth, done with the only thing that expresses depth: the *same* shadow as
+/// every other thumbnail, thrown [`ACTIVE_SHADOW_REACH`] further and
+/// [`ACTIVE_SHADOW_ALPHA`] denser. Nothing about it depends on the accent, which means nothing
+/// about it depends on the user's colour taste either.
+pub(super) fn active_workspace_shadow_config(
     config: synoik_config::WorkspaceShadow,
     view_size: Size<f64, Logical>,
-    [r, g, b]: [u8; 3],
 ) -> synoik_config::Shadow {
     let mut config = compute_workspace_shadow_config(config, view_size);
-    // Colors are stored unpremultiplied, so the alpha carries over untouched.
-    config.color.r = f32::from(r) / 255.;
-    config.color.g = f32::from(g) / 255.;
-    config.color.b = f32::from(b) / 255.;
+    config.softness *= ACTIVE_SHADOW_REACH;
+    config.spread *= ACTIVE_SHADOW_REACH;
+    // Colors are stored unpremultiplied, so this is the shadow's own opacity.
+    config.color.a = (config.color.a * ACTIVE_SHADOW_ALPHA).min(1.);
     config
 }
 

@@ -1579,10 +1579,6 @@ impl State {
                 .synoik
                 .layout
                 .set_gnome_edge_tiling(state.synoik.gnome_settings.edge_tiling);
-            state
-                .synoik
-                .layout
-                .set_gnome_accent_color(state.synoik.gnome_settings.accent_color);
             // The application catalog (dash favorites, overview search, launch),
             // seeded from the current `favorite-apps` and refreshed on
             // `installed-changed`.
@@ -1774,10 +1770,6 @@ impl State {
                             .synoik
                             .layout
                             .set_gnome_edge_tiling(settings.edge_tiling);
-                        state
-                            .synoik
-                            .layout
-                            .set_gnome_accent_color(settings.accent_color);
                         let gpu = state.backend.with_vulkan_renderer(|r| r.gpu().clone());
                         state
                             .synoik

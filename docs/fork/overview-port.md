@@ -1544,10 +1544,22 @@ landed:
 - **The inactive shrink.** `WORKSPACE_INACTIVE_SCALE` about the slot's center, exactly as
   `_updateWorkspacesState` does it for the row (`workspacesView.js:243-266`).
 
-**The indicator ring is gone**, replaced by the accent glow: `thumb_active_shadow`, the same
-shadow geometry spread wider, at full alpha, in the system accent color, which
-`set_gnome_accent_color` now recolors instead of the ring. gnome-shell's
+**The indicator ring is gone**, replaced by a deeper shadow on the active thumbnail:
+`active_workspace_shadow_config` — the shadow every other thumbnail casts, thrown 2.1x further
+and 2x denser, so the selected workspace reads as *lifted*. gnome-shell's
 `.workspace-thumbnail-indicator` border is dropped.
+
+It was the system **accent colour** from 2026-07-29 until 2026-08-05, and that was a mistake
+worth recording. A drop shadow reads as depth because it is darker than what it falls on;
+recolouring it keeps the shape and discards the reason. With a light accent (`yellow`) the halo
+came out *brighter* than the backdrop, so the one thumbnail meant to be raised was the only one
+not casting a shadow — Gustavo's report was that the selected workspace felt "pushed back rather
+than emphasized", which is exactly backwards. Four intermediate treatments were rendered and
+compared (drop the others' shadows; dim them; tint the active one 42% accent; tint *and* throw
+further, at 1x/1.5x/2x alpha) before landing on no accent at all. **No tint fraction rescues it**:
+above the thumbnail you only ever see the shadow's softness bleed — no shadow shape for a colour
+to live in — so any accent strong enough to be recognisable turns that edge into an outline.
+`set_gnome_accent_color` went with it; the layout no longer has any accent-coloured chrome.
 
 **The row centers the active workspace rather than clamping at its ends** (Gustavo, once the
 strip was workspace-sized): with the active thumbnail pinned to the band's center, the
@@ -1652,7 +1664,8 @@ today.
 
 Gustavo, from live use of the thumb strip: he wants the strip to *be* the app-grid row — same
 content (exposé previews, not raw window positions), same full-width placement, same drop shadow,
-with the accent glow kept on the selected one; and the strip's reorder / close-an-empty
+with the selected one's distinct shadow kept (the accent glow, as it then was); and the strip's
+reorder / close-an-empty
 affordances available on the app-grid row too. "The UX I am looking for is the user can't tell the
 difference between the thumb strip and the workspaces in the app grid, without affecting how the
 overview workspaces work."

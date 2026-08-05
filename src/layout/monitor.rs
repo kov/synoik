@@ -25,7 +25,7 @@ use super::shadow::Shadow;
 use super::thumbnails::{self, Strip};
 use super::tile::Tile;
 use super::workspace::{
-    accent_workspace_shadow_config, compute_working_area, OutputId, Workspace,
+    active_workspace_shadow_config, compute_working_area, OutputId, Workspace,
     WorkspaceAddWindowTarget, WorkspaceId, WorkspaceRenderElement,
 };
 use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options};
@@ -91,8 +91,9 @@ const REFERENCE_PREVIEW_H: f64 = 520.;
 const MIN_WORKSPACE_BACKGROUND_CORNER_RADIUS: f64 = 8.;
 
 /// How far past its band a thumbnail's shadow is allowed to reach, so the active
-/// workspace's accent glow is not cut flat at the thumbnail's top and bottom edges.
-/// Comfortably more than the glow's own extent (softness + spread).
+/// workspace's deeper shadow is not cut flat at the thumbnail's top and bottom edges.
+/// Comfortably more than that shadow's own extent (softness + spread, both already
+/// multiplied by `ACTIVE_SHADOW_REACH`).
 ///
 /// **Adaptive chrome, rule 1 — ramped.**
 const SHADOW_GLOW_MARGIN: f64 = 48.;
@@ -154,14 +155,10 @@ pub struct Monitor<W: LayoutElement> {
     insert_hint_element: InsertHintElement,
     /// Location to render the insert hint element.
     insert_hint_render_loc: Option<InsertHintRenderLoc>,
-    /// The system accent color, kept so [`Self::active_shadow`] can be rebuilt whenever it
-    /// or the view size changes.
-    accent_color: [u8; 3],
     /// The **active** workspace's shadow: the workspace shadow every other workspace casts
-    /// (`Workspace::render_shadow`), in the system accent color. Monitor-owned rather than
-    /// per-workspace because only one workspace wears it at a time, and both rows — the
-    /// small row and the window picker — draw it from here, so the cue cannot differ
-    /// between them. See [`workspace::accent_workspace_shadow_config`].
+    /// (`Workspace::render_shadow`), thrown further and darker. Monitor-owned rather than
+    /// per-workspace because only one workspace wears it at a time. See
+    /// [`workspace::active_workspace_shadow_config`].
     active_shadow: Shadow,
     /// The strip's new-workspace drop placeholder pill (gnome-shell's
     /// `.placeholder`).
@@ -521,11 +518,9 @@ impl<W: LayoutElement> Monitor<W> {
             previous_workspace_id: None,
             insert_hint: None,
             insert_hint_element: InsertHintElement::new(options.layout.insert_hint),
-            accent_color: crate::gnome::ACCENT_BLUE,
-            active_shadow: Shadow::new(accent_workspace_shadow_config(
+            active_shadow: Shadow::new(active_workspace_shadow_config(
                 options.overview.workspace_shadow,
                 view_size,
-                crate::gnome::ACCENT_BLUE,
             )),
             thumb_placeholder: FocusRing::new(thumbnail_placeholder_config()),
             thumb_drag: None,
@@ -1389,17 +1384,13 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn update_render_elements(&mut self, is_active: bool) {
-        // The active workspace's accent shadow, baked exactly as each workspace bakes its
-        // own (`Workspace::update_render_elements`) — same size, same radius — so the two
-        // are interchangeable and both rows can draw either through the same transform.
-        // Rebuilt every frame because the radius rides the overview's opening ramp and the
-        // accent color can change under us at any time.
-        self.active_shadow
-            .update_config(accent_workspace_shadow_config(
-                self.options.overview.workspace_shadow,
-                self.view_size,
-                self.accent_color,
-            ));
+        // The active workspace's shadow, baked exactly as each workspace bakes its own
+        // (`Workspace::update_render_elements`) — same size, same radius — so the two are
+        // interchangeable and both rows can draw either through the same transform. Rebuilt
+        // every frame because the radius rides the overview's opening ramp.
+        let active_config =
+            active_workspace_shadow_config(self.options.overview.workspace_shadow, self.view_size);
+        self.active_shadow.update_config(active_config);
         self.active_shadow.update_render_elements(
             self.view_size,
             true,
@@ -2260,12 +2251,6 @@ impl<W: LayoutElement> Monitor<W> {
         Some(&self.workspaces[idx])
     }
 
-    /// Recolors the accent-colored overview chrome (`org.gnome.desktop.interface
-    /// accent-color`).
-    pub fn set_gnome_accent_color(&mut self, accent: [u8; 3]) {
-        self.accent_color = accent;
-    }
-
     pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
         let prev_render_idx = self.workspace_render_idx();
         self.overview_progress = progress.map(OverviewProgress::from);
@@ -2729,8 +2714,8 @@ impl<W: LayoutElement> Monitor<W> {
         let band_physical = band.to_physical_precise_round(scale);
         // The clip is a *horizontal* concern: it exists to keep the row out of the
         // floating entry's column. A shadow clipped to the band as well is cut flat along
-        // the thumbnail's top and bottom edges, which turns the active workspace's accent
-        // glow into two side stripes — so shadows keep the band's x range and get the
+        // the thumbnail's top and bottom edges, which turns the active workspace's deeper
+        // shadow into two side stripes — so shadows keep the band's x range and get the
         // band's height plus their own reach. It slides with the band, so the strip's
         // entrance still clips correctly.
         let glow_margin = SHADOW_GLOW_MARGIN * overview_layout::chrome_ramp(self.view_size);
@@ -2861,11 +2846,11 @@ impl<W: LayoutElement> Monitor<W> {
             // the very shadow the workspace casts in the window picker, drawn through this
             // miniature's own transform, so the two rows are shadowed alike and the shadow
             // cannot drift from its caster mid-animation. The active workspace gets the
-            // accent one, our replacement for gnome-shell's indicator ring.
+            // deeper one, our replacement for gnome-shell's indicator ring.
             //
             // The crop is expressed in the same pre-transform (workspace) space as the
-            // contents' one above, widened by the glow's reach so the accent halo is not
-            // sliced flat along the band's top and bottom edges.
+            // contents' one above, widened by that shadow's reach so it is not sliced flat
+            // along the band's top and bottom edges.
             let glow_crop = Rectangle::new(
                 Point::from((
                     (glow_bounds_logical.loc.x - thumb.loc.x) / thumb_scale,
@@ -3065,10 +3050,10 @@ impl<W: LayoutElement> Monitor<W> {
                 );
                 push(elem);
             };
-            // Deliberately *not* the accent shadow the small row puts under its active
+            // Deliberately *not* the deeper shadow the small row puts under its active
             // workspace: the row is a switcher, where "this is the one you are on" is
             // worth a cue, while the picker only ever shows one workspace whole and
-            // centered. A halo there is decoration on something already unambiguous.
+            // centered. Lifting it there is decoration on something already unambiguous.
             ws.render_shadow(push_shadow);
         }
     }
@@ -3496,7 +3481,7 @@ fn workspace_render_scale(scroll_position: f64, idx: usize, ramp: f64) -> f64 {
 /// Where a thumbnail is actually *drawn* inside its strip slot: inactive workspaces
 /// shrink about the slot's centre, exactly as they do in the row this strip is modelled
 /// on (`_updateWorkspacesState`, `workspacesView.js:243-266`) — the strip's own "which one
-/// am I on" cue, under the accent glow.
+/// am I on" cue, under the deeper shadow.
 ///
 /// One expression, because the close button has to land on the drawn rect and not on the
 /// slot: the workspaces that grow a close button are the empty ones, which are hardly ever

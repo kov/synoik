@@ -262,8 +262,8 @@ The **thumbnails strip** (gnome-shell's ThumbnailsBox) appears above the
 workspace row once a second desktop is populated (dynamic workspaces with
 more than two workspaces, counting the trailing empty one), sliding in with
 the overview transition. Each thumbnail is the workspace at 5% scale —
-wallpaper and windows at their real positions — with the active one wrapped
-in an accent-blue indicator ring that tracks workspace switches. Clicks
+wallpaper and windows at their real positions — with the active one lifted
+by a deeper, wider drop shadow that tracks workspace switches. Clicks
 follow the same rules as the workspaces (non-active switches and stays,
 active leaves); dragging a window preview onto a thumbnail moves the window
 to that workspace, and dropping it into the gap between two thumbnails
@@ -276,9 +276,9 @@ comes right after the anti-flicker delay, then a 750 ms grace period has
 to pass before each further snap while the pointer stays on the edge (our
 affordance — continuous panning would make aiming at a desktop
 impossible); on the desktop the screen edges keep belonging to edge
-tiling. The indicator ring and other accent chrome follow
-`org.gnome.desktop.interface accent-color` (the shell's palette), updating
-live.
+tiling. The active thumbnail's shadow is deliberately **not** accent-coloured:
+a shadow reads as depth only while it is darker than what it falls on, and a
+light accent inverted the cue.
 
 Not yet ported: preview chrome (title, close button, app icon), the app
 grid, and search.
