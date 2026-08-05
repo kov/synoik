@@ -40,4 +40,4 @@ pub(crate) use frame::{pack_mat3, premultiply, ClipParams};
 pub(crate) use gaussian_backdrop::GaussianBackdrop;
 pub use renderer::{dmabuf_formats, VulkanRenderer};
 pub(crate) use types::GlyphRun;
-pub use types::{VkMapping, VkTexture, NATIVE_FOURCC};
+pub use types::{scanout_spec, ScanoutSpec, VkMapping, VkTexture, NATIVE_FOURCC};

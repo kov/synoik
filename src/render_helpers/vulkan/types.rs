@@ -47,6 +47,48 @@ pub(super) fn matches_render_order(f: Fourcc) -> bool {
 /// out (`render_and_download_as`), which is a GPU blit rather than a CPU pass over the pixels.
 pub const NATIVE_FOURCC: Fourcc = Fourcc::Argb8888;
 
+/// How a scanout buffer of a given fourcc has to be created for this renderer to use it as a
+/// target — the allocation-side twin of [`super::VulkanRenderer`]'s two bind arms.
+///
+/// It exists because we now *allocate* our scanout buffers (`backend::vulkan_scanout`) instead of
+/// asking gbm for them, and an image the renderer cannot bind is a compositor that starts and then
+/// cannot draw. Deriving both sides from one function is what keeps the arms in step: change the
+/// bind path and this stops matching, loudly, in the same file.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanoutSpec {
+    pub format: vk::Format,
+    pub usage: vk::ImageUsageFlags,
+    /// Features the chosen DRM modifier must advertise for the commands the bind path records.
+    /// None of these are guaranteed by the spec for `DRM_FORMAT_MODIFIER_EXT` tiling — see
+    /// `Gpu::check_modifier_features`.
+    pub features: vk::FormatFeatureFlags,
+}
+
+/// The [`ScanoutSpec`] for `f`, or `None` if this renderer cannot scan that fourcc out at all.
+pub fn scanout_spec(f: Fourcc) -> Option<ScanoutSpec> {
+    if matches_render_order(f) {
+        // Rendered into directly: a render-pass attachment we also read back / blit from.
+        return Some(ScanoutSpec {
+            format: IMAGE_VK_FORMAT,
+            usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC,
+            features: vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+                | vk::FormatFeatureFlags::TRANSFER_SRC
+                | vk::FormatFeatureFlags::BLIT_SRC,
+        });
+    }
+    // Present-blit target: the shadow is the attachment, this only receives a reordering blit and
+    // is read back.
+    let (format, _opaque) = import_format(f)?;
+    Some(ScanoutSpec {
+        format,
+        usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
+        features: vk::FormatFeatureFlags::BLIT_DST
+            | vk::FormatFeatureFlags::TRANSFER_SRC
+            | vk::FormatFeatureFlags::BLIT_SRC,
+    })
+}
+
 /// Map a 32-bpp DRM fourcc to the VkFormat that reproduces its byte order when sampled, plus
 /// whether the fourth byte is `X` (undefined) and alpha must be forced to 1.0. Vulkan non-PACK
 /// formats name channels in memory-byte order, so the client's bytes upload verbatim (no CPU

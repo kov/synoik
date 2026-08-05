@@ -1,0 +1,125 @@
+# Scanout allocation: our own Vulkan device, not gbm
+
+**Status: landed 2026-08-05.** `src/backend/vulkan_scanout.rs`, replacing
+`src/backend/scanout_allocator.rs` (deleted) and smithay's `GbmFramebufferExporter` on the scanout
+path. There is no gbm fallback.
+
+## The break this closes
+
+The tty backend allocated its KMS scanout buffers with gbm and imported the exported dmabuf into
+venus (`vkGetMemoryFdPropertiesKHR`). That import only ever worked by a side effect: gbm's dri
+backend follows `MESA_LOADER_DRIVER_OVERRIDE`, and while the session set `=zink`, the buffers gbm
+handed out *were* zink→venus blobs — so the host's venus renderer (vkr) recognized them as its own
+allocations.
+
+On 2026-08-04 the enhanced-tier default flipped the selector to `=virtio_gpu` (GL now rides vrend).
+gbm silently started handing out classic virgl resources, and vkr refuses those:
+
+```
+vkr: failed to query resource props: invalid res_id 9
+  (returning VK_ERROR_INVALID_EXTERNAL_HANDLE, ring stays alive)
+→ error rendering frame: vkGetMemoryFdPropertiesKHR: ERROR_INVALID_EXTERNAL_HANDLE
+```
+
+Every frame, with the host window still showing Plymouth's last frame while the session was
+otherwise alive. The stopgap was to put `MESA_LOADER_DRIVER_OVERRIDE=zink` back
+(`/etc/environment.d/90-limina-zink.conf`) — which re-couples a Vulkan compositor's ability to put a
+pixel on screen to a session-wide env var that selects a **GL** driver, and to guest-zink, which
+limina no longer configures.
+
+The generalisable part: **a compositor that renders in Vulkan should allocate what it renders into.**
+Routing that allocation through a second driver stack makes the two agree only by coincidence, and
+the coincidence is somebody else's default to change.
+
+## What we do instead
+
+Per scanout buffer, on the renderer's own `Gpu` (`Texture::allocate_scanout`, `synoik-vk`):
+
+1. `vkCreateImage` with `tiling = DRM_FORMAT_MODIFIER_EXT`, a
+   `VkImageDrmFormatModifierListCreateInfoEXT` carrying the candidates the *plane* offered, and
+   `VkExternalMemoryImageCreateInfo { handleTypes = DMA_BUF }`. Candidates the device does not
+   enumerate, or that lack the format features the bind path's commands need, are filtered out
+   first — the list create-info gives no way to learn afterwards *why* creation failed.
+2. Dedicated (`VkMemoryDedicatedAllocateInfo`) + exportable (`VkExportMemoryAllocateInfo`)
+   allocation. No `vkGetMemoryFdPropertiesKHR`: that query answers "which heaps can hold this
+   *foreign* handle", and there is no foreign handle — we are creating it.
+3. `vkGetImageDrmFormatModifierPropertiesEXT` for the modifier the driver actually picked. That is
+   what the exported dmabuf names, and therefore what both KMS and the renderer are told.
+4. `vkGetImageSubresourceLayout(VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT)` for offset/rowPitch.
+   **Never `width * 4`** — a driver may pad, and on this stack the value became truthful only with
+   the modifier passthrough in mesa 26.1.5.
+5. `vkGetMemoryFdKHR(DMA_BUF)` for the dmabuf fd. On virtio-gpu this is a prime export of the venus
+   blob GEM — the same handle a venus WSI client hands a compositor, which the whole downstream
+   stack already trusts.
+
+The framebuffer then comes from `PrimeFramebufferExporter`: `drmPrimeFDToHandle` on the KMS fd plus
+`AddFB2` with `DRM_MODE_FB_MODIFIERS`, and the imported GEM handles closed as soon as the FB holds
+its own reference.
+
+### Why the exporter had to be rewritten too
+
+Smithay's `GbmFramebufferExporter` turns a buffer into a `framebuffer::Handle` by importing it
+**back into gbm** (`framebuffer_from_dmabuf` → `dmabuf.import_to(gbm, SCANOUT)`). Handing a venus
+blob to a vrend-gbm is the same driver mismatch in reverse — swapping the allocator alone would have
+moved the failure, not removed it. Smithay ships only gbm and dumb exporters, so this one is ours.
+
+### What still uses gbm
+
+The **cursor plane**. `DrmCompositor` takes a `GbmDevice` purely to allocate CPU-written
+`CURSOR | WRITE` buffers and frame them with `framebuffer_from_bo` on the same device; Vulkan never
+sees them, so none of the above applies. (Today the cursor is software anyway — see the
+cursor-plane-hotspot note.) `Tty::primary_gbm_device` and the headless backend's gbm are likewise
+untouched.
+
+## What we get
+
+- **No env coupling.** Nothing in the scanout path consults `MESA_LOADER_DRIVER_OVERRIDE`, because
+  no GL driver is involved. The zink drop-in is a workaround that can be retired.
+- **Zero-copy present.** A venus-blob framebuffer takes limina's `SET_SCANOUT_BLOB` path: the host
+  resolves the blob's IOSurface and puts it on glass with no copy. A gbm/virgl buffer can never do
+  that for a venus-rendered compositor.
+- **One less import per scanout buffer.** Not yet realised — see "Left on the table".
+
+## Requirements, and what happens when they are missing
+
+`VulkanScanoutAllocator::new` fails compositor start-up if the render device lacks
+`VK_EXT_image_drm_format_modifier`, `VK_EXT_external_memory_dma_buf` or `VK_KHR_external_memory_fd`.
+Per allocation it fails if no offered modifier survives the feature check. Both are deliberate:
+there is no fallback to fall back *to*, and a silent one would reintroduce exactly the class of bug
+this replaces.
+
+Verified present on this stack (2026-08-05, `vulkaninfo` + `drm_info /dev/dri/card0`):
+
+| Requirement | Value |
+| --- | --- |
+| `VK_EXT_image_drm_format_modifier` | rev 2 (real host passthrough), venus / Mesa 26.1.5 |
+| `VK_EXT_external_memory_dma_buf`, `VK_KHR_external_memory_fd` | present |
+| `DRM_CAP_ADDFB2_MODIFIERS` | 1 |
+| primary + cursor plane `IN_FORMATS` | `DRM_FORMAT_MOD_LINEAR` for XRGB/ARGB/XBGR/ABGR8888 |
+| host KosmicKrisp modifiers | LINEAR only |
+
+**LINEAR only** — do not negotiate other modifiers on this stack; the host advertises nothing else.
+KosmicKrisp also wants `rowPitch ≥ 16` and 16-byte alignment, which only bites 1–4 px-wide images;
+real scanouts are fine, and the pitch comes from the query regardless.
+
+## Testing
+
+`vulkan_renders_into_its_own_scanout_dmabuf` (`render_helpers/vulkan/tests.rs`) allocates through
+`VulkanScanoutAllocator`, checks the driver reported its chosen modifier back and that the queried
+pitch covers a row, exports the dmabuf, binds it through the ordinary `Bind<Dmabuf>`, renders the
+solid scene and reads it back. It is the twin of `vulkan_renders_into_a_gbm_dmabuf` and, unlike it,
+does not care which GL driver is selected.
+
+What the headless suite **cannot** cover: `drmModeAddFB2WithModifiers` needs DRM master, so
+`PrimeFramebufferExporter` is only exercised on a real seat. Treat a seat run as the acceptance
+gate, with `SYNOIK_VK_VALIDATION=1` in the session environment.
+
+## Left on the table
+
+**Skip the import on our own buffers.** `DrmCompositor` hands the renderer a `Dmabuf` and
+`import_dmabuf_target` builds a *second* `VkImage` around it, complete with the
+`vkGetMemoryFdPropertiesKHR` this doc says is gone from the allocation path. It is correct — the
+buffer is ours and re-imports fine — but it is redundant: the allocator already holds the `VkImage`
+that memory belongs to. Registering it against the exported dmabuf so `bind()` reuses it would drop
+one image, one memory import and one query per swapchain buffer. Worth doing after the seat
+validates the current shape, not before.

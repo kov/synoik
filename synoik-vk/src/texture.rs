@@ -27,6 +27,22 @@ pub struct Texture {
     pub height: u32,
 }
 
+/// The dmabuf side of a [`Texture::allocate_scanout`] image: the exported handle plus the layout
+/// KMS needs to be told about.
+///
+/// Single plane, because every format this compositor scans out is. The fd is owned — dropping it
+/// closes it, which does **not** free the image's memory (the `VkDeviceMemory` owns that); it only
+/// drops this process's reference to the exported handle.
+#[derive(Debug)]
+pub struct ScanoutExport {
+    pub fd: OwnedFd,
+    /// The modifier the *driver* chose out of the candidate list, read back with
+    /// `vkGetImageDrmFormatModifierPropertiesEXT`.
+    pub modifier: u64,
+    pub offset: u32,
+    pub stride: u32,
+}
+
 /// Unwind guard for [`Texture::upload`]: destroys every handle created so far if a later step
 /// fails, so a mid-build error (e.g. a HOST_VISIBLE staging allocation failing under the Venus
 /// mappable-blob pressure the shm cache targets) doesn't orphan the resource. Each field starts
@@ -535,6 +551,189 @@ impl Texture {
             width,
             height,
         })
+    }
+
+    /// Allocate a **scanout** color target in Vulkan and export it as a dmabuf.
+    ///
+    /// The inverse of [`Self::import_dmabuf_render_target`], and the reason it exists: on a virtio
+    /// stack the *importing* direction only works when whoever allocated the buffer happens to be
+    /// the same driver the Vulkan device is, which for gbm is decided by a session-wide env var
+    /// (`MESA_LOADER_DRIVER_OVERRIDE`) nobody here controls. Allocating on our own device removes
+    /// the question: the memory is ours, and the dmabuf we hand KMS is a prime export of the very
+    /// blob venus rendered into. See `docs/fork/scanout-allocation.md`.
+    ///
+    /// `modifiers` is the candidate list handed to `VkImageDrmFormatModifierListCreateInfoEXT`; the
+    /// driver picks one and [`ScanoutExport::modifier`] reports which. Candidates the device does
+    /// not enumerate — or that lack `required` — are dropped first, because the list create-info
+    /// gives no way to find out afterwards *why* creation failed, and a modifier whose features
+    /// don't cover the commands we record against it is undefined behavior rather than an error
+    /// (same reasoning as [`Gpu::check_modifier_features`], which this calls).
+    ///
+    /// The returned pitch/offset come from `vkGetImageSubresourceLayout` on the memory plane, never
+    /// from `width * 4`: a driver is free to pad, and on this stack the value became truthful only
+    /// with the modifier passthrough in mesa 26.1.5.
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocate_scanout(
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        modifiers: &[u64],
+        required: vk::FormatFeatureFlags,
+        usage: vk::ImageUsageFlags,
+        filter: vk::Filter,
+    ) -> Result<(Texture, ScanoutExport)> {
+        // Same accounting as the import: a DRM-modifier `vkCreateImage` is the expensive one.
+        let _timed = crate::stats::creating();
+        let device = &gpu.device;
+
+        anyhow::ensure!(
+            gpu.supports("VK_EXT_image_drm_format_modifier")
+                && gpu.supports("VK_EXT_external_memory_dma_buf")
+                && gpu.supports("VK_KHR_external_memory_fd"),
+            "this device cannot allocate exportable scanout images: it lacks one of \
+             VK_EXT_image_drm_format_modifier / VK_EXT_external_memory_dma_buf / \
+             VK_KHR_external_memory_fd",
+        );
+
+        let usable: Vec<u64> = modifiers
+            .iter()
+            .copied()
+            .filter(|m| gpu.check_modifier_features(format, *m, required).is_ok())
+            .collect();
+        anyhow::ensure!(
+            !usable.is_empty(),
+            "no candidate DRM modifier for {format:?} supports {required:?} on this device \
+             (asked about {modifiers:x?})",
+        );
+
+        let mut mod_info =
+            vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&usable);
+        let mut ext_info = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut ext_info)
+            .push_next(&mut mod_info);
+        let mut guard = TextureGuard::new(device);
+        let image =
+            unsafe { device.create_image(&image_ci, None) }.context("create scanout image")?;
+        guard.image = image;
+
+        let mem_req = unsafe { device.get_image_memory_requirements(image) };
+        // No `vkGetMemoryFdPropertiesKHR` narrowing here — that query answers "which heaps can hold
+        // *this foreign handle*", and there is no foreign handle: we are about to create the
+        // handle. The image's own requirements are the whole constraint.
+        let mem_type =
+            gpu.find_memory_type(mem_req.memory_type_bits, vk::MemoryPropertyFlags::empty())?;
+
+        // Dedicated + exportable. Dedicated is effectively required for an exported image on this
+        // stack, and it is also what makes the exported fd name exactly this image's storage rather
+        // than a suballocation of something larger.
+        let mut export_info = vk::ExportMemoryAllocateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_req.size)
+            .memory_type_index(mem_type)
+            .push_next(&mut export_info)
+            .push_next(&mut dedicated);
+        let memory = unsafe { device.allocate_memory(&alloc_info, None) }
+            .context("allocate exportable scanout memory")?;
+        guard.memory = memory;
+        unsafe { device.bind_image_memory(image, memory, 0) }
+            .context("bind scanout image memory")?;
+
+        // Which of `usable` the driver actually picked. There is no other way to learn it, and the
+        // dmabuf we hand KMS has to name it.
+        let ext_mod = ash::ext::image_drm_format_modifier::Device::new(&gpu.instance, device);
+        let mut props = vk::ImageDrmFormatModifierPropertiesEXT::default();
+        unsafe { ext_mod.get_image_drm_format_modifier_properties(image, &mut props) }
+            .context("vkGetImageDrmFormatModifierPropertiesEXT")?;
+        let modifier = props.drm_format_modifier;
+
+        // Memory plane 0, not colour plane 0: for `DRM_FORMAT_MODIFIER_EXT` tiling the layout is
+        // queried per *memory* plane, and the aspect mask is the only thing that says which.
+        let layout = unsafe {
+            device.get_image_subresource_layout(
+                image,
+                vk::ImageSubresource {
+                    aspect_mask: vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
+                    mip_level: 0,
+                    array_layer: 0,
+                },
+            )
+        };
+
+        let ext_fd = ash::khr::external_memory_fd::Device::new(&gpu.instance, device);
+        let get_fd = vk::MemoryGetFdInfoKHR::default()
+            .memory(memory)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        // Ownership transfers to us: `vkGetMemoryFdKHR` creates a new fd per call, and closing it
+        // does not free the memory (the `VkDeviceMemory` still owns that).
+        let fd = unsafe { ext_fd.get_memory_fd(&get_fd) }.context("vkGetMemoryFdKHR")?;
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        const VIEWABLE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+            vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw()
+                | vk::ImageUsageFlags::SAMPLED.as_raw()
+                | vk::ImageUsageFlags::STORAGE.as_raw()
+                | vk::ImageUsageFlags::INPUT_ATTACHMENT.as_raw(),
+        );
+        let view = if usage.intersects(VIEWABLE) {
+            let view_ci = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(COLOR_RANGE);
+            let view = unsafe { device.create_image_view(&view_ci, None) }
+                .context("scanout image view")?;
+            guard.view = view;
+            view
+        } else {
+            vk::ImageView::null()
+        };
+
+        // Unused (a scanout target is never sampled), kept so this fits `Texture`.
+        let sampler_ci = vk::SamplerCreateInfo::default()
+            .mag_filter(filter)
+            .min_filter(filter)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        let sampler = unsafe { device.create_sampler(&sampler_ci, None) }.context("sampler")?;
+        guard.sampler = sampler;
+
+        guard.disarm();
+        Ok((
+            Texture {
+                image,
+                view,
+                sampler,
+                memory,
+                width,
+                height,
+            },
+            ScanoutExport {
+                fd,
+                modifier,
+                offset: layout.offset as u32,
+                stride: layout.row_pitch as u32,
+            },
+        ))
     }
 
     /// Import a foreign (GBM-allocated) dmabuf as a **renderable** color target: a

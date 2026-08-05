@@ -12,7 +12,7 @@ use std::num::NonZeroU64;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{io, mem};
 
@@ -22,10 +22,9 @@ use drm_ffi::drm_mode_modeinfo;
 use libc::dev_t;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::format::FormatSet;
-use smithay::backend::allocator::gbm::{GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::{Format, Fourcc};
+use smithay::backend::allocator::gbm::GbmDevice;
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
-use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, NodeType, VrrSupport,
 };
@@ -67,7 +66,7 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
 use super::{IpcOutputMap, RenderResult};
 use crate::backend::backlight::{BacklightMonitor, Backlights};
-use crate::backend::scanout_allocator::ScanoutAllocator;
+use crate::backend::vulkan_scanout::{PrimeFramebufferExporter, VulkanScanoutAllocator};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::frame_log::Phase;
@@ -120,9 +119,12 @@ pub struct Tty {
     pub backlights: Backlights,
 }
 
-type GbmDrmCompositor = DrmCompositor<
-    ScanoutAllocator,
-    GbmFramebufferExporter<DrmDeviceFd>,
+/// The scanout pipeline: buffers allocated on the renderer's own Vulkan device, framebuffers made
+/// by PRIME-importing them onto the KMS fd. Neither end goes through gbm — see
+/// [`crate::backend::vulkan_scanout`] for why.
+type ScanoutDrmCompositor = DrmCompositor<
+    VulkanScanoutAllocator,
+    PrimeFramebufferExporter,
     (OutputPresentationFeedback, Duration),
     DrmDeviceFd,
 >;
@@ -138,8 +140,9 @@ pub struct OutputDevice {
     // See https://github.com/Smithay/smithay/issues/1102.
     drm: DrmDevice,
     gbm: GbmDevice<DrmDeviceFd>,
-    // For display-only devices this will be the allocator from the primary device.
-    allocator: ScanoutAllocator,
+    // Allocates this device's scanout buffers on the renderer's Vulkan device. Display-only
+    // devices share it: there is one render device, and its buffers are what KMS displays.
+    allocator: VulkanScanoutAllocator,
 
     pub drm_lease_state: Option<DrmLeaseState>,
     non_desktop_connectors: HashSet<(connector::Handle, crtc::Handle)>,
@@ -372,7 +375,7 @@ struct TtyOutputState {
 
 struct Surface {
     name: OutputName,
-    compositor: GbmDrmCompositor,
+    compositor: ScanoutDrmCompositor,
     connector: connector::Handle,
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     gamma_props: Option<GammaProps>,
@@ -497,9 +500,9 @@ impl Tty {
         // Bring up the owned Vulkan renderer on the device backing the primary render node — the
         // same node we advertise to clients in dmabuf feedback, so their buffers are allocated for
         // the device we actually render on. (Picking by device-type rank instead, as this used to,
-        // happens to agree on a single-GPU machine and silently disagrees on any other.) GBM
-        // buffers allocated by `device.allocator` are imported into it via `Bind<Dmabuf>` for
-        // scanout.
+        // happens to agree on a single-GPU machine and silently disagrees on any other.) Its
+        // device is also what allocates the scanout buffers (`backend::vulkan_scanout`), which are
+        // then bound back into it via `Bind<Dmabuf>`.
         //
         // It is the only renderer, so failing to build it fails the backend rather than quietly
         // falling back.
@@ -920,15 +923,15 @@ impl Tty {
             }
         }
 
-        let allocator_gbm = if render_node.is_some() {
-            gbm.clone()
-        } else if let Some(primary_device) = self.devices.get(&self.primary_node) {
-            primary_device.gbm.clone()
-        } else {
-            bail!("no allocator available for device");
-        };
-        let gbm_flags = GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT;
-        let allocator = ScanoutAllocator::new(allocator_gbm, gbm_flags);
+        // Scanout buffers come from the renderer's device, not from this DRM device's gbm. That
+        // makes the display-only case fall out for free — there was never more than one device
+        // rendering, and a buffer this one merely displays is still allocated where it is drawn.
+        let renderer_gpu = self
+            .vulkan_renderer
+            .as_ref()
+            .map(|vk| vk.gpu().clone())
+            .context("no Vulkan renderer to allocate scanout buffers on")?;
+        let allocator = VulkanScanoutAllocator::new(renderer_gpu, Some(self.primary_render_node))?;
 
         let token = synoik
             .event_loop
@@ -1442,30 +1445,25 @@ impl Tty {
             output.user_data().insert_if_missing(|| PanelOrientation(x));
         }
 
-        // The owned Vulkan renderer's importable/scanout formats (LINEAR 8888): Venus GBM
-        // allocates LINEAR buffers and Vulkan dmabuf import needs an explicit modifier. The
-        // renderer renders RGBA-order buffers (Abgr/Xbgr) directly and BGRA-order ones (Argb/Xrgb
-        // — the usual KMS primary-plane byte order) via a present-blit. DrmCompositor intersects
+        // The owned Vulkan renderer's importable/scanout formats (LINEAR 8888 — all Venus exposes).
+        // The renderer renders BGRA-order buffers (Argb/Xrgb, the usual KMS primary-plane order)
+        // directly and RGBA-order ones (Abgr/Xbgr) via a present-blit. DrmCompositor intersects
         // these with the plane's formats and `SUPPORTED_COLOR_FORMATS` to pick the buffer format,
-        // then allocates via `device.allocator` and imports each into the renderer via `Bind`.
-        //
-        // The scanout set additionally carries the INVALID entries, because a driver with
-        // `fb_modifiers_not_supported` (upstream virtio-gpu) advertises no modifiers at all and
-        // smithay synthesizes INVALID for every plane format — without them the intersection is
-        // empty and the compositor cannot be created. INVALID never reaches clients: they are
-        // advertised `owned_vulkan_dmabuf_formats()`, which we can import as given.
+        // then allocates via `device.allocator` and binds each into the renderer.
         //
         // The GLES path used to filter CCS modifiers out of the EGL set here for bandwidth
         // reasons; LINEAR-only sidesteps that entirely.
-        let render_formats = owned_vulkan_scanout_formats();
+        let render_formats = owned_vulkan_dmabuf_formats();
 
-        // Create the compositor.
+        // Create the compositor. `gbm` here is only the *cursor*-plane allocator (CPU-written
+        // CURSOR buffers that KMS reads and Vulkan never touches), which is why it survives the
+        // move off gbm for scanout.
         let res = DrmCompositor::new(
             OutputModeSource::Auto(output.downgrade()),
             surface,
             None,
             device.allocator.clone(),
-            GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
+            PrimeFramebufferExporter::new(device.render_node),
             SUPPORTED_COLOR_FORMATS,
             // This is only used to pick a good internal format, so it can use the surface's render
             // formats, even though we only ever render on the primary GPU.
@@ -1474,9 +1472,9 @@ impl Tty {
             Some(device.gbm.clone()),
         );
 
-        // The GLES path's retry-with-invalid-modifier fallback does not apply: INVALID is already
-        // in the scanout set above, and an implicit allocation that comes back non-linear is
-        // rejected by `ScanoutAllocator` rather than papered over. Surface the error instead.
+        // The GLES path's retry-with-invalid-modifier fallback does not apply: every format here
+        // names LINEAR explicitly, and INVALID is refused at allocation rather than papered over.
+        // Surface the error instead.
         let mut compositor =
             res.context("error creating DRM compositor for the Vulkan renderer")?;
 
@@ -1902,7 +1900,7 @@ impl Tty {
             // Hardware cursor, overlay, and primary-plane direct scanout all work with the owned
             // Vulkan renderer because those scanout paths bypass the renderer entirely: the cursor
             // goes into DrmCompositor's own gbm Argb8888/Linear buffer (CPU copy or its internal
-            // pixman renderer), and overlay/primary scan a client's dmabuf straight to KMS via gbm.
+            // pixman renderer), and overlay/primary scan a client's dmabuf straight to KMS.
             // `render_frame` only needs `Renderer + Bind<Dmabuf>` (the primary swapchain), which we
             // satisfy. A fullscreen client reaches the compositor as a bare
             // `WaylandSurfaceRenderElement` (no clip/border/rounding wrapper), whose
@@ -1912,11 +1910,12 @@ impl Tty {
             // on resume the reported damage is computed against exactly the frame the
             // shadow holds (the age-1 superset invariant is preserved), and the present
             // blit is clipped to freshly-written pixels regardless. The BGRA-only
-            // primary plane also guarantees colour safety: gbm only frames a client
-            // buffer whose format the plane lists (Argb/Xrgb8888), so an RGBA-order
-            // client can't be misinterpreted (it falls back to compositing). So
-            // mirror the GLES flags in full. Overlay stays behind `debug.enable_overlay_planes`
-            // (off by default, same as GLES); `debug.disable_direct_scanout` drops primary+overlay.
+            // primary plane also guarantees colour safety: `PrimeFramebufferExporter`
+            // only frames a client buffer whose format the plane lists (Argb/Xrgb8888),
+            // so an RGBA-order client can't be misinterpreted (it falls back to
+            // compositing). So mirror the GLES flags in full. Overlay stays behind
+            // `debug.enable_overlay_planes` (off by default, same as GLES);
+            // `debug.disable_direct_scanout` drops primary+overlay.
             let flags =
                 compositor_frame_flags(&config, synoik, output, /* allow_primary */ true);
             render_surface_with(
@@ -2815,56 +2814,8 @@ fn owned_vulkan_dmabuf_formats() -> FormatSet {
     crate::render_helpers::vulkan::dmabuf_formats()
 }
 
-/// The formats the renderer can bind as a **scanout target**, for `DrmCompositor`'s negotiation
-/// with the plane. This is [`owned_vulkan_dmabuf_formats`] plus an INVALID entry per fourcc.
-///
-/// INVALID belongs here and nowhere else. A KMS driver that supports no modifiers offers plane
-/// formats only as INVALID, so without these entries the intersection with the renderer's formats
-/// is empty and there is no pipeline at all. What comes back from such an allocation is a buffer
-/// gbm laid out implicitly, which [`ScanoutAllocator`] proves is linear before we import it.
-///
-/// Clients keep getting [`owned_vulkan_dmabuf_formats`]: a client's INVALID buffer has no such
-/// proof behind it, so `import_dmabuf_as_texture` still refuses it.
-fn owned_vulkan_scanout_formats() -> FormatSet {
-    scanout_formats(force_implicit_modifiers())
-}
-
-/// `SYNOIK_KMS_IMPLICIT_MODIFIERS=1` drops the explicit entries from the scanout set, so the
-/// compositor negotiates INVALID with the plane even on a driver that does name modifiers.
-///
-/// That is the whole implicit path — implicit gbm allocation, its layout check, a modifier-less
-/// `AddFB2`, the renderer's substitution — exercised on hardware that still has the explicit one
-/// to fall back to. Without it the only way to test the implicit path is to boot a kernel that
-/// cannot do anything else.
-fn force_implicit_modifiers() -> bool {
-    static FORCE: OnceLock<bool> = OnceLock::new();
-    *FORCE.get_or_init(|| {
-        let force = std::env::var_os("SYNOIK_KMS_IMPLICIT_MODIFIERS").is_some_and(|x| x == "1");
-        if force {
-            warn!(
-                "SYNOIK_KMS_IMPLICIT_MODIFIERS=1: negotiating scanout without explicit modifiers"
-            );
-        }
-        force
-    })
-}
-
-fn scanout_formats(force_implicit: bool) -> FormatSet {
-    let explicit = owned_vulkan_dmabuf_formats();
-    let implicit = explicit.iter().map(|f| Format {
-        code: f.code,
-        modifier: Modifier::Invalid,
-    });
-
-    if force_implicit {
-        implicit.collect()
-    } else {
-        explicit.iter().copied().chain(implicit).collect()
-    }
-}
-
 fn surface_dmabuf_feedback(
-    compositor: &GbmDrmCompositor,
+    compositor: &ScanoutDrmCompositor,
     primary_formats: FormatSet,
     primary_render_node: DrmNode,
     surface_render_node: Option<DrmNode>,
@@ -3908,52 +3859,8 @@ mod tests {
     use synoik_ipc::{HSyncPolarity, VSyncPolarity};
 
     use crate::backend::tty::{
-        calculate_drm_mode_from_modeline, calculate_mode_cvt, owned_vulkan_dmabuf_formats,
-        scanout_formats, Format, Modifier,
+        calculate_drm_mode_from_modeline, calculate_mode_cvt, owned_vulkan_dmabuf_formats, Modifier,
     };
-
-    /// A KMS driver that names no modifiers (upstream virtio-gpu) offers its plane formats only as
-    /// INVALID, and `DrmCompositor` intersects those with what we pass it. Drop the INVALID
-    /// entries and that intersection is empty on such a driver — no scanout pipeline at all — so
-    /// this pins them in place.
-    #[test]
-    fn scanout_formats_cover_implicit_planes() {
-        let scanout = scanout_formats(false);
-
-        for explicit in owned_vulkan_dmabuf_formats() {
-            assert!(
-                scanout.contains(&explicit),
-                "scanout formats must keep the explicit {explicit:?}"
-            );
-            let implicit = Format {
-                code: explicit.code,
-                modifier: Modifier::Invalid,
-            };
-            assert!(
-                scanout.contains(&implicit),
-                "scanout formats must offer {:?} implicitly too",
-                explicit.code
-            );
-        }
-    }
-
-    /// The INVALID entries are for plane negotiation only. Advertising them to clients would
-    /// invite buffers whose layout nothing has verified, and `import_dmabuf_as_texture` rejects
-    /// those — so the client-facing set stays explicit.
-    /// `SYNOIK_KMS_IMPLICIT_MODIFIERS=1` has to leave the plane nothing explicit to agree on, or
-    /// the negotiation keeps picking LINEAR and the switch tests nothing.
-    #[test]
-    fn forced_implicit_scanout_formats_are_invalid_only() {
-        let forced = scanout_formats(true);
-
-        assert_eq!(
-            forced.iter().count(),
-            owned_vulkan_dmabuf_formats().iter().count()
-        );
-        for format in forced.iter() {
-            assert_eq!(format.modifier, Modifier::Invalid, "{format:?}");
-        }
-    }
 
     #[test]
     fn client_formats_stay_explicit() {

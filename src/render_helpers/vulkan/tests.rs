@@ -2456,6 +2456,130 @@ fn vulkan_renders_into_a_gbm_dmabuf() {
     );
 }
 
+/// The same round trip as `vulkan_renders_into_a_gbm_dmabuf`, but with the buffer allocated on the
+/// renderer's **own** device instead of by gbm — the scanout path the tty backend actually uses
+/// (`backend::vulkan_scanout`). This is the test the gbm one could never be: it does not care which
+/// GL driver `MESA_LOADER_DRIVER_OVERRIDE` selects, because no GL driver is involved.
+///
+/// It proves the four things the allocator has to get right, and each of them fails differently:
+/// the image is creatable with a modifier *list* (not an explicit layout we made up), the driver's
+/// chosen modifier comes back, `vkGetImageSubresourceLayout` reports a pitch that covers the row,
+/// and the exported fd re-imports through the ordinary `Bind<Dmabuf>` — which is what KMS and the
+/// renderer will both do with it.
+#[test]
+fn vulkan_renders_into_its_own_scanout_dmabuf() {
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::{Allocator, Buffer as _, Modifier};
+
+    use crate::backend::vulkan_scanout::VulkanScanoutAllocator;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_renders_into_its_own_scanout_dmabuf: no Vulkan device ({e})"
+            );
+            return;
+        }
+    };
+
+    let mut alloc = match VulkanScanoutAllocator::new(vk.gpu().clone(), None) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("skipping vulkan_renders_into_its_own_scanout_dmabuf: {e:#}");
+            return;
+        }
+    };
+    let buffer = match alloc.create_buffer(W as u32, H as u32, NATIVE_FOURCC, &[Modifier::Linear]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_renders_into_its_own_scanout_dmabuf: cannot allocate \
+                 {NATIVE_FOURCC:?} LINEAR ({e})"
+            );
+            return;
+        }
+    };
+
+    assert_eq!(buffer.format().code, NATIVE_FOURCC);
+    assert_eq!(
+        buffer.format().modifier,
+        Modifier::Linear,
+        "the driver must report back the modifier it chose from the candidate list",
+    );
+
+    let mut dmabuf = buffer
+        .export()
+        .expect("export the scanout buffer as a dmabuf");
+    let stride = dmabuf.strides().next().expect("one plane");
+    assert!(
+        stride >= W as u32 * 4,
+        "the queried row pitch ({stride}) cannot be narrower than a row of {W} 32-bpp pixels; \
+         a padded pitch is fine, a short one means we read the layout wrong",
+    );
+    eprintln!(
+        "own scanout dmabuf: {:?} {}x{} modifier {:?} stride {stride} on {}",
+        dmabuf.format().code,
+        dmabuf.width(),
+        dmabuf.height(),
+        dmabuf.format().modifier,
+        vk.device_name(),
+    );
+
+    let elements = solid_scene();
+    let size = Size::<i32, Physical>::from((W, H));
+    let scale = Scale::<f64>::from(1.0);
+
+    let mut fb = vk
+        .bind(&mut dmabuf)
+        .expect("bind our own dmabuf as a target");
+    {
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(CLEAR), &[Rectangle::from_size(size)])
+            .expect("clear");
+        for e in &elements {
+            let geo = Element::geometry(e, scale);
+            RenderElement::<VulkanRenderer>::draw(
+                e,
+                &mut frame,
+                Element::src(e),
+                geo,
+                &[Rectangle::from_size(geo.size)],
+                &[],
+                None,
+            )
+            .expect("draw solid");
+        }
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((W, H)));
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+
+    let red = [204, 26, 26, 255];
+    let green = [26, 179, 51, 255];
+    let grey = [64, 64, 64, 255];
+    assert!(
+        close_px(px(&pixels, W / 4, H / 2), red, 3),
+        "left half should be red, got {:?}",
+        px(&pixels, W / 4, H / 2),
+    );
+    assert!(
+        close_px(px(&pixels, 3 * W / 4, H / 4), green, 3),
+        "top-right should be green, got {:?}",
+        px(&pixels, 3 * W / 4, H / 4),
+    );
+    assert!(
+        close_px(px(&pixels, 3 * W / 4, 3 * H / 4), grey, 3),
+        "bottom-right should be the clear color, got {:?}",
+        px(&pixels, 3 * W / 4, 3 * H / 4),
+    );
+}
+
 // --- client dmabuf import cache: reuse the imported image across commits, evict freed buffers ----
 
 /// The client-dmabuf import cache (`import_dmabuf_as_texture`) keeps a client's imported

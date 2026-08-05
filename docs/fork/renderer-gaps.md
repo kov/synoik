@@ -216,63 +216,27 @@ Keep JXL decode on the CPU; make it decode *less*.
 
 ---
 
-## 10. Implicit-modifier KMS — supported, at the cost of client direct scanout
+## 10. Implicit-modifier KMS — CLOSED 2026-08-05, by not using gbm
 
-Upstream virtio-gpu sets `mode_config.fb_modifiers_not_supported` (`virtgpu_display.c`), which means
-three things at once: `DRM_CAP_ADDFB2_MODIFIERS` reads 0, no plane carries an `IN_FORMATS` blob, and
-`drmModeAddFB2` rejects `DRM_MODE_FB_MODIFIERS`. Smithay then synthesizes `Modifier::Invalid` for
-every plane format, so nothing explicit is left for `DrmCompositor` to agree on. This VM ran a
-patched kernel that advertised LINEAR purely to keep us working; that patch is no longer needed.
+Upstream virtio-gpu used to set `mode_config.fb_modifiers_not_supported` (`virtgpu_display.c`), which
+meant three things at once: `DRM_CAP_ADDFB2_MODIFIERS` read 0, no plane carried an `IN_FORMATS` blob,
+and `drmModeAddFB2` rejected `DRM_MODE_FB_MODIFIERS`. Smithay then synthesized `Modifier::Invalid`
+for every plane format, leaving nothing explicit for `DrmCompositor` to agree on, and
+`VK_EXT_image_drm_format_modifier` has no encoding for INVALID. A whole apparatus existed to bridge
+that: `backend/scanout_allocator.rs` recovered the modifier gbm implicitly chose,
+`owned_vulkan_scanout_formats()` added INVALID entries to the negotiation, and
+`SYNOIK_KMS_IMPLICIT_MODIFIERS=1` forced the path on so it could be tested.
 
-`DRM_FORMAT_MOD_INVALID` is not a layout — it means the two sides agree out of band — and
-`VK_EXT_image_drm_format_modifier` has no encoding for it, so an implicit buffer cannot simply be
-handed to the importer. KMS does not need one named: implicit means gbm and the kernel driver of the
-same device agree, and we allocate with `SCANOUT`, so whatever gbm picks is by construction
-scannable. The renderer does. So the buffer keeps **gbm's** answer rather than smithay's mask.
+**All of it is gone.** The guest kernel has advertised `IN_FORMATS` with `DRM_FORMAT_MOD_LINEAR`
+since `7.1.6-2.limina16k`, so negotiation never lands on INVALID; and scanout buffers are no longer
+allocated by gbm at all. See `docs/fork/scanout-allocation.md` for what replaced it and why the
+replacement is about far more than modifiers — the gbm dependency was a latent break tied to a *GL*
+driver-selection env var, and it fired.
 
-- `backend/scanout_allocator.rs` wraps `GbmAllocator`. For an INVALID-only request it allocates
-  through gbm's pre-modifier entry point and builds the `GbmBuffer` with `implicit = false`, so the
-  modifier gbm chose survives into the exported dmabuf. It refuses only the case where gbm itself
-  reports INVALID — nothing can name that layout — and warns once if the layout is not LINEAR.
-- `owned_vulkan_scanout_formats()` adds the INVALID entries to what `DrmCompositor` negotiates with.
-  Client feedback keeps only the explicit set — a client's INVALID buffer was allocated by someone
-  else with no layout we can recover, and `import_dmabuf_as_texture` still rejects it.
-- `import_dmabuf_target` errors on INVALID instead of guessing a layout. Our own buffers never
-  arrive that way; anything that does has bypassed the allocator.
-
-**Do not "fix" this by demanding LINEAR.** With no kernel patch, gbm is free to hand back a tiled
-`SCANOUT|RENDERING` buffer, and tiled/tiled is a perfectly working pipeline — refusing it turns a
-correct configuration into a compositor that will not start. It would not catch the failure that
-actually hurts either (a buffer *misreported* as linear scans out as garbage whichever rule we
-write). Whether the renderer can use the layout is Vulkan's question: `check_modifier` queries the
-driver's features for that exact modifier and fails closed, so an unusable layout surfaces as a
-named import error rather than a wrong picture.
-
-Two costs of keeping the real modifier on the buffer: KMS takes `AddFB2` *with* `MODIFIERS` first
-and gets EINVAL, falling back to smithay's legacy `AddFB` (one failed ioctl per swapchain buffer,
-one "using legacy fbadd" warning per session — not per frame); and if Venus enumerates no features
-for the modifier gbm chose, startup fails at the import. If that happens, the fix is to steer the
-allocation (gbm's `USE_LINEAR` flag, as mutter does for cross-device buffers), not to refuse it here.
-
-**What is lost.** Direct scanout of *client* buffers is impossible on such a driver: smithay refuses
-to hand KMS an INVALID buffer (weston's reasoning — an unknown layout can display garbage), and an
-explicit-modifier `AddFB2` is rejected by the driver. The Vulkan path already passes
-`allow_primary = false` (§9), so nothing regresses today; it does mean §9 cannot be finished on an
-unpatched virtio-gpu. Cursor-plane scanout survives via smithay's legacy `AddFB` fallback (one
-"using legacy fbadd" warning per session). The compositor's own scanout buffers are unaffected —
-implicit allocation gives the driver's best layout, which here is the same LINEAR we asked for
-before.
-
-**Testing it without a kernel rebuild:** `SYNOIK_KMS_IMPLICIT_MODIFIERS=1` drops the explicit entries
-from the scanout set, so negotiation lands on INVALID even on a driver that does name modifiers.
-Seat run 2026-08-04: session came up clean, validation layer silent, picture correct.
-
-Be careful what that proves. It covers negotiation, implicit allocation, keeping gbm's modifier, and
-the import — **all carrying a LINEAR buffer**, because while the patches are in, several layers force
-LINEAR and Venus enumerates no other modifier for these formats (`cargo run -p synoik-vk` probes: one
-modifier, `0x0`). It does *not* cover the modifier-less `AddFB2` fallback, which never engages while
-the driver still accepts modifiers, and it says nothing about what gbm picks once those layers stop
-forcing linear. Both only get a real check on the deployed VMM/mesa/kernel.
+What survives from this section is the rule, which is unchanged and now enforced in one place: a
+dmabuf with modifier INVALID is never handed to KMS and never imported. Weston's reasoning — an
+unknown layout displays garbage — is why, and `PrimeFramebufferExporter` refuses it outright rather
+than falling back to a modifier-less `AddFB2`.
 
 ---
 
