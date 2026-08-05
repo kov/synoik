@@ -577,10 +577,51 @@ impl State {
             ImEvent::DeleteSurrounding { offset, n_chars } => {
                 self.delete_surrounding(offset, n_chars)
             }
-            // Slice 4 territory: a key the engine handed back or synthesized.
-            ImEvent::ForwardKey { .. } => {}
-            ImEvent::RequireSurrounding => {}
+            ImEvent::ForwardKey { keycode, press, .. } => self.forward_engine_key(keycode, press),
+            // The engine wants surrounding text. We send it whenever the client gives us some,
+            // so the useful answer is to resend what we have rather than ask the client again —
+            // `zwp_text_input_v3` has no way to request it, the client volunteers it.
+            ImEvent::RequireSurrounding => {
+                if let Some((text, cursor)) = self.synoik.im_surrounding.clone() {
+                    if let Some(im) = self.synoik.input_method.as_mut() {
+                        im.send(ImRequest::Surrounding {
+                            text,
+                            cursor,
+                            anchor: cursor,
+                        });
+                    }
+                }
+            }
         }
+    }
+
+    /// Deliver a key the engine synthesized or handed back.
+    ///
+    /// It goes straight out rather than back through the filter: it is already the input
+    /// method's verdict, so re-offering it would loop. Clutter marks the re-injected event
+    /// `CLUTTER_EVENT_FLAG_INPUT_METHOD` and checks that flag before consulting the input method
+    /// at all (`clutter-input-method.c:522`); bypassing the filter is the same guard without the
+    /// round trip.
+    ///
+    /// xkb state is deliberately untouched. This key never went through `input_intercept`, and a
+    /// synthesized modifier that updated our state would leave it stuck: nothing will ever
+    /// deliver the matching release.
+    fn forward_engine_key(&mut self, evcode: u32, press: bool) {
+        let keyboard = self.synoik.seat.get_keyboard().unwrap();
+        let state = if press {
+            KeyState::Pressed
+        } else {
+            KeyState::Released
+        };
+        keyboard.input_forward(
+            self,
+            // IBus hands back evdev codes; xkb wants them plus 8 (`inputMethod.js:192`).
+            Keycode::new(evcode.saturating_add(8)),
+            state,
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+            crate::utils::get_monotonic_time().as_millis() as u32,
+            false,
+        );
     }
 
     /// Send finished text to the focused client.

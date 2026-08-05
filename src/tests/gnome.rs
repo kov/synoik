@@ -3365,6 +3365,36 @@ fn disabling_text_input_delivers_the_keys_still_in_flight() {
     );
 }
 
+/// A key the engine hands back reaches the client as an ordinary key event, and does not loop
+/// back into the engine that produced it.
+#[test]
+fn a_key_forwarded_by_the_engine_reaches_the_client_once() {
+    use crate::dbus::ibus::ImEvent;
+    use crate::input_method::ImUpdate;
+
+    let (mut f, id, requests) = im_fixture();
+
+    // IBus counts in evdev codes, which is what the client sees too.
+    f.synoik_state()
+        .on_im_update(ImUpdate::Event(ImEvent::ForwardKey {
+            keyval: 0x61,
+            keycode: KEY_A,
+            state: 0,
+            press: true,
+        }));
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![(KEY_A, WlKeyState::Pressed)],
+        "a forwarded key must reach the client"
+    );
+    assert!(
+        requests.try_recv().is_err(),
+        "a forwarded key must not be offered back to the engine that sent it"
+    );
+}
+
 /// A compositor keybinding still resolves while a text input is focused, and the key it claimed
 /// is never offered to the engine — the deliberate ordering divergence from mutter, which
 /// consults the input method first (`events.c:168` vs `:262`).
