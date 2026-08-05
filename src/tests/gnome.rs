@@ -2963,6 +2963,91 @@ fn dragging_maximized_window_shakes_loose_after_threshold() {
     );
 }
 
+/// mutter's three passive window button grabs are Mod+LMB to move, Mod+MMB to
+/// resize and Mod+RMB for the window menu (`window.c:7743-7844`;
+/// `meta_prefs_get_mouse_button_resize` returns 2 unless `resize-with-right-button`).
+/// The resize edges come from which third of the frame the press lands in
+/// (`window.c:7795-7807`).
+#[test]
+fn super_middle_drag_resizes_from_the_pressed_corner() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let (x, y) = focused_window_pos(&mut f);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    // Press in the bottom-right third of the frame: south|east edges.
+    pointer_motion_to(&mut f, x + 700., y + 550.);
+    f.key_press(KEY_LEFTMETA);
+    f.pointer_button(BTN_MIDDLE, ButtonState::Pressed);
+    f.pointer_motion(100., 100.);
+    f.double_roundtrip(id);
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        configures.contains("size: 900 × 700"),
+        "Mod+MMB in the bottom-right third must resize from that corner, got: {configures}"
+    );
+
+    f.pointer_button(BTN_MIDDLE, ButtonState::Released);
+    f.key_release(KEY_LEFTMETA);
+}
+
+/// The centre third of the frame has no edges, so mutter starts no grab there
+/// (`op != META_GRAB_OP_WINDOW_BASE`, `window.c:7809`).
+#[test]
+fn super_middle_drag_in_the_frame_centre_does_not_resize() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let (x, y) = focused_window_pos(&mut f);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    pointer_motion_to(&mut f, x + 400., y + 300.);
+    f.key_press(KEY_LEFTMETA);
+    f.pointer_button(BTN_MIDDLE, ButtonState::Pressed);
+    f.pointer_motion(100., 100.);
+    f.double_roundtrip(id);
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        !configures.contains("size: 900 × 700"),
+        "the centre third has no resize edges, got: {configures}"
+    );
+
+    f.pointer_button(BTN_MIDDLE, ButtonState::Released);
+    f.key_release(KEY_LEFTMETA);
+}
+
+/// Mod+RMB is mutter's window-menu button, not a resize (niri's mapping). The
+/// menu itself is not ported yet, so the press must simply not resize.
+#[test]
+fn super_right_drag_does_not_resize() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let (x, y) = focused_window_pos(&mut f);
+    let _ = f.client(id).window(&surface).recent_configures();
+
+    pointer_motion_to(&mut f, x + 700., y + 550.);
+    f.key_press(KEY_LEFTMETA);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+    f.pointer_motion(100., 100.);
+    f.double_roundtrip(id);
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        !configures.contains("size: 900 × 700"),
+        "Mod+RMB must not resize, got: {configures}"
+    );
+
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+    f.key_release(KEY_LEFTMETA);
+}
+
 /// The overview is GNOME's window picker (Experiment 1): windows spread into
 /// slots computed by gnome-shell's layout strategy (`src/layout/expose.rs`),
 /// hit-testing follows the slots, and clicking a preview activates that

@@ -6988,44 +6988,6 @@ impl State {
                 }
             }
 
-            if button == Some(MouseButton::Middle) && !pointer.is_grabbed() && mod_down {
-                let output_ws = if is_overview_open {
-                    self.synoik.workspace_under_cursor(true)
-                } else {
-                    // We don't want to accidentally "catch" the wrong workspace during
-                    // animations.
-                    self.synoik.output_under_cursor().and_then(|output| {
-                        let mon = self.synoik.layout.monitor_for_output(&output)?;
-                        Some((output, mon.active_workspace_ref()))
-                    })
-                };
-
-                if let Some((output, ws)) = output_ws {
-                    let ws_id = ws.id();
-
-                    self.synoik.layout.focus_output(&output);
-
-                    let location = pointer.current_location();
-                    let start_data = PointerGrabStartData {
-                        focus: None,
-                        button: button_code,
-                        location,
-                    };
-                    let grab = SpatialMovementGrab::new(start_data, output, ws_id, false);
-                    pointer.set_grab(self, grab, serial, Focus::Clear);
-                    self.synoik
-                        .cursor_manager
-                        .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
-
-                    // FIXME: granular.
-                    self.synoik.queue_redraw_all();
-
-                    // Don't activate the window under the cursor to avoid unnecessary
-                    // scrolling when e.g. Mod+MMB clicking on a partially off-screen window.
-                    return;
-                }
-            }
-
             // A press on a strip thumbnail takes a grab, so the release can tell a
             // workspace reorder from a plain click (divergence, see `ThumbGrab`). It comes
             // before the window check because a thumbnail is drawn over the picker, and
@@ -7101,8 +7063,11 @@ impl State {
                         }
                     }
                 }
-                // Check if we need to start an interactive resize.
-                else if button == Some(MouseButton::Right) && !pointer.is_grabbed() && mod_down {
+                // Check if we need to start an interactive resize. Mutter's passive button
+                // grabs are Mod+LMB to move, Mod+MMB to resize and Mod+RMB for the window
+                // menu (`window.c:7743-7844`, `meta_prefs_get_mouse_button_resize` defaults
+                // to button 2). The window menu is not ported yet, so Mod+RMB is inert.
+                else if button == Some(MouseButton::Middle) && !pointer.is_grabbed() && mod_down {
                     let location = pointer.current_location();
                     let (output, pos_within_output) = self.synoik.output_under(location).unwrap();
                     let edges = self

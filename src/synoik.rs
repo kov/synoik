@@ -8887,7 +8887,7 @@ impl Synoik {
         else if let Some((w, HitType::Input { win_pos })) = &self.pointer_contents.window {
             if w == &mapped.window {
                 // Grabs can modify the pointer focus, making it different from
-                // pointer_contents. Notably, gestures like Mod+MMB will remove the pointer
+                // pointer_contents. Notably, gestures like a Mod+MMB resize will remove the pointer
                 // focus, and ClickGrab will keep pointer focus on the clicked window even
                 // while it's moving over a different window.
                 //
