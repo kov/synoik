@@ -1,7 +1,7 @@
 # StatusNotifierItem / AppIndicator support
 
-**Status: S1–S3 landed (`efcf7245`, `185bd399`, `990d60c0`) — indicators register and draw, in
-all three icon forms.** The rest of this document is the plan.
+**Status: S1–S4 landed (`efcf7245`, `185bd399`, `990d60c0`, `93eb3be4`) — indicators register and
+draw in all three icon forms, and `widget::Menu` exists.** The rest of this document is the plan.
 
 ## Why this one has no GNOME reference
 
@@ -136,18 +136,22 @@ upload-once-then-reuse and the dead-device guard, or every frame pays a submit +
 aspect and is letterboxed in the slot, no special case. And a themed name stays tinted to the panel
 foreground while a pixmap or file keeps the client's colours: it is the app's artwork, not a glyph.
 
-### S4 — The data-driven menu widget
+### S4 — The data-driven menu widget ✅ (`93eb3be4`)
 `widget::Menu`: rows from a model, separators, submenus, checkmark/radio state, per-row icon,
 insensitive rows, keyboard navigation. Rendered inside the existing `PanelPopover` as a new
 `PopoverContent` variant. No D-Bus in this slice — drive it from a fixture tree so the widget is
 testable on its own, then port `app_menu.rs` onto it as proof the abstraction holds.
 
-**The open design question is the submenu model, and it should be settled first.** The extension
-renders a submenu as GNOME's inline-expanding `PopupSubMenuMenuItem` (`dbusMenu.js:590-591`,
-`:616-620`) — one surface that grows. The alternative is a cascading child surface. That choice
-decides whether `widget::Menu` needs several popover surfaces and a grab that spans them, or one
-surface with a dynamic height and therefore a scroll clip. Keyboard navigation across submenus
-falls out of the same decision. Both belong in this slice's cost.
+**Settled: submenus expand in place** (decision 2026-08-04), as GNOME's `PopupSubMenuMenuItem`
+does (`popupMenu.js:1308`; shipped in `status/keyboard.js` and `status/network.js`) and as the
+extension renders them (`dbusMenu.js:590-591`, `:616-620`). One surface, one grab, and it matches
+every other menu in the shell — which matters more here than usual, because this widget now backs
+`app_menu` too. A cascading second popover is what these clients' native toolkits do, but it needs
+a grab spanning two surfaces and per-level edge-clamping.
+
+**Left over from this slice: a menu taller than the screen does not scroll.** Inline expansion is
+what makes that reachable, so it is the first thing to add before S5 puts real client menus
+through it; until then a deep expansion clips at the screen edge.
 
 ### S5 — The DBusMenu client
 `GetLayout` at depth −1 for the initial tree, `AboutToShow` before opening any submenu **and on
