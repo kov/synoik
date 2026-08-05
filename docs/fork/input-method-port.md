@@ -147,7 +147,7 @@ renders fine headless — the blank-GPU-client caveat does not apply to it.
 | Focus | Offered to the engine | Delivered by |
 |---|---|---|
 | `ImFocus::Client` | every key that reached the forward point | `input_forward` |
-| `ImFocus::Shell(_)` | presses carrying text, plus any key during a composition | the entry's own handler |
+| `ImFocus::Shell(_)` | presses carrying text **or beginning a composition**, plus any key during one | the entry's own handler |
 | `ImFocus::None` | nothing | unchanged |
 
 The shell path is narrower on purpose. Those entries sit at the bottom of ladders that fall
@@ -155,6 +155,21 @@ through — the overview search gives way to grid navigation, then to hardcoded 
 fall-through has to produce a `FilterResult` synchronously. Deferring a key that *might* fall
 through would mean reimplementing each ladder in the delivery path. Deferring only what the entry
 is certain to consume costs nothing, because an engine has no use for the rest.
+
+**`dead_acute.key_char()` is `None`.** Gating on "carries text" therefore drops the very key a
+dead-key sequence starts with, which is why `begins_composition` (xkb's contiguous `dead_*` block
+plus `Multi_key`) is not optional. This shipped broken once: the lock screen and polkit entries
+did not compose, while the overview search *appeared* to work because a key with no text falls
+past the search block and reaches the generic client-forward path, which offers everything. An
+entry that intercepts unconditionally has no such accident to fall back on.
+
+The corpus missed it too, because the `Fixture` keymap is plain `us` — where the apostrophe key
+is an ordinary character, so a dead-key test quietly becomes a plain-typing one. Use
+`use_us_intl(&mut f)` and assert the keysym, or the test is not testing what it says.
+
+Also settled while chasing it: **IBus composes normally under `PASSWORD` and `PIN` content
+types** — announcing the password purpose does not disable the engine. `examples/ibus_password_probe.rs`
+is that experiment, kept because it was the first (wrong) theory and is cheap to re-run.
 
 `ImFocus` exists because a modal dialog can open over a client whose text input is still enabled.
 GNOME has the same single-focus rule for free: `ClutterInputMethod` holds one
