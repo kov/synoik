@@ -149,9 +149,11 @@ every other menu in the shell — which matters more here than usual, because th
 `app_menu` too. A cascading second popover is what these clients' native toolkits do, but it needs
 a grab spanning two surfaces and per-level edge-clamping.
 
-**Left over from this slice: a menu taller than the screen does not scroll.** Inline expansion is
-what makes that reachable, so it is the first thing to add before S5 puts real client menus
-through it; until then a deep expansion clips at the screen edge.
+**Scrolling landed after the fact** (`7398db88`): a menu grows to its caller's cap — the monitor's
+work area, as `panelMenu.js:168-186` does — and scrolls past it, with the keyboard dragging the view
+along. What is still missing is a **scrollbar**: a long menu gives no hint there is more below it.
+GNOME's overlay scrollbars only appear on hover, so this is a smaller gap than it sounds, but it is
+open.
 
 ### S5 — The DBusMenu client
 `GetLayout` at depth −1 for the initial tree, `AboutToShow` before opening any submenu **and on
