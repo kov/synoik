@@ -1,8 +1,9 @@
 # StatusNotifierItem / AppIndicator support
 
-**Status: S1–S6 landed — indicators register, draw in all three icon forms, and take clicks,
-middle clicks and scrolls; a primary click opens the client's remote menu or activates it,
-per `ItemIsMenu`.** What is left is S7: validation on the seat against real clients.
+**Status: S1–S6 landed and seat-validated (2026-08-04).** Indicators register, draw in all three
+icon forms, and take clicks, middle clicks and scrolls; a primary click opens the client's remote
+menu or activates it, per `ItemIsMenu`; a window opened from an icon is placed under it. S7 ran
+against three real clients — see below. The remaining backlog is at the end of this document.
 
 ## Why this one has no GNOME reference
 
@@ -196,11 +197,31 @@ dispatcher, and the scroll branch in `on_scroll_axis`. Three things worth keepin
   `Activate` must not hold up the next one's click; but the activation token has to be *with* the
   client before the event that raises the window, so that pair stays sequential.
 
-### S7 — Live validation on the seat
+### S7 — Live validation on the seat ✅ (partial)
 The corpus can prove the wire and the widget; it cannot prove that Steam's menu is usable. Run
 the seat session against a spread of real clients — one Electron (Nextcloud), one Qt/KDE
 (KeePassXC), one Ayatana (Syncthing), one that is notoriously non-conforming (Dropbox) — and
 check icon, menu, activation and teardown for each.
+
+**Ran 2026-08-04 against Nextcloud, KeePassXC and Syncthing.** Icon, menu, activation and the
+click ladder were correct for all three. Findings:
+
+- **The accepted `Activate`-no-op risk did not materialise.** Nextcloud declares `Activate`,
+  leaves `ItemIsMenu` false, and the call really does open its window — so the left click is not
+  swallowed, and no client demoted itself via `UnknownMethod`.
+- **Window placement works for Syncthing, not for Nextcloud** — and the reason is *not* the
+  sandbox. Nextcloud drops the token we hand it and **mints its own** through `xdg_activation`,
+  which is the behavior already noted for Discord and Telegram in `handlers/mod.rs:811`. A
+  self-minted token carries nothing tying it to the icon, and the sandbox has already broken the
+  PID link, so there is no signal left. Known limitation, not a bug to chase: any heuristic loose
+  enough to catch it would also capture unrelated windows.
+- **Dropbox was not tested** and should be replaced on this list by a stub client — see the
+  backlog. Its two documented quirks are both implemented and both currently unexercised.
+
+**A process trap that cost a round trip:** the seat session was running a *deleted* binary
+(`/proc/<pid>/exe -> ... (deleted)`), so the first "clicking does nothing" report was stale code,
+not a defect. `cargo test` never relinks `target/debug/synoik`. Check the inode before debugging
+anything live.
 
 ---
 
@@ -343,3 +364,31 @@ losing the open submenu or the pointer's row.
 - Submenus: inline-expanding (one surface, like the extension and like GNOME's own menus) or
   cascading child surfaces (like Plasma, and like every toolkit menu these clients were designed
   against)? Decides the shape of `widget::Menu` and how far the grab has to reach. See S4.
+
+---
+
+## Backlog (deferred 2026-08-04)
+
+Ranked by what would actually be worth doing first.
+
+1. **A stub client for the non-conforming quirks.** The two Dropbox-named behaviors —
+   `AboutToShow` replying `()` instead of `(b)`, and the root `AboutToShow(0)` being required
+   before the layout is valid — are implemented and **nothing exercises them**. A ~80-line stub
+   exporting `org.kde.StatusNotifierItem` + `com.canonical.dbusmenu` reproduces both
+   deterministically, which an install of Dropbox never could (proprietary, needs an account,
+   cannot be scripted into a failure). This is the real coverage gap.
+2. **Icon update coalescing.** The extension rate-limits icon rebuilds to 30 ms
+   (`appIndicator.js:43`); our equivalent cost is a texture upload, which is worse. Identical
+   icons are already free — the store compares pixmaps by hash and skips the redraw, and
+   Nextcloud's journal shows it re-sending the same hash repeatedly — but an icon that genuinely
+   animates (a sync progress spinner) is one upload per change. Per
+   `docs/fork/frame-submit-discipline.md` those uploads belong in the frame's own submit.
+3. **Non-square icons.** `indicator-multiload` sends a wide strip and expects its aspect ratio
+   kept (`appIndicator.js:1174`, `width >= height * 1.5`, and only for icons that resolved to a
+   file path). We would squash it into a square. No client on the seat exercises this.
+4. **No scrollbar on a long menu** (`src/ui/widget/menu.rs:33`). The menu scrolls; it just has no
+   visible indication that it can. GNOME's overlay scrollbars only appear on hover, so the gap is
+   smaller than it sounds.
+5. **The two open questions above** — whether the cluster shares `.panel-status-indicators-box`
+   with the quick-settings icons, and ordering (registration order today, which is stable within
+   a session but not across boots).
