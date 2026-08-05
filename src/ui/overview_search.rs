@@ -299,6 +299,11 @@ impl OverviewSearch {
         self.edit.text()
     }
 
+    /// The editing model itself — what the clipboard bindings need (the selection).
+    pub fn edit(&self) -> &TextEdit {
+        &self.edit
+    }
+
     /// Whether the entry is (or is becoming) the full pill rather than the resting puck.
     pub fn is_expanded(&self) -> bool {
         self.expanded

@@ -47,6 +47,10 @@ use wayland_client::globals::Global;
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
+use wayland_client::protocol::wl_data_device::{self, WlDataDevice};
+use wayland_client::protocol::wl_data_device_manager::WlDataDeviceManager;
+use wayland_client::protocol::wl_data_offer::WlDataOffer;
+use wayland_client::protocol::wl_data_source::{self, WlDataSource};
 use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_output::{self, WlOutput};
@@ -87,6 +91,15 @@ pub struct State {
     pub screencopy_manager: Option<ZwlrScreencopyManagerV1>,
     /// The in-flight wlr-screencopy capture, if any. One at a time is enough for tests.
     pub screencopy: Option<ScreencopyCapture>,
+
+    pub data_device_manager: Option<WlDataDeviceManager>,
+    /// The seat's data device, once [`Client::offer_clipboard`] made one.
+    pub data_device: Option<WlDataDevice>,
+    /// The selection this client is offering, and what it writes when asked for it.
+    pub data_source: Option<WlDataSource>,
+    pub selection_payload: Vec<u8>,
+    /// Mime types the compositor asked this client's source for, in order.
+    pub selection_sends: Vec<String>,
 
     pub text_input_manager: Option<ZwpTextInputManagerV3>,
     /// The text-input object, once [`Client::create_text_input`] made one.
@@ -241,6 +254,36 @@ impl fmt::Display for LayerConfigure {
 }
 
 impl Client {
+    /// Take the clipboard, offering `payload` under each of `mime_types` — a real client-owned
+    /// selection, which the compositor can only read back over a pipe.
+    ///
+    /// The client must have keyboard focus: smithay drops `set_selection` from anyone else
+    /// (`data_device/device.rs:148-160`). The serial is unchecked there, so 0 will do.
+    pub fn offer_clipboard(&mut self, mime_types: &[&str], payload: &[u8]) {
+        let manager = self
+            .state
+            .data_device_manager
+            .clone()
+            .expect("compositor advertises wl_data_device_manager");
+        let seat = self.state.seat.clone().expect("seat");
+        let qh = self.state.qh.clone();
+
+        let device = self
+            .state
+            .data_device
+            .get_or_insert_with(|| manager.get_data_device(&seat, &qh, ()))
+            .clone();
+        let source = manager.create_data_source(&qh, ());
+        for mime in mime_types {
+            source.offer((*mime).to_owned());
+        }
+        device.set_selection(Some(&source), 0);
+
+        self.state.data_source = Some(source);
+        self.state.selection_payload = payload.to_vec();
+        self.connection.flush().unwrap();
+    }
+
     /// Create a `zwp_text_input_v3` on this client's seat.
     ///
     /// The compositor only sends `enter` when something is acting as the input method, so a
@@ -306,6 +349,11 @@ impl Client {
         let state = State {
             qh: qh.clone(),
             globals: Vec::new(),
+            data_device_manager: None,
+            data_device: None,
+            data_source: None,
+            selection_payload: Vec::new(),
+            selection_sends: Vec::new(),
             text_input_manager: None,
             text_input: None,
             text_input_events: Vec::new(),
@@ -859,6 +907,9 @@ impl Dispatch<WlRegistry, ()> for State {
                     let version = min(version, WlOutput::interface().version);
                     let output = registry.bind(name, version, qh, ());
                     state.outputs.insert(output, String::new());
+                } else if interface == WlDataDeviceManager::interface().name {
+                    let version = min(version, WlDataDeviceManager::interface().version);
+                    state.data_device_manager = Some(registry.bind(name, version, qh, ()));
                 } else if interface == ZwpTextInputManagerV3::interface().name {
                     let version = min(version, ZwpTextInputManagerV3::interface().version);
                     state.text_input_manager = Some(registry.bind(name, version, qh, ()));
@@ -1243,6 +1294,68 @@ pub enum TextInputEvent {
         after_length: u32,
     },
     Done(u32),
+}
+
+impl Dispatch<WlDataDeviceManager, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlDataDeviceManager,
+        _event: <WlDataDeviceManager as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // The manager has no events.
+    }
+}
+
+impl Dispatch<WlDataDevice, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlDataDevice,
+        _event: <WlDataDevice as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // Offers coming *back* to this client are not what these tests are about.
+    }
+
+    wayland_client::event_created_child!(State, WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (WlDataOffer, ()),
+    ]);
+}
+
+impl Dispatch<WlDataOffer, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlDataOffer,
+        _event: <WlDataOffer as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WlDataSource, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &WlDataSource,
+        event: <WlDataSource as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let wl_data_source::Event::Send { mime_type, fd } = event {
+            state.selection_sends.push(mime_type);
+            // Write and close: the reader is waiting on EOF, and an fd left open here would
+            // hold the compositor's paste open until its timeout.
+            let mut file = std::fs::File::from(fd);
+            use std::io::Write as _;
+            let _ = file.write_all(&state.selection_payload);
+        }
+    }
 }
 
 impl Dispatch<ZwpTextInputManagerV3, ()> for State {

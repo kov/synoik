@@ -13824,6 +13824,298 @@ fn overview_search_ctrl_backspace_deletes_a_word() {
     );
 }
 
+// ---- Clipboard (`st-entry.c:656-740`) ----
+
+const KEY_C: u32 = 46;
+const KEY_X: u32 = 45;
+const KEY_INSERT: u32 = 110;
+
+/// Tap `key` with Ctrl held.
+fn ctrl_tap(f: &mut Fixture, key: u32) {
+    f.key_press(KEY_LEFTCTRL);
+    tap(f, key);
+    f.key_release(KEY_LEFTCTRL);
+}
+
+/// What the compositor currently owns the clipboard with, as text — `None` when a client owns
+/// it or it is empty.
+fn clipboard_text(f: &mut Fixture) -> Option<String> {
+    use smithay::wayland::selection::data_device::current_data_device_selection_userdata;
+
+    let bytes = current_data_device_selection_userdata(&f.synoik().seat)?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Put text on the clipboard the way a copy does, so a paste has something to find.
+fn seed_clipboard(f: &mut Fixture, text: &str) {
+    let mime = crate::clipboard::TEXT_MIME_TYPES
+        .iter()
+        .map(|m| (*m).to_owned())
+        .collect();
+    f.synoik()
+        .set_clipboard(mime, text.as_bytes().to_vec().into());
+}
+
+/// `Ctrl-c` copies the selection and leaves the entry alone; `Ctrl-x` copies and deletes it.
+/// Both offer GNOME's three text mime types (`st-clipboard.c:49-53`).
+#[test]
+fn ctrl_c_copies_and_ctrl_x_cuts_the_selection() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+
+    for key in [KEY_A, KEY_W] {
+        tap(&mut f, key);
+    }
+    assert_eq!(f.synoik().run_dialog.entry(), "aw");
+
+    ctrl_tap(&mut f, KEY_A); // select all
+    ctrl_tap(&mut f, KEY_C);
+    assert_eq!(clipboard_text(&mut f).as_deref(), Some("aw"));
+    assert_eq!(
+        f.synoik().clipboard_mime_types,
+        crate::clipboard::TEXT_MIME_TYPES,
+        "a copy offers the mime types GNOME's own clipboard does"
+    );
+    assert_eq!(
+        f.synoik().run_dialog.entry(),
+        "aw",
+        "a copy must not touch the text"
+    );
+
+    ctrl_tap(&mut f, KEY_X);
+    assert_eq!(clipboard_text(&mut f).as_deref(), Some("aw"));
+    assert_eq!(
+        f.synoik().run_dialog.entry(),
+        "",
+        "a cut deletes what it copied"
+    );
+}
+
+/// With nothing selected there is nothing to copy, and the clipboard is left as it was —
+/// St's `if (text && strlen (text))` guard.
+#[test]
+fn a_copy_with_no_selection_leaves_the_clipboard_alone() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+    seed_clipboard(&mut f, "keep me");
+
+    tap(&mut f, KEY_A);
+    ctrl_tap(&mut f, KEY_C);
+    assert_eq!(clipboard_text(&mut f).as_deref(), Some("keep me"));
+    ctrl_tap(&mut f, KEY_X);
+    assert_eq!(clipboard_text(&mut f).as_deref(), Some("keep me"));
+    assert_eq!(f.synoik().run_dialog.entry(), "a", "and nothing was cut");
+}
+
+/// `Ctrl-v` and `Shift-Insert` both paste, through the entry's own text path.
+#[test]
+fn ctrl_v_and_shift_insert_paste_into_an_entry() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+    seed_clipboard(&mut f, "gedit");
+
+    ctrl_tap(&mut f, KEY_V);
+    assert_eq!(f.synoik().run_dialog.entry(), "gedit");
+
+    f.key_press(KEY_LEFTSHIFT);
+    tap(&mut f, KEY_INSERT);
+    f.key_release(KEY_LEFTSHIFT);
+    assert_eq!(
+        f.synoik().run_dialog.entry(),
+        "geditgedit",
+        "Shift-Insert is a paste too (st-entry.c:669-670)"
+    );
+}
+
+/// A paste replaces the selection, the way typing does — `st_entry_clipboard_callback` deletes
+/// the selection before inserting (`st-entry.c:610-611`).
+#[test]
+fn a_paste_replaces_the_selection() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+
+    for key in [KEY_A, KEY_W] {
+        tap(&mut f, key);
+    }
+    ctrl_tap(&mut f, KEY_A);
+    seed_clipboard(&mut f, "zz");
+    ctrl_tap(&mut f, KEY_V);
+    assert_eq!(f.synoik().run_dialog.entry(), "zz");
+}
+
+/// Our divergence: a paste is capped at [`PASTE_LIMIT`] and only its first line goes in. These
+/// entries hold a query, a command, a folder name or a password — never a document.
+#[test]
+fn a_paste_is_capped_and_single_line() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+
+    seed_clipboard(&mut f, "first\nsecond\nthird");
+    ctrl_tap(&mut f, KEY_V);
+    assert_eq!(
+        f.synoik().run_dialog.entry(),
+        "first",
+        "lines after the first are dropped, not glued on"
+    );
+
+    f.synoik().run_dialog.close();
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+    let huge = "x".repeat(crate::clipboard::PASTE_LIMIT * 2);
+    seed_clipboard(&mut f, &huge);
+    ctrl_tap(&mut f, KEY_V);
+    assert_eq!(
+        f.synoik().run_dialog.entry().len(),
+        crate::clipboard::PASTE_LIMIT,
+        "a runaway clipboard is truncated at the cap"
+    );
+}
+
+/// A masked field never yields its contents to the clipboard
+/// (`clutter_text_get_password_char () == 0` guards both copy and cut, `st-entry.c:692,717`)
+/// — but pasting *into* one is unguarded, because that is how a password manager is used.
+#[test]
+fn a_password_entry_refuses_copy_and_cut_but_accepts_a_paste() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    f.synoik_state().update_keyboard_focus();
+
+    seed_clipboard(&mut f, "hunter2");
+    ctrl_tap(&mut f, KEY_V);
+    assert_eq!(
+        f.synoik().unlock_dialog.entry().text(),
+        "hunter2",
+        "a paste into a password field is not guarded"
+    );
+
+    ctrl_tap(&mut f, KEY_A); // select all
+    seed_clipboard(&mut f, "unchanged");
+    ctrl_tap(&mut f, KEY_C);
+    assert_eq!(
+        clipboard_text(&mut f).as_deref(),
+        Some("unchanged"),
+        "a copy out of a password field must be refused"
+    );
+    ctrl_tap(&mut f, KEY_X);
+    assert_eq!(
+        clipboard_text(&mut f).as_deref(),
+        Some("unchanged"),
+        "and so must a cut"
+    );
+    assert_eq!(
+        f.synoik().unlock_dialog.entry().text(),
+        "hunter2",
+        "a refused cut must not delete either — it is claimed, and inert"
+    );
+}
+
+/// The real path: the clipboard belongs to a *client*, so the data only arrives over a pipe the
+/// compositor hands out and then reads asynchronously. Everything above short-circuits through
+/// the compositor-owned selection instead and would not notice this breaking.
+#[test]
+fn a_paste_reads_a_clients_selection_over_the_pipe() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    map_focused_window(&mut f, id);
+    f.client(id).get_keyboard();
+    f.roundtrip(id);
+
+    // The client must hold keyboard focus to set the selection, so this happens before the
+    // modal dialog opens.
+    f.client(id)
+        .offer_clipboard(&["text/plain;charset=utf-8"], b"from the client\n");
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.synoik().clipboard_mime_types,
+        vec!["text/plain;charset=utf-8".to_owned()],
+        "the compositor caches what the new owner offers"
+    );
+
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+    ctrl_tap(&mut f, KEY_V);
+    assert_eq!(
+        f.synoik().run_dialog.entry(),
+        "",
+        "nothing lands synchronously — the client has not written yet"
+    );
+
+    // Pump both sides until the transfer completes: the client has to receive `send`, write and
+    // close, and only then does the compositor's fd source see the data and the EOF.
+    for _ in 0..50 {
+        f.double_roundtrip(id);
+        if !f.synoik().run_dialog.entry().is_empty() {
+            break;
+        }
+    }
+    assert_eq!(f.synoik().run_dialog.entry(), "from the client");
+    assert_eq!(
+        f.client(id).state.selection_sends,
+        vec!["text/plain;charset=utf-8".to_owned()],
+        "and it asked for the mime type it picked"
+    );
+    assert!(
+        !f.synoik().clipboard_paste_pending,
+        "the in-flight flag must be cleared, or every later paste is dropped"
+    );
+}
+
+/// Pasting an image (the clipboard a screenshot leaves behind) into a text entry does nothing:
+/// there is no text mime type to ask for. GNOME's `pick_mimetype` returns NULL the same way.
+#[test]
+fn a_non_text_clipboard_pastes_nothing() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+
+    f.synoik()
+        .set_clipboard(vec!["image/png".to_owned()], b"\x89PNG".to_vec().into());
+    ctrl_tap(&mut f, KEY_V);
+    assert_eq!(f.synoik().run_dialog.entry(), "");
+}
+
+/// The clipboard reaches the two entries that sit at the bottom of a fall-through ladder too —
+/// they never go through `deliver_shell_key`, so they ask for the bindings themselves.
+#[test]
+fn the_overview_search_copies_and_pastes() {
+    let (mut f, _rec) = search_overview(&[&["a.desktop"]]);
+
+    seed_clipboard(&mut f, "aw");
+    // The entry is closed and empty, so a Ctrl-v falls through to the overview's own binds —
+    // gnome-shell's entry has no key focus yet either.
+    ctrl_tap(&mut f, KEY_V);
+    assert_eq!(f.synoik().overview_search.query(), "");
+
+    tap(&mut f, KEY_A);
+    ctrl_tap(&mut f, KEY_V);
+    assert_eq!(
+        f.synoik().overview_search.query(),
+        "aaw",
+        "once the search is engaged the entry takes the paste"
+    );
+
+    ctrl_tap(&mut f, KEY_A); // select all
+    ctrl_tap(&mut f, KEY_X);
+    assert_eq!(clipboard_text(&mut f).as_deref(), Some("aaw"));
+    assert_eq!(f.synoik().overview_search.query(), "");
+}
+
 /// Home/arrows move a real caret, so typing lands mid-string instead of always appending.
 #[test]
 fn overview_search_caret_moves_and_types_mid_string() {

@@ -970,26 +970,13 @@ impl State {
 
     /// Put finished text into one of the compositor's own entries.
     ///
-    /// Delivered as one synthetic keystroke per character rather than through a new
-    /// insert-a-string API on each entry. Every entry already has a text path with its own
-    /// side effects — the search re-runs its query, the password entries clear the last error —
-    /// and routing through it means composed text behaves exactly like typed text, because it
-    /// *is* the same path. `raw: None` marks it as carrying no keysym, so nothing downstream
-    /// mistakes an accented character for a binding.
+    /// Delivered as one synthetic keystroke per character (see
+    /// [`State::type_into_shell_entry`], which a paste shares) rather than through a new
+    /// insert-a-string API on each entry.
     fn commit_into_shell_entry(&mut self, entry: ShellEntry, text: &str) {
         self.clear_preedit();
 
-        let theme = self.synoik.gnome_settings.key_theme;
-        for ch in text.chars() {
-            self.deliver_shell_key(ShellKey {
-                entry,
-                raw: None,
-                text: Some(ch),
-                mods: crate::ui::text_edit::EditMods::default(),
-                theme,
-                pressed: true,
-            });
-        }
+        self.type_into_shell_entry(entry, text);
 
         if let Some(im) = self.synoik.input_method.as_mut() {
             im.preedit = None;

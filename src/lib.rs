@@ -17,6 +17,7 @@ pub mod backlight;
 pub mod brightness;
 pub mod calendar_events;
 pub mod cli;
+pub mod clipboard;
 pub mod cursor;
 #[cfg(feature = "dbus")]
 pub mod dbus;

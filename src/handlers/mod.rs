@@ -60,7 +60,7 @@ use smithay::wayland::selection::primary_selection::{
 use smithay::wayland::selection::wlr_data_control::{
     DataControlHandler as WlrDataControlHandler, DataControlState as WlrDataControlState,
 };
-use smithay::wayland::selection::{SelectionHandler, SelectionTarget};
+use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::session_lock::{
     LockSurface, SessionLockHandler, SessionLockManagerState, SessionLocker,
 };
@@ -292,6 +292,22 @@ delegate_virtual_keyboard_manager!(State);
 
 impl SelectionHandler for State {
     type SelectionUserData = Arc<[u8]>;
+
+    /// Remember what the new clipboard owner offers.
+    ///
+    /// Smithay tracks the selection but has no accessor for its mime types, and a paste into
+    /// one of the compositor's own entries has to pick one *before* it can ask for the data.
+    /// `None` is a clear, which leaves nothing to paste.
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        if ty == SelectionTarget::Clipboard {
+            self.synoik.clipboard_mime_types = source.map(|s| s.mime_types()).unwrap_or_default();
+        }
+    }
 
     fn send_selection(
         &mut self,

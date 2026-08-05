@@ -273,6 +273,18 @@ impl State {
             pressed,
         } = key;
 
+        // Copy/cut/paste come first. In GNOME they are `StEntry`'s, reached only once
+        // `ClutterText` has declined the event (`st-entry.c:656-740`) — but nothing in
+        // `TextEdit` claims `Ctrl-c`/`Ctrl-x`/`Ctrl-v` or `Insert` in either key theme, so the
+        // order is unobservable and this is the one place all five entries pass through.
+        if pressed {
+            if let Some(action) = crate::clipboard::ClipboardAction::from_key(raw, mods) {
+                self.shell_clipboard_action(entry, action);
+                self.synoik.queue_redraw_all();
+                return;
+            }
+        }
+
         match entry {
             ShellEntry::Shield => self.on_shield_key(raw, text, mods),
             ShellEntry::RunDialog => {
@@ -1259,6 +1271,18 @@ impl State {
                                 this.synoik.suppressed_keys.insert(key_code);
                                 return FilterResult::Intercept(None);
                             }
+                            // Clipboard bindings, which `rename_key` would return `Ignored` for.
+                            // Unlike the three modal entries this site never reaches
+                            // `deliver_shell_key`, so it asks here — see that function for why
+                            // the check comes before the entry rather than after it.
+                            if let Some(action) =
+                                crate::clipboard::ClipboardAction::from_key(raw, edit_mods(mods))
+                            {
+                                this.shell_clipboard_action(ShellEntry::FolderRename, action);
+                                this.synoik.suppressed_keys.insert(key_code);
+                                this.synoik.queue_redraw_all();
+                                return FilterResult::Intercept(None);
+                            }
                             match this.synoik.folder_dialog.rename_key(
                                 raw,
                                 text,
@@ -1314,6 +1338,19 @@ impl State {
                                 key_code,
                             ) {
                                 this.synoik.suppressed_keys.insert(key_code);
+                                return FilterResult::Intercept(None);
+                            }
+                            // As at the rename entry above: this site never goes through
+                            // `deliver_shell_key`, so the clipboard bindings are asked here.
+                            // Note the `active || expanded` gate above means a `Ctrl-v` with the
+                            // search closed still falls through to the overview's own binds,
+                            // which is what gnome-shell does — its entry has no key focus yet.
+                            if let Some(action) =
+                                crate::clipboard::ClipboardAction::from_key(raw, edit_mods(mods))
+                            {
+                                this.shell_clipboard_action(ShellEntry::OverviewSearch, action);
+                                this.synoik.suppressed_keys.insert(key_code);
+                                this.synoik.queue_redraw_all();
                                 return FilterResult::Intercept(None);
                             }
                             let outcome = this.synoik.overview_search.handle_key(

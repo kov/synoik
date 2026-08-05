@@ -120,6 +120,11 @@ impl RunDialog {
         self.entry.text()
     }
 
+    /// The editing model itself — what the clipboard bindings need (the selection).
+    pub fn edit(&self) -> &TextEdit {
+        &self.entry
+    }
+
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }

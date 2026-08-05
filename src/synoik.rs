@@ -530,6 +530,18 @@ pub struct Synoik {
     /// recording is live; `None` when nothing is recording.
     pub recording_tick: Option<RegistrationToken>,
     pub data_device_state: DataDeviceState,
+    /// Mime types whoever owns the clipboard right now is offering.
+    ///
+    /// Smithay tracks the selection but exposes no way to ask what it offers, and a paste has
+    /// to pick a mime type *before* it can request the data. Kept in step from the two places
+    /// the selection changes: `SelectionHandler::new_selection` (a client took it) and
+    /// [`Self::set_clipboard`] (we did).
+    pub clipboard_mime_types: Vec<String>,
+    /// Whether a paste into one of our entries is waiting on the clipboard owner's pipe.
+    ///
+    /// One at a time: a held `Ctrl-v` would otherwise stack an fd source and a timer per key
+    /// repeat, every one of them inserting into the same field when it lands.
+    pub clipboard_paste_pending: bool,
     pub primary_selection_state: PrimarySelectionState,
     pub wlr_data_control_state: WlrDataControlState,
     pub ext_data_control_state: ExtDataControlState,
@@ -5604,6 +5616,7 @@ impl State {
             let dh = self.synoik.display_handle.clone();
             clear_data_device_selection(&dh, &self.synoik.seat);
             clear_primary_selection(&dh, &self.synoik.seat);
+            self.synoik.clipboard_mime_types.clear();
         }
 
         #[cfg(feature = "dbus")]
@@ -7128,6 +7141,8 @@ impl Synoik {
             recording_tick: None,
             idle_inhibit_manager_state,
             data_device_state,
+            clipboard_mime_types: Vec::new(),
+            clipboard_paste_pending: false,
             primary_selection_state,
             wlr_data_control_state,
             ext_data_control_state,
@@ -8792,6 +8807,16 @@ impl Synoik {
         self.mods_with_tablet_stylus_binds = mods_with_tablet_stylus_binds(keybindings);
         self.mods_with_finger_scroll_binds = mods_with_finger_scroll_binds(keybindings);
         self.hotkey_overlay.set_keybindings(keybindings);
+    }
+
+    /// Take ownership of the clipboard, offering `mime_types` for `bytes`.
+    ///
+    /// The only way the compositor should set the selection: it keeps
+    /// [`Self::clipboard_mime_types`] in step, which is what a later paste consults to decide
+    /// whether there is any *text* to paste.
+    pub fn set_clipboard(&mut self, mime_types: Vec<String>, bytes: Arc<[u8]>) {
+        set_data_device_selection(&self.display_handle, &self.seat, mime_types.clone(), bytes);
+        self.clipboard_mime_types = mime_types;
     }
 
     pub fn queue_redraw_all(&mut self) {
@@ -12101,12 +12126,9 @@ impl Synoik {
         self.event_loop
             .insert_source(rx, move |event, _, state| match event {
                 calloop::channel::Event::Msg(buf) => {
-                    set_data_device_selection(
-                        &state.synoik.display_handle,
-                        &state.synoik.seat,
-                        vec![String::from("image/png")],
-                        buf.clone(),
-                    );
+                    state
+                        .synoik
+                        .set_clipboard(vec![String::from("image/png")], buf.clone());
                 }
                 calloop::channel::Event::Closed => (),
             })

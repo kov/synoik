@@ -816,6 +816,14 @@ impl FolderDialog {
         }
     }
 
+    /// The rename entry's editing model, when one is up — what the clipboard bindings need.
+    pub fn rename_edit(&self) -> Option<&TextEdit> {
+        self.open
+            .as_ref()
+            .and_then(|open| open.rename.as_ref())
+            .map(|rename| &rename.edit)
+    }
+
     /// Whether the rename entry is up (`_showFolderEntry`, `appDisplay.js:2643-2648`).
     pub fn is_renaming(&self) -> bool {
         self.open.as_ref().is_some_and(|o| o.rename.is_some())

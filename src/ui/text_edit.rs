@@ -232,6 +232,12 @@ impl TextEdit {
         (lo != hi).then_some(lo..hi)
     }
 
+    /// The selected text, or `None` when nothing is selected — what a copy or a cut takes
+    /// (`clutter_text_get_selection`, used by `st-entry.c:700,723`).
+    pub fn selected_text(&self) -> Option<&str> {
+        self.selection().map(|sel| &self.text[sel])
+    }
+
     /// Replace the whole text, caret to the end, selection dropped.
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
