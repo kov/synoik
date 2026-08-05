@@ -30,6 +30,9 @@
 //! the accented text the whole feature exists for, so it is a function with tests rather than an
 //! `as` cast at each call site.
 
+#[cfg(feature = "dbus")]
+pub mod worker;
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -295,6 +298,35 @@ impl State {
         }
     }
 
+    /// Tell the engine which input source is active.
+    ///
+    /// **Plain xkb layouts go through IBus too.** `js/ui/status/keyboard.js:510-528` synthesizes
+    /// an `xkb:<layout>:<variant>:<lang>` engine for an `xkb` source and calls `setEngine`
+    /// unconditionally — `js/misc/inputMethod.js:331-336` never checks the source type. Dead keys
+    /// come from the `ibus-keyboard` engine, not from the keymap, so there is no "xkb needs no
+    /// input method" shortcut to take here.
+    ///
+    /// The active source is the head of `mru-sources`, which is what GNOME rewrites on an
+    /// interactive switch, falling back to the configured order.
+    pub fn sync_input_method_engine(&mut self) {
+        let sources = &self.synoik.gnome_settings.input_sources;
+        let active = sources
+            .mru_sources
+            .first()
+            .or_else(|| sources.sources.first());
+        let Some((source_type, id)) = active else {
+            return;
+        };
+
+        // The language is only used to name the engine; `eng` is `engine_name`'s default and is
+        // right for the Latin layouts. Deriving it properly needs IBus's own layout→language
+        // table, which is a lookup we do not have yet.
+        let engine = crate::dbus::ibus::engine_name(source_type, id, None);
+        if let Some(im) = self.synoik.input_method.as_mut() {
+            im.send(ImRequest::SetEngine(engine));
+        }
+    }
+
     /// Offer a keystroke to the engine, holding it back from the client until the verdict.
     ///
     /// Returns whether the key was taken. `false` means the caller must deliver it now, exactly
@@ -487,8 +519,27 @@ impl State {
     pub fn on_im_update(&mut self, update: ImUpdate) {
         match update {
             ImUpdate::Connected(connected) => {
+                if connected {
+                    self.sync_input_method_engine();
+                }
                 if let Some(im) = self.synoik.input_method.as_mut() {
                     im.connected = connected;
+                    // A reconnect brings a *new* input context, which starts unfocused and
+                    // knows nothing. Replay what the focused client already told us, or the
+                    // engine stays deaf until the user clicks into another text field.
+                    if connected && im.enabled {
+                        im.send(ImRequest::FocusIn);
+                        if let Some((text, cursor)) = self.synoik.im_surrounding.clone() {
+                            let Some(im) = self.synoik.input_method.as_mut() else {
+                                return;
+                            };
+                            im.send(ImRequest::Surrounding {
+                                text,
+                                cursor,
+                                anchor: cursor,
+                            });
+                        }
+                    }
                 }
                 if !connected {
                     // Nothing is going to answer for the keys in flight, and the preedit they

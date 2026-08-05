@@ -1685,6 +1685,46 @@ impl State {
                     }
                 })
                 .unwrap();
+            // The input method, which is two channels and a thread: requests out to IBus,
+            // engine output and key verdicts back. Both halves are inert until the worker
+            // reports a daemon, so a session with no `ibus-daemon` behaves exactly as it did
+            // before this existed.
+            #[cfg(feature = "dbus")]
+            {
+                use smithay::wayland::text_input::TextInputSeat as _;
+
+                let (to_worker, requests) = async_channel::unbounded();
+                let (updates_tx, updates_rx) = calloop::channel::channel();
+                crate::input_method::worker::spawn(requests, updates_tx);
+                state.synoik.input_method = Some(crate::input_method::InputMethod::new(to_worker));
+
+                let (events_tx, events_rx) = calloop::channel::channel();
+                state
+                    .synoik
+                    .seat
+                    .text_input()
+                    .set_internal_input_method(Some(crate::input_method::make_sink(events_tx)));
+
+                state
+                    .synoik
+                    .event_loop
+                    .insert_source(events_rx, |event, _, state| {
+                        if let calloop::channel::Event::Msg(event) = event {
+                            state.on_text_input_event(event);
+                        }
+                    })
+                    .unwrap();
+                state
+                    .synoik
+                    .event_loop
+                    .insert_source(updates_rx, |event, _, state| {
+                        if let calloop::channel::Event::Msg(update) = event {
+                            state.on_im_update(update);
+                        }
+                    })
+                    .unwrap();
+            }
+
             // The device, so the decode worker can write its pixels straight into device-visible
             // memory instead of leaving the render thread a multi-megabyte copy (see
             // `wallpaper`'s module doc). `None` before a renderer exists — the decode then falls
@@ -1797,6 +1837,12 @@ impl State {
                             state.ipc_keyboard_layouts_changed();
                         } else if mru_changed {
                             state.seed_active_layout_from_mru();
+                        }
+                        // Either kind of change can move the *active* source, and the engine
+                        // has to follow it: the keymap alone does not produce dead keys, the
+                        // engine does (`keyboard.js:510-528`).
+                        if keymap_changed || mru_changed {
+                            state.sync_input_method_engine();
                         }
                         // An icon-theme change re-themes both icon caches, so the
                         // dash's uploaded textures (keyed only by icon+size+scale, not

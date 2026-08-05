@@ -44,7 +44,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use zbus::zvariant::{OwnedObjectPath, Value};
+use zbus::zvariant::{Array, Dict, OwnedObjectPath, Signature, Structure, StructureBuilder, Value};
 
 /// The client name handed to `CreateInputContext`. gnome-shell passes `'gnome-shell'`
 /// (`js/misc/inputMethod.js:78`); ours says who we are for the same reason — it shows up in
@@ -301,6 +301,32 @@ pub fn ibus_text(value: &Value<'_>) -> Option<String> {
         Some(Value::Str(text)) => Some(text.to_string()),
         _ => None,
     }
+}
+
+/// Build an `IBusText` variant around a plain string, the inverse of [`ibus_text`].
+///
+/// `IBusText` is an `IBusSerializable`, so the wire form is `(sa{sv}sv)`: the type name, an
+/// attachment dict, the text, and a nested `IBusAttrList` for styling runs. We never style
+/// anything, so the attribute list is present and empty rather than absent — `libibus` reads
+/// the field positionally and a short structure is not an `IBusText` at all.
+pub fn make_ibus_text(text: &str) -> Structure<'static> {
+    // `Dict` and `Array` carry their signature at runtime rather than in the type, so they go in
+    // as already-built `Value`s — `add_field` is for types with a static signature.
+    let attachments = || Value::from(Dict::new(&Signature::Str, &Signature::Variant));
+    let attrs = StructureBuilder::new()
+        .add_field("IBusAttrList".to_owned())
+        .append_field(attachments())
+        .append_field(Value::from(Array::new(&Signature::Variant)))
+        .build()
+        .expect("the structure has fields");
+
+    StructureBuilder::new()
+        .add_field("IBusText".to_owned())
+        .append_field(attachments())
+        .add_field(text.to_owned())
+        .append_field(Value::from(attrs))
+        .build()
+        .expect("the structure has fields")
 }
 
 /// `org.freedesktop.IBus` — the bus object, for engine selection and context creation.
