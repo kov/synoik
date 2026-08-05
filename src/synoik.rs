@@ -560,6 +560,9 @@ pub struct Synoik {
     /// Kept because `delete_surrounding_text` arrives in *characters* and goes out in bytes, so
     /// the conversion needs the text the client last told us about.
     pub im_surrounding: Option<(String, u32)>,
+    /// Deadline for the oldest keystroke the engine has not answered for, so a wedged daemon
+    /// cannot hold the keyboard indefinitely.
+    pub im_key_timer: Option<RegistrationToken>,
 
     /// Inspectable model of the GNOME settings the compositor honors.
     pub gnome_settings: GnomeSettings,
@@ -7006,6 +7009,7 @@ impl Synoik {
         let mut synoik = Self {
             input_method: None,
             im_surrounding: None,
+            im_key_timer: None,
             config,
             config_file_output_config,
 

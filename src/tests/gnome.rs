@@ -3150,6 +3150,257 @@ fn engine_output_reaches_the_client_as_preedit_then_commit() {
     );
 }
 
+/// Stand up a client with text input enabled and a connected input method behind it, and
+/// return the channel the model's requests arrive on.
+///
+/// The sink is a `Vec` rather than the production channel, so the client's committed state is
+/// pumped through `on_text_input_event` by hand — the same thing the calloop source does.
+fn im_fixture() -> (
+    Fixture,
+    ClientId,
+    async_channel::Receiver<crate::input_method::ImRequest>,
+) {
+    use std::sync::{Arc, Mutex};
+
+    use smithay::wayland::text_input::{TextInputEvent as Ev, TextInputSeat};
+
+    use crate::input_method::{ImUpdate, InputMethod};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (to_worker, requests) = async_channel::unbounded();
+    f.synoik().input_method = Some(InputMethod::new(to_worker));
+
+    let seen: Arc<Mutex<Vec<Ev>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    f.synoik()
+        .seat
+        .text_input()
+        .set_internal_input_method(Some(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        })));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).get_keyboard();
+    f.client(id).create_text_input();
+    f.double_roundtrip(id);
+    f.client(id).enable_text_input();
+    f.double_roundtrip(id);
+
+    for event in seen.lock().unwrap().drain(..).collect::<Vec<_>>() {
+        f.synoik_state().on_text_input_event(event);
+    }
+    // A daemon answered, so the key path is live. Until this the model must behave as if there
+    // were no input method at all.
+    f.synoik_state().on_im_update(ImUpdate::Connected(true));
+
+    let _ = f.client(id).take_key_events();
+    let _ = f.client(id).text_input_events();
+    // Drain the focus-in the setup itself produced, so a test sees only its own traffic.
+    while requests.try_recv().is_ok() {}
+    (f, id, requests)
+}
+
+/// A keystroke offered to the engine must not reach the client until the engine declines it.
+///
+/// This is the whole point of the round trip: if the key were delivered eagerly, a composed
+/// character would arrive *after* the raw key that produced it — the user would get `'a` where
+/// they typed `á`.
+#[test]
+fn a_key_waits_for_the_engine_before_reaching_the_client() {
+    use crate::input_method::{ImRequest, ImUpdate};
+
+    let (mut f, id, requests) = im_fixture();
+
+    f.key_press(KEY_A);
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![],
+        "a key under consideration by the engine must not reach the client yet"
+    );
+    let request = requests.try_recv().expect("the key must reach the worker");
+    let ImRequest::ProcessKey { id: key_id, .. } = request else {
+        panic!("expected a ProcessKey request, got {request:?}");
+    };
+
+    // The engine declines it, so it is an ordinary keystroke after all.
+    f.synoik_state().on_im_update(ImUpdate::KeyResult {
+        id: key_id,
+        filtered: false,
+    });
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![(KEY_A, WlKeyState::Pressed)],
+        "a declined key must be delivered once the verdict arrives"
+    );
+}
+
+/// A key the engine consumed must never reach the client — it will arrive as committed text
+/// instead, and delivering both would double the input.
+#[test]
+fn a_key_the_engine_took_never_reaches_the_client() {
+    use crate::input_method::{ImRequest, ImUpdate};
+
+    let (mut f, id, requests) = im_fixture();
+
+    f.key_press(KEY_A);
+    f.double_roundtrip(id);
+    let Ok(ImRequest::ProcessKey { id: key_id, .. }) = requests.try_recv() else {
+        panic!("expected a ProcessKey request");
+    };
+
+    f.synoik_state().on_im_update(ImUpdate::KeyResult {
+        id: key_id,
+        filtered: true,
+    });
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![],
+        "a key the engine consumed must not also be delivered as a key event"
+    );
+    assert!(
+        !f.synoik().input_method.as_ref().unwrap().has_pending_keys(),
+        "the answered key must leave the queue"
+    );
+}
+
+/// Deferred keys are delivered in the order they were typed, never the order they were answered
+/// in. A release that overtook its own press would leave the key stuck down in the client.
+#[test]
+fn deferred_keys_are_delivered_in_typing_order() {
+    use crate::input_method::{ImRequest, ImUpdate};
+
+    let (mut f, id, requests) = im_fixture();
+
+    f.key_press(KEY_A);
+    f.key_press(KEY_S);
+    f.key_release(KEY_A);
+    f.double_roundtrip(id);
+
+    let mut ids = Vec::new();
+    while let Ok(request) = requests.try_recv() {
+        if let ImRequest::ProcessKey { id, .. } = request {
+            ids.push(id);
+        }
+    }
+    assert_eq!(ids.len(), 3, "every key must be offered to the engine");
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![],
+        "nothing is delivered while the engine is still deciding"
+    );
+
+    // Answer the *last* one first. The two before it never got a verdict, so they are delivered
+    // rather than dropped — and they must still come out in typing order.
+    f.synoik_state().on_im_update(ImUpdate::KeyResult {
+        id: ids[2],
+        filtered: false,
+    });
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![
+            (KEY_A, WlKeyState::Pressed),
+            (KEY_S, WlKeyState::Pressed),
+            (KEY_A, WlKeyState::Released),
+        ],
+        "keys must reach the client in the order they were typed"
+    );
+}
+
+/// With no daemon answering, the key path must behave exactly as it does with no input method:
+/// keys go straight to the client. Anything else means an unreachable `ibus-daemon` costs the
+/// user their keyboard.
+#[test]
+fn keys_go_straight_through_while_the_engine_is_disconnected() {
+    use crate::input_method::ImUpdate;
+
+    let (mut f, id, requests) = im_fixture();
+    f.synoik_state().on_im_update(ImUpdate::Connected(false));
+
+    f.key_press(KEY_A);
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![(KEY_A, WlKeyState::Pressed)],
+        "a disconnected input method must not hold keys back"
+    );
+    assert!(
+        requests.try_recv().is_err(),
+        "a disconnected input method must not be sent keys"
+    );
+}
+
+/// Disabling text input while keys are in flight delivers them rather than dropping them: the
+/// client just said it wants ordinary key events, and those keystrokes are its.
+#[test]
+fn disabling_text_input_delivers_the_keys_still_in_flight() {
+    use smithay::wayland::text_input::TextInputEvent as Ev;
+
+    let (mut f, id, _requests) = im_fixture();
+
+    f.key_press(KEY_A);
+    f.double_roundtrip(id);
+    assert!(
+        f.synoik().input_method.as_ref().unwrap().has_pending_keys(),
+        "the key should be held back to begin with"
+    );
+
+    f.synoik_state().on_text_input_event(Ev::Disabled);
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![(KEY_A, WlKeyState::Pressed)],
+        "keys in flight must survive the input being disabled"
+    );
+}
+
+/// A compositor keybinding still resolves while a text input is focused, and the key it claimed
+/// is never offered to the engine — the deliberate ordering divergence from mutter, which
+/// consults the input method first (`events.c:168` vs `:262`).
+///
+/// The overlay key shows both halves at once: its arming *press* is propagated (so it is offered,
+/// exactly as mutter would), while the *release* that fires the binding is swallowed by the
+/// compositor and must reach neither the client nor the engine.
+#[test]
+fn a_binding_claims_its_key_before_the_engine_sees_it() {
+    use crate::input_method::ImRequest;
+
+    let (mut f, id, requests) = im_fixture();
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "the overlay key must still fire while a text input has focus"
+    );
+
+    let offered: Vec<u32> = std::iter::from_fn(|| requests.try_recv().ok())
+        .filter_map(|request| match request {
+            ImRequest::ProcessKey { keycode, .. } => Some(keycode),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        offered,
+        vec![KEY_LEFTMETA],
+        "only the propagated press may reach the engine; the firing release was claimed"
+    );
+}
+
 /// mutter's three passive window button grabs are Mod+LMB to move, Mod+MMB to
 /// resize and Mod+RMB for the window menu (`window.c:7743-7844`;
 /// `meta_prefs_get_mouse_button_resize` returns 2 unless `resize-with-right-button`).

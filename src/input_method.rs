@@ -30,12 +30,78 @@
 //! the accented text the whole feature exists for, so it is a function with tests rather than an
 //! `as` cast at each call site.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
+use smithay::backend::input::KeyState;
+use smithay::input::keyboard::{Keycode, ModifiersState};
+use smithay::utils::Serial;
 use smithay::wayland::text_input::{TextInputEvent, TextInputSeat};
 
-use crate::dbus::ibus::{ImEvent, PreeditMode};
+use crate::dbus::ibus::{self, ImEvent, PreeditMode};
 use crate::synoik::State;
+
+/// How long a keystroke may sit waiting for the engine before we give up and deliver it.
+///
+/// GNOME has no equivalent: it passes `-1` to `process_key_event_async`
+/// (`inputMethod.js:347`), taking GDBus's 25-second default, so a wedged `ibus-daemon` costs
+/// the user 25 seconds of dead keyboard per keystroke. A healthy round trip on the same
+/// machine's session bus is well under a millisecond, so this is three orders of magnitude of
+/// headroom and still bounds the damage at "input feels slow" rather than "the session is
+/// unusable". Deliberate divergence.
+const KEY_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// A keystroke held back from the client while the engine decides on it.
+///
+/// Everything here is what [`smithay::input::keyboard::KeyboardHandle::input_forward`] needs, so
+/// that delivering a deferred key later is the same call it would have been synchronously.
+#[derive(Debug, Clone, Copy)]
+struct PendingKey {
+    id: u64,
+    keycode: Keycode,
+    state: KeyState,
+    serial: Serial,
+    time: u32,
+    mods_changed: bool,
+    /// When this key was held back, for [`KEY_TIMEOUT`]. Real time rather than the compositor
+    /// clock on purpose: this bounds an *IPC* stall, and it must still expire when the frame
+    /// clock is idle because nothing is animating.
+    queued_at: std::time::Instant,
+}
+
+/// Convert our modifier state into the X11-style mask IBus expects.
+///
+/// `iso_level3_shift` is AltGr, which is how `us(intl)` reaches the level holding the dead keys —
+/// dropping it would leave the engine unable to tell an AltGr composition from a bare one.
+pub fn ibus_modifier_state(mods: &ModifiersState, pressed: bool) -> u32 {
+    let mut state = 0;
+    if mods.shift {
+        state |= ibus::SHIFT_MASK;
+    }
+    if mods.caps_lock {
+        state |= ibus::LOCK_MASK;
+    }
+    if mods.ctrl {
+        state |= ibus::CONTROL_MASK;
+    }
+    if mods.alt {
+        state |= ibus::MOD1_MASK;
+    }
+    if mods.num_lock {
+        state |= ibus::MOD2_MASK;
+    }
+    if mods.logo {
+        state |= ibus::MOD4_MASK;
+    }
+    if mods.iso_level3_shift {
+        state |= ibus::MOD5_MASK;
+    }
+    if !pressed {
+        state |= ibus::RELEASE_MASK;
+    }
+    state
+}
 
 /// What the compositor asks of the IBus worker.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +120,17 @@ pub enum ImRequest {
     },
     /// Select the engine for the active input source (`xkb:us:intl:eng` and friends).
     SetEngine(String),
+    /// A keystroke for the engine to accept or decline. `id` comes back on the
+    /// [`ImUpdate::KeyResult`] that answers it.
+    ///
+    /// `keycode` is an **evdev** code: IBus wants the X11 keycode minus 8, and gnome-shell
+    /// subtracts it at the call (`inputMethod.js:346`).
+    ProcessKey {
+        id: u64,
+        keysym: u32,
+        keycode: u32,
+        state: u32,
+    },
 }
 
 /// What the worker reports back. Everything here is applied on the compositor thread.
@@ -64,6 +141,9 @@ pub enum ImUpdate {
     /// The worker (re)connected to a daemon, or lost it. While disconnected the compositor must
     /// behave exactly as it does with no input method at all.
     Connected(bool),
+    /// The engine's verdict on the [`ImRequest::ProcessKey`] with this `id`. `filtered` means the
+    /// engine consumed the key, so the client must never see it.
+    KeyResult { id: u64, filtered: bool },
 }
 
 /// The compositor-side input method.
@@ -76,8 +156,19 @@ pub struct InputMethod {
     /// (`meta-wayland-text-input.c:1174-1177`), so ordinary typing outside a text field never
     /// goes near the input method.
     enabled: bool,
+    /// Whether the worker has a live daemon. While false the key path behaves exactly as it does
+    /// with no input method at all, rather than queueing keys nobody will answer for.
+    connected: bool,
     /// The preedit we last sent a client, so focus changes and resets can clear it.
     preedit: Option<String>,
+    /// Keys held back from the client, oldest first, awaiting the engine's verdict.
+    ///
+    /// Order is the whole point. mutter relies on the same guarantee — "we rely on the IM
+    /// implementation to notify back of key events in the exact same order they were given"
+    /// (`clutter-input-method.c:398-400`) — and a keyboard that delivers a release before its
+    /// press leaves a key stuck down in the client.
+    pending: VecDeque<PendingKey>,
+    next_key_id: u64,
 }
 
 impl std::fmt::Debug for InputMethod {
@@ -98,13 +189,29 @@ impl InputMethod {
         Self {
             to_worker,
             enabled: false,
+            connected: false,
             preedit: None,
+            pending: VecDeque::new(),
+            next_key_id: 0,
         }
     }
 
     /// Whether a client has text input enabled right now.
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Whether keystrokes should be routed through the engine at all.
+    ///
+    /// Both halves matter: an enabled text input with no daemon behind it must not swallow keys,
+    /// and a live daemon with no focused text input must never see the user's typing.
+    pub fn wants_keys(&self) -> bool {
+        self.enabled && self.connected
+    }
+
+    /// Whether any key is currently held back from the client.
+    pub fn has_pending_keys(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     /// The preedit currently shown to the client, if any.
@@ -152,6 +259,10 @@ impl State {
             TextInputEvent::Disabled => {
                 im.enabled = false;
                 self.synoik.im_surrounding = None;
+                // Keys still in flight belong to the input that just went away. Deliver them
+                // rather than drop them — the client asked for them as ordinary key events the
+                // moment it disabled text input.
+                self.flush_pending_im_keys();
                 // A disabled input keeps no composition. Clear ours before telling the engine,
                 // so a client that re-enables immediately cannot see a stale preedit.
                 self.clear_preedit();
@@ -184,14 +295,209 @@ impl State {
         }
     }
 
+    /// Offer a keystroke to the engine, holding it back from the client until the verdict.
+    ///
+    /// Returns whether the key was taken. `false` means the caller must deliver it now, exactly
+    /// as it would with no input method.
+    ///
+    /// Called at the point the key would otherwise be forwarded, which is a deliberate
+    /// divergence: mutter consults the input method *before* keybindings
+    /// (`events.c:168` vs `:262`), so on GNOME every keystroke typed into a text field makes a
+    /// D-Bus round trip before any shortcut can resolve. Ours resolves shortcuts first and offers
+    /// the engine only what was headed for the client anyway. The practical difference is empty —
+    /// engines want unmodified printable keys plus Escape/Backspace/arrows during a composition,
+    /// none of which are GNOME accelerators — and it keeps the compositor's own modal surfaces
+    /// (the lock screen, the polkit password entry) strictly ahead of an external daemon, which
+    /// on the ordering above they would not be.
+    #[allow(clippy::too_many_arguments)]
+    pub fn im_offer_key(
+        &mut self,
+        keycode: Keycode,
+        state: KeyState,
+        serial: Serial,
+        time: u32,
+        mods_changed: bool,
+        keysym: u32,
+        mods: &ModifiersState,
+        pressed: bool,
+    ) -> bool {
+        let Some(im) = self.synoik.input_method.as_mut() else {
+            return false;
+        };
+        if !im.wants_keys() {
+            return false;
+        }
+
+        let id = im.next_key_id;
+        im.next_key_id += 1;
+
+        // IBus wants an evdev code; xkb keycodes are that plus 8 (`inputMethod.js:346`).
+        let evcode = keycode.raw().saturating_sub(8);
+        im.send(ImRequest::ProcessKey {
+            id,
+            keysym,
+            keycode: evcode,
+            state: ibus_modifier_state(mods, pressed),
+        });
+
+        let was_empty = im.pending.is_empty();
+        im.pending.push_back(PendingKey {
+            id,
+            keycode,
+            state,
+            serial,
+            time,
+            mods_changed,
+            queued_at: std::time::Instant::now(),
+        });
+
+        if was_empty {
+            self.arm_im_key_timeout(KEY_TIMEOUT);
+        }
+        true
+    }
+
+    /// The engine answered. Deliver or drop the key it answered for.
+    fn on_im_key_result(&mut self, id: u64, filtered: bool) {
+        let Some(im) = self.synoik.input_method.as_mut() else {
+            return;
+        };
+        let Some(index) = im.pending.iter().position(|key| key.id == id) else {
+            // Already flushed by a timeout or a focus change. The key has been delivered, so the
+            // verdict is moot — dropping it here is the only correct move.
+            return;
+        };
+
+        // Anything queued *before* the answered key never got its own answer. Deliver those
+        // rather than drop them: a lost keystroke is worse than one the engine wanted, and
+        // holding them back would stall the queue behind a reply that is never coming.
+        //
+        // Drained in one go before forwarding any of them, because `forward_pending_key` needs
+        // `&mut self` and so cannot run while the queue is borrowed.
+        let skipped: Vec<PendingKey> = im.pending.drain(..index).collect();
+        let key = im.pending.pop_front().expect("index is in bounds");
+        let still_pending = !im.pending.is_empty();
+
+        for key in skipped {
+            tracing::debug!(id = key.id, "no verdict for key, forwarding it");
+            self.forward_pending_key(key);
+        }
+        if !filtered {
+            self.forward_pending_key(key);
+        }
+
+        // The timer tracks the head of the queue, which has just changed.
+        self.disarm_im_key_timeout();
+        if still_pending {
+            self.arm_im_key_timeout(KEY_TIMEOUT);
+        }
+    }
+
+    /// Deliver every held-back key to the client, in order.
+    ///
+    /// The fail-open direction is the only safe one: whatever went wrong — a wedged daemon, a
+    /// lost connection, focus moving away — the alternative is keystrokes that silently vanish.
+    pub fn flush_pending_im_keys(&mut self) {
+        loop {
+            let Some(im) = self.synoik.input_method.as_mut() else {
+                return;
+            };
+            let Some(key) = im.pending.pop_front() else {
+                break;
+            };
+            self.forward_pending_key(key);
+        }
+        self.disarm_im_key_timeout();
+    }
+
+    /// Start the clock on the key at the head of the queue.
+    fn arm_im_key_timeout(&mut self, after: Duration) {
+        self.disarm_im_key_timeout();
+        let timer = calloop::timer::Timer::from_duration(after);
+        let token = self
+            .synoik
+            .event_loop
+            .insert_source(timer, |_, _, state| {
+                state.on_im_key_timeout();
+                calloop::timer::TimeoutAction::Drop
+            })
+            .unwrap();
+        self.synoik.im_key_timer = Some(token);
+    }
+
+    fn disarm_im_key_timeout(&mut self) {
+        if let Some(token) = self.synoik.im_key_timer.take() {
+            self.synoik.event_loop.remove(token);
+        }
+    }
+
+    /// The engine took too long. Deliver what has actually expired and re-arm for the rest.
+    fn on_im_key_timeout(&mut self) {
+        self.synoik.im_key_timer = None;
+
+        let now = std::time::Instant::now();
+        let mut expired = Vec::new();
+        let mut next_deadline = None;
+        if let Some(im) = self.synoik.input_method.as_mut() {
+            while let Some(key) = im.pending.front() {
+                match KEY_TIMEOUT.checked_sub(now.saturating_duration_since(key.queued_at)) {
+                    // Still has time left: it is the new head, so the timer tracks it.
+                    Some(left) if !left.is_zero() => {
+                        next_deadline = Some(left);
+                        break;
+                    }
+                    _ => expired.push(im.pending.pop_front().expect("front is Some")),
+                }
+            }
+        }
+
+        if !expired.is_empty() {
+            tracing::warn!(
+                count = expired.len(),
+                "input method did not answer in {KEY_TIMEOUT:?}, delivering keys anyway"
+            );
+        }
+        for key in expired {
+            self.forward_pending_key(key);
+        }
+
+        if let Some(left) = next_deadline {
+            self.arm_im_key_timeout(left);
+        }
+    }
+
+    /// Hand one deferred key to the focused client.
+    ///
+    /// `input_forward` is the other half of the `input_intercept` that already ran for this key:
+    /// xkb state was updated back then, and this only decides delivery. That split is why a
+    /// deferred key needs no replay through the filter and cannot double-count a modifier.
+    fn forward_pending_key(&mut self, key: PendingKey) {
+        let keyboard = self.synoik.seat.get_keyboard().unwrap();
+        keyboard.input_forward(
+            self,
+            key.keycode,
+            key.state,
+            key.serial,
+            key.time,
+            key.mods_changed,
+        );
+    }
+
     /// Something came back from the engine.
     pub fn on_im_update(&mut self, update: ImUpdate) {
         match update {
             ImUpdate::Connected(connected) => {
+                if let Some(im) = self.synoik.input_method.as_mut() {
+                    im.connected = connected;
+                }
                 if !connected {
+                    // Nothing is going to answer for the keys in flight, and the preedit they
+                    // were building can no longer be completed.
+                    self.flush_pending_im_keys();
                     self.clear_preedit();
                 }
             }
+            ImUpdate::KeyResult { id, filtered } => self.on_im_key_result(id, filtered),
             ImUpdate::Event(event) => self.on_im_event(event),
         }
     }
@@ -410,6 +716,26 @@ mod tests {
         assert_eq!(surrounding_byte_lengths("héllo", 3, 1, 1), Some((2, 1)));
         // Nothing to do is a valid answer, not an error.
         assert_eq!(surrounding_byte_lengths("héllo", 3, 0, 0), Some((0, 0)));
+    }
+
+    #[test]
+    fn modifier_state_carries_altgr_and_the_release_flag() {
+        let mut mods = ModifiersState::default();
+        assert_eq!(ibus_modifier_state(&mods, true), 0);
+        // A release has no argument of its own in `ProcessKeyEvent`; it is a bit on the state.
+        assert_eq!(ibus_modifier_state(&mods, false), ibus::RELEASE_MASK);
+
+        // AltGr is how `us(intl)` reaches the level holding the dead keys, so losing this bit
+        // loses the feature this whole module exists for.
+        mods.iso_level3_shift = true;
+        assert_eq!(ibus_modifier_state(&mods, true), ibus::MOD5_MASK);
+
+        mods.shift = true;
+        mods.ctrl = true;
+        assert_eq!(
+            ibus_modifier_state(&mods, true),
+            ibus::MOD5_MASK | ibus::SHIFT_MASK | ibus::CONTROL_MASK
+        );
     }
 
     #[test]

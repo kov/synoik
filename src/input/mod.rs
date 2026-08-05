@@ -682,17 +682,25 @@ impl State {
         #[cfg(not(feature = "dbus"))]
         let _ = consumed_by_a11y;
 
-        let filtered = self.synoik.seat.get_keyboard().unwrap().input(
+        // What the input method needs to describe this key to an engine, captured from inside the
+        // filter because that is where the resolved keysym and modifier state live.
+        let mut im_key: Option<(u32, ModifiersState)> = None;
+
+        // Split rather than `keyboard.input()`, which is exactly this pair with the forward done
+        // unconditionally. The split is what lets a keystroke go to the input method and be
+        // delivered (or not) on its answer: `input_intercept` has already updated xkb state, so a
+        // deferred key needs no replay and cannot double-count a modifier.
+        let keyboard = self.synoik.seat.get_keyboard().unwrap();
+        let (res, mods_changed) = keyboard.input_intercept(
             self,
             event.key_code(),
             event.state(),
-            serial,
-            time,
             |this, mods, keysym| {
                 let key_code = event.key_code();
                 let modified = keysym.modified_sym();
                 let raw = keysym.raw_latin_sym_or_raw_current_sym();
                 let _modifiers = modifiers_from_state(*mods);
+                im_key = Some((modified.raw(), *mods));
 
                 // After updating XKB state from accessibility-grabbed keys, return right away and
                 // don't handle them.
@@ -1214,6 +1222,37 @@ impl State {
                 res
             },
         );
+
+        // Offer the key to the input method, but only if it was headed for the client: everything
+        // above either belongs to the compositor or belongs to a modal surface of ours, and an
+        // external daemon has no business seeing a lock-screen or polkit password.
+        let filtered = match res {
+            FilterResult::Intercept(bind) => Some(bind),
+            FilterResult::Forward => {
+                let (keysym, mods) = im_key.expect("the filter always runs");
+                if !self.im_offer_key(
+                    event.key_code(),
+                    event.state(),
+                    serial,
+                    time,
+                    mods_changed,
+                    keysym,
+                    &mods,
+                    pressed,
+                ) {
+                    let keyboard = self.synoik.seat.get_keyboard().unwrap();
+                    keyboard.input_forward(
+                        self,
+                        event.key_code(),
+                        event.state(),
+                        serial,
+                        time,
+                        mods_changed,
+                    );
+                }
+                None
+            }
+        };
 
         // The caps-lock warning, for the same reason and read the same way: at the *press* of
         // Caps Lock the event's mask still describes the lock state the key is about to change, so

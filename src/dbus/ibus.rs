@@ -67,6 +67,22 @@ pub const RELEASE_MASK: u32 = 1 << 30;
 /// short-circuits on it (`inputMethod.js:338-339`). Not optional.
 pub const IGNORED_MASK: u32 = 1 << 25;
 
+/// The low bits of an IBus state word are X11's modifier mask, which is what
+/// `ClutterModifierType` also is — gnome-shell passes `event.get_state()` straight through
+/// (`inputMethod.js:337`). Engines read these to tell `a` from `Shift+a` from `Ctrl+a`, so a
+/// wrong bit here is a key the engine mis-handles rather than an outright failure.
+pub const SHIFT_MASK: u32 = 1 << 0;
+pub const LOCK_MASK: u32 = 1 << 1;
+pub const CONTROL_MASK: u32 = 1 << 2;
+/// Alt.
+pub const MOD1_MASK: u32 = 1 << 3;
+/// Num Lock.
+pub const MOD2_MASK: u32 = 1 << 4;
+/// Super / "logo".
+pub const MOD4_MASK: u32 = 1 << 6;
+/// ISO Level 3 Shift — AltGr, which `us(intl)` needs to reach its accented level.
+pub const MOD5_MASK: u32 = 1 << 7;
+
 /// `IBus.PreeditFocusMode` — what an engine wants done with a live preedit when focus leaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreeditMode {
