@@ -74,7 +74,8 @@ untouched.
 ## What we get
 
 - **No env coupling.** Nothing in the scanout path consults `MESA_LOADER_DRIVER_OVERRIDE`, because
-  no GL driver is involved. The zink drop-in is a workaround that can be retired.
+  no GL driver is involved. **This does not mean the zink drop-in can be retired** — see "The other
+  half" below; it is still load-bearing for *client* buffers.
 - **Zero-copy present.** A venus-blob framebuffer takes limina's `SET_SCANOUT_BLOB` path: the host
   resolves the blob's IOSurface and puts it on glass with no copy. A gbm/virgl buffer can never do
   that for a venus-rendered compositor.
@@ -111,8 +112,43 @@ solid scene and reads it back. It is the twin of `vulkan_renders_into_a_gbm_dmab
 does not care which GL driver is selected.
 
 What the headless suite **cannot** cover: `drmModeAddFB2WithModifiers` needs DRM master, so
-`PrimeFramebufferExporter` is only exercised on a real seat. Treat a seat run as the acceptance
-gate, with `SYNOIK_VK_VALIDATION=1` in the session environment.
+`PrimeFramebufferExporter` is only exercised on a real seat.
+
+**Seat-validated 2026-08-05.** gsrs, `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu` +
+`GALLIUM_DRIVER=virtio_gpu` (so gbm inside the compositor resolves to vrend — the configuration that
+killed every frame on 2026-08-04), `SYNOIK_VK_VALIDATION=1`, eleven minutes with gnome-terminal,
+Firefox, Epiphany and vkmark: zero `VULKAN ERROR`, zero `legacy fbadd`, zero framebuffer or
+page-flip failures. The absence of `legacy fbadd` is the positive signal for
+`PrimeFramebufferExporter` specifically — `AddFB2` with `DRM_MODE_FB_MODIFIERS` was accepted every
+time.
+
+Setting that up has one trap worth knowing. `environment.d` **cannot** carry it: GNOME's session
+startup imports the login environment into the systemd user manager at a precedence above generator
+output, so a `~/.config/environment.d/95-*.conf` that beats `/etc/environment.d/90-limina-zink.conf`
+lexicographically still loses at runtime. Verified by hand — the generator emitted `virtio_gpu`
+while the running session saw `zink`. Put it in the unit's `Environment=`, which beats both. And
+note it is *not* compositor-scoped in practice: apps launched from the shell are spawned by the
+compositor and inherit it, which is how the client failure below was found.
+
+## The other half: client buffers, still open
+
+Our own scanout buffers are fixed. A **client's** are not ours to allocate, and the same failure
+lives there: with GL on vrend a client's dmabufs are classic virgl resources, and
+`vkGetMemoryFdPropertiesKHR` refuses them, so `Tty::import_dmabuf` returns `false` and we decline the
+buffer. That is the right call — the alternative is garbage on screen — but Firefox and Epiphany both
+*hang* rather than falling back, so in practice it is a dead window.
+
+Observed 2026-08-05 in the run above: exactly two
+`error importing dmabuf into the Vulkan renderer: ERROR_INVALID_EXTERNAL_HANDLE`, one per browser,
+at the moment each tried to map its window, and only for browsers launched **from the shell** (which
+inherited the compositor's `virtio_gpu`). The same browsers launched from a terminal — still on
+zink — ran clean for the rest of the session.
+
+Mutter does not hit this: its renderer is GL, so it imports client buffers through the same driver
+that allocated them. A Vulkan compositor is cross-driver by construction. The fix is host-side —
+vkr importing classic virgl resources into venus, which limina has booked (and may already be
+deployed; unconfirmed as of 2026-08-05). **Until that is confirmed, `/etc/environment.d/90-limina-zink.conf`
+stays.** It is no longer protecting our scanout; it is keeping GL clients importable.
 
 ## Left on the table
 

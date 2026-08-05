@@ -238,6 +238,15 @@ dmabuf with modifier INVALID is never handed to KMS and never imported. Weston's
 unknown layout displays garbage — is why, and `PrimeFramebufferExporter` refuses it outright rather
 than falling back to a modifier-less `AddFB2`.
 
+**One half is still open, and it is not ours to close.** A *client's* buffers are allocated by the
+client, so a GL client on vrend hands us classic virgl resources that venus refuses to import
+(`Tty::import_dmabuf` correctly declines them; Firefox and Epiphany then hang rather than falling
+back). Mutter does not hit this because its renderer is GL — the same driver that allocated the
+buffer. A Vulkan compositor is cross-driver by construction, and the fix is host-side: vkr importing
+virgl resources into venus. Until that is confirmed deployed, `/etc/environment.d/90-limina-zink.conf`
+must stay — it is no longer protecting our scanout, only client imports. Detail in
+`docs/fork/scanout-allocation.md`.
+
 ---
 
 ## Roadmap order (recommended)
