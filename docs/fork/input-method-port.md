@@ -1,7 +1,8 @@
 # Input method (IBus) port
 
-**Status: slices 1–2 landed, nothing wired together yet.** The IBus client works and the Wayland
-seam works; the model that joins them does not exist. Dead keys are still broken in apps.
+**Status: dead keys work, in apps and in the compositor's own entries.** Slices 1–6 and 8 landed
+(2026-08-05), seat-validated. What is left is CJK: a composition shows, but there is no candidate
+popup to pick from — see the backlog.
 
 **Reference-first.** Every claim cites GNOME 50.3 in `~/Projects/gnome-shell` / `~/Projects/mutter`,
 GTK 4.22, or a live measurement on this machine (2026-08-04). Re-read the cited file before
@@ -104,6 +105,8 @@ checked.
 | 3 — IM model | `e64ecf45` | `src/input_method/mod.rs`: engine output → client, byte↔char conversion, preedit cleared before commit. |
 | 4 — Key round trip | `02a58520`, `2709fc15`, `df081c2f` | Keys held for the engine; the worker thread; forwarded keys. |
 | 5 — Engine selection | `2709fc15` | `SetGlobalEngine` from `mru-sources`, re-sent on layout change. Folded into 4 because the round trip is inert without it. |
+| 8 — Content type | `2a1e023d` | Purpose + hint mapping. Pulled ahead of 6: routing a password entry through an engine that has not been told it is a password is not a papercut. |
+| 6 — Shell entries | `ce52d477`, `0720bc37` | All five compositor entries compose; `ImFocus`; preedit in `TextEdit`. |
 
 Slice 1 is verified end to end: `dead_acute` then `a` returns a committed `"á"`.
 Slice 2 is pinned by a differential pair in `src/tests/gnome.rs` — a text input hears *nothing*
@@ -133,6 +136,31 @@ Run the isolated instance under `dbus-run-session` **and** a private `XDG_CONFIG
 active input source comes from live dconf, and neither isolates gsettings on its own. Point
 `IBUS_ADDRESS` at your own daemon on a short socket path — `SetGlobalEngine` is bus-wide, so
 using the session's daemon changes the input source for everything else on it.
+
+Slice 6 is validated the same way, on the compositor's *own* entries, which need no client at
+all: open the overview, inject `apostrophe` `a`, and `grim` the search entry. It reads `á`, and
+`Shift+grave` `space` `Shift+grave` `n` reads `~ñ`. Unlike a client window, compositor chrome
+renders fine headless — the blank-GPU-client caveat does not apply to it.
+
+### Where a key can go
+
+| Focus | Offered to the engine | Delivered by |
+|---|---|---|
+| `ImFocus::Client` | every key that reached the forward point | `input_forward` |
+| `ImFocus::Shell(_)` | presses carrying text, plus any key during a composition | the entry's own handler |
+| `ImFocus::None` | nothing | unchanged |
+
+The shell path is narrower on purpose. Those entries sit at the bottom of ladders that fall
+through — the overview search gives way to grid navigation, then to hardcoded binds — and a
+fall-through has to produce a `FilterResult` synchronously. Deferring a key that *might* fall
+through would mean reimplementing each ladder in the delivery path. Deferring only what the entry
+is certain to consume costs nothing, because an engine has no use for the rest.
+
+`ImFocus` exists because a modal dialog can open over a client whose text input is still enabled.
+GNOME has the same single-focus rule for free: `ClutterInputMethod` holds one
+`ClutterInputFocus` (`clutter-input-method.c:544`) and a shell entry taking key focus focuses out
+whatever had it. Switching flushes held keys and drops the composition first, so a half-finished
+character cannot land in the entry it was not meant for.
 
 ### The smithay patch
 
@@ -310,8 +338,8 @@ spawns it. Xwayland start ⇒ restart with `--xim`; Xwayland stop ⇒ restart wi
 
 | Slice | What | Notes |
 |---|---|---|
-| **6** | Preedit in `TextEdit` | `handle_key` takes `Option<char>`; `insert_str` is the commit sink, but a shown-not-inserted preedit string is new, and `masked_positions` deliberately never sees the password. The compositor's own entries do not go through `zwp_text_input_v3`, so today they get no engine at all — typing `'a` in the overview search still gives `'a`. |
 | **7** | Daemon lifecycle | Spawning a daemon we did not find (GNOME's `ibusManager.js` launches one), systemd-unit check. Reconnect *is* done: the worker retries on a backoff and replays focus + surrounding text. |
-| ~~8~~ | ~~Content type / purpose~~ | **Done** — pulled ahead of 6, because it is a prerequisite: routing a password entry through an engine that has not been told it is a password is not a papercut. |
-| **Deferred** | Panel interface | Lookup table, auxiliary text, candidate popup, property menu. Needed for CJK engines, not for dead keys. |
+| **A** | Candidate popup | The IBus **Panel** interface: lookup table, auxiliary text, property list. Nothing CJK is usable without it — the composition shows, but there is no way to pick among candidates. The biggest remaining gap. |
+| **B** | Cursor rectangle | `set_cursor_location`, so a candidate popup can sit under the caret. Needed by A, useless before it. |
+| **C** | Engine language | `engine_name` hardcodes `eng`. Deriving it properly needs IBus's own layout→language table. |
 | **Deferred** | OSK integration, surrounding text from our own entries | |
