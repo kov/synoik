@@ -2831,6 +2831,87 @@ fn vulkan_draws_an_app_indicator_icon() {
     );
 }
 
+/// `widget::Menu` paints an expanded submenu's children, indented, inside the one surface.
+///
+/// The model tests pin the layout arithmetic; this pins that the arithmetic reaches pixels — that
+/// expanding a submenu actually draws rows where it says they are, rather than growing the card
+/// around empty space.
+#[test]
+fn vulkan_menu_draws_an_expanded_submenus_children() {
+    use crate::ui::widget::{Menu, MenuEntry, MenuItem};
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_menu_draws_an_expanded_submenus_children: no device ({e})");
+            return;
+        }
+    };
+
+    let entries = vec![
+        MenuEntry::Item(MenuItem::new(1, "Open")),
+        MenuEntry::Item(
+            MenuItem::new(2, "Settings")
+                .with_children(vec![MenuEntry::Item(MenuItem::new(21, "Account"))]),
+        ),
+    ];
+    let mut menu = Menu::new(entries);
+    let scale = 1.;
+
+    // The row the child will occupy once the submenu opens is empty while it is shut.
+    menu.set_expanded(2, true);
+    let child_at = menu.row_center("Account").expect("the child row exists");
+    menu.set_expanded(2, false);
+
+    let ink_at = |vk: &mut VulkanRenderer, menu: &Menu, at: Point<f64, Logical>| -> usize {
+        let size = menu.logical_size();
+        let phys = crate::ui::widget::physical_size(scale, size);
+        let texture = menu.bake(vk, scale).expect("bake the menu");
+        let buffer = crate::render_helpers::texture::TextureBuffer::from_texture(
+            vk,
+            texture,
+            scale,
+            Transform::Normal,
+            vec![],
+        );
+        let elem = crate::render_helpers::texture::TextureRenderElement::from_texture_buffer(
+            buffer,
+            Point::from((0., 0.)),
+            1.,
+            None,
+            None,
+            smithay::backend::renderer::element::Kind::Unspecified,
+        );
+        let pixels = render_to_vec(
+            vk,
+            phys,
+            Scale::from(scale),
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            [elem].into_iter(),
+        )
+        .expect("render the menu");
+
+        // Count text pixels on the child row's line only.
+        let y = (at.y * scale).round() as i32;
+        if y < 0 || y >= phys.h {
+            return 0;
+        }
+        let row = &pixels[(y * phys.w) as usize * 4..][..(phys.w as usize) * 4];
+        row.chunks_exact(4).filter(|p| p[3] > 40).count()
+    };
+
+    let shut = ink_at(&mut vk, &menu, child_at);
+    menu.set_expanded(2, true);
+    let open = ink_at(&mut vk, &menu, child_at);
+
+    assert!(
+        open > shut + 5,
+        "the expanded submenu must draw its child row ({open} ink px) where the collapsed menu \
+         draws nothing ({shut})"
+    );
+}
+
 /// A client-supplied **pixmap** draws in the panel, in the client's own colours.
 ///
 /// Pixmaps are the form Electron and Qt clients fall back to when they ship no themed icon, and

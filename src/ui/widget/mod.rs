@@ -76,6 +76,9 @@ pub type Rgba = [f32; 4];
 /// Only genuinely-shared, identically-valued tokens live here; widget-specific or
 /// divergent values (a menu bg vs a tile bg, the separator alphas) stay local until
 /// a port reconciles them against `docs/fork/gnome-style-reference.md`.
+pub mod menu;
+pub use menu::{Menu, MenuEntry, MenuHit, MenuItem, Ornament};
+
 pub mod style {
     use super::Rgba;
 
