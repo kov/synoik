@@ -30,6 +30,7 @@ pub mod gnome_shell_brightness;
 pub mod gnome_shell_introspect;
 pub mod gnome_shell_screenshot;
 pub mod gtk_notifications;
+pub mod ibus;
 pub mod mpris;
 pub mod mutter_display_config;
 pub mod mutter_idle_monitor;
