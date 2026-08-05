@@ -604,7 +604,15 @@ impl PanelPopover {
         self.output = Some(output);
         self.anchor = anchor;
         self.side = side;
-        self.content = Some(PopoverContent::App(Box::new(AppMenu::new(ctx))));
+        let mut menu = AppMenu::new(ctx);
+        // GNOME caps a menu at the monitor's work area and lets the content scroll rather than
+        // running off the screen (`js/ui/panelMenu.js:168-186`). An app with many open windows is
+        // how this menu gets there.
+        let avail = output_size(self.output.as_ref().expect("just set")).h
+            - crate::ui::panel::panel_height()
+            - 2. * POPOVER_MARGIN;
+        menu.set_max_height(Some(avail.max(0.)));
+        self.content = Some(PopoverContent::App(Box::new(menu)));
         self.anim = Some(self.make_anim(0., 1.));
     }
 
@@ -1054,6 +1062,9 @@ impl PanelPopover {
         let local = pos - origin;
         match self.content.as_mut() {
             Some(PopoverContent::Calendar(dm)) => dm.scroll(local, delta),
+            // A menu only takes the wheel when it has somewhere to go; a short one leaves the
+            // event for whatever is behind it.
+            Some(PopoverContent::App(m)) => m.scroll(delta),
             _ => false,
         }
     }

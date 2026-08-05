@@ -24,9 +24,14 @@
 //! beside the parent, which is what these clients' native toolkits do — would need a grab spanning
 //! two surfaces and would look unlike every other menu in the shell.
 //!
-//! **Not done here:** a menu taller than the screen is not scrollable yet. Inline expansion is what
-//! makes that reachable (a deep tree grows the surface), so it is the first thing to add; until
-//! then a very deep expansion clips at the screen edge.
+//! **Height and scrolling.** A menu grows to fit its rows until it hits the cap the caller sets
+//! (its monitor's work area), then scrolls — which is what GNOME does to a panel menu
+//! (`panelMenu.js:168-186`). Inline expansion makes that reachable in ordinary use, since a deep
+//! tree grows the one surface. The keyboard drags the view along with it, and both ends snap so
+//! the content padding never scrolls away and leaves a row against the rounded corner.
+//!
+//! **Not done here:** no scrollbar. GNOME's overlay scrollbars only appear on hover anyway, but a
+//! long menu currently gives no hint that there is more below it.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -209,6 +214,16 @@ pub struct Menu {
     /// The keyboard-focused row, same indexing. Distinct from hover: GNOME's menus track both, and
     /// a pointer moving over a menu must not steal the keyboard's place in it.
     focused: Option<usize>,
+    /// The tallest the menu may draw, or `None` for "as tall as it likes".
+    ///
+    /// GNOME caps a panel menu at the monitor's work area and lets whatever is scrollable inside
+    /// it scroll (`panelMenu.js:168-186`); a menu whose *content* is taller then scrolls
+    /// rather than running off the screen.
+    max_height: Option<f64>,
+    /// Scroll position in content px from the top, clamped on use rather than on write — the
+    /// content can shrink underneath it (a submenu collapsing, a client dropping rows), and a
+    /// stale-too-large offset must not eat the next scroll notch.
+    scroll_y: f64,
     revision: u64,
     bg_cache: RefCell<BakeCache>,
 }
@@ -220,9 +235,97 @@ impl Menu {
             expanded: HashSet::new(),
             hovered: None,
             focused: None,
+            max_height: None,
+            scroll_y: 0.,
             revision: 0,
             bg_cache: RefCell::new(BakeCache::new()),
         }
+    }
+
+    /// Cap the menu's drawn height. Returns whether it changed.
+    pub fn set_max_height(&mut self, max_height: Option<f64>) -> bool {
+        if max_height == self.max_height {
+            return false;
+        }
+        self.max_height = max_height;
+        self.revision += 1;
+        true
+    }
+
+    /// The height the menu would take with nothing in its way — the same arithmetic
+    /// [`Self::logical_size`] caps, kept in one place so the two cannot disagree about the pad.
+    fn natural_height(&self) -> f64 {
+        let rows = self.visible_rows();
+        2. * CONTENT_PAD + self.rows_height(&rows, rows.len())
+    }
+
+    /// How far the content can scroll: zero when it all fits.
+    fn max_scroll(&self) -> f64 {
+        (self.natural_height() - self.logical_size().h).max(0.)
+    }
+
+    /// Whether the menu is currently taller than it may draw.
+    pub fn is_scrollable(&self) -> bool {
+        self.max_scroll() > 0.
+    }
+
+    /// The clamped scroll offset. Reading it clamps, so a shrunken menu draws from a valid place
+    /// even before anything scrolls it.
+    fn scroll(&self) -> f64 {
+        self.scroll_y.clamp(0., self.max_scroll())
+    }
+
+    /// Scroll by `delta` content px (positive = down). Returns whether it moved, so the caller
+    /// knows whether to redraw *and* whether the wheel event was used.
+    pub fn scroll_by(&mut self, delta: f64) -> bool {
+        let max = self.max_scroll();
+        let before = self.scroll_y.clamp(0., max);
+        let after = (before + delta).clamp(0., max);
+        if (after - before).abs() <= f64::EPSILON {
+            return false;
+        }
+        self.scroll_y = after;
+        // Whatever the pointer was over has moved out from under it.
+        self.hovered = None;
+        self.revision += 1;
+        true
+    }
+
+    /// Bring the focused row fully into view, scrolling the least that does it. Returns whether
+    /// the offset moved.
+    fn scroll_focus_into_view(&mut self) -> bool {
+        let Some(k) = self.focused else {
+            return false;
+        };
+        let rows = self.visible_rows();
+        if k >= rows.len() {
+            return false;
+        }
+        // Row edges in *content* space, i.e. before the scroll is applied.
+        let top = self.row_top(&rows, k);
+        let bottom = top + rows[k].height;
+        let view_h = self.logical_size().h;
+        let cur = self.scroll();
+
+        let mut wanted = if top < cur {
+            top
+        } else if bottom > cur + view_h {
+            bottom - view_h
+        } else {
+            return false;
+        };
+
+        // Aligning a row's edge to the viewport's would scroll the content padding away at the
+        // ends, so the first row would touch the menu's rounded corner and the last would touch
+        // the bottom one. Within a pad of either end, go all the way — the row is visible either
+        // way, and this is the only placement that looks like a menu.
+        let max = self.max_scroll();
+        if wanted <= CONTENT_PAD {
+            wanted = 0.;
+        } else if wanted >= max - CONTENT_PAD {
+            wanted = max;
+        }
+        self.scroll_by(wanted - cur)
     }
 
     /// Replace the model, keeping which submenus are open and where the keyboard is.
@@ -329,17 +432,32 @@ impl Menu {
         })
     }
 
-    /// The top y of visible row `k`, content space.
-    fn row_top(&self, rows: &[VisibleRow], k: usize) -> f64 {
-        CONTENT_PAD + rows[..k].iter().map(|r| r.height).sum::<f64>()
+    /// The stacked height of the first `k` visible rows.
+    fn rows_height(&self, rows: &[VisibleRow], k: usize) -> f64 {
+        rows[..k].iter().map(|r| r.height).sum()
     }
 
-    /// Visible row `k`'s hover/click band.
-    fn row_rect(&self, rows: &[VisibleRow], k: usize, width: f64) -> Rectangle<f64, Logical> {
+    /// The top y of visible row `k` in *content* space, before scrolling.
+    fn row_top(&self, rows: &[VisibleRow], k: usize) -> f64 {
+        CONTENT_PAD + self.rows_height(rows, k)
+    }
+
+    /// Visible row `k`'s hover/click band, as drawn: content position less `scroll`.
+    ///
+    /// `scroll` is passed in rather than read per call because resolving it walks the tree and
+    /// measures every label ([`Self::max_scroll`] needs the natural height); a caller in a loop
+    /// hoists it once.
+    fn row_rect(
+        &self,
+        rows: &[VisibleRow],
+        k: usize,
+        width: f64,
+        scroll: f64,
+    ) -> Rectangle<f64, Logical> {
         // A nested row's band is inset, so the hover wash reads as belonging to its parent.
         let indent = rows[k].depth as f64 * INDENT;
         Rectangle::new(
-            Point::from((CONTENT_PAD + indent, self.row_top(rows, k))),
+            Point::from((CONTENT_PAD + indent, self.row_top(rows, k) - scroll)),
             Size::from((width - 2. * CONTENT_PAD - indent, rows[k].height)),
         )
     }
@@ -371,7 +489,13 @@ impl Menu {
             .fold(0., f64::max);
 
         let width = (2. * (CONTENT_PAD + ITEM_PAD_H) + widest).clamp(min_w(), max_w());
-        let height = self.row_top(&rows, rows.len()) + CONTENT_PAD;
+        // Deliberately *not* `row_top`, which is scroll-relative: the box's height is what it
+        // draws, and scrolling must not change it.
+        let natural = CONTENT_PAD + self.rows_height(&rows, rows.len()) + CONTENT_PAD;
+        let height = match self.max_height {
+            Some(max) => natural.min(max.max(0.)),
+            None => natural,
+        };
         Size::from((width, height))
     }
 
@@ -414,7 +538,7 @@ impl Menu {
             self.item_at(&row.path)
                 .is_some_and(|item| item.label == label)
         })?;
-        let rect = self.row_rect(&rows, k, width);
+        let rect = self.row_rect(&rows, k, width, self.scroll());
         Some(Point::from((
             rect.loc.x + rect.size.w / 2.,
             rect.loc.y + rect.size.h / 2.,
@@ -445,8 +569,9 @@ impl Menu {
     pub fn pointer_click(&mut self, pos: Point<f64, Logical>) -> MenuHit {
         let width = self.logical_size().w;
         let rows = self.visible_rows();
+        let scroll = self.scroll();
         for k in 0..rows.len() {
-            if !self.row_rect(&rows, k, width).contains(pos) {
+            if !self.row_rect(&rows, k, width, scroll).contains(pos) {
                 continue;
             }
             let Some(item) = self.item_at(&rows[k].path) else {
@@ -472,10 +597,11 @@ impl Menu {
     pub fn pointer_hover(&mut self, pos: Option<Point<f64, Logical>>) -> bool {
         let width = self.logical_size().w;
         let rows = self.visible_rows();
+        let scroll = self.scroll();
         let hovered = pos.and_then(|p| {
             (0..rows.len()).find(|&k| {
                 self.item_at(&rows[k].path).is_some_and(|i| i.enabled)
-                    && self.row_rect(&rows, k, width).contains(p)
+                    && self.row_rect(&rows, k, width, scroll).contains(p)
             })
         });
         if hovered == self.hovered {
@@ -522,6 +648,8 @@ impl Menu {
         }
         self.focused = Some(next);
         self.revision += 1;
+        // Focus that lands off-screen is focus the user cannot see; a capped menu follows it.
+        self.scroll_focus_into_view();
         true
     }
 
@@ -561,16 +689,22 @@ impl Menu {
         if !item.is_submenu() {
             return false;
         }
-        self.set_expanded(id, expand)
+        let changed = self.set_expanded(id, expand);
+        if changed {
+            // Expanding pushes rows down; the row that was just opened should stay in view.
+            self.scroll_focus_into_view();
+        }
+        changed
     }
 
     /// Clear hover and focus — what closing and reopening a menu owes.
     pub fn reset_navigation(&mut self) {
-        if self.hovered.is_some() || self.focused.is_some() {
+        if self.hovered.is_some() || self.focused.is_some() || self.scroll_y != 0. {
             self.revision += 1;
         }
         self.hovered = None;
         self.focused = None;
+        self.scroll_y = 0.;
     }
 
     /// The ornament/icon centres to composite over the baked card, in menu-local coordinates:
@@ -581,13 +715,14 @@ impl Menu {
     pub fn ornaments(&self) -> Vec<(Vec<String>, Point<f64, Logical>)> {
         let width = self.logical_size().w;
         let rows = self.visible_rows();
+        let scroll = self.scroll();
         let mut out = Vec::new();
 
         for k in 0..rows.len() {
             let Some(item) = self.item_at(&rows[k].path) else {
                 continue;
             };
-            let rect = self.row_rect(&rows, k, width);
+            let rect = self.row_rect(&rows, k, width, scroll);
             let mid_y = rect.loc.y + rect.size.h / 2.;
 
             // The leading column: a checkmark if marked, else the row's own icon. A marked row
@@ -650,11 +785,18 @@ impl Menu {
         let size = self.logical_size();
         let rows = self.visible_rows();
         let lead = self.leading_inset();
+        let scroll = self.scroll();
         let mut p = Painter::new(frame, scale, phys);
         p.clear(style::TRANSPARENT)?;
 
         for (k, run) in runs.iter().enumerate().take(rows.len()) {
-            let rect = self.row_rect(&rows, k, size.w);
+            let rect = self.row_rect(&rows, k, size.w, scroll);
+            // Rows scrolled out of the card are not drawn at all; the bake buffer is the viewport,
+            // so anything outside it is wasted paint (and, above the top edge, has historically
+            // been a source of stray slivers).
+            if rect.loc.y + rect.size.h <= 0. || rect.loc.y >= size.h {
+                continue;
+            }
             let entry = self.entry_at(&rows[k].path);
 
             match (entry, run) {
@@ -782,8 +924,8 @@ mod tests {
         let child = menu.row_center("Account").unwrap();
         assert!(child.y > parent.y);
         let rows = menu.visible_rows();
-        let parent_rect = menu.row_rect(&rows, 1, open.w);
-        let child_rect = menu.row_rect(&rows, 2, open.w);
+        let parent_rect = menu.row_rect(&rows, 1, open.w, 0.);
+        let child_rect = menu.row_rect(&rows, 2, open.w, 0.);
         assert!(
             child_rect.loc.x > parent_rect.loc.x,
             "a child row is indented from its parent"
@@ -831,7 +973,7 @@ mod tests {
         let size = menu.logical_size();
         let rows = menu.visible_rows();
         // Row 2 is the separator.
-        let rect = menu.row_rect(&rows, 2, size.w);
+        let rect = menu.row_rect(&rows, 2, size.w, 0.);
         let at = Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.));
         assert_eq!(menu.pointer_click(at), MenuHit::Nothing);
     }
@@ -914,6 +1056,126 @@ mod tests {
         // An identical model is not a change, so a client repainting nothing costs no redraw.
         let same = menu.entries().to_vec();
         assert!(!menu.set_entries(same));
+    }
+
+    /// A menu of `n` plain rows, for the height/scroll tests.
+    fn tall(n: u64) -> Menu {
+        Menu::new((0..n).map(|i| item(i, "Row")).collect())
+    }
+
+    #[test]
+    fn a_menu_grows_until_it_hits_its_cap_and_then_scrolls() {
+        let mut menu = tall(20);
+        let natural = menu.logical_size().h;
+        assert!(!menu.is_scrollable(), "nothing caps it yet");
+
+        // A cap taller than the content changes nothing — GNOME only clamps what would overflow
+        // the work area (`panelMenu.js:168-186`).
+        assert!(menu.set_max_height(Some(natural + 100.)));
+        assert_eq!(menu.logical_size().h, natural);
+        assert!(!menu.is_scrollable());
+
+        // A cap shorter than the content clamps the box and makes the content scroll.
+        let cap = natural / 2.;
+        assert!(menu.set_max_height(Some(cap)));
+        assert_eq!(menu.logical_size().h, cap);
+        assert!(menu.is_scrollable());
+        assert!((menu.max_scroll() - (natural - cap)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scrolling_moves_the_rows_and_stops_at_both_ends() {
+        let mut menu = tall(20);
+        let natural = menu.logical_size().h;
+        menu.set_max_height(Some(natural / 2.));
+
+        let rows = menu.visible_rows();
+        let width = menu.logical_size().w;
+        let first_before = menu.row_rect(&rows, 0, width, menu.scroll()).loc.y;
+
+        assert!(menu.scroll_by(40.), "a scrollable menu scrolls");
+        let first_after = menu.row_rect(&rows, 0, width, menu.scroll()).loc.y;
+        assert!(
+            first_after < first_before,
+            "scrolling down moves the rows up: {first_before} -> {first_after}"
+        );
+
+        // Both ends stop rather than running away.
+        assert!(!menu.scroll_by(-1000.) || menu.scroll() == 0.);
+        assert!(!menu.scroll_by(-10.), "already at the top");
+        menu.scroll_by(10_000.);
+        assert!(!menu.scroll_by(10.), "already at the bottom");
+
+        // And a menu that fits does not scroll at all, so the wheel stays available to whatever is
+        // behind it.
+        let mut short = tall(2);
+        short.set_max_height(Some(10_000.));
+        assert!(!short.scroll_by(40.));
+    }
+
+    #[test]
+    fn a_click_lands_on_the_row_that_is_actually_under_it_after_scrolling() {
+        let mut menu = Menu::new((0..20).map(|i| item(i, "Row")).collect());
+        let natural = menu.logical_size().h;
+        menu.set_max_height(Some(natural / 2.));
+
+        // A point near the menu's top hits row 0 before scrolling...
+        let width = menu.logical_size().w;
+        let rows = menu.visible_rows();
+        let probe = {
+            let r = menu.row_rect(&rows, 0, width, menu.scroll());
+            Point::from((r.loc.x + r.size.w / 2., r.loc.y + r.size.h / 2.))
+        };
+        assert_eq!(menu.pointer_click(probe), MenuHit::Activated(0));
+
+        // ...and a different row once the content has moved under it. A hit test that ignored the
+        // scroll would keep answering row 0.
+        menu.scroll_by(ROW_H * 3.);
+        assert_eq!(menu.pointer_click(probe), MenuHit::Activated(3));
+    }
+
+    #[test]
+    fn keyboard_focus_scrolls_itself_into_view() {
+        let mut menu = tall(20);
+        let natural = menu.logical_size().h;
+        let cap = natural / 2.;
+        menu.set_max_height(Some(cap));
+
+        // Walk the focus down past the fold; the menu must follow it.
+        for _ in 0..12 {
+            menu.focus_step(1);
+        }
+        let id = menu.focused_id().expect("something is focused");
+        let rows = menu.visible_rows();
+        let width = menu.logical_size().w;
+        let k = menu.index_of(id).unwrap();
+        let rect = menu.row_rect(&rows, k, width, menu.scroll());
+        assert!(
+            rect.loc.y >= -0.001 && rect.loc.y + rect.size.h <= cap + 0.001,
+            "the focused row must be fully visible, got {rect:?} in a {cap}-tall menu"
+        );
+
+        // Wrapping past the last row brings the view back to the top with it.
+        while menu.focused_id() != Some(19) {
+            menu.focus_step(1);
+        }
+        assert!(menu.scroll() > 0., "the last row is past the fold");
+        menu.focus_step(1);
+        assert_eq!(menu.focused_id(), Some(0));
+        assert_eq!(menu.scroll(), 0.);
+    }
+
+    #[test]
+    fn reopening_a_menu_starts_at_the_top() {
+        let mut menu = tall(20);
+        let natural = menu.logical_size().h;
+        menu.set_max_height(Some(natural / 2.));
+        menu.scroll_by(100.);
+        assert!(menu.scroll() > 0.);
+
+        menu.reset_navigation();
+        assert_eq!(menu.scroll(), 0., "a reopened menu is not still scrolled");
+        assert_eq!(menu.focused_id(), None);
     }
 
     #[test]

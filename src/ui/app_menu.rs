@@ -180,6 +180,17 @@ impl AppMenu {
         self.menu.logical_size()
     }
 
+    /// Cap the menu's height to what the screen can show.
+    pub fn set_max_height(&mut self, max_height: Option<f64>) -> bool {
+        self.menu.set_max_height(max_height)
+    }
+
+    /// A wheel notch over the menu. Returns whether it scrolled — a menu that fits does not take
+    /// the event.
+    pub fn scroll(&mut self, delta: f64) -> bool {
+        self.menu.scroll_by(delta)
+    }
+
     /// The menu box corner radius — for the drop shadow behind it.
     pub fn corner_radius(&self) -> f64 {
         self.menu.corner_radius()
