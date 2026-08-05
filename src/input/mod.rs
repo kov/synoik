@@ -58,6 +58,7 @@ use crate::gnome::{
     modifiers_from_accel, Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction,
     GnomeKeybinding, KeybindingAction, ScreenDirection, TileSide,
 };
+use crate::input_method::ShellEntry;
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::workspace::WorkspaceId;
 use crate::layout::{ActivateWindow, LayoutElement};
@@ -223,6 +224,128 @@ fn edit_mods(mods: &ModifiersState) -> crate::ui::text_edit::EditMods {
 }
 
 impl State {
+    /// Route one key to a compositor entry: through the engine if it wants it, else straight in.
+    ///
+    /// Every one of the five entries goes through here, so the "offer, then deliver on decline"
+    /// rule lives in one place rather than five.
+    #[allow(clippy::too_many_arguments)]
+    fn shell_key(
+        &mut self,
+        entry: crate::input_method::ShellEntry,
+        raw: Option<Keysym>,
+        text: Option<char>,
+        mods: crate::ui::text_edit::EditMods,
+        keysym: u32,
+        keycode: Keycode,
+        pressed: bool,
+    ) {
+        let key = crate::input_method::ShellKey {
+            entry,
+            raw,
+            text,
+            mods,
+            theme: self.synoik.gnome_settings.key_theme,
+            pressed,
+        };
+        if !self.im_offer_shell_key(key, keysym, keycode) {
+            self.deliver_shell_key(key);
+        }
+    }
+
+    /// Hand a key to whichever of the compositor's own entries it was bound for.
+    ///
+    /// Split out of the key filter so the same work can happen either synchronously — when there
+    /// is no input method — or later, once the engine has declined the key. The filter keeps the
+    /// parts that must stay synchronous either way: `suppressed_keys` bookkeeping and the
+    /// `FilterResult` itself.
+    ///
+    /// Only *presses* ever get here deferred (see `im_offer_shell_key`'s caller), so releases
+    /// still take their original path untouched.
+    pub(crate) fn deliver_shell_key(&mut self, key: crate::input_method::ShellKey) {
+        use crate::input_method::ShellEntry;
+
+        let crate::input_method::ShellKey {
+            entry,
+            raw,
+            text,
+            mods,
+            theme,
+            pressed,
+        } = key;
+
+        match entry {
+            ShellEntry::Shield => self.on_shield_key(raw, text, mods),
+            ShellEntry::RunDialog => {
+                let outcome = self.synoik.run_dialog.handle_key(
+                    raw,
+                    text,
+                    mods,
+                    theme,
+                    pressed,
+                    &self.synoik.gnome_settings.command_history,
+                );
+                match outcome {
+                    KeyOutcome::Handled => {}
+                    KeyOutcome::Close => self.synoik.run_dialog.close(),
+                    KeyOutcome::Run(input) => self.run_dialog_execute(&input),
+                }
+                self.synoik.queue_redraw_all();
+            }
+            #[cfg(feature = "dbus")]
+            ShellEntry::Polkit => self.handle_polkit_key(raw, text, mods, theme, pressed),
+            #[cfg(not(feature = "dbus"))]
+            ShellEntry::Polkit => {}
+            ShellEntry::FolderRename => {
+                use crate::ui::folder_dialog::RenameKey;
+                match self.synoik.folder_dialog.rename_key(raw, text, mods, theme) {
+                    RenameKey::Ignored => return,
+                    RenameKey::Took => {}
+                    RenameKey::Commit => {
+                        if let Some((folder, name)) = self.synoik.folder_dialog.finish_rename() {
+                            self.rename_folder(&folder, &name);
+                        }
+                    }
+                }
+                self.synoik.queue_redraw_all();
+            }
+            ShellEntry::OverviewSearch => {
+                use crate::ui::overview_search::SearchOutcome;
+                match self
+                    .synoik
+                    .overview_search
+                    .handle_key(raw, text, mods, theme)
+                {
+                    // Only keys the entry is certain to take are ever deferred, so this is
+                    // reachable solely on the synchronous path — where the caller decides what
+                    // to fall through to.
+                    SearchOutcome::Ignored => return,
+                    SearchOutcome::Handled => {}
+                    SearchOutcome::QueryChanged | SearchOutcome::Cleared => {
+                        self.synoik.sync_overview_search();
+                    }
+                    SearchOutcome::Activate(id) => {
+                        self.launch_app(
+                            &id,
+                            crate::app_system::LaunchMode::Activate,
+                            None,
+                            "search",
+                        );
+                        self.synoik.overview_search.clear();
+                        self.synoik.layout.close_overview();
+                    }
+                    SearchOutcome::Close => {
+                        self.synoik.overview_search.clear();
+                        // Escape tiers (`searchController.js:153-159`): search → grid → hide.
+                        if !self.synoik.layout.close_app_grid() {
+                            self.synoik.layout.close_overview();
+                        }
+                    }
+                }
+                self.synoik.queue_redraw_all();
+            }
+        }
+    }
+
     /// A key on the open polkit dialog.
     ///
     /// Escape cancels, Enter activates whatever has focus, Tab and the arrows move it, and
@@ -779,7 +902,15 @@ impl State {
                         let text = modified
                             .key_char()
                             .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
-                        this.on_shield_key(raw, text, edit_mods(mods));
+                        this.shell_key(
+                            ShellEntry::Shield,
+                            raw,
+                            text,
+                            edit_mods(mods),
+                            modified.raw(),
+                            key_code,
+                            pressed,
+                        );
                     }
 
                     if pressed {
@@ -864,20 +995,15 @@ impl State {
                     let text = modified
                         .key_char()
                         .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
-                    let outcome = this.synoik.run_dialog.handle_key(
+                    this.shell_key(
+                        ShellEntry::RunDialog,
                         raw,
                         text,
                         edit_mods(mods),
-                        this.synoik.gnome_settings.key_theme,
+                        modified.raw(),
+                        key_code,
                         pressed,
-                        &this.synoik.gnome_settings.command_history,
                     );
-                    match outcome {
-                        KeyOutcome::Handled => {}
-                        KeyOutcome::Close => this.synoik.run_dialog.close(),
-                        KeyOutcome::Run(input) => this.run_dialog_execute(&input),
-                    }
-                    this.synoik.queue_redraw_all();
 
                     if pressed {
                         this.synoik.suppressed_keys.insert(key_code);
@@ -920,8 +1046,15 @@ impl State {
                     let text = modified
                         .key_char()
                         .filter(|_| !mods.ctrl && !mods.alt && !mods.logo);
-                    let theme = this.synoik.gnome_settings.key_theme;
-                    this.handle_polkit_key(raw, text, edit_mods(mods), theme, pressed);
+                    this.shell_key(
+                        ShellEntry::Polkit,
+                        raw,
+                        text,
+                        edit_mods(mods),
+                        modified.raw(),
+                        key_code,
+                        pressed,
+                    );
 
                     if pressed {
                         this.synoik.suppressed_keys.insert(key_code);
@@ -1108,6 +1241,24 @@ impl State {
                         if this.synoik.folder_dialog.is_renaming() {
                             use crate::ui::folder_dialog::RenameKey;
                             let theme = this.synoik.gnome_settings.key_theme;
+                            // Offer it to the engine first. Only keys the entry is certain to
+                            // take are ever accepted, so the `Ignored` fall-through below stays
+                            // reachable — it is the one outcome that must not be deferred.
+                            if this.im_offer_shell_key(
+                                crate::input_method::ShellKey {
+                                    entry: ShellEntry::FolderRename,
+                                    raw,
+                                    text,
+                                    mods: edit_mods(mods),
+                                    theme,
+                                    pressed,
+                                },
+                                modified.raw(),
+                                key_code,
+                            ) {
+                                this.synoik.suppressed_keys.insert(key_code);
+                                return FilterResult::Intercept(None);
+                            }
                             match this.synoik.folder_dialog.rename_key(
                                 raw,
                                 text,
@@ -1142,6 +1293,24 @@ impl State {
                         if active || expanded || starts {
                             use crate::ui::overview_search::SearchOutcome;
                             let theme = this.synoik.gnome_settings.key_theme;
+                            // As with the rename entry: offer first, and only keys the search is
+                            // certain to consume are accepted, so the `Ignored` fall-through to
+                            // grid navigation and the hardcoded binds below stays reachable.
+                            if this.im_offer_shell_key(
+                                crate::input_method::ShellKey {
+                                    entry: ShellEntry::OverviewSearch,
+                                    raw,
+                                    text,
+                                    mods: edit_mods(mods),
+                                    theme,
+                                    pressed,
+                                },
+                                modified.raw(),
+                                key_code,
+                            ) {
+                                this.synoik.suppressed_keys.insert(key_code);
+                                return FilterResult::Intercept(None);
+                            }
                             let outcome = this.synoik.overview_search.handle_key(
                                 raw,
                                 text,

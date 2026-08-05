@@ -3060,6 +3060,11 @@ impl State {
             // FIXME: can be more granular.
             self.synoik.queue_redraw_all();
         }
+
+        // Outside the `!=` guard: an entry of ours can open or close without keyboard focus
+        // moving (a modal dialog over the same window keeps `KeyboardFocus::Layout`), and the
+        // engine must not keep composing into an entry that has gone away.
+        self.sync_im_focus();
     }
 
     /// Loads the xkb keymap from a file config setting.

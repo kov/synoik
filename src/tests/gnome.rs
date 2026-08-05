@@ -38,6 +38,7 @@ use crate::utils::get_monotonic_time;
 
 /// Linux evdev codes (`input-event-codes.h`) for the inputs these tests inject.
 const KEY_ESC: u32 = 1;
+const KEY_APOSTROPHE: u32 = 40;
 const KEY_1: u32 = 2;
 const KEY_2: u32 = 3;
 const KEY_TAB: u32 = 15;
@@ -3153,6 +3154,30 @@ fn engine_output_reaches_the_client_as_preedit_then_commit() {
 /// What the client's committed text-input state lands in before it is pumped into the model.
 type ImSink = std::sync::Arc<std::sync::Mutex<Vec<smithay::wayland::text_input::TextInputEvent>>>;
 
+/// Answer every key the engine is still holding, as a real daemon would, and return everything
+/// the model asked for along the way.
+///
+/// With an input method connected, a key bound for a text entry is *held* until a verdict comes
+/// back — so a test that presses one and never answers sees nothing happen at all. The drained
+/// requests are returned rather than discarded, because the focus and content-type traffic a
+/// test wants to assert on arrives interleaved with the keys.
+fn answer_im_keys(
+    f: &mut Fixture,
+    requests: &async_channel::Receiver<crate::input_method::ImRequest>,
+    filtered: bool,
+) -> Vec<crate::input_method::ImRequest> {
+    use crate::input_method::{ImRequest, ImUpdate};
+
+    let drained: Vec<ImRequest> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
+    for request in &drained {
+        if let ImRequest::ProcessKey { id, .. } = request {
+            f.synoik_state()
+                .on_im_update(ImUpdate::KeyResult { id: *id, filtered });
+        }
+    }
+    drained
+}
+
 /// Feed everything the client has committed into the model, as the production calloop source
 /// does. Manual here because the fixture's sink is a `Vec`, not the real channel.
 fn pump_im(f: &mut Fixture, seen: &ImSink) {
@@ -3414,6 +3439,174 @@ fn a_password_field_is_announced_to_the_engine() {
             hints: 0,
         }],
         "disabling the input must reset the content type"
+    );
+}
+
+/// Typing into the compositor's *own* entries composes too. The overview search is the
+/// everyday one: `'` then `a` must put `á` in the query, not `'a`.
+#[test]
+fn the_overview_search_composes_through_the_engine() {
+    use crate::dbus::ibus::ImEvent;
+    use crate::input_method::{ImFocus, ImRequest, ImUpdate, ShellEntry};
+
+    let (mut f, id, requests, _seen) = im_fixture();
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+    while requests.try_recv().is_ok() {}
+
+    // The dead key. It carries text, so the search is certain to take it — which is what makes
+    // it safe to defer.
+    f.key_press(KEY_APOSTROPHE);
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.synoik().input_method.as_ref().unwrap().focus(),
+        ImFocus::Shell(ShellEntry::OverviewSearch),
+        "the overview search must hold the engine while it has focus"
+    );
+    let offered: Vec<ImRequest> = std::iter::from_fn(|| requests.try_recv().ok())
+        .filter(|r| matches!(r, ImRequest::ProcessKey { .. }))
+        .collect();
+    assert_eq!(offered.len(), 1, "the key must be offered to the engine");
+    assert_eq!(
+        f.synoik().overview_search.query(),
+        "",
+        "nothing may reach the entry until the engine has ruled"
+    );
+
+    // The engine takes it and, once the `a` follows, commits the composed character.
+    let ImRequest::ProcessKey { id: key_id, .. } = offered[0].clone() else {
+        unreachable!()
+    };
+    f.synoik_state().on_im_update(ImUpdate::KeyResult {
+        id: key_id,
+        filtered: true,
+    });
+    f.synoik_state()
+        .on_im_update(ImUpdate::Event(ImEvent::Commit("á".to_owned())));
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.synoik().overview_search.query(),
+        "á",
+        "composed text must land in the search entry"
+    );
+}
+
+/// The lock screen's password field is announced to the engine as a password — the same thing
+/// GNOME's `StPasswordEntry` does (`st-password-entry.c:241`) — and takes composed text.
+#[test]
+fn the_lock_screen_password_entry_is_announced_as_a_password() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+    use crate::dbus::ibus::{hints, purpose, ImEvent};
+    use crate::input_method::{ImFocus, ImRequest, ImUpdate, ShellEntry};
+    use crate::unlock_dialog::Page;
+
+    let (mut f, id, requests, _seen) = im_fixture();
+
+    // A real lock with a live verifier, not a screensaver — a dismissible shield treats any key
+    // as "wake up" rather than as text.
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    // The first key raises the prompt; from here the entry is live. It goes to the engine first
+    // like any other, so the verdict has to come back before anything happens — which is itself
+    // the deferral working on the lock screen.
+    f.key_press(KEY_A);
+    f.key_release(KEY_A);
+    assert_eq!(
+        f.synoik().unlock_dialog.page(),
+        Page::Clock,
+        "the key must be held until the engine rules on it"
+    );
+    let sent = answer_im_keys(&mut f, &requests, false);
+    assert_eq!(
+        sent.iter()
+            .filter(|r| matches!(r, ImRequest::ProcessKey { .. }))
+            .count(),
+        1,
+        "exactly the press is offered; releases keep their original path"
+    );
+    f.synoik_state().update_keyboard_focus();
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(f.synoik().unlock_dialog.page(), Page::Prompt);
+
+    assert_eq!(
+        f.synoik().input_method.as_ref().unwrap().focus(),
+        ImFocus::Shell(ShellEntry::Shield),
+        "the shield must take the engine from the client underneath it"
+    );
+    assert!(
+        sent.contains(&ImRequest::ContentType {
+            purpose: purpose::PASSWORD,
+            hints: hints::PRIVATE | hints::HIDDEN_TEXT,
+        }),
+        "the shield entry must be announced as a password, got: {sent:?}"
+    );
+
+    // ...and composed text still reaches it, so an accented password can be typed. Asserted
+    // through the masked display, because the entry's own text is a secret the test has no
+    // business reading — one bullet per character is the observable that matters.
+    let before = f.synoik().unlock_dialog.entry_display().chars().count();
+    f.synoik_state()
+        .on_im_update(ImUpdate::Event(ImEvent::Commit("á".to_owned())));
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.synoik().unlock_dialog.entry_display().chars().count(),
+        before + 1,
+        "composed text must reach the password entry"
+    );
+}
+
+/// A modal entry of ours takes the engine from a client that still has text input enabled.
+/// Otherwise the engine would be composing against the client's surrounding text while the
+/// keystrokes went into a dialog — at worst, a password one.
+#[test]
+fn a_modal_entry_takes_the_engine_from_the_client_underneath() {
+    use crate::input_method::{ImFocus, ImRequest, ShellEntry};
+
+    let (mut f, id, requests, _seen) = im_fixture();
+    assert_eq!(
+        f.synoik().input_method.as_ref().unwrap().focus(),
+        ImFocus::Client,
+        "the client starts with the engine"
+    );
+    while requests.try_recv().is_ok() {}
+
+    f.synoik_state().do_action(Action::ShowRunDialog, false);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.synoik().input_method.as_ref().unwrap().focus(),
+        ImFocus::Shell(ShellEntry::RunDialog),
+        "the dialog must take the engine"
+    );
+    let sent: Vec<ImRequest> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
+    let out = sent.iter().position(|r| *r == ImRequest::FocusOut);
+    let back_in = sent.iter().position(|r| *r == ImRequest::FocusIn);
+    assert!(
+        out.is_some() && back_in.is_some() && out < back_in,
+        "the client must be focused out before the dialog is focused in, got: {sent:?}"
+    );
+
+    // Closing it gives the engine back to the client.
+    f.synoik().run_dialog.close();
+    f.synoik_state().update_keyboard_focus();
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.synoik().input_method.as_ref().unwrap().focus(),
+        ImFocus::Client,
+        "the client must get the engine back"
     );
 }
 

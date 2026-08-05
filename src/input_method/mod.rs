@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use smithay::backend::input::KeyState;
-use smithay::input::keyboard::{Keycode, ModifiersState};
+use smithay::input::keyboard::{Keycode, Keysym, ModifiersState};
 use smithay::utils::Serial;
 use smithay::wayland::text_input::{TextInputEvent, TextInputSeat};
 
@@ -55,22 +55,100 @@ use crate::synoik::State;
 /// unusable". Deliberate divergence.
 const KEY_TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// A keystroke held back from the client while the engine decides on it.
+/// One of the compositor's own text entries — the surfaces that are *not* Wayland clients and so
+/// have no `zwp_text_input_v3` of their own.
 ///
-/// Everything here is what [`smithay::input::keyboard::KeyboardHandle::input_forward`] needs, so
-/// that delivering a deferred key later is the same call it would have been synchronously.
+/// GNOME reaches these through the same `ClutterInputFocus` a client gets, because there every
+/// entry is a `ClutterText` (`clutter-text.c:292-531`) and the shell is just another actor. We
+/// have no such common substrate, so the entries are enumerated instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellEntry {
+    /// The lock screen's password field.
+    Shield,
+    /// Alt-F2.
+    RunDialog,
+    /// The polkit authentication dialog's password field.
+    Polkit,
+    /// Renaming an app folder in the overview.
+    FolderRename,
+    /// The overview's search entry.
+    OverviewSearch,
+}
+
+impl ShellEntry {
+    /// Whether this entry holds a secret, and must be announced to the engine as such.
+    pub fn is_password(self) -> bool {
+        matches!(self, Self::Shield | Self::Polkit)
+    }
+
+    /// The content type to announce for it, already in IBus's enums.
+    fn content_type(self) -> (u32, u32) {
+        if self.is_password() {
+            // What GNOME's `StPasswordEntry` amounts to: `PURPOSE_PASSWORD`
+            // (`st-password-entry.c:241`) plus the hints a hidden, sensitive field implies.
+            (
+                ibus::purpose::PASSWORD,
+                ibus::hints::PRIVATE | ibus::hints::HIDDEN_TEXT,
+            )
+        } else {
+            (ibus::purpose::FREE_FORM, 0)
+        }
+    }
+}
+
+/// A keystroke bound for one of the compositor's own entries, carrying everything the entry's
+/// handler will need once the engine has had its say.
+#[derive(Debug, Clone, Copy)]
+pub struct ShellKey {
+    pub entry: ShellEntry,
+    pub raw: Option<Keysym>,
+    /// The character the key produces, already filtered for ctrl/alt/logo by the caller.
+    pub text: Option<char>,
+    pub mods: crate::ui::text_edit::EditMods,
+    pub theme: crate::ui::text_edit::KeyTheme,
+    pub pressed: bool,
+}
+
+/// Where a held-back key goes once the engine declines it.
+#[derive(Debug, Clone, Copy)]
+enum KeyDest {
+    /// A Wayland client. The fields are what
+    /// [`smithay::input::keyboard::KeyboardHandle::input_forward`] needs, so that delivering the
+    /// key later is the same call it would have been synchronously.
+    Client {
+        keycode: Keycode,
+        state: KeyState,
+        serial: Serial,
+        time: u32,
+        mods_changed: bool,
+    },
+    /// One of our own entries.
+    Shell(ShellKey),
+}
+
+/// A keystroke held back while the engine decides on it.
 #[derive(Debug, Clone, Copy)]
 struct PendingKey {
     id: u64,
-    keycode: Keycode,
-    state: KeyState,
-    serial: Serial,
-    time: u32,
-    mods_changed: bool,
+    dest: KeyDest,
     /// When this key was held back, for [`KEY_TIMEOUT`]. Real time rather than the compositor
     /// clock on purpose: this bounds an *IPC* stall, and it must still expire when the frame
     /// clock is idle because nothing is animating.
     queued_at: std::time::Instant,
+}
+
+/// Who the input method is currently focused on.
+///
+/// One at a time, exactly as in GNOME: `ClutterInputMethod` has a single `focus`
+/// (`clutter-input-method.c:544`), and a shell entry taking key focus focuses *out* whatever had
+/// it. That matters here because a modal dialog can open over a client whose text input is still
+/// enabled — the client must not keep the engine while the user types into the dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImFocus {
+    #[default]
+    None,
+    Client,
+    Shell(ShellEntry),
 }
 
 /// Convert our modifier state into the X11-style mask IBus expects.
@@ -157,15 +235,22 @@ pub struct InputMethod {
     to_worker: async_channel::Sender<ImRequest>,
     /// Whether a client currently has an *enabled* text input.
     ///
-    /// This is the gate for touching the keyboard path at all: mutter's
-    /// `meta_wayland_text_input_update` returns early unless there is a focused, enabled input
-    /// (`meta-wayland-text-input.c:1174-1177`), so ordinary typing outside a text field never
-    /// goes near the input method.
-    enabled: bool,
+    /// This is one input to [`ImFocus`], not the gate itself: a client can have text input
+    /// enabled while a modal dialog of ours holds the keyboard, and then the *dialog* owns the
+    /// engine.
+    client_enabled: bool,
+    /// The content type the focused client declared, kept separate from the effective one so
+    /// that focus moving to a shell entry and back restores it.
+    client_content_type: (u32, u32),
+    /// Who the engine is focused on. Nothing touches the key path while this is
+    /// [`ImFocus::None`]: mutter's `meta_wayland_text_input_update` likewise returns early
+    /// without a focused, enabled input (`meta-wayland-text-input.c:1174-1177`), so ordinary
+    /// typing outside a text field never goes near the input method.
+    focus: ImFocus,
     /// Whether the worker has a live daemon. While false the key path behaves exactly as it does
     /// with no input method at all, rather than queueing keys nobody will answer for.
     connected: bool,
-    /// The preedit we last sent a client, so focus changes and resets can clear it.
+    /// The preedit we last showed, so focus changes and resets can clear it.
     preedit: Option<String>,
     /// The content type last sent, as `(purpose, hints)`, so a reconnect can replay it. A new
     /// input context defaults to free-form, and letting a **password** field silently become
@@ -184,7 +269,7 @@ pub struct InputMethod {
 impl std::fmt::Debug for InputMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InputMethod")
-            .field("enabled", &self.enabled)
+            .field("focus", &self.focus)
             .field("preedit", &self.preedit)
             .finish()
     }
@@ -198,7 +283,9 @@ impl InputMethod {
     pub fn new(to_worker: async_channel::Sender<ImRequest>) -> Self {
         Self {
             to_worker,
-            enabled: false,
+            client_enabled: false,
+            client_content_type: (ibus::purpose::FREE_FORM, 0),
+            focus: ImFocus::None,
             connected: false,
             preedit: None,
             content_type: (ibus::purpose::FREE_FORM, 0),
@@ -207,17 +294,22 @@ impl InputMethod {
         }
     }
 
-    /// Whether a client has text input enabled right now.
+    /// Who the engine is focused on.
+    pub fn focus(&self) -> ImFocus {
+        self.focus
+    }
+
+    /// Whether the focused *client* has text input enabled.
     pub fn is_enabled(&self) -> bool {
-        self.enabled
+        self.client_enabled
     }
 
     /// Whether keystrokes should be routed through the engine at all.
     ///
-    /// Both halves matter: an enabled text input with no daemon behind it must not swallow keys,
-    /// and a live daemon with no focused text input must never see the user's typing.
+    /// Both halves matter: a focused entry with no daemon behind it must not swallow keys, and a
+    /// live daemon with nothing focused must never see the user's typing.
     pub fn wants_keys(&self) -> bool {
-        self.enabled && self.connected
+        self.focus != ImFocus::None && self.connected
     }
 
     /// Whether any key is currently held back from the client.
@@ -263,53 +355,46 @@ impl State {
         };
 
         match event {
+            // Enable and disable no longer focus the engine themselves: they feed `sync_im_focus`,
+            // which weighs them against a modal entry of ours that may hold the keyboard.
             TextInputEvent::Enabled => {
-                im.enabled = true;
-                im.send(ImRequest::FocusIn);
+                im.client_enabled = true;
+                self.sync_im_focus();
             }
             TextInputEvent::Disabled => {
-                im.enabled = false;
+                im.client_enabled = false;
+                // Back to free-form, as gnome-shell's reset does (`inputMethod.js:390`), so the
+                // client's declared type cannot outlive the input that declared it.
+                im.client_content_type = (ibus::purpose::FREE_FORM, 0);
                 self.synoik.im_surrounding = None;
-                // Keys still in flight belong to the input that just went away. Deliver them
-                // rather than drop them — the client asked for them as ordinary key events the
-                // moment it disabled text input.
-                self.flush_pending_im_keys();
-                // A disabled input keeps no composition. Clear ours before telling the engine,
-                // so a client that re-enables immediately cannot see a stale preedit.
-                self.clear_preedit();
-                let Some(im) = self.synoik.input_method.as_mut() else {
-                    return;
-                };
-                // Back to free-form, as gnome-shell's reset does (`inputMethod.js:390`). The
-                // next field to take focus sets its own content type, but until it does the
-                // engine must not still believe it is in the *previous* one — a password
-                // field's purpose outliving the password field is the wrong direction to err.
-                im.content_type = (ibus::purpose::FREE_FORM, 0);
-                im.send(ImRequest::ContentType {
-                    purpose: ibus::purpose::FREE_FORM,
-                    hints: 0,
-                });
-                im.send(ImRequest::FocusOut);
+                self.sync_im_focus();
             }
             TextInputEvent::SurroundingText {
                 text,
                 cursor,
                 anchor,
             } => {
-                im.send(ImRequest::Surrounding {
-                    text: text.clone(),
-                    cursor,
-                    anchor,
-                });
-                // Keep it: `delete_surrounding_text` comes back in characters and goes out in
-                // bytes, and only this text can convert between them.
+                // Only meaningful while the client actually holds the engine; a modal entry of
+                // ours owning it means this text is not what the user is editing.
+                if im.focus == ImFocus::Client {
+                    im.send(ImRequest::Surrounding {
+                        text: text.clone(),
+                        cursor,
+                        anchor,
+                    });
+                }
+                // Keep it regardless: `delete_surrounding_text` comes back in characters and goes
+                // out in bytes, and only this text can convert between them.
                 self.synoik.im_surrounding = Some((text, cursor));
             }
             TextInputEvent::ContentType { hint, purpose } => {
                 let purpose = ibus::content_purpose_to_ibus(purpose);
                 let hints = ibus::content_hints_to_ibus(hint);
-                im.content_type = (purpose, hints);
-                im.send(ImRequest::ContentType { purpose, hints });
+                im.client_content_type = (purpose, hints);
+                if im.focus == ImFocus::Client {
+                    im.content_type = (purpose, hints);
+                    im.send(ImRequest::ContentType { purpose, hints });
+                }
             }
             // `Done` needs no forwarding: the requests above are already the atomic batch, and
             // IBus has no matching "end of batch" call. The cursor rectangle is only needed to
@@ -318,6 +403,90 @@ impl State {
             | TextInputEvent::TextChangeCause(_)
             | TextInputEvent::CursorRectangle(_) => {}
         }
+    }
+
+    /// Which of the compositor's own entries currently owns typed text, if any.
+    ///
+    /// The order mirrors the key filter's, because that is what actually decides where a
+    /// keystroke lands — deriving it from anything else would let the engine be focused on one
+    /// entry while the keys went to another.
+    fn shell_im_entry(&self) -> Option<ShellEntry> {
+        if self.synoik.screen_shield.is_active() {
+            return Some(ShellEntry::Shield);
+        }
+        if self.synoik.run_dialog.is_open() {
+            return Some(ShellEntry::RunDialog);
+        }
+        #[cfg(feature = "dbus")]
+        if self.synoik.polkit_is_open() {
+            return Some(ShellEntry::Polkit);
+        }
+        if self.synoik.keyboard_focus.is_overview() {
+            if self.synoik.folder_dialog.is_renaming() {
+                return Some(ShellEntry::FolderRename);
+            }
+            // The search entry counts as focused even before it is open: the keystroke that
+            // *starts* a search has to be composable too.
+            return Some(ShellEntry::OverviewSearch);
+        }
+        None
+    }
+
+    /// Move the engine's focus to whatever owns text right now.
+    ///
+    /// Call it after anything that can change that: keyboard focus, a dialog opening or closing,
+    /// a client enabling or disabling its text input.
+    pub fn sync_im_focus(&mut self) {
+        let Some(im) = self.synoik.input_method.as_ref() else {
+            return;
+        };
+
+        let desired = match self.shell_im_entry() {
+            Some(entry) => ImFocus::Shell(entry),
+            None if im.client_enabled => ImFocus::Client,
+            None => ImFocus::None,
+        };
+        if desired == im.focus {
+            return;
+        }
+
+        // Whatever was in flight belonged to the old focus. Deliver those keys and drop the
+        // composition before anything hears about the new one, or a half-finished character
+        // lands in the wrong entry — including, at worst, a password field.
+        self.flush_pending_im_keys();
+        self.clear_preedit();
+
+        let Some(im) = self.synoik.input_method.as_mut() else {
+            return;
+        };
+        let had_focus = im.focus != ImFocus::None;
+        im.focus = desired;
+
+        if had_focus {
+            im.send(ImRequest::FocusOut);
+            // Reset before anything else can happen on this context. A password purpose that
+            // outlives the field it described is the one stale value here that matters, and
+            // focusing out is not by itself documented to clear it. gnome-shell's reset does the
+            // same (`inputMethod.js:390`).
+            im.content_type = (ibus::purpose::FREE_FORM, 0);
+            im.send(ImRequest::ContentType {
+                purpose: ibus::purpose::FREE_FORM,
+                hints: 0,
+            });
+        }
+        if desired == ImFocus::None {
+            return;
+        }
+
+        let (purpose, hints) = match desired {
+            ImFocus::Shell(entry) => entry.content_type(),
+            // Restore what the client declared; it does not re-send on every focus change.
+            ImFocus::Client => im.client_content_type,
+            ImFocus::None => unreachable!("returned above"),
+        };
+        im.content_type = (purpose, hints);
+        im.send(ImRequest::FocusIn);
+        im.send(ImRequest::ContentType { purpose, hints });
     }
 
     /// Tell the engine which input source is active.
@@ -382,33 +551,95 @@ impl State {
             return false;
         }
 
+        // IBus wants an evdev code; xkb keycodes are that plus 8 (`inputMethod.js:346`).
+        let evcode = keycode.raw().saturating_sub(8);
+        let state_mask = ibus_modifier_state(mods, pressed);
+        self.queue_im_key(
+            keysym,
+            evcode,
+            state_mask,
+            KeyDest::Client {
+                keycode,
+                state,
+                serial,
+                time,
+                mods_changed,
+            },
+        );
+        true
+    }
+
+    /// Offer a keystroke bound for one of *our* entries to the engine.
+    ///
+    /// Returns whether it was taken; `false` means deliver it now.
+    ///
+    /// Narrower than the client path on purpose. Only keys that carry text — or any key at all
+    /// once a composition is in progress — are offered. The compositor's entries sit at the
+    /// bottom of ladders that fall through to other handlers (the overview's search gives way to
+    /// grid navigation, then to hardcoded binds), and those fall-throughs have to produce a
+    /// `FilterResult` synchronously. Deferring a key that might fall through would mean
+    /// reimplementing each ladder in the delivery path; deferring only what the entry is certain
+    /// to consume costs nothing, because an engine has no use for the rest.
+    pub fn im_offer_shell_key(&mut self, key: ShellKey, keysym: u32, keycode: Keycode) -> bool {
+        // Sync here rather than hunting down every state change that can open or close an entry:
+        // a folder rename or a search entry engages without keyboard focus moving at all, and a
+        // stale focus would silently mean no input method for that entry. Cheap — a handful of
+        // predicate reads — and it runs only for keys already bound to one of our entries.
+        self.sync_im_focus();
+
+        let Some(im) = self.synoik.input_method.as_ref() else {
+            return false;
+        };
+        if !im.wants_keys() || im.focus != ImFocus::Shell(key.entry) {
+            return false;
+        }
+        // Presses only. Three of the five entries act on presses alone, and deferring a release
+        // would mean the entry never seeing one the engine happened to consume — for a text
+        // entry a no-op, but not worth the asymmetry. Releases keep their original path.
+        if !key.pressed {
+            return false;
+        }
+        // A composition in flight needs every key, so Backspace and Escape can cancel it.
+        if key.text.is_none() && im.preedit.is_none() {
+            return false;
+        }
+
+        let mods = self.synoik.seat.get_keyboard().unwrap().modifier_state();
+        let state_mask = ibus_modifier_state(&mods, key.pressed);
+        self.queue_im_key(
+            keysym,
+            keycode.raw().saturating_sub(8),
+            state_mask,
+            KeyDest::Shell(key),
+        );
+        true
+    }
+
+    /// Ask the engine about a key and hold it until the verdict comes back.
+    fn queue_im_key(&mut self, keysym: u32, keycode: u32, state: u32, dest: KeyDest) {
+        let Some(im) = self.synoik.input_method.as_mut() else {
+            return;
+        };
         let id = im.next_key_id;
         im.next_key_id += 1;
 
-        // IBus wants an evdev code; xkb keycodes are that plus 8 (`inputMethod.js:346`).
-        let evcode = keycode.raw().saturating_sub(8);
         im.send(ImRequest::ProcessKey {
             id,
             keysym,
-            keycode: evcode,
-            state: ibus_modifier_state(mods, pressed),
+            keycode,
+            state,
         });
 
         let was_empty = im.pending.is_empty();
         im.pending.push_back(PendingKey {
             id,
-            keycode,
-            state,
-            serial,
-            time,
-            mods_changed,
+            dest,
             queued_at: std::time::Instant::now(),
         });
 
         if was_empty {
             self.arm_im_key_timeout(KEY_TIMEOUT);
         }
-        true
     }
 
     /// The engine answered. Deliver or drop the key it answered for.
@@ -520,21 +751,25 @@ impl State {
         }
     }
 
-    /// Hand one deferred key to the focused client.
+    /// Hand one deferred key to wherever it was bound.
     ///
-    /// `input_forward` is the other half of the `input_intercept` that already ran for this key:
+    /// For a client, `input_forward` is the other half of the `input_intercept` that already ran:
     /// xkb state was updated back then, and this only decides delivery. That split is why a
     /// deferred key needs no replay through the filter and cannot double-count a modifier.
     fn forward_pending_key(&mut self, key: PendingKey) {
-        let keyboard = self.synoik.seat.get_keyboard().unwrap();
-        keyboard.input_forward(
-            self,
-            key.keycode,
-            key.state,
-            key.serial,
-            key.time,
-            key.mods_changed,
-        );
+        match key.dest {
+            KeyDest::Client {
+                keycode,
+                state,
+                serial,
+                time,
+                mods_changed,
+            } => {
+                let keyboard = self.synoik.seat.get_keyboard().unwrap();
+                keyboard.input_forward(self, keycode, state, serial, time, mods_changed);
+            }
+            KeyDest::Shell(key) => self.deliver_shell_key(key),
+        }
     }
 
     /// Something came back from the engine.
@@ -546,22 +781,26 @@ impl State {
                 }
                 if let Some(im) = self.synoik.input_method.as_mut() {
                     im.connected = connected;
-                    // A reconnect brings a *new* input context, which starts unfocused and
-                    // knows nothing. Replay what the focused client already told us, or the
-                    // engine stays deaf until the user clicks into another text field.
-                    if connected && im.enabled {
-                        im.send(ImRequest::FocusIn);
+                    // A reconnect brings a *new* input context, which starts unfocused and knows
+                    // nothing. Replay whatever holds the focus, or the engine stays deaf until
+                    // the user moves to another entry.
+                    if connected && im.focus != ImFocus::None {
                         let (purpose, hints) = im.content_type;
+                        let replay_surrounding = im.focus == ImFocus::Client;
+                        im.send(ImRequest::FocusIn);
                         im.send(ImRequest::ContentType { purpose, hints });
-                        if let Some((text, cursor)) = self.synoik.im_surrounding.clone() {
-                            let Some(im) = self.synoik.input_method.as_mut() else {
-                                return;
-                            };
-                            im.send(ImRequest::Surrounding {
-                                text,
-                                cursor,
-                                anchor: cursor,
-                            });
+
+                        if replay_surrounding {
+                            if let Some((text, cursor)) = self.synoik.im_surrounding.clone() {
+                                let Some(im) = self.synoik.input_method.as_mut() else {
+                                    return;
+                                };
+                                im.send(ImRequest::Surrounding {
+                                    text,
+                                    cursor,
+                                    anchor: cursor,
+                                });
+                            }
                         }
                     }
                 }
@@ -654,6 +893,16 @@ impl State {
     /// (`meta-wayland-text-input.c:325-341` sends `preedit_string(NULL)` before `commit_string`).
     /// Skipping it leaves the composition visible *beside* the text it turned into.
     fn commit_text(&mut self, text: &str) {
+        let focus = self
+            .synoik
+            .input_method
+            .as_ref()
+            .map_or(ImFocus::None, |im| im.focus);
+        if let ImFocus::Shell(entry) = focus {
+            self.commit_into_shell_entry(entry, text);
+            return;
+        }
+
         let had_preedit = self
             .synoik
             .input_method
@@ -676,6 +925,35 @@ impl State {
         }
     }
 
+    /// Put finished text into one of the compositor's own entries.
+    ///
+    /// Delivered as one synthetic keystroke per character rather than through a new
+    /// insert-a-string API on each entry. Every entry already has a text path with its own
+    /// side effects — the search re-runs its query, the password entries clear the last error —
+    /// and routing through it means composed text behaves exactly like typed text, because it
+    /// *is* the same path. `raw: None` marks it as carrying no keysym, so nothing downstream
+    /// mistakes an accented character for a binding.
+    fn commit_into_shell_entry(&mut self, entry: ShellEntry, text: &str) {
+        self.clear_preedit();
+
+        let theme = self.synoik.gnome_settings.key_theme;
+        for ch in text.chars() {
+            self.deliver_shell_key(ShellKey {
+                entry,
+                raw: None,
+                text: Some(ch),
+                mods: crate::ui::text_edit::EditMods::default(),
+                theme,
+                pressed: true,
+            });
+        }
+
+        if let Some(im) = self.synoik.input_method.as_mut() {
+            im.preedit = None;
+        }
+        self.synoik.queue_redraw_all();
+    }
+
     /// Show (or clear) the in-progress composition.
     fn set_preedit(&mut self, text: Option<String>, cursor_chars: u32, mode: PreeditMode) {
         // A `Commit` reset mode means an interrupted composition should be kept rather than
@@ -687,6 +965,21 @@ impl State {
             .as_deref()
             .map(|t| char_to_byte(t, cursor_chars))
             .unwrap_or(0);
+
+        // A compositor entry has no `zwp_text_input_v3` to send this over: the string is kept
+        // here and drawn by whichever entry is focused (see `preedit()`).
+        let focus = self
+            .synoik
+            .input_method
+            .as_ref()
+            .map_or(ImFocus::None, |im| im.focus);
+        if matches!(focus, ImFocus::Shell(_)) {
+            if let Some(im) = self.synoik.input_method.as_mut() {
+                im.preedit = text;
+            }
+            self.synoik.queue_redraw_all();
+            return;
+        }
 
         let payload = text.clone();
         self.synoik
