@@ -994,6 +994,12 @@ pub struct Synoik {
     /// the menu is (`setForcedHighlight`, `appDisplay.js:3028`). Stale once the menu
     /// closes — read only while `panel_popover.is_app_menu()`.
     pub app_menu_source: Option<crate::input::OverviewHit>,
+    /// Whether the open app menu was opened off the *dock* rather than the overview's dash.
+    ///
+    /// gnome-shell closes an app icon's menu when the overview hides (`appDisplay.js:3039-3040`),
+    /// which is what the dock — our divergence — walks straight into: it shows the same dash with
+    /// the overview shut, so that rule closed every dock menu on the very next frame.
+    pub app_menu_from_dock: bool,
     /// The one GPU upload map every app-icon surface draws from — the dash, the grid, the
     /// open folder, the search results and the drag proxy. Held here so the drag proxy,
     /// which has no surface of its own, can reach it.
@@ -7312,6 +7318,7 @@ impl Synoik {
             thumbnail_close_hovered: None,
             app_drag: None,
             app_menu_source: None,
+            app_menu_from_dock: false,
             app_icon_uploads: crate::ui::widget::SharedAppIconUploads::default(),
             app_drag_bg: RefCell::new(
                 crate::render_helpers::rounded_solid::RoundedSolidBuffer::new(),
@@ -9257,8 +9264,16 @@ impl Synoik {
         // gnome-shell closes it on the overview's `hiding` (`appDisplay.js:3039-3040`).
         // Synced here, once per frame, because the overview closes from a dozen places
         // (a keybind, a click, an app launching) and this covers all of them.
-        if self.panel_popover.is_app_menu() && !self.layout.is_overview_open() {
+        // A menu opened off the dock has no overview behind it to hide, so the rule does not
+        // apply to it; the dock is held open underneath it instead (`Dock::set_menu_open`).
+        if self.panel_popover.is_app_menu()
+            && !self.layout.is_overview_open()
+            && !self.app_menu_from_dock
+        {
             self.panel_popover.close();
+        }
+        if !self.panel_popover.is_app_menu() {
+            self.app_menu_from_dock = false;
         }
 
         self.notification_banner
@@ -9327,6 +9342,10 @@ impl Synoik {
         // Derived from the drag itself rather than hooked into each of the five paths that end
         // one, none of which could then forget.
         self.dock.set_dragging(self.app_drag.is_some());
+        // Same shape for the context menu: derived every frame from the popover, so no path
+        // that closes the menu has to remember to release the dock.
+        self.dock
+            .set_menu_open(self.app_menu_from_dock && self.panel_popover.is_app_menu());
         self.dock.advance_animations();
         if self.dock.next_wakeup() != self.dock_timer_at {
             self.reschedule_dock_timer();

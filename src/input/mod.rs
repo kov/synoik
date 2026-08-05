@@ -2151,9 +2151,14 @@ impl State {
             return false;
         };
         let (id, anchor, side) = match hit {
+            // The dash's own area, not `controls.dash`: with the overview shut the dock owns
+            // the dash and puts it somewhere else entirely, so anchoring to the overview's
+            // slot would have hung the menu off a rectangle nothing is drawn in.
             OverviewHit::Dash(DashHit::App(i)) => (
                 self.synoik.dash.item_id(i).map(str::to_owned),
-                self.synoik.dash.tile_rect(i, controls.dash),
+                self.synoik
+                    .dash_area(output)
+                    .and_then(|area| self.synoik.dash.tile_rect(i, area)),
                 PopoverSide::Bottom,
             ),
             OverviewHit::GridApp(i) => (
@@ -2204,6 +2209,9 @@ impl State {
             .open_app_menu(output.clone(), anchor, side, &ctx);
         // Remembered so the icon can stay highlighted for as long as its menu is up.
         self.synoik.app_menu_source = Some(hit);
+        // A menu opened off the *dock* is not the overview's, so the "close it when the
+        // overview hides" rule must not reach it — there is no overview to hide.
+        self.synoik.app_menu_from_dock = self.synoik.dock_owns_dash(output);
         true
     }
 

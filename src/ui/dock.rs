@@ -52,6 +52,10 @@ pub struct Dock {
     leave_at: Option<Duration>,
     /// Held open regardless of the pointer while an icon is being dragged out of it.
     dragging: bool,
+    /// Held open the same way while one of its icons has its context menu up — the menu pops
+    /// *upward* out of the dash, so reaching it takes the pointer off the dock, and without
+    /// this the dock slides away from under the menu a moment later.
+    menu_open: bool,
     barrier: Barrier,
     clock: Clock,
 }
@@ -64,6 +68,7 @@ impl Dock {
             hovered: false,
             leave_at: None,
             dragging: false,
+            menu_open: false,
             barrier: Barrier::new(THRESHOLD, TIMEOUT),
             clock,
         }
@@ -172,6 +177,7 @@ impl Dock {
         self.hovered = false;
         self.leave_at = None;
         self.dragging = false;
+        self.menu_open = false;
         self.barrier.leave();
     }
 
@@ -287,11 +293,36 @@ impl Dock {
     /// the change re-armed the hide deadline on every frame, which pushed it forward forever and
     /// left the dock on screen for good — invisible to a test that calls this once.
     pub fn set_dragging(&mut self, dragging: bool) {
-        if dragging == self.dragging {
+        let was = self.held();
+        self.dragging = dragging;
+        self.held_changed(was);
+    }
+
+    /// An icon's context menu is up: hold the dock open until it closes, for the reason in
+    /// [`Self::menu_open`].
+    ///
+    /// Re-stated every frame from the popover's own state like [`Self::set_dragging`], so no
+    /// close path can forget it — and idempotent for the same reason: acting on the value
+    /// rather than the change would re-arm the hide deadline every frame and leave the dock out
+    /// for good.
+    pub fn set_menu_open(&mut self, open: bool) {
+        let was = self.held();
+        self.menu_open = open;
+        self.held_changed(was);
+    }
+
+    /// Whether something other than the pointer is keeping the dock out.
+    fn held(&self) -> bool {
+        self.dragging || self.menu_open
+    }
+
+    /// Re-arm (or cancel) the hide deadline when the last hold is released or the first taken.
+    fn held_changed(&mut self, was: bool) {
+        let held = self.held();
+        if held == was {
             return;
         }
-        self.dragging = dragging;
-        if dragging {
+        if held {
             self.leave_at = None;
         } else if !self.hovered && self.is_visible() {
             self.leave_at = Some(self.clock.now_unadjusted() + HIDE_DELAY);
@@ -312,7 +343,7 @@ impl Dock {
             _ => (),
         }
 
-        if self.dragging {
+        if self.held() {
             return;
         }
         if let Some(at) = self.leave_at {
@@ -324,7 +355,7 @@ impl Dock {
 
     /// When the hide timer wants a frame, so an idle session still slides it away.
     pub fn next_wakeup(&self) -> Option<Duration> {
-        (!self.dragging).then_some(self.leave_at).flatten()
+        (!self.held()).then_some(self.leave_at).flatten()
     }
 }
 
@@ -562,5 +593,63 @@ mod tests {
         clock.set_unadjusted(Duration::from_secs(5) + HIDE_DELAY * 2);
         dock.advance_animations();
         assert!(dock.are_animations_ongoing(), "dropping releases it");
+    }
+
+    /// A context menu pins the dock the same way a drag does — the menu opens *upward* out of
+    /// the dash, so reaching it takes the pointer off the dock and the hide timer would
+    /// otherwise pull the dock out from under it.
+    #[test]
+    fn a_menu_holds_the_dock_open() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let mut dock = Dock::new(clock.clone());
+        let output = crate::utils::test_output(1920, 1080);
+
+        dock.show(&output);
+        clock.set_unadjusted(Duration::from_millis(SLIDE_MS));
+        dock.advance_animations();
+        dock.pointer_motion(&output, Point::from((960., 1050.)));
+        dock.set_menu_open(true);
+
+        // Up to the menu, well off the dock.
+        dock.pointer_motion(&output, Point::from((960., 700.)));
+        clock.set_unadjusted(Duration::from_secs(5));
+        dock.advance_animations();
+        assert!(dock.area(&output).is_some(), "an open menu pins it");
+        assert!(dock.next_wakeup().is_none(), "and arms no hide timer");
+
+        dock.set_menu_open(false);
+        clock.set_unadjusted(Duration::from_secs(5) + HIDE_DELAY * 2);
+        dock.advance_animations();
+        assert!(
+            dock.are_animations_ongoing(),
+            "closing it releases the dock"
+        );
+    }
+
+    /// Re-stated every frame, so it must be idempotent: acting on the value rather than the
+    /// change would push the hide deadline forward forever (the bug `set_dragging` already
+    /// carries a comment about).
+    #[test]
+    fn re_stating_the_menu_hold_does_not_re_arm_the_deadline() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let mut dock = Dock::new(clock.clone());
+        let output = crate::utils::test_output(1920, 1080);
+
+        dock.show(&output);
+        clock.set_unadjusted(Duration::from_millis(SLIDE_MS));
+        dock.advance_animations();
+        dock.pointer_motion(&output, Point::from((960., 1050.)));
+        dock.pointer_motion(&output, Point::from((960., 200.)));
+        let armed = dock.next_wakeup().expect("leaving arms the hide");
+
+        for _ in 0..10 {
+            clock.set_unadjusted(clock.now_unadjusted() + Duration::from_millis(16));
+            dock.set_menu_open(false);
+        }
+        assert_eq!(
+            dock.next_wakeup(),
+            Some(armed),
+            "re-stating `false` must not push the deadline out"
+        );
     }
 }

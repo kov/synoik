@@ -390,6 +390,84 @@ fn the_dock_hit_tests_the_same_dash_as_the_overview() {
     );
 }
 
+/// Right-clicking a dock icon opens its context menu and leaves it up.
+///
+/// Two things were wrong, both from the dock reusing overview code with no overview behind it.
+/// The menu anchored to `controls.dash` — the overview's slot, not where the dock draws — and
+/// the "an app menu cannot outlive its overview" rule (`appDisplay.js:3039-3040`) closed it on
+/// the very next frame, so nothing was ever seen.
+#[test]
+fn the_dock_opens_an_icons_context_menu_and_keeps_it_up() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+    seed_favorites(&mut f, &["a.desktop", "b.desktop"]);
+
+    pointer_motion_to(&mut f, 960., 1079.);
+    for _ in 0..10 {
+        f.pointer_motion(0., 20.);
+    }
+    f.synoik_complete_animations();
+    assert!(f.synoik().dock_owns_dash(&output), "the dock is out");
+
+    let area = f.synoik().dock.area(&output).expect("the dock is out");
+    let center = f
+        .synoik()
+        .dash
+        .tile_center(0, area)
+        .expect("a favorite to aim at");
+    pointer_motion_to(&mut f, center.x, center.y);
+    f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
+    f.pointer_button(BTN_RIGHT, ButtonState::Released);
+
+    assert!(
+        f.synoik().panel_popover.is_app_menu(),
+        "a right-click on a dock icon must open its context menu"
+    );
+    // It hangs off the icon the dock drew: a dash menu's arrow is on the bottom
+    // (`popupMenuSide: St.Side.BOTTOM`, `dash.js:27`), so the box sits above the tile.
+    let tile = f.synoik().dash.tile_rect(0, area).expect("tile 0");
+    let box_origin = f.synoik().panel_popover.content_location(&output);
+    assert!(
+        box_origin.y < tile.loc.y,
+        "the menu opens upward out of the dock, got {box_origin:?} for a tile at {tile:?}"
+    );
+
+    // The frame-by-frame sync is where it used to die: the overview is shut, so the
+    // outlive-the-overview rule fired and closed it before anyone saw it. Run the fade out
+    // too — `is_app_menu` stays true while a popover closes, so asserting on the frame after
+    // the sync alone would not notice.
+    f.synoik().advance_animations();
+    f.synoik_complete_animations();
+    assert!(
+        f.synoik().panel_popover.is_app_menu(),
+        "the menu must survive the frame — there is no overview for it to outlive"
+    );
+
+    // And the dock must not slide out from under it once the pointer moves up to the menu.
+    pointer_motion_to(&mut f, 960., 300.);
+    f.synoik_complete_animations();
+    assert!(
+        f.synoik().dock.area(&output).is_some(),
+        "the dock is held open while one of its icons has a menu up"
+    );
+
+    assert!(
+        f.synoik().dock.next_wakeup().is_none(),
+        "and no hide timer is armed while it is held"
+    );
+
+    // Closing the menu releases the hold: the hide deadline is armed again, and the dock goes
+    // away on its own the way it always did. (`Dock::a_menu_holds_the_dock_open` runs out that
+    // clock; here the point is that the popover state drives it.)
+    f.synoik().panel_popover.close_immediately();
+    f.synoik().advance_animations();
+    assert!(
+        f.synoik().dock.next_wakeup().is_some(),
+        "with the menu gone the dock must be free to hide again"
+    );
+}
+
 /// The dock's show-apps button opens the overview *at the app grid*, the same as `<Super>A`.
 ///
 /// gnome-shell binds one handler (`_toggleAppsPage`, `overviewControls.js:660-667,481`) to both
