@@ -151,6 +151,26 @@ pub enum ImFocus {
     Shell(ShellEntry),
 }
 
+/// Whether a keysym can *begin* a composition while producing no character of its own.
+///
+/// This is the whole point of the feature and the easiest thing to miss: `dead_acute.key_char()`
+/// is `None`. Gating what reaches the engine on "carries text" therefore drops precisely the key
+/// that starts a dead-key sequence, and composition never begins. It cost a working overview
+/// search and a broken lock screen to notice, because the overview accidentally routed dead keys
+/// to the engine down the *client* fall-through path while the lock screen — which intercepts
+/// unconditionally — had no such accident to rely on.
+///
+/// The range is xkb's contiguous block of `dead_*` keysyms (`XKB_KEY_dead_grave` through
+/// `XKB_KEY_dead_greek` and the later additions), plus `Multi_key`, which opens a Compose
+/// sequence the same way.
+pub fn begins_composition(sym: Option<Keysym>) -> bool {
+    let Some(sym) = sym else {
+        return false;
+    };
+    let raw = sym.raw();
+    (0xfe50..=0xfe93).contains(&raw) || sym == Keysym::Multi_key
+}
+
 /// Convert our modifier state into the X11-style mask IBus expects.
 ///
 /// `iso_level3_shift` is AltGr, which is how `us(intl)` reaches the level holding the dead keys —
@@ -599,8 +619,11 @@ impl State {
         if !key.pressed {
             return false;
         }
-        // A composition in flight needs every key, so Backspace and Escape can cancel it.
-        if key.text.is_none() && im.preedit.is_none() {
+        // Text, a key that starts a composition, or any key at all once one is in flight — so
+        // Backspace and Escape can cancel it. `begins_composition` is not optional: a dead key
+        // produces no character, so a "carries text" test alone drops the very key the sequence
+        // starts with.
+        if key.text.is_none() && !begins_composition(key.raw) && im.preedit.is_none() {
             return false;
         }
 
@@ -1146,6 +1169,27 @@ mod tests {
         assert_eq!(surrounding_byte_lengths("héllo", 3, 1, 1), Some((2, 1)));
         // Nothing to do is a valid answer, not an error.
         assert_eq!(surrounding_byte_lengths("héllo", 3, 0, 0), Some((0, 0)));
+    }
+
+    #[test]
+    fn a_dead_key_counts_as_composing_though_it_types_nothing() {
+        // The premise the whole feature rests on, and the one that is easy to assume away.
+        assert_eq!(Keysym::dead_acute.key_char(), None);
+        assert_eq!(Keysym::dead_tilde.key_char(), None);
+
+        assert!(begins_composition(Some(Keysym::dead_acute)));
+        assert!(begins_composition(Some(Keysym::dead_tilde)));
+        assert!(begins_composition(Some(Keysym::dead_diaeresis)));
+        assert!(begins_composition(Some(Keysym::dead_cedilla)));
+        // Compose opens a sequence the same way.
+        assert!(begins_composition(Some(Keysym::Multi_key)));
+
+        // Ordinary keys carry their own text and need no special case.
+        assert!(!begins_composition(Some(Keysym::a)));
+        assert!(!begins_composition(Some(Keysym::apostrophe)));
+        assert!(!begins_composition(Some(Keysym::BackSpace)));
+        assert!(!begins_composition(Some(Keysym::Shift_L)));
+        assert!(!begins_composition(None));
     }
 
     #[test]

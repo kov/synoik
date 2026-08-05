@@ -3178,6 +3178,19 @@ fn answer_im_keys(
     drained
 }
 
+/// Switch the fixture to `us+intl`, where the apostrophe key really is `dead_acute`.
+///
+/// The default `us` keymap makes `KEY_APOSTROPHE` an ordinary character, which quietly turns any
+/// dead-key test into a plain-typing test — that is exactly how the bug this guards against got
+/// through.
+fn use_us_intl(f: &mut Fixture) {
+    let sources = &mut f.synoik().gnome_settings.input_sources;
+    sources.present = true;
+    sources.sources = vec![("xkb".to_owned(), "us+intl".to_owned())];
+    sources.mru_sources = sources.sources.clone();
+    f.synoik_state().apply_effective_xkb();
+}
+
 /// Feed everything the client has committed into the model, as the production calloop source
 /// does. Manual here because the fixture's sink is a `Vec`, not the real channel.
 fn pump_im(f: &mut Fixture, seen: &ImSink) {
@@ -3450,13 +3463,18 @@ fn the_overview_search_composes_through_the_engine() {
     use crate::input_method::{ImFocus, ImRequest, ImUpdate, ShellEntry};
 
     let (mut f, id, requests, _seen) = im_fixture();
+    use_us_intl(&mut f);
     f.synoik_state().do_action(Action::ToggleOverview, false);
     f.synoik_complete_animations();
     f.double_roundtrip(id);
     while requests.try_recv().is_ok() {}
 
-    // The dead key. It carries text, so the search is certain to take it — which is what makes
-    // it safe to defer.
+    // A dead key on an *idle* search entry: nothing is active or expanded yet, and it carries no
+    // text, so the entry has to claim it on the strength of being a composition key alone.
+    //
+    // This used to work only by accident — the key fell past the search block entirely and was
+    // offered down the generic client-forward path, which offers everything. The lock screen,
+    // which intercepts unconditionally, had no such accident and stayed broken.
     f.key_press(KEY_APOSTROPHE);
     f.double_roundtrip(id);
 
@@ -3563,6 +3581,90 @@ fn the_lock_screen_password_entry_is_announced_as_a_password() {
         f.synoik().unlock_dialog.entry_display().chars().count(),
         before + 1,
         "composed text must reach the password entry"
+    );
+}
+
+/// The whole dead-key sequence on the lock screen, engine round trip and all: the dead key is
+/// offered and consumed, then the letter is offered and comes back as composed text.
+#[test]
+fn a_dead_key_composes_on_the_lock_screen() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+    use crate::dbus::ibus::ImEvent;
+    use crate::input_method::{ImFocus, ImRequest, ImUpdate, ShellEntry};
+
+    let (mut f, id, requests, _seen) = im_fixture();
+    use_us_intl(&mut f);
+
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    f.synoik_state().update_keyboard_focus();
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.synoik().input_method.as_ref().unwrap().focus(),
+        ImFocus::Shell(ShellEntry::Shield),
+    );
+    while requests.try_recv().is_ok() {}
+
+    // The dead key. `dead_acute.key_char()` is `None`, so it carries no text at all — gating on
+    // "carries text" drops exactly this key and composition never starts.
+    f.key_press(KEY_APOSTROPHE);
+    f.key_release(KEY_APOSTROPHE);
+    let offered: Vec<u64> = std::iter::from_fn(|| requests.try_recv().ok())
+        .filter_map(|r| match r {
+            ImRequest::ProcessKey { id, keysym, .. } => {
+                assert_eq!(keysym, Keysym::dead_acute.raw(), "really a dead key");
+                Some(id)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        offered.len(),
+        1,
+        "the dead key must reach the engine, or there is nothing to compose with"
+    );
+
+    // The engine keeps it.
+    f.synoik_state().on_im_update(ImUpdate::KeyResult {
+        id: offered[0],
+        filtered: true,
+    });
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.synoik().unlock_dialog.entry_display(),
+        "",
+        "a consumed dead key must put nothing in the entry"
+    );
+
+    // Then the letter, which the engine also keeps, committing the composed character.
+    f.key_press(KEY_A);
+    f.key_release(KEY_A);
+    let offered: Vec<u64> = std::iter::from_fn(|| requests.try_recv().ok())
+        .filter_map(|r| match r {
+            ImRequest::ProcessKey { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(offered.len(), 1, "the letter must reach the engine too");
+    f.synoik_state().on_im_update(ImUpdate::KeyResult {
+        id: offered[0],
+        filtered: true,
+    });
+    f.synoik_state()
+        .on_im_update(ImUpdate::Event(ImEvent::Commit("á".to_owned())));
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.synoik().unlock_dialog.entry_display(),
+        "\u{25cf}",
+        "the composed character must land in the password entry, masked"
     );
 }
 

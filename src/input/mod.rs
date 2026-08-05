@@ -1289,7 +1289,12 @@ impl State {
                         // the entry (editing/nav/Escape). Modifiers/Tab/arrows while the entry
                         // is closed and empty fall through to the overview binds below.
                         let expanded = this.synoik.overview_search.is_expanded();
-                        let starts = text.is_some_and(|c| !c.is_whitespace() && !c.is_control());
+                        // A dead key produces no character but is exactly how an accented search
+                        // term starts, so it engages the entry too. Without an input method it
+                        // still falls straight through: the entry returns `Ignored` for it, as
+                        // it always did.
+                        let starts = text.is_some_and(|c| !c.is_whitespace() && !c.is_control())
+                            || crate::input_method::begins_composition(raw);
                         if active || expanded || starts {
                             use crate::ui::overview_search::SearchOutcome;
                             let theme = this.synoik.gnome_settings.key_theme;
