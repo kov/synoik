@@ -1464,6 +1464,144 @@ fn vulkan_new_vulkan_resize_element_crossfades() {
     );
 }
 
+/// A CSD client whose surface is larger than its window geometry (a shadow/rounded-corner ring the
+/// client leaves transparent) must not have that ring turned into *opaque* content by the resize
+/// crossfade. The quad is grown to fit the prev snapshot's ring **scaled by `area / size_prev`**
+/// (`resize_transforms`), so it reaches past the next snapshot's geometry by `ring * scale_prev` —
+/// and outside its own geometry the next texture has nothing to say. It must read transparent, not
+/// the CLAMP_TO_EDGE smear of its edge row.
+///
+/// Ghost's snap-to-half showed exactly this: a 26pt ring scaled by 1536/908 painted an opaque band
+/// 44pt past the tile edge, hard-edged and gradient-free, worst as the animation ended.
+///
+/// prev: 32×32 geometry inside a 48×48 buffer (8px transparent ring, opaque red core).
+/// next: 64×64 geometry, buffer flush with it, solid blue.
+/// End of the animation, so `area.size == size_next`: `scale_prev = 2`, the ring scales to 16, and
+/// the quad runs 16px past the next geometry on every side.
+#[test]
+fn vulkan_resize_does_not_smear_past_a_snapshot_geometry() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_resize_does_not_smear_past_a_snapshot_geometry: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    const RING: i32 = 8;
+    const PREV_GEO: i32 = 32;
+    const PREV_BUF: i32 = PREV_GEO + 2 * RING; // 48
+    const NEXT: i32 = 64;
+    const QUAD: i32 = NEXT + 2 * RING * (NEXT / PREV_GEO); // 96: the grown crossfade quad
+
+    // prev: opaque red core with a fully transparent ring, like a CSD window's shadow margin.
+    let mut prev = Vec::with_capacity((PREV_BUF * PREV_BUF * 4) as usize);
+    for y in 0..PREV_BUF {
+        for x in 0..PREV_BUF {
+            let inside =
+                (RING..RING + PREV_GEO).contains(&x) && (RING..RING + PREV_GEO).contains(&y);
+            prev.extend_from_slice(if inside {
+                &[255u8, 0, 0, 255]
+            } else {
+                &[0u8, 0, 0, 0]
+            });
+        }
+    }
+    let next: Vec<u8> = [0u8, 0, 255, 255]
+        .iter()
+        .copied()
+        .cycle()
+        .take((NEXT * NEXT * 4) as usize)
+        .collect();
+
+    // The animated geometry rect, placed so the grown quad starts at the target's origin.
+    let area = Rectangle::<f64, Logical>::new(
+        Point::from((RING as f64 * 2.0, RING as f64 * 2.0)),
+        Size::from((NEXT as f64, NEXT as f64)),
+    );
+
+    let render = |vk: &mut VulkanRenderer, progress: f32| -> Vec<u8> {
+        let tex_prev = vk
+            .import_memory(
+                &prev,
+                Fourcc::Abgr8888,
+                Size::from((PREV_BUF, PREV_BUF)),
+                false,
+            )
+            .expect("import prev");
+        let tex_next = vk
+            .import_memory(&next, Fourcc::Abgr8888, Size::from((NEXT, NEXT)), false)
+            .expect("import next");
+        let elem = ResizeRenderElement::new(
+            area,
+            Scale::from(1.0),
+            (
+                tex_prev,
+                Rectangle::new(
+                    Point::from((-RING, -RING)),
+                    Size::from((PREV_BUF, PREV_BUF)),
+                ),
+            ),
+            Size::from((PREV_GEO as f64, PREV_GEO as f64)),
+            (tex_next, Rectangle::from_size(Size::from((NEXT, NEXT)))),
+            Size::from((NEXT as f64, NEXT as f64)),
+            progress,
+            progress,
+            CornerRadius::default(),
+            false,
+            1.0,
+            false, // built-in crossfade
+        );
+        render_to_vec(
+            vk,
+            Size::from((QUAD, QUAD)),
+            Scale::from(1.0),
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            [elem].into_iter(),
+        )
+        .expect("render resize element")
+    };
+
+    // `px` is hard-coded to a `W`-wide buffer; this target is `QUAD` wide.
+    let at = |buf: &[u8], x: i32, y: i32| -> [u8; 4] {
+        let i = ((y * QUAD + x) * 4) as usize;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    };
+    // Well outside the next geometry (which spans 16..80), still inside the grown quad.
+    let outside = [(88, 48), (4, 48), (48, 88), (48, 4)];
+
+    // Control: at progress 0 the band is pure prev, and prev's ring is transparent there.
+    let p0 = render(&mut vk, 0.0);
+    for (x, y) in outside {
+        assert_eq!(
+            at(&p0, x, y)[3],
+            0,
+            "at progress 0 ({x},{y}) is the prev snapshot's transparent ring, got {:?}",
+            at(&p0, x, y),
+        );
+    }
+
+    // At progress 1 the band is pure next — and next has no content out there at all.
+    let p1 = render(&mut vk, 1.0);
+    for (x, y) in outside {
+        assert_eq!(
+            at(&p1, x, y)[3],
+            0,
+            "({x},{y}) is outside the next snapshot's geometry, so it must stay transparent \
+             rather than smear its edge row outward, got {:?}",
+            at(&p1, x, y),
+        );
+    }
+
+    // The geometry's own interior is untouched: still the opaque next.
+    assert!(
+        close_px(at(&p1, 48, 48), [0, 0, 255, 255], 8),
+        "the interior should still be the next snapshot, got {:?}",
+        at(&p1, 48, 48),
+    );
+}
+
 /// The live wiring routes a resize animation through the user's CUSTOM resize shader when one is
 /// installed (`use_custom=true` → `render_custom_resize`) instead of the built-in crossfade. Also
 /// covers the config-facing install roundtrip: `set_custom_resize_shader` compiles + arms the slot

@@ -69,14 +69,29 @@ vec2 affine(vec4 t, vec2 v) {
     return t.xy * v + t.zw;
 }
 
+// Sample a snapshot, treating everything outside it as transparent rather than as its edge texel.
+//
+// The quad is grown to fit BOTH snapshots, each scaled by its own factor (`resize_transforms`:
+// `merge(tex_prev_geo * scale_prev, tex_next_geo * scale_next)`), so it routinely reaches past one
+// of them — a client whose surface is bigger than its window geometry (a CSD shadow/corner ring)
+// grows it by `ring * scale_prev`, which at the end of a maximize is the ring times the full size
+// ratio. Our samplers are CLAMP_TO_EDGE, so an unguarded sample there smears the snapshot's edge
+// row across that band: a hard-edged opaque skirt around a window that is transparent there.
+vec4 sample_snapshot(sampler2D tex, vec2 coords) {
+    if (coords.x < 0.0 || 1.0 < coords.x || coords.y < 0.0 || 1.0 < coords.y) {
+        return vec4(0.0);
+    }
+    return texture(tex, coords);
+}
+
 void main() {
     vec2 coords_curr_geo = affine(pc.input_to_curr_geo, v_uv);
 
     vec2 coords_tex_prev = affine(pc.geo_to_tex_prev, coords_curr_geo);
-    vec4 color_prev = texture(tex_prev, coords_tex_prev);
+    vec4 color_prev = sample_snapshot(tex_prev, coords_tex_prev);
 
     vec2 coords_tex_next = affine(pc.geo_to_tex_next, coords_curr_geo);
-    vec4 color_next = texture(tex_next, coords_tex_next);
+    vec4 color_next = sample_snapshot(tex_next, coords_tex_next);
 
     vec4 color = mix(color_prev, color_next, pc.clamped_progress);
 
