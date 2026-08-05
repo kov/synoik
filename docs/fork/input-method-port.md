@@ -101,10 +101,38 @@ checked.
 |---|---|---|
 | 1 — IBus client | `419962c2` | `src/dbus/ibus.rs`: address discovery, bus + input-context proxies, `IBusText` decoding, engine-name synthesis. `examples/ibus_probe.rs` drives a live daemon. |
 | 2 — Wayland seam | smithay `0ffb5170`, ours `f093ed60` | `TextInputHandle::set_internal_input_method`; test client speaks `zwp_text_input_v3`. |
+| 3 — IM model | `e64ecf45` | `src/input_method/mod.rs`: engine output → client, byte↔char conversion, preedit cleared before commit. |
+| 4 — Key round trip | `02a58520`, `2709fc15`, `df081c2f` | Keys held for the engine; the worker thread; forwarded keys. |
+| 5 — Engine selection | `2709fc15` | `SetGlobalEngine` from `mru-sources`, re-sent on layout change. Folded into 4 because the round trip is inert without it. |
 
 Slice 1 is verified end to end: `dead_acute` then `a` returns a committed `"á"`.
 Slice 2 is pinned by a differential pair in `src/tests/gnome.rs` — a text input hears *nothing*
 without an input method, and gets `enter` + `Enabled`/`SurroundingText`/`Done` with one.
+
+**Slice 4 is seat-validated, and the differential is the proof the feature works.** Same
+`target/debug/synoik --headless`, same `zenity --entry` client, same `us+intl` layout, same
+injected `apostrophe` then `a` — the only variable is whether `IBUS_ADDRESS` points at a live
+daemon:
+
+| Typed | IBus connected | IBus unreachable |
+|---|---|---|
+| `'` `a` | `á` (`c3 a1`) | `a` — the dead key vanished |
+| `~` space | `~` (`7e`) | — |
+| `~` `n` | `ñ` (`c3 b1`) | — |
+
+The `~`-then-space row is worth keeping: it is the *escape* path rather than the composing one,
+so it shows the engine really is running the compose state machine — holding the dead key, seeing
+a follow-up that composes with nothing, and emitting the bare accent instead of dropping it.
+
+The second row *is* the reported bug, reproduced on demand: `GtkIMContextWayland` has no compose
+table, so the dead acute produces nothing at all. Reproducing it that cheaply is worth keeping —
+the harness is `IBUS_ADDRESS=unix:path=/tmp/no-such.sock`, and any regression in the key path
+shows up as the client going back to bare `a`.
+
+Run the isolated instance under `dbus-run-session` **and** a private `XDG_CONFIG_HOME`: the
+active input source comes from live dconf, and neither isolates gsettings on its own. Point
+`IBUS_ADDRESS` at your own daemon on a short socket path — `SetGlobalEngine` is bus-wide, so
+using the session's daemon changes the input source for everything else on it.
 
 ### The smithay patch
 
@@ -274,11 +302,8 @@ spawns it. Xwayland start ⇒ restart with `--xim`; Xwayland stop ⇒ restart wi
 
 | Slice | What | Notes |
 |---|---|---|
-| **3** | Compositor-side IM model | Register the sink; own focus/enable state; drive `with_active_text_input` + `done`. |
-| **4** | Key round trip | Filter at `src/input/mod.rs:684`; async `ProcessKeyEvent`; re-inject unfiltered keys with an ignore flag. **This is where dead keys start working in apps.** |
-| **5** | Engine selection | `SetGlobalEngine` from `org.gnome.desktop.input-sources`, via `engine_name()`. Layout switching re-sets it. |
-| **6** | Preedit in `TextEdit` | `handle_key` takes `Option<char>`; `insert_str` is the commit sink, but a shown-not-inserted preedit string is new, and `masked_positions` deliberately never sees the password. |
-| **7** | Daemon lifecycle | Spawn/restart, systemd-unit check, reconnect. |
+| **6** | Preedit in `TextEdit` | `handle_key` takes `Option<char>`; `insert_str` is the commit sink, but a shown-not-inserted preedit string is new, and `masked_positions` deliberately never sees the password. The compositor's own entries do not go through `zwp_text_input_v3`, so today they get no engine at all — typing `'a` in the overview search still gives `'a`. |
+| **7** | Daemon lifecycle | Spawning a daemon we did not find (GNOME's `ibusManager.js` launches one), systemd-unit check. Reconnect *is* done: the worker retries on a backoff and replays focus + surrounding text. |
 | **8** | Content type / purpose | Hint + purpose mapping, password fields. Mind the `pin` gap. |
 | **Deferred** | Panel interface | Lookup table, auxiliary text, candidate popup, property menu. Needed for CJK engines, not for dead keys. |
 | **Deferred** | OSK integration, surrounding text from our own entries | |
