@@ -122,13 +122,25 @@ page-flip failures. The absence of `legacy fbadd` is the positive signal for
 `PrimeFramebufferExporter` specifically — `AddFB2` with `DRM_MODE_FB_MODIFIERS` was accepted every
 time.
 
-Setting that up has one trap worth knowing. `environment.d` **cannot** carry it: GNOME's session
-startup imports the login environment into the systemd user manager at a precedence above generator
-output, so a `~/.config/environment.d/95-*.conf` that beats `/etc/environment.d/90-limina-zink.conf`
-lexicographically still loses at runtime. Verified by hand — the generator emitted `virtio_gpu`
-while the running session saw `zink`. Put it in the unit's `Environment=`, which beats both. And
-note it is *not* compositor-scoped in practice: apps launched from the shell are spawned by the
-compositor and inherit it, which is how the client failure below was found.
+Setting that up has one trap worth knowing: **`environment.d` did not carry it.** A
+`~/.config/environment.d/95-*.conf` beats `/etc/environment.d/90-limina-zink.conf` lexicographically
+and the generator does resolve it that way — verified by running
+`30-systemd-environment-d-generator` by hand, which emitted `virtio_gpu` — yet the running session
+still saw `zink`. Use the unit's `Environment=` instead; that worked first try.
+
+Why it lost is **not** established. Ruled out by measurement: no other file on disk sets the
+variable; the user manager does not inherit it from PAM (its own `/proc/<pid>/environ` has no
+`MESA`); the generator finds the user file even from a bare environment; and the manager restarts on
+every login, so it was not stale. What *is* certain is that something uploads a session environment
+over the generator's output — `WAYLAND_DISPLAY`, `DISPLAY`, `GDMSESSION` and
+`XDG_SESSION_TYPE=wayland` all appear in `systemctl --user show-environment` while being absent from
+what the manager was exec'd with. That would also explain the observed split, where the *new*
+`SYNOIK_VK_VALIDATION` came through while the *pre-existing* `MESA_LOADER_DRIVER_OVERRIDE` did not.
+Unproven, and a probe file plus one login after a clean boot would settle it.
+
+Note also that `Environment=` on the compositor's unit is *not* compositor-scoped in practice: apps
+launched from the shell are spawned by the compositor and inherit it, which is how the client
+failure below was found.
 
 ## The other half: client buffers, still open
 
