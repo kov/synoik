@@ -271,6 +271,17 @@ impl Client {
         ti.commit();
     }
 
+    /// Declare what kind of field the caret is in — a password entry, say.
+    pub fn set_content_type(
+        &mut self,
+        hint: zwp_text_input_v3::ContentHint,
+        purpose: zwp_text_input_v3::ContentPurpose,
+    ) {
+        let ti = self.state.text_input.clone().expect("text input");
+        ti.set_content_type(hint, purpose);
+        ti.commit();
+    }
+
     /// Drain what the compositor has sent the text input so far.
     pub fn text_input_events(&mut self) -> Vec<TextInputEvent> {
         std::mem::take(&mut self.state.text_input_events)

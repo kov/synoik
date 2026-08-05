@@ -123,6 +123,9 @@ pub enum ImRequest {
     },
     /// Select the engine for the active input source (`xkb:us:intl:eng` and friends).
     SetEngine(String),
+    /// What kind of field the caret is in, already mapped to IBus's enums. Above all this is
+    /// how an engine learns it is looking at a **password**.
+    ContentType { purpose: u32, hints: u32 },
     /// A keystroke for the engine to accept or decline. `id` comes back on the
     /// [`ImUpdate::KeyResult`] that answers it.
     ///
@@ -164,6 +167,10 @@ pub struct InputMethod {
     connected: bool,
     /// The preedit we last sent a client, so focus changes and resets can clear it.
     preedit: Option<String>,
+    /// The content type last sent, as `(purpose, hints)`, so a reconnect can replay it. A new
+    /// input context defaults to free-form, and letting a **password** field silently become
+    /// free-form after a daemon restart is the one mistake here that matters.
+    content_type: (u32, u32),
     /// Keys held back from the client, oldest first, awaiting the engine's verdict.
     ///
     /// Order is the whole point. mutter relies on the same guarantee — "we rely on the IM
@@ -194,6 +201,7 @@ impl InputMethod {
             enabled: false,
             connected: false,
             preedit: None,
+            content_type: (ibus::purpose::FREE_FORM, 0),
             pending: VecDeque::new(),
             next_key_id: 0,
         }
@@ -272,6 +280,15 @@ impl State {
                 let Some(im) = self.synoik.input_method.as_mut() else {
                     return;
                 };
+                // Back to free-form, as gnome-shell's reset does (`inputMethod.js:390`). The
+                // next field to take focus sets its own content type, but until it does the
+                // engine must not still believe it is in the *previous* one — a password
+                // field's purpose outliving the password field is the wrong direction to err.
+                im.content_type = (ibus::purpose::FREE_FORM, 0);
+                im.send(ImRequest::ContentType {
+                    purpose: ibus::purpose::FREE_FORM,
+                    hints: 0,
+                });
                 im.send(ImRequest::FocusOut);
             }
             TextInputEvent::SurroundingText {
@@ -288,12 +305,17 @@ impl State {
                 // bytes, and only this text can convert between them.
                 self.synoik.im_surrounding = Some((text, cursor));
             }
+            TextInputEvent::ContentType { hint, purpose } => {
+                let purpose = ibus::content_purpose_to_ibus(purpose);
+                let hints = ibus::content_hints_to_ibus(hint);
+                im.content_type = (purpose, hints);
+                im.send(ImRequest::ContentType { purpose, hints });
+            }
             // `Done` needs no forwarding: the requests above are already the atomic batch, and
-            // IBus has no matching "end of batch" call. Content type and the cursor rectangle
-            // are slices 8 and 6 respectively.
+            // IBus has no matching "end of batch" call. The cursor rectangle is only needed to
+            // place a candidate popup, which is the unported Panel surface.
             TextInputEvent::Done
             | TextInputEvent::TextChangeCause(_)
-            | TextInputEvent::ContentType { .. }
             | TextInputEvent::CursorRectangle(_) => {}
         }
     }
@@ -529,6 +551,8 @@ impl State {
                     // engine stays deaf until the user clicks into another text field.
                     if connected && im.enabled {
                         im.send(ImRequest::FocusIn);
+                        let (purpose, hints) = im.content_type;
+                        im.send(ImRequest::ContentType { purpose, hints });
                         if let Some((text, cursor)) = self.synoik.im_surrounding.clone() {
                             let Some(im) = self.synoik.input_method.as_mut() else {
                                 return;

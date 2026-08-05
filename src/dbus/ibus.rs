@@ -44,6 +44,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_v3::{
+    ContentHint, ContentPurpose,
+};
 use zbus::zvariant::{Array, Dict, OwnedObjectPath, Signature, Structure, StructureBuilder, Value};
 
 /// The client name handed to `CreateInputContext`. gnome-shell passes `'gnome-shell'`
@@ -82,6 +85,34 @@ pub const MOD2_MASK: u32 = 1 << 4;
 pub const MOD4_MASK: u32 = 1 << 6;
 /// ISO Level 3 Shift — AltGr, which `us(intl)` needs to reach its accented level.
 pub const MOD5_MASK: u32 = 1 << 7;
+
+/// `IBusInputPurpose`, read off the installed typelib. It mirrors `GtkInputPurpose`, so unlike
+/// `ClutterInputContentPurpose` it **has** a `PIN` — see [`content_purpose_to_ibus`].
+pub mod purpose {
+    pub const FREE_FORM: u32 = 0;
+    pub const ALPHA: u32 = 1;
+    pub const DIGITS: u32 = 2;
+    pub const NUMBER: u32 = 3;
+    pub const PHONE: u32 = 4;
+    pub const URL: u32 = 5;
+    pub const EMAIL: u32 = 6;
+    pub const NAME: u32 = 7;
+    pub const PASSWORD: u32 = 8;
+    pub const PIN: u32 = 9;
+    pub const TERMINAL: u32 = 10;
+}
+
+/// `IBusInputHints`, likewise from the typelib.
+pub mod hints {
+    pub const SPELLCHECK: u32 = 1;
+    pub const WORD_COMPLETION: u32 = 4;
+    pub const LOWERCASE: u32 = 8;
+    pub const UPPERCASE_CHARS: u32 = 16;
+    pub const UPPERCASE_WORDS: u32 = 32;
+    pub const UPPERCASE_SENTENCES: u32 = 64;
+    pub const PRIVATE: u32 = 2048;
+    pub const HIDDEN_TEXT: u32 = 4096;
+}
 
 /// `IBus.PreeditFocusMode` — what an engine wants done with a live preedit when focus leaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,6 +334,79 @@ pub fn ibus_text(value: &Value<'_>) -> Option<String> {
     }
 }
 
+/// Map a `zwp_text_input_v3` content purpose onto IBus's.
+///
+/// **This is the call that tells an engine it is looking at a password**, so an engine can stop
+/// composing, stop logging, and stop offering candidates over the top of a secret. Everything
+/// below `Password` is a nicety; that one is the reason this exists.
+///
+/// We are deliberately *better than GNOME* in two places, because the path there loses
+/// information twice:
+///
+/// - `ClutterInputContentPurpose` has **no `PIN`** (`clutter-enums.h:1087-1099`), so mutter's
+///   `translate_purpose` has no case for the protocol's `Pin` and falls through to
+///   `g_warn_if_reached()` → `NORMAL` (`meta-wayland-text-input.c:746-781`). A PIN entry on GNOME
+///   therefore reaches the engine as ordinary free-form text. IBus itself has `PIN` at 9, so we
+///   pass it through.
+/// - Clutter *has* `DATE`/`TIME`/`DATETIME` but IBus does not, and gnome-shell's `else if` chain
+///   simply has no branch for them (`inputMethod.js:302-328`), leaving `ibusPurpose` at its `0`
+///   initializer. That is the same answer we give, so this arm only looks like a divergence.
+pub fn content_purpose_to_ibus(value: ContentPurpose) -> u32 {
+    match value {
+        ContentPurpose::Normal => purpose::FREE_FORM,
+        ContentPurpose::Alpha => purpose::ALPHA,
+        ContentPurpose::Digits => purpose::DIGITS,
+        ContentPurpose::Number => purpose::NUMBER,
+        ContentPurpose::Phone => purpose::PHONE,
+        ContentPurpose::Url => purpose::URL,
+        ContentPurpose::Email => purpose::EMAIL,
+        ContentPurpose::Name => purpose::NAME,
+        ContentPurpose::Password => purpose::PASSWORD,
+        ContentPurpose::Pin => purpose::PIN,
+        ContentPurpose::Terminal => purpose::TERMINAL,
+        // No IBus equivalent; free-form is what gnome-shell lands on too.
+        ContentPurpose::Date | ContentPurpose::Time | ContentPurpose::Datetime => {
+            purpose::FREE_FORM
+        }
+        // The protocol may grow. An unknown purpose must not silently become something
+        // permissive-sounding by accident, but free-form is the only honest "we don't know".
+        _ => purpose::FREE_FORM,
+    }
+}
+
+/// Map `zwp_text_input_v3` content hints onto IBus's, following `inputMethod.js:278-300`.
+///
+/// The protocol's `latin` and `multiline` have no IBus counterpart and are dropped, as they are
+/// on GNOME.
+pub fn content_hints_to_ibus(value: ContentHint) -> u32 {
+    let mut out = 0;
+    if value.contains(ContentHint::Completion) {
+        out |= hints::WORD_COMPLETION;
+    }
+    if value.contains(ContentHint::Spellcheck) {
+        out |= hints::SPELLCHECK;
+    }
+    if value.contains(ContentHint::AutoCapitalization) {
+        out |= hints::UPPERCASE_SENTENCES;
+    }
+    if value.contains(ContentHint::Lowercase) {
+        out |= hints::LOWERCASE;
+    }
+    if value.contains(ContentHint::Uppercase) {
+        out |= hints::UPPERCASE_CHARS;
+    }
+    if value.contains(ContentHint::Titlecase) {
+        out |= hints::UPPERCASE_WORDS;
+    }
+    if value.contains(ContentHint::SensitiveData) {
+        out |= hints::PRIVATE;
+    }
+    if value.contains(ContentHint::HiddenText) {
+        out |= hints::HIDDEN_TEXT;
+    }
+    out
+}
+
 /// Build an `IBusText` variant around a plain string, the inverse of [`ibus_text`].
 ///
 /// `IBusText` is an `IBusSerializable`, so the wire form is `(sa{sv}sv)`: the type name, an
@@ -493,6 +597,76 @@ pub const ENGINE_ACTIVATION_TIMEOUT: Duration = Duration::from_millis(4000);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mapping that keeps an engine from treating a secret like ordinary text.
+    #[test]
+    fn a_password_field_is_announced_as_one() {
+        assert_eq!(
+            content_purpose_to_ibus(ContentPurpose::Password),
+            purpose::PASSWORD
+        );
+        assert_eq!(
+            content_hints_to_ibus(ContentHint::SensitiveData),
+            hints::PRIVATE
+        );
+        assert_eq!(
+            content_hints_to_ibus(ContentHint::HiddenText),
+            hints::HIDDEN_TEXT
+        );
+
+        // A PIN is a secret too. GNOME loses this one: Clutter has no `PIN`, so mutter's
+        // `translate_purpose` falls through to `NORMAL` and the engine is told it is looking at
+        // free-form text. IBus has `PIN`, so we say so.
+        assert_eq!(content_purpose_to_ibus(ContentPurpose::Pin), purpose::PIN);
+    }
+
+    #[test]
+    fn content_purposes_map_by_name() {
+        assert_eq!(
+            content_purpose_to_ibus(ContentPurpose::Normal),
+            purpose::FREE_FORM
+        );
+        assert_eq!(content_purpose_to_ibus(ContentPurpose::Url), purpose::URL);
+        // The values diverge past `Password`: the protocol has `Pin` where IBus counts on to
+        // `Terminal`, so a numeric cast here would land `Terminal` (13) on nothing at all.
+        assert_eq!(
+            content_purpose_to_ibus(ContentPurpose::Terminal),
+            purpose::TERMINAL
+        );
+        assert_ne!(ContentPurpose::Terminal as u32, purpose::TERMINAL);
+        // No IBus equivalent, and gnome-shell's `else if` chain leaves these at 0 as well.
+        assert_eq!(
+            content_purpose_to_ibus(ContentPurpose::Date),
+            purpose::FREE_FORM
+        );
+    }
+
+    #[test]
+    fn content_hints_combine() {
+        assert_eq!(content_hints_to_ibus(ContentHint::None), 0);
+        assert_eq!(
+            content_hints_to_ibus(ContentHint::Completion | ContentHint::Spellcheck),
+            hints::WORD_COMPLETION | hints::SPELLCHECK
+        );
+        // Case hints are three distinct IBus flags, not a scale.
+        assert_eq!(
+            content_hints_to_ibus(ContentHint::Uppercase),
+            hints::UPPERCASE_CHARS
+        );
+        assert_eq!(
+            content_hints_to_ibus(ContentHint::Titlecase),
+            hints::UPPERCASE_WORDS
+        );
+        assert_eq!(
+            content_hints_to_ibus(ContentHint::AutoCapitalization),
+            hints::UPPERCASE_SENTENCES
+        );
+        // Dropped, as on GNOME: IBus has no counterpart.
+        assert_eq!(
+            content_hints_to_ibus(ContentHint::Latin | ContentHint::Multiline),
+            0
+        );
+    }
 
     /// The real file this machine's daemon wrote, comments and all.
     const SAMPLE: &str = "\

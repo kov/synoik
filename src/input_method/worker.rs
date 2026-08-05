@@ -167,6 +167,9 @@ async fn handle_request(
         ImRequest::FocusIn => ctx.focus_in().await?,
         ImRequest::FocusOut => ctx.focus_out().await?,
         ImRequest::Reset => ctx.reset().await?,
+        // A *property* whose type is the tuple `(uu)`, so it is set with one struct value
+        // rather than two scalars.
+        ImRequest::ContentType { purpose, hints } => ctx.set_content_type((purpose, hints)).await?,
         ImRequest::SetEngine(engine) => {
             // The one call gnome-shell puts a timeout on (`ibusManager.js:59-61`): an engine that
             // will not start must not wedge every later request behind it.

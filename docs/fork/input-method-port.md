@@ -198,9 +198,17 @@ dereferences the stored surrounding text without a NULL check.
 
 ### Enum traps
 
-- **`content_purpose` desynchronizes at `pin`.** Wayland `pin` = 9 has no Clutter counterpart:
-  mutter hits `g_warn_if_reached()` and returns NORMAL, so a PIN field is *not* treated as a
-  password, and every purpose ≥ 10 is off by one (`:746-781`).
+- **`content_purpose` loses `pin` on GNOME — twice.** `ClutterInputContentPurpose` has no `PIN`
+  (`clutter-enums.h:1087-1099`), so mutter's `translate_purpose` has no case for the protocol's
+  `pin`, hits `g_warn_if_reached()` and returns NORMAL (`:746-781`). A PIN entry therefore reaches
+  the engine as ordinary free-form text. Separately, Clutter *has* `DATE`/`TIME`/`DATETIME` and
+  IBus does not, and gnome-shell's `else if` chain has no branch for them, so they fall out as
+  `FREE_FORM` (`inputMethod.js:302-328`).
+  **Both stages map by name, not by value**, so there is no off-by-one — an earlier revision of
+  this doc claimed one, wrongly. But the numbers *do* diverge (protocol `pin`=9 where IBus counts
+  on to `terminal`=10), so a numeric cast would be a real bug. `content_purpose_to_ibus` maps by
+  name and passes `pin` through, since IBus has it at 9 — we are deliberately better than GNOME
+  here, and `assert_ne!(ContentPurpose::Terminal as u32, purpose::TERMINAL)` pins the trap.
 - **`preedit_shown` is not a hint.** It is diverted into `can_show_preedit` (`:876-882`).
 - `on_screen_input_provided` maps to `INHIBIT_OSK`. Hints 0x1–0x200 are bit-for-bit identical.
 - `set_text_change_cause` is stored and never read.
@@ -304,6 +312,6 @@ spawns it. Xwayland start ⇒ restart with `--xim`; Xwayland stop ⇒ restart wi
 |---|---|---|
 | **6** | Preedit in `TextEdit` | `handle_key` takes `Option<char>`; `insert_str` is the commit sink, but a shown-not-inserted preedit string is new, and `masked_positions` deliberately never sees the password. The compositor's own entries do not go through `zwp_text_input_v3`, so today they get no engine at all — typing `'a` in the overview search still gives `'a`. |
 | **7** | Daemon lifecycle | Spawning a daemon we did not find (GNOME's `ibusManager.js` launches one), systemd-unit check. Reconnect *is* done: the worker retries on a backoff and replays focus + surrounding text. |
-| **8** | Content type / purpose | Hint + purpose mapping, password fields. Mind the `pin` gap. |
+| ~~8~~ | ~~Content type / purpose~~ | **Done** — pulled ahead of 6, because it is a prerequisite: routing a password entry through an engine that has not been told it is a password is not a papercut. |
 | **Deferred** | Panel interface | Lookup table, auxiliary text, candidate popup, property menu. Needed for CJK engines, not for dead keys. |
 | **Deferred** | OSK integration, surrounding text from our own entries | |

@@ -3150,15 +3150,24 @@ fn engine_output_reaches_the_client_as_preedit_then_commit() {
     );
 }
 
+/// What the client's committed text-input state lands in before it is pumped into the model.
+type ImSink = std::sync::Arc<std::sync::Mutex<Vec<smithay::wayland::text_input::TextInputEvent>>>;
+
+/// Feed everything the client has committed into the model, as the production calloop source
+/// does. Manual here because the fixture's sink is a `Vec`, not the real channel.
+fn pump_im(f: &mut Fixture, seen: &ImSink) {
+    for event in seen.lock().unwrap().drain(..).collect::<Vec<_>>() {
+        f.synoik_state().on_text_input_event(event);
+    }
+}
+
 /// Stand up a client with text input enabled and a connected input method behind it, and
-/// return the channel the model's requests arrive on.
-///
-/// The sink is a `Vec` rather than the production channel, so the client's committed state is
-/// pumped through `on_text_input_event` by hand — the same thing the calloop source does.
+/// return the channel the model's requests arrive on plus the sink [`pump_im`] drains.
 fn im_fixture() -> (
     Fixture,
     ClientId,
     async_channel::Receiver<crate::input_method::ImRequest>,
+    ImSink,
 ) {
     use std::sync::{Arc, Mutex};
 
@@ -3189,9 +3198,7 @@ fn im_fixture() -> (
     f.client(id).enable_text_input();
     f.double_roundtrip(id);
 
-    for event in seen.lock().unwrap().drain(..).collect::<Vec<_>>() {
-        f.synoik_state().on_text_input_event(event);
-    }
+    pump_im(&mut f, &seen);
     // A daemon answered, so the key path is live. Until this the model must behave as if there
     // were no input method at all.
     f.synoik_state().on_im_update(ImUpdate::Connected(true));
@@ -3200,7 +3207,7 @@ fn im_fixture() -> (
     let _ = f.client(id).text_input_events();
     // Drain the focus-in the setup itself produced, so a test sees only its own traffic.
     while requests.try_recv().is_ok() {}
-    (f, id, requests)
+    (f, id, requests, seen)
 }
 
 /// A keystroke offered to the engine must not reach the client until the engine declines it.
@@ -3212,7 +3219,7 @@ fn im_fixture() -> (
 fn a_key_waits_for_the_engine_before_reaching_the_client() {
     use crate::input_method::{ImRequest, ImUpdate};
 
-    let (mut f, id, requests) = im_fixture();
+    let (mut f, id, requests, _seen) = im_fixture();
 
     f.key_press(KEY_A);
     f.double_roundtrip(id);
@@ -3246,7 +3253,7 @@ fn a_key_waits_for_the_engine_before_reaching_the_client() {
 fn a_key_the_engine_took_never_reaches_the_client() {
     use crate::input_method::{ImRequest, ImUpdate};
 
-    let (mut f, id, requests) = im_fixture();
+    let (mut f, id, requests, _seen) = im_fixture();
 
     f.key_press(KEY_A);
     f.double_roundtrip(id);
@@ -3277,7 +3284,7 @@ fn a_key_the_engine_took_never_reaches_the_client() {
 fn deferred_keys_are_delivered_in_typing_order() {
     use crate::input_method::{ImRequest, ImUpdate};
 
-    let (mut f, id, requests) = im_fixture();
+    let (mut f, id, requests, _seen) = im_fixture();
 
     f.key_press(KEY_A);
     f.key_press(KEY_S);
@@ -3323,7 +3330,7 @@ fn deferred_keys_are_delivered_in_typing_order() {
 fn keys_go_straight_through_while_the_engine_is_disconnected() {
     use crate::input_method::ImUpdate;
 
-    let (mut f, id, requests) = im_fixture();
+    let (mut f, id, requests, _seen) = im_fixture();
     f.synoik_state().on_im_update(ImUpdate::Connected(false));
 
     f.key_press(KEY_A);
@@ -3346,7 +3353,7 @@ fn keys_go_straight_through_while_the_engine_is_disconnected() {
 fn disabling_text_input_delivers_the_keys_still_in_flight() {
     use smithay::wayland::text_input::TextInputEvent as Ev;
 
-    let (mut f, id, _requests) = im_fixture();
+    let (mut f, id, _requests, _seen) = im_fixture();
 
     f.key_press(KEY_A);
     f.double_roundtrip(id);
@@ -3365,6 +3372,51 @@ fn disabling_text_input_delivers_the_keys_still_in_flight() {
     );
 }
 
+/// A client's password field must reach the engine *as* a password, so it can stop composing and
+/// stop offering candidates over a secret. This is the one content-type mapping whose failure is
+/// a privacy bug rather than a papercut.
+#[test]
+fn a_password_field_is_announced_to_the_engine() {
+    use smithay::reexports::wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3 as c;
+
+    use crate::dbus::ibus::{hints, purpose};
+    use crate::input_method::ImRequest;
+
+    let (mut f, id, requests, seen) = im_fixture();
+
+    f.client(id)
+        .set_content_type(c::ContentHint::SensitiveData, c::ContentPurpose::Password);
+    f.double_roundtrip(id);
+    pump_im(&mut f, &seen);
+
+    let content: Vec<ImRequest> = std::iter::from_fn(|| requests.try_recv().ok())
+        .filter(|r| matches!(r, ImRequest::ContentType { .. }))
+        .collect();
+    assert_eq!(
+        content,
+        vec![ImRequest::ContentType {
+            purpose: purpose::PASSWORD,
+            hints: hints::PRIVATE,
+        }],
+        "a password field must be announced as one"
+    );
+
+    // ...and when the field goes away, the engine must not still believe it is in one.
+    f.synoik_state()
+        .on_text_input_event(smithay::wayland::text_input::TextInputEvent::Disabled);
+    let after: Vec<ImRequest> = std::iter::from_fn(|| requests.try_recv().ok())
+        .filter(|r| matches!(r, ImRequest::ContentType { .. }))
+        .collect();
+    assert_eq!(
+        after,
+        vec![ImRequest::ContentType {
+            purpose: purpose::FREE_FORM,
+            hints: 0,
+        }],
+        "disabling the input must reset the content type"
+    );
+}
+
 /// A key the engine hands back reaches the client as an ordinary key event, and does not loop
 /// back into the engine that produced it.
 #[test]
@@ -3372,7 +3424,7 @@ fn a_key_forwarded_by_the_engine_reaches_the_client_once() {
     use crate::dbus::ibus::ImEvent;
     use crate::input_method::ImUpdate;
 
-    let (mut f, id, requests) = im_fixture();
+    let (mut f, id, requests, _seen) = im_fixture();
 
     // IBus counts in evdev codes, which is what the client sees too.
     f.synoik_state()
@@ -3406,7 +3458,7 @@ fn a_key_forwarded_by_the_engine_reaches_the_client_once() {
 fn a_binding_claims_its_key_before_the_engine_sees_it() {
     use crate::input_method::ImRequest;
 
-    let (mut f, id, requests) = im_fixture();
+    let (mut f, id, requests, _seen) = im_fixture();
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
