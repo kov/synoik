@@ -27,7 +27,7 @@ use synoik_config::{Action, Config};
 use wayland_client::protocol::wl_keyboard::KeyState as WlKeyState;
 use wayland_client::protocol::wl_surface::WlSurface;
 
-use super::client::ClientId;
+use super::client::{ClientId, TextInputEvent as ClientEv};
 use super::*;
 use crate::gnome::{
     Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction, KeybindingAction,
@@ -2960,6 +2960,92 @@ fn dragging_maximized_window_shakes_loose_after_threshold() {
     assert!(
         ws.is_floating(&focused),
         "the shaken-loose window must land floating"
+    );
+}
+
+/// Without an input method, a text-input client is told nothing at all: no `enter`, so per
+/// protocol it never sends `enable`, and every request it makes is discarded.
+///
+/// This is the state that breaks dead keys in GTK apps. GTK picks its IM backend off the mere
+/// existence of `zwp_text_input_manager_v3` (`gtk/gtkimmodule.c`, `match_backend`), and
+/// `GtkIMContextWayland` has no compose table of its own — so advertising the global with
+/// nothing behind it replaces GTK's composition with nothing.
+#[test]
+fn text_input_hears_nothing_without_an_input_method() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).create_text_input();
+    f.double_roundtrip(id);
+    f.client(id).enable_text_input();
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.client(id).text_input_events(),
+        Vec::new(),
+        "a text input must stay silent while nothing is acting as the input method"
+    );
+}
+
+/// With a compositor-internal input method registered, the same client is heard: it gets
+/// `enter` on focus, and its committed state arrives as `TextInputEvent`s.
+///
+/// This is the smithay patch under test — stock smithay gates all of this on a Wayland
+/// `zwp_input_method_v2` client existing, which is not how GNOME works (gnome-shell *is* the
+/// input method, talking to IBus over D-Bus).
+#[test]
+fn an_internal_input_method_receives_client_text_input_state() {
+    use std::sync::{Arc, Mutex};
+
+    use smithay::wayland::text_input::{TextInputEvent as Ev, TextInputSeat};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let seen: Arc<Mutex<Vec<Ev>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    f.synoik()
+        .seat
+        .text_input()
+        .set_internal_input_method(Some(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        })));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).create_text_input();
+    f.double_roundtrip(id);
+
+    // Focus reaches the text input now, which is what licenses the client to enable it.
+    assert!(
+        f.client(id).text_input_events().contains(&ClientEv::Enter),
+        "an internal input method must get the client an `enter`"
+    );
+
+    f.client(id).enable_text_input();
+    f.double_roundtrip(id);
+    f.client(id).set_surrounding_text("héllo", 6, 6);
+    f.double_roundtrip(id);
+
+    let events = seen.lock().unwrap().clone();
+    assert!(
+        events.contains(&Ev::Enabled),
+        "enable must reach the internal input method, got: {events:?}"
+    );
+    assert!(
+        events.contains(&Ev::SurroundingText {
+            // Byte offsets, not characters: "héllo" is 6 bytes, and a caret at the end is 6.
+            text: "héllo".to_owned(),
+            cursor: 6,
+            anchor: 6,
+        }),
+        "surrounding text must reach the internal input method, got: {events:?}"
+    );
+    assert!(
+        events.iter().filter(|e| **e == Ev::Done).count() >= 2,
+        "each commit ends in a Done, got: {events:?}"
     );
 }
 

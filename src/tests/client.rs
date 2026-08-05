@@ -23,6 +23,10 @@ use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::
     self, ZwpKeyboardShortcutsInhibitorV1,
 };
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
+use smithay::reexports::wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
+use smithay::reexports::wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
+    self, ZwpTextInputV3,
+};
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
@@ -83,6 +87,12 @@ pub struct State {
     pub screencopy_manager: Option<ZwlrScreencopyManagerV1>,
     /// The in-flight wlr-screencopy capture, if any. One at a time is enough for tests.
     pub screencopy: Option<ScreencopyCapture>,
+
+    pub text_input_manager: Option<ZwpTextInputManagerV3>,
+    /// The text-input object, once [`Client::create_text_input`] made one.
+    pub text_input: Option<ZwpTextInputV3>,
+    /// Everything the compositor sent on it, in order.
+    pub text_input_events: Vec<TextInputEvent>,
 
     pub keyboard: Option<WlKeyboard>,
     /// `wl_keyboard.key` events received, as `(evdev code, state)`.
@@ -231,6 +241,41 @@ impl fmt::Display for LayerConfigure {
 }
 
 impl Client {
+    /// Create a `zwp_text_input_v3` on this client's seat.
+    ///
+    /// The compositor only sends `enter` when something is acting as the input method, so a
+    /// text input created without one stays silent — which is exactly the state that takes
+    /// GTK's own compose table away and gives it nothing back.
+    pub fn create_text_input(&mut self) {
+        let manager = self
+            .state
+            .text_input_manager
+            .clone()
+            .expect("compositor advertises zwp_text_input_manager_v3");
+        let seat = self.state.seat.clone().expect("seat");
+        let qh = self.state.qh.clone();
+        self.state.text_input = Some(manager.get_text_input(&seat, &qh, ()));
+    }
+
+    /// `enable` + `commit` — what a client does when its entry takes focus.
+    pub fn enable_text_input(&mut self) {
+        let ti = self.state.text_input.clone().expect("text input");
+        ti.enable();
+        ti.commit();
+    }
+
+    /// `set_surrounding_text` + `commit`.
+    pub fn set_surrounding_text(&mut self, text: &str, cursor: i32, anchor: i32) {
+        let ti = self.state.text_input.clone().expect("text input");
+        ti.set_surrounding_text(text.to_owned(), cursor, anchor);
+        ti.commit();
+    }
+
+    /// Drain what the compositor has sent the text input so far.
+    pub fn text_input_events(&mut self) -> Vec<TextInputEvent> {
+        std::mem::take(&mut self.state.text_input_events)
+    }
+
     pub fn new(stream: UnixStream) -> Self {
         let id = ClientId::next();
 
@@ -250,6 +295,9 @@ impl Client {
         let state = State {
             qh: qh.clone(),
             globals: Vec::new(),
+            text_input_manager: None,
+            text_input: None,
+            text_input_events: Vec::new(),
             outputs: HashMap::new(),
             compositor: None,
             xdg_wm_base: None,
@@ -800,6 +848,9 @@ impl Dispatch<WlRegistry, ()> for State {
                     let version = min(version, WlOutput::interface().version);
                     let output = registry.bind(name, version, qh, ());
                     state.outputs.insert(output, String::new());
+                } else if interface == ZwpTextInputManagerV3::interface().name {
+                    let version = min(version, ZwpTextInputManagerV3::interface().version);
+                    state.text_input_manager = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WlSeat::interface().name {
                     let version = min(version, WlSeat::interface().version);
                     state.seat = Some(registry.bind(name, version, qh, ()));
@@ -1162,6 +1213,73 @@ impl Dispatch<WlSeat, ()> for State {
             wl_seat::Event::Name { .. } => (),
             _ => unreachable!(),
         }
+    }
+}
+
+/// What the compositor sent a `zwp_text_input_v3`, flattened for assertions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TextInputEvent {
+    Enter,
+    Leave,
+    PreeditString {
+        text: Option<String>,
+        cursor_begin: i32,
+        cursor_end: i32,
+    },
+    CommitString(Option<String>),
+    DeleteSurroundingText {
+        before_length: u32,
+        after_length: u32,
+    },
+    Done(u32),
+}
+
+impl Dispatch<ZwpTextInputManagerV3, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTextInputManagerV3,
+        _event: <ZwpTextInputManagerV3 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // The manager has no events.
+    }
+}
+
+impl Dispatch<ZwpTextInputV3, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwpTextInputV3,
+        event: <ZwpTextInputV3 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let recorded = match event {
+            zwp_text_input_v3::Event::Enter { .. } => TextInputEvent::Enter,
+            zwp_text_input_v3::Event::Leave { .. } => TextInputEvent::Leave,
+            zwp_text_input_v3::Event::PreeditString {
+                text,
+                cursor_begin,
+                cursor_end,
+            } => TextInputEvent::PreeditString {
+                text,
+                cursor_begin,
+                cursor_end,
+            },
+            zwp_text_input_v3::Event::CommitString { text } => TextInputEvent::CommitString(text),
+            zwp_text_input_v3::Event::DeleteSurroundingText {
+                before_length,
+                after_length,
+            } => TextInputEvent::DeleteSurroundingText {
+                before_length,
+                after_length,
+            },
+            zwp_text_input_v3::Event::Done { serial } => TextInputEvent::Done(serial),
+            _ => return,
+        };
+        state.text_input_events.push(recorded);
     }
 }
 
