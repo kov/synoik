@@ -1831,6 +1831,18 @@ impl State {
                 if has_menu && menu_first {
                     open_menu(self);
                 } else if props.supports_activation {
+                    // A tray activation usually *is* a window opening, and only we can place it
+                    // (a Wayland client cannot position its own toplevel). Remember where the
+                    // icon was so the window can be put under it when it maps.
+                    self.synoik
+                        .indicator_activations
+                        .push(crate::synoik::IndicatorActivation {
+                            token: token.clone(),
+                            anchor,
+                            output: output.clone(),
+                            expires: crate::utils::get_monotonic_time()
+                                + crate::app_system::STARTUP_TIMEOUT,
+                        });
                     self.send_indicator_request(SynoikToStatusNotifier::Activate {
                         item_id: id.to_owned(),
                         dest: address.dest,

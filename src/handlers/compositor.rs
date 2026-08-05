@@ -333,6 +333,11 @@ impl CompositorHandler for State {
                     // if the window ended up fullscreen, then we only know that it is also
                     // maximized from the is_pending_maximized variable. Tell the layout about it
                     // here so that unfullscreening the window makes it maximized.
+                    // A window a tray icon opened belongs under that icon; nothing else can put
+                    // it there. Before the fullscreen fix-up, so a window that is going fullscreen
+                    // is not first moved and then ignored.
+                    self.place_indicator_window(surface, activation_token.as_deref());
+
                     if let Some((mapped, _)) = self.synoik.layout.find_window_and_output(surface) {
                         if mapped.pending_sizing_mode().is_fullscreen() && is_pending_maximized {
                             self.synoik.layout.set_maximized(&window, true);

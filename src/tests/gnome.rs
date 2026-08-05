@@ -19246,3 +19246,114 @@ fn scrolling_an_indicator_forwards_to_the_client() {
         "and does not also switch workspaces"
     );
 }
+
+/// A window a tray icon opened is placed **under that icon**, not wherever a floating window
+/// happens to land.
+///
+/// This is ours to do or nobody's: a Wayland client cannot position its own toplevel, so the
+/// spec's `Activate(x, y)` hint is unactionable at the other end. Matched by the activation token
+/// we hand the item before `Activate` — the client PID cannot be used, because a sandboxed
+/// client's bus traffic goes through `xdg-dbus-proxy` and the connection resolves to the proxy.
+#[test]
+fn a_window_opened_from_an_indicator_lands_under_its_icon() {
+    use crate::status_notifier::SynoikToStatusNotifier as Req;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    let (tx, rx) = async_channel::unbounded();
+    f.synoik().status_notifier_emit = Some(tx);
+    register_indicator_with(&mut f, "item", |props| {
+        props.item_is_menu = false;
+        props.supports_activation = true;
+    });
+
+    let anchor = f.synoik().panel.app_indicator_rect(0, 1920.).unwrap();
+    click_first_indicator(&mut f, BTN_LEFT);
+
+    let Some(Req::Activate { token, .. }) = rx.try_recv().ok() else {
+        panic!("the click must activate the item");
+    };
+
+    // The client opens a window and passes our token along, which is the whole mechanism.
+    let window = f.client(client).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(client);
+    {
+        let synoik = f.synoik();
+        let unmapped = synoik.unmapped_windows.values_mut().next().unwrap();
+        unmapped.activation_token = Some(token);
+    }
+    let window = f.client(client).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(400, 300);
+    window.ack_last_and_commit();
+    f.double_roundtrip(client);
+    f.synoik_complete_animations();
+
+    let synoik = f.synoik();
+    let (_, _, ws) = synoik
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_windows())
+        .unwrap();
+    let (tile, pos, _) = ws.tiles_with_render_positions().next().unwrap();
+    let width = tile.tile_size().w;
+
+    assert!(
+        (pos.x + width - (anchor.loc.x + anchor.size.w)).abs() < 1.,
+        "the window's right edge lines up with the icon's: window right {} vs icon right {}",
+        pos.x + width,
+        anchor.loc.x + anchor.size.w,
+    );
+    assert!(
+        pos.y > crate::ui::panel::panel_height(),
+        "and it hangs below the panel, not under it: y={}",
+        pos.y
+    );
+    assert!(
+        pos.y < crate::ui::panel::panel_height() + 16.,
+        "close under the panel, like the menu the other button opens: y={}",
+        pos.y
+    );
+}
+
+/// A window that arrives **without** our token is left where the layout put it. There is nothing
+/// to fall back to: matching by PID would place an unrelated window under an icon whenever a
+/// sandboxed client happened to open one, and the PID does not even identify the client.
+#[test]
+fn a_window_without_our_token_is_not_moved() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let client = f.add_client();
+
+    let (tx, _rx) = async_channel::unbounded();
+    f.synoik().status_notifier_emit = Some(tx);
+    register_indicator_with(&mut f, "item", |props| {
+        props.item_is_menu = false;
+        props.supports_activation = true;
+    });
+
+    let anchor = f.synoik().panel.app_indicator_rect(0, 1920.).unwrap();
+
+    // The activation is outstanding — this is the window that would be captured if we matched on
+    // anything looser than the token.
+    click_first_indicator(&mut f, BTN_LEFT);
+    let _win = map_window_sized(&mut f, client, (400, 300), None);
+    f.synoik_complete_animations();
+
+    let synoik = f.synoik();
+    let (_, _, ws) = synoik
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_windows())
+        .unwrap();
+    let (tile, pos, _) = ws.tiles_with_render_positions().next().unwrap();
+    let right = pos.x + tile.tile_size().w;
+    assert!(
+        (right - (anchor.loc.x + anchor.size.w)).abs() > 1.,
+        "an untagged window must not be pulled under the icon: right edge {right}"
+    );
+}

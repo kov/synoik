@@ -297,6 +297,20 @@ losing the open submenu or the pointer's row.
   candidate).
 - **A real activation token.** `ProvideXdgActivationToken` with a token we minted natively, rather
   than the extension's fabricated `AppInfo` (`appIndicator.js:766-773`).
+- **A window opened from an icon is placed under that icon.** Invented outright — GNOME has no
+  tray, so there is nothing to be faithful to; Plasma does the same thing. It is ours to do or
+  nobody's: a Wayland client **cannot position its own toplevel**, so the spec's `Activate(x, y)`
+  hint ("an hint to the item where to show eventual windows") is unactionable at the far end even
+  for a client that wants to obey. Left alone, a tray window lands wherever the floating layout
+  cascades it, which on the seat was the middle of the screen for all three clients tested.
+
+  The match is **by activation token only**. The obvious alternative — the new window's client PID
+  against the item's D-Bus connection — is dead for sandboxed clients, which are most of the
+  interesting ones: their bus traffic goes through `xdg-dbus-proxy`, so
+  `GetConnectionUnixProcessID` names the proxy. Measured on the seat, Nextcloud's item resolved to
+  pid 138293 (`xdg-dbus-proxy`) while its window's client was 138297 (`nextcloud`) — not even on
+  the same branch of the process tree. A window that arrives without our token keeps the position
+  the layout gave it; there is no second signal that would not be a guess.
 - **No tooltips.** A choice, not a gap: `widget::Tooltip` exists (`src/ui/widget.rs:685`) and the
   dash, window previews and the screenshot UI use it. The extension disables `ToolTip` in its IDL
   and we follow, because the property is `(sa(iiay)ss)` — icon, title and *markup* body — and

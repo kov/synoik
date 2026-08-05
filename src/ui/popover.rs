@@ -39,7 +39,7 @@ const POPOVER_RISE: f64 = 6.;
 /// Resting gap between the popover and the panel / screen edge, logical px. gnome-shell's
 /// `.popup-menu-boxpointer { -arrow-rise: $base_padding }` is documented as the "distance
 /// from the panel & screen edge" (6px), so the menu doesn't sit flush against either.
-const POPOVER_MARGIN: f64 = 6.;
+pub(crate) const POPOVER_MARGIN: f64 = 6.;
 
 /// Horizontal inset a **panel** menu keeps from the screen edge when its anchor is close
 /// enough that the clamp binds, logical px. Not `POPOVER_MARGIN`: this one exists to line

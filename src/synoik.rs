@@ -372,6 +372,34 @@ pub struct AppGridPan {
     pub dragging: bool,
 }
 
+/// A tray item we told to activate, waiting for the window it opens.
+///
+/// **Why this exists at all.** A Wayland client cannot place its own toplevel, and the spec's
+/// `Activate(x, y)` hint — "an hint to the item where to show eventual windows" — is therefore
+/// unactionable by the client even when it wants to obey. So a tray window's position is ours to
+/// choose or nobody's, and "wherever a floating window happens to land" is what nobody's looks
+/// like. This is an invented behavior with no GNOME reference (GNOME has no tray at all); see
+/// `docs/fork/status-notifier-port.md`.
+///
+/// **Why the token and nothing else.** The obvious alternative — match the new window's client
+/// PID against the item's D-Bus connection — is dead for sandboxed clients, which are most of the
+/// interesting ones: their bus traffic goes through `xdg-dbus-proxy`, so
+/// `GetConnectionUnixProcessID` names the *proxy*. Measured on the seat: Nextcloud's item resolved
+/// to pid 138293 (`xdg-dbus-proxy`) while its window's client was 138297 (`nextcloud`), not even
+/// on the same branch of the process tree. The activation token we hand the item before `Activate`
+/// is the only thing that crosses that boundary intact — and only if the client passes it on.
+#[derive(Debug)]
+pub struct IndicatorActivation {
+    /// The token handed to the item via `ProvideXdgActivationToken`.
+    pub token: String,
+    /// The icon's rect on the panel, output-local logical — where the window should appear.
+    pub anchor: Rectangle<f64, Logical>,
+    pub output: Output,
+    /// When the record expires. A click that opens nothing must not place an unrelated window
+    /// minutes later.
+    pub expires: Duration,
+}
+
 pub struct Synoik {
     pub config: Rc<RefCell<Config>>,
 
@@ -691,6 +719,9 @@ pub struct Synoik {
     /// The item whose remote menu the watcher is currently following, reconciled against the
     /// popover each cycle by `State::reconcile_indicator_menu`.
     pub indicator_menu_open: Option<String>,
+    /// Windows we asked a tray item to open, waiting for their toplevel to arrive; see
+    /// [`IndicatorActivation`].
+    pub indicator_activations: Vec<IndicatorActivation>,
     /// The on-screen notification banner (gnome-shell's MessageTray popup).
     pub notification_banner: crate::ui::notification_banner::NotificationBanner,
     /// The on-screen display (volume/brightness/…), one window per output.
@@ -6369,6 +6400,87 @@ impl State {
         }
     }
 
+    /// Place a just-mapped window under the tray icon that opened it, if one did.
+    ///
+    /// Matched by activation token only — see [`IndicatorActivation`] for why the PID is not an
+    /// option. A window that arrives without our token is left where the floating layout put it,
+    /// which is the behavior we had before; there is nothing to fall back to that would not be a
+    /// guess about which window belongs to which icon.
+    ///
+    /// The rule is a panel menu's: the window's top edge sits below the panel by the same margin a
+    /// popover keeps, and its right edge lines up with the icon's, clamped into the work area.
+    /// Invented, because GNOME has no tray to be faithful to.
+    pub fn place_indicator_window(&mut self, surface: &WlSurface, token: Option<&str>) {
+        let now = get_monotonic_time();
+        self.synoik
+            .indicator_activations
+            .retain(|a| a.expires > now);
+
+        // Whether a client passes our token on to the window it opens is the one thing this
+        // mechanism hangs on, and it is not knowable from the spec — so say what happened while
+        // any activation is outstanding. A window that arrives with `token=None` while one is
+        // waiting is a client that dropped it, and that is the finding, not a silent no-op.
+        if !self.synoik.indicator_activations.is_empty() {
+            debug!(
+                "status-notifier: a window mapped with token={token:?} while {} indicator \
+                 activation(s) were waiting",
+                self.synoik.indicator_activations.len(),
+            );
+        }
+
+        let Some(token) = token else {
+            return;
+        };
+        let Some(idx) = self
+            .synoik
+            .indicator_activations
+            .iter()
+            .position(|a| a.token == token)
+        else {
+            return;
+        };
+        // Single use: the click opened this window and no other.
+        let activation = self.synoik.indicator_activations.remove(idx);
+
+        let Some((mapped, window_output)) = self.synoik.layout.find_window_and_output(surface)
+        else {
+            return;
+        };
+        // A window that landed on another output has its own reason to be there (a window rule, a
+        // workspace target); moving it under an icon it cannot see would be worse than leaving it.
+        if window_output != Some(&activation.output) {
+            return;
+        }
+        let window = mapped.window.clone();
+        let width = f64::from(mapped.expected_size().map_or(0, |size| size.w));
+
+        let Some(area) = self
+            .synoik
+            .layout
+            .monitor_for_output(&activation.output)
+            .map(|mon| mon.working_area())
+        else {
+            return;
+        };
+
+        // Right-aligned under the icon, like the menu the other button opens.
+        let anchor = activation.anchor;
+        let x = (anchor.loc.x + anchor.size.w - width - area.loc.x)
+            .clamp(0., (area.size.w - width).max(0.));
+        let y = crate::ui::popover::POPOVER_MARGIN;
+
+        debug!(
+            "status-notifier: placing a window from {:?} at {x},{y} in the work area",
+            anchor
+        );
+        self.synoik.layout.move_floating_window(
+            Some(&window),
+            synoik_ipc::PositionChange::SetFixed(x),
+            synoik_ipc::PositionChange::SetFixed(y),
+            false,
+        );
+    }
+
     /// Keep the watcher's idea of which menu is open in step with the popover's.
     ///
     /// Reconciled rather than driven from the open/close call sites: a popover is dismissed from
@@ -6977,6 +7089,7 @@ impl Synoik {
             status_notifier: crate::status_notifier::IndicatorStore::new(),
             status_notifier_emit: None,
             indicator_menu_open: None,
+            indicator_activations: Vec::new(),
             notification_banner,
             notification_banner_timer: None,
             osd,
