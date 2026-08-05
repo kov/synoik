@@ -171,13 +171,18 @@ impl DashMetrics {
     /// ([`ThemeNode::content_box`]) so those numbers aren't hand-summed. The icon tile
     /// itself is [`AppIcon`] (the `.overview-icon` primitive); only the pill needed
     /// modelling.
+    ///
+    /// The fill here is the dark appearance's; the paint path overwrites `background` with the
+    /// live one ([`widget::style::Appearance::plate`]). Every other caller wants the box model,
+    /// not the colour.
     fn background(&self) -> ThemeNode {
         ThemeNode {
             padding: Edges::symmetric(self.pill_pad_v, self.pill_pad_h),
             border: Edges::ZERO,
             border_color: [0., 0., 0., 0.],
             border_radius: self.pill_radius,
-            background: Some(DASH_BG),
+            // A placeholder; the paint path overwrites it with the live plate.
+            background: Some(dash_bg(widget::style::Appearance::default())),
             width: None,
             height: None,
         }
@@ -197,11 +202,13 @@ pub fn preferred_height(view_size: Size<f64, Logical>) -> f64 {
     DashMetrics::for_icon(icon).preferred_height()
 }
 
-/// The `.dash-background` pill's fill. GNOME's is opaque `$dash_background_color =
-/// mix(#222226, #fafafb, 90%)` ≈ `#38383B` (`_dash.scss:20`, `_colors.scss:50`,
-/// `_default-colors.scss:4-5`); ours is the shared translucent plate, so the blurred backdrop
-/// reads through it — see [`widget::style::OVERVIEW_PLATE`] for why.
-const DASH_BG: [f32; 4] = widget::style::OVERVIEW_PLATE;
+/// The `.dash-background` pill's fill, for the appearance the shell is drawn in. GNOME's is
+/// opaque `$dash_background_color = mix(#222226, #fafafb, 90%)` ≈ `#38383B` (`_dash.scss:20`,
+/// `_colors.scss:50`, `_default-colors.scss:4-5`); ours is the shared translucent plate, so the
+/// blurred backdrop reads through it — see [`widget::style::Appearance::plate`] for why.
+fn dash_bg(appearance: widget::style::Appearance) -> [f32; 4] {
+    appearance.plate()
+}
 
 /// The dock pill's backdrop blur — the panel's, so the two read as the same material. See
 /// [`Dash::render`] for why the overview's dash does not get one.
@@ -881,6 +888,8 @@ impl Dash {
         area: Rectangle<f64, Logical>,
         progress: f64,
         blur: bool,
+        // `org.gnome.desktop.interface color-scheme` — the pill takes the shared plate.
+        appearance: widget::style::Appearance,
     ) -> Vec<DashElement> {
         let scale = output.current_scale().fractional_scale();
         let layout = self.layout(area);
@@ -1011,8 +1020,12 @@ impl Dash {
                 _ => 0,
             })
             .unwrap_or(0);
-        let revision = (self.content_rev << 20) | (hover_code & 0xf_ffff);
+        // The appearance rides the revision, or a Dark Style toggle would leave the pill
+        // serving the old plate until its content or hover next changed.
+        let revision =
+            (self.content_rev << 21) | (appearance.rev() << 20) | (hover_code & 0xf_ffff);
 
+        let plate = dash_bg(appearance);
         let pill_origin = layout.pill.loc;
         // The bake buffer *is* the pill, so its local box is the pill at the origin.
         let pill_local = Rectangle::new(Point::from((0., 0.)), layout.pill.size);
@@ -1026,14 +1039,16 @@ impl Dash {
             |frame, phys, ()| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(widget::style::TRANSPARENT)?;
-                metrics.background().paint(&mut p, pill_local)?;
+                let mut node = metrics.background();
+                node.background = Some(plate);
+                node.paint(&mut p, pill_local)?;
 
                 // The favorites/running divider. `hairline` *clears* rather than
                 // blends, so the translucent `$system_borders_color` has to be
                 // pre-blended onto the pill or it would punch a hole in it.
                 if let Some(sep) = layout.separator {
                     let rel = Rectangle::new(sep.loc - pill_origin, sep.size);
-                    p.hairline(rel, widget::style::over(DASH_BG, SEPARATOR_COLOR))?;
+                    p.hairline(rel, widget::style::over(plate, SEPARATOR_COLOR))?;
                 }
 
                 if let Some(tile) = hovered_tile {

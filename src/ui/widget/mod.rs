@@ -190,11 +190,9 @@ pub mod style {
     /// changed — the same reason the Blur my Shell extension ships this restyle alongside its blur
     /// (`overview/style-components`; `docs/fork/blur-my-shell-inventory.md` §1).
     ///
-    /// **Darkened 2026-08-05** to [`crate::ui::panel::BAR_BG`] — the same black wash the panel
-    /// lays over its own blurred capture. It started on that extension's *light* variant
-    /// (`rgba(200,200,200,.2)`), which reads as a pale slab against the always-dark shell
-    /// foreground and against the panel a few hundred pixels above it. The shell's chrome is one
-    /// material or it is none, and the panel is the piece of it that was already right.
+    /// The plate is per-[`Appearance`] as of 2026-08-05, which is why it is a function of one
+    /// rather than a constant. This is the **dark** value: [`crate::ui::panel::BAR_BG`], the same
+    /// black wash the panel lays over its own blurred capture.
     ///
     /// Deliberately **not** adopted from that stylesheet: its re-specification of every
     /// hover/focus/active state at `rgba(230,230,230,.08–.3)`. Ours are relative washes over
@@ -202,6 +200,73 @@ pub mod style {
     /// compose over a translucent plate — and keeping them keeps GNOME's accent in the focus state,
     /// which that stylesheet drops.
     pub const OVERVIEW_PLATE: Rgba = crate::ui::panel::BAR_BG;
+
+    /// The plate in the **light** appearance — that extension's "light" variant,
+    /// `rgba(200,200,200,.2)`, which is where ours started and where it belongs.
+    pub const OVERVIEW_PLATE_LIGHT: Rgba = [0.784, 0.784, 0.784, 0.2];
+
+    /// Which way `org.gnome.desktop.interface color-scheme` is pointing, for the shell surfaces
+    /// that follow it.
+    ///
+    /// **A divergence, and a narrow one.** GNOME's own chrome is always dark: every
+    /// `$system_*` colour in the 50.1 theme is a fixed dark value and nothing under
+    /// `js/ui` reads `color-scheme` for anything but the wallpaper variant
+    /// (`background.js` `_loadBackground`) and the quick-settings tile. Ours follows it for
+    /// exactly one thing — [`Appearance::plate`], the fill the overview lays over its backdrop —
+    /// because that plate is *already* a divergence (a translucent wash where GNOME has an
+    /// opaque slab), and a translucent wash is the one kind of surface whose right value
+    /// genuinely depends on whether the desktop is meant to read light or dark. Everything else,
+    /// the panel included, stays always-dark as GNOME has it.
+    ///
+    /// `default` counts as light, matching how GNOME resolves the tri-state everywhere else:
+    /// only `prefer-dark` is dark.
+    ///
+    /// `Default` is `Light`, matching `GnomeSettings::default()` (whose `dark_style` is false,
+    /// because the schema default is `default`). Nothing should be *reading* the default — it
+    /// exists for the geometry-only paths that carry an [`EntryStyle`](super::EntryStyle) around
+    /// without ever asking it for a fill — but if one ever does, agreeing with the pristine
+    /// settings is the failure mode that looks like nothing happened rather than like a bug.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum Appearance {
+        Dark,
+        #[default]
+        Light,
+    }
+
+    impl Appearance {
+        /// From `GnomeSettings::quick_toggles.dark_style`, i.e. `color-scheme == "prefer-dark"`.
+        pub fn from_dark_style(dark: bool) -> Self {
+            if dark {
+                Self::Dark
+            } else {
+                Self::Light
+            }
+        }
+
+        /// The plate fill — the shared surface the overview lays over its backdrop: the dash
+        /// pill, the search entry, the search-results card and the app grid's folder tiles. One
+        /// function so the four cannot drift, which is the whole point: they read as one
+        /// material only if they are one colour.
+        pub fn plate(self) -> Rgba {
+            match self {
+                Self::Dark => OVERVIEW_PLATE,
+                Self::Light => OVERVIEW_PLATE_LIGHT,
+            }
+        }
+
+        /// One bit for a bake revision key.
+        ///
+        /// Every plate is drawn into a cached texture, and a cache keyed on content alone would
+        /// keep serving the old appearance's fill until something *else* changed — the toggle
+        /// would look like it did nothing, then apply itself later at random. Callers fold this
+        /// into their revision; see [`Appearance::plate`] for who they are.
+        pub fn rev(self) -> u64 {
+            match self {
+                Self::Dark => 0,
+                Self::Light => 1,
+            }
+        }
+    }
 
     /// The system accent as an [`Rgba`] — `org.gnome.desktop.interface accent-color` arrives
     /// resolved to 8-bit RGB, and every widget that draws with it needs the float form.
@@ -235,9 +300,11 @@ pub mod style {
     /// `_default-colors.scss:33`). An app tile in the same grid is `$style: flat` and forced
     /// transparent at rest, which is why only folders show a resting background.
     ///
-    /// Being the grid's only resting plate is exactly why it is [`OVERVIEW_PLATE`] here rather
+    /// Being the grid's only resting plate is exactly why it is [`Appearance::plate`] here rather
     /// than that opaque value: it is the one thing in the app grid the backdrop would stop at.
-    pub const FOLDER_BG: Rgba = OVERVIEW_PLATE;
+    pub fn folder_bg(appearance: Appearance) -> Rgba {
+        appearance.plate()
+    }
 
     /// `%system_button`'s normal fill — `button(normal, $tc: $system_fg_color, $c:
     /// $system_bg_color)`, i.e. `st-mix(#fafafb, lighten(#222226, 5%), 9%)` (`_common.scss:348`,
@@ -1119,7 +1186,11 @@ pub enum EntryHit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryStyle {
     /// `%system_entry` — the overview search field.
-    Search,
+    ///
+    /// The one entry family whose fill follows the appearance, because it is the one that sits
+    /// on the overview's backdrop and takes the shared plate; it carries its
+    /// [`Appearance`](style::Appearance) rather than every entry taking one it has no use for.
+    Search(style::Appearance),
     /// `%lockscreen_entry` (`_common.scss:370-379`): `entry(…, $style: lockscreen)` fills with
     /// `transparentize($system_fg_color, .9)` over the wallpaper and takes its focus ring from
     /// `transparentize($fg, 0.6)` (`_drawing.scss:99-105,138-142`). No icons.
@@ -1142,9 +1213,10 @@ impl EntryStyle {
     fn bg(self) -> Rgba {
         match self {
             // The one entry that sits on the overview backdrop, so it takes the shared plate
-            // rather than `%system_entry`'s opaque fill — see [`style::OVERVIEW_PLATE`]. The other
-            // two are on a wallpaper and on a dialog respectively, and keep GNOME's values.
-            EntryStyle::Search => style::OVERVIEW_PLATE,
+            // rather than `%system_entry`'s opaque fill — see [`style::Appearance::plate`]. The
+            // other two are on a wallpaper and on a dialog respectively, and keep GNOME's values
+            // (both always-dark, so neither follows the appearance).
+            EntryStyle::Search(appearance) => appearance.plate(),
             // `transparentize(white, .9)`.
             EntryStyle::Lockscreen => [1., 1., 1., 0.1],
             EntryStyle::PromptDialog => style::ENTRY_BG,
@@ -1155,7 +1227,7 @@ impl EntryStyle {
     fn focus_ring(self, accent: Rgba) -> Option<Rgba> {
         match self {
             // The search entry's focus is drawn by its caller's inset-accent ring.
-            EntryStyle::Search => None,
+            EntryStyle::Search(_) => None,
             // `transparentize(white, 0.6)`.
             EntryStyle::Lockscreen => Some([1., 1., 1., 0.4]),
             // An ordinary entry on a dialog takes `focus_ring()`'s accent (`_drawing.scss:99-105`),
@@ -1168,7 +1240,7 @@ impl EntryStyle {
     /// primary icon (`searchController.js:72-75`); the password entries put their one glyph
     /// on the trailing side.
     fn has_primary_icon(self) -> bool {
-        matches!(self, EntryStyle::Search)
+        matches!(self, EntryStyle::Search(_))
     }
 
     /// Where the text starts, and how it is aligned in the box.
@@ -1187,7 +1259,7 @@ impl EntryStyle {
     /// puck taller than the open pill, and a fixed radius would square off its corners.
     fn radius(self, height: f64) -> f64 {
         match self {
-            EntryStyle::Search => height / 2.,
+            EntryStyle::Search(_) => height / 2.,
             EntryStyle::Lockscreen | EntryStyle::PromptDialog => 8.,
         }
     }
@@ -1195,7 +1267,7 @@ impl EntryStyle {
     /// The placeholder's colour.
     fn placeholder(self) -> Rgba {
         match self {
-            EntryStyle::Search => style::MUTED,
+            EntryStyle::Search(_) => style::MUTED,
             // `transparentize($system_fg_color, 0.3)`.
             EntryStyle::Lockscreen => [1., 1., 1., 0.7],
             // `$fg_color` at 70% — `%entry`'s placeholder (`_entries.scss:3`).

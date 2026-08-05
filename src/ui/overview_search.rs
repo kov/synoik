@@ -537,7 +537,9 @@ impl OverviewSearch {
             center_y - pill_h / 2.,
             pill_w,
             pill_h,
-            widget::EntryStyle::Search,
+            // Geometry only — `Entry::layout` reads the style's radius and gutters, never its
+            // fill, so the appearance it carries is not consulted here.
+            widget::EntryStyle::Search(widget::style::Appearance::default()),
         );
         // The find glyph rides from the puck's centre to the pill's leading gutter. It has
         // to be lerped rather than read off `EntryLayout`, whose `primary_icon` is only the
@@ -701,6 +703,9 @@ impl OverviewSearch {
         // but its **selection** is `st-transparentize(-st-accent-color, 0.7)` like every other
         // entry's, so this is not the unused argument it used to be.
         accent: [u8; 3],
+        // `org.gnome.desktop.interface color-scheme`, for the two surfaces here that take the
+        // shared plate: the entry pill and the results card.
+        appearance: widget::style::Appearance,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         let SearchFade { overview, search } = fade;
         let scale = output.current_scale().fractional_scale();
@@ -811,7 +816,7 @@ impl OverviewSearch {
             // No placeholder inside the pill: at rest the control is a labelled-by-shape
             // button, and once the pill is open the caret is the invitation.
             EntryContent::of(&self.edit, "", self.expanded),
-            widget::EntryStyle::Search,
+            widget::EntryStyle::Search(appearance),
             // The search entry's focus is its caller's inset-accent ring, not the pill's.
             false,
             self.is_active(),
@@ -824,6 +829,7 @@ impl OverviewSearch {
                 .px(pill_w)
                 .px(pill_h)
                 .of(accent)
+                .of(appearance.rev())
                 .done(),
         ) {
             Ok(texture) => {
@@ -968,7 +974,10 @@ impl OverviewSearch {
                     Some(SearchHit::Result(i)) => i as u64 + 1,
                     _ => 0,
                 };
-                let card_rev = (self.content_rev << 40)
+                // The appearance rides the revision, or a Dark Style toggle would leave the
+                // card serving the old plate until its content next changed.
+                let card_rev = (self.content_rev << 41)
+                    | (appearance.rev() << 40)
                     | ((selected as u64 & 0xF_FFFF) << 20)
                     | (hover_idx & 0xF_FFFF);
                 match widget::bake(
@@ -993,8 +1002,8 @@ impl OverviewSearch {
                         p.clear(style::TRANSPARENT)?;
                         // `.search-section-content` — a plate on the overview backdrop, so it
                         // takes the shared translucent fill rather than the opaque
-                        // `$system_overlay_bg_color` (`widget::style::OVERVIEW_PLATE`).
-                        p.fill_rounded_full(CARD_RADIUS, widget::style::OVERVIEW_PLATE)?;
+                        // `$system_overlay_bg_color` (`widget::style::Appearance::plate`).
+                        p.fill_rounded_full(CARD_RADIUS, appearance.plate())?;
                         // Selection always washes; a hovered result adds/overlaps one.
                         for (i, rel) in rel_rects.iter().enumerate() {
                             if i == selected || hovered == Some(SearchHit::Result(i)) {

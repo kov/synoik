@@ -2112,6 +2112,7 @@ impl AppGrid {
         app_icons: &AppIconCache,
         scale: f64,
         accent: [u8; 3],
+        appearance: style::Appearance,
         alpha: f32,
         layout: &GridLayout,
         cache: &mut GridCache,
@@ -2121,6 +2122,7 @@ impl AppGrid {
         let first = layout.first_index;
         let page = layout.page;
         let page_entries = &self.entries[first..first + layout.tiles.len()];
+        let folder_bg = style::folder_bg(appearance);
 
         // --- Batch-upload any page icons whose decode is ready but not yet on the GPU, so the
         //     first open pays ONE submit+fence for the whole page instead of ~24 (a real Venus
@@ -2636,6 +2638,8 @@ impl AppGrid {
             let revision = widget::Revision::new()
                 .of(self.content_rev)
                 .each((0..page_entries.len()).map(has_actor))
+                // Or a Dark Style toggle would leave the folder fills on the old plate.
+                .of(appearance.rev())
                 .done();
             // The bubbles reach past the block by the deepest caption overhang on the
             // page, so the bake has to as well — a rounded fill outside its own buffer is
@@ -2656,7 +2660,7 @@ impl AppGrid {
                     let mut p = Painter::new(frame, scale, phys);
                     p.clear(style::TRANSPARENT)?;
                     for rect in &folder_rects {
-                        p.fill_rounded(*rect, radius, style::FOLDER_BG)?;
+                        p.fill_rounded(*rect, radius, folder_bg)?;
                     }
                     Ok(())
                 },
@@ -2699,12 +2703,12 @@ impl AppGrid {
                 &mut cache.fade_bake,
                 scale,
                 tile.size,
-                0,
+                appearance.rev(),
                 |_| Ok(()),
                 move |frame, phys, _: &()| {
                     let mut p = Painter::new(frame, scale, phys);
                     p.clear(style::TRANSPARENT)?;
-                    p.fill_rounded(Rectangle::from_size(tile.size), radius, style::FOLDER_BG)?;
+                    p.fill_rounded(Rectangle::from_size(tile.size), radius, folder_bg)?;
                     Ok(())
                 },
             ) {
@@ -2794,6 +2798,9 @@ impl AppGrid {
         area: Rectangle<f64, Logical>,
         alpha: f32,
         accent: [u8; 3],
+        // `org.gnome.desktop.interface color-scheme` — folder tiles are the grid's only
+        // resting plate, so they follow it.
+        appearance: style::Appearance,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         if alpha <= 0. {
             return Vec::new();
@@ -2840,6 +2847,7 @@ impl AppGrid {
                 app_icons,
                 scale,
                 accent,
+                appearance,
                 alpha,
                 &page_layout,
                 &mut cache,

@@ -1307,6 +1307,8 @@ impl FolderDialog {
         source: Option<Rectangle<f64, Logical>>,
         alpha: f32,
         accent: [u8; 3],
+        // Passed straight through to the folder's own app grid, whose tiles take the plate.
+        appearance: crate::ui::widget::style::Appearance,
         push: &mut dyn FnMut(FolderDialogRenderElement),
     ) {
         let Some(open) = &self.open else { return };
@@ -1332,6 +1334,7 @@ impl FolderDialog {
                 l.grid_area,
                 alpha,
                 accent,
+                appearance,
             )
             // Clipped to the view it lives in (`clip_to_allocation` on the grid's scroll
             // view). The app grid gets this for free — its pages slide off the *output*,

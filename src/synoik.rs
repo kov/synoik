@@ -8826,6 +8826,17 @@ impl Synoik {
         self.clipboard_mime_types = mime_types;
     }
 
+    /// Which appearance the shell's own plates are drawn in — `org.gnome.desktop.interface
+    /// color-scheme`, the same key the quick-settings Dark Style tile writes.
+    ///
+    /// See [`crate::ui::widget::style::Appearance`] for why this is the *only* thing in the
+    /// shell that follows it.
+    pub fn appearance(&self) -> crate::ui::widget::style::Appearance {
+        crate::ui::widget::style::Appearance::from_dark_style(
+            self.gnome_settings.quick_toggles.dark_style,
+        )
+    }
+
     pub fn queue_redraw_all(&mut self) {
         for state in self.output_state.values_mut() {
             state.redraw_state = mem::take(&mut state.redraw_state).queue_redraw();
@@ -9983,7 +9994,7 @@ impl Synoik {
                         bg.update(
                             tile.size,
                             metrics.radius,
-                            crate::ui::widget::style::FOLDER_BG,
+                            crate::ui::widget::style::folder_bg(self.appearance()),
                         );
                         push(
                             crate::render_helpers::rounded_solid::RoundedSolidRenderElement::from_buffer(
@@ -10085,6 +10096,7 @@ impl Synoik {
                     // The dock hangs over the raw desktop, so it brings its own blur; the
                     // overview's dash below sits on a backdrop that is already blurred.
                     true,
+                    self.appearance(),
                 ) {
                     push(element.into());
                 }
@@ -10117,6 +10129,7 @@ impl Synoik {
                     source,
                     progress as f32,
                     self.gnome_settings.accent_color,
+                    self.appearance(),
                     &mut |element| push(element.into()),
                 );
                 for element in self.dash.render(
@@ -10127,6 +10140,7 @@ impl Synoik {
                     controls.dash,
                     progress,
                     false,
+                    self.appearance(),
                 ) {
                     push(element.into());
                 }
@@ -10143,6 +10157,7 @@ impl Synoik {
                         search: self.overview_search_fade(),
                     },
                     self.gnome_settings.accent_color,
+                    self.appearance(),
                 ) {
                     push(element.into());
                 }
@@ -10173,6 +10188,7 @@ impl Synoik {
                         controls.app_display,
                         alpha,
                         self.gnome_settings.accent_color,
+                        self.appearance(),
                     ) {
                         push(element.into());
                     }

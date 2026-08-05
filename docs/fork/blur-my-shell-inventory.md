@@ -162,6 +162,24 @@ carries no alpha to fade with the overview anyway. Same argument as the paragrap
 up: the shell's chrome is one material or it is none, and the panel is the piece that was already
 right.
 
+**And then made per-appearance, same day.** Both this extension's values are now live and
+`org.gnome.desktop.interface color-scheme` picks between them: `prefer-dark` → the panel's wash,
+anything else → the "light" variant we started on. `ui::widget::style::Appearance` is the whole
+mechanism (`Synoik::appearance()` reads the key; `Appearance::plate()` answers).
+
+This is a **narrow, deliberate divergence**. GNOME's chrome is unconditionally dark — every
+`$system_*` colour in the 50.1 theme is a fixed dark value, and nothing in `js/ui` reads
+`color-scheme` except the wallpaper variant (`background.js` `_loadBackground`) and the
+quick-settings tile. The plate follows it because the plate is *already* a divergence: a
+translucent wash, and a translucent wash is the one kind of surface whose right value genuinely
+depends on whether the desktop reads light or dark. Nothing else moved — the panel included.
+
+The trap it comes with: **every plate is drawn into a cached texture**, so the appearance has to
+ride each bake's revision key (`Appearance::rev()`). Without it the toggle looks inert and then
+applies itself later, whenever the surface's content next happens to change — the
+animated-property-in-a-bake-key bug class with the sign flipped.
+`vulkan_dark_style_repaints_the_dash_pill` is the guard, and it does fail if you drop the bit.
+
 **Not adopted: its re-specification of every interaction state** at `rgba(230,230,230,.08–.3)`.
 Ours are relative washes over whatever they sit on (`HOVER_WASH`, and an accent-derived focus
 fill), so they already compose over a translucent plate — and keeping them keeps GNOME's accent in

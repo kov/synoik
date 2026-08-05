@@ -7441,6 +7441,7 @@ fn a_ping_on_an_unchanged_catalog_keeps_the_dash_icons() {
             controls.dash,
             1.0,
             false,
+            synoik.appearance(),
         );
     });
     if rendered.is_none() {
@@ -7541,6 +7542,7 @@ fn vulkan_dash_icons_shrink_with_the_ramped_tiles() {
                         band,
                         1.,
                         false,
+                        synoik.appearance(),
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7655,6 +7657,7 @@ fn vulkan_dash_hover_lightens_the_tile() {
                 controls.dash,
                 1.0,
                 false,
+                synoik.appearance(),
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7684,9 +7687,9 @@ fn vulkan_dash_hover_lightens_the_tile() {
     eprintln!("vulkan_dash_hover_lightens_the_tile: hovered={hovered:?} plain={plain:?}");
 
     // The plain tile is the pill background — proves the dash actually baked. The pill is the
-    // translucent `OVERVIEW_PLATE` now, so what is pinned is *its* alpha: an opaque result would
+    // translucent plate now, so what is pinned is *its* alpha: an opaque result would
     // mean some surface under it went back to painting a solid.
-    let plate_a = (crate::ui::widget::style::OVERVIEW_PLATE[3] * 255.).round() as u8;
+    let plate_a = (f.synoik().appearance().plate()[3] * 255.).round() as u8;
     assert_eq!(
         plain[3], plate_a,
         "the dash pill must composite at the plate's alpha ({plate_a}), got {plain:?}"
@@ -7698,6 +7701,117 @@ fn vulkan_dash_hover_lightens_the_tile() {
              (hover lightens): hovered={hovered:?} plain={plain:?}"
         );
     }
+}
+
+/// Dark Style repaints the dash pill — and does it *now*, not whenever the pill's content next
+/// happens to change.
+///
+/// The plate is the one shell surface that follows `org.gnome.desktop.interface color-scheme`,
+/// and every plate is drawn into a cached texture. A cache keyed on content alone would keep
+/// serving the old appearance's fill: the toggle would look inert and then apply itself later,
+/// at random, which is the animated-property-in-a-bake-key bug class with the sign flipped.
+/// So this renders the same dash twice across a toggle and demands the pixels move.
+#[test]
+fn vulkan_dark_style_repaints_the_dash_pill() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping vulkan_dark_style_repaints_the_dash_pill: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+
+    let apps = vec![AppEntry::fake("a.desktop", "a.desktop")];
+    f.synoik().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(apps)),
+        Box::new(RecordingLauncher::default()),
+    );
+    f.synoik()
+        .app_system
+        .set_favorites(vec!["a.desktop".into()]);
+    f.synoik().sync_dash_favorites();
+
+    let controls = f
+        .synoik()
+        .layout
+        .controls_layout_for_output(&output)
+        .expect("output 1 has a monitor");
+    let c0 = f
+        .synoik()
+        .dash
+        .tile_center(0, controls.dash)
+        .expect("tile 0");
+
+    // Sample the pill above the icon, as the hover test does.
+    let sample_pill = |f: &mut Fixture| -> Option<[u8; 4]> {
+        let output = output.clone();
+        let state = f.synoik_state();
+        let composited = state.backend.headless().with_vulkan_renderer(
+            |vk| -> anyhow::Result<(Vec<u8>, i32)> {
+                let synoik = &mut state.synoik;
+                let elements = synoik.dash.render(
+                    vk,
+                    &synoik.app_icon_cache,
+                    &synoik.icon_cache,
+                    &output,
+                    controls.dash,
+                    1.0,
+                    false,
+                    synoik.appearance(),
+                );
+                let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
+                let scale = Scale::from(output.current_scale().fractional_scale());
+                let pixels = render_to_vec(
+                    vk,
+                    phys,
+                    scale,
+                    Transform::Normal,
+                    Fourcc::Abgr8888,
+                    elements.iter().rev(),
+                )?;
+                Ok((pixels, phys.w))
+            },
+        )?;
+        let (pixels, w) = composited.expect("compositing the dash through Vulkan must not error");
+        Some(px(&pixels, w, c0.x as i32, (c0.y - 35.) as i32))
+    };
+
+    // The fixture starts on the schema default (`color-scheme = default`), i.e. light.
+    assert_eq!(
+        f.synoik().appearance(),
+        crate::ui::widget::style::Appearance::Light,
+        "the pristine settings must be the light appearance, or this test proves nothing"
+    );
+    let Some(light) = sample_pill(&mut f) else {
+        eprintln!("skipping vulkan_dark_style_repaints_the_dash_pill: no Vulkan device");
+        return;
+    };
+
+    f.synoik().gnome_settings.quick_toggles.dark_style = true;
+    assert_eq!(
+        f.synoik().appearance(),
+        crate::ui::widget::style::Appearance::Dark
+    );
+    let dark = sample_pill(&mut f).expect("the renderer was there a moment ago");
+
+    eprintln!("vulkan_dark_style_repaints_the_dash_pill: light={light:?} dark={dark:?}");
+    assert_ne!(
+        light, dark,
+        "the pill must re-bake on the toggle; identical pixels mean the cache kept the old plate"
+    );
+    // And in the direction the names promise: the dark plate is black at a higher alpha.
+    assert!(
+        dark[3] > light[3] && dark[0] < light[0],
+        "dark must be more opaque and darker: light={light:?} dark={dark:?}"
+    );
 }
 
 /// The window picker's close button actually draws: hovering a preview must put
@@ -8051,6 +8165,7 @@ fn vulkan_search_result_caption_rests_at_the_grid_line_count() {
                         search: 1.0,
                     },
                     synoik.gnome_settings.accent_color,
+                    synoik.appearance(),
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -8179,6 +8294,7 @@ fn vulkan_overview_search_draws_entry_and_selection() {
                     search: 1.0,
                 },
                 synoik.gnome_settings.accent_color,
+                synoik.appearance(),
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -8200,13 +8316,13 @@ fn vulkan_overview_search_draws_entry_and_selection() {
     let (pixels, w, _h) = result.expect("compositing the search through Vulkan must not error");
 
     // The entry pill fill, sampled low in the pill (below the text line, left of the trailing
-    // clear glyph). It is the shared translucent `OVERVIEW_PLATE` — the search entry sits on the
+    // clear glyph). It is the shared translucent plate — the search entry sits on the
     // overview backdrop — so pin its alpha rather than an opaque dark fill.
     let ex = (pill.loc.x + pill.size.w * 0.5) as i32;
     let ey = (pill.loc.y + pill.size.h - 5.) as i32;
     let entry = px(&pixels, w, ex, ey);
     eprintln!("vulkan_overview_search: entry={entry:?}");
-    let plate = crate::ui::widget::style::OVERVIEW_PLATE;
+    let plate = f.synoik().appearance().plate();
     assert_eq!(
         entry[3],
         (plate[3] * 255.).round() as u8,
@@ -8236,7 +8352,7 @@ fn vulkan_overview_search_draws_entry_and_selection() {
     eprintln!("vulkan_overview_search: selected={selected:?} plain={plain:?}");
     assert_eq!(
         plain[3],
-        (crate::ui::widget::style::OVERVIEW_PLATE[3] * 255.).round() as u8,
+        (f.synoik().appearance().plate()[3] * 255.).round() as u8,
         "the results card must composite at the plate's alpha: {plain:?}"
     );
     for ch in 0..3 {
@@ -8327,6 +8443,7 @@ fn vulkan_app_grid_draws_hovered_tile() {
                 area,
                 1.0,
                 crate::gnome::ACCENT_BLUE,
+                synoik.appearance(),
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -8457,6 +8574,7 @@ fn vulkan_app_grid_expands_a_long_caption_on_hover() {
                         area,
                         1.0,
                         crate::gnome::ACCENT_BLUE,
+                        synoik.appearance(),
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -8566,6 +8684,7 @@ fn vulkan_app_grid_previews_the_next_page_while_dragging() {
                         area,
                         1.0,
                         crate::gnome::ACCENT_BLUE,
+                        synoik.appearance(),
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -8679,6 +8798,7 @@ fn vulkan_app_grid_batch_uploads_page_icons() {
                     area,
                     1.0,
                     crate::gnome::ACCENT_BLUE,
+                    synoik.appearance(),
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -8827,6 +8947,7 @@ fn vulkan_app_grid_composes_a_folder_tile() {
                     area,
                     1.0,
                     crate::gnome::ACCENT_BLUE,
+                    synoik.appearance(),
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -8869,11 +8990,11 @@ fn vulkan_app_grid_composes_a_folder_tile() {
     let plain_corner = px(&pixels, w, px_ as i32, py as i32);
     eprintln!("vulkan_app_grid_folder: folder={folder_corner:?} plain={plain_corner:?}");
     // The folder tile is the grid's only *raised* tile, so it is the only one with a resting
-    // fill at all — the translucent `OVERVIEW_PLATE`. A plain tile's corner is empty, which is
+    // fill at all — the translucent plate. A plain tile's corner is empty, which is
     // what the comparison below is against.
     assert_eq!(
         folder_corner[3],
-        (crate::ui::widget::style::OVERVIEW_PLATE[3] * 255.).round() as u8,
+        (f.synoik().appearance().plate()[3] * 255.).round() as u8,
         "the folder tile has a resting fill at the plate's alpha: {folder_corner:?}"
     );
     assert_eq!(
@@ -8953,6 +9074,7 @@ fn vulkan_app_grid_draws_page_indicator_dots() {
                 area,
                 1.0,
                 crate::gnome::ACCENT_BLUE,
+                synoik.appearance(),
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -9059,6 +9181,7 @@ fn vulkan_app_grid_draws_navigation_arrows() {
                         area,
                         1.0,
                         crate::gnome::ACCENT_BLUE,
+                        synoik.appearance(),
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -9189,6 +9312,7 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
                 area,
                 1.0,
                 false,
+                synoik.appearance(),
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -9227,7 +9351,7 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
     );
     eprintln!("dash chrome: pill={pill:?} separator={on_sep:?} dot={dot:?} no_dot={no_dot:?}");
 
-    let plate_a = (crate::ui::widget::style::OVERVIEW_PLATE[3] * 255.).round() as u8;
+    let plate_a = (f.synoik().appearance().plate()[3] * 255.).round() as u8;
     assert_eq!(
         pill[3], plate_a,
         "the dash pill must composite at the plate's alpha ({plate_a}): {pill:?}"
@@ -10184,6 +10308,7 @@ fn vulkan_folder_dialog_draws_its_panel_over_a_shade() {
                     None,
                     1.0,
                     crate::gnome::ACCENT_BLUE,
+                    synoik.appearance(),
                     &mut |element| elements.push(element),
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
@@ -10410,6 +10535,7 @@ fn vulkan_folder_dialog_clips_its_pages_to_the_panel() {
                     None,
                     1.0,
                     crate::gnome::ACCENT_BLUE,
+                    synoik.appearance(),
                     &mut |element| elements.push(element),
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
@@ -10557,6 +10683,7 @@ fn vulkan_app_grid_eases_tiles_to_their_new_slots() {
                         area,
                         1.0,
                         crate::gnome::ACCENT_BLUE,
+                        synoik.appearance(),
                     );
                     // A tile is more than its icon: a caption left behind while the icon
                     // moves is invisible to a probe aimed at the icon, and the caption is
@@ -10787,6 +10914,7 @@ fn vulkan_folder_dialog_shrinks_toward_its_source_tile() {
                     Some(source),
                     1.0,
                     crate::gnome::ACCENT_BLUE,
+                    synoik.appearance(),
                     &mut |element| elements.push(element),
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
@@ -10909,6 +11037,7 @@ fn vulkan_app_grid_fades_a_folder_tile_caption_with_the_rest_of_it() {
                         area,
                         1.0,
                         crate::gnome::ACCENT_BLUE,
+                        synoik.appearance(),
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -11030,6 +11159,7 @@ fn vulkan_folder_tile_bubble_covers_a_two_line_caption() {
                     area,
                     1.0,
                     crate::gnome::ACCENT_BLUE,
+                    synoik.appearance(),
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -11132,6 +11262,7 @@ fn vulkan_app_grid_draws_two_caption_lines_at_rest() {
                     area,
                     1.0,
                     crate::gnome::ACCENT_BLUE,
+                    synoik.appearance(),
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -11246,6 +11377,7 @@ fn vulkan_app_grid_rings_the_keyboard_focused_tile() {
                         area,
                         1.0,
                         crate::gnome::ACCENT_BLUE,
+                        synoik.appearance(),
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -11362,6 +11494,7 @@ fn vulkan_app_grid_slides_both_pages_during_a_page_change() {
                         area,
                         1.0,
                         crate::gnome::ACCENT_BLUE,
+                        synoik.appearance(),
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -11502,6 +11635,7 @@ fn vulkan_app_grid_dots_follow_the_page() {
                         area,
                         1.0,
                         crate::gnome::ACCENT_BLUE,
+                        synoik.appearance(),
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
