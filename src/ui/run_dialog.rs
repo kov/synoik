@@ -103,6 +103,11 @@ impl RunDialog {
         self.revision += 1;
     }
 
+    /// Show (or clear) the input method's in-progress composition in the entry.
+    pub fn set_preedit(&mut self, preedit: Option<String>) -> bool {
+        self.entry.set_preedit(preedit)
+    }
+
     pub fn close(&mut self) {
         self.open = false;
     }
@@ -242,7 +247,8 @@ impl RunDialog {
             // This dialog is a modal keyboard grab (`KeyboardFocus::RunDialog`); a
             // draw failure must never leave an invisible trap. On error we skip the
             // box but still draw the backdrop below, so the modal stays visible.
-            let entry = self.entry.text();
+            let entry = self.entry.display(None);
+            let entry = entry.as_str();
             let error = self.error.as_deref();
             match widget::bake_content(
                 renderer,

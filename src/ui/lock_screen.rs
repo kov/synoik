@@ -980,6 +980,9 @@ impl LockScreen {
                 cursor: content.cursor,
                 selection: content.selection.clone(),
                 mask: None,
+                // Already spliced into `content.entry`, which arrives masked — the view is
+                // never handed the password itself, only its bullets.
+                preedit: None,
             },
             widget::EntryStyle::Lockscreen,
             content.entry_live,

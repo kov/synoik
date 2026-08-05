@@ -182,6 +182,9 @@ pub struct TextEdit {
     /// It is zeroed by [`Self::secure_clear`] and before every overwrite, for the same
     /// reason: a `String` that is merely reassigned drops its old allocation unzeroed.
     kill: String,
+    /// The engine's in-progress composition. Shown at the caret, never part of `text` — see
+    /// [`Self::preedit`].
+    preedit: Option<String>,
 }
 
 impl TextEdit {
@@ -260,6 +263,11 @@ impl TextEdit {
         self.cursor = 0;
         self.anchor = 0;
         zero(&mut self.kill);
+        // A composition abandoned mid-password is as much of the secret as the rest.
+        if let Some(preedit) = self.preedit.as_mut() {
+            zero(preedit);
+        }
+        self.preedit = None;
     }
 
     /// This edit's caret and selection **mapped onto a masked rendering** of it — the offsets
@@ -277,11 +285,80 @@ impl TextEdit {
         if !focused {
             return (None, None);
         }
-        let at = |i: usize| self.text[..i.min(self.text.len())].chars().count() * mask.len_utf8();
+        let at = |i: usize| self.masked_offset(i, mask);
+        // A shown composition sits between the caret's text position and where it is drawn, so
+        // the caret goes after it — otherwise it lands *inside* the characters being composed.
+        let preedit = self.preedit.as_deref().map_or(0, str::len);
         (
-            Some(at(self.cursor)),
+            Some(at(self.cursor) + preedit),
             self.selection().map(|s| at(s.start)..at(s.end)),
         )
+    }
+
+    /// The caret's byte offset in the *unmasked* rendering, composition included.
+    ///
+    /// The plain-text counterpart of [`Self::masked_positions`]' first element, for the entries
+    /// that draw their text as-is.
+    pub fn display_cursor(&self) -> usize {
+        self.cursor + self.preedit.as_deref().map_or(0, str::len)
+    }
+
+    /// The in-progress composition, shown at the caret but **not** part of [`Self::text`].
+    ///
+    /// It is deliberately not inserted: it is not yet input, and committing it is the engine's
+    /// call. An entry that read it as text would submit a half-composed password, search for a
+    /// dangling accent, or rename a folder to one.
+    pub fn preedit(&self) -> Option<&str> {
+        self.preedit.as_deref()
+    }
+
+    /// Set (or clear) the composition. Returns whether anything changed, so callers can skip a
+    /// redraw.
+    pub fn set_preedit(&mut self, preedit: Option<String>) -> bool {
+        if self.preedit == preedit {
+            return false;
+        }
+        // A composition that came and went must not be left on the heap of a password entry;
+        // `String` assignment would drop the old allocation unzeroed. Same reasoning as `kill`.
+        if let Some(old) = self.preedit.as_mut() {
+            zero(old);
+        }
+        self.preedit = preedit;
+        true
+    }
+
+    /// What to draw: the text — masked, if `mask` is given — with any composition spliced in at
+    /// the caret.
+    ///
+    /// **A preedit is shown in the clear even in a password field.** That is what GNOME does:
+    /// `ClutterText` builds its layout from `clutter_text_get_display_text`, which applies
+    /// `password_char`, and then inserts the raw preedit into the result
+    /// (`clutter-text.c:848-877`). Visible is the point — nobody can steer a composition they
+    /// cannot see, and it lasts only until the engine commits, at which point the committed
+    /// characters are masked like everything else.
+    pub fn display(&self, mask: Option<char>) -> String {
+        let (base, caret) = match mask {
+            Some(m) => (
+                m.to_string().repeat(self.text.chars().count()),
+                self.masked_offset(self.cursor, m),
+            ),
+            None => (self.text.clone(), self.cursor),
+        };
+
+        let Some(preedit) = self.preedit.as_deref() else {
+            return base;
+        };
+        let caret = caret.min(base.len());
+        let mut out = String::with_capacity(base.len() + preedit.len());
+        out.push_str(&base[..caret]);
+        out.push_str(preedit);
+        out.push_str(&base[caret..]);
+        out
+    }
+
+    /// A byte offset into `text`, mapped onto the masked rendering of it.
+    fn masked_offset(&self, i: usize, mask: char) -> usize {
+        self.text[..i.min(self.text.len())].chars().count() * mask.len_utf8()
     }
 
     /// Select everything, caret at the end (`clutter_text_real_select_all`,
@@ -895,6 +972,57 @@ mod tests {
 
     /// `secure_clear` zeroes the kill buffer too — otherwise an Emacs user's `Ctrl-k` leaves
     /// the password behind after the dialog has "cleared" itself.
+    #[test]
+    fn a_preedit_is_shown_but_is_not_the_text() {
+        let mut e = TextEdit::with_text("ab");
+        // Caret is at the end after `with_text`.
+        assert!(e.set_preedit(Some("ñ".to_owned())));
+        assert_eq!(e.display(None), "abñ");
+        // The composition is emphatically *not* input yet: submitting here must give "ab".
+        assert_eq!(e.text(), "ab");
+        // The caret sits after what is being composed, not inside it.
+        assert_eq!(e.display_cursor(), "abñ".len());
+
+        // Committing is the engine inserting it for real, and the preedit going away.
+        assert!(e.set_preedit(None));
+        e.insert_str("ñ");
+        assert_eq!(e.text(), "abñ");
+        assert_eq!(e.display(None), "abñ");
+        // Setting the same value twice reports no change, so callers can skip a redraw.
+        assert!(!e.set_preedit(None));
+    }
+
+    #[test]
+    fn a_preedit_shows_in_the_clear_inside_a_password() {
+        // GNOME's behavior: `ClutterText` masks its buffer and then splices the *raw* preedit
+        // into the result (`clutter-text.c:848-877`). A composition nobody can see is one
+        // nobody can steer, and it lasts only until the engine commits.
+        let mut e = TextEdit::with_capacity(64);
+        e.insert_str("hunter2");
+        e.set_preedit(Some("ñ".to_owned()));
+
+        let shown = e.display(Some('\u{25cf}'));
+        assert_eq!(shown, "\u{25cf}".repeat(7) + "ñ");
+        assert!(
+            !shown.contains("hunter2"),
+            "the secret itself must still be masked"
+        );
+
+        // And the caret maps past the composition in masked coordinates.
+        let (cursor, _) = e.masked_positions('\u{25cf}', true);
+        assert_eq!(cursor, Some(shown.len()));
+    }
+
+    #[test]
+    fn secure_clear_drops_the_composition_too() {
+        let mut e = TextEdit::with_capacity(64);
+        e.insert_str("hunter2");
+        e.set_preedit(Some("ñ".to_owned()));
+        e.secure_clear(64);
+        assert_eq!(e.preedit(), None, "a composition is as much of the secret");
+        assert_eq!(e.display(Some('\u{25cf}')), "");
+    }
+
     #[test]
     fn secure_clear_zeroes_the_kill_buffer_as_well() {
         let mut e = TextEdit::with_capacity(512);

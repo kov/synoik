@@ -808,6 +808,14 @@ impl FolderDialog {
         self.open.as_mut().is_some_and(|o| o.view.finish_reorder())
     }
 
+    /// Show (or clear) the input method's in-progress composition in the rename entry.
+    pub fn set_preedit(&mut self, preedit: Option<String>) -> bool {
+        match self.open.as_mut().and_then(|open| open.rename.as_mut()) {
+            Some(rename) => rename.edit.set_preedit(preedit),
+            None => false,
+        }
+    }
+
     /// Whether the rename entry is up (`_showFolderEntry`, `appDisplay.js:2643-2648`).
     pub fn is_renaming(&self) -> bool {
         self.open.as_ref().is_some_and(|o| o.rename.is_some())
@@ -1116,8 +1124,8 @@ impl FolderDialog {
         // `selection-background-color: st-transparentize(-st-accent-color, 0.7)`
         // (`_common.scss:179`).
         let selection = [ring[0], ring[1], ring[2], 0.3];
-        let display = rename.edit.text().to_owned();
-        let caret = rename.edit.cursor();
+        let display = rename.edit.display(None);
+        let caret = rename.edit.display_cursor();
         let sel = rename.edit.selection();
         let revision = widget::Revision::new()
             .of(&display)

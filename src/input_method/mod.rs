@@ -925,6 +925,26 @@ impl State {
         }
     }
 
+    /// Hand the in-progress composition to the entry that will draw it.
+    ///
+    /// It goes into the entry's own [`crate::ui::text_edit::TextEdit`] rather than being tracked
+    /// beside it, so every entry renders a preedit the same way and none can forget to.
+    fn set_shell_preedit(&mut self, entry: ShellEntry, preedit: Option<String>) {
+        let changed = match entry {
+            ShellEntry::Shield => self.synoik.unlock_dialog.set_preedit(preedit),
+            ShellEntry::RunDialog => self.synoik.run_dialog.set_preedit(preedit),
+            #[cfg(feature = "dbus")]
+            ShellEntry::Polkit => self.synoik.polkit_dialog.set_preedit(preedit),
+            #[cfg(not(feature = "dbus"))]
+            ShellEntry::Polkit => false,
+            ShellEntry::FolderRename => self.synoik.folder_dialog.set_preedit(preedit),
+            ShellEntry::OverviewSearch => self.synoik.overview_search.set_preedit(preedit),
+        };
+        if changed {
+            self.synoik.queue_redraw_all();
+        }
+    }
+
     /// Put finished text into one of the compositor's own entries.
     ///
     /// Delivered as one synthetic keystroke per character rather than through a new
@@ -973,7 +993,8 @@ impl State {
             .input_method
             .as_ref()
             .map_or(ImFocus::None, |im| im.focus);
-        if matches!(focus, ImFocus::Shell(_)) {
+        if let ImFocus::Shell(entry) = focus {
+            self.set_shell_preedit(entry, text.clone());
             if let Some(im) = self.synoik.input_method.as_mut() {
                 im.preedit = text;
             }

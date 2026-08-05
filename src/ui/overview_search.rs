@@ -290,6 +290,11 @@ impl OverviewSearch {
         self.edit.text().split_whitespace().next().is_some()
     }
 
+    /// Show (or clear) the input method's in-progress composition in the entry.
+    pub fn set_preedit(&mut self, preedit: Option<String>) -> bool {
+        self.edit.set_preedit(preedit)
+    }
+
     pub fn query(&self) -> &str {
         self.edit.text()
     }

@@ -390,10 +390,7 @@ impl UnlockDialog {
 
     /// What to draw in the entry — already masked when it must be.
     pub fn entry_display(&self) -> String {
-        match self.entry_mask() {
-            Some(m) => m.to_string().repeat(self.entry.text().chars().count()),
-            None => self.entry.text().to_owned(),
-        }
+        self.entry.display(self.entry_mask())
     }
 
     /// Whether the entry accepts input: only while gdm is actually waiting for an answer
@@ -484,6 +481,11 @@ impl UnlockDialog {
                 Some(effects)
             }
         }
+    }
+
+    /// Show (or clear) the input method's in-progress composition in the entry.
+    pub fn set_preedit(&mut self, preedit: Option<String>) -> bool {
+        self.entry.set_preedit(preedit)
     }
 
     /// The editing model behind the entry — what the view draws caret and selection from.

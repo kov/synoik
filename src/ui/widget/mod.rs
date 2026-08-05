@@ -1015,6 +1015,12 @@ pub struct EntryContent<'a> {
     /// Draw every character as this glyph instead — a password field. Offsets still index
     /// `text`; [`Entry::bake`] remaps them onto the mask, so a caller never has to.
     pub mask: Option<char>,
+    /// The input method's in-progress composition, drawn at the caret but not part of `text`.
+    ///
+    /// Shown **unmasked even in a password field**, which is what GNOME does: `ClutterText`
+    /// masks its buffer and then splices the raw preedit into the result
+    /// (`clutter-text.c:848-877`). A composition nobody can see is one nobody can steer.
+    pub preedit: Option<&'a str>,
 }
 
 impl<'a> EntryContent<'a> {
@@ -1036,6 +1042,7 @@ impl<'a> EntryContent<'a> {
             cursor: focused.then(|| edit.cursor()),
             selection: focused.then(|| edit.selection()).flatten(),
             mask: None,
+            preedit: edit.preedit(),
         }
     }
 
@@ -1055,13 +1062,35 @@ impl<'a> EntryContent<'a> {
     fn display(&self) -> (String, impl Fn(usize) -> usize + '_) {
         let mask = self.mask;
         let text = self.text;
-        let shown = match mask {
+        let preedit = self.preedit.unwrap_or("");
+        let masked_at = move |at: usize| match mask {
+            Some(m) => text[..at.min(text.len())].chars().count() * m.len_utf8(),
+            None => at.min(text.len()),
+        };
+
+        let base = match mask {
             Some(m) => m.to_string().repeat(text.chars().count()),
             None => text.to_owned(),
         };
-        let map = move |at: usize| match mask {
-            Some(m) => text[..at.min(text.len())].chars().count() * m.len_utf8(),
-            None => at.min(text.len()),
+        // The composition is spliced in at the caret, so every offset from there on shifts by
+        // its length — including the caret itself, which belongs *after* what is being composed.
+        let split = masked_at(self.cursor.unwrap_or(text.len()));
+        let shown = if preedit.is_empty() {
+            base
+        } else {
+            let mut out = String::with_capacity(base.len() + preedit.len());
+            out.push_str(&base[..split]);
+            out.push_str(preedit);
+            out.push_str(&base[split..]);
+            out
+        };
+        let map = move |at: usize| {
+            let at = masked_at(at);
+            if at >= split {
+                at + preedit.len()
+            } else {
+                at
+            }
         };
         (shown, map)
     }
