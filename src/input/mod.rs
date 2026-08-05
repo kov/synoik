@@ -61,6 +61,7 @@ use crate::gnome::{
 use crate::layout::scrolling::ScrollDirection;
 use crate::layout::workspace::WorkspaceId;
 use crate::layout::{ActivateWindow, LayoutElement};
+use crate::status_notifier::{ScrollOrientation, SynoikToStatusNotifier};
 use crate::synoik::{AppDrag, CastTarget, PointerVisibility, State};
 use crate::ui::app_grid::{
     AppGridEntry, DragLocation, FocusDir, PageArrow, SwipeSource, DELAYED_MOVE_MS, EDGE_BUMP_PX,
@@ -1487,15 +1488,18 @@ impl State {
             // state changes here. `Activate` also closes the popover (`closes_menu`), which the
             // reconciler turns into the `closed` event the client is owed.
             PopoverAction::IndicatorMenuActivate { item_id, node_id } => {
+                // A menu row can open a window just as an activation can, so it carries a token
+                // too (`dbusMenu.js:677-681`).
+                let token = self.mint_activation_token();
                 self.send_indicator_menu_request(
                     &item_id,
-                    crate::status_notifier::SynoikToStatusNotifier::MenuActivate(node_id),
+                    SynoikToStatusNotifier::MenuActivate { node_id, token },
                 );
             }
             PopoverAction::IndicatorMenuExpand { item_id, node_id } => {
                 self.send_indicator_menu_request(
                     &item_id,
-                    crate::status_notifier::SynoikToStatusNotifier::MenuOpenSubmenu(node_id),
+                    SynoikToStatusNotifier::MenuOpenSubmenu(node_id),
                 );
                 self.synoik.queue_redraw_all();
             }
@@ -1778,6 +1782,97 @@ impl State {
                     self.commit_favorites();
                 }
             }
+        }
+    }
+
+    /// A click on an app indicator's icon, resolved to what the spec says it means.
+    ///
+    /// **The ladder, and why it is not the extension's.** The extension never reads `ItemIsMenu`
+    /// and instead waits out a double-click timeout on every primary click of an activatable item
+    /// (`indicatorStatusIcon.js:375-445`) — a delay that exists only because it cannot tell a
+    /// menu-first item from an activatable one. `ItemIsMenu` *is* that signal, and honouring it is
+    /// what Plasma does, which is what these clients were written against. So: left click opens the
+    /// menu when the item asked for that or cannot be activated, and otherwise activates; right
+    /// click is always the menu; middle click is `SecondaryActivate`.
+    ///
+    /// An item with neither a menu nor `Activate` is not clickable at all. That is the client's
+    /// doing, not a gap here — there is nothing to invoke.
+    fn click_app_indicator(
+        &mut self,
+        id: &str,
+        output: Output,
+        anchor: Rectangle<f64, Logical>,
+        button: MouseButton,
+    ) {
+        let Some(props) = self.synoik.status_notifier.props(id).cloned() else {
+            return;
+        };
+        let Some(address) = self.synoik.status_notifier.address(id) else {
+            return;
+        };
+        let has_menu = address.menu_path.is_some();
+        // Minted up front: a token is cheap, and taking it here keeps the call sites below from
+        // borrowing `self` inside a message they are building out of it.
+        let token = self.mint_activation_token();
+        let position = indicator_hint_position(anchor);
+
+        let open_menu = |state: &mut Self| {
+            state
+                .synoik
+                .panel_popover
+                .toggle_indicator_menu(output.clone(), anchor, id.to_owned());
+        };
+
+        match button {
+            MouseButton::Left => {
+                // Menu-first when the item said so or has no `Activate` to call; activation
+                // otherwise; the menu as a last resort for an item that has one and nothing else.
+                let menu_first = props.item_is_menu || !props.supports_activation;
+                if has_menu && menu_first {
+                    open_menu(self);
+                } else if props.supports_activation {
+                    self.send_indicator_request(SynoikToStatusNotifier::Activate {
+                        item_id: id.to_owned(),
+                        dest: address.dest,
+                        path: address.item_path,
+                        position,
+                        token,
+                    });
+                } else if has_menu {
+                    open_menu(self);
+                }
+            }
+            // The menu, and only the menu: a right click that fell back to activating would be a
+            // second way to trigger what a left click already does.
+            MouseButton::Right if has_menu => open_menu(self),
+            // Always tried, in both spellings: a client may serve a method it never declared, and
+            // there is no menu-shaped fallback for a middle click.
+            MouseButton::Middle => {
+                self.send_indicator_request(SynoikToStatusNotifier::SecondaryActivate {
+                    item_id: id.to_owned(),
+                    dest: address.dest,
+                    path: address.item_path,
+                    position,
+                    token,
+                    ayatana_first: props.has_ayatana_secondary_activate,
+                });
+            }
+            _ => (),
+        }
+    }
+
+    /// A real XDG activation token for a click we are about to forward, so a client that raises a
+    /// window in response gets focus instead of an urgency hint.
+    fn mint_activation_token(&mut self) -> String {
+        let (token, _) = self.synoik.activation_state.create_external_token(None);
+        token.as_str().to_owned()
+    }
+
+    /// Send a request to the app-indicator watcher, dropped when it isn't running (headless, or a
+    /// session where another watcher owns the name).
+    fn send_indicator_request(&mut self, request: SynoikToStatusNotifier) {
+        if let Some(tx) = self.synoik.status_notifier_emit.as_ref() {
+            let _ = tx.send_blocking(request);
         }
     }
 
@@ -6749,6 +6844,20 @@ impl State {
                     }
                 }
 
+                // A click on an app indicator, whichever button — the cluster is the one panel
+                // item that takes all three, so it is handled before the left-only block below.
+                // Which icon was hit is a second question: several share the item's slot.
+                if let (Some(button), Some((output, pos))) = (button, under.clone()) {
+                    let output_w = output_size(&output).w;
+                    if let Some((id, anchor)) = self.synoik.panel.app_indicator_hit(pos, output_w) {
+                        let (id, anchor) = (id.to_owned(), anchor);
+                        self.click_app_indicator(&id, output, anchor, button);
+                        self.synoik.suppressed_buttons.insert(button_code);
+                        self.synoik.queue_redraw_all();
+                        return;
+                    }
+                }
+
                 // A left-click on a panel button: the workspace indicator toggles the overview
                 // (the mouse counterpart of the Super-tap); the clock opens the calendar popover.
                 if button == Some(MouseButton::Left) {
@@ -6787,22 +6896,6 @@ impl State {
                                     self.synoik
                                         .panel_popover
                                         .toggle_input_sources(output, anchor, items, active);
-                                }
-                                self.synoik.suppressed_buttons.insert(button_code);
-                                self.synoik.queue_redraw_all();
-                                return;
-                            }
-                            Some(crate::ui::panel::ROLE_APP_INDICATORS) => {
-                                // The cluster is many icons in one panel item, so which one was
-                                // hit is a second question. A primary click opens the menu; the
-                                // spec's activate-vs-menu ladder is S6.
-                                if let Some((id, anchor)) =
-                                    self.synoik.panel.app_indicator_hit(pos, output_w)
-                                {
-                                    let id = id.to_owned();
-                                    self.synoik
-                                        .panel_popover
-                                        .toggle_indicator_menu(output, anchor, id);
                                 }
                                 self.synoik.suppressed_buttons.insert(button_code);
                                 self.synoik.queue_redraw_all();
@@ -7336,6 +7429,50 @@ impl State {
                         self.do_action(Action::FocusWorkspaceUpUnderMouse, false);
                     }
                 }
+                return;
+            }
+        }
+
+        // Scroll over an app indicator is forwarded to its client, which is the only thing that
+        // knows what it means (`appIndicator.js:843-862`; volume applets use it, and so does
+        // anything with a "next/previous" affordance). Ahead of the volume branch below only
+        // because the regions are disjoint — neither can steal the other's.
+        //
+        // Wheel only: a touchpad's smooth stream would send a call per motion event, and the
+        // spec's `Scroll(delta, orientation)` has no notion of a gesture ending.
+        if source == AxisSource::Wheel
+            && self.synoik.layout.is_gnome_mode()
+            && !self.synoik.is_locked()
+            && !self.synoik.screenshot_ui.is_open()
+        {
+            let location = pointer.current_location();
+            let over = self
+                .synoik
+                .output_under(location)
+                .and_then(|(output, pos)| {
+                    let output_w = output_size(output).w;
+                    self.synoik
+                        .panel
+                        .app_indicator_at(pos, output_w)
+                        .map(str::to_owned)
+                });
+            if let Some(id) = over {
+                let ticks = self
+                    .synoik
+                    .vertical_wheel_tracker
+                    .accumulate(vertical_amount_v120.unwrap_or(0.));
+                if ticks != 0 {
+                    if let Some(address) = self.synoik.status_notifier.address(&id) {
+                        self.send_indicator_request(SynoikToStatusNotifier::Scroll {
+                            dest: address.dest,
+                            path: address.item_path,
+                            delta: i32::from(ticks),
+                            orientation: ScrollOrientation::Vertical,
+                        });
+                    }
+                }
+                // Consumed either way: an indicator that ignores its scroll must not fall through
+                // to switching workspaces under the user's pointer.
                 return;
             }
         }
@@ -9877,6 +10014,16 @@ fn grab_allows_hot_corner(grab: &(dyn PointerGrab<State> + 'static)) -> bool {
     }
 
     true
+}
+
+/// The `(x, y)` hint an item's `Activate`/`SecondaryActivate` carries — the spec calls it "an hint
+/// to the item where to show eventual windows", and the extension notes it has no observable
+/// effect anywhere. We send the icon's bottom-left, which is where a window would sensibly go.
+fn indicator_hint_position(anchor: Rectangle<f64, Logical>) -> (i32, i32) {
+    (
+        anchor.loc.x.round() as i32,
+        (anchor.loc.y + anchor.size.h).round() as i32,
+    )
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 # StatusNotifierItem / AppIndicator support
 
-**Status: S1–S5 landed — indicators register, draw in all three icon forms, and clicking one opens
-its client's remote menu.** What is left is S6 (the click ladder, scroll, activation tokens) and
-S7 (seat validation against real clients).
+**Status: S1–S6 landed — indicators register, draw in all three icon forms, and take clicks,
+middle clicks and scrolls; a primary click opens the client's remote menu or activates it,
+per `ItemIsMenu`.** What is left is S7: validation on the seat against real clients.
 
 ## Why this one has no GNOME reference
 
@@ -175,13 +175,26 @@ Landed as `src/dbusmenu.rs` (the model: `MenuNode`, mnemonic stripping, `to_entr
   never hears `closed` stops answering `AboutToShow`. `State::reconcile_indicator_menu` runs every
   cycle and acts only on a difference, so no dismissal path has to remember.
 
-### S6 — Interaction semantics
+### S6 — Interaction semantics ✅
 Click, middle-click, right-click, scroll (see the click ladder below), plus
 `ProvideXdgActivationToken`. The token goes out before `Activate` *and* before a menu item's
 `clicked` event (`dbusMenu.js:677-684`) — a menu entry that opens a window needs it just as much.
 The extension already mints a genuine token, by faking an `AppInfo` to get a startup-notify id out
 of `create_app_launch_context` (`appIndicator.js:766-773`); our advantage is only that we mint
 ours natively, with no fake `AppInfo` in the way.
+
+Landed as `State::click_app_indicator` (the ladder), the item-level arms of the watcher's request
+dispatcher, and the scroll branch in `on_scroll_axis`. Three things worth keeping in mind:
+
+- **`Activate`'s `UnknownMethod` is a discovery, not a failure.** The item declared the method in
+  its introspection and does not have it, so it is demoted to menu-first for good — otherwise
+  every subsequent click on that icon is silently swallowed. It travels back as
+  `StatusNotifierToSynoik::ActivationUnsupported`.
+- **A forwarded scroll is consumed either way.** An indicator that ignores it must not fall
+  through to switching workspaces under the pointer.
+- **Item calls are spawned, menu calls are awaited in order.** A client that never answers its own
+  `Activate` must not hold up the next one's click; but the activation token has to be *with* the
+  client before the event that raises the window, so that pair stays sequential.
 
 ### S7 — Live validation on the seat
 The corpus can prove the wire and the widget; it cannot prove that Steam's menu is usable. Run

@@ -32,6 +32,7 @@ use super::*;
 use crate::gnome::{
     Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction, KeybindingAction,
 };
+use crate::status_notifier::ItemProps;
 use crate::ui::osd::OsdLevel;
 use crate::utils::get_monotonic_time;
 
@@ -18785,31 +18786,58 @@ fn peripherals_settings_reach_the_input_config() {
 // `docs/fork/status-notifier-port.md`.
 // ---------------------------------------------------------------------------
 
-/// An indicator registered with a menu, ready and Active — the state a click acts on.
+/// An indicator registered with a menu, ready and Active — the state a click acts on. `tweak`
+/// shapes the properties the click ladder reads (`ItemIsMenu`, `Activate`, the menu path).
 #[cfg(test)]
-fn register_test_indicator(f: &mut Fixture, id: &str) {
-    use crate::status_notifier::{
-        ItemIcon, ItemProps, ItemStatus, RegisteredItem, StatusNotifierToSynoik,
-    };
+fn register_indicator_with(f: &mut Fixture, id: &str, tweak: impl FnOnce(&mut ItemProps)) {
+    use crate::status_notifier::{ItemIcon, ItemStatus, RegisteredItem, StatusNotifierToSynoik};
 
     let item = RegisteredItem {
         id: id.to_owned(),
         unique_name: ":1.42".to_owned(),
         object_path: "/StatusNotifierItem".to_owned(),
     };
-    let props = ItemProps {
+    let mut props = ItemProps {
         app_id: "test-indicator".to_owned(),
         title: "Test".to_owned(),
         status: ItemStatus::Active,
         icon: ItemIcon::Themed("folder".to_owned()),
         menu_path: Some("/MenuBar".to_owned()),
+        // Introspection's answer for a well-behaved KDE item: it has `Activate` and does not have
+        // the Ayatana spelling of the secondary one.
+        supports_activation: true,
         ..ItemProps::default()
     };
+    tweak(&mut props);
     f.synoik_state()
         .on_status_notifier_msg(StatusNotifierToSynoik::ItemUpdated {
             item,
             props: Box::new(props),
         });
+}
+
+/// The common case: an item that says a primary click opens its menu.
+#[cfg(test)]
+fn register_test_indicator(f: &mut Fixture, id: &str) {
+    register_indicator_with(f, id, |props| props.item_is_menu = true);
+}
+
+/// Click the first indicator on the panel with `button`, and hand back the request channel the
+/// watcher would be reading.
+#[cfg(test)]
+fn click_first_indicator(f: &mut Fixture, button: u32) {
+    let anchor = f
+        .synoik()
+        .panel
+        .app_indicator_rect(0, 1920.)
+        .expect("the indicator is on the panel");
+    pointer_motion_to(
+        f,
+        anchor.loc.x + anchor.size.w / 2.,
+        anchor.loc.y + anchor.size.h / 2.,
+    );
+    f.pointer_button(button, ButtonState::Pressed);
+    f.pointer_button(button, ButtonState::Released);
 }
 
 /// A client's layout, as `GetLayout` would deliver it: a root whose children are the rows.
@@ -18841,22 +18869,10 @@ fn test_menu_layout() -> crate::dbusmenu::MenuNode {
 fn an_indicator_menu_opens_empty_and_fills_in() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let ow = 1920.0_f64;
 
     register_test_indicator(&mut f, "org.kde.StatusNotifierItem-1-1");
 
-    let anchor = f
-        .synoik()
-        .panel
-        .app_indicator_rect(0, ow)
-        .expect("the indicator is on the panel");
-    pointer_motion_to(
-        &mut f,
-        anchor.loc.x + anchor.size.w / 2.,
-        anchor.loc.y + anchor.size.h / 2.,
-    );
-    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
-    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    click_first_indicator(&mut f, BTN_LEFT);
 
     assert_eq!(
         f.synoik().panel_popover.indicator_menu_item(),
@@ -18894,13 +18910,9 @@ fn an_indicator_menu_opens_empty_and_fills_in() {
 fn a_layout_for_another_indicator_is_ignored() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let ow = 1920.0_f64;
 
     register_test_indicator(&mut f, "org.kde.StatusNotifierItem-1-1");
-    let anchor = f.synoik().panel.app_indicator_rect(0, ow).unwrap();
-    pointer_motion_to(&mut f, anchor.loc.x + anchor.size.w / 2., anchor.loc.y + 2.);
-    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
-    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    click_first_indicator(&mut f, BTN_LEFT);
 
     f.synoik_state().on_status_notifier_msg(
         crate::status_notifier::StatusNotifierToSynoik::MenuLayout {
@@ -18930,16 +18942,12 @@ fn the_client_is_told_its_menu_opened_and_closed() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let ow = 1920.0_f64;
 
     let (tx, rx) = async_channel::unbounded();
     f.synoik().status_notifier_emit = Some(tx);
     register_test_indicator(&mut f, "org.kde.StatusNotifierItem-1-1");
 
-    let anchor = f.synoik().panel.app_indicator_rect(0, ow).unwrap();
-    pointer_motion_to(&mut f, anchor.loc.x + anchor.size.w / 2., anchor.loc.y + 2.);
-    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
-    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    click_first_indicator(&mut f, BTN_LEFT);
 
     f.synoik_state().reconcile_indicator_menu();
     assert_eq!(
@@ -18947,7 +18955,8 @@ fn the_client_is_told_its_menu_opened_and_closed() {
         Some(Req::OpenMenu {
             item_id: "org.kde.StatusNotifierItem-1-1".to_owned(),
             dest: ":1.42".to_owned(),
-            path: "/MenuBar".to_owned(),
+            item_path: "/StatusNotifierItem".to_owned(),
+            menu_path: "/MenuBar".to_owned(),
         }),
         "the watcher is told where to read the menu from"
     );
@@ -18976,16 +18985,12 @@ fn activating_a_row_sends_the_clients_node_id() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    let ow = 1920.0_f64;
 
     let (tx, rx) = async_channel::unbounded();
     f.synoik().status_notifier_emit = Some(tx);
     register_test_indicator(&mut f, "org.kde.StatusNotifierItem-1-1");
 
-    let anchor = f.synoik().panel.app_indicator_rect(0, ow).unwrap();
-    pointer_motion_to(&mut f, anchor.loc.x + anchor.size.w / 2., anchor.loc.y + 2.);
-    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
-    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    click_first_indicator(&mut f, BTN_LEFT);
     f.synoik_state().reconcile_indicator_menu();
     let _ = rx.try_recv();
 
@@ -19010,11 +19015,234 @@ fn activating_a_row_sends_the_clients_node_id() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
-    assert_eq!(rx.try_recv().ok(), Some(Req::MenuActivate(4)));
+    // The token is minted per click, so match on the row rather than the whole message.
+    assert!(
+        matches!(rx.try_recv().ok(), Some(Req::MenuActivate { node_id: 4, token }) if !token.is_empty()),
+        "the client's node id, with a real activation token"
+    );
 
     // And the menu goes away, as activating any menu row does.
     f.settle_animations();
     assert!(!f.synoik().panel_popover.is_open());
     f.synoik_state().reconcile_indicator_menu();
     assert_eq!(rx.try_recv().ok(), Some(Req::CloseMenu));
+}
+
+/// The click ladder's first rung: an item that can be activated and did **not** ask for
+/// menu-first behavior is activated by a left click, menu or no menu.
+///
+/// This is our divergence from the extension, which never reads `ItemIsMenu` and instead waits
+/// out a double-click timeout on every primary click (`indicatorStatusIcon.js:375-445`).
+#[test]
+fn a_left_click_activates_an_activatable_indicator() {
+    use crate::status_notifier::SynoikToStatusNotifier as Req;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (tx, rx) = async_channel::unbounded();
+    f.synoik().status_notifier_emit = Some(tx);
+    register_indicator_with(&mut f, "item", |props| {
+        props.item_is_menu = false;
+        props.supports_activation = true;
+    });
+
+    click_first_indicator(&mut f, BTN_LEFT);
+
+    assert!(
+        matches!(rx.try_recv().ok(), Some(Req::Activate { item_id, token, .. })
+            if item_id == "item" && !token.is_empty()),
+        "a primary click activates, with a real activation token"
+    );
+    assert!(
+        f.synoik().panel_popover.indicator_menu().is_none(),
+        "and does not open the menu"
+    );
+}
+
+/// `ItemIsMenu` flips that: the client says a primary click is a menu, so no `Activate` is sent
+/// even though the item has one. This is what Plasma does and what these clients are tested
+/// against.
+#[test]
+fn item_is_menu_makes_a_left_click_open_the_menu() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (tx, rx) = async_channel::unbounded();
+    f.synoik().status_notifier_emit = Some(tx);
+    register_indicator_with(&mut f, "item", |props| {
+        props.item_is_menu = true;
+        props.supports_activation = true;
+    });
+
+    click_first_indicator(&mut f, BTN_LEFT);
+
+    assert_eq!(f.synoik().panel_popover.indicator_menu_item(), Some("item"));
+    assert!(
+        rx.try_recv().is_err(),
+        "nothing is called on the item itself"
+    );
+}
+
+/// An item with no `Activate` falls back to its menu, and one with neither is simply not
+/// clickable — there is nothing to invoke, which is the client's doing rather than a gap here.
+#[test]
+fn an_indicator_without_activate_falls_back_to_its_menu() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (tx, rx) = async_channel::unbounded();
+    f.synoik().status_notifier_emit = Some(tx);
+    register_indicator_with(&mut f, "item", |props| {
+        props.item_is_menu = false;
+        props.supports_activation = false;
+    });
+
+    click_first_indicator(&mut f, BTN_LEFT);
+    assert_eq!(f.synoik().panel_popover.indicator_menu_item(), Some("item"));
+    assert!(rx.try_recv().is_err());
+
+    // Now take the menu away too.
+    f.synoik().panel_popover.close_immediately();
+    register_indicator_with(&mut f, "item", |props| {
+        props.item_is_menu = false;
+        props.supports_activation = false;
+        props.menu_path = None;
+    });
+
+    click_first_indicator(&mut f, BTN_LEFT);
+    assert!(f.synoik().panel_popover.indicator_menu().is_none());
+    assert!(rx.try_recv().is_err(), "there is nothing to call");
+}
+
+/// A right click is always the menu, even on an item a left click would activate — that is the
+/// only way to reach the menu of an activatable item.
+#[test]
+fn a_right_click_always_opens_the_menu() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (tx, rx) = async_channel::unbounded();
+    f.synoik().status_notifier_emit = Some(tx);
+    register_indicator_with(&mut f, "item", |props| {
+        props.item_is_menu = false;
+        props.supports_activation = true;
+    });
+
+    click_first_indicator(&mut f, BTN_RIGHT);
+
+    assert_eq!(f.synoik().panel_popover.indicator_menu_item(), Some("item"));
+    assert!(rx.try_recv().is_err(), "no Activate on a right click");
+}
+
+/// A middle click is `SecondaryActivate`, in whichever spelling introspection found — the Ayatana
+/// one takes a timestamp and KDE's takes coordinates, and a client has one or the other
+/// (`appIndicator.js:817-840`).
+#[test]
+fn a_middle_click_secondary_activates_in_the_clients_spelling() {
+    use crate::status_notifier::SynoikToStatusNotifier as Req;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (tx, rx) = async_channel::unbounded();
+    f.synoik().status_notifier_emit = Some(tx);
+    register_indicator_with(&mut f, "item", |props| {
+        props.has_ayatana_secondary_activate = true;
+    });
+
+    click_first_indicator(&mut f, BTN_MIDDLE);
+
+    assert!(
+        matches!(
+            rx.try_recv().ok(),
+            Some(Req::SecondaryActivate {
+                ayatana_first: true,
+                ..
+            })
+        ),
+        "an Ayatana client is asked in its own spelling first"
+    );
+    assert!(
+        f.synoik().panel_popover.indicator_menu().is_none(),
+        "and the menu stays shut"
+    );
+}
+
+/// An `Activate` that answers `UnknownMethod` is a discovery, not a failed click: the item
+/// declared the method and does not have it, so it is demoted to menu-first for good
+/// (`appIndicator.js:804-810`). Without this, every future click on that icon vanishes.
+#[test]
+fn a_declared_but_missing_activate_demotes_the_item() {
+    use crate::status_notifier::{StatusNotifierToSynoik, SynoikToStatusNotifier as Req};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (tx, rx) = async_channel::unbounded();
+    f.synoik().status_notifier_emit = Some(tx);
+    register_indicator_with(&mut f, "item", |props| {
+        props.item_is_menu = false;
+        props.supports_activation = true;
+    });
+
+    click_first_indicator(&mut f, BTN_LEFT);
+    assert!(matches!(rx.try_recv().ok(), Some(Req::Activate { .. })));
+
+    // The watcher reports what the call turned out to mean.
+    f.synoik_state()
+        .on_status_notifier_msg(StatusNotifierToSynoik::ActivationUnsupported {
+            item_id: "item".to_owned(),
+        });
+
+    click_first_indicator(&mut f, BTN_LEFT);
+    assert_eq!(
+        f.synoik().panel_popover.indicator_menu_item(),
+        Some("item"),
+        "the next click opens the menu instead of vanishing"
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+/// A wheel notch over an indicator is forwarded to its client with an axis name, and is consumed:
+/// an indicator that ignores its scroll must not fall through to switching workspaces under the
+/// pointer.
+#[test]
+fn scrolling_an_indicator_forwards_to_the_client() {
+    use crate::status_notifier::{ScrollOrientation, SynoikToStatusNotifier as Req};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // A mapped window gives the monitor a second workspace to (wrongly) scroll to.
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+
+    let (tx, rx) = async_channel::unbounded();
+    f.synoik().status_notifier_emit = Some(tx);
+    register_test_indicator(&mut f, "item");
+
+    let anchor = f.synoik().panel.app_indicator_rect(0, 1920.).unwrap();
+    pointer_motion_to(
+        &mut f,
+        anchor.loc.x + anchor.size.w / 2.,
+        anchor.loc.y + anchor.size.h / 2.,
+    );
+    f.scroll_wheel();
+
+    assert!(
+        matches!(rx.try_recv().ok(), Some(Req::Scroll { delta, orientation: ScrollOrientation::Vertical, .. })
+            if delta > 0),
+        "the notch reaches the client as a vertical scroll"
+    );
+    f.synoik_complete_animations();
+    assert_eq!(
+        f.synoik()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx(),
+        0,
+        "and does not also switch workspaces"
+    );
 }

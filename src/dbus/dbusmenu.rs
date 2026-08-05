@@ -239,8 +239,10 @@ pub fn watch_menu(
                         break;
                     };
                     match request {
-                        SynoikToStatusNotifier::MenuActivate(id) => {
-                            send_event(&conn, &dest, &path, id, "clicked").await;
+                        // The token has already been handed to the *item* by the dispatcher; what
+                        // is left here is telling the menu which row it was.
+                        SynoikToStatusNotifier::MenuActivate { node_id, .. } => {
+                            send_event(&conn, &dest, &path, node_id, "clicked").await;
                         }
                         SynoikToStatusNotifier::MenuOpenSubmenu(id) => {
                             // The client may fill the submenu in only when asked.
@@ -250,10 +252,10 @@ pub fn watch_menu(
                                 }
                             }
                         }
-                        // `OpenMenu` is handled by the dispatcher, which closes this task before
-                        // starting the next menu's; either way this one is done.
-                        SynoikToStatusNotifier::CloseMenu
-                        | SynoikToStatusNotifier::OpenMenu { .. } => break,
+                        // `CloseMenu` is the dispatcher's way of ending this task; anything else
+                        // reaching here is an item-level call the dispatcher serves itself, and a
+                        // menu task is the wrong place to interpret it.
+                        _ => break,
                     }
                 }
             }

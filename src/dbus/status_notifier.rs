@@ -100,10 +100,15 @@ impl StatusNotifierWatcher {
     }
 }
 
-/// Route the shell's menu requests to the task following the menu that is open.
+/// Serve the shell's requests against items and the menu that is open.
 ///
 /// One task, because one popover: opening a second menu supersedes the first, and the client whose
 /// menu was replaced is told it closed rather than being left believing it is still on screen.
+///
+/// The item-level calls (activate, secondary-activate, scroll) are served **here** rather than
+/// forwarded, because they are not about a menu at all — an item with no menu still takes clicks.
+/// Each is spawned rather than awaited: a client that does not answer its own `Activate` must not
+/// stop the next one's click from being delivered.
 fn serve_menu_requests(
     conn: &zbus::Connection,
     to_niri: calloop::channel::Sender<StatusNotifierToSynoik>,
@@ -113,41 +118,255 @@ fn serve_menu_requests(
 
     let task = async move {
         let conn = task_conn;
-        // The open menu's request sender. Dropping it also ends its task, so a `CloseMenu` that
-        // races the task's own exit is not an error.
-        let mut open: Option<async_channel::Sender<SynoikToStatusNotifier>> = None;
+        // The open menu's request sender, and where its *item* lives — a menu row's activation
+        // token goes to the item, not to the menu. Dropping the sender also ends its task, so a
+        // `CloseMenu` that races the task's own exit is not an error.
+        let mut open: Option<(
+            async_channel::Sender<SynoikToStatusNotifier>,
+            String,
+            String,
+        )> = None;
 
         while let Ok(request) = from_niri.recv().await {
             match request {
                 SynoikToStatusNotifier::OpenMenu {
                     item_id,
                     dest,
-                    path,
+                    item_path,
+                    menu_path,
                 } => {
-                    if let Some(prev) = open.take() {
+                    if let Some((prev, ..)) = open.take() {
                         let _ = prev.send(SynoikToStatusNotifier::CloseMenu).await;
                     }
                     let (tx, rx) = async_channel::unbounded();
-                    super::dbusmenu::watch_menu(&conn, item_id, dest, path, to_niri.clone(), rx);
-                    open = Some(tx);
+                    super::dbusmenu::watch_menu(
+                        &conn,
+                        item_id,
+                        dest.clone(),
+                        menu_path,
+                        to_niri.clone(),
+                        rx,
+                    );
+                    open = Some((tx, dest, item_path));
                 }
                 SynoikToStatusNotifier::CloseMenu => {
-                    if let Some(prev) = open.take() {
+                    if let Some((prev, ..)) = open.take() {
                         let _ = prev.send(SynoikToStatusNotifier::CloseMenu).await;
                     }
                 }
-                other => {
-                    if let Some(tx) = &open {
-                        let _ = tx.send(other).await;
+                SynoikToStatusNotifier::MenuActivate { node_id, token } => {
+                    let Some((tx, dest, item_path)) = open.as_ref() else {
+                        continue;
+                    };
+                    // Before the event, not after: a row that opens a window needs the token to
+                    // already be with the client when the window appears.
+                    provide_activation_token(&conn, dest, item_path, &token).await;
+                    let _ = tx
+                        .send(SynoikToStatusNotifier::MenuActivate { node_id, token })
+                        .await;
+                }
+                request @ SynoikToStatusNotifier::MenuOpenSubmenu(_) => {
+                    if let Some((tx, ..)) = open.as_ref() {
+                        let _ = tx.send(request).await;
                     }
+                }
+                SynoikToStatusNotifier::Activate {
+                    item_id,
+                    dest,
+                    path,
+                    position,
+                    token,
+                } => {
+                    let (conn, to_niri) = (conn.clone(), to_niri.clone());
+                    conn.clone()
+                        .executor()
+                        .spawn(
+                            async move {
+                                provide_activation_token(&conn, &dest, &path, &token).await;
+                                activate(&conn, &to_niri, &item_id, &dest, &path, position).await;
+                            },
+                            "activate a StatusNotifierItem",
+                        )
+                        .detach();
+                }
+                SynoikToStatusNotifier::SecondaryActivate {
+                    dest,
+                    path,
+                    position,
+                    token,
+                    ayatana_first,
+                    ..
+                } => {
+                    let conn = conn.clone();
+                    conn.clone()
+                        .executor()
+                        .spawn(
+                            async move {
+                                provide_activation_token(&conn, &dest, &path, &token).await;
+                                secondary_activate(&conn, &dest, &path, position, ayatana_first)
+                                    .await;
+                            },
+                            "secondary-activate a StatusNotifierItem",
+                        )
+                        .detach();
+                }
+                SynoikToStatusNotifier::Scroll {
+                    dest,
+                    path,
+                    delta,
+                    orientation,
+                } => {
+                    let conn = conn.clone();
+                    conn.clone()
+                        .executor()
+                        .spawn(
+                            async move {
+                                let _ = conn
+                                    .call_method(
+                                        Some(dest.as_str()),
+                                        path.as_str(),
+                                        Some(ITEM_IFACE),
+                                        "Scroll",
+                                        &(delta, orientation.as_str()),
+                                    )
+                                    .await;
+                            },
+                            "forward a scroll to a StatusNotifierItem",
+                        )
+                        .detach();
                 }
             }
         }
     };
 
     conn.executor()
-        .spawn(task, "route app-indicator menu requests")
+        .spawn(task, "serve app-indicator requests")
         .detach();
+}
+
+/// Hand a client an XDG activation token before a click that may raise a window.
+///
+/// Optional in every sense: clients that predate the method answer `UnknownMethod`, and the click
+/// still goes through. Failing to *await* it, though, would race the window it exists for — hence
+/// no spawning here.
+async fn provide_activation_token(conn: &zbus::Connection, dest: &str, path: &str, token: &str) {
+    if let Err(err) = conn
+        .call_method(
+            Some(dest),
+            path,
+            Some(ITEM_IFACE),
+            "ProvideXdgActivationToken",
+            &(token,),
+        )
+        .await
+    {
+        if !is_unknown_method(&err) {
+            debug!("status-notifier: {dest}{path} refused an activation token: {err:?}");
+        }
+    }
+}
+
+/// A primary click on an activatable item.
+///
+/// An `UnknownMethod` here is not a failed click but a **discovery**: the item declared `Activate`
+/// in its introspection and does not have it. Reported back so the model demotes it to menu-first,
+/// the way the extension's `supportsActivation` does (`appIndicator.js:804-810`) — otherwise every
+/// future click on that icon is silently swallowed.
+async fn activate(
+    conn: &zbus::Connection,
+    to_niri: &calloop::channel::Sender<StatusNotifierToSynoik>,
+    item_id: &str,
+    dest: &str,
+    path: &str,
+    (x, y): (i32, i32),
+) {
+    let Err(err) = conn
+        .call_method(Some(dest), path, Some(ITEM_IFACE), "Activate", &(x, y))
+        .await
+    else {
+        return;
+    };
+
+    if is_unknown_method(&err) {
+        debug!("status-notifier: {item_id} declared Activate but does not have it");
+        let _ = to_niri.send(StatusNotifierToSynoik::ActivationUnsupported {
+            item_id: item_id.to_owned(),
+        });
+    } else {
+        warn!("status-notifier: {item_id} failed to activate: {err:?}");
+    }
+}
+
+/// A middle click, in whichever of the two spellings the client has.
+///
+/// Ayatana's takes a timestamp and KDE's takes coordinates, and a client implements one
+/// (`appIndicator.js:817-840`). Introspection picks which to try first; the other is the fallback,
+/// because a client may serve a method it never declared.
+async fn secondary_activate(
+    conn: &zbus::Connection,
+    dest: &str,
+    path: &str,
+    (x, y): (i32, i32),
+    ayatana_first: bool,
+) {
+    let ayatana = |conn: &zbus::Connection| {
+        let (conn, dest, path) = (conn.clone(), dest.to_owned(), path.to_owned());
+        async move {
+            conn.call_method(
+                Some(dest.as_str()),
+                path.as_str(),
+                Some(ITEM_IFACE),
+                "XAyatanaSecondaryActivate",
+                // The timestamp the spec wants is an X11 server time we do not have and clients
+                // do not check; the extension passes the event's, which is as meaningless here.
+                &(0u32,),
+            )
+            .await
+        }
+    };
+    let kde = |conn: &zbus::Connection| {
+        let (conn, dest, path) = (conn.clone(), dest.to_owned(), path.to_owned());
+        async move {
+            conn.call_method(
+                Some(dest.as_str()),
+                path.as_str(),
+                Some(ITEM_IFACE),
+                "SecondaryActivate",
+                &(x, y),
+            )
+            .await
+        }
+    };
+
+    let first = if ayatana_first {
+        ayatana(conn).await
+    } else {
+        kde(conn).await
+    };
+    let Err(err) = first else {
+        return;
+    };
+    if !is_unknown_method(&err) {
+        warn!("status-notifier: {dest}{path} failed to secondary-activate: {err:?}");
+        return;
+    }
+
+    let second = if ayatana_first {
+        kde(conn).await
+    } else {
+        ayatana(conn).await
+    };
+    if let Err(err) = second {
+        if !is_unknown_method(&err) {
+            warn!("status-notifier: {dest}{path} failed to secondary-activate: {err:?}");
+        }
+    }
+}
+
+/// Whether an error means the client does not serve that method.
+fn is_unknown_method(err: &zbus::Error) -> bool {
+    matches!(err, zbus::Error::MethodError(name, _, _)
+        if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod")
 }
 
 #[interface(name = "org.kde.StatusNotifierWatcher")]

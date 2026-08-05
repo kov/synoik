@@ -6322,6 +6322,14 @@ impl State {
         let changed = match msg {
             Msg::ItemUpdated { item, props } => self.synoik.status_notifier.upsert(item, *props),
             Msg::ItemUnregistered { id } => self.synoik.status_notifier.remove(&id),
+            Msg::ActivationUnsupported { item_id } => {
+                // Nothing drawn changes — the *next* left click on this icon opens its menu
+                // instead of vanishing into a method the client does not have.
+                self.synoik
+                    .status_notifier
+                    .set_activation_unsupported(&item_id);
+                return;
+            }
             Msg::MenuLayout { item_id, root } => {
                 // Straight to the popover, not into a store: a remote menu has no life outside
                 // the menu that is showing it, and the *next* open re-reads it anyway.
@@ -6385,18 +6393,24 @@ impl State {
         match &want {
             // `OpenMenu` supersedes whatever the watcher was following, so a *swap* needs no
             // separate close — the dispatcher tells the old client for us.
-            Some(id) => match self.synoik.status_notifier.menu_address(id) {
-                Some((dest, path)) => {
+            Some(id) => match self
+                .synoik
+                .status_notifier
+                .address(id)
+                .filter(|a| a.menu_path.is_some())
+            {
+                Some(address) => {
                     let _ = tx.send_blocking(
                         crate::status_notifier::SynoikToStatusNotifier::OpenMenu {
                             item_id: id.clone(),
-                            dest,
-                            path,
+                            dest: address.dest,
+                            item_path: address.item_path,
+                            menu_path: address.menu_path.expect("filtered above"),
                         },
                     );
                 }
-                // The item went away between the click and here. Nothing to follow; the menu
-                // stays empty until the user dismisses it.
+                // The item went away between the click and here, or never had a menu. Nothing to
+                // follow; the menu stays empty until the user dismisses it.
                 None => {
                     let _ =
                         tx.send_blocking(crate::status_notifier::SynoikToStatusNotifier::CloseMenu);

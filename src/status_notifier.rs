@@ -601,6 +601,18 @@ impl Indicator {
     }
 }
 
+/// Where to send an item's calls: one connection, two object paths.
+///
+/// The menu is a *separate object* on the same connection, and the two are not interchangeable —
+/// an `Activate` goes to the item, an `Event` goes to the menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemAddress {
+    pub dest: String,
+    pub item_path: String,
+    /// `None` when the client has no menu, including the `/NO_DBUSMENU` sentinel.
+    pub menu_path: Option<String>,
+}
+
 /// The indicators the shell knows about, in registration order.
 ///
 /// Ordering is registration order for now — see the open question in
@@ -650,13 +662,25 @@ impl IndicatorStore {
         self.items.iter().filter(|i| i.is_shown())
     }
 
-    /// Where one item's menu lives: the connection to call and the object path on it. `None` when
-    /// the item is gone or has no menu — including the `/NO_DBUSMENU` sentinel, which the bus
-    /// layer has already turned into `None`.
-    pub fn menu_address(&self, id: &str) -> Option<(String, String)> {
+    /// Where one item can be reached, `None` when it is gone.
+    pub fn address(&self, id: &str) -> Option<ItemAddress> {
         let item = self.items.iter().find(|i| i.item.id == id)?;
-        let path = item.props.menu_path.clone()?;
-        Some((item.item.unique_name.clone(), path))
+        Some(ItemAddress {
+            dest: item.item.unique_name.clone(),
+            item_path: item.item.object_path.clone(),
+            menu_path: item.props.menu_path.clone(),
+        })
+    }
+
+    /// Record that an item's `Activate` does not really exist. Returns whether this is news —
+    /// nothing the panel *draws* changes, so the caller owes no redraw either way.
+    pub fn set_activation_unsupported(&mut self, id: &str) -> bool {
+        let Some(item) = self.items.iter_mut().find(|i| i.item.id == id) else {
+            return false;
+        };
+        let was = item.props.supports_activation;
+        item.props.supports_activation = false;
+        was
     }
 
     /// One item's current properties, by public id.
@@ -688,6 +712,12 @@ pub enum StatusNotifierToSynoik {
     ItemUnregistered {
         id: String,
     },
+    /// `Activate` answered `UnknownMethod`: the item declared the method and does not have it.
+    /// Demotes it to menu-first for the rest of its life, as the extension's `supportsActivation`
+    /// does (`appIndicator.js:804-810`) — introspection is a promise, a call is the proof.
+    ActivationUnsupported {
+        item_id: String,
+    },
     /// An open menu's layout, freshly read from the client. Sent on open and again on every change
     /// the client announces while it is up, so the whole tree replaces the previous one.
     MenuLayout {
@@ -708,15 +738,65 @@ pub enum SynoikToStatusNotifier {
         item_id: String,
         /// The connection serving the menu — the item's own.
         dest: String,
+        /// The item's own object path. Carried alongside the menu's because a menu row's
+        /// activation token goes to the *item*, not to the menu (`dbusMenu.js:677-681`).
+        item_path: String,
         /// The `Menu` object path the item advertised.
-        path: String,
+        menu_path: String,
     },
-    /// The user activated a row (`Event(id, "clicked")`).
-    MenuActivate(i32),
+    /// The user activated a row: the item is handed the activation token, then the menu is told
+    /// (`Event(id, "clicked")`).
+    MenuActivate { node_id: i32, token: String },
     /// A submenu is being expanded: the client may only fill it in when asked (`AboutToShow`).
     MenuOpenSubmenu(i32),
     /// The menu went away. Stops the task and tells the client (`Event(0, "closed")`).
     CloseMenu,
+    /// A primary click on an item that activates rather than opening a menu: the token first, then
+    /// `Activate(x, y)` (`appIndicator.js:793-815`). The coordinates are "an hint to the item
+    /// where to show eventual windows" and, as the extension notes, have no observable effect —
+    /// they are sent because the spec's signature has them.
+    Activate {
+        item_id: String,
+        dest: String,
+        path: String,
+        position: (i32, i32),
+        token: String,
+    },
+    /// A middle click. Two spellings exist and clients implement one or the other, so the one
+    /// introspection found is tried and the other is the fallback (`appIndicator.js:817-840`).
+    SecondaryActivate {
+        item_id: String,
+        dest: String,
+        path: String,
+        position: (i32, i32),
+        token: String,
+        /// Whether to try `XAyatanaSecondaryActivate(timestamp)` before `SecondaryActivate(x, y)`.
+        ayatana_first: bool,
+    },
+    /// A wheel notch over the icon, forwarded with an axis name (`appIndicator.js:843-862`).
+    Scroll {
+        dest: String,
+        path: String,
+        delta: i32,
+        orientation: ScrollOrientation,
+    },
+}
+
+/// Which axis a forwarded scroll names. The spec spells these out as strings, and a client that
+/// does not recognize one ignores the event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollOrientation {
+    Horizontal,
+    Vertical,
+}
+
+impl ScrollOrientation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Horizontal => "horizontal",
+            Self::Vertical => "vertical",
+        }
+    }
 }
 
 #[cfg(test)]
