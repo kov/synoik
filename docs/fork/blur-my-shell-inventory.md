@@ -146,12 +146,21 @@ per-surface knobs, kept working by a `customize` flag that switches between "use
 
 ## 5. What we took from §1 (landed 2026-08-04)
 
-Adopted: **the plates**. One shared `ui::widget::style::OVERVIEW_PLATE`
-(`rgba(200,200,200,.2)` — the "light" variant's value) now fills the four surfaces the overview
-lays over its backdrop: the dash pill (`DASH_BG`), the search entry (`EntryStyle::Search`), the
-search-results card (`.search-section-content`) and the app grid's folder tiles (`FOLDER_BG`, the
-grid's only tile with a resting fill). One constant, so they cannot drift — they read as one
-material only if they are one colour.
+Adopted: **the plates**. One shared `ui::widget::style::OVERVIEW_PLATE` now fills the four surfaces
+the overview lays over its backdrop: the dash pill (`DASH_BG`), the search entry
+(`EntryStyle::Search`), the search-results card (`.search-section-content`) and the app grid's
+folder tiles (`FOLDER_BG`, the grid's only tile with a resting fill). One constant, so they cannot
+drift — they read as one material only if they are one colour.
+
+**Revised 2026-08-05: the plate is the panel's wash, not this extension's.** It shipped on the
+"light" variant's `rgba(200,200,200,.2)`, which reads as a pale slab under an always-dark shell
+foreground — and, once the dash also stood in as the dock, a few hundred pixels below a panel that
+is `rgba(0,0,0,.4)` over a blurred capture. The plate is now `panel::BAR_BG`, and the **dock**
+(only) also gets `panel::BAR_BLUR` under its pill: the overview's own backdrop is already a blurred
+wallpaper, so a second blur there would re-blur something blurred, and a `FramebufferEffectElement`
+carries no alpha to fade with the overview anyway. Same argument as the paragraph above, one level
+up: the shell's chrome is one material or it is none, and the panel is the piece that was already
+right.
 
 **Not adopted: its re-specification of every interaction state** at `rgba(230,230,230,.08–.3)`.
 Ours are relative washes over whatever they sit on (`HOVER_WASH`, and an accent-derived focus

@@ -187,16 +187,21 @@ pub mod style {
     /// (`$system_overlay_bg_color`, `%system_entry`, `.app-folder`) because `#overviewGroup` behind
     /// them is a flat `$system_base_color` slab. Ours is a blurred wallpaper
     /// (`overview-port.md` §13), and opaque plates over it read as the chrome forgot the backdrop
-    /// changed — the same reason the Blur my Shell extension ships this restyle alongside its blur,
-    /// and this is its "light" variant's value (`overview/style-components`, its default;
-    /// `docs/fork/blur-my-shell-inventory.md` §1).
+    /// changed — the same reason the Blur my Shell extension ships this restyle alongside its blur
+    /// (`overview/style-components`; `docs/fork/blur-my-shell-inventory.md` §1).
+    ///
+    /// **Darkened 2026-08-05** to [`crate::ui::panel::BAR_BG`] — the same black wash the panel
+    /// lays over its own blurred capture. It started on that extension's *light* variant
+    /// (`rgba(200,200,200,.2)`), which reads as a pale slab against the always-dark shell
+    /// foreground and against the panel a few hundred pixels above it. The shell's chrome is one
+    /// material or it is none, and the panel is the piece of it that was already right.
     ///
     /// Deliberately **not** adopted from that stylesheet: its re-specification of every
     /// hover/focus/active state at `rgba(230,230,230,.08–.3)`. Ours are relative washes over
     /// whatever they sit on ([`HOVER_WASH`], and an accent-derived focus fill), so they already
     /// compose over a translucent plate — and keeping them keeps GNOME's accent in the focus state,
     /// which that stylesheet drops.
-    pub const OVERVIEW_PLATE: Rgba = [0.784, 0.784, 0.784, 0.2];
+    pub const OVERVIEW_PLATE: Rgba = crate::ui::panel::BAR_BG;
 
     /// The system accent as an [`Rgba`] — `org.gnome.desktop.interface accent-color` arrives
     /// resolved to 8-bit RGB, and every widget that draws with it needs the float form.

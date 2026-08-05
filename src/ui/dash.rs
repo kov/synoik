@@ -52,12 +52,17 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use synoik_config::CornerRadius;
 
 use crate::animation::{Animation, Clock, Curve};
 use crate::app_system::AppIconRef;
+use crate::render_helpers::background_effect::RenderParams;
+use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
+use crate::synoik_render_elements;
 use crate::ui::theme_node::{allocate_1d, Align1, Edges, ThemeNode};
 use crate::ui::widget::{self, AppIcon, Painter, SharedAppIconUploads};
 
@@ -198,6 +203,10 @@ pub fn preferred_height(view_size: Size<f64, Logical>) -> f64 {
 /// reads through it — see [`widget::style::OVERVIEW_PLATE`] for why.
 const DASH_BG: [f32; 4] = widget::style::OVERVIEW_PLATE;
 
+/// The dock pill's backdrop blur — the panel's, so the two read as the same material. See
+/// [`Dash::render`] for why the overview's dash does not get one.
+const PILL_BLUR: BlurOptions = crate::ui::panel::BAR_BLUR;
+
 /// The tile hover fill. GNOME's is `st-lighten($dash_background_color, 7%)` (flat + always-dark,
 /// `_drawing.scss:186-189,270-274`) — an *absolute* colour derived from an opaque pill, which over
 /// a translucent plate would be an opaque patch on it. A relative wash is the same gesture and
@@ -305,6 +314,16 @@ struct DashCache {
     icons: SharedAppIconUploads,
 }
 
+// The dash draws a texture (the baked pill chrome and the composited icons) and, when it is
+// standing in for the dock, a `Backdrop` — the blurred capture of whatever is behind the pill,
+// under everything else. See [`Dash::render`] for why only the dock gets one.
+synoik_render_elements! {
+    DashElement => {
+        Texture = TextureRenderElement<VkTexture>,
+        Backdrop = FramebufferEffectElement,
+    }
+}
+
 /// The overview dash. Owned on `Synoik`; fed by `sync_dash_apps`.
 pub struct Dash {
     /// Favorites first, then running non-favorites (`Dash._redisplay`,
@@ -346,6 +365,9 @@ pub struct Dash {
     hovered: Option<DashHit>,
     clock: Clock,
     cache: RefCell<DashCache>,
+    /// Identity of the pill's backdrop-blur element, the dock's only. Holds no pixels — the
+    /// capture and blur chain live in the damage tracker's per-`Id` user data, like the panel's.
+    backdrop: FramebufferEffect,
 }
 
 impl Dash {
@@ -361,6 +383,7 @@ impl Dash {
             hovered: None,
             clock,
             cache: RefCell::new(DashCache::default()),
+            backdrop: FramebufferEffect::new(),
         }
     }
 
@@ -845,6 +868,10 @@ impl Dash {
     /// The dash render elements for `output`, faded by overview `progress` (0..1).
     /// Icons are pushed first (topmost); the pill chrome last (below them) — the
     /// panel first-topmost order.
+    ///
+    /// `blur` puts a blurred capture of the scene under the pill. The dock wants it and the
+    /// overview does not; the reasons are at the push site.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
         renderer: &mut VulkanRenderer,
@@ -853,7 +880,8 @@ impl Dash {
         output: &Output,
         area: Rectangle<f64, Logical>,
         progress: f64,
-    ) -> Vec<TextureRenderElement<VkTexture>> {
+        blur: bool,
+    ) -> Vec<DashElement> {
         let scale = output.current_scale().fractional_scale();
         let layout = self.layout(area);
         let metrics = layout.metrics;
@@ -910,13 +938,15 @@ impl Dash {
                         Transform::Normal,
                         vec![],
                     );
-                    elements.push(TextureRenderElement::from_texture_buffer(
-                        buffer,
-                        layout.pill.loc,
-                        alpha,
-                        None,
-                        None,
-                        Kind::Unspecified,
+                    elements.push(DashElement::Texture(
+                        TextureRenderElement::from_texture_buffer(
+                            buffer,
+                            layout.pill.loc,
+                            alpha,
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ),
                     ));
                 }
                 Err(err) => tracing::error!("error baking the dash running dots: {err:#}"),
@@ -936,7 +966,7 @@ impl Dash {
                 layout.icon_center(i),
                 alpha,
             ) {
-                elements.push(el);
+                elements.push(DashElement::Texture(el));
             }
         }
 
@@ -953,13 +983,15 @@ impl Dash {
                 let logical = tb.logical_size();
                 let center = layout.icon_center(layout.n_items);
                 let loc = center - Point::from((logical.w / 2., logical.h / 2.));
-                elements.push(TextureRenderElement::from_texture_buffer(
-                    tb,
-                    loc,
-                    alpha,
-                    None,
-                    None,
-                    Kind::Unspecified,
+                elements.push(DashElement::Texture(
+                    TextureRenderElement::from_texture_buffer(
+                        tb,
+                        loc,
+                        alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ),
                 ));
             }
         }
@@ -1032,16 +1064,42 @@ impl Dash {
                     Transform::Normal,
                     vec![],
                 );
-                elements.push(TextureRenderElement::from_texture_buffer(
-                    buffer,
-                    layout.pill.loc,
-                    alpha,
-                    None,
-                    None,
-                    Kind::Unspecified,
+                elements.push(DashElement::Texture(
+                    TextureRenderElement::from_texture_buffer(
+                        buffer,
+                        layout.pill.loc,
+                        alpha,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ),
                 ));
             }
             Err(err) => tracing::error!("error baking the dash: {err:#}"),
+        }
+
+        // The blurred capture under the pill — pushed last, so it is *under* everything above
+        // (the first element pushed is the topmost).
+        //
+        // Only the dock asks for it, and the reason is not thrift: the overview's own backdrop is
+        // already a blurred wallpaper (`overview-port.md` §13), so a second blur there would cost
+        // a capture and a Kawase chain to re-blur something blurred. The dock hangs over the raw
+        // desktop instead, where the wash alone reads as a flat grey slab. It also cannot fade —
+        // `FramebufferEffectElement` carries no alpha — and the overview dash fades in with the
+        // overview, which is the other reason it would not belong there.
+        if blur {
+            elements.push(DashElement::Backdrop(self.backdrop.render(
+                None,
+                RenderParams {
+                    geometry: layout.pill,
+                    subregion: None,
+                    clip: Some((layout.pill, CornerRadius::from(metrics.pill_radius as f32))),
+                    scale,
+                },
+                Some(PILL_BLUR),
+                0.,
+                1.,
+            )));
         }
 
         elements

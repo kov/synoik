@@ -169,7 +169,7 @@ pub(crate) const BAR_BG: [f32; 4] = [0., 0., 0., 0.4];
 /// the bar. Fixed rather than config-driven: there is no config file (see
 /// `docs/fork/STRATEGY.md`), and these are the values the surface-level effect defaults to
 /// (`synoik_config::Blur::default`).
-const BAR_BLUR: BlurOptions = BlurOptions {
+pub(crate) const BAR_BLUR: BlurOptions = BlurOptions {
     passes: 3,
     offset: 3.,
 };

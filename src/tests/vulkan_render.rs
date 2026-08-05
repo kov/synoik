@@ -7440,6 +7440,7 @@ fn a_ping_on_an_unchanged_catalog_keeps_the_dash_icons() {
             &output,
             controls.dash,
             1.0,
+            false,
         );
     });
     if rendered.is_none() {
@@ -7539,6 +7540,7 @@ fn vulkan_dash_icons_shrink_with_the_ramped_tiles() {
                         &output,
                         band,
                         1.,
+                        false,
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7652,6 +7654,7 @@ fn vulkan_dash_hover_lightens_the_tile() {
                 &output,
                 controls.dash,
                 1.0,
+                false,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -9185,6 +9188,7 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
                 &output,
                 area,
                 1.0,
+                false,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());

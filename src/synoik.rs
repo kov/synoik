@@ -10082,6 +10082,9 @@ impl Synoik {
                     output,
                     area,
                     1.,
+                    // The dock hangs over the raw desktop, so it brings its own blur; the
+                    // overview's dash below sits on a backdrop that is already blurred.
+                    true,
                 ) {
                     push(element.into());
                 }
@@ -10123,6 +10126,7 @@ impl Synoik {
                     output,
                     controls.dash,
                     progress,
+                    false,
                 ) {
                     push(element.into());
                 }
@@ -14781,6 +14785,8 @@ synoik_render_elements! {
         // The window picker's per-preview chrome: close button, caption, app icon.
         PreviewChrome = crate::ui::window_preview::PreviewChromeRenderElement,
         ThumbnailChrome = crate::ui::thumbnail_chrome::ThumbnailChromeRenderElement,
+        // The dash: baked chrome, plus the dock's backdrop blur under its pill.
+        Dash = crate::ui::dash::DashElement,
     }
 }
 
