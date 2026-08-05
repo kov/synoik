@@ -650,6 +650,23 @@ impl IndicatorStore {
         self.items.iter().filter(|i| i.is_shown())
     }
 
+    /// Where one item's menu lives: the connection to call and the object path on it. `None` when
+    /// the item is gone or has no menu — including the `/NO_DBUSMENU` sentinel, which the bus
+    /// layer has already turned into `None`.
+    pub fn menu_address(&self, id: &str) -> Option<(String, String)> {
+        let item = self.items.iter().find(|i| i.item.id == id)?;
+        let path = item.props.menu_path.clone()?;
+        Some((item.item.unique_name.clone(), path))
+    }
+
+    /// One item's current properties, by public id.
+    pub fn props(&self, id: &str) -> Option<&ItemProps> {
+        self.items
+            .iter()
+            .find(|i| i.item.id == id)
+            .map(|i| &i.props)
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -671,6 +688,35 @@ pub enum StatusNotifierToSynoik {
     ItemUnregistered {
         id: String,
     },
+    /// An open menu's layout, freshly read from the client. Sent on open and again on every change
+    /// the client announces while it is up, so the whole tree replaces the previous one.
+    MenuLayout {
+        item_id: String,
+        root: Box<crate::dbusmenu::MenuNode>,
+    },
+}
+
+/// What the shell asks of an item — the reverse channel, consumed by the watcher's menu task.
+///
+/// Only one indicator menu can be up at a time (it is a popover), so these carry no menu handle:
+/// [`OpenMenu`](Self::OpenMenu) supersedes whatever was open, and everything after it addresses
+/// that menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SynoikToStatusNotifier {
+    /// Start following an item's menu: fetch it, keep it current, and tell the client it is open.
+    OpenMenu {
+        item_id: String,
+        /// The connection serving the menu — the item's own.
+        dest: String,
+        /// The `Menu` object path the item advertised.
+        path: String,
+    },
+    /// The user activated a row (`Event(id, "clicked")`).
+    MenuActivate(i32),
+    /// A submenu is being expanded: the client may only fill it in when asked (`AboutToShow`).
+    MenuOpenSubmenu(i32),
+    /// The menu went away. Stops the task and tells the client (`Event(0, "closed")`).
+    CloseMenu,
 }
 
 #[cfg(test)]

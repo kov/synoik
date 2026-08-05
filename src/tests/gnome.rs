@@ -18776,3 +18776,245 @@ fn peripherals_settings_reach_the_input_config() {
     assert_eq!(input.keyboard.repeat_delay, 250);
     assert_eq!(input.keyboard.repeat_rate, 10);
 }
+
+// ---------------------------------------------------------------------------
+// App indicators — the remote menu (`com.canonical.dbusmenu`)
+//
+// GNOME Shell has no equivalent, so these pin *our* behavior against the
+// `gnome-shell-extension-appindicator` extension's; see
+// `docs/fork/status-notifier-port.md`.
+// ---------------------------------------------------------------------------
+
+/// An indicator registered with a menu, ready and Active — the state a click acts on.
+#[cfg(test)]
+fn register_test_indicator(f: &mut Fixture, id: &str) {
+    use crate::status_notifier::{
+        ItemIcon, ItemProps, ItemStatus, RegisteredItem, StatusNotifierToSynoik,
+    };
+
+    let item = RegisteredItem {
+        id: id.to_owned(),
+        unique_name: ":1.42".to_owned(),
+        object_path: "/StatusNotifierItem".to_owned(),
+    };
+    let props = ItemProps {
+        app_id: "test-indicator".to_owned(),
+        title: "Test".to_owned(),
+        status: ItemStatus::Active,
+        icon: ItemIcon::Themed("folder".to_owned()),
+        menu_path: Some("/MenuBar".to_owned()),
+        ..ItemProps::default()
+    };
+    f.synoik_state()
+        .on_status_notifier_msg(StatusNotifierToSynoik::ItemUpdated {
+            item,
+            props: Box::new(props),
+        });
+}
+
+/// A client's layout, as `GetLayout` would deliver it: a root whose children are the rows.
+#[cfg(test)]
+fn test_menu_layout() -> crate::dbusmenu::MenuNode {
+    use crate::dbusmenu::{MenuNode, NodeKind};
+
+    let row = |id: i32, label: &str| MenuNode {
+        label: label.to_owned(),
+        ..MenuNode::new(id)
+    };
+    MenuNode {
+        children: vec![
+            row(1, "_Open Nextcloud"),
+            MenuNode {
+                kind: NodeKind::Separator,
+                ..MenuNode::new(2)
+            },
+            row(3, "Settings"),
+            row(4, "Quit"),
+        ],
+        ..MenuNode::new(0)
+    }
+}
+
+/// Clicking an indicator opens its menu, which is **empty** until the client answers: a remote
+/// menu's rows are a round trip away, so the box is on screen before its contents are.
+#[test]
+fn an_indicator_menu_opens_empty_and_fills_in() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let ow = 1920.0_f64;
+
+    register_test_indicator(&mut f, "org.kde.StatusNotifierItem-1-1");
+
+    let anchor = f
+        .synoik()
+        .panel
+        .app_indicator_rect(0, ow)
+        .expect("the indicator is on the panel");
+    pointer_motion_to(
+        &mut f,
+        anchor.loc.x + anchor.size.w / 2.,
+        anchor.loc.y + anchor.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert_eq!(
+        f.synoik().panel_popover.indicator_menu_item(),
+        Some("org.kde.StatusNotifierItem-1-1"),
+        "the click opens that indicator's menu"
+    );
+    assert!(
+        f.synoik()
+            .panel_popover
+            .indicator_menu()
+            .unwrap()
+            .labels()
+            .is_empty(),
+        "the rows have not been asked for yet"
+    );
+
+    f.synoik_state().on_status_notifier_msg(
+        crate::status_notifier::StatusNotifierToSynoik::MenuLayout {
+            item_id: "org.kde.StatusNotifierItem-1-1".to_owned(),
+            root: Box::new(test_menu_layout()),
+        },
+    );
+
+    assert_eq!(
+        f.synoik().panel_popover.indicator_menu().unwrap().labels(),
+        // The mnemonic marker is gone, and the separator is not a row.
+        vec!["Open Nextcloud", "Settings", "Quit"],
+    );
+}
+
+/// A layout for an item whose menu is *not* the one on screen is dropped rather than shown.
+/// Two indicators' menus are two different clients' node-id spaces, and drawing one into the
+/// other's box would activate whatever row happened to share the number.
+#[test]
+fn a_layout_for_another_indicator_is_ignored() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let ow = 1920.0_f64;
+
+    register_test_indicator(&mut f, "org.kde.StatusNotifierItem-1-1");
+    let anchor = f.synoik().panel.app_indicator_rect(0, ow).unwrap();
+    pointer_motion_to(&mut f, anchor.loc.x + anchor.size.w / 2., anchor.loc.y + 2.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    f.synoik_state().on_status_notifier_msg(
+        crate::status_notifier::StatusNotifierToSynoik::MenuLayout {
+            item_id: "some.other.item".to_owned(),
+            root: Box::new(test_menu_layout()),
+        },
+    );
+
+    assert!(
+        f.synoik()
+            .panel_popover
+            .indicator_menu()
+            .unwrap()
+            .labels()
+            .is_empty(),
+        "a layout that lost the race with a dismissal has nowhere to go"
+    );
+}
+
+/// The watcher is told which menu is open, and — however the menu went away — that it closed.
+///
+/// The close matters more than the open: a client left believing its menu is still up stops
+/// answering `AboutToShow` and, for some, stops updating its rows at all.
+#[test]
+fn the_client_is_told_its_menu_opened_and_closed() {
+    use crate::status_notifier::SynoikToStatusNotifier as Req;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let ow = 1920.0_f64;
+
+    let (tx, rx) = async_channel::unbounded();
+    f.synoik().status_notifier_emit = Some(tx);
+    register_test_indicator(&mut f, "org.kde.StatusNotifierItem-1-1");
+
+    let anchor = f.synoik().panel.app_indicator_rect(0, ow).unwrap();
+    pointer_motion_to(&mut f, anchor.loc.x + anchor.size.w / 2., anchor.loc.y + 2.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    f.synoik_state().reconcile_indicator_menu();
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(Req::OpenMenu {
+            item_id: "org.kde.StatusNotifierItem-1-1".to_owned(),
+            dest: ":1.42".to_owned(),
+            path: "/MenuBar".to_owned(),
+        }),
+        "the watcher is told where to read the menu from"
+    );
+
+    // Re-running the reconciler must not re-open: it runs every cycle.
+    f.synoik_state().reconcile_indicator_menu();
+    assert!(rx.try_recv().is_err(), "nothing changed, nothing sent");
+
+    // Escape, not a click on a row — one of the several ways a popover is dismissed.
+    f.synoik_state().on_status_notifier_msg(
+        crate::status_notifier::StatusNotifierToSynoik::MenuLayout {
+            item_id: "org.kde.StatusNotifierItem-1-1".to_owned(),
+            root: Box::new(test_menu_layout()),
+        },
+    );
+    f.synoik().panel_popover.close();
+    f.synoik_state().reconcile_indicator_menu();
+    assert_eq!(rx.try_recv().ok(), Some(Req::CloseMenu));
+}
+
+/// Clicking a row names it back to the client by the client's own node id — not by a row index,
+/// which would drift the moment the client hid a row.
+#[test]
+fn activating_a_row_sends_the_clients_node_id() {
+    use crate::status_notifier::SynoikToStatusNotifier as Req;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let ow = 1920.0_f64;
+
+    let (tx, rx) = async_channel::unbounded();
+    f.synoik().status_notifier_emit = Some(tx);
+    register_test_indicator(&mut f, "org.kde.StatusNotifierItem-1-1");
+
+    let anchor = f.synoik().panel.app_indicator_rect(0, ow).unwrap();
+    pointer_motion_to(&mut f, anchor.loc.x + anchor.size.w / 2., anchor.loc.y + 2.);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.synoik_state().reconcile_indicator_menu();
+    let _ = rx.try_recv();
+
+    f.synoik_state().on_status_notifier_msg(
+        crate::status_notifier::StatusNotifierToSynoik::MenuLayout {
+            item_id: "org.kde.StatusNotifierItem-1-1".to_owned(),
+            root: Box::new(test_menu_layout()),
+        },
+    );
+
+    // "Quit" is the client's node 4 and our third row: the ids are the client's, not ours.
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let origin = f.synoik().panel_popover.content_location(&out);
+    let row = f
+        .synoik()
+        .panel_popover
+        .indicator_menu()
+        .unwrap()
+        .row_center("Quit")
+        .expect("the row is there");
+    pointer_motion_to(&mut f, origin.x + row.x, origin.y + row.y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    assert_eq!(rx.try_recv().ok(), Some(Req::MenuActivate(4)));
+
+    // And the menu goes away, as activating any menu row does.
+    f.settle_animations();
+    assert!(!f.synoik().panel_popover.is_open());
+    f.synoik_state().reconcile_indicator_menu();
+    assert_eq!(rx.try_recv().ok(), Some(Req::CloseMenu));
+}

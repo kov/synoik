@@ -14,6 +14,7 @@ use crate::synoik::State;
 pub mod accounts_service;
 pub mod bluez;
 pub mod calendar_server;
+pub mod dbusmenu;
 pub mod fprintd;
 pub mod freedesktop_a11y;
 pub mod freedesktop_locale1;
@@ -353,7 +354,12 @@ impl DBusServers {
                     calloop::channel::Event::Closed => (),
                 })
                 .unwrap();
-            dbus.conn_status_notifier = try_start(StatusNotifierWatcher::new(to_niri));
+            let (to_status_notifier, sn_from_niri) = async_channel::unbounded();
+            dbus.conn_status_notifier =
+                try_start(StatusNotifierWatcher::new(to_niri, sn_from_niri));
+            if dbus.conn_status_notifier.is_some() {
+                synoik.status_notifier_emit = Some(to_status_notifier);
+            }
         }
 
         let (to_niri, from_login1) = calloop::channel::channel();

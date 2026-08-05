@@ -20,6 +20,7 @@ pub mod cli;
 pub mod cursor;
 #[cfg(feature = "dbus")]
 pub mod dbus;
+pub mod dbusmenu;
 pub mod end_session;
 pub mod frame_clock;
 pub mod frame_log;

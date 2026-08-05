@@ -33,7 +33,8 @@ use super::Start;
 use crate::status_notifier::{
     clean_text, icon_from_name, item_id, parse_service_argument, pick_pixmap, pixmap_from_argb,
     ItemCategory, ItemIcon, ItemProps, ItemRegistry, ItemStatus, ParseError, RegisteredItem,
-    Registration, ServiceRef, StatusNotifierToSynoik, DEFAULT_ITEM_OBJECT_PATH,
+    Registration, ServiceRef, StatusNotifierToSynoik, SynoikToStatusNotifier,
+    DEFAULT_ITEM_OBJECT_PATH,
 };
 
 pub const BUS_NAME: &str = "org.kde.StatusNotifierWatcher";
@@ -82,15 +83,71 @@ pub struct StatusNotifierWatcher {
     /// Shared with the owner-watching task, which is the only other writer.
     registry: Arc<Mutex<ItemRegistry>>,
     to_niri: calloop::channel::Sender<StatusNotifierToSynoik>,
+    /// The shell's side of the menu conversation, taken by the dispatcher task at start.
+    from_niri: Option<async_channel::Receiver<SynoikToStatusNotifier>>,
 }
 
 impl StatusNotifierWatcher {
-    pub fn new(to_niri: calloop::channel::Sender<StatusNotifierToSynoik>) -> Self {
+    pub fn new(
+        to_niri: calloop::channel::Sender<StatusNotifierToSynoik>,
+        from_niri: async_channel::Receiver<SynoikToStatusNotifier>,
+    ) -> Self {
         Self {
             registry: Arc::new(Mutex::new(ItemRegistry::new())),
             to_niri,
+            from_niri: Some(from_niri),
         }
     }
+}
+
+/// Route the shell's menu requests to the task following the menu that is open.
+///
+/// One task, because one popover: opening a second menu supersedes the first, and the client whose
+/// menu was replaced is told it closed rather than being left believing it is still on screen.
+fn serve_menu_requests(
+    conn: &zbus::Connection,
+    to_niri: calloop::channel::Sender<StatusNotifierToSynoik>,
+    from_niri: async_channel::Receiver<SynoikToStatusNotifier>,
+) {
+    let task_conn = conn.clone();
+
+    let task = async move {
+        let conn = task_conn;
+        // The open menu's request sender. Dropping it also ends its task, so a `CloseMenu` that
+        // races the task's own exit is not an error.
+        let mut open: Option<async_channel::Sender<SynoikToStatusNotifier>> = None;
+
+        while let Ok(request) = from_niri.recv().await {
+            match request {
+                SynoikToStatusNotifier::OpenMenu {
+                    item_id,
+                    dest,
+                    path,
+                } => {
+                    if let Some(prev) = open.take() {
+                        let _ = prev.send(SynoikToStatusNotifier::CloseMenu).await;
+                    }
+                    let (tx, rx) = async_channel::unbounded();
+                    super::dbusmenu::watch_menu(&conn, item_id, dest, path, to_niri.clone(), rx);
+                    open = Some(tx);
+                }
+                SynoikToStatusNotifier::CloseMenu => {
+                    if let Some(prev) = open.take() {
+                        let _ = prev.send(SynoikToStatusNotifier::CloseMenu).await;
+                    }
+                }
+                other => {
+                    if let Some(tx) = &open {
+                        let _ = tx.send(other).await;
+                    }
+                }
+            }
+        }
+    };
+
+    conn.executor()
+        .spawn(task, "route app-indicator menu requests")
+        .detach();
 }
 
 #[interface(name = "org.kde.StatusNotifierWatcher")]
@@ -651,8 +708,10 @@ async fn announce_unregistered(conn: &zbus::Connection, id: &str) -> zbus::Resul
 }
 
 impl Start for StatusNotifierWatcher {
-    fn start(self) -> anyhow::Result<zbus::blocking::Connection> {
+    fn start(mut self) -> anyhow::Result<zbus::blocking::Connection> {
         let conn = zbus::blocking::Connection::session()?;
+        let from_niri = self.from_niri.take();
+        let to_niri = self.to_niri.clone();
         conn.object_server().at(OBJECT_PATH, self)?;
 
         // DoNotQueue without ReplaceExisting: if something else is already the watcher, queueing
@@ -690,6 +749,10 @@ impl Start for StatusNotifierWatcher {
                 "announce the StatusNotifier host",
             )
             .detach();
+
+        if let Some(from_niri) = from_niri {
+            serve_menu_requests(conn.inner(), to_niri, from_niri);
+        }
 
         Ok(conn)
     }

@@ -1223,14 +1223,24 @@ impl Panel {
         ))
     }
 
-    /// Which indicator, if any, sits at an output-local position — the id a click should act on
-    /// once there is something to act with (S6).
-    pub fn app_indicator_at(&self, pos: Point<f64, Logical>, output_width: f64) -> Option<&str> {
+    /// Which indicator, if any, sits at an output-local position, and the rect it occupies — the
+    /// id a click acts on, plus the anchor its menu hangs from. One walk, because a click needs
+    /// both and looking the rect up again by id would be a second search for the same answer.
+    pub fn app_indicator_hit(
+        &self,
+        pos: Point<f64, Logical>,
+        output_width: f64,
+    ) -> Option<(&str, Rectangle<f64, Logical>)> {
         (0..self.app_indicators.len()).find_map(|i| {
             self.app_indicator_rect(i, output_width)
                 .filter(|rect| rect.contains(pos))
-                .map(|_| self.app_indicators[i].id.as_str())
+                .map(|rect| (self.app_indicators[i].id.as_str(), rect))
         })
+    }
+
+    /// Which indicator sits at an output-local position.
+    pub fn app_indicator_at(&self, pos: Point<f64, Logical>, output_width: f64) -> Option<&str> {
+        self.app_indicator_hit(pos, output_width).map(|(id, _)| id)
     }
 
     /// Adopt the indicators the StatusNotifier watcher currently has. Returns whether the panel

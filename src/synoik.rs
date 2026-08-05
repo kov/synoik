@@ -684,6 +684,13 @@ pub struct Synoik {
     /// The app indicators registered with our `org.kde.StatusNotifierWatcher`, in registration
     /// order; see [`crate::status_notifier`] and `docs/fork/status-notifier-port.md`.
     pub status_notifier: crate::status_notifier::IndicatorStore,
+    /// Menu channel to the app-indicator watcher's task, which owns the bus connection; `None`
+    /// when the watcher isn't running.
+    pub status_notifier_emit:
+        Option<async_channel::Sender<crate::status_notifier::SynoikToStatusNotifier>>,
+    /// The item whose remote menu the watcher is currently following, reconciled against the
+    /// popover each cycle by `State::reconcile_indicator_menu`.
+    pub indicator_menu_open: Option<String>,
     /// The on-screen notification banner (gnome-shell's MessageTray popup).
     pub notification_banner: crate::ui::notification_banner::NotificationBanner,
     /// The on-screen display (volume/brightness/…), one window per output.
@@ -1844,6 +1851,8 @@ impl State {
         self.refresh_popup_grab();
         self.update_keyboard_focus();
         self.synoik.refresh_overview_search_state();
+        // An indicator's client must learn its menu closed however the menu went away.
+        self.reconcile_indicator_menu();
 
         // Should be called before refresh_layout() because that one will refresh other window
         // states and then send a pending configure.
@@ -6313,6 +6322,18 @@ impl State {
         let changed = match msg {
             Msg::ItemUpdated { item, props } => self.synoik.status_notifier.upsert(item, *props),
             Msg::ItemUnregistered { id } => self.synoik.status_notifier.remove(&id),
+            Msg::MenuLayout { item_id, root } => {
+                // Straight to the popover, not into a store: a remote menu has no life outside
+                // the menu that is showing it, and the *next* open re-reads it anyway.
+                if self
+                    .synoik
+                    .panel_popover
+                    .set_indicator_layout(&item_id, &root)
+                {
+                    self.synoik.queue_redraw_all();
+                }
+                return;
+            }
         };
 
         // Only a change the panel would *show* is worth a redraw: a client that repaints a
@@ -6320,6 +6341,73 @@ impl State {
         if changed {
             self.synoik.refresh_panel_indicators();
         }
+    }
+
+    /// Ask an indicator's client to do something to its open menu.
+    ///
+    /// Dropped unless the watcher is following *that* item's menu right now: a request for a menu
+    /// that is no longer open would be delivered to whatever menu replaced it, and node ids are
+    /// only meaningful within one client's tree.
+    pub fn send_indicator_menu_request(
+        &mut self,
+        item_id: &str,
+        request: crate::status_notifier::SynoikToStatusNotifier,
+    ) {
+        if self.synoik.indicator_menu_open.as_deref() != Some(item_id) {
+            return;
+        }
+        if let Some(tx) = self.synoik.status_notifier_emit.as_ref() {
+            let _ = tx.send_blocking(request);
+        }
+    }
+
+    /// Keep the watcher's idea of which menu is open in step with the popover's.
+    ///
+    /// Reconciled rather than driven from the open/close call sites: a popover is dismissed from
+    /// half a dozen places (Escape, an outside click, another menu opening, the overview, a lock),
+    /// and a client left believing its menu is still up is a bug that only shows in that client.
+    /// Run every cycle, so it must be idempotent — it is: it only acts on a difference.
+    pub fn reconcile_indicator_menu(&mut self) {
+        let want = self
+            .synoik
+            .panel_popover
+            .indicator_menu_item()
+            .map(str::to_owned);
+        if want == self.synoik.indicator_menu_open {
+            return;
+        }
+
+        let Some(tx) = self.synoik.status_notifier_emit.as_ref() else {
+            self.synoik.indicator_menu_open = want;
+            return;
+        };
+
+        match &want {
+            // `OpenMenu` supersedes whatever the watcher was following, so a *swap* needs no
+            // separate close — the dispatcher tells the old client for us.
+            Some(id) => match self.synoik.status_notifier.menu_address(id) {
+                Some((dest, path)) => {
+                    let _ = tx.send_blocking(
+                        crate::status_notifier::SynoikToStatusNotifier::OpenMenu {
+                            item_id: id.clone(),
+                            dest,
+                            path,
+                        },
+                    );
+                }
+                // The item went away between the click and here. Nothing to follow; the menu
+                // stays empty until the user dismisses it.
+                None => {
+                    let _ =
+                        tx.send_blocking(crate::status_notifier::SynoikToStatusNotifier::CloseMenu);
+                }
+            },
+            None => {
+                let _ = tx.send_blocking(crate::status_notifier::SynoikToStatusNotifier::CloseMenu);
+            }
+        }
+
+        self.synoik.indicator_menu_open = want;
     }
 
     /// A media card's transport control (`mpris.js:73-91`). The player is addressed by bus name,
@@ -6873,6 +6961,8 @@ impl Synoik {
             mpris: crate::mpris::MprisStore::new(),
             mpris_emit: None,
             status_notifier: crate::status_notifier::IndicatorStore::new(),
+            status_notifier_emit: None,
+            indicator_menu_open: None,
             notification_banner,
             notification_banner_timer: None,
             osd,

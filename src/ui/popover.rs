@@ -75,6 +75,7 @@ use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::a11y_menu::A11yMenu;
 use crate::ui::app_menu::AppMenu;
 use crate::ui::calendar::DateMenu;
+use crate::ui::indicator_menu::IndicatorMenu;
 use crate::ui::input_source_menu::{InputSourceItem, InputSourceMenu};
 use crate::ui::notification_card::CardGroup;
 use crate::ui::panel::panel_height;
@@ -138,6 +139,12 @@ pub enum PopoverAction {
     /// Connect or disconnect a Bluetooth device (`Device1.Connect`/`Disconnect`, a device-list
     /// row). The menu stays open; the row shows a busy mark until the call finishes.
     ConnectBluetoothDevice { path: String, connect: bool },
+    /// Activate a row of an app indicator's remote menu — `Event(id, "clicked")` on the client.
+    /// The popover closes, as a menu activation does everywhere else.
+    IndicatorMenuActivate { item_id: String, node_id: i32 },
+    /// Expand a submenu of an app indicator's remote menu. The menu stays open, and the client is
+    /// told (`AboutToShow`) so it can fill the submenu in before it is drawn.
+    IndicatorMenuExpand { item_id: String, node_id: i32 },
     /// Open the interactive screenshot UI (the screenshot system button); the
     /// popover closes.
     Screenshot,
@@ -243,6 +250,9 @@ impl PopoverAction {
                 | PopoverAction::SetA11yToggle { .. }
                 // `vfunc_clicked` raises the player and calls `Main.panel.closeCalendar()`.
                 | PopoverAction::RaiseMediaPlayer(_)
+                // Activating a remote row closes the menu too — but *expanding* one does not,
+                // which is why the two are separate actions.
+                | PopoverAction::IndicatorMenuActivate { .. }
         )
     }
 }
@@ -256,6 +266,8 @@ pub enum PopoverContent {
     InputSources(InputSourceMenu),
     A11y(Box<A11yMenu>),
     App(Box<AppMenu>),
+    /// An app indicator's remote menu, which opens empty and fills in when the client answers.
+    Indicator(Box<IndicatorMenu>),
 }
 
 impl PopoverContent {
@@ -266,6 +278,7 @@ impl PopoverContent {
             PopoverContent::InputSources(m) => m.logical_size(),
             PopoverContent::A11y(m) => m.logical_size(),
             PopoverContent::App(m) => m.logical_size(),
+            PopoverContent::Indicator(m) => m.logical_size(),
         }
     }
 
@@ -277,6 +290,7 @@ impl PopoverContent {
             PopoverContent::InputSources(m) => m.corner_radius(),
             PopoverContent::A11y(m) => m.corner_radius(),
             PopoverContent::App(m) => m.corner_radius(),
+            PopoverContent::Indicator(m) => m.corner_radius(),
         }
     }
 }
@@ -370,6 +384,10 @@ impl PanelPopover {
             PopoverContent::A11y(_) => Some(crate::ui::panel::ROLE_A11Y),
             // Not a panel menu: nothing in the panel should light up for it.
             PopoverContent::App(_) => None,
+            // The indicator cluster is one panel item per icon, so the pressed-role highlight
+            // would have to name *which* icon; it does not, and lighting the whole cluster would
+            // be worse than lighting none of it.
+            PopoverContent::Indicator(_) => None,
         }
     }
 
@@ -608,12 +626,76 @@ impl PanelPopover {
         // GNOME caps a menu at the monitor's work area and lets the content scroll rather than
         // running off the screen (`js/ui/panelMenu.js:168-186`). An app with many open windows is
         // how this menu gets there.
-        let avail = output_size(self.output.as_ref().expect("just set")).h
-            - crate::ui::panel::panel_height()
-            - 2. * POPOVER_MARGIN;
-        menu.set_max_height(Some(avail.max(0.)));
+        menu.set_max_height(Some(self.available_menu_height()));
         self.content = Some(PopoverContent::App(Box::new(menu)));
         self.anim = Some(self.make_anim(0., 1.));
+    }
+
+    /// Pop up an app indicator's menu, anchored on its panel icon.
+    ///
+    /// Opens **empty**: the rows are a client's to send, and asking for them is a round trip. The
+    /// menu is a box with nothing in it until [`Self::set_indicator_layout`] lands, which is what
+    /// the extension's menus do as well — its `RemoteMenu` populates asynchronously
+    /// (`dbusMenu.js:880-900`).
+    pub fn toggle_indicator_menu(
+        &mut self,
+        output: Output,
+        anchor: Rectangle<f64, Logical>,
+        item_id: String,
+    ) {
+        // A second click on the same icon dismisses, like every other panel button. A click on a
+        // *different* indicator swaps the menu rather than closing.
+        if self.indicator_menu().map(|m| m.item_id()) == Some(item_id.as_str()) {
+            self.close();
+            return;
+        }
+        self.open = true;
+        self.closing = false;
+        self.output = Some(output);
+        self.anchor = anchor;
+        self.side = PopoverSide::Top;
+        let mut menu = IndicatorMenu::new(item_id);
+        menu.set_max_height(Some(self.available_menu_height()));
+        self.content = Some(PopoverContent::Indicator(Box::new(menu)));
+        self.anim = Some(self.make_anim(0., 1.));
+    }
+
+    /// How tall a panel menu may be before it must scroll: the work area under the panel, less the
+    /// margin the box keeps from the screen edge (`js/ui/panelMenu.js:168-186`).
+    fn available_menu_height(&self) -> f64 {
+        let Some(output) = self.output.as_ref() else {
+            return 0.;
+        };
+        (output_size(output).h - crate::ui::panel::panel_height() - 2. * POPOVER_MARGIN).max(0.)
+    }
+
+    /// The open indicator menu, if that is what is up.
+    pub fn indicator_menu(&self) -> Option<&IndicatorMenu> {
+        match &self.content {
+            Some(PopoverContent::Indicator(m)) if self.open && !self.closing => Some(m),
+            _ => None,
+        }
+    }
+
+    /// The item whose menu is up — what the watcher is asked to follow.
+    pub fn indicator_menu_item(&self) -> Option<&str> {
+        self.indicator_menu().map(|m| m.item_id())
+    }
+
+    /// A client's menu layout arrived. Ignored unless it is for the menu that is actually up: a
+    /// layout that lost the race with a dismissal has nowhere to go. Returns whether it changed
+    /// anything drawn.
+    pub fn set_indicator_layout(
+        &mut self,
+        item_id: &str,
+        root: &crate::dbusmenu::MenuNode,
+    ) -> bool {
+        match &mut self.content {
+            Some(PopoverContent::Indicator(m)) if self.open && m.item_id() == item_id => {
+                m.set_layout(root)
+            }
+            _ => false,
+        }
     }
 
     /// Whether an app context menu is the content that is up — the overview closes it
@@ -916,6 +998,7 @@ impl PanelPopover {
             Some(PopoverContent::InputSources(m)) => m.pointer_hover(local),
             Some(PopoverContent::A11y(m)) => m.pointer_hover(local),
             Some(PopoverContent::App(m)) => m.pointer_hover(local),
+            Some(PopoverContent::Indicator(m)) => m.pointer_hover(local),
             None => false,
         }
     }
@@ -1014,6 +1097,7 @@ impl PanelPopover {
                 Some(PopoverContent::InputSources(m)) => m.pointer_click(local),
                 Some(PopoverContent::A11y(m)) => m.pointer_click(local),
                 Some(PopoverContent::App(m)) => m.pointer_click(local),
+                Some(PopoverContent::Indicator(m)) => m.pointer_click(local),
                 None => PopoverAction::Consumed,
             };
             // A system button (screenshot / settings / lock / power / pill)
@@ -1065,6 +1149,7 @@ impl PanelPopover {
             // A menu only takes the wheel when it has somewhere to go; a short one leaves the
             // event for whatever is behind it.
             Some(PopoverContent::App(m)) => m.scroll(delta),
+            Some(PopoverContent::Indicator(m)) => m.scroll(delta),
             _ => false,
         }
     }
@@ -1159,6 +1244,7 @@ impl PanelPopover {
             Some(PopoverContent::InputSources(m)) => m.render(renderer, icons, scale, origin),
             Some(PopoverContent::A11y(m)) => m.render(renderer, scale, origin),
             Some(PopoverContent::App(m)) => m.render(renderer, scale, origin),
+            Some(PopoverContent::Indicator(m)) => m.render(renderer, scale, origin),
             None => Vec::new(),
         };
 

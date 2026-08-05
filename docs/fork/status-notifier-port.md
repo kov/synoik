@@ -1,7 +1,8 @@
 # StatusNotifierItem / AppIndicator support
 
-**Status: S1–S4 landed (`efcf7245`, `185bd399`, `990d60c0`, `93eb3be4`) — indicators register and
-draw in all three icon forms, and `widget::Menu` exists.** The rest of this document is the plan.
+**Status: S1–S5 landed — indicators register, draw in all three icon forms, and clicking one opens
+its client's remote menu.** What is left is S6 (the click ladder, scroll, activation tokens) and
+S7 (seat validation against real clients).
 
 ## Why this one has no GNOME reference
 
@@ -155,12 +156,24 @@ along. What is still missing is a **scrollbar**: a long menu gives no hint there
 GNOME's overlay scrollbars only appear on hover, so this is a smaller gap than it sounds, but it is
 open.
 
-### S5 — The DBusMenu client
+### S5 — The DBusMenu client ✅
 `GetLayout` at depth −1 for the initial tree, `AboutToShow` before opening any submenu **and on
 the root**, `Event("clicked")` on activation, `opened`/`closed` on menu open/close
 (`dbusMenu.js:664-673`), and live re-fetch on `LayoutUpdated` / `ItemsPropertiesUpdated`. Wire
 S4 to it. `AboutToShow`'s reply is not decoration: `needUpdate = true` means re-fetch the layout
 before showing, and the reply must be accepted in both signatures (see the traps).
+
+Landed as `src/dbusmenu.rs` (the model: `MenuNode`, mnemonic stripping, `to_entries`),
+`src/dbus/dbusmenu.rs` (the wire: `GetLayout`, `Event`, `AboutToShow`, the two update signals) and
+`ui::indicator_menu::IndicatorMenu` (the popover content). Two things the plan did not say:
+
+- **The menu opens empty.** A client's rows are a round trip away, and `AboutToShow` may be a
+  second, so the box is on screen before its contents are. Everything downstream — the height cap,
+  the anchor — has to survive a layout arriving *after* the open.
+- **The close needs a reconciler, not a call site.** A popover is dismissed from half a dozen
+  places (Escape, an outside click, another menu opening, the overview, a lock), and a client that
+  never hears `closed` stops answering `AboutToShow`. `State::reconcile_indicator_menu` runs every
+  cycle and acts only on a difference, so no dismissal path has to remember.
 
 ### S6 — Interaction semantics
 Click, middle-click, right-click, scroll (see the click ladder below), plus

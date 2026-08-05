@@ -1483,6 +1483,22 @@ impl State {
             // screenshot button only closes the quick-settings menu and calls
             // `Main.screenshotUI.open()` (`js/ui/status/system.js:120-127`), which has no
             // `Main.overview.hide()` anywhere in it.
+            // A remote menu's rows are the client's, so both of these are messages rather than
+            // state changes here. `Activate` also closes the popover (`closes_menu`), which the
+            // reconciler turns into the `closed` event the client is owed.
+            PopoverAction::IndicatorMenuActivate { item_id, node_id } => {
+                self.send_indicator_menu_request(
+                    &item_id,
+                    crate::status_notifier::SynoikToStatusNotifier::MenuActivate(node_id),
+                );
+            }
+            PopoverAction::IndicatorMenuExpand { item_id, node_id } => {
+                self.send_indicator_menu_request(
+                    &item_id,
+                    crate::status_notifier::SynoikToStatusNotifier::MenuOpenSubmenu(node_id),
+                );
+                self.synoik.queue_redraw_all();
+            }
             PopoverAction::Screenshot => {
                 // `closes_menu()` already started the fade, but opening the picker *freezes the
                 // screen*, and a fading popover is still on it — so every shot taken from this
@@ -6771,6 +6787,22 @@ impl State {
                                     self.synoik
                                         .panel_popover
                                         .toggle_input_sources(output, anchor, items, active);
+                                }
+                                self.synoik.suppressed_buttons.insert(button_code);
+                                self.synoik.queue_redraw_all();
+                                return;
+                            }
+                            Some(crate::ui::panel::ROLE_APP_INDICATORS) => {
+                                // The cluster is many icons in one panel item, so which one was
+                                // hit is a second question. A primary click opens the menu; the
+                                // spec's activate-vs-menu ladder is S6.
+                                if let Some((id, anchor)) =
+                                    self.synoik.panel.app_indicator_hit(pos, output_w)
+                                {
+                                    let id = id.to_owned();
+                                    self.synoik
+                                        .panel_popover
+                                        .toggle_indicator_menu(output, anchor, id);
                                 }
                                 self.synoik.suppressed_buttons.insert(button_code);
                                 self.synoik.queue_redraw_all();
