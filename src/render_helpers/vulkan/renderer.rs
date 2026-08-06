@@ -2366,21 +2366,12 @@ impl VulkanRenderer {
     fn report_gpu_phases(&self, ticks: &[u64], slot: GpuTimerSlot, total: Duration) {
         use synoik_vk::stats::GpuPhase;
 
-        if ticks.contains(&0) {
+        let Some(deltas) = phase_tick_deltas(ticks, self.gpu.timestamp_valid_bits) else {
             return;
-        }
-        if ticks.windows(2).any(|w| w[1] < w[0]) {
-            return;
-        }
-
+        };
         let mut phases = [Duration::ZERO; GpuPhase::ALL.len()];
         for (i, phase) in GpuPhase::ALL.iter().enumerate() {
-            let delta =
-                match timestamp_ticks([ticks[i], ticks[i + 1]], self.gpu.timestamp_valid_bits) {
-                    TimestampSample::Delta(d) => self.gpu.timestamp_delta(d),
-                    _ => return,
-                };
-            phases[phase.index()] = delta;
+            phases[phase.index()] = self.gpu.timestamp_delta(deltas[i]);
         }
 
         // The parts must be the whole: the marks are inside the same command buffer as the span,
@@ -2444,6 +2435,49 @@ pub(super) fn timestamp_ticks(ticks: [u64; 2], valid_bits: u32) -> TimestampSamp
         0 => TimestampSample::Lost,
         delta => TimestampSample::Delta(delta),
     }
+}
+
+/// The per-phase tick deltas within one submit's marks, or `None` when the marks cannot be
+/// subdivided at all.
+///
+/// `ticks` is the submit's [`GpuTimer::MARKS`] timestamps in order — the submit's start, then one
+/// closing each [`GpuPhase`](synoik_vk::stats::GpuPhase). `None` means an unwritten mark (a zero
+/// tick) or a sequence that goes backwards (a wrap, or two clock domains); either way the
+/// subdivision is not measurement and the submit's own span still stands on its own.
+///
+/// A phase delta of **zero is a real answer**, and this is why the whole-span classifier
+/// ([`timestamp_ticks`]) must not be reused here: for a submit *span*, zero means the pair is
+/// bogus, but a phase that does nothing — an empty prepass, or the present phase of an offscreen
+/// frame — genuinely takes less than one tick. Reusing the classifier discarded every phase of any
+/// frame that had an idle one, silently and with `lost` still at zero, so
+/// `vulkan_gpu_phases_subdivide_the_frame_they_belong_to` reported it as a missing
+/// `gpu_timer_mark`. Pinned by `phase_deltas_accept_a_phase_that_took_no_time`.
+pub(super) fn phase_tick_deltas(
+    ticks: &[u64],
+    valid_bits: u32,
+) -> Option<[u64; synoik_vk::stats::GpuPhase::ALL.len()]> {
+    let mask = if valid_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << valid_bits) - 1
+    };
+    let mut out = [0u64; synoik_vk::stats::GpuPhase::ALL.len()];
+    if ticks.len() != out.len() + 1 {
+        return None;
+    }
+    let mut prev = ticks[0] & mask;
+    if prev == 0 {
+        return None;
+    }
+    for (slot, tick) in out.iter_mut().zip(&ticks[1..]) {
+        let tick = tick & mask;
+        if tick == 0 || tick < prev {
+            return None;
+        }
+        *slot = tick - prev;
+        prev = tick;
+    }
+    Some(out)
 }
 
 /// Whether the session asked for the scanout submit to be left in flight, via

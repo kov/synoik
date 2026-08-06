@@ -5656,3 +5656,74 @@ fn vulkan_partial_redraw_into_a_scanout_dmabuf_preserves_the_rest() {
         );
     }
 }
+
+/// A phase that took **no measurable time** is a measurement, not a lost sample.
+///
+/// `phase_tick_deltas` exists as its own function because the whole-span classifier
+/// (`timestamp_ticks`) was being reused to subdivide a submit, and there a zero delta means the
+/// pair is bogus. A phase legitimately takes zero ticks — an empty prepass, or the present phase of
+/// an offscreen frame, which has no blit to do — so reusing it threw away the *entire* subdivision
+/// of any frame with an idle phase. Silently: the submit's own span still measured fine and `lost`
+/// stayed at zero, so `vulkan_gpu_phases_subdivide_the_frame_they_belong_to` blamed a missing
+/// `gpu_timer_mark` instead. Observed on jabuticaba 2026-08-05 with real marks
+/// `[T, T, T+10223, T+10223]`.
+///
+/// No device needed, which is the point: the real-device test can only fail when the timing lands
+/// that way.
+#[test]
+fn phase_deltas_accept_a_phase_that_took_no_time() {
+    use synoik_vk::stats::GpuPhase;
+
+    use super::renderer::phase_tick_deltas;
+
+    const N: usize = GpuPhase::ALL.len();
+
+    // The shape that broke: prepass and present idle, all four marks written.
+    let t = 13_228_841_211_594u64;
+    let mut ticks = vec![t; N + 1];
+    for tick in ticks.iter_mut().skip(2) {
+        *tick = t + 10_223;
+    }
+    let deltas = phase_tick_deltas(&ticks, 64).expect("all marks written and in order");
+    assert_eq!(
+        deltas[0], 0,
+        "an idle prepass measured zero ticks, not lost"
+    );
+    assert_eq!(deltas[1], 10_223, "the render pass keeps its own time");
+    assert_eq!(
+        deltas[2], 0,
+        "an offscreen frame's present phase does nothing"
+    );
+    assert_eq!(
+        deltas.iter().sum::<u64>(),
+        10_223,
+        "the phases must still sum to the span they subdivide",
+    );
+
+    // What genuinely cannot be subdivided.
+    let mut unwritten = ticks.clone();
+    unwritten[1] = 0;
+    assert!(
+        phase_tick_deltas(&unwritten, 64).is_none(),
+        "an unwritten intermediate mark is not a zero-length phase",
+    );
+    let mut backwards = ticks.clone();
+    backwards[N] = t - 1;
+    assert!(
+        phase_tick_deltas(&backwards, 64).is_none(),
+        "ticks that go backwards are a wrap or another clock domain, not a measurement",
+    );
+    assert!(
+        phase_tick_deltas(&ticks[..N], 64).is_none(),
+        "one mark per phase plus the submit's start, or nothing",
+    );
+
+    // Only `valid_bits` of each tick count: the high bits are undefined, and masking them must
+    // happen before the ordering test or a stale high bit reads as time travel.
+    let masked: Vec<u64> = ticks.iter().map(|t| t | 1 << 63).collect();
+    assert_eq!(
+        phase_tick_deltas(&masked, 63),
+        Some([0, 10_223, 0]),
+        "the undefined high bits must be masked off, not compared",
+    );
+}
