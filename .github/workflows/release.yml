@@ -30,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y curl gcc clang libudev-dev libgbm-dev libxkbcommon-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libglib2.0-dev libpango1.0-dev libcairo2-dev libpixman-1-dev libdisplay-info-dev
+          sudo apt-get install -y curl gcc clang glslang-tools libudev-dev libgbm-dev libxkbcommon-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libglib2.0-dev libpango1.0-dev libcairo2-dev libpixman-1-dev libdisplay-info-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
