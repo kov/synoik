@@ -29,6 +29,7 @@ pub mod gnome_shell;
 pub mod gnome_shell_brightness;
 pub mod gnome_shell_introspect;
 pub mod gnome_shell_screenshot;
+pub mod gnome_software;
 pub mod gtk_notifications;
 pub mod ibus;
 pub mod mpris;
