@@ -3522,6 +3522,94 @@ fn vulkan_alternating_present_blit_sizes_reuse_shadows() {
     }
 }
 
+/// The backdrop cache is keyed on the **exact** intermediate size, so an effect geometry that
+/// moves by a pixel throws away the capture texture, the whole dual-Kawase chain (a level image
+/// plus its ping-pong twin per pass, with their render passes and descriptor sets) and the blurred
+/// output, and builds them again — every frame, for as long as the geometry is animating.
+///
+/// A cache *hit* is invisible to a pixel assertion, which is why this counts allocations, like the
+/// two counters above it. It pins two things at once: that a steady geometry allocates exactly
+/// once, and that an animating one pays per frame. The second assert is documentation of a defect,
+/// not of a desirable invariant — see `docs/fork/client-blur.md` gap 8. Flip it when the sizing
+/// learns some slack.
+#[test]
+fn vulkan_backdrop_blur_rebuilds_on_every_size_change() {
+    use smithay::utils::user_data::UserDataMap;
+
+    use crate::render_helpers::background_effect::RenderParams;
+    use crate::render_helpers::framebuffer_effect::FramebufferEffect;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_backdrop_blur_rebuilds_on_every_size_change: no Vulkan ({e})"
+            );
+            return;
+        }
+    };
+
+    const S: i32 = 64;
+    let size = Size::<i32, Physical>::from((S, S));
+    let mut target = vk
+        .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((S, S)))
+        .expect("create target");
+
+    // One cache, as the damage tracker keeps one per element Id across frames.
+    let cache = UserDataMap::new();
+
+    // Capture once at `w` × S, the way an animating window's effect geometry would each frame.
+    let capture_at = |vk: &mut VulkanRenderer, target: &mut VkTexture, w: i32| {
+        let effect = FramebufferEffect::new();
+        let element = effect.render(
+            None,
+            RenderParams {
+                geometry: Rectangle::from_size(Size::from((w as f64, S as f64))),
+                subregion: None,
+                clip: None,
+                scale: 1.0,
+            },
+            Some(BlurOptions {
+                passes: 3,
+                offset: 2.0,
+            }),
+            0.0,
+            1.0,
+        );
+        let src = element.src();
+        let dst = element.geometry(Scale::from(1.0));
+
+        let mut fb = vk.bind(target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        RenderElement::<VulkanRenderer>::capture_framebuffer(
+            &element, &mut frame, src, dst, &cache,
+        )
+        .expect("capture_framebuffer");
+        let _ = frame.finish().expect("finish");
+    };
+
+    // A geometry that holds still builds the cache once and then reuses it.
+    for _ in 0..4 {
+        capture_at(&mut vk, &mut target, S);
+    }
+    assert_eq!(
+        vk.backdrop_blur_allocs(),
+        1,
+        "a steady geometry must build the backdrop cache once and reuse it",
+    );
+
+    // A geometry that moves rebuilds all of it, every frame.
+    let before = vk.backdrop_blur_allocs();
+    for w in (S - 4)..S {
+        capture_at(&mut vk, &mut target, w);
+    }
+    assert_eq!(
+        vk.backdrop_blur_allocs() - before,
+        4,
+        "known defect: a 1px geometry change rebuilds capture + chain + output",
+    );
+}
+
 /// The renderer has exactly one render-pass format ([`NATIVE_FOURCC`]'s BGRA order), so an
 /// offscreen in the *other* byte order is not a legal framebuffer attachment and `create_buffer`
 /// must reject it — a mismatched attachment is undefined behavior, not a wrong picture.

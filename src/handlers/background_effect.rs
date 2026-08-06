@@ -115,7 +115,19 @@ fn mark_blur_region_pending_dirty(wl_surface: &WlSurface) {
 
 impl ExtBackgroundEffectHandler for State {
     fn capabilities(&self) -> background_effect::Capability {
-        background_effect::Capability::Blur
+        // "when the capability goes away, the corresponding effect is no longer applied by the
+        // compositor, even if it was set before" — which is exactly what blur turned off globally
+        // means, so say so instead of accepting regions we will ignore.
+        //
+        // The event is only sent at bind time; there is no re-send when this changes. That is
+        // honest today because `Blur::off` has no runtime writer (there is no config file, so the
+        // blur config is its Default for the life of the process) — the moment one appears, this
+        // needs to walk the bound managers and re-send.
+        if self.synoik.config.borrow().blur.off {
+            background_effect::Capability::empty()
+        } else {
+            background_effect::Capability::Blur
+        }
     }
 
     fn set_blur_region(&mut self, wl_surface: WlSurface, _region: RegionAttributes) {

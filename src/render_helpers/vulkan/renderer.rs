@@ -210,6 +210,16 @@ pub struct VulkanRenderer {
     /// pixel assertion. See `vulkan_repeated_converting_readbacks_reuse_staging`.
     #[cfg(test)]
     readback_staging_allocs: usize,
+    /// Count of [`BackdropBlur`](super::BackdropBlur) (re)builds — capture texture plus, when blur
+    /// is on, a whole `BlurChain` and its output (test-only observability).
+    ///
+    /// The same no-churn invariant as the two counters above, for the cache that is *not* keyed by
+    /// a bounded set of sizes: the backdrop cache is rebuilt whenever the effect's intermediate
+    /// size changes by so much as a pixel, and an animated geometry moves it every frame. A cache
+    /// hit is invisible to a pixel assertion, so this is what pins it. See
+    /// `vulkan_backdrop_blur_rebuilds_on_every_size_change`.
+    #[cfg(test)]
+    backdrop_blur_allocs: usize,
     /// Imported scanout dmabuf targets, keyed by buffer identity. `DrmCompositor` cycles a small
     /// fixed set of GBM buffers and re-binds one every frame; **importing** a dmabuf on Venus
     /// creates a host-side resource, so re-importing per frame churns those resources on the host
@@ -583,6 +593,8 @@ impl VulkanRenderer {
             present_blit_shadow_allocs: 0,
             #[cfg(test)]
             readback_staging_allocs: 0,
+            #[cfg(test)]
+            backdrop_blur_allocs: 0,
             dmabuf_target_cache: HashMap::new(),
             dmabuf_import_cache: HashMap::new(),
             warned_modifiers: HashSet::new(),
@@ -3288,6 +3300,17 @@ impl VulkanRenderer {
     #[cfg(test)]
     pub(super) fn readback_staging_allocs(&self) -> usize {
         self.readback_staging_allocs
+    }
+
+    /// See [`Self::backdrop_blur_allocs`].
+    #[cfg(test)]
+    pub(super) fn backdrop_blur_allocs(&self) -> usize {
+        self.backdrop_blur_allocs
+    }
+
+    #[cfg(test)]
+    pub(super) fn note_backdrop_blur_alloc(&mut self) {
+        self.backdrop_blur_allocs += 1;
     }
 
     #[cfg(test)]

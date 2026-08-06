@@ -112,13 +112,28 @@ impl SharedBlurChain {
 
 impl Drop for SharedBlurChain {
     fn drop(&mut self) {
-        // Every recorded reference is gone by construction — that is what the refcount means — but
-        // a submit carrying one may still be *executing*, and the chain's teardown does not wait.
-        // Only runs when a chain is rebuilt (pass count changed, source recreated) or at teardown,
-        // never per frame.
-        unsafe {
-            let _ = self.gpu.device.device_wait_idle();
-        }
+        // No wait here, and none needed: **refcount zero already means every submit that recorded
+        // this chain has completed.** The three ways a reference is released each prove it —
+        //
+        // - A *deferred* finish moves the frame's chains into an [`InFlightSubmit`]
+        //   (`VulkanFrame::finish_internal_impl`), and `VulkanRenderer::retire_completed` drains
+        //   only submits whose timeline value the queue has already **passed**.
+        // - A *synchronous* finish parks on `wait_for_fences` and only then lets the frame — still
+        //   holding its chains — drop.
+        // - A frame that errors before its submit, or is abandoned, has nothing executing at all.
+        // - The one recording that happens outside a frame, `flush_pending_blurs`, goes through
+        //   `run_commands`, which waits — and holds the chains across it.
+        //
+        // It used to `device_wait_idle` here, defended by a comment claiming this "only runs when
+        // a chain is rebuilt … never per frame". `BackdropBlur::matches` keys on the exact
+        // intermediate size, so an animating geometry rebuilds — and stalled — every single frame
+        // (`vulkan_backdrop_blur_rebuilds_on_every_size_change` counts the rebuilds). That is the
+        // whole reason the wait had to go: it was a full-device stall on the compositor thread,
+        // once per animation frame, guarding an invariant the refcount already gives.
+        //
+        // The renderer's own teardown is covered too: `VulkanRenderer::drop` runs
+        // `drain_in_flight()` (which waits) before destroying anything, so a chain outliving the
+        // renderer — it holds its own `Arc<Gpu>` — has nothing in flight either.
         self.chain.destroy(&self.gpu);
     }
 }

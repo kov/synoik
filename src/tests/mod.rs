@@ -25,6 +25,7 @@ pub(crate) mod fixture;
 mod server;
 
 mod animations;
+mod background_effect;
 mod floating;
 mod fullscreen;
 mod gnome;

@@ -126,6 +126,13 @@ impl BackgroundEffect {
             effect.blur == Some(true)
         };
 
+        // Blur turned off globally is off for everyone, including surfaces that asked through
+        // `ext-background-effect-v1`. Folded in here rather than at render time so a surface whose
+        // *only* effect was that blur stops being visible at all: leaving it visible-but-unblurred
+        // would punch an unblurred see-through hole where the client asked for blur, which is
+        // strictly worse than ignoring the request. `capabilities()` clears the blur bit to match.
+        let blur = blur && !self.blur_config.off;
+
         let mut options = Options {
             blur,
             xray: effect.xray == Some(true),
@@ -135,7 +142,13 @@ impl BackgroundEffect {
 
         // If we have some background effect but xray wasn't explicitly set, default it to true
         // since it's cheaper.
-        if options.is_visible() && effect.xray.is_none() {
+        //
+        // Only for effects the *shell* turned on. A client asking through
+        // `ext-background-effect-v1` is asking for the real thing — the windows behind it, blurred
+        // — and xray cannot give it that: the xray buffer holds only the background layer and the
+        // wallpaper (`Synoik::fill_xray_elements`), so a window with another window behind it would
+        // show the wallpaper through it. KWin and macOS both blur the true backdrop; so do we.
+        if !has_blur_region && options.is_visible() && effect.xray.is_none() {
             options.xray = true;
         }
 
@@ -173,8 +186,8 @@ impl BackgroundEffect {
         let damage = self.damage.render(params.geometry);
 
         // Use noise/saturation from options, falling back to blur defaults if blurred, and
-        // to no effect if not blurred.
-        let blur = self.options.blur && !self.blur_config.off;
+        // to no effect if not blurred. `blur_config.off` was already folded into `options.blur`.
+        let blur = self.options.blur;
         let blur_options = blur.then_some(BlurOptions::from(self.blur_config));
         let noise = if blur { self.blur_config.noise } else { 0. };
         let noise = self.options.noise.unwrap_or(noise) as f32;
@@ -334,4 +347,75 @@ pub fn render_for_tile(
         let xray_pos = xray_pos.offset(params.geometry.loc - geometry.loc);
         background_effect.render(ctx, ns, params, xray_pos, push);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Resolve the options a surface ends up with, through the real entry point.
+    fn resolve(
+        blur_config: synoik_config::Blur,
+        effect: synoik_config::BackgroundEffect,
+        has_blur_region: bool,
+    ) -> Options {
+        let mut bg = BackgroundEffect::new();
+        bg.update_config(blur_config);
+        bg.update_render_elements(CornerRadius::default(), effect, has_blur_region);
+        bg.options
+    }
+
+    /// A client asking through `ext-background-effect-v1` gets the real backdrop blurred, not the
+    /// xray see-through — the xray buffer holds only the wallpaper and the background layer, so a
+    /// window stacked over another window would show the wallpaper through it.
+    #[test]
+    fn a_client_blur_region_blurs_the_real_backdrop() {
+        let options = resolve(
+            synoik_config::Blur::default(),
+            synoik_config::BackgroundEffect::default(),
+            true,
+        );
+        assert!(options.blur);
+        assert!(!options.xray, "client-requested blur must not use xray");
+    }
+
+    /// ...but a rule that explicitly asks for xray still gets it.
+    #[test]
+    fn an_explicit_xray_rule_beats_the_client_default() {
+        let effect = synoik_config::BackgroundEffect {
+            xray: Some(true),
+            ..Default::default()
+        };
+        let options = resolve(synoik_config::Blur::default(), effect, true);
+        assert!(options.xray);
+    }
+
+    /// An effect the *shell* turns on keeps defaulting to xray, which is the cheap path.
+    #[test]
+    fn a_shell_requested_effect_still_defaults_to_xray() {
+        let effect = synoik_config::BackgroundEffect {
+            blur: Some(true),
+            ..Default::default()
+        };
+        let options = resolve(synoik_config::Blur::default(), effect, false);
+        assert!(options.blur);
+        assert!(options.xray);
+    }
+
+    /// Blur off globally means the client's request is ignored outright. It must not degrade into a
+    /// visible-but-unblurred effect: that would punch a see-through hole where blur was asked for.
+    #[test]
+    fn blur_off_ignores_a_client_blur_region_entirely() {
+        let blur_config = synoik_config::Blur {
+            off: true,
+            ..Default::default()
+        };
+        let options = resolve(
+            blur_config,
+            synoik_config::BackgroundEffect::default(),
+            true,
+        );
+        assert!(!options.blur);
+        assert!(!options.is_visible(), "must render nothing at all");
+    }
 }

@@ -1326,6 +1326,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let dims = (size.w as u32, size.h as u32);
         let reuse = slot.as_ref().is_some_and(|b| b.matches(dims, passes));
         if !reuse {
+            #[cfg(test)]
+            self.renderer.note_backdrop_blur_alloc();
             *slot = Some(BackdropBlur::new(self.renderer, size, passes)?);
         }
         let bb = slot.as_ref().expect("just populated");
@@ -1336,8 +1338,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         })?;
         // The chain's images and the output are read by a submit that has not happened yet (this
         // frame's), so they must outlive it exactly as a queued upload's destination does. The
-        // textures go in `held`; the chain has no reference count and is drained by
-        // `BackdropBlur::drop` instead.
+        // textures go in `held`, the chain in `blur_chains` — and holding that `Arc` until this
+        // frame's submit retires is the whole of what makes `SharedBlurChain::drop` safe without a
+        // wait, so it is not optional bookkeeping.
         let (capture, intermediate) = (bb.capture().clone(), bb.intermediate().clone());
         self.held.push(capture);
         self.held.push(intermediate);
