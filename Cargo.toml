@@ -26,17 +26,19 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracy-client = { version = "0.18.4", default-features = false }
 
 [workspace.dependencies.smithay]
-# version = "0.4.1"
-# Local patched fork (branch gsrs-cursor-hotspot off upstream rev
-# ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef): adds para-virt cursor-plane
-# hotspot support (DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT + HOTSPOT_X/Y) so the
-# virtio-gpu host stops drawing its own pointer alongside ours.
-path = "../smithay"
+# Patched fork (branch `synoik` off upstream rev ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef):
+# para-virt cursor-plane hotspot support (DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT + HOTSPOT_X/Y)
+# so the virtio-gpu host stops drawing its own pointer alongside ours, plus the compositor-side
+# text-input and rect-rounding fixes. Working on smithay itself means editing a local clone and
+# adding `paths = ["../smithay"]` to `.cargo/config.toml` — do NOT flip this back to a path dep,
+# it is what broke every CI job when the repo went public.
+git = "https://github.com/kov/smithay.git"
+branch = "synoik"
 default-features = false
 
 [workspace.dependencies.smithay-drm-extras]
-# version = "0.1.0"
-path = "../smithay/smithay-drm-extras"
+git = "https://github.com/kov/smithay.git"
+branch = "synoik"
 
 [package]
 name = "synoik"

@@ -9,33 +9,28 @@ assignees: ''
 
 <!-- Please describe the issue here at the top, then fill in the system information below. -->
 
-<!-- Attaching your full niri config can help diagnose the problem. -->
-<details><summary>Config</summary>
+<!--
+Synoik has no configuration file: settings come from GSettings, the same keys GNOME uses. If the
+bug involves a setting, the useful thing to attach is the output of the relevant schema, e.g.
 
-```kdl
-insert config here
-```
+$ gsettings list-recursively org.gnome.desktop.interface
 
-</details> 
+If a behavior differs from GNOME Shell, please say which GNOME version you compared against —
+"GNOME does X, synoik does Y" is the most actionable form a report can take.
+-->
 
 <!--
-If you have a problem with a specific app, please verify that it is running on Wayland, rather than X11. An easy way is to run xeyes and mouse over the app: xeyes will be able to "see" only X11 windows.
-
-You can also check what process the window PID belongs to:
-
-$ readlink /proc/$(niri msg --json pick-window | jq .pid)/exe
-
-If this points to xwayland-satellite, then it's an X11 window.
-
-Please report issues with X11 apps to xwayland-satellite instead of niri: https://github.com/Supreeeme/xwayland-satellite/issues
+If the renderer is involved (glitches, corruption, a hang around drawing), running the session with
+SYNOIK_VK_VALIDATION=1 and attaching the "VULKAN ERROR" lines from the journal is worth more than
+any description.
 -->
 
 ### System Information
 
-<!-- Paste the output of `niri -V`, e.g. niri 25.02 (b94a5db) -->
-* niri version: 
+<!-- Paste the output of `synoik -V`, e.g. synoik 26.4.0 (b94a5db) -->
+* Synoik version: 
 
-<!-- Write your distribution, e.g. Fedora 40 Silverblue -->
+<!-- Write your distribution, e.g. Fedora 42 -->
 * Distro: 
 
 <!-- Write your GPU vendor and model, e.g. AMD RX 6700M -->

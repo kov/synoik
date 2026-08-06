@@ -22,3 +22,8 @@ updates:
       interval: "weekly"
     cooldown:
       default-days: 7
+    ignore:
+      # The msrv job pins dtolnay/rust-toolchain to our `rust-version`, not to a version of the
+      # action; dependabot reads that as an out-of-date action and keeps proposing an MSRV bump.
+      # The MSRV moves when we decide it does, in Cargo.toml.
+      - dependency-name: "dtolnay/rust-toolchain"

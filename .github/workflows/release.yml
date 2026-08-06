@@ -26,10 +26,11 @@ jobs:
         with:
           show-progress: false
 
+      # Keep in sync with DEPS_APT in ci.yml.
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y curl gcc clang libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libpango1.0-dev libdisplay-info-dev libadwaita-1-dev
+          sudo apt-get install -y curl gcc clang libudev-dev libgbm-dev libxkbcommon-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libglib2.0-dev libpango1.0-dev libcairo2-dev libpixman-1-dev libdisplay-info-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -40,13 +41,13 @@ jobs:
           tar cJf synoik-${{ github.event.inputs.version }}-vendored-dependencies.tar.xz vendor/
 
       - name: Build
-        run: cargo build --all --frozen --release
+        run: cargo build --workspace --frozen --release
 
       - name: Build tests
-        run: cargo test --no-run --all --frozen --release
+        run: cargo test --no-run --workspace --frozen --release
 
       - name: Test
-        run: cargo test --all --frozen --release -- --nocapture
+        run: cargo test --workspace --frozen --release -- --nocapture
 
       - name: Draft release
         uses: softprops/action-gh-release@v2
