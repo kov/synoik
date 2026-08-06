@@ -10,11 +10,16 @@
 //! pure [`crate::end_session::EndSession`] state machine; this widget is only the interactive
 //! surface — the open/close animation, which button has focus, and the CPU-rendered texture.
 //!
-//! Each dialog type has exactly one action button (plus Cancel), so the layout is fixed: `Cancel`
-//! on the left, the action (`Log Out` / `Power Off` / `Restart`) on the right, with a title and a
-//! counting-down description above. Left/Right/Tab move focus, Enter activates the focused button,
-//! Esc cancels; the pointer hovers to focus and clicks to activate. Content (which type, seconds
-//! left) is passed in at render time so there is a single source of truth in the state machine.
+//! Each dialog has exactly one action button (plus Cancel), so the layout is fixed: `Cancel` on the
+//! left, the action (`Log Out` / `Power Off` / `Restart` / `Restart & Install`) on the right, with
+//! a title and a counting-down description above, and the update checkbox between them when there
+//! is one. Left/Right/Tab move focus, Enter activates the focused button, Space toggles the focused
+//! checkbox, Esc cancels; the pointer hovers to focus and clicks to activate.
+//!
+//! What is drawn is a [`crate::end_session::Presentation`], not the wire dialog type: gnome-shell's
+//! fourth presentation, `UPDATE_RESTART`, is one the session manager never asks for. Content
+//! (presentation, seconds left, checkbox) is passed in at render time so the state machine stays
+//! the single source of truth.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -28,7 +33,7 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 use synoik_config::Config;
 
 use crate::animation::{Animation, Clock};
-use crate::end_session::EndSessionType;
+use crate::end_session::Presentation;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
@@ -51,6 +56,11 @@ const CONTENT_SPACING: i32 = 18;
 const CHECK_ROW_H: i32 = 20;
 const PADDING: i32 = 24;
 const BUTTON_W: i32 = 120;
+/// The promoted "Restart & Install" label does not fit [`BUTTON_W`]. GNOME's dialog buttons expand
+/// to their content; ours are fixed, so the one label that overflows gets its own width rather than
+/// widening every dialog. `action_button_w` is the single definition, and
+/// `the_action_label_fits_its_button` holds it to the shaped run.
+const WIDE_BUTTON_W: i32 = 140;
 const BUTTON_H: i32 = 40;
 const BUTTON_GAP: i32 = 12;
 /// Title font size (bold, GNOME `%title_3` = 15pt) and body/label font size (11pt),
@@ -113,14 +123,16 @@ enum State {
 
 /// Pack the content signature (dialog type, countdown, focus, checkbox, accent) into a
 /// [`widget::bake`] revision — the cache re-renders only when one of these changes (per output
-/// scale, which the bake key handles). Bits 0-1 kind, bit 2 focused-is-action, bits 3-34 the
-/// countdown (0 = none), bits 35-36 the checkbox (0 absent / 1 unticked / 2 ticked), bit 37
+/// scale, which the bake key handles). Bits 0-1 presentation, bit 2 focused-is-action, bits 3-34
+/// the countdown (0 = none), bits 35-36 the checkbox (0 absent / 1 unticked / 2 ticked), bit 37
 /// checkbox-focused, bits 40-63 the accent RGB (so a live accent change re-bakes).
 ///
 /// The checkbox bits matter twice over: ticking the box also swaps the *title*
-/// (`subjectWithUpdates`), so a revision that ignored it would leave the old title baked.
+/// (`subjectWithUpdates`), so a revision that ignored it would leave the old title baked. Bits 0-1
+/// hold the presentation rather than the wire type for the same reason: gnome-software's answer can
+/// promote a Restart to `UpdateRestart` under an open dialog, which rewrites every string on it.
 fn revision_for(
-    kind: EndSessionType,
+    presentation: Presentation,
     seconds_left: Option<u64>,
     focused: Focus,
     checkbox: Option<bool>,
@@ -133,7 +145,7 @@ fn revision_for(
         Some(true) => 2,
     };
     let accent = (accent[0] as u64) << 16 | (accent[1] as u64) << 8 | (accent[2] as u64);
-    (kind as u64)
+    (presentation as u64)
         | (((focused == Focus::Button(Button::Action)) as u64) << 2)
         | (secs << 3)
         | (check << 35)
@@ -153,14 +165,14 @@ fn height(has_checkbox: bool) -> i32 {
 pub struct EndSessionDialog {
     state: State,
     focused: Focus,
-    /// What the dialog is showing (type, seconds left, update checkbox). Fed from the
+    /// What the dialog is showing (presentation, seconds left, update checkbox). Fed from the
     /// [`crate::end_session`] state machine — the single source of truth — via
     /// [`Self::show`]/[`Self::set_content`], and kept through the close animation (when the state
     /// machine has already cleared) so the fade-out still has something to draw.
     ///
     /// The checkbox is `None` when it isn't offered and `Some(ticked)` when it is; it can turn up
     /// *after* the dialog opens, because gnome-software is asked asynchronously.
-    content: Option<(EndSessionType, Option<u64>, Option<bool>)>,
+    content: Option<(Presentation, Option<u64>, Option<bool>)>,
     /// One cached texture per output scale, keyed by the content revision it was baked at.
     cache: RefCell<BakeCache>,
 
@@ -211,20 +223,21 @@ impl EndSessionDialog {
         }
     }
 
-    /// Raise the dialog for `kind` (default focus on the action button, so Enter confirms).
-    pub fn show(&mut self, kind: EndSessionType) {
+    /// Raise the dialog for `presentation` (default focus on the action button, so Enter confirms).
+    pub fn show(&mut self, presentation: Presentation) {
         self.focused = Focus::Button(Button::Action);
-        self.content = Some((kind, None, None));
+        self.content = Some((presentation, None, None));
         if !self.is_open() {
             self.state = State::Showing(self.animation(self.value(), 1.));
         }
     }
 
-    /// Update the displayed type, countdown and update checkbox (the state machine drives this
-    /// each second, and again when gnome-software answers).
+    /// Update the displayed presentation, countdown and update checkbox (the state machine drives
+    /// this each second, and again when gnome-software answers — which can change the presentation
+    /// as well as the checkbox).
     pub fn set_content(
         &mut self,
-        kind: EndSessionType,
+        presentation: Presentation,
         seconds_left: Option<u64>,
         checkbox: Option<bool>,
     ) {
@@ -232,7 +245,13 @@ impl EndSessionDialog {
         if checkbox.is_none() && self.focused == Focus::Check {
             self.focused = Focus::Button(Button::Action);
         }
-        self.content = Some((kind, seconds_left, checkbox));
+        self.content = Some((presentation, seconds_left, checkbox));
+    }
+
+    /// The presentation currently on screen, or the plain restart as a stand-in before the first
+    /// `set_content` (nothing is drawn in that window — [`Self::render`] returns early).
+    fn presentation(&self) -> Presentation {
+        self.content.map_or(Presentation::Restart, |(p, _, _)| p)
     }
 
     /// Whether the update checkbox is currently on screen.
@@ -381,17 +400,31 @@ impl EndSessionDialog {
         Point::from((x, y))
     }
 
+    /// The action button's width: wider for the one label that does not fit
+    /// ([`WIDE_BUTTON_W`]). Cancel always keeps [`BUTTON_W`].
+    fn action_button_w(presentation: Presentation) -> i32 {
+        match presentation {
+            Presentation::UpdateRestart => WIDE_BUTTON_W,
+            _ => BUTTON_W,
+        }
+    }
+
     /// Button rectangle in dialog-local logical coordinates.
-    fn button_rect(button: Button, has_checkbox: bool) -> Rectangle<f64, Logical> {
+    fn button_rect(
+        button: Button,
+        has_checkbox: bool,
+        presentation: Presentation,
+    ) -> Rectangle<f64, Logical> {
         let y = height(has_checkbox) - PADDING - BUTTON_H;
-        let action_x = WIDTH - PADDING - BUTTON_W;
-        let x = match button {
-            Button::Action => action_x,
-            Button::Cancel => action_x - BUTTON_GAP - BUTTON_W,
+        let action_w = Self::action_button_w(presentation);
+        let action_x = WIDTH - PADDING - action_w;
+        let (x, w) = match button {
+            Button::Action => (action_x, action_w),
+            Button::Cancel => (action_x - BUTTON_GAP - BUTTON_W, BUTTON_W),
         };
         Rectangle::new(
             Point::from((f64::from(x), f64::from(y))),
-            Size::from((f64::from(BUTTON_W), f64::from(BUTTON_H))),
+            Size::from((f64::from(w), f64::from(BUTTON_H))),
         )
     }
 
@@ -423,9 +456,10 @@ impl EndSessionDialog {
                 return Some(Focus::Check);
             }
         }
+        let presentation = self.presentation();
         [Button::Cancel, Button::Action]
             .into_iter()
-            .find(|&b| Self::button_rect(b, has_checkbox).contains(local))
+            .find(|&b| Self::button_rect(b, has_checkbox, presentation).contains(local))
             .map(Focus::Button)
     }
 
@@ -442,7 +476,7 @@ impl EndSessionDialog {
             State::Showing(anim) | State::Hiding(anim) => (anim.value(), anim.clamped_value()),
             State::Visible => (1., 1.),
         };
-        let Some((kind, seconds_left, checkbox)) = self.content else {
+        let Some((presentation, seconds_left, checkbox)) = self.content else {
             return;
         };
         let _span = tracy_client::span!("EndSessionDialog::render");
@@ -451,7 +485,7 @@ impl EndSessionDialog {
         let scale = output.current_scale().fractional_scale();
         let output_size = output_size(output);
         let accent_rgba: Rgba = widget::style::accent_rgba(accent);
-        let revision = revision_for(kind, seconds_left, self.focused, checkbox, accent);
+        let revision = revision_for(presentation, seconds_left, self.focused, checkbox, accent);
         let box_h = height(checkbox.is_some());
 
         let texture = {
@@ -466,7 +500,14 @@ impl EndSessionDialog {
                 Size::from((f64::from(WIDTH), f64::from(box_h))),
                 revision,
                 |renderer| {
-                    prepare_dialog(renderer, scale, kind, seconds_left, self.focused, checkbox)
+                    prepare_dialog(
+                        renderer,
+                        scale,
+                        presentation,
+                        seconds_left,
+                        self.focused,
+                        checkbox,
+                    )
                 },
                 |frame, phys, layout| paint_dialog(frame, phys, layout, scale, accent_rgba),
             ) {
@@ -552,29 +593,61 @@ impl EndSessionDialog {
     }
 }
 
-/// Title, action-button label, and counting-down description for a dialog type — mirrors the
-/// per-type content in gnome-shell's `endSessionDialog.js`.
+/// Title, action-button label, and counting-down description for a presentation — mirrors the
+/// per-type content objects in gnome-shell's `endSessionDialog.js:44-124`.
+///
+/// `subject` / `description` / `confirmButtons[0].label`, in that order. The fourth presentation,
+/// [`Presentation::UpdateRestart`], is the one gnome-session never asks for
+/// (`restartUpdateDialogContent`, `:106-124`).
 fn content(
-    kind: EndSessionType,
+    presentation: Presentation,
     seconds_left: Option<u64>,
     installing_updates: bool,
 ) -> (&'static str, &'static str, String) {
-    let (title, action, verb) = match kind {
-        EndSessionType::Logout => ("Log Out", "Log Out", "logged out"),
-        EndSessionType::Shutdown => ("Power Off", "Power Off", "powered off"),
-        EndSessionType::Restart => ("Restart", "Restart", "restarted"),
+    // Title, action label, and the two description phrasings: the counting-down clause and the
+    // question we ask when `Open` gave us no timeout (which GNOME, always counting down, has no
+    // string for).
+    let (title, action, counting, question) = match presentation {
+        Presentation::Logout => (
+            "Log Out",
+            "Log Out",
+            "You will be logged out automatically",
+            "log out",
+        ),
+        Presentation::Shutdown => (
+            "Power Off",
+            "Power Off",
+            "The system will power off automatically",
+            "power off",
+        ),
+        Presentation::Restart => (
+            "Restart",
+            "Restart",
+            "The system will restart automatically",
+            "restart",
+        ),
+        Presentation::UpdateRestart => (
+            "Restart & Install Updates",
+            "Restart & Install",
+            "The system will automatically restart and install updates",
+            "restart and install updates",
+        ),
     };
     // `subjectWithUpdates` (`js/ui/endSessionDialog.js:70`/`:89`): ticking the box renames the
     // dialog, because it is now describing two things happening, not one. Only the *title*
-    // changes — the button keeps its own label.
-    let title = match (kind, installing_updates) {
-        (EndSessionType::Shutdown, true) => "Install Updates & Power Off",
-        (EndSessionType::Restart, true) => "Install Updates & Restart",
+    // changes — the button keeps its own label. `UpdateRestart` carries no box, so it never
+    // reaches this.
+    let title = match (presentation, installing_updates) {
+        (Presentation::Shutdown, true) => "Install Updates & Power Off",
+        (Presentation::Restart, true) => "Install Updates & Restart",
         _ => title,
     };
     let description = match seconds_left {
-        Some(secs) => format!("The system will be {verb} automatically in {secs} seconds."),
-        None => format!("Do you want to {}?", action.to_lowercase()),
+        // GNOME uses ngettext here; the singular is the last tick of every countdown, so it is a
+        // second the user reliably sees.
+        Some(1) => format!("{counting} in 1 second."),
+        Some(secs) => format!("{counting} in {secs} seconds."),
+        None => format!("Do you want to {question}?"),
     };
     (title, action, description)
 }
@@ -608,13 +681,14 @@ struct DialogLayout {
 fn prepare_dialog(
     renderer: &mut VulkanRenderer,
     scale: f64,
-    kind: EndSessionType,
+    presentation: Presentation,
     seconds_left: Option<u64>,
     focused: Focus,
     checkbox: Option<bool>,
 ) -> anyhow::Result<DialogLayout> {
     let _span = tracy_client::span!("end_session_dialog::prepare_dialog");
-    let (title, action_label, description) = content(kind, seconds_left, checkbox.unwrap_or(false));
+    let (title, action_label, description) =
+        content(presentation, seconds_left, checkbox.unwrap_or(false));
 
     let px = |logical: i32| to_physical_precise_round::<i32>(scale, logical);
     let padding = px(PADDING).max(0);
@@ -645,12 +719,12 @@ fn prepare_dialog(
     // The two neutral dialog buttons (logical geometry); the focused one draws the ring.
     let has_checkbox = checkbox.is_some();
     let cancel_btn = widget::Button::new(
-        EndSessionDialog::button_rect(Button::Cancel, has_checkbox),
+        EndSessionDialog::button_rect(Button::Cancel, has_checkbox, presentation),
         widget::ButtonStyle::Dialog,
     )
     .focused(focused == Focus::Button(Button::Cancel));
     let action_btn = widget::Button::new(
-        EndSessionDialog::button_rect(Button::Action, has_checkbox),
+        EndSessionDialog::button_rect(Button::Action, has_checkbox, presentation),
         widget::ButtonStyle::Dialog,
     )
     .focused(focused == Focus::Button(Button::Action));
@@ -754,22 +828,32 @@ mod tests {
             }
         };
 
-        for kind in [
-            EndSessionType::Logout,
-            EndSessionType::Shutdown,
-            EndSessionType::Restart,
+        for presentation in [
+            Presentation::Logout,
+            Presentation::Shutdown,
+            Presentation::Restart,
+            Presentation::UpdateRestart,
         ] {
-            for seconds in [Some(59), Some(0), None] {
+            for seconds in [Some(59), Some(1), Some(0), None] {
                 // Every focus target, and every checkbox state including absent — the checkbox
                 // changes the box's height and the title, so it is a rendering variant, not a flag.
-                for (focused, checkbox) in [
-                    (Focus::Button(Button::Cancel), None),
-                    (Focus::Button(Button::Action), None),
-                    (Focus::Button(Button::Action), Some(false)),
-                    (Focus::Button(Button::Cancel), Some(true)),
-                    (Focus::Check, Some(true)),
-                    (Focus::Check, Some(false)),
-                ] {
+                // UpdateRestart never carries one (it *is* the answer the box would ask for), so it
+                // draws only the boxless variants.
+                let variants: &[(Focus, Option<bool>)] = match presentation {
+                    Presentation::UpdateRestart => &[
+                        (Focus::Button(Button::Cancel), None),
+                        (Focus::Button(Button::Action), None),
+                    ],
+                    _ => &[
+                        (Focus::Button(Button::Cancel), None),
+                        (Focus::Button(Button::Action), None),
+                        (Focus::Button(Button::Action), Some(false)),
+                        (Focus::Button(Button::Cancel), Some(true)),
+                        (Focus::Check, Some(true)),
+                        (Focus::Check, Some(false)),
+                    ],
+                };
+                for &(focused, checkbox) in variants {
                     let box_h = height(checkbox.is_some());
                     let mut cache = BakeCache::new();
                     let mut tex = widget::bake(
@@ -777,8 +861,8 @@ mod tests {
                         &mut cache,
                         1.,
                         Size::from((f64::from(WIDTH), f64::from(box_h))),
-                        revision_for(kind, seconds, focused, checkbox, [0x35, 0x84, 0xe4]),
-                        |r| prepare_dialog(r, 1., kind, seconds, focused, checkbox),
+                        revision_for(presentation, seconds, focused, checkbox, [0x35, 0x84, 0xe4]),
+                        |r| prepare_dialog(r, 1., presentation, seconds, focused, checkbox),
                         |frame, phys, layout| {
                             paint_dialog(frame, phys, layout, 1., [0.2, 0.52, 0.89, 1.])
                         },
@@ -802,7 +886,8 @@ mod tests {
                     // rect (the fill is the neutral translucent dialog-button color, matching GNOME
                     // 50.1). Sample 1px below the top edge → the accent band (B clearly dominant).
                     if let Focus::Button(b) = focused {
-                        let rect = EndSessionDialog::button_rect(b, checkbox.is_some());
+                        let rect =
+                            EndSessionDialog::button_rect(b, checkbox.is_some(), presentation);
                         let bx = (rect.loc.x + rect.size.w / 2.) as i32;
                         let by = rect.loc.y as i32 + 1;
                         let i = ((by * size.w + bx) * 4) as usize;
@@ -826,20 +911,71 @@ mod tests {
 
     #[test]
     fn buttons_do_not_overlap_and_fit_within_the_dialog() {
-        for has_checkbox in [false, true] {
-            let cancel = EndSessionDialog::button_rect(Button::Cancel, has_checkbox);
-            let action = EndSessionDialog::button_rect(Button::Action, has_checkbox);
+        for presentation in [
+            Presentation::Logout,
+            Presentation::Shutdown,
+            Presentation::Restart,
+            Presentation::UpdateRestart,
+        ] {
+            for has_checkbox in [false, true] {
+                let cancel =
+                    EndSessionDialog::button_rect(Button::Cancel, has_checkbox, presentation);
+                let action =
+                    EndSessionDialog::button_rect(Button::Action, has_checkbox, presentation);
+                assert!(
+                    cancel.loc.x + cancel.size.w <= action.loc.x,
+                    "cancel must sit fully left of the action button ({presentation:?})",
+                );
+                assert!(
+                    cancel.loc.x >= f64::from(PADDING),
+                    "the widened action button must not push cancel out of the padding \
+                     ({presentation:?})",
+                );
+                assert!(
+                    action.loc.x + action.size.w <= f64::from(WIDTH),
+                    "the action button must fit within the dialog width ({presentation:?})",
+                );
+                assert!(
+                    action.loc.y + action.size.h <= f64::from(height(has_checkbox)),
+                    "the buttons must fit within the dialog height ({presentation:?})",
+                );
+            }
+        }
+    }
+
+    /// Our buttons are a fixed width where GNOME's expand, so a label that outgrows its button has
+    /// nothing to stop it overflowing — [`Painter::button`] just centres the run. Hold every action
+    /// label to the button it is drawn in, so the next long string fails here rather than on
+    /// screen. (This is what sized [`WIDE_BUTTON_W`]; "Restart & Install" does not fit
+    /// [`BUTTON_W`].)
+    #[test]
+    fn the_action_label_fits_its_button() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping the_action_label_fits_its_button: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let mut shaper = TextShaper::new(&mut vk, 1.);
+        for presentation in [
+            Presentation::Logout,
+            Presentation::Shutdown,
+            Presentation::Restart,
+            Presentation::UpdateRestart,
+        ] {
+            let (_, label, _) = content(presentation, Some(59), false);
+            let run = shaper
+                .shape(label, TextStyle::new(BODY_PT).bold())
+                .expect("shape the action label");
+            let (ix, _, iw, _) = run.ink_bounds();
+            let width = f64::from(ix + iw);
+            // `%dialog_button { padding: $base_padding * 2 }` (`_common.scss:211-213`, `:31`) —
+            // 12px, so the label needs its own width plus 12px either side.
+            let available = f64::from(EndSessionDialog::action_button_w(presentation)) - 2. * 12.;
             assert!(
-                cancel.loc.x + cancel.size.w <= action.loc.x,
-                "cancel must sit fully left of the action button",
-            );
-            assert!(
-                action.loc.x + action.size.w <= f64::from(WIDTH),
-                "the action button must fit within the dialog width",
-            );
-            assert!(
-                action.loc.y + action.size.h <= f64::from(height(has_checkbox)),
-                "the buttons must fit within the dialog height",
+                width <= available,
+                "{presentation:?} label {label:?} is {width}px, but only {available}px fits",
             );
         }
     }
@@ -849,7 +985,7 @@ mod tests {
     #[test]
     fn the_checkbox_row_sits_above_the_buttons_and_inside_the_box() {
         let check = EndSessionDialog::check_rect();
-        let action = EndSessionDialog::button_rect(Button::Action, true);
+        let action = EndSessionDialog::button_rect(Button::Action, true, Presentation::Restart);
         assert!(
             check.loc.y + check.size.h + f64::from(CONTENT_SPACING) <= action.loc.y,
             "the checkbox must clear the buttons by the content spacing: {check:?} {action:?}",

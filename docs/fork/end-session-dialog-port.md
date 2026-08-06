@@ -94,12 +94,39 @@ service is activatable and the interface is real, not aspirational.
   `scheduled`. Content: subject "Restart & Install Updates", button "Restart & Install", no
   checkbox. **`EndSessionType` must stay a three-variant wire enum** — this is a separate
   presentation field, not a fourth `from_u32` case, or an unexpected `3` on the wire becomes a
-  reboot.
+  reboot. Ours is `end_session::Presentation`, derived from `(kind, state)`.
+
+  Why only restart, when a scheduled update plus "Power Off" looks like the mirror image: **there is
+  no `UPDATE_SHUTDOWN`, and it cannot be built on this interface.** `GetState` reports `scheduled`
+  but never *which* action was scheduled with it, and the XML defines `scheduled` as "scheduled for
+  the next reboot" — so reboot is the one action a presentation may assume. GNOME leans into that:
+  UPDATE_RESTART re-asserts `SetAction("reboot")` on confirm (`:494-496`) rather than reading
+  anything back, which is a no-op when the prior action was a reboot and corrective when it wasn't.
+  The shutdown side keeps the checkbox because it needs the two things a presentation cannot give
+  it: a `NOT_SUPPORTED` fallback that leaves the signal `ConfirmedShutdown` (a button already
+  labelled "Install & Power Off" has promised what the backend may refuse), and `Cancel` as an
+  escape hatch. GNOME has the symmetric case *drafted but unshipped* — `restartUpdateDialogContent`
+  carries `unusedFutureButtonForTranslation: "Install & Power Off"` and
+  `unusedFutureCheckBoxForTranslation: "Power off after updates are installed"` (`:120-121`), both
+  inside the **restart-update** content, so the intended future is a checkbox *on this dialog*, not
+  a fifth type. Mirror the gap; implement their design when it lands, not a guess at it.
 
 ### 3.2 Slices — LANDED
 
-All four; the checkbox works end to end. What is *not* here is the `UPDATE_RESTART` presentation
-type and the battery gate, both in §4.
+All four, plus the `UPDATE_RESTART` presentation; the checkbox works end to end. What is *not* here
+is the battery gate, in §4.
+
+`Presentation` is derived per read from `(kind, updates)` rather than latched at `Open`, which is a
+small divergence with a reason: GNOME resolves gnome-software's state *before* showing the dialog
+(`_sync` runs in the `Open` handler), while we put the dialog up immediately and ask asynchronously,
+so ours can promote under an open dialog. Deriving means the promotion, the checkbox and the title
+can never disagree about the same state. It also means the presentation reaches
+`revision_for` — bits 0-1 — so the promotion re-bakes.
+
+Our action buttons are a fixed 120px where GNOME's expand to their content, and "Restart & Install"
+does not fit (113px of ink needs 137px of button). `action_button_w` widens that one to 140px, and
+`the_action_label_fits_its_button` measures every action label against its own button so the next
+long string fails in the suite rather than overflowing on screen.
 
 One thing worth knowing before changing the rendering: **the tick glyph is not in the baked card.**
 Icons are textures, not paint verbs, so `Painter::check_box` draws the frame and
@@ -126,7 +153,6 @@ of the baked texture therefore shows an empty accent square, correctly.
 
 Everything gnome-shell's dialog has that ours does not. None of it blocks §3; all of it is real.
 
-- **`UPDATE_RESTART` presentation type** (§3.1). Deferred with the rest of §3 beyond the checkbox.
 - **Battery gate** — `_isBatteryLow()` (`:313-316`): discharging *and* under 30% ⇒ the update
   checkbox starts unchecked. We have `system_status::BatteryStatus.percentage`
   (`src/system_status.rs:295`), but "discharging" is currently approximated from
@@ -134,7 +160,9 @@ Everything gnome-shell's dialog has that ours does not. None of it blocks §3; a
   if this lands alone:** GNOME pairs the gate with a visible warning label (below), and a checkbox
   that silently starts unchecked with no explanation is worse than either end.
 - **Low-battery warning label** — "Low battery power: please plug in before installing updates"
-  (`:260-266`), shown per `_shouldShowLowBatteryWarning`. Pairs with the gate above.
+  (`:260-266`), shown per `_shouldShowLowBatteryWarning`. Pairs with the gate above. Note the
+  warning is gated on `showBatteryWarning`, which the `UPDATE_RESTART` content also sets (`:115`) —
+  so landing this covers the promoted dialog too, not only the checkbox ones.
 - **Inhibitor application list** — the gap `session-end.md` §3 defers here, and the one that is a
   missing *feature* rather than a limit. `Open` hands us inhibitor object paths
   (`src/dbus/gnome_session.rs:59`) and we discard them, so an app with unsaved work cannot say so.

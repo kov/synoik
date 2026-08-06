@@ -6548,9 +6548,16 @@ impl State {
             EndSessionDialogToSynoik::Open { kind, seconds } => {
                 let kind = EndSessionType::from_u32(kind);
                 self.synoik.end_session.open(kind, seconds, now);
-                self.synoik.end_session_dialog.show(kind);
+                // Before gnome-software answers the presentation is just the wire type; a restart
+                // with an already-scheduled update is promoted when the reply lands.
+                let presentation = self
+                    .synoik
+                    .end_session
+                    .presentation()
+                    .expect("a dialog was just opened");
+                self.synoik.end_session_dialog.show(presentation);
                 self.synoik.end_session_dialog.set_content(
-                    kind,
+                    presentation,
                     self.synoik.end_session.seconds_left(now),
                     self.synoik.update_checkbox(),
                 );
@@ -14325,14 +14332,14 @@ impl Synoik {
 
     /// Push the state machine's current content at the dialog widget and redraw.
     fn refresh_end_session_content(&mut self) {
-        let Some(kind) = self.end_session.kind() else {
+        let Some(presentation) = self.end_session.presentation() else {
             return;
         };
         let now = self.clock.now_unadjusted();
         let seconds_left = self.end_session.seconds_left(now);
         let checkbox = self.update_checkbox();
         self.end_session_dialog
-            .set_content(kind, seconds_left, checkbox);
+            .set_content(presentation, seconds_left, checkbox);
         self.queue_redraw_all();
     }
 
@@ -14394,9 +14401,9 @@ impl Synoik {
         }
 
         // Still counting down: update the displayed seconds and tick again in a second.
-        if let Some(kind) = self.end_session.kind() {
+        if let Some(presentation) = self.end_session.presentation() {
             self.end_session_dialog.set_content(
-                kind,
+                presentation,
                 self.end_session.seconds_left(now),
                 self.update_checkbox(),
             );

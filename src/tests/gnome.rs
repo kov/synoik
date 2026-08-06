@@ -7807,6 +7807,68 @@ fn end_session_dialog_offers_pending_updates() {
     );
 }
 
+/// gnome-shell's fourth dialog *presentation*, `UPDATE_RESTART` (`endSessionDialog.js:684-687`):
+/// gnome-session never sends type 3, the shell promotes a restart to it when gnome-software says an
+/// update is already scheduled. The promotion happens under a dialog that is already on screen,
+/// because we ask gnome-software asynchronously — so this drives the real `Open` and the real
+/// reply.
+#[test]
+fn end_session_dialog_promotes_a_restart_with_a_scheduled_update() {
+    use crate::dbus::gnome_session::EndSessionDialogToSynoik;
+    use crate::end_session::{OfflineUpdateState, PostUpdateAction, Presentation, UpdateDecision};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // A restart opens as a plain restart — gnome-software has not answered yet.
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
+            kind: 2,
+            seconds: 60,
+        });
+    assert_eq!(
+        f.synoik().end_session.presentation(),
+        Some(Presentation::Restart)
+    );
+
+    // The answer lands: the update is already scheduled, so the dialog re-presents itself under the
+    // user rather than growing a checkbox to ask a question they have already answered.
+    f.synoik()
+        .on_offline_update_state(OfflineUpdateState::Scheduled);
+    assert_eq!(
+        f.synoik().end_session.presentation(),
+        Some(Presentation::UpdateRestart)
+    );
+    assert_eq!(
+        f.synoik().update_checkbox(),
+        None,
+        "the promoted dialog asks with its title, not a checkbox",
+    );
+
+    // Confirming still schedules the reboot: `GetState` never says *which* action was scheduled, so
+    // the dialog re-asserts it instead of reading it back.
+    let c = f.synoik().end_session.confirm().unwrap();
+    assert_eq!(c.updates, UpdateDecision::Install(PostUpdateAction::Reboot));
+    assert_eq!(c.signal(true), "ConfirmedReboot");
+    assert_eq!(c.signal(false), "ConfirmedReboot");
+
+    // Power off does NOT promote: GNOME has that half drafted but unshipped (the
+    // `unusedFuture*ForTranslation` strings, `:120-121`), so a scheduled update still gets the
+    // checkbox — and with it the fallback for a `SetAction` gnome-software refuses.
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
+            kind: 1,
+            seconds: 60,
+        });
+    f.synoik()
+        .on_offline_update_state(OfflineUpdateState::Scheduled);
+    assert_eq!(
+        f.synoik().end_session.presentation(),
+        Some(Presentation::Shutdown)
+    );
+    assert_eq!(f.synoik().update_checkbox(), Some(true));
+}
+
 #[test]
 fn screencast_area_picks_the_largest_intersection_output() {
     use smithay::utils::{Point, Rectangle, Size};

@@ -120,6 +120,50 @@ impl OfflineUpdateState {
     }
 }
 
+/// How the dialog is *presented* — its title, description and action label — as opposed to which
+/// action it confirms.
+///
+/// gnome-shell's `DialogType` has a fourth member, `UPDATE_RESTART`
+/// (`js/ui/endSessionDialog.js:130`), that gnome-session never sends: the shell promotes a
+/// `RESTART` to it itself when gnome-software says an update is already `scheduled` (`:684-687`).
+/// The user has already asked for the update, so asking again with a checkbox would be redundant;
+/// instead the whole dialog changes register to "Restart & Install Updates".
+///
+/// This is derived from `(kind, state)` rather than being a fourth [`EndSessionType`] variant on
+/// purpose: `EndSessionType` is the *wire* enum, and an unexpected `3` arriving in `Open` must not
+/// be able to turn into a reboot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presentation {
+    Logout = 0,
+    Shutdown = 1,
+    Restart = 2,
+    UpdateRestart = 3,
+}
+
+impl Presentation {
+    /// Promote a restart to [`UpdateRestart`](Self::UpdateRestart) when an update is already
+    /// scheduled. Only `Scheduled` promotes: `Prepared` means the update is downloaded but nobody
+    /// has asked for it, which is the checkbox's job.
+    pub fn for_dialog(kind: EndSessionType, state: OfflineUpdateState) -> Self {
+        match (kind, state) {
+            (EndSessionType::Restart, OfflineUpdateState::Scheduled) => Self::UpdateRestart,
+            (EndSessionType::Logout, _) => Self::Logout,
+            (EndSessionType::Shutdown, _) => Self::Shutdown,
+            (EndSessionType::Restart, _) => Self::Restart,
+        }
+    }
+
+    /// Whether this presentation carries the "Install pending software updates" checkbox: a pending
+    /// update *and* a presentation that offers one.
+    ///
+    /// Logout never does — you cannot install updates by logging out, and GNOME sets `checkBoxText`
+    /// only on the shutdown and restart content (`:77`/`:96`). Neither does `UpdateRestart`: it
+    /// exists precisely because the answer is already yes.
+    fn offers_updates(self, state: OfflineUpdateState) -> bool {
+        matches!(self, Self::Shutdown | Self::Restart) && state.has_pending_update()
+    }
+}
+
 /// What gnome-software should do once the updates are applied (`SetAction`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostUpdateAction {
@@ -222,22 +266,23 @@ impl EndSession {
         };
         dialog.updates = state;
         // Ticked by default whenever the box appears (`js/ui/endSessionDialog.js:718`).
-        dialog.install_updates = Self::offers_updates_for(dialog.kind, state);
+        dialog.install_updates = Presentation::for_dialog(dialog.kind, state).offers_updates(state);
     }
 
-    /// Whether the update checkbox is on screen: a pending update *and* a dialog type that offers
-    /// one. Logout never does — you cannot install updates by logging out
-    /// (`checkBoxText` is set only on the shutdown and restart content, `:77`/`:96`).
-    fn offers_updates_for(kind: EndSessionType, state: OfflineUpdateState) -> bool {
-        matches!(kind, EndSessionType::Shutdown | EndSessionType::Restart)
-            && state.has_pending_update()
+    /// How the open dialog presents itself, which the answer from gnome-software can change under
+    /// it: a restart whose update turns out to be `scheduled` becomes an "Restart & Install
+    /// Updates" dialog when the reply lands. `None` when no dialog is open.
+    pub fn presentation(&self) -> Option<Presentation> {
+        self.dialog
+            .as_ref()
+            .map(|d| Presentation::for_dialog(d.kind, d.updates))
     }
 
     /// Whether the update checkbox is currently on screen.
     pub fn offers_updates(&self) -> bool {
         self.dialog
             .as_ref()
-            .is_some_and(|d| Self::offers_updates_for(d.kind, d.updates))
+            .is_some_and(|d| Presentation::for_dialog(d.kind, d.updates).offers_updates(d.updates))
     }
 
     /// Whether that checkbox is ticked. Always false when it isn't shown.
@@ -281,10 +326,11 @@ impl EndSession {
     /// return what to do — the session action, and what became of the offline update. `None` if no
     /// dialog is open.
     pub fn confirm(&mut self) -> Option<Confirmation> {
+        let presentation = self.presentation()?;
         let offers = self.offers_updates();
         self.dialog.take().map(|d| Confirmation {
             kind: d.kind,
-            updates: Self::decide(d.kind, offers, d.install_updates),
+            updates: Self::decide(presentation, offers, d.install_updates),
         })
     }
 
@@ -294,18 +340,30 @@ impl EndSession {
     /// nothing the user said about updates, so we say nothing to gnome-software
     /// (`js/ui/endSessionDialog.js:469`). With a box, unticking it is an explicit "not this time"
     /// and gets a `Cancel`.
-    fn decide(kind: EndSessionType, offers: bool, install: bool) -> UpdateDecision {
+    ///
+    /// The exception is [`Presentation::UpdateRestart`], which has no box because the whole dialog
+    /// *is* the question: confirming it re-asserts `reboot` unconditionally
+    /// (`js/ui/endSessionDialog.js:494-496`). That call is a no-op restatement when the scheduled
+    /// action was already a reboot, and corrective when it was not — and it has to be, because
+    /// `GetState` reports only that an update is scheduled, never which action was scheduled with
+    /// it. The dialog can't read the action back, so it sets it.
+    fn decide(presentation: Presentation, offers: bool, install: bool) -> UpdateDecision {
         if !offers {
-            return UpdateDecision::Untouched;
+            return match presentation {
+                Presentation::UpdateRestart => UpdateDecision::Install(PostUpdateAction::Reboot),
+                _ => UpdateDecision::Untouched,
+            };
         }
         if !install {
             return UpdateDecision::Discard;
         }
-        match kind {
-            EndSessionType::Restart => UpdateDecision::Install(PostUpdateAction::Reboot),
-            EndSessionType::Shutdown => UpdateDecision::Install(PostUpdateAction::Shutdown),
-            // Unreachable: logout never offers the box (`offers_updates_for`).
-            EndSessionType::Logout => UpdateDecision::Untouched,
+        match presentation {
+            Presentation::Restart | Presentation::UpdateRestart => {
+                UpdateDecision::Install(PostUpdateAction::Reboot)
+            }
+            Presentation::Shutdown => UpdateDecision::Install(PostUpdateAction::Shutdown),
+            // Unreachable: logout never offers the box (`Presentation::offers_updates`).
+            Presentation::Logout => UpdateDecision::Untouched,
         }
     }
 
@@ -482,23 +540,29 @@ mod offline_update_tests {
     }
 
     /// The box is offered only where GNOME sets `checkBoxText` — shutdown and restart — and only
-    /// when something is actually pending. Logging out installs nothing.
+    /// when something is actually pending. Logging out installs nothing, and a restart whose update
+    /// is already `scheduled` is promoted to [`Presentation::UpdateRestart`], which asks with its
+    /// title instead of a checkbox.
     #[test]
     fn only_shutdown_and_restart_offer_the_checkbox() {
         for state in [OfflineUpdateState::Prepared, OfflineUpdateState::Scheduled] {
             assert!(
                 open(EndSessionType::Shutdown, state).offers_updates(),
-                "{state:?}"
-            );
-            assert!(
-                open(EndSessionType::Restart, state).offers_updates(),
-                "{state:?}"
+                "power off offers the box whichever way the update is pending ({state:?})"
             );
             assert!(
                 !open(EndSessionType::Logout, state).offers_updates(),
                 "logout must never offer to install updates ({state:?})"
             );
         }
+        assert!(
+            open(EndSessionType::Restart, OfflineUpdateState::Prepared).offers_updates(),
+            "a prepared update is the checkbox's question to ask"
+        );
+        assert!(
+            !open(EndSessionType::Restart, OfflineUpdateState::Scheduled).offers_updates(),
+            "a scheduled update is already answered — the dialog changes instead"
+        );
         for state in [OfflineUpdateState::None, OfflineUpdateState::Unavailable] {
             assert!(
                 !open(EndSessionType::Shutdown, state).offers_updates(),
@@ -602,9 +666,89 @@ mod offline_update_tests {
     /// the box was on screen and ticked, and the user let it stand.
     #[test]
     fn the_countdown_auto_confirms_the_update_too() {
-        let mut e = open(EndSessionType::Restart, OfflineUpdateState::Scheduled);
+        let mut e = open(EndSessionType::Restart, OfflineUpdateState::Prepared);
+        assert!(
+            e.offers_updates(),
+            "this is the checkbox path, not the promoted one"
+        );
         let c = e.tick(s(60)).unwrap();
         assert_eq!(c.updates, UpdateDecision::Install(PostUpdateAction::Reboot));
+    }
+
+    /// **The promotion.** A restart whose update is already scheduled becomes gnome-shell's fourth
+    /// dialog *presentation* — `UPDATE_RESTART` (`js/ui/endSessionDialog.js:684-687`) — which the
+    /// wire enum never carries. The user already asked for the update, so the dialog says so in its
+    /// title instead of asking again with a checkbox.
+    #[test]
+    fn a_scheduled_update_promotes_a_restart_to_update_restart() {
+        for (kind, state, expected) in [
+            (
+                EndSessionType::Restart,
+                OfflineUpdateState::Scheduled,
+                Presentation::UpdateRestart,
+            ),
+            // Prepared is downloaded-but-unasked-for: that is the checkbox's question.
+            (
+                EndSessionType::Restart,
+                OfflineUpdateState::Prepared,
+                Presentation::Restart,
+            ),
+            (
+                EndSessionType::Restart,
+                OfflineUpdateState::None,
+                Presentation::Restart,
+            ),
+            // Only a restart promotes. GNOME has the shutdown half drafted but unshipped (the
+            // `unusedFuture*ForTranslation` strings, `:120-121`), so power-off keeps the checkbox.
+            (
+                EndSessionType::Shutdown,
+                OfflineUpdateState::Scheduled,
+                Presentation::Shutdown,
+            ),
+            (
+                EndSessionType::Logout,
+                OfflineUpdateState::Scheduled,
+                Presentation::Logout,
+            ),
+        ] {
+            assert_eq!(
+                open(kind, state).presentation(),
+                Some(expected),
+                "{kind:?} + {state:?}"
+            );
+        }
+    }
+
+    /// The promoted dialog has no checkbox, but confirming it still schedules the reboot: the
+    /// dialog itself is the question, and `GetState` cannot tell us which action was scheduled, so
+    /// we re-assert it (`:494-496`).
+    #[test]
+    fn confirming_a_promoted_restart_re_asserts_the_reboot() {
+        let mut e = open(EndSessionType::Restart, OfflineUpdateState::Scheduled);
+        assert!(!e.offers_updates(), "no checkbox on the promoted dialog");
+        assert!(!e.install_updates());
+
+        let c = e.confirm().unwrap();
+        assert_eq!(
+            c.updates,
+            UpdateDecision::Install(PostUpdateAction::Reboot),
+            "the promoted dialog installs even though nothing was ticked",
+        );
+        // Nothing to rewrite: a restart is a reboot however `SetAction` went.
+        assert_eq!(c.signal(true), "ConfirmedReboot");
+        assert_eq!(c.signal(false), "ConfirmedReboot");
+    }
+
+    /// Space on a dialog with no checkbox must not arm anything — the promoted dialog has no box to
+    /// toggle, and toggling must not be able to turn its unconditional install into a `Cancel`.
+    #[test]
+    fn the_promoted_dialog_cannot_be_toggled_out_of_installing() {
+        let mut e = open(EndSessionType::Restart, OfflineUpdateState::Scheduled);
+        e.toggle_install_updates();
+        assert_eq!(
+            e.confirm().unwrap().updates,
+            UpdateDecision::Install(PostUpdateAction::Reboot),
+        );
     }
 
     /// Cancelling the dialog says nothing to gnome-software at all: `Cancel` is what unticking the
