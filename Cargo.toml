@@ -177,7 +177,12 @@ xdp-gnome-screencast = ["pipewire"]
 # Enables the audio (volume/mute) indicator + quick-settings slider via PipeWire.
 audio = ["pipewire"]
 # Enables the Tracy profiler instrumentation.
-profile-with-tracy = ["profiling/profile-with-tracy", "tracy-client/default", "smithay/tracy_gpu_profiling"]
+# No `smithay/tracy_gpu_profiling`: it instruments smithay's *GLES* renderer, which we deleted, and
+# it enables `renderer_gl` → `backend_egl`. That flips smithay's blanket `ImportAll` to the variant
+# requiring `ImportEgl` (renderer/mod.rs:692-697), which `VulkanRenderer` deliberately does not
+# implement — there is no EGL in this build — so the feature simply did not compile. Our own GPU
+# timings come from Vulkan timestamp queries, not smithay's.
+profile-with-tracy = ["profiling/profile-with-tracy", "tracy-client/default"]
 # Enables the on-demand Tracy profiler instrumentation.
 profile-with-tracy-ondemand = ["profile-with-tracy", "tracy-client/ondemand", "tracy-client/manual-lifetime"]
 # Enables Tracy allocation profiling.
