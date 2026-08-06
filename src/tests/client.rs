@@ -18,6 +18,10 @@ use std::time::Duration;
 use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
 use single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
+use smithay::reexports::wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::{
+    self, Capability, ExtBackgroundEffectManagerV1,
+};
+use smithay::reexports::wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
 use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
 use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::{
     self, ZwpKeyboardShortcutsInhibitorV1,
@@ -86,6 +90,9 @@ pub struct State {
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub shm: Option<WlShm>,
     pub viewporter: Option<WpViewporter>,
+    pub background_effect_manager: Option<ExtBackgroundEffectManagerV1>,
+    /// The capabilities the compositor announced on bind, if the global was there at all.
+    pub background_effect_capabilities: Option<Capability>,
     pub seat: Option<WlSeat>,
     pub shortcuts_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
     pub screencopy_manager: Option<ZwlrScreencopyManagerV1>,
@@ -364,6 +371,8 @@ impl Client {
             spbm: None,
             shm: None,
             viewporter: None,
+            background_effect_manager: None,
+            background_effect_capabilities: None,
             seat: None,
             shortcuts_inhibit_manager: None,
             screencopy_manager: None,
@@ -418,6 +427,18 @@ impl Client {
         height: i32,
     ) {
         self.state.set_opaque_region(surface, x, y, width, height)
+    }
+
+    pub fn set_blur_region(
+        &mut self,
+        surface: &WlSurface,
+        rect: (i32, i32, i32, i32),
+    ) -> ExtBackgroundEffectSurfaceV1 {
+        self.state.set_blur_region(surface, rect)
+    }
+
+    pub fn background_effect_capabilities(&self) -> Option<Capability> {
+        self.state.background_effect_capabilities
     }
 
     pub fn create_layer(
@@ -535,6 +556,30 @@ impl State {
     /// `width`/`height` go on the wire verbatim, so a test can send a **negative** extent — which
     /// the protocol permits and real clients do send (Firefox, while resizing). Used to pin that
     /// the compositor survives it.
+    /// Ask for background blur behind `rect` of `surface`, through
+    /// `ext-background-effect-v1`, and commit it.
+    ///
+    /// Returns the effect object: the protocol allows only one per surface (a second is a
+    /// `background_effect_exists` error), so a caller that wants to change or unset the region
+    /// keeps this rather than calling again.
+    pub fn set_blur_region(
+        &mut self,
+        surface: &WlSurface,
+        rect: (i32, i32, i32, i32),
+    ) -> ExtBackgroundEffectSurfaceV1 {
+        let compositor = self.compositor.as_ref().unwrap();
+        let manager = self.background_effect_manager.as_ref().unwrap();
+
+        let effect = manager.get_background_effect(surface, &self.qh, ());
+        let region = compositor.create_region(&self.qh, ());
+        let (x, y, width, height) = rect;
+        region.add(x, y, width, height);
+        effect.set_blur_region(Some(&region));
+        region.destroy();
+        surface.commit();
+        effect
+    }
+
     pub fn set_opaque_region(
         &mut self,
         surface: &WlSurface,
@@ -903,6 +948,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == WpViewporter::interface().name {
                     let version = min(version, WpViewporter::interface().version);
                     state.viewporter = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ExtBackgroundEffectManagerV1::interface().name {
+                    let version = min(version, ExtBackgroundEffectManagerV1::interface().version);
+                    state.background_effect_manager = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WlOutput::interface().name {
                     let version = min(version, WlOutput::interface().version);
                     let output = registry.bind(name, version, qh, ());
@@ -1232,6 +1280,37 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
             // LinuxDmabuf/Damage/Flags: not needed for the shm byte check.
             _ => {}
         }
+    }
+}
+
+impl Dispatch<ExtBackgroundEffectManagerV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &ExtBackgroundEffectManagerV1,
+        event: <ExtBackgroundEffectManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_background_effect_manager_v1::Event::Capabilities { flags } => {
+                state.background_effect_capabilities = flags.into_result().ok();
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<ExtBackgroundEffectSurfaceV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtBackgroundEffectSurfaceV1,
+        _event: <ExtBackgroundEffectSurfaceV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
     }
 }
 

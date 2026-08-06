@@ -24,6 +24,16 @@ We register the global unconditionally (`synoik.rs:6790`) and always answer `Cap
 we cache the committed region as non-overlapping surface-local rects and damage the surface's
 background effect on commit.
 
+**Fixed 2026-08-06** (§5 defects 1 and 2): client-requested blur now takes the real-backdrop path,
+and blur turned off globally makes the request a no-op rather than a see-through hole. §2 describes
+the state before that change and the machinery both paths still share; the resolution rule now reads:
+
+```
+has_blur_region → blur = true, xray = false        (unless a rule says otherwise)
+shell-requested → blur per rule, xray = true       (unchanged: the cheap path)
+blur.off        → nothing renders, capability bit cleared
+```
+
 ## 2. Today's rendering path
 
 `src/render_helpers/background_effect.rs` decides, per surface, from three inputs: the client's blur
@@ -122,14 +132,26 @@ per-material tint/vibrancy recipe, the active/inactive fallback, and the accessi
 
 Defects first — these are wrong, not merely absent.
 
-1. **Client blur is wallpaper-only.** §2. The fix is to reach the `FramebufferEffect` path for
-   client-requested regions; the path already exists. Needs a decision on the default and on what
-   replaces the dead rule plumbing.
-2. **`blur.off` + a client region turns the window see-through.** With blur disabled, `options.xray`
-   is still true and `blur` is false, so the client gets an *unblurred* hole onto the wallpaper —
-   strictly worse than doing nothing. `capabilities()` also keeps advertising `Blur` in that state
-   instead of clearing the bit (the protocol explicitly supports capabilities changing, and says the
-   effect stops being applied when the bit goes away).
+1. ~~**Client blur is wallpaper-only.**~~ **DONE 2026-08-06.** `update_render_elements` no longer
+   defaults xray on when the region came from the client, so client blur reaches the existing
+   `FramebufferEffect` real-backdrop path. An explicit `xray: true` rule still wins; shell-requested
+   effects still default to xray, which is the cheaper path and what the overview/shell chrome want.
+   Pinned by `a_client_blur_region_blurs_the_real_backdrop` and its three siblings, over the
+   resolution rule, and by `src/tests/background_effect.rs` over the protocol seam either side of it
+   (a real client binds the manager, sets a region, and the compositor-side cache is read back).
+   The draw itself was already pinned: `vulkan_backdrop_blur_honours_the_subregion` renders the
+   real-backdrop path with a `set_blur_region` subregion and checks the edge softens inside it and
+   stays sharp outside.
+   **Cost note:** each blurred surface now pays a mid-frame capture + its own Kawase chain per
+   frame, where the xray path shared one buffer per output. Both are cached across frames
+   (`BackdropBlur` in the element's `UserDataMap`) and the blur records into the frame's own command
+   buffer, so it is not a submit — but it is real per-surface GPU work, and gap 8 (occlusion skip)
+   is what bounds it.
+2. ~~**`blur.off` + a client region turns the window see-through.**~~ **DONE 2026-08-06.** `off` is
+   folded into `options.blur` at resolve time, so a surface whose only effect was that blur stops
+   being visible instead of degrading to an unblurred hole, and `capabilities()` clears the blur bit
+   to match. The capabilities event is bind-time only; that is honest while `Blur::off` has no
+   runtime writer, and the handler says what to do when one appears.
 3. **No corner rounding for client regions.** `clip_to_geometry` is unreachable, so the blur under a
    rounded CSD corner is square unless the client's own region is rounded. KWin has a shader for
    exactly this.
