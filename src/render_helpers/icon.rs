@@ -545,6 +545,10 @@ fn embedded_icon(name: &str) -> Option<&'static [u8]> {
         "preview-close-symbolic" => Some(include_bytes!(
             "../../resources/icons/preview-close-symbolic.svg"
         )),
+        // The tick inside a `widget::CheckBox` (`js/ui/checkBox.js:27`). Not to be confused with
+        // `object-select-symbolic` (`style::CHECK_ICONS`), which is Adwaita's and is what a *menu
+        // ornament* uses — this one is gnome-shell's own, 14px, and is the check box's glyph.
+        "check-symbolic" => Some(include_bytes!("../../resources/icons/check-symbolic.svg")),
         // The screenshot UI's type buttons and its show-pointer toggle. `camera-photo-symbolic`
         // and `camera-web-symbolic`, which the shot/cast pair uses, come from the icon theme
         // instead — those are Adwaita's, not gnome-shell's own.

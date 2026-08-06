@@ -122,6 +122,49 @@ pub mod style {
     /// Icon-name fallback chain for an "active/selected" check mark.
     pub const CHECK_ICONS: &[&str] = &["object-select-symbolic", "emblem-ok-symbolic"];
 
+    /// SCSS `lighten($c, n%)` / `darken($c, n%)`: shift HSL **lightness** by `delta` (in 0..=1,
+    /// signed), clamped, leaving hue and saturation alone. Alpha is untouched.
+    ///
+    /// Most of this module resolves such expressions at authoring time into a literal constant —
+    /// which is only possible when the input is literal too. The *accent* is chosen at runtime, so
+    /// every accent-derived hover/press state has to do the arithmetic here instead. Multiplying
+    /// the channels is not the same operation: it darkens saturated colours toward black and
+    /// cannot lighten a pure channel at all.
+    pub fn shift_lightness(c: Rgba, delta: f32) -> Rgba {
+        let (r, g, b) = (c[0], c[1], c[2]);
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let l = (max + min) / 2.;
+        let target = (l + delta).clamp(0., 1.);
+
+        // Scale toward white or black about the current lightness, which preserves hue and
+        // saturation the way HSL's own round trip does for the achromatic-safe cases.
+        let scale = |v: f32| {
+            if target >= l {
+                if l >= 1. {
+                    return 1.;
+                }
+                v + (1. - v) * ((target - l) / (1. - l))
+            } else {
+                if l <= 0. {
+                    return 0.;
+                }
+                v * (target / l)
+            }
+        };
+        [scale(r), scale(g), scale(b), c[3]]
+    }
+
+    /// SCSS `lighten($c, n%)`, `amount` in 0..=1.
+    pub fn lighten(c: Rgba, amount: f32) -> Rgba {
+        shift_lightness(c, amount)
+    }
+
+    /// SCSS `darken($c, n%)`, `amount` in 0..=1.
+    pub fn darken(c: Rgba, amount: f32) -> Rgba {
+        shift_lightness(c, -amount)
+    }
+
     /// `%osd_panel` background — `$osd_bg_color` = `lighten(#222226, 5%)` ≈ `#2e2e33`
     /// (`_colors.scss:17`). Shared: the OSD pill and the Alt-Tab `.switcher-list` both extend
     /// `%osd_panel` (`_common.scss:294`, `_switcher-popup.scss:11`), so they are one value.
@@ -2429,6 +2472,160 @@ impl IconButton {
     }
 }
 
+/// GNOME's `CheckBox` (`js/ui/checkBox.js`) — a tick box plus a label, the whole row clickable.
+///
+/// The glyph *frame* is paint ([`Painter::check_box`]); the tick itself is an icon element the
+/// caller composites at [`CheckBox::glyph_centre`], the same split [`menu::Menu::ornaments`] uses,
+/// because icons are textures rather than paint verbs. The tick is only drawn when `checked` —
+/// unchecked is `color: transparent` in the SCSS (`_check-box.scss:21`), i.e. the glyph is still
+/// laid out, just invisible; not drawing it at all is the same picture.
+///
+/// Sizes come from `_check-box.scss` via `gnome-style-reference.md` §check-box. `rect` is the whole
+/// row (frame + spacing + label) so the hit target matches GNOME's, where the CheckBox *is* the
+/// St.Button and clicking the label toggles it.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckBox {
+    /// The whole clickable row, in the owner's logical space.
+    pub rect: Rectangle<f64, Logical>,
+    pub checked: bool,
+    pub hovered: bool,
+    /// Keyboard-focused — draws the focus ring around the frame (not around the row).
+    pub focused: bool,
+    /// Pressed (pointer down on it).
+    pub active: bool,
+}
+
+impl CheckBox {
+    /// `icon-size: 14px` (`_check-box.scss:18`).
+    pub const ICON_PX: f64 = 14.;
+    /// `StIcon { padding: 1px; border: 2px }` — the frame is the glyph plus both.
+    const GLYPH_PAD: f64 = 1.;
+    const BORDER: f64 = 2.;
+    /// `border-radius: 6px` on the glyph frame (`:22`).
+    const RADIUS: f64 = 6.;
+    /// `StBin { border-radius: 7px; padding: 2px }` — the focus ring's box, one step out
+    /// from the frame (`:6-8`).
+    const FOCUS_PAD: f64 = 2.;
+    const FOCUS_RADIUS: f64 = 7.;
+
+    /// The glyph frame's side: 14px icon + 1px padding + 2px border, per side.
+    pub fn frame_px() -> f64 {
+        Self::ICON_PX + (Self::GLYPH_PAD + Self::BORDER) * 2.
+    }
+
+    /// `StBoxLayout { spacing: .8em }` (`:4`) between the frame and the label. `em` resolves
+    /// against the row's own font size, so it is a function of the label's point size rather
+    /// than a constant.
+    pub fn label_gap(label_pt: f64) -> f64 {
+        super::pt_to_px(label_pt) * 0.8
+    }
+
+    /// Where the label starts, given the row's origin: past the frame and the gap.
+    pub fn label_x(&self, label_pt: f64) -> f64 {
+        self.rect.loc.x + Self::frame_px() + Self::label_gap(label_pt)
+    }
+
+    pub fn new(rect: Rectangle<f64, Logical>, checked: bool) -> Self {
+        Self {
+            rect,
+            checked,
+            hovered: false,
+            focused: false,
+            active: false,
+        }
+    }
+
+    pub fn hovered(mut self, hovered: bool) -> Self {
+        self.hovered = hovered;
+        self
+    }
+
+    pub fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+
+    pub fn active(mut self, active: bool) -> Self {
+        self.active = active;
+        self
+    }
+
+    /// The glyph frame, vertically centred on the row (`y_align: START` on the bin but the label
+    /// is `CENTER`, and with a single-line label the two agree).
+    pub fn frame_rect(&self) -> Rectangle<f64, Logical> {
+        let side = Self::frame_px();
+        Rectangle::new(
+            Point::from((
+                self.rect.loc.x,
+                self.rect.loc.y + (self.rect.size.h - side) / 2.,
+            )),
+            Size::from((side, side)),
+        )
+    }
+
+    /// The tick's centre, for the caller to composite `check-symbolic` at [`Self::ICON_PX`].
+    pub fn glyph_centre(&self) -> Point<f64, Logical> {
+        let f = self.frame_rect();
+        Point::from((f.loc.x + f.size.w / 2., f.loc.y + f.size.h / 2.))
+    }
+
+    /// Hit-test in the row's own logical space — the **whole row**, label included.
+    pub fn contains(&self, p: Point<f64, Logical>) -> bool {
+        self.rect.contains(p)
+    }
+}
+
+impl Painter<'_, '_, '_> {
+    /// Draw a [`CheckBox`]'s frame: the border (or the accent fill when checked) and the focus
+    /// ring. The tick glyph and the label are composited by the caller.
+    ///
+    /// Unchecked the frame is a 2px border and nothing else — `background-color` is unset, so the
+    /// dialog behind shows through. Checked it is a solid accent fill with **no** border
+    /// (`border-color: transparent`, `:37`): filling *and* stroking would thicken the box by 2px
+    /// the moment it is ticked.
+    pub fn check_box(&mut self, c: &CheckBox, accent: Rgba) -> anyhow::Result<()> {
+        let frame = c.frame_rect();
+
+        if c.checked {
+            // `:checked { background-color: -st-accent-color }`, lightened 5% on hover and
+            // darkened 7% on press (`:40-47`).
+            let bg = match (c.active, c.hovered) {
+                (true, _) => style::darken(accent, 0.07),
+                (false, true) => style::lighten(accent, 0.05),
+                (false, false) => accent,
+            };
+            self.fill_rounded(frame, CheckBox::RADIUS, bg)?;
+        } else {
+            // `border: 2px solid transparentize(white, .85)`, tightening to .8 on hover and
+            // .7 on press (`:23-31`).
+            let alpha = match (c.active, c.hovered) {
+                (true, _) => 0.3,
+                (false, true) => 0.2,
+                (false, false) => 0.15,
+            };
+            self.stroke_rounded(
+                frame,
+                CheckBox::RADIUS,
+                CheckBox::BORDER,
+                [1., 1., 1., alpha],
+            )?;
+        }
+
+        if c.focused {
+            // `:focus StBin { box-shadow: inset 0 0 0 2px accent @35% }` — on the *bin*, which is
+            // the frame grown by its 2px padding, at the bin's own 7px radius.
+            let pad = CheckBox::FOCUS_PAD;
+            let ring = Rectangle::new(
+                Point::from((frame.loc.x - pad, frame.loc.y - pad)),
+                Size::from((frame.size.w + pad * 2., frame.size.h + pad * 2.)),
+            );
+            let color = [accent[0], accent[1], accent[2], 0.35];
+            self.stroke_rounded(ring, CheckBox::FOCUS_RADIUS, 2., color)?;
+        }
+        Ok(())
+    }
+}
+
 impl Painter<'_, '_, '_> {
     /// Paint an [`IconButton`]'s chrome — the circle, its hover wash and its focus ring. The glyph
     /// itself is composited by the caller (icons are textures, not paint ops); use
@@ -4142,5 +4339,81 @@ mod tests {
         assert_eq!(b.loc.x, a.loc.x + seg.w + S::SPACING);
         // The last segment ends exactly one padding short of the container edge.
         assert_eq!(b.loc.x + b.size.w + S::PAD, rect.loc.x + rect.size.w);
+    }
+}
+
+#[cfg(test)]
+mod check_box_tests {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use super::{style, CheckBox};
+
+    fn row() -> CheckBox {
+        CheckBox::new(
+            Rectangle::new(Point::from((10., 100.)), Size::from((300., 24.))),
+            false,
+        )
+    }
+
+    /// The frame is the glyph plus its padding *and* its border, per side — 14 + (1 + 2) * 2. Read
+    /// off `_check-box.scss:17-23`; deriving it from `icon-size` alone would draw a 14px box and
+    /// leave the tick touching the border.
+    #[test]
+    fn frame_is_the_glyph_plus_padding_and_border() {
+        assert_eq!(CheckBox::frame_px(), 20.);
+        let f = row().frame_rect();
+        assert_eq!(f.size, Size::from((20., 20.)));
+        // Vertically centred on the row, horizontally at its leading edge.
+        assert_eq!(f.loc.x, 10.);
+        assert_eq!(f.loc.y, 100. + (24. - 20.) / 2.);
+    }
+
+    /// `spacing: .8em` is a function of the label's own point size, not a constant — a caller
+    /// using a bigger label must get a proportionally bigger gap.
+    #[test]
+    fn label_gap_scales_with_the_label_size() {
+        let small = CheckBox::label_gap(11.);
+        let big = CheckBox::label_gap(22.);
+        assert!((big - small * 2.).abs() < 1e-6, "{small} {big}");
+        assert!((small - crate::ui::pt_to_px(11.) * 0.8).abs() < 1e-6);
+        // The label clears the frame and the gap.
+        assert_eq!(row().label_x(11.), 10. + 20. + small);
+    }
+
+    /// The whole row is the hit target, label included — GNOME's CheckBox *is* the St.Button, so
+    /// clicking the text toggles it. Hit-testing only the 20px frame would make the label look
+    /// clickable and not be.
+    #[test]
+    fn the_whole_row_is_clickable_not_just_the_frame() {
+        let c = row();
+        assert!(c.contains(Point::from((12., 110.))), "the frame");
+        assert!(c.contains(Point::from((250., 110.))), "the label");
+        assert!(!c.contains(Point::from((400., 110.))), "past the row");
+        assert!(!c.contains(Point::from((250., 130.))), "below the row");
+    }
+
+    /// `lighten`/`darken` are HSL lightness shifts. Pinned because the obvious channel-multiply
+    /// stand-in gets both directions wrong: it cannot lighten a saturated primary at all, and it
+    /// darkens toward black rather than toward the requested lightness.
+    #[test]
+    fn lighten_and_darken_move_lightness_not_channels() {
+        let blue: super::Rgba = [0., 0., 1., 1.];
+        let lit = style::lighten(blue, 0.1);
+        assert!(
+            lit[0] > 0. && lit[1] > 0.,
+            "lightening must raise the floor"
+        );
+        assert!((lit[2] - 1.).abs() < 1e-6, "and leave the ceiling alone");
+
+        let dark = style::darken(blue, 0.1);
+        assert!(
+            dark[2] < 1. && dark[2] > 0.7,
+            "darkened, not crushed: {dark:?}"
+        );
+        assert_eq!(dark[3], 1., "alpha is untouched");
+
+        // Saturating at either end must not produce a NaN.
+        assert_eq!(style::lighten([1., 1., 1., 1.], 0.5), [1., 1., 1., 1.]);
+        assert_eq!(style::darken([0., 0., 0., 1.], 0.5), [0., 0., 0., 1.]);
     }
 }
