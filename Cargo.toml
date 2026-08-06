@@ -11,7 +11,10 @@ description = "A GNOME-behaviors Wayland desktop, written in Rust"
 authors = ["Gustavo Noronha Silva <gustavo@noronha.dev.br>"]
 license = "GPL-3.0-only"
 edition = "2021"
-rust-version = "1.85"
+# The floor our dependency tree actually imposes: glib/gio 0.22 want 1.92, and synoik-vk has
+# declared 1.92 on its own since it was written. Inherited from niri as 1.85, which no longer
+# resolved — keep this honest, the `msrv` CI job builds against exactly this number.
+rust-version = "1.92"
 
 [workspace.dependencies]
 anyhow = "1.0.102"

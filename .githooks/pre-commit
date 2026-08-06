@@ -8,12 +8,17 @@
 # drift has ridden into commits before (the volume-slider slice); this gate
 # stops it. Clippy is strict: -D warnings across all targets.
 
-cargo fmt --all -- --check || {
-    echo "cargo fmt found issues; run 'cargo fmt --all' to fix" >&2
+# Both tools are pinned to the toolchain the matching CI job uses, so "green hook = green job"
+# is actually true. It was not: with a nightly default toolchain the hook ran nightly clippy,
+# which carries lints stable has not shipped yet, and rejected commits CI would have passed.
+# rustfmt needs nightly (rustfmt.toml uses the unstable imports_granularity/group_imports);
+# clippy must be stable, which is what the CI job installs.
+cargo +nightly fmt --all -- --check || {
+    echo "cargo fmt found issues; run 'cargo +nightly fmt --all' to fix" >&2
     exit 1
 }
 
-cargo clippy --workspace --all-targets -- -D warnings || {
+cargo +stable clippy --workspace --all-targets -- -D warnings || {
     echo "cargo clippy found issues" >&2
     exit 1
 }

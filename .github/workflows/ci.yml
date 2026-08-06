@@ -147,7 +147,9 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y ${{ env.DEPS_APT }}
 
-      - uses: dtolnay/rust-toolchain@1.85.0
+      # Must match `rust-version` in the workspace Cargo.toml — that is the number this job exists
+      # to prove, and the two drifting apart is how it came to pin a toolchain cargo would refuse.
+      - uses: dtolnay/rust-toolchain@1.92.0
 
       - uses: Swatinem/rust-cache@v2
 
