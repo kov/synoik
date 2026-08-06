@@ -3699,7 +3699,15 @@ mod tests {
                 &xml,
                 &mut sources,
             ),
-            Err(_) => eprintln!("gsd media-keys schema not installed; media keys unchecked"),
+            // Not optional: the media keys are a real part of the keymap this test compares, and
+            // "unchecked" is indistinguishable from "checked and fine" in a green run. Install
+            // gnome-settings-daemon (Fedora) / gnome-settings-daemon-common (Debian, Ubuntu).
+            Err(err) => panic!(
+                "gsd media-keys schema is not installed ({gsd}): {err}\n\
+                 This test compares our accelerators against GNOME's, and gnome-settings-daemon \
+                 owns the media-key half of them — without it the comparison silently comes up \
+                 short instead of failing.",
+            ),
         }
 
         assert!(

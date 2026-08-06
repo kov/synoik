@@ -14,8 +14,12 @@ env:
   # oracle the Vulkan render tests compare against; pango/cairo are for synoik-vk's text. glslang
   # supplies `glslangValidator`, which synoik-vk/build.rs shells out to to compile the shaders to
   # SPIR-V — a build dependency, not a runtime one, and a hard failure without it.
-  DEPS_APT: curl gcc clang glslang-tools libudev-dev libgbm-dev libxkbcommon-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libglib2.0-dev libpango1.0-dev libcairo2-dev libpixman-1-dev libdisplay-info-dev
-  DEPS_DNF: cargo gcc clang glslang libudev-devel libgbm-devel libxkbcommon-devel wayland-devel libinput-devel dbus-devel systemd-devel libseat-devel pipewire-devel glib2-devel pango-devel cairo-gobject-devel pixman-devel libdisplay-info-devel
+  # gsettings-desktop-schemas and gnome-settings-daemon are TEST dependencies, not build ones: the
+  # conformance corpus asserts our defaults against GNOME's own schema defaults, so without the
+  # schemas installed those tests cannot make their assertion. They fail rather than skip — a
+  # skipped check is indistinguishable from a passing one in a green run.
+  DEPS_APT: curl gcc clang glslang-tools libudev-dev libgbm-dev libxkbcommon-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libglib2.0-dev libpango1.0-dev libcairo2-dev libpixman-1-dev libdisplay-info-dev gsettings-desktop-schemas gnome-settings-daemon-common
+  DEPS_DNF: cargo gcc clang glslang libudev-devel libgbm-devel libxkbcommon-devel wayland-devel libinput-devel dbus-devel systemd-devel libseat-devel pipewire-devel glib2-devel pango-devel cairo-gobject-devel pixman-devel libdisplay-info-devel gsettings-desktop-schemas gnome-settings-daemon
 
 jobs:
   test:

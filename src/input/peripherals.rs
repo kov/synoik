@@ -277,7 +277,26 @@ mod tests {
     use super::*;
 
     /// A memory-backed store per test: the real dconf would be the developer's own session.
+    ///
+    /// These tests assert that our compiled-in defaults equal *GNOME's schema defaults*, so a
+    /// missing schema means the assertion cannot be made — it is a broken environment, not a
+    /// reason to pass quietly. Fail, naming the package.
+    ///
+    /// The lookup is what makes that possible: `gio::Settings::with_backend` does not fail on a
+    /// missing schema, it `g_error`s, which aborts the **whole test binary** with `SIGTRAP` and no
+    /// test name attached. That took down the entire `test` job — 1600+ passing tests vanished and
+    /// it read as "the suite crashed" rather than "install gsettings-desktop-schemas". Look it up
+    /// first so the failure is one named test with a sentence explaining itself.
     fn store(schema: &str) -> gio::Settings {
+        let source = gio::SettingsSchemaSource::default().expect(
+            "no GSettings schemas are installed at all; these tests need gsettings-desktop-schemas",
+        );
+        assert!(
+            source.lookup(schema, true).is_some(),
+            "{schema} is not installed. These tests check our defaults against GNOME's own schema \
+             defaults, so they need gsettings-desktop-schemas present — install it rather than \
+             expecting them to skip.",
+        );
         let backend = gio::memory_settings_backend_new();
         gio::Settings::with_backend(schema, &backend)
     }
