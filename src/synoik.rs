@@ -125,22 +125,16 @@ use synoik_config::{
 };
 use wayland_server::protocol::wl_output::WlOutput;
 
-#[cfg(feature = "dbus")]
 use crate::a11y::A11y;
 use crate::animation::{Animation, Clock};
 use crate::app_system::AppIconRef;
 use crate::backend::tty::SurfaceDmabufFeedback;
 use crate::backend::{Backend, BackendMode, Headless, RenderResult, Tty};
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
-#[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_locale1::Locale1ToSynoik;
-#[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_login1::Login1ToSynoik;
-#[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_introspect::{self, IntrospectToSynoik, SynoikToIntrospect};
-#[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_screenshot::{ScreenshotToSynoik, SynoikToScreenshot};
-#[cfg(feature = "dbus")]
 use crate::dbus::system_status::SystemStatusToSynoik;
 use crate::frame_clock::FrameClock;
 use crate::frame_log::{FrameContext, FrameLog, Phase};
@@ -303,7 +297,7 @@ fn write_png_in_thread(
 ///
 /// User-visible, and deliberately says what it *does* rather than who made it — it sits in a list
 /// beside the user's real windows in a shell that presents itself as GNOME.
-#[cfg(all(feature = "dbus", feature = "xdp-gnome-screencast"))]
+#[cfg(feature = "xdp-gnome-screencast")]
 pub const DYNAMIC_CAST_TARGET_LABEL: &str = "Dynamic Target";
 
 /// What the reload timer should do when it fires: `Some(deadline)` to wait again (a ping
@@ -600,7 +594,6 @@ pub struct Synoik {
     /// A clone of the system-status watcher's inbound channel, for
     /// [`crate::dbus::bluez::connect_device`] to report `BluetoothConnectDone` back through the
     /// same path the snapshots take. `None` without the `dbus` feature / before D-Bus starts.
-    #[cfg(feature = "dbus")]
     pub system_status_tx:
         Option<calloop::channel::Sender<crate::dbus::system_status::SystemStatusToSynoik>>,
     /// Every output that has a usable display backlight, with its current brightness. Empty
@@ -613,7 +606,6 @@ pub struct Synoik {
     pub brightness: crate::brightness::BrightnessManager,
     /// The outbound half of `org.gnome.Shell.Brightness`: `HasBrightnessControl` changes and the
     /// `BrightnessChanged` signal. `None` without the `dbus` feature / before D-Bus starts.
-    #[cfg(feature = "dbus")]
     pub brightness_emit:
         Option<async_channel::Sender<crate::dbus::gnome_shell_brightness::SynoikToBrightness>>,
     /// The screen shield — GNOME's session lock (`ScreenShield`, `js/ui/screenShield.js`).
@@ -672,7 +664,6 @@ pub struct Synoik {
     /// Drives [`crate::dbus::gdm`]. `None` before D-Bus starts, and on a build without it — in
     /// which case the shield never gets a verifier and so never locks, which is the correct
     /// behaviour rather than a degradation.
-    #[cfg(feature = "dbus")]
     pub gdm_requests: Option<async_channel::Sender<crate::dbus::gdm::VerifierRequest>>,
     /// The pending idle lock (`_lockTimeoutId`). Armed when the session goes idle, dropped when
     /// the user comes back — the grace period is exactly this token's lifetime.
@@ -690,20 +681,16 @@ pub struct Synoik {
     /// logind's `delay` sleep inhibitor, held while a suspend would still owe a lock. Dropping the
     /// fd is what tells logind to go ahead and suspend, so this field's *lifetime* is the
     /// mechanism, not a handle we happen to keep.
-    #[cfg(feature = "dbus")]
     pub sleep_inhibitor: Option<zbus::zvariant::OwnedFd>,
     /// What `GetActive` / `GetActiveTime` read, mirrored out of [`Self::screen_shield`] on every
     /// change so the bus task can answer without a round trip through the event loop.
-    #[cfg(feature = "dbus")]
     pub shield_snapshot:
         std::sync::Arc<std::sync::Mutex<crate::dbus::gnome_screen_saver::ShieldSnapshot>>,
     /// `ActiveChanged` / `WakeUpScreen`. `None` before D-Bus starts.
-    #[cfg(feature = "dbus")]
     pub screen_saver_emit:
         Option<async_channel::Sender<crate::dbus::gnome_screen_saver::SynoikToScreenSaver>>,
     /// A clone of the login1 watcher's inbound channel, so a brightness write can report its
     /// completion back to the write serializer through the same path.
-    #[cfg(feature = "dbus")]
     pub login1_tx:
         Option<calloop::channel::Sender<crate::dbus::freedesktop_login1::Login1ToSynoik>>,
     /// The notifications model behind the banner/list/indicator surfaces and the
@@ -917,16 +904,13 @@ pub struct Synoik {
     pub run_dialog: RunDialog,
     pub end_session_dialog: EndSessionDialog,
     /// The polkit "Authentication Required" dialog: what it is asking, and how it is drawn.
-    #[cfg(feature = "dbus")]
     /// Set while the picker is up on behalf of `org.gnome.Shell.Screenshot.SelectArea`: the
     /// caller wants coordinates, not a file. Answered on confirm *and* on every close, because a
     /// D-Bus caller left unanswered blocks until its timeout.
-    #[cfg(feature = "dbus")]
     pub select_area_reply: Option<crate::dbus::gnome_shell_screenshot::SelectAreaReply>,
 
     /// Set while the picker is up on behalf of `InteractiveScreenshot`: the caller wants the URI
     /// of whatever gets saved. Answered when the save completes, and on every close.
-    #[cfg(feature = "dbus")]
     pub interactive_screenshot_reply: Option<crate::dbus::gnome_shell_screenshot::InteractiveReply>,
 
     /// A capture armed to fire after the picker's delay has run out. **Our divergence** — GNOME's
@@ -948,20 +932,16 @@ pub struct Synoik {
     /// The dash as a bottom-edge dock (a divergence — see [`crate::ui::dock`]).
     pub dock: crate::ui::dock::Dock,
     pub polkit_dialog: crate::polkit_dialog::PolkitDialog,
-    #[cfg(feature = "dbus")]
     pub polkit_ui: crate::ui::polkit_dialog::PolkitDialogUi,
     /// The agent's side of the conversation.
-    #[cfg(feature = "dbus")]
     pub polkit_requests: Option<async_channel::Sender<crate::dbus::polkit_agent::PolkitRequest>>,
     /// A request that arrived while the screen was locked.
     ///
     /// GNOME does not prompt over a lock screen: it waits for the session mode to change and
     /// re-runs the request then (`polkitAgent.js:439-450`). Anything else would either put a
     /// password box on top of the shield or answer polkitd without asking anyone.
-    #[cfg(feature = "dbus")]
     pub polkit_deferred: Option<Box<crate::dbus::polkit_agent::BeginRequest>>,
     /// The delayed entry reset — see [`crate::polkit_dialog::DELAYED_RESET`].
-    #[cfg(feature = "dbus")]
     pub polkit_reset_timer: Option<calloop::RegistrationToken>,
     pub panel: Panel,
     pub panel_popover: PanelPopover,
@@ -1083,13 +1063,9 @@ pub struct Synoik {
     /// See [`crate::frame_log`].
     pub frame_log: FrameLog,
 
-    #[cfg(feature = "dbus")]
     pub dbus: Option<crate::dbus::DBusServers>,
-    #[cfg(feature = "dbus")]
     pub a11y_keyboard_monitor: Option<crate::dbus::freedesktop_a11y::KeyboardMonitor>,
-    #[cfg(feature = "dbus")]
     pub a11y: A11y,
-    #[cfg(feature = "dbus")]
     pub inhibit_power_key_fd: Option<zbus::zvariant::OwnedFd>,
 
     pub ipc_server: Option<IpcServer>,
@@ -1135,7 +1111,6 @@ enum PendingAction {
         path: Option<String>,
         /// The `InteractiveScreenshot` caller still waiting, lifted out of `Synoik` as this armed
         /// so the close would not answer it with a dismissal.
-        #[cfg(feature = "dbus")]
         reply: Option<crate::dbus::gnome_shell_screenshot::InteractiveReply>,
     },
     Cast {
@@ -1148,7 +1123,6 @@ enum PendingAction {
 impl PendingAction {
     /// Answer whatever caller this action was holding with a dismissal. A cast holds none.
     fn dismiss(self) {
-        #[cfg(feature = "dbus")]
         if let Self::Shot {
             reply: Some(tx), ..
         } = self
@@ -1703,7 +1677,6 @@ impl State {
             // engine output and key verdicts back. Both halves are inert until the worker
             // reports a daemon, so a session with no `ibus-daemon` behaves exactly as it did
             // before this existed.
-            #[cfg(feature = "dbus")]
             {
                 use smithay::wayland::text_input::TextInputSeat as _;
 
@@ -1897,7 +1870,6 @@ impl State {
         // gets covered — our own shield and an `ext-session-lock` client — and only one of them
         // has an event we own. A held request that nobody resumes is polkitd waiting forever on a
         // dialog that will never be drawn.
-        #[cfg(feature = "dbus")]
         if self.synoik.polkit_deferred.is_some() && !self.synoik.screen_is_covered() {
             self.resume_deferred_polkit();
         }
@@ -1917,7 +1889,6 @@ impl State {
             self.synoik.display_handle.flush_clients().unwrap();
         }
 
-        #[cfg(feature = "dbus")]
         self.synoik.update_locked_hint();
 
         // Clear the time so it's fetched afresh next iteration.
@@ -1997,7 +1968,6 @@ impl State {
         self.refresh_keyboard_layout_indicator();
 
         // Needs to be called after updating the keyboard focus.
-        #[cfg(feature = "dbus")]
         self.synoik.refresh_a11y();
     }
 
@@ -3768,7 +3738,6 @@ impl State {
             ipc_output.logical = logical;
         }
 
-        #[cfg(feature = "dbus")]
         self.synoik.on_ipc_outputs_changed();
 
         // The backlight device match depends on the connector set and on each connector's
@@ -3893,7 +3862,6 @@ impl State {
 
         // Taken *before* the close, which answers whatever is still pending with `None`. An armed
         // capture has not failed, so its caller must keep waiting for the real answer.
-        #[cfg(feature = "dbus")]
         let reply = self.synoik.interactive_screenshot_reply.take();
 
         self.arm_delayed_capture(
@@ -3904,7 +3872,6 @@ impl State {
                 show_pointer,
                 write_to_disk,
                 path,
-                #[cfg(feature = "dbus")]
                 reply,
             },
         );
@@ -4082,13 +4049,11 @@ impl State {
                 show_pointer,
                 write_to_disk,
                 path,
-                #[cfg(feature = "dbus")]
                 reply,
             } => {
                 // The reply travels into `save_screenshot`, which answers it once the PNG lands.
                 // The spare is for the paths that never get that far — the channel is used once, so
                 // whichever sends first is the answer.
-                #[cfg(feature = "dbus")]
                 let spare = reply.clone();
                 let res = self.backend.with_vulkan_renderer(|renderer| match target {
                     PendingTarget::Window(id) => {
@@ -4107,7 +4072,6 @@ impl State {
                             write_to_disk,
                             show_pointer,
                             path,
-                            #[cfg(feature = "dbus")]
                             reply,
                         )
                     }
@@ -4118,7 +4082,6 @@ impl State {
                         write_to_disk,
                         show_pointer,
                         path,
-                        #[cfg(feature = "dbus")]
                         reply,
                     ),
                 });
@@ -4130,7 +4093,6 @@ impl State {
                 };
                 if let Some(err) = failed {
                     warn!("error taking the delayed screenshot: {err}");
-                    #[cfg(feature = "dbus")]
                     if let Some(tx) = spare {
                         let _ = tx.send_blocking(None);
                     }
@@ -4138,7 +4100,6 @@ impl State {
                 }
 
                 // `save_screenshot` owns the reply from here; it answers when the PNG lands.
-                #[cfg(feature = "dbus")]
                 drop(spare);
             }
         }
@@ -4171,10 +4132,7 @@ impl State {
 
         // A `SelectArea` caller wanted coordinates, not a picture: hand them over and save
         // nothing. Answered before the close, which would otherwise answer `None`.
-        #[cfg(feature = "dbus")]
         let selecting = self.synoik.select_area_reply.is_some();
-        #[cfg(not(feature = "dbus"))]
-        let selecting = false;
         if selecting {
             // A delay has nothing to apply to here: the caller wants coordinates, and it already
             // has them.
@@ -4189,16 +4147,11 @@ impl State {
             // that capture failed (warned there) — fail closed rather than save a wrong screenshot.
             match self.synoik.screenshot_ui.capture_from_neutral() {
                 Some((size, pixels)) => {
-                    #[cfg(feature = "dbus")]
                     let reply = self.synoik.interactive_screenshot_reply.take();
-                    if let Err(err) = self.synoik.save_screenshot(
-                        size,
-                        pixels,
-                        write_to_disk,
-                        path,
-                        #[cfg(feature = "dbus")]
-                        reply,
-                    ) {
+                    if let Err(err) =
+                        self.synoik
+                            .save_screenshot(size, pixels, write_to_disk, path, reply)
+                    {
                         warn!("error saving screenshot: {err:?}");
                     }
                 }
@@ -4464,7 +4417,6 @@ impl State {
     #[cfg(not(feature = "xdp-gnome-screencast"))]
     pub fn set_dynamic_cast_target(&mut self, _target: CastTarget) {}
 
-    #[cfg(feature = "dbus")]
     pub fn on_screen_shot_msg(
         &mut self,
         to_screenshot: &async_channel::Sender<SynoikToScreenshot>,
@@ -4508,7 +4460,6 @@ impl State {
         }
     }
 
-    #[cfg(feature = "dbus")]
     fn handle_take_screenshot(
         &mut self,
         to_screenshot: &async_channel::Sender<SynoikToScreenshot>,
@@ -4538,7 +4489,6 @@ impl State {
     }
 
     /// `SelectArea` — the picker, opened to hand back coordinates rather than save a file.
-    #[cfg(feature = "dbus")]
     fn handle_select_area(&mut self, tx: crate::dbus::gnome_shell_screenshot::SelectAreaReply) {
         self.synoik.select_area_reply = Some(tx);
         self.open_screenshot_ui(false, None);
@@ -4552,7 +4502,6 @@ impl State {
     }
 
     /// `InteractiveScreenshot` — the shell's own picker, answering with the saved file's URI.
-    #[cfg(feature = "dbus")]
     fn handle_interactive_screenshot(
         &mut self,
         tx: crate::dbus::gnome_shell_screenshot::InteractiveReply,
@@ -4568,7 +4517,6 @@ impl State {
     }
 
     /// `ScreenshotWindow` captures the *focused* window, like GNOME's.
-    #[cfg(feature = "dbus")]
     fn handle_take_screenshot_window(
         &mut self,
         to_screenshot: &async_channel::Sender<SynoikToScreenshot>,
@@ -4631,7 +4579,6 @@ impl State {
         }
     }
 
-    #[cfg(feature = "dbus")]
     fn take_screenshot_with_renderer(
         synoik: &mut Synoik,
         renderer: &mut VulkanRenderer,
@@ -4662,7 +4609,6 @@ impl State {
         }
     }
 
-    #[cfg(feature = "dbus")]
     pub fn on_introspect_msg(
         &mut self,
         to_introspect: &async_channel::Sender<SynoikToIntrospect>,
@@ -4701,7 +4647,6 @@ impl State {
     }
 
     /// `GetWindows` (`introspect.js:135-182`).
-    #[cfg(feature = "dbus")]
     fn introspect_windows(&mut self) -> HashMap<u64, gnome_shell_introspect::WindowProperties> {
         use crate::utils::with_toplevel_role;
 
@@ -4786,7 +4731,6 @@ impl State {
     ///
     /// GNOME keys the map by desktop id and sends an *empty* dict for each app, adding
     /// `active-on-seats` only to the focused one (`:86-95`).
-    #[cfg(feature = "dbus")]
     fn introspect_running_applications(
         &mut self,
     ) -> HashMap<String, gnome_shell_introspect::AppProperties> {
@@ -4817,7 +4761,6 @@ impl State {
             .collect()
     }
 
-    #[cfg(feature = "dbus")]
     pub fn on_login1_msg(&mut self, msg: Login1ToSynoik) {
         match msg {
             Login1ToSynoik::LidClosedChanged(is_closed) => {
@@ -4949,7 +4892,6 @@ impl State {
             self.synoik.queue_redraw_all();
         }
 
-        #[cfg(feature = "dbus")]
         if let Some(tx) = self.synoik.brightness_emit.as_ref() {
             use crate::dbus::gnome_shell_brightness::SynoikToBrightness;
 
@@ -4959,8 +4901,6 @@ impl State {
                 let _ = tx.send_blocking(SynoikToBrightness::UserChanged);
             }
         }
-        #[cfg(not(feature = "dbus"))]
-        let _ = (user, moved, has_control);
     }
 
     /// `BrightnessManager._showOSD` (`js/misc/brightnessManager.js:264-275`): one bar per monitor
@@ -4994,9 +4934,7 @@ impl State {
 
     /// A call on `org.gnome.Shell.Brightness` — gsd-power asking for idle dimming or feeding an
     /// auto-brightness target. Never `user`: these are not the user touching a slider.
-    #[cfg(feature = "dbus")]
     /// A call on `org.gnome.ScreenSaver` — see [`crate::dbus::gnome_screen_saver`].
-    #[cfg(feature = "dbus")]
     pub fn on_screen_saver_msg(
         &mut self,
         msg: crate::dbus::gnome_screen_saver::ScreenSaverToSynoik,
@@ -5172,7 +5110,6 @@ impl State {
     /// does and for the same stated reason ([`crate::unlock_dialog::UnlockDialog::show_clock`]) —
     /// against a lock screen nobody can get past. Cancelling becomes safe once there is a re-Begin;
     /// see `authenticator_lost`, which is the same fail-open instinct from the other direction.
-    #[cfg(feature = "dbus")]
     pub fn switch_user(&mut self) {
         let now = crate::utils::get_monotonic_time();
         let effects = self.synoik.unlock_dialog.cancel();
@@ -5259,19 +5196,15 @@ impl State {
 
     pub fn apply_unlock_effects(&mut self, effects: crate::unlock_dialog::UnlockEffects) {
         if let Some(request) = effects.request {
-            #[cfg(feature = "dbus")]
             if let Some(tx) = self.synoik.gdm_requests.as_ref() {
                 let _ = tx.send_blocking(request);
             }
-            #[cfg(not(feature = "dbus"))]
-            let _ = request;
         }
 
         // The reader is armed by the prompt coming up, never before it (`_showPrompt` →
         // `_ensureAuthPrompt`, `unlockDialog.js:799-800`). Sent unconditionally: whether there is a
         // reader at all, and whether it has already been started on this channel, is the verifier
         // task's to know — it is the one holding the conversation.
-        #[cfg(feature = "dbus")]
         if effects.start_fingerprint {
             if let Some(tx) = self.synoik.gdm_requests.as_ref() {
                 let _ = tx.send_blocking(crate::dbus::gdm::VerifierRequest::StartFingerprint);
@@ -5335,7 +5268,6 @@ impl State {
     }
 
     /// A message from the polkit agent — see [`crate::dbus::polkit_agent`].
-    #[cfg(feature = "dbus")]
     pub fn on_polkit_msg(&mut self, msg: crate::dbus::polkit_agent::PolkitToSynoik) {
         use crate::dbus::polkit_agent::PolkitToSynoik;
 
@@ -5362,7 +5294,6 @@ impl State {
     }
 
     /// The screen has unlocked: run whatever polkit asked for while it was down.
-    #[cfg(feature = "dbus")]
     pub fn resume_deferred_polkit(&mut self) {
         let Some(request) = self.synoik.polkit_deferred.take() else {
             return;
@@ -5371,7 +5302,6 @@ impl State {
     }
 
     /// The one funnel for everything the dialog decides.
-    #[cfg(feature = "dbus")]
     pub fn apply_polkit_effects(&mut self, effects: crate::polkit_dialog::PolkitEffects) {
         if let Some(request) = effects.request {
             if let Some(tx) = self.synoik.polkit_requests.as_ref() {
@@ -5417,7 +5347,6 @@ impl State {
     /// then.
     ///
     /// [`DELAYED_RESET`]: crate::polkit_dialog::DELAYED_RESET
-    #[cfg(feature = "dbus")]
     fn arm_polkit_reset_timer(&mut self) {
         if let Some(token) = self.synoik.polkit_reset_timer.take() {
             self.synoik.event_loop.remove(token);
@@ -5437,7 +5366,6 @@ impl State {
     }
 
     /// A message from gdm's verifier — see [`crate::dbus::gdm`].
-    #[cfg(feature = "dbus")]
     pub fn on_verifier_event(&mut self, event: crate::dbus::gdm::VerifierEvent) {
         use crate::dbus::gdm::VerifierEvent;
 
@@ -5472,9 +5400,7 @@ impl State {
     /// GNOME closely enough — it re-runs `_maybeStartFingerprintVerification` on a late detection
     /// (`util.js:437-442`) — and the window is one round trip at startup against a lock screen that
     /// is not up yet.
-    #[cfg(feature = "dbus")]
     /// gsd's smartcard tokens changed.
-    #[cfg(feature = "dbus")]
     pub fn on_smartcard_msg(&mut self, msg: crate::dbus::smartcard::SmartcardToSynoik) {
         let crate::dbus::smartcard::SmartcardToSynoik::Detected(detected) = msg;
         self.synoik.smartcard_detected = detected;
@@ -5495,7 +5421,6 @@ impl State {
     /// Both are the same event: re-read and re-render. `PasswordMode` in particular is not
     /// read-once — a user setting or clearing their password mid-session changes what every
     /// *later* lock should do, and a cached value would keep locking (or not) the old way.
-    #[cfg(feature = "dbus")]
     pub fn on_accounts_msg(&mut self, msg: crate::dbus::accounts_service::AccountsToSynoik) {
         use crate::dbus::accounts_service::AccountsToSynoik;
 
@@ -5573,7 +5498,6 @@ impl State {
         // one than the lock it was standing in for.
         if let Some(epoch) = effects.request_authenticator {
             let mut asked = false;
-            #[cfg(feature = "dbus")]
             if let Some(tx) = self.synoik.gdm_requests.as_ref() {
                 let username = self.synoik.unlock_dialog.user().name.clone();
                 asked = tx
@@ -5597,7 +5521,6 @@ impl State {
         // A raised shield ends the conversation: leaving a PAM worker and an open channel behind
         // for a screen nobody is looking at is both a leak and a stale verifier that could answer
         // a later lock.
-        #[cfg(feature = "dbus")]
         if effects.cancel_authenticator {
             if let Some(tx) = self.synoik.gdm_requests.as_ref() {
                 let _ = tx.send_blocking(crate::dbus::gdm::VerifierRequest::Cancel);
@@ -5617,7 +5540,6 @@ impl State {
             self.synoik.clipboard_mime_types.clear();
         }
 
-        #[cfg(feature = "dbus")]
         {
             // `_activationTime` is not gated: it is stamped when the session went idle or the
             // lock was asked for, and `GetActiveTime` is what gsd reads to decide how long the
@@ -5776,7 +5698,6 @@ impl State {
 
     /// Hold or release logind's `delay` sleep inhibitor to match the shield's state
     /// (`_syncInhibitor`, `screenShield.js:202-231`).
-    #[cfg(feature = "dbus")]
     pub fn sync_sleep_inhibitor(&mut self) {
         let want = self
             .synoik
@@ -5803,11 +5724,7 @@ impl State {
         self.synoik.sleep_inhibitor = crate::dbus::freedesktop_login1::take_sleep_inhibitor(conn);
     }
 
-    #[cfg(not(feature = "dbus"))]
-    pub fn sync_sleep_inhibitor(&mut self) {}
-
     /// gnome-session's presence changed (`_onStatusChanged`, `screenShield.js:242-272`).
-    #[cfg(feature = "dbus")]
     pub fn on_presence_msg(&mut self, msg: crate::dbus::gnome_session_presence::PresenceToSynoik) {
         use crate::dbus::gnome_session_presence::{PresenceStatus, PresenceToSynoik};
 
@@ -5950,7 +5867,6 @@ impl State {
         }
     }
 
-    #[cfg(feature = "dbus")]
     fn send_backlight_write(&mut self, write: crate::backend::backlight::PendingWrite) {
         let Some(dbus) = self.synoik.dbus.as_ref() else {
             return;
@@ -5970,12 +5886,6 @@ impl State {
         );
     }
 
-    /// Without D-Bus there is no logind to write through, and no pkexec helper fallback (D1), so
-    /// the backlight is read-only.
-    #[cfg(not(feature = "dbus"))]
-    fn send_backlight_write(&mut self, _write: crate::backend::backlight::PendingWrite) {}
-
-    #[cfg(feature = "dbus")]
     pub fn on_locale1_msg(&mut self, msg: Locale1ToSynoik) {
         let Locale1ToSynoik::XkbChanged(xkb) = msg;
 
@@ -6003,7 +5913,6 @@ impl State {
         self.ipc_keyboard_layouts_changed();
     }
 
-    #[cfg(feature = "dbus")]
     pub fn on_system_status_msg(&mut self, msg: SystemStatusToSynoik) {
         match msg {
             SystemStatusToSynoik::Battery(battery) => self.synoik.system_status.battery = battery,
@@ -6064,7 +5973,6 @@ impl State {
     /// Adopt a fresh rfkill snapshot from the gsd-rfkill watcher: the panel airplane icon, an open
     /// QS "Airplane Mode" toggle tile (which appears/vanishes with `show`), and the Bluetooth
     /// tile's availability gate + kill-switch state.
-    #[cfg(feature = "dbus")]
     pub fn on_rfkill_status(&mut self, status: crate::dbus::rfkill::RfkillStatus) {
         self.synoik.system_status.airplane = status.airplane;
         self.synoik.system_status.bluetooth_rfkill = status.bluetooth;
@@ -6176,7 +6084,6 @@ impl State {
         }
     }
 
-    #[cfg(feature = "dbus")]
     pub fn on_gnome_shell_msg(&mut self, msg: crate::dbus::gnome_shell::GnomeShellToSynoik) {
         use crate::dbus::gnome_shell::GnomeShellToSynoik;
         match msg {
@@ -6216,7 +6123,6 @@ impl State {
     /// or to all of them when none is given. This is how volume, mute, mic-mute,
     /// keyboard-backlight and rotation-lock OSDs arrive — gsd-media-keys handles
     /// those keys and supplies the icon, level and stepping.
-    #[cfg(feature = "dbus")]
     pub fn show_osd(
         &mut self,
         connector: Option<String>,
@@ -6250,7 +6156,6 @@ impl State {
         self.synoik.queue_redraw_all();
     }
 
-    #[cfg(feature = "dbus")]
     pub fn on_idle_monitor_msg(
         &mut self,
         msg: crate::dbus::mutter_idle_monitor::IdleMonitorToSynoik,
@@ -6628,7 +6533,6 @@ impl State {
     /// gnome-session's `EndSessionDialog.Open`/`Close` land here (see `dbus::gnome_session`): raise
     /// or dismiss the logout/shutdown/restart confirmation. Confirm/cancel come from input, not the
     /// bus (`confirm_end_session`/`cancel_end_session`).
-    #[cfg(feature = "dbus")]
     pub fn on_end_session_msg(
         &mut self,
         msg: crate::dbus::gnome_session::EndSessionDialogToSynoik,
@@ -6965,13 +6869,11 @@ impl Synoik {
 
         let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone());
         let end_session_dialog = EndSessionDialog::new(animation_clock.clone(), config.clone());
-        #[cfg(feature = "dbus")]
         let polkit_ui =
             crate::ui::polkit_dialog::PolkitDialogUi::new(animation_clock.clone(), config.clone());
         let panel_popover = PanelPopover::new(animation_clock.clone(), config.clone());
         let panel = Panel::new(animation_clock.clone(), config.clone());
 
-        #[cfg(feature = "dbus")]
         let a11y = A11y::new(event_loop.clone());
 
         event_loop
@@ -7181,11 +7083,9 @@ impl Synoik {
             pending_switcher_outcome: None,
             cycler_highlight: None,
             last_power_profile: "power-saver".to_string(),
-            #[cfg(feature = "dbus")]
             system_status_tx: None,
             backlight: crate::backlight::BacklightSnapshot::default(),
             brightness: crate::brightness::BrightnessManager::default(),
-            #[cfg(feature = "dbus")]
             brightness_emit: None,
             screen_shield: crate::screen_shield::ScreenShield::new(Default::default()),
             lock_screen: Default::default(),
@@ -7201,19 +7101,14 @@ impl Synoik {
             can_switch_user: false,
             switch_user_hovered: false,
             multiple_users: false,
-            #[cfg(feature = "dbus")]
             gdm_requests: None,
             lock_timer: None,
             fade_timer: None,
             unlock_message_timer: None,
             session_active: true,
-            #[cfg(feature = "dbus")]
             sleep_inhibitor: None,
-            #[cfg(feature = "dbus")]
             shield_snapshot: Default::default(),
-            #[cfg(feature = "dbus")]
             screen_saver_emit: None,
-            #[cfg(feature = "dbus")]
             login1_tx: None,
             wallpaper: Wallpaper::default(),
             accel_grabs: Vec::new(),
@@ -7280,21 +7175,15 @@ impl Synoik {
             pending_capture: None,
             capture_countdown: Default::default(),
             cast_area_indicator: Default::default(),
-            #[cfg(feature = "dbus")]
             select_area_reply: None,
-            #[cfg(feature = "dbus")]
             interactive_screenshot_reply: None,
             flashspot: crate::ui::flashspot::FlashSpot::new(),
             ripples: crate::ui::ripples::Ripples::new(),
             dock: crate::ui::dock::Dock::new(animation_clock.clone()),
             polkit_dialog: crate::polkit_dialog::PolkitDialog::new(),
-            #[cfg(feature = "dbus")]
             polkit_ui,
-            #[cfg(feature = "dbus")]
             polkit_requests: None,
-            #[cfg(feature = "dbus")]
             polkit_deferred: None,
-            #[cfg(feature = "dbus")]
             polkit_reset_timer: None,
             panel,
             panel_popover,
@@ -7347,13 +7236,9 @@ impl Synoik {
 
             frame_log: FrameLog::from_env(),
 
-            #[cfg(feature = "dbus")]
             dbus: None,
-            #[cfg(feature = "dbus")]
             a11y_keyboard_monitor: None,
-            #[cfg(feature = "dbus")]
             a11y,
-            #[cfg(feature = "dbus")]
             inhibit_power_key_fd: None,
 
             ipc_server,
@@ -7401,7 +7286,6 @@ impl Synoik {
         }
     }
 
-    #[cfg(feature = "dbus")]
     pub fn inhibit_power_key(&mut self) -> anyhow::Result<()> {
         use smithay::reexports::rustix::io::{fcntl_setfd, FdFlags};
 
@@ -8320,13 +8204,8 @@ impl Synoik {
     /// Whether the polkit dialog is on screen. Always false without `dbus`, where there is no
     /// agent to raise one.
     pub fn polkit_is_open(&self) -> bool {
-        #[cfg(feature = "dbus")]
         {
             self.polkit_ui.is_open()
-        }
-        #[cfg(not(feature = "dbus"))]
-        {
-            false
         }
     }
 
@@ -9337,7 +9216,6 @@ impl Synoik {
 
         self.exit_confirm_dialog.advance_animations();
         self.end_session_dialog.advance_animations();
-        #[cfg(feature = "dbus")]
         self.polkit_ui.advance_animations();
         self.flashspot.advance(self.clock.now_unadjusted());
         self.ripples.advance(self.clock.now_unadjusted());
@@ -9409,7 +9287,6 @@ impl Synoik {
         }
         self.published_active = active;
 
-        #[cfg(feature = "dbus")]
         {
             self.shield_snapshot.lock().unwrap().active = active;
             if let Some(tx) = self.screen_saver_emit.as_ref() {
@@ -9654,7 +9531,6 @@ impl Synoik {
         // Next, the polkit authentication dialog. Above the three above it and below the lock
         // surface, which is the order it can actually be in: it defers rather than stacking on a
         // shield.
-        #[cfg(feature = "dbus")]
         self.polkit_ui.render(
             ctx.renderer,
             output,
@@ -10726,7 +10602,6 @@ impl Synoik {
             state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
             state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
             state.unfinished_animations_remain |= self.end_session_dialog.are_animations_ongoing();
-            #[cfg(feature = "dbus")]
             {
                 state.unfinished_animations_remain |= self
                     .polkit_ui
@@ -11669,6 +11544,31 @@ impl Synoik {
     #[cfg(not(feature = "xdp-gnome-screencast"))]
     pub fn stop_cast(&mut self, _session_id: crate::utils::CastSessionId) {}
 
+    // The native recorder is our own — capture, the encoder seam, ffmpeg — but it lives in
+    // `screencasting`, so it is gated behind the *portal* feature it otherwise has nothing to do
+    // with. These three stubs are what the two above already had; without them the no-portal build
+    // does not compile, which is exactly how it rotted unnoticed. Giving the recorder its own
+    // feature (or none) is the real fix and belongs with the recorder, not here.
+    #[cfg(not(feature = "xdp-gnome-screencast"))]
+    pub fn start_native_recording(
+        &mut self,
+        _output: &Output,
+        _path: std::path::PathBuf,
+        _framerate: u32,
+        _draw_cursor: bool,
+        _crop: Option<Rectangle<i32, Logical>>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this build has no recorder (xdp-gnome-screencast is off)")
+    }
+
+    #[cfg(not(feature = "xdp-gnome-screencast"))]
+    pub fn stop_screen_recordings(&mut self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+
+    #[cfg(not(feature = "xdp-gnome-screencast"))]
+    pub fn stop_native_recordings_for_output(&mut self, _output: &Output) {}
+
     pub fn debug_toggle_damage(&mut self) {
         self.debug_draw_damage = !self.debug_draw_damage;
 
@@ -11932,15 +11832,8 @@ impl Synoik {
             elements,
         )?;
 
-        self.save_screenshot(
-            size,
-            pixels,
-            write_to_disk,
-            path,
-            #[cfg(feature = "dbus")]
-            None,
-        )
-        .context("error saving screenshot")
+        self.save_screenshot(size, pixels, write_to_disk, path, None)
+            .context("error saving screenshot")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11958,9 +11851,7 @@ impl Synoik {
         write_to_disk: bool,
         include_pointer: bool,
         path: Option<String>,
-        #[cfg(feature = "dbus")] reply: Option<
-            crate::dbus::gnome_shell_screenshot::InteractiveReply,
-        >,
+        reply: Option<crate::dbus::gnome_shell_screenshot::InteractiveReply>,
     ) -> anyhow::Result<()> {
         let _span = tracy_client::span!("Synoik::screenshot_area");
 
@@ -11995,15 +11886,8 @@ impl Synoik {
         let pixels =
             crate::ui::screenshot_ui::crop_rgba(Size::from((size.w, size.h)), &pixels, rect);
 
-        self.save_screenshot(
-            rect.size,
-            pixels,
-            write_to_disk,
-            path,
-            #[cfg(feature = "dbus")]
-            reply,
-        )
-        .context("error saving screenshot")
+        self.save_screenshot(rect.size, pixels, write_to_disk, path, reply)
+            .context("error saving screenshot")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -12015,21 +11899,12 @@ impl Synoik {
         write_to_disk: bool,
         show_pointer: bool,
         path: Option<String>,
-        #[cfg(feature = "dbus")] reply: Option<
-            crate::dbus::gnome_shell_screenshot::InteractiveReply,
-        >,
+        reply: Option<crate::dbus::gnome_shell_screenshot::InteractiveReply>,
     ) -> anyhow::Result<()> {
         let (size, pixels) =
             self.render_window_to_pixels(renderer, output, mapped, show_pointer)?;
-        self.save_screenshot(
-            size,
-            pixels,
-            write_to_disk,
-            path,
-            #[cfg(feature = "dbus")]
-            reply,
-        )
-        .context("error saving screenshot")
+        self.save_screenshot(size, pixels, write_to_disk, path, reply)
+            .context("error saving screenshot")
     }
 
     /// `ScreenshotWindow` — writes the file and nothing else.
@@ -12038,7 +11913,6 @@ impl Synoik {
     /// and raises a notification. Those belong to the user pressing a key, not to a portal call the
     /// user never sees; a screenshot API that silently replaced the clipboard would be a surprise
     /// with a privacy edge to it.
-    #[cfg(feature = "dbus")]
     pub fn screenshot_window_to_path(
         &self,
         renderer: &mut VulkanRenderer,
@@ -12132,9 +12006,7 @@ impl Synoik {
         pixels: Vec<u8>,
         write_to_disk: bool,
         path_arg: Option<String>,
-        #[cfg(feature = "dbus")] interactive_reply: Option<
-            crate::dbus::gnome_shell_screenshot::InteractiveReply,
-        >,
+        interactive_reply: Option<crate::dbus::gnome_shell_screenshot::InteractiveReply>,
     ) -> anyhow::Result<()> {
         let path = write_to_disk
             .then(|| {
@@ -12166,7 +12038,6 @@ impl Synoik {
             .unwrap();
 
         // Prepare to send screenshot completion event back to main thread.
-        #[cfg(feature = "dbus")]
         let mut interactive_reply = interactive_reply;
         // The path plus the shot itself, already downscaled to a notification icon. Built on the
         // encoding thread, which is holding the raw pixels anyway: making the main loop re-read and
@@ -12176,7 +12047,6 @@ impl Synoik {
         self.event_loop
             .insert_source(event_rx, move |event, _, state| match event {
                 calloop::channel::Event::Msg((path, thumbnail)) => {
-                    #[cfg(feature = "dbus")]
                     if let Some(tx) = interactive_reply.take() {
                         let _ = tx.send_blocking(path.as_deref().map(|p| format!("file://{p}")));
                     }
@@ -12256,7 +12126,6 @@ impl Synoik {
         Ok(())
     }
 
-    #[cfg(feature = "dbus")]
     pub fn screenshot_all_outputs(
         &mut self,
         renderer: &mut VulkanRenderer,
@@ -12361,7 +12230,6 @@ impl Synoik {
     }
 
     /// Hand a `SelectArea` caller its result, once.
-    #[cfg(feature = "dbus")]
     pub fn answer_select_area(&mut self, rect: Option<Rectangle<i32, Logical>>) {
         if let Some(tx) = self.select_area_reply.take() {
             // The channel is bounded(1) and used once, so this cannot block.
@@ -12369,11 +12237,7 @@ impl Synoik {
         }
     }
 
-    #[cfg(not(feature = "dbus"))]
-    pub fn answer_select_area(&mut self, _rect: Option<Rectangle<i32, Logical>>) {}
-
     /// Hand an `InteractiveScreenshot` caller its result, once. `None` is a dismissal.
-    #[cfg(feature = "dbus")]
     pub fn answer_interactive_screenshot(&mut self, path: Option<&str>) {
         if let Some(tx) = self.interactive_screenshot_reply.take() {
             // GNOME returns `file.get_uri()`, not a path.
@@ -12381,9 +12245,6 @@ impl Synoik {
             let _ = tx.send_blocking(uri);
         }
     }
-
-    #[cfg(not(feature = "dbus"))]
-    pub fn answer_interactive_screenshot(&mut self, _path: Option<&str>) {}
 
     pub fn is_locked(&self) -> bool {
         match self.lock_state {
@@ -12522,7 +12383,6 @@ impl Synoik {
         self.queue_redraw_all();
     }
 
-    #[cfg(feature = "dbus")]
     fn update_locked_hint(&mut self) {
         if !self.is_session_instance {
             return;
@@ -12682,7 +12542,6 @@ impl Synoik {
         root.clone()
     }
 
-    #[cfg(feature = "dbus")]
     pub fn on_ipc_outputs_changed(&self) {
         let _span = tracy_client::span!("Synoik::on_ipc_outputs_changed");
 
@@ -12723,7 +12582,6 @@ impl Synoik {
     /// Send `AcceleratorActivated`/`AcceleratorDeactivated` for a grabbed
     /// accelerator, unicast to the grabbing client like gnome-shell does. The
     /// parameters dict carries `timestamp` and `action-mode`.
-    #[cfg(feature = "dbus")]
     pub fn emit_accelerator_signal(&self, action: u32, activated: bool) {
         use std::collections::HashMap;
 
@@ -12768,9 +12626,6 @@ impl Synoik {
         }
     }
 
-    #[cfg(not(feature = "dbus"))]
-    pub fn emit_accelerator_signal(&self, _action: u32, _activated: bool) {}
-
     /// Tell the portal the window/app list moved.
     ///
     /// GNOME emits `WindowsChanged` off `tracked-windows-changed` and
@@ -12778,7 +12633,6 @@ impl Synoik {
     /// (`introspect.js:36-47`, `:100-108`). `sync_running_apps` is the one place that already
     /// re-snapshots both, so it is the seam — the alternative is invalidation hooks on every path
     /// that can map, unmap or focus a window, and the ones that get forgotten are silent.
-    #[cfg(feature = "dbus")]
     pub fn emit_introspect_changed(&self) {
         let Some(conn) = self.dbus.as_ref().and_then(|d| d.conn_introspect.as_ref()) else {
             return;
@@ -12796,9 +12650,6 @@ impl Synoik {
             }
         }
     }
-
-    #[cfg(not(feature = "dbus"))]
-    pub fn emit_introspect_changed(&self) {}
 
     pub fn handle_focus_follows_mouse(&mut self, new_focus: &PointContents) {
         let Some(ffm) = self.config.borrow().input.focus_follows_mouse else {
@@ -14371,7 +14222,6 @@ impl Synoik {
         self.reschedule_idle_monitor_timer();
     }
 
-    #[cfg(feature = "dbus")]
     pub fn emit_idle_watch_fired(&self, fired: &[crate::idle_monitor::Fired]) {
         use zbus::names::BusName;
 
@@ -14401,9 +14251,6 @@ impl Synoik {
             }
         }
     }
-
-    #[cfg(not(feature = "dbus"))]
-    pub fn emit_idle_watch_fired(&self, _fired: &[crate::idle_monitor::Fired]) {}
 
     /// The user confirmed the end-session dialog (clicked the action button, pressed Enter on it,
     /// or the countdown expired): tell gnome-session to proceed and close the dialog.
@@ -14469,7 +14316,6 @@ impl Synoik {
         self.reschedule_end_session_timer();
     }
 
-    #[cfg(feature = "dbus")]
     pub fn emit_end_session_signal(&self, signal: &str) {
         let Some(conn) = self.dbus.as_ref().and_then(|d| d.conn_end_session.clone()) else {
             return;
@@ -14488,23 +14334,14 @@ impl Synoik {
         }
     }
 
-    #[cfg(not(feature = "dbus"))]
-    pub fn emit_end_session_signal(&self, _signal: &str) {}
-
     /// Ask gnome-session to start a logout/power-off/restart (the `Logout`/`PowerOff`/`Reboot`
     /// actions). gnome-session then calls `EndSessionDialog.Open` back on us.
-    #[cfg(feature = "dbus")]
     pub fn request_session_action(&self, request: crate::end_session::SessionRequest) {
         let Some(conn) = self.dbus.as_ref().and_then(|d| d.conn_end_session.clone()) else {
             warn!("cannot request {request:?}: no session bus connection");
             return;
         };
         crate::dbus::gnome_session::request_session_action(&conn, request);
-    }
-
-    #[cfg(not(feature = "dbus"))]
-    pub fn request_session_action(&self, _request: crate::end_session::SessionRequest) {
-        warn!("session actions require the dbus feature");
     }
 
     /// The switcher's window list — `getWindows` (`altTab.js:51-61`) over our layout.
@@ -14772,7 +14609,6 @@ synoik_render_elements! {
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         RunDialog = RunDialogRenderElement,
         EndSessionDialog = EndSessionDialogRenderElement,
-        #[cfg(feature = "dbus")]
         PolkitDialog = crate::ui::polkit_dialog::PolkitDialogRenderElement,
         FolderDialog = crate::ui::folder_dialog::FolderDialogRenderElement,
         // CPU-rendered UI (panel, notifications) uploaded through the active renderer, so it draws

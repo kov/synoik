@@ -52,7 +52,6 @@ use self::resize_grab::ResizeGrab;
 use self::spatial_movement_grab::SpatialMovementGrab;
 use self::thumb_grab::ThumbGrab;
 use crate::app_system::{AppState, LaunchMode};
-#[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::gnome::{
     modifiers_from_accel, Accel, AccelGrab, AccelMods, AccelTrigger, GnomeKeyAction,
@@ -303,10 +302,7 @@ impl State {
                 }
                 self.synoik.queue_redraw_all();
             }
-            #[cfg(feature = "dbus")]
             ShellEntry::Polkit => self.handle_polkit_key(raw, text, mods, theme, pressed),
-            #[cfg(not(feature = "dbus"))]
-            ShellEntry::Polkit => {}
             ShellEntry::FolderRename => {
                 use crate::ui::folder_dialog::RenameKey;
                 match self.synoik.folder_dialog.rename_key(raw, text, mods, theme) {
@@ -363,7 +359,6 @@ impl State {
     /// Escape cancels, Enter activates whatever has focus, Tab and the arrows move it, and
     /// everything else is text for the entry. Nothing here reaches a client — the caller has
     /// already decided to swallow it.
-    #[cfg(feature = "dbus")]
     fn handle_polkit_key(
         &mut self,
         raw: Option<Keysym>,
@@ -409,7 +404,6 @@ impl State {
     }
 
     /// Hovering a polkit control focuses it, the way its siblings do.
-    #[cfg(feature = "dbus")]
     fn polkit_pointer_motion(
         &mut self,
         output_size: smithay::utils::Size<f64, Logical>,
@@ -427,7 +421,6 @@ impl State {
     }
 
     /// A left click on the polkit dialog.
-    #[cfg(feature = "dbus")]
     fn polkit_pointer_click(
         &mut self,
         output_size: smithay::utils::Size<f64, Logical>,
@@ -797,7 +790,6 @@ impl State {
         //
         // Other accessibility-grabbed keys should still update our XKB state, but not cause any
         // other changes.
-        #[cfg(feature = "dbus")]
         let block = {
             let block = self.a11y_process_key(
                 Duration::from_millis(u64::from(time)),
@@ -814,8 +806,6 @@ impl State {
             }
             block
         };
-        #[cfg(not(feature = "dbus"))]
-        let _ = consumed_by_a11y;
 
         // What the input method needs to describe this key to an engine, captured from inside the
         // filter because that is where the resolved keysym and modifier state live.
@@ -839,7 +829,6 @@ impl State {
 
                 // After updating XKB state from accessibility-grabbed keys, return right away and
                 // don't handle them.
-                #[cfg(feature = "dbus")]
                 if block != KbMonBlock::Pass {
                     // HACK: there's a slight problem with this code. Here we filter out keys
                     // consumed by accessibility from getting sent to the Wayland client. However,
@@ -1053,7 +1042,6 @@ impl State {
                 // The polkit "Authentication Required" dialog is modal in the same way, and it is
                 // the one that matters most: it is a password box, so a key that leaked past it
                 // would be a character of somebody's password delivered to a window.
-                #[cfg(feature = "dbus")]
                 if this.synoik.polkit_is_open() {
                     let text = modified
                         .key_char()
@@ -1832,7 +1820,6 @@ impl State {
             PopoverAction::SetInputDevice(key) => self.activate_audio_device(key, false),
             // Airplane mode: fire-and-forget property write on gsd-rfkill's connection (never a
             // blocking Set on this thread); the tile updates when gsd echoes `PropertiesChanged`.
-            #[cfg(feature = "dbus")]
             PopoverAction::SetAirplaneMode(active) => {
                 if let Some(conn) = self
                     .synoik
@@ -1843,12 +1830,9 @@ impl State {
                     crate::dbus::rfkill::set_airplane_mode(conn, active);
                 }
             }
-            #[cfg(not(feature = "dbus"))]
-            PopoverAction::SetAirplaneMode(_) => {}
             // Power Mode body toggle: Balanced ↔ the compositor-owned last-selected profile
             // (gnome-shell's `clicked`). Fire-and-forget write on the system-status connection; the
             // tile updates on the daemon's echo.
-            #[cfg(feature = "dbus")]
             PopoverAction::TogglePowerProfile => {
                 let target = if self.synoik.system_status.power.is_active() {
                     "balanced".to_string()
@@ -1865,7 +1849,6 @@ impl State {
                 }
             }
             // Power Mode picker row: set the chosen profile directly.
-            #[cfg(feature = "dbus")]
             PopoverAction::SetPowerProfile(profile) => {
                 if let Some(conn) = self
                     .synoik
@@ -1881,7 +1864,6 @@ impl State {
             // on), and if the adapter isn't powered, also power it. Both fire-and-forget,
             // echo-driven; the tile's predicted icon is the only optimistic part, so arm its 30 s
             // failsafe (`bluetooth.js:27,131-136`) in case no state change ever echoes back.
-            #[cfg(feature = "dbus")]
             PopoverAction::ToggleBluetooth => {
                 let was_active = self.synoik.system_status.bluetooth.powered;
                 if let Some(conn) = self
@@ -1917,7 +1899,6 @@ impl State {
             }
             // A Bluetooth device row: `Device1.Connect`/`Disconnect` on the system connection,
             // reporting completion back through the system-status channel to clear the busy mark.
-            #[cfg(feature = "dbus")]
             PopoverAction::ConnectBluetoothDevice { path, connect } => {
                 if let (Some(conn), Some(done)) = (
                     self.synoik
@@ -1929,11 +1910,6 @@ impl State {
                     crate::dbus::bluez::connect_device(conn, path, connect, done);
                 }
             }
-            #[cfg(not(feature = "dbus"))]
-            PopoverAction::TogglePowerProfile
-            | PopoverAction::SetPowerProfile(_)
-            | PopoverAction::ToggleBluetooth
-            | PopoverAction::ConnectBluetoothDevice { .. } => {}
             // Message-list card interactions: the same store paths as the
             // banner's clicks (`on_banner_hit`); `apply_notification_effects`
             // pushes the shrunk snapshot back into the open popover.
@@ -2669,7 +2645,6 @@ impl State {
                             write_to_disk,
                             show_pointer,
                             path,
-                            #[cfg(feature = "dbus")]
                             None,
                         )
                     });
@@ -2698,7 +2673,6 @@ impl State {
                             write_to_disk,
                             show_pointer,
                             path,
-                            #[cfg(feature = "dbus")]
                             None,
                         )
                     });
@@ -4092,7 +4066,6 @@ impl State {
                 if self.synoik.hotkey_overlay.show() {
                     self.synoik.queue_redraw_all();
 
-                    #[cfg(feature = "dbus")]
                     self.synoik.a11y_announce_hotkey_overlay();
                 }
             }
@@ -4915,7 +4888,6 @@ impl State {
 
         // Hovering a polkit control focuses it, so the pointer and the keyboard agree about which
         // button Enter would press.
-        #[cfg(feature = "dbus")]
         if self.synoik.polkit_is_open() {
             if let Some((output, pos_within_output)) = self.synoik.output_under(new_pos) {
                 let output_size = output_size(output);
@@ -5102,7 +5074,6 @@ impl State {
 
         // Hovering a polkit control focuses it, so the pointer and the keyboard agree about which
         // button Enter would press.
-        #[cfg(feature = "dbus")]
         if self.synoik.polkit_is_open() {
             if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                 let output_size = output_size(output);
@@ -6977,7 +6948,6 @@ impl State {
             // ...and so is the polkit dialog: a left click activates whatever is under the cursor,
             // every button is swallowed, and a click on the card's background does nothing rather
             // than dismissing it (polkit's ModalDialog has no click-outside-to-close either).
-            #[cfg(feature = "dbus")]
             if self.synoik.polkit_is_open() {
                 if button == Some(MouseButton::Left) {
                     let location = pointer.current_location();
@@ -8266,7 +8236,6 @@ impl State {
 
         // Hovering a polkit control focuses it, so the pointer and the keyboard agree about which
         // button Enter would press.
-        #[cfg(feature = "dbus")]
         if self.synoik.polkit_is_open() {
             if let Some((output, pos_within_output)) = self.synoik.output_under(pos) {
                 let output_size = output_size(output);

@@ -4506,16 +4506,7 @@ fn vulkan_screenshots_a_window_through_vulkan() {
     let ran = state.backend.headless().with_vulkan_renderer(|vk| {
         state
             .synoik
-            .screenshot_window(
-                vk,
-                &output,
-                mapped,
-                false,
-                false,
-                None,
-                #[cfg(feature = "dbus")]
-                None,
-            )
+            .screenshot_window(vk, &output, mapped, false, false, None, None)
             .expect("screenshot_window must succeed on the Vulkan renderer");
     });
     assert!(
@@ -12872,7 +12863,6 @@ fn the_crossfade_asks_for_one_avatar_not_one_per_frame() {
 /// - the fallback glyph is **gone** — GNOME's `Avatar.update()` is one branch or the other
 ///   (`userWidget.js:78-92`), so drawing both would put a default avatar under the photograph and
 ///   show it wherever the picture is translucent.
-#[cfg(feature = "dbus")]
 #[test]
 fn vulkan_draws_the_account_picture_round() {
     use std::io::Cursor;
@@ -13066,7 +13056,6 @@ fn the_account_picture_uploads_once_per_scale() {
 /// kind of rule that is easy to read as "one padding from the edge" and land twice as close as it
 /// should. And because it is a sibling of the page stack rather than part of it, nothing about the
 /// crossfade would stop it drawing over the clock: its `progress > 0` gate is its own.
-#[cfg(feature = "dbus")]
 #[test]
 fn vulkan_draws_the_switch_user_button_in_its_corner() {
     use crate::dbus::accounts_service::AccountsToSynoik;

@@ -451,7 +451,6 @@ pub fn history_add(history: &mut Vec<String>, input: &str) -> String {
     input
 }
 
-#[cfg(feature = "dbus")]
 pub fn a11y_node() -> accesskit::Node {
     let mut node = accesskit::Node::new(accesskit::Role::Dialog);
     node.set_label("Run a Command");

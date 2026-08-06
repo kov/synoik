@@ -1953,7 +1953,6 @@ impl Tty {
     }
 
     pub fn suspend(&self) {
-        #[cfg(feature = "dbus")]
         if let Err(err) = suspend() {
             warn!("error suspending: {err:?}");
         }
@@ -2962,7 +2961,6 @@ fn refresh_interval(mode: DrmMode) -> Duration {
     Duration::from_nanos(refresh_interval)
 }
 
-#[cfg(feature = "dbus")]
 fn suspend() -> anyhow::Result<()> {
     let conn = zbus::blocking::Connection::system().context("error connecting to system bus")?;
 

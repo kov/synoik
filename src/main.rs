@@ -23,9 +23,6 @@ use sd_notify::NotifyState;
 use smithay::reexports::wayland_server::Display;
 use synoik::backend::BackendMode;
 use synoik::cli::{Cli, CompletionShell, Sub};
-#[cfg(feature = "dbus")]
-use synoik::dbus;
-use synoik::frame_log;
 use synoik::ipc::client::handle_msg;
 use synoik::synoik::State;
 use synoik::utils::spawning::{
@@ -33,6 +30,7 @@ use synoik::utils::spawning::{
     REMOVE_ENV_RUST_BACKTRACE, REMOVE_ENV_RUST_LIB_BACKTRACE,
 };
 use synoik::utils::{cause_panic, version, xwayland, IS_SYSTEMD_SERVICE};
+use synoik::{dbus, frame_log};
 use synoik_config::Config;
 use synoik_ipc::socket::SOCKET_PATH_ENV;
 use tracing_subscriber::EnvFilter;
@@ -302,7 +300,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         import_environment();
 
         // Inhibit power key handling so we can suspend on it.
-        #[cfg(feature = "dbus")]
         if !state
             .synoik
             .config
@@ -316,7 +313,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    #[cfg(feature = "dbus")]
     dbus::DBusServers::start(&mut state, cli.session);
 
     // Default-sink volume/mute for the panel indicator + QS slider, from PipeWire.
@@ -333,7 +329,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    #[cfg(feature = "dbus")]
     if cli.session {
         state.synoik.a11y.start();
     }

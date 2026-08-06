@@ -19,7 +19,6 @@ pub struct Server {
     /// The receiving half of the shield's gdm request channel, kept alive for the fixture's
     /// lifetime. See [`Server::new`] — dropping it would close the channel and turn every lock
     /// into "nobody to ask".
-    #[cfg(feature = "dbus")]
     _gdm_requests: async_channel::Receiver<crate::dbus::gdm::VerifierRequest>,
 }
 
@@ -43,9 +42,7 @@ impl Server {
         // driving `State::on_verifier_event`, and without a channel to send `Begin` down the shield
         // would refuse to lock at all — correctly, since a lock nobody can answer is a lockout, but
         // it would leave the whole locked-shield corpus untestable.
-        #[cfg(feature = "dbus")]
         let (to_gdm, from_niri) = async_channel::unbounded();
-        #[cfg(feature = "dbus")]
         {
             state.synoik.gdm_requests = Some(to_gdm);
         }
@@ -53,7 +50,6 @@ impl Server {
         Self {
             event_loop,
             state,
-            #[cfg(feature = "dbus")]
             _gdm_requests: from_niri,
         }
     }

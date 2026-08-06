@@ -7,7 +7,6 @@
 #[macro_use]
 extern crate tracing;
 
-#[cfg(feature = "dbus")]
 pub mod a11y;
 pub mod animation;
 pub mod app_system;
@@ -19,7 +18,6 @@ pub mod calendar_events;
 pub mod cli;
 pub mod clipboard;
 pub mod cursor;
-#[cfg(feature = "dbus")]
 pub mod dbus;
 pub mod dbusmenu;
 pub mod end_session;
@@ -40,9 +38,7 @@ pub mod mpris;
 pub mod notifications;
 #[cfg(feature = "pipewire")]
 pub mod pipewire_audio;
-/// The polkit dialog's state machine. Gated with `dbus` because the authentication agent it
-/// answers to is a D-Bus service: with no bus there is nothing to prompt for.
-#[cfg(feature = "dbus")]
+/// The polkit dialog's state machine, answering the D-Bus authentication agent.
 pub mod polkit_dialog;
 pub mod protocols;
 pub mod recording;

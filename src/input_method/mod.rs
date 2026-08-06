@@ -30,7 +30,6 @@
 //! the accented text the whole feature exists for, so it is a function with tests rather than an
 //! `as` cast at each call site.
 
-#[cfg(feature = "dbus")]
 pub mod worker;
 
 use std::collections::VecDeque;
@@ -437,7 +436,6 @@ impl State {
         if self.synoik.run_dialog.is_open() {
             return Some(ShellEntry::RunDialog);
         }
-        #[cfg(feature = "dbus")]
         if self.synoik.polkit_is_open() {
             return Some(ShellEntry::Polkit);
         }
@@ -956,10 +954,7 @@ impl State {
         let changed = match entry {
             ShellEntry::Shield => self.synoik.unlock_dialog.set_preedit(preedit),
             ShellEntry::RunDialog => self.synoik.run_dialog.set_preedit(preedit),
-            #[cfg(feature = "dbus")]
             ShellEntry::Polkit => self.synoik.polkit_dialog.set_preedit(preedit),
-            #[cfg(not(feature = "dbus"))]
-            ShellEntry::Polkit => false,
             ShellEntry::FolderRename => self.synoik.folder_dialog.set_preedit(preedit),
             ShellEntry::OverviewSearch => self.synoik.overview_search.set_preedit(preedit),
         };

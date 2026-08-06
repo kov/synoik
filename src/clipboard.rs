@@ -163,10 +163,7 @@ impl State {
     fn shell_entry_selection(&self, entry: ShellEntry) -> Option<String> {
         let edit = match entry {
             ShellEntry::Shield => self.synoik.unlock_dialog.entry(),
-            #[cfg(feature = "dbus")]
             ShellEntry::Polkit => self.synoik.polkit_dialog.entry(),
-            #[cfg(not(feature = "dbus"))]
-            ShellEntry::Polkit => return None,
             ShellEntry::RunDialog => self.synoik.run_dialog.edit(),
             ShellEntry::FolderRename => self.synoik.folder_dialog.rename_edit()?,
             ShellEntry::OverviewSearch => self.synoik.overview_search.edit(),

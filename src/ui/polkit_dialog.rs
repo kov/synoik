@@ -721,7 +721,6 @@ fn paint_card(
     Ok(())
 }
 
-#[cfg(feature = "dbus")]
 pub fn a11y_node() -> accesskit::Node {
     let mut node = accesskit::Node::new(accesskit::Role::AlertDialog);
     node.set_label(TITLE);

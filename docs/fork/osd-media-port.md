@@ -327,7 +327,7 @@ port-level model (below) will want.
    `on_audio_status` (`src/synoik.rs:3527`) only refreshes the panel and popover. `show_osd` is
    reachable from the same `&mut self`, and `audio::volume_icon` already picks the icon. Follow
    `ed26af2e` (brightness): have the audio path *return* an OSD request rather than reach into the
-   OSD manager. Note the feature gating — the audio path is `pipewire`, the OSD's caller `dbus`.
+   OSD manager. Note the feature gating — the audio path is `pipewire`; D-Bus is unconditional.
 2. **Fidelity of the scroll itself** — small. Ours is `AxisSource::Wheel` only, so a touchpad
    two-finger scroll does nothing where GNOME honours smooth deltas; and the whole status cluster is
    one `ROLE_QUICK_SETTINGS` rect (`src/ui/panel.rs:1158-1181`), so we scroll-adjust volume anywhere

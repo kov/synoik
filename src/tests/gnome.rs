@@ -7295,7 +7295,6 @@ fn brightness_changes_show_the_osd() {
 /// `BrightnessChanged` marks changes *the user* made, so the ambient-light loop can tell its own
 /// adjustments apart from ours (`brightnessManager.js:151-158,172-179` emit `user-update` only
 /// from the slider handlers).
-#[cfg(feature = "dbus")]
 #[test]
 fn brightness_dbus_dims_without_moving_the_scales() {
     use crate::dbus::gnome_shell_brightness::{BrightnessToSynoik, SynoikToBrightness};
@@ -7396,7 +7395,6 @@ fn brightness_keys_work_when_locked() {
 /// handlers are `this._globalScale?.stepUp()` (`brightnessManager.js:107-132`): with no scale
 /// there is no `notify::value` and so no `user-update`. Emitting anyway would tell gsd-power's
 /// ambient-light loop to back off over a key press that did nothing.
-#[cfg(feature = "dbus")]
 #[test]
 fn a_brightness_key_with_no_backlight_is_silent() {
     use crate::dbus::gnome_shell_brightness::SynoikToBrightness;
@@ -7571,7 +7569,6 @@ fn idle_monitor_input_activity_resets_idle_time() {
 ///
 /// The clock is pinned through the `ResetIdletime` handler so the deadlines are deterministic —
 /// `refresh` is then called directly rather than waiting on the real-time calloop timer.
-#[cfg(feature = "dbus")]
 #[test]
 fn idle_monitor_dbus_idle_watch_fires_and_rearms() {
     use crate::dbus::mutter_idle_monitor::IdleMonitorToSynoik;
@@ -7641,7 +7638,6 @@ fn idle_monitor_dbus_idle_watch_fires_and_rearms() {
 /// dialog; confirming closes both and would emit the type's confirm signal; cancelling and
 /// gnome-session's own `Close` also close it. The countdown auto-confirm and signal-name mapping
 /// are unit-tested in `crate::end_session`.
-#[cfg(feature = "dbus")]
 #[test]
 fn end_session_dialog_open_confirm_and_cancel() {
     use crate::dbus::gnome_session::EndSessionDialogToSynoik;
@@ -16546,7 +16542,6 @@ fn osd_icon_candidates_parse_serialized_gicons() {
 /// (and cancels the rest), an absent one goes to all, an absent `level` means no
 /// bar rather than a bar at zero, and an absent `max_level` is 1
 /// (`js/ui/shellDBus.js:143-152`, `js/ui/osdWindow.js:71-72,86-88`).
-#[cfg(feature = "dbus")]
 #[test]
 fn osd_show_osd_routes_by_connector() {
     use crate::dbus::gnome_shell::GnomeShellToSynoik;
@@ -16613,7 +16608,6 @@ fn osd_show_osd_routes_by_connector() {
 /// An icon that is not a theme name leaves no candidates, and `show()` refuses
 /// without an icon (`js/ui/osdWindow.js:90-92`) — so a ShowOSD carrying only a
 /// file icon draws nothing rather than an empty pill.
-#[cfg(feature = "dbus")]
 #[test]
 fn osd_show_osd_without_a_resolvable_icon_draws_nothing() {
     use crate::dbus::gnome_shell::GnomeShellToSynoik;
@@ -16772,7 +16766,6 @@ fn album_art_is_loaded_when_the_player_appears() {
 /// - a **shared eviction**. The avatar lives in the same `ImageCache` as album art, whose `retain`
 ///   is the cache's only bound. Built from the live players alone, it drops the avatar on every
 ///   MPRIS change — which on a machine playing music is continuously.
-#[cfg(feature = "dbus")]
 #[test]
 fn the_account_picture_is_decoded_up_front_and_outlives_a_track_change() {
     use crate::dbus::accounts_service::{AccountIcon, AccountsToSynoik, UserAccount};
@@ -16847,7 +16840,6 @@ fn the_account_picture_is_decoded_up_front_and_outlives_a_track_change() {
 /// same path. Two independent things therefore have to notice the swap, and if either does not the
 /// old picture survives until the session restarts — with nothing in the logs, because nothing
 /// failed.
-#[cfg(feature = "dbus")]
 #[test]
 fn changing_the_account_picture_in_place_replaces_it() {
     use crate::dbus::accounts_service::{AccountIcon, AccountsToSynoik, UserAccount};
@@ -16919,7 +16911,6 @@ fn changing_the_account_picture_in_place_replaces_it() {
 /// hands out a route past a policy somebody set deliberately. Each is asserted from a state where
 /// everything *else* is satisfied, so a gate that is wired to the wrong field cannot hide behind
 /// another gate that happens to be false too.
-#[cfg(feature = "dbus")]
 #[test]
 fn each_condition_alone_hides_the_switch_user_button() {
     use crate::dbus::accounts_service::AccountsToSynoik;
@@ -16994,7 +16985,6 @@ fn each_condition_alone_hides_the_switch_user_button() {
 ///
 /// The times here are picked either side of `CROSSFADE_TIME`, which is what makes this a test of
 /// the *transition* rather than of the two resting states.
-#[cfg(feature = "dbus")]
 #[test]
 fn the_switch_user_button_is_clickable_exactly_while_it_is_drawn() {
     use std::time::Duration;
@@ -17057,7 +17047,6 @@ fn the_switch_user_button_is_clickable_exactly_while_it_is_drawn() {
 /// with no observable state here, so what this asserts is the compositor's half — including that a
 /// click a few pixels outside the circle still just raises the prompt, since the button is round
 /// and its bounding box is a quarter larger than it is.
-#[cfg(feature = "dbus")]
 #[test]
 fn clicking_the_switch_user_button_cancels_the_prompt() {
     use smithay::utils::{Point, Rectangle, Size};
@@ -19102,7 +19091,6 @@ fn a_request_that_arrives_locked_waits_for_the_unlock() {
 /// mistakes that matter: an `app-id` that is the raw Wayland id instead of the resolved desktop id
 /// (which is why the chooser used to have no icons), a focus flag that never moves, or a window on
 /// an inactive workspace reported as showing.
-#[cfg(feature = "dbus")]
 #[test]
 fn the_portal_window_list_carries_what_its_chooser_reads() {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
@@ -19302,7 +19290,6 @@ fn click_picker_control(
 /// **Our divergence, the delay.** Arming hands the whole capture to a timer and closes the picker,
 /// so the two things that must not happen at that moment are answering the D-Bus caller — it has
 /// been given nothing yet — and losing the capture with the picker that armed it.
-#[cfg(feature = "dbus")]
 #[test]
 fn arming_a_delayed_capture_does_not_answer_its_caller() {
     use crate::ui::screenshot_ui::PointerUp;
@@ -19379,7 +19366,6 @@ fn arming_a_delayed_capture_does_not_answer_its_caller() {
 
 /// A lock landing mid-countdown must take the capture with it: the delay was armed against a screen
 /// the user could see, and firing into a lock screen would capture what the lock exists to hide.
-#[cfg(feature = "dbus")]
 #[test]
 fn a_lock_mid_countdown_cancels_the_delayed_capture() {
     use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
@@ -19886,7 +19872,6 @@ fn single_keys_pick_the_capture_type_and_mode() {
 /// which makes this fixture exactly the refusal case, driven through the real
 /// `State::on_screen_shot_msg`. The dismissal is driven through `Synoik::close_screenshot_ui`, the
 /// one seam every dismissal path goes through.
-#[cfg(feature = "dbus")]
 #[test]
 fn select_area_always_answers_its_caller() {
     use crate::dbus::gnome_shell_screenshot::ScreenshotToSynoik;

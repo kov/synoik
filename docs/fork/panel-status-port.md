@@ -13,7 +13,7 @@ order/placement** comes from the JS `add_child`/`_addItems` sequence cited here 
 
 **Our code.** The panel lives in `src/ui/panel.rs` (bar + roles + indicator cluster), `src/ui/popover.rs`
 (popover framework + contents), `src/ui/quick_settings.rs` (QS menu), `src/ui/calendar.rs` (dateMenu
-calendar). Backing models: `src/system_status.rs` (network+battery, feature `dbus`), `src/audio.rs` +
+calendar). Backing models: `src/system_status.rs` (network+battery), `src/audio.rs` +
 `src/pipewire_audio.rs` (volume, feature `pipewire`), `src/gnome.rs` (gsettings toggles). D-Bus
 watchers follow the `src/dbus/system_status.rs` pattern (one `Connection::system()`, a task per
 service, `PropertiesChanged` → calloop channel → observable model → panel setter).
