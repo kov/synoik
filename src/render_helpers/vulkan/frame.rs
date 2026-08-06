@@ -1326,6 +1326,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let dims = (size.w as u32, size.h as u32);
         let reuse = slot.as_ref().is_some_and(|b| b.matches(dims, passes));
         if !reuse {
+            #[cfg(test)]
+            self.renderer.note_backdrop_blur_alloc();
             *slot = Some(BackdropBlur::new(self.renderer, size, passes)?);
         }
         let bb = slot.as_ref().expect("just populated");

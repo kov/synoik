@@ -167,6 +167,30 @@ Then the absent capabilities, in the order I'd take them:
 6. **Active/inactive fallback**, macOS-style: an unfocused window stops paying for a live blur and
    gains a focus cue. Cheapest perf win on the list.
 7. **XWayland** `_KDE_NET_WM_BLUR_BEHIND_REGION`.
-8. **Occlusion skip** for the real-backdrop path — the xray path already checks whether an opaque
-   workspace background fully covers the element; the framebuffer path should not capture at all
-   when the surface is fully occluded or the region is empty.
+8. **Bound the real-backdrop cost.** Originally written as "add an occlusion skip"; that was
+   mis-scoped. Read against `smithay/src/backend/renderer/damage/mod.rs`, the damage tracker
+   already does all three skips, and does them better than a compositor-side check could:
+   - **Occluded or undamaged**: element damage subtracts the opaque regions of everything above,
+     and an empty result `continue`s *before* both `capture_framebuffer` and `draw` (`mod.rs:907`).
+   - **Nothing below changed**: `needs_capture` is set only when the accumulated damage below the
+     effect overlaps it (`mod.rs:689-724`). A static scene captures and blurs nothing at all.
+   - **Empty client region**: `render_params_for_tile` already returns `None`.
+
+   What is genuinely left is allocation churn under **animated geometry**. `BackdropBlur::matches`
+   keys on the exact intermediate size, so a geometry that moves by one pixel discards the capture
+   texture, the whole Kawase chain (a level image and its ping-pong twin per pass, with render
+   passes and descriptor sets) and the blurred output, and rebuilds them — every frame of the
+   animation. Pinned by `vulkan_backdrop_blur_rebuilds_on_every_size_change`. Two halves:
+   - **The stall.** `SharedBlurChain::drop` calls `device_wait_idle`, on the strength of a comment
+     that says it "only runs when a chain is rebuilt … never per frame". Under an animating
+     geometry it runs every frame, so that is a full GPU stall per frame. The wait looks removable:
+     `retire_completed` drains only submits the timeline has *passed*, so a refcount that reaches
+     zero already implies every submit that recorded the chain is GPU-complete. Three premises to
+     verify before touching it (abandoned-frame path, renderer teardown ordering, no non-test early
+     drain) — and a mistake here is VMM-fatal UB, so it wants the validation layer on the run.
+   - **The churn.** Giving the sizing slack (round up, blur the sub-rect) needs `BlurChain::record`
+     to take a region, which it does not — synoik-vk shader work, a slice of its own. Worth
+     measuring after the stall is gone rather than designing now.
+
+   Note the intermediate size comes from the effect *geometry*, not `dst`, so overview zoom is
+   explicitly not a rebuild case; window resize and open/close (`surface_anim_scale`) are.
