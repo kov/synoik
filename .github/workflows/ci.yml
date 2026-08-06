@@ -71,9 +71,6 @@ jobs:
       - name: Check (no default features)
         run: cargo check --no-default-features
 
-      - name: Check (just dbus)
-        run: cargo check --no-default-features --features dbus
-
       - name: Check (just systemd)
         run: cargo check --no-default-features --features systemd
 
