@@ -96,7 +96,17 @@ service is activatable and the interface is real, not aspirational.
   presentation field, not a fourth `from_u32` case, or an unexpected `3` on the wire becomes a
   reboot.
 
-### 3.2 Slices
+### 3.2 Slices — LANDED
+
+All four; the checkbox works end to end. What is *not* here is the `UPDATE_RESTART` presentation
+type and the battery gate, both in §4.
+
+One thing worth knowing before changing the rendering: **the tick glyph is not in the baked card.**
+Icons are textures, not paint verbs, so `Painter::check_box` draws the frame and
+`EndSessionDialog::render` composites `check-symbolic` over it — taking the same fade *and* the same
+open-animation rescale about the same centre, or it slides off its own frame on the way in. A dump
+of the baked texture therefore shows an empty accent square, correctly.
+
 
 1. **`widget::CheckBox`** — a shared toolkit control, not an inline shape in the dialog (see
    CLAUDE.md, toolkit-first). Spec cached in `gnome-style-reference.md` §check-box, from

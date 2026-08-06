@@ -520,6 +520,9 @@ pub struct Synoik {
     pub end_session: crate::end_session::EndSession,
     /// The timer armed to the countdown's auto-confirm deadline (see `EndSession::deadline`).
     pub end_session_timer: Option<RegistrationToken>,
+    /// Where `org.gnome.Software.OfflineUpdates.GetState` replies come back to. `None` with no
+    /// session bus, which simply means the update checkbox is never offered.
+    pub offline_update_tx: Option<calloop::channel::Sender<crate::end_session::OfflineUpdateState>>,
     /// 1 s repeating timer that ticks the R1 screen-recording indicator's `M:SS` label while any
     /// recording is live; `None` when nothing is recording.
     pub recording_tick: Option<RegistrationToken>,
@@ -6546,9 +6549,14 @@ impl State {
                 let kind = EndSessionType::from_u32(kind);
                 self.synoik.end_session.open(kind, seconds, now);
                 self.synoik.end_session_dialog.show(kind);
-                self.synoik
-                    .end_session_dialog
-                    .set_content(kind, self.synoik.end_session.seconds_left(now));
+                self.synoik.end_session_dialog.set_content(
+                    kind,
+                    self.synoik.end_session.seconds_left(now),
+                    self.synoik.update_checkbox(),
+                );
+                // Ask gnome-software what is pending. Asynchronous: the dialog is already up, and
+                // the checkbox appears if and when the answer says there is something to install.
+                self.synoik.query_offline_updates();
                 self.synoik.reschedule_end_session_timer();
                 self.synoik.queue_redraw_all();
             }
@@ -7038,6 +7046,7 @@ impl Synoik {
             idle_monitor_timer: None,
             end_session: crate::end_session::EndSession::new(),
             end_session_timer: None,
+            offline_update_tx: None,
             recording_tick: None,
             idle_inhibit_manager_state,
             data_device_state,
@@ -9523,6 +9532,7 @@ impl Synoik {
         // Next, the end-session (logout/shutdown/restart) confirmation dialog.
         self.end_session_dialog.render(
             ctx.renderer,
+            &self.icon_cache,
             output,
             self.gnome_settings.accent_color,
             &mut |elem| push(elem.into()),
@@ -14255,12 +14265,87 @@ impl Synoik {
     /// The user confirmed the end-session dialog (clicked the action button, pressed Enter on it,
     /// or the countdown expired): tell gnome-session to proceed and close the dialog.
     pub fn confirm_end_session(&mut self) {
-        if let Some(kind) = self.end_session.confirm() {
-            self.emit_end_session_signal(kind.confirmed_signal());
+        if let Some(confirmation) = self.end_session.confirm() {
+            self.emit_confirmation(confirmation);
         }
         self.end_session_dialog.hide();
         self.reschedule_end_session_timer();
         self.queue_redraw_all();
+    }
+
+    /// Act on a [`Confirmation`]: settle the offline update with gnome-software first, *then* emit
+    /// the signal, because what we settled decides which signal it is.
+    ///
+    /// Ordering is gnome-shell's (`js/ui/endSessionDialog.js:469-500`): it awaits `SetAction`
+    /// before emitting, for the same reason — a `shutdown` that gnome-software accepted must
+    /// become a reboot on the wire, and one it refused must not.
+    fn emit_confirmation(&self, confirmation: crate::end_session::Confirmation) {
+        use crate::end_session::UpdateDecision;
+
+        let accepted = match (confirmation.updates, self.gnome_software_conn()) {
+            (UpdateDecision::Install(action), Some(conn)) => {
+                crate::dbus::gnome_software::set_action(&conn, action)
+            }
+            (UpdateDecision::Discard, Some(conn)) => {
+                crate::dbus::gnome_software::cancel(&conn);
+                false
+            }
+            // No connection to say it to, or nothing to say.
+            _ => false,
+        };
+        self.emit_end_session_signal(confirmation.signal(accepted));
+    }
+
+    /// The session-bus connection the offline-update calls ride on. The same one the dialog's own
+    /// signals use — gnome-software is addressed by name, so any session connection reaches it.
+    fn gnome_software_conn(&self) -> Option<zbus::blocking::Connection> {
+        self.dbus.as_ref().and_then(|d| d.conn_end_session.clone())
+    }
+
+    /// The update checkbox's state for the dialog to draw: `None` when it isn't offered at all,
+    /// `Some(checked)` otherwise.
+    pub fn update_checkbox(&self) -> Option<bool> {
+        self.end_session
+            .offers_updates()
+            .then(|| self.end_session.install_updates())
+    }
+
+    /// gnome-software answered. If it says there is something pending, the checkbox appears on the
+    /// dialog that is already on screen — which is also why the box is taller from here on.
+    pub fn on_offline_update_state(&mut self, state: crate::end_session::OfflineUpdateState) {
+        self.end_session.set_offline_update_state(state);
+        self.refresh_end_session_content();
+    }
+
+    /// The user toggled the update checkbox.
+    pub fn toggle_install_updates(&mut self) {
+        self.end_session.toggle_install_updates();
+        self.refresh_end_session_content();
+    }
+
+    /// Push the state machine's current content at the dialog widget and redraw.
+    fn refresh_end_session_content(&mut self) {
+        let Some(kind) = self.end_session.kind() else {
+            return;
+        };
+        let now = self.clock.now_unadjusted();
+        let seconds_left = self.end_session.seconds_left(now);
+        let checkbox = self.update_checkbox();
+        self.end_session_dialog
+            .set_content(kind, seconds_left, checkbox);
+        self.queue_redraw_all();
+    }
+
+    /// Ask gnome-software what is pending, for a dialog that just opened. The answer arrives
+    /// asynchronously via [`Self::on_offline_update_state`].
+    fn query_offline_updates(&self) {
+        let Some(conn) = self.gnome_software_conn() else {
+            return;
+        };
+        let Some(tx) = self.offline_update_tx.clone() else {
+            return;
+        };
+        crate::dbus::gnome_software::query_state(&conn, tx);
     }
 
     /// The user cancelled the end-session dialog (Cancel button or Esc): tell gnome-session to
@@ -14299,9 +14384,10 @@ impl Synoik {
         self.end_session_timer = None;
         let now = self.clock.now_unadjusted();
 
-        if let Some(kind) = self.end_session.tick(now) {
-            // Countdown expired: auto-confirm the default action, exactly as clicking it would.
-            self.emit_end_session_signal(kind.confirmed_signal());
+        if let Some(confirmation) = self.end_session.tick(now) {
+            // Countdown expired: auto-confirm the default action, exactly as clicking it would —
+            // including whatever the update checkbox was left saying.
+            self.emit_confirmation(confirmation);
             self.end_session_dialog.hide();
             self.queue_redraw_all();
             return;
@@ -14309,8 +14395,11 @@ impl Synoik {
 
         // Still counting down: update the displayed seconds and tick again in a second.
         if let Some(kind) = self.end_session.kind() {
-            self.end_session_dialog
-                .set_content(kind, self.end_session.seconds_left(now));
+            self.end_session_dialog.set_content(
+                kind,
+                self.end_session.seconds_left(now),
+                self.update_checkbox(),
+            );
         }
         self.queue_redraw_all();
         self.reschedule_end_session_timer();

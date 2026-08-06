@@ -299,6 +299,22 @@ impl DBusServers {
                 }
             }
 
+            // Where gnome-software's offline-update answers come back to, for the dialog's
+            // "Install pending software updates" checkbox. Only a receiver: the question is asked
+            // on demand when a dialog opens, never at startup — gnome-software's unit is delayed
+            // and a query would activate it early.
+            let (to_niri, from_offline_updates) = calloop::channel::channel();
+            synoik
+                .event_loop
+                .insert_source(from_offline_updates, move |event, _, state| match event {
+                    calloop::channel::Event::Msg(state_) => {
+                        state.synoik.on_offline_update_state(state_)
+                    }
+                    calloop::channel::Event::Closed => (),
+                })
+                .unwrap();
+            synoik.offline_update_tx = Some(to_niri);
+
             #[cfg(feature = "xdp-gnome-screencast")]
             {
                 let (to_niri, from_screen_cast) = calloop::channel::channel();

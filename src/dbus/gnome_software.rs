@@ -29,6 +29,8 @@ use std::time::Duration;
 
 use zbus::fdo;
 
+use crate::end_session::{OfflineUpdateState, PostUpdateAction};
+
 const BUS_NAME: &str = "org.gnome.Software";
 const OBJECT_PATH: &str = "/org/gnome/Software/OfflineUpdates";
 const IFACE: &str = "org.gnome.Software.OfflineUpdates";
@@ -36,59 +38,6 @@ const IFACE: &str = "org.gnome.Software.OfflineUpdates";
 /// How long any single call gets before we give up and treat updates as unavailable. The dialog is
 /// on screen with a countdown running; a wedged gnome-software must not hold it.
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// What gnome-software says is pending, from `GetState`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OfflineUpdateState {
-    /// gnome-software isn't running, didn't answer, or answered something we don't understand.
-    /// The dialog shows no checkbox and behaves as though this feature did not exist.
-    #[default]
-    Unavailable,
-    /// Running, nothing pending.
-    None,
-    /// An update is downloaded and can be scheduled via `SetAction`.
-    Prepared,
-    /// An update is already scheduled for the next reboot.
-    Scheduled,
-}
-
-impl OfflineUpdateState {
-    /// Map `GetState`'s reply. An unrecognized string is [`Unavailable`](Self::Unavailable), not a
-    /// guess: the interface is explicitly unstable, so a future state we've never heard of must
-    /// fail closed rather than be lumped in with "there is an update to install".
-    pub fn from_wire(s: &str) -> Self {
-        match s {
-            "none" => Self::None,
-            "prepared" => Self::Prepared,
-            "scheduled" => Self::Scheduled,
-            other => {
-                warn!("unknown org.gnome.Software.OfflineUpdates state {other:?}");
-                Self::Unavailable
-            }
-        }
-    }
-
-    /// Whether there is something for the checkbox to offer to install.
-    pub fn has_pending_update(self) -> bool {
-        matches!(self, Self::Prepared | Self::Scheduled)
-    }
-}
-
-/// What gnome-software should do once the updates are applied (`SetAction`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PostUpdateAction {
-    Reboot,
-    Shutdown,
-}
-
-impl PostUpdateAction {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Reboot => "reboot",
-            Self::Shutdown => "shutdown",
-        }
-    }
-}
 
 /// Ask gnome-software what is pending, off the main loop, delivering the answer over `to_synoik`.
 ///
@@ -208,56 +157,5 @@ async fn with_timeout<F: std::future::Future>(future: F) -> Option<F::Output> {
     match select(future, timeout).await {
         Either::Left((out, _)) => Some(out),
         Either::Right(_) => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The interface is documented as unstable, so an unknown state must fail closed. Treating an
-    /// unrecognized string as "there is an update" would offer to install something gnome-software
-    /// never said was ready.
-    #[test]
-    fn unknown_states_are_unavailable_not_pending() {
-        assert_eq!(
-            OfflineUpdateState::from_wire("none"),
-            OfflineUpdateState::None
-        );
-        assert_eq!(
-            OfflineUpdateState::from_wire("prepared"),
-            OfflineUpdateState::Prepared
-        );
-        assert_eq!(
-            OfflineUpdateState::from_wire("scheduled"),
-            OfflineUpdateState::Scheduled
-        );
-        for weird in ["", "PREPARED", "downloading", "unknown"] {
-            assert_eq!(
-                OfflineUpdateState::from_wire(weird),
-                OfflineUpdateState::Unavailable,
-                "{weird:?}"
-            );
-            assert!(!OfflineUpdateState::from_wire(weird).has_pending_update());
-        }
-    }
-
-    #[test]
-    fn only_prepared_and_scheduled_offer_an_install() {
-        assert!(OfflineUpdateState::Prepared.has_pending_update());
-        assert!(OfflineUpdateState::Scheduled.has_pending_update());
-        assert!(!OfflineUpdateState::None.has_pending_update());
-        assert!(!OfflineUpdateState::Unavailable.has_pending_update());
-        // The default must be the safe one: a dialog that has not heard back yet shows no checkbox.
-        assert_eq!(
-            OfflineUpdateState::default(),
-            OfflineUpdateState::Unavailable
-        );
-    }
-
-    #[test]
-    fn actions_use_gnome_softwares_wire_names() {
-        assert_eq!(PostUpdateAction::Reboot.as_str(), "reboot");
-        assert_eq!(PostUpdateAction::Shutdown.as_str(), "shutdown");
     }
 }

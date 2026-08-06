@@ -7736,6 +7736,77 @@ fn screencast_area_resolves_to_the_containing_output() {
     assert!(f.synoik().cast_params_for_area(off).is_none());
 }
 
+/// The offline-update checkbox, driven through the real entry points: gnome-session's `Open`, the
+/// asynchronous answer from gnome-software, the user toggling the box, and confirming.
+///
+/// The bus is not involved — `on_offline_update_state` is exactly what the D-Bus reply lands on, so
+/// the corpus can hand it any answer including ones a real gnome-software would rarely produce.
+#[test]
+fn end_session_dialog_offers_pending_updates() {
+    use crate::dbus::gnome_session::EndSessionDialogToSynoik;
+    use crate::end_session::{OfflineUpdateState, PostUpdateAction, UpdateDecision};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // A power-off dialog opens with no checkbox: gnome-software has not answered yet.
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
+            kind: 1,
+            seconds: 60,
+        });
+    assert_eq!(f.synoik().update_checkbox(), None, "nothing offered yet");
+
+    // It answers: an update is downloaded and waiting. The box appears, already ticked.
+    f.synoik()
+        .on_offline_update_state(OfflineUpdateState::Prepared);
+    assert_eq!(f.synoik().update_checkbox(), Some(true));
+
+    // Unticking it is remembered, and confirming then asks gnome-software to drop the update.
+    f.synoik().toggle_install_updates();
+    assert_eq!(f.synoik().update_checkbox(), Some(false));
+    assert_eq!(
+        f.synoik().end_session.confirm().unwrap().updates,
+        UpdateDecision::Discard,
+    );
+
+    // Nothing pending: no box, whatever the dialog type.
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
+            kind: 2,
+            seconds: 60,
+        });
+    f.synoik().on_offline_update_state(OfflineUpdateState::None);
+    assert_eq!(f.synoik().update_checkbox(), None);
+
+    // Logging out never offers it, even with an update ready to go.
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
+            kind: 0,
+            seconds: 60,
+        });
+    f.synoik()
+        .on_offline_update_state(OfflineUpdateState::Scheduled);
+    assert_eq!(
+        f.synoik().update_checkbox(),
+        None,
+        "logout installs nothing, so it must not offer to",
+    );
+
+    // A restart with the box left ticked schedules the update and reboots into it.
+    f.synoik_state()
+        .on_end_session_msg(EndSessionDialogToSynoik::Open {
+            kind: 2,
+            seconds: 60,
+        });
+    f.synoik()
+        .on_offline_update_state(OfflineUpdateState::Prepared);
+    assert_eq!(
+        f.synoik().end_session.confirm().unwrap().updates,
+        UpdateDecision::Install(PostUpdateAction::Reboot),
+    );
+}
+
 #[test]
 fn screencast_area_picks_the_largest_intersection_output() {
     use smithay::utils::{Point, Rectangle, Size};

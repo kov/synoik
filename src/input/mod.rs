@@ -1025,6 +1025,7 @@ impl State {
                         DialogOutcome::Handled => this.synoik.queue_redraw_all(),
                         DialogOutcome::Confirm => this.synoik.confirm_end_session(),
                         DialogOutcome::Cancel => this.synoik.cancel_end_session(),
+                        DialogOutcome::ToggleUpdates => this.synoik.toggle_install_updates(),
                     }
 
                     if pressed {
@@ -6937,6 +6938,7 @@ impl State {
                             DialogOutcome::Handled => {}
                             DialogOutcome::Confirm => self.synoik.confirm_end_session(),
                             DialogOutcome::Cancel => self.synoik.cancel_end_session(),
+                            DialogOutcome::ToggleUpdates => self.synoik.toggle_install_updates(),
                         }
                     }
                 }

@@ -519,6 +519,24 @@ fn icon_key(name: &str, logical_px: f64, scale: f64, color: [f32; 4]) -> Symboli
 /// `notification-collapse-symbolic` is our derived name for the expand chevron
 /// rotated 180° — gnome-shell rotates the button actor instead
 /// (`js/ui/messageList.js:635-638`); we bake the rotation into the SVG.
+/// The names [`embedded_icon`] answers to, so a test can walk the table rather than trusting that
+/// each new arm was spelled the same in both places.
+pub const EMBEDDED_ICON_NAMES: &[&str] = &[
+    "no-notifications-symbolic",
+    "notification-expand-symbolic",
+    "notification-collapse-symbolic",
+    "message-indicator-symbolic",
+    "group-collapse-symbolic",
+    "carousel-arrow-next-symbolic",
+    "carousel-arrow-previous-symbolic",
+    "preview-close-symbolic",
+    "check-symbolic",
+    "screenshot-ui-area-symbolic",
+    "screenshot-ui-display-symbolic",
+    "screenshot-ui-window-symbolic",
+    "screenshot-ui-show-pointer-symbolic",
+];
+
 fn embedded_icon(name: &str) -> Option<&'static [u8]> {
     match name {
         "no-notifications-symbolic" => Some(include_bytes!(
@@ -1946,6 +1964,20 @@ mod tests {
             "decoded at the requested physical size"
         );
         assert!((buffer.logical_size().w - 48.).abs() < 1.0);
+    }
+
+    /// Every name in [`embedded_icon`] must actually resolve, because the callers all take the
+    /// `Option` and skip a missing glyph in silence — a typo'd name there is a widget that draws
+    /// its frame and no icon, which looks like a rendering bug rather than a missing file. Cheap
+    /// enough to cover the whole table, so it does.
+    #[test]
+    fn every_embedded_icon_name_resolves() {
+        for name in EMBEDDED_ICON_NAMES {
+            let svg = embedded_icon(name)
+                .unwrap_or_else(|| panic!("{name} is listed but embedded_icon does not know it"));
+            // They open with an SPDX comment, so look for the element rather than the first byte.
+            assert!(svg.windows(4).any(|w| w == b"<svg"), "{name} is not an SVG",);
+        }
     }
 
     /// `retain` is the image cache's only bound: its key space is one entry per cover *played*,
