@@ -4,11 +4,19 @@
 
 //! The on-screen notification banner, gnome-shell 50.1's `MessageTray` popup.
 //!
-//! One banner at a time, top-center on a single output (our stand-in for
-//! GNOME's primary monitor), sliding down from above the panel with a fade
-//! (`js/ui/messageTray.js:1124-1160`, 200 ms). The widget is the shared
-//! message card (`ui/notification_card.rs`) at `.notification-banner` metrics:
-//! 34em wide, radius `$modal_radius` (`_notifications.scss:1-17`).
+//! One banner at a time, in the top-*right* corner of a single output (our
+//! stand-in for GNOME's primary monitor), sliding down from above the panel
+//! with a fade (`js/ui/messageTray.js:1124-1160`, 200 ms). The widget is the
+//! shared message card (`ui/notification_card.rs`) at `.notification-banner`
+//! metrics: 34em wide, radius `$modal_radius` (`_notifications.scss:1-17`).
+//!
+//! **Divergence — the corner, not the center.** GNOME centers the banner
+//! (`_bannerBin`'s `x_align: CENTER`, `js/ui/messageTray.js:731-736`) because
+//! its dateMenu — the clock, whose popover hosts the message list these
+//! banners belong to — is centered in the panel. Ours lives in the right
+//! corner (`RIGHT_BOX_ORDER`, [`crate::ui::panel`]), so the banner follows it
+//! there and comes out of the same corner its list lives in. See
+//! [`edge_inset`].
 //!
 //! Timing is the tray's own — the client's `expire_timeout` is ignored:
 //! 4000 ms (`NOTIFICATION_TIMEOUT`, `js/ui/messageTray.js:19`), CRITICAL never
@@ -79,6 +87,24 @@ const SHADOW: widget::DropShadowSpec = widget::DropShadowSpec {
 };
 /// `.notification-banner` margin (`_notifications.scss:12`).
 const MARGIN: f64 = 4.;
+
+/// Inset the banner's right edge keeps from the screen edge, logical px.
+///
+/// **Divergence — the banner hangs off the right corner** (see the module doc). It is the
+/// dateMenu's popup, and the dateMenu is in our right corner
+/// (`RIGHT_BOX_ORDER`, [`crate::ui::panel`]), so the banner lines its right edge up with the
+/// calendar popover that opens under the same button — hence the popover's panel-edge inset
+/// (`crate::ui::popover::PANEL_EDGE_INSET`, itself the panel button's own pill inset), not
+/// this widget's own `MARGIN`.
+fn edge_inset() -> f64 {
+    crate::ui::panel::BTN_MARGIN_X
+}
+
+/// The banner's output-local left edge: right-anchored at [`edge_inset`], falling back to
+/// flush-left on an output too narrow to hold it.
+fn shown_x(output_w: f64, banner_w: f64) -> f64 {
+    (output_w - banner_w - edge_inset()).max(0.)
+}
 
 /// `NOTIFICATION_TIMEOUT` (`js/ui/messageTray.js:19`).
 const TIMEOUT: Duration = Duration::from_millis(4000);
@@ -487,12 +513,12 @@ impl NotificationBanner {
         matches!(self.state, State::Showing(_) | State::Hiding { .. })
     }
 
-    /// The banner's rectangle on its output when fully shown (for hit-tests).
-    fn shown_rect(&self, output: &Output) -> Option<Rectangle<f64, Logical>> {
+    /// The banner's rectangle on its output when fully shown (for hit-tests, and for tests
+    /// that need a point on the banner without reimplementing where it sits).
+    pub(crate) fn shown_rect(&self, output: &Output) -> Option<Rectangle<f64, Logical>> {
         let content = self.content.as_ref()?;
         let layout = self.layout(content);
-        let ow = output_size(output).w;
-        let x = ((ow - layout.size.w) / 2.).max(0.);
+        let x = shown_x(output_size(output).w, layout.size.w);
         let y = crate::ui::panel::panel_height() + MARGIN;
         Some(Rectangle::new(Point::from((x, y)), layout.size))
     }
@@ -565,7 +591,7 @@ impl NotificationBanner {
         };
         let alpha = progress as f32;
 
-        let x = ((ow - layout.size.w) / 2.).max(0.);
+        let x = shown_x(ow, layout.size.w);
         let y_shown = crate::ui::panel::panel_height() + MARGIN;
         // Slide down from fully off-screen above, like the tray banner.
         let y = -layout.size.h + progress * (layout.size.h + y_shown);

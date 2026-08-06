@@ -8557,6 +8557,18 @@ fn banner_notify(f: &mut Fixture, req: crate::notifications::NotifyRequest) -> u
     rx.recv_blocking().unwrap().unwrap()
 }
 
+/// The banner's on-screen rect, asked of the banner itself. It hangs off the *right*
+/// corner, under the clock whose popover owns its message list (see
+/// [`crate::ui::notification_banner`]), so tests derive their sample points from here
+/// instead of assuming where it lands.
+fn banner_rect(
+    f: &mut Fixture,
+    output: u8,
+) -> smithay::utils::Rectangle<f64, smithay::utils::Logical> {
+    let output = f.synoik_output(output);
+    f.synoik().notification_banner.shown_rect(&output).unwrap()
+}
+
 /// Pin the clock forward and advance — the banner's deadline authority is the
 /// pinned clock, not the wake-up timer (see the headless-animation-clock trap).
 fn tick(f: &mut Fixture, ms: u64) {
@@ -8618,12 +8630,14 @@ fn a_resize_grab_keeps_its_cursor_under_a_banner() {
     );
 
     // Drag up into the banner's own rect, which is where the arrow used to take over.
-    pointer_motion_to(&mut f, 960., 40.);
+    let banner = banner_rect(&mut f, 1);
+    let on_banner = banner.loc + Point::from((banner.size.w / 2., 4.));
+    pointer_motion_to(&mut f, on_banner.x, on_banner.y);
     let output = f.synoik_output(1);
     assert!(
         f.synoik()
             .notification_banner
-            .pointer_inside(&output, Point::from((960., 40.))),
+            .pointer_inside(&output, on_banner),
         "the sample point must really be under the banner, or this proves nothing"
     );
     assert_eq!(
@@ -8791,14 +8805,12 @@ fn notification_banner_close_click_dismisses() {
     let id = banner_notify(&mut f, banner_req("app", ":1.1"));
     f.settle_animations();
 
-    // Banner geometry: 34em wide centered, y = panel(32) + margin(4); the close
-    // circle (28px) sits PAD + its 3px margin from the right edge, centered in
-    // the header row (`_message-list.scss:152-155`).
-    let em = crate::ui::pt_to_px(11.);
-    let w = 34. * em;
-    let x0 = (1920. - w) / 2.;
-    let close_x = x0 + w - 6. - 3. - 14.;
-    let close_y = 36. + 6. + 12.;
+    // Banner geometry: 34em wide in the top-right corner, y = panel(32) + margin(4);
+    // the close circle (28px) sits PAD + its 3px margin from the right edge, centered
+    // in the header row (`_message-list.scss:152-155`).
+    let banner = banner_rect(&mut f, 1);
+    let close_x = banner.loc.x + banner.size.w - 6. - 3. - 14.;
+    let close_y = banner.loc.y + 6. + 12.;
     pointer_motion_to(&mut f, close_x, close_y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
@@ -8836,12 +8848,14 @@ fn notification_banner_action_click_emits_and_dismisses() {
     assert!(!f.synoik().notification_banner.is_expanded());
 
     // Hovering the shown banner expands it, revealing the action row.
-    pointer_motion_to(&mut f, 960., 80.);
+    let banner = banner_rect(&mut f, 1);
+    let center_x = banner.loc.x + banner.size.w / 2.;
+    pointer_motion_to(&mut f, center_x, banner.loc.y + 44.);
     assert!(f.synoik().notification_banner.is_expanded());
 
     // Single action button: centered in the action row below the body block.
-    let action_y = 36. + 6. + 24. + 6. + 48. + 6. + 14.;
-    pointer_motion_to(&mut f, 960., action_y);
+    let action_y = banner.loc.y + 6. + 24. + 6. + 48. + 6. + 14.;
+    pointer_motion_to(&mut f, center_x, action_y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
@@ -9628,23 +9642,29 @@ fn notification_banner_hover_expand_and_under_pointer_guard() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    // Park the pointer where the banner is about to land.
+    // Park the pointer where the banner is about to land — top-right corner, a
+    // banner's width in from the edge.
     f.pointer_motion(1., 1.);
-    pointer_motion_to(&mut f, 960., 80.);
+    let x = 1920. - 100.;
+    pointer_motion_to(&mut f, x, 80.);
     banner_notify(&mut f, banner_req("app", ":1.1"));
     f.settle_animations();
     assert!(!f.synoik().notification_banner.is_expanded());
+    assert!(
+        banner_rect(&mut f, 1).contains(smithay::utils::Point::from((x, 80.))),
+        "the parked pointer must really be under the banner, or the guard proves nothing"
+    );
 
     // Hovering in place (it popped up under us) must NOT expand.
-    pointer_motion_to(&mut f, 961., 80.);
+    pointer_motion_to(&mut f, x + 1., 80.);
     assert!(
         !f.synoik().notification_banner.is_expanded(),
         "popped-under-pointer: hover without leaving first doesn't expand"
     );
 
     // Leave, come back: now it expands.
-    pointer_motion_to(&mut f, 960., 400.);
-    pointer_motion_to(&mut f, 960., 80.);
+    pointer_motion_to(&mut f, x, 400.);
+    pointer_motion_to(&mut f, x, 80.);
     assert!(f.synoik().notification_banner.is_expanded());
 }
 
@@ -9659,7 +9679,12 @@ fn notification_banner_hover_during_slide_expands_when_shown() {
 
     banner_notify(&mut f, banner_req("app", ":1.1"));
     // Mid-slide: move onto the banner's area and stop.
-    pointer_motion_to(&mut f, 960., 80.);
+    let banner = banner_rect(&mut f, 1);
+    pointer_motion_to(
+        &mut f,
+        banner.loc.x + banner.size.w / 2.,
+        banner.loc.y + 44.,
+    );
     assert!(!f.synoik().notification_banner.is_expanded());
 
     f.settle_animations();
@@ -9689,11 +9714,41 @@ fn notification_banner_critical_auto_expands() {
 
     // The action row is present in the hit-test (short body: one line, so the
     // row sits right below the 48px body block).
+    let banner = banner_rect(&mut f, 1);
     let output = f.synoik_output(1);
-    let action_pos = smithay::utils::Point::from((960., 36. + 6. + 24. + 6. + 48. + 6. + 14.));
+    let action_pos = banner.loc + smithay::utils::Point::from((banner.size.w / 2., 104.));
     assert_eq!(
         f.synoik().notification_banner.hit_test(&output, action_pos),
         Some(crate::ui::notification_banner::BannerHit::Action(0))
+    );
+}
+
+/// **Divergence from GNOME's centered `_bannerBin`** (`js/ui/messageTray.js:731-736`):
+/// the banner hangs off the top-*right* corner, because that is where our dateMenu
+/// lives — and its popover is what hosts the message list the banner belongs to. Its
+/// right edge lines up with that popover's, so the two come out of the same corner.
+#[test]
+fn notification_banner_hangs_off_the_right_corner() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    banner_notify(&mut f, banner_req("app", ":1.1"));
+    f.settle_animations();
+    let banner = banner_rect(&mut f, 1);
+    assert!(
+        banner.loc.x > 1920. / 2.,
+        "the banner starts in the right half, not centered: {banner:?}"
+    );
+
+    open_calendar(&mut f);
+    f.settle_animations();
+    let popover_x = popover_origin(&mut f).x;
+    let popover_w = f.synoik().panel_popover.content_size().unwrap().w;
+    assert_eq!(
+        banner.loc.x + banner.size.w,
+        popover_x + popover_w,
+        "banner and calendar share a right edge"
     );
 }
 
