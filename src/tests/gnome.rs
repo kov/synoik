@@ -9723,6 +9723,57 @@ fn notification_banner_critical_auto_expands() {
     );
 }
 
+/// The banner's own buttons light on hover, like the message list's
+/// (`%notification_button:hover`, `_drawing.scss:228`): the close circle and each
+/// action button, one at a time, while the card body stays hovered throughout.
+#[test]
+fn notification_banner_buttons_light_under_the_pointer() {
+    use crate::ui::notification_card::CardZone;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(1., 1.);
+
+    let mut req = banner_req("app", ":1.1");
+    req.urgency = crate::notifications::Urgency::Critical; // auto-expands: the action row is up
+    req.actions = vec![("ok".to_owned(), "OK".to_owned())];
+    banner_notify(&mut f, req);
+    f.settle_animations();
+    let banner = banner_rect(&mut f, 1);
+    assert_eq!(f.synoik().notification_banner.hovered_zone(), None);
+
+    // Onto the action button (the row below the 48px body block).
+    pointer_motion_to(
+        &mut f,
+        banner.loc.x + banner.size.w / 2.,
+        banner.loc.y + 104.,
+    );
+    assert_eq!(
+        f.synoik().notification_banner.hovered_zone(),
+        Some(CardZone::Action(0)),
+        "the action button under the pointer lights up"
+    );
+
+    // Onto the close circle: the highlight moves, it does not stay behind.
+    pointer_motion_to(
+        &mut f,
+        banner.loc.x + banner.size.w - 6. - 3. - 14.,
+        banner.loc.y + 6. + 12.,
+    );
+    assert_eq!(
+        f.synoik().notification_banner.hovered_zone(),
+        Some(CardZone::Close)
+    );
+
+    // On the body but no button: the card darkens, nothing lights.
+    pointer_motion_to(&mut f, banner.loc.x + 20., banner.loc.y + 60.);
+    assert_eq!(f.synoik().notification_banner.hovered_zone(), None);
+
+    // Off the banner entirely.
+    pointer_motion_to(&mut f, 400., 600.);
+    assert_eq!(f.synoik().notification_banner.hovered_zone(), None);
+}
+
 /// **Divergence from GNOME's centered `_bannerBin`** (`js/ui/messageTray.js:731-736`):
 /// the banner hangs off the top-*right* corner, because that is where our dateMenu
 /// lives — and its popover is what hosts the message list the banner belongs to. Its

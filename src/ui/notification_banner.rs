@@ -57,7 +57,9 @@ use crate::animation::{Animation, Clock};
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
-use crate::ui::notification_card::{card_elements, layout, CardCache, CardContent, CardLayout};
+use crate::ui::notification_card::{
+    card_elements, layout, CardCache, CardContent, CardLayout, CardZone,
+};
 use crate::ui::widget;
 use crate::utils::output_size;
 
@@ -152,6 +154,14 @@ pub struct NotificationBanner {
     content: Option<CardContent>,
     output: Option<Output>,
     hovered: bool,
+    /// Which of the card's buttons the pointer is on, so it can light up
+    /// (`%notification_button:hover`). Derived from [`Self::hover_at`] alone —
+    /// never assigned from anywhere but [`Self::refresh_hovered_zone`].
+    hovered_zone: Option<CardZone>,
+    /// Where the pointer is while it is on the banner, kept so the lit button can
+    /// be recomputed whenever the *layout* moves under a stationary pointer —
+    /// expanding grows an action row, and there is no motion event to notice it.
+    hover_at: Option<(Output, Point<f64, Logical>)>,
     blocked: bool,
     idle_at_show: bool,
     /// Expanded body + action row. Set at show for CRITICAL
@@ -182,6 +192,8 @@ impl NotificationBanner {
             content: None,
             output: None,
             hovered: false,
+            hovered_zone: None,
+            hover_at: None,
             blocked: false,
             idle_at_show: false,
             expanded: false,
@@ -268,6 +280,8 @@ impl NotificationBanner {
             self.shown_rect(&output).is_some_and(|r| r.contains(p))
         });
         self.hovered = false;
+        self.hovered_zone = None;
+        self.hover_at = None;
         self.idle_at_show = user_idle;
         self.active_during_show = false;
         self.revision += 1;
@@ -384,16 +398,64 @@ impl NotificationBanner {
         }
     }
 
+    /// Move the pointer, `at` being its output and output-local position (`None`
+    /// when it is on no output at all).
+    ///
     /// Hover holds expiry and expands the (fully shown) banner; leaving
     /// restarts the full countdown (`js/ui/messageTray.js:970-1050,1102-1105`,
     /// simplified). A banner that popped up under the pointer doesn't expand
     /// until the pointer leaves and comes back (`:978-991`; our hover cycle
     /// stands in for GNOME's mouse-away tracking). Returns true when anything
     /// changed (re-arm the wake-up timer and redraw).
-    pub fn set_hovered(&mut self, hovered: bool) -> bool {
-        if self.hovered == hovered {
+    ///
+    /// Whole-card hover and the per-button zone come off the same position here
+    /// rather than from two call sites, so they cannot disagree — a button
+    /// cannot stay lit under a pointer the banner thinks has left.
+    pub fn set_hovered(&mut self, at: Option<(Output, Point<f64, Logical>)>) -> bool {
+        let hovered = at
+            .as_ref()
+            .is_some_and(|(output, p)| self.pointer_inside(output, *p));
+        self.hover_at = at.filter(|_| hovered);
+        let mut changed = self.hovered != hovered && self.set_hovered_inner(hovered);
+        // Read *after* the state machine above: a hover that expands the banner
+        // grows an action row the pointer may already be sitting on, and reading
+        // it first would leave that button dark until the next motion event.
+        changed |= self.refresh_hovered_zone();
+        changed
+    }
+
+    /// Recompute which button the pointer is on from [`Self::hover_at`], bumping
+    /// the revision when it moves. Call after anything that changes the card's
+    /// layout while the pointer sits still — otherwise the highlight is a frame
+    /// (or a whole hover) behind the geometry it belongs to.
+    fn refresh_hovered_zone(&mut self) -> bool {
+        let zone = self
+            .hover_at
+            .clone()
+            .and_then(|(output, p)| self.hit_test(&output, p))
+            .and_then(|hit| match hit {
+                BannerHit::Close => Some(CardZone::Close),
+                BannerHit::Action(i) => Some(CardZone::Action(i)),
+                // The body is not a button; the whole card darkens instead.
+                BannerHit::Body => None,
+            });
+        if self.hovered_zone == zone {
             return false;
         }
+        self.hovered_zone = zone;
+        self.revision += 1;
+        true
+    }
+
+    /// Which button the pointer is lighting up, exactly as handed to the card
+    /// bake — the render path's own value, so a test asserts what is drawn.
+    #[cfg(test)]
+    pub(crate) fn hovered_zone(&self) -> Option<CardZone> {
+        self.hovered_zone
+    }
+
+    /// The whole-card half of [`Self::set_hovered`] — expiry and hover-expand.
+    fn set_hovered_inner(&mut self, hovered: bool) -> bool {
         self.hovered = hovered;
         // The card body darkens while hovered (`%card:hover`); re-bake it even
         // when the hover doesn't also expand the banner (popped-under-pointer or
@@ -488,6 +550,10 @@ impl NotificationBanner {
                     if self.hovered && !self.popped_under_pointer {
                         self.expand();
                     }
+                    // Both arriving here (the banner only becomes hit-testable
+                    // when Shown) and expanding above move the buttons under a
+                    // pointer that has not sent an event since.
+                    self.refresh_hovered_zone();
                 }
             }
             State::Shown { deadline, .. } => {
@@ -613,11 +679,11 @@ impl NotificationBanner {
                 origin,
                 alpha,
                 scale,
-                // The whole banner darkens while hovered (`%card:hover`); it tracks
-                // only whole-banner hover, so no per-button highlight (a minor gap
-                // vs the popover list, which does light individual buttons).
+                // The whole banner darkens while hovered (`%card:hover`), and the
+                // close/action button under the pointer lights on top of it
+                // (`%notification_button:hover`).
                 self.hovered,
-                None,
+                self.hovered_zone,
             )
         };
 

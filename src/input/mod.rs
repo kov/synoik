@@ -4663,10 +4663,14 @@ impl State {
         // banner; leaving restarts the countdown
         // (`js/ui/messageTray.js:970-1050,1102-1105`, simplified).
         if self.synoik.layout.is_gnome_mode() {
-            let inside = self.synoik.output_under(pos).is_some_and(|(output, p)| {
-                self.synoik.notification_banner.pointer_inside(output, p)
+            let at = self
+                .synoik
+                .output_under(pos)
+                .map(|(output, p)| (output.clone(), p));
+            let inside = at.as_ref().is_some_and(|(output, p)| {
+                self.synoik.notification_banner.pointer_inside(output, *p)
             });
-            if self.synoik.notification_banner.set_hovered(inside) {
+            if self.synoik.notification_banner.set_hovered(at) {
                 self.synoik.reschedule_notification_banner_timer();
                 // Hover-expand changes the banner's layout.
                 self.synoik.queue_redraw_all();
