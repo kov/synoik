@@ -641,7 +641,7 @@ behavior*, which is precisely the thing we are free to reproduce.
 
 Our contributions are **GPL-3.0-only**. Combined with niri's or-later grant the aggregate
 conveys as **GPLv3 exactly**, and that is what the package metadata says (`Cargo.toml`,
-`synoik-vk/Cargo.toml`, the RPM spec, `flake.nix`).
+`synoik-vk/Cargo.toml`, the RPM spec).
 
 Per-file SPDX tags describe the *file*, not the aggregate, so they differ on purpose: files
 we never touched keep `GPL-3.0-or-later`, because that grant is niri's to give and
