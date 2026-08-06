@@ -79,7 +79,7 @@ pub fn tab_list(windows: &[SwitcherWindow], current_workspace_only: bool) -> Vec
 
     // MRU: most recently focused first, never-focused windows last. Stable, so windows that
     // share a timestamp (or have none) keep the caller's order.
-    candidates.sort_by(|a, b| b.focus_timestamp.cmp(&a.focus_timestamp));
+    candidates.sort_by_key(|w| std::cmp::Reverse(w.focus_timestamp));
 
     if current_workspace_only {
         let (here, elsewhere): (Vec<_>, Vec<_>) =

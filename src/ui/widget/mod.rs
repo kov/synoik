@@ -1003,7 +1003,11 @@ impl TileMetrics {
     ) -> Point<f64, Logical> {
         let center = self.icon_center(rect);
         let quarter = self.icon_px / 4.;
-        let dx = if i % 2 == 0 { -quarter } else { quarter };
+        let dx = if i.is_multiple_of(2) {
+            -quarter
+        } else {
+            quarter
+        };
         let dy = if i / 2 == 0 { -quarter } else { quarter };
         Point::from((center.x + dx, center.y + dy))
     }
