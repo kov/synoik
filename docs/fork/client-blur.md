@@ -181,13 +181,15 @@ Then the absent capabilities, in the order I'd take them:
    texture, the whole Kawase chain (a level image and its ping-pong twin per pass, with render
    passes and descriptor sets) and the blurred output, and rebuilds them — every frame of the
    animation. Pinned by `vulkan_backdrop_blur_rebuilds_on_every_size_change`. Two halves:
-   - **The stall.** `SharedBlurChain::drop` calls `device_wait_idle`, on the strength of a comment
-     that says it "only runs when a chain is rebuilt … never per frame". Under an animating
-     geometry it runs every frame, so that is a full GPU stall per frame. The wait looks removable:
-     `retire_completed` drains only submits the timeline has *passed*, so a refcount that reaches
-     zero already implies every submit that recorded the chain is GPU-complete. Three premises to
-     verify before touching it (abandoned-frame path, renderer teardown ordering, no non-test early
-     drain) — and a mistake here is VMM-fatal UB, so it wants the validation layer on the run.
+   - **The stall — DONE.** `SharedBlurChain::drop` called `device_wait_idle`, on the strength of a
+     comment saying it "only runs when a chain is rebuilt … never per frame"; under an animating
+     geometry that is exactly what it did, once per frame, on the compositor thread. Removed: a
+     refcount of zero already implies every submit that recorded the chain has completed, by all
+     four release paths (deferred finish → `InFlightSubmit`, drained only past the queue timeline;
+     synchronous finish → the frame outlives its own `wait_for_fences`; an errored or abandoned
+     frame never submitted; `flush_pending_blurs` → `run_commands`, which waits). Renderer teardown
+     is covered by `drain_in_flight()`. The invariant is written out in the `Drop`. Suite clean
+     under `SYNOIK_VK_VALIDATION=1` (exit 0, zero `VULKAN ERROR`). **Not yet seat-validated.**
    - **The churn.** Giving the sizing slack (round up, blur the sub-rect) needs `BlurChain::record`
      to take a region, which it does not — synoik-vk shader work, a slice of its own. Worth
      measuring after the stall is gone rather than designing now.
