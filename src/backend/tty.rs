@@ -72,7 +72,7 @@ use crate::frame_clock::FrameClock;
 use crate::frame_log::Phase;
 use crate::monitors_xml::{MonitorsConfig, SavedMode};
 use crate::render_helpers::debug::draw_damage;
-use crate::render_helpers::vulkan::VulkanRenderer;
+use crate::render_helpers::vulkan::{matches_render_order, VulkanRenderer};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::synoik::{RedrawState, State, Synoik};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
@@ -1862,22 +1862,14 @@ impl Tty {
 
         let tty_state: &TtyOutputState = output.user_data().get().unwrap();
 
-        // Damage-preserving (partial-damage) rendering on the owned Vulkan renderer is only safe
-        // with a SINGLE live scanout surface: the renderer keeps ONE present-blit shadow (shared
-        // Tty-wide, keyed by size), so with two same-size outputs a partial-damage frame for output
-        // B would LOAD-preserve output A's shadow content. Count the surfaces up front (before the
-        // mutable `device` borrow) and fall back to a full redraw whenever more than one exists.
-        // FIXME: a per-CRTC shadow (or the seed-blit variant) would lift this to multi-output.
+        // Count the live scanout surfaces up front, before the mutable `device` borrow — the
+        // partial-damage decision below needs it. See `renders_direct`.
         let single_scanout_surface = self
             .devices
             .values()
             .map(|d| d.surfaces.len())
             .sum::<usize>()
             == 1;
-
-        // `SYNOIK_VK_FULL_DAMAGE=1` takes the whole partial-damage chain out of the picture. See
-        // `full_damage_requested`.
-        let force_full_damage = !single_scanout_surface || full_damage_requested();
 
         let Some(device) = self.devices.get_mut(&tty_state.node) else {
             error!("missing output device");
@@ -1890,6 +1882,23 @@ impl Tty {
         };
 
         span.emit_text(&surface.name.connector);
+
+        // Whether damage-preserving (partial-damage) rendering is safe for THIS surface, which
+        // depends on which bind arm its scanout format takes — the same `matches_render_order` the
+        // renderer will consult, so the two cannot drift:
+        //
+        // - **Direct** (`Argb8888`/`Xrgb8888`, i.e. every plane we have met): the renderer draws
+        //   straight into this surface's own scanout buffers and preserves them across frames.
+        //   Nothing is shared with another surface, so the number of outputs is irrelevant.
+        // - **Present-blit** (a plane whose byte order differs): the target is a shadow shared
+        //   Tty-wide and keyed by SIZE, so with two same-size outputs a partial frame for output B
+        //   would LOAD-preserve output A's content. Fall back to a full redraw there.
+        //
+        // FIXME: a per-CRTC shadow would lift the second case to multi-output too. Unreachable on
+        // any plane we have seen, so it stays a fallback rather than a project.
+        let renders_direct = matches_render_order(surface.compositor.format());
+        let force_full_damage =
+            (!renders_direct && !single_scanout_surface) || full_damage_requested();
 
         if !device.drm.is_active() {
             // This branch hits any time we try to render while the user had switched to a
@@ -1929,11 +1938,8 @@ impl Tty {
                 surface,
                 &config,
                 flags,
-                // Partial-damage rendering works when there's a single scanout surface (see
-                // `single_scanout_surface`): the Vulkan renderer preserves the target across
-                // frames (render-pass LOAD) so DrmCompositor's buffer-age damage
-                // is enough. With multiple surfaces the shared shadow makes that
-                // unsafe, so force a full redraw there.
+                // Decided above, per surface: the renderer preserves the target across frames
+                // (render-pass LOAD), so DrmCompositor's buffer-age damage is enough.
                 force_full_damage,
                 target_presentation_time,
             )

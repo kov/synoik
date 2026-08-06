@@ -33,7 +33,7 @@ pub(super) const IMAGE_VK_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
 /// Whether `f` is one of the DRM fourccs whose byte order matches [`IMAGE_VK_FORMAT`], i.e. can be
 /// rendered into directly rather than through a channel-reordering shadow.
-pub(super) fn matches_render_order(f: Fourcc) -> bool {
+pub fn matches_render_order(f: Fourcc) -> bool {
     matches!(f, Fourcc::Argb8888 | Fourcc::Xrgb8888)
 }
 
