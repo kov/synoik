@@ -9,12 +9,13 @@ use std::str::FromStr as _;
 
 use insta::assert_snapshot;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel;
 use synoik_config::utils::RegexEq;
 use synoik_config::window_rule::Match;
 use synoik_config::workspace::WorkspaceName;
 use synoik_config::{
     BorderRule, Config, DefaultPresetSize, FloatOrInt, LayoutPart, Output, Outputs, PresetSize,
-    WindowRule, Workspace, WorkspaceLayoutPart,
+    Struts, WindowRule, Workspace, WorkspaceLayoutPart,
 };
 use synoik_ipc::ColumnDisplay;
 
@@ -903,4 +904,71 @@ post-map configures:
     settings.set_description(snapshot_desc.join("\n"));
     let _guard = settings.bind_to_scope();
     assert_snapshot!(snapshot);
+}
+
+/// A maximize arriving *after* the initial configure must be sized against the workspace the
+/// window was opened on, not against whatever workspace its monitor happens to be showing.
+///
+/// niri gets away with dropping the workspace here because it treats maximized and fullscreen
+/// windows as workspaces of their own; we do not, so the seed has to survive the request.
+#[test]
+fn maximize_after_the_initial_configure_keeps_the_windows_workspace() {
+    // Two named workspaces on the same output with different struts, so the toplevel bounds in
+    // the configure say which of the two the window was configured against.
+    let struts = |side| {
+        Some(WorkspaceLayoutPart(LayoutPart {
+            struts: Some(Struts {
+                left: FloatOrInt(side),
+                right: FloatOrInt(side),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    };
+    let config = scrolling(Config {
+        workspaces: vec![
+            Workspace {
+                name: WorkspaceName(String::from("ws-a")),
+                open_on_output: Some(String::from("headless-1")),
+                layout: struts(0.),
+            },
+            Workspace {
+                name: WorkspaceName(String::from("ws-b")),
+                open_on_output: Some(String::from("headless-1")),
+                layout: struts(100.),
+            },
+        ],
+        window_rules: vec![WindowRule {
+            open_on_workspace: Some(String::from("ws-b")),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    // ws-a is the active workspace; the rule sends this window to ws-b.
+    let client = f.client(id);
+    let window = client.create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    // Now maximize, still before mapping.
+    f.client(id).window(&surface).set_maximized();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    let configure = window.configures_received.last().unwrap().1.clone();
+    assert!(
+        configure.states.contains(&xdg_toplevel::State::Maximized),
+        "the maximize should have been acknowledged: {configure:?}"
+    );
+    // The bounds come from the workspace the window is configured against: 1280 minus ws-b's two
+    // 100px struts, minus the 32px of gaps. Against ws-a, which has no struts, it would be 1248.
+    assert_eq!(configure.bounds, Some((1048, 688)));
 }

@@ -438,19 +438,13 @@ impl XdgShellHandler for State {
                 InitialConfigureState::Configured {
                     rules,
                     output,
+                    workspace_name,
                     is_pending_maximized,
                     ..
                 } => {
-                    // DIVERGENCE, carried over unchanged from before the placement seam: this
-                    // does not seed the stored `workspace_name`, while unmaximize and
-                    // unfullscreen do. So a window with an `open-on-workspace` rule that
-                    // maximizes before mapping is sized against its monitor's *active*
-                    // workspace instead of its target one. Latent rather than live: window
-                    // rules have no config surface since the config file was removed, so
-                    // `open_on_workspace` is only ever set by tests. Left alone here because
-                    // unifying it is a behaviour change, not a refactor.
                     let parent = toplevel.parent();
                     let target = self.synoik.layout.resolve_placement(PlacementSeeds {
+                        workspace_name: workspace_name.as_deref(),
                         output: output.as_ref(),
                         parent: parent.as_ref(),
                         ..Default::default()
@@ -609,11 +603,23 @@ impl XdgShellHandler for State {
 
                     // The required configure will be the initial configure.
                 }
-                InitialConfigureState::Configured { rules, output, .. } => {
-                    // Same divergence as `maximize_request`, and unlike `unfullscreen_request`
-                    // below: no `workspace_name` seed. See the note there.
+                InitialConfigureState::Configured {
+                    rules,
+                    output,
+                    workspace_name,
+                    ..
+                } => {
                     let parent = toplevel.parent();
                     let target = self.synoik.layout.resolve_placement(PlacementSeeds {
+                        // Only when the client did not name an output: a named workspace pins
+                        // the monitor, so seeding both would let the workspace we resolved
+                        // earlier veto the output the client just asked for. The mapped path
+                        // above honours `requested_output` unconditionally; so do we.
+                        workspace_name: if requested_output.is_some() {
+                            None
+                        } else {
+                            workspace_name.as_deref()
+                        },
                         // A requested output wins; otherwise the one we resolved before.
                         output: requested_output.as_ref().or(output.as_ref()),
                         parent: parent.as_ref(),

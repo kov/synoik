@@ -260,19 +260,26 @@ pins workspace restore under all three reasons so this stays deliberate.
 
 ---
 
+### The maximize/unmaximize workspace-seed drift — settled, seed it always
+
+Surfaced by slice 0: `maximize_request` and `fullscreen_request` did not seed the stored
+`workspace_name` when re-resolving a not-yet-mapped window's monitor, while `unmaximize_request`
+and `unfullscreen_request` did. A window with an `open-on-workspace` rule that maximized before
+mapping was therefore sized against its monitor's *active* workspace instead of its own.
+
+That asymmetry is niri's, and it only made sense there: niri gives maximized and fullscreen
+windows workspaces of their own, so losing the window's workspace on the way in costs nothing.
+We do not do that — a maximized window stays on its workspace — so all four requests now seed
+`workspace_name`. Restore inherits the fixed behaviour.
+
+One exception, at `fullscreen_request`: when the client names an output, the workspace seed is
+dropped, because a named workspace pins the monitor and would otherwise let the workspace we
+resolved earlier veto the output the client just asked for. The mapped path honours
+`requested_output` unconditionally; the unmapped path now matches it.
+
+Pinned by `tests::window_opening::maximize_after_the_initial_configure_keeps_the_windows_workspace`.
+
 ## Open questions
-
-### The maximize/unmaximize workspace-seed drift
-
-Surfaced by slice 0, not decided. `maximize_request` and `fullscreen_request` do not seed the
-stored `workspace_name` when re-resolving a not-yet-mapped window's monitor; `unmaximize_request`
-and `unfullscreen_request` do. So a window with an `open-on-workspace` rule that maximizes before
-mapping is sized against its monitor's *active* workspace instead of its target one.
-
-It is latent rather than live — window rules have no config surface since the config file was
-removed, so `open_on_workspace` is only ever set by tests — and unifying it is a behaviour change
-rather than a refactor, so slice 0 carried it over unchanged and documented it at the call site.
-Worth deciding before slice 4 only if restore ends up seeding a workspace name.
 
 ### Eviction — cap at 1000 sessions, most-recently-used
 
