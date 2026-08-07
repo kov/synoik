@@ -6557,6 +6557,29 @@ fn vulkan_clips_a_window_through_the_overview_wrapper() {
         x1 - x0,
         y1 - y0,
     );
+
+    // ...and still *rounded*. Without this the test passes with clipping switched off entirely:
+    // "present and zoomed out" is satisfied by an unclipped window just as well as a clipped one,
+    // so the two assertions above say nothing about the thing the test is named for. Verified by
+    // stubbing `Tile`'s `clip_to_geometry` to `false` — this is the assertion that then fails.
+    //
+    // The corners of the green box must be cut away and the mid-edges must not, exactly as
+    // `vulkan_clips_a_window_to_rounded_geometry` checks on the desktop. The radius rides the
+    // overview's zoom down with the window, but the extreme corner pixel sits outside the
+    // quarter-circle at any scale, which is what makes this scale-independent.
+    let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+    for (x, y) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)] {
+        assert!(
+            !is_green(px(&pixels, w, x, y)),
+            "the zoomed-out corner ({x},{y}) is still window content — the wrapped render did not \
+             round it. bbox=({x0},{y0})..({x1},{y1})"
+        );
+    }
+    assert!(
+        is_green(px(&pixels, w, cx, y0 + 2)) && is_green(px(&pixels, w, x0 + 2, cy)),
+        "the mid-edges are not window content — the wrapper over-clipped rather than rounded. \
+         bbox=({x0},{y0})..({x1},{y1})"
+    );
 }
 
 /// The focus ring / border outline must be rounded, not pointy. It is drawn by
