@@ -588,7 +588,14 @@ struct BarCache {
     /// so nothing in this bake varies with the workspace at all. Neither is the background
     /// ([`bar_bg`]) — one cached bake serves the whole overview fade *and* the whole
     /// workspace switch.
-    textures: HashMap<(NotNan<f64>, i32), VkTexture>,
+    ///
+    /// The cached value is the [`TextureBuffer`], not the bare texture: the buffer is what carries
+    /// the element `Id`, and building a fresh one per frame from a cached texture churns that `Id`
+    /// even though not a pixel changed. Damage tracking then sees the old element *gone* and a new
+    /// one arrive every frame, which forces a full redraw of every framebuffer effect on the
+    /// output — see [`Self::bg`] and [`Self::dots`], kept for exactly this reason.
+    /// `nothing_churns_its_element_id_per_frame` is the guard.
+    textures: HashMap<(NotNan<f64>, i32), TextureBuffer<VkTexture>>,
     /// The bar background. A buffer rather than a bare colour so its commit counter
     /// bumps when the colour or width changes — that is what tells damage tracking the
     /// background moved, now that it is no longer part of the chrome bake.
@@ -1535,7 +1542,11 @@ impl Panel {
         // What is left — the clock label and the recording/keyboard labels — changes on
         // content, not on a clock tick within an animation, so a single bake now serves
         // every frame of both animations. `position` is deliberately not consulted here.
-        // `the_panel_rebakes_nothing_per_frame` is the guard.
+        // `the_overview_animation_rebakes_nothing_per_frame` and
+        // `the_workspace_switch_rebakes_nothing_per_frame` are the guards — both were written
+        // against this bake. They only see *bakes*, though: a cached texture rewrapped in a fresh
+        // buffer every frame bakes nothing and still churns the element identity, which is what
+        // `nothing_churns_its_element_id_per_frame` covers.
         let bar_key = (scale_key, width_px);
         #[allow(clippy::map_entry)]
         if !cache.textures.contains_key(&bar_key) {
@@ -1549,7 +1560,18 @@ impl Panel {
                 keyboard_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
             ) {
                 Ok(texture) => {
-                    cache.textures.insert(bar_key, texture);
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        // The chrome is transparent everywhere it does not draw, so it never
+                        // occludes. Nothing in the panel does any more: the background below it is
+                        // a translucent wash over a blurred backdrop, so the strip has no opaque
+                        // region at all and whatever is under the bar still has to be drawn.
+                        Vec::new(),
+                    );
+                    cache.textures.insert(bar_key, buffer);
                 }
                 Err(err) => {
                     tracing::error!("error drawing the panel bar: {err:#}");
@@ -1557,23 +1579,10 @@ impl Panel {
                 }
             }
         }
-        let bar_texture = cache.textures.get(&bar_key).cloned();
-
-        if let Some(texture) = bar_texture {
-            let buffer = TextureBuffer::from_texture(
-                renderer,
-                texture,
-                scale,
-                Transform::Normal,
-                // The chrome is transparent everywhere it does not draw, so it never
-                // occludes. Nothing in the panel does any more: the background below it is a
-                // translucent wash over a blurred backdrop, so the strip has no opaque region
-                // at all and whatever is under the bar still has to be drawn.
-                Vec::new(),
-            );
+        if let Some(buffer) = cache.textures.get(&bar_key) {
             elements.push(PanelElement::Texture(
                 TextureRenderElement::from_texture_buffer(
-                    buffer,
+                    buffer.clone(),
                     Point::from((0., 0.)),
                     1.,
                     None,

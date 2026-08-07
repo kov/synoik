@@ -9772,6 +9772,66 @@ fn the_workspace_switch_rebakes_nothing_per_frame() {
     );
 }
 
+/// The element `Id`s composited for `output`, in draw order, for one frame.
+fn element_ids(f: &mut Fixture, output: &Output) -> Vec<String> {
+    let state = f.synoik_state();
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            use smithay::backend::renderer::element::Element as _;
+
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(output));
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            synoik
+                .render_to_vec(ctx, output, false)
+                .iter()
+                .map(|e| format!("{:?}", e.id()))
+                .collect::<Vec<_>>()
+        })
+        .expect("the fixture must have a Vulkan renderer")
+}
+
+/// On an idle desktop, no element may change its `Id` from one frame to the next.
+///
+/// An element `Id` is an *identity*, not a handle: damage tracking uses it to recognise the same
+/// element across frames. Mint a fresh one each render and the tracker sees the old element
+/// disappear and a stranger arrive, which sets `force_effect_redraw` — so **every** framebuffer
+/// effect on the output re-captures and re-blurs, every frame, forever.
+///
+/// This is invisible to the `*_rebakes_nothing_per_frame` guards above, and that is the point:
+/// `ui/panel.rs` cached the bar *texture* correctly and then built a fresh `TextureBuffer` around
+/// it on every render. Nothing re-baked — the bake guards were green — while the panel handed the
+/// tracker a brand-new 1280x32 element 60 times a second.
+#[test]
+fn nothing_churns_its_element_id_per_frame() {
+    let Some(mut f) = window_fixture_settled(GREEN, true, Some("id churn probe")) else {
+        return;
+    };
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+
+    // One warm-up: first-composite allocations are legitimate, they just must not repeat.
+    let _ = element_ids(&mut f, &output);
+
+    let first = element_ids(&mut f, &output);
+    for frame in 1..4 {
+        let next = element_ids(&mut f, &output);
+        assert_eq!(
+            first, next,
+            "the element list changed identity on idle frame {frame} with nothing happening.\n\
+             An `Id` must be cached alongside whatever it names (see `BarCache::bg`, `::dots`, \
+             `::textures`) — building the buffer per frame from a cached texture bakes nothing \
+             but still churns the identity, and that forces every backdrop blur on the output to \
+             re-capture every frame.",
+        );
+    }
+}
+
 /// Open the quick-settings popover on `output`, exactly as the panel indicator does.
 fn open_quick_settings(f: &mut Fixture, output: &Output) {
     let output_w = output_size(output).w;
