@@ -121,8 +121,14 @@ What each material carries, that neither Wayland compositor has as a concept:
 - **Vibrancy.** Text and symbols drawn inside the view get a blend mode that keeps them legible
   against whatever the backdrop turned out to be. This is the part that reads as "quality" and it
   is a *foreground* treatment, not a blur.
-- **Active/inactive state.** `NSVisualEffectView.State` follows window key state; an inactive window
-  falls back toward a flat material instead of staying live-blurred. Cheaper *and* a focus cue.
+- **Active/inactive state.** `NSVisualEffectView.State` follows window key state, and an inactive
+  window renders its material in an inactive *appearance*.
+  **Corrected 2026-08-07 — this line used to say "falls back toward a flat material instead of
+  staying live-blurred. Cheaper *and* a focus cue", and that was wrong.** It was uncited, and
+  Gustavo checked ghost on a real macOS: an unfocused window **still updates what is behind it**.
+  So the inactive state is an appearance change, not a freeze — `.behindWindow` keeps sampling
+  live — and the "cheaper" half was our inference, never an observation. It is the reason gap 6
+  existed; see there.
 - **Reduce transparency** (accessibility) collapses every material to an opaque fill, globally.
 
 So "clients cannot tune the blur" is true on all three systems. macOS's real advantages are the
@@ -291,8 +297,27 @@ Then the absent capabilities, in the order I'd take them:
    **Possible follow-up, not scheduled:** expose the recipe through a synoik gsettings schema of our
    own, so the tint is tunable rather than compiled in (Gustavo, 2026-08-07 — "looks great the way
    it is right now", so this is an option, not a defect).
-6. **Active/inactive fallback**, macOS-style: an unfocused window stops paying for a live blur and
-   gains a focus cue. Cheapest perf win on the list.
+6. ~~**Active/inactive fallback**, macOS-style.~~ **MIS-SCOPED, closed 2026-08-07 without code** —
+   the third gap on this list to die on a premise check, after 3 and 8's occlusion half. It read:
+   "an unfocused window stops paying for a live blur and gains a focus cue. Cheapest perf win on the
+   list." Both halves are false.
+
+   - **It is not what macOS does.** Gustavo checked ghost on a real macOS: an unfocused window still
+     updates what is behind it. The inactive state changes a material's *appearance*; it does not
+     freeze the backdrop. §4 above has been corrected — the claim was uncited and was ours, not
+     Apple's.
+   - **There is no perf win to collect, because we already collect it.** `needs_capture` is set only
+     when accumulated damage *below* the effect overlaps it (gap 8), so an unfocused window over a
+     static backdrop already captures and blurs **nothing** — pinned, not assumed: the idle control
+     in `moving_the_effect_recaptures_even_with_a_static_backdrop` asserts a settled frame does not
+     re-capture, and that assertion exists precisely because it once silently didn't hold. The only
+     time an unfocused blurred window costs anything is when the backdrop under it *is* changing —
+     which is exactly when freezing it would show stale content, the bug class `blur-probe` was
+     built to exonerate us from.
+
+   What survives is a *focus cue* on unfocused blurred windows: a product decision on its own
+   merits, with no performance argument behind it and no macOS precedent for the frozen form. Not
+   scheduled.
 7. **XWayland** `_KDE_NET_WM_BLUR_BEHIND_REGION`.
 8. **Bound the real-backdrop cost.** Originally written as "add an occlusion skip"; that was
    mis-scoped. Read against `smithay/src/backend/renderer/damage/mod.rs`, the damage tracker
