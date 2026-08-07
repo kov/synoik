@@ -1,0 +1,164 @@
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
+# Initial window placement
+
+Where a newly-mapped floating toplevel lands, what mutter 50.3 does, where our port
+diverges, and which knobs are worth turning.
+
+Reference: `~/Projects/mutter` @ 50.3, `src/core/place.c`. Ours: `src/layout/floating.rs`.
+
+## 1. The complaint, measured
+
+"Windows tend to open at the top left." That perception is **correct, and it is faithful
+mutter behavior** — not a port bug. Measured on the headless fixture, one 1920×1080 output,
+GNOME mode, work area `(0, 32) 1920×1048` (top panel strut), windows mapped in order:
+
+| # | committed size | placed at | via |
+|---|---|---|---|
+| 1 | 900×600 | (59, 181) | first-fit, "centered tile" slot |
+| 2 | 900×600 | (959, 181) | first-fit, beside window 1 |
+| 3 | 1000×700 | **(0, 32)** | cascade, work-area origin |
+| 4 | 500×400 | (50, 82) | cascade, +1 step |
+| 5 | 640×480 | (100, 132) | cascade, +2 steps |
+
+Two separate reasons the result reads as top-left:
+
+**a. The "centered tile" slot is not centered.** `find_first_fit`'s first candidate
+(place.c:603-622 `center_tile_rect_in_area`) is the top-left cell of a hypothetical grid of
+same-size windows; the offset is the grid *remainder*, halved horizontally and **divided by
+three** vertically:
+
+```
+x = area.x + (area.w % (size.w + 1)) / 2
+y = area.y + (area.h % (size.h + 1)) / 3
+```
+
+The modulo makes the x offset effectively arbitrary in the window's width: 900 wide on a 1920
+work area gives `118 / 2 = 59` px from the left edge; 1000 wide gives `919 / 2 = 459`. A window
+whose width divides the work area cleanly lands flush left. The `/ 3` guarantees the vertical
+result is always in the upper third of the leftover.
+
+**b. Once first-fit fails, everything cascades from the top-left corner.** `find_first_fit`
+requires a candidate that fits the work area *and* overlaps nothing. With two windows open,
+almost nothing qualifies, so `find_next_cascade` takes over — and its LTR origin is
+`MAX(0, work_area.x), MAX(0, work_area.y)` (place.c:236-240), i.e. the top-left corner, stepping
+50 px diagonally per collision. Window 3 above landed at exactly `(0, 32)`. From the third window
+onward, **the top-left corner is the default**, and the first-fit "grid" phase rarely fires again.
+
+This also confirms placement runs against the client's *committed* size, not a pre-commit
+placeholder — every measured position matches the hand-computed modulo for the final size.
+
+## 2. What mutter does, in order
+
+`meta_window_place` (place.c:839-1106):
+
+- **A. Type deny-list** (861-887). Only `NORMAL`, `DIALOG`, `MODAL_DIALOG`, `SPLASHSCREEN` are
+  placed. Docks, menus, tooltips, all override-redirect types: "the app knows best", never placed.
+- **B. Position hints** (889-949). X11 only. With the default (workarounds enabled) *either*
+  `PPosition` or `USPosition` skips placement outright. **Wayland windows never set these**
+  (`meta-window-wayland.c:1188-1192`), so every Wayland toplevel runs the full algorithm.
+- **C. Monitor** (951-971). First-time-shown windows go to
+  `meta_backend_get_current_logical_monitor` — **the monitor with the pointer**. Not the focused
+  window's, not primary (primary is only the NULL fallback). Already-shown windows keep
+  `window->monitor`.
+- **D. Work area** for that monitor, strut-reduced. gnome-shell contributes the panel strut via
+  `layout.js:283` `affectsStruts: true` → `set_builtin_struts`; it does **not** override placement
+  policy anywhere in JS.
+- **E. Center on transient parent** (977-1010). `DIALOG`, `MODAL_DIALOG`, **and Wayland `NORMAL`
+  with a `transient_for`** (979-980 — this is how GTK4/libadwaita dialogs get centered). Math is
+  identical for modal and non-modal: horizontally centered on the parent *frame*, vertically
+  `parent.y + (parent.h - h) / 3`. Then straight to auto-maximize, skipping everything below.
+  Modal-only extra: `avoid_being_obscured_as_second_modal_dialog` (461-501), X11-only in practice.
+- **F. Peers** = `find_windows_relevant_for_placement` (810-837): showing, on this workspace
+  (or all workspaces, if the new window is sticky).
+- **G. Centered vs origin** (1018-1045). `window_place_centered()` is true for dialogs, splash,
+  or `NORMAL` when the **`org.gnome.mutter center-new-windows` gsetting** is on. Centered path:
+  true work-area centering, then a cascade seeded at the centered corner. Otherwise: first-fit,
+  then origin cascade.
+- **H. Denied focus** (1052-1086). When the window was denied focus-steal and overlaps the focus
+  window, placement restarts against a one-element obstacle list; failing that,
+  `find_most_freespace` puts it on whichever side of the focus window has the most room.
+- **I. Auto-maximize** (1088-1101), gated on the `auto-maximize` pref: first-shown +
+  `has_maximize_func` + area > 80% of the work area (`MAX_UNMAXIMIZED_WINDOW_AREA`).
+
+Constants: `CASCADE_FUZZ 15`, `CASCADE_INTERVAL 50` (place.c:44-47),
+`META_WINDOW_TITLEBAR_HEIGHT 50` (window-private.h:46, the diagonal step).
+
+Not reached by any of this: `xdg_popup` and anything with a `placement.rule`, which go through
+`meta_window_process_placement` (759-808) instead.
+
+## 3. Our port, and where it differs
+
+Entry: `Workspace::add_tile` → `FloatingSpace::add_tile_at` (`floating.rs:557-563`) →
+`stored_or_default_tile_pos` (stored size-fraction position, then a `default_floating_position`
+rule) → `place_new_tile` (`floating.rs:1684-1701`).
+
+Faithfully ported: the transient centering (`+ (pw-w)/2, (ph-h)/3`), `find_first_fit`'s three
+phases and its centered-tile modulo, `find_next_cascade` with all three constants, the
+off-screen clamp (`Data::recompute_logical_pos`, `min_on_screen = clamp(size/4, 10, 75)`), the
+80% auto-maximize with the `sqrt(0.8)` restore-size clamp, and the top-panel strut. Tile size
+carries no border/shadow padding in GNOME mode, so the modulo math matches mutter's frame rect.
+
+Gaps, in the order I'd fix them:
+
+1. **`center-new-windows` is never read.** The key already ships in
+   `resources/schemas/org.gnome.mutter.gschema.xml:95`, and we already bind that schema
+   (`gnome.rs:2478`) for `overlay-key` and `edge-tiling`. This is GNOME's own settings surface for
+   exactly the complaint in §1 — honoring it is fidelity, not divergence. Needs the
+   `window_place_centered` branch and the `place_centered` cascade variant (place.c:206-244).
+2. **Monitor selection is the active monitor, not the pointer monitor.** `AddWindowTarget::Auto`
+   resolves to `*active_monitor_idx` (`layout/mod.rs:1016`); mutter uses the pointer's monitor for
+   first-shown windows (place.c:954). Real, user-visible difference on multi-monitor: launch
+   something from a keybinding with the pointer parked elsewhere and it lands on a different
+   screen than GNOME would pick. Worth deciding deliberately rather than inheriting.
+3. **`auto-maximize` is unconditional.** `auto_maximize_if_too_big` always runs in GNOME mode
+   (`handlers/compositor.rs:362-368`); mutter gates it on the pref (schema line 86, default true).
+   One-line fix, same binding as (1).
+4. **Our obstacle set is every tile.** `find_first_fit` builds `others` from all
+   `self.data` (`floating.rs:1712-1717`); mutter's `rectangle_overlaps_some_window`
+   (place.c:503-548) counts only `NORMAL`, `UTILITY`, `TOOLBAR`, `MENU` — dialogs, modal dialogs,
+   docks and splash screens are **not** obstacles. With an open dialog we fall through to the
+   cascade where mutter would still find a fit, which makes the top-left pile-up in §1 *worse*
+   than upstream.
+5. **The denied-focus placement path (step H) is not ported.** We compute `denied_focus_steal`
+   (`handlers/compositor.rs:176`) but only use it to set urgency (`:349`); there is no re-place
+   against the focus window and no `find_most_freespace`. Low priority — it only bites when a
+   background app maps a window while you're working.
+6. **No test coverage.** `place_new_tile`, `find_first_fit` and `find_next_cascade` have no
+   conformance test; `src/tests/floating.rs` covers sizing only. The table in §1 came from a
+   throwaway probe. Any change here should land the probe as a real test first.
+
+## 4. Divergence options
+
+Fidelity work (1)-(6) above is uncontroversial. The interesting question is the *default*, since
+mutter's default is what produces the top-left pile-up. Options, cheapest first:
+
+**A. Ship GNOME's default (`center-new-windows` off), just make it settable.** Zero behavior
+change; the user turns it on in Tweaks. Honest, but it means the complaint in §1 stands
+out of the box.
+
+**B. Default `center-new-windows` on.** A one-value divergence, fully reversible by the user,
+and it uses mutter's own code path — no new heuristic to maintain. Cost: mutter's centered path
+skips `find_first_fit` entirely, so windows stack near the centre and only shift when two land on
+the *exact* same corner (fuzz 15). Two terminals side by side becomes two terminals on top of
+each other.
+
+**C. First-fit, then a centered cascade.** Keep `find_first_fit` (so non-overlapping placements
+still happen when there is room) but change the *fallback* origin from the top-left corner to the
+centered corner — i.e. use mutter's `place_centered=TRUE` cascade seeding while leaving
+`window_place_centered()` alone. This is the smallest change that fixes the measured symptom:
+window 3 in §1 moves from `(0, 32)` to roughly `(460, 200)` and cascades from there. It is a true
+divergence (no mutter pref produces it), but a conservative one.
+
+**D. Minimal-overlap placement.** Replace the cascade fallback with a search that scores
+candidate positions by total overlap area (KWin's "smart" placement) and picks the minimum.
+Best results, most code, most drift from the reference, and the hardest to pin with a
+conformance test.
+
+My recommendation: land (1)-(4) as fidelity, then take **C** as the divergence, with the
+gsetting from (1) still honored on top of it (setting it on gives you plain GNOME centering).
+That keeps every mutter behavior reachable and only changes the case where mutter has no answer
+other than "pile up at the corner".
+
+Open for decision: option A/B/C/D, and whether to switch monitor selection to the pointer
+monitor (gap 2) or keep the active monitor deliberately.
