@@ -1679,8 +1679,16 @@ impl<W: LayoutElement> FloatingSpace<W> {
     /// their parent; for the rest, `center-new-windows` picks the strategy
     /// exactly as mutter's `window_place_centered()` does — on (GNOME's
     /// default since mutter 48) the window goes to the middle of the work area
-    /// and `find_first_fit` never runs at all, off it tries first-fit and falls
-    /// back to a cascade from the work-area origin.
+    /// and `find_first_fit` never runs at all, off it tries first-fit first.
+    ///
+    /// **Divergence (approved 2026-08-07, option B in
+    /// `docs/fork/window-placement.md` §5).** The off branch's *fallback* is
+    /// mutter's centered cascade, not its origin one. mutter only ever pairs
+    /// the centered cascade with skipping first-fit, so this is a mode it does
+    /// not have: try not to overlap, and when nothing fits pile up from the
+    /// middle of the screen rather than from the top-left corner. §1's
+    /// complaint was windows appearing in the corner, and the origin cascade is
+    /// the one path that still put them there.
     ///
     /// Two of mutter's inputs have no xdg-shell equivalent. Window *types*
     /// (splash, utility, dock) are absent, so `window_place_centered()`'s
@@ -1707,11 +1715,11 @@ impl<W: LayoutElement> FloatingSpace<W> {
         // there is no first-fit attempt, so nothing tries to keep windows from
         // overlapping.
         if self.options.gnome_center_new_windows {
-            return self.find_next_cascade(size, true);
+            return self.find_next_cascade(size);
         }
 
         self.find_first_fit(size)
-            .unwrap_or_else(|| self.find_next_cascade(size, false))
+            .unwrap_or_else(|| self.find_next_cascade(size))
     }
 
     /// mutter's `find_first_fit()`: the first candidate position where the
@@ -1800,11 +1808,13 @@ impl<W: LayoutElement> FloatingSpace<W> {
     /// slot diagonally past every window already sitting on it; overflowing the
     /// work area starts a fresh column shifted right.
     ///
-    /// `centered` is mutter's `place_centered` argument. It moves the slot from
-    /// the work-area origin to the work-area center, and swaps the walk order
-    /// from northwest-first to nearest-the-center-first (`window_distance_cmp`,
-    /// place.c:64-101).
-    fn find_next_cascade(&self, size: Size<f64, Logical>, centered: bool) -> Point<f64, Logical> {
+    /// Always mutter's `place_centered = TRUE` shape: the slot starts at the
+    /// center of the work area, and the walk order is nearest-the-center-first
+    /// (`window_distance_cmp`, place.c:64-101). mutter's other shape — slot at
+    /// the work-area origin, walk order northwest-first by `x + y` — has no
+    /// caller here; see [`Self::place_new_tile`] for why, and
+    /// `docs/fork/window-placement.md` §5 for what it looked like.
+    fn find_next_cascade(&self, size: Size<f64, Logical>) -> Point<f64, Logical> {
         // place.c: CASCADE_FUZZ, META_WINDOW_TITLEBAR_HEIGHT, CASCADE_INTERVAL.
         const FUZZ: f64 = 15.;
         const STEP: f64 = 50.;
@@ -1818,30 +1828,22 @@ impl<W: LayoutElement> FloatingSpace<W> {
             area.loc.x + area.size.w / 2. - size.w / 2.,
             area.loc.y + area.size.h / 2. - size.h / 2.,
         ));
-        let origin = if centered {
-            Point::from((center.x, f64::max(0., center.y)))
-        } else {
-            Point::from((f64::max(0., area.loc.x), f64::max(0., area.loc.y)))
-        };
+        let origin = Point::from((center.x, f64::max(0., center.y)));
 
         let mut others: Vec<(Point<f64, Logical>, Size<f64, Logical>)> = self
             .data
             .iter()
             .map(|data| (data.logical_pos, data.size))
             .collect();
-        if centered {
-            // Squared distance from the centered corner. mutter measures from
-            // the *new* window's centered corner (so only its size enters
-            // here), and uses the unclamped one, unlike the slot above.
-            let dist = |pos: Point<f64, Logical>| {
-                let dx = center.x - pos.x;
-                let dy = center.y - pos.y;
-                dx * dx + dy * dy
-            };
-            others.sort_by(|a, b| dist(a.0).partial_cmp(&dist(b.0)).unwrap());
-        } else {
-            others.sort_by(|a, b| (a.0.x + a.0.y).partial_cmp(&(b.0.x + b.0.y)).unwrap());
-        }
+        // Squared distance from the centered corner. mutter measures from the
+        // *new* window's centered corner (so only its size enters here), and
+        // uses the unclamped one, unlike the slot above.
+        let dist = |pos: Point<f64, Logical>| {
+            let dx = center.x - pos.x;
+            let dy = center.y - pos.y;
+            dx * dx + dy * dy
+        };
+        others.sort_by(|a, b| dist(a.0).partial_cmp(&dist(b.0)).unwrap());
 
         let mut stage = 0.;
         'restart: loop {

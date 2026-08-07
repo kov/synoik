@@ -2280,7 +2280,7 @@ fn placement_first_fit_falls_back_to_beside() {
 }
 
 /// The cascade's column overflow: when a diagonal run reaches the bottom of
-/// the work area, the next window restarts at the origin shifted right by one
+/// the work area, the next window restarts at the seed shifted right by one
 /// `CASCADE_INTERVAL` (place.c:281-312).
 #[test]
 fn placement_cascade_starts_a_new_column_when_it_overflows() {
@@ -2290,24 +2290,34 @@ fn placement_cascade_starts_a_new_column_when_it_overflows() {
     let id = f.add_client();
 
     // 1000 × 600 in a 1920 × 1048 work area: after the first takes the grid
-    // slot, nothing ever fits again, so every later window cascades. The run
-    // is (0, 32), (50, 82), … stepping 50px until the next step would put the
-    // bottom edge past the work area.
-    for _ in 0..10 {
+    // slot, nothing ever fits again, so every later window cascades. Seeded at
+    // the center (460, 256), the run is (460, 256), (510, 306), … stepping 50px
+    // until the next step would put the bottom edge past the work area.
+    for _ in 0..2 {
         map_window_sized(&mut f, id, (1000, 600), None);
     }
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (400., 432.),
-        "precondition: the tenth window ends the first cascade column",
+        (460., 256.),
+        "the cascade must start at the work-area center",
     );
 
-    // (450, 482) would put the bottom edge at 1082, past the work area's 1080,
-    // so the column restarts at the origin plus one interval.
+    for _ in 0..4 {
+        map_window_sized(&mut f, id, (1000, 600), None);
+    }
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (660., 456.),
+        "precondition: the sixth window ends the first cascade column",
+    );
+
+    // (710, 506) would put the bottom edge at 1106, past the work area's 1080,
+    // so the column restarts at the center plus one interval horizontally, back
+    // at the center vertically.
     map_window_sized(&mut f, id, (1000, 600), None);
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (50., 32.),
+        (510., 256.),
         "an overflowing cascade must start a new column 50px to the right",
     );
 }
@@ -2335,8 +2345,10 @@ fn placement_dialogs_center_on_parent() {
     );
 }
 
-/// With `center-new-windows` off and nothing fitting, placement cascades from
-/// the work-area origin in 50px diagonal steps (place.c find_next_cascade).
+/// With `center-new-windows` off and nothing fitting, placement cascades in
+/// 50px diagonal steps (place.c find_next_cascade) — seeded from the *center*
+/// of the work area, which is divergence B (`window-placement.md` §5): mutter
+/// only centers the cascade when it also skips first-fit.
 #[test]
 fn placement_cascades_when_nothing_fits() {
     let mut f = Fixture::new();
@@ -2347,26 +2359,30 @@ fn placement_cascades_when_nothing_fits() {
     // 1000×600 windows: after the first takes the centered-tile slot,
     // below/right candidates all overflow the 1920×1048 work area (the top
     // panel insets it), so first-fit fails and every subsequent window cascades.
+    // The centered corner is (1920/2 - 500, 32 + 1048/2 - 300) = (460, 256).
     let _w1 = map_window_sized(&mut f, id, (1000, 600), None);
 
+    // The first window sits at the grid slot (459.5, 47.667): within the 15px
+    // fuzz horizontally, but nowhere near it vertically, so it does not step
+    // the cascade — both axes have to match.
     let _w2 = map_window_sized(&mut f, id, (1000, 600), None);
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (0., 32.),
-        "the first cascaded window must sit at the work-area origin",
+        (460., 256.),
+        "the first cascaded window must sit at the work-area center",
     );
 
     let _w3 = map_window_sized(&mut f, id, (1000, 600), None);
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (50., 82.),
+        (510., 306.),
         "the next cascade slot is one 50px diagonal step down",
     );
 
     let _w4 = map_window_sized(&mut f, id, (1000, 600), None);
     assert_pos_eq(
         focused_window_pos(&mut f),
-        (100., 132.),
+        (560., 356.),
         "each occupied slot steps the cascade another 50px",
     );
 }

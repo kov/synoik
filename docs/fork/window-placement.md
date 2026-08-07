@@ -49,6 +49,11 @@ almost nothing qualifies, so `find_next_cascade` takes over — and its LTR orig
 50 px diagonally per collision. Window 3 above landed at exactly `(0, 32)`. From the third window
 onward, **the top-left corner is the default**, and the first-fit "grid" phase rarely fires again.
 
+Both mechanisms are now gone, by different routes: (a) does not run at all under GNOME's default
+(§4), and (b) no longer exists in either branch — option B (§5) re-seeded the cascade at the
+work-area centre. The table above is the *diagnosis*, kept as measured; nothing in it is current
+behavior.
+
 This also confirms placement runs against the client's *committed* size, not a pre-commit
 placeholder — every measured position matches the hand-computed modulo for the final size.
 
@@ -134,7 +139,7 @@ All six gaps found in the first pass are now closed. What each one was, and what
    was auto-placed — a stored position or a `default_floating_position` rule skips placement in
    mutter too. Ordered before auto-maximize, matching mutter's H then I.
    → `denied_focus_window_moves_off_the_focus_window`.
-6. **Test coverage.** `src/tests/gnome.rs` now pins the centred path, the origin path's grid slot,
+6. **Test coverage.** `src/tests/gnome.rs` now pins the centred path, the first-fit path's grid slot,
    downward chain, *beside* phase and cascade, the cascade's column overflow, transients, both
    prefs, the pointer monitor and the denied-focus move. Each new assertion was checked to fail
    with its fix reverted, so none of them is decoration.
@@ -149,6 +154,15 @@ Known remaining divergences, deliberate:
   chosen side would push the new window off-screen.
 - RTL is not ported anywhere in placement (mutter mirrors the grid slot, the cascade origin and
   the *beside* candidate).
+- **Option B (approved 2026-08-07).** `find_next_cascade` is always mutter's
+  `place_centered = TRUE` shape — seeded at the work-area centre, walked nearest-centre-first.
+  mutter only pairs that with *skipping* first-fit, so the `center-new-windows = false` branch is
+  a mode GNOME does not have: first-fit still runs in front, and when nothing fits the pile grows
+  from the middle instead of the top-left corner. The seeding and the walk order move together,
+  as they do in mutter; taking one without the other would sort peers by a distance to a corner
+  the slot no longer sits at. mutter's origin shape (slot at the work-area origin, northwest
+  `x + y` order) now has no caller and was deleted rather than left as a dead branch — §5 below
+  describes it, and it is six lines in `db520323` if it is ever wanted back.
 
 Two things found along the way that are **not** placement bugs, recorded so the next reader
 does not re-derive them:
@@ -159,7 +173,7 @@ does not re-derive them:
   freezes at drag-begin, so the other previews should not shuffle at all.
   `overview_drag_freezes_the_other_previews` used to pass over this by asserting during
   `Starting`, and only with an ordering that made the re-flow a no-op.
-- `src/tests/vulkan_render.rs`'s shared `window_fixture` now pins the origin algorithm: those
+- `src/tests/vulkan_render.rs`'s shared `window_fixture` now pins the first-fit path: those
   tests count a colour over the whole output, so a centred window hides under centred chrome
   (the switcher panel) and the measurement stops meaning anything.
 
@@ -220,25 +234,32 @@ Gaps (1)-(6) in §3 are all fidelity; none of them needs a decision. In particul
 honoring `center-new-windows` at GNOME's own default of `true` — is the fix for the reported
 symptom, and is *not* a divergence. The remaining questions:
 
-**The default.** **A is landed.** Windows centre; turning the key off in dconf/Tweaks gets the
-origin algorithm back, now with gaps 2-5 fixed underneath it. Whether to go further is still
-open:
+**The default.** **A and B are landed.** Windows centre; turning the key off in dconf/Tweaks gets
+first-fit back, now with gaps 2-5 fixed underneath it and a centre-seeded cascade behind it.
+Whether to go further is still open:
 
 - ~~**A. Pure fidelity.** Read the key, default `true`.~~ **DONE.**
-- **B. A better `false` branch.** Same as A, but also change the *non-centred*
+- ~~**B. A better `false` branch.** Same as A, but also change the *non-centred*
   cascade fallback to seed from the centred corner instead of the work-area origin (i.e. use
-  `place_centered = TRUE`'s seeding with `find_first_fit` still in front of it). Gives a mode
-  GNOME does not have: try not to overlap, and when that fails pile up from the middle rather
-  than the corner. Costs one bool and a divergence note.
+  `place_centered = TRUE`'s seeding with `find_first_fit` still in front of it).~~ **DONE**
+  (2026-08-07). It turned out to be a deletion rather than an addition: with both call sites
+  wanting the centred shape, `find_next_cascade`'s `centered` parameter had one live value, so the
+  parameter and mutter's origin branch went with it. For the record, what was removed is a slot at
+  `(max(0, work_area.x), max(0, work_area.y))` and a peer walk sorted by `x + y` (northwest-first)
+  instead of by squared distance from the centred corner. Pinned by
+  `placement_cascades_when_nothing_fits` and
+  `placement_cascade_starts_a_new_column_when_it_overflows`, both of which now assert
+  centre-seeded runs; the divergence note is in §3.
 - **C. Minimal-overlap placement.** Replace the cascade fallback with a search scoring candidates
   by total overlap area (KWin's "smart" placement). Best results, most code, most drift, hardest
-  to pin with a conformance test.
+  to pin with a conformance test. **Not taken**, and B is the reason it can wait: the corner pile
+  was the visible half of §1's complaint, and B moved it to the middle without inventing a
+  placement algorithm GNOME's source could not be used to check. Revisit only if overlapping
+  windows in the `false` branch actually grate in use.
 
-Recommendation: live with A for a few days. If the loss of overlap-avoidance (§4, second bullet)
-grates, **B** is a small follow-up and only affects the non-default branch.
+Note both B and C only affect the branch taken when `center-new-windows` is `false`, which is not
+GNOME's default — neither changes what a stock session does.
 
 The one thing still owed is a real multi-monitor check of gap 2 on a seat with two outputs.
-
-**Monitor selection** (gap 2) is independent and does need a call: adopt mutter's pointer monitor
-for first-shown windows, or keep our active monitor deliberately? Ours is arguably better with
-focus-follows-keyboard workflows; mutter's is what a GNOME user's muscle memory expects.
+The **monitor selection** question that used to sit here is settled: gap 2 adopted mutter's
+pointer monitor, so a window opens where the mouse is, matching a GNOME user's muscle memory.
