@@ -6752,12 +6752,9 @@ fn overview_drag_freezes_the_other_previews() {
     let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
     pointer_motion_to(&mut f, grab.0, grab.1);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
-    // Two motions, not one: the move is promoted out of its rubberbanding
-    // `Starting` phase on the event *after* the threshold is crossed, and the
-    // freeze is taken on that promotion. A single motion leaves the drag in
-    // `Starting`, where the tile is still in the layout and its offset rect
-    // re-flows the picker — see the `Starting`-phase note in
-    // docs/fork/window-placement.md.
+    // Two motions, not one: the first begins the move (`Starting`, zero delta)
+    // and the second is the first update, which in the overview promotes to
+    // `Moving` and takes the freeze.
     f.pointer_motion(0., 10.);
     f.pointer_motion(0., 90.);
 
@@ -6776,6 +6773,59 @@ fn overview_drag_freezes_the_other_previews() {
         f.synoik().layout.expose_target_rect(&win_a),
         Some(slot_a),
         "the drop must let the source desktop's picker layout recompute"
+    );
+}
+
+/// Picking a preview up must not re-flow the picker. The tile is still in the
+/// workspace while the move is `Starting`, so any offset on it feeds
+/// `compute_slots`, whose row assignment sorts by `center().y` — a large enough
+/// first motion re-orders the slots, and the freeze then holds the shuffle for
+/// the whole drag. gnome-shell's `WindowPreview` drag never moves the window in
+/// the workspace layout at all, so nothing there can perturb the layout.
+#[test]
+fn overview_drag_does_not_reflow_the_picker_on_pickup() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // Same-size windows cascade 50px apart (window-placement.md §4), so their
+    // centers sit 50px apart in y — near enough that a rubberbanded pickup can
+    // sort one past another.
+    let _a = map_window_sized(&mut f, id, (700, 500), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (700, 500), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+    let _c = map_window_sized(&mut f, id, (700, 500), None);
+    let win_c = f.synoik().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.synoik_complete_animations();
+
+    let slot_a = f.synoik().layout.expose_target_rect(&win_a).unwrap();
+    let slot_b = f.synoik().layout.expose_target_rect(&win_b).unwrap();
+
+    // Grab the bottom-most preview and yank it up past the row above it. One
+    // motion, and a big one: in the overview the drag promotes on the *first*
+    // update, so only that first delta ever perturbs anything — and the
+    // rubberband damps small deltas to sub-pixel, which is why this went
+    // unnoticed. Reverting the fix moves B from beside A down into C's
+    // vacated row.
+    let rect = f.synoik().layout.expose_target_rect(&win_c).unwrap();
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., -400.);
+
+    assert_eq!(
+        (
+            f.synoik().layout.expose_target_rect(&win_a),
+            f.synoik().layout.expose_target_rect(&win_b),
+        ),
+        (Some(slot_a), Some(slot_b)),
+        "picking up a preview must not re-flow the remaining ones"
     );
 }
 

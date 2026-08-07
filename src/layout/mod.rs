@@ -4234,11 +4234,11 @@ impl<W: LayoutElement> Layout<W> {
                 let (cx, cy) = (pointer_delta.x, pointer_delta.y);
                 let sq_dist = cx * cx + cy * cy;
 
-                let factor = RubberBand {
-                    stiffness: 1.0,
-                    limit: 0.5,
-                }
-                .band(sq_dist / INTERACTIVE_MOVE_START_THRESHOLD);
+                let gnome_mode = self.options.layout.windowing_mode == WindowingMode::Floating;
+                // In the overview the drag grabs a picker preview, which starts
+                // moving right away — there's nothing to shake loose from
+                // (gnome-shell's WindowPreview drags).
+                let in_expose = gnome_mode && self.overview_open;
 
                 let (is_floating, tile, workspace_config) = self
                     .workspaces_mut()
@@ -4254,7 +4254,29 @@ impl<W: LayoutElement> Layout<W> {
                         )
                     })
                     .unwrap();
-                tile.interactive_move_offset = pointer_delta.upscale(factor);
+                // The rubberband is the *visual* for a shake-loose threshold:
+                // the window trails the pointer with resistance so you can see
+                // you are pulling on something. In the overview there is no
+                // threshold — `started` below is unconditionally true — so the
+                // offset would be written and cleared inside this one call,
+                // having been resistance nobody saw.
+                //
+                // It is not free, though. `expose_layout` builds its input rects
+                // from render positions, which include this offset, and
+                // `compute_slots` sorts by `center().y` to assign rows. A large
+                // enough first motion therefore re-orders every preview's slot —
+                // and both the pickup slot below and `freeze_expose` are taken
+                // *after* this, so the shuffle is captured and held for the whole
+                // drag. gnome-shell's WindowPreview drag never moves the window
+                // in the workspace layout at all.
+                if !in_expose {
+                    let factor = RubberBand {
+                        stiffness: 1.0,
+                        limit: 0.5,
+                    }
+                    .band(sq_dist / INTERACTIVE_MOVE_START_THRESHOLD);
+                    tile.interactive_move_offset = pointer_delta.upscale(factor);
+                }
                 let is_edge_tiled = tile.window().edge_tiled_side().is_some();
                 let is_expanded = !tile.window().pending_sizing_mode().is_normal();
 
@@ -4273,11 +4295,6 @@ impl<W: LayoutElement> Layout<W> {
                 // property of the window's sizing mode, not of the layer it
                 // sits in — in GNOME mode every window is floating, maximized
                 // ones included.
-                let gnome_mode = self.options.layout.windowing_mode == WindowingMode::Floating;
-                // In the overview the drag grabs a picker preview, which
-                // starts moving right away — there's nothing to shake loose
-                // from (gnome-shell's WindowPreview drags).
-                let in_expose = gnome_mode && self.overview_open;
                 let started = if in_expose {
                     true
                 } else if gnome_mode && is_expanded {

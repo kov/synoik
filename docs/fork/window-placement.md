@@ -167,12 +167,21 @@ Known remaining divergences, deliberate:
 Two things found along the way that are **not** placement bugs, recorded so the next reader
 does not re-derive them:
 
-- The overview picker re-flows while an overview drag is still in its rubberbanding `Starting`
-  phase: the tile is in the layout with an offset rect, and `freeze_expose` is only taken when
-  the move is promoted to `Moving` on the following event (`layout/mod.rs:4303`). gnome-shell
-  freezes at drag-begin, so the other previews should not shuffle at all.
-  `overview_drag_freezes_the_other_previews` used to pass over this by asserting during
-  `Starting`, and only with an ordering that made the re-flow a no-op.
+- The overview picker used to re-flow when a drag was picked up: `interactive_move_update` writes
+  a rubberband offset onto the tile *before* deciding the drag has started, the tile is still in
+  the workspace at that point, and `expose_layout` feeds render positions to `compute_slots`,
+  whose row assignment sorts by `center().y`. Both the pickup slot and `freeze_expose` are taken
+  after that write, so the shuffle was captured and held for the whole drag. **Fixed
+  2026-08-07:** the offset is no longer written when `in_expose`, where it was pure noise — the
+  overview has no shake-loose threshold, so `started` is unconditionally true and the offset was
+  written and cleared inside one call, having been resistance nobody saw. gnome-shell's
+  `WindowPreview` drag never moves the window in the workspace layout at all.
+  → `overview_drag_does_not_reflow_the_picker_on_pickup`. Two things the first attempt at that
+  test got wrong, worth not repeating: the drag promotes on the **first** update in the overview,
+  not the second, so only the first motion event's delta ever perturbs anything; and the
+  rubberband damps small deltas to sub-pixel, so it takes one large motion (~400px) to move a
+  slot. `overview_drag_freezes_the_other_previews` never caught it — two windows there gave an
+  ordering the re-flow could not change.
 - `src/tests/vulkan_render.rs`'s shared `window_fixture` now pins the first-fit path: those
   tests count a colour over the whole output, so a centred window hides under centred chrome
   (the switcher panel) and the measurement stops meaning anything.
