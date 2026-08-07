@@ -211,8 +211,19 @@ Then the absent capabilities, in the order I'd take them:
      surface's *view* is what everything else is sized from, so the effect came out one pixel wide
      while the region said 200x120. `damage_buffer` does not fix that; damage is not size.
 
-   Not seat-validated: no installed client puts a blur region on a subsurface. `tools/blur-probe`
-   could grow a `--subsurface` arm to cover it.
+   **A fourth thing, and the reason to distrust self-relative assertions.** The first version placed
+   the effect a whole subsurface-offset *past* the subsurface: the walk already folds a surface's
+   `view.offset` into the origin it reports, and `render_for_surface` folds it in again. The blur was
+   the right size and blurred the right content — only its position was wrong — and the test passed,
+   because every assertion compared the subregion against the effect's *own* geometry and both moved
+   together. Two subsurfaces at different offsets fix that: the distance between their effects is
+   checkable against the distance between them, and a doubled offset makes it 200x100 instead of
+   100x50. Found by eye first, via `tools/blur-probe --subsurface`.
+
+   That arm paints the parent opaque with 6px diagonal stripes, which any real blur radius averages
+   to a flat wash — so "did the subsurface blur its own parent" is answerable at a glance. Harness
+   numbers after the fix: local contrast 413 in the parent on all three sides of the child, 3.4
+   inside it.
 5. **A contrast/tint step.** We have saturation and noise; KWin's merged contrast matrix and macOS's
    per-material tint are what make light-mode blur legible. Ours is one global recipe with no
    appearance awareness — and the shell plate already follows `color-scheme`

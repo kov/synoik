@@ -48,6 +48,24 @@ diff the same window at radius 0 against radius N, then split the corner band by
 corner circle's centre. Inside the quarter-disc must be zero. And whether a **multi-rect region
 respecified every configure** lags, which is the shape ghost actually sends.
 
+## Subsurfaces
+
+`--subsurface` puts the blur on a subsurface inset inside the toplevel, and makes the toplevel
+**opaque** and finely striped. That is the point: a subsurface's backdrop is everything below it,
+its own parent surface included, so a correct implementation turns the parent's 6px diagonal stripes
+into a flat wash *inside the child and nowhere else*. Any real blur radius averages that pattern
+out, which makes the answer visible at a glance and measurable as a collapse in local contrast.
+
+```
+blur-probe --subsurface --region exact
+```
+
+On the headless harness after the fix: local contrast 413 in the parent on all three sides of the
+child, 3.4 inside it. Before the fix the flat patch sat in the parent's bottom-right corner instead
+— the effect was placed a whole subsurface-offset past the subsurface. Worth knowing what a
+misplacement looks like, because the blur is the right size and blurs the right content; only its
+position is wrong, and every self-relative check still passes.
+
 ## Driving it
 
 `--pulse` resizes the window from inside the client, so no mouse and no human are needed — which is
