@@ -852,6 +852,11 @@ impl Window {
         self.surface.attach(Some(&buffer), 0, 0);
     }
 
+    /// Attach a null buffer, which unmaps the surface on the next commit.
+    pub fn attach_null_buffer(&self) {
+        self.surface.attach(None, 0, 0);
+    }
+
     /// Attach an opaque single-pixel buffer of the given color (premultiplied u32 channels, as the
     /// protocol expects), so the mapped window has visible content in a screenshot.
     // Only the `vulkan` render tests map client buffers, so gate the attach helpers on it to avoid

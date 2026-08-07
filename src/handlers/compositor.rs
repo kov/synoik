@@ -461,8 +461,11 @@ impl CompositorHandler for State {
                     }
 
                     // Newly-unmapped toplevels must perform the initial commit-configure sequence
-                    // afresh.
-                    let unmapped = Unmapped::new(window);
+                    // afresh. The *toplevel object* is not new though, so its initial commit is
+                    // long past: `already_mapped` is pinned to the first commit after the toplevel
+                    // was created, not after it was last unmapped.
+                    let mut unmapped = Unmapped::new(window);
+                    unmapped.had_initial_commit = true;
                     self.synoik
                         .unmapped_windows
                         .insert(surface.clone(), unmapped);

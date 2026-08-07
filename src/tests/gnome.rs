@@ -21602,3 +21602,73 @@ fn a_destroyed_session_goes_inert() {
         "the destroyed id must not be handed back out"
     );
 }
+
+/// `restore_toplevel` for a name the session has never heard of degrades to `add_toplevel`, and
+/// in particular sends **no** `restored` event. Nothing is persisted yet, so every name is
+/// unknown; slice 4 is what makes the other branch reachable.
+#[test]
+fn restoring_an_unknown_name_adds_it_without_a_restored_event() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, _session_id) = new_session(&mut f, id);
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    let qh = f.client(id).qh.clone();
+    session.restore_toplevel(&toplevel, String::from("one"), &qh, String::from("one"));
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+
+    assert_eq!(
+        f.client(id).session_events(),
+        [SessionEvent::Created(_session_id)],
+        "an unknown name must not be reported as restored"
+    );
+
+    // And the name really was taken, so a second toplevel cannot claim it — that is what makes
+    // this an `add_toplevel` rather than a no-op.
+    let second = f.client(id).create_window().xdg_toplevel.clone();
+    session.add_toplevel(&second, String::from("one"), &qh, String::from("one"));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.roundtrip(id)));
+    assert!(panicked.is_err(), "expected a name_in_use protocol error");
+}
+
+/// A toplevel that has already been mapped once cannot be restored, even though unmapping it puts
+/// it back through the initial commit-configure sequence: `already_mapped` is pinned to the first
+/// commit after the *toplevel* was created.
+#[test]
+#[should_panic(expected = "Protocol error 2 on object xdg_session_v1")]
+fn restoring_a_remapped_toplevel_is_still_already_mapped() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, _session_id) = new_session(&mut f, id);
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    // Map, then unmap by attaching a null buffer, which puts the toplevel back in the unmapped
+    // set as if it were new.
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_null_buffer();
+    window.commit();
+    f.double_roundtrip(id);
+
+    let qh = f.client(id).qh.clone();
+    session.restore_toplevel(&toplevel, String::from("one"), &qh, String::from("one"));
+    f.roundtrip(id);
+}

@@ -248,10 +248,15 @@ too-new `version` rejection, and the tombstone-vs-pending-save interaction.
    `already_mapped` needs the *initial commit*, not the initial configure, which is sent from an
    idle a beat later; `Unmapped::had_initial_commit` was added for exactly that distinction.
 
+   An unmapped toplevel is re-inserted as a fresh `Unmapped` (`compositor.rs`, the same site
+   slice 3 targets), so the flag is carried across explicitly: `already_mapped` is pinned to the
+   first commit after the *toplevel* was created, not after it was last unmapped.
+
    Landed in `src/tests/gnome.rs`: `basic` (created, and an added toplevel is never restored),
    unknown-id-is-new, `replace` (restored to the taker, replaced to the loser), `in_use`,
-   `already_mapped`, `name_in_use`, `already_added`, rename-frees-the-old-name,
-   rename-onto-a-taken-name, and destroy-goes-inert.
+   `already_mapped` both fresh and after a remap, restore-of-an-unknown-name-adds-without-restored,
+   `name_in_use`, `already_added`, rename-frees-the-old-name, rename-onto-a-taken-name, and
+   destroy-goes-inert.
 2. **Persistence** — `src/session_state.rs`, load at startup, debounced + shutdown save.
    Store unit tests.
 3. **Save on unmap** — snapshot geometry/state/workspace when a registered window goes away.
