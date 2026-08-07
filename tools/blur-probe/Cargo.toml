@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
+[package]
+name = "blur-probe"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+# Deliberately NOT a member of the synoik workspace: the dev loop is
+# `cargo test --workspace`, and a diagnostic client has no business slowing it down.
+# Build it on its own: `cargo build --manifest-path tools/blur-probe/Cargo.toml`.
+[workspace]
+
+[dependencies]
+rustix = { version = "1.1.2", features = ["fs", "mm"] }
+wayland-client = "0.31.14"
+wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }

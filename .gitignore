@@ -1,4 +1,8 @@
 /target
 /result
 
+# tools/ hold standalone crates, each with its own build dir — the leading slash
+# above anchors to the repo root and does not reach them.
+/tools/*/target
+
 .idea
