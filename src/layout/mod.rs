@@ -3830,6 +3830,26 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// mutter's denied-focus placement (place.c:1052-1086): keeps a window
+    /// that was refused focus from covering the window that kept it.
+    ///
+    /// Returns whether the window moved.
+    pub fn avoid_focus_window(&mut self, id: &W::Id) -> bool {
+        let Some(focus) = self.focus().map(|win| win.id().clone()) else {
+            return false;
+        };
+        if focus == *id {
+            return false;
+        }
+
+        for ws in self.workspaces_mut() {
+            if ws.has_window(id) {
+                return ws.avoid_focus_window(id, &focus);
+            }
+        }
+        false
+    }
+
     /// mutter's map-time auto-maximize: maximizes the window if it covers
     /// more than 80% of the work area, and `org.gnome.mutter auto-maximize`
     /// allows it (place.c:1088).

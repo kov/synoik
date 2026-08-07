@@ -1722,24 +1722,41 @@ impl<W: LayoutElement> FloatingSpace<W> {
     /// existing window (top-most/left-most first), then to the right of each
     /// (left-most/top-most first).
     fn find_first_fit(&self, size: Size<f64, Logical>) -> Option<Point<f64, Logical>> {
-        let area = self.working_area;
-        let others: Vec<Rectangle<f64, Logical>> = self
-            .data
+        let windows: Vec<_> = self
+            .tiles
             .iter()
-            .map(|data| Rectangle::new(data.logical_pos, data.size))
+            .zip(&self.data)
+            .map(|(tile, data)| {
+                (
+                    Rectangle::new(data.logical_pos, data.size),
+                    tile.window().is_transient(),
+                )
+            })
             .collect();
+        self.find_first_fit_among(size, &windows)
+    }
+
+    /// [`Self::find_first_fit`] over an explicit window list — mutter passes a
+    /// one-element list here when re-placing a focus-denied window
+    /// (place.c:1073-1078). Each entry carries whether it is a transient, i.e.
+    /// whether it counts as an obstacle.
+    fn find_first_fit_among(
+        &self,
+        size: Size<f64, Logical>,
+        windows: &[(Rectangle<f64, Logical>, bool)],
+    ) -> Option<Point<f64, Logical>> {
+        let area = self.working_area;
+        let others: Vec<Rectangle<f64, Logical>> = windows.iter().map(|(rect, _)| *rect).collect();
 
         // Candidate positions come from *every* window, but only some of them
         // block a candidate: `rectangle_overlaps_some_window` (place.c:503-548)
         // skips dialogs, docks and splash screens, while place.c:698 and :724
         // walk the unfiltered list. See `LayoutElement::is_transient` for how
         // "dialog" maps onto xdg-shell.
-        let obstacles: Vec<Rectangle<f64, Logical>> = self
-            .tiles
+        let obstacles: Vec<Rectangle<f64, Logical>> = windows
             .iter()
-            .zip(&others)
-            .filter(|(tile, _)| !tile.window().is_transient())
-            .map(|(_, rect)| *rect)
+            .filter(|(_, transient)| !transient)
+            .map(|(rect, _)| *rect)
             .collect();
 
         let fits = |pos: Point<f64, Logical>| {
@@ -1850,6 +1867,138 @@ impl<W: LayoutElement> FloatingSpace<W> {
             }
 
             return cascade;
+        }
+    }
+
+    /// mutter's denied-focus placement (place.c:1052-1086): a window that was
+    /// refused focus, and is not a transient of the window holding it, must not
+    /// cover that window if there is anywhere else to put it. Re-runs first-fit
+    /// against the focus window alone, then falls back to whichever side of it
+    /// shows the most of the new window.
+    ///
+    /// mutter runs this inside `meta_window_place`; we run it just after the
+    /// tile lands, which is why it re-checks that the window was auto-placed —
+    /// a stored position or a `default_floating_position` rule skips placement
+    /// entirely and must not be overridden here.
+    ///
+    /// Returns whether the window moved.
+    pub fn avoid_focus_window(&mut self, window: &W::Id, focus: &W::Id) -> bool {
+        let (Some(idx), Some(focus_idx)) = (self.idx_of(window), self.idx_of(focus)) else {
+            // A focus window on another workspace or output cannot be overlapped.
+            return false;
+        };
+        if idx == focus_idx || self.stored_or_default_tile_pos(&self.tiles[idx]).is_some() {
+            return false;
+        }
+
+        let size = self.data[idx].size;
+        let pos = self.data[idx].logical_pos;
+        let avoid = Rectangle::new(self.data[focus_idx].logical_pos, self.data[focus_idx].size);
+
+        // `window_overlaps_focus_window` (place.c:425-446). No overlap, nothing to do.
+        if !Rectangle::new(pos, size).overlaps(avoid) {
+            return false;
+        }
+
+        let placed = self
+            .find_first_fit_among(size, &[(avoid, false)])
+            .unwrap_or_else(|| self.find_most_freespace(size, avoid, pos));
+        if placed == pos {
+            return false;
+        }
+
+        self.data[idx].set_logical_pos(placed);
+        true
+    }
+
+    /// mutter's `find_most_freespace()` (place.c:332-423): put the window on
+    /// whichever side of `avoid` shows the most of it, flush against `avoid`
+    /// when the window fits beside it and against the work area when it does
+    /// not. Returns `current` unchanged when there is nowhere to go.
+    fn find_most_freespace(
+        &self,
+        size: Size<f64, Logical>,
+        avoid: Rectangle<f64, Logical>,
+        current: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        enum Side {
+            Left,
+            Right,
+            Top,
+            Bottom,
+        }
+
+        let area = self.working_area;
+        let max_width = f64::min(avoid.size.w, size.w);
+        let max_height = f64::min(avoid.size.h, size.h);
+
+        let left_space = avoid.loc.x - area.loc.x;
+        let right_space = area.size.w - (avoid.loc.x + avoid.size.w - area.loc.x);
+        let top_space = avoid.loc.y - area.loc.y;
+        let bottom_space = area.size.h - (avoid.loc.y + avoid.size.h - area.loc.y);
+
+        let left = f64::min(left_space, size.w);
+        let right = f64::min(right_space, size.w);
+        let top = f64::min(top_space, size.h);
+        let bottom = f64::min(bottom_space, size.h);
+
+        // Ties go to the earlier side, like mutter's chain of strict `>`.
+        let mut side = Side::Left;
+        let mut max_area = left * max_height;
+        if right * max_height > max_area {
+            side = Side::Right;
+            max_area = right * max_height;
+        }
+        if top * max_width > max_area {
+            side = Side::Top;
+            max_area = top * max_width;
+        }
+        if bottom * max_width > max_area {
+            side = Side::Bottom;
+            max_area = bottom * max_width;
+        }
+
+        // Nowhere to put it — the focus window is maximized. mutter tests
+        // `max_area == 0`; we take `<= 0` as well, since a negative product
+        // means the focus window is already outside the work area and the
+        // chosen side would push the new window off-screen.
+        if max_area <= 0. {
+            return current;
+        }
+
+        match side {
+            Side::Left => Point::from((
+                if left_space > size.w {
+                    avoid.loc.x - size.w
+                } else {
+                    area.loc.x
+                },
+                avoid.loc.y,
+            )),
+            Side::Right => Point::from((
+                if right_space > size.w {
+                    avoid.loc.x + avoid.size.w
+                } else {
+                    area.loc.x + area.size.w - size.w
+                },
+                avoid.loc.y,
+            )),
+            Side::Top => Point::from((
+                avoid.loc.x,
+                if top_space > size.h {
+                    avoid.loc.y - size.h
+                } else {
+                    area.loc.y
+                },
+            )),
+            Side::Bottom => Point::from((
+                avoid.loc.x,
+                if bottom_space > size.h {
+                    avoid.loc.y + avoid.size.h
+                } else {
+                    area.loc.y + area.size.h - size.h
+                },
+            )),
         }
     }
 

@@ -2334,6 +2334,73 @@ fn new_window_without_launch_time_takes_focus() {
     );
 }
 
+/// A focus-denied window is also moved out from under the window that kept
+/// the focus (mutter's place.c step H, :1052-1086): first-fit is re-run
+/// against the focus window alone, and when nothing fits `find_most_freespace`
+/// puts it on whichever side shows the most of it.
+#[test]
+fn denied_focus_window_moves_off_the_focus_window() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // Work area (0, 32) 1920 × 1048; centered, A lands at (510, 256).
+    let _a = map_window_sized(&mut f, id, (900, 600), None);
+    let a_id = f.synoik().layout.focus().unwrap().id();
+    let a_pos = focused_window_pos(&mut f);
+    assert_pos_eq(a_pos, (510., 256.), "the focus window");
+
+    // Start mapping B with a launch token minted now, then keep typing into A
+    // so B's launch predates the interaction and focus is denied.
+    let window = f.client(id).create_window();
+    let b_surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    {
+        let synoik = f.synoik();
+        let unmapped = synoik.unmapped_windows.values_mut().next().unwrap();
+        unmapped.activation_token_data = Some(XdgActivationTokenData {
+            client_id: None,
+            serial: None,
+            app_id: None,
+            surface: None,
+            timestamp: Instant::now(),
+            user_data: Arc::new(UserDataMap::new()),
+        });
+    }
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    tap(&mut f, KEY_A);
+
+    let window = f.client(id).window(&b_surface);
+    window.attach_new_buffer();
+    window.set_size(900, 600);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+
+    let synoik = f.synoik();
+    assert_eq!(
+        synoik.layout.focus().unwrap().id(),
+        a_id,
+        "precondition: B must have been denied the focus"
+    );
+
+    let ws = synoik.layout.active_workspace().unwrap();
+    let (_, b_pos, _) = ws
+        .tiles_with_render_positions()
+        .find(|(tile, _, _)| tile.window().id() != a_id)
+        .unwrap();
+
+    // Nothing fits beside A within the work area, so find_most_freespace picks
+    // the left of the two equal-area sides and flushes B to the work-area edge,
+    // keeping A's y.
+    assert_pos_eq(
+        (b_pos.x, b_pos.y),
+        (0., 256.),
+        "the denied window must move off the focus window",
+    );
+}
+
 /// A window whose launch (activation-token mint) predates the last user
 /// interaction with the focused window is denied focus, marked urgent, and
 /// stacked below the focus window (mutter `meta_window_show`).

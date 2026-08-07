@@ -1559,6 +1559,12 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    /// mutter's denied-focus placement, see
+    /// [`FloatingSpace::avoid_focus_window`].
+    pub fn avoid_focus_window(&mut self, window: &W::Id, focus: &W::Id) -> bool {
+        self.floating.avoid_focus_window(window, focus)
+    }
+
     /// mutter's map-time auto-maximize (place.c): a window covering more
     /// than 80% of the work area opens maximized. The restore size is
     /// clamped to sqrt(0.8) of the work area per dimension, aspect

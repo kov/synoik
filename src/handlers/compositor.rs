@@ -359,6 +359,17 @@ impl CompositorHandler for State {
                         }
                     }
 
+                    // A window that was denied focus must not cover the window
+                    // that kept it (mutter's place.c step H, which runs just
+                    // before the auto-maximize below).
+                    if denied_focus_steal
+                        && windowing_mode == WindowingMode::Floating
+                        && is_floating
+                        && parent.is_none()
+                    {
+                        self.synoik.layout.avoid_focus_window(&window);
+                    }
+
                     // GNOME auto-maximize (mutter place.c): a first-shown window
                     // covering more than 80% of the work area opens maximized.
                     // Transients are left alone.
