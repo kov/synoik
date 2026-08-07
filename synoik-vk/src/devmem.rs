@@ -18,10 +18,19 @@
 //! the source location that asked for it, and every `vkFreeMemory` clears it. What survives is
 //! ours.
 //!
-//! Reading the result: **flat live bytes while the host grows means the leak is not ours** — it is
-//! the VMM or venus retaining across a guest-side free, which is not fixable from here (see
-//! `docs/fork/explicit-sync.md` for the precedent). **Growing live bytes are ours**, and the site
-//! label names the subsystem.
+//! Two different questions, and the census answers both because **live bytes alone cannot tell them
+//! apart**:
+//!
+//! - *Is something holding memory?* Growing live bytes. The site label names the subsystem.
+//! - *Is something cycling memory?* Flat live bytes, large per-census churn. This is the one that
+//!   actually took the host down on 2026-08-06: a per-frame `reset_buffer_ages()` reallocated the
+//!   whole 4K swapchain every frame, ~3.9 GB/s into the VMM, while the live set never exceeded four
+//!   buffers. Every guest-side instrument pointed at *retention* read as perfectly healthy
+//!   throughout. Churn is cumulative allocation, reported as a delta per census.
+//!
+//! And if neither moves while the host still grows, the retention is **not ours** — it is the VMM
+//! or venus holding on across a guest-side free, which is not fixable from here (see
+//! `docs/fork/explicit-sync.md` for the precedent).
 //!
 //! Imported dmabufs are counted like any other allocation even though the import allocates no new
 //! storage: an import that is never freed pins the exporter's buffer just as effectively as a leak
@@ -61,9 +70,41 @@ struct Live {
     bytes: u64,
 }
 
-static LIVE: Mutex<Option<HashMap<u64, Live>>> = Mutex::new(None);
+/// What a site has allocated over the whole run, and what it had allocated when the census last
+/// looked. The difference between the two is the only thing that distinguishes a subsystem sitting
+/// on memory from one *cycling* it.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Churn {
+    allocs: u64,
+    bytes: u64,
+}
+
+impl std::ops::Sub for Churn {
+    type Output = Churn;
+
+    fn sub(self, rhs: Churn) -> Churn {
+        Churn {
+            allocs: self.allocs.saturating_sub(rhs.allocs),
+            bytes: self.bytes.saturating_sub(rhs.bytes),
+        }
+    }
+}
+
+#[derive(Default)]
+struct State {
+    /// Live blocks by `VkDeviceMemory` handle.
+    live: HashMap<u64, Live>,
+    /// Cumulative allocation per site, never decremented.
+    churn: HashMap<Site, Churn>,
+    /// [`Self::churn`] as of the previous [`census`], so each census can report a delta.
+    reported: HashMap<Site, Churn>,
+}
+
+static STATE: Mutex<Option<State>> = Mutex::new(None);
 static LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 static LIVE_COUNT: AtomicU64 = AtomicU64::new(0);
+static TOTAL_ALLOCS: AtomicU64 = AtomicU64::new(0);
+static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Highest [`LIVE_BYTES`] ever reached. A leak is a high-water mark that never comes down, so the
 /// peak is worth keeping next to the current value — a sample that happens to land after a cleanup
 /// would otherwise read as healthy.
@@ -74,16 +115,23 @@ pub fn track(memory: vk::DeviceMemory, bytes: u64, site: Site) {
     if memory == vk::DeviceMemory::null() {
         return;
     }
-    let mut guard = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let map = guard.get_or_insert_with(HashMap::new);
+    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let state = guard.get_or_insert_with(State::default);
     // A handle the driver has reused after a free we failed to record would otherwise double-count.
-    if let Some(stale) = map.insert(as_key(memory), Live { site, bytes }) {
+    if let Some(stale) = state.live.insert(as_key(memory), Live { site, bytes }) {
         LIVE_BYTES.fetch_sub(stale.bytes, Ordering::Relaxed);
         LIVE_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
+    let churn = state.churn.entry(site).or_default();
+    churn.allocs += 1;
+    churn.bytes += bytes;
+    drop(guard);
+
     let total = LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
     LIVE_COUNT.fetch_add(1, Ordering::Relaxed);
     PEAK_BYTES.fetch_max(total, Ordering::Relaxed);
+    TOTAL_ALLOCS.fetch_add(1, Ordering::Relaxed);
+    TOTAL_BYTES.fetch_add(bytes, Ordering::Relaxed);
 }
 
 /// Clear `memory`. Call immediately before or after `vkFreeMemory`; a handle that was never tracked
@@ -92,11 +140,11 @@ pub fn untrack(memory: vk::DeviceMemory) {
     if memory == vk::DeviceMemory::null() {
         return;
     }
-    let mut guard = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = guard.as_mut() else {
+    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(state) = guard.as_mut() else {
         return;
     };
-    if let Some(live) = map.remove(&as_key(memory)) {
+    if let Some(live) = state.live.remove(&as_key(memory)) {
         LIVE_BYTES.fetch_sub(live.bytes, Ordering::Relaxed);
         LIVE_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
@@ -116,39 +164,104 @@ pub fn totals() -> (u64, u64, u64) {
     )
 }
 
-/// Live bytes and block count per site, largest first.
-pub fn by_site() -> Vec<(String, u64, u64)> {
-    let guard = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = guard.as_ref() else {
-        return Vec::new();
-    };
-    let mut per: HashMap<Site, (u64, u64)> = HashMap::new();
-    for live in map.values() {
-        let entry = per.entry(live.site).or_default();
-        entry.0 += live.bytes;
-        entry.1 += 1;
-    }
-    drop(guard);
-    let mut out: Vec<_> = per
-        .into_iter()
-        .map(|(site, (bytes, count))| (site.to_string(), bytes, count))
-        .collect();
-    out.sort_by_key(|(_, bytes, _)| std::cmp::Reverse(*bytes));
-    out
+/// Every allocation this process has made: count and bytes, never decremented.
+///
+/// Live bytes answer "is something holding memory". These answer "is something *cycling* it", which
+/// is a different failure and the one that actually took the host down — a path that allocates and
+/// frees a 4K image every frame reads as perfectly flat on the live counters while handing the VMM
+/// gigabytes a second.
+pub fn churn_totals() -> (u64, u64) {
+    (
+        TOTAL_ALLOCS.load(Ordering::Relaxed),
+        TOTAL_BYTES.load(Ordering::Relaxed),
+    )
 }
 
-/// One-line summary plus the biggest sites, for a periodic log.
-pub fn report(top: usize) -> String {
+/// One row of the census: a site, what it holds now, and what it has allocated since the last one.
+pub struct SiteRow {
+    pub site: String,
+    pub live_bytes: u64,
+    pub live_count: u64,
+    /// Allocations by this site since the previous [`census`] — the churn rate, given a census on
+    /// a fixed timer.
+    pub new_allocs: u64,
+    pub new_bytes: u64,
+}
+
+/// The periodic census: live totals, churn since the last call, and the busiest sites.
+///
+/// **Advances the delta window**, so it must have exactly one caller (the timer in `synoik`). A
+/// second caller would silently halve everyone's deltas — which is why there is no non-mutating
+/// variant to reach for by mistake; use [`totals`] and [`churn_totals`] for a one-off look.
+///
+/// Rows are ranked by churn first and size second: a site cycling 4 GB/s while holding 32 MB is the
+/// interesting one, and ranking by live bytes alone would bury it.
+pub fn census(top: usize) -> String {
+    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let state = guard.get_or_insert_with(State::default);
+
+    let mut rows: HashMap<Site, SiteRow> = HashMap::new();
+    for live in state.live.values() {
+        let row = rows.entry(live.site).or_insert_with(|| SiteRow {
+            site: live.site.to_string(),
+            live_bytes: 0,
+            live_count: 0,
+            new_allocs: 0,
+            new_bytes: 0,
+        });
+        row.live_bytes += live.bytes;
+        row.live_count += 1;
+    }
+
+    let mut delta = Churn::default();
+    for (site, churn) in &state.churn {
+        let since = *churn - state.reported.get(site).copied().unwrap_or_default();
+        delta.allocs += since.allocs;
+        delta.bytes += since.bytes;
+        if since == Churn::default() {
+            continue;
+        }
+        // A site can churn while holding nothing live, which is exactly the case worth seeing.
+        let row = rows.entry(*site).or_insert_with(|| SiteRow {
+            site: site.to_string(),
+            live_bytes: 0,
+            live_count: 0,
+            new_allocs: 0,
+            new_bytes: 0,
+        });
+        row.new_allocs = since.allocs;
+        row.new_bytes = since.bytes;
+    }
+    state.reported = state.churn.clone();
+    drop(guard);
+
     let (bytes, count, peak) = totals();
+    let (all_allocs, all_bytes) = churn_totals();
     let mut out = format!(
-        "device memory live {:.1} MiB in {count} blocks (peak {:.1} MiB)",
+        "device memory live {:.1} MiB in {count} blocks (peak {:.1} MiB); \
+         since last census +{} allocs / {:.1} MiB; total {all_allocs} allocs / {:.1} MiB",
         mib(bytes),
         mib(peak),
+        delta.allocs,
+        mib(delta.bytes),
+        mib(all_bytes),
     );
-    for (site, site_bytes, site_count) in by_site().into_iter().take(top) {
+
+    let mut rows: Vec<SiteRow> = rows.into_values().collect();
+    rows.sort_by_key(|row| {
+        (
+            std::cmp::Reverse(row.new_bytes),
+            std::cmp::Reverse(row.live_bytes),
+        )
+    });
+    for row in rows.into_iter().take(top) {
         out.push_str(&format!(
-            "\n    {:>9.1} MiB  {site_count:>4}  {site}",
-            mib(site_bytes)
+            "\n    live {:>9.1} MiB {:>4}   new {:>9.1} MiB {:>5}   {}",
+            mib(row.live_bytes),
+            row.live_count,
+            mib(row.new_bytes),
+            row.new_allocs,
+            row.site,
         ));
     }
     out
@@ -211,6 +324,63 @@ mod tests {
         );
         untrack(handle(0x2001));
         assert_eq!(totals().0, base);
+    }
+
+    /// The failure this module exists to catch, and the reason live bytes are not enough: a site
+    /// that allocates and frees at the same rate holds nothing and costs the host everything.
+    #[test]
+    fn churn_is_visible_even_though_live_bytes_never_move() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let site = Site::Explicit("test-churn");
+        census(0); // open a clean delta window
+
+        let (base_allocs, base_bytes) = churn_totals();
+        let live_before = totals().0;
+
+        // Ten frames of allocate-then-free, exactly like the swapchain bug.
+        for i in 0..10 {
+            let handle = handle(0x3000 + i);
+            track(handle, 1 << 20, site);
+            untrack(handle);
+        }
+
+        assert_eq!(
+            totals().0,
+            live_before,
+            "live bytes must be unchanged — that is what makes this invisible without churn",
+        );
+        let (allocs, bytes) = churn_totals();
+        assert_eq!(allocs - base_allocs, 10);
+        assert_eq!(bytes - base_bytes, 10 << 20);
+
+        let line = census(8);
+        assert!(
+            line.contains("+10 allocs"),
+            "the census must report the churn it just saw, got: {line}",
+        );
+        assert!(
+            line.contains("test-churn"),
+            "and must name the site that did it, got: {line}",
+        );
+    }
+
+    /// The delta is per-census, not cumulative, or a rate cannot be read off it.
+    #[test]
+    fn the_delta_window_closes_at_each_census() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let site = Site::Explicit("test-window");
+        census(0);
+
+        let handle = handle(0x4001);
+        track(handle, 4096, site);
+        untrack(handle);
+        assert!(census(8).contains("+1 allocs"));
+
+        // Nothing happened since; the same allocation must not be counted twice.
+        assert!(
+            census(8).contains("+0 allocs"),
+            "a quiet interval must report zero, not repeat the last one",
+        );
     }
 
     #[test]

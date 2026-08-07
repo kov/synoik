@@ -6960,7 +6960,7 @@ impl Synoik {
         if tracing::enabled!(target: DEVICE_MEMORY_CENSUS_TARGET, tracing::Level::DEBUG) {
             event_loop
                 .insert_source(Timer::immediate(), |_, _, _state| {
-                    debug!(target: DEVICE_MEMORY_CENSUS_TARGET, "{}", synoik_vk::devmem::report(8));
+                    debug!(target: DEVICE_MEMORY_CENSUS_TARGET, "{}", synoik_vk::devmem::census(8));
                     TimeoutAction::ToDuration(DEVICE_MEMORY_CENSUS_PERIOD)
                 })
                 .unwrap();
