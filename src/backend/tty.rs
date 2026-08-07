@@ -3035,12 +3035,23 @@ fn render_surface_with(
     // Hand them over to the DRM.
     let drm_compositor = &mut surface.compositor;
     drm_compositor.set_cursor_hotspot(cursor_hotspot);
-    // The owned Vulkan renderer's render pass discards the target's prior contents (loadOp
-    // DONT_CARE) and does not preserve buffer-age content, so DrmCompositor's partial-damage
-    // rendering would leave undamaged regions (desktop background, window borders) black once the
-    // scene settles. Reset the buffer ages so every frame is a full redraw.
-    // FIXME: implement damage-preserving rendering (render pass LOAD + a dmabuf→shadow pre-load for
-    // the present-blit path) and drop this full-redraw-every-frame fallback.
+    // Age 0 on every slot means "contents unknown", which is how you ask `DrmCompositor` for a full
+    // redraw. Only the two cases `force_full_damage` names reach here (see where it is computed):
+    // the `SYNOIK_VK_FULL_DAMAGE` debugging knob, and a present-blit surface sharing its shadow
+    // with another output of the same size.
+    //
+    // This is NOT the old "the render pass discards prior contents" fallback — `f3f2f076` gave the
+    // scanout pass a LOAD arm keyed on the target's image layout, so the direct-render path
+    // preserves undamaged regions and never comes through here at all.
+    //
+    // Resetting every frame is only sane because `Swapchain::reset_buffer_ages` *keeps* its
+    // buffers. The version we inherited replaced any slot it could not take `&mut` to — which is
+    // every slot with a frame in flight — throwing away the buffer and the userdata where the
+    // exported `Dmabuf` is cached. That made this line reallocate and re-export the whole swapchain
+    // once per frame: at 4K over venus, ~3.9 GB/s of allocation into the host, which took the VM's
+    // memory from 10 GB to 50 GB in a minute and got it OOM-killed by the host on 2026-08-06. Fixed
+    // in our smithay fork; pinned by `tests::swapchain_ages`, which is where to look before
+    // touching this.
     if force_full_damage {
         drm_compositor.reset_buffer_ages();
     }

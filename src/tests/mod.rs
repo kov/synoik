@@ -33,6 +33,7 @@ mod layer_shell;
 mod perf_probe;
 mod producer_sync;
 mod remove_output;
+mod swapchain_ages;
 mod transactions;
 mod vulkan_render;
 mod window_opening;
