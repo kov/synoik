@@ -674,21 +674,18 @@ fn moving_the_effect_recaptures_even_with_a_static_backdrop() {
     );
 }
 
-/// A blur region set on a **subsurface** is accepted on the wire and then dropped on the floor.
+/// A blur region set on a **subsurface** must blur that subsurface's own backdrop.
 ///
-/// This is `docs/fork/client-blur.md` §5 gap 4, pinned as it stands today rather than asserted as
-/// correct: the protocol lets a client call `get_background_effect` on any `wl_surface`, and a
-/// GTK/Qt client that puts its blurred chrome on a subsurface will do exactly that. We accept the
-/// request, cache the region against that surface, and never look at it —
-/// `render_background_effect` resolves effects for the *toplevel's* surface only
-/// (`window/mapped.rs:836`), with a separate loop for popups (`:799`). The surface tree is never
-/// walked.
+/// `docs/fork/client-blur.md` §5 gap 4. The protocol lets a client call `get_background_effect` on
+/// any `wl_surface`, and a GTK/Qt client with blurred chrome on a subsurface does exactly that. We
+/// used to accept the request, cache the region, and never look at it: effects resolved for the
+/// toplevel's surface only, with a separate loop for popups, and the surface tree was never walked.
 ///
-/// The two halves are asserted separately on purpose. The compositor-side cache **does** hold the
-/// region, so the protocol seam is fine and a fix is a render-path change, not a handler one —
-/// which is the useful thing to know before implementing. Flip this test when it lands.
+/// The effect has to land *directly beneath the subsurface that asked for it*, not under the whole
+/// window — that is what makes its backdrop "everything below me, my own parent surface included",
+/// which is what such chrome wants. So this asserts placement, not merely presence.
 #[test]
-fn a_subsurface_blur_region_is_cached_but_never_rendered() {
+fn a_subsurface_blur_region_blurs_that_subsurface() {
     use crate::render_helpers::vulkan::VulkanRenderer;
 
     if let Err(e) = VulkanRenderer::new() {
@@ -750,11 +747,37 @@ fn a_subsurface_blur_region_is_cached_but_never_rendered() {
          protocol-seam bug, not the render-path gap this test is about",
     );
 
-    // Half two: nothing renders from it.
+    // Half two: an effect resolves for it, at the subsurface's own rect rather than the window's.
     let samples = sample_effect(&mut f);
+    let sub = samples
+        .iter()
+        .find(|s| s.subregion_bbox.is_some())
+        .unwrap_or_else(|| {
+            panic!("no effect resolved for the subsurface's blur region: {samples:?}")
+        });
+
     assert!(
-        samples.iter().all(|s| s.subregion_bbox.is_none()),
-        "a subsurface blur region rendered, so gap 4 is fixed and this test should be inverted \
-         to assert the blur lands on the subsurface: {samples:?}",
+        sub.effect_geometry.size.w >= 200. && sub.effect_geometry.size.h >= 120.,
+        "the effect covers {:?}, smaller than the 200x120 subsurface — it was sized from something \
+         other than the subsurface's own view",
+        sub.effect_geometry.size,
+    );
+    let bbox = sub.subregion_bbox.unwrap();
+    assert!(
+        rect_approx_eq(
+            bbox,
+            smithay::utils::Rectangle::new(sub.effect_geometry.loc, (200., 120.).into()),
+        ),
+        "the blur region landed at {bbox:?}, not on the subsurface at {:?}",
+        sub.effect_geometry.loc,
+    );
+    // The client region is what selects the real-backdrop path; xray holds only the wallpaper and
+    // the background layer, so it could not show the parent surface beneath the chrome.
+    assert!(
+        sub.blur && !sub.xray,
+        "the subsurface effect resolved to xray={} blur={}, so its backdrop would be the wallpaper \
+         rather than what is actually beneath it",
+        sub.xray,
+        sub.blur,
     );
 }

@@ -383,6 +383,50 @@ pub fn render_for_tile(
     push: &mut dyn FnMut(BackgroundEffectElement),
 ) {
     with_states(surface, |states| {
+        render_for_surface(
+            ctx,
+            ns,
+            geometry,
+            scale,
+            clip_to_geometry,
+            states,
+            surface_off,
+            surface_anim_scale,
+            blur_config,
+            radius,
+            effect,
+            should_block_out,
+            xray_pos,
+            push,
+        );
+    });
+}
+
+/// As [`render_for_tile`], but against a surface's already-borrowed [`SurfaceData`].
+///
+/// **A surface-tree walk must use this one.** `with_surface_tree_downward` holds a *mutable* lock
+/// on each surface's user data while it calls the processor
+/// (`smithay/src/wayland/compositor/tree.rs`), so calling `render_for_tile` from inside the walk
+/// re-enters that lock on the same surface and deadlocks — no panic, no message, the compositor
+/// simply stops. That is how the subsurface hook first behaved.
+#[allow(clippy::too_many_arguments)]
+pub fn render_for_surface(
+    ctx: RenderCtx,
+    ns: Option<usize>,
+    geometry: Rectangle<f64, Logical>,
+    scale: f64,
+    clip_to_geometry: bool,
+    states: &SurfaceData,
+    surface_off: Point<f64, Logical>,
+    surface_anim_scale: Scale<f64>,
+    blur_config: synoik_config::Blur,
+    radius: CornerRadius,
+    effect: synoik_config::BackgroundEffect,
+    should_block_out: bool,
+    xray_pos: XrayPos,
+    push: &mut dyn FnMut(BackgroundEffectElement),
+) {
+    {
         let background_effect = SurfaceBackgroundEffect::get(states);
         let mut background_effect = background_effect.0.lock().unwrap();
 
@@ -433,7 +477,7 @@ pub fn render_for_tile(
 
         let xray_pos = xray_pos.offset(params.geometry.loc - geometry.loc);
         background_effect.render(ctx, ns, params, xray_pos, push);
-    });
+    }
 }
 
 #[cfg(test)]

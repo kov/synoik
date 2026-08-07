@@ -1192,6 +1192,7 @@ impl<W: LayoutElement> Tile<W> {
                                 Point::from((0., 0.)),
                                 scale,
                                 1.,
+                                xray_pos,
                                 &mut |elem| window_elements.push(elem),
                             );
 
@@ -1313,10 +1314,14 @@ impl<W: LayoutElement> Tile<W> {
                 push(damage.into());
             }
 
-            self.window
-                .render_normal(ctx.r(), window_render_loc, scale, win_alpha, &mut |elem| {
-                    push(clip(elem))
-                });
+            self.window.render_normal(
+                ctx.r(),
+                window_render_loc,
+                scale,
+                win_alpha,
+                xray_pos,
+                &mut |elem| push(clip(elem)),
+            );
         }
 
         if fullscreen_progress > 0. {

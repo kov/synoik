@@ -188,7 +188,7 @@ pub trait LayoutElement {
         push: &mut dyn FnMut(LayoutElementRenderElement),
     ) {
         self.render_popups(ctx.r(), location, scale, alpha, xray_pos, push);
-        self.render_normal(ctx.r(), location, scale, alpha, push);
+        self.render_normal(ctx.r(), location, scale, alpha, xray_pos, push);
     }
 
     /// Renders the non-popup parts of the element.
@@ -198,9 +198,10 @@ pub trait LayoutElement {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
+        xray_pos: XrayPos,
         push: &mut dyn FnMut(LayoutElementRenderElement),
     ) {
-        let _ = (ctx, location, scale, alpha, push);
+        let _ = (ctx, location, scale, alpha, xray_pos, push);
     }
 
     /// Renders the popups of the element.

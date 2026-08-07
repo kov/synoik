@@ -9,9 +9,32 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Physical, Point, Scale};
-use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
+use smithay::wayland::compositor::{with_surface_tree_downward, SurfaceData, TraversalAction};
 
+use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::vulkan::VulkanRenderer;
+
+/// What a surface-tree walk emits: the surfaces themselves, plus anything a caller's hook wants
+/// interleaved between them.
+///
+/// The two cannot be separate callbacks. `with_surface_tree_downward` walks nearest-to-deepest and
+/// we push front-to-back, so an element that must sit *directly below* a given surface has to be
+/// pushed immediately after it — which means one ordered stream, not two lists to merge afterwards.
+/// The per-surface hook [`push_elements_from_surface_tree_with_effects`] calls: given the renderer,
+/// the surface and its physical origin, push any effects that belong beneath it.
+pub type SurfaceEffectHook<'a> = dyn FnMut(
+        &mut VulkanRenderer,
+        &WlSurface,
+        &SurfaceData,
+        Point<f64, Physical>,
+        &mut dyn FnMut(BackgroundEffectElement),
+    ) + 'a;
+
+pub enum SurfaceTreeElement {
+    Surface(WaylandSurfaceRenderElement<VulkanRenderer>),
+    /// A background effect belonging to the surface just pushed, and therefore drawn beneath it.
+    Effect(BackgroundEffectElement),
+}
 
 pub fn push_elements_from_surface_tree(
     renderer: &mut VulkanRenderer,
@@ -22,6 +45,41 @@ pub fn push_elements_from_surface_tree(
     alpha: f32,
     kind: Kind,
     push: &mut dyn FnMut(WaylandSurfaceRenderElement<VulkanRenderer>),
+) {
+    push_elements_from_surface_tree_with_effects(
+        renderer,
+        surface,
+        location,
+        scale,
+        alpha,
+        kind,
+        &mut |elem| match elem {
+            SurfaceTreeElement::Surface(s) => push(s),
+            SurfaceTreeElement::Effect(_) => unreachable!("no hook was installed"),
+        },
+        &mut |_, _, _, _, _| {},
+    );
+}
+
+/// As [`push_elements_from_surface_tree`], but `after_each` runs once per surface, immediately
+/// after that surface's own element, and may push effects that belong *beneath* it.
+///
+/// This is how a subsurface gets a background effect: `ext-background-effect-v1` lets a client
+/// attach one to any `wl_surface`, and a client with blurred chrome on a subsurface expects that
+/// chrome's backdrop — everything drawn below it, its own parent surface included — to be blurred.
+/// Resolving effects only for the toplevel cannot express that, because the effect would land under
+/// the whole window rather than under the one subsurface.
+#[allow(clippy::too_many_arguments)]
+pub fn push_elements_from_surface_tree_with_effects(
+    renderer: &mut VulkanRenderer,
+    surface: &WlSurface,
+    // Fractional scale expects surface buffers to be aligned to physical pixels.
+    location: Point<i32, Physical>,
+    scale: Scale<f64>,
+    alpha: f32,
+    kind: Kind,
+    push: &mut dyn FnMut(SurfaceTreeElement),
+    after_each: &mut SurfaceEffectHook<'_>,
 ) {
     let _span = tracy_client::span!("push_elements_from_surface_tree");
 
@@ -61,12 +119,17 @@ pub fn push_elements_from_surface_tree(
                     match WaylandSurfaceRenderElement::from_surface(
                         renderer, surface, states, location, alpha, kind,
                     ) {
-                        Ok(Some(surface)) => push(surface),
+                        Ok(Some(elem)) => push(SurfaceTreeElement::Surface(elem)),
                         Ok(None) => {} // surface is not mapped
                         Err(err) => {
                             warn!("failed to import surface: {}", err);
                         }
                     };
+
+                    // After the surface, so anything pushed here lands beneath it.
+                    after_each(renderer, surface, states, location, &mut |effect| {
+                        push(SurfaceTreeElement::Effect(effect))
+                    });
                 }
             }
         },

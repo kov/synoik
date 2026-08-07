@@ -699,6 +699,17 @@ impl State {
         let subsurface = subcompositor.get_subsurface(&surface, parent, &self.qh, ());
         subsurface.set_position(x, y);
 
+        // A single-pixel buffer is 1x1, and the surface's *view* is what the compositor sizes
+        // everything else from — an effect over this surface would come out one pixel wide, and
+        // `damage_buffer(0, 0, w, h)` would not fix that because damage is not size. A viewport
+        // destination is what makes the surface genuinely `w`x`h` without needing real pixels.
+        let viewport = self
+            .viewporter
+            .as_ref()
+            .expect("the compositor must advertise wp_viewporter")
+            .get_viewport(&surface, &self.qh, ());
+        viewport.set_destination(w, h);
+
         let buffer = self.spbm.as_ref().unwrap().create_u32_rgba_buffer(
             color[0],
             color[1],

@@ -7,7 +7,6 @@
 use std::cell::{Cell, Ref, RefCell};
 use std::time::Duration;
 
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::desktop::space::SpaceElement as _;
 use smithay::desktop::{PopupKind, PopupManager, Window};
@@ -28,6 +27,7 @@ use wayland_backend::server::Credentials;
 
 use super::{ResolvedWindowRules, WindowRef};
 use crate::gnome::TileSide;
+use crate::handlers::background_effect::get_cached_blur_region;
 use crate::handlers::KdeDecorationsModeState;
 use crate::layout::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, LayoutElementRenderElement,
@@ -38,7 +38,10 @@ use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::offscreen::OffscreenData;
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::surface::push_elements_from_surface_tree;
+use crate::render_helpers::surface::{
+    push_elements_from_surface_tree, push_elements_from_surface_tree_with_effects,
+    SurfaceTreeElement,
+};
 use crate::render_helpers::vulkan::VulkanRenderer;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{background_effect, RenderCtx, RenderTarget};
@@ -727,6 +730,7 @@ impl LayoutElement for Mapped {
         location: Point<f64, Logical>,
         scale: Scale<f64>,
         alpha: f32,
+        xray_pos: XrayPos,
         push: &mut dyn FnMut(LayoutElementRenderElement),
     ) {
         if ctx.target.should_block_out(self.rules.block_out_from) {
@@ -737,16 +741,65 @@ impl LayoutElement for Mapped {
             push(elem.into());
         } else {
             let buf_pos = location - self.window.geometry().loc.to_f64();
-            let surface = self.toplevel().wl_surface();
-            let mut push = |elem: WaylandSurfaceRenderElement<VulkanRenderer>| push(elem.into());
-            push_elements_from_surface_tree(
+            let root = self.toplevel().wl_surface().clone();
+
+            // A blur region on a *subsurface* resolves here rather than in
+            // `render_background_effect`, because the effect has to land directly beneath the
+            // subsurface that asked for it — that is what makes its backdrop "everything below me,
+            // my own parent surface included". The root is excluded: its effect is the window's,
+            // pushed under the whole tile by `render_background_effect`.
+            let (target, xray) = (ctx.target, ctx.xray);
+            let blur_config = self.blur_config;
+            let effect_rules = self.rules.background_effect;
+            let should_block_out = target.should_block_out(self.rules.block_out_from);
+
+            push_elements_from_surface_tree_with_effects(
                 ctx.renderer,
-                surface,
+                &root,
                 buf_pos.to_physical_precise_round(scale),
                 scale,
                 alpha,
                 Kind::ScanoutCandidate,
-                &mut push,
+                &mut |elem| match elem {
+                    SurfaceTreeElement::Surface(s) => push(s.into()),
+                    SurfaceTreeElement::Effect(e) => push(e.into()),
+                },
+                &mut |renderer, surface, states, surface_loc, push_effect| {
+                    if *surface == root {
+                        return;
+                    }
+                    if !get_cached_blur_region(states).is_some_and(|r| !r.is_empty()) {
+                        return;
+                    }
+
+                    // The walk hands us the surface's own physical origin, which is exactly the
+                    // rect the effect must cover; `render_for_tile` derives the rest from the
+                    // surface's view, so the size it is given here is not load-bearing.
+                    let geometry = Rectangle::new(surface_loc.to_logical(scale), Size::default());
+                    // `render_for_surface`, not `render_for_tile`: the tree walk already holds a
+                    // mutable lock on this surface's data, and re-entering it deadlocks.
+                    background_effect::render_for_surface(
+                        RenderCtx {
+                            renderer,
+                            target,
+                            xray,
+                        },
+                        None,
+                        geometry,
+                        scale.x,
+                        // A subsurface has no window geometry of its own to clip to.
+                        false,
+                        states,
+                        Point::from((0., 0.)),
+                        Scale::from(1.),
+                        blur_config,
+                        CornerRadius::default(),
+                        effect_rules,
+                        should_block_out,
+                        xray_pos,
+                        push_effect,
+                    );
+                },
             )
         }
     }
