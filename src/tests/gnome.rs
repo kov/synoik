@@ -27,11 +27,13 @@ use synoik_config::{Action, Config};
 use wayland_client::protocol::wl_keyboard::KeyState as WlKeyState;
 use wayland_client::protocol::wl_surface::WlSurface;
 
-use super::client::{ClientId, TextInputEvent as ClientEv};
+use super::client::{ClientId, SessionEvent, TextInputEvent as ClientEv};
 use super::*;
 use crate::gnome::{
     Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction, KeybindingAction,
 };
+use crate::protocols::raw::xdg_session_management::v1::client::xdg_session_manager_v1::Reason;
+use crate::protocols::raw::xdg_session_management::v1::client::xdg_session_v1::XdgSessionV1;
 use crate::status_notifier::ItemProps;
 use crate::ui::osd::OsdLevel;
 use crate::utils::get_monotonic_time;
@@ -21332,5 +21334,271 @@ fn a_window_without_our_token_is_not_moved() {
     assert!(
         (right - (anchor.loc.x + anchor.size.w)).abs() > 1.,
         "an untagged window must not be pulled under the icon: right edge {right}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// xdg_session_management_v1 — see docs/fork/session-management-port.md.
+//
+// Slice 1 is the protocol skeleton: sessions live only as long as a client holds them and nothing
+// is persisted, so these pin object lifetime, takeover and the error cases. Restore itself is
+// pinned once slices 2-4 give it something to restore.
+// ---------------------------------------------------------------------------
+
+/// Creates a session and returns the id the compositor minted for it.
+#[track_caller]
+fn new_session(f: &mut Fixture, id: ClientId) -> (XdgSessionV1, String) {
+    let session = f.client(id).get_session(Reason::Launch, None);
+    f.roundtrip(id);
+
+    let events = f.client(id).session_events();
+    let [SessionEvent::Created(session_id)] = events else {
+        panic!("expected exactly one created event, got {events:?}");
+    };
+    let session_id = session_id.clone();
+    assert!(!session_id.is_empty(), "the session id must not be empty");
+    (session, session_id)
+}
+
+/// mutter's `basic`: a fresh session reports `created`, and a toplevel merely *added* to it is
+/// never reported as restored.
+#[test]
+fn a_new_session_is_created_and_adds_do_not_restore() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    let (session, _session_id) = new_session(&mut f, id);
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    let qh = f.client(id).qh.clone();
+    session.add_toplevel(&toplevel, String::from("one"), &qh, String::from("one"));
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+
+    assert_eq!(
+        f.client(id).session_events().len(),
+        1,
+        "adding a toplevel must not emit restored: {:?}",
+        f.client(id).session_events()
+    );
+}
+
+/// An id the compositor has never issued is treated as if NULL had been passed: a brand new
+/// session, with a brand new id, and no `restored`.
+#[test]
+fn an_unknown_session_id_is_treated_as_a_new_session() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    let _session = f
+        .client(id)
+        .get_session(Reason::Launch, Some("not-a-session"));
+    f.roundtrip(id);
+
+    let events = f.client(id).session_events();
+    let [SessionEvent::Created(session_id)] = events else {
+        panic!("expected exactly one created event, got {events:?}");
+    };
+    assert_ne!(
+        session_id, "not-a-session",
+        "an unknown id must not be adopted; a fresh one is minted"
+    );
+}
+
+/// mutter's `replace`: a second client asking for a live session takes it over. It is told the
+/// session was `restored`; the first client is told it was `replaced`.
+#[test]
+fn another_client_taking_a_session_over_replaces_the_first() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let first = f.add_client();
+    f.roundtrip(first);
+    let (_session, session_id) = new_session(&mut f, first);
+
+    let second = f.add_client();
+    f.roundtrip(second);
+    let _taken = f
+        .client(second)
+        .get_session(Reason::Launch, Some(&session_id));
+    f.roundtrip(second);
+    f.roundtrip(first);
+
+    assert_eq!(
+        f.client(second).session_events(),
+        [SessionEvent::Restored],
+        "the taking client is told the session was restored, not created"
+    );
+    assert_eq!(
+        f.client(first).session_events(),
+        [SessionEvent::Created(session_id), SessionEvent::Replaced],
+        "the losing client is told it was replaced"
+    );
+}
+
+/// The *same* client asking twice for one live session is a protocol error, not a takeover.
+#[test]
+#[should_panic(expected = "Protocol error 1 on object xdg_session_manager_v1")]
+fn re_requesting_a_live_session_is_in_use() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (_session, session_id) = new_session(&mut f, id);
+
+    let _again = f.client(id).get_session(Reason::Launch, Some(&session_id));
+    f.roundtrip(id);
+}
+
+/// `restore_toplevel` changes the very first configure, so it is meaningless — and an error —
+/// once the client has committed the surface.
+#[test]
+#[should_panic(expected = "Protocol error 2 on object xdg_session_v1")]
+fn restoring_a_toplevel_after_its_first_commit_is_an_error() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, _session_id) = new_session(&mut f, id);
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+
+    let qh = f.client(id).qh.clone();
+    session.restore_toplevel(&toplevel, String::from("one"), &qh, String::from("one"));
+    f.roundtrip(id);
+}
+
+/// Two toplevels cannot share a name within one session.
+#[test]
+#[should_panic(expected = "Protocol error 1 on object xdg_session_v1")]
+fn two_toplevels_with_the_same_name_is_name_in_use() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, _session_id) = new_session(&mut f, id);
+
+    let qh = f.client(id).qh.clone();
+    for _ in 0..2 {
+        let toplevel = f.client(id).create_window().xdg_toplevel.clone();
+        session.add_toplevel(&toplevel, String::from("same"), &qh, String::from("same"));
+    }
+    f.roundtrip(id);
+}
+
+/// One toplevel cannot be added twice, even under a different name.
+#[test]
+#[should_panic(expected = "Protocol error 4 on object xdg_session_v1")]
+fn adding_one_toplevel_twice_is_already_added() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, _session_id) = new_session(&mut f, id);
+
+    let qh = f.client(id).qh.clone();
+    let toplevel = f.client(id).create_window().xdg_toplevel.clone();
+    session.add_toplevel(&toplevel, String::from("one"), &qh, String::from("one"));
+    session.add_toplevel(&toplevel, String::from("two"), &qh, String::from("two"));
+    f.roundtrip(id);
+}
+
+/// `rename` frees the old name, so a later toplevel may take it.
+#[test]
+fn renaming_a_toplevel_session_frees_its_old_name() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, _session_id) = new_session(&mut f, id);
+
+    let qh = f.client(id).qh.clone();
+    let first = f.client(id).create_window().xdg_toplevel.clone();
+    let handle = session.add_toplevel(&first, String::from("one"), &qh, String::from("one"));
+    handle.rename(String::from("renamed"));
+
+    // "one" is free again, so this must not raise name_in_use.
+    let second = f.client(id).create_window().xdg_toplevel.clone();
+    session.add_toplevel(&second, String::from("one"), &qh, String::from("one"));
+    f.roundtrip(id);
+
+    assert_eq!(
+        f.client(id).session_events().len(),
+        1,
+        "only the original created event: {:?}",
+        f.client(id).session_events()
+    );
+}
+
+/// Renaming onto a name the session already holds is a protocol error.
+#[test]
+#[should_panic(expected = "Protocol error 1 on object xdg_session_v1")]
+fn renaming_onto_a_taken_name_is_name_in_use() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, _session_id) = new_session(&mut f, id);
+
+    let qh = f.client(id).qh.clone();
+    let first = f.client(id).create_window().xdg_toplevel.clone();
+    let handle = session.add_toplevel(&first, String::from("one"), &qh, String::from("one"));
+
+    let second = f.client(id).create_window().xdg_toplevel.clone();
+    session.add_toplevel(&second, String::from("two"), &qh, String::from("two"));
+
+    handle.rename(String::from("two"));
+    f.roundtrip(id);
+}
+
+/// Destroying a session makes it inert rather than erroring: later requests on it are ignored,
+/// and the id stops being live, so asking for it again mints a fresh session.
+#[test]
+fn a_destroyed_session_goes_inert() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    let qh = f.client(id).qh.clone();
+    let toplevel = f.client(id).create_window().xdg_toplevel.clone();
+    session.add_toplevel(&toplevel, String::from("one"), &qh, String::from("one"));
+    f.roundtrip(id);
+
+    session.destroy();
+    f.roundtrip(id);
+
+    // The id is no longer live, so this is a fresh session rather than `in_use`.
+    let _again = f.client(id).get_session(Reason::Launch, Some(&session_id));
+    f.roundtrip(id);
+
+    let events = f.client(id).session_events();
+    let [SessionEvent::Created(first), SessionEvent::Created(second)] = events else {
+        panic!("expected two created events, got {events:?}");
+    };
+    assert_eq!(first, &session_id);
+    assert_ne!(
+        first, second,
+        "the destroyed id must not be handed back out"
     );
 }

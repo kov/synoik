@@ -94,6 +94,7 @@ impl CompositorHandler for State {
                         state,
                         activation_token_data,
                         activation_token,
+                        had_initial_commit: _,
                     } = entry.remove();
 
                     window.on_commit();
@@ -395,7 +396,8 @@ impl CompositorHandler for State {
 
                 // The toplevel remains unmapped.
                 trace!("toplevel remains unmapped");
-                let unmapped = entry.get();
+                let unmapped = entry.into_mut();
+                unmapped.had_initial_commit = true;
                 if unmapped.needs_initial_configure() {
                     let toplevel = unmapped.window.toplevel().expect("no x11 support").clone();
                     self.queue_initial_configure(toplevel);

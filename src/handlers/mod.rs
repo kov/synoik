@@ -25,6 +25,7 @@ use smithay::input::pointer::{CursorImageStatus, Focus, PointerHandle};
 use smithay::input::{keyboard, Seat, SeatHandler, SeatState};
 use smithay::output::Output;
 use smithay::reexports::rustix::fs::{fcntl_setfl, OFlags};
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel;
 use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -90,6 +91,7 @@ use crate::protocols::gamma_control::{GammaControlHandler, GammaControlManagerSt
 use crate::protocols::mutter_x11_interop::MutterX11InteropHandler;
 use crate::protocols::output_management::{OutputManagementHandler, OutputManagementManagerState};
 use crate::protocols::screencopy::{Screencopy, ScreencopyHandler, ScreencopyManagerState};
+use crate::protocols::session_management::{SessionManagerHandler, SessionManagerState};
 use crate::protocols::virtual_pointer::{
     VirtualPointerAxisEvent, VirtualPointerButtonEvent, VirtualPointerHandler,
     VirtualPointerInputBackend, VirtualPointerManagerState, VirtualPointerMotionAbsoluteEvent,
@@ -100,7 +102,7 @@ use crate::utils::{ipc_transform_to_smithay, output_size, send_scale_transform};
 use crate::{
     delegate_ext_workspace, delegate_foreign_toplevel, delegate_gamma_control,
     delegate_mutter_x11_interop, delegate_output_management, delegate_screencopy,
-    delegate_virtual_pointer,
+    delegate_session_management, delegate_virtual_pointer,
 };
 
 pub const XDG_ACTIVATION_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -942,5 +944,30 @@ delegate_output_management!(State);
 
 impl MutterX11InteropHandler for State {}
 delegate_mutter_x11_interop!(State);
+
+impl SessionManagerHandler for State {
+    fn session_manager_state(&mut self) -> &mut SessionManagerState {
+        &mut self.synoik.session_manager_state
+    }
+
+    fn toplevel_had_initial_commit(&mut self, toplevel: &XdgToplevel) -> bool {
+        let surface = self
+            .synoik
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find(|s| s.xdg_toplevel() == toplevel);
+        let Some(surface) = surface else {
+            // A toplevel we do not know about cannot be restored either way.
+            return true;
+        };
+        match self.synoik.unmapped_windows.get(surface.wl_surface()) {
+            Some(unmapped) => unmapped.had_initial_commit,
+            // Not unmapped means already mapped, which is well past the initial commit.
+            None => true,
+        }
+    }
+}
+delegate_session_management!(State);
 
 delegate_single_pixel_buffer!(State);

@@ -126,6 +126,7 @@ zbus = { version = "5.13.2", features = ["p2p"] }
 jiff = "0.2"
 tzf-rs = "1.3"
 unicode-segmentation = "1.13.3"
+uuid = { version = "1.24.0", features = ["v4"] }
 
 [dependencies.smithay]
 workspace = true

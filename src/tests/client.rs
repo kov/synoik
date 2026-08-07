@@ -47,6 +47,16 @@ use smithay::reexports::wayland_protocols_wlr::screencopy::v1::client::zwlr_scre
 };
 use smithay::reexports::wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1;
 use wayland_backend::client::Backend;
+
+use crate::protocols::raw::xdg_session_management::v1::client::xdg_session_manager_v1::{
+    Reason, XdgSessionManagerV1,
+};
+use crate::protocols::raw::xdg_session_management::v1::client::xdg_session_v1::{
+    self, XdgSessionV1,
+};
+use crate::protocols::raw::xdg_session_management::v1::client::xdg_toplevel_session_v1::{
+    self, XdgToplevelSessionV1,
+};
 use wayland_client::globals::Global;
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
@@ -121,8 +131,26 @@ pub struct State {
     /// `wl_keyboard.key` events received, as `(evdev code, state)`.
     pub key_events: Vec<(u32, wl_keyboard::KeyState)>,
 
+    pub session_manager: Option<XdgSessionManagerV1>,
+    /// Every `xdg_session_v1` / `xdg_toplevel_session_v1` event this client received, in order.
+    pub session_events: Vec<SessionEvent>,
+
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
+}
+
+/// What the compositor told us about a session, flattened across objects because a fixture client
+/// only ever juggles a couple of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEvent {
+    /// `xdg_session_v1.created`, carrying the id the compositor minted.
+    Created(String),
+    /// `xdg_session_v1.restored` — the id we passed was known.
+    Restored,
+    /// `xdg_session_v1.replaced` — another client took our session over.
+    Replaced,
+    /// `xdg_toplevel_session_v1.restored`, with the name we asked to restore.
+    ToplevelRestored(String),
 }
 
 /// The in-flight state of one wlr-screencopy capture, updated by the frame's [`Dispatch`] impl.
@@ -383,6 +411,8 @@ impl Client {
             screencopy: None,
             keyboard: None,
             key_events: Vec::new(),
+            session_manager: None,
+            session_events: Vec::new(),
             windows: Vec::new(),
             layers: Vec::new(),
         };
@@ -416,6 +446,16 @@ impl Client {
 
     pub fn create_window(&mut self) -> &mut Window {
         self.state.create_window()
+    }
+
+    /// `xdg_session_manager_v1.get_session`. `session_id` is `None` to ask for a fresh session.
+    pub fn get_session(&mut self, reason: Reason, session_id: Option<&str>) -> XdgSessionV1 {
+        self.state.get_session(reason, session_id)
+    }
+
+    /// Every session event received so far, in order.
+    pub fn session_events(&self) -> &[SessionEvent] {
+        &self.state.session_events
     }
 
     pub fn window(&mut self, surface: &WlSurface) -> &mut Window {
@@ -640,6 +680,14 @@ impl State {
         surface.set_opaque_region(Some(&region));
         surface.commit();
         region.destroy();
+    }
+
+    pub fn get_session(&mut self, reason: Reason, session_id: Option<&str>) -> XdgSessionV1 {
+        let manager = self
+            .session_manager
+            .as_ref()
+            .expect("the compositor must advertise xdg_session_manager_v1");
+        manager.get_session(reason, session_id.map(String::from), &self.qh, ())
     }
 
     pub fn create_window(&mut self) -> &mut Window {
@@ -1074,6 +1122,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == ZwlrScreencopyManagerV1::interface().name {
                     let version = min(version, ZwlrScreencopyManagerV1::interface().version);
                     state.screencopy_manager = Some(registry.bind(name, version, qh, ()));
+                } else if interface == XdgSessionManagerV1::interface().name {
+                    let version = min(version, XdgSessionManagerV1::interface().version);
+                    state.session_manager = Some(registry.bind(name, version, qh, ()));
                 }
 
                 let global = Global {
@@ -1669,5 +1720,53 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for State {
             zwp_keyboard_shortcuts_inhibitor_v1::Event::Inactive => (),
             _ => unreachable!(),
         }
+    }
+}
+
+impl Dispatch<XdgSessionManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &XdgSessionManagerV1,
+        _event: <XdgSessionManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // xdg_session_manager_v1 has no events.
+    }
+}
+
+impl Dispatch<XdgSessionV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &XdgSessionV1,
+        event: <XdgSessionV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let event = match event {
+            xdg_session_v1::Event::Created { session_id } => SessionEvent::Created(session_id),
+            xdg_session_v1::Event::Restored => SessionEvent::Restored,
+            xdg_session_v1::Event::Replaced => SessionEvent::Replaced,
+        };
+        state.session_events.push(event);
+    }
+}
+
+/// The toplevel session's `restored` carries no name, so the name rides along as user data.
+impl Dispatch<XdgToplevelSessionV1, String> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &XdgToplevelSessionV1,
+        event: <XdgToplevelSessionV1 as wayland_client::Proxy>::Event,
+        name: &String,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let xdg_toplevel_session_v1::Event::Restored = event;
+        state
+            .session_events
+            .push(SessionEvent::ToplevelRestored(name.clone()));
     }
 }

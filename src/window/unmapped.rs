@@ -22,6 +22,13 @@ pub struct Unmapped {
     /// matched against an open startup sequence by id — mutter's
     /// `xdg_activation_token_lookup` path (`meta-wayland-activation.c:339-347`).
     pub activation_token: Option<String>,
+    /// Whether the client has performed the initial commit on this toplevel's surface.
+    ///
+    /// Not the same as having been configured: the initial configure is sent from an idle, so
+    /// between the commit and that idle the window is still `NotConfigured`. Requests that the
+    /// spec pins to "before the first commit" — `xdg_toplevel_session_v1`'s `already_mapped`
+    /// error — need the commit itself, not the configure.
+    pub had_initial_commit: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -98,6 +105,7 @@ impl Unmapped {
             },
             activation_token_data: None,
             activation_token: None,
+            had_initial_commit: false,
         }
     }
 

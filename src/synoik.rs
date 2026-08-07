@@ -163,6 +163,7 @@ use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
+use crate::protocols::session_management::SessionManagerState;
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
@@ -558,6 +559,7 @@ pub struct Synoik {
     pub gamma_control_manager_state: GammaControlManagerState,
     pub activation_state: XdgActivationState,
     pub mutter_x11_interop_state: MutterX11InteropManagerState,
+    pub session_manager_state: SessionManagerState,
 
     // This will not work as is outside of tests, so it is gated with #[cfg(test)] for now. In
     // particular, shaders will need to learn about the single pixel buffer. Also, it must be
@@ -6847,6 +6849,8 @@ impl Synoik {
 
         let mutter_x11_interop_state =
             MutterX11InteropManagerState::new::<State, _>(&display_handle, move |_| true);
+        let session_manager_state =
+            SessionManagerState::new::<State, _>(&display_handle, move |_| true);
 
         #[cfg(test)]
         let single_pixel_buffer_state = SinglePixelBufferState::new::<State>(&display_handle);
@@ -7190,6 +7194,7 @@ impl Synoik {
             gamma_control_manager_state,
             activation_state,
             mutter_x11_interop_state,
+            session_manager_state,
             #[cfg(test)]
             single_pixel_buffer_state,
 

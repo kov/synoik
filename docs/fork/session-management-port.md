@@ -232,8 +232,26 @@ too-new `version` rejection, and the tombstone-vs-pending-save interaction.
    maximize/fullscreen don't seed the stored workspace name while unmaximize/unfullscreen do —
    carried over unchanged and documented at the call site; see the open question below.
 
-1. **Protocol skeleton** — XML, scanner wiring, the three interfaces, the global, all state in
-   memory only, no restore. Lands `basic`, `replace`, `in_use`, unknown-id, and the error tests.
+1. **Protocol skeleton — DONE.** `resources/xdg-session-management-v1.xml` is vendored (a
+   byte-for-byte copy of wayland-protocols 0.32.13, which ships the XML but no bindings module
+   yet); `protocols::raw::xdg_session_management` runs the scanner over it, server-side always and
+   client-side under `cfg(test)` for the fixture. `protocols::session_management` implements the
+   three interfaces with all state in memory: sessions live only while a client holds them, and
+   `restore_toplevel` always degrades to `add_toplevel` because there is nothing to restore yet.
+
+   **Inertness is not a flag.** A session object is inert exactly when it is no longer the object
+   registered for its id, which covers takeover, `destroy` and `remove` at once with no bit that
+   can go stale; toplevel handles follow the same rule one level down. `destroy` and `remove` are
+   both destructors and both fall to the same `destroyed` hook today — they stay separate arms
+   because slice 2 gives `remove` the extra job of deleting the stored state.
+
+   `already_mapped` needs the *initial commit*, not the initial configure, which is sent from an
+   idle a beat later; `Unmapped::had_initial_commit` was added for exactly that distinction.
+
+   Landed in `src/tests/gnome.rs`: `basic` (created, and an added toplevel is never restored),
+   unknown-id-is-new, `replace` (restored to the taker, replaced to the loser), `in_use`,
+   `already_mapped`, `name_in_use`, `already_added`, rename-frees-the-old-name,
+   rename-onto-a-taken-name, and destroy-goes-inert.
 2. **Persistence** — `src/session_state.rs`, load at startup, debounced + shutdown save.
    Store unit tests.
 3. **Save on unmap** — snapshot geometry/state/workspace when a registered window goes away.
