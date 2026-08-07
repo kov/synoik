@@ -196,3 +196,45 @@ Then the absent capabilities, in the order I'd take them:
 
    Note the intermediate size comes from the effect *geometry*, not `dst`, so overview zoom is
    explicitly not a rebuild case; window resize and open/close (`surface_anim_scale`) are.
+
+## 6. The resize-lag report: measured, and not ours
+
+Reported 2026-08-07 against ghost on synoik — dragging a blurred window's edge left the blur behind:
+stale backdrop trailing a grow, a glass pane trailing a shrink. Long hunt; the answer came from
+`tools/blur-probe/` (see its README), run on the gsrs seat with **neither** `SYNOIK_VK_VALIDATION`
+nor `SYNOIK_VK_FULL_DAMAGE` set, i.e. the real partial-damage path.
+
+The probe separates a compositor that re-captures late from a client that respecifies its blur
+region late. Method: pulse the window 420x320 ↔ 1300x850 on a 1.6 s cycle, capture bursts with
+`grim`, locate the window by its opaque orange frame, and measure high-frequency energy in a band
+just inside the growing edge against a band mid-window. A blurred backdrop is smooth; an unblurred
+one is not, so the ratio is the signal.
+
+| arm | region behaviour | median edge/middle | max |
+|---|---|---|---|
+| `whole` | one oversized rect, set **once** — cannot go stale | **1.00** | 1.57 |
+| `exact` | `(0,0,w,h)` respecified per configure | **0.99** | 1.40 |
+| `lag:4` | the size from 4 configures ago | **2.55** | 4.10 |
+
+`lag:4`'s low frames (0.87, 0.97) are the shrink half, where a stale *larger* region clips to the
+surface and looks correct — exactly as predicted, which is what makes the arm trustworthy.
+
+The shrink symptom was tested separately: roughness in the band immediately outside the border
+against one further out. A trailing glass pane would leave the inner band smooth, i.e. a ratio well
+below 1. Median was 1.03 / 1.06 / 1.07 across the three arms with **no** value below 0.95. Nothing
+trails outside the window.
+
+**Conclusion: a correctly-behaving client shows no blur lag on this compositor, on grow or shrink.
+The reported symptom is reproduced exactly, and only, by a client whose region is late.** Ghost is
+structurally that kind of client: it blurs through a vendored winit whose `reapply_blur_shape`
+derives the region from the window size whenever the corner radii are non-zero
+(`~/Projects/ghost/vendor/winit/src/platform_impl/linux/wayland/window/state.rs`). winit's own
+resize-invariant `WHOLE_SURFACE` rect is used only at radius 0.
+
+Two things this does **not** cover, and either could still be a real difference from ghost:
+
+- **Buffer type.** The probe is `wl_shm`; ghost presents dmabuf. The capture path is shared, but
+  commit timing is not obviously identical.
+- **Region shape.** The probe's `exact` arm sends **one** rect. Ghost's rounded-corner region is a
+  stack of them (`blur_shape_rects`). A multi-rect region respecified per frame is untested here;
+  adding `--radius` to the probe would close it.
