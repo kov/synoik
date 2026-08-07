@@ -9,8 +9,11 @@ Reference: `~/Projects/mutter` @ 50.3, `src/core/place.c`. Ours: `src/layout/flo
 
 ## 1. The complaint, measured
 
-"Windows tend to open at the top left." That perception is **correct, and it is faithful
-mutter behavior** — not a port bug. Measured on the headless fixture, one 1920×1080 output,
+"Windows tend to open at the top left." The perception is **correct**, and the mechanism is a
+faithful port of mutter's *non-centering* path — but see §4: that path is no longer what GNOME
+runs. `center-new-windows` has defaulted to `true` since mutter 48, and we pinned the pre-48
+default. So this is a fidelity bug after all, not an inherited quirk. Measured on the headless
+fixture, one 1920×1080 output,
 GNOME mode, work area `(0, 32) 1920×1048` (top panel strut), windows mapped in order:
 
 | # | committed size | placed at | via |
@@ -71,10 +74,12 @@ placeholder — every measured position matches the hand-computed modulo for the
   Modal-only extra: `avoid_being_obscured_as_second_modal_dialog` (461-501), X11-only in practice.
 - **F. Peers** = `find_windows_relevant_for_placement` (810-837): showing, on this workspace
   (or all workspaces, if the new window is sticky).
-- **G. Centered vs origin** (1018-1045). `window_place_centered()` is true for dialogs, splash,
-  or `NORMAL` when the **`org.gnome.mutter center-new-windows` gsetting** is on. Centered path:
-  true work-area centering, then a cascade seeded at the centered corner. Otherwise: first-fit,
-  then origin cascade.
+- **G. Centered vs origin** (1018-1045). `window_place_centered()` (448-459) is true for dialogs,
+  modal dialogs, splash screens, or `NORMAL` when the **`org.gnome.mutter center-new-windows`
+  gsetting** is on — **and that key defaults to `true` since mutter 48**
+  (`9fe83c736c`, "schemas: Center windows by default", Feb 2025, closing gnome/mutter#246,
+  #1662, #2123). Centering is therefore *the* GNOME behavior, not an opt-in; §4 spells the path
+  out. Otherwise: first-fit, then origin cascade.
 - **H. Denied focus** (1052-1086). When the window was denied focus-steal and overlaps the focus
   window, placement restarts against a one-element obstacle list; failing that,
   `find_most_freespace` puts it on whichever side of the focus window has the most room.
@@ -101,10 +106,13 @@ carries no border/shadow padding in GNOME mode, so the modulo math matches mutte
 
 Gaps, in the order I'd fix them:
 
-1. **`center-new-windows` is never read.** The key already ships in
-   `resources/schemas/org.gnome.mutter.gschema.xml:95`, and we already bind that schema
-   (`gnome.rs:2478`) for `overlay-key` and `edge-tiling`. This is GNOME's own settings surface for
-   exactly the complaint in §1 — honoring it is fidelity, not divergence. Needs the
+1. **`center-new-windows` is never read, and we assume the wrong default.** `place_new_tile`'s
+   doc comment says it reproduces mutter "with the default preferences (`center-new-windows` …
+   off)" — that default flipped to `true` in mutter 48. Our own vendored copy of the schema
+   already carries `<default>true</default>`
+   (`resources/schemas/org.gnome.mutter.gschema.xml:96`), and we already bind that schema
+   (`gnome.rs:2478`) for `overlay-key` and `edge-tiling`; nothing reads the key. **This is the
+   single fix for the symptom in §1** — see §4 for the behavior owed. Needs the
    `window_place_centered` branch and the `place_centered` cascade variant (place.c:206-244).
 2. **Monitor selection is the active monitor, not the pointer monitor.** `AddWindowTarget::Auto`
    resolves to `*active_monitor_idx` (`layout/mod.rs:1016`); mutter uses the pointer's monitor for
@@ -128,37 +136,81 @@ Gaps, in the order I'd fix them:
    conformance test; `src/tests/floating.rs` covers sizing only. The table in §1 came from a
    throwaway probe. Any change here should land the probe as a real test first.
 
-## 4. Divergence options
+## 4. What `center-new-windows = true` actually does
 
-Fidelity work (1)-(6) above is uncontroversial. The interesting question is the *default*, since
-mutter's default is what produces the top-left pile-up. Options, cheapest first:
+This is the behavior we owe, since it is GNOME's default. `window_place_centered()` returns true,
+so step G takes the centered branch (place.c:1018-1032) and **`find_first_fit` never runs at
+all** — no grid slot, no "below/beside an existing window", none of §1's mechanism (a) or (b).
 
-**A. Ship GNOME's default (`center-new-windows` off), just make it settable.** Zero behavior
-change; the user turns it on in Tweaks. Honest, but it means the complaint in §1 stands
-out of the box.
+The whole placement is one call, `find_next_cascade (…, place_centered = TRUE)`
+(place.c:167-330):
 
-**B. Default `center-new-windows` on.** A one-value divergence, fully reversible by the user,
-and it uses mutter's own code path — no new heuristic to maintain. Cost: mutter's centered path
-skips `find_first_fit` entirely, so windows stack near the centre and only shift when two land on
-the *exact* same corner (fuzz 15). Two terminals side by side becomes two terminals on top of
-each other.
+1. **Slot = the centre of the work area.** `cascade_origin_x = work_area.x + work_area.width/2 -
+   window_width/2`, `cascade_y = MAX (0, work_area.y + work_area.height/2 - window_height/2)`
+   (place.c:225-244). (The `x`/`y` computed just above the call at place.c:1021-1022 are dead —
+   `find_next_cascade` always overwrites them. Note it also recomputes the centre as
+   `w/2 - size/2` rather than `(w - size)/2`, so the two disagree by 1px when exactly one of the
+   two is odd. Match mutter's version, not the readable one.)
+2. **Peers are visited in order of distance from that slot** — `window_distance_cmp`
+   (place.c:64-101), squared euclidean distance from the centred corner, not northwest order.
+3. **Fuzzy collision, 15 px.** A peer counts as sitting on the slot only when *both*
+   `|peer.x - slot.x| < CASCADE_FUZZ` and `|peer.y - slot.y| < CASCADE_FUZZ`. When it does, the
+   slot moves to `peer.x + 50, peer.y + 50` — one titlebar height diagonally (place.c:272-278) —
+   and the walk *continues down the same list* from the next element. So a run of already-cascaded
+   windows is chased down the diagonal in a single pass.
+4. **Overflow starts a new column right of centre.** If the stepped slot leaves the work area, the
+   slot resets to `centre + CASCADE_INTERVAL * ++stage` horizontally, `centre_y` vertically, and
+   the scan restarts from the head of the list (place.c:281-312). When even that has no room, the
+   result is the exact centre and windows stack there.
 
-**C. First-fit, then a centered cascade.** Keep `find_first_fit` (so non-overlapping placements
-still happen when there is room) but change the *fallback* origin from the top-left corner to the
-centered corner — i.e. use mutter's `place_centered=TRUE` cascade seeding while leaving
-`window_place_centered()` alone. This is the smallest change that fixes the measured symptom:
-window 3 in §1 moves from `(0, 32)` to roughly `(460, 200)` and cascades from there. It is a true
-divergence (no mutter pref produces it), but a conservative one.
+Then steps H (denied focus) and I (auto-maximize) apply unchanged.
 
-**D. Minimal-overlap placement.** Replace the cascade fallback with a search that scores
-candidate positions by total overlap area (KWin's "smart" placement) and picks the minimum.
-Best results, most code, most drift from the reference, and the hardest to pin with a
-conformance test.
+Consequences worth being explicit about, because they are not "windows are centred, done":
 
-My recommendation: land (1)-(4) as fidelity, then take **C** as the divergence, with the
-gsetting from (1) still honored on top of it (setting it on gives you plain GNOME centering).
-That keeps every mutter behavior reachable and only changes the case where mutter has no answer
-other than "pile up at the corner".
+- **Two same-size windows do not stack.** The second lands on the first, trips the 15 px test, and
+  cascades to `centre + (50, 50)`; the third to `centre + (100, 100)`. The pile is diagonal, from
+  the middle of the screen instead of from the corner.
+- **Different-size windows overlap freely.** Nothing avoids overlap any more — a 500×400 opened
+  over a 1000×700 sits in the middle of it, because their centred corners are >15 px apart so no
+  cascade fires. The non-centred path would have tried to find it a clear spot. This is the real
+  trade: centring buys a predictable, reachable position and gives up the tiling attempt.
+- **Dialogs are unaffected by the key**, both ways: with a transient parent they take step E
+  (centred on the parent, `+ (ph - h) / 3`); without one they were already centred, since
+  `window_place_centered()` returns true for `DIALOG`/`MODAL_DIALOG`/`SPLASHSCREEN` regardless of
+  the pref (place.c:448-459).
 
-Open for decision: option A/B/C/D, and whether to switch monitor selection to the pointer
-monitor (gap 2) or keep the active monitor deliberately.
+Applied to §1's measured sequence, on the same work area `(0, 32) 1920×1048`:
+
+| # | size | today (measured) | with centring (hand-computed) |
+|---|---|---|---|
+| 1 | 900×600 | (59, 181) | (510, 256) |
+| 2 | 900×600 | (959, 181) | (560, 306) — cascaded off #1 |
+| 3 | 1000×700 | **(0, 32)** | (460, 206) — no peer within 15 px |
+
+## 5. Options
+
+Gaps (1)-(6) in §3 are all fidelity; none of them needs a decision. In particular gap 1 —
+honoring `center-new-windows` at GNOME's own default of `true` — is the fix for the reported
+symptom, and is *not* a divergence. The remaining questions:
+
+**The default.** Ship GNOME's (`true`, §4) and stop there? Or keep the current behavior reachable
+and diverge?
+
+- **A. Pure fidelity.** Read the key, default `true`. Windows centre. Turning it off in
+  dconf/Tweaks gets today's behavior back, bugs 2-5 fixed.
+- **B. Fidelity plus a better `false` branch.** Same as A, but also change the *non-centred*
+  cascade fallback to seed from the centred corner instead of the work-area origin (i.e. use
+  `place_centered = TRUE`'s seeding with `find_first_fit` still in front of it). Gives a mode
+  GNOME does not have: try not to overlap, and when that fails pile up from the middle rather
+  than the corner. Costs one bool and a divergence note.
+- **C. Minimal-overlap placement.** Replace the cascade fallback with a search scoring candidates
+  by total overlap area (KWin's "smart" placement). Best results, most code, most drift, hardest
+  to pin with a conformance test.
+
+My recommendation: **A now** — it is a bug fix, it needs no approval, and it may well be the
+whole answer. Live with it for a few days; if the loss of overlap-avoidance (§4, second bullet)
+grates, **B** is a small follow-up and only affects the non-default branch.
+
+**Monitor selection** (gap 2) is independent and does need a call: adopt mutter's pointer monitor
+for first-shown windows, or keep our active monitor deliberately? Ours is arguably better with
+focus-follows-keyboard workflows; mutter's is what a GNOME user's muscle memory expects.
