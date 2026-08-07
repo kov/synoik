@@ -3522,18 +3522,55 @@ fn vulkan_alternating_present_blit_sizes_reuse_shadows() {
     }
 }
 
-/// The backdrop cache is keyed on the **exact** intermediate size, so an effect geometry that
-/// moves by a pixel throws away the capture texture, the whole dual-Kawase chain (a level image
+/// The ladder's three properties, none of which are optional and all of which are cheap to break
+/// by "tuning" the constants: it never returns a size *smaller* than asked (that would sample
+/// beyond the allocation), it is monotone (a non-monotone ladder makes a smooth resize rebuild at
+/// points where it grew), and the slack is bounded (unbounded slack is unbounded fill rate).
+#[test]
+fn backdrop_blur_quantize_is_monotone_and_bounded() {
+    use crate::render_helpers::vulkan::backdrop_blur::quantize;
+
+    let mut prev = 0;
+    for v in 1..4096 {
+        let q = quantize(v);
+        assert!(q >= v, "quantize({v}) = {q} is smaller than the need");
+        assert!(
+            q >= prev,
+            "quantize is not monotone at {v}: {prev} then {q}"
+        );
+        prev = q;
+        // Below the base rung the ratio is meaningless (everything lands on 64); above it, the
+        // slack is what bounds the extra fill rate we pay on every blurred frame.
+        if v >= 64 {
+            assert!(
+                q <= v * 5 / 4,
+                "quantize({v}) = {q} overshoots the 25% the ladder promises",
+            );
+        }
+    }
+
+    // The first rung is a floor, not a starting point to count up from.
+    assert_eq!(quantize(1), 64);
+    assert_eq!(quantize(64), 64);
+    assert_eq!(quantize(65), 80);
+}
+
+/// The backdrop cache used to be keyed on the **exact** intermediate size, so an effect geometry
+/// that moved by a pixel threw away the capture texture, the whole dual-Kawase chain (a level image
 /// plus its ping-pong twin per pass, with their render passes and descriptor sets) and the blurred
-/// output, and builds them again — every frame, for as long as the geometry is animating.
+/// output, and built them again — every frame, for as long as the geometry animated. Measured at
+/// 1600x1000: 5.79 ms per frame on top of a 0.92 ms steady capture-and-blur. `quantize` gives the
+/// sizing a ladder of slack; this is the guard that it works.
 ///
 /// A cache *hit* is invisible to a pixel assertion, which is why this counts allocations, like the
-/// two counters above it. It pins two things at once: that a steady geometry allocates exactly
-/// once, and that an animating one pays per frame. The second assert is documentation of a defect,
-/// not of a desirable invariant — see `docs/fork/client-blur.md` gap 8. Flip it when the sizing
-/// learns some slack.
+/// two counters above it.
+///
+/// **Both directions, asserted separately.** That is not thoroughness, it is the whole point: the
+/// obvious alternative fix — reuse while the need stays within some band of the current allocation
+/// — flaps on a monotone sweep in exactly one of the two directions, depending on where its realloc
+/// target sits in the band. A grow-only sweep passes with that bug fully present in shrink.
 #[test]
-fn vulkan_backdrop_blur_rebuilds_on_every_size_change() {
+fn vulkan_backdrop_blur_reuses_across_a_size_sweep() {
     use smithay::utils::user_data::UserDataMap;
 
     use crate::render_helpers::background_effect::RenderParams;
@@ -3542,14 +3579,14 @@ fn vulkan_backdrop_blur_rebuilds_on_every_size_change() {
     let mut vk = match VulkanRenderer::new() {
         Ok(vk) => vk,
         Err(e) => {
-            eprintln!(
-                "skipping vulkan_backdrop_blur_rebuilds_on_every_size_change: no Vulkan ({e})"
-            );
+            eprintln!("skipping vulkan_backdrop_blur_reuses_across_a_size_sweep: no Vulkan ({e})");
             return;
         }
     };
 
-    const S: i32 = 64;
+    // Big enough that the sweep crosses several rungs of the ladder — at 64 the whole range would
+    // sit on the first rung and reuse for the wrong reason.
+    const S: i32 = 512;
     let size = Size::<i32, Physical>::from((S, S));
     let mut target = vk
         .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((S, S)))
@@ -3598,16 +3635,37 @@ fn vulkan_backdrop_blur_rebuilds_on_every_size_change() {
         "a steady geometry must build the backdrop cache once and reuse it",
     );
 
-    // A geometry that moves rebuilds all of it, every frame.
+    // A pixel-at-a-time move must not rebuild anything at all: it stays on one rung.
     let before = vk.backdrop_blur_allocs();
     for w in (S - 4)..S {
         capture_at(&mut vk, &mut target, w);
     }
     assert_eq!(
         vk.backdrop_blur_allocs() - before,
-        4,
-        "known defect: a 1px geometry change rebuilds capture + chain + output",
+        0,
+        "a 1px geometry change must reuse the cache, not rebuild capture + chain + output",
     );
+
+    // A full resize animation, both ways. 200 -> 512 crosses the rungs at 244/305/381/476/595, so
+    // the floor is 5 and anything near the frame count means the slack is not working.
+    const LO: i32 = 200;
+    let frames = (S - LO) as u64;
+    for (name, sweep) in [
+        ("grow", (LO..S).collect::<Vec<_>>()),
+        ("shrink", (LO..S).rev().collect::<Vec<_>>()),
+    ] {
+        let before = vk.backdrop_blur_allocs();
+        for w in sweep {
+            capture_at(&mut vk, &mut target, w);
+        }
+        let allocs = vk.backdrop_blur_allocs() - before;
+        eprintln!("vulkan_backdrop_blur_reuses_across_a_size_sweep: {name} {allocs} rebuilds / {frames} frames");
+        assert!(
+            allocs <= 8,
+            "a {name} sweep over {frames} frames rebuilt the backdrop cache {allocs} times; \
+             the ladder should bound it to a handful",
+        );
+    }
 }
 
 /// The renderer has exactly one render-pass format ([`NATIVE_FOURCC`]'s BGRA order), so an

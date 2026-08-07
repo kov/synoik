@@ -5554,6 +5554,134 @@ fn vulkan_backdrop_blur_softens_a_hard_edge() {
     );
 }
 
+/// The intermediate is allocated on a ladder of sizes rather than exactly
+/// (`backdrop_blur::quantize`, so an animating geometry stops rebuilding the whole blur chain every
+/// frame). The taps are `offset` half-texels **of the intermediate**, so a rounded-up intermediate
+/// is a higher-resolution one and would blur *narrower* on screen — up to 25% narrower — unless the
+/// offset is scaled back up to compensate. A step like that on every rung crossing is exactly the
+/// visible artefact this optimisation could introduce, on exactly the frames (a live resize) where
+/// it would be noticed.
+///
+/// Measure the on-screen width of the blend across a hard red|green edge at two intermediate sizes
+/// that straddle a rung: one landing *on* 472 (no slack) and one just past it that rounds up to 590
+/// (24% slack). The destination is 512 wide in both cases, so the blend must come out the same
+/// width. Without the compensation the second is ~19% narrower and this fails.
+#[test]
+fn vulkan_backdrop_blur_radius_survives_a_rung_crossing() {
+    use smithay::backend::renderer::Offscreen;
+    use smithay::utils::user_data::UserDataMap;
+
+    use crate::render_helpers::background_effect::RenderParams;
+    use crate::render_helpers::blur::BlurOptions;
+    use crate::render_helpers::framebuffer_effect::FramebufferEffect;
+    use crate::render_helpers::vulkan::VulkanRenderer as Vk;
+
+    let mut vk = match Vk::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_backdrop_blur_radius_survives_a_rung_crossing: no Vulkan ({e})"
+            );
+            return;
+        }
+    };
+
+    const S: i32 = 512;
+    let size = Size::<i32, Physical>::from((S, S));
+
+    // Width of the blended band across the middle row: the on-screen blur radius, in dst pixels.
+    // `scale` sets the *intermediate* resolution (S * scale) while the destination stays S.
+    let blend_width = |vk: &mut Vk, scale: f64| -> usize {
+        let mut target = vk
+            .create_buffer(NATIVE_FOURCC, Size::from((S, S)))
+            .expect("create target");
+        let effect = FramebufferEffect::new();
+        let element = effect.render(
+            None,
+            RenderParams {
+                geometry: Rectangle::from_size(Size::from((S as f64, S as f64))),
+                subregion: None,
+                clip: None,
+                scale,
+            },
+            Some(BlurOptions {
+                passes: 3,
+                offset: 3.0,
+            }),
+            0.0,
+            1.0,
+        );
+        let cache = UserDataMap::new();
+        let src = element.src();
+        let dst = element.geometry(Scale::from(1.0));
+        {
+            let mut fb = vk.bind(&mut target).expect("bind");
+            let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+            frame
+                .draw_solid(
+                    Rectangle::new((0, 0).into(), (S / 2, S).into()),
+                    &[Rectangle::from_size((S / 2, S).into())],
+                    Color32F::from([1., 0., 0., 1.]),
+                )
+                .expect("draw red");
+            frame
+                .draw_solid(
+                    Rectangle::new((S / 2, 0).into(), (S / 2, S).into()),
+                    &[Rectangle::from_size((S / 2, S).into())],
+                    Color32F::from([0., 1., 0., 1.]),
+                )
+                .expect("draw green");
+            RenderElement::<Vk>::capture_framebuffer(&element, &mut frame, src, dst, &cache)
+                .expect("capture_framebuffer");
+            RenderElement::<Vk>::draw(
+                &element,
+                &mut frame,
+                src,
+                dst,
+                &[Rectangle::from_size(size)],
+                &[],
+                Some(&cache),
+            )
+            .expect("draw");
+            let _ = frame.finish().expect("finish");
+        }
+        let fb = vk.bind(&mut target).expect("rebind");
+        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((S, S)));
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy_framebuffer");
+        let pixels = vk.map_texture(&mapping).expect("map").to_vec();
+        let y = S / 2;
+        (0..S)
+            .filter(|&x| {
+                let p = px(&pixels, S, x, y);
+                p[0].min(p[1]) > 20
+            })
+            .count()
+    };
+
+    // 472 is a rung, so this one gets no slack at all.
+    let exact = blend_width(&mut vk, 472.0 / S as f64);
+    // 480 rounds up to the next rung, 590 — the worst overshoot the ladder allows.
+    let slack = blend_width(&mut vk, 480.0 / S as f64);
+
+    eprintln!(
+        "vulkan_backdrop_blur_radius_survives_a_rung_crossing: on-rung={exact}px \
+         over-rung={slack}px"
+    );
+    assert!(
+        exact > 8 && slack > 8,
+        "the blend band should be many pixels wide at 3 passes / offset 3 \
+         (on-rung {exact}, over-rung {slack}); the blur did not run"
+    );
+    let ratio = slack as f64 / exact as f64;
+    assert!(
+        (0.9..=1.1).contains(&ratio),
+        "the blur radius stepped across a rung: {exact}px on the rung vs {slack}px just past it \
+         (ratio {ratio:.3}) — the tap offset is not being compensated for the slack"
+    );
+}
+
 /// A surface that sets a blur region (`ext-background-effect-v1` `set_blur_region`) must get blur
 /// **only inside that region**. The subregion restricts the drawn damage, so the scene outside it
 /// stays untouched.

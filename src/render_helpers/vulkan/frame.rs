@@ -16,7 +16,7 @@ use synoik_vk::render::{
 };
 use tracing::warn;
 
-use super::backdrop_blur::BackdropBlur;
+use super::backdrop_blur::{self, BackdropBlur};
 use super::blur_chain::SharedBlurChain;
 use super::custom::{CustomAnimPush, CustomResizePush, CustomShaderType};
 use super::error::VulkanError;
@@ -1322,6 +1322,30 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         if size.w <= 0 || size.h <= 0 {
             return Ok(());
         }
+
+        // Give the intermediate sizing some slack so an animating geometry stops rebuilding the
+        // cache every frame — see `backdrop_blur::quantize` for why this is free of seams and why
+        // it is a ladder and not a hysteresis band. Only when blur is on: the unblurred path
+        // composites the capture directly, where an upsample-then-downsample through the slack is a
+        // visible softening of otherwise crisp backdrop (text, most obviously), and there is no
+        // chain to rebuild anyway — the capture texture alone is a fraction of the cost.
+        let (size, offset) = match passes {
+            Some(_) => {
+                let quantized = Size::from((
+                    backdrop_blur::quantize(size.w),
+                    backdrop_blur::quantize(size.h),
+                ));
+                // The taps are `offset` half-texels of the intermediate, so a higher-resolution
+                // intermediate is a proportionally *smaller* radius on screen. Scale the offset
+                // back up by how much we overshot, or the blur would visibly thin at every rung
+                // crossing. One scalar, not one per axis: the two overshoots differ by at most
+                // 1.25:1, and that much anisotropy in a blur is not something you can see.
+                let ratio = (f64::from(quantized.w) / f64::from(size.w))
+                    * (f64::from(quantized.h) / f64::from(size.h));
+                (quantized, offset * ratio.sqrt() as f32)
+            }
+            None => (size, offset),
+        };
 
         let dims = (size.w as u32, size.h as u32);
         let reuse = slot.as_ref().is_some_and(|b| b.matches(dims, passes));

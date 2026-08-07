@@ -247,11 +247,11 @@ Then the absent capabilities, in the order I'd take them:
      effect overlaps it (`mod.rs:689-724`). A static scene captures and blurs nothing at all.
    - **Empty client region**: `render_params_for_tile` already returns `None`.
 
-   What is genuinely left is allocation churn under **animated geometry**. `BackdropBlur::matches`
-   keys on the exact intermediate size, so a geometry that moves by one pixel discards the capture
+   What was genuinely left is allocation churn under **animated geometry**. `BackdropBlur::matches`
+   keyed on the exact intermediate size, so a geometry that moved by one pixel discarded the capture
    texture, the whole Kawase chain (a level image and its ping-pong twin per pass, with render
-   passes and descriptor sets) and the blurred output, and rebuilds them — every frame of the
-   animation. Pinned by `vulkan_backdrop_blur_rebuilds_on_every_size_change`. Two halves:
+   passes and descriptor sets) and the blurred output, and rebuilt them — every frame of the
+   animation. Two halves, **both now DONE**:
    - **The stall — DONE.** `SharedBlurChain::drop` called `device_wait_idle`, on the strength of a
      comment saying it "only runs when a chain is rebuilt … never per frame"; under an animating
      geometry that is exactly what it did, once per frame, on the compositor thread. Removed: a
@@ -261,12 +261,41 @@ Then the absent capabilities, in the order I'd take them:
      frame never submitted; `flush_pending_blurs` → `run_commands`, which waits). Renderer teardown
      is covered by `drain_in_flight()`. The invariant is written out in the `Drop`. Suite clean
      under `SYNOIK_VK_VALIDATION=1` (exit 0, zero `VULKAN ERROR`). **Not yet seat-validated.**
-   - **The churn.** Giving the sizing slack (round up, blur the sub-rect) needs `BlurChain::record`
-     to take a region, which it does not — synoik-vk shader work, a slice of its own. Worth
-     measuring after the stall is gone rather than designing now.
+   - **The churn — DONE.** Measured first, per the rule this section keeps earning: at 1600x1000
+     with `passes: 3`, the rebuild cost **5.79 ms per frame** on top of a 0.92 ms steady-state
+     capture-and-blur. A third of a 60 Hz frame, paid for the whole of every resize and open/close
+     animation. Fixed by giving the sizing slack — `backdrop_blur::quantize`, a `64 x 1.25^n`
+     ladder.
 
-   Note the intermediate size comes from the effect *geometry*, not `dst`, so overview zoom is
-   explicitly not a rebuild case; window resize and open/close (`surface_anim_scale`) are.
+     **The stated blocker was stale.** "Round up and blur the sub-rect" would indeed need
+     `BlurChain::record` to take a region, but no sub-rect is involved: `capture_region` blits the
+     source region across the *whole* destination texture whatever its extent, and `draw_backdrop`
+     maps that whole extent back onto the destination rect. The intermediate is a **resample** of
+     the backdrop, not a copy of it, so its size is purely a resolution choice — round it up and
+     nothing else moves. No seam, no region, no shader work. This is the same mechanism that already
+     kept overview zoom from rebuilding (see the note below); it just had to be extended to resize.
+
+     Two costs, both accounted for. The blur runs over up to 56% more pixels — measured at
+     1600x1000 as 0.922 -> 0.934 ms/frame for ~29% extra area, i.e. not fill-bound at these sizes.
+     And a higher-resolution intermediate is a proportionally *smaller* radius on screen, since the
+     taps are `offset` half-texels of it; `capture_backdrop` scales the offset back up by the
+     overshoot, or the blur would visibly thin by up to 20% at every rung crossing — during a live
+     resize, which is when it would be most obvious. `passes: None` is exempt from the whole thing:
+     the raw capture is composited crisply, and an upsample-then-downsample through the slack would
+     soften backdrop text for no gain.
+
+     A stateless ladder rather than hysteresis around the current allocation. A "reuse while the
+     need is within X% of the allocation" band **flaps**: whichever single target the realloc picks
+     sits at a band edge, so a monotone sweep in one of the two directions re-triggers every frame —
+     the defect surviving in one direction, and invisible to a one-direction test. Hence
+     `vulkan_backdrop_blur_reuses_across_a_size_sweep` asserts grow and shrink separately: over 312
+     frames it now allocates **5 times growing and 4 shrinking**, against 312 each before.
+     `vulkan_backdrop_blur_radius_survives_a_rung_crossing` pins the offset compensation (60 px
+     blend band on a rung vs 58 px just past one; 48 px with the compensation stubbed out).
+
+   Note the intermediate size comes from the effect *geometry*, not `dst`, so overview zoom was
+   explicitly never a rebuild case; window resize and open/close (`surface_anim_scale`) were, and
+   are what the ladder covers.
 
 ## 6. The resize-lag report: measured, and not ours
 
