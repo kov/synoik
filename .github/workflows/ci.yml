@@ -18,8 +18,11 @@ env:
   # conformance corpus asserts our defaults against GNOME's own schema defaults, so without the
   # schemas installed those tests cannot make their assertion. They fail rather than skip — a
   # skipped check is indistinguishable from a passing one in a green run.
-  DEPS_APT: curl gcc clang glslang-tools libudev-dev libgbm-dev libxkbcommon-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libglib2.0-dev libpango1.0-dev libcairo2-dev libpixman-1-dev libdisplay-info-dev gsettings-desktop-schemas gnome-settings-daemon-common
+  DEPS_APT: curl gcc clang glslang-tools libudev-dev libgbm-dev libxkbcommon-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libglib2.0-dev libpango1.0-dev libcairo2-dev libpixman-1-dev libdisplay-info-dev gsettings-desktop-schemas gnome-settings-daemon-common mesa-vulkan-drivers
   DEPS_DNF: cargo gcc clang glslang libudev-devel libgbm-devel libxkbcommon-devel wayland-devel libinput-devel dbus-devel systemd-devel libseat-devel pipewire-devel glib2-devel pango-devel cairo-gobject-devel pixman-devel libdisplay-info-devel gsettings-desktop-schemas gnome-settings-daemon
+  # The `reference-env` tests measure shaped text, so the UI font stack is part of the fixture:
+  # Adwaita Sans is what `font-name` resolves to at runtime (docs/fork/gnome-style-reference.md).
+  FONTS_DNF: adwaita-sans-fonts adwaita-mono-fonts abattis-cantarell-fonts
 
 jobs:
   test:
@@ -204,9 +207,12 @@ jobs:
 
   # Fedora is what the development VM and the test seat run, so this is the distro build that
   # matters; it also checks we still build with the distro's Rust rather than rustup's.
+  # The reference-environment job: Fedora 44 is what the dev box and the gnome-shell/mutter 50.3
+  # reference checkouts run, so this is the only runner where measured text geometry means
+  # anything. It is therefore the one that turns on `reference-env` (see Cargo.toml).
   fedora:
     runs-on: ubuntu-24.04
-    container: fedora:42
+    container: fedora:44
 
     steps:
       - uses: actions/checkout@v6
@@ -216,10 +222,10 @@ jobs:
       - name: Install dependencies
         run: |
           dnf update -y
-          dnf install -y ${{ env.DEPS_DNF }}
+          dnf install -y ${{ env.DEPS_DNF }} ${{ env.FONTS_DNF }}
 
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace
+      - run: cargo test --workspace --features reference-env
 
   publish-docs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
