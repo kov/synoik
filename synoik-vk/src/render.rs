@@ -254,10 +254,14 @@ const _: () = {
 };
 
 /// Push constants for the resize cross-fade material (`resize.vert`/`resize.frag`). Blends two
-/// window snapshots (bound at set 0 / set 1) by `clamped_progress`, then optionally clips/rounds to
-/// the current geometry. The three used transforms are affine-diagonal, each packed as a `vec4`
-/// `[scale.xy, translate.xy]` (the GLES shader's two unused matrices and `synoik_progress` are
-/// dropped). `vec2`s paired and `vec4`s at 16-aligned offsets (natural std430). 128 bytes.
+/// window snapshots (bound at set 0 / set 1) by `clamped_progress`. The three used transforms are
+/// affine-diagonal, each packed as a `vec4` `[scale.xy, translate.xy]` (the GLES shader's two
+/// unused matrices and `synoik_progress` are dropped). `vec2`s paired and `vec4`s at 16-aligned
+/// offsets (natural std430). 124 bytes.
+///
+/// `curr_geo_size`, `corner_radius` and `synoik_scale` are unused by the fragment stage since
+/// clip-to-geometry was removed; they stay because dropping a `vec2`/`vec4` mid-block would shift
+/// every later `vec4` off its 16-byte alignment.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct ResizePush {
@@ -272,7 +276,6 @@ pub struct ResizePush {
     pub geo_to_tex_next: [f32; 4],
     pub corner_radius: [f32; 4],
     pub clamped_progress: f32,
-    pub clip_to_geometry: f32,
     pub synoik_scale: f32,
     pub synoik_alpha: f32,
 }

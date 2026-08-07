@@ -43,7 +43,6 @@ pub struct WindowRule {
     pub draw_border_with_background: Option<bool>,
     pub opacity: Option<f32>,
     pub geometry_corner_radius: Option<CornerRadius>,
-    pub clip_to_geometry: Option<bool>,
     pub baba_is_float: Option<bool>,
     pub block_out_from: Option<BlockOutFrom>,
     pub variable_refresh_rate: Option<bool>,

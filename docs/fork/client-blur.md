@@ -68,9 +68,10 @@ screen's, specified in source pixels to match `Shell.BlurEffect`.
 Region handling: the committed region is flattened to non-overlapping rects, offset to the surface's
 geometry, and intersected with the frame's damage so the draw is scissored to it
 (`framebuffer_effect.rs:265`). The effect geometry is the *surface* geometry, so the region can't
-escape the surface. Corner rounding is applied only when `clip_to_geometry` is set — which, again,
-nothing can set today, so a client's rounded window gets a square-cornered blur under its corners
-unless its own region excludes them.
+escape the surface. There is no corner rounding: a client's rounded window gets a square-cornered
+blur under its corners unless its own region excludes them. (Rounding used to be conditional on the
+`clip_to_geometry` window rule, which nothing could set; the rule was removed wholesale on
+2026-08-07, so the branch is gone rather than merely unreachable.)
 
 Reach: toplevels, their popups, and layer-shell surfaces (`window/mapped.rs`, `layer/mapped.rs`).
 **Not subsurfaces** — `layout/tile.rs:1301` says so outright. Not XWayland: we honor no
@@ -180,10 +181,10 @@ Defects first — these are wrong, not merely absent.
 
    What is genuinely left is the client that has rounded corners and sends a *square* region. Under
    this protocol that is the client's choice, not our bug — and we could not fix it if we wanted to,
-   because a CSD client never tells us its radius. `clip_to_geometry` would not help either: it
-   clips to the *window geometry*, is reachable only through a niri window rule, and those went with
-   the config file ([[no-config-file]]). That plumbing is now dead code
-   (`layout/tile.rs:1138` can only ever see `None`) and is a removal candidate, not a feature.
+   because a CSD client never tells us its radius. `clip_to_geometry` would not have helped either:
+   it clipped to the *window geometry*, and was reachable only through a niri window rule, which
+   went with the config file ([[no-config-file]]). It was removed wholesale on 2026-08-07
+   (`docs/fork/clip-to-geometry.md`).
 
    KWin's shader exists because KWin also drives blur from its own decorations, where it *does* know
    the radius. We do not decorate client windows.

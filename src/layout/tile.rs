@@ -24,7 +24,6 @@ use crate::animation::{Animation, Clock};
 use crate::layout::SizingMode;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
-use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
@@ -126,9 +125,6 @@ pub struct Tile<W: LayoutElement> {
     /// Snapshot of the last render for use in the close animation.
     unmap_snapshot: Option<TileUnmapSnapshot>,
 
-    /// Extra damage for clipped surface corner radius changes.
-    rounded_corner_damage: RoundedCornerDamage,
-
     /// The view size for the tile's workspace.
     ///
     /// Used as the fullscreen target size.
@@ -153,7 +149,6 @@ synoik_render_elements! {
         Resize = ResizeRenderElement,
         Border = BorderRenderElement,
         Shadow = ShadowRenderElement,
-        ClippedSurface = ClippedSurfaceRenderElement,
         Offscreen = OffscreenRenderElement,
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,
@@ -280,7 +275,6 @@ impl<W: LayoutElement> Tile<W> {
             alpha_animation: None,
             interactive_move_offset: Point::from((0., 0.)),
             unmap_snapshot: None,
-            rounded_corner_damage: Default::default(),
             view_size,
             scale,
             clock,
@@ -457,13 +451,6 @@ impl<W: LayoutElement> Tile<W> {
 
         let shadow_config = self.options.layout.shadow.merged_with(&rules.shadow);
         self.shadow.update_config(shadow_config);
-
-        let window_size = self.window_size();
-        let radius = self
-            .window
-            .geometry_corner_radius()
-            .fit_to(window_size.w as f32, window_size.h as f32);
-        self.rounded_corner_damage.set_corner_radius(radius);
     }
 
     pub fn advance_animations(&mut self) {
@@ -1133,9 +1120,6 @@ impl<W: LayoutElement> Tile<W> {
 
         let rules = self.window.rules();
 
-        // Clip to geometry including during the fullscreen animation to help with buggy clients
-        // that submit a full-sized buffer before acking the fullscreen state (Firefox).
-        let clip_to_geometry = fullscreen_progress < 1. && rules.clip_to_geometry == Some(true);
         let radius = self
             .window
             .geometry_corner_radius()
@@ -1221,7 +1205,6 @@ impl<W: LayoutElement> Tile<W> {
                                     resize.anim.value() as f32,
                                     resize.anim.clamped_value().clamp(0., 1.) as f32,
                                     radius,
-                                    clip_to_geometry,
                                     win_alpha,
                                     use_custom,
                                 );
@@ -1260,21 +1243,12 @@ impl<W: LayoutElement> Tile<W> {
 
             let clip = |elem| match elem {
                 LayoutElementRenderElement::Wayland(elem) => {
-                    // If we should clip to geometry, render a clipped window.
-                    if clip_to_geometry
-                        && ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius)
-                    {
-                        return ClippedSurfaceRenderElement::new(elem, scale, geo, radius).into();
-                    }
-
-                    // Otherwise, render it normally.
                     LayoutElementRenderElement::Wayland(elem).into()
                 }
                 LayoutElementRenderElement::SolidColor(elem) => {
                     // In this branch we're rendering a blocked-out window with a solid
-                    // color. We need to render it with a rounded corner shader even if
-                    // clip_to_geometry is false, because in this case we're assuming that
-                    // the unclipped window CSD already has corners rounded to the
+                    // color. We render it with a rounded corner shader because we assume
+                    // the window's own CSD already has corners rounded to the
                     // user-provided radius, so our blocked-out rendering should match that
                     // radius.
                     if radius != CornerRadius::default() {
@@ -1305,14 +1279,6 @@ impl<W: LayoutElement> Tile<W> {
                     elem.into()
                 }
             };
-
-            // The radius is not part of any surface's own damage, so this element is the only thing
-            // that reports a radius change. It must be pushed whenever the `clip` closure above
-            // will clip.
-            if clip_to_geometry {
-                let damage = self.rounded_corner_damage.render(geo);
-                push(damage.into());
-            }
 
             self.window.render_normal(
                 ctx.r(),
@@ -1393,7 +1359,6 @@ impl<W: LayoutElement> Tile<W> {
             ctx.r(),
             area,
             self.scale,
-            clip_to_geometry,
             surface_anim_scale,
             radius,
             xray_pos,

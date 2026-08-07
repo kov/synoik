@@ -1245,10 +1245,10 @@ fn vulkan_postprocess_clips_and_desaturates() {
 // --- M3 step 4: resize cross-fade through the owned Vulkan renderer ------------------------------
 
 /// The resize cross-fade material (`render_resize`, niri's `ResizeRenderElement`) blends two window
-/// snapshots (prev + next) by `clamped_progress`, then optionally clips/rounds to the current
-/// geometry. With an opaque red "prev", blue "next", `clamped_progress = 0.5`, identity transforms,
-/// and `corner_radius = 16` clipped to the whole quad: the interior is the 50/50 blend (purple),
-/// and a deep corner is clipped away to the CLEAR background. Oracle-free structural invariants.
+/// snapshots (prev + next) by `clamped_progress`. With an opaque red "prev", blue "next",
+/// `clamped_progress = 0.5` and identity transforms, the interior is the 50/50 blend (purple) —
+/// and so is a deep corner, since clip-to-geometry was removed and the material now covers the
+/// whole quad. Oracle-free structural invariants.
 #[test]
 fn vulkan_resize_crossfades() {
     let mut vk = match VulkanRenderer::new() {
@@ -1299,7 +1299,6 @@ fn vulkan_resize_crossfades() {
             geo_to_tex_next: [1.0, 1.0, 0.0, 0.0],
             corner_radius: [16.0; 4],
             clamped_progress: 0.5,
-            clip_to_geometry: 1.0,
             synoik_scale: 1.0,
             synoik_alpha: 1.0,
             // origin/size/target are filled by render_resize.
@@ -1338,10 +1337,11 @@ fn vulkan_resize_crossfades() {
         (inner[0] as i32 - inner[2] as i32).abs() < 20,
         "at progress 0.5 red and blue should be ~equal, got {inner:?}",
     );
-    // Deep corner: rounded/clipped away to the CLEAR background.
+    // Deep corner: the material no longer clips, so the corner carries the same blend as the
+    // interior rather than the CLEAR background.
     assert!(
-        close_px(px(&pixels, 2, 2), clear_u8(), 8),
-        "corner should be clipped to the background, got {:?}",
+        close_px(px(&pixels, 2, 2), inner, 8),
+        "corner should carry the same blend as the interior, got {:?}",
         px(&pixels, 2, 2),
     );
 }
@@ -1399,7 +1399,6 @@ fn vulkan_new_vulkan_resize_element_crossfades() {
             progress,
             progress,
             CornerRadius::default(),
-            false,
             1.0,
             false, // built-in crossfade
         );
@@ -1551,7 +1550,6 @@ fn vulkan_resize_does_not_smear_past_a_snapshot_geometry() {
             progress,
             progress,
             CornerRadius::default(),
-            false,
             1.0,
             false, // built-in crossfade
         );
@@ -1658,7 +1656,6 @@ fn vulkan_resize_element_uses_custom_shader_when_installed() {
         0.5,
         0.5,
         CornerRadius::default(),
-        false,
         1.0,
         true, // custom shader
     );
@@ -1832,12 +1829,12 @@ fn solid_texels(rgba: [u8; 4]) -> Vec<u8> {
 }
 
 /// A user **resize** snippet, compiled from GLSL at runtime (glslangValidator) and drawn through
-/// the owned Vulkan renderer, produces the crossfade + clip it describes. This exercises the whole
+/// the owned Vulkan renderer, produces the crossfade it describes. This exercises the whole
 /// runtime custom-shader path at once: assemble → compile → cached two-texture pipeline → draw,
 /// plus the `texture2D`→`texture` shim and the affine `mat3` reconstruction from packed `vec4`s.
-/// Red "prev" + blue "next" at progress 0.5 ⇒ a purple interior; a deep corner is clipped away
-/// (clip_to_geometry + corner rounding), exactly like the built-in `render_resize` material — but
-/// here the shader came from a config-style snippet, not a compiled-in one.
+/// Red "prev" + blue "next" at progress 0.5 ⇒ a purple interior, corners included, exactly like
+/// the built-in `render_resize` material — but here the shader came from a config-style snippet,
+/// not a compiled-in one.
 #[test]
 fn vulkan_custom_resize_crossfade() {
     let mut vk = match VulkanRenderer::new() {
@@ -1896,7 +1893,6 @@ vec4 resize_color(vec3 coords_curr_geo, vec3 size_curr_geo) {
             corner_radius: [16.0; 4],
             progress: 0.5,
             clamped_progress: 0.5,
-            clip_to_geometry: 1.0,
             alpha: 1.0,
             scale: 1.0,
             ..Default::default()
@@ -1928,8 +1924,8 @@ vec4 resize_color(vec3 coords_curr_geo, vec3 size_curr_geo) {
         "custom resize interior should be the 50/50 red/blue blend, got {inner:?}",
     );
     assert!(
-        close_px(px(&pixels, 2, 2), clear_u8(), 8),
-        "custom resize corner should be clipped to the background, got {:?}",
+        close_px(px(&pixels, 2, 2), inner, 8),
+        "custom resize corner should carry the same blend as the interior, got {:?}",
         px(&pixels, 2, 2),
     );
 }

@@ -151,7 +151,6 @@ impl ResizeRenderElement {
         progress: f32,
         clamped_progress: f32,
         corner_radius: CornerRadius,
-        clip_to_geometry: bool,
         result_alpha: f32,
         use_custom: bool,
     ) -> Self {
@@ -170,7 +169,6 @@ impl ResizeRenderElement {
             corner_radius,
         );
 
-        let clip_to_geometry = if clip_to_geometry { 1. } else { 0. };
         let push = if use_custom {
             // The user's custom resize shader: the extra curr_geo_to_{prev,next}_geo matrices
             // and unclamped progress the built-in crossfade doesn't use.
@@ -185,7 +183,6 @@ impl ResizeRenderElement {
                 corner_radius: <[f32; 4]>::from(t.corner_radius),
                 progress,
                 clamped_progress,
-                clip_to_geometry,
                 alpha: result_alpha,
                 scale: t.scale_x,
                 ..Default::default()
@@ -198,7 +195,6 @@ impl ResizeRenderElement {
                 geo_to_tex_next: pack_affine(t.geo_to_tex_next),
                 corner_radius: <[f32; 4]>::from(t.corner_radius),
                 clamped_progress,
-                clip_to_geometry,
                 synoik_scale: t.scale_x,
                 synoik_alpha: result_alpha,
                 // origin/size/target are filled by render_resize.

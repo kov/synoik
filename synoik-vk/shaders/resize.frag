@@ -4,9 +4,8 @@
 
 #version 450
 
-// Resize cross-fade material: sample two window snapshots (prev + next), blend them by
-// clamped_progress, then optionally clip / round-corner to the current geometry. This is the
-// owned-renderer port of niri's resize shader (render_helpers/shaders/resize_prelude.frag +
+// Resize cross-fade material: sample two window snapshots (prev + next) and blend them by
+// clamped_progress. This is the owned-renderer port of niri's resize shader (render_helpers/shaders/resize_prelude.frag +
 // resize.frag + resize_epilogue.frag).
 //
 // The GLES shader carries five mat3 uniforms but only three are used
@@ -29,40 +28,18 @@ layout(push_constant) uniform Push {
     vec4 input_to_curr_geo; // [scale.xy, translate.xy]
     vec4 geo_to_tex_prev;
     vec4 geo_to_tex_next;
+    // curr_geo_size, corner_radius and synoik_scale are unused since clip-to-geometry was
+    // removed. They stay because dropping a vec2/vec4 mid-block would shift every later vec4
+    // off its std430 16-byte alignment, and CustomResizePush still exposes them to custom
+    // shader snippets through the prelude.
     vec4 corner_radius;
     float clamped_progress;
-    float clip_to_geometry;
     float synoik_scale;
     float synoik_alpha;
 } pc;
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o;
-
-float synoik_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius) {
-    vec2 center;
-    float radius;
-
-    if (coords.x < corner_radius.x && coords.y < corner_radius.x) {
-        radius = corner_radius.x;
-        center = vec2(radius, radius);
-    } else if (size.x - corner_radius.y < coords.x && coords.y < corner_radius.y) {
-        radius = corner_radius.y;
-        center = vec2(size.x - radius, radius);
-    } else if (size.x - corner_radius.z < coords.x && size.y - corner_radius.z < coords.y) {
-        radius = corner_radius.z;
-        center = vec2(size.x - radius, size.y - radius);
-    } else if (coords.x < corner_radius.w && size.y - corner_radius.w < coords.y) {
-        radius = corner_radius.w;
-        center = vec2(radius, size.y - radius);
-    } else {
-        return 1.0;
-    }
-
-    float dist = distance(coords, center);
-    float t = clamp((dist - radius) * pc.synoik_scale + 0.5, 0.0, 1.0);
-    return 1.0 - t * t * (3.0 - 2.0 * t);
-}
 
 // Apply an affine-diagonal transform packed as [scale.xy, translate.xy].
 vec2 affine(vec4 t, vec2 v) {
@@ -94,17 +71,6 @@ void main() {
     vec4 color_next = sample_snapshot(tex_next, coords_tex_next);
 
     vec4 color = mix(color_prev, color_next, pc.clamped_progress);
-
-    if (pc.clip_to_geometry == 1.0) {
-        if (coords_curr_geo.x < 0.0 || 1.0 < coords_curr_geo.x
-                || coords_curr_geo.y < 0.0 || 1.0 < coords_curr_geo.y) {
-            // Clip outside geometry.
-            color = vec4(0.0);
-        } else {
-            // Apply corner rounding inside geometry.
-            color = color * synoik_rounding_alpha(coords_curr_geo * pc.curr_geo_size, pc.curr_geo_size, pc.corner_radius);
-        }
-    }
 
     color = color * pc.synoik_alpha;
     o = color;

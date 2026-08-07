@@ -19,7 +19,6 @@ layout(push_constant) uniform Push {
     vec4 geo_to_tex_next;
     vec4 corner_radius;
     float clamped_progress;
-    float clip_to_geometry;
     float synoik_scale;
     float synoik_alpha;
 } pc;

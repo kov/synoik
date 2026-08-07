@@ -53,7 +53,7 @@ pub(crate) enum CustomShaderType {
 /// Push constants for a custom **resize** shader. Mirrors niri's resize uniform set; the five
 /// transform matrices are affine-diagonal, each packed as `vec4 [sx, sy, tx, ty]`. Field order is
 /// the std430 layout the assembled GLSL push block declares (all `vec4`s land on 16-byte
-/// boundaries because `proj` is 16 bytes and the four following `vec2`s sum to 32). 164 bytes.
+/// boundaries because `proj` is 16 bytes and the four following `vec2`s sum to 32). 160 bytes.
 ///
 /// `proj` leads the block (matching `quad.vert`/`resize.vert`) so the shared vertex stage can
 /// rotate placement into a rotated output; prepending keeps every `vec4` 16-aligned so std430 and
@@ -74,7 +74,6 @@ pub(crate) struct CustomResizePush {
     pub corner_radius: [f32; 4],
     pub progress: f32,
     pub clamped_progress: f32,
-    pub clip_to_geometry: f32,
     pub alpha: f32,
     pub scale: f32,
 }
@@ -237,7 +236,6 @@ layout(push_constant) uniform Push {
     vec4 corner_radius;
     float progress;
     float clamped_progress;
-    float clip_to_geometry;
     float alpha;
     float scale;
 } pc;
@@ -281,7 +279,6 @@ layout(location = 0) out vec4 synoik_out_color;
 #define synoik_curr_geo_size (pc.curr_geo_size)
 #define synoik_progress (pc.progress)
 #define synoik_clamped_progress (pc.clamped_progress)
-#define synoik_clip_to_geometry (pc.clip_to_geometry)
 #define synoik_corner_radius (pc.corner_radius)
 #define synoik_alpha (pc.alpha)
 #define synoik_scale (pc.scale)
@@ -300,15 +297,6 @@ void main() {
     vec3 size_curr_geo = vec3(synoik_curr_geo_size, 1.0);
 
     vec4 color = resize_color(coords_curr_geo, size_curr_geo);
-
-    if (synoik_clip_to_geometry == 1.0) {
-        if (coords_curr_geo.x < 0.0 || 1.0 < coords_curr_geo.x
-                || coords_curr_geo.y < 0.0 || 1.0 < coords_curr_geo.y) {
-            color = vec4(0.0);
-        } else {
-            color = color * synoik_rounding_alpha(coords_curr_geo.xy * size_curr_geo.xy, size_curr_geo.xy, synoik_corner_radius);
-        }
-    }
 
     color = color * synoik_alpha;
     synoik_out_color = color;
@@ -488,7 +476,7 @@ mod unit {
         // The GLSL push blocks (std430) and these `#[repr(C)]` structs must agree byte-for-byte.
         // `proj` leads both blocks so every `vec4` stays 16-aligned and the two layout systems
         // never disagree; a reorder that reintroduces padding skew changes these sizes.
-        assert_eq!(std::mem::size_of::<CustomResizePush>(), 164);
+        assert_eq!(std::mem::size_of::<CustomResizePush>(), 160);
         assert_eq!(std::mem::size_of::<CustomAnimPush>(), 100);
     }
 

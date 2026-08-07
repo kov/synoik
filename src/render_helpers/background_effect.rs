@@ -244,7 +244,6 @@ impl BackgroundEffect {
 fn render_params_for_tile(
     geometry: Rectangle<f64, Logical>,
     scale: f64,
-    clip_to_geometry: bool,
     block_out: bool,
     blur_region: Option<Arc<Vec<Rectangle<i32, Logical>>>>,
     surface_geo: Rectangle<f64, Logical>,
@@ -260,8 +259,9 @@ fn render_params_for_tile(
             // Surface has a set, but empty blur region.
             return None;
         } else {
-            // If the surface itself requests the effects, apply different defaults.
-            clip = clip_to_geometry;
+            // If the surface itself requests the effects, apply different defaults: the
+            // effect follows the surface's own region rather than the window geometry.
+            clip = false;
 
             // Use geometry-shaped blur for blocked-out windows to avoid unintentionally
             // leaking any surface shapes. We render those windows as geometry-shaped solid
@@ -389,7 +389,6 @@ pub fn render_for_tile(
     ns: Option<usize>,
     geometry: Rectangle<f64, Logical>,
     scale: f64,
-    clip_to_geometry: bool,
     surface: &WlSurface,
     surface_off: Point<f64, Logical>,
     surface_anim_scale: Scale<f64>,
@@ -406,7 +405,6 @@ pub fn render_for_tile(
             ns,
             geometry,
             scale,
-            clip_to_geometry,
             states,
             surface_off,
             surface_anim_scale,
@@ -433,7 +431,6 @@ pub fn render_for_surface(
     ns: Option<usize>,
     geometry: Rectangle<f64, Logical>,
     scale: f64,
-    clip_to_geometry: bool,
     states: &SurfaceData,
     surface_off: Point<f64, Logical>,
     surface_anim_scale: Scale<f64>,
@@ -464,7 +461,6 @@ pub fn render_for_surface(
         let Some(params) = render_params_for_tile(
             geometry,
             scale,
-            clip_to_geometry,
             should_block_out,
             blur_region,
             surface_geo,

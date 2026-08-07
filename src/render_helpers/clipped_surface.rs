@@ -11,20 +11,12 @@ use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use synoik_config::CornerRadius;
 
-use super::damage::ExtraDamage;
-
 #[derive(Debug)]
 pub struct ClippedSurfaceRenderElement {
     inner: WaylandSurfaceRenderElement<VulkanRenderer>,
     corner_radius: CornerRadius,
     geometry: Rectangle<f64, Logical>,
     scale: f32,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct RoundedCornerDamage {
-    damage: ExtraDamage,
-    corner_radius: CornerRadius,
 }
 
 impl ClippedSurfaceRenderElement {
@@ -286,22 +278,6 @@ impl RenderElement<VulkanRenderer> for ClippedSurfaceRenderElement {
 
     fn underlying_storage(&self, _renderer: &mut VulkanRenderer) -> Option<UnderlyingStorage<'_>> {
         None
-    }
-}
-
-impl RoundedCornerDamage {
-    pub fn set_corner_radius(&mut self, corner_radius: CornerRadius) {
-        if self.corner_radius == corner_radius {
-            return;
-        }
-
-        // FIXME: make the damage granular.
-        self.corner_radius = corner_radius;
-        self.damage.damage_all();
-    }
-
-    pub fn render(&self, geometry: Rectangle<f64, Logical>) -> ExtraDamage {
-        self.damage.render(geometry)
     }
 }
 
