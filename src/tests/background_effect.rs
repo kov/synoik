@@ -673,3 +673,88 @@ fn moving_the_effect_recaptures_even_with_a_static_backdrop() {
         captures,
     );
 }
+
+/// A blur region set on a **subsurface** is accepted on the wire and then dropped on the floor.
+///
+/// This is `docs/fork/client-blur.md` §5 gap 4, pinned as it stands today rather than asserted as
+/// correct: the protocol lets a client call `get_background_effect` on any `wl_surface`, and a
+/// GTK/Qt client that puts its blurred chrome on a subsurface will do exactly that. We accept the
+/// request, cache the region against that surface, and never look at it —
+/// `render_background_effect` resolves effects for the *toplevel's* surface only
+/// (`window/mapped.rs:836`), with a separate loop for popups (`:799`). The surface tree is never
+/// walked.
+///
+/// The two halves are asserted separately on purpose. The compositor-side cache **does** hold the
+/// region, so the protocol seam is fine and a fix is a render-path change, not a handler one —
+/// which is the useful thing to know before implementing. Flip this test when it lands.
+#[test]
+fn a_subsurface_blur_region_is_cached_but_never_rendered() {
+    use crate::render_helpers::vulkan::VulkanRenderer;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let parent = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&parent);
+    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX / 2);
+    window.set_size(400, 300);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    // Blurred chrome on a subsurface, inset from the parent so its region cannot be mistaken for
+    // the toplevel's own.
+    let (child, _subsurface) =
+        f.client(id)
+            .create_subsurface(&parent, 40, 40, 200, 120, [0, 0, u32::MAX, u32::MAX / 2]);
+    f.client(id).set_blur_region(&child, (0, 0, 200, 120));
+    // A synchronized subsurface only takes effect when the parent commits.
+    f.client(id).window(&parent).commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    // Half one: the protocol seam works. Walk the compositor's surface tree for the window and
+    // find a cached blur region on something that is not the toplevel itself.
+    let mapped = f.synoik().layout.windows().next().unwrap().1;
+    let root = mapped.toplevel().wl_surface().clone();
+    let mut on_a_child = false;
+    smithay::wayland::compositor::with_surface_tree_downward(
+        &root,
+        (),
+        |_, _, _| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+        |surface, states, _| {
+            if *surface != root && get_cached_blur_region(states).is_some_and(|r| !r.is_empty()) {
+                on_a_child = true;
+            }
+        },
+        |_, _, _| true,
+    );
+    assert!(
+        on_a_child,
+        "the subsurface's blur region never reached the compositor's cache — that would be a \
+         protocol-seam bug, not the render-path gap this test is about",
+    );
+
+    // Half two: nothing renders from it.
+    let samples = sample_effect(&mut f);
+    assert!(
+        samples.iter().all(|s| s.subregion_bbox.is_none()),
+        "a subsurface blur region rendered, so gap 4 is fixed and this test should be inverted \
+         to assert the blur lands on the subsurface: {samples:?}",
+    );
+}
