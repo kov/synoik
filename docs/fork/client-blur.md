@@ -231,10 +231,57 @@ Then the absent capabilities, in the order I'd take them:
    305-309 while the child reads 6.6-17.2, a 17x to 47x collapse at every size — so the effect
    tracks the subsurface through a resize as well as at rest. (The child measures higher than on the
    harness only because it draws its own sharp grid lines.)
-5. **A contrast/tint step.** We have saturation and noise; KWin's merged contrast matrix and macOS's
-   per-material tint are what make light-mode blur legible. Ours is one global recipe with no
-   appearance awareness — and the shell plate already follows `color-scheme`
-   (`docs/fork/` shell-plate work), so the seam exists.
+5. ~~**A contrast/tint step.**~~ **DONE 2026-08-07** (`21514776`). A tint composited *over* the
+   blurred backdrop plus a contrast term, resolved from `color-scheme`.
+
+   **Why.** A blurred backdrop is whatever was behind the window, at whatever brightness; the client
+   then draws its own text over it in colours picked for its own theme, and cannot know what it
+   landed on. Light-mode text over a dark backdrop is unreadable and no amount of blur fixes it —
+   that is what KWin's merged contrast matrix and every macOS material are for.
+
+   **The signal, and its weakness.** `color-scheme` says what the *desktop* is set to, not what the
+   client drew. It is the only signal available: unlike macOS, where the app names a material and
+   therefore its own light/dark intent, `ext-background-effect-v1` carries a region and nothing
+   else, so we cannot ask. A light desktop is overwhelmingly running light apps, and it is the same
+   key the shell's plate already follows.
+
+   **Scope.** The four postprocess parameters became one `render_helpers::blur::Finish`, because
+   they are one recipe rather than four knobs — macOS's actual insight, and the thing a
+   blur-strength slider cannot buy. `Finish::NONE` is what the shell's chrome passes: the panel and
+   dash paint their own `$system_*` fill over the blur, so a tint underneath would only muddy a
+   colour the theme already specifies. The xray path stays untinted for a different reason — it
+   samples only the wallpaper and the background layer, so a legibility wash over a backdrop that
+   is already wrong would make the wrongness harder to see, not easier.
+
+   **Where it is resolved matters more than the values.** The appearance goes into `Options`, which
+   `update_render_elements` compares to decide whether to `damage_all()`. Read at draw time instead,
+   a new tint would be correct and *invisible*: `draw` runs only where the tracker reports damage,
+   and on a static desktop with a settled window that is nowhere.
+   `a_color_scheme_flip_redraws_a_blurred_surface` pins it and fails without it (verified by
+   stubbing). It rides `RenderCtx`, not the blur config — config is a dead carrier in a live
+   session, as `State::reload_config` says in its own doc comment — and it is an `Option` because a
+   path that cannot name the live appearance must not vote on one: two writers disagreeing would
+   flip the cached value and damage every blurred surface every frame, and a snapshot capture
+   (three levels down a chain that never sees the compositor) is exactly such a path.
+
+   **Values, deliberately modest and open to revision.** Light: white at alpha 0.20. Dark:
+   `#17171b`-ish at 0.20 — not pure black, because GNOME's own dark surfaces are a desaturated
+   near-black and a true black wash reads as a hole punched in the desktop. Contrast +0.06 both. A
+   client asking for blur asked to be *seen through*; a wash heavy enough to guarantee legibility
+   over any backdrop would override the one thing the client did get to decide. Measured on the
+   harness against the same binary with the tint stubbed out: **+19.4 luminance** inside a
+   translucent client window in light mode, over a real wallpaper.
+
+   **A trap for anyone re-measuring this:** you cannot A/B the tint by flipping `color-scheme` on a
+   live desktop, because GNOME swaps the *wallpaper variant* on the same key (`background.js`
+   `_loadBackground`). The backdrop changes underneath you and swamps the tint — first attempt read
+   a 100-plus luminance difference that was entirely wallpaper. A/B the same scheme against a
+   tint-disabled build instead.
+
+   **Not yet seat-validated end-to-end.** The unit guard proves a `dark_style` change damages and
+   redraws; what the harness could not show is the *gsettings notification* reaching `dark_style`
+   live, because a live `gsettings set` there changed nothing at all — not even the wallpaper — the
+   known dconf-notification trap in that environment, not this code.
 6. **Active/inactive fallback**, macOS-style: an unfocused window stops paying for a live blur and
    gains a focus cue. Cheapest perf win on the list.
 7. **XWayland** `_KDE_NET_WM_BLUR_BEHIND_REGION`.
