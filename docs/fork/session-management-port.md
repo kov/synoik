@@ -258,7 +258,11 @@ that `launch` might restore size-only while `session_restore` also restores work
 app ignoring its saved workspace would read as a bug, not a feature. Add a conformance test that
 pins workspace restore under all three reasons so this stays deliberate.
 
-### Open: the maximize/unmaximize workspace-seed drift
+---
+
+## Open questions
+
+### The maximize/unmaximize workspace-seed drift
 
 Surfaced by slice 0, not decided. `maximize_request` and `fullscreen_request` do not seed the
 stored `workspace_name` when re-resolving a not-yet-mapped window's monitor; `unmaximize_request`
