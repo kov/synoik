@@ -4,11 +4,11 @@
 
 #version 450
 
-// Postprocess-and-clip material: sample a bound texture, apply saturation / noise / a premultiplied
-// background (postprocess.frag), then clip it to a rounded rectangle expressed in a general
+// Postprocess-and-clip material: sample a bound texture, apply saturation / contrast / tint /
+// noise / a premultiplied background (postprocess.frag), then clip it to a rounded rectangle expressed in a general
 // geometry space (clipped_surface.frag + rounding_alpha.frag). This is the owned-renderer port of
 // niri's clipped-surface / framebuffer-effect postprocess: the `clipped_surface` program is this
-// with saturation=1, noise=0, bg=0; the `postprocess_and_clip` program is the full thing.
+// with saturation=1, contrast=0, tint=0, noise=0, bg=0; the `postprocess_and_clip` program is the full thing.
 //
 // Ported verbatim from render_helpers/shaders/{clipped_surface,postprocess,rounding_alpha}.frag.
 // The GLES named uniforms + the input_to_geo mat3 become the PostprocessPush push constant (the
@@ -37,6 +37,12 @@ layout(push_constant) uniform Push {
     float synoik_alpha;
     float saturation;
     float noise;
+    vec4 tint;           // premultiplied, composited OVER the backdrop
+    float contrast;      // boost about mid-grey; 0 is identity
+    // Pad to the std430 struct alignment so the Rust side's 240 bytes match exactly.
+    float pad0;
+    float pad1;
+    float pad2;
 } pc;
 
 layout(location = 0) in vec2 v_uv;
@@ -84,6 +90,24 @@ vec4 postprocess(vec4 color) {
         color.rgb = saturate_color(color.rgb, pc.saturation);
     }
 
+    // Contrast about mid-grey. The pivot is scaled by alpha because `color` is premultiplied:
+    // straight-alpha (s - 0.5) * k + 0.5 premultiplies to (c - 0.5a) * k + 0.5a, which needs no
+    // divide and stays correct for a translucent source. 0 is the identity, which is what makes
+    // `PostprocessPush::default()` safe.
+    if (pc.contrast != 0.0) {
+        float k = 1.0 + pc.contrast;
+        color.rgb = (color.rgb - 0.5 * color.a) * k + 0.5 * color.a;
+    }
+
+    // The material tint, composited OVER the backdrop -- this is what makes a blur legible instead
+    // of merely soft, and it is the only appearance-aware step in the recipe. Premultiplied-over,
+    // not mix(): mix is only correct when color.a == 1, which happens to hold for the mid-frame
+    // capture but must not be baked into a shader four other materials share.
+    if (pc.tint.a > 0.0) {
+        color = pc.tint + color * (1.0 - pc.tint.a);
+    }
+
+    // Grain last of the three, so the tint does not wash it back out.
     if (pc.noise > 0.0) {
         color.rgb += (hash12(gl_FragCoord.xy) - 0.5) * pc.noise;
     }

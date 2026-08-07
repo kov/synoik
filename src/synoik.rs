@@ -4382,6 +4382,7 @@ impl State {
     }
 
     pub fn store_unmap_snapshot(&mut self, window: &Window, output: Option<&Output>) {
+        let appearance = self.synoik.appearance();
         // The unmapping tile may have an xray background, in which case we will render xray
         // elements, so they need to be updated.
         self.synoik.update_xray_render_elements(output);
@@ -4392,6 +4393,7 @@ impl State {
                     target: RenderTarget::Output,
                     renderer,
                     xray: None,
+                    appearance: Some(appearance),
                 };
 
                 self.synoik.fill_xray_elements(ctx.r(), output);
@@ -11407,6 +11409,7 @@ impl Synoik {
         output: &Output,
     ) {
         let _span = tracy_client::span!("Synoik::render_for_screencopy_with_damage");
+        let appearance = self.appearance();
 
         let mut screencopy_state = mem::take(&mut self.screencopy_state);
 
@@ -11418,6 +11421,7 @@ impl Synoik {
                         renderer,
                         target: RenderTarget::ScreenCapture,
                         xray: None,
+                        appearance: Some(appearance),
                     };
                     let offset = screencopy.region_loc().upscale(-1);
                     let mut elements = Vec::new();
@@ -11496,6 +11500,7 @@ impl Synoik {
             renderer,
             target: RenderTarget::ScreenCapture,
             xray: None,
+            appearance: Some(self.appearance()),
         };
         let offset = screencopy.region_loc().upscale(-1);
         let mut elements = Vec::new();
@@ -11722,6 +11727,7 @@ impl Synoik {
             renderer,
             target,
             xray: None,
+            appearance: Some(self.appearance()),
         };
         let elements = self.render_to_vec(ctx, output, false);
         let elements = elements.iter().rev();
@@ -11865,6 +11871,7 @@ impl Synoik {
             renderer,
             target: RenderTarget::ScreenCapture,
             xray: None,
+            appearance: Some(self.appearance()),
         };
         let elements = self.render_to_vec(ctx, output, include_pointer);
         let elements = elements.iter().rev();
@@ -11911,6 +11918,7 @@ impl Synoik {
             renderer,
             target: RenderTarget::ScreenCapture,
             xray: None,
+            appearance: Some(self.appearance()),
         };
         let elements = self.render_to_vec(ctx, output, include_pointer);
         let elements = elements.iter().rev();
@@ -12013,6 +12021,7 @@ impl Synoik {
             renderer,
             target: RenderTarget::ScreenCapture,
             xray: None,
+            appearance: Some(self.appearance()),
         };
         mapped.render(
             ctx,
@@ -12229,6 +12238,7 @@ impl Synoik {
             renderer,
             target: RenderTarget::ScreenCapture,
             xray: None,
+            appearance: Some(self.appearance()),
         };
         let elements = self.render_to_vec(ctx, &output, include_pointer);
         let elements = elements.iter().rev();
@@ -12773,6 +12783,7 @@ impl Synoik {
             renderer,
             target,
             xray: None,
+            appearance: Some(self.appearance()),
         };
         let elements = self.render_to_vec(ctx, output, false);
         let elements = elements.iter().rev();

@@ -76,6 +76,7 @@ fn sample_effect(
                 renderer: vk,
                 target: RenderTarget::Output,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             // Building the elements is what runs the resolution; nothing needs to be drawn.
             let _ = synoik.render_to_vec(ctx, &output, false);
@@ -134,6 +135,7 @@ fn sample_with_damage(
                 renderer: vk,
                 target: RenderTarget::Output,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);
             // age 1: the buffer we would be drawing into holds the previous frame, which is the
@@ -178,6 +180,7 @@ fn render_frame(
                 renderer: vk,
                 target: RenderTarget::Output,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);
             let mut texture = create_texture(vk, size, NATIVE_FOURCC).expect("create offscreen");
@@ -503,6 +506,7 @@ fn the_capture_grabs_the_rect_the_effect_is_drawn_at() {
                     renderer: vk,
                     target: RenderTarget::Output,
                     xray: None,
+                    appearance: Some(synoik.appearance()),
                 };
                 let elements = synoik.render_to_vec(ctx, &output, false);
                 let mut texture = crate::render_helpers::create_texture(vk, size, NATIVE_FOURCC)
@@ -803,5 +807,101 @@ fn a_subsurface_blur_region_blurs_that_subsurface() {
          rather than what is actually beneath it",
         sub.xray,
         sub.blur,
+    );
+}
+
+/// Flipping `org.gnome.desktop.interface color-scheme` must repaint every blurred surface, with no
+/// window damage and nothing else changing.
+///
+/// This is the whole reason the appearance is resolved into `Options` — which
+/// `update_render_elements` compares to decide whether to `damage_all()` — instead of being read at
+/// draw time. Read at draw time the new tint would be correct and *invisible*: `draw` only runs
+/// where the tracker says the output is damaged, and on a static desktop with a settled window that
+/// is nowhere. The window would keep its old tint until something unrelated happened to damage it.
+///
+/// The idle control is not optional, for the same reason it is not optional in
+/// `moving_the_effect_recaptures_even_with_a_static_backdrop`: if a settled frame re-captures
+/// anyway, the assertion below passes whatever the flip does.
+#[test]
+fn a_color_scheme_flip_redraws_a_blurred_surface() {
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+
+    use crate::render_helpers::vulkan::VulkanRenderer;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    // Translucent: an opaque buffer occludes the effect and the tracker culls it before the
+    // framebuffer-effect scan, which would make this test pass for the wrong reason.
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX / 2);
+    window.set_size(400, 300);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    f.client(id).set_blur_region(&surface, (0, 0, 400, 300));
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.synoik_output(1);
+    let mut tracker = OutputDamageTracker::from_output(&output);
+
+    let mut geo = None;
+    for _ in 0..3 {
+        let (_, sample) = render_frame(&mut f, &mut tracker);
+        if let Some(s) = sample.first() {
+            geo = Some(s.effect_geometry);
+        }
+    }
+    let geo = geo
+        .expect("the effect must render before the flip")
+        .to_physical_precise_round(f.synoik_output(1).current_scale().fractional_scale());
+
+    // Control: settled, nothing happening, no re-capture.
+    let (idle, _) = render_frame(&mut f, &mut tracker);
+    assert!(
+        !idle.iter().any(|c| c.dst == geo),
+        "control failed: the effect re-captured on an idle frame, so this test cannot tell \
+         whether the color-scheme flip is what causes the redraw.\ncaptures: {idle:?}",
+    );
+
+    // The flip. The client is not told, nothing is committed, no geometry moves.
+    assert!(
+        !f.synoik_state()
+            .synoik
+            .gnome_settings
+            .quick_toggles
+            .dark_style,
+        "the fixture should start light, or this flips nothing",
+    );
+    f.synoik_state()
+        .synoik
+        .gnome_settings
+        .quick_toggles
+        .dark_style = true;
+
+    let (captures, _) = render_frame(&mut f, &mut tracker);
+    assert!(
+        captures.iter().any(|c| c.dst == geo),
+        "a color-scheme flip must redraw the blurred surface — its tint is appearance-dependent, \
+         and nothing else will ever damage a settled window.\nwanted dst {geo:?}, \
+         captures: {captures:?}",
     );
 }

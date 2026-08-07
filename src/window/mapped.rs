@@ -586,6 +586,8 @@ impl Mapped {
                 renderer,
                 target: RenderTarget::Screencast,
                 xray: None,
+                // A single-window cast has no compositor at hand; see `RenderCtx::appearance`.
+                appearance: None,
             },
             location,
             scale,
@@ -748,7 +750,7 @@ impl LayoutElement for Mapped {
             // subsurface that asked for it — that is what makes its backdrop "everything below me,
             // my own parent surface included". The root is excluded: its effect is the window's,
             // pushed under the whole tile by `render_background_effect`.
-            let (target, xray) = (ctx.target, ctx.xray);
+            let (target, xray, appearance) = (ctx.target, ctx.xray, ctx.appearance);
             let blur_config = self.blur_config;
             let effect_rules = self.rules.background_effect;
             let should_block_out = target.should_block_out(self.rules.block_out_from);
@@ -794,6 +796,7 @@ impl LayoutElement for Mapped {
                             renderer,
                             target,
                             xray,
+                            appearance,
                         },
                         None,
                         geometry,

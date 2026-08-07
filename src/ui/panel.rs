@@ -51,7 +51,7 @@ use crate::animation::{Animation, Clock};
 use crate::audio::{AudioStatus, MicStatus};
 use crate::gnome::{A11ySettings, ClockFormat, QuickToggles};
 use crate::render_helpers::background_effect::RenderParams;
-use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::blur::{BlurOptions, Finish};
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
 use crate::render_helpers::icon::{DrawCaches, IconCache, ImageFit};
 use crate::render_helpers::rounded_solid::{RoundedSolidBuffer, RoundedSolidRenderElement};
@@ -1655,8 +1655,7 @@ impl Panel {
                 scale,
             },
             Some(BAR_BLUR),
-            0.,
-            1.,
+            Finish::NONE,
         )));
 
         elements

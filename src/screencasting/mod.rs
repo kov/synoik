@@ -617,6 +617,7 @@ impl Synoik {
         output: &Output,
         target_presentation_time: Duration,
     ) {
+        let appearance = self.appearance();
         let _span = tracy_client::span!("Synoik::render_for_screen_cast");
 
         let weak = output.downgrade();
@@ -688,6 +689,7 @@ impl Synoik {
                     renderer,
                     target: RenderTarget::Screencast,
                     xray: None,
+                    appearance: Some(appearance),
                 };
                 self.render(ctx, output, false, &mut |elem| elements.push(elem.into()));
 
@@ -809,6 +811,7 @@ impl Synoik {
         output: &Output,
         target_presentation_time: Duration,
     ) {
+        let appearance = self.appearance();
         let _span = tracy_client::span!("Synoik::render_area_for_screen_cast");
 
         let weak = output.downgrade();
@@ -881,6 +884,7 @@ impl Synoik {
                 renderer,
                 target: RenderTarget::Screencast,
                 xray: None,
+                appearance: Some(appearance),
             };
             self.render(ctx, output, false, &mut |elem| {
                 let elem =
@@ -1256,6 +1260,7 @@ impl Synoik {
         output: &Output,
         target_presentation_time: Duration,
     ) {
+        let appearance = self.appearance();
         use smithay::backend::allocator::Fourcc;
         use smithay::utils::Transform;
 
@@ -1330,6 +1335,7 @@ impl Synoik {
                     renderer,
                     target: RenderTarget::Screencast,
                     xray: None,
+                    appearance: Some(appearance),
                 };
                 let elements: Vec<_> = self
                     .render_to_vec(ctx, output, draw_cursor)

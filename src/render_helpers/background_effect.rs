@@ -12,12 +12,13 @@ use synoik_config::CornerRadius;
 use wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::handlers::background_effect::get_cached_blur_region;
-use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::blur::{client_finish, BlurOptions};
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
 use crate::render_helpers::xray::{XrayElement, XrayPos};
 use crate::render_helpers::RenderCtx;
 use crate::synoik_render_elements;
+use crate::ui::widget::style::Appearance;
 use crate::utils::region::TransformedRegion;
 use crate::utils::surface_geo;
 
@@ -41,6 +42,16 @@ pub struct Options {
     pub xray: bool,
     pub noise: Option<f64>,
     pub saturation: Option<f64>,
+    /// Which appearance the client-blur recipe was last resolved for
+    /// ([`crate::render_helpers::blur::client_finish`]).
+    ///
+    /// **Resolved into the options rather than read at draw time on purpose.** `Options` is what
+    /// `update_render_elements` compares to decide whether to `damage_all()`, so putting the
+    /// appearance here is what makes a color-scheme flip repaint every blurred surface — with no
+    /// window damage, no config reload and no explicit invalidation anywhere. Read at draw time it
+    /// would change nothing until something else happened to damage the surface, which on a static
+    /// desktop is never. `nothing_but_a_color_scheme_flip_redraws_a_blurred_surface` is the guard.
+    pub appearance: Appearance,
 }
 
 impl Options {
@@ -118,6 +129,7 @@ impl BackgroundEffect {
         corner_radius: CornerRadius,
         effect: synoik_config::BackgroundEffect,
         has_blur_region: bool,
+        appearance: Option<Appearance>,
     ) {
         // If the surface explicitly requests a blur region, default blur to true.
         let blur = if has_blur_region {
@@ -138,6 +150,10 @@ impl BackgroundEffect {
             xray: effect.xray == Some(true),
             noise: effect.noise,
             saturation: effect.saturation,
+            // `None` keeps what we were last told — a path that cannot name the live appearance
+            // must not vote on it, or the two writers flip the value back and forth and damage
+            // every blurred surface every frame. See `RenderCtx::appearance`.
+            appearance: appearance.unwrap_or(self.options.appearance),
         };
 
         // If we have some background effect but xray wasn't explicitly set, default it to true
@@ -215,9 +231,11 @@ impl BackgroundEffect {
             );
         } else {
             // Render non-xray effect.
-            let elem = self
-                .nonxray
-                .render(ns, params, blur_options, noise, saturation);
+            // The appearance-aware client recipe: the tint and contrast that make a blurred
+            // backdrop something a client's own text can sit on. Only here — the shell's chrome
+            // paints its own `$system_*` fill over its blur and passes `Finish::NONE`.
+            let finish = client_finish(self.options.appearance, noise, saturation);
+            let elem = self.nonxray.render(ns, params, blur_options, finish);
             push(elem.into());
         }
     }
@@ -434,7 +452,7 @@ pub fn render_for_surface(
         let has_blur_region = blur_region.as_ref().is_some_and(|r| !r.is_empty());
 
         background_effect.update_config(blur_config);
-        background_effect.update_render_elements(radius, effect, has_blur_region);
+        background_effect.update_render_elements(radius, effect, has_blur_region, ctx.appearance);
 
         if !background_effect.is_visible() {
             return;
@@ -492,7 +510,7 @@ mod tests {
     ) -> Options {
         let mut bg = BackgroundEffect::new();
         bg.update_config(blur_config);
-        bg.update_render_elements(CornerRadius::default(), effect, has_blur_region);
+        bg.update_render_elements(CornerRadius::default(), effect, has_blur_region, None);
         bg.options
     }
 

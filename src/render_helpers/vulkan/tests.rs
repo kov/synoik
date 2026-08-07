@@ -1177,6 +1177,9 @@ fn vulkan_postprocess_clips_and_desaturates() {
             geo_size: [W as f32, H as f32],
             corner_radius: [16.0; 4],
             bg_color: [0.0; 4],
+            tint: [0.0; 4],
+            contrast: 0.0,
+            _pad0: [0.0; 3],
             // Identity mat3 (as columns): coords_geo == v_uv, so the geometry is the whole quad.
             input_to_geo: [
                 [1.0, 0.0, 0.0, 0.0],
@@ -3610,8 +3613,7 @@ fn vulkan_backdrop_blur_reuses_across_a_size_sweep() {
                 passes: 3,
                 offset: 2.0,
             }),
-            0.0,
-            1.0,
+            crate::render_helpers::blur::Finish::NONE,
         );
         let src = element.src();
         let dst = element.geometry(Scale::from(1.0));

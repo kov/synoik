@@ -57,7 +57,7 @@ use synoik_config::CornerRadius;
 use crate::animation::{Animation, Clock, Curve};
 use crate::app_system::AppIconRef;
 use crate::render_helpers::background_effect::RenderParams;
-use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::blur::{BlurOptions, Finish};
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -1112,8 +1112,7 @@ impl Dash {
                     scale,
                 },
                 Some(PILL_BLUR),
-                0.,
-                1.,
+                Finish::NONE,
             )));
         }
 

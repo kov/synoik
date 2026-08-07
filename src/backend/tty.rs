@@ -3017,6 +3017,7 @@ fn render_surface_with(
         renderer: &mut *renderer,
         target: RenderTarget::Output,
         xray: None,
+        appearance: Some(synoik.appearance()),
     };
     synoik.frame_log.phase(Phase::Collect);
     let mut elements = synoik.render_to_vec(ctx, output, true);

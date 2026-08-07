@@ -62,6 +62,23 @@ pub struct RenderCtx<'a> {
     pub renderer: &'a mut VulkanRenderer,
     pub target: RenderTarget,
     pub xray: Option<&'a Xray>,
+    /// Which way `org.gnome.desktop.interface color-scheme` is pointing, for the client-blur
+    /// recipe ([`blur::client_finish`]).
+    ///
+    /// It rides the *frame* context, not the per-window blur config, because the config is a dead
+    /// carrier in a live session: `State::reload_config` says so in its own doc comment, and a
+    /// color-scheme flip pushes nothing to windows — a tint resolved from stored config would keep
+    /// the old appearance until something unrelated happened to change.
+    ///
+    /// `None` means **"this path does not know, and must not decide"**: the effect keeps whatever
+    /// appearance it was last told. Only paths that can name the live value pass `Some`, which
+    /// gives the stored appearance exactly one writer. That is not tidiness — a second path
+    /// passing a *different* value would flip the cached value back and forth and damage every
+    /// blurred surface on every frame, and a snapshot capture (`Tile::render_snapshot_vulkan`,
+    /// three levels down a chain that never sees the compositor) is precisely such a path.
+    ///
+    /// [`blur::client_finish`]: crate::render_helpers::blur::client_finish
+    pub appearance: Option<crate::ui::widget::style::Appearance>,
 }
 
 impl<'a> RenderCtx<'a> {
@@ -72,6 +89,7 @@ impl<'a> RenderCtx<'a> {
             renderer: self.renderer,
             target: self.target,
             xray: self.xray,
+            appearance: self.appearance,
         }
     }
 }

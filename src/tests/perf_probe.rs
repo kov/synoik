@@ -196,6 +196,7 @@ fn render_once(f: &mut Fixture) -> (Duration, u64, u64) {
                 renderer: vk,
                 target: RenderTarget::Output,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);
 
@@ -262,6 +263,7 @@ fn render_once_dmabuf(
                 renderer: vk,
                 target: RenderTarget::Output,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);
 
@@ -758,6 +760,7 @@ fn render_once_gpu(f: &mut Fixture) -> Option<(Duration, u64, u64)> {
                 renderer: vk,
                 target: RenderTarget::Output,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);
 

@@ -229,6 +229,7 @@ fn render_output_vulkan_target(
                 renderer: vk,
                 target,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, output, false);
             let elements = elements.iter().rev();
@@ -273,6 +274,7 @@ fn vulkan_composites_a_mapped_window() {
                 renderer: vk,
                 target: RenderTarget::ScreenCapture,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);
             let elements = elements.iter().rev();
@@ -1713,6 +1715,7 @@ fn vulkan_composites_a_scene_into_a_scanout_dmabuf() {
                 renderer: vk,
                 target: RenderTarget::Output,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             let elements: Vec<OutputRenderElements> = synoik.render_to_vec(ctx, &output, false);
 
@@ -1860,6 +1863,7 @@ fn vulkan_composites_a_scene_into_an_argb_scanout_dmabuf() {
                 renderer: vk,
                 target: RenderTarget::Output,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             let elements: Vec<OutputRenderElements> = synoik.render_to_vec(ctx, &output, false);
 
@@ -4678,6 +4682,7 @@ fn vulkan_render_to_dmabuf_composites_the_scene() {
                 renderer: vk,
                 target: RenderTarget::ScreenCapture,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             let elements: Vec<OutputRenderElements> = synoik.render_to_vec(ctx, &output, false);
 
@@ -5013,7 +5018,12 @@ fn vulkan_framebuffer_effect_captures_and_blurs_through_the_render_loop() {
         passes: 3,
         offset: 5.0,
     };
-    let elem = fbe.render(None, params, Some(blur), 0.0, 1.0);
+    let elem = fbe.render(
+        None,
+        params,
+        Some(blur),
+        crate::render_helpers::blur::Finish::NONE,
+    );
 
     // render_to_vec invokes capture_framebuffer() for is_framebuffer_effect elements, then draw().
     // Reaching a readback proves the whole owned-Vulkan capture+blur+postprocess path ran cleanly.
@@ -5078,7 +5088,12 @@ fn vulkan_a_blurred_frame_adds_no_submits() {
             passes,
             offset: 5.0,
         };
-        fbe.render(None, params, Some(blur), 0.0, 1.0)
+        fbe.render(
+            None,
+            params,
+            Some(blur),
+            crate::render_helpers::blur::Finish::NONE,
+        )
     };
 
     // Warm every cache a first frame would build (pipelines are lazy, the pool's staging chunk is
@@ -5474,8 +5489,7 @@ fn vulkan_backdrop_blur_softens_a_hard_edge() {
             passes: 3,
             offset: 2.0,
         }),
-        0.0, // noise
-        1.0, // saturation (identity)
+        crate::render_helpers::blur::Finish::NONE,
     );
     let _ = CornerRadius::default();
     let cache = UserDataMap::new();
@@ -5608,8 +5622,7 @@ fn vulkan_backdrop_blur_radius_survives_a_rung_crossing() {
                 passes: 3,
                 offset: 3.0,
             }),
-            0.0,
-            1.0,
+            crate::render_helpers::blur::Finish::NONE,
         );
         let cache = UserDataMap::new();
         let src = element.src();
@@ -5682,6 +5695,120 @@ fn vulkan_backdrop_blur_radius_survives_a_rung_crossing() {
     );
 }
 
+/// The client-blur **finish**: an appearance-aware tint composited over the blurred backdrop, which
+/// is what lets a client's own text sit on it (gap 5, `docs/fork/client-blur.md`). The protocol
+/// hands us a region and nothing else, so both the decision and the values are the compositor's.
+///
+/// Three things at once, over a mid-grey backdrop so a wash either way is unambiguous: that the
+/// light recipe lightens, that the dark recipe darkens, and that `Finish::NONE` — what the shell's
+/// own chrome passes, because the panel and dash paint their own `$system_*` fill over the blur —
+/// leaves the backdrop exactly where it was. The last is the regression this feature can cause: a
+/// tint that leaked into the shared path would shift every chrome colour in the theme.
+#[test]
+fn vulkan_client_blur_finish_tints_by_appearance() {
+    use smithay::backend::renderer::Offscreen;
+    use smithay::utils::user_data::UserDataMap;
+
+    use crate::render_helpers::background_effect::RenderParams;
+    use crate::render_helpers::blur::{client_finish, BlurOptions, Finish};
+    use crate::render_helpers::framebuffer_effect::FramebufferEffect;
+    use crate::render_helpers::vulkan::VulkanRenderer as Vk;
+    use crate::ui::widget::style::Appearance;
+
+    let mut vk = match Vk::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping vulkan_client_blur_finish_tints_by_appearance: no Vulkan ({e})");
+            return;
+        }
+    };
+
+    const S: i32 = 64;
+    let size = Size::<i32, Physical>::from((S, S));
+
+    // Mid-grey backdrop, whole-output effect, and read the middle pixel back.
+    let render_with = |vk: &mut Vk, finish: Finish| -> [u8; 4] {
+        let mut target = vk
+            .create_buffer(NATIVE_FOURCC, Size::from((S, S)))
+            .expect("create target");
+        let effect = FramebufferEffect::new();
+        let element = effect.render(
+            None,
+            RenderParams {
+                geometry: Rectangle::from_size(Size::from((S as f64, S as f64))),
+                subregion: None,
+                clip: None,
+                scale: 1.0,
+            },
+            Some(BlurOptions {
+                passes: 3,
+                offset: 2.0,
+            }),
+            finish,
+        );
+        let cache = UserDataMap::new();
+        let src = element.src();
+        let dst = element.geometry(Scale::from(1.0));
+        {
+            let mut fb = vk.bind(&mut target).expect("bind");
+            let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+            frame
+                .draw_solid(
+                    Rectangle::from_size((S, S).into()),
+                    &[Rectangle::from_size((S, S).into())],
+                    Color32F::from([0.5, 0.5, 0.5, 1.]),
+                )
+                .expect("draw backdrop");
+            RenderElement::<Vk>::capture_framebuffer(&element, &mut frame, src, dst, &cache)
+                .expect("capture_framebuffer");
+            RenderElement::<Vk>::draw(
+                &element,
+                &mut frame,
+                src,
+                dst,
+                &[Rectangle::from_size(size)],
+                &[],
+                Some(&cache),
+            )
+            .expect("draw");
+            let _ = frame.finish().expect("finish");
+        }
+        let fb = vk.bind(&mut target).expect("rebind");
+        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((S, S)));
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy_framebuffer");
+        let pixels = vk.map_texture(&mapping).expect("map").to_vec();
+        px(&pixels, S, S / 2, S / 2)
+    };
+
+    // `client_finish`'s own noise/saturation arguments are held at identity so the only thing
+    // moving between the three arms is the tint and its contrast.
+    let plain = render_with(&mut vk, Finish::NONE);
+    let light = render_with(&mut vk, client_finish(Appearance::Light, 0., 1.));
+    let dark = render_with(&mut vk, client_finish(Appearance::Dark, 0., 1.));
+
+    eprintln!(
+        "vulkan_client_blur_finish_tints_by_appearance: none={plain:?} light={light:?} dark={dark:?}"
+    );
+
+    // A blurred flat grey is that same grey: the untinted arm is the reference point.
+    assert!(
+        (120..=136).contains(&plain[0]),
+        "an untouched blur of flat mid-grey should come back mid-grey, got {plain:?} — \
+         `Finish::NONE` is not the identity, which means the shell chrome moved too"
+    );
+    assert!(
+        light[0] > plain[0] + 10,
+        "the light recipe must lighten the backdrop so a light client's dark text has something \
+         to sit on: none={plain:?} light={light:?}"
+    );
+    assert!(
+        dark[0] + 10 < plain[0],
+        "the dark recipe must darken it: none={plain:?} dark={dark:?}"
+    );
+}
+
 /// A surface that sets a blur region (`ext-background-effect-v1` `set_blur_region`) must get blur
 /// **only inside that region**. The subregion restricts the drawn damage, so the scene outside it
 /// stays untouched.
@@ -5736,8 +5863,7 @@ fn vulkan_backdrop_blur_honours_the_subregion() {
             passes: 3,
             offset: 2.0,
         }),
-        0.0,
-        1.0,
+        crate::render_helpers::blur::Finish::NONE,
     );
     let cache = UserDataMap::new();
     let src = element.src();
@@ -5852,6 +5978,9 @@ fn vulkan_effect_buffer_renders_offscreen_and_blur() {
     // Identity postprocess (no clip, no rounding, no desaturation); render_postprocess fills
     // origin/size/proj/target/src_rect.
     let identity_push = |geo: i32| PostprocessPush {
+        tint: [0.; 4],
+        contrast: 0.,
+        _pad0: [0.; 3],
         origin: [0.0, 0.0],
         size: [0.0, 0.0],
         proj: [0.0; 4],
@@ -6286,7 +6415,12 @@ fn vulkan_backdrop_effect_roundtrips_under_rotation() {
                     scale: 1.0,
                 };
                 // noise 0, saturation 1: with `blur` None the effect should reproduce the backdrop.
-                let element = effect.render(None, params, blur, 0.0, 1.0);
+                let element = effect.render(
+                    None,
+                    params,
+                    blur,
+                    crate::render_helpers::blur::Finish::NONE,
+                );
                 let cache = UserDataMap::new();
                 let src = element.src();
                 let dst = element.geometry(Scale::from(1.0));
@@ -6600,6 +6734,7 @@ fn vulkan_clipped_tile_pushes_its_rounded_corner_damage() {
                 renderer: vk,
                 target: RenderTarget::Output,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             // Same `{elem:?}`-sniffing idiom as `render_helpers::debug::push_opaque_regions`: the
             // element list is an opaque enum tree, and `ExtraDamage` is the only thing in this
@@ -7397,6 +7532,7 @@ fn vulkan_area_cast_crops_to_the_output_subrect() {
                 renderer: vk,
                 target: RenderTarget::Screencast,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             let elements = synoik.render_to_vec(ctx, &output, false);
             let full = render_to_vec(
@@ -9938,6 +10074,7 @@ fn element_ids(f: &mut Fixture, output: &Output) -> Vec<String> {
                 renderer: vk,
                 target: RenderTarget::Output,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             synoik
                 .render_to_vec(ctx, output, false)
@@ -10331,6 +10468,7 @@ fn render_deferred_once(f: &mut Fixture, output: &Output) -> (u64, u64) {
                 renderer: vk,
                 target: RenderTarget::Output,
                 xray: None,
+                appearance: Some(synoik.appearance()),
             };
             // Reset before *collection*: the xray effect buffer is prepared while elements are
             // built, so its offscreen and blur allocations land there, not in the render below.

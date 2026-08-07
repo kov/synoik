@@ -28,6 +28,12 @@ layout(push_constant) uniform Push {
     float synoik_alpha;
     float saturation;
     float noise;
+    vec4 tint;
+    float contrast;
+    // Pad to the std430 struct alignment so the Rust side's 240 bytes match exactly.
+    float pad0;
+    float pad1;
+    float pad2;
 } pc;
 
 layout(location = 0) out vec2 v_uv;

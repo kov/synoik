@@ -1542,6 +1542,9 @@ impl<W: LayoutElement> Tile<W> {
                         target,
                         renderer,
                         xray,
+                        // A snapshot capture cannot name the live appearance — see
+                        // `RenderCtx::appearance` for why it must not guess one either.
+                        appearance: None,
                     },
                     Point::from((0., 0.)),
                     xray_pos,

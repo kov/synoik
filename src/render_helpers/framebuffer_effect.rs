@@ -12,7 +12,7 @@ use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
 use synoik_config::CornerRadius;
 
 use crate::render_helpers::background_effect::RenderParams;
-use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::blur::{BlurOptions, Finish};
 use crate::utils::region::TransformedRegion;
 
 #[derive(Debug)]
@@ -33,8 +33,7 @@ pub struct FramebufferEffectElement {
     subregion: Option<TransformedRegion>,
     scale: f32,
     blur_options: Option<BlurOptions>,
-    noise: f32,
-    saturation: f32,
+    finish: Finish,
 }
 
 impl FramebufferEffect {
@@ -62,8 +61,7 @@ impl FramebufferEffect {
         ns: Option<usize>,
         params: RenderParams,
         blur_options: Option<BlurOptions>,
-        noise: f32,
-        saturation: f32,
+        finish: Finish,
     ) -> FramebufferEffectElement {
         let (clip_geo, corner_radius) = params
             .clip
@@ -83,8 +81,7 @@ impl FramebufferEffect {
             subregion: params.subregion,
             scale: params.scale as f32,
             blur_options,
-            noise,
-            saturation,
+            finish,
         }
     }
 }
@@ -178,8 +175,10 @@ mod vulkan_impl {
                 sample_transform: pack_mat3(sample_transform),
                 synoik_scale: self.scale,
                 synoik_alpha: 1.0,
-                saturation: self.saturation,
-                noise: self.noise,
+                saturation: self.finish.saturation,
+                noise: self.finish.noise,
+                tint: self.finish.tint_premultiplied(),
+                contrast: self.finish.contrast,
                 // origin/size/target/src_rect are filled by render_postprocess.
                 ..Default::default()
             }

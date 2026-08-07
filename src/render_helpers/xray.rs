@@ -468,6 +468,14 @@ impl RenderElement<VulkanRenderer> for XrayElement {
             synoik_alpha: 1.,
             saturation: self.saturation,
             noise: self.noise,
+            // No tint on the xray path. It is the shell's cheap see-through — it samples only the
+            // wallpaper and the background layer, never the windows between — and gap 1 routes
+            // every *client*-requested blur to the framebuffer path precisely because xray cannot
+            // show what is actually behind. A legibility wash over a backdrop that is already
+            // wrong would only make the wrongness harder to see.
+            tint: [0.; 4],
+            contrast: 0.,
+            _pad0: [0.; 3],
         };
 
         frame.render_postprocess(&texture, src, dst, damage, push)
