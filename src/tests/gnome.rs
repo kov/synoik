@@ -2251,6 +2251,67 @@ fn placement_first_fit_prefers_below() {
     );
 }
 
+/// first-fit's third phase: when the grid slot is taken and nothing fits
+/// *below* an existing window, a candidate *beside* one is tried
+/// (place.c:724-751).
+#[test]
+fn placement_first_fit_falls_back_to_beside() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik().layout.set_gnome_center_new_windows(false);
+    let id = f.add_client();
+
+    // Work area (0, 32) 1920 × 1048. A 900-tall window leaves no room below
+    // itself, but does leave room to its right.
+    let slot = ((1920. % 901.) / 2., 32. + (1048. % 901.) / 3.);
+    let _w1 = map_window_sized(&mut f, id, (900, 900), None);
+    assert_pos_eq(focused_window_pos(&mut f), slot, "the first window");
+    assert!(
+        slot.1 + 900. + 900. > 1080.,
+        "precondition: there must be no room below the first window"
+    );
+
+    let _w2 = map_window_sized(&mut f, id, (900, 900), None);
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (slot.0 + 900., slot.1),
+        "the second window must first-fit beside the first",
+    );
+}
+
+/// The cascade's column overflow: when a diagonal run reaches the bottom of
+/// the work area, the next window restarts at the origin shifted right by one
+/// `CASCADE_INTERVAL` (place.c:281-312).
+#[test]
+fn placement_cascade_starts_a_new_column_when_it_overflows() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik().layout.set_gnome_center_new_windows(false);
+    let id = f.add_client();
+
+    // 1000 × 600 in a 1920 × 1048 work area: after the first takes the grid
+    // slot, nothing ever fits again, so every later window cascades. The run
+    // is (0, 32), (50, 82), … stepping 50px until the next step would put the
+    // bottom edge past the work area.
+    for _ in 0..10 {
+        map_window_sized(&mut f, id, (1000, 600), None);
+    }
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (400., 432.),
+        "precondition: the tenth window ends the first cascade column",
+    );
+
+    // (450, 482) would put the bottom edge at 1082, past the work area's 1080,
+    // so the column restarts at the origin plus one interval.
+    map_window_sized(&mut f, id, (1000, 600), None);
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (50., 32.),
+        "an overflowing cascade must start a new column 50px to the right",
+    );
+}
+
 /// Transient windows (dialogs) center horizontally on their parent and sit
 /// at the top-biased third vertically, leaving twice as much parent below as
 /// above (place.c).
