@@ -279,6 +279,46 @@ fn render_params_for_tile(
     })
 }
 
+/// Test-only record of what [`render_for_tile`] resolved, so a test can watch the two clocks that
+/// feed it without reimplementing the resolution.
+///
+/// The effect's placement is mixed from sources that update at different times: `tile_geometry` is
+/// the layout's area for the window, which moves as soon as the compositor decides on a new size,
+/// while `surface_geo` and the blur region are the *client's* committed state, which only lands
+/// when it acks and attaches. A resize is exactly the interval where those two disagree, and an
+/// end-state test cannot see it — both have settled by then.
+#[cfg(test)]
+pub mod trace {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct EffectSample {
+        /// The layout's area for this window — the compositor's clock.
+        pub tile_geometry: Rectangle<f64, Logical>,
+        /// The client's committed xdg window geometry — the client's clock.
+        pub surface_geo: Rectangle<f64, Logical>,
+        /// What the effect actually ended up covering.
+        pub effect_geometry: Rectangle<f64, Logical>,
+        /// Bounding box of the blur subregion, in the same space as `effect_geometry`.
+        pub subregion_bbox: Option<Rectangle<f64, Logical>>,
+    }
+
+    thread_local! {
+        static SAMPLES: RefCell<Vec<EffectSample>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Drain what has been recorded since the last call.
+    pub fn take() -> Vec<EffectSample> {
+        SAMPLES.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    pub(super) fn record(sample: EffectSample) {
+        SAMPLES.with(|s| s.borrow_mut().push(sample));
+    }
+}
+
 /// Per-surface background effect stored in its data map.
 struct SurfaceBackgroundEffect(Mutex<BackgroundEffect>);
 
@@ -343,6 +383,24 @@ pub fn render_for_tile(
         ) else {
             return;
         };
+
+        #[cfg(test)]
+        trace::record(trace::EffectSample {
+            tile_geometry: geometry,
+            surface_geo,
+            effect_geometry: params.geometry,
+            subregion_bbox: params.subregion.as_ref().and_then(|region| {
+                region
+                    .iter()
+                    .map(|(a, b)| Rectangle::new(a, (b - a).to_size()))
+                    .reduce(|acc, r| {
+                        let min = Point::from((acc.loc.x.min(r.loc.x), acc.loc.y.min(r.loc.y)));
+                        let max_x = (acc.loc.x + acc.size.w).max(r.loc.x + r.size.w);
+                        let max_y = (acc.loc.y + acc.size.h).max(r.loc.y + r.size.h);
+                        Rectangle::new(min, (max_x - min.x, max_y - min.y).into())
+                    })
+            }),
+        });
 
         let xray_pos = xray_pos.offset(params.geometry.loc - geometry.loc);
         background_effect.render(ctx, ns, params, xray_pos, push);

@@ -50,6 +50,158 @@ fn compositor_blur_rects(
     })
 }
 
+/// Render one full frame through the real path and drain what `render_for_tile` resolved.
+///
+/// Rendering is what runs the resolution, so there is no cheaper way to see it:
+/// `update_render_elements` settles the *options*, but the geometry the effect lands on is computed
+/// per frame.
+fn sample_effect(
+    f: &mut Fixture,
+) -> Vec<crate::render_helpers::background_effect::trace::EffectSample> {
+    use crate::render_helpers::background_effect::trace;
+    use crate::render_helpers::{RenderCtx, RenderTarget};
+
+    // Drop anything an earlier frame left behind, so a sample is only this frame.
+    let _ = trace::take();
+
+    let output = f.synoik_output(1);
+    let state = f.synoik_state();
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            // Building the elements is what runs the resolution; nothing needs to be drawn.
+            let _ = synoik.render_to_vec(ctx, &output, false);
+        })
+        .expect("the fixture must have a Vulkan renderer");
+
+    trace::take()
+}
+
+/// Compare two rects up to float slop.
+///
+/// The subregion's corners are scaled and offset per rect, so a bbox that *is* the tile still
+/// comes back as `401.99999999999994` against `402.0`. Exact equality here is a flake generator:
+/// which side of the epsilon it lands on depends on the scale factor the animation happens to be
+/// at when the sample is taken, so it passes alone and fails in the full suite.
+fn rect_approx_eq(
+    a: smithay::utils::Rectangle<f64, smithay::utils::Logical>,
+    b: smithay::utils::Rectangle<f64, smithay::utils::Logical>,
+) -> bool {
+    const EPS: f64 = 1e-6;
+    (a.loc.x - b.loc.x).abs() < EPS
+        && (a.loc.y - b.loc.y).abs() < EPS
+        && (a.size.w - b.size.w).abs() < EPS
+        && (a.size.h - b.size.h).abs() < EPS
+}
+
+/// The effect must track the *tile* through a resize, subregion included — including the frames
+/// in the middle of the resize animation, where the client's buffer has already grown but the
+/// tile has not caught up.
+///
+/// This is the shape of bug an end-state test cannot see: at both ends of a resize every rect
+/// agrees, and only the frames between can disagree. It is pinned here because that mid-flight
+/// consistency is what "the blur trails the window" would break, and reading the code is not
+/// enough to know it holds — the effect geometry, the client's committed geometry and the region
+/// are three values updated on two different clocks.
+#[test]
+fn the_effect_tracks_the_tile_through_a_resize() {
+    use crate::render_helpers::vulkan::VulkanRenderer;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX);
+    window.set_size(400, 300);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let effect = f.client(id).set_blur_region(&surface, (0, 0, 400, 300));
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    // Settled: the effect covers the tile exactly.
+    for s in sample_effect(&mut f) {
+        assert_eq!(s.effect_geometry, s.tile_geometry);
+        assert!(s
+            .subregion_bbox
+            .is_some_and(|r| rect_approx_eq(r, s.tile_geometry)));
+    }
+
+    // The compositor decides on a new size before the client can answer.
+    f.synoik_state()
+        .do_action(synoik_config::Action::Maximize, false);
+    f.double_roundtrip(id);
+    for s in sample_effect(&mut f) {
+        assert_eq!(
+            s.effect_geometry, s.tile_geometry,
+            "an unacked resize must not detach the effect from the tile",
+        );
+    }
+
+    // The client answers with a bigger buffer and a matching region, in one commit — which is what
+    // a real client does (verified on the wire against ghost). The resize animation is still
+    // running, so the tile is between the two sizes here.
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX);
+    window.set_size(800, 600);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.client(id)
+        .update_blur_region(&effect, &surface, (0, 0, 800, 600));
+    f.double_roundtrip(id);
+
+    let mid = sample_effect(&mut f);
+    assert!(!mid.is_empty(), "the effect must still render mid-resize");
+    for s in &mid {
+        assert!(
+            s.surface_geo.size.w > s.tile_geometry.size.w,
+            "precondition: the client should have outgrown the tile mid-animation \
+             (surf {:?} vs tile {:?}) — if this trips, the animation settled early and the \
+             test is no longer sampling the interesting frames",
+            s.surface_geo.size,
+            s.tile_geometry.size,
+        );
+        assert_eq!(
+            s.effect_geometry, s.tile_geometry,
+            "mid-resize the effect must follow the tile, not the client's committed size",
+        );
+        assert!(
+            s.subregion_bbox
+                .is_some_and(|r| rect_approx_eq(r, s.tile_geometry)),
+            "the client's region must be scaled onto the tile, not left at buffer scale \
+             (sub {:?} vs tile {:?})",
+            s.subregion_bbox,
+            s.tile_geometry,
+        );
+    }
+}
+
 #[test]
 fn the_compositor_announces_the_blur_capability() {
     let mut f = Fixture::new();

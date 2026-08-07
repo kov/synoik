@@ -437,6 +437,15 @@ impl Client {
         self.state.set_blur_region(surface, rect)
     }
 
+    pub fn update_blur_region(
+        &mut self,
+        effect: &ExtBackgroundEffectSurfaceV1,
+        surface: &WlSurface,
+        rect: (i32, i32, i32, i32),
+    ) {
+        self.state.update_blur_region(effect, surface, rect);
+    }
+
     pub fn background_effect_capabilities(&self) -> Option<Capability> {
         self.state.background_effect_capabilities
     }
@@ -578,6 +587,27 @@ impl State {
         region.destroy();
         surface.commit();
         effect
+    }
+
+    /// Re-specify the region on an effect the surface already has.
+    ///
+    /// The protocol allows only one effect object per surface, so calling
+    /// [`set_blur_region`](Self::set_blur_region) twice is a protocol error, not a second region.
+    /// A client that reshapes its blur on resize — which is the normal case — must come through
+    /// here with the object it was handed the first time.
+    pub fn update_blur_region(
+        &mut self,
+        effect: &ExtBackgroundEffectSurfaceV1,
+        surface: &WlSurface,
+        rect: (i32, i32, i32, i32),
+    ) {
+        let compositor = self.compositor.as_ref().unwrap();
+        let region = compositor.create_region(&self.qh, ());
+        let (x, y, width, height) = rect;
+        region.add(x, y, width, height);
+        effect.set_blur_region(Some(&region));
+        region.destroy();
+        surface.commit();
     }
 
     pub fn set_opaque_region(
