@@ -2168,6 +2168,31 @@ fn focused_window_pos(f: &mut Fixture) -> (f64, f64) {
     (pos.x, pos.y)
 }
 
+/// Name of the output the focused window ended up on.
+///
+/// Goes through the window id rather than the surface: the fixture's client
+/// `WlSurface` is `wayland_client`'s type, and the layout speaks
+/// `wayland_server`'s.
+#[track_caller]
+fn focused_window_output(f: &mut Fixture) -> String {
+    let synoik = f.synoik();
+    // `Mapped::id()` is the `MappedId`; the layout keys windows by the smithay
+    // `Window`, which is `<Mapped as LayoutElement>::Id`.
+    let window = synoik
+        .layout
+        .focus()
+        .expect("no focused window")
+        .window
+        .clone();
+    synoik
+        .layout
+        .monitors()
+        .find(|mon| mon.has_window(&window))
+        .expect("the focused window must be on some monitor")
+        .output()
+        .name()
+}
+
 #[track_caller]
 fn assert_pos_eq(actual: (f64, f64), expected: (f64, f64), what: &str) {
     // Render positions round to physical pixels; allow that.
@@ -2342,6 +2367,123 @@ fn placement_dialogs_center_on_parent() {
             parent_pos.1 + (400. - 100.) / 3.,
         ),
         "a transient must center on its parent, biased to the top third",
+    );
+}
+
+/// Which monitor a new window opens on is seeded from the pointer, not from
+/// the active monitor: mutter seeds `window->monitor` from the pointer for a
+/// window that gave no position hint (`window.c:1245-1259`), and placement
+/// later picks the same one up (`place.c:951-955`). niri's scrolling mode
+/// keeps the active monitor instead, which is the behaviour this replaces.
+///
+/// This is the only seed in `layout::placement` fed by the pointer, and only
+/// at the initial configure — see
+/// [`the_monitor_choice_survives_the_pointer_moving_away`].
+#[test]
+fn a_new_window_opens_on_the_monitor_under_the_pointer() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    // Outputs tile left to right, so output 2 spans x = 1920..3840.
+    pointer_motion_to(&mut f, 1920. + 960., 540.);
+
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+
+    assert_eq!(
+        focused_window_output(&mut f),
+        "headless-2",
+        "a new window must open under the pointer"
+    );
+}
+
+/// The monitor is decided **once**, at the initial configure, and a request
+/// that arrives before the window maps must not re-decide it. Re-consulting
+/// the pointer from a later request would let a window hop monitors merely
+/// because the mouse moved between the client's first commit and its first
+/// buffer.
+///
+/// This pins the invariant that `layout::placement` documents: only
+/// `send_initial_configure` seeds `pointer_output`. The stored output, pinned
+/// at the initial configure, outranks both the pointer and the active monitor
+/// for every later request.
+#[test]
+fn the_monitor_choice_survives_the_pointer_moving_away() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    // Make output 2 the *active* monitor, by opening a window there. Every
+    // seed below output 1 in the chain — the pointer, and the active monitor
+    // fallback — now points at output 2, so the assertion at the end can only
+    // hold if the output pinned at the initial configure is what decided it.
+    pointer_motion_to(&mut f, 1920. + 960., 540.);
+    let _elsewhere = map_window_sized(&mut f, id, (400, 300), None);
+    assert_eq!(
+        focused_window_output(&mut f),
+        "headless-2",
+        "precondition: output 2 must be the active monitor"
+    );
+
+    // Decide our window's monitor on output 1, by having the pointer there at
+    // the initial configure.
+    pointer_motion_to(&mut f, 960., 540.);
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    // The window is now configured but not yet mapped. Move the pointer back
+    // to the other output and have the client change its mind.
+    pointer_motion_to(&mut f, 1920. + 960., 540.);
+    f.client(id).window(&surface).set_maximized();
+    f.roundtrip(id);
+
+    // Now map it.
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+
+    assert_eq!(
+        focused_window_output(&mut f),
+        "headless-1",
+        "the monitor is decided at the initial configure; a later request must \
+         not follow the pointer to another output"
+    );
+}
+
+/// A dialog follows its parent's monitor rather than the pointer's. The
+/// parent seed sits ahead of the pointer seed in `layout::placement`, and
+/// unlike the other seeds it deliberately does *not* get pinned onto the
+/// window, so that mapping re-fetches the parent's monitor in case the parent
+/// moved in between (`PlacementTarget::output_to_store`).
+#[test]
+fn a_dialog_opens_on_its_parents_monitor_not_the_pointers() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    // Parent opens on output 1.
+    pointer_motion_to(&mut f, 960., 540.);
+    let parent = map_window_sized(&mut f, id, (600, 400), None);
+
+    // Pointer moves to output 2, then the dialog appears.
+    pointer_motion_to(&mut f, 1920. + 960., 540.);
+    let _dialog = map_window_sized(&mut f, id, (200, 100), Some(&parent));
+
+    assert_eq!(
+        focused_window_output(&mut f),
+        "headless-1",
+        "a dialog must follow its parent, not the pointer"
     );
 }
 

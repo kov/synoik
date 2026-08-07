@@ -21,6 +21,7 @@ use super::*;
 
 mod animations;
 mod fullscreen;
+mod placement;
 
 impl<W: LayoutElement> Default for Layout<W> {
     fn default() -> Self {

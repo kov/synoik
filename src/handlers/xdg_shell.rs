@@ -48,6 +48,7 @@ use crate::input::move_grab::MoveGrab;
 use crate::input::resize_grab::ResizeGrab;
 use crate::input::touch_resize_grab::TouchResizeGrab;
 use crate::input::{PointerOrTouchStartData, DOUBLE_CLICK_TIME};
+use crate::layout::placement::PlacementSeeds;
 use crate::layout::ActivateWindow;
 use crate::synoik::{CastTarget, PopupGrabState, State};
 use crate::utils::transaction::Transaction;
@@ -440,39 +441,23 @@ impl XdgShellHandler for State {
                     is_pending_maximized,
                     ..
                 } => {
-                    // Figure out the monitor following a similar logic to initial configure.
-                    // FIXME: deduplicate.
-                    let mon = output
-                        .as_ref()
-                        .and_then(|o| self.synoik.layout.monitor_for_output(o))
-                        .map(|mon| (mon, false))
-                        // If not, check if we have a parent with a monitor.
-                        .or_else(|| {
-                            toplevel
-                                .parent()
-                                .and_then(|parent| {
-                                    self.synoik.layout.find_window_and_output(&parent)
-                                })
-                                .and_then(|(_win, output)| output)
-                                .and_then(|o| self.synoik.layout.monitor_for_output(o))
-                                .map(|mon| (mon, true))
-                        })
-                        // If not, fall back to the active monitor.
-                        .or_else(|| {
-                            self.synoik
-                                .layout
-                                .active_monitor_ref()
-                                .map(|mon| (mon, false))
-                        });
+                    // DIVERGENCE, carried over unchanged from before the placement seam: this
+                    // does not seed the stored `workspace_name`, while unmaximize and
+                    // unfullscreen do. So a window with an `open-on-workspace` rule that
+                    // maximizes before mapping is sized against its monitor's *active*
+                    // workspace instead of its target one. Latent rather than live: window
+                    // rules have no config surface since the config file was removed, so
+                    // `open_on_workspace` is only ever set by tests. Left alone here because
+                    // unifying it is a behaviour change, not a refactor.
+                    let parent = toplevel.parent();
+                    let target = self.synoik.layout.resolve_placement(PlacementSeeds {
+                        output: output.as_ref(),
+                        parent: parent.as_ref(),
+                        ..Default::default()
+                    });
 
-                    *output = mon
-                        .filter(|(_, parent)| !parent)
-                        .map(|(mon, _)| mon.output().clone());
-                    let mon = mon.map(|(mon, _)| mon);
-
-                    let ws = mon
-                        .map(|mon| mon.active_workspace_ref())
-                        .or_else(|| self.synoik.layout.active_workspace());
+                    *output = target.output_to_store();
+                    let ws = target.workspace;
 
                     if let Some(ws) = ws {
                         // If the window is pending fullscreen, then this will do nothing. But
@@ -529,50 +514,16 @@ impl XdgShellHandler for State {
                     workspace_name,
                     is_pending_maximized,
                 } => {
-                    // Figure out the monitor following a similar logic to initial configure.
-                    // FIXME: deduplicate.
-                    let mon = workspace_name
-                        .as_deref()
-                        .and_then(|name| self.synoik.layout.monitor_for_workspace(name))
-                        .map(|mon| (mon, false));
-
-                    let mon = mon.or_else(|| {
-                        output
-                            .as_ref()
-                            .and_then(|o| self.synoik.layout.monitor_for_output(o))
-                            .map(|mon| (mon, false))
-                            // If not, check if we have a parent with a monitor.
-                            .or_else(|| {
-                                toplevel
-                                    .parent()
-                                    .and_then(|parent| {
-                                        self.synoik.layout.find_window_and_output(&parent)
-                                    })
-                                    .and_then(|(_win, output)| output)
-                                    .and_then(|o| self.synoik.layout.monitor_for_output(o))
-                                    .map(|mon| (mon, true))
-                            })
-                            // If not, fall back to the active monitor.
-                            .or_else(|| {
-                                self.synoik
-                                    .layout
-                                    .active_monitor_ref()
-                                    .map(|mon| (mon, false))
-                            })
+                    let parent = toplevel.parent();
+                    let target = self.synoik.layout.resolve_placement(PlacementSeeds {
+                        workspace_name: workspace_name.as_deref(),
+                        output: output.as_ref(),
+                        parent: parent.as_ref(),
+                        ..Default::default()
                     });
 
-                    *output = mon
-                        .filter(|(_, parent)| !parent)
-                        .map(|(mon, _)| mon.output().clone());
-                    let mon = mon.map(|(mon, _)| mon);
-
-                    let ws = workspace_name
-                        .as_deref()
-                        .and_then(|name| mon.map(|mon| mon.find_named_workspace(name)))
-                        .unwrap_or_else(|| {
-                            mon.map(|mon| mon.active_workspace_ref())
-                                .or_else(|| self.synoik.layout.active_workspace())
-                        });
+                    *output = target.output_to_store();
+                    let ws = target.workspace;
 
                     if let Some(ws) = ws {
                         // If the window is pending fullscreen, then this will do nothing since
@@ -659,41 +610,18 @@ impl XdgShellHandler for State {
                     // The required configure will be the initial configure.
                 }
                 InitialConfigureState::Configured { rules, output, .. } => {
-                    // Figure out the monitor following a similar logic to initial configure.
-                    // FIXME: deduplicate.
-                    let mon = requested_output
-                        .as_ref()
-                        // If none requested, try currently configured output.
-                        .or(output.as_ref())
-                        .and_then(|o| self.synoik.layout.monitor_for_output(o))
-                        .map(|mon| (mon, false))
-                        // If not, check if we have a parent with a monitor.
-                        .or_else(|| {
-                            toplevel
-                                .parent()
-                                .and_then(|parent| {
-                                    self.synoik.layout.find_window_and_output(&parent)
-                                })
-                                .and_then(|(_win, output)| output)
-                                .and_then(|o| self.synoik.layout.monitor_for_output(o))
-                                .map(|mon| (mon, true))
-                        })
-                        // If not, fall back to the active monitor.
-                        .or_else(|| {
-                            self.synoik
-                                .layout
-                                .active_monitor_ref()
-                                .map(|mon| (mon, false))
-                        });
+                    // Same divergence as `maximize_request`, and unlike `unfullscreen_request`
+                    // below: no `workspace_name` seed. See the note there.
+                    let parent = toplevel.parent();
+                    let target = self.synoik.layout.resolve_placement(PlacementSeeds {
+                        // A requested output wins; otherwise the one we resolved before.
+                        output: requested_output.as_ref().or(output.as_ref()),
+                        parent: parent.as_ref(),
+                        ..Default::default()
+                    });
 
-                    *output = mon
-                        .filter(|(_, parent)| !parent)
-                        .map(|(mon, _)| mon.output().clone());
-                    let mon = mon.map(|(mon, _)| mon);
-
-                    let ws = mon
-                        .map(|mon| mon.active_workspace_ref())
-                        .or_else(|| self.synoik.layout.active_workspace());
+                    *output = target.output_to_store();
+                    let ws = target.workspace;
 
                     if let Some(ws) = ws {
                         toplevel.with_pending_state(|state| {
@@ -745,50 +673,16 @@ impl XdgShellHandler for State {
                     workspace_name,
                     is_pending_maximized,
                 } => {
-                    // Figure out the monitor following a similar logic to initial configure.
-                    // FIXME: deduplicate.
-                    let mon = workspace_name
-                        .as_deref()
-                        .and_then(|name| self.synoik.layout.monitor_for_workspace(name))
-                        .map(|mon| (mon, false));
-
-                    let mon = mon.or_else(|| {
-                        output
-                            .as_ref()
-                            .and_then(|o| self.synoik.layout.monitor_for_output(o))
-                            .map(|mon| (mon, false))
-                            // If not, check if we have a parent with a monitor.
-                            .or_else(|| {
-                                toplevel
-                                    .parent()
-                                    .and_then(|parent| {
-                                        self.synoik.layout.find_window_and_output(&parent)
-                                    })
-                                    .and_then(|(_win, output)| output)
-                                    .and_then(|o| self.synoik.layout.monitor_for_output(o))
-                                    .map(|mon| (mon, true))
-                            })
-                            // If not, fall back to the active monitor.
-                            .or_else(|| {
-                                self.synoik
-                                    .layout
-                                    .active_monitor_ref()
-                                    .map(|mon| (mon, false))
-                            })
+                    let parent = toplevel.parent();
+                    let target = self.synoik.layout.resolve_placement(PlacementSeeds {
+                        workspace_name: workspace_name.as_deref(),
+                        output: output.as_ref(),
+                        parent: parent.as_ref(),
+                        ..Default::default()
                     });
 
-                    *output = mon
-                        .filter(|(_, parent)| !parent)
-                        .map(|(mon, _)| mon.output().clone());
-                    let mon = mon.map(|(mon, _)| mon);
-
-                    let ws = workspace_name
-                        .as_deref()
-                        .and_then(|name| mon.map(|mon| mon.find_named_workspace(name)))
-                        .unwrap_or_else(|| {
-                            mon.map(|mon| mon.active_workspace_ref())
-                                .or_else(|| self.synoik.layout.active_workspace())
-                        });
+                    *output = target.output_to_store();
+                    let ws = target.workspace;
 
                     if let Some(ws) = ws {
                         toplevel.with_pending_state(|state| {
@@ -1077,72 +971,40 @@ impl State {
             return;
         };
 
-        // Pick the target monitor. First, check if we had a workspace set in the window rules.
-        let mon = rules
-            .open_on_workspace
-            .as_deref()
-            .and_then(|name| self.synoik.layout.monitor_for_workspace(name));
-
-        // If not, check if we had an output set in the window rules.
-        let mon = mon.or_else(|| {
-            rules
-                .open_on_output
-                .as_deref()
-                .and_then(|name| {
-                    self.synoik
-                        .global_space
-                        .outputs()
-                        .find(|output| output_matches_name(output, name))
-                })
-                .and_then(|o| self.synoik.layout.monitor_for_output(o))
-        });
-
-        // If not, check if the window requested one for fullscreen.
-        let mon = mon.or_else(|| {
-            wants_fullscreen
-                .as_ref()
-                .and_then(|x| x.as_ref())
-                // The monitor might not exist if the output was disconnected.
-                .and_then(|o| self.synoik.layout.monitor_for_output(o))
-        });
-
-        // If not, check if this is a dialog with a parent, to place it next to the parent.
-        let mon = mon.map(|mon| (mon, false)).or_else(|| {
-            toplevel
-                .parent()
-                .and_then(|parent| self.synoik.layout.find_window_and_output(&parent))
-                .and_then(|(_win, output)| output)
-                .and_then(|o| self.synoik.layout.monitor_for_output(o))
-                .map(|mon| (mon, true))
-        });
-
-        // If not, use the monitor holding the pointer. This is where mutter
-        // seeds `window->monitor` for a window that gave no position hint
-        // (`window.c:1245-1259`), and the same monitor placement later picks up
-        // (`meta_backend_get_current_logical_monitor`, `place.c:951-955`) — the
-        // pointer's, not the one the keyboard focus last landed on. niri's
-        // scrolling mode keeps the active monitor.
-        let mon = mon.or_else(|| {
-            pointer_output
-                .as_ref()
-                .and_then(|output| self.synoik.layout.monitor_for_output(output))
-                .map(|mon| (mon, false))
-        });
-
-        // If not (no outputs, or the pointer is off all of them), the active monitor.
-        let mon = mon.or_else(|| {
+        // Two things can name an output here: the window rules, and a fullscreen request that
+        // came in before the initial configure. Take the first that actually corresponds to a
+        // monitor, so a rule naming a disconnected output doesn't mask the fullscreen request.
+        let rule_output = rules.open_on_output.as_deref().and_then(|name| {
             self.synoik
-                .layout
-                .active_monitor_ref()
-                .map(|mon| (mon, false))
+                .global_space
+                .outputs()
+                .find(|output| output_matches_name(output, name))
+        });
+        let fullscreen_output = wants_fullscreen.as_ref().and_then(|x| x.as_ref());
+        let seed_output = [rule_output, fullscreen_output]
+            .into_iter()
+            .flatten()
+            .find(|o| self.synoik.layout.monitor_for_output(o).is_some());
+
+        let parent = toplevel.parent();
+        let target = self.synoik.layout.resolve_placement(PlacementSeeds {
+            workspace_name: rules.open_on_workspace.as_deref(),
+            output: seed_output,
+            // A dialog with a parent follows it, and `output_to_store` then declines to pin the
+            // output so that mapping re-fetches the parent's, in case it moved in between.
+            parent: parent.as_ref(),
+            // Only the initial configure seeds the pointer. This is where mutter seeds
+            // `window->monitor` for a window that gave no position hint (`window.c:1245-1259`),
+            // and the same monitor placement later picks up
+            // (`meta_backend_get_current_logical_monitor`, `place.c:951-955`) — the pointer's,
+            // not the one the keyboard focus last landed on. niri's scrolling mode keeps the
+            // active monitor. Later requests must not re-consult it, or a window would hop
+            // monitors because the mouse moved.
+            pointer_output: pointer_output.as_ref(),
         });
 
-        // If we're following the parent, don't set the target output, so that when the window is
-        // mapped, it fetches the possibly changed parent's output again, and shows up there.
-        let output = mon
-            .filter(|(_, parent)| !parent)
-            .map(|(mon, _)| mon.output().clone());
-        let mon = mon.map(|(mon, _)| mon);
+        let output = target.output_to_store();
+        let ws = target.workspace;
 
         let mut width = None;
         let mut floating_width = None;
@@ -1151,16 +1013,6 @@ impl State {
         let is_full_width = rules.open_maximized.unwrap_or(false);
         let is_floating = rules
             .compute_open_floating(toplevel, self.synoik.config.borrow().layout.windowing_mode);
-
-        // Tell the surface the preferred size and bounds for its likely output.
-        let ws = rules
-            .open_on_workspace
-            .as_deref()
-            .and_then(|name| mon.map(|mon| mon.find_named_workspace(name)))
-            .unwrap_or_else(|| {
-                mon.map(|mon| mon.active_workspace_ref())
-                    .or_else(|| self.synoik.layout.active_workspace())
-            });
 
         let mut is_pending_maximized = false;
         if let Some(ws) = ws {
