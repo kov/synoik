@@ -184,8 +184,35 @@ Defects first — these are wrong, not merely absent.
 
 Then the absent capabilities, in the order I'd take them:
 
-4. **Subsurfaces** (`layout/tile.rs:1301`). A GTK/Qt client that puts its blurred chrome on a
-   subsurface gets nothing today.
+4. ~~**Subsurfaces.**~~ **DONE 2026-08-07** (`71e9eddb`). Premise checked first and it held, unlike
+   gaps 3 and 8: the region *did* reach the compositor's cache and *nothing* rendered from it, so
+   this was a render-path gap, not a handler one.
+
+   `push_elements_from_surface_tree_with_effects` runs a hook after each surface's own element, and
+   `render_normal` uses it to resolve an effect for any non-root surface carrying a region. The root
+   is skipped — its effect is the window's, still pushed under the whole tile.
+
+   **Semantics (chosen deliberately): a subsurface's backdrop is everything below it, its own parent
+   surface included.** That falls out of the tree walk for nothing — smithay traverses
+   nearest-to-deepest and we push front-to-back, so the effect pushed immediately after its surface
+   is directly underneath it. The alternative (blur only what is behind the whole window) would need
+   the effect hoisted to the bottom and the parent's pixels excluded, and a translucent parent would
+   double-composite.
+
+   Three things worth keeping:
+   - **The tree walk emits one ordered stream**, not two callbacks. Both pushes need the caller's
+     `push` and two closures cannot capture it mutably — and one stream states the ordering
+     constraint instead of leaving it to a merge afterwards.
+   - **`render_for_surface` exists because `render_for_tile` deadlocks here.** The traversal holds a
+     *mutable* lock on each surface's user data while running the processor
+     (`smithay/src/wayland/compositor/tree.rs`), so `with_states` on that same surface re-enters it.
+     No panic, no message — the compositor just stops. The first version did exactly this.
+   - **A test subsurface needs a viewport destination.** A single-pixel buffer is 1x1 and the
+     surface's *view* is what everything else is sized from, so the effect came out one pixel wide
+     while the region said 200x120. `damage_buffer` does not fix that; damage is not size.
+
+   Not seat-validated: no installed client puts a blur region on a subsurface. `tools/blur-probe`
+   could grow a `--subsurface` arm to cover it.
 5. **A contrast/tint step.** We have saturation and noise; KWin's merged contrast matrix and macOS's
    per-material tint are what make light-mode blur legible. Ours is one global recipe with no
    appearance awareness — and the shell plate already follows `color-scheme`
