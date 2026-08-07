@@ -224,6 +224,13 @@ Then the absent capabilities, in the order I'd take them:
    to a flat wash — so "did the subsurface blur its own parent" is answerable at a glance. Harness
    numbers after the fix: local contrast 413 in the parent on all three sides of the child, 3.4
    inside it.
+
+   **Seat-validated 2026-08-07** on gsrs, no debug flags, real partial-damage path. Static at
+   1000x720: local contrast 305/305/311/301 in the parent on all four sides of the child, **18.7**
+   inside it. Under `--pulse`, six frames spanning 752x562 to 1622x1084: the parent band holds
+   305-309 while the child reads 6.6-17.2, a 17x to 47x collapse at every size — so the effect
+   tracks the subsurface through a resize as well as at rest. (The child measures higher than on the
+   harness only because it draws its own sharp grid lines.)
 5. **A contrast/tint step.** We have saturation and noise; KWin's merged contrast matrix and macOS's
    per-material tint are what make light-mode blur legible. Ours is one global recipe with no
    appearance awareness — and the shell plate already follows `color-scheme`
