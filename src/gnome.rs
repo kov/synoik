@@ -3800,7 +3800,19 @@ mod tests {
     ///
     /// Skipped where the originals are not installed: the copies exist precisely for that
     /// case, and there is nothing to compare against.
+    ///
+    /// **`#[ignore]`, and it has to be:** what this compares against is *whatever GNOME the machine
+    /// happens to have*. That is the point on a developer box tracking 50.3, and a hazard anywhere
+    /// else — CI runs Ubuntu 24.04, whose `org.gnome.desktop.wm.keybindings` is GNOME 46, so the
+    /// test reports drift for a version difference rather than for anyone's mistake. Worse, it is
+    /// not opt-in: installing `gsettings-desktop-schemas` for the peripherals tests is what put
+    /// that file on the runner in the first place.
+    ///
+    /// Run it deliberately, on a box matching the reference checkouts, after a GNOME upgrade:
+    /// `cargo test --workspace vendored_schemas_match_the_installed_ones -- --ignored`
     #[test]
+    #[ignore = "compares against the host's GNOME, so it reports version skew as drift; run it by \
+                hand on a 50.3 box after an upgrade"]
     fn vendored_schemas_match_the_installed_ones() {
         let vendored = [
             (
