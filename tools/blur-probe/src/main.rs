@@ -40,7 +40,8 @@ use std::time::{Duration, Instant};
 
 use wayland_client::protocol::{
     wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_region::WlRegion, wl_registry::WlRegistry,
-    wl_shm::{Format, WlShm}, wl_shm_pool::WlShmPool, wl_surface::WlSurface,
+    wl_shm::{Format, WlShm}, wl_shm_pool::WlShmPool, wl_subcompositor::WlSubcompositor,
+    wl_subsurface::WlSubsurface, wl_surface::WlSurface,
 };
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle, WEnum};
 use wayland_protocols::ext::background_effect::v1::client::{
@@ -80,6 +81,10 @@ struct Opts {
     alpha: u8,
     frames: Option<u64>,
     opaque: bool,
+    /// Put the blur on a **subsurface** inset in the toplevel, instead of on the toplevel itself.
+    /// The toplevel then paints an opaque high-frequency pattern, so "did it blur its own parent"
+    /// is answerable by eye.
+    subsurface: bool,
     /// Corner radius for the blur region, in surface-local pixels. Non-zero turns the region into a
     /// scanline stack of rects — which is the only way this protocol can express a round corner,
     /// and what winit (so ghost) sends whenever its radii are non-zero.
@@ -102,6 +107,7 @@ impl Default for Opts {
             frames: None,
             opaque: false,
             radius: 0,
+            subsurface: false,
         }
     }
 }
@@ -159,6 +165,7 @@ fn parse_args() -> Result<Opts, String> {
             "--pulse" => o.pulse = true,
             "--opaque" => o.opaque = true,
             "--radius" => o.radius = value()?.parse().map_err(|_| "bad --radius")?,
+            "--subsurface" => o.subsurface = true,
             "--min" => o.min = parse_size(&value()?)?,
             "--max" => o.max = parse_size(&value()?)?,
             "--period" => o.period = value()?.parse().map_err(|_| "bad --period")?,
@@ -197,6 +204,8 @@ blur-probe — a minimal ext-background-effect-v1 client for isolating blur-lag 
   --radius N        round the region's corners: a scanline stack of rects, as a
                     rounded-corner client must send. Only affects exact/lag.
   --opaque          declare an opaque region — expect the effect to be culled
+  --subsurface      put the blur on an inset subsurface, over an opaque patterned
+                    parent — shows whether a subsurface blurs its own parent
   --frames N        exit after N frames
 
 Read it as: if --region whole lags, the compositor is late re-capturing. If only
@@ -212,6 +221,9 @@ struct State {
     capabilities: Capability,
 
     surface: Option<WlSurface>,
+    subcompositor: Option<WlSubcompositor>,
+    /// The inset subsurface under `--subsurface`, and its own shm arenas.
+    child: Option<(WlSurface, WlSubsurface)>,
     effect: Option<ExtBackgroundEffectSurfaceV1>,
 
     /// The size the compositor last configured us to, if it named one.
@@ -259,6 +271,15 @@ impl State {
         )
     }
 
+    /// The inset subsurface's rect within a parent of `size`.
+    ///
+    /// Kept well inside the parent so there is patterned parent visible on every side of it: the
+    /// whole point of this arm is comparing blurred-through-the-child against sharp-beside-it.
+    fn child_rect(&self, size: (i32, i32)) -> (i32, i32, i32, i32) {
+        let (x, y) = (size.0 / 5, size.1 / 5);
+        ((x, y, (size.0 - 2 * x).max(1), (size.1 - 2 * y).max(1)))
+    }
+
     /// The rects the blur region should hold for a surface of `size`, per `--region`.
     fn region_rects(&self, size: (i32, i32)) -> Vec<(i32, i32, i32, i32)> {
         match self.opts.region {
@@ -304,6 +325,8 @@ fn main() {
         effect_manager: None,
         capabilities: Capability::empty(),
         surface: None,
+        subcompositor: None,
+        child: None,
         effect: None,
         configured: None,
         dictated: false,
@@ -322,6 +345,9 @@ fn main() {
                 state.compositor = Some(globals.registry().bind(global.name, 4.min(global.version), &qh, ()))
             }
             "wl_shm" => state.shm = Some(globals.registry().bind(global.name, 1, &qh, ())),
+            "wl_subcompositor" => {
+                state.subcompositor = Some(globals.registry().bind(global.name, 1, &qh, ()))
+            }
             "xdg_wm_base" => {
                 state.wm_base = Some(globals.registry().bind(global.name, 1, &qh, ()))
             }
@@ -360,7 +386,22 @@ fn main() {
         (Some(manager), true) => {
             // One effect object per surface, for the surface's whole life: a second
             // `get_background_effect` on the same surface is a protocol error.
-            state.effect = Some(manager.get_background_effect(&surface, &qh, ()));
+            let target = if state.opts.subsurface {
+                let subcompositor = state
+                    .subcompositor
+                    .clone()
+                    .expect("--subsurface needs wl_subcompositor");
+                let child = compositor.create_surface(&qh, ());
+                let sub = subcompositor.get_subsurface(&child, &surface, &qh, ());
+                // Desynchronized: otherwise the child's state only lands when the parent commits,
+                // and a probe measuring per-frame behaviour would be reporting the parent's clock.
+                sub.set_desync();
+                state.child = Some((child.clone(), sub));
+                child
+            } else {
+                surface.clone()
+            };
+            state.effect = Some(manager.get_background_effect(&target, &qh, ()));
         }
     }
 
@@ -377,6 +418,7 @@ fn main() {
     );
 
     let mut pool = ShmPool::new();
+    let mut child_pool = ShmPool::new();
     while !state.closed {
         if let Some(limit) = state.opts.frames {
             if state.frame >= limit {
@@ -385,7 +427,15 @@ fn main() {
         }
 
         let size = state.target_size();
-        let rects = state.region_rects(size);
+        // The region is surface-local, so under --subsurface it is stated against the *child's*
+        // size, not the toplevel's.
+        let child_rect = state.child_rect(size);
+        let region_size = if state.opts.subsurface {
+            (child_rect.2, child_rect.3)
+        } else {
+            size
+        };
+        let rects = state.region_rects(region_size);
 
         // Order matters, and it is the order winit uses: state the region for the size we are
         // about to show, then attach the buffer that has that size, then commit — so the region
@@ -414,11 +464,15 @@ fn main() {
 
         let shm = state.shm.clone().unwrap();
         let alpha = state.opts.alpha;
+        // Under --subsurface the toplevel is the thing being blurred *through*, so it is opaque and
+        // finely patterned: blur turns a high-frequency pattern into a flat wash, which is visible
+        // at a glance and measurable as a drop in local contrast.
+        let parent_alpha = if state.opts.subsurface { 255 } else { alpha };
         let (w, h) = (size.0.max(1), size.1.max(1));
         // Wait for an arena the compositor is not still reading. Dispatching is what lets a
         // `release` land, so this cannot be a bare spin.
         let buffer = loop {
-            if let Some(buffer) = pool.try_buffer(&shm, &qh, w, h, alpha) {
+            if let Some(buffer) = pool.try_buffer(&shm, &qh, w, h, parent_alpha, state.opts.subsurface) {
                 break buffer;
             }
             queue
@@ -440,6 +494,25 @@ fn main() {
         surface.attach(Some(&buffer), 0, 0);
         surface.damage_buffer(0, 0, size.0.max(1), size.1.max(1));
         surface.commit();
+
+        // The child, if any. Painted after the parent so its own commit lands in the same frame;
+        // it is desynchronized, so it does not need the parent's commit to take effect.
+        if let Some((child, sub)) = state.child.clone() {
+            let (cx, cy, cw, ch) = child_rect;
+            sub.set_position(cx, cy);
+            let child_buffer = loop {
+                if let Some(b) = child_pool.try_buffer(&shm, &qh, cw, ch, alpha, false) {
+                    break b;
+                }
+                queue
+                    .blocking_dispatch(&mut state)
+                    .expect("dispatch while waiting for a child buffer release");
+            };
+            child.attach(Some(&child_buffer), 0, 0);
+            child.damage_buffer(0, 0, cw, ch);
+            child.commit();
+            surface.commit();
+        }
 
         state.history.push(size);
         // The history only exists to serve `lag:N`; keep it from growing for the whole session.
@@ -517,6 +590,7 @@ impl ShmPool {
         w: i32,
         h: i32,
         alpha: u8,
+        fine: bool,
     ) -> Option<WlBuffer> {
         use rustix::fs::{ftruncate, memfd_create, MemfdFlags};
         use rustix::mm::{mmap, MapFlags, ProtFlags};
@@ -559,7 +633,7 @@ impl ShmPool {
         let offset = slot * self.stride;
         let map = self.map.expect("mapped pool");
         let pixels = unsafe { std::slice::from_raw_parts_mut(map.add(offset), needed) };
-        paint(pixels, w, h, alpha);
+        paint(pixels, w, h, alpha, fine);
 
         self.busy[slot].store(true, std::sync::atomic::Ordering::Relaxed);
         Some(self.pool.as_ref().unwrap().create_buffer(
@@ -581,7 +655,7 @@ impl ShmPool {
 /// blur is a size behind, it stops short of the frame (grow) or runs past it (shrink), and either
 /// is visible without measuring anything. Argb8888 is premultiplied, so every channel is scaled by
 /// the alpha it ships with.
-fn paint(pixels: &mut [u8], w: i32, h: i32, alpha: u8) {
+fn paint(pixels: &mut [u8], w: i32, h: i32, alpha: u8, fine: bool) {
     const BORDER: i32 = 3;
     let a = alpha as u32;
     let premul = |c: u32, a: u32| ((c * a) / 255) as u8;
@@ -589,6 +663,20 @@ fn paint(pixels: &mut [u8], w: i32, h: i32, alpha: u8) {
     for y in 0..h {
         for x in 0..w {
             let edge = x < BORDER || y < BORDER || x >= w - BORDER || y >= h - BORDER;
+            // The parent under `--subsurface` needs a pattern a blur can visibly destroy. Diagonal
+            // stripes at a 6px period average to a flat wash under any real blur radius, so
+            // "is this blurred" is answerable by eye and measurable as a collapse in local
+            // contrast. A 64px grid would survive a small radius and prove nothing.
+            if fine && !edge {
+                let stripe = ((x + y) % 6) < 3;
+                let (r, g, b) = if stripe { (235, 235, 245) } else { (25, 25, 45) };
+                let i = ((y * w + x) * 4) as usize;
+                pixels[i] = b;
+                pixels[i + 1] = g;
+                pixels[i + 2] = r;
+                pixels[i + 3] = 255;
+                continue;
+            }
             let grid = x % 64 == 0 || y % 64 == 0;
             let (r, g, b, a) = if edge {
                 // Opaque, so the window's true extent is never in doubt.
@@ -704,6 +792,8 @@ impl Dispatch<ExtBackgroundEffectManagerV1, ()> for State {
 }
 
 delegate_noop!(State: ignore WlCompositor);
+delegate_noop!(State: ignore WlSubcompositor);
+delegate_noop!(State: ignore WlSubsurface);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore WlRegion);
 delegate_noop!(State: ignore WlShm);

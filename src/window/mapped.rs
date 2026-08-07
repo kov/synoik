@@ -49,7 +49,7 @@ use crate::synoik_render_elements;
 use crate::utils::id::IdCounter;
 use crate::utils::transaction::Transaction;
 use crate::utils::{
-    get_credentials_for_surface, send_scale_transform, update_tiled_state,
+    get_credentials_for_surface, send_scale_transform, surface_geo, update_tiled_state,
     with_toplevel_last_uncommitted_configure, with_toplevel_role, with_toplevel_role_and_current,
     ResizeEdge,
 };
@@ -772,10 +772,21 @@ impl LayoutElement for Mapped {
                         return;
                     }
 
-                    // The walk hands us the surface's own physical origin, which is exactly the
-                    // rect the effect must cover; `render_for_tile` derives the rest from the
-                    // surface's view, so the size it is given here is not load-bearing.
-                    let geometry = Rectangle::new(surface_loc.to_logical(scale), Size::default());
+                    // `surface_loc` is the surface's own origin — the walk has *already* folded in
+                    // this surface's `view.offset`, which is where a subsurface's position lives.
+                    // `render_for_surface` folds that offset in again on its own, so handing it
+                    // `surface_loc` directly double-counts: the effect lands one subsurface-offset
+                    // past the subsurface. Subtract it back out so the two together come to
+                    // `surface_loc` exactly.
+                    //
+                    // Invisible to a test that only checks the effect against its own subregion —
+                    // both move together — which is why the two are pinned apart now.
+                    let view_off = surface_geo(states)
+                        .map(|g| g.loc.to_f64())
+                        .unwrap_or_default();
+                    let origin = surface_loc.to_logical(scale) - view_off;
+                    // The size is not load-bearing: `render_for_surface` takes it from the view.
+                    let geometry = Rectangle::new(origin, Size::default());
                     // `render_for_surface`, not `render_for_tile`: the tree walk already holds a
                     // mutable lock on this surface's data, and re-entering it deadlocks.
                     background_effect::render_for_surface(

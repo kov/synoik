@@ -293,3 +293,38 @@ No lag.
 
 One thing this still does **not** cover: **buffer type.** The probe is `wl_shm`; ghost presents
 dmabuf. The capture path is shared, but commit timing is not obviously identical.
+
+## 7. Resolution, from the ghost side (2026-08-07)
+
+§6 held: the compositor was never at fault, and neither buffer type nor region shape mattered. The
+untested axis was **timing** — not *what* the client says, but *when*. Two client-side causes, one
+mechanism.
+
+**Cause 1 — the blur region.** ghost stated it inside winit's configure callback, while its buffer
+for that configure arrives later (a GPU swapchain presents on its own schedule). Measured over one
+drag: 873 of 1910 commits paired a buffer with a region of another height, out to 162px. Fixed by
+stating the region from the present hook, against the buffer being committed: 0 of 710 after.
+
+Why `exact` looked clean in the probe: the probe draws, attaches and commits *inside* its configure
+handler, so its region and buffer are atomically paired by construction. `exact` cannot express
+ghost's bug — the discriminator it was built for was region *content*, and the defect was region
+*time*.
+
+**Cause 2 — the same thing, one layer up.** `xdg_surface.set_window_geometry`, the CSD frame's size
+and its subsurfaces' placement, the viewport destination: all double-buffered, all sent at configure
+time, all landing on a buffer from before it. 285 of 711 commits published a geometry the buffer
+did not match, out to 216px. Since placement is anchored from the geometry, a **left**-edge drag
+was worse than a right-edge one: the window shifted left while the buffer stayed short, and the
+shortfall opened as bare desktop down the *right*. Fixed the same way — the configure is held until
+a buffer answers it, then applied from the present hook: 802 of 802 commits agree.
+
+Worth recording for any client: a client cannot fix this by refusing to commit early, because the
+commit is not its to time. Mesa's display queue puts the `attach` and `commit` on the wire on its
+own FIFO schedule, and a configure handled meanwhile lands between them. The only reliable pairing
+is to write the state immediately before presenting.
+
+**What this costs, and what a compositor sees.** A correct client now answers a configure with the
+first frame it can draw at that size — one frame, ~18ms at 60Hz, and whatever the frame time is
+under load. That is inherent: an earlier answer is an answer about content that does not exist.
+Compositors that pace interactive resize on the ack will feel this as backpressure rather than as
+lag, which is the honest signal.

@@ -714,11 +714,19 @@ fn a_subsurface_blur_region_blurs_that_subsurface() {
     f.double_roundtrip(id);
 
     // Blurred chrome on a subsurface, inset from the parent so its region cannot be mistaken for
-    // the toplevel's own.
-    let (child, _subsurface) =
+    // the toplevel's own. *Two* of them, at different offsets: the effect's absolute origin is not
+    // checkable against anything the test already knows, but the distance between two of them is,
+    // and it is exactly what a mis-scaled or double-counted offset gets wrong. One subsurface hid a
+    // bug where the surface's own `view.offset` was folded in twice — the effect landed a whole
+    // subsurface-offset past the subsurface, and every self-relative assertion still passed.
+    let (child, _sub) =
         f.client(id)
             .create_subsurface(&parent, 40, 40, 200, 120, [0, 0, u32::MAX, u32::MAX / 2]);
     f.client(id).set_blur_region(&child, (0, 0, 200, 120));
+    let (child2, _sub2) =
+        f.client(id)
+            .create_subsurface(&parent, 140, 90, 200, 120, [0, 0, u32::MAX, u32::MAX / 2]);
+    f.client(id).set_blur_region(&child2, (0, 0, 200, 120));
     // A synchronized subsurface only takes effect when the parent commits.
     f.client(id).window(&parent).commit();
     f.double_roundtrip(id);
@@ -747,14 +755,30 @@ fn a_subsurface_blur_region_blurs_that_subsurface() {
          protocol-seam bug, not the render-path gap this test is about",
     );
 
-    // Half two: an effect resolves for it, at the subsurface's own rect rather than the window's.
+    // Half two: an effect resolves for each, at the subsurface's own rect rather than the window's.
     let samples = sample_effect(&mut f);
-    let sub = samples
+    let mut subs: Vec<_> = samples
         .iter()
-        .find(|s| s.subregion_bbox.is_some())
-        .unwrap_or_else(|| {
-            panic!("no effect resolved for the subsurface's blur region: {samples:?}")
-        });
+        .filter(|s| s.subregion_bbox.is_some())
+        .collect();
+    assert_eq!(
+        subs.len(),
+        2,
+        "expected one effect per blurred subsurface, got {}: {samples:?}",
+        subs.len(),
+    );
+    subs.sort_by(|a, b| a.effect_geometry.loc.x.total_cmp(&b.effect_geometry.loc.x));
+
+    // The two subsurfaces are 100x50 apart, so their effects must be too. A doubled offset puts
+    // them 200x100 apart; a dropped one puts them on top of each other.
+    let delta = subs[1].effect_geometry.loc - subs[0].effect_geometry.loc;
+    assert!(
+        (delta.x - 100.).abs() < 1e-6 && (delta.y - 50.).abs() < 1e-6,
+        "the two subsurfaces are 100x50 apart but their effects are {delta:?} apart — the \
+         subsurface offset is being scaled or counted the wrong number of times",
+    );
+
+    let sub = subs[0];
 
     assert!(
         sub.effect_geometry.size.w >= 200. && sub.effect_geometry.size.h >= 120.,
