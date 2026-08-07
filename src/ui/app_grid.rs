@@ -3233,6 +3233,11 @@ mod tests {
     /// is capped — so past a certain canvas the leftover is dead margin. We scale the mode
     /// instead. One factor for both axes, so a 6x4 becomes 12x8 and never 19x4.
     #[test]
+    #[cfg_attr(
+        not(feature = "reference-env"),
+        ignore = "measures shaped text, so it needs the reference font stack; \
+run it with --features reference-env, as the fedora CI job does"
+    )]
     fn a_roomy_canvas_scales_the_page_mode_up() {
         // Deep as well as wide — a merely wide band cannot grow, since the factor is shared.
         let area = rect(0., 0., 3840., 1900.);
@@ -3335,6 +3340,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "reference-env"),
+        ignore = "measures shaped text, so it needs the reference font stack; \
+run it with --features reference-env, as the fedora CI job does"
+    )]
     fn wide_band_lays_eight_columns_at_ninety_six_px() {
         let l = grid_n(24).layout(wide());
         assert_eq!(l.n_pages, 1);

@@ -1652,6 +1652,11 @@ mod tests {
     /// (`_app-grid.scss:21-37`, `search.js:142` extending it via
     /// `_search-results.scss:58-60`). The dash is the other case and keeps `%tile`.
     #[test]
+    #[cfg_attr(
+        not(feature = "reference-env"),
+        ignore = "measures shaped text, so it needs the reference font stack; \
+run it with --features reference-env, as the fedora CI job does"
+    )]
     fn result_tile_follows_the_overview_tile_rule() {
         // BaseIcon's default `ICON_SIZE` (`iconGrid.js:11,83`), not the dash's 64.
         assert_eq!(RESULT_ICON_PX, 96.);

@@ -3978,6 +3978,11 @@ mod tests {
     /// shell, not a re-derivation of our own constants — the assertion this replaced rebuilt
     /// `logical_size` from the same constants it was checking, so it could not fail.
     #[test]
+    #[cfg_attr(
+        not(feature = "reference-env"),
+        ignore = "measures shaped text, so it needs the reference font stack; \
+run it with --features reference-env, as the fedora CI job does"
+    )]
     fn calendar_matches_the_live_shell() {
         let layout = Layout::new(true);
 
@@ -5057,6 +5062,11 @@ mod tests {
     /// Driven through the real height entry points rather than re-adding up the constants, so
     /// this fails if the border stops being reserved, not merely if a literal is edited.
     #[test]
+    #[cfg_attr(
+        not(feature = "reference-env"),
+        ignore = "measures shaped text, so it needs the reference font stack; \
+run it with --features reference-env, as the fedora CI job does"
+    )]
     fn display_cards_match_the_live_shell() {
         let mut dm = DateMenu::new(0, false, [0, 0, 0], vec![]);
 

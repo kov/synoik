@@ -797,6 +797,11 @@ mod tests {
     /// level's `min-width: 160` sets the column and the label is stretched to match. A model that
     /// sized the column from the label alone would agree on every OSD wide enough to hide it.
     #[test]
+    #[cfg_attr(
+        not(feature = "reference-env"),
+        ignore = "measures shaped text, so it needs the reference font stack; \
+run it with --features reference-env, as the fedora CI job does"
+    )]
     fn the_osd_matches_the_live_shell() {
         let l = layout(
             &OsdContent::icon(&["audio-volume-high-symbolic"])

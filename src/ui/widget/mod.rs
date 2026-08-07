@@ -3759,6 +3759,11 @@ mod tests {
     /// on the small canvases the second line exists for), so the chrome drawn around a
     /// caption grows by the overhang instead.
     #[test]
+    #[cfg_attr(
+        not(feature = "reference-env"),
+        ignore = "measures shaped text, so it needs the reference font stack; \
+run it with --features reference-env, as the fedora CI job does"
+    )]
     fn an_overview_tile_is_a_square_around_its_caption_box() {
         let m = TileMetrics::overview();
         // The caption band is the shared line box, not a number of its own — the tile is a

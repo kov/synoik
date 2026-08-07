@@ -189,6 +189,12 @@ profile-with-tracy-ondemand = ["profile-with-tracy", "tracy-client/ondemand", "t
 profile-with-tracy-allocations = ["profile-with-tracy"]
 # Enables dinit integration (global environment).
 dinit = []
+# Test-only: run the checks that measure *shaped text* — calendar, OSD, app-grid and overview tile
+# geometry compared against the live shell. They assert real pixel sizes, so they only mean anything
+# on the reference font stack (Fedora, Adwaita Sans); anywhere else they report the runner's fonts
+# as a layout bug. Gated as a feature rather than a list of test names in CI so that adding an
+# eighth such test cannot silently leave it unrun. The fedora job turns it on.
+reference-env = []
 
 [lints.clippy]
 new_without_default = "allow"
