@@ -152,9 +152,35 @@ Defects first — these are wrong, not merely absent.
    being visible instead of degrading to an unblurred hole, and `capabilities()` clears the blur bit
    to match. The capabilities event is bind-time only; that is honest while `Blur::off` has no
    runtime writer, and the handler says what to do when one appears.
-3. **No corner rounding for client regions.** `clip_to_geometry` is unreachable, so the blur under a
-   rounded CSD corner is square unless the client's own region is rounded. KWin has a shader for
-   exactly this.
+3. ~~**No corner rounding for client regions.**~~ **MIS-SCOPED — measured 2026-08-07, we already do
+   this exactly.** The premise was that the blur under a rounded CSD corner comes out square. It
+   does not. `FramebufferEffectElement::draw` intersects the damage with the client's region
+   (`framebuffer_effect.rs:282`), and a `wl_region` is the *only* vocabulary this protocol gives a
+   client for a curve — a rounded corner is a scanline stack of rects, which is what winit sends
+   whenever its radii are non-zero. Because the mask is per-rect rather than to the bounding box,
+   that staircase is honoured as-is.
+
+   Pinned on the seat with `tools/blur-probe --region exact --radius N`. Same window, same place,
+   radius 0 vs 260, differenced; then the corner band split by distance from the corner circle's
+   centre:
+
+   | area | what the region does | mean abs diff |
+   |---|---|---|
+   | inside the quarter-disc | keeps it | **0.00** (n=80909) |
+   | the wedge outside it | drops it | **10.02** (n=24716) |
+   | mid-window control | untouched by any radius | **0.00** |
+
+   Exactly zero inside, across eighty thousand pixels. The mask follows the curve to the pixel.
+
+   What is genuinely left is the client that has rounded corners and sends a *square* region. Under
+   this protocol that is the client's choice, not our bug — and we could not fix it if we wanted to,
+   because a CSD client never tells us its radius. `clip_to_geometry` would not help either: it
+   clips to the *window geometry*, is reachable only through a niri window rule, and those went with
+   the config file ([[no-config-file]]). That plumbing is now dead code
+   (`layout/tile.rs:1138` can only ever see `None`) and is a removal candidate, not a feature.
+
+   KWin's shader exists because KWin also drives blur from its own decorations, where it *does* know
+   the radius. We do not decorate client windows.
 
 Then the absent capabilities, in the order I'd take them:
 
@@ -231,10 +257,12 @@ derives the region from the window size whenever the corner radii are non-zero
 (`~/Projects/ghost/vendor/winit/src/platform_impl/linux/wayland/window/state.rs`). winit's own
 resize-invariant `WHOLE_SURFACE` rect is used only at radius 0.
 
-Two things this does **not** cover, and either could still be a real difference from ghost:
+**Region shape was the one open caveat, and it is now closed.** `--region exact --radius 40` under
+the same live pulse — a multi-rect region rebuilt and respecified on every configure, which is
+precisely what ghost does — gives median 1.27, max 1.63. Higher than the square arm's 0.99/1.40 and
+noisier, because a rounded region legitimately leaves some backdrop unblurred near the edges and the
+metric cannot tell that from lag. But it is nowhere near the late-client signature of 2.55/4.10.
+No lag.
 
-- **Buffer type.** The probe is `wl_shm`; ghost presents dmabuf. The capture path is shared, but
-  commit timing is not obviously identical.
-- **Region shape.** The probe's `exact` arm sends **one** rect. Ghost's rounded-corner region is a
-  stack of them (`blur_shape_rects`). A multi-rect region respecified per frame is untested here;
-  adding `--radius` to the probe would close it.
+One thing this still does **not** cover: **buffer type.** The probe is `wl_shm`; ghost presents
+dmabuf. The capture path is shared, but commit timing is not obviously identical.

@@ -80,6 +80,10 @@ struct Opts {
     alpha: u8,
     frames: Option<u64>,
     opaque: bool,
+    /// Corner radius for the blur region, in surface-local pixels. Non-zero turns the region into a
+    /// scanline stack of rects — which is the only way this protocol can express a round corner,
+    /// and what winit (so ghost) sends whenever its radii are non-zero.
+    radius: i32,
 }
 
 impl Default for Opts {
@@ -97,8 +101,39 @@ impl Default for Opts {
             alpha: 90,
             frames: None,
             opaque: false,
+            radius: 0,
         }
     }
+}
+
+/// The rects covering a `w`x`h` rounded rectangle, as a scanline stack.
+///
+/// A `wl_region` is rectangles and nothing else, so a round corner is a staircase — there is no
+/// other vocabulary in this protocol. One row per scanline inside the corner band, the rest as a
+/// single body rect. This is the shape a rounded-corner client sends, and it is what makes the
+/// region multi-rect: the interesting property to test is not the curve but that the compositor
+/// masks the blur per-rect rather than to the bounding box.
+fn rounded_rect_rects(w: i32, h: i32, radius: i32) -> Vec<(i32, i32, i32, i32)> {
+    let r = radius.min(w / 2).min(h / 2);
+    if r <= 0 {
+        return vec![(0, 0, w, h)];
+    }
+    let mut rects = Vec::with_capacity(2 * r as usize + 1);
+    // The straight middle, full width.
+    rects.push((0, r, w, h - 2 * r));
+    for i in 0..r {
+        // Distance from the corner circle's centre to this scanline's midpoint.
+        let dy = (r - i) as f64 - 0.5;
+        let dx = ((r as f64).powi(2) - dy * dy).max(0.0).sqrt();
+        let inset = ((r as f64) - dx).round() as i32;
+        let width = w - 2 * inset;
+        if width <= 0 {
+            continue;
+        }
+        rects.push((inset, i, width, 1));
+        rects.push((inset, h - 1 - i, width, 1));
+    }
+    rects
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -123,6 +158,7 @@ fn parse_args() -> Result<Opts, String> {
             }
             "--pulse" => o.pulse = true,
             "--opaque" => o.opaque = true,
+            "--radius" => o.radius = value()?.parse().map_err(|_| "bad --radius")?,
             "--min" => o.min = parse_size(&value()?)?,
             "--max" => o.max = parse_size(&value()?)?,
             "--period" => o.period = value()?.parse().map_err(|_| "bad --period")?,
@@ -158,6 +194,8 @@ blur-probe — a minimal ext-background-effect-v1 client for isolating blur-lag 
   --max WxH         pulse ceiling (default 1100x800)
   --period MS       one grow-and-shrink cycle (default 3000)
   --alpha N         surface alpha, 0-255 (default 90)
+  --radius N        round the region's corners: a scanline stack of rects, as a
+                    rounded-corner client must send. Only affects exact/lag.
   --opaque          declare an opaque region — expect the effect to be culled
   --frames N        exit after N frames
 
@@ -225,8 +263,10 @@ impl State {
     fn region_rects(&self, size: (i32, i32)) -> Vec<(i32, i32, i32, i32)> {
         match self.opts.region {
             RegionMode::None => Vec::new(),
+            // A radius has no meaning here: the whole point of this arm is a rect that outlives
+            // every size, and a rounded one is size-derived by construction.
             RegionMode::Whole => vec![(0, 0, WHOLE_SURFACE, WHOLE_SURFACE)],
-            RegionMode::Exact => vec![(0, 0, size.0, size.1)],
+            RegionMode::Exact => rounded_rect_rects(size.0, size.1, self.opts.radius),
             RegionMode::Lag(n) => {
                 // `history` does not yet contain this frame's size, so index n from the end.
                 let (w, h) = self
@@ -236,7 +276,7 @@ impl State {
                     .and_then(|i| self.history.get(i))
                     .copied()
                     .unwrap_or(size);
-                vec![(0, 0, w, h)]
+                rounded_rect_rects(w, h, self.opts.radius)
             }
         }
     }

@@ -37,6 +37,17 @@ surface, so it means "all of it" at every size and can never be stale.
 Always run `lag:2` at least once. It is what a known-late client looks like, and it is worth knowing
 whether the reported symptom actually matches that before blaming anything for it.
 
+## Rounded regions
+
+`--radius N` turns the region into a scanline stack of rects, which is the only way this protocol
+can express a curve and what a rounded-corner client sends. It affects `exact` and `lag` only —
+`whole` is resize-invariant by construction, and a rounded rect is size-derived.
+
+Two things it answers. Whether the compositor masks the blur **per-rect or to the bounding box**:
+diff the same window at radius 0 against radius N, then split the corner band by distance from the
+corner circle's centre. Inside the quarter-disc must be zero. And whether a **multi-rect region
+respecified every configure** lags, which is the shape ghost actually sends.
+
 ## Driving it
 
 `--pulse` resizes the window from inside the client, so no mouse and no human are needed — which is
