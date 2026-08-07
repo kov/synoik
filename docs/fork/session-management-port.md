@@ -221,6 +221,17 @@ too-new `version` rejection, and the tombstone-vs-pending-save interaction.
 
 ## Slices
 
+0. **Placement seam — DONE (`d2645598`).** `layout::placement` now owns the monitor/workspace
+   resolution chain that the xdg-shell handlers had open-coded at five sites (four with a
+   `FIXME: deduplicate`). Callers pass `PlacementSeeds`; the order lives in one place. Restore
+   becomes a *writer* of seeds in slice 4 rather than a sixth copy of the chain.
+
+   Two per-site differences were load-bearing and survive as seeds: only the initial configure
+   consults the pointer (so a window can't hop monitors after being configured), and a
+   parent-inherited monitor is not pinned (so dialogs re-fetch at map time). A third is drift —
+   maximize/fullscreen don't seed the stored workspace name while unmaximize/unfullscreen do —
+   carried over unchanged and documented at the call site; see the open question below.
+
 1. **Protocol skeleton** — XML, scanner wiring, the three interfaces, the global, all state in
    memory only, no restore. Lands `basic`, `replace`, `in_use`, unknown-id, and the error tests.
 2. **Persistence** — `src/session_state.rs`, load at startup, debounced + shutdown save.
@@ -246,6 +257,18 @@ This is the *only* thing `reason` is used for. We deliberately do **not** honour
 that `launch` might restore size-only while `session_restore` also restores workspace: a launched
 app ignoring its saved workspace would read as a bug, not a feature. Add a conformance test that
 pins workspace restore under all three reasons so this stays deliberate.
+
+### Open: the maximize/unmaximize workspace-seed drift
+
+Surfaced by slice 0, not decided. `maximize_request` and `fullscreen_request` do not seed the
+stored `workspace_name` when re-resolving a not-yet-mapped window's monitor; `unmaximize_request`
+and `unfullscreen_request` do. So a window with an `open-on-workspace` rule that maximizes before
+mapping is sized against its monitor's *active* workspace instead of its target one.
+
+It is latent rather than live — window rules have no config surface since the config file was
+removed, so `open_on_workspace` is only ever set by tests — and unifying it is a behaviour change
+rather than a refactor, so slice 0 carried it over unchanged and documented it at the call site.
+Worth deciding before slice 4 only if restore ends up seeding a workspace name.
 
 ### Eviction — cap at 1000 sessions, most-recently-used
 
