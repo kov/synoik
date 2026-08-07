@@ -220,6 +220,14 @@ mod vulkan_impl {
             let passes = self.blur_options.map(|o| (o.passes as usize).clamp(1, 31));
             let offset = self.blur_options.map_or(0.0, |o| o.offset) as f32;
 
+            #[cfg(test)]
+            crate::render_helpers::background_effect::trace::record_capture(
+                crate::render_helpers::background_effect::trace::CaptureSample {
+                    dst,
+                    src: src_region,
+                },
+            );
+
             let inner =
                 cache.get_or_insert::<RefCell<Option<BackdropBlur>>, _>(|| RefCell::new(None));
             let mut slot = inner.borrow_mut();

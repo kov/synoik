@@ -389,3 +389,131 @@ fn a_resize_damages_the_ground_the_effect_vacated() {
         uncovered.len(),
     );
 }
+
+/// Does the framebuffer capture grab the rectangle the effect is being drawn at, or the one it was
+/// at last frame?
+///
+/// The recording of the live bug shows the blurred *content* stopping short of the window's leading
+/// edge during a drag while the effect's geometry tracks correctly — so the disagreement, if there
+/// is one, is between the rect handed to `capture_framebuffer` and the sub-region actually blitted
+/// out of the framebuffer. Nothing cheaper can see this: `damage_output` never calls the capture,
+/// so the frame has to be really rendered.
+#[test]
+fn the_capture_grabs_the_rect_the_effect_is_drawn_at() {
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+    use smithay::backend::renderer::Bind;
+    use smithay::utils::{Physical, Size};
+
+    use crate::render_helpers::background_effect::trace;
+    use crate::render_helpers::vulkan::VulkanRenderer;
+    use crate::render_helpers::{RenderCtx, RenderTarget, NATIVE_FOURCC};
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX);
+    window.set_size(400, 300);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let effect = f.client(id).set_blur_region(&surface, (0, 0, 400, 300));
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.synoik_output(1);
+    let size: Size<i32, Physical> = output.current_mode().unwrap().size;
+    let mut tracker = OutputDamageTracker::from_output(&output);
+
+    // One rendered frame, returning what the capture grabbed and where the effect was drawn.
+    let mut frame = |f: &mut Fixture| -> (Vec<trace::CaptureSample>, Vec<trace::EffectSample>) {
+        let _ = trace::take();
+        let _ = trace::take_captures();
+        let output = f.synoik_output(1);
+        let state = f.synoik_state();
+        state
+            .backend
+            .headless()
+            .with_vulkan_renderer(|vk| {
+                let synoik = &mut state.synoik;
+                synoik.update_render_elements(Some(&output));
+                let ctx = RenderCtx {
+                    renderer: vk,
+                    target: RenderTarget::Output,
+                    xray: None,
+                };
+                let elements = synoik.render_to_vec(ctx, &output, false);
+                let mut texture = crate::render_helpers::create_texture(vk, size, NATIVE_FOURCC)
+                    .expect("create offscreen");
+                let mut fb = vk.bind(&mut texture).expect("bind offscreen");
+                // Elements come back front-to-back; the tracker wants them in that same order.
+                tracker
+                    .render_output(vk, &mut fb, 1, &elements, [0., 0., 0., 1.])
+                    .expect("render output");
+            })
+            .expect("the fixture must have a Vulkan renderer");
+        (trace::take_captures(), trace::take())
+    };
+
+    let _ = frame(&mut f);
+    let (c0, e0) = frame(&mut f);
+    eprintln!("--- settled ---");
+    for (c, e) in c0.iter().zip(e0.iter()) {
+        eprintln!("  capture dst={:?} src={:?}", c.dst, c.src);
+        eprintln!(
+            "  effect  geo={:?} xray={} blur={}",
+            e.effect_geometry, e.xray, e.blur
+        );
+    }
+
+    // Grow the window, the way a drag does.
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX);
+    window.set_size(700, 300);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.client(id)
+        .update_blur_region(&effect, &surface, (0, 0, 700, 300));
+    f.double_roundtrip(id);
+
+    for i in 0..3 {
+        let (c, e) = frame(&mut f);
+        eprintln!("--- frame {i} after the grow ---");
+        for s in &c {
+            eprintln!("  capture dst={:?} src={:?}", s.dst, s.src);
+        }
+        for s in &e {
+            eprintln!(
+                "  effect  geo={:?} tile={:?}",
+                s.effect_geometry, s.tile_geometry
+            );
+        }
+        assert!(
+            !c.is_empty(),
+            "the capture must run on a real rendered frame"
+        );
+        for s in &c {
+            assert_eq!(
+                s.src, s.dst,
+                "the capture must grab the rect the effect is drawn at",
+            );
+        }
+    }
+}

@@ -303,10 +303,28 @@ pub mod trace {
         pub effect_geometry: Rectangle<f64, Logical>,
         /// Bounding box of the blur subregion, in the same space as `effect_geometry`.
         pub subregion_bbox: Option<Rectangle<f64, Logical>>,
+        /// Which draw path this resolved to: xray (sample the background-only offscreen) or the
+        /// real-backdrop framebuffer capture.
+        pub xray: bool,
+        /// Whether the blur is on at all.
+        pub blur: bool,
+    }
+
+    /// What the framebuffer capture actually grabbed, as opposed to where the effect was drawn.
+    ///
+    /// `dst` is the element geometry the damage tracker handed to `capture_framebuffer`; `src` is
+    /// the sub-rectangle of the framebuffer that was blitted out of it. If the blur's *content*
+    /// trails the window while its geometry tracks correctly, the disagreement has to show up
+    /// between these two.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct CaptureSample {
+        pub dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+        pub src: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
     }
 
     thread_local! {
         static SAMPLES: RefCell<Vec<EffectSample>> = const { RefCell::new(Vec::new()) };
+        static CAPTURES: RefCell<Vec<CaptureSample>> = const { RefCell::new(Vec::new()) };
     }
 
     /// Drain what has been recorded since the last call.
@@ -316,6 +334,15 @@ pub mod trace {
 
     pub(super) fn record(sample: EffectSample) {
         SAMPLES.with(|s| s.borrow_mut().push(sample));
+    }
+
+    /// Drain the captures recorded since the last call.
+    pub fn take_captures() -> Vec<CaptureSample> {
+        CAPTURES.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    pub fn record_capture(sample: CaptureSample) {
+        CAPTURES.with(|s| s.borrow_mut().push(sample));
     }
 }
 
@@ -389,6 +416,8 @@ pub fn render_for_tile(
             tile_geometry: geometry,
             surface_geo,
             effect_geometry: params.geometry,
+            xray: background_effect.options.xray,
+            blur: background_effect.options.blur,
             subregion_bbox: params.subregion.as_ref().and_then(|region| {
                 region
                     .iter()
