@@ -102,6 +102,50 @@ fn rect_approx_eq(
         && (a.size.h - b.size.h).abs() < EPS
 }
 
+/// Build this frame's elements and hand them to a damage tracker, returning the damage it computed
+/// plus what the effect resolved.
+///
+/// The headless backend's `render` is bookkeeping only — it never builds a damage tracker — so the
+/// whole corpus composites every frame from scratch and *cannot* see a damage bug. The live path
+/// does the opposite: `OutputDamageTracker` redraws only what it is told changed, and whatever it
+/// skips keeps whatever the recycled buffer already held. Driving the tracker by hand is the only
+/// way to put that logic under test.
+fn sample_with_damage(
+    f: &mut Fixture,
+    tracker: &mut smithay::backend::renderer::damage::OutputDamageTracker,
+) -> (
+    Vec<smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
+    Vec<crate::render_helpers::background_effect::trace::EffectSample>,
+) {
+    use crate::render_helpers::background_effect::trace;
+    use crate::render_helpers::{RenderCtx, RenderTarget};
+
+    let _ = trace::take();
+
+    let output = f.synoik_output(1);
+    let state = f.synoik_state();
+    let damage = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            let elements = synoik.render_to_vec(ctx, &output, false);
+            // age 1: the buffer we would be drawing into holds the previous frame, which is the
+            // situation partial damage exists for and the one that can show stale content.
+            let (damage, _states) = tracker.damage_output(1, &elements).expect("damage output");
+            damage.cloned().unwrap_or_default()
+        })
+        .expect("the fixture must have a Vulkan renderer");
+
+    (damage, trace::take())
+}
+
 /// The effect must track the *tile* through a resize, subregion included — including the frames
 /// in the middle of the resize animation, where the client's buffer has already grown but the
 /// tile has not caught up.
@@ -246,5 +290,102 @@ fn unsetting_the_blur_region_removes_it() {
     assert!(
         compositor_blur_rects(&mut f).is_none(),
         "a NULL region must clear the blur, not leave the last one in the cache",
+    );
+}
+
+/// A resize must damage everything the effect used to cover as well as everything it now covers.
+///
+/// This is the assertion the corpus structurally could not make before: with partial damage, any
+/// pixel outside the reported damage keeps whatever the recycled buffer held, so an effect that
+/// moves or resizes without damaging the ground it vacated leaves the old blur on screen — a glass
+/// pane sitting where the window no longer is.
+#[test]
+fn a_resize_damages_the_ground_the_effect_vacated() {
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+    use smithay::utils::Rectangle;
+
+    use crate::render_helpers::vulkan::VulkanRenderer;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX);
+    window.set_size(600, 500);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let effect = f.client(id).set_blur_region(&surface, (0, 0, 600, 500));
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.synoik_output(1);
+    let mut tracker = OutputDamageTracker::from_output(&output);
+    let scale = output.current_scale().fractional_scale();
+
+    // Two settled frames, so the tracker has history and stops reporting full damage.
+    let _ = sample_with_damage(&mut f, &mut tracker);
+    let (_, before) = sample_with_damage(&mut f, &mut tracker);
+    let old_effect = before
+        .first()
+        .expect("the effect must render before the resize")
+        .effect_geometry;
+
+    // Shrink: the effect gives up ground, which is the direction that can leave residue.
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX);
+    window.set_size(300, 250);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.client(id)
+        .update_blur_region(&effect, &surface, (0, 0, 300, 250));
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    let (damage, after) = sample_with_damage(&mut f, &mut tracker);
+    let new_effect = after
+        .first()
+        .expect("the effect must still render after the resize")
+        .effect_geometry;
+
+    assert!(
+        new_effect.size.w < old_effect.size.w,
+        "precondition: the effect should have shrunk ({:?} -> {:?})",
+        old_effect.size,
+        new_effect.size,
+    );
+
+    // Every pixel the effect used to cover has to be repainted by somebody this frame.
+    let vacated: Rectangle<i32, smithay::utils::Physical> =
+        old_effect.to_physical_precise_round(scale);
+    let uncovered = damage.iter().fold(vec![vacated], |acc, d| {
+        acc.into_iter()
+            .flat_map(|r| Rectangle::subtract_rect(r, *d))
+            .collect()
+    });
+
+    assert!(
+        uncovered.is_empty(),
+        "the effect shrank from {old_effect:?} to {new_effect:?}, but {} sub-rect(s) of the \
+         ground it vacated were never damaged: {uncovered:?}\ndamage was: {damage:?}",
+        uncovered.len(),
     );
 }
