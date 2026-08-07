@@ -146,6 +146,51 @@ fn sample_with_damage(
     (damage, trace::take())
 }
 
+/// Render one real frame through `tracker`, returning what the capture grabbed and what the effect
+/// resolved. Unlike `sample_with_damage` this actually draws, which is the only way
+/// `capture_framebuffer` runs at all.
+fn render_frame(
+    f: &mut Fixture,
+    tracker: &mut smithay::backend::renderer::damage::OutputDamageTracker,
+) -> (
+    Vec<crate::render_helpers::background_effect::trace::CaptureSample>,
+    Vec<crate::render_helpers::background_effect::trace::EffectSample>,
+) {
+    use smithay::backend::renderer::Bind;
+    use smithay::utils::{Physical, Size};
+
+    use crate::render_helpers::background_effect::trace;
+    use crate::render_helpers::{create_texture, RenderCtx, RenderTarget, NATIVE_FOURCC};
+
+    let _ = trace::take();
+    let _ = trace::take_captures();
+
+    let output = f.synoik_output(1);
+    let size: Size<i32, Physical> = output.current_mode().unwrap().size;
+    let state = f.synoik_state();
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                xray: None,
+            };
+            let elements = synoik.render_to_vec(ctx, &output, false);
+            let mut texture = create_texture(vk, size, NATIVE_FOURCC).expect("create offscreen");
+            let mut fb = vk.bind(&mut texture).expect("bind offscreen");
+            tracker
+                .render_output(vk, &mut fb, 1, &elements, [0., 0., 0., 1.])
+                .expect("render output");
+        })
+        .expect("the fixture must have a Vulkan renderer");
+
+    (trace::take_captures(), trace::take())
+}
+
 /// The effect must track the *tile* through a resize, subregion included — including the frames
 /// in the middle of the resize animation, where the client's buffer has already grown but the
 /// tile has not caught up.
@@ -516,4 +561,115 @@ fn the_capture_grabs_the_rect_the_effect_is_drawn_at() {
             );
         }
     }
+}
+
+/// Moving a backdrop effect must re-capture, even when nothing behind it changed.
+///
+/// The tracker asks for a recapture only when damage from something *below* the element overlaps
+/// it — an element's own damage is skipped (`element_damage_index` starts past its own z-index).
+/// That is right for an ordinary element and wrong for one whose content is a picture of what sits
+/// behind it: move it and it should be showing a different part of the desktop, but nothing in that
+/// condition says so, so the cached blur from the old position is reused at the new one.
+///
+/// `CenterWindow` is the clean form of the case: the geometry's origin moves, the size does not,
+/// the client commits nothing and the wallpaper below is untouched.
+#[test]
+fn moving_the_effect_recaptures_even_with_a_static_backdrop() {
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+
+    use crate::render_helpers::vulkan::VulkanRenderer;
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    // Translucent on purpose: a client that asks for a backdrop blur is asking for the backdrop to
+    // show through it. An *opaque* buffer would fully occlude the effect below it, and the damage
+    // tracker culls fully-occluded elements before the framebuffer-effect scan ever sees them —
+    // the effect would then never capture for a reason that has nothing to do with this test.
+    let window = f.client(id).window(&surface);
+    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX / 2);
+    window.set_size(400, 300);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    f.client(id).set_blur_region(&surface, (0, 0, 400, 300));
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.synoik_output(1);
+    let mut tracker = OutputDamageTracker::from_output(&output);
+
+    // Settle: a few frames so the tracker has history and the caches are warm.
+    let mut before = Vec::new();
+    for _ in 0..3 {
+        let (_, sample) = render_frame(&mut f, &mut tracker);
+        if !sample.is_empty() {
+            before = sample;
+        }
+    }
+    let old_geo = before
+        .first()
+        .expect("the effect must render before the move")
+        .effect_geometry;
+
+    // The control that keeps this test honest. A settled frame with nothing happening must NOT
+    // re-capture: if it does, the assertion below passes no matter what the tracker decides about
+    // the move, and the test is decoration. This is not hypothetical — it was exactly that until
+    // the panel stopped minting a fresh element `Id` every frame, which set `force_effect_redraw`
+    // and made every effect on the output re-capture unconditionally
+    // (`nothing_churns_its_element_id_per_frame`).
+    let (idle, _) = render_frame(&mut f, &mut tracker);
+    let idle_geo =
+        old_geo.to_physical_precise_round(f.synoik_output(1).current_scale().fractional_scale());
+    assert!(
+        !idle.iter().any(|c| c.dst == idle_geo),
+        "control failed: the effect re-captured on an idle frame, so this test cannot tell \
+         whether *moving* it is what causes a re-capture.\ncaptures: {idle:?}",
+    );
+
+    // Move it. Nothing behind it changes; the client is not even told.
+    f.synoik_state()
+        .do_action(synoik_config::Action::CenterWindow, false);
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    let (captures, after) = render_frame(&mut f, &mut tracker);
+    let new_geo = after
+        .first()
+        .expect("the effect must render after the move")
+        .effect_geometry;
+
+    assert_ne!(
+        old_geo.loc, new_geo.loc,
+        "precondition: the window should have moved",
+    );
+
+    let scale = f.synoik_output(1).current_scale().fractional_scale();
+    let want = new_geo.to_physical_precise_round(scale);
+    assert!(
+        captures.iter().any(|c| c.dst == want),
+        "the effect moved from {:?} to {:?} but never re-captured the framebuffer, so it is \
+         still showing the backdrop from where it used to be.\ncaptures this frame: {:?}",
+        old_geo.loc,
+        new_geo.loc,
+        captures,
+    );
 }
