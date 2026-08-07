@@ -41,7 +41,7 @@ use smithay::wayland::xdg_foreign::{XdgForeignHandler, XdgForeignState};
 use smithay::{
     delegate_kde_decoration, delegate_xdg_decoration, delegate_xdg_foreign, delegate_xdg_shell,
 };
-use synoik_config::PresetSize;
+use synoik_config::{PresetSize, WindowingMode};
 use tracing::field::Empty;
 
 use crate::input::move_grab::MoveGrab;
@@ -1047,6 +1047,13 @@ impl State {
     pub fn send_initial_configure(&mut self, toplevel: &ToplevelSurface) {
         let _span = tracy_client::span!("State::send_initial_configure");
 
+        // Resolved up here because `output_under_cursor` borrows all of
+        // `self.synoik`, which the `unmapped_windows` borrow below rules out.
+        let pointer_output = (self.synoik.config.borrow().layout.windowing_mode
+            == WindowingMode::Floating)
+            .then(|| self.synoik.output_under_cursor())
+            .flatten();
+
         let Some(unmapped) = self.synoik.unmapped_windows.get_mut(toplevel.wl_surface()) else {
             error!("window must be present in unmapped_windows in send_initial_configure()");
             return;
@@ -1109,7 +1116,20 @@ impl State {
                 .map(|mon| (mon, true))
         });
 
-        // If not, use the active monitor.
+        // If not, use the monitor holding the pointer. This is where mutter
+        // seeds `window->monitor` for a window that gave no position hint
+        // (`window.c:1245-1259`), and the same monitor placement later picks up
+        // (`meta_backend_get_current_logical_monitor`, `place.c:951-955`) — the
+        // pointer's, not the one the keyboard focus last landed on. niri's
+        // scrolling mode keeps the active monitor.
+        let mon = mon.or_else(|| {
+            pointer_output
+                .as_ref()
+                .and_then(|output| self.synoik.layout.monitor_for_output(output))
+                .map(|mon| (mon, false))
+        });
+
+        // If not (no outputs, or the pointer is off all of them), the active monitor.
         let mon = mon.or_else(|| {
             self.synoik
                 .layout

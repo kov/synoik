@@ -2750,6 +2750,53 @@ fn new_windows_center_by_default() {
     );
 }
 
+/// mutter places a first-shown window on the monitor holding the *pointer*
+/// (`meta_backend_get_current_logical_monitor`, place.c:951-955), not on the
+/// monitor the keyboard focus last landed on.
+#[test]
+fn new_windows_open_on_the_pointer_monitor() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (1920, 1080));
+
+    // Whichever output sits on the right, asked rather than assumed.
+    let mut outs = [f.synoik_output(1), f.synoik_output(2)];
+    outs.sort_by_key(|o| f.synoik().global_space.output_geometry(o).unwrap().loc.x);
+    let (left, right) = (outs[0].clone(), outs[1].clone());
+    let right_geo = f.synoik().global_space.output_geometry(&right).unwrap();
+
+    // Park the pointer on the right-hand output while the left one is active.
+    // Without this precondition the assertion below could not tell the pointer
+    // monitor from the active one.
+    pointer_motion_to(
+        &mut f,
+        right_geo.loc.x as f64 + 100.,
+        right_geo.loc.y as f64 + 100.,
+    );
+    assert_eq!(
+        f.synoik().layout.active_output(),
+        Some(&left),
+        "precondition: moving the pointer must not have changed the active monitor"
+    );
+
+    let id = f.add_client();
+    let _surface = map_window_sized(&mut f, id, (400, 300), None);
+
+    let synoik = f.synoik();
+    let win = synoik.layout.focus().unwrap().window.clone();
+    let placed = synoik
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&win))
+        .and_then(|(mon, _, _)| mon)
+        .map(|mon| mon.output().clone());
+    assert_eq!(
+        placed,
+        Some(right),
+        "a new window must open on the monitor under the pointer"
+    );
+}
+
 /// `org.gnome.mutter auto-maximize` off leaves an oversized window alone
 /// (place.c:1088 gates the whole branch on the pref).
 #[test]
