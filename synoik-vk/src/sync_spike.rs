@@ -395,8 +395,10 @@ impl Drop for BusyWork<'_> {
         unsafe {
             let _ = device.device_wait_idle();
             device.destroy_buffer(self.buf_a, None);
+            crate::devmem::untrack(self.mem_a);
             device.free_memory(self.mem_a, None);
             device.destroy_buffer(self.buf_b, None);
+            crate::devmem::untrack(self.mem_b);
             device.free_memory(self.mem_b, None);
             device.destroy_command_pool(self.pool, None);
         }

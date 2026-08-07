@@ -105,6 +105,7 @@ impl HostStaging {
                 Ok(ptr) => ptr as *mut u8,
                 Err(err) => {
                     device.destroy_buffer(buffer, None);
+                    crate::devmem::untrack(memory);
                     device.free_memory(memory, None);
                     return Err(err);
                 }
@@ -160,6 +161,7 @@ impl Drop for HostStaging {
         unsafe {
             self.gpu.device.unmap_memory(self.memory);
             self.gpu.device.destroy_buffer(self.buffer, None);
+            crate::devmem::untrack(self.memory);
             self.gpu.device.free_memory(self.memory, None);
         }
     }
@@ -235,6 +237,7 @@ impl StagingChunk {
                 Ok(ptr) => ptr as *mut u8,
                 Err(err) => {
                     device.destroy_buffer(buffer, None);
+                    crate::devmem::untrack(memory);
                     device.free_memory(memory, None);
                     return Err(err);
                 }
@@ -283,6 +286,7 @@ impl Drop for StagingChunk {
         unsafe {
             self.gpu.device.unmap_memory(self.memory);
             self.gpu.device.destroy_buffer(self.buffer, None);
+            crate::devmem::untrack(self.memory);
             self.gpu.device.free_memory(self.memory, None);
         }
     }

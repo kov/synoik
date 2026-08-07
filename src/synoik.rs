@@ -216,6 +216,15 @@ use crate::wallpaper::Wallpaper;
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
 
+/// How often the live device-memory census is logged (DEBUG only).
+///
+/// Long enough that a whole session's worth of lines stays readable in the journal, short enough to
+/// see a leak's slope inside one sitting.
+const DEVICE_MEMORY_CENSUS_PERIOD: Duration = Duration::from_secs(30);
+
+/// Log target for that census, kept off `synoik`'s own tree so it can be enabled by itself.
+const DEVICE_MEMORY_CENSUS_TARGET: &str = "devmem";
+
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 
 /// The screen shield's wash over the wallpaper: black at `1 - BLUR_BRIGHTNESS`, which multiplies
@@ -6937,6 +6946,25 @@ impl Synoik {
                 Ok(PostAction::Continue)
             })
             .unwrap();
+
+        // Census the live `VkDeviceMemory` into the log, so a long session leaves a time series a
+        // leak's slope is readable from. It is a *timer* and not a per-frame hook on purpose:
+        // memory this instrument exists to find (see `synoik_vk::devmem`) lives on the host, in the
+        // VMM, where no guest process accounting reaches it — an idle compositor that is quietly
+        // retaining is exactly the case a frame-driven sample would miss.
+        //
+        // On its own `devmem` target so a seat can turn the census on *alone*
+        // (`RUST_LOG=synoik=info,devmem=debug`) instead of running a whole desktop at debug for the
+        // days a slow leak takes to show — which is noisy enough that nobody would leave it on, and
+        // an instrument nobody leaves on measures nothing.
+        if tracing::enabled!(target: DEVICE_MEMORY_CENSUS_TARGET, tracing::Level::DEBUG) {
+            event_loop
+                .insert_source(Timer::immediate(), |_, _, _state| {
+                    debug!(target: DEVICE_MEMORY_CENSUS_TARGET, "{}", synoik_vk::devmem::report(8));
+                    TimeoutAction::ToDuration(DEVICE_MEMORY_CENSUS_PERIOD)
+                })
+                .unwrap();
+        }
 
         event_loop
             .insert_source(

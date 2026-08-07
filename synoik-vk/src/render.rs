@@ -332,6 +332,11 @@ impl RenderTarget {
             .allocation_size(req.size)
             .memory_type_index(index);
         let memory = unsafe { device.allocate_memory(&alloc, None) }.context("target memory")?;
+        crate::devmem::track(
+            memory,
+            req.size,
+            crate::devmem::Site::Explicit("render-target"),
+        );
         unsafe { device.bind_image_memory(image, memory, 0)? };
 
         let view_ci = vk::ImageViewCreateInfo::default()
@@ -408,6 +413,7 @@ impl RenderTarget {
             .allocation_size(req.size)
             .memory_type_index(index);
         let buf_mem = unsafe { device.allocate_memory(&alloc, None) }.context("readback memory")?;
+        crate::devmem::track(buf_mem, req.size, crate::devmem::Site::Explicit("readback"));
         unsafe { device.bind_buffer_memory(buffer, buf_mem, 0)? };
 
         gpu.run_commands(pool, crate::stats::SubmitSite::Readback, |cbuf| unsafe {
@@ -452,6 +458,7 @@ impl RenderTarget {
             std::ptr::copy_nonoverlapping(ptr, pixels.as_mut_ptr(), size as usize);
             device.unmap_memory(buf_mem);
             device.destroy_buffer(buffer, None);
+            crate::devmem::untrack(buf_mem);
             device.free_memory(buf_mem, None);
         }
         Ok(pixels)
@@ -464,6 +471,7 @@ impl RenderTarget {
             d.destroy_render_pass(self.render_pass, None);
             d.destroy_image_view(self.view, None);
             d.destroy_image(self.image, None);
+            crate::devmem::untrack(self.memory);
             d.free_memory(self.memory, None);
         }
     }

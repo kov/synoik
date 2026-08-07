@@ -88,12 +88,14 @@ impl Drop for UploadGuard<'_> {
                 d.destroy_image(self.image, None);
             }
             if self.memory != vk::DeviceMemory::null() {
+                crate::devmem::untrack(self.memory);
                 d.free_memory(self.memory, None);
             }
             if self.staging != vk::Buffer::null() {
                 d.destroy_buffer(self.staging, None);
             }
             if self.smem != vk::DeviceMemory::null() {
+                crate::devmem::untrack(self.smem);
                 d.free_memory(self.smem, None);
             }
         }
@@ -152,6 +154,7 @@ impl Drop for TextureGuard<'_> {
                 d.destroy_image(self.image, None);
             }
             if self.memory != vk::DeviceMemory::null() {
+                crate::devmem::untrack(self.memory);
                 d.free_memory(self.memory, None);
             }
         }
@@ -653,6 +656,11 @@ impl Texture {
             .push_next(&mut dedicated);
         let memory = unsafe { device.allocate_memory(&alloc_info, None) }
             .context("allocate exportable scanout memory")?;
+        crate::devmem::track(
+            memory,
+            mem_req.size,
+            crate::devmem::Site::Explicit("scanout-export"),
+        );
         guard.memory = memory;
         unsafe { device.bind_image_memory(image, memory, 0) }
             .context("bind scanout image memory")?;
@@ -827,6 +835,11 @@ impl Texture {
             drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
             anyhow::anyhow!("import dmabuf render-target memory (vkAllocateMemory): {e}")
         })?;
+        crate::devmem::track(
+            memory,
+            mem_req.size,
+            crate::devmem::Site::Explicit("dmabuf-import-render-target"),
+        );
         guard.memory = memory;
         unsafe { device.bind_image_memory(image, memory, 0) }
             .context("bind imported render-target memory")?;
@@ -977,6 +990,11 @@ impl Texture {
             drop(unsafe { OwnedFd::from_raw_fd(raw_fd) });
             anyhow::anyhow!("import sampled dmabuf memory (vkAllocateMemory): {e}")
         })?;
+        crate::devmem::track(
+            memory,
+            mem_req.size,
+            crate::devmem::Site::Explicit("dmabuf-import-sampled"),
+        );
         guard.memory = memory;
         unsafe { device.bind_image_memory(image, memory, 0) }
             .context("bind imported sampled memory")?;
@@ -1121,6 +1139,7 @@ impl Texture {
         // device on a wait error, so freeing here can't race an in-flight submission.
         unsafe {
             device.destroy_buffer(staging, None);
+            crate::devmem::untrack(smem);
             device.free_memory(smem, None);
         }
         match result {
@@ -1358,6 +1377,7 @@ impl Texture {
             d.destroy_sampler(self.sampler, None);
             d.destroy_image_view(self.view, None);
             d.destroy_image(self.image, None);
+            crate::devmem::untrack(self.memory);
             d.free_memory(self.memory, None);
         }
     }
@@ -1686,6 +1706,7 @@ impl Staging {
         {
             unsafe {
                 device.destroy_buffer(buffer, None);
+                crate::devmem::untrack(memory);
                 device.free_memory(memory, None);
             }
             return Err(e);
@@ -1746,6 +1767,7 @@ impl Staging {
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
         if self.memory != vk::DeviceMemory::null() {
             device.destroy_buffer(self.buffer, None);
+            crate::devmem::untrack(self.memory);
             device.free_memory(self.memory, None);
         }
         self.buffer = vk::Buffer::null();
@@ -1782,6 +1804,7 @@ impl Drop for GlyphStaging {
     fn drop(&mut self) {
         unsafe {
             self.gpu.device.destroy_buffer(self.buffer, None);
+            crate::devmem::untrack(self.memory);
             self.gpu.device.free_memory(self.memory, None);
         }
     }

@@ -187,6 +187,7 @@ impl Drop for NewGuard<'_> {
                 d.destroy_framebuffer(level.framebuffer, None);
                 d.destroy_image_view(level.view, None);
                 d.destroy_image(level.image, None);
+                crate::devmem::untrack(level.memory);
                 d.free_memory(level.memory, None);
             }
             d.destroy_pipeline(self.down, None);
@@ -710,6 +711,7 @@ impl BlurChain {
             std::ptr::copy_nonoverlapping(ptr, pixels.as_mut_ptr(), size as usize);
             device.unmap_memory(mem);
             device.destroy_buffer(buffer, None);
+            crate::devmem::untrack(mem);
             device.free_memory(mem, None);
         }
         Ok(pixels)
@@ -824,6 +826,7 @@ impl BlurChain {
                 d.destroy_framebuffer(level.framebuffer, None);
                 d.destroy_image_view(level.view, None);
                 d.destroy_image(level.image, None);
+                crate::devmem::untrack(level.memory);
                 d.free_memory(level.memory, None);
             }
             if let Some(g) = &self.gaussian {

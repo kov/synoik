@@ -19,6 +19,7 @@
 //! modules that need it, so both the library and the binary target share one shader build.
 
 pub mod blur;
+pub mod devmem;
 pub mod dmabuf;
 pub mod gpu;
 pub mod probes;

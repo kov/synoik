@@ -279,6 +279,11 @@ impl ImportedImage {
         // On failure `raw_fd` leaks (Vulkan only takes ownership on success) — spike-level.
         let memory = unsafe { device.allocate_memory(&alloc_info, None) }
             .context("import dmabuf memory (vkAllocateMemory)")?;
+        crate::devmem::track(
+            memory,
+            mem_req.size,
+            crate::devmem::Site::Explicit("dmabuf-import"),
+        );
         unsafe { device.bind_image_memory(image, memory, 0) }.context("bind imported memory")?;
 
         // Acquire the content: the producer is outside Vulkan, so transfer ownership from the
@@ -342,6 +347,7 @@ impl ImportedImage {
             d.destroy_sampler(self.sampler, None);
             d.destroy_image_view(self.view, None);
             d.destroy_image(self.image, None);
+            crate::devmem::untrack(self.memory);
             d.free_memory(self.memory, None);
         }
     }

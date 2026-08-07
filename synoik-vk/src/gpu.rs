@@ -631,6 +631,10 @@ impl Gpu {
     }
 
     /// Allocate device memory sized/typed for `req` with the given property `flags`.
+    ///
+    /// `#[track_caller]` so [`crate::devmem`] attributes the block to whoever asked for it rather
+    /// than to this line — the site label is the whole value of the accounting.
+    #[track_caller]
     pub fn allocate(
         &self,
         req: vk::MemoryRequirements,
@@ -640,7 +644,14 @@ impl Gpu {
         let info = vk::MemoryAllocateInfo::default()
             .allocation_size(req.size)
             .memory_type_index(index);
-        unsafe { self.device.allocate_memory(&info, None) }.context("allocate_memory")
+        let memory =
+            unsafe { self.device.allocate_memory(&info, None) }.context("allocate_memory")?;
+        crate::devmem::track(
+            memory,
+            req.size,
+            crate::devmem::Site::Caller(std::panic::Location::caller()),
+        );
+        Ok(memory)
     }
 
     /// Submit `cbufs` on the queue, chained after every previous submit, signalling `fence`.
