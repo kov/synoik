@@ -278,10 +278,19 @@ Then the absent capabilities, in the order I'd take them:
    a 100-plus luminance difference that was entirely wallpaper. A/B the same scheme against a
    tint-disabled build instead.
 
-   **Not yet seat-validated end-to-end.** The unit guard proves a `dark_style` change damages and
-   redraws; what the harness could not show is the *gsettings notification* reaching `dark_style`
-   live, because a live `gsettings set` there changed nothing at all — not even the wallpaper — the
-   known dconf-notification trap in that environment, not this code.
+   **Seat-validated 2026-08-07**, including the live path. Set both `picture-uri` and
+   `picture-uri-dark` to the *same* image (that is what makes the A/B possible at all, per the trap
+   above), put a translucent client over it, and flip `color-scheme` with the window untouched:
+   inside the window **60.0 → 23.3** luminance, wallpaper beside it **51.3 → 51.3**. Zero backdrop
+   drift, so all 36.7 is tint, and it repainted *live* — no commit, no move, no resize. That also
+   settles what the harness could not: the gsettings notification does reach `dark_style` on a real
+   seat. The harness's failure to show it was the known dconf-notification trap there (a live
+   `gsettings set` changed nothing at all, not even the wallpaper), not this code. Signed off on the
+   seat with ghost, both appearances.
+
+   **Possible follow-up, not scheduled:** expose the recipe through a synoik gsettings schema of our
+   own, so the tint is tunable rather than compiled in (Gustavo, 2026-08-07 — "looks great the way
+   it is right now", so this is an option, not a defect).
 6. **Active/inactive fallback**, macOS-style: an unfocused window stops paying for a live blur and
    gains a focus cue. Cheapest perf win on the list.
 7. **XWayland** `_KDE_NET_WM_BLUR_BEHIND_REGION`.
