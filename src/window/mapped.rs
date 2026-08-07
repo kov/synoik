@@ -1495,6 +1495,10 @@ impl LayoutElement for Mapped {
         self.toplevel().parent().as_ref() == Some(parent.toplevel().wl_surface())
     }
 
+    fn is_transient(&self) -> bool {
+        self.toplevel().parent().is_some()
+    }
+
     fn edge_tiled_side(&self) -> Option<TileSide> {
         self.edge_tiled_side
     }

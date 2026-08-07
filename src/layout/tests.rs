@@ -260,6 +260,10 @@ impl LayoutElement for TestWindow {
         self.0.parent_id.get() == Some(parent.0.id)
     }
 
+    fn is_transient(&self) -> bool {
+        self.0.parent_id.get().is_some()
+    }
+
     fn refresh(&self) {}
 
     fn rules(&self) -> &ResolvedWindowRules {

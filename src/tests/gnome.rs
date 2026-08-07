@@ -2750,6 +2750,41 @@ fn new_windows_center_by_default() {
     );
 }
 
+/// A dialog is not an obstacle: `rectangle_overlaps_some_window` skips dialog
+/// types (place.c:503-548), so a window may first-fit into a slot a dialog
+/// covers instead of falling through to the cascade. Dialogs still *offer*
+/// candidate positions — place.c:698 and :724 walk the unfiltered list.
+#[test]
+fn dialogs_do_not_block_first_fit() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik().layout.set_gnome_center_new_windows(false);
+    let id = f.add_client();
+
+    // Work area (0, 32) 1920 × 1048.
+    let parent = map_window_sized(&mut f, id, (100, 100), None);
+    let parent_pos = focused_window_pos(&mut f);
+
+    // Centered on the parent, this 400 × 400 dialog clamps to the work-area
+    // corner and covers (0, 32)–(400, 432).
+    let _dialog = map_window_sized(&mut f, id, (400, 400), Some(&parent));
+    assert_pos_eq(focused_window_pos(&mut f), (0., 32.), "the dialog");
+
+    // The grid slot for a 900 × 600 window is (59, 181) — clear of the parent,
+    // but well inside the dialog. It is taken anyway.
+    let _w = map_window_sized(&mut f, id, (900, 600), None);
+    let slot = ((1920. % 901.) / 2., 32. + (1048. % 601.) / 3.);
+    assert!(
+        slot.1 > parent_pos.1 + 100.,
+        "precondition: the grid slot must be clear of the parent, got {slot:?} vs {parent_pos:?}"
+    );
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        slot,
+        "a dialog must not block the grid slot",
+    );
+}
+
 /// mutter places a first-shown window on the monitor holding the *pointer*
 /// (`meta_backend_get_current_logical_monitor`, place.c:951-955), not on the
 /// monitor the keyboard focus last landed on.

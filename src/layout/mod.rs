@@ -337,6 +337,16 @@ pub trait LayoutElement {
 
     fn is_child_of(&self, parent: &Self) -> bool;
 
+    /// Whether this window has a transient parent at all.
+    ///
+    /// Stands in for mutter's dialog window *types* when placing: xdg-shell has
+    /// no types, so `rectangle_overlaps_some_window`'s "a dialog is not an
+    /// obstacle" rule (place.c:503-548) keys off the parent instead. The
+    /// approximation is one-sided — mutter still treats a `UTILITY` window as an
+    /// obstacle, and a GTK utility window with a parent looks the same as a
+    /// dialog from here.
+    fn is_transient(&self) -> bool;
+
     /// Which half of the work area this window is edge-tiled to (GNOME
     /// Super+Left/Right), if any.
     fn edge_tiled_side(&self) -> Option<TileSide> {

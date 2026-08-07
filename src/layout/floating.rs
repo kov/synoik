@@ -1729,9 +1729,22 @@ impl<W: LayoutElement> FloatingSpace<W> {
             .map(|data| Rectangle::new(data.logical_pos, data.size))
             .collect();
 
+        // Candidate positions come from *every* window, but only some of them
+        // block a candidate: `rectangle_overlaps_some_window` (place.c:503-548)
+        // skips dialogs, docks and splash screens, while place.c:698 and :724
+        // walk the unfiltered list. See `LayoutElement::is_transient` for how
+        // "dialog" maps onto xdg-shell.
+        let obstacles: Vec<Rectangle<f64, Logical>> = self
+            .tiles
+            .iter()
+            .zip(&others)
+            .filter(|(tile, _)| !tile.window().is_transient())
+            .map(|(_, rect)| *rect)
+            .collect();
+
         let fits = |pos: Point<f64, Logical>| {
             let rect = Rectangle::new(pos, size);
-            area.contains_rect(rect) && !others.iter().any(|other| other.overlaps(rect))
+            area.contains_rect(rect) && !obstacles.iter().any(|other| other.overlaps(rect))
         };
 
         // The "centered tile" slot: the top-left tile of a hypothetical grid
