@@ -37,6 +37,17 @@ surface, so it means "all of it" at every size and can never be stale.
 Always run `lag:2` at least once. It is what a known-late client looks like, and it is worth knowing
 whether the reported symptom actually matches that before blaming anything for it.
 
+**Measure the right edges.** The region is anchored at (0, 0), so a late one is short on the
+**right and bottom** and covers the top and left completely. An instrument that samples a band
+inside the top border reads a perfect 1.00 for a client that is visibly lagging.
+
+**And do not measure roughness over a soft wallpaper.** A gradient looks the same blurred or not, so
+the edge-vs-middle ratio has nothing to work with; worse, the probe's own white 64px grid lands
+inside a sampling band or not depending on the window size, which swings a *mean* roughness between
+~12 and ~40 for reasons unrelated to the blur and makes `whole` look as bad as `lag:4`. On a
+backdrop like that use `--subsurface` (below) instead: it supplies its own high-frequency pattern,
+so the signal is a 16x-19x contrast collapse rather than a ratio hovering around 1.
+
 ## Rounded regions
 
 `--radius N` turns the region into a scanline stack of rects, which is the only way this protocol

@@ -260,7 +260,8 @@ Then the absent capabilities, in the order I'd take them:
      synchronous finish → the frame outlives its own `wait_for_fences`; an errored or abandoned
      frame never submitted; `flush_pending_blurs` → `run_commands`, which waits). Renderer teardown
      is covered by `drain_in_flight()`. The invariant is written out in the `Drop`. Suite clean
-     under `SYNOIK_VK_VALIDATION=1` (exit 0, zero `VULKAN ERROR`). **Not yet seat-validated.**
+     under `SYNOIK_VK_VALIDATION=1` (exit 0, zero `VULKAN ERROR`). **Seat-validated 2026-08-07**,
+     alongside the churn half below — see there.
    - **The churn — DONE.** Measured first, per the rule this section keeps earning: at 1600x1000
      with `passes: 3`, the rebuild cost **5.79 ms per frame** on top of a 0.92 ms steady-state
      capture-and-blur. A third of a 60 Hz frame, paid for the whole of every resize and open/close
@@ -292,10 +293,23 @@ Then the absent capabilities, in the order I'd take them:
      mean absolute difference **0.30**, max **4** (of 255) over 153,095 pixels, local contrast ratio
      **0.9992**. The slack is visually free at the worst case the design permits.
 
-     **Not yet seat-validated** (same as the stall half above): the gsrs seat is still on a
-     pre-`1cae05f8` binary, so the next login covers both. What the seat adds over the harness is
-     only the real partial-damage path — the radius question is answered more precisely above than
-     an eyeball could.
+     **Seat-validated 2026-08-07** on gsrs, real partial-damage path, no debug flags. `--subsurface`
+     pulsing 460x380 to 1300x900 (physical 576x476 to 1574x1094, crossing the rungs at
+     590/737/921/1151/1438): the striped parent holds **330.4-330.7 local contrast on all four
+     sides at every size** while the child reads 17.6-20.9, a 16x-19x collapse — the blur tracks the
+     surface through the whole sweep with no stale band and no misregistration. Static at 1000x720
+     it reads 20.1, deterministic across three captures.
+
+     That 20.1 is above the 18.7 this doc quotes for the same command before the ladder, but the
+     two numbers come from independently-written measurement scripts and **the difference is not
+     the ladder**: an A/B on the harness with the same script, same size, and the same binary bar
+     the quantize branch reads **25.7 with the ladder against 25.8 without**. (The harness reads
+     higher than the seat throughout — different backdrop and scale — which is the other reason
+     absolute contrast numbers do not travel between setups.)
+
+     This run also covers the stall half's seat flag: the seat drove many minutes of continuous
+     resize on a binary with no `device_wait_idle` in `SharedBlurChain::drop`, with no stall, no
+     wedge and no error in the journal.
 
      **Residual, deliberate.** `passes: None` is exempt, and `is_visible()` is true for noise or
      saturation alone, so a *visible but unblurred* effect under animating geometry still allocates
