@@ -2,8 +2,9 @@
 
 # Initial window placement
 
-Where a newly-mapped floating toplevel lands, what mutter 50.3 does, where our port
-diverges, and which knobs are worth turning.
+Where a newly-mapped floating toplevel lands, what mutter 50.3 does, and where our port still
+diverges. The six fidelity gaps found in the first pass are closed (§3); §5 records the one
+open design question.
 
 Reference: `~/Projects/mutter` @ 50.3, `src/core/place.c`. Ours: `src/layout/floating.rs`.
 
@@ -104,40 +105,52 @@ off-screen clamp (`Data::recompute_logical_pos`, `min_on_screen = clamp(size/4, 
 80% auto-maximize with the `sqrt(0.8)` restore-size clamp, and the top-panel strut. Tile size
 carries no border/shadow padding in GNOME mode, so the modulo math matches mutter's frame rect.
 
-Gaps, in the order I'd fix them:
+All six gaps found in the first pass are now closed. What each one was, and what closed it:
 
-1. ~~**`center-new-windows` is never read, and we assume the wrong default.**~~ **FIXED.** The
-   pref rides `layout::Options` down to every `FloatingSpace`
-   (`Layout::set_gnome_center_new_windows`), is read in `load_mutter` (`gnome.rs`) and pushed at
-   both GSettings sites in `synoik.rs`. `find_next_cascade` takes mutter's `place_centered`
-   argument. Pinned by `new_windows_center_by_default` in `src/tests/gnome.rs`.
-2. **Monitor selection is the active monitor, not the pointer monitor.** `AddWindowTarget::Auto`
-   resolves to `*active_monitor_idx` (`layout/mod.rs:1016`); mutter uses the pointer's monitor for
-   first-shown windows (place.c:954). Real, user-visible difference on multi-monitor: launch
-   something from a keybinding with the pointer parked elsewhere and it lands on a different
-   screen than GNOME would pick. Worth deciding deliberately rather than inheriting.
-3. **`auto-maximize` is unconditional.** `auto_maximize_if_too_big` always runs in GNOME mode
-   (`handlers/compositor.rs:362-368`); mutter gates it on the pref (schema line 86, default true).
-   One-line fix, same binding as (1).
-4. **Our obstacle set is every tile.** `find_first_fit` builds `others` from all
-   `self.data` (`floating.rs:1712-1717`); mutter's `rectangle_overlaps_some_window`
-   (place.c:503-548) counts only `NORMAL`, `UTILITY`, `TOOLBAR`, `MENU` — dialogs, modal dialogs,
-   docks and splash screens are **not** obstacles. With an open dialog we fall through to the
-   cascade where mutter would still find a fit, which makes the top-left pile-up in §1 *worse*
-   than upstream.
-5. **The denied-focus placement path (step H) is not ported.** We compute `denied_focus_steal`
-   (`handlers/compositor.rs:176`) but only use it to set urgency (`:349`); there is no re-place
-   against the focus window and no `find_most_freespace`. Low priority — it only bites when a
-   background app maps a window while you're working.
-6. **Thin test coverage.** `src/tests/gnome.rs` pins the centred path
-   (`new_windows_center_by_default`), the origin path's grid slot and downward chain
-   (`placement_first_fit_prefers_below`), the origin cascade
-   (`placement_cascades_when_nothing_fits`) and transients
-   (`placement_dialogs_center_on_parent`). Still uncovered: `find_first_fit`'s third phase
-   (*beside* an existing window), the cascade's stage/column overflow, and every multi-monitor
-   path.
+1. **`center-new-windows` was never read, and we assumed the wrong default.** The pref rides
+   `layout::Options` down to every `FloatingSpace` (`Layout::set_gnome_center_new_windows`), is
+   read in `load_mutter` (`gnome.rs`) and pushed at both GSettings sites in `synoik.rs`.
+   `find_next_cascade` takes mutter's `place_centered` argument.
+   → `new_windows_center_by_default`.
+2. **Monitor selection was the active monitor, not the pointer monitor.** mutter seeds
+   `window->monitor` from the pointer for a window with no position hint (`window.c:1245-1259`),
+   and placement reuses it (`place.c:951-955`). Fixed at the *initial configure*
+   (`xdg_shell.rs send_initial_configure`), not at map: the output recorded there is what the map
+   path reuses, and it also picks the workspace the initial size is resolved against. The active
+   monitor stays the fallback for no-outputs / pointer-off-all-outputs, and niri's scrolling mode
+   keeps it outright. → `new_windows_open_on_the_pointer_monitor`. **Headless proof only** — no
+   multi-monitor seat validation yet.
+3. **`auto-maximize` was unconditional.** Now gated inside `Layout::auto_maximize_if_too_big`,
+   sharing gap 1's plumbing. → `auto_maximize_can_be_disabled`.
+4. **Our obstacle set was every tile.** `rectangle_overlaps_some_window` (place.c:503-548) counts
+   only `NORMAL`, `UTILITY`, `TOOLBAR`, `MENU`; dialogs, docks and splash screens are not
+   obstacles. Candidate positions still come from every window (place.c:698, :724 walk the
+   unfiltered list) — only the overlap test filters. xdg-shell has no types, so
+   `LayoutElement::is_transient` stands in for "dialog"; the approximation is one-sided, since
+   mutter still treats a `UTILITY` window as an obstacle. → `dialogs_do_not_block_first_fit`.
+5. **The denied-focus placement path (step H) was not ported.** `FloatingSpace::avoid_focus_window`
+   re-runs first-fit against the focus window alone, then `find_most_freespace` (place.c:332-423).
+   It runs just after the tile lands rather than inside placement, so it re-checks that the window
+   was auto-placed — a stored position or a `default_floating_position` rule skips placement in
+   mutter too. Ordered before auto-maximize, matching mutter's H then I.
+   → `denied_focus_window_moves_off_the_focus_window`.
+6. **Test coverage.** `src/tests/gnome.rs` now pins the centred path, the origin path's grid slot,
+   downward chain, *beside* phase and cascade, the cascade's column overflow, transients, both
+   prefs, the pointer monitor and the denied-focus move. Each new assertion was checked to fail
+   with its fix reverted, so none of them is decoration.
 
-Two things found while landing (1) that are **not** placement bugs, recorded so the next reader
+Known remaining divergences, deliberate:
+
+- `find_windows_relevant_for_placement` (place.c:810-837) excludes windows not showing on their
+  workspace; our obstacle and candidate lists are whatever is in the floating space. If a
+  minimized tile stays in `self.data`, placement avoids an invisible window.
+- `find_most_freespace` gives up on `max_area == 0` in mutter; we give up on `<= 0` as well,
+  because a negative product means the focus window is already outside the work area and mutter's
+  chosen side would push the new window off-screen.
+- RTL is not ported anywhere in placement (mutter mirrors the grid slot, the cascade origin and
+  the *beside* candidate).
+
+Two things found along the way that are **not** placement bugs, recorded so the next reader
 does not re-derive them:
 
 - The overview picker re-flows while an overview drag is still in its rubberbanding `Starting`
@@ -208,7 +221,8 @@ honoring `center-new-windows` at GNOME's own default of `true` — is the fix fo
 symptom, and is *not* a divergence. The remaining questions:
 
 **The default.** **A is landed.** Windows centre; turning the key off in dconf/Tweaks gets the
-origin algorithm back. Whether to go further is still open:
+origin algorithm back, now with gaps 2-5 fixed underneath it. Whether to go further is still
+open:
 
 - ~~**A. Pure fidelity.** Read the key, default `true`.~~ **DONE.**
 - **B. A better `false` branch.** Same as A, but also change the *non-centred*
@@ -223,7 +237,7 @@ origin algorithm back. Whether to go further is still open:
 Recommendation: live with A for a few days. If the loss of overlap-avoidance (§4, second bullet)
 grates, **B** is a small follow-up and only affects the non-default branch.
 
-Ready follow-up sharing this exact plumbing: gap 3, the unread `auto-maximize` pref.
+The one thing still owed is a real multi-monitor check of gap 2 on a seat with two outputs.
 
 **Monitor selection** (gap 2) is independent and does need a call: adopt mutter's pointer monitor
 for first-shown windows, or keep our active monitor deliberately? Ours is arguably better with
