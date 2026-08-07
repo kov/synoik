@@ -3646,8 +3646,9 @@ fn vulkan_backdrop_blur_reuses_across_a_size_sweep() {
         "a 1px geometry change must reuse the cache, not rebuild capture + chain + output",
     );
 
-    // A full resize animation, both ways. 200 -> 512 crosses the rungs at 244/305/381/476/595, so
-    // the floor is 5 and anything near the frame count means the slack is not working.
+    // A full resize animation, both ways. 200 -> 512 crosses the rungs at 243/303/378/472 (the
+    // ladder floors at each step, so it compounds away from exact powers of 1.25), which with the
+    // opening allocation is a floor of 5. Anything near the frame count means the slack is off.
     const LO: i32 = 200;
     let frames = (S - LO) as u64;
     for (name, sweep) in [

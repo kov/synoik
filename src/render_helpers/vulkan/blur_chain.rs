@@ -127,7 +127,7 @@ impl Drop for SharedBlurChain {
         // It used to `device_wait_idle` here, defended by a comment claiming this "only runs when
         // a chain is rebuilt … never per frame". `BackdropBlur::matches` keys on the exact
         // intermediate size, so an animating geometry rebuilds — and stalled — every single frame
-        // (`vulkan_backdrop_blur_rebuilds_on_every_size_change` counts the rebuilds). That is the
+        // (`vulkan_backdrop_blur_reuses_across_a_size_sweep` counts the rebuilds). That is the
         // whole reason the wait had to go: it was a full-device stall on the compositor thread,
         // once per animation frame, guarding an invariant the refcount already gives.
         //

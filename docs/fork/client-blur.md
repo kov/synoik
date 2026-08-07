@@ -251,7 +251,7 @@ Then the absent capabilities, in the order I'd take them:
    keyed on the exact intermediate size, so a geometry that moved by one pixel discarded the capture
    texture, the whole Kawase chain (a level image and its ping-pong twin per pass, with render
    passes and descriptor sets) and the blurred output, and rebuilt them — every frame of the
-   animation. Two halves, **both now DONE**:
+   animation. Two halves, both now DONE (bar the seat flag noted under each):
    - **The stall — DONE.** `SharedBlurChain::drop` called `device_wait_idle`, on the strength of a
      comment saying it "only runs when a chain is rebuilt … never per frame"; under an animating
      geometry that is exactly what it did, once per frame, on the compositor thread. Removed: a
@@ -283,6 +283,26 @@ Then the absent capabilities, in the order I'd take them:
      resize, which is when it would be most obvious. `passes: None` is exempt from the whole thing:
      the raw capture is composited crisply, and an upsample-then-downsample through the slack would
      soften backdrop text for no gain.
+
+     **Live-validated on the headless harness** (real client, `blur-probe`), not just in unit tests.
+     870 resize frames crossing every rung between 300 and 900 wide, under
+     `SYNOIK_VK_VALIDATION=1`: zero `VULKAN ERROR`, blur filling exactly to the probe's opaque frame
+     at every size, no trailing. And an A/B at a fixed 480 wide — which the ladder rounds up to 590,
+     23% slack, near the worst it allows — against the same binary with the ladder stubbed out:
+     mean absolute difference **0.30**, max **4** (of 255) over 153,095 pixels, local contrast ratio
+     **0.9992**. The slack is visually free at the worst case the design permits.
+
+     **Not yet seat-validated** (same as the stall half above): the gsrs seat is still on a
+     pre-`1cae05f8` binary, so the next login covers both. What the seat adds over the harness is
+     only the real partial-damage path — the radius question is answered more precisely above than
+     an eyeball could.
+
+     **Residual, deliberate.** `passes: None` is exempt, and `is_visible()` is true for noise or
+     saturation alone, so a *visible but unblurred* effect under animating geometry still allocates
+     one capture texture per frame. No default path builds one — it needs a window rule asking for
+     noise/saturation with `blur: false` and an explicit `xray: false` — and quantizing it is the
+     wrong trade: the raw capture is a resample, so slack would upsample then downsample it, and
+     that path exists precisely to leave the backdrop crisp.
 
      A stateless ladder rather than hysteresis around the current allocation. A "reuse while the
      need is within X% of the allocation" band **flaps**: whichever single target the realloc picks

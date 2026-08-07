@@ -217,7 +217,7 @@ pub struct VulkanRenderer {
     /// a bounded set of sizes: the backdrop cache is rebuilt whenever the effect's intermediate
     /// size changes by so much as a pixel, and an animated geometry moves it every frame. A cache
     /// hit is invisible to a pixel assertion, so this is what pins it. See
-    /// `vulkan_backdrop_blur_rebuilds_on_every_size_change`.
+    /// `vulkan_backdrop_blur_reuses_across_a_size_sweep`.
     #[cfg(test)]
     backdrop_blur_allocs: usize,
     /// Imported scanout dmabuf targets, keyed by buffer identity. `DrmCompositor` cycles a small

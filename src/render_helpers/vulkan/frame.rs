@@ -1329,6 +1329,14 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // composites the capture directly, where an upsample-then-downsample through the slack is a
         // visible softening of otherwise crisp backdrop (text, most obviously), and there is no
         // chain to rebuild anyway — the capture texture alone is a fraction of the cost.
+        //
+        // That leaves a residual: a *visible but unblurred* effect (`is_visible()` is also true for
+        // noise or saturation alone) under animating geometry still allocates one capture texture
+        // per frame. Reachable only through a window rule that asks for noise/saturation with
+        // `blur: false` and an explicit `xray: false` — no default path builds one — so it is a
+        // known gap, not an oversight. Quantizing it is the wrong trade: the raw capture is a
+        // resample of the framebuffer, so slack would upsample and then downsample it, and that
+        // path exists precisely to leave the backdrop crisp.
         let (size, offset) = match passes {
             Some(_) => {
                 let quantized = Size::from((
