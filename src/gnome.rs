@@ -100,6 +100,9 @@ pub struct GnomeSettings {
     /// the middle of the work area instead of wherever placement finds room.
     /// GNOME's schema has defaulted this to true since mutter 48.
     pub center_new_windows: bool,
+    /// `org.gnome.mutter auto-maximize`: whether a window covering most of the
+    /// work area opens maximized.
+    pub auto_maximize: bool,
     /// `org.gnome.desktop.background`: the wallpaper GNOME would draw.
     pub background: BackgroundSettings,
     /// `org.gnome.desktop.interface accent-color`, resolved to RGB with
@@ -405,6 +408,7 @@ impl Default for GnomeSettings {
             focus_new_windows: FocusNewWindows::Smart,
             edge_tiling: true,
             center_new_windows: true,
+            auto_maximize: true,
             enable_animations: true,
             enable_hot_corners: true,
             background: BackgroundSettings::default(),
@@ -559,6 +563,9 @@ impl GnomeSettings {
         }
         if settings_has_key(mutter, "center-new-windows") {
             self.center_new_windows = mutter.boolean("center-new-windows");
+        }
+        if settings_has_key(mutter, "auto-maximize") {
+            self.auto_maximize = mutter.boolean("auto-maximize");
         }
     }
 

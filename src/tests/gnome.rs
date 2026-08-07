@@ -2750,6 +2750,26 @@ fn new_windows_center_by_default() {
     );
 }
 
+/// `org.gnome.mutter auto-maximize` off leaves an oversized window alone
+/// (place.c:1088 gates the whole branch on the pref).
+#[test]
+fn auto_maximize_can_be_disabled() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.synoik().layout.set_gnome_auto_maximize(false);
+    let id = f.add_client();
+
+    // The same 1800×1000 that auto-maximizes below.
+    let surface = map_window_sized(&mut f, id, (1800, 1000), None);
+    f.double_roundtrip(id);
+
+    let configures = f.client(id).window(&surface).format_recent_configures();
+    assert!(
+        !configures.contains("Maximized"),
+        "with auto-maximize off an oversized window must stay floating, got: {configures}"
+    );
+}
+
 /// mutter's auto-maximize: a window covering more than 80% of the work area
 /// opens maximized; unmaximizing restores a size clamped to sqrt(0.8) of the
 /// work area, aspect preserved (place.c / window.c).

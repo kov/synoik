@@ -1569,6 +1569,10 @@ impl State {
                 .synoik
                 .layout
                 .set_gnome_center_new_windows(state.synoik.gnome_settings.center_new_windows);
+            state
+                .synoik
+                .layout
+                .set_gnome_auto_maximize(state.synoik.gnome_settings.auto_maximize);
             // The application catalog (dash favorites, overview search, launch),
             // seeded from the current `favorite-apps` and refreshed on
             // `installed-changed`.
@@ -1763,6 +1767,10 @@ impl State {
                             .synoik
                             .layout
                             .set_gnome_center_new_windows(settings.center_new_windows);
+                        state
+                            .synoik
+                            .layout
+                            .set_gnome_auto_maximize(settings.auto_maximize);
                         let gpu = state.backend.with_vulkan_renderer(|r| r.gpu().clone());
                         state
                             .synoik

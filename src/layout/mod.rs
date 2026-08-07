@@ -436,6 +436,10 @@ pub struct Options {
     /// carries it across a config reload, and
     /// [`Layout::set_gnome_center_new_windows`] is the only writer.
     pub gnome_center_new_windows: bool,
+    /// `org.gnome.mutter auto-maximize`: whether a window covering most of the
+    /// work area opens maximized. GSettings-owned like
+    /// `gnome_center_new_windows`.
+    pub gnome_auto_maximize: bool,
     // Debug flags.
     pub disable_resize_throttling: bool,
     pub disable_transactions: bool,
@@ -450,10 +454,11 @@ impl Default for Options {
             gestures: Default::default(),
             overview: Default::default(),
             blur: Default::default(),
-            // GNOME's own schema default since mutter 48 (9fe83c736c). Spelled
-            // out here rather than derived so no `Options` can be built with
-            // centering silently off.
+            // GNOME's own schema defaults (centering since mutter 48,
+            // 9fe83c736c). Spelled out here rather than derived so no `Options`
+            // can be built with a GNOME behavior silently off.
             gnome_center_new_windows: true,
+            gnome_auto_maximize: true,
             disable_resize_throttling: false,
             disable_transactions: false,
             deactivate_unfocused_windows: false,
@@ -759,9 +764,10 @@ impl Options {
             gestures: config.gestures,
             overview: config.overview,
             blur: config.blur,
-            // GSettings-owned; `Layout::update_config` carries the live value
-            // over this one.
+            // GSettings-owned; `Layout::update_config` carries the live values
+            // over these.
             gnome_center_new_windows: true,
+            gnome_auto_maximize: true,
             disable_resize_throttling: config.debug.disable_resize_throttling,
             disable_transactions: config.debug.disable_transactions,
             deactivate_unfocused_windows: config.debug.deactivate_unfocused_windows,
@@ -853,13 +859,22 @@ impl<W: LayoutElement> Layout<W> {
     /// model. Unlike edge-tiling this one is read deep in the floating layout,
     /// so it rides [`Options`] down to every space instead of living here.
     pub fn set_gnome_center_new_windows(&mut self, center: bool) {
-        if self.options.gnome_center_new_windows == center {
-            return;
-        }
+        self.update_gnome_option(|options| options.gnome_center_new_windows = center);
+    }
 
+    /// Pushes `org.gnome.mutter auto-maximize` in from the GSettings model.
+    pub fn set_gnome_auto_maximize(&mut self, auto_maximize: bool) {
+        self.update_gnome_option(|options| options.gnome_auto_maximize = auto_maximize);
+    }
+
+    /// Applies a GSettings-owned [`Options`] change, re-pushing the options to
+    /// every space only when the value actually moved.
+    fn update_gnome_option(&mut self, change: impl FnOnce(&mut Options)) {
         let mut options = (*self.options).clone();
-        options.gnome_center_new_windows = center;
-        self.update_options(options);
+        change(&mut options);
+        if options != *self.options {
+            self.update_options(options);
+        }
     }
 
     pub fn add_output(&mut self, output: Output, layout_config: Option<LayoutPart>) {
@@ -3165,10 +3180,11 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
-        // `gnome_center_new_windows` comes from GSettings, not from the config,
-        // so a config reload must not reset it to the schema default.
+        // The `gnome_*` options come from GSettings, not from the config, so a
+        // config reload must not reset them to the schema defaults.
         let mut options = Options::from_config(config);
         options.gnome_center_new_windows = self.options.gnome_center_new_windows;
+        options.gnome_auto_maximize = self.options.gnome_auto_maximize;
         self.update_options(options);
     }
 
@@ -3805,8 +3821,13 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     /// mutter's map-time auto-maximize: maximizes the window if it covers
-    /// more than 80% of the work area.
+    /// more than 80% of the work area, and `org.gnome.mutter auto-maximize`
+    /// allows it (place.c:1088).
     pub fn auto_maximize_if_too_big(&mut self, id: &W::Id) -> bool {
+        if !self.options.gnome_auto_maximize {
+            return false;
+        }
+
         for ws in self.workspaces_mut() {
             if ws.has_window(id) {
                 return ws.auto_maximize_if_too_big(id);
