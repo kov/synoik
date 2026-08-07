@@ -106,14 +106,11 @@ carries no border/shadow padding in GNOME mode, so the modulo math matches mutte
 
 Gaps, in the order I'd fix them:
 
-1. **`center-new-windows` is never read, and we assume the wrong default.** `place_new_tile`'s
-   doc comment says it reproduces mutter "with the default preferences (`center-new-windows` …
-   off)" — that default flipped to `true` in mutter 48. Our own vendored copy of the schema
-   already carries `<default>true</default>`
-   (`resources/schemas/org.gnome.mutter.gschema.xml:96`), and we already bind that schema
-   (`gnome.rs:2478`) for `overlay-key` and `edge-tiling`; nothing reads the key. **This is the
-   single fix for the symptom in §1** — see §4 for the behavior owed. Needs the
-   `window_place_centered` branch and the `place_centered` cascade variant (place.c:206-244).
+1. ~~**`center-new-windows` is never read, and we assume the wrong default.**~~ **FIXED.** The
+   pref rides `layout::Options` down to every `FloatingSpace`
+   (`Layout::set_gnome_center_new_windows`), is read in `load_mutter` (`gnome.rs`) and pushed at
+   both GSettings sites in `synoik.rs`. `find_next_cascade` takes mutter's `place_centered`
+   argument. Pinned by `new_windows_center_by_default` in `src/tests/gnome.rs`.
 2. **Monitor selection is the active monitor, not the pointer monitor.** `AddWindowTarget::Auto`
    resolves to `*active_monitor_idx` (`layout/mod.rs:1016`); mutter uses the pointer's monitor for
    first-shown windows (place.c:954). Real, user-visible difference on multi-monitor: launch
@@ -132,9 +129,26 @@ Gaps, in the order I'd fix them:
    (`handlers/compositor.rs:176`) but only use it to set urgency (`:349`); there is no re-place
    against the focus window and no `find_most_freespace`. Low priority — it only bites when a
    background app maps a window while you're working.
-6. **No test coverage.** `place_new_tile`, `find_first_fit` and `find_next_cascade` have no
-   conformance test; `src/tests/floating.rs` covers sizing only. The table in §1 came from a
-   throwaway probe. Any change here should land the probe as a real test first.
+6. **Thin test coverage.** `src/tests/gnome.rs` pins the centred path
+   (`new_windows_center_by_default`), the origin path's grid slot and downward chain
+   (`placement_first_fit_prefers_below`), the origin cascade
+   (`placement_cascades_when_nothing_fits`) and transients
+   (`placement_dialogs_center_on_parent`). Still uncovered: `find_first_fit`'s third phase
+   (*beside* an existing window), the cascade's stage/column overflow, and every multi-monitor
+   path.
+
+Two things found while landing (1) that are **not** placement bugs, recorded so the next reader
+does not re-derive them:
+
+- The overview picker re-flows while an overview drag is still in its rubberbanding `Starting`
+  phase: the tile is in the layout with an offset rect, and `freeze_expose` is only taken when
+  the move is promoted to `Moving` on the following event (`layout/mod.rs:4303`). gnome-shell
+  freezes at drag-begin, so the other previews should not shuffle at all.
+  `overview_drag_freezes_the_other_previews` used to pass over this by asserting during
+  `Starting`, and only with an ordering that made the re-flow a no-op.
+- `src/tests/vulkan_render.rs`'s shared `window_fixture` now pins the origin algorithm: those
+  tests count a colour over the whole output, so a centred window hides under centred chrome
+  (the switcher panel) and the measurement stops meaning anything.
 
 ## 4. What `center-new-windows = true` actually does
 
@@ -193,12 +207,11 @@ Gaps (1)-(6) in §3 are all fidelity; none of them needs a decision. In particul
 honoring `center-new-windows` at GNOME's own default of `true` — is the fix for the reported
 symptom, and is *not* a divergence. The remaining questions:
 
-**The default.** Ship GNOME's (`true`, §4) and stop there? Or keep the current behavior reachable
-and diverge?
+**The default.** **A is landed.** Windows centre; turning the key off in dconf/Tweaks gets the
+origin algorithm back. Whether to go further is still open:
 
-- **A. Pure fidelity.** Read the key, default `true`. Windows centre. Turning it off in
-  dconf/Tweaks gets today's behavior back, bugs 2-5 fixed.
-- **B. Fidelity plus a better `false` branch.** Same as A, but also change the *non-centred*
+- ~~**A. Pure fidelity.** Read the key, default `true`.~~ **DONE.**
+- **B. A better `false` branch.** Same as A, but also change the *non-centred*
   cascade fallback to seed from the centred corner instead of the work-area origin (i.e. use
   `place_centered = TRUE`'s seeding with `find_first_fit` still in front of it). Gives a mode
   GNOME does not have: try not to overlap, and when that fails pile up from the middle rather
@@ -207,9 +220,10 @@ and diverge?
   by total overlap area (KWin's "smart" placement). Best results, most code, most drift, hardest
   to pin with a conformance test.
 
-My recommendation: **A now** — it is a bug fix, it needs no approval, and it may well be the
-whole answer. Live with it for a few days; if the loss of overlap-avoidance (§4, second bullet)
+Recommendation: live with A for a few days. If the loss of overlap-avoidance (§4, second bullet)
 grates, **B** is a small follow-up and only affects the non-default branch.
+
+Ready follow-up sharing this exact plumbing: gap 3, the unread `auto-maximize` pref.
 
 **Monitor selection** (gap 2) is independent and does need a call: adopt mutter's pointer monitor
 for first-shown windows, or keep our active monitor deliberately? Ours is arguably better with

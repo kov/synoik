@@ -422,17 +422,43 @@ enum MonitorSet<W: LayoutElement> {
     },
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Options {
     pub layout: synoik_config::Layout,
     pub animations: synoik_config::Animations,
     pub gestures: synoik_config::Gestures,
     pub overview: synoik_config::Overview,
     pub blur: synoik_config::Blur,
+    /// `org.gnome.mutter center-new-windows`: place new windows in the middle
+    /// of the work area rather than searching for a free spot.
+    ///
+    /// Owned by GSettings, not by the config — [`Layout::update_config`]
+    /// carries it across a config reload, and
+    /// [`Layout::set_gnome_center_new_windows`] is the only writer.
+    pub gnome_center_new_windows: bool,
     // Debug flags.
     pub disable_resize_throttling: bool,
     pub disable_transactions: bool,
     pub deactivate_unfocused_windows: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            layout: Default::default(),
+            animations: Default::default(),
+            gestures: Default::default(),
+            overview: Default::default(),
+            blur: Default::default(),
+            // GNOME's own schema default since mutter 48 (9fe83c736c). Spelled
+            // out here rather than derived so no `Options` can be built with
+            // centering silently off.
+            gnome_center_new_windows: true,
+            disable_resize_throttling: false,
+            disable_transactions: false,
+            deactivate_unfocused_windows: false,
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -733,6 +759,9 @@ impl Options {
             gestures: config.gestures,
             overview: config.overview,
             blur: config.blur,
+            // GSettings-owned; `Layout::update_config` carries the live value
+            // over this one.
+            gnome_center_new_windows: true,
             disable_resize_throttling: config.debug.disable_resize_throttling,
             disable_transactions: config.debug.disable_transactions,
             deactivate_unfocused_windows: config.debug.deactivate_unfocused_windows,
@@ -818,6 +847,19 @@ impl<W: LayoutElement> Layout<W> {
     /// Pushes `org.gnome.mutter edge-tiling` in from the GSettings model.
     pub fn set_gnome_edge_tiling(&mut self, edge_tiling: bool) {
         self.gnome_edge_tiling = edge_tiling;
+    }
+
+    /// Pushes `org.gnome.mutter center-new-windows` in from the GSettings
+    /// model. Unlike edge-tiling this one is read deep in the floating layout,
+    /// so it rides [`Options`] down to every space instead of living here.
+    pub fn set_gnome_center_new_windows(&mut self, center: bool) {
+        if self.options.gnome_center_new_windows == center {
+            return;
+        }
+
+        let mut options = (*self.options).clone();
+        options.gnome_center_new_windows = center;
+        self.update_options(options);
     }
 
     pub fn add_output(&mut self, output: Output, layout_config: Option<LayoutPart>) {
@@ -3123,7 +3165,11 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
-        self.update_options(Options::from_config(config));
+        // `gnome_center_new_windows` comes from GSettings, not from the config,
+        // so a config reload must not reset it to the schema default.
+        let mut options = Options::from_config(config);
+        options.gnome_center_new_windows = self.options.gnome_center_new_windows;
+        self.update_options(options);
     }
 
     fn update_options(&mut self, options: Options) {

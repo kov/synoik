@@ -595,6 +595,9 @@ fn moving_the_effect_recaptures_even_with_a_static_backdrop() {
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1280, 720));
+    // Placement centers new windows by default, which would make the
+    // `CenterWindow` action below a no-op and void this test's precondition.
+    f.synoik().layout.set_gnome_center_new_windows(false);
 
     let id = f.add_client();
     let window = f.client(id).create_window();
@@ -649,6 +652,8 @@ fn moving_the_effect_recaptures_even_with_a_static_backdrop() {
     );
 
     // Move it. Nothing behind it changes; the client is not even told.
+    // (The fixture turns `center-new-windows` off precisely so this action has
+    // somewhere to move the window to.)
     f.synoik_state()
         .do_action(synoik_config::Action::CenterWindow, false);
     f.double_roundtrip(id);

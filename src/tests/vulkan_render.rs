@@ -116,6 +116,11 @@ fn window_fixture_with_client(
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (OUT_W, OUT_H));
+    // These tests count a color over the whole output, so the window must not
+    // sit under centered chrome (the switcher panel, an OSD). Placement centers
+    // new windows by default now; pin this fixture to the origin algorithm so
+    // the window lands off to the side.
+    f.synoik().layout.set_gnome_center_new_windows(false);
 
     let id = f.add_client();
     let window = f.client(id).create_window();

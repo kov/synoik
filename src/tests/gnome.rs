@@ -2212,13 +2212,15 @@ fn windows_open_floating_by_default() {
     );
 }
 
-/// New windows follow mutter's placement (`place.c`): the first window goes
-/// to the "centered tile" slot, and subsequent same-size windows first-fit
-/// *below* existing ones before going anywhere else.
+/// With `center-new-windows` off, new windows follow mutter's origin
+/// algorithm (`place.c`): the first window goes to the "centered tile" slot,
+/// and subsequent same-size windows first-fit *below* existing ones before
+/// going anywhere else.
 #[test]
 fn placement_first_fit_prefers_below() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
+    f.synoik().layout.set_gnome_center_new_windows(false);
     let id = f.add_client();
 
     // place.c center_tile_rect_in_area: the leftover space of a hypothetical
@@ -2272,12 +2274,13 @@ fn placement_dialogs_center_on_parent() {
     );
 }
 
-/// When nothing fits, placement cascades from the work-area origin in 50px
-/// diagonal steps (place.c find_next_cascade).
+/// With `center-new-windows` off and nothing fitting, placement cascades from
+/// the work-area origin in 50px diagonal steps (place.c find_next_cascade).
 #[test]
 fn placement_cascades_when_nothing_fits() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
+    f.synoik().layout.set_gnome_center_new_windows(false);
     let id = f.add_client();
 
     // 1000×600 windows: after the first takes the centered-tile slot,
@@ -2709,6 +2712,41 @@ fn fullscreen_window_covers_the_top_layer() {
             .unwrap()
             .render_above_top_layer(),
         "a fullscreen window must render above the top layer"
+    );
+}
+
+/// `org.gnome.mutter center-new-windows`, GNOME's default since mutter 48:
+/// a new window opens in the middle of the work area. `find_first_fit` never
+/// runs, so nothing tries to avoid overlap — a window landing within
+/// `CASCADE_FUZZ` of the slot pushes it one titlebar height down-right
+/// instead (place.c `find_next_cascade`, `place_centered = TRUE`).
+#[test]
+fn new_windows_center_by_default() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // Work area is 1920 × 1048 at (0, 32) — the top panel struts the rest.
+    // Centered slot for 900 × 600: (960 - 450, 32 + 524 - 300).
+    map_window_sized(&mut f, id, (900, 600), None);
+    assert_pos_eq(focused_window_pos(&mut f), (510., 256.), "the first window");
+
+    // The second lands on the first, so it cascades by 50 px diagonally.
+    map_window_sized(&mut f, id, (900, 600), None);
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (560., 306.),
+        "the second window, cascaded off the first",
+    );
+
+    // A differently-sized window centers on its own slot: at 50 px away, the
+    // nearest peer is outside the 15 px fuzz, so no cascade fires and the two
+    // simply overlap.
+    map_window_sized(&mut f, id, (1000, 700), None);
+    assert_pos_eq(
+        focused_window_pos(&mut f),
+        (460., 206.),
+        "a differently-sized window centers without cascading",
     );
 }
 
@@ -6468,7 +6506,14 @@ fn overview_drag_freezes_the_other_previews() {
     let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
     pointer_motion_to(&mut f, grab.0, grab.1);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
-    f.pointer_motion(0., 100.);
+    // Two motions, not one: the move is promoted out of its rubberbanding
+    // `Starting` phase on the event *after* the threshold is crossed, and the
+    // freeze is taken on that promotion. A single motion leaves the drag in
+    // `Starting`, where the tile is still in the layout and its offset rect
+    // re-flows the picker — see the `Starting`-phase note in
+    // docs/fork/window-placement.md.
+    f.pointer_motion(0., 10.);
+    f.pointer_motion(0., 90.);
 
     assert_eq!(
         f.synoik().layout.expose_target_rect(&win_a),

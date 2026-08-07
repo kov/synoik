@@ -96,6 +96,10 @@ pub struct GnomeSettings {
     /// `org.gnome.mutter edge-tiling`: whether dragging a window to a screen
     /// edge tiles (sides) or maximizes (top) it.
     pub edge_tiling: bool,
+    /// `org.gnome.mutter center-new-windows`: whether a new window opens in
+    /// the middle of the work area instead of wherever placement finds room.
+    /// GNOME's schema has defaulted this to true since mutter 48.
+    pub center_new_windows: bool,
     /// `org.gnome.desktop.background`: the wallpaper GNOME would draw.
     pub background: BackgroundSettings,
     /// `org.gnome.desktop.interface accent-color`, resolved to RGB with
@@ -400,6 +404,7 @@ impl Default for GnomeSettings {
             shield: Default::default(),
             focus_new_windows: FocusNewWindows::Smart,
             edge_tiling: true,
+            center_new_windows: true,
             enable_animations: true,
             enable_hot_corners: true,
             background: BackgroundSettings::default(),
@@ -551,6 +556,9 @@ impl GnomeSettings {
         }
         if settings_has_key(mutter, "edge-tiling") {
             self.edge_tiling = mutter.boolean("edge-tiling");
+        }
+        if settings_has_key(mutter, "center-new-windows") {
+            self.center_new_windows = mutter.boolean("center-new-windows");
         }
     }
 

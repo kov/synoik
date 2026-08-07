@@ -1565,6 +1565,10 @@ impl State {
                 .synoik
                 .layout
                 .set_gnome_edge_tiling(state.synoik.gnome_settings.edge_tiling);
+            state
+                .synoik
+                .layout
+                .set_gnome_center_new_windows(state.synoik.gnome_settings.center_new_windows);
             // The application catalog (dash favorites, overview search, launch),
             // seeded from the current `favorite-apps` and refreshed on
             // `installed-changed`.
@@ -1755,6 +1759,10 @@ impl State {
                             .synoik
                             .layout
                             .set_gnome_edge_tiling(settings.edge_tiling);
+                        state
+                            .synoik
+                            .layout
+                            .set_gnome_center_new_windows(settings.center_new_windows);
                         let gpu = state.backend.with_vulkan_renderer(|r| r.gpu().clone());
                         state
                             .synoik
