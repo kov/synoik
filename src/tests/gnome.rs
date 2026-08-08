@@ -23572,3 +23572,64 @@ fn creating_a_session_schedules_a_write() {
     assert!(!f.synoik().session_manager_state.store.is_dirty());
     assert!(f.synoik().session_save_timer.is_none());
 }
+
+/// Dropping a preview must not re-flow the picker while the dropped window
+/// eases back into place. The layout strategy reads the windows' settled
+/// frame rects (gnome-shell's `computeLayout` takes `metaWindow`
+/// geometry, `workspace.js`), so a tile's move animation must not reach
+/// `compute_slots` — its row assignment sorts by `center().y` and its column
+/// assignment by `center().x`, so an animating rect re-sorts the whole grid
+/// for the length of the animation and then snaps back.
+///
+/// The endpoints are blind to this: before the pickup and after the settle
+/// the layout is identical either way. Sample across the settle.
+#[test]
+fn overview_drop_does_not_reflow_the_picker_while_the_window_settles() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // A big window and two smaller ones: two rows, the small pair sharing the
+    // bottom one, which is what makes a mis-sorted grid visible as a swap.
+    let _a = map_window_sized(&mut f, id, (1600, 1000), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    let _b = map_window_sized(&mut f, id, (760, 600), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+    let _c = map_window_sized(&mut f, id, (740, 480), None);
+    let win_c = f.synoik().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+
+    use smithay::utils::{Logical, Rectangle};
+
+    let wins = [win_a, win_b, win_c];
+    let slots = |f: &mut Fixture| -> Vec<Rectangle<f64, Logical>> {
+        wins.iter()
+            .map(|w| f.synoik().layout.expose_target_rect(w).unwrap())
+            .collect()
+    };
+    let before = slots(&mut f);
+
+    // Pick C's preview up, carry it a short way, and drop it back on its own
+    // workspace — `keep_position`, so the settled layout is the one we started
+    // with and every sample in between must match it too.
+    let rect = before[2];
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    f.pointer_motion(-60., -40.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    let samples = f.sample_animation(Duration::from_millis(600), 12, |f| slots(f));
+    for (i, sample) in samples.iter().enumerate() {
+        assert_eq!(
+            sample, &before,
+            "the picker must hold its layout across the drop settle, sample {i}"
+        );
+    }
+}

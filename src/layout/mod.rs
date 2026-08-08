@@ -4297,14 +4297,11 @@ impl<W: LayoutElement> Layout<W> {
                 // offset would be written and cleared inside this one call,
                 // having been resistance nobody saw.
                 //
-                // It is not free, though. `expose_layout` builds its input rects
-                // from render positions, which include this offset, and
-                // `compute_slots` sorts by `center().y` to assign rows. A large
-                // enough first motion therefore re-orders every preview's slot —
-                // and both the pickup slot below and `freeze_expose` are taken
-                // *after* this, so the shuffle is captured and held for the whole
-                // drag. gnome-shell's WindowPreview drag never moves the window
-                // in the workspace layout at all.
+                // gnome-shell's WindowPreview drag never moves the window in the
+                // workspace layout at all. (`expose_layout` now subtracts
+                // `Tile::render_offset()` before laying out, so an offset here
+                // would no longer re-sort the picker either — but writing one
+                // nobody can see is still pointless work.)
                 if !in_expose {
                     let factor = RubberBand {
                         stiffness: 1.0,

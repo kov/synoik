@@ -2022,9 +2022,39 @@ impl<W: LayoutElement> Workspace<W> {
     /// the working area, front-to-back like
     /// [`Self::tiles_with_render_positions`].
     fn expose_layout(&self) -> ExposeLayout<'_, W> {
+        let scale = self.scale().fractional_scale();
+        // Two rects per tile: the *render* rect, which the overview
+        // open/close leg interpolates from, and the *settled* rect the slots
+        // are laid out over.
+        //
+        // They differ by `Tile::render_offset()` — a move animation or an
+        // interactive-move offset. gnome-shell's layout strategy reads
+        // `metaWindow.get_frame_rect()` (`workspace.js` `_getWindowCenter`,
+        // `computeLayout`), never the actor's animated position, and it has
+        // to: `compute_slots` assigns rows by `center().y` and columns by
+        // `center().x`, so an animating rect re-sorts the grid for as long as
+        // the animation runs and the whole picker shuffles and snaps back
+        // when it lands. A drop's move-back animation did exactly that to
+        // every other preview.
+        //
+        // Only the tile's own offset is subtracted. The scrolling layer's
+        // view/column animations ride in `pos` too, but the picker is
+        // GNOME-mode-only (`Monitor::expose_progress`) and GNOME mode keeps
+        // every window — maximized and fullscreen included — in the floating
+        // layout, so there is nothing in the scrolling layer to lay out.
         let tiles: Vec<_> = self
             .tiles_with_render_positions()
-            .map(|(tile, pos, _)| (tile, Rectangle::new(pos, tile.tile_size())))
+            .map(|(tile, pos, _)| {
+                let size = tile.tile_size();
+                let settled = (pos - tile.render_offset())
+                    .to_physical_precise_round(scale)
+                    .to_logical(scale);
+                (
+                    tile,
+                    Rectangle::new(pos, size),
+                    Rectangle::new(settled, size),
+                )
+            })
             .collect();
 
         // While frozen (an overview drag is in flight), the remaining tiles
@@ -2034,7 +2064,7 @@ impl<W: LayoutElement> Workspace<W> {
         if let Some(frozen) = &self.expose_frozen {
             let slots: Option<Vec<_>> = tiles
                 .iter()
-                .map(|(tile, _)| {
+                .map(|(tile, _, _)| {
                     frozen
                         .iter()
                         .find(|(id, _)| id == tile.window().id())
@@ -2045,18 +2075,18 @@ impl<W: LayoutElement> Workspace<W> {
                 return tiles
                     .into_iter()
                     .zip(slots)
-                    .map(|((tile, rect), slot)| (tile, rect, slot))
+                    .map(|((tile, rect, _), slot)| (tile, rect, slot))
                     .collect();
             }
         }
 
-        let rects: Vec<_> = tiles.iter().map(|(_, rect)| *rect).collect();
+        let rects: Vec<_> = tiles.iter().map(|(_, _, settled)| *settled).collect();
         let area = self.expose_area();
         let slots = expose::compute_slots(self.view_size.h, area, &rects);
         tiles
             .into_iter()
             .zip(slots)
-            .map(|((tile, rect), slot)| (tile, rect, slot))
+            .map(|((tile, rect, _), slot)| (tile, rect, slot))
             .collect()
     }
 
