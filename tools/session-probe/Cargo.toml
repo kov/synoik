@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
+[package]
+name = "session-probe"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+# Deliberately NOT a member of the synoik workspace, for the same reason as blur-probe: the dev
+# loop is `cargo test --workspace`, and a diagnostic client has no business slowing it down.
+# Build it on its own: `cargo build --manifest-path tools/session-probe/Cargo.toml`.
+[workspace]
+
+[dependencies]
+rustix = { version = "1.1.2", features = ["fs", "mm", "event", "time"] }
+wayland-client = "0.31.14"
+wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
+wayland-scanner = "0.31.10"
