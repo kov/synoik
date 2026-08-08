@@ -60,7 +60,7 @@ use crate::utils::{
     get_monotonic_time, output_matches_name, send_scale_transform, update_tiled_state, ResizeEdge,
 };
 use crate::window::{
-    InitialConfigureState, ResolvedWindowRules, RestoreOnMap, Unmapped, WindowRef,
+    InitialConfigureState, ResolvedWindowRules, RestoreOnMap, RestoreRuleSeeds, Unmapped, WindowRef,
 };
 
 impl XdgShellHandler for State {
@@ -1039,14 +1039,14 @@ impl State {
         // Resolved before the `unmapped_windows` borrow below, like `pointer_output`. `None` for
         // every window that did not ask to be restored, which is what keeps this whole branch
         // additive: without it, everything below runs exactly as it did before.
-        let restore = self
+        let wants_restore = self
             .synoik
             .unmapped_windows
             .get(toplevel.wl_surface())
-            .is_some_and(|unmapped| unmapped.wants_session_restore)
+            .is_some_and(|unmapped| unmapped.wants_session_restore);
+        let restore = wants_restore
             .then(|| self.resolve_session_restore(toplevel))
             .flatten();
-
         let Some(unmapped) = self.synoik.unmapped_windows.get_mut(toplevel.wl_surface()) else {
             error!("window must be present in unmapped_windows in send_initial_configure()");
             return;
@@ -1061,18 +1061,22 @@ impl State {
 
         // Restore writes itself into the *rules*, so the placement, sizing and state code below
         // stays one path. It overrides any config window rule: the saved state is both more
-        // specific and more recent than a static rule.
+        // specific and more recent than a static rule. The seeds are kept as well as applied, so
+        // that a later recompute of the rules — a title change, a config reload — can put them
+        // back instead of dropping them; see `RestoreRuleSeeds`.
+        let mut rule_seeds = RestoreRuleSeeds::default();
         if let Some(restore) = &restore {
             match restore.record.restorable_state() {
-                Some(WindowState::Fullscreen) => rules.open_fullscreen = Some(true),
-                Some(WindowState::Maximized) => rules.open_maximized_to_edges = Some(true),
+                Some(WindowState::Fullscreen) => rule_seeds.open_fullscreen = Some(true),
+                Some(WindowState::Maximized) => rule_seeds.open_maximized_to_edges = Some(true),
                 _ => (),
             }
 
             if let Some([_, _, w, h]) = restore.record.floating_rect {
-                rules.default_width = Some(Some(PresetSize::Fixed(w)));
-                rules.default_height = Some(Some(PresetSize::Fixed(h)));
+                rule_seeds.default_width = Some(Some(PresetSize::Fixed(w)));
+                rule_seeds.default_height = Some(Some(PresetSize::Fixed(h)));
             }
+            rule_seeds.apply(&mut rules);
         }
 
         let Unmapped { window, state, .. } = unmapped;
@@ -1105,20 +1109,10 @@ impl State {
             .find(|o| self.synoik.layout.monitor_for_output(o).is_some());
 
         let parent = toplevel.parent();
-        let restore_on_map = restore.as_ref().map(|restore| RestoreOnMap {
-            reason: restore.reason,
-            workspace_idx: restore.record.workspace.map(|idx| idx as usize),
-            // Only for a window that maps straight into maximized or fullscreen — anything else
-            // gets its floating geometry from the configure and the position rule.
-            unmaximize_to: restore
-                .record
-                .restorable_state()
-                .filter(|state| *state != WindowState::Floating)
-                .and(restore.record.floating_rect),
-        });
-        let restore_workspace_idx = restore_on_map
+        let restore_workspace_idx = restore
             .as_ref()
-            .and_then(|restore| restore.workspace_idx);
+            .and_then(|restore| restore.record.workspace)
+            .map(|idx| idx as usize);
 
         let target = self.synoik.layout.resolve_placement(PlacementSeeds {
             workspace_name: rules.open_on_workspace.as_deref(),
@@ -1156,12 +1150,26 @@ impl State {
                 .and_then(|output| self.synoik.global_space.output_geometry(output))
                 .map_or_else(Point::default, |geo| geo.loc);
             let area = ws.working_area();
-            rules.default_floating_position = Some(FloatingPosition {
+            rule_seeds.default_floating_position = Some(FloatingPosition {
                 x: FloatOrInt(f64::from(x - origin.x) - area.loc.x),
                 y: FloatOrInt(f64::from(y - origin.y) - area.loc.y),
                 relative_to: RelativeTo::TopLeft,
             });
+            rule_seeds.apply(&mut rules);
         }
+
+        let restore_on_map = restore.as_ref().map(|restore| RestoreOnMap {
+            reason: restore.reason,
+            workspace_idx: restore_workspace_idx,
+            // Only for a window that maps straight into maximized or fullscreen — anything else
+            // gets its floating geometry from the configure and the position rule.
+            unmaximize_to: restore
+                .record
+                .restorable_state()
+                .filter(|state| *state != WindowState::Floating)
+                .and(restore.record.floating_rect),
+            rule_seeds,
+        });
 
         let mut width = None;
         let mut floating_width = None;
@@ -1434,8 +1442,14 @@ impl State {
                 WindowRef::Unmapped(unmapped),
                 self.synoik.is_at_startup,
             );
-            if let InitialConfigureState::Configured { rules, .. } = &mut unmapped.state {
+            if let InitialConfigureState::Configured { rules, restore, .. } = &mut unmapped.state {
                 *rules = new_rules;
+                // Recomputing from the config alone would drop everything a session restore
+                // seeded. Overlay it back — the window is still unmapped, so its saved position
+                // and size have not been applied yet.
+                if let Some(restore) = restore {
+                    restore.rule_seeds.apply(rules);
+                }
             }
         } else if let Some((mapped, output)) = self
             .synoik

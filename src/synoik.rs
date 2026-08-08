@@ -13074,8 +13074,15 @@ impl Synoik {
                     WindowRef::Unmapped(unmapped),
                     self.is_at_startup,
                 );
-                if let InitialConfigureState::Configured { rules, .. } = &mut unmapped.state {
+                if let InitialConfigureState::Configured { rules, restore, .. } =
+                    &mut unmapped.state
+                {
                     *rules = new_rules;
+                    // Same as in `update_window_rules`: a config reload must not cost an
+                    // in-flight restore its seeded position, size and state.
+                    if let Some(restore) = restore {
+                        restore.rule_seeds.apply(rules);
+                    }
                 }
             }
 

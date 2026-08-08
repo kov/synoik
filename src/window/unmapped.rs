@@ -60,6 +60,54 @@ pub struct RestoreOnMap {
     /// had a floating incarnation this run, so nothing else fills in `Tile::tiled_restore_*` and
     /// un-maximizing would land on a default size instead of the one it was saved with.
     pub unmaximize_to: Option<crate::session_state::Rect>,
+
+    /// The rule fields the restore seeded, kept so they can be put back.
+    ///
+    /// Restore writes itself into the window rules to keep placement, sizing and state on one
+    /// path, but the rules are *recomputed from the config* whenever the client changes its title
+    /// or app id, and that recompute assigns over the whole struct. A terminal naming itself after
+    /// its shell between the initial configure and the map would otherwise throw its own restored
+    /// position away. Applied again after every recompute; see `RestoreRuleSeeds::apply`.
+    pub rule_seeds: RestoreRuleSeeds,
+}
+
+/// The window-rule fields a session restore seeds, as concrete values.
+///
+/// The *values*, not the recipe: `default_floating_position` is derived from the working area of
+/// the workspace placement resolved onto, so re-deriving it outside the initial configure would
+/// mean re-running placement. Everything here is already resolved, and re-applying is a copy.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreRuleSeeds {
+    pub open_fullscreen: Option<bool>,
+    pub open_maximized_to_edges: Option<bool>,
+    pub default_width: Option<Option<PresetSize>>,
+    pub default_height: Option<Option<PresetSize>>,
+    pub default_floating_position: Option<synoik_config::FloatingPosition>,
+}
+
+impl RestoreRuleSeeds {
+    /// Overlays the seeds onto freshly computed rules.
+    ///
+    /// An overlay rather than a replacement: a config window rule keyed on the title the client
+    /// just set is legitimate and still has to land. The restore only wins on the fields it
+    /// actually saved, being both more specific and more recent than a static rule.
+    pub fn apply(&self, rules: &mut ResolvedWindowRules) {
+        if let Some(x) = self.open_fullscreen {
+            rules.open_fullscreen = Some(x);
+        }
+        if let Some(x) = self.open_maximized_to_edges {
+            rules.open_maximized_to_edges = Some(x);
+        }
+        if let Some(x) = self.default_width {
+            rules.default_width = Some(x);
+        }
+        if let Some(x) = self.default_height {
+            rules.default_height = Some(x);
+        }
+        if let Some(x) = self.default_floating_position {
+            rules.default_floating_position = Some(x);
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]

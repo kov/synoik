@@ -23735,3 +23735,100 @@ fn restoring_the_same_window_repeatedly_does_not_drift() {
         }
     }
 }
+
+/// A window that changes its title (or app id) between the initial configure
+/// and the map still comes back where it was saved.
+///
+/// Restore seeds itself into the *rules* so that placement, sizing and state
+/// stay one path — but `title_changed` recomputes those rules from the config's
+/// window rules alone and assigns over the whole struct, which drops every seed
+/// the restore wrote. Clients set their title on the first commit after the
+/// configure all the time (a terminal names itself after its shell), so this is
+/// the common case, not a corner.
+///
+/// The tell on the live seat was that the *workspace* restored and the position
+/// did not: the workspace rides `RestoreOnMap`, which survives the recompute.
+/// Size survives too, because its configure has already gone out — so only the
+/// position, which is read from the rules at map time, is actually lost.
+#[test]
+fn a_title_change_between_configure_and_map_keeps_the_restored_position() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let first = f.add_client();
+    f.roundtrip(first);
+    let (session, session_id) = new_session(&mut f, first);
+
+    let window = f.client(first).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    let qh = f.client(first).qh.clone();
+    session.add_toplevel(&toplevel, String::from("main"), &qh, String::from("main"));
+    f.client(first).window(&surface).commit();
+    f.roundtrip(first);
+    let w = f.client(first).window(&surface);
+    w.attach_new_buffer();
+    w.set_size(400, 300);
+    w.ack_last_and_commit();
+    f.double_roundtrip(first);
+    f.synoik_complete_animations();
+
+    // Somewhere the placement cascade would never put it, so that coming back
+    // centred is distinguishable from coming back restored.
+    f.synoik_state().do_action(
+        Action::MoveFloatingWindowById {
+            id: None,
+            x: synoik_ipc::PositionChange::SetFixed(150.),
+            y: synoik_ipc::PositionChange::SetFixed(90.),
+        },
+        false,
+    );
+    f.synoik_complete_animations();
+    f.double_roundtrip(first);
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let saved = f
+        .synoik()
+        .layout
+        .session_snapshot(&win)
+        .unwrap()
+        .floating_rect
+        .expect("a floated window has a rect");
+
+    let w = f.client(first).window(&surface);
+    w.attach_null_buffer();
+    w.commit();
+    f.double_roundtrip(first);
+    drop(session);
+
+    let second = f.add_client();
+    f.roundtrip(second);
+    let session = f
+        .client(second)
+        .get_session(Reason::SessionRestore, Some(&session_id));
+    f.roundtrip(second);
+    let (surface, _handle) = restore_window(&mut f, second, &session, "main");
+
+    // The initial configure has landed. Now name ourselves, as a terminal does
+    // once its shell is up, and only then map.
+    f.client(second)
+        .window(&surface)
+        .set_title("gustavo@host: ~");
+    f.roundtrip(second);
+    map_at_configured_size(&mut f, second, &surface);
+    f.synoik_complete_animations();
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let got = f
+        .synoik()
+        .layout
+        .session_snapshot(&win)
+        .unwrap()
+        .floating_rect
+        .expect("the restored window has a rect");
+    assert_eq!(
+        (got.loc.x, got.loc.y),
+        (saved.loc.x, saved.loc.y),
+        "a title change after the configure must not drop the restored position"
+    );
+}

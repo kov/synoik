@@ -26,7 +26,7 @@ pub mod mapped;
 pub use mapped::Mapped;
 
 pub mod unmapped;
-pub use unmapped::{InitialConfigureState, RestoreOnMap, Unmapped};
+pub use unmapped::{InitialConfigureState, RestoreOnMap, RestoreRuleSeeds, Unmapped};
 
 /// Reference to a mapped or unmapped window.
 #[derive(Debug, Clone, Copy)]
