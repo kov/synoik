@@ -16,10 +16,18 @@
 //! we do not understand parses as "do not restore" while still round-tripping to disk untouched.
 //! synoik cannot represent minimize or edge half-tiling yet; both are intended, so their slots are
 //! carried rather than dropped.
+//!
+//! **The write happens off the compositor thread.** Serializing is cheap and stays inline — that is
+//! what pins the bytes to live state at save time — but the write itself is an `fsync`, measured at
+//! 9-22 ms for a full store on a warm NVMe and with a much worse tail on a busy disk. The
+//! compositor has one thread, so that would be dropped frames on the very interactions (a window
+//! closing, a session going away) that schedule a save. See [`StoreWriter`].
 
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -183,9 +191,11 @@ impl From<io::Error> for LoadError {
 pub struct SessionStore {
     path: Option<PathBuf>,
     sessions: HashMap<String, SessionRecord>,
-    /// Set by every mutation, cleared by a successful write. The debounce timer is what turns this
-    /// into an actual save.
+    /// Set by every mutation, cleared when a write is queued. The debounce timer is what turns
+    /// this into an actual save.
     dirty: bool,
+    /// Started on the first save, so a store that is never written costs no thread.
+    writer: Option<StoreWriter>,
 }
 
 impl SessionStore {
@@ -310,19 +320,83 @@ impl SessionStore {
         serde_json::to_vec_pretty(&file)
     }
 
-    /// Writes the store to its path, if it has one. Clears the dirty flag on success.
+    /// Hands the current state to the writer thread, if this store has a path.
+    ///
+    /// Returns once the bytes are queued, not once they are on disk: see [`StoreWriter`]. A write
+    /// that then fails is warned about by the worker and retried by [`Self::flush`] on the way out.
     pub fn save(&mut self) -> Result<(), io::Error> {
+        self.dirty = false;
+
         let Some(path) = self.path.clone() else {
-            self.dirty = false;
             return Ok(());
         };
 
         let bytes = self
             .serialize()
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        write_atomically(&path, &bytes)?;
-        self.dirty = false;
+
+        self.writer
+            .get_or_insert_with(|| StoreWriter::spawn(path))
+            .queue(bytes);
         Ok(())
+    }
+
+    /// Writes synchronously and waits for the worker to finish. For the shutdown path only.
+    ///
+    /// Unconditional rather than dirty-gated: this is the one place that can still recover from a
+    /// queued write having failed, and it runs once per session.
+    pub fn flush(&mut self) {
+        if self.save().is_ok() {
+            if let Some(writer) = self.writer.take() {
+                writer.finish();
+            }
+        }
+    }
+}
+
+/// The thread that owns writing the store to disk.
+///
+/// Long-lived and single, rather than a thread per save, so writes cannot land out of order: the
+/// channel is the ordering. It coalesces — if several saves queued while one write was in flight,
+/// only the newest is written, since each payload is a complete snapshot.
+#[derive(Debug)]
+struct StoreWriter {
+    queue: mpsc::Sender<Vec<u8>>,
+    thread: JoinHandle<()>,
+}
+
+impl StoreWriter {
+    fn spawn(path: PathBuf) -> Self {
+        let (queue, rx) = mpsc::channel::<Vec<u8>>();
+        let builder = std::thread::Builder::new().name("session store".to_owned());
+        let thread = builder
+            .spawn(move || {
+                // Ends when the sender drops, which is the compositor going away.
+                while let Ok(mut bytes) = rx.recv() {
+                    while let Ok(newer) = rx.try_recv() {
+                        bytes = newer;
+                    }
+                    if let Err(err) = write_atomically(&path, &bytes) {
+                        tracing::warn!("error saving the session store: {err}");
+                    }
+                }
+            })
+            .expect("could not start the session store thread");
+
+        Self { queue, thread }
+    }
+
+    fn queue(&self, bytes: Vec<u8>) {
+        // The worker only ends when we drop it, so a closed channel means it panicked; the warning
+        // it would have logged is already out.
+        let _ = self.queue.send(bytes);
+    }
+
+    /// Drains everything queued and joins.
+    fn finish(self) {
+        let Self { queue, thread } = self;
+        drop(queue);
+        let _ = thread.join();
     }
 }
 
@@ -501,8 +575,8 @@ mod tests {
             .touch("kept")
             .toplevels
             .insert(String::from("w"), record(2));
-        store.save().unwrap();
-        assert!(!store.is_dirty(), "a successful save clears the flag");
+        store.flush();
+        assert!(!store.is_dirty(), "a queued save clears the flag");
 
         let (loaded, err) = SessionStore::load(path);
         assert!(err.is_none(), "{err:?}");
@@ -510,6 +584,32 @@ mod tests {
             loaded.get("kept").unwrap().toplevels["w"].restorable_state(),
             Some(WindowState::Maximized)
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn queued_saves_coalesce_to_the_last_one() {
+        let dir = std::env::temp_dir().join(format!("synoik-session-queue-{}", std::process::id()));
+        let path = dir.join("session.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut store = SessionStore {
+            path: Some(path.clone()),
+            ..SessionStore::default()
+        };
+
+        // Three saves in a row, as a burst of debounce firings would do. Each payload is a whole
+        // snapshot, so the file must end up matching the newest and not some interleaving.
+        for i in 0..3 {
+            store.touch(&format!("session-{i}"));
+            store.save().unwrap();
+        }
+        store.flush();
+
+        let (loaded, err) = SessionStore::load(path);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(loaded.len(), 3, "the last write wins, and it had all three");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -7375,26 +7375,29 @@ impl Synoik {
         }
     }
 
-    /// Writes the session store if anything changed since the last write.
+    /// Queues a session store write if anything changed since the last one.
     ///
-    /// Called from the debounce timer and once more on the way out, so a clean shutdown never
-    /// loses state. A `SIGKILL` still costs up to `SESSION_SAVE_DELAY`, same as mutter.
+    /// Called from the debounce timer. Only the serialization happens here; the write itself is on
+    /// the store's worker thread, since an `fsync` on the compositor thread is dropped frames.
     pub fn save_session_store(&mut self) {
         let store = &mut self.session_manager_state.store;
         if !store.is_dirty() {
             return;
         }
         if let Err(err) = store.save() {
-            warn!("error saving the session store: {err}");
+            warn!("error serializing the session store: {err}");
         }
     }
 
-    /// Cancels a pending debounced save and writes immediately. For the shutdown path.
+    /// Cancels a pending debounced save and writes synchronously. For the shutdown path.
+    ///
+    /// This is the one blocking write, so a clean shutdown never loses state. A `SIGKILL` still
+    /// costs up to `SESSION_SAVE_DELAY`, same as mutter.
     pub fn flush_session_store(&mut self) {
         if let Some(token) = self.session_save_timer.take() {
             self.event_loop.remove(token);
         }
-        self.save_session_store();
+        self.session_manager_state.store.flush();
     }
 
     pub fn inhibit_power_key(&mut self) -> anyhow::Result<()> {
