@@ -4490,7 +4490,19 @@ impl State {
     /// the unmap path above. We tear down without unmapping, so the sweep is explicit — without it
     /// the flagship case, logging out with windows open, would save nothing.
     pub fn save_session_toplevels_still_mapped(&mut self) {
+        self.save_live_session_toplevels_matching(None);
+    }
+
+    /// Snapshots every still-mapped registered toplevel, or only one session's when `only` is set.
+    ///
+    /// Two callers with the same need: shutdown, which has to sweep everything because we tear down
+    /// without unmapping, and `xdg_session_v1.destroy`, which has to freeze one session's state
+    /// before its registrations go away.
+    pub(crate) fn save_live_session_toplevels_matching(&mut self, only: Option<&str>) {
         for (session_id, name, toplevel) in self.synoik.session_manager_state.live_registrations() {
+            if only.is_some_and(|wanted| wanted != session_id) {
+                continue;
+            }
             let Some(window) = self
                 .synoik
                 .layout

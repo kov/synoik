@@ -975,6 +975,10 @@ impl SessionManagerHandler for State {
             .ok();
     }
 
+    fn save_live_session_toplevels(&mut self, session_id: &str) {
+        self.save_live_session_toplevels_matching(Some(session_id));
+    }
+
     fn note_session_restore_requested(&mut self, toplevel: &XdgToplevel) {
         let Some(unmapped) = self
             .synoik

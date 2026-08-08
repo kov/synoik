@@ -52,6 +52,14 @@ pub trait SessionManagerHandler {
     /// never commits.
     fn note_session_restore_requested(&mut self, toplevel: &XdgToplevel);
 
+    /// Snapshots the state of every still-mapped toplevel registered under `session_id`.
+    ///
+    /// `xdg_session_v1.destroy` is specified as "preserving the current state", so the state has to
+    /// be frozen as of the request. Our only other save trigger is unmap, and a client is entitled
+    /// to destroy the session while its windows are still up — which would otherwise leave those
+    /// windows holding whatever record their *previous* run wrote.
+    fn save_live_session_toplevels(&mut self, session_id: &str);
+
     /// Arms the debounced write of the session store.
     ///
     /// The protocol code owns *what* changed; the timer lives with the event loop, so the two are
@@ -437,9 +445,18 @@ where
         // Drops the session when the client goes away, too. Only if this object still owns the
         // id: a takeover already moved it to somebody else.
         let manager = state.session_manager_state();
-        if manager.live.get(&data.id).map(|live| &live.resource) == Some(session) {
-            manager.live.remove(&data.id);
+        if manager.live.get(&data.id).map(|live| &live.resource) != Some(session) {
+            return;
         }
+
+        // Freeze the state *before* dropping the registrations, per the spec's "preserving the
+        // current state". Afterwards there is nothing left to look these toplevels up under, so an
+        // unmap that arrives later — the client tearing its windows down after its session, or the
+        // whole client disappearing at once — would save nothing and leave a stale record behind.
+        state.save_live_session_toplevels(&data.id);
+        state.schedule_session_save();
+
+        state.session_manager_state().live.remove(&data.id);
     }
 }
 

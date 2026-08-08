@@ -21462,6 +21462,40 @@ fn re_requesting_a_live_session_is_in_use() {
     f.roundtrip(id);
 }
 
+/// The loser of a takeover destroying its session object must not disturb the winner.
+///
+/// A takeover moves the id to the new client, leaving the old object inert; when that object is
+/// eventually destroyed — which happens on its own schedule, and often long after — its destructor
+/// must recognise that it no longer owns the id and do nothing. Without that check it drops the
+/// *winner's* live session, and the id silently stops being held.
+#[test]
+#[should_panic(expected = "Protocol error 1 on object xdg_session_manager_v1")]
+fn a_replaced_session_being_destroyed_leaves_the_winner_holding_the_id() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let loser = f.add_client();
+    f.roundtrip(loser);
+    let (losing_session, session_id) = new_session(&mut f, loser);
+
+    let winner = f.add_client();
+    f.roundtrip(winner);
+    let _won = f
+        .client(winner)
+        .get_session(Reason::Launch, Some(&session_id));
+    f.roundtrip(winner);
+
+    // The inert object goes away afterwards, as a real client's would.
+    losing_session.destroy();
+    f.double_roundtrip(loser);
+
+    // The winner still holds it, so asking again is `in_use` — not a restore.
+    let _again = f
+        .client(winner)
+        .get_session(Reason::Launch, Some(&session_id));
+    f.roundtrip(winner);
+}
+
 /// `restore_toplevel` changes the very first configure, so it is meaningless — and an error —
 /// once the client has committed the surface.
 #[test]
@@ -21598,6 +21632,90 @@ fn a_destroyed_session_goes_inert_but_stays_known() {
     assert_eq!(
         f.client(id).session_events(),
         [SessionEvent::Created(session_id), SessionEvent::Restored]
+    );
+}
+
+/// Destroying a session must save what its still-mapped toplevels look like *now*.
+///
+/// The spec's word for `destroy` is "preserving the current state" — the state is frozen as of the
+/// request, not left at whatever the last unmap happened to record. Our only save trigger is unmap,
+/// so without this a session destroyed while its windows are up keeps a record from a previous run.
+#[test]
+fn destroying_a_session_saves_its_still_mapped_toplevels() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let _surface = map_session_window(&mut f, id, &session, "main");
+
+    // Somewhere unmistakable, and somewhere that is not where a fresh window lands.
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.synoik_complete_animations();
+
+    session.destroy();
+    f.double_roundtrip(id);
+
+    let saved = f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .and_then(|record| record.toplevels.get("main"))
+        .and_then(|toplevel| toplevel.workspace);
+    assert_eq!(
+        saved,
+        Some(1),
+        "destroying the session must preserve where the window is *now*"
+    );
+}
+
+/// Ghost's shape: two windows, one torn down before the session and one after. The second one must
+/// not be left holding a stale record — which is exactly how a window comes back on the desktop it
+/// was on two runs ago.
+#[test]
+fn a_toplevel_outliving_its_session_still_saves() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let first = map_session_window(&mut f, id, &session, "first");
+    let second = map_session_window(&mut f, id, &session, "second");
+
+    // `second` has focus; move it one desktop down so the two differ.
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.synoik_complete_animations();
+
+    // Tear down in the order that loses state: one toplevel, then the session, then the rest.
+    f.client(id).window(&first).attach_null_buffer();
+    f.client(id).window(&first).commit();
+    f.double_roundtrip(id);
+
+    session.destroy();
+    f.double_roundtrip(id);
+
+    f.client(id).window(&second).attach_null_buffer();
+    f.client(id).window(&second).commit();
+    f.double_roundtrip(id);
+
+    let saved = |f: &mut Fixture, name: &str| {
+        f.synoik()
+            .session_manager_state
+            .store
+            .get(&session_id)
+            .and_then(|record| record.toplevels.get(name))
+            .and_then(|toplevel| toplevel.workspace)
+    };
+    assert_eq!(saved(&mut f, "first"), Some(0), "`first` unmapped normally");
+    assert_eq!(
+        saved(&mut f, "second"),
+        Some(1),
+        "`second` outlived the session and must still have been saved"
     );
 }
 

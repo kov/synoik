@@ -85,6 +85,13 @@ session-probe — drive xdg_session_management_v1 against a live compositor
     --hold SECS        exit after SECS instead of waiting for a signal
     --quit-on-configure  exit as soon as every window has mapped; useful for a
                        one-shot 'where did they land' check
+    --quit-style S     how to tear down on the way out (default all-windows):
+                         all-windows  destroy every toplevel, then the session
+                         session-first destroy the session, then the toplevels
+                         session-mid  destroy one toplevel, then the session,
+                                      then the rest
+                       Which of these loses a window's saved state is exactly
+                       the question when an app comes back on the wrong desktop.
     -h, --help         this
 
 Exiting destroys the toplevels, which is what makes the compositor save the
@@ -99,6 +106,14 @@ struct Opts {
     reason: Reason,
     hold: Option<Duration>,
     quit_on_configure: bool,
+    quit_style: QuitStyle,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum QuitStyle {
+    AllWindows,
+    SessionFirst,
+    SessionMid,
 }
 
 impl Default for Opts {
@@ -111,6 +126,7 @@ impl Default for Opts {
             reason: Reason::Launch,
             hold: None,
             quit_on_configure: false,
+            quit_style: QuitStyle::AllWindows,
         }
     }
 }
@@ -150,6 +166,14 @@ fn parse_args() -> Result<Opts, String> {
                 opts.hold = Some(Duration::from_secs(secs));
             }
             "--quit-on-configure" => opts.quit_on_configure = true,
+            "--quit-style" => {
+                opts.quit_style = match value()?.as_str() {
+                    "all-windows" => QuitStyle::AllWindows,
+                    "session-first" => QuitStyle::SessionFirst,
+                    "session-mid" => QuitStyle::SessionMid,
+                    other => return Err(format!("unknown quit style {other}")),
+                }
+            }
             other => return Err(format!("unexpected argument {other}")),
         }
     }
@@ -360,15 +384,41 @@ fn main() {
         }
     }
 
-    // Unmapping is what makes the compositor save: destroy the toplevels and flush before exit.
-    println!("quitting: destroying {} toplevel(s)", state.windows.len());
-    for w in &state.windows {
+    // Unmapping is what makes the compositor save. *When* the session object dies relative to the
+    // toplevels is the interesting variable: a session destroyed first may take the registrations
+    // with it, and then the unmap that follows has nothing to look itself up under.
+    println!(
+        "quitting: style={:?}, destroying {} toplevel(s)",
+        state.opts.quit_style,
+        state.windows.len()
+    );
+    let destroy = |w: &Window| {
         if let Some(handle) = &w.handle {
             handle.destroy();
         }
         w.toplevel.destroy();
         w.xdg_surface.destroy();
         w.surface.destroy();
+    };
+    match state.opts.quit_style {
+        QuitStyle::AllWindows => {
+            state.windows.iter().for_each(destroy);
+            session.destroy();
+        }
+        QuitStyle::SessionFirst => {
+            session.destroy();
+            let _ = queue.roundtrip(&mut state);
+            state.windows.iter().for_each(destroy);
+        }
+        QuitStyle::SessionMid => {
+            if let Some(first) = state.windows.first() {
+                destroy(first);
+            }
+            let _ = queue.roundtrip(&mut state);
+            session.destroy();
+            let _ = queue.roundtrip(&mut state);
+            state.windows.iter().skip(1).for_each(destroy);
+        }
     }
     // A plain flush can return before the compositor has processed the destroys; a roundtrip
     // guarantees it has, which is the difference between saving the session and not.
