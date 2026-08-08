@@ -29,6 +29,27 @@ pub struct Unmapped {
     /// spec pins to "before the first commit" — `xdg_toplevel_session_v1`'s `already_mapped`
     /// error — need the commit itself, not the configure.
     pub had_initial_commit: bool,
+    /// Whether the client asked to *restore* this toplevel rather than merely add it to a session.
+    ///
+    /// Only the flag: everything else — the session, the name, the handle, the saved record — is
+    /// re-resolved when the initial configure fires, since any of it can have gone away in
+    /// between. See `protocols::session_management::SessionManagerState::restore_target_for`.
+    pub wants_session_restore: bool,
+}
+
+/// The part of a session restore that can only be applied once the window maps.
+#[derive(Debug, Clone)]
+pub struct RestoreOnMap {
+    /// Saved workspace index, resolved against the mapped monitor rather than pinned to an id at
+    /// configure time: the monitor's workspaces can change in between.
+    pub workspace_idx: Option<usize>,
+
+    /// The rect to return to when un-maximized, in global coordinates.
+    ///
+    /// Set only when the window maps straight into maximized or fullscreen. Such a window never
+    /// had a floating incarnation this run, so nothing else fills in `Tile::tiled_restore_*` and
+    /// un-maximizing would land on a default size instead of the one it was saved with.
+    pub unmaximize_to: Option<crate::session_state::Rect>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -85,6 +106,9 @@ pub enum InitialConfigureState {
         /// Workspace to open this window on.
         workspace_name: Option<String>,
 
+        /// What a session restore still owes the map step.
+        restore: Option<RestoreOnMap>,
+
         /// Whether the window should be maximized.
         ///
         /// This corresponds to the window having the Maximized toplevel state. However, if the
@@ -106,6 +130,7 @@ impl Unmapped {
             activation_token_data: None,
             activation_token: None,
             had_initial_commit: false,
+            wants_session_restore: false,
         }
     }
 

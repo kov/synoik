@@ -27,7 +27,7 @@ use smithay::reexports::wayland_server::{
 use wayland_backend::server::ClientId;
 
 use super::raw::xdg_session_management::v1::server::xdg_session_manager_v1::{
-    self, XdgSessionManagerV1,
+    self, Reason, XdgSessionManagerV1,
 };
 use super::raw::xdg_session_management::v1::server::xdg_session_v1::{self, XdgSessionV1};
 use super::raw::xdg_session_management::v1::server::xdg_toplevel_session_v1::{
@@ -46,6 +46,12 @@ pub trait SessionManagerHandler {
     /// the very first configure the toplevel receives.
     fn toplevel_had_initial_commit(&mut self, toplevel: &XdgToplevel) -> bool;
 
+    /// Marks a not-yet-configured toplevel as wanting session restore.
+    ///
+    /// A no-op if the toplevel is not in `unmapped_windows` — a client can register a toplevel it
+    /// never commits.
+    fn note_session_restore_requested(&mut self, toplevel: &XdgToplevel);
+
     /// Arms the debounced write of the session store.
     ///
     /// The protocol code owns *what* changed; the timer lives with the event loop, so the two are
@@ -58,6 +64,9 @@ pub trait SessionManagerHandler {
 struct LiveSession {
     /// The object managing this session. Any other [`XdgSessionV1`] carrying the same id is inert.
     resource: XdgSessionV1,
+
+    /// Why it was asked for; decides whether a restored window takes focus.
+    reason: Reason,
 
     /// Toplevel names registered in this session.
     ///
@@ -88,6 +97,18 @@ pub struct SessionManagerState {
 #[derive(Debug)]
 pub struct SessionData {
     id: String,
+}
+
+/// Everything [`State::send_initial_configure`] needs to restore a toplevel, resolved fresh at
+/// configure time rather than trusted from when `restore_toplevel` was made: in between, the
+/// session can have been taken over, the record removed, or the handle destroyed.
+#[derive(Debug)]
+pub struct RestoreTarget {
+    pub session_id: String,
+    pub name: String,
+    pub reason: Reason,
+    /// The handle to send `restored` on, immediately before the first configure.
+    pub handle: XdgToplevelSessionV1,
 }
 
 /// User data on an [`XdgToplevelSessionV1`].
@@ -156,6 +177,26 @@ impl SessionManagerState {
         })
     }
 
+    /// Resolves what it takes to restore `toplevel`, or `None` if it is no longer restorable.
+    ///
+    /// A takeover empties the previous holder's registrations, so a session that changed hands
+    /// between the request and the configure simply fails to resolve here — the inertness rule
+    /// doing the work rather than a staleness check.
+    pub fn restore_target_for(&self, toplevel: &XdgToplevel) -> Option<RestoreTarget> {
+        self.live.iter().find_map(|(session_id, live)| {
+            let (name, reg) = live
+                .toplevels
+                .iter()
+                .find(|(_, reg)| &reg.toplevel == toplevel)?;
+            Some(RestoreTarget {
+                session_id: session_id.clone(),
+                name: name.clone(),
+                reason: live.reason,
+                handle: reg.handle.clone(),
+            })
+        })
+    }
+
     /// Every live registration, as `(session id, name, toplevel)`.
     ///
     /// For the shutdown sweep: mutter reaches the same state by unmanaging every window before its
@@ -177,7 +218,7 @@ impl SessionManagerState {
     /// The previous holder is told it was `replaced` and everything it owned becomes inert. Its
     /// live registrations do not carry over: what a takeover inherits is the *saved* state, which
     /// this slice does not have yet.
-    fn take_over(&mut self, id: String, resource: XdgSessionV1) {
+    fn take_over(&mut self, id: String, resource: XdgSessionV1, reason: Reason) {
         if let Some(previous) = self.live.remove(&id) {
             if previous.resource.is_alive() {
                 previous.resource.replaced();
@@ -188,6 +229,7 @@ impl SessionManagerState {
             id,
             LiveSession {
                 resource,
+                reason,
                 toplevels: HashMap::new(),
             },
         );
@@ -243,7 +285,7 @@ where
                 reason,
                 session_id,
             } => {
-                if reason.into_result().is_err() {
+                let Ok(reason) = reason.into_result() else {
                     // Still initialise the object: the client is about to be disconnected, but
                     // leaving a `New` uninitialised is a panic in wayland-rs.
                     data_init.init(
@@ -257,7 +299,7 @@ where
                         "unknown session reason",
                     );
                     return;
-                }
+                };
 
                 // An id is *known* if some client holds it right now or the store remembers it
                 // from a previous run. Anything else is treated as if NULL had been passed, so it
@@ -285,7 +327,7 @@ where
                     Some((sid, false)) => {
                         let session = data_init.init(id, SessionData { id: sid.clone() });
                         let manager = state.session_manager_state();
-                        manager.take_over(sid.clone(), session.clone());
+                        manager.take_over(sid.clone(), session.clone(), reason);
                         manager.store.touch(&sid);
                         state.schedule_session_save();
                         session.restored();
@@ -294,7 +336,7 @@ where
                         let sid = uuid::Uuid::new_v4().to_string();
                         let session = data_init.init(id, SessionData { id: sid.clone() });
                         let manager = state.session_manager_state();
-                        manager.take_over(sid.clone(), session.clone());
+                        manager.take_over(sid.clone(), session.clone(), reason);
                         manager.store.touch(&sid);
                         state.schedule_session_save();
                         session.created(sid);
@@ -351,10 +393,28 @@ where
                     return;
                 }
 
-                // With no persistent store yet there is never anything to restore, so this
-                // degrades to `add_toplevel` and sends no `restored` event — which is exactly
-                // what the spec prescribes for an unknown name. Slice 4 makes it real.
-                add_toplevel(state, client, session, data, id, toplevel, name, data_init);
+                // The registration is the same either way; what `restore_toplevel` adds is the
+                // intent, which the initial configure acts on. A name the session has no record
+                // for simply finds nothing there and degrades to a plain add, with no `restored`
+                // event — what the spec prescribes.
+                let known = state
+                    .session_manager_state()
+                    .store
+                    .get(&data.id)
+                    .is_some_and(|record| record.toplevels.contains_key(&name));
+                add_toplevel(
+                    state,
+                    client,
+                    session,
+                    data,
+                    id,
+                    toplevel.clone(),
+                    name,
+                    data_init,
+                );
+                if known {
+                    state.note_session_restore_requested(&toplevel);
+                }
             }
             xdg_session_v1::Request::RemoveToplevel { name } => {
                 if state.session_manager_state().session_of(session).is_none() {

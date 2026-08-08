@@ -548,6 +548,10 @@ impl<W: LayoutElement> Monitor<W> {
         self.workspaces
     }
 
+    pub fn workspaces_ref(&self) -> &[Workspace<W>] {
+        &self.workspaces
+    }
+
     pub fn output(&self) -> &Output {
         &self.output
     }

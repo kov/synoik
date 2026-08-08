@@ -12,6 +12,7 @@ use smithay::reexports::calloop::Interest;
 use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Resource};
+use smithay::utils::{Point, Rectangle, Size};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     add_blocker, add_pre_commit_hook, get_parent, is_sync_subsurface, remove_pre_commit_hook,
@@ -95,6 +96,7 @@ impl CompositorHandler for State {
                         activation_token_data,
                         activation_token,
                         had_initial_commit: _,
+                        wants_session_restore: _,
                     } = entry.remove();
 
                     window.on_commit();
@@ -110,6 +112,8 @@ impl CompositorHandler for State {
                         output,
                         workspace_id,
                         is_pending_maximized,
+                        was_restored,
+                        unmaximize_to,
                     ) = if let InitialConfigureState::Configured {
                         rules,
                         width,
@@ -120,6 +124,7 @@ impl CompositorHandler for State {
                         output,
                         workspace_name,
                         is_pending_maximized,
+                        restore,
                     } = state
                     {
                         // Check that the output is still connected.
@@ -132,6 +137,22 @@ impl CompositorHandler for State {
                             .and_then(|n| self.synoik.layout.find_workspace_by_name(n))
                             .map(|(_, ws)| ws.id());
 
+                        // A restored window goes back to its saved workspace *index*, resolved
+                        // now rather than at configure time: the monitor's workspaces can have
+                        // changed in between. Clamped to the last one, since with dynamic
+                        // workspaces the index may no longer exist and clamping beats creating
+                        // workspaces up to it.
+                        let workspace_id = workspace_id.or_else(|| {
+                            let idx = restore.as_ref()?.workspace_idx?;
+                            let mon = self.synoik.layout.monitor_for_output(output.as_ref()?)?;
+                            let workspaces = mon.workspaces_ref();
+                            let last = workspaces.len().checked_sub(1)?;
+                            Some(workspaces[idx.min(last)].id())
+                        });
+
+                        let was_restored = restore.is_some();
+                        let unmaximize_to = restore.and_then(|restore| restore.unmaximize_to);
+
                         (
                             rules,
                             width,
@@ -140,6 +161,8 @@ impl CompositorHandler for State {
                             output,
                             workspace_id,
                             is_pending_maximized,
+                            was_restored,
+                            unmaximize_to,
                         )
                     } else {
                         // Can happen when a surface unmaps by attaching a null buffer while
@@ -153,6 +176,8 @@ impl CompositorHandler for State {
                             None,
                             None,
                             false,
+                            false,
+                            None,
                         )
                     };
 
@@ -374,9 +399,35 @@ impl CompositorHandler for State {
                     // GNOME auto-maximize (mutter place.c): a first-shown window
                     // covering more than 80% of the work area opens maximized.
                     // Transients are left alone.
-                    if windowing_mode == WindowingMode::Floating && is_floating && parent.is_none()
+                    //
+                    // A session-restored window is not first-shown in the sense that matters: its
+                    // size is remembered rather than guessed, and auto-maximize would both
+                    // override the remembered state and overwrite the rect to return to with its
+                    // own shrunken guess.
+                    if windowing_mode == WindowingMode::Floating
+                        && is_floating
+                        && parent.is_none()
+                        && !was_restored
                     {
                         self.synoik.layout.auto_maximize_if_too_big(&window);
+                    }
+
+                    // A restored window that maps straight into maximized or fullscreen has no
+                    // floating incarnation this run, so tell the layout the rect it came from —
+                    // otherwise un-maximizing lands on a default size rather than the saved one.
+                    // After auto-maximize, which is the other writer of this field.
+                    if let Some([x, y, w, h]) = unmaximize_to {
+                        let origin = output
+                            .as_ref()
+                            .and_then(|output| self.synoik.global_space.output_geometry(output))
+                            .map_or_else(Point::default, |geo| geo.loc.to_f64());
+                        let rect = Rectangle::new(
+                            Point::from((f64::from(x), f64::from(y))),
+                            Size::from((f64::from(w), f64::from(h))),
+                        );
+                        self.synoik
+                            .layout
+                            .seed_unmaximize_geometry(&window, rect, origin);
                     }
 
                     if let Some(output) = output {

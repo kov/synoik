@@ -975,6 +975,18 @@ impl SessionManagerHandler for State {
             .ok();
     }
 
+    fn note_session_restore_requested(&mut self, toplevel: &XdgToplevel) {
+        let Some(unmapped) = self
+            .synoik
+            .unmapped_windows
+            .values_mut()
+            .find(|unmapped| unmapped.toplevel().xdg_toplevel() == toplevel)
+        else {
+            return;
+        };
+        unmapped.wants_session_restore = true;
+    }
+
     fn toplevel_had_initial_commit(&mut self, toplevel: &XdgToplevel) -> bool {
         let surface = self
             .synoik

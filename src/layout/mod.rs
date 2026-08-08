@@ -5527,6 +5527,21 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// See [`Workspace::seed_unmaximize_geometry`]. `output_origin` converts the stored global
+    /// rect into the workspace's frame.
+    pub fn seed_unmaximize_geometry(
+        &mut self,
+        id: &W::Id,
+        rect: Rectangle<f64, Logical>,
+        output_origin: Point<f64, Logical>,
+    ) {
+        for ws in self.workspaces_mut() {
+            if ws.seed_unmaximize_geometry(id, rect, output_origin) {
+                return;
+            }
+        }
+    }
+
     /// Everything the session store needs about `id`, other than the output origin.
     ///
     /// The workspace index is **per monitor**, while the rect the caller composes is global. The

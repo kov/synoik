@@ -22,7 +22,7 @@ use smithay::reexports::wayland_server::protocol::wl_output;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{self, Resource, WEnum};
-use smithay::utils::{Logical, Rectangle, Scale, Serial};
+use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 use smithay::wayland::compositor::{
     add_blocker, add_pre_commit_hook, with_states, BufferAssignment, CompositorHandler as _,
     HookId, SurfaceAttributes,
@@ -41,7 +41,8 @@ use smithay::wayland::xdg_foreign::{XdgForeignHandler, XdgForeignState};
 use smithay::{
     delegate_kde_decoration, delegate_xdg_decoration, delegate_xdg_foreign, delegate_xdg_shell,
 };
-use synoik_config::{PresetSize, WindowingMode};
+use synoik_config::window_rule::{FloatingPosition, RelativeTo};
+use synoik_config::{FloatOrInt, PresetSize, WindowingMode};
 use tracing::field::Empty;
 
 use crate::input::move_grab::MoveGrab;
@@ -50,12 +51,17 @@ use crate::input::touch_resize_grab::TouchResizeGrab;
 use crate::input::{PointerOrTouchStartData, DOUBLE_CLICK_TIME};
 use crate::layout::placement::PlacementSeeds;
 use crate::layout::ActivateWindow;
+use crate::protocols::raw::xdg_session_management::v1::server::xdg_session_manager_v1::Reason;
+use crate::protocols::raw::xdg_session_management::v1::server::xdg_toplevel_session_v1::XdgToplevelSessionV1;
+use crate::session_state::{ToplevelRecord, WindowState};
 use crate::synoik::{CastTarget, PopupGrabState, State};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
     get_monotonic_time, output_matches_name, send_scale_transform, update_tiled_state, ResizeEdge,
 };
-use crate::window::{InitialConfigureState, ResolvedWindowRules, Unmapped, WindowRef};
+use crate::window::{
+    InitialConfigureState, ResolvedWindowRules, RestoreOnMap, Unmapped, WindowRef,
+};
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -436,6 +442,7 @@ impl XdgShellHandler for State {
                     // The required configure will be the initial configure.
                 }
                 InitialConfigureState::Configured {
+                    restore: _,
                     rules,
                     output,
                     workspace_name,
@@ -498,6 +505,7 @@ impl XdgShellHandler for State {
                     // The required configure will be the initial configure.
                 }
                 InitialConfigureState::Configured {
+                    restore: _,
                     rules,
                     width,
                     height,
@@ -604,6 +612,7 @@ impl XdgShellHandler for State {
                     // The required configure will be the initial configure.
                 }
                 InitialConfigureState::Configured {
+                    restore: _,
                     rules,
                     output,
                     workspace_name,
@@ -669,6 +678,7 @@ impl XdgShellHandler for State {
                     // The required configure will be the initial configure.
                 }
                 InitialConfigureState::Configured {
+                    restore: _,
                     rules,
                     width,
                     height,
@@ -944,7 +954,78 @@ impl XdgForeignHandler for State {
 }
 delegate_xdg_foreign!(State);
 
+/// A resolved session restore, from [`State::resolve_session_restore`].
+#[derive(Debug)]
+struct SessionRestore {
+    /// The handle to send `restored` on, immediately before the first configure.
+    handle: XdgToplevelSessionV1,
+    /// Decides activation, and nothing else.
+    reason: Reason,
+    record: ToplevelRecord,
+    /// The output the saved rect lands on, or `None` if that monitor is gone.
+    output: Option<Output>,
+}
+
 impl State {
+    /// What a `restore_toplevel` request resolves to, once the initial configure actually fires.
+    ///
+    /// Nothing here is trusted from when the request was made: the session can have been taken
+    /// over, the record removed, or the handle destroyed in between. A takeover empties the
+    /// previous holder's registrations, so it simply fails to resolve.
+    fn resolve_session_restore(&self, toplevel: &ToplevelSurface) -> Option<SessionRestore> {
+        let target = self
+            .synoik
+            .session_manager_state
+            .restore_target_for(toplevel.xdg_toplevel())?;
+        if !target.handle.is_alive() {
+            return None;
+        }
+
+        let record = self
+            .synoik
+            .session_manager_state
+            .store
+            .get(&target.session_id)?
+            .toplevels
+            .get(&target.name)?
+            .clone();
+
+        let output = record
+            .floating_rect
+            .and_then(|rect| self.output_for_saved_rect(rect));
+
+        Some(SessionRestore {
+            handle: target.handle,
+            reason: target.reason,
+            record,
+            output,
+        })
+    }
+
+    /// The output a saved rect belongs to: the one it overlaps most, as in mutter's
+    /// `meta_monitor_manager_get_logical_monitor_from_rect`.
+    ///
+    /// `None` when it overlaps none of them — the monitor it was saved on is gone, so the normal
+    /// placement chain decides instead of forcing it somewhere arbitrary.
+    fn output_for_saved_rect(&self, rect: crate::session_state::Rect) -> Option<Output> {
+        let saved = Rectangle::new(
+            Point::from((rect[0], rect[1])),
+            Size::from((rect[2].max(1), rect[3].max(1))),
+        );
+
+        self.synoik
+            .global_space
+            .outputs()
+            .filter_map(|output| {
+                let geo = self.synoik.global_space.output_geometry(output)?;
+                let overlap = geo.intersection(saved)?;
+                let area = i64::from(overlap.size.w) * i64::from(overlap.size.h);
+                (area > 0).then(|| (area, output.clone()))
+            })
+            .max_by_key(|(area, _)| *area)
+            .map(|(_, output)| output)
+    }
+
     pub fn send_initial_configure(&mut self, toplevel: &ToplevelSurface) {
         let _span = tracy_client::span!("State::send_initial_configure");
 
@@ -955,17 +1036,52 @@ impl State {
             .then(|| self.synoik.output_under_cursor())
             .flatten();
 
+        // Resolved before the `unmapped_windows` borrow below, like `pointer_output`. `None` for
+        // every window that did not ask to be restored, which is what keeps this whole branch
+        // additive: without it, everything below runs exactly as it did before.
+        let restore = self
+            .synoik
+            .unmapped_windows
+            .get(toplevel.wl_surface())
+            .is_some_and(|unmapped| unmapped.wants_session_restore)
+            .then(|| self.resolve_session_restore(toplevel))
+            .flatten();
+
         let Some(unmapped) = self.synoik.unmapped_windows.get_mut(toplevel.wl_surface()) else {
             error!("window must be present in unmapped_windows in send_initial_configure()");
             return;
         };
 
         let config = self.synoik.config.borrow();
-        let rules = ResolvedWindowRules::compute(
+        let mut rules = ResolvedWindowRules::compute(
             &config.window_rules,
             WindowRef::Unmapped(unmapped),
             self.synoik.is_at_startup,
         );
+
+        // Restore writes itself into the *rules*, so the placement, sizing and state code below
+        // stays one path. It overrides any config window rule: the saved state is both more
+        // specific and more recent than a static rule.
+        if let Some(restore) = &restore {
+            match restore.record.restorable_state() {
+                Some(WindowState::Fullscreen) => rules.open_fullscreen = Some(true),
+                Some(WindowState::Maximized) => rules.open_maximized_to_edges = Some(true),
+                _ => (),
+            }
+
+            if let Some([_, _, w, h]) = restore.record.floating_rect {
+                rules.default_width = Some(Some(PresetSize::Fixed(w)));
+                rules.default_height = Some(Some(PresetSize::Fixed(h)));
+            }
+
+            // `launch` is left alone so it goes through focus-stealing prevention like any other
+            // launch — that is what "behaves like any other launch" means. Only the two
+            // non-interactive reasons suppress focus, so restoring five windows at login does not
+            // have each one steal focus in turn.
+            if restore.reason != Reason::Launch {
+                rules.open_focused = Some(false);
+            }
+        }
 
         let Unmapped { window, state, .. } = unmapped;
 
@@ -988,14 +1104,32 @@ impl State {
                 .find(|output| output_matches_name(output, name))
         });
         let fullscreen_output = wants_fullscreen.as_ref().and_then(|x| x.as_ref());
-        let seed_output = [rule_output, fullscreen_output]
+        // A restore's saved rect names the output ahead of a rule, since it *is* where the window
+        // was; the rule only ever described where it should open the first time.
+        let restore_output = restore.as_ref().and_then(|r| r.output.as_ref());
+        let seed_output = [restore_output, rule_output, fullscreen_output]
             .into_iter()
             .flatten()
             .find(|o| self.synoik.layout.monitor_for_output(o).is_some());
 
         let parent = toplevel.parent();
+        let restore_on_map = restore.as_ref().map(|restore| RestoreOnMap {
+            workspace_idx: restore.record.workspace.map(|idx| idx as usize),
+            // Only for a window that maps straight into maximized or fullscreen — anything else
+            // gets its floating geometry from the configure and the position rule.
+            unmaximize_to: restore
+                .record
+                .restorable_state()
+                .filter(|state| *state != WindowState::Floating)
+                .and(restore.record.floating_rect),
+        });
+        let restore_workspace_idx = restore_on_map
+            .as_ref()
+            .and_then(|restore| restore.workspace_idx);
+
         let target = self.synoik.layout.resolve_placement(PlacementSeeds {
             workspace_name: rules.open_on_workspace.as_deref(),
+            workspace_idx: restore_workspace_idx,
             output: seed_output,
             // A dialog with a parent follows it, and `output_to_store` then declines to pin the
             // output so that mapping re-fetches the parent's, in case it moved in between.
@@ -1012,6 +1146,29 @@ impl State {
 
         let output = target.output_to_store();
         let ws = target.workspace;
+
+        // The saved position, converted into the frame `default_floating_position` speaks: the
+        // working area of the workspace the window is actually landing on. That is per-workspace
+        // (struts differ), which is why it waits until placement has resolved rather than being
+        // folded in with the size above. Going in, a floating rule is what makes the placement
+        // cascade leave the window alone (`FloatingSpace::avoid_focus_window`), which is exactly
+        // what restoring a remembered position wants.
+        if let Some(([x, y, _, _], ws)) = restore
+            .as_ref()
+            .and_then(|r| r.record.floating_rect)
+            .zip(ws)
+        {
+            let origin = ws
+                .current_output()
+                .and_then(|output| self.synoik.global_space.output_geometry(output))
+                .map_or_else(Point::default, |geo| geo.loc);
+            let area = ws.working_area();
+            rules.default_floating_position = Some(FloatingPosition {
+                x: FloatOrInt(f64::from(x - origin.x) - area.loc.x),
+                y: FloatOrInt(f64::from(y - origin.y) - area.loc.y),
+                relative_to: RelativeTo::TopLeft,
+            });
+        }
 
         let mut width = None;
         let mut floating_width = None;
@@ -1075,7 +1232,17 @@ impl State {
             output,
             workspace_name: ws.and_then(|w| w.name().cloned()),
             is_pending_maximized,
+            restore: restore_on_map,
         };
+
+        // "prior to the first xdg_toplevel.configure" — the spec pins the ordering, and the
+        // client needs it to know that the configure it is about to see is a restored geometry
+        // rather than a fresh placement.
+        if let Some(restore) = &restore {
+            if restore.handle.is_alive() {
+                restore.handle.restored();
+            }
+        }
 
         trace!(surface = %toplevel.wl_surface().id(), "sending initial configure");
         toplevel.send_configure();

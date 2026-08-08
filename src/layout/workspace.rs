@@ -2637,6 +2637,34 @@ impl<W: LayoutElement> Workspace<W> {
         self.working_area
     }
 
+    /// Seeds the geometry an un-maximize or un-fullscreen returns `id` to, from a global rect.
+    ///
+    /// A window that maps straight into maximized or fullscreen never had a floating incarnation
+    /// this run, so nothing has filled in `tiled_restore_*` and `restore_normal` would fall back
+    /// to a default size. Session restore is the one caller that knows better, because it kept the
+    /// rect from last time.
+    ///
+    /// Returns whether the window was found here.
+    pub fn seed_unmaximize_geometry(
+        &mut self,
+        id: &W::Id,
+        rect: Rectangle<f64, Logical>,
+        output_origin: Point<f64, Logical>,
+    ) -> bool {
+        let pos = self.floating.logical_to_size_frac(rect.loc - output_origin);
+
+        let Some(tile) = self.tiles_mut().find(|tile| tile.window().id() == id) else {
+            return false;
+        };
+
+        tile.tiled_restore_size = Some(Size::from((
+            rect.size.w.round() as i32,
+            rect.size.h.round() as i32,
+        )));
+        tile.tiled_restore_pos = Some(pos);
+        true
+    }
+
     /// What the session store remembers about `id`: its sizing mode and the rect it would take if
     /// floating — mutter's `saved_rect` (`meta-wayland-xdg-session-state.c:32-57`).
     ///

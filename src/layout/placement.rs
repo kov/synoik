@@ -42,6 +42,15 @@ pub struct PlacementSeeds<'a> {
     /// A workspace requested by name, e.g. from the `open-on-workspace` window rule.
     pub workspace_name: Option<&'a str>,
 
+    /// A workspace requested by *index* on the resolved monitor — session restore, which persists
+    /// an index because workspace ids are runtime-only and meaningless across restarts.
+    ///
+    /// Unlike a name this does not pin the monitor: restore resolves the monitor from the saved
+    /// rect first, then indexes into it. Clamped to the last workspace, since with dynamic
+    /// workspaces the saved index may no longer exist and clamping beats creating workspaces up
+    /// to it. Ignored when a name is also given — a name is the more specific request.
+    pub workspace_idx: Option<usize>,
+
     /// An output the window asked for, or the one we resolved for it previously.
     pub output: Option<&'a Output>,
 
@@ -133,14 +142,21 @@ impl<W: LayoutElement> Layout<W> {
         // workspace by that name we deliberately yield `None` rather than falling back to the
         // active workspace — the caller asked for a specific workspace, and quietly configuring
         // against a different one would size the window wrong.
-        let workspace = seeds
-            .workspace_name
-            .and_then(|name| monitor.map(|mon| mon.find_named_workspace(name)))
-            .unwrap_or_else(|| {
-                monitor
-                    .map(|mon| mon.active_workspace_ref())
-                    .or_else(|| self.active_workspace())
-            });
+        let workspace = if seeds.workspace_name.is_some() {
+            seeds
+                .workspace_name
+                .and_then(|name| monitor.map(|mon| mon.find_named_workspace(name)))
+                .unwrap_or(None)
+        } else if let Some(idx) = seeds.workspace_idx {
+            monitor.and_then(|mon| {
+                let last = mon.workspaces.len().checked_sub(1)?;
+                mon.workspaces.get(idx.min(last))
+            })
+        } else {
+            monitor
+                .map(|mon| mon.active_workspace_ref())
+                .or_else(|| self.active_workspace())
+        };
 
         PlacementTarget {
             monitor,

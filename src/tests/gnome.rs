@@ -32,9 +32,11 @@ use super::*;
 use crate::gnome::{
     Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction, KeybindingAction,
 };
+use crate::layout::SizingMode;
 use crate::protocols::raw::xdg_session_management::v1::client::xdg_session_manager_v1::Reason;
 use crate::protocols::raw::xdg_session_management::v1::client::xdg_session_v1::XdgSessionV1;
-use crate::session_state::WindowState;
+use crate::protocols::raw::xdg_session_management::v1::client::xdg_toplevel_session_v1::XdgToplevelSessionV1;
+use crate::session_state::{ToplevelRecord, WindowState};
 use crate::status_notifier::ItemProps;
 use crate::ui::osd::OsdLevel;
 use crate::utils::get_monotonic_time;
@@ -22077,6 +22079,383 @@ fn renaming_a_toplevel_moves_its_saved_state() {
     assert!(
         toplevels.contains_key("new"),
         "the saved state must follow the rename: {toplevels:?}"
+    );
+}
+
+/// Seeds the store as a previous run would have left it.
+fn remember(f: &mut Fixture, session_id: &str, name: &str, record: ToplevelRecord) {
+    f.synoik()
+        .session_manager_state
+        .store
+        .save_toplevel(session_id, name, record);
+}
+
+/// Asks to restore `name` and returns the surface, configured but not yet mapped.
+#[track_caller]
+fn restore_window(
+    f: &mut Fixture,
+    id: ClientId,
+    session: &XdgSessionV1,
+    name: &str,
+) -> (WlSurface, XdgToplevelSessionV1) {
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    let qh = f.client(id).qh.clone();
+    let handle = session.restore_toplevel(&toplevel, String::from(name), &qh, String::from(name));
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+    (surface, handle)
+}
+
+/// Acks the pending configure at the size the compositor asked for, mapping the window.
+#[track_caller]
+fn map_at_configured_size(f: &mut Fixture, id: ClientId, surface: &WlSurface) -> (i32, i32) {
+    let size = f
+        .client(id)
+        .window(surface)
+        .recent_configures()
+        .last()
+        .expect("the window must have been configured")
+        .size;
+    let window = f.client(id).window(surface);
+    window.attach_new_buffer();
+    window.set_size(size.0 as u16, size.1 as u16);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    size
+}
+
+/// The heart of the protocol: close a window somewhere, and it comes back there.
+#[test]
+fn a_windows_geometry_survives_a_restart() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    // First run: map a window, move it somewhere unmistakable, close it.
+    let first = f.add_client();
+    f.roundtrip(first);
+    let (session, session_id) = new_session(&mut f, first);
+    let surface = map_session_window(&mut f, first, &session, "main");
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.synoik_complete_animations();
+    f.double_roundtrip(first);
+    let saved = f.synoik().layout.session_snapshot(&win).unwrap();
+    let saved_rect = saved.floating_rect.expect("a floated window has a rect");
+
+    let window = f.client(first).window(&surface);
+    window.attach_null_buffer();
+    window.commit();
+    f.double_roundtrip(first);
+    drop(session);
+
+    // Second run: a fresh client asks for the same session and restores the same name.
+    let second = f.add_client();
+    f.roundtrip(second);
+    let session = f
+        .client(second)
+        .get_session(Reason::SessionRestore, Some(&session_id));
+    f.roundtrip(second);
+    let (surface, _handle) = restore_window(&mut f, second, &session, "main");
+    let size = map_at_configured_size(&mut f, second, &surface);
+    f.synoik_complete_animations();
+
+    assert_eq!(
+        size,
+        (
+            saved_rect.size.w.round() as i32,
+            saved_rect.size.h.round() as i32
+        ),
+        "the restored window must be configured at its saved size"
+    );
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let restored = f
+        .synoik()
+        .layout
+        .session_snapshot(&win)
+        .unwrap()
+        .floating_rect
+        .expect("the restored window has a rect");
+    assert_eq!(
+        (restored.loc.x.round(), restored.loc.y.round()),
+        (saved_rect.loc.x.round(), saved_rect.loc.y.round()),
+        "the restored window must come back where it was closed"
+    );
+}
+
+/// The spec pins `restored` to "prior to the first `xdg_toplevel.configure`".
+#[test]
+fn restored_arrives_before_the_first_configure() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([100, 200, 300, 400]),
+            workspace: Some(0),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+
+    assert_eq!(
+        f.client(id).session_events().last(),
+        Some(&SessionEvent::ToplevelRestored(String::from("main"))),
+        "restore must report the name as restored"
+    );
+    assert!(
+        f.client(id)
+            .window(&surface)
+            .recent_configures()
+            .next()
+            .is_some(),
+        "and the configure must have followed it"
+    );
+}
+
+/// A saved state comes back as pending toplevel state on the very first configure, so the client
+/// never sees an unmaximized frame first.
+#[test]
+fn a_saved_window_state_is_restored_on_the_first_configure() {
+    for (saved, expected) in [
+        (WindowState::Maximized, xdg_toplevel::State::Maximized),
+        (WindowState::Fullscreen, xdg_toplevel::State::Fullscreen),
+    ] {
+        let mut f = Fixture::new();
+        f.add_output(1, (1280, 720));
+
+        let id = f.add_client();
+        f.roundtrip(id);
+        let (session, session_id) = new_session(&mut f, id);
+        remember(
+            &mut f,
+            &session_id,
+            "main",
+            ToplevelRecord {
+                state: Some(saved.as_raw()),
+                floating_rect: Some([100, 200, 300, 400]),
+                workspace: Some(0),
+                ..Default::default()
+            },
+        );
+
+        let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+        let configure = f
+            .client(id)
+            .window(&surface)
+            .recent_configures()
+            .last()
+            .expect("configured")
+            .clone();
+        assert!(
+            configure.states.contains(&expected),
+            "restoring {saved:?} must configure {expected:?}, got {configure}"
+        );
+    }
+}
+
+/// A restored window goes back to its workspace under **all three** reasons. This is the
+/// deliberate divergence from the spec's hint that only `session_restore` restores placement.
+#[test]
+fn a_restored_window_returns_to_its_workspace_under_every_reason() {
+    for reason in [Reason::Launch, Reason::Recover, Reason::SessionRestore] {
+        let mut f = Fixture::new();
+        f.add_output(1, (1280, 720));
+
+        let id = f.add_client();
+        f.roundtrip(id);
+        let session = f.client(id).get_session(reason, None);
+        f.roundtrip(id);
+        let events = f.client(id).session_events();
+        let [SessionEvent::Created(session_id)] = events else {
+            panic!("expected created, got {events:?}");
+        };
+        let session_id = session_id.clone();
+
+        remember(
+            &mut f,
+            &session_id,
+            "main",
+            ToplevelRecord {
+                state: Some(WindowState::Floating.as_raw()),
+                floating_rect: Some([100, 200, 300, 400]),
+                workspace: Some(1),
+                ..Default::default()
+            },
+        );
+
+        let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+        map_at_configured_size(&mut f, id, &surface);
+        f.synoik_complete_animations();
+
+        // Not via `focus()`: two of the three reasons deliberately do not take focus.
+        let win = f
+            .synoik()
+            .layout
+            .windows()
+            .map(|(_, mapped)| mapped.window.clone())
+            .next()
+            .expect("the restored window must be mapped");
+        assert_eq!(
+            f.synoik()
+                .layout
+                .session_snapshot(&win)
+                .unwrap()
+                .workspace_idx,
+            1,
+            "reason {reason:?} must still restore the workspace"
+        );
+    }
+}
+
+/// A saved index past the end of the monitor's workspaces clamps rather than creating workspaces
+/// up to it — with dynamic workspaces the saved index routinely no longer exists.
+#[test]
+fn a_saved_workspace_index_that_is_gone_clamps() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let workspaces = f.synoik().layout.workspaces().count();
+
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([100, 200, 300, 400]),
+            workspace: Some(99),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.synoik_complete_animations();
+
+    // Mapping onto the last workspace legitimately grows the strip by one — dynamic workspaces.
+    // What must not happen is 99 of them.
+    assert!(
+        f.synoik().layout.workspaces().count() <= workspaces + 1,
+        "restoring must not create workspaces up to the saved index"
+    );
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    assert_eq!(
+        f.synoik()
+            .layout
+            .session_snapshot(&win)
+            .unwrap()
+            .workspace_idx,
+        workspaces - 1,
+        "it must land on the last workspace instead"
+    );
+}
+
+/// The saved rect names the output. When that monitor is gone the window must still map, by the
+/// normal placement chain rather than at the saved off-screen coordinates.
+#[test]
+fn restoring_onto_a_monitor_that_is_gone_still_maps() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            // Far off to the right of every connected output.
+            floating_rect: Some([9000, 9000, 300, 400]),
+            workspace: Some(0),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.synoik_complete_animations();
+
+    let win = f
+        .synoik()
+        .layout
+        .focus()
+        .expect("the window must still map somewhere")
+        .window
+        .clone();
+    let rect = f
+        .synoik()
+        .layout
+        .session_snapshot(&win)
+        .unwrap()
+        .floating_rect
+        .expect("it has a rect");
+    assert!(
+        rect.loc.x < 1280. && rect.loc.y < 720.,
+        "it must land on a connected output, got {rect:?}"
+    );
+}
+
+/// Unmaximizing a restored window returns it to the rect it was saved with — the `saved_rect`
+/// round trip the whole format exists for. The window never floated this run, so nothing but the
+/// restore can have seeded it.
+#[test]
+fn unmaximizing_a_restored_window_returns_it_to_the_saved_rect() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Maximized.as_raw()),
+            floating_rect: Some([100, 200, 300, 400]),
+            workspace: Some(0),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.synoik_complete_animations();
+
+    f.synoik_state().do_action(Action::Unmaximize, false);
+    f.double_roundtrip(id);
+    map_at_configured_size(&mut f, id, &surface);
+    f.synoik_complete_animations();
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let snapshot = f.synoik().layout.session_snapshot(&win).unwrap();
+    assert_eq!(
+        snapshot.sizing_mode,
+        SizingMode::Normal,
+        "the window must have unmaximized"
+    );
+    let rect = snapshot.floating_rect.expect("it has a rect");
+    assert_eq!(
+        (rect.size.w.round() as i32, rect.size.h.round() as i32),
+        (300, 400),
+        "unmaximizing must return it to the saved size, not a default"
     );
 }
 
