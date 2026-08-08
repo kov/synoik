@@ -9288,6 +9288,7 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
             id: crate::window::mapped::MappedId::next(),
             app_id: Some("run".to_owned()),
             title: None,
+            urgent: false,
             last_focus: None,
         }]);
     f.synoik().sync_dash_favorites();

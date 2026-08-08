@@ -169,6 +169,11 @@ pub struct RunningWindow {
     /// The toplevel title — an "Open Windows" row's label, falling back to the app
     /// name when empty (`_updateWindowsSection`, `appMenu.js:283`).
     pub title: Option<String>,
+    /// Whether this window is demanding attention (`Mapped::is_urgent`).
+    ///
+    /// Carried per window rather than per app because it clears on focus, one window at a time.
+    pub urgent: bool,
+
     /// `Mapped::get_focus_timestamp()`, standing in for
     /// `shell_app_get_last_user_time()` in [`shell_app_compare`]'s last clause.
     /// `None` (never focused) sorts last, as GNOME's `0` does.
@@ -192,6 +197,11 @@ pub struct RunningApp {
 }
 
 impl RunningApp {
+    /// Whether any of the app's windows is demanding attention.
+    pub fn is_urgent(&self) -> bool {
+        self.windows.iter().any(|window| window.urgent)
+    }
+
     /// How many windows resolved to this app — `shell_app_get_n_windows()`.
     pub fn n_windows(&self) -> usize {
         self.windows.len()
@@ -616,6 +626,11 @@ impl AppSystem {
 
     /// Whether the running dot shows — every state but STOPPED
     /// (`AppIcon._updateRunningStyle`, `appDisplay.js:3007-3012`).
+    /// Whether the app has a window demanding attention — what the dock pokes for.
+    pub fn has_urgent_window(&self, id: &str) -> bool {
+        self.running_app(id).is_some_and(RunningApp::is_urgent)
+    }
+
     pub fn shows_running_dot(&self, id: &str) -> bool {
         self.app_state(id) != AppState::Stopped
     }
@@ -2098,6 +2113,7 @@ Actions=newwin;\n\n\
             id: MappedId::next(),
             app_id: Some(app_id.to_owned()),
             title: None,
+            urgent: false,
             last_focus: secs.map(Duration::from_secs),
         }
     }
@@ -2255,6 +2271,7 @@ Actions=newwin;\n\n\
                 id: MappedId::next(),
                 app_id: None,
                 title: None,
+                urgent: false,
                 last_focus: Some(Duration::from_secs(3)),
             },
         ]);
@@ -2274,6 +2291,7 @@ Actions=newwin;\n\n\
             "an unresolvable window must not trigger a redisplay"
         );
         let refocused = RunningWindow {
+            urgent: false,
             last_focus: Some(Duration::from_secs(4)),
             ..a
         };

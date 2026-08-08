@@ -163,6 +163,7 @@ mod tests {
                     id,
                     app_id: None,
                     title: None,
+                    urgent: false,
                     last_focus: None,
                 })
                 .collect(),

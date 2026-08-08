@@ -13276,6 +13276,7 @@ impl Synoik {
                 // still launching shows one (`_updateRunningStyle`,
                 // `appDisplay.js:3007-3012`).
                 running: self.app_system.shows_running_dot(&e.id),
+                urgent: self.app_system.has_urgent_window(&e.id),
                 id: e.id,
                 name: e.name,
                 icon: e.icon,
@@ -13291,6 +13292,7 @@ impl Synoik {
             // skipped rather than drawn iconless.
             if let Some(entry) = self.app_system.lookup(&app.id) {
                 items.push(DashEntry {
+                    urgent: self.app_system.has_urgent_window(&entry.id),
                     id: entry.id,
                     name: entry.name,
                     icon: entry.icon,
@@ -13653,6 +13655,7 @@ impl Synoik {
                 id: mapped.id(),
                 app_id,
                 title,
+                urgent: mapped.is_urgent(),
                 last_focus: mapped.get_focus_timestamp(),
             });
         });

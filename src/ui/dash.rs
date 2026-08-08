@@ -272,6 +272,12 @@ pub struct DashEntry {
     /// Whether the app has an open window — draws the running dot
     /// (`AppIcon._updateRunningStyle`, `appDisplay.js:3007`).
     pub running: bool,
+    /// Whether one of its windows is demanding attention.
+    ///
+    /// **Divergence:** gnome-shell shows urgency only as a notification
+    /// (`windowAttentionHandler.js`) and puts nothing on the dash. We poke the icon above the
+    /// bottom edge instead — see `Dock`.
+    pub urgent: bool,
 }
 
 /// What a point over the dash hit.
@@ -392,6 +398,11 @@ impl Dash {
             cache: RefCell::new(DashCache::default()),
             backdrop: FramebufferEffect::new(),
         }
+    }
+
+    /// The current app snapshot, favorites first.
+    pub fn items(&self) -> &[DashEntry] {
+        &self.items
     }
 
     /// Replace the app snapshot: `items` is favorites (the first `n_favorites`)
@@ -1207,6 +1218,7 @@ mod tests {
         for i in 0..n_running {
             items.push(DashEntry {
                 running: true,
+                urgent: false,
                 ..entry(&format!("run{i}.desktop"))
             });
         }
@@ -1220,6 +1232,7 @@ mod tests {
             name: id.to_owned(),
             icon: AppIconRef::Fallback,
             running: false,
+            urgent: false,
         }
     }
 
@@ -1322,6 +1335,7 @@ mod tests {
             dash.set_items(
                 vec![DashEntry {
                     running: true,
+                    urgent: false,
                     ..entry("a.desktop")
                 }],
                 1

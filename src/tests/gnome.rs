@@ -22832,6 +22832,86 @@ fn a_window_moved_to_the_third_desktop_comes_back_to_the_third_desktop() {
     }
 }
 
+/// An app with a window demanding attention is flagged in the dash, so the dock can poke its icon
+/// above the bottom edge — our affordance for urgency, which GNOME has no equivalent of
+/// (`windowAttentionHandler.js` shows a notification and touches nothing in the dash).
+#[test]
+fn a_window_demanding_attention_marks_its_app_urgent_in_the_dash() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+    // The catalog is keyed by desktop id; a toplevel `app_id` of "a" resolves through
+    // `lookup_desktop_wmclass` to "a.desktop".
+    seed_favorites(&mut f, &["a.desktop"]);
+
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    // Two windows: one to hold focus on the first desktop, and one for "a" that maps on the
+    // second — mapping where the user is not looking is what marks it urgent.
+    let holder = f.client(id).create_window();
+    let holder_surface = holder.surface.clone();
+    holder.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&holder_surface);
+    window.attach_new_buffer();
+    window.set_size(300, 200);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([100, 100, 300, 200]),
+            workspace: Some(1),
+            ..Default::default()
+        },
+    );
+
+    let (surface, toplevel, qh) = {
+        let win = f.client(id).create_window();
+        win.set_app_id("a");
+        (
+            win.surface.clone(),
+            win.xdg_toplevel.clone(),
+            f.client(id).qh.clone(),
+        )
+    };
+    let _handle =
+        session.restore_toplevel(&toplevel, String::from("main"), &qh, String::from("main"));
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+    map_at_configured_size(&mut f, id, &surface);
+    f.synoik_complete_animations();
+
+    assert!(
+        f.synoik()
+            .layout
+            .windows()
+            .any(|(_, mapped)| mapped.is_urgent()),
+        "a window mapping on another desktop demands attention"
+    );
+
+    f.synoik().sync_running_apps();
+    f.synoik().sync_dash_favorites();
+    let urgent: Vec<&str> = f
+        .synoik()
+        .dash
+        .items()
+        .iter()
+        .filter(|item| item.urgent)
+        .map(|item| item.id.as_str())
+        .collect();
+    assert_eq!(
+        urgent,
+        ["a.desktop"],
+        "the dash must know which app is urgent, or there is nothing to poke"
+    );
+}
+
 /// The mapped window registered in the session under `name`.
 ///
 /// Session tests cannot ask the layout for the *focused* window any more: a restored window that
