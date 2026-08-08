@@ -444,6 +444,35 @@ A restored window activates iff `reason == launch`. `recover` and `session_resto
 taking focus, so restoring five windows at login doesn't have each one steal focus in turn, while
 a launcher-started app still behaves like any other launch. Mutter says nothing here; this is ours.
 
+**Mapping never moves the user, and that is not a restore rule** (fixed 2026-08-08). Placing a
+window used to activate its workspace, so a session coming back walked the user across every
+desktop in turn — and the same jump happened for an `open-on-workspace` rule or any app opening a
+window elsewhere. GNOME does not: `meta_window_show` focuses but never activates a workspace, the
+single activation site in `window.c` (`:3921`) is reached only from an explicit activation, and a
+window wanting attention from another workspace gets the pulsing indicator instead
+(`window.c:3891-3899`). Mutter's restore agrees by construction — it calls
+`meta_window_change_workspace_by_index` and nothing else.
+
+**The exception is the client's lever: a fresh activation token**, gated exactly as mutter gates it
+on `allow_workspace_switch = (timestamp != 0)` (`window.c:3866`). An app that wants you looking at a
+particular window activates that one, and since a launch mints one token, at most one window can
+move you. Tokens are honoured for `launch` only: at login the shell owns where you land, not a queue
+of apps each minting one.
+
+Focus travels with the workspace on purpose. Focusing a window the user cannot see would let a
+restored window take focus from the one in front of them, and mutter has no such state — focusing a
+window elsewhere goes down the activate-the-workspace branch instead.
+
+Restore expresses this in the **activation decision**, not by setting the `open_focused` window
+rule. That rule means "the user configured this app not to steal focus"; borrowing it for restore
+conflated the two and short-circuited the activation path *before* the token was ever consulted, so
+a restored window's token could not work at all. A policy that a client is supposed to be able to
+override must not be expressed as a config override.
+
+A knock-on for the corpus: session tests can no longer find their window via `layout.focus()`, since
+a restored window on another desktop deliberately does not take it. `session_window(f, name)` goes
+through the live registration instead.
+
 This is the *only* thing `reason` is used for. We deliberately do **not** honour the spec's hint
 that `launch` might restore size-only while `session_restore` also restores workspace: a launched
 app ignoring its saved workspace would read as a bug, not a feature. Add a conformance test that
