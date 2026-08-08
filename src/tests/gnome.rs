@@ -22671,7 +22671,7 @@ fn a_saved_workspace_index_past_the_end_grows_the_strip() {
     map_at_configured_size(&mut f, id, &surface);
     f.synoik_complete_animations();
 
-    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let win = session_window(&mut f, "main");
     assert_eq!(
         f.synoik()
             .layout
@@ -22721,7 +22721,7 @@ fn restoring_windows_out_of_order_still_lands_each_on_its_own_workspace() {
             let (surface, _handle) = restore_window(&mut f, id, &session, name);
             map_at_configured_size(&mut f, id, &surface);
             f.synoik_complete_animations();
-            let win = f.synoik().layout.focus().unwrap().window.clone();
+            let win = session_window(&mut f, name);
             let idx = f
                 .synoik()
                 .layout
@@ -22815,8 +22815,8 @@ fn a_window_moved_to_the_third_desktop_comes_back_to_the_third_desktop() {
             let (surface, _handle) = restore_window(&mut f, id, &session, name);
             map_at_configured_size(&mut f, id, &surface);
             f.synoik_complete_animations();
+            let win = session_window(&mut f, name);
             let synoik = f.synoik();
-            let win = synoik.layout.focus().unwrap().window.clone();
             landed.push((
                 name,
                 synoik.layout.session_snapshot(&win).unwrap().workspace_idx,
@@ -22830,6 +22830,230 @@ fn a_window_moved_to_the_third_desktop_comes_back_to_the_third_desktop() {
             "restored in the order {order:?}, `b` must come back to the third desktop"
         );
     }
+}
+
+/// The mapped window registered in the session under `name`.
+///
+/// Session tests cannot ask the layout for the *focused* window any more: a restored window that
+/// lands on a workspace the user is not looking at deliberately does not take focus, so `focus()`
+/// answers about some other window entirely. Going through the registration asks the question the
+/// test actually means.
+#[track_caller]
+fn session_window(f: &mut Fixture, name: &str) -> smithay::desktop::Window {
+    let synoik = f.synoik();
+    let toplevel = synoik
+        .session_manager_state
+        .live_registrations()
+        .into_iter()
+        .find(|(_, registered, _)| registered == name)
+        .map(|(_, _, toplevel)| toplevel)
+        .expect("a live registration under that name");
+    synoik
+        .layout
+        .windows()
+        .find(|(_, mapped)| mapped.toplevel().xdg_toplevel() == &toplevel)
+        .map(|(_, mapped)| mapped.window.clone())
+        .expect("a mapped window for that toplevel")
+}
+
+/// The active workspace index of the only monitor.
+fn active_idx(f: &mut Fixture) -> usize {
+    let synoik = f.synoik();
+    synoik
+        .layout
+        .workspaces()
+        .find(|(mon, idx, _)| mon.is_some_and(|mon| mon.active_workspace_idx() == *idx))
+        .map(|(_, idx, _)| idx)
+        .expect("an active workspace")
+}
+
+/// Mapping a window never moves you to it.
+///
+/// GNOME's rule, and it is not about session restore: `meta_window_show` focuses but never calls
+/// `meta_workspace_activate`, and the one activation site in `window.c` (`:3921`) is reached only
+/// from an explicit activation. A window that appears elsewhere gets the pulsing indicator instead
+/// — "we just set up a pulsing indicator, rather than move windows or workspaces"
+/// (`window.c:3891-3899`).
+#[test]
+fn a_window_mapping_on_another_workspace_does_not_take_you_there() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([100, 100, 300, 200]),
+            workspace: Some(1),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(active_idx(&mut f), 0, "starting on the first desktop");
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.synoik_complete_animations();
+
+    assert_eq!(
+        active_idx(&mut f),
+        0,
+        "the window landed on the second desktop; we must not have followed it"
+    );
+    let win = f.synoik().layout.focus().map(|f| f.window.clone());
+    assert!(
+        win.is_none() || {
+            let synoik = f.synoik();
+            synoik
+                .layout
+                .session_snapshot(&win.clone().unwrap())
+                .unwrap()
+                .workspace_idx
+                == 0
+        },
+        "and nothing on another desktop may hold focus"
+    );
+}
+
+/// Restoring a set of windows must not walk the active workspace across all of them — the jarring
+/// case that made this rule worth writing down.
+#[test]
+fn restoring_several_windows_leaves_the_active_workspace_alone() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    for (name, idx) in [("w0", 0u32), ("w1", 1), ("w2", 2)] {
+        remember(
+            &mut f,
+            &session_id,
+            name,
+            ToplevelRecord {
+                state: Some(WindowState::Floating.as_raw()),
+                floating_rect: Some([100, 100, 300, 200]),
+                workspace: Some(idx),
+                ..Default::default()
+            },
+        );
+    }
+
+    for name in ["w0", "w1", "w2"] {
+        let (surface, _handle) = restore_window(&mut f, id, &session, name);
+        map_at_configured_size(&mut f, id, &surface);
+        f.synoik_complete_animations();
+    }
+
+    assert_eq!(
+        active_idx(&mut f),
+        0,
+        "restoring onto three desktops must leave us on the one we started on"
+    );
+}
+
+/// At login, restoring must not steal focus even for windows landing on the desktop you are on.
+///
+/// The workspace rule above already covers anything landing elsewhere; this is the remaining case,
+/// and the reason the policy is keyed on `reason` at all — five windows coming back on your current
+/// desktop must not each grab focus in turn.
+#[test]
+fn a_login_restore_does_not_steal_focus_from_what_you_are_using() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    // Something already focused, on the desktop the restored windows will land on.
+    let _mine = map_session_window(&mut f, id, &session, "mine");
+    let mine = session_window(&mut f, "mine");
+
+    for name in ["a", "b"] {
+        remember(
+            &mut f,
+            &session_id,
+            name,
+            ToplevelRecord {
+                state: Some(WindowState::Floating.as_raw()),
+                floating_rect: Some([100, 100, 300, 200]),
+                workspace: Some(0),
+                ..Default::default()
+            },
+        );
+    }
+
+    let restoring = f.add_client();
+    f.roundtrip(restoring);
+    let session2 = f
+        .client(restoring)
+        .get_session(Reason::SessionRestore, Some(&session_id));
+    f.roundtrip(restoring);
+    for name in ["a", "b"] {
+        let (surface, _handle) = restore_window(&mut f, restoring, &session2, name);
+        map_at_configured_size(&mut f, restoring, &surface);
+        f.synoik_complete_animations();
+    }
+
+    let focused = f.synoik().layout.focus().map(|focus| focus.window.clone());
+    assert_eq!(
+        focused,
+        Some(mine),
+        "a session_restore must leave focus where the user left it"
+    );
+}
+
+/// The one exception, and the client's lever: a window carrying a fresh activation token *does*
+/// take you to its workspace. mutter gates exactly this on `allow_workspace_switch = (timestamp
+/// != 0)` (`window.c:3866`), so an app that wants you looking at a particular window says so by
+/// activating it.
+#[test]
+fn an_activation_token_takes_you_to_the_windows_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([100, 100, 300, 200]),
+            workspace: Some(1),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    {
+        let synoik = f.synoik();
+        let unmapped = synoik.unmapped_windows.values_mut().next().unwrap();
+        unmapped.activation_token_data = Some(XdgActivationTokenData {
+            client_id: None,
+            serial: None,
+            app_id: None,
+            surface: None,
+            timestamp: Instant::now(),
+            user_data: Arc::new(UserDataMap::new()),
+        });
+    }
+    map_at_configured_size(&mut f, id, &surface);
+    f.synoik_complete_animations();
+
+    assert_eq!(
+        active_idx(&mut f),
+        1,
+        "an activated window is allowed to take us to its desktop"
+    );
 }
 
 /// Growth is driven by a number read off disk, so it is capped. Past the cap the index clamps —
@@ -22867,8 +23091,9 @@ fn a_nonsense_saved_workspace_index_does_not_inflate_the_strip() {
         count <= 64,
         "a corrupt index must not grow the strip without bound, got {count}"
     );
-    assert!(
-        f.synoik().layout.focus().is_some(),
+    assert_eq!(
+        f.synoik().layout.windows().count(),
+        1,
         "and the window must still map"
     );
 }

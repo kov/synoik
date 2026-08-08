@@ -31,6 +31,7 @@ use super::xdg_shell::add_mapped_toplevel_pre_commit_hook;
 use crate::gnome::FocusNewWindows;
 use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
 use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
+use crate::protocols::raw::xdg_session_management::v1::server::xdg_session_manager_v1::Reason;
 use crate::synoik::{CastTarget, ClientState, LockState, State};
 use crate::utils::transaction::Transaction;
 use crate::utils::{get_monotonic_time, is_mapped, send_scale_transform, with_toplevel_role};
@@ -113,6 +114,7 @@ impl CompositorHandler for State {
                         workspace_id,
                         is_pending_maximized,
                         was_restored,
+                        restore_reason,
                         unmaximize_to,
                     ) = if let InitialConfigureState::Configured {
                         rules,
@@ -149,6 +151,7 @@ impl CompositorHandler for State {
                         });
 
                         let was_restored = restore.is_some();
+                        let restore_reason = restore.as_ref().map(|restore| restore.reason);
                         let unmaximize_to = restore.and_then(|restore| restore.unmaximize_to);
 
                         (
@@ -160,6 +163,7 @@ impl CompositorHandler for State {
                             workspace_id,
                             is_pending_maximized,
                             was_restored,
+                            restore_reason,
                             unmaximize_to,
                         )
                     } else {
@@ -175,6 +179,7 @@ impl CompositorHandler for State {
                             None,
                             false,
                             false,
+                            None,
                             None,
                         )
                     };
@@ -198,8 +203,15 @@ impl CompositorHandler for State {
                     // Whether GNOME focus-stealing prevention denied the focus; the
                     // window is marked urgent after mapping.
                     let mut denied_focus_steal = false;
+                    // Denied focus because it mapped on a workspace the user is not looking at.
+                    // Marks urgent like `denied_focus_steal`, but must not reposition the window.
+                    let mut wants_attention = false;
+                    // Read before the niri branch below consumes the token.
+                    let token_is_fresh = activation_token_data.as_ref().is_some_and(|token| {
+                        token.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT
+                    });
 
-                    let activate = match activate {
+                    let mut activate = match activate {
                         Some(activate) => activate,
                         None if windowing_mode == WindowingMode::Floating => {
                             // GNOME focus-stealing prevention (mutter's
@@ -286,6 +298,45 @@ impl CompositorHandler for State {
                         }
                     };
 
+                    // GNOME never moves you to a window. `meta_window_show` focuses but never
+                    // activates a workspace; the single activation site in `window.c` (`:3921`) is
+                    // reached only from an explicit activation, and a window that wants attention
+                    // from another workspace gets the pulsing indicator instead — "we just set up
+                    // a pulsing indicator, rather than move windows or workspaces"
+                    // (`window.c:3891-3899`).
+                    //
+                    // The exception is the client's lever: a fresh activation token, which mutter
+                    // gates on `allow_workspace_switch = (timestamp != 0)` (`window.c:3866`). A
+                    // launch mints one token, so at most one window can move the user.
+                    //
+                    // Focus and the workspace travel together here on purpose. Focusing a window
+                    // the user cannot see would let a restored window steal focus from the one in
+                    // front of them, and mutter has no such state: focusing a window elsewhere
+                    // goes down the activate-the-workspace branch instead.
+                    let lands_where_we_are =
+                        workspace_id.is_none_or(|id| self.synoik.layout.workspace_is_active(id));
+                    // At login the shell owns where you land, not a queue of apps each minting a
+                    // token; an interactive `launch` is the app's to direct.
+                    let token_may_move_us = token_is_fresh
+                        && restore_reason.is_none_or(|reason| reason == Reason::Launch);
+
+                    // A restore that is not an interactive launch does not take focus at all, so
+                    // restoring five windows does not have each one steal it in turn.
+                    if restore_reason.is_some_and(|reason| reason != Reason::Launch) {
+                        activate = ActivateWindow::No;
+                    } else if activate == ActivateWindow::Yes
+                        && !lands_where_we_are
+                        && !token_may_move_us
+                    {
+                        activate = ActivateWindow::No;
+                        // It wanted focus and was denied because it is somewhere else: that is
+                        // precisely mutter's demands-attention case. Deliberately *not*
+                        // `denied_focus_steal`, which also runs `avoid_focus_window` — moving a
+                        // window to dodge a focused window on a different workspace is nonsense,
+                        // and for a restored window it would discard the position we just seeded.
+                        wants_attention = true;
+                    }
+
                     let parent = toplevel
                         .parent()
                         .and_then(|parent| self.synoik.layout.find_window_and_output(&parent))
@@ -370,7 +421,7 @@ impl CompositorHandler for State {
                         error!("layout is missing the window that we just added");
                     }
 
-                    if denied_focus_steal {
+                    if denied_focus_steal || wants_attention {
                         // The window wanted focus but taking it would have been a
                         // steal: mark it demands-attention (urgent) so the shell can
                         // surface it, like mutter's meta_window_show. (mutter only

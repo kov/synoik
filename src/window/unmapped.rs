@@ -37,9 +37,19 @@ pub struct Unmapped {
     pub wants_session_restore: bool,
 }
 
+use crate::protocols::raw::xdg_session_management::v1::server::xdg_session_manager_v1::Reason;
+
 /// The part of a session restore that can only be applied once the window maps.
 #[derive(Debug, Clone)]
 pub struct RestoreOnMap {
+    /// Why the client asked for this session back.
+    ///
+    /// Carried to the map rather than folded into a window rule at configure time: whether a
+    /// restored window may take focus, and whether its activation token may move the user to it,
+    /// are activation decisions, and expressing them through `open_focused` conflated them with
+    /// the *config* rule of the same name — which is what made a client's token unreachable here.
+    pub reason: Reason,
+
     /// Saved workspace index, resolved against the mapped monitor rather than pinned to an id at
     /// configure time: the monitor's workspaces can change in between.
     pub workspace_idx: Option<usize>,

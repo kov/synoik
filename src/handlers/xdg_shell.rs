@@ -1073,14 +1073,6 @@ impl State {
                 rules.default_width = Some(Some(PresetSize::Fixed(w)));
                 rules.default_height = Some(Some(PresetSize::Fixed(h)));
             }
-
-            // `launch` is left alone so it goes through focus-stealing prevention like any other
-            // launch — that is what "behaves like any other launch" means. Only the two
-            // non-interactive reasons suppress focus, so restoring five windows at login does not
-            // have each one steal focus in turn.
-            if restore.reason != Reason::Launch {
-                rules.open_focused = Some(false);
-            }
         }
 
         let Unmapped { window, state, .. } = unmapped;
@@ -1114,6 +1106,7 @@ impl State {
 
         let parent = toplevel.parent();
         let restore_on_map = restore.as_ref().map(|restore| RestoreOnMap {
+            reason: restore.reason,
             workspace_idx: restore.record.workspace.map(|idx| idx as usize),
             // Only for a window that maps straight into maximized or fullscreen — anything else
             // gets its floating geometry from the configure and the position rule.

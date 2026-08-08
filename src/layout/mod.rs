@@ -1927,6 +1927,17 @@ impl<W: LayoutElement> Layout<W> {
         self.monitors_mut().find(|mon| &mon.output == output)
     }
 
+    /// Whether `id` is the active workspace on its *own* monitor.
+    ///
+    /// The question a mapping window has to answer before it is allowed to take focus: landing on
+    /// another monitor's active workspace is ordinary, landing on a workspace that monitor is not
+    /// showing means following it would move the user.
+    pub fn workspace_is_active(&self, id: WorkspaceId) -> bool {
+        self.workspaces().any(|(mon, idx, ws)| {
+            ws.id() == id && mon.is_some_and(|mon| mon.active_workspace_idx() == idx)
+        })
+    }
+
     /// The workspace a restored window belongs on, growing the strip if the index is past the end.
     ///
     /// See [`Monitor::ensure_workspace_at`] for why restore grows rather than clamps.
