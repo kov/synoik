@@ -328,13 +328,23 @@ impl SessionStore {
 
 /// Write through a temporary file in the same directory, so a crash mid-write leaves the previous
 /// store intact rather than a truncated one.
+///
+/// The `sync_all` is what makes that true of a power loss rather than only of a process crash:
+/// without it the rename can be durable before the bytes are, and the store comes back empty.
+/// glib's `g_file_set_contents`, which mutter writes through, fsyncs for the same reason.
 fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, bytes)?;
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+
     std::fs::rename(&tmp, path)
 }
 
