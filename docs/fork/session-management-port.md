@@ -192,9 +192,39 @@ arm the 3s debounce.
 `remove_toplevel(name)` and session `remove` delete from the store; session `destroy` keeps the
 data but makes the objects inert.
 
+**Unmap is not the only trigger, and assuming it was is a bug we shipped.** The spec's word for
+`xdg_session_v1.destroy` is *"preserving the current state"* — frozen as of the request. A client is
+entitled to destroy its session while its windows are still up, and the destructor dropped the
+registrations, so anything torn down afterwards had nothing left to look itself up under and kept
+whatever record its *previous* run wrote. `destroyed` now snapshots every live registration before
+dropping them, via the `save_live_session_toplevels` hook, reusing the sweep shutdown already runs
+for the same reason (`save_live_session_toplevels_matching`). Two symptoms fell out of the one
+cause, and both looked like placement bugs:
+
+- a client that tears down **session-then-toplevels** loses the state of every window that outlives
+  the session — for a partial order, exactly one window comes back on the desktop it was on *two*
+  runs ago;
+- a client that is **killed outright** saves nothing at all, while still leaving a
+  restorable-looking session id behind (the id is `touch`ed, the toplevel map stays empty). The next
+  run then restores nothing and every window opens wherever new windows go — which reads as "all my
+  windows came back on one desktop".
+
+Found on the live seat, not in the corpus: `tools/session-probe --quit-style` drives all three
+teardown orders, and only *toplevels-before-session* used to save. The corpus had modelled the
+polite order alone.
+
 ---
 
 ## Conformance corpus
+
+The corpus is headless, and that is the right home for the rules — but it models the client we
+wrote, so it inherits our assumptions about how a client behaves. Both bugs found after slice 4
+landed were of that shape: a legal teardown order and a shorter workspace strip, neither of which
+any test thought to produce. **`tools/session-probe` is the live counterpart** — it speaks the real
+protocol against a running compositor, and its `--quit-style` exists precisely because the order a
+client tears down in turned out to be load-bearing. Reach for it when a report comes from the seat:
+a rebuilt binary does not reach a running session until that session restarts, so "the tests pass"
+and "the desktop is fixed" are different claims.
 
 Mutter's tests (`src/tests/wayland-xdg-session-management-tests.c`, plus three test clients) name
 exactly the behaviours to pin in `src/tests/gnome.rs`:
@@ -215,6 +245,9 @@ Plus, from the staging spec text and not covered by mutter's suite:
 - `rename` preserves the toplevel's saved state
 - workspace index that no longer exists grows the strip; a nonsense one is capped
 - a set of windows restores onto the right desktops in any order the client asks in
+- a session destroyed while its windows are up freezes their *current* state
+- a toplevel torn down after its session still saves; the loser of a takeover destroying its inert
+  object leaves the winner holding the id
 
 And pinning our own policy calls (see below), which no reference covers:
 
