@@ -22624,6 +22624,96 @@ fn restoring_windows_out_of_order_still_lands_each_on_its_own_workspace() {
     }
 }
 
+/// The everyday case, end to end: two windows, one left on the first desktop and one moved to the
+/// third, saved by quitting the app and restored into a *fresh* session that starts with two
+/// desktops. The gap matters — desktop 1 stays empty — and so does the order, since neither window
+/// can rely on the other having grown the strip first.
+#[test]
+fn a_window_moved_to_the_third_desktop_comes_back_to_the_third_desktop() {
+    for order in [["a", "b"], ["b", "a"]] {
+        // First run: `a` stays put, `b` moves two desktops down. Quitting unmaps both, which is
+        // what writes them to the store.
+        let mut f = Fixture::new();
+        f.add_output(1, (1280, 720));
+        let id = f.add_client();
+        f.roundtrip(id);
+        let (session, session_id) = new_session(&mut f, id);
+
+        let a = map_session_window(&mut f, id, &session, "a");
+        let b = map_session_window(&mut f, id, &session, "b");
+        for _ in 0..2 {
+            f.synoik_state()
+                .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+            f.synoik_complete_animations();
+        }
+
+        for surface in [&a, &b] {
+            f.client(id).window(surface).attach_null_buffer();
+            f.client(id).window(surface).commit();
+            f.double_roundtrip(id);
+        }
+
+        let saved = |f: &mut Fixture, name: &str| {
+            f.synoik()
+                .session_manager_state
+                .store
+                .get(&session_id)
+                .and_then(|record| record.toplevels.get(name))
+                .and_then(|toplevel| toplevel.workspace)
+        };
+        assert_eq!(
+            saved(&mut f, "a"),
+            Some(0),
+            "`a` never left the first desktop"
+        );
+        assert_eq!(saved(&mut f, "b"), Some(2), "`b` was moved to the third");
+
+        // Second run: a fresh session, which starts with two desktops — so the third has to be
+        // grown before `b` can go back to it.
+        let mut f = Fixture::new();
+        f.add_output(1, (1280, 720));
+        let id = f.add_client();
+        f.roundtrip(id);
+        // Seed the store before asking for the session: an id the store does not know is treated
+        // as a brand new one, which would hand back a different id entirely.
+        for (name, idx) in [("a", 0u32), ("b", 2)] {
+            remember(
+                &mut f,
+                &session_id,
+                name,
+                ToplevelRecord {
+                    state: Some(WindowState::Floating.as_raw()),
+                    floating_rect: Some([100, 100, 300, 200]),
+                    workspace: Some(idx),
+                    ..Default::default()
+                },
+            );
+        }
+        let session = f.client(id).get_session(Reason::Launch, Some(&session_id));
+        f.roundtrip(id);
+
+        let mut landed = Vec::new();
+        for name in order {
+            let (surface, _handle) = restore_window(&mut f, id, &session, name);
+            map_at_configured_size(&mut f, id, &surface);
+            f.synoik_complete_animations();
+            let synoik = f.synoik();
+            let win = synoik.layout.focus().unwrap().window.clone();
+            landed.push((
+                name,
+                synoik.layout.session_snapshot(&win).unwrap().workspace_idx,
+            ));
+        }
+        landed.sort();
+
+        assert_eq!(
+            landed,
+            vec![("a", 0), ("b", 2)],
+            "restored in the order {order:?}, `b` must come back to the third desktop"
+        );
+    }
+}
+
 /// Growth is driven by a number read off disk, so it is capped. Past the cap the index clamps —
 /// the window still maps, it just doesn't get to inflate the strip.
 #[test]
