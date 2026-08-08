@@ -323,6 +323,11 @@ struct DashCache {
     /// (`_dot` is added to `_iconContainer` after the icon, `appDisplay.js:2964`)
     /// while the pill chrome draws under them.
     dots: widget::BakeCache,
+    /// The poke highlights — the plate behind each urgent icon while the dock rests part-way
+    /// out. Its own layer, and it must be: it draws *under* the icons where the dots draw over
+    /// them, and reusing either cache for a second kind of content under the same revision key is
+    /// how a bake goes stale.
+    poke: widget::BakeCache,
     /// Full-color favorite icon uploads.
     icons: SharedAppIconUploads,
 }
@@ -901,6 +906,11 @@ impl Dash {
         blur: bool,
         // `org.gnome.desktop.interface color-scheme` — the pill takes the shared plate.
         appearance: widget::style::Appearance,
+        // Drawing the *poke*: only the apps demanding attention, each on a highlight, and no pill
+        // chrome at all. The dock rests part-way out in this mode, so what shows above the screen
+        // edge is icons rather than a slab of dash — and they keep their normal horizontal
+        // positions, so pushing into the edge lands the pointer on the one you are about to click.
+        poking: bool,
     ) -> Vec<DashElement> {
         let scale = output.current_scale().fractional_scale();
         let layout = self.layout(area);
@@ -922,7 +932,7 @@ impl Dash {
         // `offset-y` lifts it onto the icon's lower edge. Its own bake layer: the
         // pill chrome underneath the icons cannot carry something that must draw
         // over them. Skipped entirely when nothing is running.
-        if self.items.iter().any(|e| e.running) {
+        if !poking && self.items.iter().any(|e| e.running) {
             let dots: Vec<Rectangle<f64, Logical>> = self
                 .items
                 .iter()
@@ -973,8 +983,66 @@ impl Dash {
             }
         }
 
-        // App icons, on their tiles.
-        for (i, entry) in self.items.iter().enumerate() {
+        // The poke highlights, under the icons.
+        if poking {
+            let tiles: Vec<Rectangle<f64, Logical>> = self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.urgent)
+                .map(|(i, _)| {
+                    let t = layout.tiles[i];
+                    Rectangle::new(t.loc - layout.pill.loc, t.size)
+                })
+                .collect();
+            let radius = AppIcon::RADIUS;
+            let texture = widget::bake(
+                renderer,
+                &mut cache.poke,
+                scale,
+                layout.pill.size,
+                self.content_rev,
+                |_| Ok(()),
+                |frame, phys, ()| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(widget::style::TRANSPARENT)?;
+                    for tile in &tiles {
+                        p.fill_rounded(*tile, radius, TILE_HOVER)?;
+                    }
+                    Ok(())
+                },
+            );
+            match texture {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        vec![],
+                    );
+                    elements.push(DashElement::Texture(
+                        TextureRenderElement::from_texture_buffer(
+                            buffer,
+                            layout.pill.loc,
+                            alpha,
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ),
+                    ));
+                }
+                Err(err) => tracing::error!("error baking the dash poke highlight: {err:#}"),
+            }
+        }
+
+        // App icons, on their tiles. While poking, only the ones asking for attention.
+        for (i, entry) in self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !poking || entry.urgent)
+        {
             if let Some(el) = widget::app_icon_element(
                 renderer,
                 &mut cache.icons.borrow_mut(),

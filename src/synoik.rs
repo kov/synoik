@@ -1991,6 +1991,9 @@ impl State {
                 self.synoik.queue_redraw_all();
             }
         }
+        // Cheap and idempotent, so it runs every refresh rather than only when the dash changed:
+        // urgency also clears on *focus*, which moves no window and adds no app.
+        self.synoik.sync_dock_urgency();
 
         self.synoik
             .cursor_manager
@@ -10187,6 +10190,7 @@ impl Synoik {
                     // overview's dash below sits on a backdrop that is already blurred.
                     true,
                     self.appearance(),
+                    self.dock.is_poking(),
                 ) {
                     push(element.into());
                 }
@@ -10231,6 +10235,8 @@ impl Synoik {
                     progress,
                     false,
                     self.appearance(),
+                    // The overview always shows the whole dash.
+                    false,
                 ) {
                     push(element.into());
                 }
@@ -13720,6 +13726,28 @@ impl Synoik {
             return None;
         }
         self.dock.area(output)
+    }
+
+    /// Point the dock at whichever output has an app demanding attention, so it can poke that
+    /// app's icon above the bottom edge.
+    ///
+    /// Suppressed while a fullscreen window is focused: poking into a fullscreen video is the one
+    /// place where "louder than GNOME" turns into "worse than GNOME". (A setting may follow.)
+    pub fn sync_dock_urgency(&mut self) {
+        let urgent = self.dash.items().iter().any(|item| item.urgent);
+
+        let fullscreen = self
+            .layout
+            .focus()
+            .is_some_and(|focus| focus.sizing_mode().is_fullscreen());
+
+        let output = self
+            .layout
+            .active_output()
+            .or_else(|| self.dock.output())
+            .cloned();
+        self.dock
+            .set_poking(output.as_ref(), urgent && !fullscreen && output.is_some());
     }
 
     /// Whether the dock — not the overview — currently owns the dash on `output`.

@@ -36,6 +36,14 @@ const SLIDE_MS: u64 = 200;
 /// gap between two icons, or to overshoot the dock's top edge and come back.
 const HIDE_DELAY: Duration = Duration::from_millis(300);
 
+/// How far out the dock rests while an app is demanding attention: enough of the icon to read
+/// which app it is, not so much that it becomes a dock you did not ask for.
+///
+/// **Divergence.** gnome-shell's only urgency affordance is a notification
+/// (`windowAttentionHandler.js`) and its dash shows nothing at all. The poke is deliberately
+/// louder, and it costs no screen space — the dock reserves none.
+const POKE_PROGRESS: f64 = 0.45;
+
 enum State {
     Hidden,
     Showing(Animation),
@@ -52,6 +60,10 @@ pub struct Dock {
     leave_at: Option<Duration>,
     /// Held open regardless of the pointer while an icon is being dragged out of it.
     dragging: bool,
+    /// Whether an app is demanding attention, which gives the dock a *resting* position above
+    /// the edge instead of fully hidden. Not a hold: the dock still slides freely between the
+    /// poke and fully out, the poke is just where "away" now means.
+    poking: bool,
     /// Held open the same way while one of its icons has its context menu up — the menu pops
     /// *upward* out of the dash, so reaching it takes the pointer off the dock, and without
     /// this the dock slides away from under the menu a moment later.
@@ -68,6 +80,7 @@ impl Dock {
             hovered: false,
             leave_at: None,
             dragging: false,
+            poking: false,
             menu_open: false,
             barrier: Barrier::new(THRESHOLD, TIMEOUT),
             clock,
@@ -166,7 +179,8 @@ impl Dock {
             State::Showing(anim) => anim.clamped_value(),
         };
         self.leave_at = None;
-        self.state = State::Hiding(self.slide(from, 0.));
+        // To the floor, not to nothing: an app still wanting attention keeps its poke.
+        self.state = State::Hiding(self.slide(from, self.floor()));
     }
 
     /// Hide without animating — for the cases where the dock must simply not be there
@@ -177,6 +191,7 @@ impl Dock {
         self.hovered = false;
         self.leave_at = None;
         self.dragging = false;
+        self.poking = false;
         self.menu_open = false;
         self.barrier.leave();
     }
@@ -198,7 +213,48 @@ impl Dock {
 
     /// Whether the dock is on screen at all (including mid-slide, in either direction).
     pub fn is_visible(&self) -> bool {
-        !matches!(self.state, State::Hidden)
+        !matches!(self.state, State::Hidden) || self.poking
+    }
+
+    /// Whether the dock is only out because an app wants attention — the state where it draws
+    /// the urgent icons alone rather than the whole dash.
+    pub fn is_poking(&self) -> bool {
+        self.poking && matches!(self.state, State::Hidden)
+    }
+
+    /// How far out "away" is: the bottom edge normally, the poke while an app wants attention.
+    fn floor(&self) -> f64 {
+        if self.poking {
+            POKE_PROGRESS
+        } else {
+            0.
+        }
+    }
+
+    /// An app started or stopped demanding attention on `output`.
+    ///
+    /// Idempotent, and it has to be: the dash snapshot is re-stated on every sync, and re-arming
+    /// the slide from a value it already holds would restart the animation every frame — the
+    /// same shape as the hide deadline that once got pushed forward forever.
+    pub fn set_poking(&mut self, output: Option<&Output>, poking: bool) {
+        if self.poking == poking {
+            return;
+        }
+        self.poking = poking;
+
+        if poking {
+            if self.output.is_none() {
+                self.output = output.cloned();
+            }
+            // Rise into the poke only from rest; mid-slide or fully out, the floor change is
+            // enough and the current animation still lands somewhere sensible.
+            if matches!(self.state, State::Hidden) {
+                self.state = State::Hiding(self.slide(0., POKE_PROGRESS));
+            }
+        } else if matches!(self.state, State::Hidden) {
+            // Resting on the poke with the urgency gone: slide the rest of the way away.
+            self.state = State::Hiding(self.slide(POKE_PROGRESS, 0.));
+        }
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
@@ -208,7 +264,7 @@ impl Dock {
     /// How far out the dock is: 0 fully hidden, 1 fully out.
     fn progress(&self) -> f64 {
         match &self.state {
-            State::Hidden => 0.,
+            State::Hidden => self.floor(),
             State::Shown => 1.,
             State::Showing(anim) | State::Hiding(anim) => anim.clamped_value(),
         }
@@ -336,9 +392,12 @@ impl Dock {
             State::Showing(anim) if anim.is_clamped_done() => self.state = State::Shown,
             State::Hiding(anim) if anim.is_clamped_done() => {
                 self.state = State::Hidden;
-                self.output = None;
                 self.hovered = false;
                 self.leave_at = None;
+                // A poking dock is still on screen and still belongs to its output.
+                if !self.poking {
+                    self.output = None;
+                }
             }
             _ => (),
         }
@@ -362,6 +421,69 @@ impl Dock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An app demanding attention pokes its icon above the bottom edge while the dock is away.
+    ///
+    /// **Divergence.** gnome-shell's only urgency affordance is a notification
+    /// (`windowAttentionHandler.js`); the dash shows nothing. A poke is louder on purpose, and it
+    /// costs no screen space — the dock is an overlay that reserves none.
+    #[test]
+    fn urgency_pokes_the_dock_above_the_edge() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let mut dock = Dock::new(clock.clone());
+        let output = crate::utils::test_output(1920, 1080);
+
+        assert!(dock.area(&output).is_none(), "nothing to show at rest");
+
+        dock.set_poking(Some(&output), true);
+        clock.set_unadjusted(Duration::from_millis(SLIDE_MS));
+        dock.advance_animations();
+        let poked = dock.area(&output).expect("urgency must put it on screen");
+
+        dock.show(&output);
+        clock.set_unadjusted(Duration::from_millis(SLIDE_MS * 3));
+        dock.advance_animations();
+        let full = dock.area(&output).expect("shown").loc.y;
+        assert!(
+            poked.loc.y > full,
+            "the poke sits lower than the shown dock ({} vs {full})",
+            poked.loc.y
+        );
+        assert!(
+            poked.loc.y < 1080.,
+            "but still on screen, or there is nothing to see"
+        );
+    }
+
+    /// The poke is a resting position, not a transient: it survives the hide the pointer leaving
+    /// would otherwise complete, and only clearing the urgency puts the dock away.
+    #[test]
+    fn the_poke_outlives_a_hide_and_ends_with_the_urgency() {
+        let mut clock = Clock::with_time(Duration::ZERO);
+        let mut dock = Dock::new(clock.clone());
+        let output = crate::utils::test_output(1920, 1080);
+
+        dock.set_poking(Some(&output), true);
+        dock.show(&output);
+        clock.set_unadjusted(Duration::from_millis(SLIDE_MS));
+        dock.advance_animations();
+
+        dock.hide();
+        clock.set_unadjusted(Duration::from_millis(SLIDE_MS * 2));
+        dock.advance_animations();
+        assert!(
+            dock.area(&output).is_some(),
+            "hiding must fall back to the poke while the app still wants attention"
+        );
+
+        dock.set_poking(Some(&output), false);
+        clock.set_unadjusted(Duration::from_millis(SLIDE_MS * 4));
+        dock.advance_animations();
+        assert!(
+            dock.area(&output).is_none(),
+            "and clearing the urgency puts it away"
+        );
+    }
 
     /// Pushing into the bottom edge builds pressure the same way the hot corner does: contact
     /// alone is not enough.
