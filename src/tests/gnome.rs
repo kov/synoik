@@ -1409,6 +1409,39 @@ fn super_number_counts_the_favorites_the_dash_shows() {
     );
 }
 
+/// Every `<Super>N` activates the Nth favourite, not just the low digits.
+///
+/// Nine favourites, every digit, one assertion each. Written to chase a seat report of `<Super>8`
+/// launching the *seventh* favourite, which turned out to be the instrument rather than the
+/// compositor — `synoik msg input key Super+8` reads a bare number as a **decimal evdev keycode**
+/// (`input::synthetic::resolve_key`), and keycode 8 is `KEY_7`. The test stays because the shape
+/// it rules out is real: a mapping that is right at 2 and wrong at 8 is what a per-digit slip
+/// looks like, and the one spot-check we had could not have seen it.
+#[test]
+fn every_super_digit_activates_that_favorite() {
+    const DIGIT_KEYS: [u32; 9] = [2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+    let favorites: Vec<String> = (1..=9).map(|n| format!("app{n}.desktop")).collect();
+    let refs: Vec<&str> = favorites.iter().map(String::as_str).collect();
+    let (mut f, recorder) = dash_fixture(&refs);
+
+    for (i, key) in DIGIT_KEYS.iter().enumerate() {
+        f.key_press(KEY_LEFTMETA);
+        tap(&mut f, *key);
+        f.key_release(KEY_LEFTMETA);
+        f.synoik_complete_animations();
+
+        let calls = recorder.calls.borrow();
+        let n = i + 1;
+        assert_eq!(calls.len(), n, "<Super>{n} must have activated something");
+        assert_eq!(
+            calls[i].0.id,
+            format!("app{n}.desktop"),
+            "<Super>{n} must activate favourite {n}"
+        );
+    }
+}
+
 /// `<Super><Ctrl>N` is `open-new-window-application-N`, which asks for another
 /// window rather than raising the one the app has — and, unlike its plain
 /// counterpart, leaves the overview up (`_openNewApplicationWindow` has no
