@@ -22186,6 +22186,76 @@ fn a_windows_geometry_survives_a_restart() {
     );
 }
 
+/// A restored window lands at the exact position it was saved at, on the output the saved rect
+/// names — including the second one, which pins that the global origin is folded back out, and
+/// clearing the panel strut, which pins that the per-workspace working area is too.
+#[test]
+fn a_restored_window_lands_at_its_saved_position() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+    f.add_output(2, (1280, 720));
+
+    let origin = {
+        let synoik = f.synoik();
+        let output = synoik
+            .global_space
+            .outputs()
+            .find(|output| output.name() == "headless-2")
+            .cloned()
+            .expect("the second output must exist");
+        synoik
+            .global_space
+            .output_geometry(&output)
+            .expect("in global space")
+            .loc
+    };
+    assert_ne!(
+        origin.x, 0,
+        "the outputs must not overlap, or this proves nothing"
+    );
+
+    // Somewhere unmistakable on the second output, well clear of any default placement.
+    let saved = [origin.x + 500, origin.y + 400, 300, 200];
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some(saved),
+            workspace: Some(0),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.synoik_complete_animations();
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let global = {
+        let synoik = f.synoik();
+        let snapshot = synoik.layout.session_snapshot(&win).unwrap();
+        let rect = snapshot.floating_rect.expect("it has a rect");
+        let origin = snapshot
+            .output
+            .and_then(|output| synoik.global_space.output_geometry(output))
+            .expect("mapped on an output")
+            .loc;
+        rect.loc + origin.to_f64()
+    };
+
+    assert_eq!(
+        (global.x.round() as i32, global.y.round() as i32),
+        (saved[0], saved[1]),
+        "the restored window must land exactly where it was saved"
+    );
+}
+
 /// The spec pins `restored` to "prior to the first `xdg_toplevel.configure`".
 #[test]
 fn restored_arrives_before_the_first_configure() {
@@ -22317,6 +22387,133 @@ fn a_restored_window_returns_to_its_workspace_under_every_reason() {
             "reason {reason:?} must still restore the workspace"
         );
     }
+}
+
+/// The saved workspace decides the *configure*, not just where the window lands: a window is sized
+/// against its own workspace's working area, and workspaces can have different struts.
+#[test]
+fn a_restored_window_is_configured_against_its_saved_workspace() {
+    // Two workspaces on one output with different struts, so the toplevel bounds in the configure
+    // say which of the two the window was configured against — as in
+    // `window_opening::maximize_after_the_initial_configure_keeps_the_windows_workspace`.
+    let struts = |side| {
+        Some(synoik_config::WorkspaceLayoutPart(
+            synoik_config::LayoutPart {
+                struts: Some(synoik_config::Struts {
+                    left: synoik_config::FloatOrInt(side),
+                    right: synoik_config::FloatOrInt(side),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ))
+    };
+    let config = Config {
+        workspaces: vec![
+            synoik_config::workspace::Workspace {
+                name: synoik_config::workspace::WorkspaceName(String::from("ws-a")),
+                open_on_output: Some(String::from("headless-1")),
+                layout: struts(0.),
+            },
+            synoik_config::workspace::Workspace {
+                name: synoik_config::workspace::WorkspaceName(String::from("ws-b")),
+                open_on_output: Some(String::from("headless-1")),
+                layout: struts(100.),
+            },
+        ],
+        ..Default::default()
+    };
+
+    // Scrolling mode: GNOME mode derives the working area from the layer zone and the panel
+    // alone, so per-workspace struts — the only lever that makes two workspaces on one monitor
+    // configure differently — do not apply there. The configure path itself is shared.
+    let mut f = Fixture::with_config(scrolling(config));
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    // Two windows, one saved to each workspace. Comparing the two configures is what makes this
+    // discriminating: `Workspace::working_area` deliberately excludes the config struts (see its
+    // comment there), so there is no accessor to read the expected width off, and one window's
+    // bounds on its own is a bare number that either workspace could plausibly have produced.
+    for (name, workspace) in [("on-a", 0u32), ("on-b", 1)] {
+        remember(
+            &mut f,
+            &session_id,
+            name,
+            ToplevelRecord {
+                state: Some(WindowState::Floating.as_raw()),
+                floating_rect: Some([100, 200, 300, 200]),
+                workspace: Some(workspace),
+                ..Default::default()
+            },
+        );
+    }
+
+    let bounds_for = |f: &mut Fixture, name: &str| {
+        let (surface, handle) = restore_window(f, id, &session, name);
+        let bounds = f
+            .client(id)
+            .window(&surface)
+            .recent_configures()
+            .last()
+            .expect("configured")
+            .bounds
+            .expect("bounded");
+        (bounds, handle)
+    };
+
+    let (on_a, _a) = bounds_for(&mut f, "on-a");
+    let (on_b, _b) = bounds_for(&mut f, "on-b");
+
+    assert_eq!(
+        on_a.0 - on_b.0,
+        200,
+        "ws-b's 100px-per-side struts must narrow its bounds ({}) against ws-a's ({})",
+        on_b.0,
+        on_a.0
+    );
+    assert_eq!(on_a.1, on_b.1, "neither workspace struts the vertical axis");
+}
+
+/// GNOME auto-maximize must not touch a restored window. Its size is remembered, not guessed, so
+/// a saved rect that happens to cover most of the work area is a deliberate floating size.
+#[test]
+fn a_restored_window_is_not_auto_maximized() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            // Well over the 80% of the work area that triggers auto-maximize.
+            floating_rect: Some([0, 40, 1270, 660]),
+            workspace: Some(0),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.synoik_complete_animations();
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    assert_eq!(
+        f.synoik()
+            .layout
+            .session_snapshot(&win)
+            .unwrap()
+            .sizing_mode,
+        SizingMode::Normal,
+        "a restored window must keep its saved floating state"
+    );
 }
 
 /// A saved index past the end of the monitor's workspaces clamps rather than creating workspaces
