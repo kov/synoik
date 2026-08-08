@@ -360,6 +360,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .run(None, &mut state, |state| state.refresh_and_flush_clients())
         .unwrap();
 
+    // The debounced session-store write is up to three seconds behind; a clean exit must not lose
+    // it. A SIGKILL still does, exactly as it does for mutter.
+    state.synoik.flush_session_store();
+
     Ok(())
 }
 

@@ -257,8 +257,35 @@ too-new `version` rejection, and the tombstone-vs-pending-save interaction.
    `already_mapped` both fresh and after a remap, restore-of-an-unknown-name-adds-without-restored,
    `name_in_use`, `already_added`, rename-frees-the-old-name, rename-onto-a-taken-name, and
    destroy-goes-inert.
-2. **Persistence** — `src/session_state.rs`, load at startup, debounced + shutdown save.
-   Store unit tests.
+2. **Persistence — DONE.** `src/session_state.rs` is the store: plain data and serde, no Wayland
+   types, JSON at `$XDG_DATA_HOME/synoik/session.json`, written through a temp file and renamed so
+   a crash mid-write cannot truncate the previous store. Loaded in `State::new`, saved by a 3s
+   debounce armed through the new `SessionManagerHandler::schedule_session_save` hook (the protocol
+   owns *what* changed, the event loop owns the timer), and flushed once more after
+   `event_loop.run` returns so a clean exit never loses it. First-change-wins arming, matching
+   mutter (`meta-wayland-xdg-session-manager.c:136-141`).
+
+   With the store in place a session id is *known* if a client holds it **or** the store remembers
+   it, so `destroy` now keeps the id restorable while only `remove` forgets it — the difference the
+   spec draws between the two, which slice 1 could not express.
+
+   **No tombstones.** The proposal called for them, but the save serializes from live state at the
+   moment it fires and only then hands bytes to the filesystem, so there is no window in which a
+   removed session could be resurrected by an in-flight write. The mechanism would have guarded a
+   hazard this shape does not have.
+
+   A headless test instance gets a store with no path — the suite must neither read nor clobber the
+   real session file — using the same `BackendMode::HeadlessTest` gate as the GSettings watcher.
+
+   The [`MAX_SESSIONS`] cap is enforced **at load only**. Evicting mid-run could drop a session a
+   client is still holding; a run that creates more than 1000 sessions simply keeps them until the
+   next start.
+
+   Store unit tests cover the JSON round trip, the too-new version refusal, an unsupported state
+   value (half-tiling) that keeps its record but restores nothing, an unknown-to-us state value
+   from a future synoik, MRU eviction, dirty-flag bookkeeping, and save-then-load. Conformance
+   tests cover restore-from-a-remembered-id, destroy-keeps/remove-forgets, an inert session's
+   `remove` being a no-op, and the write being scheduled rather than inline.
 3. **Save on unmap** — snapshot geometry/state/workspace when a registered window goes away.
 4. **Restore** — the `Unmapped` → `send_initial_configure` → map pipeline. Lands the `restore-*`
    tests.

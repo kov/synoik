@@ -21569,10 +21569,10 @@ fn renaming_onto_a_taken_name_is_name_in_use() {
     f.roundtrip(id);
 }
 
-/// Destroying a session makes it inert rather than erroring: later requests on it are ignored,
-/// and the id stops being live, so asking for it again mints a fresh session.
+/// `destroy` makes the session object inert but *keeps* the state, so the id stays known: asking
+/// for it again is a restore, not a fresh session. That is the whole difference from `remove`.
 #[test]
-fn a_destroyed_session_goes_inert() {
+fn a_destroyed_session_goes_inert_but_stays_known() {
     let mut f = Fixture::new();
     f.add_output(1, (1280, 720));
 
@@ -21588,7 +21588,30 @@ fn a_destroyed_session_goes_inert() {
     session.destroy();
     f.roundtrip(id);
 
-    // The id is no longer live, so this is a fresh session rather than `in_use`.
+    // No longer live, so this is not `in_use`; still known, so it is a restore.
+    let _again = f.client(id).get_session(Reason::Launch, Some(&session_id));
+    f.roundtrip(id);
+
+    assert_eq!(
+        f.client(id).session_events(),
+        [SessionEvent::Created(session_id), SessionEvent::Restored]
+    );
+}
+
+/// `remove` forgets the session, so the id stops being known and asking for it again mints a new
+/// one.
+#[test]
+fn a_removed_session_is_forgotten() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    session.remove();
+    f.roundtrip(id);
+
     let _again = f.client(id).get_session(Reason::Launch, Some(&session_id));
     f.roundtrip(id);
 
@@ -21597,9 +21620,47 @@ fn a_destroyed_session_goes_inert() {
         panic!("expected two created events, got {events:?}");
     };
     assert_eq!(first, &session_id);
-    assert_ne!(
-        first, second,
-        "the destroyed id must not be handed back out"
+    assert_ne!(first, second, "a removed id must not be handed back out");
+}
+
+/// An inert session — one another client took over — must not be able to delete the state it no
+/// longer manages.
+#[test]
+fn removing_from_an_inert_session_does_not_forget_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let first = f.add_client();
+    f.roundtrip(first);
+    let (losing, session_id) = new_session(&mut f, first);
+
+    let second = f.add_client();
+    f.roundtrip(second);
+    let taken = f
+        .client(second)
+        .get_session(Reason::Launch, Some(&session_id));
+    f.roundtrip(second);
+    f.roundtrip(first);
+
+    // The first client is now inert. Its `remove` must be a no-op.
+    losing.remove();
+    f.roundtrip(first);
+    f.roundtrip(second);
+
+    taken.destroy();
+    f.roundtrip(second);
+
+    let third = f.add_client();
+    f.roundtrip(third);
+    let _again = f
+        .client(third)
+        .get_session(Reason::Launch, Some(&session_id));
+    f.roundtrip(third);
+
+    assert_eq!(
+        f.client(third).session_events(),
+        [SessionEvent::Restored],
+        "the inert client's remove must not have deleted the session"
     );
 }
 
@@ -21671,4 +21732,60 @@ fn restoring_a_remapped_toplevel_is_still_already_mapped() {
     let qh = f.client(id).qh.clone();
     session.restore_toplevel(&toplevel, String::from("one"), &qh, String::from("one"));
     f.roundtrip(id);
+}
+
+/// A session id the store remembers from a previous run is *known* even though no client holds
+/// it, so asking for it is a restore rather than a fresh session. This is what persistence buys.
+#[test]
+fn a_session_id_only_the_store_knows_is_restored() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    // Stand in for a store loaded off disk at startup.
+    f.synoik()
+        .session_manager_state
+        .store
+        .touch("from-a-previous-run");
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let _session = f
+        .client(id)
+        .get_session(Reason::Launch, Some("from-a-previous-run"));
+    f.roundtrip(id);
+
+    assert_eq!(
+        f.client(id).session_events(),
+        [SessionEvent::Restored],
+        "a remembered id must not be re-minted"
+    );
+}
+
+/// Creating a session dirties the store and arms the debounced write, rather than writing inline.
+#[test]
+fn creating_a_session_schedules_a_write() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    assert!(!f.synoik().session_manager_state.store.is_dirty());
+    assert!(f.synoik().session_save_timer.is_none());
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let _session = f.client(id).get_session(Reason::Launch, None);
+    f.roundtrip(id);
+
+    assert!(
+        f.synoik().session_manager_state.store.is_dirty(),
+        "the new session must be pending a write"
+    );
+    assert!(
+        f.synoik().session_save_timer.is_some(),
+        "the debounced write must be armed"
+    );
+
+    // The shutdown path cancels the timer and writes whatever is outstanding.
+    f.synoik().flush_session_store();
+    assert!(!f.synoik().session_manager_state.store.is_dirty());
+    assert!(f.synoik().session_save_timer.is_none());
 }

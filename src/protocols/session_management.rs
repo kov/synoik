@@ -33,6 +33,7 @@ use super::raw::xdg_session_management::v1::server::xdg_session_v1::{self, XdgSe
 use super::raw::xdg_session_management::v1::server::xdg_toplevel_session_v1::{
     self, XdgToplevelSessionV1,
 };
+use crate::session_state::SessionStore;
 
 const VERSION: u32 = 1;
 
@@ -44,6 +45,12 @@ pub trait SessionManagerHandler {
     /// `restore_toplevel` is only meaningful before that commit, since restoring means changing
     /// the very first configure the toplevel receives.
     fn toplevel_had_initial_commit(&mut self, toplevel: &XdgToplevel) -> bool;
+
+    /// Arms the debounced write of the session store.
+    ///
+    /// The protocol code owns *what* changed; the timer lives with the event loop, so the two are
+    /// kept apart by this hook rather than by handing the loop into the protocol.
+    fn schedule_session_save(&mut self);
 }
 
 /// A session currently held by a client.
@@ -71,6 +78,10 @@ struct RegisteredToplevel {
 #[derive(Debug, Default)]
 pub struct SessionManagerState {
     live: HashMap<String, LiveSession>,
+
+    /// Everything we remember across restarts. A session id is "known" if it is in here, whether
+    /// or not any client currently holds it.
+    pub store: SessionStore,
 }
 
 /// User data on an [`XdgSessionV1`].
@@ -92,7 +103,7 @@ pub struct SessionManagerGlobalData {
 }
 
 impl SessionManagerState {
-    pub fn new<D, F>(display: &DisplayHandle, filter: F) -> Self
+    pub fn new<D, F>(display: &DisplayHandle, store: SessionStore, filter: F) -> Self
     where
         D: GlobalDispatch<XdgSessionManagerV1, SessionManagerGlobalData>,
         D: Dispatch<XdgSessionManagerV1, ()>,
@@ -107,7 +118,10 @@ impl SessionManagerState {
         };
         display.create_global::<D, XdgSessionManagerV1, _>(VERSION, global_data);
 
-        Self::default()
+        Self {
+            store,
+            ..Self::default()
+        }
     }
 
     /// The live session this object manages, or `None` if the object is inert.
@@ -215,18 +229,20 @@ where
                     return;
                 }
 
-                // An id we do not know about is treated as if NULL had been passed, so both cases
-                // fall through to "make a fresh session".
-                let known = session_id
-                    .filter(|sid| state.session_manager_state().live.contains_key(sid))
-                    .map(|sid| {
-                        let holder = state.session_manager_state().live[&sid]
-                            .resource
-                            .client()
-                            .as_ref()
-                            == Some(client);
-                        (sid, holder)
-                    });
+                // An id is *known* if some client holds it right now or the store remembers it
+                // from a previous run. Anything else is treated as if NULL had been passed, so it
+                // falls through to "make a fresh session" — spec, and mutter, both.
+                let known = session_id.and_then(|sid| {
+                    let manager = state.session_manager_state();
+                    let holder = manager
+                        .live
+                        .get(&sid)
+                        .and_then(|live| live.resource.client());
+                    if holder.is_none() && !manager.store.contains(&sid) {
+                        return None;
+                    }
+                    Some((sid, holder.as_ref() == Some(client)))
+                });
 
                 match known {
                     Some((sid, true)) => {
@@ -238,17 +254,19 @@ where
                     }
                     Some((sid, false)) => {
                         let session = data_init.init(id, SessionData { id: sid.clone() });
-                        state
-                            .session_manager_state()
-                            .take_over(sid, session.clone());
+                        let manager = state.session_manager_state();
+                        manager.take_over(sid.clone(), session.clone());
+                        manager.store.touch(&sid);
+                        state.schedule_session_save();
                         session.restored();
                     }
                     None => {
                         let sid = uuid::Uuid::new_v4().to_string();
                         let session = data_init.init(id, SessionData { id: sid.clone() });
-                        state
-                            .session_manager_state()
-                            .take_over(sid.clone(), session.clone());
+                        let manager = state.session_manager_state();
+                        manager.take_over(sid.clone(), session.clone());
+                        manager.store.touch(&sid);
+                        state.schedule_session_save();
                         session.created(sid);
                     }
                 }
@@ -279,7 +297,15 @@ where
             // *stored* state, which slice 2 adds: `remove` deletes it, `destroy` keeps it. That
             // is why the two arms stay separate even though they read alike today.
             xdg_session_v1::Request::Destroy => (),
-            xdg_session_v1::Request::Remove => (),
+            xdg_session_v1::Request::Remove => {
+                // Only the object that still owns the id may forget it: an inert session (one
+                // another client took over) must not delete the state it no longer manages.
+                if state.session_manager_state().session_of(session).is_some()
+                    && state.session_manager_state().store.remove(&data.id)
+                {
+                    state.schedule_session_save();
+                }
+            }
             xdg_session_v1::Request::AddToplevel { id, toplevel, name } => {
                 add_toplevel(state, client, session, data, id, toplevel, name, data_init);
             }
@@ -301,8 +327,17 @@ where
                 add_toplevel(state, client, session, data, id, toplevel, name, data_init);
             }
             xdg_session_v1::Request::RemoveToplevel { name } => {
-                if let Some(live) = state.session_manager_state().session_of(session) {
-                    live.toplevels.remove(&name);
+                if state.session_manager_state().session_of(session).is_none() {
+                    return;
+                }
+                let manager = state.session_manager_state();
+                manager
+                    .session_of(session)
+                    .expect("checked above")
+                    .toplevels
+                    .remove(&name);
+                if manager.store.remove_toplevel(&data.id, &name) {
+                    state.schedule_session_save();
                 }
             }
         }

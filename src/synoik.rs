@@ -560,6 +560,8 @@ pub struct Synoik {
     pub activation_state: XdgActivationState,
     pub mutter_x11_interop_state: MutterX11InteropManagerState,
     pub session_manager_state: SessionManagerState,
+    /// Armed by [`State::schedule_session_save`]; `None` means no write is pending.
+    pub session_save_timer: Option<RegistrationToken>,
 
     // This will not work as is outside of tests, so it is gated with #[cfg(test)] for now. In
     // particular, shaders will need to learn about the single pixel buffer. Also, it must be
@@ -1529,6 +1531,21 @@ impl State {
         // GSettings/dconf backend — the same store gnome-shell uses — and keep the
         // model current as keys change. Headless test instances keep the defaults
         // and drive the model directly instead.
+        // A headless test instance keeps the in-memory session store it was built with: the suite
+        // must neither read nor clobber the real session file.
+        if mode != BackendMode::HeadlessTest {
+            match crate::session_state::default_path() {
+                Some(path) => {
+                    let (store, err) = crate::session_state::SessionStore::load(path);
+                    if let Some(err) = err {
+                        warn!("error loading the session store, starting empty: {err}");
+                    }
+                    state.synoik.session_manager_state.store = store;
+                }
+                None => warn!("no data directory; sessions will not persist"),
+            }
+        }
+
         if mode != BackendMode::HeadlessTest {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.synoik.gnome_settings = initial;
@@ -6849,8 +6866,12 @@ impl Synoik {
 
         let mutter_x11_interop_state =
             MutterX11InteropManagerState::new::<State, _>(&display_handle, move |_| true);
-        let session_manager_state =
-            SessionManagerState::new::<State, _>(&display_handle, move |_| true);
+        // Starts empty and in memory; `State::new` loads the real file, except in tests.
+        let session_manager_state = SessionManagerState::new::<State, _>(
+            &display_handle,
+            crate::session_state::SessionStore::in_memory(),
+            move |_| true,
+        );
 
         #[cfg(test)]
         let single_pixel_buffer_state = SinglePixelBufferState::new::<State>(&display_handle);
@@ -7195,6 +7216,7 @@ impl Synoik {
             activation_state,
             mutter_x11_interop_state,
             session_manager_state,
+            session_save_timer: None,
             #[cfg(test)]
             single_pixel_buffer_state,
 
@@ -7351,6 +7373,28 @@ impl Synoik {
         if let Err(err) = self.display_handle.insert_client(client, data) {
             warn!("error inserting client: {err}");
         }
+    }
+
+    /// Writes the session store if anything changed since the last write.
+    ///
+    /// Called from the debounce timer and once more on the way out, so a clean shutdown never
+    /// loses state. A `SIGKILL` still costs up to `SESSION_SAVE_DELAY`, same as mutter.
+    pub fn save_session_store(&mut self) {
+        let store = &mut self.session_manager_state.store;
+        if !store.is_dirty() {
+            return;
+        }
+        if let Err(err) = store.save() {
+            warn!("error saving the session store: {err}");
+        }
+    }
+
+    /// Cancels a pending debounced save and writes immediately. For the shutdown path.
+    pub fn flush_session_store(&mut self) {
+        if let Some(token) = self.session_save_timer.take() {
+            self.event_loop.remove(token);
+        }
+        self.save_session_store();
     }
 
     pub fn inhibit_power_key(&mut self) -> anyhow::Result<()> {

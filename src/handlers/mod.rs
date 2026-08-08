@@ -107,6 +107,10 @@ use crate::{
 
 pub const XDG_ACTIVATION_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a session-store change waits before it is written, matching mutter's
+/// `TIMEOUT_DELAY_SECONDS` (`meta-wayland-xdg-session-manager.c:33`).
+pub const SESSION_SAVE_DELAY: Duration = Duration::from_secs(3);
+
 impl SeatHandler for State {
     type KeyboardFocus = WlSurface;
     type PointerFocus = WlSurface;
@@ -948,6 +952,27 @@ delegate_mutter_x11_interop!(State);
 impl SessionManagerHandler for State {
     fn session_manager_state(&mut self) -> &mut SessionManagerState {
         &mut self.synoik.session_manager_state
+    }
+
+    fn schedule_session_save(&mut self) {
+        // First change wins, as in mutter (`meta-wayland-xdg-session-manager.c:136-141`): the
+        // timer is armed once and not pushed back by later changes, so a busy session still gets
+        // written every few seconds rather than only when it goes quiet.
+        if self.synoik.session_save_timer.is_some() {
+            return;
+        }
+
+        let timer = calloop::timer::Timer::from_duration(SESSION_SAVE_DELAY);
+        self.synoik.session_save_timer = self
+            .synoik
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                state.synoik.session_save_timer = None;
+                state.synoik.save_session_store();
+                calloop::timer::TimeoutAction::Drop
+            })
+            .map_err(|err| warn!("error arming the session store save: {err:?}"))
+            .ok();
     }
 
     fn toplevel_had_initial_commit(&mut self, toplevel: &XdgToplevel) -> bool {
