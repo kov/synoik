@@ -22912,6 +22912,94 @@ fn a_window_demanding_attention_marks_its_app_urgent_in_the_dash() {
     );
 }
 
+/// **An app with a focused window is not urgent**, even when another of its windows demanded
+/// attention from a desktop you are not on.
+///
+/// Urgency stays per window, as mutter keeps it (`window.c:5090-5091` unsets it for the window
+/// that took focus and no other). The dash and dock, though, aggregate per app — so this is the
+/// app-level half of that rule, and without it an app that launches a focused window here and a
+/// second one on another desktop pokes the dock at you while you are already using it. Reported
+/// from the seat on 2026-08-08, and the reason it is checked at snapshot time rather than on a
+/// focus change: the second window arrives by *mapping*, long after focus last moved.
+#[test]
+fn an_app_you_are_looking_at_does_not_demand_attention() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+    seed_favorites(&mut f, &["a.desktop"]);
+
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    // Window one of app "a": maps where the user is, takes focus.
+    let here = {
+        let win = f.client(id).create_window();
+        win.set_app_id("a");
+        win.commit();
+        win.surface.clone()
+    };
+    f.roundtrip(id);
+    let window = f.client(id).window(&here);
+    window.attach_new_buffer();
+    window.set_size(300, 200);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+
+    // Window two of the same app, restored onto the second desktop — the arm that marks urgent.
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "elsewhere",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([100, 100, 300, 200]),
+            workspace: Some(1),
+            ..Default::default()
+        },
+    );
+    let (surface, toplevel, qh) = {
+        let win = f.client(id).create_window();
+        win.set_app_id("a");
+        (
+            win.surface.clone(),
+            win.xdg_toplevel.clone(),
+            f.client(id).qh.clone(),
+        )
+    };
+    let _handle = session.restore_toplevel(
+        &toplevel,
+        String::from("elsewhere"),
+        &qh,
+        String::from("elsewhere"),
+    );
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+    map_at_configured_size(&mut f, id, &surface);
+    f.synoik_complete_animations();
+
+    // The snapshot is where the invariant runs, and it must reach the dash cleared.
+    f.synoik().sync_running_apps();
+    f.synoik().sync_dash_favorites();
+    f.synoik().sync_dock_urgency();
+
+    assert!(
+        !f.synoik()
+            .layout
+            .windows()
+            .any(|(_, mapped)| mapped.is_urgent()),
+        "no window of a focused app may stay urgent"
+    );
+    assert!(
+        !f.synoik().dash.items().iter().any(|item| item.urgent),
+        "so the dash has nothing to poke"
+    );
+    assert!(
+        !f.synoik().dock.is_poking(),
+        "and the dock must not poke at an app the user is already in"
+    );
+}
+
 /// The mapped window registered in the session under `name`.
 ///
 /// Session tests cannot ask the layout for the *focused* window any more: a restored window that

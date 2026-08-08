@@ -218,8 +218,13 @@ impl Dock {
 
     /// Whether the dock is only out because an app wants attention — the state where it draws
     /// the urgent icons alone rather than the whole dash.
+    ///
+    /// True while *sliding* into (or back down to) the poke as well as at rest on it, and false
+    /// whenever the dock is out for its own reasons. Keying this on `Hidden` alone meant the
+    /// rise into a poke was drawn as the full dash and only snapped to icons when the slide
+    /// finished — chrome flashing up the screen edge on every urgent window.
     pub fn is_poking(&self) -> bool {
-        self.poking && matches!(self.state, State::Hidden)
+        self.poking && !matches!(self.state, State::Shown | State::Showing(_))
     }
 
     /// How far out "away" is: the bottom edge normally, the poke while an app wants attention.

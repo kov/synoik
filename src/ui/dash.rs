@@ -220,6 +220,16 @@ const PILL_BLUR: BlurOptions = crate::ui::panel::BAR_BLUR;
 /// composes: the shared [`widget::style::HOVER_WASH`], which is already what the app grid's tiles
 /// use for this (10% white where GNOME lightens 4%), so the two hovers now match.
 const TILE_HOVER: [f32; 4] = widget::style::HOVER_WASH;
+/// The poke glow, as `(blur radius, alpha)` layers drawn behind an urgent icon: a tight bright
+/// core plus a wide soft falloff. Ours, not GNOME's — see the poke's own note in
+/// [`Dash::render`]. The pair is what keeps it reading as *light* rather than as a coloured
+/// smudge; one wide layer alone looks like fog, one tight layer alone like a border.
+const GLOW_LAYERS: [(f64, f32); 2] = [(8., 0.75), (22., 0.45)];
+/// Transparent margin the glow bake needs on every side: a drop shadow bleeds ~1.5·blur (3σ)
+/// past its box, so the buffer has to hold the widest layer's fringe or the outermost icons'
+/// halos clip flat against the edge.
+const GLOW_PAD: f64 = GLOW_LAYERS[1].0 * 1.5;
+
 /// The show-apps glyph color: `$system_fg_color` ≈ `#fafafb` (`_dash.scss:57,62`).
 const SHOW_APPS_FG: [f32; 4] = [0.980, 0.980, 0.984, 1.];
 /// The show-apps button glyph (`view-app-grid-symbolic`, `dash.js:216`).
@@ -805,6 +815,24 @@ impl Dash {
             })
     }
 
+    /// Narrow a [`hit_test`](Self::hit_test) result to what a *poking* dock actually draws:
+    /// the icons demanding attention, and nothing else.
+    ///
+    /// Without this the invisible tiles keep their click targets, so pushing the pointer into
+    /// the bottom edge to reach the one glowing icon can activate a favorite you cannot see —
+    /// or open the app grid, which is not even drawn. `poking` comes from the dock rather than
+    /// from a mirrored flag here: it depends on the slide animation's state, so a copy on the
+    /// dash would go stale between refreshes.
+    pub fn filter_poke(&self, hit: DashHit, poking: bool) -> Option<DashHit> {
+        if !poking {
+            return Some(hit);
+        }
+        match hit {
+            DashHit::App(k) if self.items.get(k).is_some_and(|entry| entry.urgent) => Some(hit),
+            _ => None,
+        }
+    }
+
     /// The logical center of tile `i` within `area` — favorites are
     /// `[0, n)`, the trailing show-apps button is `[n]`. Where a drag of that tile
     /// picks the icon up from, and a geometry probe for the conformance corpus,
@@ -906,12 +934,14 @@ impl Dash {
         blur: bool,
         // `org.gnome.desktop.interface color-scheme` — the pill takes the shared plate.
         appearance: widget::style::Appearance,
-        // Drawing the *poke*: only the apps demanding attention, each on a highlight, and no pill
-        // chrome at all. The dock rests part-way out in this mode, so what shows above the screen
-        // edge is icons rather than a slab of dash — and they keep their normal horizontal
-        // positions, so pushing into the edge lands the pointer on the one you are about to click.
-        poking: bool,
+        // Drawing the *poke*, in the system accent: only the apps demanding attention, each
+        // behind an accent glow, and no pill, blur, separator, dots or show-apps button — the
+        // dock rests part-way out in this mode, so what shows above the screen edge is icons
+        // rather than a slab of dash. They keep their normal horizontal positions, so pushing
+        // into the edge lands the pointer on the one you are about to click.
+        poke: Option<[u8; 3]>,
     ) -> Vec<DashElement> {
+        let poking = poke.is_some();
         let scale = output.current_scale().fractional_scale();
         let layout = self.layout(area);
         let metrics = layout.metrics;
@@ -983,59 +1013,6 @@ impl Dash {
             }
         }
 
-        // The poke highlights, under the icons.
-        if poking {
-            let tiles: Vec<Rectangle<f64, Logical>> = self
-                .items
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| entry.urgent)
-                .map(|(i, _)| {
-                    let t = layout.tiles[i];
-                    Rectangle::new(t.loc - layout.pill.loc, t.size)
-                })
-                .collect();
-            let radius = AppIcon::RADIUS;
-            let texture = widget::bake(
-                renderer,
-                &mut cache.poke,
-                scale,
-                layout.pill.size,
-                self.content_rev,
-                |_| Ok(()),
-                |frame, phys, ()| {
-                    let mut p = Painter::new(frame, scale, phys);
-                    p.clear(widget::style::TRANSPARENT)?;
-                    for tile in &tiles {
-                        p.fill_rounded(*tile, radius, TILE_HOVER)?;
-                    }
-                    Ok(())
-                },
-            );
-            match texture {
-                Ok(texture) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        vec![],
-                    );
-                    elements.push(DashElement::Texture(
-                        TextureRenderElement::from_texture_buffer(
-                            buffer,
-                            layout.pill.loc,
-                            alpha,
-                            None,
-                            None,
-                            Kind::Unspecified,
-                        ),
-                    ));
-                }
-                Err(err) => tracing::error!("error baking the dash poke highlight: {err:#}"),
-            }
-        }
-
         // App icons, on their tiles. While poking, only the ones asking for attention.
         for (i, entry) in self
             .items
@@ -1056,6 +1033,93 @@ impl Dash {
             ) {
                 elements.push(DashElement::Texture(el));
             }
+        }
+
+        // The accent glow behind each urgent icon. Pushed *after* the icons, because the first
+        // element pushed is the topmost — an "under the icons" layer has to come later.
+        //
+        // Two shadows on one box: a tight bright core and a wide soft falloff, which is what
+        // makes a glow read as light rather than as a coloured blob. There is no GNOME
+        // reference for this — the poking dock is ours (`dock-divergence`), and GNOME surfaces
+        // attention as a notification instead.
+        if let Some(accent) = poke {
+            let accent = widget::style::accent_rgba(accent);
+            let tiles: Vec<Rectangle<f64, Logical>> = self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.urgent)
+                .map(|(i, _)| {
+                    let t = layout.tiles[i];
+                    Rectangle::new(
+                        t.loc - layout.pill.loc + Point::from((GLOW_PAD, GLOW_PAD)),
+                        t.size,
+                    )
+                })
+                .collect();
+            // The bake buffer carries `GLOW_PAD` of transparent margin on every side: a
+            // drop shadow bleeds ~1.5·blur (3σ) past its box, and a pill-sized buffer would
+            // clip the halo of the outermost icons flat.
+            let size = Size::from((
+                layout.pill.size.w + GLOW_PAD * 2.,
+                layout.pill.size.h + GLOW_PAD * 2.,
+            ));
+            let radius = AppIcon::RADIUS;
+            // The accent rides the revision, or changing it would keep serving the old glow
+            // until the dash content next changed. Same rule as the pill's appearance below.
+            let revision = (self.content_rev << 24)
+                | ((u64::from(accent[0] as u8) << 16)
+                    | (u64::from(accent[1] as u8) << 8)
+                    | u64::from(accent[2] as u8));
+            let texture = widget::bake(
+                renderer,
+                &mut cache.poke,
+                scale,
+                size,
+                revision,
+                |_| Ok(()),
+                |frame, phys, ()| {
+                    let mut p = Painter::new(frame, scale, phys);
+                    p.clear(widget::style::TRANSPARENT)?;
+                    for tile in &tiles {
+                        for (blur, alpha) in GLOW_LAYERS {
+                            let color = [accent[0], accent[1], accent[2], alpha];
+                            p.drop_shadow(*tile, radius, blur, (0., 0.), color)?;
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            match texture {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        vec![],
+                    );
+                    elements.push(DashElement::Texture(
+                        TextureRenderElement::from_texture_buffer(
+                            buffer,
+                            layout.pill.loc - Point::from((GLOW_PAD, GLOW_PAD)),
+                            alpha,
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ),
+                    ));
+                }
+                Err(err) => tracing::error!("error baking the dash poke glow: {err:#}"),
+            }
+        }
+
+        // A poke is icons and their glow, and nothing else — every layer below this point is
+        // dash chrome. One early return rather than a `!poking` guard per layer, because that
+        // is what the first cut did and the show-apps button was left out of it, riding up the
+        // screen edge alongside the urgent icon.
+        if poking {
+            return elements;
         }
 
         // The show-apps symbolic glyph. Built by hand rather than via `icon_element`
@@ -1085,7 +1149,7 @@ impl Dash {
         }
 
         // The pill chrome (background + separator + running dots + the hovered
-        // tile's fill), baked + cached.
+        // tile's fill), baked + cached. A poke draws none of it.
         let hovered_tile = match self.hovered {
             Some(DashHit::App(k)) if k < layout.n_items => Some(layout.tiles[k]),
             Some(DashHit::ShowApps) => layout.tiles.last().copied(),
@@ -1365,6 +1429,43 @@ mod tests {
         // Shrinking to one favorite would leave index 2 dangling — must clear.
         dash.set_items(vec![entry("only.desktop")], 1);
         assert_eq!(dash.hovered, None, "a favorites change clears the hover");
+    }
+
+    /// A poking dock draws only the urgent icons, so only those can be clicked — the tiles that
+    /// are not drawn keep their geometry, and without the filter pushing the pointer into the
+    /// bottom edge to reach the glowing icon would activate an invisible neighbour, or open the
+    /// app grid, which the poke does not draw at all.
+    #[test]
+    fn a_poke_can_only_be_clicked_on_its_urgent_icons() {
+        let mut dash = dash_with(3);
+        let mut items: Vec<DashEntry> = (0..3).map(|i| entry(&format!("app{i}.desktop"))).collect();
+        items[1].urgent = true;
+        dash.set_items(items, 3);
+
+        // Not poking: every hit passes through untouched.
+        assert_eq!(
+            dash.filter_poke(DashHit::App(0), false),
+            Some(DashHit::App(0))
+        );
+        assert_eq!(
+            dash.filter_poke(DashHit::ShowApps, false),
+            Some(DashHit::ShowApps)
+        );
+
+        // Poking: only the urgent app survives.
+        assert_eq!(
+            dash.filter_poke(DashHit::App(1), true),
+            Some(DashHit::App(1)),
+            "the icon that is actually drawn must stay clickable"
+        );
+        assert_eq!(dash.filter_poke(DashHit::App(0), true), None);
+        assert_eq!(dash.filter_poke(DashHit::App(2), true), None);
+        assert_eq!(
+            dash.filter_poke(DashHit::ShowApps, true),
+            None,
+            "the app grid is not an app demanding attention"
+        );
+        assert_eq!(dash.filter_poke(DashHit::Background, true), None);
     }
 
     /// Click targets extend to the bottom screen edge (`padding-bottom`).

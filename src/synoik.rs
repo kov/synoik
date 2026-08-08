@@ -10190,7 +10190,9 @@ impl Synoik {
                     // overview's dash below sits on a backdrop that is already blurred.
                     true,
                     self.appearance(),
-                    self.dock.is_poking(),
+                    self.dock
+                        .is_poking()
+                        .then_some(self.gnome_settings.accent_color),
                 ) {
                     push(element.into());
                 }
@@ -10236,7 +10238,7 @@ impl Synoik {
                     false,
                     self.appearance(),
                     // The overview always shows the whole dash.
-                    false,
+                    None,
                 ) {
                     push(element.into());
                 }
@@ -13641,9 +13643,59 @@ impl Synoik {
     /// app's *state* (our `app-state-changed`, `dash.js:383`). The second half
     /// matters because a launch moves an app to STARTING, which shows a running dot,
     /// without touching a single window.
+    /// Enforce the app-level urgency rule: **an app with a focused window is not urgent.**
+    ///
+    /// Urgency itself stays per window, exactly as mutter keeps it — focusing a window unsets
+    /// its own `wm_state_demands_attention` and nothing else's (`window.c:5090-5091`), and
+    /// [`Mapped::set_urgent`] refuses to mark the focused window for the same reason. But the
+    /// dash and the dock are per *app*: a second window demanding attention from another
+    /// workspace kept the dock poking for an app whose window the user was already working in,
+    /// and only walking over to focus *that* window shut it up.
+    ///
+    /// Written as an invariant re-stated every refresh rather than as a hook on focus changes,
+    /// because the case that motivated it is a **map**, not a focus change: an app launches,
+    /// focuses its first window, and only then maps a second one on another workspace. A focus
+    /// hook would have run before the urgent window existed, and would have worked or not
+    /// depending on the order the client happened to map in.
+    ///
+    /// **Interim** (decided 2026-08-08): urgency wants a redesign around a less distracting
+    /// per-window affordance; until there is one, an app you are looking at does not shout.
+    fn clear_urgency_of_focused_app(&mut self) {
+        use crate::utils::with_toplevel_role;
+
+        let focused_app = self.layout.focus().and_then(|focused| {
+            let app_id = with_toplevel_role(focused.toplevel(), |role| role.app_id.clone())?;
+            self.app_system
+                .app_for_window(&app_id)
+                .map(|entry| entry.id)
+        });
+        let Some(focused_app) = focused_app else {
+            return;
+        };
+
+        // Resolved through `app_for_window`, not by comparing `app_id` strings: that is the
+        // identity the dash aggregates on, and a window resolving differently would leave a
+        // poke that focusing could never clear.
+        let app_system = &self.app_system;
+        self.layout.with_windows_mut(|mapped, _| {
+            if !mapped.is_urgent() {
+                return;
+            }
+            let same_app = with_toplevel_role(mapped.toplevel(), |role| role.app_id.clone())
+                .and_then(|id| app_system.app_for_window(&id))
+                .is_some_and(|entry| entry.id == focused_app);
+            if same_app {
+                mapped.set_urgent(false);
+            }
+        });
+    }
+
     pub fn sync_running_apps(&mut self) -> bool {
         use crate::app_system::RunningWindow;
         use crate::utils::with_toplevel_role;
+
+        // Before the snapshot, so a window cleared here never reaches the dash as urgent.
+        self.clear_urgency_of_focused_app();
 
         // Sweep timed-out startup sequences here too — mutter runs a timeout source
         // for the same purpose (`startup_sequence_timeout`,

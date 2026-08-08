@@ -4543,11 +4543,17 @@ impl State {
         } else {
             // The overview is shut, but the dock may still have the dash on screen — and it is
             // the same dash, tracking hover the same way. Nothing else of the overview is up.
+            // A poke narrows that to the urgent icons, so hover matches what can be clicked.
             match self.synoik.output_under(pos) {
                 Some((output, p)) => (
                     self.synoik
                         .dash_area(output)
-                        .and_then(|area| self.synoik.dash.hit_test(p, area)),
+                        .and_then(|area| self.synoik.dash.hit_test(p, area))
+                        .and_then(|hit| {
+                            self.synoik
+                                .dash
+                                .filter_poke(hit, self.synoik.dock.is_poking())
+                        }),
                     None,
                     None,
                     None,
@@ -6436,10 +6442,12 @@ impl State {
         // so it produces the same hit and rides the same activation path. Nothing else of the
         // overview is up, so nothing else can be hit.
         if self.synoik.dock_owns_dash(output) {
+            let poking = self.synoik.dock.is_poking();
             return self
                 .synoik
                 .dash_area(output)
                 .and_then(|area| self.synoik.dash.hit_test(pos, area))
+                .and_then(|hit| self.synoik.dash.filter_poke(hit, poking))
                 .map(OverviewHit::Dash);
         }
 

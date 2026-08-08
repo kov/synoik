@@ -7404,6 +7404,124 @@ fn an_icon_theme_change_keeps_the_symbolic_icons_drawable() {
     }
 }
 
+/// The poking dock renders: urgent icons plus their accent glow, and none of the dash chrome.
+///
+/// Worth a render test rather than a layout one because the glow is the dash's only
+/// [`Painter::drop_shadow`] caller and it bakes into a buffer *padded* for the 3σ fringe — a
+/// path nothing else exercises, so under `SYNOIK_VK_VALIDATION=1` this is what proves the
+/// oversized bake and its offset draw are legal.
+#[test]
+fn a_poking_dash_draws_glowing_icons_and_no_chrome() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+
+    let catalog = FakeCatalog::new(vec![
+        AppEntry::fake("a.desktop", "a.desktop"),
+        AppEntry::fake("b.desktop", "b.desktop"),
+    ]);
+    f.synoik().app_system =
+        AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
+    f.synoik()
+        .app_system
+        .set_favorites(vec!["a.desktop".into(), "b.desktop".into()]);
+    f.synoik().sync_dash_favorites();
+
+    let controls = f
+        .synoik()
+        .layout
+        .controls_layout_for_output(&output)
+        .expect("output 1 has a monitor");
+
+    let state = f.synoik_state();
+    let counts = state.backend.headless().with_vulkan_renderer(|vk| {
+        let synoik = &mut state.synoik;
+        let whole = synoik
+            .dash
+            .render(
+                vk,
+                &synoik.app_icon_cache,
+                &synoik.icon_cache,
+                &output,
+                controls.dash,
+                1.0,
+                false,
+                synoik.appearance(),
+                None,
+            )
+            .len();
+        // Nothing is urgent yet: a poke with no urgent app draws nothing at all.
+        let empty_poke = synoik
+            .dash
+            .render(
+                vk,
+                &synoik.app_icon_cache,
+                &synoik.icon_cache,
+                &output,
+                controls.dash,
+                1.0,
+                false,
+                synoik.appearance(),
+                Some([53, 132, 228]),
+            )
+            .len();
+        (whole, empty_poke)
+    });
+    let Some((whole, empty_poke)) = counts else {
+        eprintln!("skipping a_poking_dash_draws_glowing_icons_and_no_chrome: no Vulkan device");
+        return;
+    };
+
+    assert!(
+        whole > empty_poke,
+        "the whole dash ({whole} elements) must draw more than a poke with nothing urgent \
+         ({empty_poke}): the pill, its blur and the show-apps button are chrome a poke omits"
+    );
+
+    // Now mark one app urgent and poke again: its icon and the glow behind it come back.
+    let mut items = f.synoik().dash.items().to_vec();
+    items[0].urgent = true;
+    let n = items.len();
+    f.synoik().dash.set_items(items, n);
+
+    let state = f.synoik_state();
+    let poked = state.backend.headless().with_vulkan_renderer(|vk| {
+        let synoik = &mut state.synoik;
+        synoik
+            .dash
+            .render(
+                vk,
+                &synoik.app_icon_cache,
+                &synoik.icon_cache,
+                &output,
+                controls.dash,
+                1.0,
+                false,
+                synoik.appearance(),
+                Some([53, 132, 228]),
+            )
+            .len()
+    });
+    let poked = poked.expect("the renderer was there a moment ago");
+
+    assert!(
+        poked > empty_poke,
+        "an urgent app must add its icon and glow ({poked} vs {empty_poke})"
+    );
+    assert!(
+        poked < whole,
+        "but a poke stays smaller than the whole dash ({poked} vs {whole}) — one icon and a \
+         glow, never the pill"
+    );
+}
+
 #[test]
 fn a_ping_on_an_unchanged_catalog_keeps_the_dash_icons() {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
@@ -7453,7 +7571,7 @@ fn a_ping_on_an_unchanged_catalog_keeps_the_dash_icons() {
             1.0,
             false,
             synoik.appearance(),
-            false,
+            None,
         );
     });
     if rendered.is_none() {
@@ -7555,7 +7673,7 @@ fn vulkan_dash_icons_shrink_with_the_ramped_tiles() {
                         1.,
                         false,
                         synoik.appearance(),
-                        false,
+                        None,
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7671,7 +7789,7 @@ fn vulkan_dash_hover_lightens_the_tile() {
                 1.0,
                 false,
                 synoik.appearance(),
-                false,
+                None,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7780,7 +7898,7 @@ fn vulkan_dark_style_repaints_the_dash_pill() {
                     1.0,
                     false,
                     synoik.appearance(),
-                    false,
+                    None,
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -9329,7 +9447,7 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
                 1.0,
                 false,
                 synoik.appearance(),
-                false,
+                None,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
