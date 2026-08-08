@@ -22912,6 +22912,80 @@ fn a_window_demanding_attention_marks_its_app_urgent_in_the_dash() {
     );
 }
 
+/// A window that already knows its workspace **still completes its app's startup sequence.**
+///
+/// mutter completes the sequence as soon as a window matches it
+/// (`meta_startup_sequence_complete`, `display.c:2712`) and only afterwards asks whether to apply
+/// its properties, guarded by `if (!window->initial_workspace_set)`. We had the completion nested
+/// inside the workspace lookup, so every window that arrived with a workspace already decided —
+/// every restored window, and anything an `open-on-workspace` rule pinned — left its app STARTING
+/// until the sequence timed out. Seat symptom: ghost showed a loading state for twenty seconds
+/// after it was up, and its dash icon did nothing when clicked, because a STARTING app is not
+/// activatable.
+#[test]
+fn a_window_with_a_seeded_workspace_still_finishes_its_apps_startup() {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+    f.synoik().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![AppEntry::fake("a.desktop", "A")])),
+        Box::new(RecordingLauncher::default()),
+    );
+
+    let id = f.add_client();
+    f.roundtrip(id);
+
+    // The app is launching: a sequence is open, so the dash shows it as STARTING.
+    f.synoik()
+        .app_system
+        .begin_startup("a.desktop", None, None, get_monotonic_time());
+    assert_eq!(
+        f.synoik().app_system.starting_apps().collect::<Vec<_>>(),
+        ["a.desktop"],
+        "the launch must open a sequence, or this test proves nothing"
+    );
+
+    // Its window arrives with a workspace already chosen — here by a session restore, which is
+    // how ghost hits this on every launch that has something to restore.
+    let (session, session_id) = new_session(&mut f, id);
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([100, 100, 300, 200]),
+            workspace: Some(1),
+            ..Default::default()
+        },
+    );
+    let (surface, toplevel, qh) = {
+        let win = f.client(id).create_window();
+        win.set_app_id("a");
+        (
+            win.surface.clone(),
+            win.xdg_toplevel.clone(),
+            f.client(id).qh.clone(),
+        )
+    };
+    let _handle =
+        session.restore_toplevel(&toplevel, String::from("main"), &qh, String::from("main"));
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+    map_at_configured_size(&mut f, id, &surface);
+    f.synoik_complete_animations();
+
+    assert!(
+        f.synoik()
+            .app_system
+            .starting_apps()
+            .collect::<Vec<_>>()
+            .is_empty(),
+        "the window is up, so its app is running — not starting until the sequence expires"
+    );
+}
+
 /// A **`recover`** puts its windows back and marks the ones that landed elsewhere; a
 /// **`session_restore`** marks nothing.
 ///

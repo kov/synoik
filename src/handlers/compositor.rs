@@ -379,12 +379,23 @@ impl CompositorHandler for State {
                     // (`mutter/src/core/display.c:2661-2731`): the window completes
                     // the startup sequence it belongs to — matched by its activation
                     // token, else by app id — and inherits that sequence's workspace.
+                    //
+                    // Completing it is unconditional, and mutter's shape says why: it calls
+                    // `meta_startup_sequence_complete` as soon as a window matches (`:2712`)
+                    // and only *then* asks whether to apply the properties, guarded by
+                    // `if (!window->initial_workspace_set)`. Nesting the completion inside
+                    // "do I still need a workspace?" meant every window that already had one
+                    // — every restored window, and anything an `open-on-workspace` rule
+                    // pinned — left its app STARTING until the sequence timed out: a launcher
+                    // stuck showing a loading state, and a dash icon that does nothing when
+                    // clicked, for an app that had been up for twenty seconds.
+                    let sequence_workspace = self.synoik.app_system.complete_startup(
+                        app_id.as_deref(),
+                        activation_token.as_deref(),
+                        get_monotonic_time(),
+                    );
                     let workspace_id = workspace_id.or_else(|| {
-                        let target = self.synoik.app_system.complete_startup(
-                            app_id.as_deref(),
-                            activation_token.as_deref(),
-                            get_monotonic_time(),
-                        )?;
+                        let target = sequence_workspace?;
                         // The workspace may be gone by the time the app got around
                         // to mapping.
                         self.synoik
