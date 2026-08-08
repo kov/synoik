@@ -51,10 +51,15 @@ synoik msg input key-release Alt    # …commit on release
 synoik msg input pointer-motion 200 300; synoik msg input click; synoik msg input scroll 1
 ```
 
-Keys are evdev keycodes in decimal (`125`), XKB keysym names
-(case-insensitive: `Super_L`, `F2`, `a`), or the shorthands
-`alt`/`ctrl`/`shift`/`super`; names resolve through the instance's active
-keymap, and unresolvable keys come back as errors. Injection works on any
+Keys are XKB keysym names (case-insensitive: `Super_L`, `F2`, `a`, `8`), the shorthands
+`alt`/`ctrl`/`shift`/`super`, or `code:N` for a raw evdev keycode (`code:125` =
+`KEY_LEFTMETA`); names resolve through the instance's active keymap, and unresolvable keys
+come back as errors.
+
+**A bare number is the digit key.** `Super+8` presses `8`, as the accelerator reads. It used to
+be parsed as the keycode, and evdev 8 is `KEY_7` — so every digit accelerator silently fired
+its neighbour, and `Super+8` "launching the wrong favourite" was investigated as a compositor
+bug before the instrument was suspected. Injection works on any
 backend, not just headless — handy for poking a nested instance past the
 host compositor's grabs.
 

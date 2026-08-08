@@ -1413,9 +1413,10 @@ fn super_number_counts_the_favorites_the_dash_shows() {
 ///
 /// Nine favourites, every digit, one assertion each. Written to chase a seat report of `<Super>8`
 /// launching the *seventh* favourite, which turned out to be the instrument rather than the
-/// compositor — `synoik msg input key Super+8` reads a bare number as a **decimal evdev keycode**
-/// (`input::synthetic::resolve_key`), and keycode 8 is `KEY_7`. The test stays because the shape
-/// it rules out is real: a mapping that is right at 2 and wrong at 8 is what a per-digit slip
+/// compositor: `synoik msg input key Super+8` read a bare number as a decimal evdev keycode, and
+/// keycode 8 is `KEY_7`. Bare digits now mean the digit key (`input::synthetic::resolve_key`; raw
+/// keycodes moved behind `code:`), so the command means what it reads. The test stays because the
+/// shape it rules out is real: a mapping that is right at 2 and wrong at 8 is what a per-digit slip
 /// looks like, and the one spot-check we had could not have seen it.
 #[test]
 fn every_super_digit_activates_that_favorite() {

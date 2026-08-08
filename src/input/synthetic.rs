@@ -120,10 +120,20 @@ fn send_button(state: &mut State, button_code: u32, button_state: ButtonState) {
     state.process_input_event(event);
 }
 
-/// Resolves a key given as a decimal evdev keycode or an XKB keysym name to
-/// an xkb-space keycode.
+/// Resolves a key given as an XKB keysym name, or as `code:N` for a raw decimal evdev
+/// keycode, to an xkb-space keycode.
+///
+/// **A bare number is the digit key, not a keycode.** It used to be the keycode, which made
+/// `input key Super+8` press `KEY_7` — evdev 8 *is* `KEY_7` — and every accelerator written the
+/// way a user says it out loud silently activated its neighbour. That cost an hour of chasing a
+/// favourites off-by-one that did not exist, so the reading that matches the accelerator string
+/// wins and raw keycodes moved behind `code:`. Nothing is lost: evdev 1-9 are `ESC` and the digit
+/// row, all reachable by name.
 fn resolve_key(state: &mut State, key: &str) -> Result<Keycode, String> {
-    if let Ok(code) = key.parse::<u32>() {
+    if let Some(raw) = key.strip_prefix("code:") {
+        let code = raw
+            .parse::<u32>()
+            .map_err(|_| format!("not a decimal evdev keycode: {raw:?}"))?;
         return Ok(Keycode::new(code + XKB_KEYCODE_OFFSET));
     }
 
@@ -500,7 +510,36 @@ mod tests {
         }
     }
 
-    /// Keys resolve as evdev codes, keysym names and modifier shorthands, all
+    /// A bare digit is the digit key, and `code:` is how you ask for a raw keycode.
+    ///
+    /// These two spellings used to be the same one, and the collision is silent where it hurts:
+    /// evdev 8 is `KEY_7`, so `input key Super+8` fired `switch-to-application-7` and looked for
+    /// all the world like a compositor off-by-one — which is exactly how it was investigated.
+    #[test]
+    fn a_bare_digit_is_the_digit_key_not_a_keycode() {
+        const KEY_8: u32 = 9;
+        const KEY_LEFTALT: u32 = 56;
+
+        let mut f = Fixture::new();
+        f.add_output(1, (1920, 1080));
+
+        assert_eq!(
+            resolve_key(f.synoik_state(), "8").unwrap(),
+            Keycode::new(KEY_8 + XKB_KEYCODE_OFFSET),
+            "`8` must press the 8 key, as `Super+8` reads"
+        );
+        assert_eq!(
+            resolve_key(f.synoik_state(), "code:56").unwrap(),
+            Keycode::new(KEY_LEFTALT + XKB_KEYCODE_OFFSET),
+            "`code:N` is the raw evdev keycode"
+        );
+        assert!(
+            resolve_key(f.synoik_state(), "code:nope").is_err(),
+            "a `code:` that is not a number is an error, not a keysym lookup"
+        );
+    }
+
+    /// Keys resolve as `code:`-prefixed evdev codes, keysym names and modifier shorthands, all
     /// landing in the real input pipeline (here: the `<Alt>F2` bind), and
     /// `Text` types into the focused UI, synthesizing Shift for level-1
     /// characters.
@@ -509,12 +548,12 @@ mod tests {
         let mut f = Fixture::new();
         f.add_output(1, (1920, 1080));
 
-        // Deliberately mixed spellings: evdev code, keysym name, shorthand.
+        // Deliberately mixed spellings: raw evdev code, keysym name, shorthand.
         inject_all(
             &mut f,
             &[
                 InjectedEvent::KeyPress {
-                    key: String::from("56"), // KEY_LEFTALT
+                    key: String::from("code:56"), // KEY_LEFTALT
                 },
                 InjectedEvent::KeyPress {
                     key: String::from("F2"),

@@ -122,10 +122,14 @@ pub enum Msg {
 
 /// One `synoik msg input` invocation, turned into a batch of [`InjectedEvent`]s.
 ///
-/// Keys are Linux evdev keycodes in decimal (e.g. `125` for `KEY_LEFTMETA`)
-/// or XKB keysym names (case-insensitive: `Super_L`, `F2`, `a`), resolved
-/// through the running instance's active keymap. Buttons are `left`,
-/// `middle`, `right`, or an evdev `BTN_*` code in decimal.
+/// Keys are XKB keysym names (case-insensitive: `Super_L`, `F2`, `a`, `8`), resolved through
+/// the running instance's active keymap, or `code:N` for a raw decimal evdev keycode
+/// (`code:125` is `KEY_LEFTMETA`). Buttons are `left`, `middle`, `right`, or an evdev `BTN_*`
+/// code in decimal.
+///
+/// A bare number is the **digit key**: `Super+8` presses `8`, as the accelerator string reads.
+/// It used to mean the keycode, where evdev 8 is `KEY_7`, so every digit accelerator quietly
+/// fired its neighbour.
 #[derive(Subcommand)]
 pub enum InputCmd {
     /// Tap a key or a combo: press, then release in reverse order.
