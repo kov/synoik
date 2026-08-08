@@ -2650,25 +2650,34 @@ impl<W: LayoutElement> Workspace<W> {
     ) -> Option<(SizingMode, Option<Rectangle<f64, Logical>>)> {
         let tile = self.tiles().find(|tile| tile.window().id() == id)?;
 
-        // Model values throughout, never render positions: a window closed mid-animation must be
-        // remembered where the layout has it, not where the animation had reached.
-        let rect = match (tile.floating_pos, tile.floating_window_size) {
-            // The remembered floating geometry, which survives maximize and fullscreen — the
-            // whole point of mutter keeping a `saved_rect` separate from the live one.
-            (Some(pos), Some(size)) => Some(Rectangle::new(
-                self.floating.scale_by_working_area(pos) + tile.window_offset(),
-                size.to_f64(),
-            )),
-            // Nothing remembered, so fall back to where it actually sits — but only the floating
-            // layer has a position worth saving; a scrolling-layer tile's is a column offset.
-            _ => self
-                .floating
-                .tiles_with_offsets()
-                .find(|(tile, _)| tile.window().id() == id)
-                .map(|(tile, offset)| {
-                    Rectangle::new(offset + tile.window_offset(), tile.window_size())
-                }),
-        };
+        // Where it actually sits, as the last resort — but only the floating layer has a position
+        // worth saving; a scrolling-layer tile's is a column offset. Model values throughout,
+        // never render positions: a window closed mid-animation must be remembered where the
+        // layout has it, not where the animation had reached.
+        let live = self
+            .floating
+            .tiles_with_offsets()
+            .find(|(tile, _)| tile.window().id() == id)
+            .map(|(tile, offset)| (offset, tile.window_size()));
+
+        // `tiled_restore_*` first: that is the rect an un-maximize returns the window to, and in
+        // GNOME mode — where the tile stays in the floating layer — it is the one that holds the
+        // pre-maximize geometry. `floating_*` is the same memory for scrolling mode, where the
+        // tile moved layers instead. Between them they are mutter's `saved_rect`.
+        let pos = tile
+            .tiled_restore_pos
+            .or(tile.floating_pos)
+            .map(|pos| self.floating.scale_by_working_area(pos))
+            .or(live.map(|(offset, _)| offset));
+        let size = tile
+            .tiled_restore_size
+            .or(tile.floating_window_size)
+            .map(Size::to_f64)
+            .or(live.map(|(_, size)| size));
+
+        let rect = pos
+            .zip(size)
+            .map(|(pos, size)| Rectangle::new(pos + tile.window_offset(), size));
 
         Some((tile.sizing_mode(), rect))
     }

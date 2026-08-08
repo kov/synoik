@@ -21918,8 +21918,20 @@ fn a_maximized_window_saves_its_pre_maximize_rect() {
 
     f.synoik_state().do_action(Action::Maximize, false);
     f.double_roundtrip(id);
+
+    // Actually take the maximized size. Without this the client stays 300x200 and the test would
+    // pass even if the save read the *live* rect instead of the remembered floating one.
+    let maximized = f
+        .client(id)
+        .window(&surface)
+        .recent_configures()
+        .last()
+        .expect("maximize must configure the window")
+        .size;
+    assert_ne!(maximized, (300, 200), "maximize must change the size");
     let window = f.client(id).window(&surface);
     window.attach_new_buffer();
+    window.set_size(maximized.0 as u16, maximized.1 as u16);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
 
