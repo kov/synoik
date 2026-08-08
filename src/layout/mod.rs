@@ -1927,6 +1927,14 @@ impl<W: LayoutElement> Layout<W> {
         self.monitors_mut().find(|mon| &mon.output == output)
     }
 
+    /// The workspace a restored window belongs on, growing the strip if the index is past the end.
+    ///
+    /// See [`Monitor::ensure_workspace_at`] for why restore grows rather than clamps.
+    pub fn ensure_restore_workspace(&mut self, output: &Output, idx: usize) -> Option<WorkspaceId> {
+        let mon = self.monitor_for_output_mut(output)?;
+        Some(mon.ensure_workspace_at(idx).id())
+    }
+
     pub fn monitor_for_workspace(&self, workspace_name: &str) -> Option<&Monitor<W>> {
         self.monitors().find(|monitor| {
             monitor.workspaces.iter().any(|ws| {

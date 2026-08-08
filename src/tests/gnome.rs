@@ -22521,17 +22521,21 @@ fn a_restored_window_is_not_auto_maximized() {
     );
 }
 
-/// A saved index past the end of the monitor's workspaces clamps rather than creating workspaces
-/// up to it — with dynamic workspaces the saved index routinely no longer exists.
+/// A saved index past the end of the monitor's workspaces **grows** the strip to reach it. A fresh
+/// monitor has two desktops, so anything saved past the second would otherwise have nowhere to go.
 #[test]
-fn a_saved_workspace_index_that_is_gone_clamps() {
+fn a_saved_workspace_index_past_the_end_grows_the_strip() {
     let mut f = Fixture::new();
     f.add_output(1, (1280, 720));
 
     let id = f.add_client();
     f.roundtrip(id);
     let (session, session_id) = new_session(&mut f, id);
-    let workspaces = f.synoik().layout.workspaces().count();
+    assert_eq!(
+        f.synoik().layout.workspaces().count(),
+        2,
+        "a fresh monitor shows two desktops"
+    );
 
     remember(
         &mut f,
@@ -22540,7 +22544,7 @@ fn a_saved_workspace_index_that_is_gone_clamps() {
         ToplevelRecord {
             state: Some(WindowState::Floating.as_raw()),
             floating_rect: Some([100, 200, 300, 400]),
-            workspace: Some(99),
+            workspace: Some(4),
             ..Default::default()
         },
     );
@@ -22549,12 +22553,6 @@ fn a_saved_workspace_index_that_is_gone_clamps() {
     map_at_configured_size(&mut f, id, &surface);
     f.synoik_complete_animations();
 
-    // Mapping onto the last workspace legitimately grows the strip by one — dynamic workspaces.
-    // What must not happen is 99 of them.
-    assert!(
-        f.synoik().layout.workspaces().count() <= workspaces + 1,
-        "restoring must not create workspaces up to the saved index"
-    );
     let win = f.synoik().layout.focus().unwrap().window.clone();
     assert_eq!(
         f.synoik()
@@ -22562,8 +22560,108 @@ fn a_saved_workspace_index_that_is_gone_clamps() {
             .session_snapshot(&win)
             .unwrap()
             .workspace_idx,
-        workspaces - 1,
-        "it must land on the last workspace instead"
+        4,
+        "the window must land on the desktop it was saved on"
+    );
+    assert_eq!(
+        f.synoik().layout.workspaces().count(),
+        6,
+        "0..=4 plus the trailing empty that landing on the last one appends"
+    );
+}
+
+/// Restoring a set of windows must not depend on the order the client asks in. This is the
+/// regression test for the bug that clamping caused: three windows saved on desktops 0/1/2
+/// restored correctly in ascending order — each landing on the trailing empty grew the strip just
+/// in time for the next — and collapsed two onto one desktop in any other order.
+#[test]
+fn restoring_windows_out_of_order_still_lands_each_on_its_own_workspace() {
+    for order in [["w0", "w1", "w2"], ["w2", "w1", "w0"], ["w1", "w2", "w0"]] {
+        let mut f = Fixture::new();
+        f.add_output(1, (1280, 720));
+
+        let id = f.add_client();
+        f.roundtrip(id);
+        let (session, session_id) = new_session(&mut f, id);
+
+        for (name, idx) in [("w0", 0u32), ("w1", 1), ("w2", 2)] {
+            remember(
+                &mut f,
+                &session_id,
+                name,
+                ToplevelRecord {
+                    state: Some(WindowState::Floating.as_raw()),
+                    floating_rect: Some([100, 100, 300, 200]),
+                    workspace: Some(idx),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let mut landed = Vec::new();
+        for name in order {
+            let (surface, _handle) = restore_window(&mut f, id, &session, name);
+            map_at_configured_size(&mut f, id, &surface);
+            f.synoik_complete_animations();
+            let win = f.synoik().layout.focus().unwrap().window.clone();
+            let idx = f
+                .synoik()
+                .layout
+                .session_snapshot(&win)
+                .unwrap()
+                .workspace_idx;
+            landed.push((name, idx));
+        }
+
+        let expected: Vec<_> = order
+            .iter()
+            .map(|name| (*name, name[1..].parse::<usize>().unwrap()))
+            .collect();
+        assert_eq!(
+            landed, expected,
+            "restored in the order {order:?}, every window must land on its saved desktop"
+        );
+    }
+}
+
+/// Growth is driven by a number read off disk, so it is capped. Past the cap the index clamps —
+/// the window still maps, it just doesn't get to inflate the strip.
+#[test]
+fn a_nonsense_saved_workspace_index_does_not_inflate_the_strip() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    remember(
+        &mut f,
+        &session_id,
+        "main",
+        ToplevelRecord {
+            state: Some(WindowState::Floating.as_raw()),
+            floating_rect: Some([100, 200, 300, 400]),
+            workspace: Some(u32::MAX),
+            ..Default::default()
+        },
+    );
+
+    let (surface, _handle) = restore_window(&mut f, id, &session, "main");
+    map_at_configured_size(&mut f, id, &surface);
+    f.synoik_complete_animations();
+
+    // A literal, not `MAX_NUM_WORKSPACES`: the property is "the strip stays small whatever the
+    // file says", and an assertion phrased in terms of the constant it is guarding moves with it
+    // and can never fail.
+    let count = f.synoik().layout.workspaces().count();
+    assert!(
+        count <= 64,
+        "a corrupt index must not grow the strip without bound, got {count}"
+    );
+    assert!(
+        f.synoik().layout.focus().is_some(),
+        "and the window must still map"
     );
 }
 

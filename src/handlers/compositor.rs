@@ -139,15 +139,13 @@ impl CompositorHandler for State {
 
                         // A restored window goes back to its saved workspace *index*, resolved
                         // now rather than at configure time: the monitor's workspaces can have
-                        // changed in between. Clamped to the last one, since with dynamic
-                        // workspaces the index may no longer exist and clamping beats creating
-                        // workspaces up to it.
+                        // changed in between. The strip grows if the index is past the end, so
+                        // that restoring a set of windows does not depend on the order the client
+                        // asks in — see `Monitor::ensure_workspace_at`.
                         let workspace_id = workspace_id.or_else(|| {
                             let idx = restore.as_ref()?.workspace_idx?;
-                            let mon = self.synoik.layout.monitor_for_output(output.as_ref()?)?;
-                            let workspaces = mon.workspaces_ref();
-                            let last = workspaces.len().checked_sub(1)?;
-                            Some(workspaces[idx.min(last)].id())
+                            let output = output.as_ref()?;
+                            self.synoik.layout.ensure_restore_workspace(output, idx)
                         });
 
                         let was_restored = restore.is_some();

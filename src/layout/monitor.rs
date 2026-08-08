@@ -52,6 +52,15 @@ use crate::wallpaper::Wallpaper;
 /// shows two desktops in the overview, not one.
 pub const MIN_NUM_WORKSPACES: usize = 2;
 
+/// The most workspaces session restore will grow a monitor to.
+///
+/// GNOME's own sanity bound on a workspace count: `org.gnome.desktop.wm.preferences
+/// num-workspaces` is declared `<range min="1" max="36"/>`. Nothing else in this fork caps the
+/// strip — it grows as you fill the trailing empty — but a restore index is a `u32` read back
+/// from an on-disk file a user can edit, so it is the one path that must not be trusted to be
+/// small.
+pub const MAX_NUM_WORKSPACES: usize = 36;
+
 /// Amount of touchpad movement to scroll the height of one workspace.
 const WORKSPACE_GESTURE_MOVEMENT: f64 = 300.;
 
@@ -633,6 +642,42 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn add_workspace_bottom(&mut self) {
         self.add_workspace_at(self.workspaces.len());
+    }
+
+    /// Grows the strip until `idx` exists, and returns that workspace.
+    ///
+    /// Session restore's one caller. Restoring a set of windows must not depend on the order the
+    /// client happens to ask in, and clamping a missing index to the last workspace made it
+    /// depend on exactly that: three windows saved on desktops 0/1/2 restored correctly in
+    /// ascending order — each landing on the trailing empty grew the strip in time for the next —
+    /// and collapsed two of them onto one desktop in any other order.
+    ///
+    /// **Divergence from mutter (approved 2026-08-08).** It appends a *single* workspace
+    /// (`meta_window_change_workspace_by_index(.., append = TRUE)`, `window.c:5557-5565`), which
+    /// is order-independent for a contiguous set but lands a sparse index on the wrong desktop.
+    /// Growing to the index restores what was actually saved. That is a cheaper trade here than
+    /// upstream because this fork does not reap empty workspaces
+    /// (`docs/fork/dynamic-workspaces-divergence.md`), so an empty desktop in the middle of the
+    /// strip is already a legal, first-class state rather than something the reaper would fight.
+    ///
+    /// Past [`MAX_NUM_WORKSPACES`] the index is clamped instead: growth is driven by a number
+    /// read off disk, and a corrupt record must not be able to inflate the strip without bound.
+    pub fn ensure_workspace_at(&mut self, idx: usize) -> &Workspace<W> {
+        let idx = if idx < MAX_NUM_WORKSPACES {
+            idx
+        } else {
+            warn!(
+                "restoring a window to workspace {idx}, past the {MAX_NUM_WORKSPACES} cap; \
+                 clamping"
+            );
+            MAX_NUM_WORKSPACES - 1
+        };
+
+        while self.workspaces.len() <= idx {
+            self.add_workspace_bottom();
+        }
+
+        &self.workspaces[idx]
     }
 
     pub fn activate_workspace(&mut self, idx: usize) {

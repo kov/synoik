@@ -46,9 +46,15 @@ pub struct PlacementSeeds<'a> {
     /// an index because workspace ids are runtime-only and meaningless across restarts.
     ///
     /// Unlike a name this does not pin the monitor: restore resolves the monitor from the saved
-    /// rect first, then indexes into it. Clamped to the last workspace, since with dynamic
-    /// workspaces the saved index may no longer exist and clamping beats creating workspaces up
-    /// to it. Ignored when a name is also given — a name is the more specific request.
+    /// rect first, then indexes into it. Ignored when a name is also given — a name is the more
+    /// specific request.
+    ///
+    /// Clamped to the last workspace here, and *only* here. Placement resolution is `&self` and
+    /// this seed is consulted to pick a size to configure against, which the clamp answers
+    /// identically: the growing happens at map time, where the window's real workspace is
+    /// decided ([`Monitor::ensure_workspace_at`]). Growing at configure time would also leave
+    /// workspaces behind for a client that is configured and then dies before its first
+    /// commit — and this fork never reaps them.
     pub workspace_idx: Option<usize>,
 
     /// An output the window asked for, or the one we resolved for it previously.
