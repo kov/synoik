@@ -296,7 +296,40 @@ too-new `version` rejection, and the tombstone-vs-pending-save interaction.
    to the newest. Conformance
    tests cover restore-from-a-remembered-id, destroy-keeps/remove-forgets, an inert session's
    `remove` being a no-op, and the write being scheduled rather than inline.
-3. **Save on unmap** — snapshot geometry/state/workspace when a registered window goes away.
+3. **Save on unmap — DONE.** `State::save_session_toplevel` writes a registered window's sizing
+   mode, saved rect and workspace index into the store when it unmaps or is destroyed, mirroring
+   mutter's one and only save trigger, `on_window_unmanaging`
+   (`meta-wayland-xdg-session.c:262-276`). It runs **before the unmapping commit is processed** —
+   alongside the close-animation snapshot, for the same reason: afterwards the window's size is
+   already zero.
+
+   Two things the reference gets for free and we do not:
+
+   - **Shutdown with windows open.** `meta_display_close` unmanages every window (`display.c:1052`)
+     before the context's synchronous save (`meta-context-main.c:445`), so mutter's flagship case
+     falls out of save-on-unmap. We tear down without unmapping, so `main.rs` sweeps every live
+     registration before flushing. Without it, logging out with windows open would save nothing —
+     the demo case (close a window, reopen the app) would have worked and the real one would not.
+   - **`rename` moves the stored record**, or a window unmapped before the rename would leave its
+     state orphaned under a name nothing answers to. Only reachable once there is a record.
+
+   The rect is **global**; the workspace index is **per monitor**. The pair is deliberate: restore
+   resolves the output from the rect first, then indexes into that monitor's workspaces.
+
+   Which rect gets saved is the subtle part. In GNOME mode a maximizing tile stays in the floating
+   layer, so its pre-maximize geometry goes to `Tile::tiled_restore_*`; `floating_*` is the same
+   memory for scrolling mode, where the tile changes layers instead. Between them they are mutter's
+   `saved_rect`, and `Workspace::session_snapshot` prefers them in that order, falling back to the
+   live floating position. Reading only `floating_*` made a maximized window save its *maximized*
+   rect — the exact thing a separate `saved_rect` exists to prevent.
+
+   Everything read is a model value, never a render position: `Tile::window_loc` centres the window
+   using animated sizes, so `window_offset` was split out to do it from the model ones. A window
+   closed mid-animation must be remembered where the layout has it.
+
+   Conformance tests cover unmap-saves-state, the rect being global and clearing the panel strut,
+   a maximized window saving its pre-maximize rect, `remove_toplevel`-then-unmap saving nothing,
+   the shutdown sweep, and rename carrying the record.
 4. **Restore** — the `Unmapped` → `send_initial_configure` → map pipeline. Lands the `restore-*`
    tests.
 
