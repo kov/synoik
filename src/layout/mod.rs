@@ -646,6 +646,23 @@ struct OverviewGesture {
     value: f64,
 }
 
+/// A window's persistable layout state, from [`Layout::session_snapshot`].
+#[derive(Debug)]
+pub struct SessionSnapshot<'a> {
+    /// The output the window is on, or `None` while there are no outputs at all.
+    pub output: Option<&'a Output>,
+
+    /// Index within `output`'s workspaces, not a [`WorkspaceId`]: ids are runtime-only and
+    /// meaningless across restarts, which is also why mutter persists an index.
+    pub workspace_idx: usize,
+
+    pub sizing_mode: SizingMode,
+
+    /// The rect the window would take if floating, **output-local**. `None` when it has never
+    /// floated, so there is nothing remembered to restore it to.
+    pub floating_rect: Option<Rectangle<f64, Logical>>,
+}
+
 impl SizingMode {
     #[must_use]
     pub fn is_normal(&self) -> bool {
@@ -5508,6 +5525,23 @@ impl<W: LayoutElement> Layout<W> {
                 }
             }
         }
+    }
+
+    /// Everything the session store needs about `id`, other than the output origin.
+    ///
+    /// The workspace index is **per monitor**, while the rect the caller composes is global. The
+    /// pair is deliberate: restore resolves the output from the rect first, then indexes into that
+    /// monitor's workspaces.
+    pub fn session_snapshot(&self, id: &W::Id) -> Option<SessionSnapshot<'_>> {
+        self.workspaces().find_map(|(monitor, idx, ws)| {
+            let (sizing_mode, floating_rect) = ws.session_snapshot(id)?;
+            Some(SessionSnapshot {
+                output: monitor.map(|mon| &mon.output),
+                workspace_idx: idx,
+                sizing_mode,
+                floating_rect,
+            })
+        })
     }
 
     pub fn workspaces(

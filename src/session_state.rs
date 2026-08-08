@@ -307,6 +307,30 @@ impl SessionStore {
         removed
     }
 
+    /// Moves a toplevel's record to a new name — `xdg_toplevel_session_v1.rename`.
+    ///
+    /// Overwrites whatever was under `new`; the protocol rejects renaming onto a name that is
+    /// live, and a stale record under an unheld name has no claim on it.
+    pub fn rename_toplevel(&mut self, id: &str, old: &str, new: &str) -> bool {
+        let Some(session) = self.sessions.get_mut(id) else {
+            return false;
+        };
+        let Some(record) = session.toplevels.remove(old) else {
+            return false;
+        };
+        session.toplevels.insert(new.to_owned(), record);
+        self.dirty = true;
+        true
+    }
+
+    /// Records what we know about one toplevel — the save-on-unmap snapshot.
+    ///
+    /// Stamps the session as used, since a window closing is the session being used.
+    pub fn save_toplevel(&mut self, id: &str, name: &str, record: ToplevelRecord) {
+        let session = self.touch(id);
+        session.toplevels.insert(name.to_owned(), record);
+    }
+
     /// Serializes the current state.
     ///
     /// Deliberately separate from writing it: the bytes are produced synchronously from live state

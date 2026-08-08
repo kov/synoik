@@ -792,28 +792,38 @@ impl<W: LayoutElement> Tile<W> {
 
     /// Returns the location of the window's visual geometry within this Tile.
     pub fn window_loc(&self) -> Point<f64, Logical> {
-        let mut loc = Point::from((0., 0.));
+        self.centered_window_offset(self.animated_tile_size(), self.animated_window_size())
+    }
 
-        let window_size = self.animated_window_size();
-        let target_size = self.animated_tile_size();
+    /// Where the window sits inside its tile, from the *model* sizes rather than the animated ones.
+    ///
+    /// Anything persisted has to use this one: a window closed mid-resize would otherwise be
+    /// remembered at wherever the animation happened to have reached.
+    pub fn window_offset(&self) -> Point<f64, Logical> {
+        self.centered_window_offset(self.tile_size(), self.window_size())
+    }
 
-        // Center the window within its tile.
-        //
-        // - Without borders, the sizes match, so this difference is zero.
-        // - Borders always match from all sides, so this difference is pre-rounded to physical.
-        // - In fullscreen, if the window is smaller than the tile, then it gets centered, otherwise
-        //   the tile size matches the window.
-        // - During animations, the window remains centered within the tile; this is important for
-        //   the to/from fullscreen animation.
-        loc.x += (target_size.w - window_size.w) / 2.;
-        loc.y += (target_size.h - window_size.h) / 2.;
+    /// Center the window within its tile.
+    ///
+    /// - Without borders, the sizes match, so this difference is zero.
+    /// - Borders always match from all sides, so this difference is pre-rounded to physical.
+    /// - In fullscreen, if the window is smaller than the tile, then it gets centered, otherwise
+    ///   the tile size matches the window.
+    /// - During animations, the window remains centered within the tile; this is important for the
+    ///   to/from fullscreen animation.
+    fn centered_window_offset(
+        &self,
+        tile_size: Size<f64, Logical>,
+        window_size: Size<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        let loc = Point::from((
+            (tile_size.w - window_size.w) / 2.,
+            (tile_size.h - window_size.h) / 2.,
+        ));
 
         // Round to physical pixels.
-        loc = loc
-            .to_physical_precise_round(self.scale)
-            .to_logical(self.scale);
-
-        loc
+        loc.to_physical_precise_round(self.scale)
+            .to_logical(self.scale)
     }
 
     pub fn tile_size(&self) -> Size<f64, Logical> {

@@ -34,7 +34,7 @@ use super::shadow::Shadow;
 use super::tile::{SnapshotRenderer, Tile, TileRenderElement, TileUnmapSnapshot};
 use super::{
     expose, ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
-    RemovedTile, SizeFrac,
+    RemovedTile, SizeFrac, SizingMode,
 };
 use crate::animation::{Animation, Clock};
 use crate::gnome::{EdgeTileTarget, TileSide};
@@ -2635,6 +2635,42 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn working_area(&self) -> Rectangle<f64, Logical> {
         self.working_area
+    }
+
+    /// What the session store remembers about `id`: its sizing mode and the rect it would take if
+    /// floating — mutter's `saved_rect` (`meta-wayland-xdg-session-state.c:32-57`).
+    ///
+    /// The rect is **output-local**; `Layout` does not know global space, so the caller adds the
+    /// output origin. `None` for the rect means the window has never floated (it opened straight
+    /// into maximize, say) and there is no remembered geometry to restore — the sizing mode is
+    /// still worth having.
+    pub fn session_snapshot(
+        &self,
+        id: &W::Id,
+    ) -> Option<(SizingMode, Option<Rectangle<f64, Logical>>)> {
+        let tile = self.tiles().find(|tile| tile.window().id() == id)?;
+
+        // Model values throughout, never render positions: a window closed mid-animation must be
+        // remembered where the layout has it, not where the animation had reached.
+        let rect = match (tile.floating_pos, tile.floating_window_size) {
+            // The remembered floating geometry, which survives maximize and fullscreen — the
+            // whole point of mutter keeping a `saved_rect` separate from the live one.
+            (Some(pos), Some(size)) => Some(Rectangle::new(
+                self.floating.scale_by_working_area(pos) + tile.window_offset(),
+                size.to_f64(),
+            )),
+            // Nothing remembered, so fall back to where it actually sits — but only the floating
+            // layer has a position worth saving; a scrolling-layer tile's is a column offset.
+            _ => self
+                .floating
+                .tiles_with_offsets()
+                .find(|(tile, _)| tile.window().id() == id)
+                .map(|(tile, offset)| {
+                    Rectangle::new(offset + tile.window_offset(), tile.window_size())
+                }),
+        };
+
+        Some((tile.sizing_mode(), rect))
     }
 
     pub fn layout_config(&self) -> Option<&synoik_config::LayoutPart> {

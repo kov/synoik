@@ -155,6 +155,7 @@ use crate::layout::tile::TileRenderElement;
 use crate::layout::workspace::{Workspace, WorkspaceId};
 use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
+    SizingMode,
 };
 use crate::notifications::{bounded_pixels, PixelIcon};
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
@@ -163,7 +164,7 @@ use crate::protocols::gamma_control::GammaControlManagerState;
 use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
-use crate::protocols::session_management::SessionManagerState;
+use crate::protocols::session_management::{SessionManagerHandler as _, SessionManagerState};
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
@@ -182,6 +183,7 @@ use crate::render_helpers::{
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
+use crate::session_state::{ToplevelRecord, WindowState};
 use crate::synoik_render_elements;
 use crate::system_status::SystemStatus;
 use crate::ui::app_grid::{AppGrid, AppGridEntry};
@@ -4413,6 +4415,99 @@ impl State {
                 self.sync_screenshot_ui_cursor();
                 self.synoik.queue_redraw_all();
             }
+        }
+    }
+
+    /// Snapshots a window's layout state into the session store, if it is registered in a session.
+    ///
+    /// Mutter's only save trigger, via `on_window_unmanaging`
+    /// (`meta-wayland-xdg-session.c:262-276`): state is captured when the window goes away, not
+    /// continuously as it moves. Must run *before* `Layout::remove_window` — after it there is
+    /// nothing left to read.
+    pub fn save_session_toplevel(&mut self, window: &Window) {
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+        let toplevel = toplevel.xdg_toplevel().clone();
+        let Some((session_id, name)) = self
+            .synoik
+            .session_manager_state
+            .registration_for(&toplevel)
+        else {
+            return;
+        };
+
+        let Some(record) = self.session_record_for(window) else {
+            return;
+        };
+
+        self.synoik
+            .session_manager_state
+            .store
+            .save_toplevel(&session_id, &name, record);
+        self.schedule_session_save();
+    }
+
+    /// The store record for a mapped window: sizing mode, global floating rect, workspace index.
+    fn session_record_for(&self, window: &Window) -> Option<ToplevelRecord> {
+        let snapshot = self.synoik.layout.session_snapshot(window)?;
+
+        let state = match snapshot.sizing_mode {
+            SizingMode::Normal => WindowState::Floating,
+            SizingMode::Maximized => WindowState::Maximized,
+            SizingMode::Fullscreen => WindowState::Fullscreen,
+        };
+
+        // The layout works in output-local coordinates; the store is global, so that restore can
+        // pick the output back out of the rect.
+        let origin = snapshot
+            .output
+            .and_then(|output| self.synoik.global_space.output_geometry(output))
+            .map_or_else(Point::default, |geo| geo.loc.to_f64());
+
+        let floating_rect = snapshot.floating_rect.map(|rect| {
+            let loc = rect.loc + origin;
+            [
+                loc.x.round() as i32,
+                loc.y.round() as i32,
+                rect.size.w.round() as i32,
+                rect.size.h.round() as i32,
+            ]
+        });
+
+        Some(ToplevelRecord {
+            state: Some(state.as_raw()),
+            floating_rect,
+            workspace: Some(snapshot.workspace_idx as u32),
+            ..Default::default()
+        })
+    }
+
+    /// Snapshots every registered window that is still mapped, for the shutdown save.
+    ///
+    /// Mutter gets this for free: `meta_display_close` unmanages every window (`display.c:1052`)
+    /// before the context's synchronous save (`meta-context-main.c:445`), so each one goes through
+    /// the unmap path above. We tear down without unmapping, so the sweep is explicit — without it
+    /// the flagship case, logging out with windows open, would save nothing.
+    pub fn save_session_toplevels_still_mapped(&mut self) {
+        for (session_id, name, toplevel) in self.synoik.session_manager_state.live_registrations() {
+            let Some(window) = self
+                .synoik
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.toplevel().xdg_toplevel() == &toplevel)
+                .map(|(_, mapped)| mapped.window.clone())
+            else {
+                continue;
+            };
+
+            let Some(record) = self.session_record_for(&window) else {
+                continue;
+            };
+            self.synoik
+                .session_manager_state
+                .store
+                .save_toplevel(&session_id, &name, record);
         }
     }
 

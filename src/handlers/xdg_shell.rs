@@ -763,6 +763,7 @@ impl XdgShellHandler for State {
         self.synoik
             .stop_casts_for_target(CastTarget::Window { id: id.get() });
 
+        self.save_session_toplevel(&window);
         self.store_unmap_snapshot(&window, output.as_ref());
 
         let transaction = Transaction::new();

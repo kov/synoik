@@ -34,6 +34,7 @@ use crate::gnome::{
 };
 use crate::protocols::raw::xdg_session_management::v1::client::xdg_session_manager_v1::Reason;
 use crate::protocols::raw::xdg_session_management::v1::client::xdg_session_v1::XdgSessionV1;
+use crate::session_state::WindowState;
 use crate::status_notifier::ItemProps;
 use crate::ui::osd::OsdLevel;
 use crate::utils::get_monotonic_time;
@@ -21758,6 +21759,312 @@ fn a_session_id_only_the_store_knows_is_restored() {
         f.client(id).session_events(),
         [SessionEvent::Restored],
         "a remembered id must not be re-minted"
+    );
+}
+
+/// Maps a window into `session` under `name`, and returns its surface.
+#[track_caller]
+fn map_session_window(
+    f: &mut Fixture,
+    id: ClientId,
+    session: &XdgSessionV1,
+    name: &str,
+) -> WlSurface {
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    let qh = f.client(id).qh.clone();
+    session.add_toplevel(&toplevel, String::from(name), &qh, String::from(name));
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(300, 200);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    surface
+}
+
+/// Unmapping a registered window writes its state, geometry and workspace into the store —
+/// mutter's `on_window_unmanaging` (`meta-wayland-xdg-session.c:262-276`).
+#[test]
+fn unmapping_a_registered_window_saves_its_state() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let surface = map_session_window(&mut f, id, &session, "main");
+
+    assert!(
+        f.synoik()
+            .session_manager_state
+            .store
+            .get(&session_id)
+            .unwrap()
+            .toplevels
+            .is_empty(),
+        "nothing is saved while the window is still mapped"
+    );
+
+    let window = f.client(id).window(&surface);
+    window.attach_null_buffer();
+    window.commit();
+    f.double_roundtrip(id);
+
+    let record = f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .expect("the session must be in the store")
+        .toplevels
+        .get("main")
+        .cloned()
+        .expect("the unmapped toplevel must have a record");
+
+    assert_eq!(record.restorable_state(), Some(WindowState::Floating));
+    assert_eq!(record.workspace, Some(0));
+    let rect = record.floating_rect.expect("a floated window has a rect");
+    assert_eq!(
+        [rect[2], rect[3]],
+        [300, 200],
+        "the saved size is the window's"
+    );
+    assert!(
+        f.synoik().session_save_timer.is_some(),
+        "the save must be debounced, not written inline"
+    );
+}
+
+/// The saved rect is **global**: on a second output it carries that output's origin, so restore
+/// can pick the output back out of it. And it clears the panel strut, since the working area does.
+#[test]
+fn the_saved_rect_is_in_global_coordinates() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+    f.add_output(2, (1280, 720));
+
+    let origin = {
+        let synoik = f.synoik();
+        let output = synoik
+            .global_space
+            .outputs()
+            .find(|output| output.name() == "headless-2")
+            .cloned()
+            .expect("the second output must exist");
+        synoik
+            .global_space
+            .output_geometry(&output)
+            .expect("the second output must be in global space")
+            .loc
+    };
+    assert_ne!(
+        origin.x, 0,
+        "the outputs must not overlap, or this proves nothing"
+    );
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let surface = map_session_window(&mut f, id, &session, "main");
+
+    // Put it on the second output, then close it.
+    f.synoik_state()
+        .do_action(Action::MoveWindowToMonitorRight, false);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_null_buffer();
+    window.commit();
+    f.double_roundtrip(id);
+
+    let rect = f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .unwrap()
+        .toplevels["main"]
+        .floating_rect
+        .expect("a floated window has a rect");
+
+    assert!(
+        rect[0] >= origin.x,
+        "the saved x ({}) must carry the second output's origin ({})",
+        rect[0],
+        origin.x
+    );
+    assert!(
+        rect[1] >= crate::ui::panel::panel_height().round() as i32,
+        "the saved y ({}) must clear the panel strut",
+        rect[1]
+    );
+}
+
+/// A maximized window saves `maximized` plus the rect it would go back to, not the maximized one —
+/// mutter's `saved_rect`, which is the whole reason the two are kept apart.
+#[test]
+fn a_maximized_window_saves_its_pre_maximize_rect() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let surface = map_session_window(&mut f, id, &session, "main");
+
+    f.synoik_state().do_action(Action::Maximize, false);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_null_buffer();
+    window.commit();
+    f.double_roundtrip(id);
+
+    let record = f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .unwrap()
+        .toplevels["main"]
+        .clone();
+
+    assert_eq!(record.restorable_state(), Some(WindowState::Maximized));
+    let rect = record
+        .floating_rect
+        .expect("the pre-maximize rect is remembered");
+    assert_eq!(
+        [rect[2], rect[3]],
+        [300, 200],
+        "the remembered size is the floating one, not the maximized one"
+    );
+}
+
+/// A window whose record was dropped by `remove_toplevel` must not come back when it unmaps: the
+/// registration is gone, so there is nothing to save under.
+#[test]
+fn removing_a_toplevel_then_unmapping_it_saves_nothing() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let surface = map_session_window(&mut f, id, &session, "main");
+
+    session.remove_toplevel(String::from("main"));
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_null_buffer();
+    window.commit();
+    f.double_roundtrip(id);
+
+    assert!(
+        f.synoik()
+            .session_manager_state
+            .store
+            .get(&session_id)
+            .unwrap()
+            .toplevels
+            .is_empty(),
+        "an unregistered toplevel must not be resurrected by unmapping"
+    );
+}
+
+/// Logging out with windows still open saves them. Mutter gets this from unmanaging every window
+/// before its final save (`display.c:1052`); we have no unmanage-all, so the shutdown sweep is
+/// what stands in for it — and it is the flagship case for the whole protocol.
+#[test]
+fn shutting_down_saves_windows_that_are_still_mapped() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+    let _surface = map_session_window(&mut f, id, &session, "main");
+
+    assert!(
+        f.synoik()
+            .session_manager_state
+            .store
+            .get(&session_id)
+            .unwrap()
+            .toplevels
+            .is_empty(),
+        "nothing is saved while it is still mapped"
+    );
+
+    f.synoik_state().save_session_toplevels_still_mapped();
+
+    let record = f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .unwrap()
+        .toplevels
+        .get("main")
+        .cloned()
+        .expect("a still-mapped window must be swept into the store at shutdown");
+    assert_eq!(record.restorable_state(), Some(WindowState::Floating));
+    assert_eq!(record.workspace, Some(0));
+}
+
+/// Renaming carries the saved state to the new name, rather than orphaning it under the old one.
+#[test]
+fn renaming_a_toplevel_moves_its_saved_state() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+
+    let id = f.add_client();
+    f.roundtrip(id);
+    let (session, session_id) = new_session(&mut f, id);
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    let toplevel = window.xdg_toplevel.clone();
+    let qh = f.client(id).qh.clone();
+    let handle = session.add_toplevel(&toplevel, String::from("old"), &qh, String::from("old"));
+    f.client(id).window(&surface).commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(300, 200);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    // Unmap first, so there is a saved record to move, then rename.
+    let window = f.client(id).window(&surface);
+    window.attach_null_buffer();
+    window.commit();
+    f.double_roundtrip(id);
+    handle.rename(String::from("new"));
+    f.roundtrip(id);
+
+    let toplevels = &f
+        .synoik()
+        .session_manager_state
+        .store
+        .get(&session_id)
+        .unwrap()
+        .toplevels;
+    assert!(
+        !toplevels.contains_key("old"),
+        "the old name must be released"
+    );
+    assert!(
+        toplevels.contains_key("new"),
+        "the saved state must follow the rename: {toplevels:?}"
     );
 }
 

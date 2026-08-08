@@ -362,6 +362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The debounced session-store write is up to three seconds behind; a clean exit must not lose
     // it. A SIGKILL still does, exactly as it does for mutter.
+    state.save_session_toplevels_still_mapped();
     state.synoik.flush_session_store();
 
     Ok(())

@@ -142,6 +142,36 @@ impl SessionManagerState {
         })
     }
 
+    /// The `(session id, name)` this toplevel is registered under, if any.
+    ///
+    /// A toplevel belongs to one client and `already_added` is client-scoped, so there is at most
+    /// one registration to find.
+    pub fn registration_for(&self, toplevel: &XdgToplevel) -> Option<(String, String)> {
+        self.live.iter().find_map(|(id, live)| {
+            let (name, _) = live
+                .toplevels
+                .iter()
+                .find(|(_, reg)| &reg.toplevel == toplevel)?;
+            Some((id.clone(), name.clone()))
+        })
+    }
+
+    /// Every live registration, as `(session id, name, toplevel)`.
+    ///
+    /// For the shutdown sweep: mutter reaches the same state by unmanaging every window before its
+    /// final save (`display.c:1052`), which runs each one through `on_window_unmanaging`. We have
+    /// no unmanage-all, so the sweep walks the registrations instead.
+    pub fn live_registrations(&self) -> Vec<(String, String, XdgToplevel)> {
+        self.live
+            .iter()
+            .flat_map(|(id, live)| {
+                live.toplevels
+                    .iter()
+                    .map(move |(name, reg)| (id.clone(), name.clone(), reg.toplevel.clone()))
+            })
+            .collect()
+    }
+
     /// Hands `id` to `resource`, replacing whoever held it.
     ///
     /// The previous holder is told it was `replaced` and everything it owned becomes inert. Its
@@ -472,7 +502,17 @@ where
 
                 let registration = live.toplevels.remove(&*current).expect("checked above");
                 live.toplevels.insert(new_name.clone(), registration);
-                *current = new_name;
+
+                // The saved state moves with the name, or a window that was unmapped before the
+                // rename would leave its record orphaned under a name nothing answers to.
+                let old_name = std::mem::replace(&mut *current, new_name.clone());
+                drop(current);
+                if manager
+                    .store
+                    .rename_toplevel(&data.session_id, &old_name, &new_name)
+                {
+                    state.schedule_session_save();
+                }
             }
         }
     }

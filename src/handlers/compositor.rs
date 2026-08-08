@@ -424,6 +424,11 @@ impl CompositorHandler for State {
                     self.synoik
                         .layout
                         .start_close_animation_for_window(&window, blocker);
+
+                    // Before `on_commit`, for the same reason the close snapshot is: the commit
+                    // being processed is the one that unmaps, so afterwards the window's size is
+                    // already zero and there is nothing left worth remembering.
+                    self.save_session_toplevel(&window);
                 }
 
                 window.on_commit();
