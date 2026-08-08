@@ -22505,14 +22505,19 @@ fn a_restored_window_is_not_auto_maximized() {
     f.synoik_complete_animations();
 
     let win = f.synoik().layout.focus().unwrap().window.clone();
+    let snapshot = f.synoik().layout.session_snapshot(&win).unwrap();
+    // The *geometry* is the observable, not the sizing mode: auto-maximize's visible effect on a
+    // window this size is that it scales the floating rect down by `sqrt(0.8)` and keeps that as
+    // the restore size. The mode reads `Normal` either way, so asserting on it pins nothing.
     assert_eq!(
-        f.synoik()
-            .layout
-            .session_snapshot(&win)
-            .unwrap()
-            .sizing_mode,
+        snapshot.floating_rect.map(|r| (r.size.w, r.size.h)),
+        Some((1270., 660.)),
+        "a restored window keeps its saved size; auto-maximize would have scaled it down"
+    );
+    assert_eq!(
+        snapshot.sizing_mode,
         SizingMode::Normal,
-        "a restored window must keep its saved floating state"
+        "and it stays floating"
     );
 }
 

@@ -155,8 +155,10 @@ next write so a concurrent `remove` isn't resurrected by a pending save.
    hand the state to the new one. Invalid `reason` → `invalid_reason`.
 2. **`restore_toplevel(toplevel, name)`** — if the surface already had its initial commit, raise
    `already_mapped` (mutter's `meta_wayland_surface_has_initial_commit` check maps onto our
-   `unmapped_windows` / `InitialConfigureState` state). Otherwise stash
-   `restore: Option<(SessionId, String)>` on the `Unmapped`.
+   `unmapped_windows` / `InitialConfigureState` state). Otherwise set
+   `Unmapped::wants_session_restore` — a bare bit, deliberately: the id and name are looked up
+   again from the registration at configure time, so nothing is carried across the idle that a
+   takeover could make stale.
 3. **`send_initial_configure`** (`src/handlers/xdg_shell.rs`) — if the `Unmapped` carries a
    restore request *and* the store still has a record for that name, `resolve_session_restore`
    turns it into seeds:
