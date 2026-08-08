@@ -23633,3 +23633,105 @@ fn overview_drop_does_not_reflow_the_picker_while_the_window_settles() {
         );
     }
 }
+
+/// Restore must not drift: a window that is saved, restored, saved again and
+/// restored again comes back at the same rect every cycle, not a slightly
+/// smaller one. Every existing restore test is a *single* cycle, and a
+/// per-cycle loss of a pixel or a border is invisible in one — it only reads as
+/// "my windows shrink every time I log in".
+///
+/// Two entry sizes, because they reach the first save differently: the modest
+/// one is saved at the size the client asked for, the oversized one trips
+/// GNOME's map-time auto-maximize on its first (un-restored) run and is saved
+/// at the sqrt(0.8)-clamped rect instead. Both then have to hold still.
+///
+/// This does *not* pin the auto-maximize skip — by cycle 2 the clamped rect is
+/// already under the 80% threshold, so the guard has nothing to do here.
+/// `a_restored_window_is_not_auto_maximized` is what pins that.
+#[test]
+fn restoring_the_same_window_repeatedly_does_not_drift() {
+    for (label, first_size) in [("modest", (900u16, 600u16)), ("oversized", (1200, 680))] {
+        let mut f = Fixture::new();
+        f.add_output(1, (1280, 720));
+
+        // Run 1: a plain add (no restore), mapped at the client's own size.
+        let first = f.add_client();
+        f.roundtrip(first);
+        let (session, session_id) = new_session(&mut f, first);
+
+        let window = f.client(first).create_window();
+        let surface = window.surface.clone();
+        let toplevel = window.xdg_toplevel.clone();
+        let qh = f.client(first).qh.clone();
+        session.add_toplevel(&toplevel, String::from("main"), &qh, String::from("main"));
+        f.client(first).window(&surface).commit();
+        f.roundtrip(first);
+        let w = f.client(first).window(&surface);
+        w.attach_new_buffer();
+        w.set_size(first_size.0, first_size.1);
+        w.ack_last_and_commit();
+        f.double_roundtrip(first);
+        f.synoik_complete_animations();
+
+        let win = f.synoik().layout.focus().unwrap().window.clone();
+        let first_rect = f
+            .synoik()
+            .layout
+            .session_snapshot(&win)
+            .unwrap()
+            .floating_rect
+            .expect("a floated window has a rect");
+
+        let w = f.client(first).window(&surface);
+        w.attach_null_buffer();
+        w.commit();
+        f.double_roundtrip(first);
+        drop(session);
+
+        for cycle in 2..=5 {
+            let next = f.add_client();
+            f.roundtrip(next);
+            let session = f
+                .client(next)
+                .get_session(Reason::SessionRestore, Some(&session_id));
+            f.roundtrip(next);
+            let (surface, _handle) = restore_window(&mut f, next, &session, "main");
+            let size = map_at_configured_size(&mut f, next, &surface);
+            f.synoik_complete_animations();
+
+            assert_eq!(
+                size,
+                (
+                    first_rect.size.w.round() as i32,
+                    first_rect.size.h.round() as i32
+                ),
+                "[{label}] cycle {cycle} must be configured at the saved size"
+            );
+
+            let win = f.synoik().layout.focus().unwrap().window.clone();
+            let rect = f
+                .synoik()
+                .layout
+                .session_snapshot(&win)
+                .unwrap()
+                .floating_rect
+                .expect("the restored window has a rect");
+            assert_eq!(
+                (rect.loc.x, rect.loc.y, rect.size.w, rect.size.h),
+                (
+                    first_rect.loc.x,
+                    first_rect.loc.y,
+                    first_rect.size.w,
+                    first_rect.size.h
+                ),
+                "[{label}] cycle {cycle} drifted from the first run's rect"
+            );
+
+            let w = f.client(next).window(&surface);
+            w.attach_null_buffer();
+            w.commit();
+            f.double_roundtrip(next);
+            drop(session);
+        }
+    }
+}
