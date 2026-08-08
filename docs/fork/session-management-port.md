@@ -480,6 +480,56 @@ pins workspace restore under all three reasons so this stays deliberate.
 
 ---
 
+### `reason` — we are its only consumer, and a client cannot compute it
+
+Established live on 2026-08-08, chasing "launching ghost from the dash never restores its session".
+
+**Mutter ignores `reason` outright.** `xdg_session_manager_get_session`
+(`~/Projects/mutter/src/wayland/meta-wayland-xdg-session-manager.c:215-285`) takes `reason_value` at
+`:226` and never reads it again; it is the only occurrence of the word in the xdg-session files. So
+the enum has no reference behaviour at all, ours included: keying activation on it (above) is a
+**divergence by addition**, not a port. A client that has only ever met mutter has had no way to
+learn that the field does anything.
+
+**A client cannot honestly distinguish `launch` from `session_restore` today.** The reason describes
+*how the process came to be running*, and two of the three values are knowable only to whoever
+started it:
+
+- `recover` an app can determine alone (crash sentinel, or its previous Wayland connection dropping);
+- `launch` and `session_restore` are identical from inside the process — same argv, env, cwd,
+  parent. Nothing on this desktop marks a restore-initiated start: gnome-session and systemd set no
+  such marker, and the compositor never relaunches apps. The value is provisioned for a future
+  session manager that replays a saved app list and says so.
+
+The rule a client should follow, therefore: **default to `launch`; send `recover` when you know you
+crashed; send `session_restore` only when something external told you it is a restore.** The reason
+describes how the process *started*, never what the app then decides to reopen — restoring saved
+windows is what an app does *after* a launch, and does not retroactively make the launch a restore.
+
+**The failure mode this invites, observed in ghost** (`ghost-ui/src/lib.rs:3409-3425`): it maps
+`Startup::Restore(_) => SessionReason::SessionRestore`, i.e. any launch that finds a non-empty
+`windows.toml` — a dash click included — reports `session_restore`. Its own comment names the cause:
+*"synoik lets only a `Launch` take focus — so a workspace restore must say so."* The client reached
+for `reason` as a **focus lever** because we made it one and mutter made it free. Reported to ghost
+on 2026-08-08 as a client bug; the compositor side is unchanged.
+
+The lesson for us: acting on a client-chosen descriptive field turns it into an interface clients
+will steer with. Our behaviour for a given reason must stay defensible when the reason is *wrong*,
+because there is no path by which we can validate it. It currently is — a mis-tagged
+`session_restore` costs the app its focus and nothing else — but any future rule keyed on `reason`
+has to clear that same bar.
+
+**Open — the urgency affordance is unreachable for restores.** `handlers::compositor` takes the
+`restore_reason != Launch` branch, sets `activate = ActivateWindow::No` and returns *before* the
+off-workspace arm that would set `wants_attention`. So a restored window landing on a desktop you
+are not on is silent: no focus (right) and no dock poke (arguably wrong — it is exactly the "window
+wants attention elsewhere" state the pulsing indicator exists for). The candidate fix is to keep
+`activate = No` for every reason but still let the off-workspace arm set `wants_attention`, except
+inside the login restore window, where every window would raise it at once. **Not decided** — it
+interacts with how apps opening windows on other workspaces should behave generally.
+
+---
+
 ### The maximize/unmaximize workspace-seed drift — settled, seed it always
 
 Surfaced by slice 0: `maximize_request` and `fullscreen_request` did not seed the stored
