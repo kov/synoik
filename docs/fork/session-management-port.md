@@ -157,22 +157,26 @@ next write so a concurrent `remove` isn't resurrected by a pending save.
    `already_mapped` (mutter's `meta_wayland_surface_has_initial_commit` check maps onto our
    `unmapped_windows` / `InitialConfigureState` state). Otherwise stash
    `restore: Option<(SessionId, String)>` on the `Unmapped`.
-3. **`send_initial_configure`** (`src/handlers/xdg_shell.rs:1047`) — if the `Unmapped` carries a
-   restore request *and* the store has a record for that name:
-   - pick the output from the saved rect via `global_space` (mutter:
-     `meta_monitor_manager_get_logical_monitor_from_rect`), falling back to the normal monitor
-     choice when the rect lands on no connected output;
-   - set pending `Fullscreen`/`Maximized` toplevel states from the saved record;
-   - configure the saved size instead of the resolved default width/height;
-   - store the restore payload in `InitialConfigureState::Configured` for the map step;
-   - send `xdg_toplevel_session_v1.restored` **immediately before** `toplevel.send_configure()` —
+3. **`send_initial_configure`** (`src/handlers/xdg_shell.rs`) — if the `Unmapped` carries a
+   restore request *and* the store still has a record for that name, `resolve_session_restore`
+   turns it into seeds:
+   - the output comes from the saved rect by largest overlap (mutter:
+     `meta_monitor_manager_get_logical_monitor_from_rect`), and is simply not seeded when the rect
+     lands on no connected output, so the normal monitor choice takes over;
+   - `open_fullscreen` / `open_maximized_to_edges` from the saved state;
+   - `default_width`/`default_height` and `default_floating_position` from the saved rect, the
+     position folded out of global into the workspace's working area;
+   - `workspace_idx` into `PlacementSeeds`, clamped to the monitor's last workspace;
+   - `open_focused = false` for every reason but `launch` (see Policy below);
+   - the payload is stashed in `InitialConfigureState::Configured` for the map step;
+   - `xdg_toplevel_session_v1.restored` goes out **immediately before** `toplevel.send_configure()` —
      the spec pins it to "prior to the first `xdg_toplevel.configure`".
 
    If the name is *unknown* in the session, the request degrades to `add_toplevel` and **no**
    `restored` event is sent.
-4. **On map** — consume the payload: `Layout::add_window` with
-   `AddWindowTarget::Workspace(saved_idx)` and the saved `floating_pos`, marking the window as
-   already placed so the placement cascade (`docs/fork/` window-placement work) doesn't re-centre it.
+4. **On map** — consume the payload: pick the workspace by the saved index (again clamped), skip
+   GNOME auto-maximize, and seed `Tile::tiled_restore_*` with the saved rect so a window that maps
+   straight into maximized has somewhere to unmaximize *to*.
 
 ### Save flow
 
@@ -330,10 +334,47 @@ too-new `version` rejection, and the tombstone-vs-pending-save interaction.
    Conformance tests cover unmap-saves-state, the rect being global and clearing the panel strut,
    a maximized window saving its pre-maximize rect, `remove_toplevel`-then-unmap saving nothing,
    the shutdown sweep, and rename carrying the record.
-4. **Restore** — the `Unmapped` → `send_initial_configure` → map pipeline. Lands the `restore-*`
-   tests.
+4. **Restore — DONE.** The `Unmapped` → `send_initial_configure` → map pipeline, built as slice 0
+   promised: restore is a **writer of seeds**, not a sixth copy of the placement chain. It fills in
+   `ResolvedWindowRules` (`open_fullscreen`, `open_maximized_to_edges`, `default_width`/`_height`,
+   `default_floating_position`, `open_focused`) and `PlacementSeeds` (`output`, the new
+   `workspace_idx`), and everything downstream is the code every window already took. A window that
+   didn't ask to be restored runs an unchanged path.
 
-Slices 1–3 are independently useful and independently testable; slice 4 is where the real risk is,
+   **Nothing is trusted across the idle.** The initial configure is queued in a calloop idle, so the
+   payload is re-resolved at configure time rather than stashed at `restore_toplevel` time. A
+   takeover in between empties the previous holder's registrations, so a stale request simply fails
+   to look up — inertness doing the work again, with no staleness bit.
+
+   **The output comes from the saved rect, by largest overlap** (mutter:
+   `meta_monitor_manager_get_logical_monitor_from_rect`). No overlap with any connected output —
+   the monitor is gone — and the seed is dropped, so the window falls through to the normal choice
+   and still maps.
+
+   **The workspace index is clamped to the last workspace** rather than creating workspaces up to
+   it: with dynamic workspaces a saved index routinely no longer exists, and clamping is the answer
+   that can't inflate the strip. The index is seeded twice, at configure and at map, because the two
+   answer different questions — the configure needs a workspace to *size* against, the map needs one
+   to add to.
+
+   Two things restore had to teach the layout:
+
+   - **A restored maximized window never floated this run**, so there is no `tiled_restore_*` for
+     unmaximize to return to. `Workspace::seed_unmaximize_geometry` writes the saved rect there
+     directly — the reverse of the read slice 3 added.
+   - **GNOME auto-maximize must skip restored windows.** Its size is remembered, not guessed. Left
+     in, it overwrote the seed with its own scaled-down rect, so unmaximizing a restored window
+     returned it to a default. The seed is applied *after* the auto-maximize point, not before.
+
+   `restored` is sent immediately before `toplevel.send_configure()`, per the spec's "prior to the
+   first `xdg_toplevel.configure`".
+
+   Conformance tests cover the geometry round trip, `restored`-before-configure, state restore,
+   the workspace round trip under all three reasons, index clamping, a saved monitor that is gone,
+   unmaximize returning to the saved rect, the saved position, the configure being taken against the
+   saved workspace, and the auto-maximize exemption.
+
+Slices 1–3 are independently useful and independently testable; slice 4 is where the real risk was,
 because it touches the initial-configure path that every window goes through.
 
 ---
