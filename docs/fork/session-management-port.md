@@ -98,8 +98,8 @@ tiled-left/right and `is-minimized` slot in unchanged when they land, and a file
 future synoik still parses today. Unknown state values parse as "no restore".
 
 Workspaces persist **by index**, like mutter — `WorkspaceId(u64)` is runtime-only and meaningless
-across restarts. With dynamic workspaces the index may no longer exist at restore time; clamp to
-the last real workspace rather than creating up to the saved index.
+across restarts. With dynamic workspaces the index routinely no longer exists at restore time;
+grow the strip until it does, capped (see slice 4).
 
 > **Do not port this bug.** `meta-wayland-xdg-session-state.c:304` reads
 > `is_minimized` but tests `state` (a `"u"`) against `G_VARIANT_TYPE ("b")`, so the condition is
@@ -168,7 +168,8 @@ next write so a concurrent `remove` isn't resurrected by a pending save.
    - `open_fullscreen` / `open_maximized_to_edges` from the saved state;
    - `default_width`/`default_height` and `default_floating_position` from the saved rect, the
      position folded out of global into the workspace's working area;
-   - `workspace_idx` into `PlacementSeeds`, clamped to the monitor's last workspace;
+   - `workspace_idx` into `PlacementSeeds`, clamped to the monitor's last workspace — this seed
+     only picks a size to configure against; the real workspace is decided at map time;
    - `open_focused = false` for every reason but `launch` (see Policy below);
    - the payload is stashed in `InitialConfigureState::Configured` for the map step;
    - `xdg_toplevel_session_v1.restored` goes out **immediately before** `toplevel.send_configure()` —
@@ -176,7 +177,8 @@ next write so a concurrent `remove` isn't resurrected by a pending save.
 
    If the name is *unknown* in the session, the request degrades to `add_toplevel` and **no**
    `restored` event is sent.
-4. **On map** — consume the payload: pick the workspace by the saved index (again clamped), skip
+4. **On map** — consume the payload: pick the workspace by the saved index, growing the strip if
+   it is past the end (`Monitor::ensure_workspace_at`, capped), skip
    GNOME auto-maximize, and seed `Tile::tiled_restore_*` with the saved rect so a window that maps
    straight into maximized has somewhere to unmaximize *to*.
 
@@ -211,7 +213,8 @@ Plus, from the staging spec text and not covered by mutter's suite:
 - `restore_toplevel` after the first commit → `already_mapped`
 - `name_in_use` on duplicate name; `already_added` on double-add
 - `rename` preserves the toplevel's saved state
-- workspace index that no longer exists clamps instead of panicking
+- workspace index that no longer exists grows the strip; a nonsense one is capped
+- a set of windows restores onto the right desktops in any order the client asks in
 
 And pinning our own policy calls (see below), which no reference covers:
 
@@ -353,11 +356,29 @@ too-new `version` rejection, and the tombstone-vs-pending-save interaction.
    the monitor is gone — and the seed is dropped, so the window falls through to the normal choice
    and still maps.
 
-   **The workspace index is clamped to the last workspace** rather than creating workspaces up to
-   it: with dynamic workspaces a saved index routinely no longer exists, and clamping is the answer
-   that can't inflate the strip. The index is seeded twice, at configure and at map, because the two
-   answer different questions — the configure needs a workspace to *size* against, the map needs one
-   to add to.
+   **The workspace index grows the strip** until it exists (`Monitor::ensure_workspace_at`), capped
+   at 36 — the range GNOME declares for `num-workspaces`, and the bound matters because the index
+   comes back from a file a user can edit. The index is seeded twice, at configure and at map,
+   because the two answer different questions: the configure needs a workspace to *size* against
+   and only clamps, the map needs one to *add to* and is where the growth happens.
+
+   **This was originally a clamp, and the clamp was a bug (fixed 2026-08-08).** Restoring a set of
+   windows must not depend on the order the client asks in, and clamping made it depend on exactly
+   that: three windows saved on desktops 0/1/2 came back correctly in *ascending* order — each
+   landing on the trailing empty grew the strip just in time for the next — and collapsed two onto
+   one desktop in any other order. A client iterating a hash map draws a different order per run,
+   which is what made it present as intermittent. Found by asking what the implemented behavior
+   actually was rather than what it was designed to be.
+
+   **Divergence from mutter (approved 2026-08-08).** It appends a *single* workspace
+   (`meta_window_change_workspace_by_index(.., append = TRUE)`, `window.c:5557-5565`), which is
+   order-independent for a contiguous set but lands a sparse index on the wrong desktop. Growing to
+   the index restores what was actually saved, and costs less here than upstream because this fork
+   does not reap empty workspaces (`docs/fork/dynamic-workspaces-divergence.md`) — a gap in the
+   middle of the strip is already a legal, first-class state.
+
+   Growth is deliberately map-time only: placement resolution stays `&self`, and a window that is
+   configured but dies before its first commit would otherwise leave desktops behind for good.
 
    Two things restore had to teach the layout:
 
@@ -372,7 +393,8 @@ too-new `version` rejection, and the tombstone-vs-pending-save interaction.
    first `xdg_toplevel.configure`".
 
    Conformance tests cover the geometry round trip, `restored`-before-configure, state restore,
-   the workspace round trip under all three reasons, index clamping, a saved monitor that is gone,
+   the workspace round trip under all three reasons, an index past the end growing the strip, a
+   nonsense index being capped, a set restoring in any order, a saved monitor that is gone,
    unmaximize returning to the saved rect, the saved position, the configure being taken against the
    saved workspace, and the auto-maximize exemption.
 
