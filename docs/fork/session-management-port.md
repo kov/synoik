@@ -513,6 +513,35 @@ windows is what an app does *after* a launch, and does not retroactively make th
 for `reason` as a **focus lever** because we made it one and mutter made it free. Reported to ghost
 on 2026-08-08 as a client bug; the compositor side is unchanged.
 
+**Upstream agrees it is missing, and is building the mechanism** (GUADEC 2026, Adrian Vovk's
+save-and-restore talk; LWN 2026-07-22, <https://lwn.net/Articles/1083750/>). The design is three
+layers, of which our protocol is the bottom one:
+
+- `xdg_session_management_v1` — compositor-owned window state, merged in mutter. The stated
+  motivation includes keeping restore decisions central *so apps cannot force workspace switches*,
+  which is the rule we arrived at independently.
+- **`org.freedesktop.portal.SaveRestore`** (xdg-desktop-portal PR #1818, design discussion #1698) —
+  `Register()` returns an **instance id** plus the app's saved state *and a restore reason*:
+  `PRISTINE` (restore nothing) / `LAUNCH` (minimal — size, navigation position) / `RESTORE` (whole
+  previous state) / `RECOVER` (restore, and you crashed). The session manager knows because it is
+  the thing doing the relaunching. Four values to our three: `PRISTINE` needs no Wayland
+  counterpart, since an app with nothing to restore just never asks for a session.
+- **`gnome-session`** (MR !158) — tracks apps by app id and relaunches from their `.desktop` files
+  rather than saved command lines.
+
+GTK's app-facing API (`gtk!8502`: `GtkApplication:support-save`, `save-state`/`restore-window`,
+15 s autosave) is merged, but the plumbing between the layers is not: the MR states the open
+question outright — *"how to communicate the restore reason to an activated application. It
+currently uses the `GTK_APPLICATION_RESTORE` environment variable, but that is probably not what we
+want."* So the correct source for a client's Wayland `reason` is the portal's restore reason, passed
+through; until the portal lands, an env var from the launcher is the honest stopgap. None of it
+ships in GNOME 51.
+
+**Re-check when 51 reaches the reference checkouts.** "Mutter ignores `reason`" is verified against
+50.3 and is the world ghost was written against, but mutter's implementation is reported as mostly
+complete for the 51 beta. Re-grep `meta-wayland-xdg-session*.c` before continuing to treat our
+reason-keyed activation as having no reference behaviour to compare with.
+
 The lesson for us: acting on a client-chosen descriptive field turns it into an interface clients
 will steer with. Our behaviour for a given reason must stay defensible when the reason is *wrong*,
 because there is no path by which we can validate it. It currently is — a mis-tagged
