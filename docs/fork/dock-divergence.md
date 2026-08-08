@@ -55,8 +55,55 @@ serve (absolute pointing devices, which build no pressure at all and so have no 
   corner, top-left). So there is no corner-versus-dock conflict to arbitrate at the bottom
   corners today. If bottom corners ever come back, the agreed rule is that **the corner wins**.
 
+## The poke — urgency on the dock
+
+A window demanding attention slides the dock a fraction of the way out (`POKE_PROGRESS = 0.45`)
+and draws **only** the icons asking for it, each behind an accent glow: no pill, no blur, no
+separator, no running dots, no show-apps button. The icons keep their normal dash x, so pushing
+the pointer into the bottom edge to answer the poke lands on the icon you are about to click.
+Suppressed while a fullscreen window is focused — poking into a fullscreen video is where "louder
+than GNOME" becomes "worse than GNOME".
+
+This has no GNOME counterpart at all: `windowAttentionHandler.js` posts a notification and touches
+nothing in the dash. The glow is likewise ours — two `drop_shadow` layers on one box, a tight
+bright core plus a wide soft falloff, which is what makes it read as light rather than as a
+coloured blob.
+
+### Urgency is per window; an app you are looking at is not urgent
+
+Urgency stays per window, as mutter keeps it: focusing a window unsets its own
+`wm_state_demands_attention` and nothing else's (`window.c:5090-5091`), and `Mapped::set_urgent`
+refuses to mark the focused window for the same reason.
+
+The dash and the dock, though, aggregate per **app** — so an app that focuses one window on your
+desktop and maps a second one elsewhere used to poke at you while you were already working in it,
+and only walking over to focus *that* window would stop it. So: **an app with a focused window is
+never urgent.** `Synoik::clear_urgency_of_focused_app` enforces it, and it runs at snapshot time
+inside `sync_running_apps` rather than on focus changes, because the window that demands attention
+arrives by *mapping*, long after focus last moved — a focus hook would fire before the urgent
+window existed, and would work or not depending on the order the client happened to map in. App
+identity comes from `app_for_window`, the same resolution the dash aggregates on; comparing
+`app_id` strings would leave a poke that focusing could never clear.
+
+**Interim, decided 2026-08-08.** Urgency wants a redesign around a less distracting per-window
+affordance; until there is one, an app you are looking at does not shout.
+
+Two gaps left open:
+
+- **Mutter also refuses to flag a window in full view** (`meta_window_set_demands_attention`,
+  `window.c:6635-6700`: another workspace or minimized counts as obscured, otherwise it walks the
+  stack looking for an overlap). We only test "not on the active workspace".
+- **A restore cannot poke at all**: `handlers::compositor` returns from the
+  `reason != Launch` branch before the arm that marks attention
+  (`session-management-port.md` §`reason`).
+
 ## Tests
 
+- `src/ui/dash.rs` — `a_poke_can_only_be_clicked_on_its_urgent_icons`: what a poke draws is what a
+  poke can be clicked on, or pushing into the edge activates an invisible favorite.
+- `src/tests/vulkan_render.rs` — `a_poking_dash_draws_glowing_icons_and_no_chrome`, which is also
+  the only exercise of the padded glow bake under `SYNOIK_VK_VALIDATION=1`.
+- `src/tests/gnome.rs` — `an_app_you_are_looking_at_does_not_demand_attention`.
 - `src/ui/dock.rs` — the state machine: pressure, the slide, the grace period, the drag hold.
 - `src/tests/gnome.rs` — `the_dock_needs_pressure_on_the_bottom_edge`,
   `the_dock_hit_tests_the_same_dash_as_the_overview`, driving real synthetic input against the
