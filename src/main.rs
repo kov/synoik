@@ -356,15 +356,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Run the compositor.
-    event_loop
-        .run(None, &mut state, |state| state.refresh_and_flush_clients())
-        .unwrap();
+    //
+    // A loop error is reported rather than panicked on, so that the shutdown below still runs: a
+    // panic here would skip the session save, which is the one exit route that loses state without
+    // the user having done anything to deserve it. The exit status still reflects the failure.
+    let outcome = event_loop.run(None, &mut state, |state| state.refresh_and_flush_clients());
+    if let Err(err) = &outcome {
+        error!("event loop error, shutting down: {err:?}");
+    }
 
     // The debounced session-store write is up to three seconds behind; a clean exit must not lose
     // it. A SIGKILL still does, exactly as it does for mutter.
     state.save_session_toplevels_still_mapped();
     state.synoik.flush_session_store();
 
+    outcome?;
     Ok(())
 }
 
