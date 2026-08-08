@@ -38,6 +38,9 @@ use crate::utils::{output_size, to_physical_precise_round};
 const OUT_W: u16 = 1280;
 const OUT_H: u16 = 720;
 const WIN: u16 = 200;
+/// GNOME's default blue, as `org.gnome.desktop.interface accent-color` resolves it — what the
+/// dash draws an urgent app's glow in.
+const ACCENT: [u8; 3] = [53, 132, 228];
 // A saturated, opaque green window — distinct from any background/backdrop color, so its presence
 // in the composited readback is unambiguous. Single-pixel-buffer channels are premultiplied and
 // scaled so u32::MAX == 1.0.
@@ -7454,7 +7457,8 @@ fn a_poking_dash_draws_glowing_icons_and_no_chrome() {
                 1.0,
                 false,
                 synoik.appearance(),
-                None,
+                ACCENT,
+                false,
             )
             .len();
         // Nothing is urgent yet: a poke with no urgent app draws nothing at all.
@@ -7469,7 +7473,8 @@ fn a_poking_dash_draws_glowing_icons_and_no_chrome() {
                 1.0,
                 false,
                 synoik.appearance(),
-                Some([53, 132, 228]),
+                ACCENT,
+                true,
             )
             .len();
         (whole, empty_poke)
@@ -7492,9 +7497,9 @@ fn a_poking_dash_draws_glowing_icons_and_no_chrome() {
     f.synoik().dash.set_items(items, n);
 
     let state = f.synoik_state();
-    let poked = state.backend.headless().with_vulkan_renderer(|vk| {
+    let urgent = state.backend.headless().with_vulkan_renderer(|vk| {
         let synoik = &mut state.synoik;
-        synoik
+        let poked = synoik
             .dash
             .render(
                 vk,
@@ -7505,11 +7510,32 @@ fn a_poking_dash_draws_glowing_icons_and_no_chrome() {
                 1.0,
                 false,
                 synoik.appearance(),
-                Some([53, 132, 228]),
+                ACCENT,
+                true,
             )
-            .len()
+            .len();
+        // The same urgency with the dock all the way out: the whole dash *plus* the glow.
+        let full = synoik
+            .dash
+            .render(
+                vk,
+                &synoik.app_icon_cache,
+                &synoik.icon_cache,
+                &output,
+                controls.dash,
+                1.0,
+                false,
+                synoik.appearance(),
+                ACCENT,
+                false,
+            )
+            .len();
+        (poked, full)
     });
+    let poked = urgent.map(|(poked, _)| poked);
+    let full_with_glow = urgent.map(|(_, full)| full);
     let poked = poked.expect("the renderer was there a moment ago");
+    let full_with_glow = full_with_glow.expect("the renderer was there a moment ago");
 
     assert!(
         poked > empty_poke,
@@ -7519,6 +7545,13 @@ fn a_poking_dash_draws_glowing_icons_and_no_chrome() {
         poked < whole,
         "but a poke stays smaller than the whole dash ({poked} vs {whole}) — one icon and a \
          glow, never the pill"
+    );
+    assert_eq!(
+        full_with_glow,
+        whole + 1,
+        "pulling the dock the rest of the way out keeps the glow — exactly one layer more than \
+         the same dash with nothing urgent, or the mark saying which icon you came for vanishes \
+         at the moment you reach for it"
     );
 }
 
@@ -7571,7 +7604,8 @@ fn a_ping_on_an_unchanged_catalog_keeps_the_dash_icons() {
             1.0,
             false,
             synoik.appearance(),
-            None,
+            ACCENT,
+            false,
         );
     });
     if rendered.is_none() {
@@ -7673,7 +7707,8 @@ fn vulkan_dash_icons_shrink_with_the_ramped_tiles() {
                         1.,
                         false,
                         synoik.appearance(),
-                        None,
+                        ACCENT,
+                        false,
                     );
                     let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7789,7 +7824,8 @@ fn vulkan_dash_hover_lightens_the_tile() {
                 1.0,
                 false,
                 synoik.appearance(),
-                None,
+                ACCENT,
+                false,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());
@@ -7898,7 +7934,8 @@ fn vulkan_dark_style_repaints_the_dash_pill() {
                     1.0,
                     false,
                     synoik.appearance(),
-                    None,
+                    ACCENT,
+                    false,
                 );
                 let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
                 let scale = Scale::from(output.current_scale().fractional_scale());
@@ -9447,7 +9484,8 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
                 1.0,
                 false,
                 synoik.appearance(),
-                None,
+                ACCENT,
+                false,
             );
             let phys: Size<i32, Physical> = output.current_mode().unwrap().size;
             let scale = Scale::from(output.current_scale().fractional_scale());

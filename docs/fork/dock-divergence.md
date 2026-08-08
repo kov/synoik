@@ -58,16 +58,20 @@ serve (absolute pointing devices, which build no pressure at all and so have no 
 ## The poke — urgency on the dock
 
 A window demanding attention slides the dock a fraction of the way out (`POKE_PROGRESS = 0.45`)
-and draws **only** the icons asking for it, each behind an accent glow: no pill, no blur, no
-separator, no running dots, no show-apps button. The icons keep their normal dash x, so pushing
-the pointer into the bottom edge to answer the poke lands on the icon you are about to click.
-Suppressed while a fullscreen window is focused — poking into a fullscreen video is where "louder
-than GNOME" becomes "worse than GNOME".
+and draws **only** the icons asking for it: no pill, no blur, no separator, no running dots, no
+show-apps button. The icons keep their normal dash x, so pushing the pointer into the bottom edge
+to answer the poke lands on the icon you are about to click. Suppressed while a fullscreen window
+is focused — poking into a fullscreen video is where "louder than GNOME" becomes "worse than
+GNOME".
 
 This has no GNOME counterpart at all: `windowAttentionHandler.js` posts a notification and touches
-nothing in the dash. The glow is likewise ours — two `drop_shadow` layers on one box, a tight
-bright core plus a wide soft falloff, which is what makes it read as light rather than as a
-coloured blob.
+nothing in the dash.
+
+An urgent icon glows in the system accent — one `drop_shadow`, no offset, baked into a buffer
+padded for the 3σ fringe. The glow is drawn **wherever the dash is**, not only during a poke:
+pulling the dock the rest of the way out is exactly the moment you are reaching for that icon, and
+that is the wrong moment for the only mark identifying it to disappear. It sits above the pill
+plate and below the icons, which is what the push order buys — first element pushed is topmost.
 
 ### Urgency is per window; an app you are looking at is not urgent
 
@@ -88,14 +92,16 @@ identity comes from `app_for_window`, the same resolution the dash aggregates on
 **Interim, decided 2026-08-08.** Urgency wants a redesign around a less distracting per-window
 affordance; until there is one, an app you are looking at does not shout.
 
-Two gaps left open:
+One gap left open:
 
 - **Mutter also refuses to flag a window in full view** (`meta_window_set_demands_attention`,
   `window.c:6635-6700`: another workspace or minimized counts as obscured, otherwise it walks the
   stack looking for an overlap). We only test "not on the active workspace".
-- **A restore cannot poke at all**: `handlers::compositor` returns from the
-  `reason != Launch` branch before the arm that marks attention
-  (`session-management-port.md` §`reason`).
+**What each restore `reason` may do** (decided 2026-08-08, `session-management-port.md` §`reason`):
+`launch` takes focus and may mark; **`recover` marks but never focuses** — one app returning from a
+crash gets to say where it went, which is a single window's worth of noise; `session_restore` does
+neither, because a login restoring everything you had open would have every app shouting at once,
+which is no signal at all.
 
 ## Tests
 

@@ -324,6 +324,17 @@ impl CompositorHandler for State {
                     // restoring five windows does not have each one steal it in turn.
                     if restore_reason.is_some_and(|reason| reason != Reason::Launch) {
                         activate = ActivateWindow::No;
+                        // A `recover` still gets to say where it went. One app is coming back from
+                        // a crash, so a window landing on another desktop reads as "your app is
+                        // back, over there" — the volume problem that rules this out for
+                        // `session_restore` (a login restoring every app you had open, each one
+                        // shouting) does not apply to a single app. Not gated on the window having
+                        // wanted focus, unlike the launch arm below: restore deliberately seeds
+                        // `open_focused = false` for every reason but `launch`, so that test would
+                        // make this unreachable.
+                        if restore_reason == Some(Reason::Recover) && !lands_where_we_are {
+                            wants_attention = true;
+                        }
                     } else if activate == ActivateWindow::Yes
                         && !lands_where_we_are
                         && !token_may_move_us

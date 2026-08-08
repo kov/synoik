@@ -220,15 +220,14 @@ const PILL_BLUR: BlurOptions = crate::ui::panel::BAR_BLUR;
 /// composes: the shared [`widget::style::HOVER_WASH`], which is already what the app grid's tiles
 /// use for this (10% white where GNOME lightens 4%), so the two hovers now match.
 const TILE_HOVER: [f32; 4] = widget::style::HOVER_WASH;
-/// The poke glow, as `(blur radius, alpha)` layers drawn behind an urgent icon: a tight bright
-/// core plus a wide soft falloff. Ours, not GNOME's — see the poke's own note in
-/// [`Dash::render`]. The pair is what keeps it reading as *light* rather than as a coloured
-/// smudge; one wide layer alone looks like fog, one tight layer alone like a border.
-const GLOW_LAYERS: [(f64, f32); 2] = [(8., 0.75), (22., 0.45)];
+/// The urgency glow behind an app icon demanding attention: one accent drop shadow, no offset.
+/// Ours, not GNOME's — see the note in [`Dash::render`].
+const GLOW_BLUR: f64 = 14.;
+const GLOW_ALPHA: f32 = 0.8;
 /// Transparent margin the glow bake needs on every side: a drop shadow bleeds ~1.5·blur (3σ)
-/// past its box, so the buffer has to hold the widest layer's fringe or the outermost icons'
-/// halos clip flat against the edge.
-const GLOW_PAD: f64 = GLOW_LAYERS[1].0 * 1.5;
+/// past its box, so the buffer has to hold that fringe or the outermost icons' halos clip flat
+/// against the edge.
+const GLOW_PAD: f64 = GLOW_BLUR * 1.5;
 
 /// The show-apps glyph color: `$system_fg_color` ≈ `#fafafb` (`_dash.scss:57,62`).
 const SHOW_APPS_FG: [f32; 4] = [0.980, 0.980, 0.984, 1.];
@@ -934,14 +933,16 @@ impl Dash {
         blur: bool,
         // `org.gnome.desktop.interface color-scheme` — the pill takes the shared plate.
         appearance: widget::style::Appearance,
-        // Drawing the *poke*, in the system accent: only the apps demanding attention, each
-        // behind an accent glow, and no pill, blur, separator, dots or show-apps button — the
-        // dock rests part-way out in this mode, so what shows above the screen edge is icons
-        // rather than a slab of dash. They keep their normal horizontal positions, so pushing
-        // into the edge lands the pointer on the one you are about to click.
-        poke: Option<[u8; 3]>,
+        // `org.gnome.desktop.interface accent-color` — what an urgent app's icon glows in,
+        // wherever the dash is drawn.
+        accent: [u8; 3],
+        // Drawing the *poke*: only the apps demanding attention, and no pill, blur, separator,
+        // dots or show-apps button — the dock rests part-way out in this mode, so what shows
+        // above the screen edge is icons rather than a slab of dash. They keep their normal
+        // horizontal positions, so pushing into the edge lands the pointer on the one you are
+        // about to click.
+        poking: bool,
     ) -> Vec<DashElement> {
-        let poking = poke.is_some();
         let scale = output.current_scale().fractional_scale();
         let layout = self.layout(area);
         let metrics = layout.metrics;
@@ -1036,13 +1037,15 @@ impl Dash {
         }
 
         // The accent glow behind each urgent icon. Pushed *after* the icons, because the first
-        // element pushed is the topmost — an "under the icons" layer has to come later.
+        // element pushed is the topmost — an "under the icons" layer has to come later — and
+        // *before* the pill, so the halo lies on the plate rather than under it.
         //
-        // Two shadows on one box: a tight bright core and a wide soft falloff, which is what
-        // makes a glow read as light rather than as a coloured blob. There is no GNOME
-        // reference for this — the poking dock is ours (`dock-divergence`), and GNOME surfaces
-        // attention as a notification instead.
-        if let Some(accent) = poke {
+        // Drawn wherever the dash is, not only in a poke: an app demanding attention still is
+        // once you pull the dock the rest of the way out, and losing the glow at that moment
+        // would drop the only mark saying which icon you came for. There is no GNOME reference
+        // — attention on the dash is ours (`dock-divergence.md`); GNOME posts a notification
+        // and leaves the dash alone.
+        if self.items.iter().any(|entry| entry.urgent) {
             let accent = widget::style::accent_rgba(accent);
             let tiles: Vec<Rectangle<f64, Logical>> = self
                 .items
@@ -1081,11 +1084,9 @@ impl Dash {
                 |frame, phys, ()| {
                     let mut p = Painter::new(frame, scale, phys);
                     p.clear(widget::style::TRANSPARENT)?;
+                    let color = [accent[0], accent[1], accent[2], GLOW_ALPHA];
                     for tile in &tiles {
-                        for (blur, alpha) in GLOW_LAYERS {
-                            let color = [accent[0], accent[1], accent[2], alpha];
-                            p.drop_shadow(*tile, radius, blur, (0., 0.), color)?;
-                        }
+                        p.drop_shadow(*tile, radius, GLOW_BLUR, (0., 0.), color)?;
                     }
                     Ok(())
                 },
@@ -1110,7 +1111,7 @@ impl Dash {
                         ),
                     ));
                 }
-                Err(err) => tracing::error!("error baking the dash poke glow: {err:#}"),
+                Err(err) => tracing::error!("error baking the dash urgency glow: {err:#}"),
             }
         }
 

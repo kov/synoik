@@ -10190,9 +10190,8 @@ impl Synoik {
                     // overview's dash below sits on a backdrop that is already blurred.
                     true,
                     self.appearance(),
-                    self.dock
-                        .is_poking()
-                        .then_some(self.gnome_settings.accent_color),
+                    self.gnome_settings.accent_color,
+                    self.dock.is_poking(),
                 ) {
                     push(element.into());
                 }
@@ -10237,8 +10236,9 @@ impl Synoik {
                     progress,
                     false,
                     self.appearance(),
+                    self.gnome_settings.accent_color,
                     // The overview always shows the whole dash.
-                    None,
+                    false,
                 ) {
                     push(element.into());
                 }

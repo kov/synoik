@@ -22912,6 +22912,82 @@ fn a_window_demanding_attention_marks_its_app_urgent_in_the_dash() {
     );
 }
 
+/// A **`recover`** puts its windows back and marks the ones that landed elsewhere; a
+/// **`session_restore`** marks nothing.
+///
+/// One app coming back from a crash can say where it went — "your app is back, over there" — and
+/// that is a single window's worth of noise. A login restoring everything you had open cannot:
+/// every app would shout at once, which is no signal at all. Neither takes focus; only the mark
+/// differs (decided 2026-08-08).
+#[test]
+fn a_recover_demands_attention_from_another_desktop_but_a_restore_does_not() {
+    for (reason, expected) in [(Reason::Recover, true), (Reason::SessionRestore, false)] {
+        let mut f = Fixture::new();
+        f.add_output(1, (1280, 720));
+
+        let id = f.add_client();
+        f.roundtrip(id);
+
+        // A window on the active desktop, so the restored one lands somewhere else.
+        let holder = f.client(id).create_window();
+        let holder_surface = holder.surface.clone();
+        holder.commit();
+        f.roundtrip(id);
+        let window = f.client(id).window(&holder_surface);
+        window.attach_new_buffer();
+        window.set_size(300, 200);
+        window.ack_last_and_commit();
+        f.double_roundtrip(id);
+
+        let session_id = format!("{reason:?}-session");
+        let session = f.client(id).get_session(reason, Some(&session_id));
+        remember(
+            &mut f,
+            &session_id,
+            "main",
+            ToplevelRecord {
+                state: Some(WindowState::Floating.as_raw()),
+                floating_rect: Some([100, 100, 300, 200]),
+                workspace: Some(1),
+                ..Default::default()
+            },
+        );
+
+        let (surface, toplevel, qh) = {
+            let win = f.client(id).create_window();
+            (
+                win.surface.clone(),
+                win.xdg_toplevel.clone(),
+                f.client(id).qh.clone(),
+            )
+        };
+        let _handle =
+            session.restore_toplevel(&toplevel, String::from("main"), &qh, String::from("main"));
+        f.client(id).window(&surface).commit();
+        f.roundtrip(id);
+        map_at_configured_size(&mut f, id, &surface);
+        f.synoik_complete_animations();
+
+        let urgent = f
+            .synoik()
+            .layout
+            .windows()
+            .any(|(_, mapped)| mapped.is_urgent());
+        assert_eq!(
+            urgent, expected,
+            "{reason:?} landing a window on another desktop: urgency should be {expected}"
+        );
+        let restored = session_window(&mut f, "main");
+        assert!(
+            f.synoik()
+                .layout
+                .focus()
+                .is_some_and(|focused| focused.window != restored),
+            "{reason:?} must not take focus either way"
+        );
+    }
+}
+
 /// **An app with a focused window is not urgent**, even when another of its windows demanded
 /// attention from a desktop you are not on.
 ///

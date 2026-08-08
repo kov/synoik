@@ -548,14 +548,21 @@ because there is no path by which we can validate it. It currently is — a mis-
 `session_restore` costs the app its focus and nothing else — but any future rule keyed on `reason`
 has to clear that same bar.
 
-**Open — the urgency affordance is unreachable for restores.** `handlers::compositor` takes the
-`restore_reason != Launch` branch, sets `activate = ActivateWindow::No` and returns *before* the
-off-workspace arm that would set `wants_attention`. So a restored window landing on a desktop you
-are not on is silent: no focus (right) and no dock poke (arguably wrong — it is exactly the "window
-wants attention elsewhere" state the pulsing indicator exists for). The candidate fix is to keep
-`activate = No` for every reason but still let the off-workspace arm set `wants_attention`, except
-inside the login restore window, where every window would raise it at once. **Not decided** — it
-interacts with how apps opening windows on other workspaces should behave generally.
+**Settled 2026-08-08 — what each reason may do.** Focus and attention are separate decisions:
+
+| reason | takes focus | marks urgent when it lands elsewhere |
+| --- | --- | --- |
+| `launch` | yes (or marks, if denied) | yes |
+| `recover` | no | **yes** |
+| `session_restore` | no | no |
+
+`recover` marks because a single app returning from a crash gets to say where it went — "your app
+is back, over there" is one window's worth of noise, and useful. `session_restore` must not: a
+login restoring everything you had open would have every app shouting at once, which is no signal
+at all. The `recover` arm is deliberately *not* gated on the window having wanted focus, unlike the
+launch arm: restore seeds `open_focused = false` for every reason but `launch`, so that test would
+make it unreachable. Pinned by
+`a_recover_demands_attention_from_another_desktop_but_a_restore_does_not`.
 
 ---
 
