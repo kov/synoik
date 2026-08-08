@@ -258,8 +258,9 @@ too-new `version` rejection, and the tombstone-vs-pending-save interaction.
    `name_in_use`, `already_added`, rename-frees-the-old-name, rename-onto-a-taken-name, and
    destroy-goes-inert.
 2. **Persistence — DONE.** `src/session_state.rs` is the store: plain data and serde, no Wayland
-   types, JSON at `$XDG_DATA_HOME/synoik/session.json`, written through a temp file and renamed so
-   a crash mid-write cannot truncate the previous store. Loaded in `State::new`, saved by a 3s
+   types, JSON at `$XDG_DATA_HOME/synoik/session.json`, written through a temp file that is
+   `fsync`ed and renamed, so neither a crash nor a power loss mid-write can truncate the previous
+   store. Loaded in `State::new`, saved by a 3s
    debounce armed through the new `SessionManagerHandler::schedule_session_save` hook (the protocol
    owns *what* changed, the event loop owns the timer), and flushed once more after
    `event_loop.run` returns so a clean exit never loses it. First-change-wins arming, matching
@@ -274,6 +275,14 @@ too-new `version` rejection, and the tombstone-vs-pending-save interaction.
    removed session could be resurrected by an in-flight write. The mechanism would have guarded a
    hazard this shape does not have.
 
+   **The write is off the compositor thread**, as the settled cadence said. Only the serialize is
+   inline — which is exactly what makes tombstones unnecessary — and the bytes go to one long-lived
+   worker thread, so the channel gives write ordering for free and coalesces a burst down to the
+   newest snapshot. It was briefly synchronous; that was wrong, because the `fsync` measures 9–22 ms
+   for a full store on a warm NVMe (worse tail on a busy disk) and the compositor has one thread, so
+   it would drop frames on the very interactions that schedule a save. Only the shutdown flush
+   blocks, and it writes unconditionally so it doubles as the retry for a queued write that failed.
+
    A headless test instance gets a store with no path — the suite must neither read nor clobber the
    real session file — using the same `BackendMode::HeadlessTest` gate as the GSettings watcher.
 
@@ -283,7 +292,8 @@ too-new `version` rejection, and the tombstone-vs-pending-save interaction.
 
    Store unit tests cover the JSON round trip, the too-new version refusal, an unsupported state
    value (half-tiling) that keeps its record but restores nothing, an unknown-to-us state value
-   from a future synoik, MRU eviction, dirty-flag bookkeeping, and save-then-load. Conformance
+   from a future synoik, MRU eviction, dirty-flag bookkeeping, save-then-load, and that a burst of queued saves coalesces
+   to the newest. Conformance
    tests cover restore-from-a-remembered-id, destroy-keeps/remove-forgets, an inert session's
    `remove` being a no-op, and the write being scheduled rather than inline.
 3. **Save on unmap** — snapshot geometry/state/workspace when a registered window goes away.
