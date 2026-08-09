@@ -177,8 +177,16 @@ fn center(rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
 
 /// `computeScaleAndSpace`.
 fn compute_scale_and_space(layout: &mut GridLayout, area: Rectangle<f64, Logical>) -> (f64, f64) {
-    let hspacing = (layout.max_columns - 1) as f64 * spacing();
-    let vspacing = (layout.rows.len() - 1) as f64 * spacing();
+    // Gaps-between-N: subtract in f64, never in the `usize` the count is held in. A row
+    // can legitimately hold no windows — degenerate window sizes make `ideal_row_width`
+    // NaN, which makes every `_keepSameRow` comparison false, so every window falls
+    // through to the last row (`i == num_rows - 1`) and `max_row` stays at the empty row
+    // 0, because `NaN > 0.` is false too. GNOME reaches the same state and takes
+    // `(0 - 1) * spacing` in stride (`workspace.js:280`); only the port underflowed.
+    // Every `len() - 1` spacing term in this file is the same shape — see
+    // `_compute_row_sizes` and `compute_window_slots` below.
+    let hspacing = (layout.max_columns as f64 - 1.) * spacing();
+    let vspacing = (layout.rows.len() as f64 - 1.) * spacing();
 
     let horizontal_scale = (area.size.w - hspacing) / layout.grid_width;
     let vertical_scale = (area.size.h - vspacing) / layout.grid_height;
@@ -255,14 +263,16 @@ pub fn compute_slots(
     // `_computeRowSizes`.
     let scale = layout.scale;
     for row in &mut layout.rows {
-        row.width = row.full_width * scale + (row.windows.len() - 1) as f64 * spacing();
+        // `(row.windows.length - 1) * this._columnSpacing` (`workspace.js:188`) — an empty
+        // row gives one negative spacing there, and must here too.
+        row.width = row.full_width * scale + (row.windows.len() as f64 - 1.) * spacing();
         row.height = row.full_height * scale;
     }
 
     // `computeWindowSlots`.
     let rows = &mut layout.rows;
     let height_without_spacing: f64 = rows.iter().map(|row| row.height).sum();
-    let vertical_spacing = (rows.len() - 1) as f64 * spacing();
+    let vertical_spacing = (rows.len() as f64 - 1.) * spacing();
     let additional_vertical_scale = f64::min(
         1.,
         (area.size.h - vertical_spacing) / height_without_spacing,
@@ -273,7 +283,7 @@ pub fn compute_slots(
     let mut compensation = 0.;
     let mut y = 0.;
     for row in rows.iter_mut() {
-        let horizontal_spacing = (row.windows.len() - 1) as f64 * spacing();
+        let horizontal_spacing = (row.windows.len() as f64 - 1.) * spacing();
         let width_without_spacing = row.width - horizontal_spacing;
         let additional_horizontal_scale = f64::min(
             1.,
