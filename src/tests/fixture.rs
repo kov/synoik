@@ -131,6 +131,20 @@ impl Fixture {
         &mut self.state.server.state
     }
 
+    /// Run the compositor's reconcile phase (`State::refresh`) — and **nothing else**: no
+    /// animation advance, no redraw.
+    ///
+    /// This, not a render, is where UI state that *tracks* the layout is brought in line (the
+    /// panel's Activities highlight, a panel menu the overview opens over). Reach for it after
+    /// driving an action directly with `do_action`, which does not pump the loop.
+    ///
+    /// Deliberately not `refresh_and_flush_clients`: that redraws too, so a test using it would
+    /// pass whether the state were synced here or at render time — which is exactly the confusion
+    /// that let the Activities highlight sit one cycle late.
+    pub fn refresh(&mut self) {
+        self.synoik_state().refresh();
+    }
+
     pub fn synoik(&mut self) -> &mut Synoik {
         &mut self.synoik_state().synoik
     }

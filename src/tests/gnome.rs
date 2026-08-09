@@ -7214,7 +7214,7 @@ fn panel_activities_click_toggles_overview() {
     f.add_output(1, (1920, 1080));
 
     assert!(!f.synoik().layout.is_overview_open());
-    f.synoik().update_render_elements(None);
+    f.refresh();
     assert!(
         !f.synoik().panel.activities_checked(),
         "Activities starts unchecked"
@@ -7230,7 +7230,7 @@ fn panel_activities_click_toggles_overview() {
         f.synoik().layout.is_overview_open(),
         "clicking Activities must open the overview"
     );
-    f.synoik().update_render_elements(None);
+    f.refresh();
     assert!(
         f.synoik().panel.activities_checked(),
         "Activities must be checked while the overview is open"
@@ -7244,7 +7244,7 @@ fn panel_activities_click_toggles_overview() {
         !f.synoik().layout.is_overview_open(),
         "clicking Activities again must close the overview"
     );
-    f.synoik().update_render_elements(None);
+    f.refresh();
     assert!(
         !f.synoik().panel.activities_checked(),
         "Activities must be unchecked once the overview closes"
@@ -7442,7 +7442,7 @@ fn panel_popover_stays_open_in_overview() {
     f.add_output(1, (1920, 1080));
 
     f.synoik_state().do_action(Action::ToggleOverview, false);
-    f.synoik().update_render_elements(None);
+    f.refresh();
     assert!(f.synoik().layout.is_overview_open());
 
     // Click the clock: the calendar popover opens.
@@ -7455,18 +7455,49 @@ fn panel_popover_stays_open_in_overview() {
         "clicking the clock in the overview must open the calendar popover"
     );
 
-    // Subsequent frames must not dismiss it (a level-triggered overview check
-    // once closed the popover on the render update right after it opened).
-    f.synoik().update_render_elements(None);
-    f.synoik().update_render_elements(None);
+    // Subsequent cycles must not dismiss it (a level-triggered overview check
+    // once closed the popover on the very next reconcile after it opened).
+    f.refresh();
+    f.refresh();
     f.settle_animations();
     assert!(
         f.synoik().panel_popover.is_open(),
-        "a popover opened in the overview must stay open across frames"
+        "a popover opened in the overview must stay open across cycles"
     );
     assert!(
         f.synoik().layout.is_overview_open(),
         "the overview stays open under the popover"
+    );
+}
+
+/// The Activities highlight tracks the overview **without a render**.
+///
+/// It used to be armed inside `update_render_elements`, so the frame that opened the overview
+/// drew the button unlit and the highlight only latched on the next advance+render — one frame
+/// late on the seat, and invisible to any test that did not render first. The sync belongs where
+/// the state changes (`State::refresh`), which is what this pins: not one render happens here.
+#[test]
+fn panel_activities_highlight_needs_no_render() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.refresh();
+    assert!(
+        !f.synoik().panel.activities_checked(),
+        "Activities starts unchecked"
+    );
+
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.refresh();
+    assert!(
+        f.synoik().panel.activities_checked(),
+        "one refresh after the overview opens, Activities must already be lit — no render",
+    );
+
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.refresh();
+    assert!(
+        !f.synoik().panel.activities_checked(),
+        "and unlit again one refresh after it closes",
     );
 }
 
@@ -7477,7 +7508,7 @@ fn panel_popover_stays_open_in_overview() {
 fn overview_open_dismisses_open_panel_popover() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.synoik().update_render_elements(None);
+    f.refresh();
 
     let x = clock_center_x(&mut f, 1920.);
     pointer_motion_to(&mut f, x, 10.);
@@ -7486,7 +7517,7 @@ fn overview_open_dismisses_open_panel_popover() {
     assert!(f.synoik().panel_popover.is_open());
 
     f.synoik_state().do_action(Action::ToggleOverview, false);
-    f.synoik().update_render_elements(None);
+    f.refresh();
     f.settle_animations();
     assert!(
         !f.synoik().panel_popover.is_open(),

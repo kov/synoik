@@ -1958,7 +1958,11 @@ impl State {
         self.backend.on_output_config_changed(&mut self.synoik);
     }
 
-    fn refresh(&mut self) {
+    /// The reconcile phase of a cycle: everything that brings derived state in line with the
+    /// layout, with no animation advance and no redraw. `pub(crate)` so a test can drive exactly
+    /// this — a helper that also redrew would hide UI state that is (wrongly) synced at render
+    /// time, which is how the panel's Activities highlight stayed one cycle late unnoticed.
+    pub(crate) fn refresh(&mut self) {
         let _span = tracy_client::span!("State::refresh");
 
         // Handle commits for surfaces whose blockers cleared this cycle. This should happen before
@@ -1968,6 +1972,9 @@ impl State {
         // These should be called periodically, before flushing the clients.
         self.synoik.popups.cleanup();
         self.refresh_popup_grab();
+        // Before the focus update, so a panel menu this dismisses (the overview opening over it)
+        // has its keyboard focus recomputed in the same cycle rather than the next one.
+        self.synoik.refresh_overview_panel_state();
         self.update_keyboard_focus();
         self.synoik.refresh_overview_search_state();
         // An indicator's client must learn its menu closed however the menu went away.
@@ -9532,18 +9539,16 @@ impl Synoik {
         }
     }
 
-    pub fn update_render_elements(&mut self, output: Option<&Output>) {
-        self.update_xray_render_elements(output);
-        self.layout.update_render_elements(output);
-
-        // Retire a finished curtain slide. Without this the state stays `Hiding` forever and the
-        // *next* lock is told the curtain is already on its way, so it never descends.
-        self.lock_screen
-            .settle_curtain(crate::utils::get_monotonic_time());
-        self.settle_lock_replies();
-        self.publish_shield_active();
-
-        // Keep the panel's Activities highlight in sync with the overview.
+    /// Reflect the overview's open state on the panel chrome, and dismiss a panel menu the
+    /// overview opened over.
+    ///
+    /// Runs from `State::refresh`, i.e. where the state it reads actually changes — **not** from
+    /// `update_render_elements`, which is where it used to live. Arming the Activities fade inside
+    /// the render meant the frame that opened the overview drew the button unlit and the highlight
+    /// only latched on the next advance+render: one frame late on the seat, and a state no test
+    /// could observe without rendering first (the tests here used to call
+    /// `update_render_elements` purely to make the panel catch up).
+    pub(crate) fn refresh_overview_panel_state(&mut self) {
         let overview_open = self.layout.is_overview_open();
         self.panel.set_overview_open(overview_open);
 
@@ -9565,6 +9570,18 @@ impl Synoik {
         // (the clock/quick-settings button stays lit while its menu is up).
         let open_role = self.panel_popover.open_role();
         self.panel.set_open_menu(open_role);
+    }
+
+    pub fn update_render_elements(&mut self, output: Option<&Output>) {
+        self.update_xray_render_elements(output);
+        self.layout.update_render_elements(output);
+
+        // Retire a finished curtain slide. Without this the state stays `Hiding` forever and the
+        // *next* lock is told the curtain is already on its way, so it never descends.
+        self.lock_screen
+            .settle_curtain(crate::utils::get_monotonic_time());
+        self.settle_lock_replies();
+        self.publish_shield_active();
 
         for (out, state) in self.output_state.iter_mut() {
             if output.is_none_or(|output| out == output) {
