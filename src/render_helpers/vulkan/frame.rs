@@ -167,15 +167,25 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // base pass (identical attachment/subpass layout), so `framebuffer` (built against the base
         // pass) and every pipeline bind unchanged.
         //
-        // Offscreens are excluded, and not just because they end their frame in
-        // `SHADER_READ_ONLY_OPTIMAL`: a bake target is handed to its caller as a blank canvas, and
-        // one that happened to be left in `TRANSFER_SRC_OPTIMAL` by a readback would otherwise come
-        // back carrying the previous bake.
+        // An offscreen only preserves when its binder *asked* to
+        // (`VulkanRenderer::bind_preserving`, i.e. `OffscreenBuffer`'s persistent, damage-tracked
+        // target). A bake target is handed to its caller as a blank canvas, and one that happened
+        // to be left in a defined layout would otherwise come back carrying the previous bake.
+        // Offscreens end their frame in `SHADER_READ_ONLY_OPTIMAL`, not the `TRANSFER_SRC_OPTIMAL`
+        // the continuation pass loads from, so a preserving one is transitioned back below —
+        // contents survive any transition out of a defined layout.
         //
         // Getting this wrong is invisible to every test that renders one frame and to every
         // screenshot (both full-damage): the direct arm silently discarded, so the parts of the
         // screen the scene had stopped repainting decayed into whatever the driver left behind.
-        let preserve = !fb.offscreen && fb.buffer.layout() == vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        // The offscreen arm discarded the same way, and a tiling driver writes back only the tiles
+        // a draw touched — so a 32×32 damage rect came back as a 64×64 tile-aligned hole with the
+        // redraw in one corner of it, which is what the overview's fade-out group was trailing.
+        let preserve = if fb.offscreen {
+            fb.preserve
+        } else {
+            fb.buffer.layout() == vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        };
         let render_pass = if preserve {
             renderer.continuation_render_pass
         } else {
@@ -249,6 +259,25 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // them — the blurs below, and every draw in this frame. See
         // `VulkanRenderer::make_sampleable`.
         acquired.extend(renderer.record_pending_sampleable(cbuf));
+
+        // A preserving offscreen was left sampleable by its last frame, but the continuation pass
+        // loads from `TRANSFER_SRC_OPTIMAL` — hand it over here, in the same command buffer and
+        // the same submit as every other pre-pass barrier. (Layout transitions are illegal inside
+        // a render pass, so this cannot ride along with the draws.)
+        if preserve && fb.offscreen {
+            unsafe {
+                transition_image(
+                    &renderer.gpu.device,
+                    cbuf,
+                    fb.buffer.image(),
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::COLOR_ATTACHMENT_READ,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                );
+            }
+            fb.buffer.set_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        }
 
         // Blurs queued while collecting elements (the xray effect buffer). Recorded here for the
         // same reason and into the same slot — outside the render pass, riding this frame's

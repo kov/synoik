@@ -559,6 +559,12 @@ pub struct VkFramebuffer<'a> {
     /// frame targeting one finishes it in `SHADER_READ_ONLY_OPTIMAL`; a scanout
     /// target must stay in `TRANSFER_SRC_OPTIMAL` for the present blit.
     pub(super) offscreen: bool,
+    /// Only ever set on an offscreen target: the caller re-renders into this texture frame after
+    /// frame and redraws **only its damage**, so the pass must LOAD what is already there instead
+    /// of discarding it. Off by default — a bake target is a blank canvas, and preserving one
+    /// would let the previous bake bleed through wherever the new one does not paint.
+    /// See the decision in [`super::VulkanFrame::begin`].
+    pub(super) preserve: bool,
     /// Set on the **present-blit** scanout path (planes whose byte order differs from the
     /// renderer's render pass — since 2026-07-31 that is `Abgr8888`/`Xbgr8888`, not the KMS-common
     /// `Argb8888`/`Xrgb8888`): `buffer` is then a [`NATIVE_FOURCC`]-order shadow rendered into as
@@ -577,6 +583,7 @@ impl VkFramebuffer<'_> {
         VkFramebuffer {
             buffer,
             offscreen: true,
+            preserve: false,
             present: None,
             _marker: std::marker::PhantomData,
         }
@@ -587,6 +594,7 @@ impl VkFramebuffer<'_> {
         VkFramebuffer {
             buffer,
             offscreen: false,
+            preserve: false,
             present: None,
             _marker: std::marker::PhantomData,
         }
@@ -598,9 +606,16 @@ impl VkFramebuffer<'_> {
         VkFramebuffer {
             buffer,
             offscreen: false,
+            preserve: false,
             present: Some(present),
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Ask for this (offscreen) target's prior contents to be preserved — see [`Self::preserve`].
+    pub(super) fn preserving(mut self) -> Self {
+        self.preserve = true;
+        self
     }
 }
 

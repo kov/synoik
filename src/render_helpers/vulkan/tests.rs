@@ -5813,6 +5813,126 @@ fn vulkan_partial_redraw_into_a_scanout_dmabuf_preserves_the_rest() {
     }
 }
 
+/// The offscreen sibling of `vulkan_partial_redraw_into_a_scanout_dmabuf_preserves_the_rest`, and
+/// the same defect one level down: `OffscreenBuffer` re-renders a *persistent* texture every frame
+/// and redraws only the damage its tracker computed at age 1, but every offscreen frame used to
+/// begin a `DONT_CARE` pass. Outside the damage the contents were undefined, and a tiling driver
+/// writes back only the tiles a draw touched — so a 32×32 damage rect came back as a 64×64
+/// tile-aligned hole with the redraw in one corner of it. On the seat that was the overview's
+/// fade-out group trailing ghosts of itself as the app grid slid in.
+///
+/// A bake target must NOT preserve (it is handed to its caller as a blank canvas), so this pins
+/// both answers: plain `bind` discards, `bind_preserving` loads.
+#[test]
+fn vulkan_partial_redraw_into_a_persistent_offscreen_preserves_the_rest() {
+    const NAME: &str = "vulkan_partial_redraw_into_a_persistent_offscreen_preserves_the_rest";
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping {NAME}: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    let size = Size::<i32, Physical>::from((W, H));
+    let buffer_size = Size::<i32, BufferCoord>::from((W, H));
+    let mut tex: VkTexture = vk
+        .create_buffer(NATIVE_FOURCC, buffer_size)
+        .expect("create an offscreen render target");
+
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+    const PATCH: i32 = 16;
+
+    // Frame 1: the full-damage frame that fills a fresh texture. Nothing to preserve yet.
+    {
+        let mut fb = vk.bind_preserving(&mut tex).expect("bind the offscreen");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        assert!(
+            !frame.preserves_target(),
+            "a fresh offscreen has nothing to preserve",
+        );
+        frame
+            .clear(Color32F::from(RED), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let _sync = frame.finish().expect("finish");
+    }
+    // What `OffscreenBuffer::render` does between frames: the element samples the texture.
+    vk.make_sampleable(&tex)
+        .expect("make the offscreen sampleable");
+
+    // A bake asks for a blank canvas and must keep getting one, sampleable prior contents or not.
+    {
+        let mut fb = vk
+            .bind(&mut tex)
+            .expect("bind the offscreen as a bake target");
+        let frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        assert!(
+            !frame.preserves_target(),
+            "a bake target must not carry the previous bake into the new one",
+        );
+        let _sync = frame.finish().expect("finish");
+    }
+    vk.make_sampleable(&tex)
+        .expect("make the offscreen sampleable");
+    // That bake discarded the texture, so re-establish frame 1's red before the real check.
+    {
+        let mut fb = vk.bind(&mut tex).expect("re-bind the offscreen");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(RED), &[Rectangle::from_size(size)])
+            .expect("clear");
+        let _sync = frame.finish().expect("finish");
+    }
+    vk.make_sampleable(&tex)
+        .expect("make the offscreen sampleable");
+
+    // Frame 2: only the damage, exactly as a partial re-render of a cached group does.
+    let patch = Rectangle::<i32, Physical>::from_size(Size::from((PATCH, PATCH)));
+    {
+        let mut fb = vk.bind_preserving(&mut tex).expect("re-bind the offscreen");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        // THE assertion. The pixel checks below are a bonus: `DONT_CARE` leaves the untouched
+        // pixels *undefined*, so a driver that happens to keep them makes a broken frame read as
+        // correct. The pass choice is the contract.
+        assert!(
+            frame.preserves_target(),
+            "re-rendering a persistent offscreen with partial damage must LOAD what is already \
+             there — a DONT_CARE pass makes everything outside the damage undefined, which is how \
+             the overview grew trails",
+        );
+        frame
+            .clear(Color32F::from(BLUE), &[patch])
+            .expect("clear the damage");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    let fb = vk.bind(&mut tex).expect("bind for readback");
+    let region = Rectangle::<i32, BufferCoord>::from_size(buffer_size);
+    let mapping = vk
+        .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+        .expect("copy_framebuffer");
+    let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
+    drop(fb);
+
+    let red = [255, 0, 0, 255];
+    let blue = [0, 0, 255, 255];
+    assert!(
+        close_px(px(&pixels, PATCH / 2, PATCH / 2), blue, 3),
+        "the redrawn damage should be blue, got {:?}",
+        px(&pixels, PATCH / 2, PATCH / 2),
+    );
+    for (x, y) in [(W / 2, H / 2), (W - 1, 0), (0, H - 1), (W - 1, H - 1)] {
+        assert!(
+            close_px(px(&pixels, x, y), red, 3),
+            "({x},{y}) was outside the damage, so it must still hold the first frame's red; \
+             got {:?}",
+            px(&pixels, x, y),
+        );
+    }
+}
+
 /// A phase that took **no measurable time** is a measurement, not a lost sample.
 ///
 /// `phase_tick_deltas` exists as its own function because the whole-span classifier

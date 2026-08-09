@@ -16,9 +16,7 @@ use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::utils::{
     CommitCounter, DamageBag, DamageSet, DamageSnapshot, OpaqueRegions,
 };
-use smithay::backend::renderer::{
-    Bind, Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture,
-};
+use smithay::backend::renderer::{Color32F, ContextId, Frame as _, Offscreen, Renderer, Texture};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
@@ -167,7 +165,7 @@ impl OffscreenBuffer {
         }
 
         let res = {
-            let mut target = renderer.bind(&mut inner.texture)?;
+            let mut target = renderer.bind_preserving(&mut inner.texture)?;
             inner
                 .damage
                 .render_output(renderer, &mut target, 1, &elements, Color32F::TRANSPARENT)

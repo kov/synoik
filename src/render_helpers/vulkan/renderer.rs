@@ -2623,6 +2623,32 @@ impl Renderer for VulkanRenderer {
     }
 }
 
+impl VulkanRenderer {
+    /// [`Bind::bind`] for a **persistent** offscreen: one the caller re-renders into every frame,
+    /// redrawing only the damage since the last one (`OffscreenBuffer`, whose damage tracker runs
+    /// at age 1). Such a target must survive its own render pass, so the frame takes the LOAD
+    /// continuation pass instead of the DONT_CARE base pass.
+    ///
+    /// Preserving is requested, not assumed: it only happens if the image is genuinely in a
+    /// defined layout — a texture with a *queued* make-sampleable barrier reports
+    /// `SHADER_READ_ONLY_OPTIMAL` while its image is still `UNDEFINED` (see
+    /// [`Self::make_sampleable`]), and `bind` drops that barrier, so ask before it does.
+    ///
+    /// Without this a partial-damage re-render is undefined outside the damage, which on a tiling
+    /// driver comes back as tile-granular holes punched around each damage rect — the overview's
+    /// fade-out group trailing ghosts of itself.
+    pub(crate) fn bind_preserving<'a>(
+        &mut self,
+        target: &'a mut VkTexture,
+    ) -> Result<VkFramebuffer<'a>, VulkanError> {
+        let image = target.image();
+        let defined = !self.pending_sampleable.iter().any(|t| t.image() == image)
+            && target.layout() == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        let fb = self.bind(target)?;
+        Ok(if defined { fb.preserving() } else { fb })
+    }
+}
+
 impl Bind<VkTexture> for VulkanRenderer {
     fn bind<'a>(&mut self, target: &'a mut VkTexture) -> Result<VkFramebuffer<'a>, VulkanError> {
         // Only offscreen textures (created by `create_buffer`) carry a render-pass framebuffer.
