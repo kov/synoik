@@ -171,6 +171,25 @@ fn compute_layout(
     }
 }
 
+/// How far `content` must shrink to fit in `available`, never growing it —
+/// `Math.min(1, available / content)` (`workspace.js:320`, `:329`), but defined
+/// when the grid has no extent to scale.
+///
+/// A grid dimension of zero is reachable: a row whose windows all scale to zero
+/// height sums to `-0.`, and `656. / -0.` is `-f64::INFINITY`, which `min` then
+/// picks over 1. That negative-infinite scale spread through the slot sizes into
+/// `expose_pickup_size` and came out the far end as a NaN tile position, an
+/// assertion in `Layout::verify_invariants` away from being a window rendered
+/// nowhere. GNOME divides the same way and has the same hole; it just never hands
+/// the grid a zero-height row. Nothing to shrink means nothing to shrink *by*, so
+/// a non-positive extent leaves the scale at 1.
+fn shrink_to_fit(available: f64, content: f64) -> f64 {
+    if content <= 0. || !content.is_finite() {
+        return 1.;
+    }
+    f64::min(1., available / content)
+}
+
 fn center(rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
     Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.))
 }
@@ -273,10 +292,8 @@ pub fn compute_slots(
     let rows = &mut layout.rows;
     let height_without_spacing: f64 = rows.iter().map(|row| row.height).sum();
     let vertical_spacing = (rows.len() as f64 - 1.) * spacing();
-    let additional_vertical_scale = f64::min(
-        1.,
-        (area.size.h - vertical_spacing) / height_without_spacing,
-    );
+    let additional_vertical_scale =
+        shrink_to_fit(area.size.h - vertical_spacing, height_without_spacing);
 
     // Keep track of how much smaller the grid becomes due to scaling so it
     // can be centered again.
@@ -285,10 +302,8 @@ pub fn compute_slots(
     for row in rows.iter_mut() {
         let horizontal_spacing = (row.windows.len() as f64 - 1.) * spacing();
         let width_without_spacing = row.width - horizontal_spacing;
-        let additional_horizontal_scale = f64::min(
-            1.,
-            (area.size.w - horizontal_spacing) / width_without_spacing,
-        );
+        let additional_horizontal_scale =
+            shrink_to_fit(area.size.w - horizontal_spacing, width_without_spacing);
 
         if additional_horizontal_scale < additional_vertical_scale {
             row.additional_scale = additional_horizontal_scale;
