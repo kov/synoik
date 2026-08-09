@@ -2095,11 +2095,19 @@ impl<W: LayoutElement> FloatingSpace<W> {
                 assert!(idx < self.options.layout.preset_window_heights.len());
             }
 
-            assert_eq!(
-                tile.window().pending_sizing_mode(),
-                SizingMode::Normal,
-                "floating windows cannot be maximized or fullscreen"
-            );
+            // Only in niri's scrolling mode: there, sizing a window to the screen is the
+            // scrolling layout's job, so `Workspace::set_fullscreen` migrates the tile out
+            // of here first. In GNOME mode there is nowhere to migrate to — the floating
+            // space owns maximize and fullscreen (`Workspace::set_fullscreen` hands
+            // straight to `FloatingSpace::set_fullscreen`), so a tile in a non-normal
+            // sizing mode is the expected state, not a leak.
+            if self.options.layout.windowing_mode == WindowingMode::Scrolling {
+                assert_eq!(
+                    tile.window().pending_sizing_mode(),
+                    SizingMode::Normal,
+                    "in scrolling mode floating windows cannot be maximized or fullscreen"
+                );
+            }
 
             data.verify_invariants();
 
