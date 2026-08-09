@@ -928,7 +928,13 @@ impl SwitcherUi {
             }
         };
 
-        open.art.remove(index);
+        // A cycler has no art at all — `CyclerList` draws nothing, which is why `open_with` waives
+        // the items/art length check for one. Removing at `index` there is an out-of-bounds panic
+        // on an empty vec, and this runs from a wl_resource destructor, where a panic is an abort
+        // rather than a failed test.
+        if !matches!(open.items, Items::Cycler { .. }) {
+            open.art.remove(index);
+        }
         open.state.item_removed(index);
         self.relayout();
         self.take_outcome()

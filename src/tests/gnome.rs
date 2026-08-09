@@ -19004,6 +19004,51 @@ fn alt_escape_cycles_windows_in_place_with_no_popup() {
     );
 }
 
+/// A window closing under a running cycler removes it from the walk, and nothing else.
+///
+/// `_itemRemoved` (`switcherPopup.js:269-284`) is shared by every switcher, but a cycler is the one
+/// with no `_switcherList` items to remove alongside — `CyclerList` draws nothing
+/// (`altTab.js:472-484`). Ours used to drop the art entry regardless, which on a cycler is an
+/// index into an empty vec. That path runs from the `xdg_toplevel` destructor, where a panic is an
+/// abort, so the compositor went down with it.
+#[test]
+fn closing_a_window_under_a_cycler_does_not_take_the_compositor_with_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.A");
+    let a = f.synoik().layout.focus().unwrap().id();
+    let b_surface = map_window_for_app(&mut f, client, "org.example.B");
+    let b = f.synoik().layout.focus().unwrap().id();
+    f.synoik_complete_animations();
+
+    f.key_press(KEY_LEFTALT);
+    tap(&mut f, KEY_ESC);
+    assert_eq!(f.synoik().switcher.cycler_window(), Some(a));
+
+    // Walk onto B, then have its client take it away underneath the cycler.
+    tap(&mut f, KEY_ESC);
+    assert_eq!(f.synoik().switcher.cycler_window(), Some(b));
+
+    let window = f.client(client).window(&b_surface);
+    window.xdg_toplevel.destroy();
+    window.xdg_surface.destroy();
+    window.surface.destroy();
+    f.double_roundtrip(client);
+
+    // One window left, so the cycler is still up and pointing at it.
+    assert!(
+        f.synoik().switcher.is_open(),
+        "the cycler survives the close"
+    );
+    assert_eq!(f.synoik().switcher.cycler_window(), Some(a));
+
+    f.key_release(KEY_LEFTALT);
+    f.synoik_complete_animations();
+    assert_eq!(f.synoik().layout.focus().unwrap().id(), a);
+}
+
 /// `cycle-group` (`<Alt>F6`) is the same listless cycler over the focused app's windows only.
 ///
 /// `GroupCyclerPopup._getWindows` is `focus_app.get_windows()` (`altTab.js:557-570`), so a window
