@@ -348,3 +348,87 @@ door — [[test-the-code-not-a-reimplementation]].
   at the top of the window layer (`CyclerHighlight` is a child of `global.window_group`,
   `altTab.js:498`), so they stay under the panel and the layer-shell surfaces above it. The
   "raise" half is a draw-order skip in `FloatingSpace::render`, not a restack.
+
+## Amendment 2026-08-09: what a switcher *shows* you, and what its commit does
+
+Three changes, landed together because they are one idea: the switcher should show you the state
+its commit would produce, and its commit should produce the state GNOME's does.
+
+### 1. Committing on an app raises the whole app — conformance, not divergence
+
+`shell_app_activate_window` (`shell-app.c:381-442`) brings **every** window of the app forward, not
+just the one it focuses. We only ever raised the focused one, which is invisible in the common
+one-window case and is why it went unnoticed for the whole port. Three details come straight from
+there and are all load-bearing:
+
+- only windows on the **target's workspace** are raised (`:413-415`) — activating an app must not
+  reshuffle its windows on desktops you are not looking at;
+- they are raised **in reverse order** (`:416-425`), so the group arrives with its own relative
+  stacking intact rather than re-sorted by MRU;
+- only the *app row's* commit does this. A picked thumbnail is `Main.activateWindow`
+  (`altTab.js:285`), one window and no group raise — as are the window switcher (`:632`) and the
+  cyclers (`:525`).
+
+This lands as `Layout::raise_under`, on top of a new `FloatingSpace::raise_window_only` (a raise
+that does not touch the active window, i.e. `meta_window_raise_and_make_recent_on_workspace`).
+The switcher hands the compositor an `Activation` — the windows to bring forward, topmost first —
+instead of the single `Option<MappedId>` it used to, and that one list is also what the preview
+below reads, so the two cannot drift.
+
+Fixed on the way past: `SwitcherUi::open` returned the outcome *without* a target, so a session
+that lost the release race at open (bgo#596695, `switcherPopup.js:144-155`) committed to nothing.
+
+### 2. DIVERGENCE: `switch-group` is a window switcher, not a pinned app switcher
+
+GNOME opens `AppSwitcherPopup` on (app 0, window 1) with the sub-list already up
+(`altTab.js:117-137`), spending the top of the popup on an app row you cannot usefully move in.
+Every item in that session belongs to one app by construction, so we show that app's windows
+directly: `Items::Windows` over `focus_app.get_windows()`, same previews, same footer title, no
+row and no sub-list. Its own binding pressed again simply walks the list. Commit stays
+`Main.activateWindow` — one window, no group raise — which keeps Alt-Tab and Above_Tab consistent
+with each other and leaves the group raise as the thing Super-Tab does.
+
+The `group` flag on `OpenRequest` and the pinned initial selection it drove are gone with it.
+
+### 3. DIVERGENCE: every switcher previews what it would raise
+
+GNOME previews nothing outside the cycler. The cycler's raise — a draw-order skip in
+`FloatingSpace::render`, see the slice 6 note above — generalizes to all three switchers and to a
+whole app's worth of windows: `cycler_raised: Option<W::Id>` becomes `preview_raised: Vec<W::Id>`,
+topmost first, fed from the same `Activation` the commit uses.
+
+Rules, and why each is the way it is:
+
+- **Draw order only.** No restack, no focus change, nothing a client can observe. A preview that
+  really raised would be indistinguishable while the popup is up and would silently destroy
+  Escape's guarantee that the stack is left exactly as it was found. The corpus asserts both
+  halves for that reason.
+- **Gated on visibility** for the popups: a tap too quick to show a popup must not shuffle the
+  screen on its way through either. The cycler is exempt — raising the window *is* its whole UI,
+  and it starts from `_initialSelection` inside `show()`.
+- **Workspace-restricted**, same rule as the commit's raise: the preview is a rehearsal, so it
+  must not promise a stacking the commit will not perform.
+
+**The workspace half.** When the selection lives on another workspace, that monitor animates to it
+— a real `switch_workspace`, so it is the real animation. Abandoning the session animates back;
+committing keeps it. Two things make it safe to do for real:
+
+- **A dwell** (`WORKSPACE_PREVIEW_DELAY`, 150 ms, ours). The raise half is instant because it costs
+  a draw order; a workspace slide is not, and tabbing across apps on three workspaces would start,
+  interrupt and reverse one per keypress. Re-armed from scratch on every move, so holding Tab down
+  never settles anywhere — a dwell, not a rate limit.
+- **The `previous_workspace_id` bookmark is preserved.** A workspace you previewed and abandoned is
+  not somewhere you "were": "switch to previous workspace" must not learn about workspaces a
+  switcher merely passed through. On commit the bookmark is pointed at where the *session* started,
+  not at the last stop before it.
+
+Origins are recorded per output on first touch (`Synoik::switcher_ws_preview`), so a monitor
+tabbed across three workspaces is still owed back the one the session started on. A session that
+ends without reaching `finish_switcher` — a modal or the lock screen taking the grab — is handed
+back by the per-frame `sync_switcher_preview`, which owns both halves of the preview and is the
+single writer for them.
+
+Corpus: `super_tab_brings_the_whole_app_forward_not_just_its_focused_window`,
+`switch_group_walks_the_current_apps_windows_as_a_window_switcher`,
+`a_switcher_shows_what_it_would_raise_and_puts_it_back_on_escape`,
+`the_switcher_previews_another_workspace_and_gives_it_back`.

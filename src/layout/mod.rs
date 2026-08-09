@@ -558,6 +558,27 @@ enum DndHoldTarget<WindowId> {
     Workspace(WorkspaceId),
 }
 
+/// Where a switcher preview found a monitor, so the session can put it back — see
+/// [`Layout::preview_workspace_of`].
+///
+/// Carries the origin workspace twice, by index *and* by id, because the two answer different
+/// questions: the index is where to slide back to, and the id is what the "previous workspace"
+/// bookmark should say afterwards. An index alone would go stale if the strip grew under the
+/// preview; an id alone cannot be handed to `switch_workspace`.
+#[derive(Debug, Clone)]
+pub struct WorkspacePreviewOrigin {
+    output: Output,
+    idx: usize,
+    id: WorkspaceId,
+    previous: Option<WorkspaceId>,
+}
+
+impl WorkspacePreviewOrigin {
+    pub fn output(&self) -> &Output {
+        &self.output
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct InteractiveResizeData {
     pub(self) edges: ResizeEdge,
@@ -1644,6 +1665,28 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         ws_idx == mon.active_workspace_idx
+    }
+
+    /// Bring `under` to the front of `window`'s workspace, ready for `window` to be activated on
+    /// top of them — the raising half of `shell_app_activate_window` (`shell-app.c:413-425`).
+    ///
+    /// Two rules come straight from there and are the whole content of this function. It raises
+    /// **in reverse**, so the group arrives with its relative stacking intact rather than
+    /// re-sorted; and it raises only what shares `window`'s workspace, so activating an app does
+    /// not reshuffle its windows on desktops you are not looking at.
+    pub fn raise_under(&mut self, window: &W::Id, under: &[W::Id]) {
+        if under.is_empty() {
+            return;
+        }
+
+        let Some(ws) = self.workspaces_mut().find(|ws| ws.has_window(window)) else {
+            return;
+        };
+        for id in under.iter().rev() {
+            if id != window {
+                ws.raise_window_only(id);
+            }
+        }
     }
 
     pub fn activate_window(&mut self, window: &W::Id) {
@@ -4124,22 +4167,103 @@ impl<W: LayoutElement> Layout<W> {
         true
     }
 
-    /// Show `id` above every other window while a cycler is up, and report the rect it occupies
-    /// on `output` so the caller can put a `.cycler-highlight` border around it.
+    /// Show `windows` above every other window while a switcher is up, topmost first.
     ///
-    /// Both halves come from one call because they must agree: the border is drawn by the shell
-    /// against the same tile position the layout just promoted. `None` clears the raise, and
-    /// clearing always runs over every workspace — a cycler that ends on another monitor must
-    /// not leave a window pinned on the one it started on.
-    pub fn set_cycler_raised(
-        &mut self,
-        target: Option<(&W::Id, &Output)>,
-    ) -> Option<Rectangle<f64, Logical>> {
+    /// Only the windows sharing the *first* one's workspace are promoted, the same restriction
+    /// `shell_app_activate_window` puts on its raise (`shell-app.c:413-415`): the preview is a
+    /// rehearsal of the commit, so it must not promise a stacking the commit will not perform.
+    ///
+    /// The clearing half always runs over every workspace — a preview that ends on another
+    /// monitor must not leave a window pinned on the one it started on — which is why an empty
+    /// slice is the way to drop a preview, and why this must be called even with nothing open.
+    pub fn set_preview_raised(&mut self, windows: &[W::Id]) {
+        let on_workspace = windows.first().and_then(|first| {
+            self.workspaces()
+                .find(|(_, _, ws)| ws.has_window(first))
+                .map(|(_, _, ws)| {
+                    let ids: Vec<W::Id> = windows
+                        .iter()
+                        .filter(|id| ws.has_window(id))
+                        .cloned()
+                        .collect();
+                    (ws.id(), ids)
+                })
+        });
+
         for ws in self.workspaces_mut() {
-            ws.set_cycler_raised(target.map(|(id, _)| id));
+            match &on_workspace {
+                Some((ws_id, ids)) if ws.id() == *ws_id => ws.set_preview_raised(ids),
+                _ => ws.set_preview_raised(&[]),
+            }
+        }
+    }
+
+    /// Take `window`'s monitor to `window`'s workspace for a *preview*, reporting where it was so
+    /// the session can put it back. `None` when it is already there, or the window is gone.
+    ///
+    /// DIVERGENCE: this is a real workspace switch, animation and all — a preview of the commit,
+    /// performed rather than mimed, so what you are looking at while you tab is what you get. The
+    /// one piece of state it must not disturb is the `previous_workspace_id` bookmark: a preview
+    /// you abandoned is not somewhere you "were", and "switch to previous workspace" must not
+    /// learn about the workspaces a switcher merely passed through.
+    pub fn preview_workspace_of(&mut self, window: &W::Id) -> Option<WorkspacePreviewOrigin> {
+        let (output, target_idx) = self.monitors().find_map(|mon| {
+            let idx = mon.workspaces.iter().position(|ws| ws.has_window(window))?;
+            Some((mon.output().clone(), idx))
+        })?;
+
+        let mon = self.monitor_for_output_mut(&output)?;
+        if mon.active_workspace_idx() == target_idx {
+            return None;
         }
 
-        let (id, output) = target?;
+        let origin = WorkspacePreviewOrigin {
+            output,
+            idx: mon.active_workspace_idx(),
+            id: mon.workspaces[mon.active_workspace_idx()].id(),
+            previous: mon.previous_workspace_id,
+        };
+        mon.switch_workspace(target_idx);
+        Some(origin)
+    }
+
+    /// Put a monitor back the way [`preview_workspace_of`](Self::preview_workspace_of) found it,
+    /// animating the way it came — the abandoned-session half.
+    pub fn undo_workspace_preview(&mut self, origin: &WorkspacePreviewOrigin) {
+        let Some(mon) = self.monitor_for_output_mut(&origin.output) else {
+            return;
+        };
+        mon.switch_workspace(origin.idx);
+        mon.previous_workspace_id = origin.previous;
+    }
+
+    /// Keep where the preview went, but point the bookmark at where the session *started* — the
+    /// committed half. Otherwise "switch to previous workspace" lands on whichever workspace the
+    /// tabbing happened to rest on last, which is not a place you have ever been.
+    pub fn keep_workspace_preview(&mut self, origin: &WorkspacePreviewOrigin) {
+        let Some(mon) = self.monitor_for_output_mut(&origin.output) else {
+            return;
+        };
+        mon.previous_workspace_id = Some(origin.id);
+    }
+
+    /// Which output `id` is on, for deciding whose preview a commit gets to keep.
+    pub fn output_of_window(&self, id: &W::Id) -> Option<Output> {
+        self.monitors()
+            .find(|mon| mon.has_window(id))
+            .map(|mon| mon.output().clone())
+    }
+
+    /// Where `id` is drawn on `output` right now, for the `.cycler-highlight` border the shell
+    /// puts around it. `None` when the window lives on another output.
+    ///
+    /// Re-derived rather than remembered, because the window can move or resize under a switcher
+    /// that is still up.
+    pub fn window_render_rect(
+        &self,
+        id: &W::Id,
+        output: &Output,
+    ) -> Option<Rectangle<f64, Logical>> {
         let (mon, (ws, ws_geo)) = self.monitors().find_map(|mon| {
             mon.workspaces_with_render_geo()
                 .find(|(ws, _)| ws.has_window(id))

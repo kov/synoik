@@ -775,10 +775,18 @@ pub struct Synoik {
     pub switcher_timer_at: Option<Duration>,
     /// An outcome produced by a timer firing inside `advance_animations`, which is `Synoik`-level
     /// and so cannot activate a window itself. Drained by [`State::finish_switcher`].
-    pub pending_switcher_outcome: Option<(crate::ui::switcher::SwitcherOutcome, Option<MappedId>)>,
+    pub pending_switcher_outcome: Option<(
+        crate::ui::switcher::SwitcherOutcome,
+        crate::ui::switcher::ui::Activation,
+    )>,
     /// Where a running cycler's `.cycler-highlight` goes, on the switcher's own output. Re-derived
-    /// every frame by [`Synoik::sync_cycler_highlight`]; `None` whenever no cycler is up.
+    /// every frame by [`Synoik::sync_switcher_preview`]; `None` whenever no cycler is up.
     pub cycler_highlight: Option<Rectangle<f64, Logical>>,
+    /// Monitors a switcher preview took off their workspace, with where to put each one back.
+    ///
+    /// One entry per output, recorded on first touch: tabbing on across three workspaces still
+    /// owes the screen back to where the *session* started, not to the last stop before this one.
+    pub switcher_ws_preview: Vec<crate::layout::WorkspacePreviewOrigin>,
     /// Wake-up timer for the shown banner's expiry deadline (the pinned-clock check in
     /// `advance_animations` is the authority; this only wakes an otherwise idle loop).
     pub notification_banner_timer: Option<RegistrationToken>,
@@ -2472,15 +2480,17 @@ impl State {
         }
 
         let art = self.synoik.switcher_app_art(&items);
-        self.raise_switcher(Items::Apps(items), art, backward, false);
+        self.raise_switcher(Items::Apps(items), art, backward);
     }
 
-    /// `switch-group` — the app switcher opened *inside* the current app
-    /// (`windowManager.js:1670-1694`, `altTab.js:117-137`).
+    /// `switch-group` — walking the windows of the app you are already in.
     ///
-    /// The same popup and the same item list as `switch-applications`: what differs is where it
-    /// starts (app 0, with its window sub-list already up) and what a repeat press does — it walks
-    /// that app's windows instead of the app row.
+    /// DIVERGENCE: GNOME opens the *app* switcher pinned to app 0 with its thumbnail sub-list up
+    /// (`altTab.js:117-137`), so the app row you cannot use takes up most of the popup. We show
+    /// the window switcher over that app's windows instead — the same previews, the same footer
+    /// title, no app row — because every item in this session belongs to one app by construction,
+    /// and the row above them names it once and then just sits there. Recorded in
+    /// `docs/fork/alt-tab-port.md`.
     pub fn switch_group(&mut self, backward: bool) {
         if self.synoik.switcher.is_open() {
             let now = self.synoik.clock.now_unadjusted();
@@ -2494,20 +2504,30 @@ impl State {
             return;
         }
 
-        // `switch-group` spans workspaces like the app switcher it is — same popup, same setting.
+        // `switch-group` spans workspaces like the app switcher whose setting it reads — the same
+        // key `GroupCyclerPopup` reads for its own list (`altTab.js:557-570`).
         let only_here = self
             .synoik
             .gnome_settings
             .switchers
             .apps_current_workspace_only;
         let tab_list = self.synoik.switcher_tab_list(only_here);
+
+        // The focused app's windows, in tab-list order — `focus_app.get_windows()`.
+        let focused = self.synoik.layout.focus().map(|m| m.id());
         let items = app_items(self.synoik.app_system.running(), &tab_list);
-        if items.is_empty() {
+        let Some(item) =
+            focused.and_then(|id| items.into_iter().find(|item| item.windows.contains(&id)))
+        else {
+            return;
+        };
+        let windows = item.windows;
+        if windows.is_empty() {
             return;
         }
 
-        let art = self.synoik.switcher_app_art(&items);
-        self.raise_switcher(Items::Apps(items), art, backward, true);
+        let art = self.synoik.switcher_window_art(&windows);
+        self.raise_switcher(Items::Windows(windows), art, backward);
     }
 
     /// `cycle-windows` (`<Alt>Escape`) and `cycle-group` (`<Alt>F6`) — the listless switchers
@@ -2534,7 +2554,7 @@ impl State {
                 .key_press(SwitcherKey::Advance { backward }, now);
             self.finish_switcher(outcome);
             self.hide_osd_for_switcher();
-            self.synoik.sync_cycler_highlight();
+            self.synoik.sync_switcher_preview();
             self.synoik.queue_redraw_switcher_output();
             return;
         }
@@ -2568,13 +2588,8 @@ impl State {
             return;
         }
 
-        self.raise_switcher(
-            Items::Cycler { windows, group },
-            Vec::new(),
-            backward,
-            false,
-        );
-        self.synoik.sync_cycler_highlight();
+        self.raise_switcher(Items::Cycler { windows, group }, Vec::new(), backward);
+        self.synoik.sync_switcher_preview();
     }
 
     /// `switch-windows` — the *window* switcher (`altTab.js:580-640`).
@@ -2598,7 +2613,7 @@ impl State {
         }
 
         let art = self.synoik.switcher_window_art(&tab_list);
-        self.raise_switcher(Items::Windows(tab_list), art, backward, false);
+        self.raise_switcher(Items::Windows(tab_list), art, backward);
     }
 
     /// A key the open popup acts on — the arrows, Escape, and the explicit-commit keys.
@@ -2674,7 +2689,6 @@ impl State {
         items: Items,
         art: Vec<crate::ui::switcher::ui::ItemArt>,
         backward: bool,
-        group: bool,
     ) {
         let now = self.synoik.clock.now_unadjusted();
         let Some(output) = self.synoik.layout.active_output().cloned() else {
@@ -2700,22 +2714,20 @@ impl State {
                 output,
                 monitor,
                 label_height,
-                group,
             },
             now,
         );
-        self.finish_switcher(outcome.map(|outcome| {
-            // `show()` only returns an outcome for the release race, where the selection is the
-            // initial one.
-            (outcome, None)
-        }));
+        self.finish_switcher(outcome);
         self.synoik.queue_redraw_switcher_output();
     }
 
     /// Act on a finished switcher session: activate the selection, or leave focus alone.
     pub fn finish_switcher(
         &mut self,
-        outcome: Option<(crate::ui::switcher::SwitcherOutcome, Option<MappedId>)>,
+        outcome: Option<(
+            crate::ui::switcher::SwitcherOutcome,
+            crate::ui::switcher::ui::Activation,
+        )>,
     ) {
         // A timeout that fired inside `advance_animations` has been waiting for a caller that can
         // actually focus a window.
@@ -2723,25 +2735,53 @@ impl State {
         let Some((outcome, target)) = outcome else {
             return;
         };
-        self.synoik.queue_redraw_all();
-        self.synoik.sync_cycler_highlight();
 
-        if outcome != crate::ui::switcher::SwitcherOutcome::Commit {
-            return;
+        // Drained *before* the sync below, which would otherwise see a closed switcher, decide the
+        // session was abandoned and hand every previewed workspace back before the commit gets to
+        // say which one it is keeping.
+        let previews = std::mem::take(&mut self.synoik.switcher_ws_preview);
+
+        self.synoik.queue_redraw_all();
+        self.synoik.sync_switcher_preview();
+
+        let stack: Vec<Window> = target
+            .iter()
+            .filter_map(|&id| self.synoik.find_window_by_id(id))
+            .collect();
+        let committed = (outcome == crate::ui::switcher::SwitcherOutcome::Commit)
+            .then(|| stack.split_first())
+            .flatten();
+
+        // A commit keeps the workspace it landed on and gives back every other one it passed
+        // through; anything else — Escape, a click outside, the last item closing — gives all of
+        // them back. Reversed, so a monitor touched twice ends on its earliest origin.
+        let keep = committed.and_then(|(window, _)| self.synoik.layout.output_of_window(window));
+        for origin in previews.iter().rev() {
+            if Some(origin.output()) == keep.as_ref() {
+                self.synoik.layout.keep_workspace_preview(origin);
+            } else {
+                self.synoik.layout.undo_workspace_preview(origin);
+            }
         }
-        let Some(window) = target.and_then(|id| self.synoik.find_window_by_id(id)) else {
+
+        let Some((window, under)) = committed else {
             return;
         };
+
+        // `shell_app_activate_window` (`shell-app.c:413-425`) raises the app's *other* windows
+        // first and in reverse, so they come forward as a block without re-sorting among
+        // themselves, and only then activates the one that takes focus.
+        self.synoik.layout.raise_under(window, under);
 
         // Same ordering as `confirm_mru`: the keyboard focus still points at the popup we just
         // closed (it is only recomputed at the end of the loop), so force it before focusing or
         // cursor warping does not happen.
         self.update_keyboard_focus();
-        self.focus_window(&window);
+        self.focus_window(window);
         // The popup is gone, so nothing is raised any more. Done here rather than left to the
         // next frame because the commit *activates* the window, and a stale raise would keep a
         // second one on top of it in between.
-        self.synoik.sync_cycler_highlight();
+        self.synoik.sync_switcher_preview();
     }
 
     pub fn maybe_warp_cursor_to_focus(&mut self) -> bool {
@@ -7284,6 +7324,7 @@ impl Synoik {
             switcher_timer_at: None,
             pending_switcher_outcome: None,
             cycler_highlight: None,
+            switcher_ws_preview: Vec::new(),
             last_power_profile: "power-saver".to_string(),
             system_status_tx: None,
             backlight: crate::backlight::BacklightSnapshot::default(),
@@ -9438,10 +9479,11 @@ impl Synoik {
             self.reschedule_switcher_timer();
         }
 
-        // A cycler's whole UI is the window it is showing, so the raise and the border it wears
-        // are re-derived every frame: the selection moves under the keys, and the window itself
-        // can move or resize while the cycler is up.
-        self.sync_cycler_highlight();
+        // The preview raise and the cycler's border are re-derived every frame rather than pushed
+        // from each key: the selection moves under the keys, the popup reveals itself on a timer,
+        // and the windows themselves can move or resize while the switcher is up. One writer,
+        // driven by the frame, is what keeps every one of those in step.
+        self.sync_switcher_preview();
 
         self.exit_confirm_dialog.advance_animations();
         self.end_session_dialog.advance_animations();
@@ -14895,20 +14937,50 @@ impl Synoik {
             });
     }
 
-    /// Keep the layout's cycler raise and the highlight rect in step with the popup — see
-    /// [`SwitcherUi::render_cycler`](crate::ui::switcher::ui::SwitcherUi::render_cycler).
+    /// Keep the layout's preview raise and the cycler's highlight rect in step with the popup —
+    /// see [`SwitcherUi::preview_windows`](crate::ui::switcher::ui::SwitcherUi::preview_windows).
     ///
-    /// Always runs the clearing half, even with nothing open: that is what un-pins a window when
-    /// the cycler ends.
-    pub fn sync_cycler_highlight(&mut self) {
-        let target = self
+    /// Always runs the clearing half, even with nothing open: that is what un-pins the windows
+    /// when the session ends.
+    pub fn sync_switcher_preview(&mut self) {
+        let windows: Vec<Window> = self
+            .switcher
+            .preview_windows()
+            .into_iter()
+            .filter_map(|id| self.find_window_by_id(id))
+            .collect();
+        self.layout.set_preview_raised(&windows);
+
+        self.cycler_highlight = self
             .switcher
             .cycler_window()
             .and_then(|id| self.find_window_by_id(id))
-            .zip(self.switcher.output().cloned());
-        self.cycler_highlight = self
-            .layout
-            .set_cycler_raised(target.as_ref().map(|(id, output)| (id, output)));
+            .zip(self.switcher.output().cloned())
+            .and_then(|(id, output)| self.layout.window_render_rect(&id, &output));
+
+        let Some(target) = self
+            .switcher
+            .workspace_preview()
+            .and_then(|id| self.find_window_by_id(id))
+        else {
+            // No settled target — either nothing is open, or a session ended without going
+            // through `finish_switcher` (a modal or the lock screen took the grab). Either way
+            // the workspaces it borrowed are owed back.
+            for origin in std::mem::take(&mut self.switcher_ws_preview).iter().rev() {
+                self.layout.undo_workspace_preview(origin);
+            }
+            return;
+        };
+
+        if let Some(origin) = self.layout.preview_workspace_of(&target) {
+            if !self
+                .switcher_ws_preview
+                .iter()
+                .any(|seen| seen.output() == origin.output())
+            {
+                self.switcher_ws_preview.push(origin);
+            }
+        }
     }
 
     pub fn queue_redraw_switcher_output(&mut self) {

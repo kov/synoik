@@ -617,9 +617,19 @@ impl<W: LayoutElement> Workspace<W> {
         scrolling.chain(floating)
     }
 
-    /// See [`FloatingSpace::set_cycler_raised`].
-    pub fn set_cycler_raised(&mut self, id: Option<&W::Id>) {
-        self.floating.set_cycler_raised(id);
+    /// See [`FloatingSpace::raise_window_only`].
+    pub fn raise_window_only(&mut self, id: &W::Id) -> bool {
+        self.floating.raise_window_only(id)
+    }
+
+    /// See [`FloatingSpace::set_preview_raised`].
+    pub fn set_preview_raised(&mut self, ids: &[W::Id]) {
+        self.floating.set_preview_raised(ids);
+    }
+
+    /// See [`FloatingSpace::preview_raised`].
+    pub fn preview_raised(&self) -> &[W::Id] {
+        self.floating.preview_raised()
     }
 
     pub fn is_floating(&self, id: &W::Id) -> bool {

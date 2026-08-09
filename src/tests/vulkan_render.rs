@@ -12624,7 +12624,7 @@ fn vulkan_raises_the_cycled_window_above_the_ones_over_it() {
     // Cancel, and it drops back under the newer one — the raise is for the cycler's lifetime,
     // not a restacking.
     f.synoik().switcher.cancel();
-    f.synoik().sync_cycler_highlight();
+    f.synoik().sync_switcher_preview();
     let (after, w, _) = render_output_vulkan(&mut f, &output);
     let middle = px(&after, w, cx, cy);
     assert!(

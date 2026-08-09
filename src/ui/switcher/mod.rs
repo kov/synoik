@@ -55,6 +55,15 @@ pub const NO_MODS_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DISABLE_HOVER_TIMEOUT: Duration = Duration::from_millis(500);
 /// `POPUP_FADE_OUT_TIME` (`:11`).
 pub const FADE_OUT: Duration = Duration::from_millis(100);
+/// How long a selection must rest before the preview follows it onto another workspace.
+///
+/// Ours, not GNOME's: GNOME previews nothing. The raise half of the preview is instant because it
+/// costs a draw order, but the workspace half is a whole animated slide — and tabbing across four
+/// apps spread over three workspaces would otherwise start, interrupt and reverse a slide per
+/// keypress, which reads as the screen convulsing rather than as a preview. Same value and same
+/// job as [`POPUP_DELAY`]: long enough that passing through costs nothing, short enough that
+/// stopping shows you where you are going.
+pub const WORKSPACE_PREVIEW_DELAY: Duration = Duration::from_millis(150);
 /// `POPUP_SCROLL_TIME` (`:10`) — how long the list takes to scroll a newly selected
 /// item into view.
 pub const SCROLL_TIME: Duration = Duration::from_millis(100);

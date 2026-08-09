@@ -107,18 +107,29 @@ impl Items {
         }
     }
 
-    /// The window a commit on item `n` activates.
+    /// The windows a commit on item `n` brings forward, in [`Activation`] order.
     ///
-    /// For an app that is its most recently used window — `_finish` calls
-    /// `Main.activateWindow(this._items[i].cachedWindows[0])` when no specific window was picked
-    /// (`altTab.js:283-291`), and `cachedWindows` is in tab-list order.
-    fn window_at(&self, n: usize) -> Option<MappedId> {
+    /// An app item gives up **all** of its windows, because its commit is
+    /// `shell_app_activate_window` (`shell-app.c:381-442`) — the whole app comes forward, with the
+    /// most recently used window focused on top. `windows` is in tab-list order, which is already
+    /// topmost-first.
+    fn activation_at(&self, n: usize) -> Activation {
         match self {
-            Items::Apps(items) => items.get(n)?.windows.first().copied(),
-            Items::Windows(ids) | Items::Cycler { windows: ids, .. } => ids.get(n).copied(),
+            Items::Apps(items) => items.get(n).map_or_else(Vec::new, |a| a.windows.clone()),
+            Items::Windows(ids) | Items::Cycler { windows: ids, .. } => {
+                ids.get(n).copied().into_iter().collect()
+            }
         }
     }
 }
+
+/// The windows an activation brings forward, **topmost first**: `[0]` takes focus, and the rest
+/// are raised underneath it in that order.
+///
+/// Longer than one element only for the app switcher's own commit. Every other path activates a
+/// lone window: `Main.activateWindow` is what a picked thumbnail (`altTab.js:285`), the window
+/// switcher (`:632`) and a cycler (`:525`) all end in.
+pub type Activation = Vec<MappedId>;
 
 /// Everything one item needs on screen, resolved once when the popup opens.
 #[derive(Debug, Clone)]
@@ -157,10 +168,6 @@ pub struct OpenRequest {
     /// The **primary** monitor's logical rect — GNOME centers on it, not on the focused output.
     pub monitor: Rectangle<f64, Logical>,
     pub label_height: f64,
-    /// `switch-group`: pin the app row to item 0 — the app you are already in — and open its
-    /// window sub-list straight away (`_initialSelection`, `altTab.js:117-137`). The item list is
-    /// still every running app, so you can tab out of the group; only the starting point differs.
-    pub group: bool,
 }
 
 struct Open {
@@ -177,6 +184,14 @@ struct Open {
     thumbs: Option<Thumbs>,
     /// When a resting selection pops its own sub-list (`_thumbnailTimeoutId`, `:349-356`).
     thumb_deadline: Option<Duration>,
+    /// The focus target the workspace preview has settled on — what the screen is showing.
+    ws_preview: Option<MappedId>,
+    /// The focus target the selection wants, which is a different answer from `ws_preview` for as
+    /// long as the dwell runs. Keeping both is the dwell: see [`WORKSPACE_PREVIEW_DELAY`].
+    ws_wanted: Option<MappedId>,
+    /// When `ws_wanted` takes over. Re-armed from scratch whenever the selection moves again, so
+    /// holding Tab down never settles anywhere — a dwell, not a rate limit.
+    ws_deadline: Option<Duration>,
 }
 
 /// The app switcher's open window sub-list — see [`thumbnails`].
@@ -219,6 +234,65 @@ impl Open {
             Items::Apps(_) | Items::Cycler { .. } => 0.,
             Items::Windows(_) => self.label_height,
         }
+    }
+
+    /// What committing *right now* would bring forward — the answer both the commit and the
+    /// preview need, so neither can drift from the other.
+    fn activation(&self) -> Activation {
+        // `_finish` (`altTab.js:282-285`): a picked thumbnail goes through `Main.activateWindow`,
+        // which is one window and no group raise. Only the app row's own commit is
+        // `app.activate_window`, and only that brings the rest of the app with it.
+        if let Some(picked) = self
+            .thumbs
+            .as_ref()
+            .and_then(|t| Some(*t.windows.get(t.selected?)?))
+        {
+            return vec![picked];
+        }
+        self.items.activation_at(self.state.selected())
+    }
+
+    /// Re-arm the workspace-preview dwell when the selection has moved off what it settled on.
+    ///
+    /// Called after *every* mutation rather than from each of the handful of places a selection
+    /// can move — the app row, the sub-list, hover, a removed item — because a path that forgot to
+    /// call it would leave the preview pointing at a window that is no longer selected, which is
+    /// exactly the failure the dwell exists to avoid.
+    fn note_ws_preview(&mut self, now: Duration) {
+        let want = self.preview_focus();
+        if want != self.ws_wanted {
+            self.ws_wanted = want;
+            // Moving *back* onto what is already showing cancels the pending switch outright
+            // rather than counting down to a no-op.
+            self.ws_deadline =
+                (want != self.ws_preview).then(|| now + super::WORKSPACE_PREVIEW_DELAY);
+        }
+
+        if self.ws_deadline.is_some_and(|at| now >= at) {
+            self.ws_deadline = None;
+            self.ws_preview = self.ws_wanted;
+        }
+    }
+
+    /// The window a commit would focus — the head of the activation, and the window whose
+    /// workspace the preview follows.
+    fn preview_focus(&self) -> Option<MappedId> {
+        self.preview_windows().first().copied()
+    }
+
+    /// What this popup is showing you it would raise, or nothing while it is still invisible.
+    ///
+    /// The delay is what makes a quick tap switch with no UI at all (see [`Visibility`]), so it
+    /// has to gate the preview too — a tap that slid the screen around on its way through would
+    /// be louder than the popup it was avoiding. A cycler is exempt: raising the window *is* its
+    /// entire UI, and it starts from `_initialSelection` inside `show()`.
+    fn preview_windows(&self) -> Activation {
+        if self.state.visibility() == Visibility::Pending
+            && !matches!(self.items, Items::Cycler { .. })
+        {
+            return Activation::new();
+        }
+        self.activation()
     }
 
     /// The selected app's windows, or empty for a window switcher (which has no sub-list).
@@ -525,6 +599,30 @@ impl SwitcherUi {
         self.open.as_ref().map(|o| &o.output)
     }
 
+    /// What the open switcher is showing you it would raise, in [`Activation`] order — the
+    /// same list its commit would act on, so the preview cannot promise something the commit will
+    /// not do.
+    ///
+    /// DIVERGENCE: GNOME previews nothing outside the cycler. Empty while the popup is still
+    /// inside its [`POPUP_DELAY`](super::POPUP_DELAY), because the tap that never shows a popup
+    /// must not disturb the screen on its way through either — the cycler is exempt, since
+    /// raising the window *is* its whole UI and it starts doing so from `_initialSelection`.
+    pub fn preview_windows(&self) -> Activation {
+        self.open
+            .as_ref()
+            .map_or_else(Activation::new, Open::preview_windows)
+    }
+
+    /// The window whose workspace the preview has settled on, once it has rested there for
+    /// [`WORKSPACE_PREVIEW_DELAY`](super::WORKSPACE_PREVIEW_DELAY).
+    ///
+    /// DIVERGENCE, and the only part of a preview that touches state the user can see afterwards:
+    /// the compositor takes that window's monitor to its workspace, remembers where it was, and
+    /// puts it back if the session is abandoned.
+    pub fn workspace_preview(&self) -> Option<MappedId> {
+        self.open.as_ref()?.ws_preview
+    }
+
     /// The window a running cycler is showing — `CyclerHighlight.window` (`altTab.js:433-457`).
     ///
     /// `None` for every other popup and when nothing is up, which is also the signal to drop the
@@ -590,8 +688,15 @@ impl SwitcherUi {
     /// Open a switcher, or return the outcome if it finished immediately.
     ///
     /// An immediate finish is not an error: it is the modifier-already-released race
-    /// (`switcherPopup.js:144-155`), and the caller must still activate the selection.
-    pub fn open(&mut self, req: OpenRequest, now: Duration) -> Option<SwitcherOutcome> {
+    /// (`switcherPopup.js:144-155`), and the caller must still activate the selection — which is
+    /// why this returns the same `(outcome, activation)` pair every other entry point does. It
+    /// used to return the outcome alone, and the tap that lost its race quietly switched to
+    /// nothing.
+    pub fn open(
+        &mut self,
+        req: OpenRequest,
+        now: Duration,
+    ) -> Option<(SwitcherOutcome, Activation)> {
         debug_assert!(
             matches!(req.items, Items::Cycler { .. }) || req.items.len() == req.art.len()
         );
@@ -605,7 +710,6 @@ impl SwitcherUi {
             output,
             monitor,
             label_height,
-            group,
         } = req;
 
         let state = SwitcherPopup::show(items.kind(), items.len(), backward, mask, held, now)?;
@@ -623,7 +727,6 @@ impl SwitcherUi {
             // Nothing is drawn in a panel, so there is no icon to size.
             Items::Cycler { .. } => 0.,
         };
-        let outcome = state.outcome();
         let mut open = Open {
             state,
             items,
@@ -636,6 +739,9 @@ impl SwitcherUi {
             label_height,
             thumbs: None,
             thumb_deadline: None,
+            ws_preview: None,
+            ws_wanted: None,
+            ws_deadline: None,
         };
         // A cycler draws no panel, and must not measure one either: an empty `PanelLayout` is
         // also what keeps the pointer from hit-testing item rects that are not on screen.
@@ -650,35 +756,16 @@ impl SwitcherUi {
         // on a multi-window app is already counting down to its sub-list (`altTab.js:349-356`).
         open.close_thumbs(now, true);
         self.fading = None;
-
-        // ...except for `switch-group`, which starts *inside* app 0's windows: forward on its
-        // second window (the one you are not in), backward on its last (`altTab.js:118-127`).
-        if group {
-            open.state.select(0);
-            let windows = open.selected_windows().len();
-            if windows > 0 {
-                let window = if backward {
-                    windows - 1
-                } else if windows > 1 {
-                    1
-                } else {
-                    0
-                };
-                let fade = self.fade(0., 1.);
-                open.select_thumb(window, true, fade);
-            }
-        }
         self.open = Some(open);
 
-        if outcome.is_some() {
-            // Nothing was ever drawn, so there is no fade to wait out.
-            self.open = None;
-        }
-        outcome
+        // Read through the popup rather than from `state.outcome()` directly, so a race lost at
+        // open still commits to the window the popup would have started on. `take_outcome` clears
+        // `self.open` itself; nothing was ever drawn, so there is no fade to wait out.
+        self.take_outcome()
     }
 
     /// Drive the timers. Returns an outcome the moment the session ends.
-    pub fn advance(&mut self, now: Duration) -> Option<(SwitcherOutcome, Option<MappedId>)> {
+    pub fn advance(&mut self, now: Duration) -> Option<(SwitcherOutcome, Activation)> {
         // Retire a list that has finished fading away. Before the early return below, so a fade
         // that outlives its popup still ends.
         if self.fading.as_ref().is_some_and(|t| t.fade.is_done()) {
@@ -697,6 +784,12 @@ impl SwitcherUi {
             open.thumb_deadline = None;
             open.open_thumbs(None, false, fade_in);
         }
+
+        // The workspace preview is driven from here alone, rather than pushed from each of the
+        // half-dozen places a selection can move: this runs every frame with a real `now`, and a
+        // path that forgot to re-arm the dwell would leave the screen on a workspace the
+        // selection has already left.
+        open.note_ws_preview(now);
 
         self.note_shown(was);
         self.take_outcome()
@@ -725,17 +818,21 @@ impl SwitcherUi {
     /// When [`advance`](Self::advance) next has something to do.
     pub fn next_deadline(&self) -> Option<Duration> {
         let open = self.open.as_ref()?;
-        [open.state.next_deadline(), open.thumb_deadline]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            open.state.next_deadline(),
+            open.thumb_deadline,
+            open.ws_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub fn key_press(
         &mut self,
         key: SwitcherKey,
         now: Duration,
-    ) -> Option<(SwitcherOutcome, Option<MappedId>)> {
+    ) -> Option<(SwitcherOutcome, Activation)> {
         let fade_in = self.fade(0., 1.);
         let mut going = None;
         let open = self.open.as_mut()?;
@@ -759,6 +856,16 @@ impl SwitcherUi {
             self.note_shown(was);
             return self.take_outcome();
         }
+
+        // `switch-group` is our window switcher over one app (see `State::switch_group`), so on a
+        // window list its own binding just walks the list — there is no sub-list to descend into
+        // and nothing else it could sensibly mean.
+        let key = match key {
+            SwitcherKey::Group { backward } if matches!(open.items, Items::Windows(_)) => {
+                SwitcherKey::Advance { backward }
+            }
+            key => key,
+        };
 
         // `AppSwitcherPopup._keyPressHandler` (`altTab.js:190-208`) takes the arrows before the
         // base does, and what they mean depends on where the focus is: with the sub-list focused
@@ -825,7 +932,7 @@ impl SwitcherUi {
         &mut self,
         held: Modifiers,
         now: Duration,
-    ) -> Option<(SwitcherOutcome, Option<MappedId>)> {
+    ) -> Option<(SwitcherOutcome, Activation)> {
         let open = self.open.as_mut()?;
         open.state.key_release(held, now);
         self.take_outcome()
@@ -869,7 +976,7 @@ impl SwitcherUi {
     pub fn pointer_click(
         &mut self,
         pos: Point<f64, Logical>,
-    ) -> Option<(SwitcherOutcome, Option<MappedId>)> {
+    ) -> Option<(SwitcherOutcome, Activation)> {
         let open = self.open.as_mut()?;
 
         // `_windowActivated` (`:255-259`): a click in the sub-list activates *that* window and
@@ -900,7 +1007,7 @@ impl SwitcherUi {
     }
 
     /// A window went away while the popup is up (`_itemRemoved`, `switcherPopup.js:269-284`).
-    pub fn window_removed(&mut self, id: MappedId) -> Option<(SwitcherOutcome, Option<MappedId>)> {
+    pub fn window_removed(&mut self, id: MappedId) -> Option<(SwitcherOutcome, Activation)> {
         let open = self.open.as_mut()?;
 
         let index = match &mut open.items {
@@ -946,19 +1053,12 @@ impl SwitcherUi {
         self.open = None;
     }
 
-    fn take_outcome(&mut self) -> Option<(SwitcherOutcome, Option<MappedId>)> {
+    fn take_outcome(&mut self) -> Option<(SwitcherOutcome, Activation)> {
         let open = self.open.as_ref()?;
         let outcome = open.state.outcome()?;
         let target = match outcome {
-            // `_finish` (`altTab.js:284-292`): a picked window wins, and with nothing picked the
-            // app's first window does — which is why a sub-list that merely *popped up* still
-            // activates what the app row promised.
-            SwitcherOutcome::Commit => open
-                .thumbs
-                .as_ref()
-                .and_then(|t| Some(*t.windows.get(t.selected?)?))
-                .or_else(|| open.items.window_at(open.state.selected())),
-            SwitcherOutcome::Cancel => None,
+            SwitcherOutcome::Commit => open.activation(),
+            SwitcherOutcome::Cancel => Activation::new(),
         };
         self.open = None;
         Some((outcome, target))

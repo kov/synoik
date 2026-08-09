@@ -55,15 +55,17 @@ pub struct FloatingSpace<W: LayoutElement> {
     /// This is always set to `Some()` when `tiles` isn't empty.
     active_window_id: Option<W::Id>,
 
-    /// The window a running window cycler is showing, drawn above every other tile without
-    /// touching the stacking order — `CyclerHighlight` (`altTab.js:410-472`) does the same thing
-    /// by cloning the window into `window_group` and raising the clone, so Escape leaves the
-    /// stack exactly as it found it.
+    /// What an open switcher is showing you it would raise, **topmost first** — drawn above every
+    /// other tile without touching the stacking order, so abandoning the switcher leaves the stack
+    /// exactly as it found it.
     ///
-    /// A clone is what GNOME needs and we do not: we own the render loop, so drawing the tile
-    /// out of order is both cheaper and free of the double-composite a clone over a still-visible
-    /// original would give a translucent window.
-    cycler_raised: Option<W::Id>,
+    /// DIVERGENCE: GNOME previews nothing. Its cycler is the closest thing — `CyclerHighlight`
+    /// (`altTab.js:410-472`) clones the selected window into `window_group` and raises the clone —
+    /// and we generalize that to every switcher and to a whole app's worth of windows, so what you
+    /// see while tabbing is what committing would give you. A clone is what GNOME needs and we do
+    /// not: we own the render loop, so drawing the tiles out of order is both cheaper and free of
+    /// the double-composite a clone over a still-visible original would give a translucent window.
+    preview_raised: Vec<W::Id>,
 
     /// Ongoing interactive resize.
     interactive_resize: Option<InteractiveResize<W>>,
@@ -286,7 +288,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             tiles: Vec::new(),
             data: Vec::new(),
             active_window_id: None,
-            cycler_raised: None,
+            preview_raised: Vec::new(),
             interactive_resize: None,
             closing_windows: Vec::new(),
             view_size,
@@ -712,10 +714,32 @@ impl<W: LayoutElement> FloatingSpace<W> {
         true
     }
 
-    /// Show `id` above every other tile for as long as a cycler is up. See
-    /// [`cycler_raised`](Self::cycler_raised).
-    pub fn set_cycler_raised(&mut self, id: Option<&W::Id>) {
-        self.cycler_raised = id.cloned();
+    /// Bring `id` to the top of the stack without changing which window is active —
+    /// `meta_window_raise_and_make_recent_on_workspace`, the call
+    /// `shell_app_activate_window` makes for every window of the app *except* the one it focuses
+    /// (`shell-app.c:416-425`).
+    pub fn raise_window_only(&mut self, id: &W::Id) -> bool {
+        let Some(idx) = self.idx_of(id) else {
+            return false;
+        };
+
+        self.raise_window(idx, 0);
+        // A raise takes the window's transients with it, as `meta_window_raise` does — leaving a
+        // dialog behind its own parent is the one stacking mistake a raise must never make.
+        self.bring_up_descendants_of(0);
+        true
+    }
+
+    /// What is being drawn above the stack right now, topmost first.
+    pub fn preview_raised(&self) -> &[W::Id] {
+        &self.preview_raised
+    }
+
+    /// Show `ids` above every other tile, topmost first, for as long as a switcher is up. See
+    /// [`preview_raised`](Self::preview_raised).
+    pub fn set_preview_raised(&mut self, ids: &[W::Id]) {
+        let mine: Vec<W::Id> = ids.iter().filter(|id| self.contains(id)).cloned().collect();
+        self.preview_raised = mine;
     }
 
     fn raise_window(&mut self, from_idx: usize, to_idx: usize) {
@@ -1463,9 +1487,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
 
         let active = self.active_window_id.clone();
-        let raised = self.cycler_raised.clone();
-        // `push` is front-to-back, so the cycler's window goes out *first* to land on top, and
-        // is then skipped in its own place below.
+        let raised = self.preview_raised.clone();
+        // `push` is front-to-back, so the previewed windows go out *first* to land on top, in
+        // their own order, and are then skipped in their places below.
         let mut draw = |tile: &Tile<W>, tile_pos, ctx: &mut RenderCtx| {
             let focus_ring = focus_ring && Some(tile.window().id()) == active.as_ref();
             let xray_pos = xray_pos.offset(tile_pos);
@@ -1474,7 +1498,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             });
         };
 
-        if let Some(id) = &raised {
+        for id in &raised {
             if let Some((tile, tile_pos)) = self
                 .tiles_with_render_positions()
                 .find(|(tile, _)| tile.window().id() == id)
@@ -1484,7 +1508,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
 
         for (tile, tile_pos) in self.tiles_with_render_positions() {
-            if Some(tile.window().id()) == raised.as_ref() {
+            if raised.iter().any(|id| id == tile.window().id()) {
                 continue;
             }
             draw(tile, tile_pos, &mut ctx);

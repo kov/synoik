@@ -18853,32 +18853,28 @@ fn the_window_sublist_closes_on_up_and_on_moving_to_another_app() {
     f.key_release(KEY_LEFTMETA);
 }
 
-/// `switch-group` opens the app switcher *inside* the current app, on its window sub-list.
+/// DIVERGENCE: `switch-group` is the *window* switcher over one app, not the app switcher
+/// pinned inside it.
 ///
-/// It is the same popup and the same item list as `switch-applications` — you can still tab out
-/// to another app — but it starts at (app 0, window 1): app 0 is the app you are in, and window 1
-/// is the one you are not, so a tap-and-release swaps between an app's two windows the way
-/// tap-and-release swaps between two apps (`_initialSelection`, `altTab.js:117-137`).
+/// GNOME opens `AppSwitcherPopup` on (app 0, window 1) with the thumbnail sub-list already up
+/// (`_initialSelection`, `altTab.js:117-137`), which spends the top of the popup on an app row
+/// you cannot usefully move in. Every item in this session belongs to one app by construction, so
+/// we show that app's windows directly: same previews, same footer title, no row.
+///
+/// The two are told apart here by their *arrangement*, not by an internal flag — a window
+/// switcher has one panel-wide title band and no sub-list, an app switcher has neither.
 ///
 /// Driven through the real `Above_Tab` key, which is a **keycode** match: mutter special-cases its
 /// fake keysym to `KEY_GRAVE + 8` before consulting any layout
 /// (`src/core/keybindings.c:385-392`), so the binding is the physical key above Tab whatever it
 /// happens to type.
 #[test]
-fn switch_group_opens_inside_the_current_app_on_its_second_window() {
-    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
-
+fn switch_group_walks_the_current_apps_windows_as_a_window_switcher() {
     const KEY_GRAVE: u32 = 41;
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    f.synoik().app_system = AppSystem::with_parts(
-        Box::new(FakeCatalog::new(vec![
-            AppEntry::fake("org.example.One.desktop", "One"),
-            AppEntry::fake("org.example.Two.desktop", "Two"),
-        ])),
-        Box::new(crate::app_system::RecordingLauncher::default()),
-    );
+    switcher_apps(&mut f);
 
     let client = f.add_client();
     // "One" gets three windows so forward's "second" and backward's "last" are distinguishable.
@@ -18901,30 +18897,29 @@ fn switch_group_opens_inside_the_current_app_on_its_second_window() {
         "Above_Tab raises the switcher"
     );
     assert_eq!(
-        f.synoik().switcher.selected(),
-        Some(0),
-        "pinned to the app you are already in, not the previous one"
+        f.synoik().switcher.item_count(),
+        Some(3),
+        "over the focused app's windows alone — \"Two\" is not in the list"
     );
     assert!(
-        f.synoik().switcher.thumbnails_open(),
-        "with its windows already up — no waiting for the popup timer"
+        f.synoik().switcher.footer_rect().is_some(),
+        "laid out as window previews, with the title in the panel-wide footer band"
+    );
+    assert!(
+        !f.synoik().switcher.thumbnails_open(),
+        "there is no app row to descend out of, so there is no sub-list"
     );
     assert_eq!(
-        f.synoik().switcher.thumbnail_selected(),
+        f.synoik().switcher.selected(),
         Some(1),
         "starting on the app's *second* window — the one you are not in"
     );
 
-    // A second press walks that app's windows rather than moving to the next app.
+    // A second press walks the same list; there is nothing else it could mean.
     tap(&mut f, KEY_GRAVE);
-    assert_eq!(
-        f.synoik().switcher.selected(),
-        Some(0),
-        "still the same app"
-    );
-    assert_eq!(f.synoik().switcher.thumbnail_selected(), Some(2));
+    assert_eq!(f.synoik().switcher.selected(), Some(2));
 
-    // And releasing commits to the window the sub-list had picked.
+    // And releasing commits to the window it had picked.
     f.key_release(KEY_LEFTMETA);
     f.synoik_complete_animations();
     f.double_roundtrip(client);
@@ -18932,13 +18927,17 @@ fn switch_group_opens_inside_the_current_app_on_its_second_window() {
     assert_eq!(focused, a, "committed to the picked window");
     assert_ne!(focused, b);
     assert_ne!(focused, c);
+    assert_eq!(
+        stack_order(&mut f).first().copied(),
+        Some(a),
+        "...and only that one came forward: a window switcher is not a group raise"
+    );
 
-    // Backward starts at the *end* of the app's windows instead (`cachedWindows.length - 1`).
+    // Backward starts at the *end* of the app's windows instead.
     f.key_press(KEY_LEFTSHIFT);
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_GRAVE);
-    assert_eq!(f.synoik().switcher.selected(), Some(0));
-    assert_eq!(f.synoik().switcher.thumbnail_selected(), Some(2));
+    assert_eq!(f.synoik().switcher.selected(), Some(2));
     f.key_release(KEY_LEFTMETA);
     f.key_release(KEY_LEFTSHIFT);
 }
@@ -19645,6 +19644,258 @@ fn alt_tab_stays_on_this_workspace_and_super_tab_does_not() {
         "stock Alt-Tab shows only this workspace's window"
     );
     assert_eq!(super_tab_items, Some(2), "stock Super-Tab spans workspaces");
+}
+
+/// Two apps with a fake catalog, the shape most switcher tests want.
+fn switcher_apps(f: &mut Fixture) {
+    use crate::app_system::{AppEntry, AppSystem, FakeCatalog};
+
+    f.synoik().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(vec![
+            AppEntry::fake("org.example.One.desktop", "One"),
+            AppEntry::fake("org.example.Two.desktop", "Two"),
+        ])),
+        Box::new(crate::app_system::RecordingLauncher::default()),
+    );
+}
+
+/// Let the clock run without ending the session, so a timer inside the popup can fire.
+fn switcher_rest(f: &mut Fixture, by: Duration) {
+    let mut clock = f.synoik().clock.clone();
+    let now = clock.now_unadjusted();
+    clock.set_unadjusted(now + by);
+    f.synoik().advance_animations();
+}
+
+/// The active workspace's floating stack, topmost first.
+fn stack_order(f: &mut Fixture) -> Vec<crate::window::mapped::MappedId> {
+    f.synoik()
+        .layout
+        .active_workspace()
+        .unwrap()
+        .windows()
+        .map(|w| w.id())
+        .collect()
+}
+
+/// Committing on an app brings **all** of its windows forward, not just the one that takes focus.
+///
+/// `shell_app_activate_window` (`shell-app.c:413-425`) raises every window of the app on the
+/// target's workspace before activating the target, so switching to a two-window editor does not
+/// leave its second window buried under the app you just left. Ours only ever raised the one
+/// window, which looks right in the common one-window case and is why it went unnoticed.
+///
+/// The reverse-order raise is half the contract and is asserted here too: the group arrives with
+/// its own relative stacking intact rather than re-sorted, so `a` stays under `b`.
+#[test]
+fn super_tab_brings_the_whole_app_forward_not_just_its_focused_window() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    switcher_apps(&mut f);
+
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.One");
+    let a = f.synoik().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.One");
+    let b = f.synoik().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.Two");
+    let c = f.synoik().layout.focus().unwrap().id();
+    f.synoik_complete_animations();
+
+    assert_eq!(
+        stack_order(&mut f),
+        vec![c, b, a],
+        "sanity: \"Two\" is on top, with \"One\"'s two windows buried under it"
+    );
+
+    // Super-Tab opens on item 1 — "One", the app we are not in — and releasing commits to it.
+    f.key_press(KEY_LEFTMETA);
+    f.synoik_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+    f.key_release(KEY_LEFTMETA);
+    f.synoik_complete_animations();
+    f.double_roundtrip(client);
+
+    assert_eq!(
+        f.synoik().layout.focus().unwrap().id(),
+        b,
+        "focus goes to the app's most recently used window"
+    );
+    assert_eq!(
+        stack_order(&mut f),
+        vec![b, a, c],
+        "and its other window comes with it, above the app we left"
+    );
+}
+
+/// DIVERGENCE: while a switcher is up, the windows it would raise are drawn on top — and put back
+/// untouched when you abandon it.
+///
+/// GNOME previews nothing outside the cycler. The preview is deliberately *draw order only*: it
+/// must never restack, so Escape is free. This asserts both halves, because a preview implemented
+/// by really raising would pass the first one and silently destroy the second.
+#[test]
+fn a_switcher_shows_what_it_would_raise_and_puts_it_back_on_escape() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    switcher_apps(&mut f);
+
+    let client = f.add_client();
+    map_window_for_app(&mut f, client, "org.example.One");
+    let a = f.synoik().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.One");
+    let b = f.synoik().layout.focus().unwrap().id();
+    map_window_for_app(&mut f, client, "org.example.Two");
+    let c = f.synoik().layout.focus().unwrap().id();
+    f.synoik_complete_animations();
+
+    // `preview_raised` speaks the layout's window handles, so translate back to the ids the rest
+    // of the test names windows by.
+    let previewed = |f: &mut Fixture| {
+        let raised: Vec<_> = f
+            .synoik()
+            .layout
+            .active_workspace()
+            .unwrap()
+            .preview_raised()
+            .to_vec();
+        raised
+            .iter()
+            .filter_map(|w| {
+                f.synoik()
+                    .layout
+                    .windows()
+                    .find(|(_, m)| crate::layout::LayoutElement::id(*m) == w)
+                    .map(|(_, m)| m.id())
+            })
+            .collect::<Vec<_>>()
+    };
+
+    f.key_press(KEY_LEFTMETA);
+    f.synoik_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+
+    assert!(
+        previewed(&mut f).is_empty(),
+        "nothing is previewed while the popup is still inside its open delay — a tap that shows \
+         no UI must not shuffle the screen either"
+    );
+
+    switcher_rest(&mut f, crate::ui::switcher::POPUP_DELAY * 2);
+    assert_eq!(
+        previewed(&mut f),
+        vec![b, a],
+        "once it is on screen, the whole app it would commit to is drawn on top, in the order \
+         the commit would leave it"
+    );
+    assert_eq!(
+        stack_order(&mut f),
+        vec![c, b, a],
+        "but the real stack has not moved: the preview is draw order, not a raise"
+    );
+
+    // Escape abandons it.
+    tap(&mut f, KEY_ESC);
+    f.key_release(KEY_LEFTMETA);
+    f.synoik_complete_animations();
+    f.double_roundtrip(client);
+
+    assert!(previewed(&mut f).is_empty(), "the preview is dropped");
+    assert_eq!(
+        stack_order(&mut f),
+        vec![c, b, a],
+        "and nothing about the stack changed"
+    );
+    assert_eq!(
+        f.synoik().layout.focus().unwrap().id(),
+        c,
+        "nor about focus"
+    );
+}
+
+/// DIVERGENCE: a selection whose window lives on another workspace takes you there while you
+/// hold the switcher, and brings you back if you let it go.
+///
+/// The trip is on a dwell, so tabbing *through* an app that lives elsewhere costs nothing. Both
+/// the going and the coming back are asserted: a preview that switched workspaces without
+/// recording where it came from would pass the first half and strand you on the second.
+#[test]
+fn the_switcher_previews_another_workspace_and_gives_it_back() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    switcher_apps(&mut f);
+
+    let client = f.add_client();
+
+    // "Two" lives one workspace down. Mapped *first*, because the app switcher's item order is
+    // pure MRU by focus timestamp and switching workspaces does not re-stamp the window it lands
+    // on — mapping "One" last is what makes it unambiguously the app we are in.
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    map_window_for_app(&mut f, client, "org.example.Two");
+    let there = f.synoik().layout.focus().unwrap().id();
+
+    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    map_window_for_app(&mut f, client, "org.example.One");
+    let here = f.synoik().layout.focus().unwrap().id();
+    f.synoik_complete_animations();
+
+    let ws = |f: &mut Fixture| {
+        f.synoik()
+            .layout
+            .active_monitor_ref()
+            .unwrap()
+            .active_workspace_idx()
+    };
+    assert_eq!(ws(&mut f), 0, "sanity: we start where \"One\" is");
+
+    // Leg 1: open on "Two" and pass straight through — too quick to have gone anywhere.
+    f.key_press(KEY_LEFTMETA);
+    f.synoik_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+    switcher_rest(&mut f, crate::ui::switcher::POPUP_DELAY);
+    assert_eq!(
+        ws(&mut f),
+        0,
+        "the dwell has not elapsed, so nothing has moved yet"
+    );
+
+    // Rest on it, and the screen follows the selection.
+    switcher_rest(&mut f, crate::ui::switcher::WORKSPACE_PREVIEW_DELAY * 2);
+    f.synoik_complete_animations();
+    assert_eq!(
+        ws(&mut f),
+        1,
+        "resting on a window that lives elsewhere shows you where it lives"
+    );
+
+    // Escape: we are owed the workspace we started on.
+    tap(&mut f, KEY_ESC);
+    f.key_release(KEY_LEFTMETA);
+    f.synoik_complete_animations();
+    f.double_roundtrip(client);
+    assert_eq!(ws(&mut f), 0, "abandoning it brings us back");
+    assert_eq!(
+        f.synoik().layout.focus().unwrap().id(),
+        here,
+        "with the focus we had"
+    );
+
+    // Leg 2: the same trip, committed this time — we stay.
+    f.key_press(KEY_LEFTMETA);
+    f.synoik_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+    switcher_rest(&mut f, crate::ui::switcher::WORKSPACE_PREVIEW_DELAY * 2);
+    f.key_release(KEY_LEFTMETA);
+    f.synoik_complete_animations();
+    f.double_roundtrip(client);
+
+    assert_eq!(ws(&mut f), 1, "committing keeps the workspace we went to");
+    assert_eq!(
+        f.synoik().layout.focus().unwrap().id(),
+        there,
+        "and focuses the window we picked"
+    );
 }
 
 /// A polkit request goes from polkitd to a prompt, takes a real password off the keyboard, and its
