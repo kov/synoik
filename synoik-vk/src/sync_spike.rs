@@ -222,18 +222,49 @@ impl SyncSpikeReport {
 
 // ---- entry point -----------------------------------------------------------------------------
 
-pub fn run_sync_spike(gpu: &Gpu) -> Result<SyncSpikeReport> {
+/// The render node the syncobj ioctls go to. Every one of them is `DRM_RENDER_ALLOW`, so no
+/// DRM master is needed — but the node itself must exist.
+const DRM_RENDER_NODE: &str = "/dev/dri/renderD128";
+
+/// Why this machine cannot answer the question the spike asks, or `None` if it can.
+///
+/// Both halves are preconditions, not results: without the `SYNC_FD` extensions there is no
+/// bridge to export across, and without the render node there is nothing to bridge *into*.
+/// They are kept together because they are not the same condition and CI proved it — the
+/// ubuntu runner's lavapipe (LLVM 20.1) lacks the extensions, while fedora's (LLVM 22.1)
+/// exposes them and then has no render node. A check for either alone still failed half the
+/// jobs, which is exactly what happened.
+pub fn sync_spike_unavailable(gpu: &Gpu) -> Option<String> {
     if !gpu.supports("VK_KHR_external_semaphore_fd") || !gpu.supports("VK_KHR_external_fence_fd") {
-        return Err(anyhow!(
-            "device does not expose SYNC_FD external semaphore/fence extensions — cannot bridge sync"
+        return Some(
+            "device exposes no SYNC_FD external semaphore/fence extensions, so there is no \
+             bridge to measure"
+                .to_owned(),
+        );
+    }
+    if let Err(e) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(DRM_RENDER_NODE)
+    {
+        return Some(format!(
+            "no usable DRM render node at {DRM_RENDER_NODE} ({e}), so there is nothing to \
+             bridge into"
         ));
+    }
+    None
+}
+
+pub fn run_sync_spike(gpu: &Gpu) -> Result<SyncSpikeReport> {
+    if let Some(reason) = sync_spike_unavailable(gpu) {
+        return Err(anyhow!("cannot run the sync spike: {reason}"));
     }
 
     let drm = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open("/dev/dri/renderD128")
-        .context("open /dev/dri/renderD128")?;
+        .open(DRM_RENDER_NODE)
+        .context("open the DRM render node")?;
     let drm = drm.as_fd();
 
     let ext_sem = ash::khr::external_semaphore_fd::Device::new(&gpu.instance, &gpu.device);
@@ -941,17 +972,12 @@ mod tests {
         let gpu = Gpu::new()?;
 
         // The probe asks whether host-GPU completion propagates through a fence-exported
-        // sync_file into a kernel syncobj. A device without the SYNC_FD extensions cannot
-        // answer that question either way, so there is nothing here to pass or fail —
-        // lavapipe on a CI runner is exactly that case, and it was failing the job on a
-        // capability the runner never claimed to have. Skip like the render-node tests do.
-        if !gpu.supports("VK_KHR_external_semaphore_fd")
-            || !gpu.supports("VK_KHR_external_fence_fd")
-        {
-            eprintln!(
-                "skipping explicit_sync_bridge: device exposes no SYNC_FD external \
-                 semaphore/fence extensions, so there is no bridge to measure"
-            );
+        // sync_file into a kernel syncobj. A machine that cannot carry that question at all
+        // has nothing here to pass or fail — a CI runner is exactly that case, and the job
+        // was failing on capabilities the runner never claimed to have. Skip like the
+        // render-node tests do; where the pieces exist this still runs in full.
+        if let Some(reason) = sync_spike_unavailable(&gpu) {
+            eprintln!("skipping explicit_sync_bridge: {reason}");
             return Ok(());
         }
 
