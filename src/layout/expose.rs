@@ -171,23 +171,27 @@ fn compute_layout(
     }
 }
 
-/// How far `content` must shrink to fit in `available`, never growing it —
-/// `Math.min(1, available / content)` (`workspace.js:320`, `:329`), but defined
-/// when the grid has no extent to scale.
+/// The scale that fits `extent` into `available`, never above `cap` —
+/// `Math.min(cap, available / extent)`, but defined when there is no extent to
+/// scale. Every "scale to fit" in this file goes through here; `cap` is 1 where
+/// the step may only shrink, `MAXIMUM_SCALE` where it may also enlarge.
 ///
 /// A grid dimension of zero is reachable: a row whose windows all scale to zero
 /// height sums to `-0.`, and `656. / -0.` is `-f64::INFINITY`, which `min` then
-/// picks over 1. That negative-infinite scale spread through the slot sizes into
-/// `expose_pickup_size` and came out the far end as a NaN tile position, an
+/// picks over the cap. That negative-infinite scale spread through the slot sizes
+/// into `expose_pickup_size` and came out the far end as a NaN tile position, an
 /// assertion in `Layout::verify_invariants` away from being a window rendered
-/// nowhere. GNOME divides the same way and has the same hole; it just never hands
-/// the grid a zero-height row. Nothing to shrink means nothing to shrink *by*, so
-/// a non-positive extent leaves the scale at 1.
-fn shrink_to_fit(available: f64, content: f64) -> f64 {
-    if content <= 0. || !content.is_finite() {
-        return 1.;
+/// nowhere. GNOME divides the same way at every one of these sites
+/// (`workspace.js:284-285`, `:320`, `:329`) and has the same hole; it just never
+/// hands the grid a zero-extent row.
+///
+/// An axis with no extent constrains nothing, so it yields `cap` — the identity
+/// for the `min` each caller folds it into.
+fn scale_to_fit(available: f64, extent: f64, cap: f64) -> f64 {
+    if extent <= 0. || !extent.is_finite() {
+        return cap;
     }
-    f64::min(1., available / content)
+    f64::min(cap, available / extent)
 }
 
 fn center(rect: Rectangle<f64, Logical>) -> Point<f64, Logical> {
@@ -207,9 +211,12 @@ fn compute_scale_and_space(layout: &mut GridLayout, area: Rectangle<f64, Logical
     let hspacing = (layout.max_columns as f64 - 1.) * spacing();
     let vspacing = (layout.rows.len() as f64 - 1.) * spacing();
 
-    let horizontal_scale = (area.size.w - hspacing) / layout.grid_width;
-    let vertical_scale = (area.size.h - vspacing) / layout.grid_height;
-    let scale = f64::min(f64::min(horizontal_scale, vertical_scale), MAXIMUM_SCALE);
+    // Folding `MAXIMUM_SCALE` in per axis rather than once around the pair: `min` is
+    // associative, so the result is unchanged, and it makes the cap the value an axis
+    // with no extent contributes.
+    let horizontal_scale = scale_to_fit(area.size.w - hspacing, layout.grid_width, MAXIMUM_SCALE);
+    let vertical_scale = scale_to_fit(area.size.h - vspacing, layout.grid_height, MAXIMUM_SCALE);
+    let scale = f64::min(horizontal_scale, vertical_scale);
 
     let scaled_width = layout.grid_width * scale + hspacing;
     let scaled_height = layout.grid_height * scale + vspacing;
@@ -293,7 +300,7 @@ pub fn compute_slots(
     let height_without_spacing: f64 = rows.iter().map(|row| row.height).sum();
     let vertical_spacing = (rows.len() as f64 - 1.) * spacing();
     let additional_vertical_scale =
-        shrink_to_fit(area.size.h - vertical_spacing, height_without_spacing);
+        scale_to_fit(area.size.h - vertical_spacing, height_without_spacing, 1.);
 
     // Keep track of how much smaller the grid becomes due to scaling so it
     // can be centered again.
@@ -303,7 +310,7 @@ pub fn compute_slots(
         let horizontal_spacing = (row.windows.len() as f64 - 1.) * spacing();
         let width_without_spacing = row.width - horizontal_spacing;
         let additional_horizontal_scale =
-            shrink_to_fit(area.size.w - horizontal_spacing, width_without_spacing);
+            scale_to_fit(area.size.w - horizontal_spacing, width_without_spacing, 1.);
 
         if additional_horizontal_scale < additional_vertical_scale {
             row.additional_scale = additional_horizontal_scale;
