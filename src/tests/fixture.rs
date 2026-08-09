@@ -478,3 +478,38 @@ impl State {
         self.clients.iter_mut().find(|c| c.id == id).unwrap()
     }
 }
+
+impl Drop for State {
+    /// Disconnect the clients and let the compositor reap them, before the display goes away.
+    ///
+    /// A wayland resource handle holds a strong `Arc` to its own object data (the `data` field
+    /// wayland-scanner puts on every generated `Resource`), and smithay's
+    /// `PrivateSurfaceData::init` pushes `surface.clone()` into the surface's *own* `children`
+    /// list. That is a self-cycle, and the only thing that breaks it is `cleanup()`, which runs
+    /// from `ObjectData::destroyed`. Tearing the display down cold never calls `destroyed` —
+    /// `wl_display_destroy_clients` runs with wayland-backend's `PENDING_DESTRUCTORS` set, so
+    /// destructors are only *queued* — and every surface the fixture ever made stays alive, with
+    /// its caches, hooks and role state, for the rest of the process. Memory only: no descriptor
+    /// is involved. But the suite builds ~1800 of these, which is what makes it worth an ordered
+    /// teardown instead of a shrug.
+    ///
+    /// Dropping the clients closes their sockets; the compositor only notices when it dispatches,
+    /// hence the pump. That is the same path a client exiting mid-test takes, so nothing here is a
+    /// teardown-only shortcut.
+    fn drop(&mut self) {
+        // A test that is already failing gets no teardown: a panic raised inside `dispatch` while
+        // this one unwinds is an abort, and it would take the whole binary down instead of one
+        // test. Leaking on the way out of a failure is the cheaper mistake.
+        if std::thread::panicking() {
+            return;
+        }
+
+        self.clients.clear();
+
+        // Bounded, because a compositor that will not reap is a bug to see, not to hang on. One
+        // dispatch is enough in practice; the rest are for a client whose disconnect races it.
+        for _ in 0..5 {
+            self.server.dispatch();
+        }
+    }
+}
