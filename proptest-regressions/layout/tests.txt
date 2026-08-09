@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 982b022a5ff4bb043fd831b6551ed16820db973248fbe161c7ffa6606b77ff16
+cc 04209775971a99a12dcb874221267c57dfe20eae903fa1c4ea44223fc2e4ecb0 # shrinks to ops = [AddNamedWorkspace { ws_name: 1, output_name: Some(1), layout_config: None }, AddOutput(2), AddScaledOutput { id: 1, scale: 1.0, layout_config: None }], layout_config = LayoutPart { windowing_mode: None, focus_ring: None, border: None, shadow: None, tab_indicator: None, insert_hint: None, preset_column_widths: None, default_column_width: None, preset_window_heights: None, center_focused_column: None, always_center_single_column: None, default_column_display: None, gaps: None, struts: None, background_color: None }

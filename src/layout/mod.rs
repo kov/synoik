@@ -913,20 +913,18 @@ impl<W: LayoutElement> Layout<W> {
             } => {
                 let primary = &mut monitors[primary_idx];
 
-                let mut stopped_primary_ws_switch = false;
+                let mut took_from_primary = false;
 
                 let mut workspaces = vec![];
                 for i in (0..primary.workspaces.len()).rev() {
                     if primary.workspaces[i].original_output.matches(&output) {
                         let ws = primary.workspaces.remove(i);
+                        took_from_primary = true;
 
                         // FIXME: this can be coded in a way that the workspace switch won't be
                         // affected if the removed workspace is invisible. But this is good enough
                         // for now.
-                        if primary.workspace_switch.is_some() {
-                            primary.workspace_switch = None;
-                            stopped_primary_ws_switch = true;
-                        }
+                        primary.workspace_switch = None;
 
                         // The user could've closed a window while remaining on this workspace, on
                         // another monitor. However, we will add an empty workspace in the end
@@ -942,8 +940,15 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 }
 
-                // If we stopped a workspace switch, then we might need to clean up workspaces.
-                if stopped_primary_ws_switch {
+                // Whatever we took, the monitor we took it from still owes the workspace-list
+                // invariants: a trailing empty, and gnome-shell's `MIN_NUM_WORKSPACES` of them.
+                // This used to run only when a workspace switch had been stopped, which was
+                // enough back when the only invariant was the trailing empty — the loop leaves
+                // that one behind on its own. It is not enough for the minimum: handing a
+                // two-workspace monitor's named workspace to the output that just came back
+                // left it with one. Removing anything also clears the switch above, so the
+                // `workspace_switch.is_none()` `clean_up_workspaces` asserts still holds.
+                if took_from_primary {
                     primary.clean_up_workspaces();
                 }
 
