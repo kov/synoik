@@ -949,6 +949,11 @@ mod tests {
     /// screen. (This is what sized [`WIDE_BUTTON_W`]; "Restart & Install" does not fit
     /// [`BUTTON_W`].)
     #[test]
+    #[cfg_attr(
+        not(feature = "reference-env"),
+        ignore = "measures shaped text, so it needs the reference font stack; \
+run it with --features reference-env, as the fedora CI job does"
+    )]
     fn the_action_label_fits_its_button() {
         let mut vk = match VulkanRenderer::new() {
             Ok(r) => r,
