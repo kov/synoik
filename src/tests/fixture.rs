@@ -47,6 +47,13 @@ pub struct State {
 /// is codepoint order and "Utilities" comes before "archive". Every test that asserts on
 /// the app grid's order depends on which it is, so it is pinned rather than inherited:
 /// `en_US.UTF-8` if the machine has it, else whatever the environment says.
+///
+/// `setlocale` succeeding is not enough — a machine without the `en_US` locale data falls
+/// through to the environment, and a bare container's environment *is* C. That used to
+/// leave the app-grid order tests silently asserting codepoint order, which is how eleven
+/// folder tests failed on the fedora job alone. So the *property* is checked, not the
+/// locale's name: panic here, where the message names the missing dependency, rather than
+/// eleven assertions away where it looks like a folder bug.
 fn pin_collation() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -57,11 +64,24 @@ fn pin_collation() {
                 c"en_US.utf8".as_ptr(),
                 c"".as_ptr(),
             ] {
-                if !libc::setlocale(libc::LC_COLLATE, locale).is_null() {
+                if libc::setlocale(libc::LC_COLLATE, locale).is_null() {
+                    continue;
+                }
+                // Dictionary order puts "a" before "Utilities"; codepoint order does not
+                // ('U' is 0x55, 'a' is 0x61). This is exactly the comparison the app grid
+                // makes, so it is the one worth proving.
+                if libc::strcoll(c"a".as_ptr(), c"Utilities".as_ptr()) < 0 {
                     return;
                 }
             }
         }
+
+        panic!(
+            "no locale on this machine collates \"a\" before \"Utilities\" — the app grid's \
+             name order would be codepoint order, and every test that asserts on it would \
+             assert the wrong thing. Install the en_US locale data (fedora: glibc-langpack-en, \
+             debian/ubuntu: locales + `locale-gen en_US.UTF-8`)."
+        );
     });
 }
 
