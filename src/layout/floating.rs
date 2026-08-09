@@ -515,19 +515,31 @@ impl<W: LayoutElement> FloatingSpace<W> {
             // In niri's scrolling mode only the scrolling layout can size a window to the screen,
             // so a window arriving here leaves those states behind. Restore the previous floating
             // window size, and in case the tile is fullscreen, unfullscreen it.
-            mode => {
+            _ => {
                 let floating_size = tile.floating_window_size;
                 let win = tile.window_mut();
-                let mut size = if mode.is_normal() {
-                    // If the window wasn't fullscreen without a floating size (e.g. it was tiled
-                    // before), ask for the current size. If the current size is unknown (the
-                    // window was only ever fullscreen until now), fall back to (0, 0).
-                    floating_size.unwrap_or_else(|| win.expected_size().unwrap_or_default())
-                } else {
-                    // If the window was fullscreen or maximized without a floating size, ask for
-                    // (0, 0).
-                    floating_size.unwrap_or_default()
-                };
+                // A remembered floating size is ours to restore either way. Without one, the two
+                // modes want opposite things.
+                //
+                // In niri's scrolling mode a window can arrive here straight out of the tiling
+                // layout, which owned its size; nothing else would pin it, so ask for the size it
+                // currently has.
+                //
+                // In GNOME mode it cannot — this space owns maximize and fullscreen, so a window
+                // with no remembered size is one that has just mapped, and its size is its own.
+                // Ask for (0, 0), "you choose". GNOME never sizes a window from its own geometry:
+                // a client-driven geometry change updates min/max size and recalculates features,
+                // nothing more (mutter `meta-wayland-xdg-shell.c:1081-1103`). Handing it back
+                // freezes whatever the geometry happened to be at this instant, and on a map that
+                // is *before* a toolkit has drawn its decorations, so the window loses them and
+                // shrinks — see `a_window_is_not_configured_smaller_than_it_asked_for`.
+                let mut size = floating_size.unwrap_or_else(|| {
+                    if gnome_mode {
+                        Size::default()
+                    } else {
+                        win.expected_size().unwrap_or_default()
+                    }
+                });
 
                 // Apply min/max size window rules. If requesting a concrete size, apply
                 // completely; if requesting (0, 0), apply only when min/max results in a fixed

@@ -23832,3 +23832,66 @@ fn a_title_change_between_configure_and_map_keeps_the_restored_position() {
         "a title change after the configure must not drop the restored position"
     );
 }
+
+/// Mapping a window must not configure it smaller than the size it chose.
+///
+/// A client that draws its own decorations declares a window geometry covering
+/// them — `(0, -35, w, content + 35)`, negative because the header subsurface
+/// sits above the content origin. A subsurface with no buffer yet is not in the
+/// surface tree's bounding box (smithay's `bbox_from_surface_tree` skips it, and
+/// mutter's `meta_wayland_subsurface_union_geometry` skips it too), so until the
+/// header draws, the declared geometry is *correctly* clamped down to the bare
+/// content. That truncation is a transient and heals on the next commit.
+///
+/// It only does damage if the compositor reads it and hands it back as a
+/// configure size, because the client must honour a configure as a
+/// compositor-driven resize. Then the transient is frozen into the client's real
+/// size, and it loses its header again every time it starts — 35px a launch.
+///
+/// GNOME does not do this: a client-driven geometry change updates min/max size
+/// and recalculates features, and nothing else (mutter
+/// `meta-wayland-xdg-shell.c:1081-1103`). The window's size comes from the
+/// compositor's own model, never read back off the client.
+#[test]
+fn a_window_is_not_configured_smaller_than_it_asked_for() {
+    const HEADER: i32 = 35;
+    const CONTENT: i32 = 300;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1280, 720));
+    let id = f.add_client();
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    // Map with the decorations declared but not yet drawn, which is the state a
+    // real toolkit is in on its first frame.
+    let w = f.client(id).window(&surface);
+    w.attach_new_buffer();
+    w.set_size(400, CONTENT as u16);
+    w.set_window_geometry(0, -HEADER, 400, CONTENT + HEADER);
+    w.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+
+    let configured = f
+        .client(id)
+        .window(&surface)
+        .recent_configures()
+        .last()
+        .expect("the window must have been configured")
+        .size;
+
+    // Zero means "you choose", which is the correct answer here. Anything else
+    // must at least not be shorter than what the client asked for.
+    assert!(
+        configured.1 == 0 || configured.1 >= CONTENT + HEADER,
+        "mapping configured the window to {}px tall, shorter than the {}px of \
+         window geometry it declared — it will shrink to fit and lose its \
+         decorations, once per launch",
+        configured.1,
+        CONTENT + HEADER,
+    );
+}

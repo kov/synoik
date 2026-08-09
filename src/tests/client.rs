@@ -923,6 +923,16 @@ impl Window {
         self.viewport.set_destination(i32::from(w), i32::from(h));
     }
 
+    /// The xdg window geometry — what a configure's size actually refers to.
+    ///
+    /// A client whose decorations are subsurfaces *above* its content sends a negative `y` and a
+    /// height larger than its own buffer. Until those subsurfaces have buffers of their own they
+    /// are not in the surface tree's bounding box, so the declared geometry is legitimately
+    /// clamped down to the content — see `a_window_is_not_configured_smaller_than_it_asked_for`.
+    pub fn set_window_geometry(&self, x: i32, y: i32, w: i32, h: i32) {
+        self.xdg_surface.set_window_geometry(x, y, w, h);
+    }
+
     pub fn set_fullscreen(&self, output: Option<&WlOutput>) {
         self.xdg_toplevel.set_fullscreen(output);
     }
