@@ -54,6 +54,7 @@ mod perf_probe;
 mod producer_sync;
 mod remove_output;
 mod swapchain_ages;
+mod teardown;
 mod transactions;
 mod vulkan_render;
 mod window_opening;
