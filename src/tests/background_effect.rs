@@ -476,7 +476,7 @@ fn the_capture_grabs_the_rect_the_effect_is_drawn_at() {
     f.roundtrip(id);
 
     let window = f.client(id).window(&surface);
-    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX);
+    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX / 2);
     window.set_size(400, 300);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
@@ -532,19 +532,23 @@ fn the_capture_grabs_the_rect_the_effect_is_drawn_at() {
         );
     }
 
-    // Grow the window, the way a drag does.
-    let window = f.client(id).window(&surface);
-    window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX);
-    window.set_size(700, 300);
-    window.ack_last_and_commit();
-    f.double_roundtrip(id);
-    f.client(id)
-        .update_blur_region(&effect, &surface, (0, 0, 700, 300));
-    f.double_roundtrip(id);
+    // Grow the window a step at a time, the way a drag does. It has to keep moving: the capture
+    // is a picture of what is behind the effect, so a frame where nothing changed is *correct* to
+    // reuse the cached blur, and asserting on one asserts the absence of that optimization. A lag
+    // between the captured rect and the drawn one only shows while the geometry is in motion.
+    for (i, width) in [700u16, 750, 800].into_iter().enumerate() {
+        let window = f.client(id).window(&surface);
+        window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX / 2);
+        window.set_size(width, 300);
+        // Plain commit, not an ack: the client is resizing itself, not answering a configure.
+        window.commit();
+        f.double_roundtrip(id);
+        f.client(id)
+            .update_blur_region(&effect, &surface, (0, 0, i32::from(width), 300));
+        f.double_roundtrip(id);
 
-    for i in 0..3 {
         let (c, e) = frame(&mut f);
-        eprintln!("--- frame {i} after the grow ---");
+        eprintln!("--- frame {i} after growing to {width} ---");
         for s in &c {
             eprintln!("  capture dst={:?} src={:?}", s.dst, s.src);
         }
