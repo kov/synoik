@@ -20,6 +20,26 @@ fn scrolling(mut config: Config) -> Config {
     config
 }
 
+/// Whether an `ffmpeg` we can spawn is on `PATH`.
+///
+/// The native recorder streams frames to an `ffmpeg` subprocess
+/// ([`crate::recording::encoder::FfmpegEncoder`]), so every test that starts a recording
+/// needs one. CI installs it (see `DEPS_APT`/`DEPS_DNF` in `.github/workflows/ci.yml`);
+/// a dev box without it skips those tests rather than failing them somewhere deep in the
+/// recorder with nothing naming the missing binary.
+fn have_ffmpeg() -> bool {
+    let ok = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("skipping: ffmpeg not installed, so no recording can be started");
+    }
+    ok
+}
+
 mod client;
 pub(crate) mod fixture;
 mod server;

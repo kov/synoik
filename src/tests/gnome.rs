@@ -8576,16 +8576,7 @@ fn native_screen_recording_registers_and_stops() {
     use crate::screencasting::RecordingKind;
     use crate::ui::panel::{WorkspaceState, ROLE_SCREEN_RECORDING};
 
-    // A native recording spawns an ffmpeg encoder; skip cleanly where ffmpeg is unavailable.
-    let ffmpeg = std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ffmpeg {
-        eprintln!("skipping: ffmpeg not installed");
+    if !super::have_ffmpeg() {
         return;
     }
 
@@ -8647,15 +8638,7 @@ fn shell_screencast_dbus_start_and_stop() {
     use crate::dbus::gnome_shell_screencast::ScreencastToSynoik;
     use crate::screencasting::RecordingKind;
 
-    let ffmpeg = std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ffmpeg {
-        eprintln!("skipping: ffmpeg not installed");
+    if !super::have_ffmpeg() {
         return;
     }
 

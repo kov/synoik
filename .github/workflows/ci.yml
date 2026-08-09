@@ -18,8 +18,14 @@ env:
   # conformance corpus asserts our defaults against GNOME's own schema defaults, so without the
   # schemas installed those tests cannot make their assertion. They fail rather than skip — a
   # skipped check is indistinguishable from a passing one in a green run.
-  DEPS_APT: curl gcc clang glslang-tools libudev-dev libgbm-dev libxkbcommon-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libglib2.0-dev libpango1.0-dev libcairo2-dev libpixman-1-dev libdisplay-info-dev gsettings-desktop-schemas gnome-settings-daemon-common mesa-vulkan-drivers
-  DEPS_DNF: cargo gcc clang glslang libudev-devel libgbm-devel libxkbcommon-devel wayland-devel libinput-devel dbus-devel systemd-devel libseat-devel pipewire-devel glib2-devel pango-devel cairo-gobject-devel pixman-devel libdisplay-info-devel gsettings-desktop-schemas gnome-settings-daemon
+  # ffmpeg is the other test dependency of that kind: the native recorder streams frames to an
+  # `ffmpeg` subprocess (src/recording/encoder.rs), so the recording tests skip themselves without
+  # it — and a skipped recorder is a recorder nothing checks.
+  # The fedora container ships only the C locale, but the app grid sorts names through
+  # `g_utf8_collate_key`/`strcoll`, so glibc-langpack-en supplies the collation the order tests
+  # assert on (see `pin_collation` in src/tests/fixture.rs). The ubuntu runners already have it.
+  DEPS_APT: curl gcc clang glslang-tools libudev-dev libgbm-dev libxkbcommon-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libglib2.0-dev libpango1.0-dev libcairo2-dev libpixman-1-dev libdisplay-info-dev gsettings-desktop-schemas gnome-settings-daemon-common mesa-vulkan-drivers ffmpeg
+  DEPS_DNF: cargo gcc clang glslang libudev-devel libgbm-devel libxkbcommon-devel wayland-devel libinput-devel dbus-devel systemd-devel libseat-devel pipewire-devel glib2-devel pango-devel cairo-gobject-devel pixman-devel libdisplay-info-devel gsettings-desktop-schemas gnome-settings-daemon glibc-langpack-en ffmpeg-free
   # The `reference-env` tests measure shaped text, so the UI font stack is part of the fixture:
   # Adwaita Sans is what `font-name` resolves to at runtime (docs/fork/gnome-style-reference.md).
   FONTS_DNF: adwaita-sans-fonts adwaita-mono-fonts abattis-cantarell-fonts

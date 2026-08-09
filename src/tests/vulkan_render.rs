@@ -557,6 +557,10 @@ fn vulkan_screenshot_ui_cast_mode_drops_the_frozen_screen() {
 /// real ffmpeg, and the corpus should not need an external process to run.
 #[test]
 fn vulkan_screenshot_ui_cast_mode_capture_starts_a_recording() {
+    if !super::have_ffmpeg() {
+        return;
+    }
+
     let Some(mut f) = green_window_fixture() else {
         return;
     };
@@ -974,16 +978,7 @@ fn vulkan_captures_the_screenshot_neutral_through_vulkan() {
 /// assertion is implicit: the validation layer must report nothing (checked at process exit).
 #[test]
 fn vulkan_recorder_capture_path_is_clean() {
-    // The recording spawns an ffmpeg encoder; skip cleanly where ffmpeg is unavailable.
-    let ffmpeg = std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ffmpeg {
-        eprintln!("skipping: ffmpeg not installed");
+    if !super::have_ffmpeg() {
         return;
     }
 
