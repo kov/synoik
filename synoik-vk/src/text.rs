@@ -1892,8 +1892,15 @@ mod line_box_tests {
     ///
     /// This asserts against Adwaita Sans specifically, so it is also a check that the UI font
     /// resolves at all: a machine without it measures some fallback face and fails here rather
-    /// than silently laying the whole shell out to another font's metrics.
+    /// than silently laying the whole shell out to another font's metrics — which is exactly why
+    /// it is gated. Where the reference fonts are guaranteed the check keeps its teeth; on a
+    /// runner with some fallback face it reported 18 for the 19 the shell measures.
     #[test]
+    #[cfg_attr(
+        not(feature = "reference-env"),
+        ignore = "measures shaped text, so it needs the reference font stack; \
+run it with --features reference-env, as the fedora CI job does"
+    )]
     fn line_box_matches_the_live_shell() {
         for (px, expected) in [(11.996, 15.), (14.666, 19.), (20.004, 25.)] {
             assert_eq!(
@@ -1909,6 +1916,11 @@ mod line_box_tests {
     /// default line spacing is 0, so `n` lines is exactly `n *` the single-line box. The
     /// calendar and the quick-settings placeholder both size wrapped text that way.
     #[test]
+    #[cfg_attr(
+        not(feature = "reference-env"),
+        ignore = "builds on the single-line box, so it measures shaped text too; \
+run it with --features reference-env, as the fedora CI job does"
+    )]
     fn line_boxes_stack_without_leading() {
         let one = line_box_px(14.666);
         assert_eq!(one * 2., 38., "two 14.666px lines are two 19px boxes");

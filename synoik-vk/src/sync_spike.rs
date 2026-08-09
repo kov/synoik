@@ -939,6 +939,22 @@ mod tests {
     #[test]
     fn explicit_sync_bridge() -> Result<()> {
         let gpu = Gpu::new()?;
+
+        // The probe asks whether host-GPU completion propagates through a fence-exported
+        // sync_file into a kernel syncobj. A device without the SYNC_FD extensions cannot
+        // answer that question either way, so there is nothing here to pass or fail —
+        // lavapipe on a CI runner is exactly that case, and it was failing the job on a
+        // capability the runner never claimed to have. Skip like the render-node tests do.
+        if !gpu.supports("VK_KHR_external_semaphore_fd")
+            || !gpu.supports("VK_KHR_external_fence_fd")
+        {
+            eprintln!(
+                "skipping explicit_sync_bridge: device exposes no SYNC_FD external \
+                 semaphore/fence extensions, so there is no bridge to measure"
+            );
+            return Ok(());
+        }
+
         let report = run_sync_spike(&gpu)?;
         report.print();
 

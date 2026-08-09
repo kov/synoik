@@ -195,7 +195,9 @@ dinit = []
 # on the reference font stack (Fedora, Adwaita Sans); anywhere else they report the runner's fonts
 # as a layout bug. Gated as a feature rather than a list of test names in CI so that adding an
 # eighth such test cannot silently leave it unrun. The fedora job turns it on.
-reference-env = []
+# Forwarded to synoik-vk, which owns the shaper and so measures text of its own — the fedora job
+# turns the feature on once, for the workspace.
+reference-env = ["synoik-vk/reference-env"]
 
 [lints.clippy]
 new_without_default = "allow"
