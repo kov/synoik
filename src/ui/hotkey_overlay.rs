@@ -334,7 +334,7 @@ fn collect_actions(config: &Config, keybindings: &[GnomeKeybinding]) -> Vec<Acti
     // Screenshot is not as important, can omit if not bound.
     if let Some(action) = bound
         .iter()
-        .find(|action| matches!(action, Action::Screenshot(_, _)))
+        .find(|action| matches!(action, Action::Screenshot(_)))
     {
         actions.push(action.clone());
     }
@@ -569,7 +569,7 @@ fn action_name(action: &Action) -> String {
             String::from("Switch Focus Between Floating and Tiling")
         }
         Action::ToggleOverview => String::from("Open the Overview"),
-        Action::Screenshot(_, _) => String::from("Take a Screenshot"),
+        Action::Screenshot(_) => String::from("Take a Screenshot"),
         // Spawn actions are handled structurally in `action_label`; this is only a plain fallback.
         Action::Spawn(args) => {
             format!("Spawn {}", args.first().map(String::as_str).unwrap_or(""))

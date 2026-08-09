@@ -380,7 +380,7 @@ fn vulkan_screenshot_ui_draws_the_frozen_screen() {
     };
     let output = f.synoik_output(1);
 
-    f.synoik_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(None);
     assert!(
         f.synoik().screenshot_ui.is_open(),
         "screenshot UI must be open"
@@ -437,7 +437,7 @@ fn vulkan_screenshot_ui_draws_the_control_panel() {
     };
     let output = f.synoik_output(1);
 
-    f.synoik_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(None);
     settle_screenshot_ui_open(&mut f);
 
     // The panel is built lazily on the first render, so render before reading its rect.
@@ -520,7 +520,7 @@ fn vulkan_screenshot_ui_cast_mode_drops_the_frozen_screen() {
     };
     let output = f.synoik_output(1);
 
-    f.synoik_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(None);
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
@@ -566,7 +566,7 @@ fn vulkan_screenshot_ui_cast_mode_capture_starts_a_recording() {
     };
     let output = f.synoik_output(1);
 
-    f.synoik_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(None);
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
     let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
@@ -632,7 +632,7 @@ fn vulkan_screenshot_ui_a_delayed_capture_shoots_the_live_screen() {
     let path = std::env::temp_dir().join("gsrs-delayed-capture-test.png");
     std::fs::remove_file(&path).ok();
     f.synoik_state()
-        .open_screenshot_ui(false, Some(path.to_string_lossy().into_owned()));
+        .open_screenshot_ui(Some(path.to_string_lossy().into_owned()));
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
@@ -710,7 +710,7 @@ fn vulkan_screenshot_ui_countdown_cannot_reach_a_capture() {
     let (pixels, w, _) = render_output_vulkan_target(&mut f, &output, RenderTarget::ScreenCapture);
     let undisturbed = px(&pixels, w, centre.0, centre.1);
 
-    f.synoik_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(None);
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
     let layout = f.synoik().screenshot_ui.panel_layout(&output).unwrap();
@@ -746,7 +746,7 @@ fn vulkan_screenshot_ui_type_buttons_take_clicks_where_they_are_drawn() {
     };
     let output = f.synoik_output(1);
 
-    f.synoik_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(None);
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
@@ -864,7 +864,7 @@ fn vulkan_screenshot_ui_button_is_scale_correct() {
         "expected a scale-2 output, got {scale}; the guard is vacuous otherwise"
     );
 
-    f.synoik_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(None);
     settle_screenshot_ui_open(&mut f);
 
     let (pixels, w, h) = render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
@@ -7010,7 +7010,7 @@ fn vulkan_screenshot_ui_draws_the_frozen_screen_into_a_cast() {
     };
     let output = f.synoik_output(1);
 
-    f.synoik_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(None);
     assert!(
         f.synoik().screenshot_ui.is_open(),
         "screenshot UI must be open"
@@ -13750,7 +13750,7 @@ fn vulkan_screenshot_ui_window_mode_picks_a_frozen_window() {
     let output = f.synoik_output(1);
     let scale = output.current_scale().fractional_scale();
 
-    f.synoik_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(None);
     // Recolour the live window red *after* the picker froze it. Every green pixel below therefore
     // came from the frozen capture, and any red would mean Window mode read the live window —
     // which is the whole difference between this and `screenshot_window`.
@@ -13847,7 +13847,7 @@ fn vulkan_screenshot_ui_window_button_is_inert_without_windows() {
     f.synoik().update_render_elements(None);
 
     let output = f.synoik_output(1);
-    f.synoik_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(None);
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 
@@ -13910,7 +13910,7 @@ fn vulkan_screenshot_ui_tooltip_waits_before_it_shows() {
     let output = f.synoik_output(1);
     let scale = output.current_scale().fractional_scale();
 
-    f.synoik_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(None);
     settle_screenshot_ui_open(&mut f);
     render_output_vulkan_target(&mut f, &output, RenderTarget::Output);
 

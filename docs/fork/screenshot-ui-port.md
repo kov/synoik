@@ -53,6 +53,14 @@ Two things the panel's shape now fixes in place, worth knowing before touching i
 - **Icons are render elements, not paint verbs**, so they ride *on top* of the bake and fade with
   it. They also arrive a frame late (the symbolic worker rasterizes off-thread and queues a redraw
   on arrival), which is why a first-frame capture of the panel can be glyphless and mean nothing.
+- **The `Closed` variant is what the picker remembers.** GNOME's `ScreenshotUI` is a startup
+  singleton that only hides (`screenshot.js:1727`), so the capture type, the pointer toggle and the
+  area are still set the next time it opens; `_finishClosing` resets shot-vs-cast alone
+  (`:1739`), and the window selector is rebuilt from scratch. Ours is an enum that is genuinely
+  destroyed on close, so anything session-lived has to be handed to `Closed` explicitly — that is
+  the whole of GNOME's "storage" for this UI, which has no GSettings key and does not survive a
+  restart. Because Screen and Window mode borrow `selection`, the close saves `saved_area` when
+  there is one, or it would remember the whole output as the area.
 
 ## Slices
 

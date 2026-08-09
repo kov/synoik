@@ -14547,7 +14547,7 @@ fn overview_dash_inert_behind_screenshot_ui() {
     // of the dash so no hover is set yet.
     f.pointer_motion(960., 540.);
     // Raise the screenshot UI over the open overview (it doesn't close the overview).
-    f.synoik_state().open_screenshot_ui(false, None);
+    f.synoik_state().open_screenshot_ui(None);
     assert!(
         f.synoik().screenshot_ui.is_open(),
         "screenshot UI must open"
@@ -19964,7 +19964,7 @@ fn open_picker_headless(f: &mut Fixture) {
         .collect();
 
     f.synoik_state()
-        .open_screenshot_ui_with(neutrals, window_shots, false, None);
+        .open_screenshot_ui_with(neutrals, window_shots, None);
     assert!(
         f.synoik().screenshot_ui.is_open(),
         "the picker must open from hand-built neutrals; a renderer is not what opens it"
@@ -20313,6 +20313,116 @@ fn the_area_selection_survives_a_trip_through_screen_mode() {
         selection_of(&mut f),
         area,
         "and coming back hands the rectangle back, rather than leaving the whole screen selected"
+    );
+}
+
+/// The picker comes back the way you left it, for as long as the session lasts.
+///
+/// gnome-shell's `ScreenshotUI` is a singleton built at startup that merely hides on close
+/// (`js/ui/screenshot.js:1727`), so its controls still hold last time's state when it opens again:
+/// `_finishClosing` touches neither the capture type nor the Show Pointer toggle, and
+/// `AreaSelector.reset()` (`:304`) explicitly preserves the rectangle. What it *does* reset is
+/// shot-vs-cast (`_shotButton.checked = true`, `:1739`), so the picker never comes back armed to
+/// record. None of it is stored: GNOME has no GSettings key for any of this, so a restart starts
+/// over — and neither does ours.
+#[test]
+fn the_picker_remembers_its_controls_across_opens() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use crate::ui::screenshot_ui::{CaptureMode, CaptureType};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    open_picker_headless(&mut f);
+
+    assert!(
+        !f.synoik().screenshot_ui.show_pointer(),
+        "GNOME builds the button unchecked (`screenshot.js:1417-1421`), so a first picker hides the \
+         pointer"
+    );
+
+    drag_selection(&mut f, (300, 300), (699, 599));
+    let area = Rectangle::new(Point::from((300, 300)), Size::from((400, 300)));
+    f.synoik().screenshot_ui.toggle_pointer();
+    f.synoik().screenshot_ui.set_mode(CaptureMode::Cast);
+    f.synoik()
+        .screenshot_ui
+        .set_capture_type(CaptureType::Screen);
+
+    f.synoik().close_screenshot_ui();
+    open_picker_headless(&mut f);
+
+    assert!(
+        f.synoik().screenshot_ui.show_pointer(),
+        "the pointer toggle is the user's answer to a question we should only ask once"
+    );
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_type(),
+        CaptureType::Screen,
+        "the capture type survives the close, as GNOME's checked button does"
+    );
+    assert_eq!(
+        f.synoik().screenshot_ui.mode(),
+        CaptureMode::Shot,
+        "but shot-vs-cast does not: GNOME resets it on every close"
+    );
+
+    f.synoik()
+        .screenshot_ui
+        .set_capture_type(CaptureType::Selection);
+    assert_eq!(
+        selection_of(&mut f),
+        area,
+        "and the area is still the one dragged before the close — closing in Screen mode must not \
+         remember the whole output as the selection"
+    );
+}
+
+/// Window mode is not remembered into a picker with nothing to pick.
+///
+/// GNOME's own guard is at open, not at close: `_syncWindowButtonSensitivity` is followed by
+/// `if (!this._windowButton.reactive) this._selectionButton.checked = true`
+/// (`js/ui/screenshot.js:1662-1664`). Restoring the type through `set_capture_type` inherits that
+/// refusal rather than restating it — but only if the restore actually goes through it.
+#[test]
+fn a_remembered_window_mode_falls_back_when_there_are_no_windows() {
+    use crate::ui::screenshot_ui::CaptureType;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_focused_window(&mut f, id);
+
+    open_picker_headless(&mut f);
+    f.synoik()
+        .screenshot_ui
+        .set_capture_type(CaptureType::Window);
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_type(),
+        CaptureType::Window,
+        "with a window mapped, Window mode is selectable"
+    );
+    f.synoik().close_screenshot_ui();
+
+    open_picker_headless(&mut f);
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_type(),
+        CaptureType::Window,
+        "and it is remembered while the window is still there"
+    );
+    f.synoik().close_screenshot_ui();
+
+    let window = f.client(id).window(&surface);
+    window.attach_null_buffer();
+    window.commit();
+    f.double_roundtrip(id);
+
+    open_picker_headless(&mut f);
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_type(),
+        CaptureType::Selection,
+        "with the window gone, the remembered type falls back rather than arming an insensitive \
+         button"
     );
 }
 
@@ -20690,7 +20800,7 @@ fn the_screenshot_keys_come_from_gnome_settings() {
     use crate::input::action_for_gnome;
     assert!(matches!(
         action_for_gnome(GnomeKeyAction::ShowScreenshotUi),
-        Some(Action::Screenshot(true, None))
+        Some(Action::Screenshot(None))
     ));
     assert!(matches!(
         action_for_gnome(GnomeKeyAction::Screenshot),

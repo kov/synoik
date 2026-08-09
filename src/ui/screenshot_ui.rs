@@ -105,8 +105,21 @@ const SHADOW_OFFSET_Y: f64 = 2.;
 // As a consequence of this, selection coordinates are in output-local coordinate space.
 #[allow(clippy::large_enum_variant)]
 pub enum ScreenshotUi {
+    /// Closed, but still holding what the next open should come back to.
+    ///
+    /// gnome-shell's `ScreenshotUI` is a singleton built at startup that merely hides on close
+    /// (`screenshot.js:1727`), so its controls keep their state for the life of the session — the
+    /// capture type and the Show Pointer toggle are never touched by `_finishClosing`, and
+    /// `AreaSelector.reset()` (`screenshot.js:304`) preserves the rectangle unless it has fallen
+    /// out of bounds. This variant is that singleton's surviving fields. Nothing here reaches
+    /// disk: GNOME has no GSettings key for any of it either, so a restart starts over.
     Closed {
         last_selection: Option<(WeakOutput, Rectangle<i32, Physical>)>,
+        /// Remembered across opens, like GNOME's toggle button. Not remembered across restarts.
+        show_pointer: bool,
+        /// Remembered across opens. Falls back to `Selection` at open time if `Window` is picked
+        /// but there is nothing to pick, mirroring `screenshot.js:1663-1664`.
+        capture_type: CaptureType,
         clock: Clock,
         config: Rc<RefCell<Config>>,
     },
@@ -118,6 +131,9 @@ pub enum ScreenshotUi {
         /// Seconds to wait before the capture fires, cycling through [`DELAYS`]. Our divergence:
         /// GNOME's shell UI has no delay, only gnome-screenshot did.
         delay: u8,
+        /// Deliberately *not* remembered across opens: GNOME resets to Shot on every close
+        /// (`_shotButton.checked = true`, `screenshot.js:1739`), so the picker never comes back
+        /// armed to record.
         mode: CaptureMode,
         capture_type: CaptureType,
         /// The window the selector has picked, as `(output, window id)`.
@@ -700,19 +716,21 @@ impl ScreenshotUi {
     pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
         Self::Closed {
             last_selection: None,
+            // GNOME's button is constructed unchecked (`screenshot.js:1417-1421`) and the cursor
+            // actor starts hidden, so a first-ever picker shows no pointer.
+            show_pointer: false,
+            capture_type: CaptureType::default(),
             clock,
             config,
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn open(
         &mut self,
         // Output, screencast, screen capture.
         screenshots: HashMap<Output, [OutputScreenshot; 3]>,
         mut window_shots: HashMap<Output, Vec<WindowShot>>,
         default_output: Output,
-        show_pointer: bool,
         focused_window: Option<u64>,
         path: Option<String>,
     ) -> bool {
@@ -725,12 +743,16 @@ impl ScreenshotUi {
 
         let Self::Closed {
             last_selection,
+            show_pointer,
+            capture_type: remembered_type,
             clock,
             config,
         } = self
         else {
             return false;
         };
+        let show_pointer = *show_pointer;
+        let remembered_type = *remembered_type;
 
         let last_selection = last_selection
             .take()
@@ -853,12 +875,21 @@ impl ScreenshotUi {
 
         self.update_buffers();
 
+        // Applied after the state exists so the restore goes through the same door a click does:
+        // Screen has to widen the selection and put the area aside, and Window has to decline when
+        // there is nothing to pick. `set_capture_type` is a no-op for `Selection`, which is the
+        // common case, so the usual open still bakes once.
+        self.set_capture_type(remembered_type);
+
         true
     }
 
     pub fn close(&mut self) -> bool {
         let Self::Open {
             selection,
+            saved_area,
+            show_pointer,
+            capture_type,
             clock,
             config,
             ..
@@ -867,13 +898,20 @@ impl ScreenshotUi {
             return false;
         };
 
+        // Screen and Window mode borrow `selection`, so what the user dragged is in `saved_area`.
+        // Remembering `selection` regardless would hand the next open a whole-output rectangle and
+        // silently eat the area — in GNOME the area selector is a separate widget that Screen mode
+        // never touches at all.
+        let area = saved_area.unwrap_or((selection.1, selection.2));
         let last_selection = Some((
             selection.0.downgrade(),
-            rect_from_corner_points(selection.1, selection.2),
+            rect_from_corner_points(area.0, area.1),
         ));
 
         *self = Self::Closed {
             last_selection,
+            show_pointer: *show_pointer,
+            capture_type: *capture_type,
             clock: clock.clone(),
             config: config.clone(),
         };
@@ -1088,17 +1126,19 @@ impl ScreenshotUi {
         ))
     }
 
+    /// Whether the capture should include the pointer.
+    ///
+    /// Answers while closed too, with what the next open will come back to.
     pub fn show_pointer(&self) -> bool {
         match self {
-            Self::Open { show_pointer, .. } => *show_pointer,
-            Self::Closed { .. } => false,
+            Self::Open { show_pointer, .. } | Self::Closed { show_pointer, .. } => *show_pointer,
         }
     }
 
+    /// What the capture button acts on — likewise remembered while closed.
     pub fn capture_type(&self) -> CaptureType {
         match self {
-            Self::Open { capture_type, .. } => *capture_type,
-            Self::Closed { .. } => CaptureType::default(),
+            Self::Open { capture_type, .. } | Self::Closed { capture_type, .. } => *capture_type,
         }
     }
 

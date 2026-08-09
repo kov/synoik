@@ -3809,7 +3809,7 @@ impl State {
             .notify_changes(new_config);
     }
 
-    pub fn open_screenshot_ui(&mut self, show_pointer: bool, path: Option<String>) {
+    pub fn open_screenshot_ui(&mut self, path: Option<String>) {
         if self.synoik.is_locked() || self.synoik.screenshot_ui.is_open() {
             return;
         }
@@ -3828,7 +3828,7 @@ impl State {
             .with_vulkan_renderer(|vk| self.synoik.capture_screenshot_window_neutrals(vk))
             .unwrap_or_default();
 
-        self.open_screenshot_ui_with(vk_neutrals, window_shots, show_pointer, path);
+        self.open_screenshot_ui_with(vk_neutrals, window_shots, path);
     }
 
     /// Open the picker around neutrals that have **already been captured**.
@@ -3841,7 +3841,6 @@ impl State {
         &mut self,
         vk_neutrals: std::collections::HashMap<Output, [ScreenshotNeutral; RenderTarget::COUNT]>,
         window_shots: std::collections::HashMap<Output, Vec<crate::ui::screenshot_ui::WindowShot>>,
-        show_pointer: bool,
         path: Option<String>,
     ) {
         let default_output = self
@@ -3871,7 +3870,6 @@ impl State {
             screenshots,
             window_shots,
             default_output,
-            show_pointer,
             focused_window,
             path,
         );
@@ -4657,7 +4655,7 @@ impl State {
     /// `SelectArea` — the picker, opened to hand back coordinates rather than save a file.
     fn handle_select_area(&mut self, tx: crate::dbus::gnome_shell_screenshot::SelectAreaReply) {
         self.synoik.select_area_reply = Some(tx);
-        self.open_screenshot_ui(false, None);
+        self.open_screenshot_ui(None);
 
         // The picker refuses to open when the screen is locked or it is already up. Answering now
         // is the difference between a caller that gets an error and one that hangs until its
@@ -4673,7 +4671,7 @@ impl State {
         tx: crate::dbus::gnome_shell_screenshot::InteractiveReply,
     ) {
         self.synoik.interactive_screenshot_reply = Some(tx);
-        self.open_screenshot_ui(false, None);
+        self.open_screenshot_ui(None);
 
         // Same reason as `SelectArea`: a picker that refuses to open must still answer, or the
         // caller blocks until its D-Bus timeout with nothing on screen to explain why.

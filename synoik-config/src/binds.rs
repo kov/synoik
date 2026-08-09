@@ -143,8 +143,8 @@ pub enum Action {
     ScreenshotTypeWindow,
     /// Flip the screenshot UI between its shot and cast modes (its `v` key).
     ScreenshotToggleCast,
+    /// Open the screenshot UI. The pointer toggle is the UI's own, remembered across opens.
     Screenshot(
-        bool,
         // Path; not settable from knuffel
         Option<String>,
     ),
@@ -438,9 +438,7 @@ impl From<synoik_ipc::Action> for Action {
             synoik_ipc::Action::DoScreenTransition { delay_ms } => {
                 Self::DoScreenTransition(delay_ms)
             }
-            synoik_ipc::Action::Screenshot { show_pointer, path } => {
-                Self::Screenshot(show_pointer, path)
-            }
+            synoik_ipc::Action::Screenshot { path } => Self::Screenshot(path),
             synoik_ipc::Action::ScreenshotScreen {
                 write_to_disk,
                 show_pointer,

@@ -302,11 +302,11 @@ pub enum Action {
         delay_ms: Option<u16>,
     },
     /// Open the screenshot UI.
+    ///
+    /// The pointer toggle is not an argument: it is a control in the UI, and the UI remembers it
+    /// (along with the capture type and the selection) for as long as the compositor runs, the way
+    /// gnome-shell's session-lived `ScreenshotUI` singleton does.
     Screenshot {
-        ///  Whether to show the mouse pointer by default in the screenshot UI.
-        #[cfg_attr(feature = "clap", arg(short = 'p', long, action = clap::ArgAction::Set, default_value_t = true))]
-        show_pointer: bool,
-
         /// Path to save the screenshot to.
         ///
         /// The path must be absolute, otherwise an error is returned.

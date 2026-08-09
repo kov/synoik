@@ -1750,7 +1750,7 @@ impl State {
                 // (`js/ui/status/system.js:121-128`); dropping the popover outright before the
                 // capture is the same ordering without the later.
                 self.synoik.panel_popover.close_immediately();
-                self.open_screenshot_ui(true, None);
+                self.open_screenshot_ui(None);
             }
             // Every shell surface that starts an app leaves the overview first —
             // `Main.overview.hide(); Main.panel.close…(); app.activate()`, in the
@@ -2631,8 +2631,8 @@ impl State {
             Action::ScreenshotToggleCast => {
                 self.toggle_screenshot_capture_mode();
             }
-            Action::Screenshot(show_cursor, path) => {
-                self.open_screenshot_ui(show_cursor, path);
+            Action::Screenshot(path) => {
+                self.open_screenshot_ui(path);
                 self.synoik.switcher.cancel();
             }
             Action::ScreenshotWindow(write_to_disk, show_pointer, path) => {
@@ -9578,11 +9578,12 @@ pub(crate) fn action_for_gnome(action: GnomeKeyAction) -> Option<Action> {
             crate::brightness::Step::Down => Action::ScreenBrightnessDown(current_monitor),
             crate::brightness::Step::Cycle => Action::ScreenBrightnessCycle(current_monitor),
         },
-        // `path: None` in all three means our configured screenshot location. Note the leading
-        // argument differs: `Screenshot` opens the UI and takes `show_pointer`, while the two
-        // direct captures take `write_to_disk` first — GNOME's unmodified `Print` saves a file
-        // rather than only filling the clipboard.
-        GnomeKeyAction::ShowScreenshotUi => Action::Screenshot(true, None),
+        // `path: None` in all three means our configured screenshot location. The two direct
+        // captures also take `write_to_disk` first — GNOME's unmodified `Print` saves a file
+        // rather than only filling the clipboard. `Screenshot` takes neither: the picker owns its
+        // pointer toggle and remembers it across opens, like GNOME's `open()` which takes only a
+        // mode.
+        GnomeKeyAction::ShowScreenshotUi => Action::Screenshot(None),
         GnomeKeyAction::Screenshot => Action::ScreenshotScreen(true, true, None),
         GnomeKeyAction::ScreenshotWindow => Action::ScreenshotWindow(true, true, None),
         GnomeKeyAction::ShowScreenRecordingUi => Action::ToggleScreenRecord,
