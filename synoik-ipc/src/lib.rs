@@ -125,6 +125,8 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Request the frame-timing tallies for this session.
+    FramePerf,
     /// Inject synthetic input events through the real input pipeline.
     ///
     /// The events go through the same code path as hardware input: keyboard
@@ -240,6 +242,61 @@ pub enum Response {
     OverviewState(Overview),
     /// Information about screencasts.
     Casts(Vec<Cast>),
+    /// Frame-timing tallies for this session.
+    FramePerf(FramePerf),
+}
+
+/// Frame-timing tallies for the whole session.
+///
+/// The frame log's rolling summary resets every period, so the journal answers "how
+/// was the last ten seconds" and never "has this session been stuttering". This is
+/// the same events kept, so a hitch can be asked about long after it happened.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct FramePerf {
+    /// Whether frame logging is on at all. When false every tally below is zero
+    /// because nothing was counted — *not* because nothing went wrong.
+    pub enabled: bool,
+    /// How many records the in-memory ring can hold; 0 if ring mode is off.
+    pub ring_capacity: usize,
+    /// How many it currently holds.
+    pub ring_len: usize,
+    /// Missed refresh cycles that trigger an automatic dump, if enabled.
+    pub autodump_cycles: Option<u64>,
+    /// Dumps written automatically.
+    pub autodumps: u64,
+    /// Dumps written in total, including those asked for with `SIGUSR1`.
+    pub dumps: u64,
+    /// Turns of the event loop that spent significant time outside the frame path.
+    pub stalls: u64,
+    /// Per-output tallies.
+    pub outputs: Vec<FramePerfOutput>,
+}
+
+/// One output's session tallies. See [`FramePerf`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct FramePerfOutput {
+    /// The output's connector name.
+    pub output: String,
+    /// Frames built for this output.
+    pub frames: u64,
+    /// Of those, how many exceeded their budget.
+    pub over_budget: u64,
+    /// The worst single frame, in milliseconds.
+    pub worst_ms: f64,
+    /// Presentations that landed at least one refresh cycle late.
+    pub misses: u64,
+    /// Cycles lost across all of them. One 4-cycle miss and four 1-cycle misses give
+    /// the same number and are very different experiences, hence `worst_miss_cycles`.
+    pub missed_cycles: u64,
+    /// The largest single miss, in cycles.
+    pub worst_miss_cycles: u64,
+    /// Gap between consecutive presentations, bucketed by whole refresh cycles: index
+    /// 1 means back-to-back, and the last bucket collects everything longer. A
+    /// damage-driven compositor is legitimately idle most of the time, so a fat tail
+    /// here is not by itself a fault — it is the shape a stutter shows up in.
+    pub cadence: Vec<u64>,
 }
 
 /// Overview information.

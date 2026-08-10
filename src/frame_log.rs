@@ -1161,6 +1161,34 @@ pub struct FrameLog {
     autodumps: u64,
     /// Watches for time the compositor thread spent outside the frame path.
     loop_watch: LoopWatch,
+    /// Per-output tallies since the session started, never reset.
+    ///
+    /// [`Stats`] is cleared on every summary, which makes it useless for the question
+    /// a person actually asks after a hitch — "has this been happening?". Answering
+    /// that from the journal means finding and adding up every summary line since
+    /// login. These are the same events, kept.
+    lifetime: HashMap<String, Lifetime>,
+}
+
+/// Per-output tallies for the whole session, behind the perf IPC request.
+///
+/// Deliberately counters and a histogram rather than percentiles: a session-lifetime
+/// percentile would mean retaining every frame's total for the life of the session,
+/// and the tail is what matters anyway. The cadence histogram carries the shape.
+#[derive(Debug, Default, Clone)]
+struct Lifetime {
+    frames: u64,
+    over_budget: u64,
+    worst: Duration,
+    /// Presentations that landed at least one refresh cycle late.
+    misses: u64,
+    /// Cycles lost across all of them — a single 4-cycle miss and four 1-cycle
+    /// misses are the same number here and very different experiences, which is why
+    /// `worst_miss` is kept too.
+    missed_cycles: u64,
+    worst_miss: u64,
+    /// Gap to the previous presentation, in whole refresh cycles. See [`Stats::cadence`].
+    cadence: [u64; CADENCE_MAX + 1],
 }
 
 impl FrameLog {
@@ -1193,6 +1221,18 @@ impl FrameLog {
                     ""
                 },
             );
+            // Said separately and explicitly, because this line is what delimits a
+            // session in the journal and in a dump: whether the recorder was armed
+            // decides what a later reader is entitled to conclude from silence.
+            match (settings.ring, settings.autodump) {
+                (Some(cap), Some(cycles)) => tracing::info!(
+                    "frame ring on: {cap} records, auto-dumping at {cycles}+ missed cycles"
+                ),
+                (Some(cap), None) => {
+                    tracing::info!("frame ring on: {cap} records, dump with SIGUSR1")
+                }
+                (None, _) => tracing::info!("frame ring off: nothing is being banked"),
+            }
         }
 
         // Reserved up front: growing by doubling would memcpy the whole ring
@@ -1221,6 +1261,7 @@ impl FrameLog {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lifetime: HashMap::new(),
         }
     }
 
@@ -1518,6 +1559,11 @@ impl FrameLog {
         // The summary's percentiles are the same quantity its over-budget count is, or the two
         // disagree: "p50 1.24ms, 0 over budget" was a true statement about a session whose frames
         // needed 13.83ms.
+        let life = self.lifetime.entry(frame.output.clone()).or_default();
+        life.frames += 1;
+        life.over_budget += u64::from(over);
+        life.worst = life.worst.max(cost);
+
         self.stats
             .entry(frame.output)
             .or_default()
@@ -1810,6 +1856,8 @@ impl FrameLog {
             .map(|gap| (gap.as_secs_f64() / refresh.as_secs_f64()).round() as usize);
         if let Some(cycles) = since_last_flip {
             self.stats.entry(output.to_owned()).or_default().cadence[cycles.min(CADENCE_MAX)] += 1;
+            self.lifetime.entry(output.to_owned()).or_default().cadence[cycles.min(CADENCE_MAX)] +=
+                1;
         }
 
         // The same quantity measured against what the frame *aimed at* instead of where it landed.
@@ -1845,6 +1893,10 @@ impl FrameLog {
         }
 
         self.stats.entry(output.to_owned()).or_default().dropped += missed;
+        let life = self.lifetime.entry(output.to_owned()).or_default();
+        life.missed_cycles += missed;
+        life.misses += 1;
+        life.worst_miss = life.worst_miss.max(missed);
 
         let queued = match headroom {
             Some(us) if us >= 0 => format!(", queued {} early", ms_us(us)),
@@ -1961,6 +2013,38 @@ impl FrameLog {
     /// How many main-loop stalls this session has seen.
     pub fn stalls(&self) -> u64 {
         self.loop_watch.stalls
+    }
+
+    /// Everything the session has tallied, for the perf IPC request.
+    ///
+    /// The point of exposing this at all: a one-off hitch is over before anyone can
+    /// arm an instrument, and until now the only way to ask "has this session been
+    /// stuttering" was to find every summary line in the journal since login and add
+    /// them up. This answers it in one call, days later, from the running process.
+    pub fn perf_snapshot(&self) -> synoik_ipc::FramePerf {
+        synoik_ipc::FramePerf {
+            enabled: self.is_enabled(),
+            ring_capacity: self.settings.and_then(|s| s.ring).unwrap_or(0),
+            ring_len: self.ring.len(),
+            autodump_cycles: self.settings.and_then(|s| s.autodump),
+            autodumps: self.autodumps,
+            dumps: self.dumps,
+            stalls: self.loop_watch.stalls,
+            outputs: self
+                .lifetime
+                .iter()
+                .map(|(name, life)| synoik_ipc::FramePerfOutput {
+                    output: name.clone(),
+                    frames: life.frames,
+                    over_budget: life.over_budget,
+                    worst_ms: life.worst.as_secs_f64() * 1000.,
+                    misses: life.misses,
+                    missed_cycles: life.missed_cycles,
+                    worst_miss_cycles: life.worst_miss,
+                    cadence: life.cadence.to_vec(),
+                })
+                .collect(),
+        }
     }
 
     /// Write the run-up to a bad miss to a file by itself, so a stutter nobody was
@@ -2686,6 +2770,7 @@ mod tests {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lifetime: HashMap::new(),
         }
     }
 
@@ -3450,6 +3535,7 @@ mod tests {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lifetime: HashMap::new(),
         };
         let dropped = |log: &FrameLog| log.stats.get("out").map_or(0, |s| s.dropped);
 
@@ -3498,6 +3584,7 @@ mod tests {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lifetime: HashMap::new(),
         };
         for i in 0..5 {
             let target = Duration::from_secs(200) + Duration::from_secs(i);
@@ -3533,6 +3620,7 @@ mod tests {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lifetime: HashMap::new(),
         };
 
         let base = Duration::from_secs(100);
@@ -3578,6 +3666,7 @@ mod tests {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lifetime: HashMap::new(),
         };
 
         let base = Duration::from_secs(100);
@@ -3630,6 +3719,7 @@ mod tests {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lifetime: HashMap::new(),
         };
         let headroom = |log: &FrameLog| {
             log.stats

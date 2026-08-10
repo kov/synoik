@@ -118,6 +118,8 @@ pub enum Msg {
     OverviewState,
     /// List screencasts.
     Casts,
+    /// Print this session's frame-timing tallies.
+    FramePerf,
 }
 
 /// One `synoik msg input` invocation, turned into a batch of [`InjectedEvent`]s.

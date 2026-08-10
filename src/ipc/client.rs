@@ -55,6 +55,7 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
         Msg::RequestError => Request::ReturnError,
         Msg::OverviewState => Request::OverviewState,
         Msg::Casts => Request::Casts,
+        Msg::FramePerf => Request::FramePerf,
         Msg::Input { input } => Request::InjectInput {
             events: input.to_events(),
         },
@@ -562,6 +563,75 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
             for cast in casts {
                 print_cast(&cast);
                 println!();
+            }
+        }
+        Msg::FramePerf => {
+            let Response::FramePerf(perf) = response else {
+                bail!("unexpected response: expected FramePerf, got {response:?}");
+            };
+
+            if json {
+                let perf = serde_json::to_string(&perf).context("error formatting response")?;
+                println!("{perf}");
+                return Ok(());
+            }
+
+            // Said first and plainly: with logging off every number below is zero
+            // because nothing counted them, which reads exactly like a session that
+            // never stuttered. That confusion is the whole reason this prints.
+            if !perf.enabled {
+                println!("Frame logging is off — set SYNOIK_FRAME_LOG to collect these.");
+                println!(
+                    "Suggested for a session you actually use: SYNOIK_FRAME_LOG=ring,gpu,autodump"
+                );
+                return Ok(());
+            }
+
+            println!("Frame logging is on.");
+            if perf.ring_capacity > 0 {
+                println!(
+                    "  Ring: {} of {} records banked",
+                    perf.ring_len, perf.ring_capacity
+                );
+            }
+            match perf.autodump_cycles {
+                Some(cycles) => println!(
+                    "  Auto-dump: on, at {cycles}+ missed cycles ({} written)",
+                    perf.autodumps
+                ),
+                None => println!("  Auto-dump: off"),
+            }
+            println!("  Dumps written: {}", perf.dumps);
+            println!("  Main-loop stalls: {}", perf.stalls);
+
+            for out in &perf.outputs {
+                println!();
+                println!("Output \"{}\":", out.output);
+                println!(
+                    "  Frames: {} ({} over budget, worst {:.2}ms)",
+                    out.frames, out.over_budget, out.worst_ms
+                );
+                println!(
+                    "  Late presentations: {} ({} cycles lost, worst {})",
+                    out.misses, out.missed_cycles, out.worst_miss_cycles
+                );
+                let cadence: Vec<String> = out
+                    .cadence
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| **n > 0)
+                    .map(|(cycles, n)| {
+                        // The last bucket is a catch-all, so it is a floor, not a count.
+                        if cycles + 1 == out.cadence.len() {
+                            format!("{cycles}+×{n}")
+                        } else {
+                            format!("{cycles}×{n}")
+                        }
+                    })
+                    .collect();
+                if !cadence.is_empty() {
+                    println!("  Presentation gaps, in cycles: {}", cadence.join(" "));
+                }
             }
         }
     }
