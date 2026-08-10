@@ -152,6 +152,17 @@ Marginal value for synoik's own testing either way.
 
 That clears ghost's stated bar for replacing both mutter and weston.
 
+**Confirmed from outside, same day.** ghost built `bcde724e` and drove its real binary against
+`--headless --output 1600x1000@1.25 --wayland-display syn-test`: the swapchain came up with no
+`ERROR_SURFACE_LOST_KHR`, and its own frame invariant (surface − geometry == inset) held at every
+step of floating@1.25 → `maximize` → `output … scale 1.3333` → `unmaximize` — 65px, then 0 while
+maximized, then 69/70 — with zero dropped frames. So the headless present loop *does* drive a real
+WSI client end to end, which §2 called out as the likely place for surprises; there were none.
+Their cross-check also validates `surface_size`: 780x527 against a 728x475 logical `window_size` is
+the same 65px ghost measures for itself, the first time that arithmetic has been checked against
+anything but ghost. Not exercised by them: input injection, screenshot-to-file,
+`ext-background-effect-v1`.
+
 ## 7. One trap for any rig
 
 `reload_output_config` loads the developer's real `~/.config/monitors.xml` (`src/synoik.rs:3568`),
