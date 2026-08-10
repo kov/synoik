@@ -62,6 +62,7 @@ pub use self::monitor::MonitorRenderElement;
 use self::monitor::{Monitor, WorkspaceSwitch};
 use self::workspace::{OutputId, Workspace};
 use crate::animation::{Animation, Clock};
+use crate::frame_log::AnimCauses;
 use crate::gnome::{EdgeTileTarget, TileSide};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::scrolling::ScrollDirection;
@@ -3030,22 +3031,32 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn are_animations_ongoing(&self, output: Option<&Output>) -> bool {
+        !self.animation_causes(output).is_empty()
+    }
+
+    /// The same predicates as [`Self::are_animations_ongoing`], but keeping *which*
+    /// ones fired so the frame log can name what a frame was animating. The bool is
+    /// derived from this set rather than accumulated beside it, so a new animation
+    /// cannot be added to one and forgotten in the other.
+    pub fn animation_causes(&self, output: Option<&Output>) -> AnimCauses {
+        let mut causes = AnimCauses::empty();
+
         // Keep advancing animations if we might need to scroll the view.
         if let Some(dnd) = &self.dnd {
             if output.is_none_or(|output| *output == dnd.output) {
-                return true;
+                causes |= AnimCauses::DND;
             }
         }
 
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if output.is_none_or(|output| *output == move_.output) {
                 if move_.tile.are_animations_ongoing() {
-                    return true;
+                    causes |= AnimCauses::INTERACTIVE_MOVE;
                 }
 
                 // Keep advancing animations if we might need to scroll the view.
                 if !move_.is_floating || self.overview_open {
-                    return true;
+                    causes |= AnimCauses::INTERACTIVE_MOVE;
                 }
             }
         }
@@ -3055,7 +3066,7 @@ impl<W: LayoutElement> Layout<W> {
             .as_ref()
             .is_some_and(|p| p.is_animation())
         {
-            return true;
+            causes |= AnimCauses::OVERVIEW;
         }
 
         for mon in self.monitors() {
@@ -3063,12 +3074,10 @@ impl<W: LayoutElement> Layout<W> {
                 continue;
             }
 
-            if mon.are_animations_ongoing() {
-                return true;
-            }
+            causes |= mon.animation_causes();
         }
 
-        false
+        causes
     }
 
     pub fn update_render_elements(&mut self, output: Option<&Output>) {

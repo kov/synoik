@@ -30,6 +30,7 @@ use super::workspace::{
 };
 use super::{compute_overview_zoom, ActivateWindow, HitType, LayoutElement, Options};
 use crate::animation::{Animation, Clock};
+use crate::frame_log::AnimCauses;
 use crate::gnome::EdgeTileTarget;
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::render_helpers::rounded_texture::RoundedTextureRenderElement;
@@ -1385,13 +1386,44 @@ impl<W: LayoutElement> Monitor<W> {
         self.update_app_grid_expand();
     }
 
-    pub(super) fn are_animations_ongoing(&self) -> bool {
-        self.workspace_switch
+    /// Which animations are running on this monitor, or an empty set if none are.
+    ///
+    /// Replaced a bool: the frame log needs to *name* what a slow frame was
+    /// animating, and callers that only want "is anything running" ask
+    /// `!…is_empty()`. Keeping one predicate means a new animation cannot be added
+    /// to the named set and forgotten in the bool.
+    pub(super) fn animation_causes(&self) -> AnimCauses {
+        let mut causes = AnimCauses::empty();
+        if self
+            .workspace_switch
             .as_ref()
             .is_some_and(|s| s.is_animation_ongoing())
-            || self.app_grid_expand.is_some()
-            || self.thumb_close_slide.is_some()
-            || self.workspaces.iter().any(|ws| ws.are_animations_ongoing())
+        {
+            causes |= AnimCauses::WORKSPACE_SWITCH;
+        }
+        if self.app_grid_expand.is_some() {
+            causes |= AnimCauses::APP_GRID_EXPAND;
+        }
+        if self.thumb_close_slide.is_some() {
+            causes |= AnimCauses::THUMB_CLOSE_SLIDE;
+        }
+        if self.workspaces.iter().any(|ws| ws.are_animations_ongoing()) {
+            causes |= AnimCauses::WINDOWS;
+        }
+        causes
+    }
+
+    /// Whether a workspace switch is in progress *at all*, including a touchpad
+    /// gesture that is being dragged rather than animating.
+    ///
+    /// Deliberately separate from [`Self::animation_causes`], which answers "must we
+    /// queue another frame ourselves". A swipe in progress answers no — its frames
+    /// come from the input events driving it — but it is still a workspace switch,
+    /// and a frame log that only named the animated case would be silent for exactly
+    /// the interaction a person is most likely to call janky. This is for labelling
+    /// a frame, never for deciding whether to draw one.
+    pub fn workspace_switch_in_progress(&self) -> bool {
+        self.workspace_switch.is_some()
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {

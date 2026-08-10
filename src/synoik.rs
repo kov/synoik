@@ -137,7 +137,7 @@ use crate::dbus::gnome_shell_introspect::{self, IntrospectToSynoik, SynoikToIntr
 use crate::dbus::gnome_shell_screenshot::{ScreenshotToSynoik, SynoikToScreenshot};
 use crate::dbus::system_status::SystemStatusToSynoik;
 use crate::frame_clock::FrameClock;
-use crate::frame_log::{FrameContext, FrameLog, Phase};
+use crate::frame_log::{AnimCauses, FrameContext, FrameLog, Phase};
 use crate::gnome::{AccelGrab, GnomeSettings, GnomeSettingsWriter};
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::pick_color_grab::PickColorGrab;
@@ -1254,6 +1254,10 @@ pub struct OutputState {
     /// [`crate::frame_log`], which reports them alongside a slow frame.
     pub last_frame_elements: usize,
     pub last_frame_full_damage: bool,
+    /// Which animations were running when the last frame was built. The set the
+    /// redraw loop derives `unfinished_animations_remain` from, kept so the frame
+    /// log can name what a slow frame was doing.
+    pub last_frame_anim_causes: AnimCauses,
 }
 
 #[derive(Debug, Default)]
@@ -7818,6 +7822,7 @@ impl Synoik {
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
             last_frame_elements: 0,
             last_frame_full_damage: false,
+            last_frame_anim_causes: AnimCauses::empty(),
         };
         let rv = self.output_state.insert(output.clone(), state);
         assert!(rv.is_none(), "output was already tracked");
@@ -10885,71 +10890,129 @@ impl Synoik {
 
         let mut res = RenderResult::Skipped;
         if self.monitors_active {
-            let state = self.output_state.get_mut(output).unwrap();
-            state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
-            state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.end_session_dialog.are_animations_ongoing();
-            {
-                state.unfinished_animations_remain |= self
-                    .polkit_ui
-                    .are_animations_ongoing(self.clock.now_unadjusted());
-            }
+            // Accumulated as a *named* set rather than a bare bool: the frame log records
+            // it, and "animating" alone could not distinguish a workspace switch from a
+            // panel button's fill fade, which is exactly the question a stutter report
+            // asks. `unfinished_animations_remain` is derived from this set below, so
+            // adding an animation here cannot leave the two disagreeing.
+            let mut causes = self.layout.animation_causes(Some(output));
+            let now_unadjusted = self.clock.now_unadjusted();
+            causes.set(
+                AnimCauses::DIALOG,
+                self.exit_confirm_dialog.are_animations_ongoing()
+                    || self.end_session_dialog.are_animations_ongoing(),
+            );
+            causes.set(
+                AnimCauses::POLKIT,
+                self.polkit_ui.are_animations_ongoing(now_unadjusted),
+            );
             // The flash is fired from a D-Bus call and is usually the only thing on screen that
             // is moving, so without this it would freeze at full white until something else asked
             // for a frame.
-            state.unfinished_animations_remain |=
-                self.flashspot.is_animating(self.clock.now_unadjusted());
+            causes.set(
+                AnimCauses::FLASHSPOT,
+                self.flashspot.is_animating(now_unadjusted),
+            );
             // Same for the hot-corner ripple: the overview toggle it accompanies settles well
             // before the last wave has finished expanding.
-            state.unfinished_animations_remain |=
-                self.ripples.is_animating(self.clock.now_unadjusted());
-            state.unfinished_animations_remain |= self.dock.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.panel_popover.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.notification_banner.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.osd.are_animations_ongoing();
+            causes.set(
+                AnimCauses::RIPPLE,
+                self.ripples.is_animating(now_unadjusted),
+            );
+            causes.set(AnimCauses::DOCK, self.dock.are_animations_ongoing());
+            causes.set(
+                AnimCauses::SCREENSHOT_UI,
+                self.screenshot_ui.are_animations_ongoing(),
+            );
+            causes.set(
+                AnimCauses::PANEL_POPOVER,
+                self.panel_popover.are_animations_ongoing(),
+            );
+            causes.set(
+                AnimCauses::NOTIFICATION,
+                self.notification_banner.are_animations_ongoing(),
+            );
+            causes.set(AnimCauses::OSD, self.osd.are_animations_ongoing());
             // The switcher's sub-list fades in and out, and the next event on a switcher is
             // usually the key that ends the session — so without this the fade would only
             // advance when something else happened to force a frame.
-            state.unfinished_animations_remain |= self.switcher.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.panel.are_animations_ongoing();
+            causes.set(AnimCauses::SWITCHER, self.switcher.are_animations_ongoing());
+            causes.set(AnimCauses::PANEL, self.panel.are_animations_ongoing());
             // The dash's drop gap eases shut after a drop, with no pointer motion left
             // to generate the frames it needs.
-            state.unfinished_animations_remain |= self.dash.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.app_grid.are_animations_ongoing();
-            state.unfinished_animations_remain |= self.folder_dialog.are_animations_ongoing();
+            causes.set(AnimCauses::DASH, self.dash.are_animations_ongoing());
+            causes.set(AnimCauses::APP_GRID, self.app_grid.are_animations_ongoing());
+            causes.set(
+                AnimCauses::FOLDER_DIALOG,
+                self.folder_dialog.are_animations_ongoing(),
+            );
             // The overview search cross-fade lives on `Synoik` (not the layout), so it
             // must keep the redraw loop alive here too — otherwise the fade only
             // advances when another event (e.g. pointer motion) forces a frame, and
             // the results appear stuck at a partial alpha until the mouse moves.
-            state.unfinished_animations_remain |= self.overview_search_fade.is_some();
-            state.unfinished_animations_remain |= self.overview_search_expand.is_some();
-            state.unfinished_animations_remain |= state.screen_transition.is_some();
+            causes.set(
+                AnimCauses::OVERVIEW_SEARCH,
+                self.overview_search_fade.is_some() || self.overview_search_expand.is_some(),
+            );
             // The shield's hint fades in four seconds after the last input, and there is by
             // definition no input coming — nothing else would ask for those frames.
-            let now = crate::utils::get_monotonic_time();
-            state.unfinished_animations_remain |= self.lock_screen.is_animating(now);
+            //
             // The clock↔prompt crossfade is the same story: it starts on a keypress and then owes
             // 300 ms of frames nothing else will ask for. So is the curtain's own slide, which
             // additionally runs *after* the shield is gone and so has nothing else to ask at all.
-            state.unfinished_animations_remain |= self.lock_screen.page_is_animating(now);
-            state.unfinished_animations_remain |= self.lock_screen.is_sliding(now);
-            state.unfinished_animations_remain |= self.lock_screen.is_fading(now);
-            state.unfinished_animations_remain |= self.lock_screen.caps_is_animating(now);
-            state.unfinished_animations_remain |= self.lock_screen.wiggle_is_animating(now);
+            let now = crate::utils::get_monotonic_time();
+            causes.set(
+                AnimCauses::LOCK_SCREEN,
+                self.lock_screen.is_animating(now)
+                    || self.lock_screen.page_is_animating(now)
+                    || self.lock_screen.is_sliding(now)
+                    || self.lock_screen.is_fading(now)
+                    || self.lock_screen.caps_is_animating(now)
+                    || self.lock_screen.wiggle_is_animating(now),
+            );
 
             // Also keep redrawing if the current cursor is animated.
-            state.unfinished_animations_remain |= self
-                .cursor_manager
-                .is_current_cursor_animated(output.current_scale().integer_scale());
+            causes.set(
+                AnimCauses::CURSOR,
+                self.cursor_manager
+                    .is_current_cursor_animated(output.current_scale().integer_scale()),
+            );
 
-            // Also check layer surfaces.
-            if !state.unfinished_animations_remain {
-                state.unfinished_animations_remain |= layer_map_for_output(output)
-                    .layers()
-                    .filter_map(|surface| self.mapped_layer_surfaces.get(surface))
-                    .any(|mapped| mapped.are_animations_ongoing());
+            causes.set(
+                AnimCauses::SCREEN_TRANSITION,
+                self.output_state[output].screen_transition.is_some(),
+            );
+
+            // Also check layer surfaces. Still guarded on the set being otherwise empty:
+            // the scan walks every layer surface on the output and the answer cannot
+            // change whether we redraw, only why.
+            if causes.is_empty() {
+                causes.set(
+                    AnimCauses::LAYER_SURFACE,
+                    layer_map_for_output(output)
+                        .layers()
+                        .filter_map(|surface| self.mapped_layer_surfaces.get(surface))
+                        .any(|mapped| mapped.are_animations_ongoing()),
+                );
             }
+
+            // Whether to keep drawing is decided by `causes` alone. The log gets one
+            // extra bit that must NOT feed that decision: a workspace switch being
+            // *dragged* on a touchpad queues no frames of its own — the input events
+            // do — so folding it in would spin the redraw loop for as long as a
+            // finger rests on the touchpad. It still needs naming, because a dragged
+            // switch is exactly the interaction someone calls janky.
+            let drag_switch = self
+                .layout
+                .monitor_for_output(output)
+                .is_some_and(|mon| mon.workspace_switch_in_progress());
+
+            let state = self.output_state.get_mut(output).unwrap();
+            state.unfinished_animations_remain = !causes.is_empty();
+            if drag_switch {
+                causes |= AnimCauses::WORKSPACE_SWITCH;
+            }
+            state.last_frame_anim_causes = causes;
 
             // Render. The backend marks its own sub-phases (collect / submit /
             // queue) as it goes.
@@ -11038,7 +11101,7 @@ impl Synoik {
             self.frame_log.set_context(FrameContext {
                 elements: state.last_frame_elements,
                 full_damage: state.last_frame_full_damage,
-                animating: state.unfinished_animations_remain,
+                animating: state.last_frame_anim_causes,
                 overview_state: self
                     .layout
                     .monitor_for_output(output)

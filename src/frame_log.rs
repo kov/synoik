@@ -23,10 +23,14 @@
 //! | `all` | log every frame (very noisy — for short captures) |
 //! | `summary=<secs>` | how often to emit the rolling summary; `0` turns it off |
 //! | `gpu` | also time the GPU passes (see [`gpu_timing`]) |
+//! | `ring[=N]` | bank raw frame records in a bounded ring; dump on `SIGUSR1` |
+//! | `autodump[=cycles]` | dump the ring's tail by itself on a miss of `cycles` or more (default 2); implies `ring` |
 //!
 //! So `SYNOIK_FRAME_LOG=1` for everyday use, `SYNOIK_FRAME_LOG=8,summary=5,gpu` to
 //! chase something specific, `SYNOIK_FRAME_LOG=all` to capture a few seconds in
-//! full.
+//! full, and **`SYNOIK_FRAME_LOG=ring,gpu,autodump`** to leave running on a session
+//! you actually use — that combination costs no per-frame I/O and still leaves a
+//! file behind for a hitch nobody was ready to catch.
 //!
 //! # What it measures
 //!
@@ -557,6 +561,130 @@ impl Phase {
     }
 }
 
+bitflags::bitflags! {
+    /// Which animations were running when a frame was built.
+    ///
+    /// This used to be a single `animating: bool`, which meant a workspace switch, a
+    /// window opening and a panel button's fill fade were indistinguishable in the
+    /// log — so a report of "switching workspaces stuttered" could not be matched
+    /// against the frames that did it. The bits are the *same* predicates the redraw
+    /// loop already evaluates to decide whether to queue another frame
+    /// (`Synoik::redraw`); naming them costs nothing beyond an OR, and there is one
+    /// source of truth because `animating` is derived from this set rather than
+    /// accumulated alongside it.
+    ///
+    /// Bits are deliberately fine-grained where the cost classes differ: a workspace
+    /// switch composites *two* workspaces with a crop on the join axis, which is a
+    /// different frame shape from any other layout animation.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct AnimCauses: u32 {
+        /// A workspace switch — a keyboard/programmatic animation, or a touchpad
+        /// gesture being dragged. The gesture case is labelling only: a drag does not
+        /// make the compositor queue frames (the input events do), so this bit can be
+        /// set on a frame that reports no *ongoing animation*.
+        const WORKSPACE_SWITCH = 1 << 0;
+        /// The app grid expanding or collapsing within the monitor.
+        const APP_GRID_EXPAND = 1 << 1;
+        /// A workspace thumbnail sliding shut after a close.
+        const THUMB_CLOSE_SLIDE = 1 << 2;
+        /// Window-level animations inside a workspace: open, close, move, resize.
+        const WINDOWS = 1 << 3;
+        /// Any other layout animation this set does not name individually. A frame
+        /// carrying only this bit means the layout reported work the breakdown missed
+        /// — treat it as a gap in this enum, not as a mystery.
+        const LAYOUT_OTHER = 1 << 4;
+        /// The exit-confirm or end-session dialog.
+        const DIALOG = 1 << 5;
+        /// The polkit authentication dialog.
+        const POLKIT = 1 << 6;
+        /// The screenshot flash.
+        const FLASHSPOT = 1 << 7;
+        /// The hot-corner ripple.
+        const RIPPLE = 1 << 8;
+        /// The dock showing, hiding or poking.
+        const DOCK = 1 << 9;
+        /// The screenshot UI.
+        const SCREENSHOT_UI = 1 << 10;
+        /// A panel popover (quick settings, calendar, …).
+        const PANEL_POPOVER = 1 << 11;
+        /// A notification banner.
+        const NOTIFICATION = 1 << 12;
+        /// An OSD (volume, brightness, …).
+        const OSD = 1 << 13;
+        /// The alt-tab switcher, including its sub-list fade.
+        const SWITCHER = 1 << 14;
+        /// The panel itself — button fill fades, the workspace dot morph.
+        const PANEL = 1 << 15;
+        /// The dash, including its drop gap easing shut.
+        const DASH = 1 << 16;
+        /// The app grid.
+        const APP_GRID = 1 << 17;
+        /// An app-folder dialog.
+        const FOLDER_DIALOG = 1 << 18;
+        /// The overview search cross-fade or entry expand.
+        const OVERVIEW_SEARCH = 1 << 19;
+        /// A screen transition (the crossfade over a mode set).
+        const SCREEN_TRANSITION = 1 << 20;
+        /// The lock screen: shield, page crossfade, slide, fade, caps hint or wiggle.
+        const LOCK_SCREEN = 1 << 21;
+        /// An animated cursor theme.
+        const CURSOR = 1 << 22;
+        /// A layer-shell surface animating.
+        const LAYER_SURFACE = 1 << 23;
+        /// The overview opening, closing or moving along its state axis.
+        const OVERVIEW = 1 << 24;
+        /// A drag-and-drop in progress, which keeps frames coming so the view can scroll.
+        const DND = 1 << 25;
+        /// An interactive window move.
+        const INTERACTIVE_MOVE = 1 << 26;
+    }
+}
+
+impl AnimCauses {
+    /// Lowercase, hyphenated names of the set bits, for the log line. Allocates, so
+    /// this is for formatting a frame that is already being written out — never on
+    /// the banking path, which stores the raw bits.
+    pub fn names(self) -> Vec<&'static str> {
+        // `bitflags`' own `Debug` prints `WORKSPACE_SWITCH | PANEL`, which is fine
+        // for a dump but reads badly in a line that is otherwise prose. The explicit
+        // table also keeps the log's vocabulary stable if a constant is ever renamed.
+        const TABLE: &[(AnimCauses, &str)] = &[
+            (AnimCauses::WORKSPACE_SWITCH, "workspace-switch"),
+            (AnimCauses::APP_GRID_EXPAND, "app-grid-expand"),
+            (AnimCauses::THUMB_CLOSE_SLIDE, "thumb-close-slide"),
+            (AnimCauses::WINDOWS, "windows"),
+            (AnimCauses::LAYOUT_OTHER, "layout-other"),
+            (AnimCauses::DIALOG, "dialog"),
+            (AnimCauses::POLKIT, "polkit"),
+            (AnimCauses::FLASHSPOT, "flashspot"),
+            (AnimCauses::RIPPLE, "ripple"),
+            (AnimCauses::DOCK, "dock"),
+            (AnimCauses::SCREENSHOT_UI, "screenshot-ui"),
+            (AnimCauses::PANEL_POPOVER, "panel-popover"),
+            (AnimCauses::NOTIFICATION, "notification"),
+            (AnimCauses::OSD, "osd"),
+            (AnimCauses::SWITCHER, "switcher"),
+            (AnimCauses::PANEL, "panel"),
+            (AnimCauses::DASH, "dash"),
+            (AnimCauses::APP_GRID, "app-grid"),
+            (AnimCauses::FOLDER_DIALOG, "folder-dialog"),
+            (AnimCauses::OVERVIEW_SEARCH, "overview-search"),
+            (AnimCauses::SCREEN_TRANSITION, "screen-transition"),
+            (AnimCauses::LOCK_SCREEN, "lock-screen"),
+            (AnimCauses::CURSOR, "cursor"),
+            (AnimCauses::LAYER_SURFACE, "layer-surface"),
+            (AnimCauses::OVERVIEW, "overview"),
+            (AnimCauses::DND, "dnd"),
+            (AnimCauses::INTERACTIVE_MOVE, "interactive-move"),
+        ];
+        TABLE
+            .iter()
+            .filter(|(bit, _)| self.contains(*bit))
+            .map(|(_, name)| *name)
+            .collect()
+    }
+}
+
 /// What the frame was doing, for the log line. Cheap to collect — every field is
 /// already at hand where a frame is assembled.
 #[derive(Debug, Clone, Copy, Default)]
@@ -565,8 +693,9 @@ pub struct FrameContext {
     pub elements: usize,
     /// Damage tracking was bypassed and the whole output redrawn.
     pub full_damage: bool,
-    /// Some animation is still running, so another frame is already due.
-    pub animating: bool,
+    /// Which animations were running, so another frame is already due. Empty means
+    /// the frame was not animating.
+    pub animating: AnimCauses,
     /// Where the overview sits on its 0..2 state axis, if it is open at all.
     pub overview_state: Option<f64>,
     /// The output's physical area in pixels, to express shading as an overdraw multiple.
@@ -593,6 +722,19 @@ struct Settings {
     /// cost untouched. Banking the raw record is a move of data the frame already
     /// built — no formatting, no allocation beyond the ring, no I/O.
     ring: Option<usize>,
+    /// Dump the tail of the ring by itself when a presentation misses at least this
+    /// many refresh cycles. `None` = off; implies [`Self::ring`].
+    ///
+    /// This is what makes the recorder useful for a stutter you cannot reproduce.
+    /// The manual path requires noticing the hitch and getting `SIGUSR1` in before
+    /// the ring rolls over, which is exactly the thing that fails for a one-off.
+    ///
+    /// **The threshold is at least 2 for a reason.** On this stack a *single* missed
+    /// cycle is routine — `docs/fork/present-misses.md` measures ~12% of presented
+    /// frames landing one cycle late, unresolved and largely host-side. Triggering
+    /// on that would dump continuously and tell you nothing. Two cycles (33ms at
+    /// 60Hz) is past the point where a person sees a hitch rather than a statistic.
+    autodump: Option<u64>,
 }
 
 impl Default for Settings {
@@ -602,9 +744,29 @@ impl Default for Settings {
             log_all: false,
             summary_every: Some(Duration::from_secs(10)),
             ring: None,
+            autodump: None,
         }
     }
 }
+
+/// How many banked entries an automatic dump keeps: the run-up to the miss, not the
+/// whole ring. ~10 s at 60 Hz on one output, and the interesting part of a stutter is
+/// the second or two before it.
+const AUTODUMP_TAIL: usize = 600;
+
+/// Shortest gap between two automatic dumps. A bad stretch misses many times over,
+/// and without this the first hitch's dump would be immediately overwritten in spirit
+/// by a hundred more — each one costing synchronous I/O on the compositor thread
+/// while the session is already struggling.
+const AUTODUMP_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Most automatic dumps in one session. A session that misses all day would otherwise
+/// fill the state directory unattended; the first few carry the same information.
+const AUTODUMP_MAX: u64 = 20;
+
+/// Default trigger, in missed refresh cycles. See [`Settings::autodump`] for why this
+/// is not 1.
+const AUTODUMP_DEFAULT_CYCLES: u64 = 2;
 
 /// Largest presentation gap [`Stats::cadence`] counts on its own; anything longer
 /// lands in this bucket. Four cycles is 67ms at 60Hz — well past "a hitch".
@@ -879,6 +1041,10 @@ pub struct FrameLog {
     /// presentation interval. See [`Stats::cadence`].
     last_presented: HashMap<String, Duration>,
     last_summary: Instant,
+    /// When the last automatic dump ran, for [`AUTODUMP_COOLDOWN`]. `None` = none yet.
+    last_autodump: Option<Instant>,
+    /// How many automatic dumps this session has written, for [`AUTODUMP_MAX`].
+    autodumps: u64,
 }
 
 impl FrameLog {
@@ -936,6 +1102,8 @@ impl FrameLog {
             queued: HashMap::new(),
             last_presented: HashMap::new(),
             last_summary: Instant::now(),
+            last_autodump: None,
+            autodumps: 0,
         }
     }
 
@@ -971,6 +1139,25 @@ impl FrameLog {
                         settings.ring = Some(n);
                     }
                     Err(_) => tracing::warn!("SYNOIK_FRAME_LOG: bad ring size {v:?}, ignoring"),
+                },
+                // Implies `ring`, rather than silently doing nothing without it:
+                // there is nothing to dump otherwise, and a no-op instrument reads
+                // exactly like a session that never stuttered.
+                ("autodump", None) => {
+                    enabled = true;
+                    settings.autodump = Some(AUTODUMP_DEFAULT_CYCLES);
+                    settings.ring.get_or_insert(DEFAULT_RING);
+                }
+                ("autodump", Some(v)) => match v.parse::<u64>() {
+                    Ok(0) => settings.autodump = None,
+                    Ok(cycles) => {
+                        enabled = true;
+                        settings.autodump = Some(cycles);
+                        settings.ring.get_or_insert(DEFAULT_RING);
+                    }
+                    Err(_) => {
+                        tracing::warn!("SYNOIK_FRAME_LOG: bad autodump threshold {v:?}, ignoring")
+                    }
                 },
                 ("summary", Some(v)) => match v.parse::<u64>() {
                     Ok(0) => settings.summary_every = None,
@@ -1395,8 +1582,11 @@ impl FrameLog {
         if ctx.full_damage {
             line.push_str(", full damage");
         }
-        if ctx.animating {
-            line.push_str(", animating");
+        if !ctx.animating.is_empty() {
+            // Naming the animations is the whole point: "animating" alone could not
+            // distinguish a workspace switch from a button's fill fade, so a stutter
+            // report had nothing to join against.
+            let _ = write!(line, ", animating {}", ctx.animating.names().join("+"));
         }
         if let Some(state) = ctx.overview_state {
             let _ = write!(line, ", overview {state:.2}");
@@ -1568,6 +1758,48 @@ impl FrameLog {
             self.ring.push_back(Entry::Line(line.clone()));
         }
         tracing::warn!("{line}");
+
+        self.maybe_autodump(settings, missed, &line);
+    }
+
+    /// Write the run-up to a bad miss to a file by itself, so a stutter nobody was
+    /// ready for still leaves evidence.
+    ///
+    /// Fires *after* the miss line is banked, so the dump ends with the miss that
+    /// caused it — the last line of the file names the event, and everything above it
+    /// is the run-up.
+    fn maybe_autodump(&mut self, settings: Settings, missed: u64, cause: &str) {
+        let Some(threshold) = settings.autodump else {
+            return;
+        };
+        if missed < threshold {
+            return;
+        }
+        if self.autodumps >= AUTODUMP_MAX {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_autodump
+            .is_some_and(|last| now.duration_since(last) < AUTODUMP_COOLDOWN)
+        {
+            return;
+        }
+
+        // Set before the write, not after: a dump that fails still consumed the
+        // cooldown. Otherwise a persistent failure (a full disk, a read-only state
+        // directory) retries on every single miss, which turns one broken instrument
+        // into a per-frame syscall storm on the compositor thread.
+        self.last_autodump = Some(now);
+        self.autodumps += 1;
+
+        match self.dump_tail(AUTODUMP_TAIL) {
+            Ok((path, entries)) => tracing::warn!(
+                "frame log: auto-dumped {entries} entries to {} ({cause})",
+                path.display()
+            ),
+            Err(err) => tracing::warn!("frame log: auto-dump failed: {err}"),
+        }
     }
 
     fn maybe_summarize(&mut self, now: Instant) {
@@ -1694,10 +1926,44 @@ impl FrameLog {
     /// frames. The text is byte-identical to the journal's, so
     /// `scripts/correlate-frame-log.py` reads a dump directly.
     pub fn dump(&mut self) -> std::io::Result<(std::path::PathBuf, usize)> {
+        let path = dump_path(self.dump_override.clone(), self.dumps);
+        let entries = self.write_ring(&path, self.ring.len())?;
+
+        self.ring.clear();
+        self.dumps += 1;
+        Ok((path, entries))
+    }
+
+    /// Write the newest `keep` banked entries **without clearing the ring**, for the
+    /// automatic dump ([`Settings::autodump`]).
+    ///
+    /// Both halves of that are deliberate. *Newest only*, because the point of an
+    /// automatic dump is the run-up to one bad moment, and writing the whole
+    /// ~22-minute ring would be tens of MB of synchronous I/O on the compositor
+    /// thread — a hitch caused by the instrument, fired precisely when the session
+    /// is already struggling. *Without clearing*, because otherwise the automatic
+    /// dump silently destroys the window a later `SIGUSR1` would have collected, and
+    /// two triggers in a row would eat each other's evidence.
+    fn dump_tail(&mut self, keep: usize) -> std::io::Result<(std::path::PathBuf, usize)> {
+        let path = dump_path(self.dump_override.clone(), self.dumps);
+        let entries = self.write_ring(&path, keep)?;
+        self.dumps += 1;
+        Ok((path, entries))
+    }
+
+    /// Format and write the newest `keep` banked entries, oldest first.
+    ///
+    /// A file rather than the journal on purpose: a dump is tens of thousands of
+    /// lines at once, and journald's rate limiter would *drop* some of them, which
+    /// is the one failure this whole mechanism cannot tolerate — a log with
+    /// invisible holes reads exactly like a log of a session that rendered fewer
+    /// frames. The text is byte-identical to the journal's, so
+    /// `scripts/correlate-frame-log.py` reads a dump directly.
+    fn write_ring(&self, path: &std::path::Path, keep: usize) -> std::io::Result<usize> {
         use std::io::Write as _;
 
-        let path = dump_path(self.dump_override.clone(), self.dumps);
-        let entries = self.ring.len();
+        let skip = self.ring.len().saturating_sub(keep);
+        let entries = self.ring.len() - skip;
 
         // Write beside the target and rename into place. A dump is tens of MB onto a
         // tmpfs, so a mid-write ENOSPC is a real outcome — and a half-written file at
@@ -1713,8 +1979,9 @@ impl FrameLog {
             let mut out = std::io::BufWriter::new(file);
             // By reference, not `drain`: dropping a `Drain` discards the whole drained
             // range, so an error partway through used to destroy the entries it had
-            // not written yet. The ring is cleared below, once the bytes are safe.
-            for entry in self.ring.iter() {
+            // not written yet. The caller clears the ring afterwards, once the bytes
+            // are safe.
+            for entry in self.ring.iter().skip(skip) {
                 match entry {
                     Entry::Frame {
                         frame,
@@ -1731,11 +1998,9 @@ impl FrameLog {
             }
             out.flush()?;
         }
-        std::fs::rename(&tmp, &path)?;
+        std::fs::rename(&tmp, path)?;
 
-        self.ring.clear();
-        self.dumps += 1;
-        Ok((path, entries))
+        Ok(entries)
     }
 }
 
@@ -2216,6 +2481,8 @@ mod tests {
             queued: HashMap::new(),
             last_presented: HashMap::new(),
             last_summary: Instant::now(),
+            last_autodump: None,
+            autodumps: 0,
         }
     }
 
@@ -2409,6 +2676,128 @@ mod tests {
             log.ring.len(),
             1,
             "a failed dump must not consume the entries it could not write"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `autodump` must turn the ring on by itself, and must not trip on the routine
+    /// single-cycle miss.
+    ///
+    /// Both halves are correctness, not ergonomics. Without the implication,
+    /// `SYNOIK_FRAME_LOG=autodump` is a silent no-op — there is no ring to dump — and
+    /// a session that never writes a file is indistinguishable from a session that
+    /// never stuttered. And a default of 1 would fire on the ~12% of presentations
+    /// that land one cycle late on this stack (`docs/fork/present-misses.md`), i.e.
+    /// continuously, which is the same as not having a trigger.
+    #[test]
+    fn autodump_implies_ring_and_ignores_the_routine_miss() {
+        let s = FrameLog::parse("autodump").expect("autodump alone must enable logging");
+        assert_eq!(s.autodump, Some(AUTODUMP_DEFAULT_CYCLES));
+        assert!(
+            s.ring.is_some(),
+            "autodump without a ring has nothing to dump"
+        );
+        const {
+            assert!(
+                AUTODUMP_DEFAULT_CYCLES >= 2,
+                "a 1-cycle trigger fires on routine misses and is no trigger at all"
+            )
+        };
+
+        let s = FrameLog::parse("ring=16,autodump=3").expect("enabled");
+        assert_eq!(s.autodump, Some(3));
+        assert_eq!(s.ring, Some(16), "an explicit ring size must survive");
+
+        let s = FrameLog::parse("ring,autodump=0").expect("ring still enables logging");
+        assert_eq!(s.autodump, None, "autodump=0 must turn it off");
+    }
+
+    /// An automatic dump writes the run-up to a bad miss *without* consuming the
+    /// ring, and rate-limits itself.
+    ///
+    /// Keeping the ring is the load-bearing part. If the automatic dump cleared it
+    /// the way `SIGUSR1` does, the instrument would quietly destroy the evidence it
+    /// exists to preserve: the first hitch of a bad stretch would take the window
+    /// with it, and a person who then reached for `SIGUSR1` would collect the
+    /// handful of frames since — reading as a healthy session.
+    #[test]
+    fn an_automatic_dump_keeps_the_ring_and_rate_limits() {
+        let dir = std::env::temp_dir().join(format!("synoik-autodump-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auto.txt");
+
+        let mut log = test_log();
+        log.dump_override = Some(path.clone());
+        log.settings = Some(Settings {
+            ring: Some(64),
+            autodump: Some(2),
+            summary_every: None,
+            ..Settings::default()
+        });
+
+        for _ in 0..5 {
+            log.begin("out");
+            log.end(Some(Duration::from_millis(16)));
+        }
+        let banked = log.ring.len();
+        assert_eq!(banked, 5, "frames must be banked before the miss");
+
+        // One cycle late: under the threshold, so nothing is written.
+        log.presented(
+            "out",
+            Duration::from_millis(100),
+            Duration::from_millis(116),
+            Some(Duration::from_millis(16)),
+        );
+        assert_eq!(log.autodumps, 0, "a 1-cycle miss must not trigger a dump");
+
+        // Two cycles late: over the threshold.
+        log.presented(
+            "out",
+            Duration::from_millis(200),
+            Duration::from_millis(233),
+            Some(Duration::from_millis(16)),
+        );
+        assert_eq!(log.autodumps, 1, "a 2-cycle miss must trigger a dump");
+        assert!(
+            log.ring.len() > banked,
+            "the automatic dump must NOT clear the ring — it would destroy the \
+             window a later SIGUSR1 would collect"
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.lines()
+                .last()
+                .is_some_and(|l| l.starts_with("missed ")),
+            "the dump must end with the miss that caused it, so the file names \
+             its own trigger: {text}"
+        );
+
+        // A bad stretch misses many times over; each dump is synchronous I/O on the
+        // compositor thread, so the second one inside the cooldown must be skipped.
+        log.presented(
+            "out",
+            Duration::from_millis(300),
+            Duration::from_millis(333),
+            Some(Duration::from_millis(16)),
+        );
+        assert_eq!(
+            log.autodumps, 1,
+            "a second miss inside the cooldown must not dump again"
+        );
+
+        // And the manual dump still has the whole window, including both misses.
+        let (_, n) = log.dump().expect("dump");
+        assert_eq!(
+            n, 8,
+            "SIGUSR1 must still collect everything the automatic dump left alone: \
+             5 frames plus 3 miss lines"
+        );
+        assert!(
+            log.ring.is_empty(),
+            "the manual dump still empties the ring"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2753,6 +3142,8 @@ mod tests {
             queued: HashMap::new(),
             last_presented: HashMap::new(),
             last_summary: Instant::now(),
+            last_autodump: None,
+            autodumps: 0,
         };
         let dropped = |log: &FrameLog| log.stats.get("out").map_or(0, |s| s.dropped);
 
@@ -2798,6 +3189,8 @@ mod tests {
             queued: HashMap::new(),
             last_presented: HashMap::new(),
             last_summary: Instant::now(),
+            last_autodump: None,
+            autodumps: 0,
         };
         for i in 0..5 {
             let target = Duration::from_secs(200) + Duration::from_secs(i);
@@ -2830,6 +3223,8 @@ mod tests {
             queued: HashMap::new(),
             last_presented: HashMap::new(),
             last_summary: Instant::now(),
+            last_autodump: None,
+            autodumps: 0,
         };
 
         let base = Duration::from_secs(100);
@@ -2872,6 +3267,8 @@ mod tests {
             queued: HashMap::new(),
             last_presented: HashMap::new(),
             last_summary: Instant::now(),
+            last_autodump: None,
+            autodumps: 0,
         };
 
         let base = Duration::from_secs(100);
@@ -2921,6 +3318,8 @@ mod tests {
             queued: HashMap::new(),
             last_presented: HashMap::new(),
             last_summary: Instant::now(),
+            last_autodump: None,
+            autodumps: 0,
         };
         let headroom = |log: &FrameLog| {
             log.stats
