@@ -230,6 +230,37 @@ remaining slow frame is an overview animation or first-time startup work.
 4. **Idle `collect` outliers.** One idle frame showed `2 shaped runs in 26.39 ms` where every
    other was 3.9–5.1 ms. One sample, no pattern. Watch, don't chase.
 
+## 6b. Catching a stutter nobody was ready for (2026-08-09)
+
+Everything above is a *measurement* — you decide to look, you arm the instrument, you drive a
+workload. That answers nothing about a hitch someone noticed once and could not reproduce, which
+is how most of them arrive. Three additions close that:
+
+- **`SYNOIK_FRAME_LOG=ring,gpu,autodump`** is the combination to leave running on a session you
+  actually use. `ring` costs no per-frame I/O (that is the whole reason it exists — see
+  `Settings::ring`), and `autodump` writes the tail of the ring to `~/.local/state/synoik/` by
+  itself when a presentation misses **2+ refresh cycles**. Two, not one: ~12% of presentations
+  land one cycle late on this stack (`present-misses.md`), so a 1-cycle trigger fires
+  continuously and means nothing. The automatic dump does **not** clear the ring, so a later
+  `SIGUSR1` still gets the full window.
+- **A frame's line now names what it was animating** — `animating workspace-switch+panel` rather
+  than `animating`. The bits are the predicates the redraw loop already evaluates, and
+  `unfinished_animations_remain` is derived from them, so the two cannot drift. One bit is
+  labelling only: a workspace switch being *dragged* on a touchpad queues no frames of its own,
+  so folding it into the redraw decision would spin the loop while a finger rests on the pad.
+- **Main-loop stalls.** Every other instrument here measures a frame, `begin` to `end`. A hitch
+  caused by anything else on the compositor thread produces **no slow frame at all** — the log
+  reports everything under budget and the only trace is a `cadence` bucket. `LoopWatch` measures
+  one turn of calloop's loop and splits it with `CLOCK_THREAD_CPUTIME_ID`: CPU outside the frame
+  path is a stall whatever else is true, and time *not running* is a stall if a redraw was
+  already queued. That second case is the point — a handler blocked on a synchronous D-Bus round
+  trip burns no CPU, so anything measuring work is blind to it.
+
+`synoik msg frame-perf` reads the session's tallies out of the running compositor (the rolling
+summary resets every period, so the journal cannot answer "has this been happening?"). It says
+first whether logging is on at all, because with it off every number is zero for lack of
+counting — which reads exactly like a session that never stuttered.
+
 ## 7. Picking this back up
 
 1. `SYNOIK_FRAME_LOG=1` is set for the gsrs session via
@@ -238,6 +269,15 @@ remaining slow frame is an overview animation or first-time startup work.
    [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md)). `systemd --user` only
    reads `environment.d` at start or `daemon-reload`, so a plain logout/login may not pick up a
    change.
+
+   **On a lingering user, `environment.d` does not work at all.** With `Linger=yes` the
+   `user@UID.service` manager starts at *boot* and survives logout, and environment generators
+   only run at manager start — so a drop-in added mid-session is never picked up, not even by a
+   re-login. It reads as "this is on" while the compositor never sees it. Both gsrs and kov
+   linger, so session env goes on the unit override
+   (`~/.config/systemd/user/org.gnome.Shell@user.service.d/override.conf`, `Environment=`)
+   followed by `systemctl --user daemon-reload` and a relog. kov's own seat carries
+   `SYNOIK_FRAME_LOG=ring,gpu,autodump` there as of 2026-08-09.
 2. Read frames with `journalctl _UID=$(id -u gsrs)`; filter on `frame on`. Sessions are
    delimited by the `frame logging on:` line.
 3. `cargo test` does **not** rebuild `target/debug/synoik`. After a code change,
