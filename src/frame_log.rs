@@ -3171,9 +3171,15 @@ mod tests {
 
         // A frame that burns real CPU. Busy-spin rather than sleep: sleeping accrues
         // wall time and no CPU, which is the *other* case entirely.
+        //
+        // The spin is bounded by CPU time, not wall time. libtest runs these in
+        // parallel, so a wall-clock deadline can be spent descheduled — the thread
+        // would accrue almost no CPU and the assertion below would fail on a busy
+        // machine and pass on an idle one. Spinning on the same clock the assertion
+        // reads makes it true by construction.
         log.begin("out");
-        let spin_until = Instant::now() + Duration::from_millis(12);
-        while Instant::now() < spin_until {
+        let spin_from = thread_cpu();
+        while thread_cpu().saturating_sub(spin_from) < Duration::from_millis(6) {
             std::hint::spin_loop();
         }
         log.end(Some(Duration::from_millis(16)));
