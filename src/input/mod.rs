@@ -1074,7 +1074,7 @@ impl State {
                 // is the hardcoded VT-switch chord (Ctrl+Alt+F1..F12): switching to a text console
                 // must never be blocked by an in-compositor overlay, so let it through to the
                 // backend even while the popover holds the grab.
-                if this.synoik.panel_popover.is_open() {
+                if this.synoik.panel_popover.grabs_input() {
                     #[allow(non_upper_case_globals)]
                     if let keysyms::KEY_XF86Switch_VT_1..=keysyms::KEY_XF86Switch_VT_12 =
                         modified.raw()
@@ -4501,7 +4501,7 @@ impl State {
             (None, None, None, None)
         } else if let Some(drag) = &self.synoik.app_drag {
             (drag.unpin.then_some(DashHit::ShowApps), None, None, None)
-        } else if self.synoik.panel_popover.is_open() {
+        } else if self.synoik.panel_popover.grabs_input() {
             // An open menu holds a `Clutter.Grab` (`PopupMenuManager`), so motion never
             // reaches the actors beneath it — not the icon under the box, and not the
             // ones beside it either. Without this an app's own context menu lights up
@@ -4670,7 +4670,7 @@ impl State {
         // (see `contents_under`), so the app can't set the cursor image while we're open.
         // Force the default arrow so a stale client cursor (e.g. a terminal's I-beam that was
         // showing when the popover opened) doesn't linger over the popover.
-        if self.synoik.panel_popover.is_open() {
+        if self.synoik.panel_popover.grabs_input() {
             if !grabbed {
                 self.synoik
                     .cursor_manager
@@ -6982,7 +6982,7 @@ impl State {
                 // An open popover (dateMenu calendar, quick settings, …) grabs pointer clicks: a
                 // click inside routes to it (a quick-settings tile/button returns an action we
                 // apply), anywhere else dismisses it. Either way the click is consumed.
-                if self.synoik.panel_popover.is_open() {
+                if self.synoik.panel_popover.grabs_input() {
                     self.synoik.suppressed_buttons.insert(button_code);
                     match under {
                         Some((output, pos)) => {
@@ -7505,7 +7505,7 @@ impl State {
         // never leaks to workspace switching underneath. A scroll elsewhere
         // (the panel indicators, a window) still falls through to the handlers
         // below. Wheel notches move a fixed step; touchpad pixels pass as-is.
-        if self.synoik.panel_popover.is_open() {
+        if self.synoik.panel_popover.grabs_input() {
             let location = pointer.current_location();
             let target = self
                 .synoik

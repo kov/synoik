@@ -365,8 +365,28 @@ impl PanelPopover {
     }
 
     /// Whether the popover is showing (including while it fades out on close).
+    ///
+    /// This is the *rendering* question. For "does it hold the modal grab", ask
+    /// [`grabs_input`](Self::grabs_input) instead — the two diverge for the length of the
+    /// close fade.
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Whether the popover holds the modal input grab: keyboard focus, pointer focus,
+    /// clicks, scrolls and the cursor image.
+    ///
+    /// A *closing* popover no longer grabs, even though it is still on screen fading out.
+    /// gnome-shell releases the grab synchronously at the top of the close: `close()` emits
+    /// `open-state-changed, false` (`js/ui/popupMenu.js:1095`) right after merely *starting*
+    /// the box-pointer ease, and `PopupMenuManager` calls `Main.popModal` from that signal
+    /// (`js/ui/popupMenu.js:1487`) — which dismisses the `Clutter.Grab`, so mutter's
+    /// `notify::is-grabbed` handler re-runs `get_focus_surface` and sends `wl_keyboard.enter`
+    /// back to the window before the menu has faded at all. Gating on [`is_open`](Self::is_open)
+    /// here instead would leave the client with no focus, no keys and no clicks for the whole
+    /// 150 ms fade.
+    pub fn grabs_input(&self) -> bool {
+        self.open && !self.closing
     }
 
     /// The panel button role whose menu is up, so the panel can keep that button's

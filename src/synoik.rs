@@ -2960,7 +2960,7 @@ impl State {
             KeyboardFocus::ScreenshotUi
         } else if self.synoik.switcher.is_open() {
             KeyboardFocus::Switcher
-        } else if self.synoik.panel_popover.is_open() {
+        } else if self.synoik.panel_popover.grabs_input() {
             KeyboardFocus::Popover
         } else if let Some(output) = self.synoik.layout.active_output() {
             let mon = self.synoik.layout.monitor_for_output(output).unwrap();
@@ -8596,7 +8596,10 @@ impl Synoik {
             return rv;
         }
 
-        if self.screenshot_ui.is_open() || self.panel_popover.is_open() || self.switcher.is_open() {
+        if self.screenshot_ui.is_open()
+            || self.panel_popover.grabs_input()
+            || self.switcher.is_open()
+        {
             // These grab input modally (clicks and motion): while one is open no window under it
             // should receive pointer focus, so the app can't keep driving the cursor image (e.g. a
             // maximized terminal's I-beam over the clock popover).

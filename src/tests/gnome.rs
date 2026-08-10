@@ -9845,6 +9845,69 @@ fn open_popover_suppresses_underlying_pointer_focus() {
     );
 }
 
+/// A panel menu releases its modal grab at the TOP of the close, not at the end of the
+/// fade-out. gnome-shell's `PopupMenu.close()` merely *starts* the box-pointer ease and then
+/// synchronously emits `open-state-changed, false` (`js/ui/popupMenu.js:1081-1096`), which
+/// `PopupMenuManager` turns into `Main.popModal` (`js/ui/popupMenu.js:1487`) — dismissing the
+/// `Clutter.Grab`, so mutter re-runs `get_focus_surface` off `notify::is-grabbed`
+/// (`meta-wayland-input.c:112-133`) and the window gets `wl_keyboard.enter` back while the menu
+/// is still visibly fading. Gating focus on `is_open` (true for the whole fade) instead left the
+/// client with no keyboard focus — and no keys and no clicks — for the 150 ms of the fade.
+#[test]
+fn closing_popover_restores_keyboard_focus_before_the_fade_ends() {
+    use crate::synoik::KeyboardFocus;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _w = map_window_sized(&mut f, id, (800, 600), None);
+    f.refresh();
+
+    let focused_surface = |f: &mut Fixture| match &f.synoik().keyboard_focus {
+        KeyboardFocus::Layout { surface } => surface.clone(),
+        other => panic!("expected the layout to hold the keyboard, got {other:?}"),
+    };
+    let window_surface = focused_surface(&mut f);
+    assert!(
+        window_surface.is_some(),
+        "the mapped window starts with keyboard focus"
+    );
+
+    // Opening takes the keyboard away — like `pushModal` at the top of the open animation.
+    open_calendar(&mut f);
+    f.refresh();
+    assert!(
+        matches!(f.synoik().keyboard_focus, KeyboardFocus::Popover),
+        "the open menu holds the modal grab: {:?}",
+        f.synoik().keyboard_focus,
+    );
+
+    // Escape starts the close. Do NOT settle: the assertion is about the fade window.
+    f.key_press(KEY_ESC);
+    f.key_release(KEY_ESC);
+    f.refresh();
+
+    assert!(
+        f.synoik().panel_popover.is_open(),
+        "the popover is still on screen, fading out"
+    );
+    assert_eq!(
+        focused_surface(&mut f),
+        window_surface,
+        "the window has its keyboard focus back before the fade has finished"
+    );
+    assert!(
+        !f.synoik().panel_popover.grabs_input(),
+        "and the fading menu no longer holds the grab"
+    );
+
+    // And it stays there once the fade settles — the restore is not undone by the settle.
+    f.settle_animations();
+    f.refresh();
+    assert!(!f.synoik().panel_popover.is_open());
+    assert_eq!(focused_surface(&mut f), window_surface);
+}
+
 /// The panel MessagesIndicator dot (`js/ui/dateMenu.js:787-798`): lit when
 /// banners are enabled and there are unseen notifications not still queued for a
 /// banner, hidden under DND, and cleared by opening the calendar (which acks
