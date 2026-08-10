@@ -1523,6 +1523,17 @@ pub struct Window {
     pub is_floating: bool,
     /// Whether this window requests your attention.
     pub is_urgent: bool,
+    /// Whether the window is maximized (`xdg_toplevel` `maximized`).
+    pub is_maximized: bool,
+    /// Whether the window is fullscreen (`xdg_toplevel` `fullscreen`).
+    pub is_fullscreen: bool,
+    /// Whether the window is activated (`xdg_toplevel` `activated`) — what the *client* was last
+    /// told about its focus, which is not always [`is_focused`](Self::is_focused): the two
+    /// disagree for as long as a configure is unacked, and that window is where focus bugs
+    /// live.
+    pub is_activated: bool,
+    /// Which edges the window is tiled against.
+    pub tiled_edges: TiledEdges,
     /// Position- and size-related properties of the window.
     pub layout: WindowLayout,
     /// Timestamp when the window was most recently focused.
@@ -1533,6 +1544,30 @@ pub struct Window {
     ///
     /// The timestamp comes from the monotonic clock.
     pub focus_timestamp: Option<Timestamp>,
+}
+
+/// The edges a window is tiled against (`xdg_toplevel` `tiled_*`).
+///
+/// All false for a window that is not tiled. GNOME's half-tiling sets one vertical edge plus top
+/// and bottom; a maximized window is not tiled at all.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct TiledEdges {
+    /// Tiled against the left edge.
+    pub left: bool,
+    /// Tiled against the right edge.
+    pub right: bool,
+    /// Tiled against the top edge.
+    pub top: bool,
+    /// Tiled against the bottom edge.
+    pub bottom: bool,
+}
+
+impl TiledEdges {
+    /// Whether the window is tiled against any edge at all.
+    pub fn any(self) -> bool {
+        self.left || self.right || self.top || self.bottom
+    }
 }
 
 /// A moment in time.
@@ -1579,6 +1614,15 @@ pub struct WindowLayout {
     /// Currently, Wayland toplevel windows can only be integer-sized in logical pixels, even
     /// though it doesn't necessarily align to physical pixels.
     pub window_size: (i32, i32),
+    /// Size of everything the client actually committed, in logical pixels: the main surface and
+    /// its subsurfaces, before the window's declared geometry crops it.
+    ///
+    /// This is the *buffer* side of the pair whose other half is
+    /// [`window_size`](Self::window_size). A CSD client's invisible shadow margins are exactly the
+    /// difference between the two, so a client that drops or keeps them (on maximize, on tile) can
+    /// be checked against what the compositor received rather than against what the client
+    /// believes it sent.
+    pub surface_size: (i32, i32),
     /// Tile position within the current view of the workspace.
     ///
     /// This is the same "workspace view" as in gradients' `relative-to` in the niri config.

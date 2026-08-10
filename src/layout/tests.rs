@@ -166,6 +166,11 @@ impl LayoutElement for TestWindow {
         (0, 0).into()
     }
 
+    fn buf_size(&self) -> Size<i32, Logical> {
+        // A test window has no CSD shadow, so its buffer is exactly its visual geometry.
+        self.size()
+    }
+
     fn is_in_input_region(&self, _point: Point<f64, Logical>) -> bool {
         false
     }

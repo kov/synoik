@@ -24481,3 +24481,73 @@ fn enable_animations_off_stops_the_shell_animating() {
         "with animations on the overview transition must actually run",
     );
 }
+
+/// `synoik msg windows` reports the window states the client was actually told.
+///
+/// Everything a consumer could ask about a window's shape used to have to be inferred: the listing
+/// carried focus and floating, and nothing about maximized, fullscreen, tiled or activated. That
+/// leaves an outside test (a toolkit's own suite, say) checking its beliefs against itself, which
+/// is exactly where "I dropped my shadow margins on maximize" hides — the compositor's view is the
+/// only independent witness.
+///
+/// `is_activated` is deliberately separate from `is_focused`: focus is ours, activated is what the
+/// client last acked, and they disagree while a configure is in flight.
+#[test]
+fn ipc_windows_report_maximized_and_tiled_state() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let surface = map_window_for_app(&mut f, id, "org.example.App");
+    f.synoik_state().ipc_refresh_layout();
+
+    let win = |f: &mut Fixture| -> synoik_ipc::Window {
+        f.synoik()
+            .ipc_server
+            .as_ref()
+            .unwrap()
+            .event_stream_state()
+            .windows
+            .windows
+            .values()
+            .next()
+            .expect("the mapped window must be in the IPC listing")
+            .clone()
+    };
+
+    let w = win(&mut f);
+    assert!(!w.is_maximized, "a freshly mapped window is not maximized");
+    assert!(!w.is_fullscreen);
+    assert!(!w.tiled_edges.any(), "nor tiled against anything");
+
+    // Maximize through the real action, then let the client ack: the state is reported from the
+    // acked configure, so a test that never acks is asserting on a window the client has not
+    // agreed to be yet.
+    f.synoik_state().do_action(Action::Maximize, false);
+    f.double_roundtrip(id);
+    f.client(id).window(&surface).ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_state().ipc_refresh_layout();
+
+    let w = win(&mut f);
+    assert!(w.is_maximized, "Maximize must show up in the listing");
+    assert!(
+        !w.tiled_edges.any(),
+        "a maximized window is maximized, not tiled — they are different xdg states",
+    );
+
+    // Tiling to an edge is the other half: GNOME's half-tile sets one vertical edge plus top and
+    // bottom, and drops the maximized state.
+    f.synoik_state().do_action(Action::ToggleTiledLeft, false);
+    f.double_roundtrip(id);
+    f.client(id).window(&surface).ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_state().ipc_refresh_layout();
+
+    let w = win(&mut f);
+    assert!(!w.is_maximized, "tiling replaces the maximized state");
+    assert!(
+        w.tiled_edges.any(),
+        "a tiled window must report the edges it is tiled against",
+    );
+}

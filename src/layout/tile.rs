@@ -930,6 +930,7 @@ impl<W: LayoutElement> Tile<W> {
             pos_in_scrolling_layout: None,
             tile_size: self.tile_size().into(),
             window_size: self.window().size().into(),
+            surface_size: self.window().buf_size().into(),
             tile_pos_in_workspace_view: None,
             window_offset_in_tile: self.window_loc().into(),
         }

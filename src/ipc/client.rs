@@ -796,6 +796,7 @@ fn print_window(window: &Window) {
         pos_in_scrolling_layout,
         tile_size,
         window_size,
+        surface_size,
         tile_pos_in_workspace_view,
         window_offset_in_tile,
     } = window.layout;
@@ -820,6 +821,7 @@ fn print_window(window: &Window) {
     }
 
     println!("    Window size: {} x {}", window_size.0, window_size.1);
+    println!("    Surface size: {} x {}", surface_size.0, surface_size.1);
     println!(
         "    Window offset in tile: {} x {}",
         fmt_rounded(window_offset_in_tile.0),

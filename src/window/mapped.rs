@@ -721,6 +721,12 @@ impl LayoutElement for Mapped {
         Point::from((0, 0)) - self.window.geometry().loc
     }
 
+    fn buf_size(&self) -> Size<i32, Logical> {
+        // The whole surface tree, so subsurfaces sticking out past the main surface count — and a
+        // bufferless subsurface does not (it is created, not mapped).
+        self.window.bbox().size
+    }
+
     fn is_in_input_region(&self, point: Point<f64, Logical>) -> bool {
         let surface_local = point + self.window.geometry().loc.to_f64();
         self.window.is_in_input_region(&surface_local)

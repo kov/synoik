@@ -27,6 +27,7 @@ use smithay::input::pointer::{
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 use smithay::reexports::rustix::fs::unlink;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
 use synoik_config::OutputName;
@@ -40,7 +41,7 @@ use crate::backend::IpcOutputMap;
 use crate::input::pick_window_grab::PickWindowGrab;
 use crate::layout::workspace::WorkspaceId;
 use crate::synoik::State;
-use crate::utils::{version, with_toplevel_role};
+use crate::utils::{version, with_toplevel_role, with_toplevel_role_and_current};
 use crate::window::Mapped;
 
 // If an event stream client fails to read events fast enough that we accumulate more than this
@@ -116,6 +117,14 @@ impl IpcServer {
             event_streams: Rc::new(RefCell::new(Vec::new())),
             event_stream_state: Rc::new(RefCell::new(EventStreamState::default())),
         })
+    }
+
+    /// The state `msg windows` / `msg workspaces` answer from — the same snapshot an IPC client
+    /// gets, so a test asserts on what a consumer would actually read rather than on the layout it
+    /// was derived from.
+    #[cfg(test)]
+    pub fn event_stream_state(&self) -> std::cell::Ref<'_, EventStreamState> {
+        self.event_stream_state.borrow()
     }
 
     fn send_event(&self, event: Event) {
@@ -542,6 +551,7 @@ fn make_ipc_window(
     workspace_id: Option<WorkspaceId>,
     layout: WindowLayout,
 ) -> synoik_ipc::Window {
+    let states = ipc_window_states(mapped);
     with_toplevel_role(mapped.toplevel(), |role| synoik_ipc::Window {
         id: mapped.id().get(),
         title: role.title.clone(),
@@ -551,8 +561,43 @@ fn make_ipc_window(
         is_focused: mapped.is_focused(),
         is_floating: mapped.is_floating(),
         is_urgent: mapped.is_urgent(),
+        is_maximized: states.is_maximized,
+        is_fullscreen: states.is_fullscreen,
+        is_activated: states.is_activated,
+        tiled_edges: states.tiled_edges,
         layout,
         focus_timestamp: mapped.get_focus_timestamp().map(Timestamp::from),
+    })
+}
+
+/// The window states as the *client* was last told them.
+struct IpcWindowStates {
+    is_maximized: bool,
+    is_fullscreen: bool,
+    is_activated: bool,
+    tiled_edges: synoik_ipc::TiledEdges,
+}
+
+/// Read the states out of the toplevel's **last acked** configure, not out of our own intent: this
+/// is what the client has actually been told it is, which is the half a client's own tests cannot
+/// see. Before the first commit there is no acked state, and a window with no state set is not
+/// maximized, fullscreen, activated or tiled — which is what a freshly-mapped window is.
+fn ipc_window_states(mapped: &Mapped) -> IpcWindowStates {
+    with_toplevel_role_and_current(mapped.toplevel(), |_role, current| {
+        let states = current.map(|c| &c.states);
+        let has = |state| states.is_some_and(|s| s.contains(state));
+
+        IpcWindowStates {
+            is_maximized: has(xdg_toplevel::State::Maximized),
+            is_fullscreen: has(xdg_toplevel::State::Fullscreen),
+            is_activated: has(xdg_toplevel::State::Activated),
+            tiled_edges: synoik_ipc::TiledEdges {
+                left: has(xdg_toplevel::State::TiledLeft),
+                right: has(xdg_toplevel::State::TiledRight),
+                top: has(xdg_toplevel::State::TiledTop),
+                bottom: has(xdg_toplevel::State::TiledBottom),
+            },
+        }
     })
 }
 
@@ -751,8 +796,17 @@ impl State {
             };
 
             let workspace_id = ws_id.map(|id| id.get());
-            let mut changed =
-                ipc_win.workspace_id != workspace_id || ipc_win.is_floating != mapped.is_floating();
+            // The xdg states belong here too: a maximize or a tile changes what the client was
+            // told without changing title, app id, workspace or floating, so leaving them out
+            // would let an event-stream consumer hold a window that is maximized on screen and
+            // not maximized in its copy.
+            let states = ipc_window_states(mapped);
+            let mut changed = ipc_win.workspace_id != workspace_id
+                || ipc_win.is_floating != mapped.is_floating()
+                || ipc_win.is_maximized != states.is_maximized
+                || ipc_win.is_fullscreen != states.is_fullscreen
+                || ipc_win.is_activated != states.is_activated
+                || ipc_win.tiled_edges != states.tiled_edges;
 
             changed |= with_toplevel_role(mapped.toplevel(), |role| {
                 ipc_win.title != role.title || ipc_win.app_id != role.app_id

@@ -171,6 +171,13 @@ pub trait LayoutElement {
     /// I.e. if the element has CSD shadows, its buffer location will have negative coordinates.
     fn buf_loc(&self) -> Point<i32, Logical>;
 
+    /// Size of everything the client committed, i.e. [`size`](Self::size) plus whatever the
+    /// visual geometry crops off — CSD shadow margins, most of the time.
+    ///
+    /// The pair (`buf_loc`, `buf_size`) is the buffer rectangle; `size` is the part of it the user
+    /// would point at.
+    fn buf_size(&self) -> Size<i32, Logical>;
+
     /// Checks whether a point is in the element's input region.
     ///
     /// The point is relative to the element's visual geometry.
