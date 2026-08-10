@@ -26,6 +26,10 @@ use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::
 use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::{
     self, ZwpKeyboardShortcutsInhibitorV1,
 };
+use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1::{
+    self, ZwpLinuxBufferParamsV1,
+};
+use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1;
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
 use smithay::reexports::wayland_protocols::wp::text_input::zv3::client::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
 use smithay::reexports::wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
@@ -101,6 +105,10 @@ pub struct State {
     pub xdg_wm_base: Option<XdgWmBase>,
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
+    /// `zwp_linux_dmabuf_v1`, if the compositor advertised it. Headless only has it once the
+    /// backend found a render node to advertise, so a test must treat `None` as "skip", not as a
+    /// failure — see [`Window::attach_dmabuf_buffer`].
+    pub linux_dmabuf: Option<ZwpLinuxDmabufV1>,
     pub shm: Option<WlShm>,
     pub viewporter: Option<WpViewporter>,
     pub background_effect_manager: Option<ExtBackgroundEffectManagerV1>,
@@ -198,6 +206,8 @@ pub struct Window {
     pub spbm: WpSinglePixelBufferManagerV1,
     // Only read by the `attach_shm_buffer*` helpers; bound unconditionally from `State.shm`.
     pub shm: Option<WlShm>,
+    // `None` when the compositor advertised no dmabuf global; see `attach_dmabuf_buffer`.
+    pub linux_dmabuf: Option<ZwpLinuxDmabufV1>,
 
     pub surface: WlSurface,
     pub xdg_surface: XdgSurface,
@@ -401,6 +411,7 @@ impl Client {
             xdg_wm_base: None,
             layer_shell: None,
             spbm: None,
+            linux_dmabuf: None,
             shm: None,
             viewporter: None,
             background_effect_manager: None,
@@ -704,6 +715,7 @@ impl State {
             qh: self.qh.clone(),
             spbm: self.spbm.clone().unwrap(),
             shm: self.shm.clone(),
+            linux_dmabuf: self.linux_dmabuf.clone(),
 
             surface,
             xdg_surface,
@@ -864,6 +876,63 @@ impl Window {
     pub fn attach_solid_buffer(&self, r: u32, g: u32, b: u32, a: u32) {
         let buffer = self.spbm.create_u32_rgba_buffer(r, g, b, a, &self.qh, ());
         self.surface.attach(Some(&buffer), 0, 0);
+    }
+
+    /// Attach a `wl_buffer` made from `dmabuf` — the GPU path a real client presents through, and
+    /// the one the compositor imports with [`Headless::import_dmabuf`].
+    ///
+    /// This is what an shm buffer cannot exercise: a headless session used to advertise no dmabuf
+    /// at all, so every GPU-rendering client composited empty and window *contents* could never be
+    /// judged from a headless shot. Returns `false` when the compositor advertised no dmabuf global
+    /// (no render node — a software ICD), which is a skip, not a failure.
+    ///
+    /// Uses `create_immed`: the buffer either exists when this returns or the compositor kills the
+    /// connection with a protocol error, so a test never has to round-trip to find out whether its
+    /// buffer was accepted.
+    ///
+    /// [`Headless::import_dmabuf`]: crate::backend::Headless::import_dmabuf
+    #[must_use]
+    pub fn attach_dmabuf_buffer(
+        &self,
+        dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
+    ) -> bool {
+        use std::os::fd::AsFd as _;
+
+        use smithay::backend::allocator::Buffer as _;
+
+        let Some(manager) = &self.linux_dmabuf else {
+            return false;
+        };
+
+        let params = manager.create_params(&self.qh, ());
+        let modifier = u64::from(dmabuf.format().modifier);
+        for (i, (fd, (offset, stride))) in dmabuf
+            .handles()
+            .zip(dmabuf.offsets().zip(dmabuf.strides()))
+            .enumerate()
+        {
+            params.add(
+                fd.as_fd(),
+                i as u32,
+                offset,
+                stride,
+                (modifier >> 32) as u32,
+                (modifier & 0xFFFF_FFFF) as u32,
+            );
+        }
+
+        let buffer = params.create_immed(
+            dmabuf.width() as i32,
+            dmabuf.height() as i32,
+            dmabuf.format().code as u32,
+            zwp_linux_buffer_params_v1::Flags::empty(),
+            &self.qh,
+            (),
+        );
+        params.destroy();
+
+        self.surface.attach(Some(&buffer), 0, 0);
+        true
     }
 
     /// Attach an opaque `w`×`h` **shm** buffer filled with a solid RGBA color. Unlike a
@@ -1106,6 +1175,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == WpSinglePixelBufferManagerV1::interface().name {
                     let version = min(version, WpSinglePixelBufferManagerV1::interface().version);
                     state.spbm = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ZwpLinuxDmabufV1::interface().name {
+                    let version = min(version, ZwpLinuxDmabufV1::interface().version);
+                    state.linux_dmabuf = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WlShm::interface().name {
                     let version = min(version, WlShm::interface().version);
                     state.shm = Some(registry.bind(name, version, qh, ()));
@@ -1429,6 +1501,34 @@ impl Dispatch<WpSinglePixelBufferManagerV1, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         unreachable!()
+    }
+}
+
+impl Dispatch<ZwpLinuxDmabufV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpLinuxDmabufV1,
+        _event: <ZwpLinuxDmabufV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // `format`/`modifier` events only, and only below version 4 — the tests allocate against
+        // the node they know the renderer is on rather than negotiating from the advertised list.
+    }
+}
+
+impl Dispatch<ZwpLinuxBufferParamsV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpLinuxBufferParamsV1,
+        _event: <ZwpLinuxBufferParamsV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // `created`/`failed` answer the async `create` request; `create_immed` reports failure as a
+        // protocol error instead, and that is what `attach_dmabuf_buffer` uses.
     }
 }
 

@@ -13983,3 +13983,130 @@ fn vulkan_screenshot_ui_tooltip_waits_before_it_shows() {
         "a sensitive Window button does offer its tip"
     );
 }
+
+/// A client that presents a **dmabuf** must reach the composited frame.
+///
+/// This is the headless harness's oldest blind spot: with no dmabuf global advertised, every
+/// GPU-rendering client fell back to shm or drew nothing, so window *contents* could never be
+/// judged from a headless shot (`docs/fork/test-harness-realism.md` §1). Every other window test in
+/// this file attaches a single-pixel or shm buffer, neither of which touches
+/// `Headless::import_dmabuf` — the path a real client actually presents through, and the one that
+/// used to be `unimplemented!()`.
+///
+/// Green is deliberate: it survives an R↔B swap, so this asserts the buffer *arrived*, not the
+/// channel order (`vulkan_scanout_blit_reorders_channels` is where byte order is pinned).
+#[test]
+fn a_client_dmabuf_reaches_the_composited_frame() {
+    use std::fs::File;
+
+    use smithay::backend::allocator::dmabuf::AsDmabuf;
+    use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+    use smithay::backend::allocator::{Allocator, Modifier};
+
+    if let Err(e) = VulkanRenderer::new() {
+        eprintln!("skipping: no Vulkan device ({e})");
+        return;
+    }
+
+    let mut f = Fixture::new();
+    let state = f.synoik_state();
+    state
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    let synoik = &mut state.synoik;
+    state.backend.headless().add_dmabuf_global(synoik);
+    f.add_output(1, (OUT_W, OUT_H));
+
+    // Allocate the client's buffer the way a real client would: LINEAR, one of the four 8888
+    // orders the renderer imports. A machine with a Vulkan device but no GBM (lavapipe) skips.
+    let Ok(file) = File::options()
+        .read(true)
+        .write(true)
+        .open("/dev/dri/renderD128")
+    else {
+        eprintln!("skipping: no render node");
+        return;
+    };
+    let Ok(gbm) = GbmDevice::new(file) else {
+        eprintln!("skipping: no GBM device");
+        return;
+    };
+    let mut alloc = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING);
+    let Ok(bo) = alloc.create_buffer(
+        u32::from(WIN),
+        u32::from(WIN),
+        Fourcc::Argb8888,
+        &[Modifier::Linear],
+    ) else {
+        eprintln!("skipping: cannot allocate a LINEAR client buffer");
+        return;
+    };
+    let Ok(mut dmabuf) = bo.export() else {
+        eprintln!("skipping: cannot export the buffer as a dmabuf");
+        return;
+    };
+
+    // Fill it on the GPU, as a client does — the renderer binding its own device's dmabuf here is
+    // standing in for the client's renderer, not for anything the compositor does.
+    let state = f.synoik_state();
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| -> anyhow::Result<()> {
+            let mut fb = vk
+                .bind(&mut dmabuf)
+                .map_err(|e| anyhow::anyhow!("bind the client dmabuf: {e}"))?;
+            let size: Size<i32, Physical> = (i32::from(WIN), i32::from(WIN)).into();
+            let mut frame = vk
+                .render(&mut fb, size, Transform::Normal)
+                .map_err(|e| anyhow::anyhow!("begin frame: {e}"))?;
+            let whole = Rectangle::from_size(size);
+            frame
+                .clear(Color32F::from([0., 1., 0., 1.]), &[whole])
+                .map_err(|e| anyhow::anyhow!("clear: {e}"))?;
+            frame
+                .finish()
+                .map_err(|e| anyhow::anyhow!("finish: {e}"))?
+                .wait()
+                .map_err(|e| anyhow::anyhow!("wait: {e}"))?;
+            Ok(())
+        })
+        .expect("headless backend must hold a Vulkan renderer")
+        .expect("filling the client buffer must not error");
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    if !window.attach_dmabuf_buffer(&dmabuf) {
+        // No render node behind the Vulkan device, so no global was advertised. Honest skip: on
+        // this machine there is nothing for a client to present through.
+        eprintln!("skipping: the compositor advertised no dmabuf global");
+        return;
+    }
+    window.set_size(WIN, WIN);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    let output = f.synoik_output(1);
+    let (pixels, w, h) = render_output_vulkan(&mut f, &output);
+
+    // Count opaque, strongly-green pixels. A window that failed to import composites as a hole in
+    // the backdrop, which has no green of its own at this saturation.
+    let green = pixels
+        .chunks_exact(4)
+        .filter(|p| p[1] > 200 && p[0] < 80 && p[2] < 80 && p[3] > 200)
+        .count();
+    assert!(
+        green > 1000,
+        "the client's dmabuf must reach the frame: {green} green pixels in {w}x{h} \
+         (a hole here means the buffer was accepted and then never sampled)",
+    );
+}

@@ -253,6 +253,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(err) = state.backend.headless().add_renderer() {
             warn!("error creating headless renderer, running without one: {err:?}");
         }
+        // With a renderer there can be a dmabuf global, which is what lets a client present
+        // through the GPU instead of shm — the difference between a headless screenshot that
+        // shows window contents and one that shows a hole where the window is.
+        let synoik = &mut state.synoik;
+        state.backend.headless().add_dmabuf_global(synoik);
         // `SYNOIK_HEADLESS_MODE=WxH` sizes the virtual output. The headless backend
         // advertises exactly one (custom) mode, so `synoik msg output … mode` cannot reach
         // any other shape — and chrome that adapts to the canvas has to be judged on a

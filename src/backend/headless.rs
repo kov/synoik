@@ -6,10 +6,15 @@
 // distributed under the GNU General Public License version 3 or later.
 // Modified for synoik in 2026.
 
-//! Headless backend for tests.
+//! Headless backend: no display and no input devices, one virtual output, driven over IPC.
 //!
-//! This can eventually grow into a more complete backend if needed, but for now it's missing some
-//! crucial parts like dmabufs.
+//! Not a test-only fork of the compositor — it runs the same `Synoik` the tty backend does, which
+//! is what makes the conformance corpus worth anything. What it does not have is a scanout: there
+//! is no screen to composite for, so `render` only paces frame callbacks, and the capture paths
+//! (screencast, screencopy, screenshot) are what actually draw.
+//!
+//! Clients present through the GPU here, same as on a real seat: [`Headless::add_dmabuf_global`]
+//! advertises dmabuf off a plain render node — no DRM master, no seat, no VT.
 
 use std::mem;
 use std::sync::{Arc, Mutex};
@@ -22,14 +27,17 @@ use smithay::backend::allocator::gbm::GbmDevice;
 #[cfg(feature = "xdp-gnome-screencast")]
 use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::renderer::element::RenderElementStates;
+use smithay::backend::renderer::ImportDma as _;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay::reexports::rustix::fs as rfs;
 #[cfg(feature = "xdp-gnome-screencast")]
-use smithay::reexports::rustix::fs::{self as rfs, OFlags};
+use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 #[cfg(feature = "xdp-gnome-screencast")]
 use smithay::utils::DeviceFd;
 use smithay::utils::Size;
+use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::presentation::Refresh;
 use synoik_config::OutputName;
 
@@ -62,6 +70,9 @@ pub struct Headless {
     /// [`State::prepare_pw_cast`]: crate::synoik::State
     #[cfg(feature = "xdp-gnome-screencast")]
     gbm: Option<GbmDevice<DrmDeviceFd>>,
+    /// The `zwp_linux_dmabuf_v1` global, once [`add_dmabuf_global`](Self::add_dmabuf_global) has
+    /// found a render node to advertise. `None` means clients only ever see shm.
+    dmabuf_global: Option<DmabufGlobal>,
 }
 
 impl Headless {
@@ -72,6 +83,7 @@ impl Headless {
             last_vt: None,
             #[cfg(feature = "xdp-gnome-screencast")]
             gbm: None,
+            dmabuf_global: None,
         }
     }
 
@@ -135,6 +147,63 @@ impl Headless {
 
         self.renderer = Some(vulkan);
         Ok(())
+    }
+
+    /// Advertise `zwp_linux_dmabuf_v1` for the device the renderer actually draws on, so headless
+    /// clients can present through the GPU instead of falling back to shm.
+    ///
+    /// Without this a headless session is blind to exactly the thing a screenshot test most wants
+    /// to assert: a GPU-rendering client composites empty, so window *contents* can never be judged
+    /// from a headless shot (`docs/fork/test-harness-realism.md` §1). Nothing here needs DRM
+    /// master, a seat or a VT — the owned Vulkan renderer imports client dmabufs off a plain
+    /// render node.
+    ///
+    /// The node advertised is the one the *renderer* reports (`VK_EXT_physical_device_drm`), not
+    /// whatever `SYNOIK_HEADLESS_RENDER_NODE` points GBM at: feedback names the device a client
+    /// should allocate for, and the only device we can import on is the one we render on. Drivers
+    /// that report no node (lavapipe) get **no global at all** rather than a wrong one — a
+    /// compositor advertising dmabuf it cannot import hands clients a blank window and per-frame
+    /// error spam, where shm just works.
+    ///
+    /// Must not be split from [`import_dmabuf`](Self::import_dmabuf): creating the global is what
+    /// makes that path reachable.
+    pub fn add_dmabuf_global(&mut self, synoik: &mut Synoik) {
+        if self.dmabuf_global.is_some() {
+            error!("add_dmabuf_global: the global must not already exist");
+            return;
+        }
+
+        let Some(renderer) = &self.renderer else {
+            debug!("no dmabuf global: headless is running without a renderer");
+            return;
+        };
+
+        let Some((major, minor)) = renderer.gpu().drm_render_node() else {
+            // Normal on a software ICD; the corpus runs there.
+            debug!("no dmabuf global: the Vulkan device reports no DRM render node");
+            return;
+        };
+        let dev_id = rfs::makedev(major, minor);
+
+        // The same format set the tty backend advertises (LINEAR 8888), from the same source of
+        // truth — a client that honors this feedback allocates something `import_dmabuf` accepts.
+        let formats = crate::render_helpers::vulkan::dmabuf_formats();
+        let feedback = match DmabufFeedbackBuilder::new(dev_id, formats).build() {
+            Ok(feedback) => feedback,
+            Err(err) => {
+                warn!("error building headless dmabuf feedback: {err:?}");
+                return;
+            }
+        };
+
+        let global = synoik
+            .dmabuf_state
+            .create_global_with_default_feedback::<crate::synoik::State>(
+                &synoik.display_handle,
+                &feedback,
+            );
+        self.dmabuf_global = Some(global);
+        debug!("headless dmabuf global on DRM render node {major}:{minor}");
     }
 
     pub fn add_output(&mut self, synoik: &mut Synoik, n: u8, size: (u16, u16)) {
@@ -246,8 +315,25 @@ impl Headless {
         RenderResult::Submitted
     }
 
-    pub fn import_dmabuf(&mut self, _dmabuf: &Dmabuf) -> bool {
-        unimplemented!()
+    /// The `DmabufHandler` validation callback: the one site that decides which client buffers are
+    /// accepted. It has to answer from the *renderer*, not from the feedback we advertised — a
+    /// client is free to ignore feedback, and a tiled or multi-planar buffer waved through here
+    /// fails later at render time, which reads as a blank window rather than a rejected buffer.
+    /// Same reasoning, and same import call, as the tty path.
+    pub fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> bool {
+        // Unreachable without a global, which is only created when there is a renderer — but the
+        // answer for "we cannot import this" is false, never a panic.
+        let Some(renderer) = &mut self.renderer else {
+            return false;
+        };
+
+        match renderer.import_dmabuf(dmabuf, None) {
+            Ok(_texture) => true,
+            Err(err) => {
+                debug!("error importing dmabuf into the Vulkan renderer: {err:?}");
+                false
+            }
+        }
     }
 
     pub fn ipc_outputs(&self) -> Arc<Mutex<IpcOutputMap>> {
