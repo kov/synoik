@@ -378,7 +378,10 @@ Two things follow, and they point away from §9.1.1:
 1. **The transition is at 2 cycles (33 ms), and the rate is then flat out to 5 seconds.** A flip
    that immediately follows another misses 1% of the time; a flip with even *one* idle cycle in
    front of it misses a quarter to a half, and waiting longer barely changes that.
-2. **This session essentially never has a >5 s gap** — exactly one flip in 18 575. `vblankoffdelay`
+2. **This session essentially never has a >5 s gap** — exactly one flip in 18 575. **Point 2's
+   premise no longer holds: see §40.B.** The idle regime has changed — the compositor now sleeps a
+   full minute between flips, past `vblankoffdelay`, so the re-anchor is back in scope and this
+   paragraph must not be quoted as ruling it out. `vblankoffdelay`
    here reads **5000**, and our idle is a clock/cursor cadence of roughly one flip per second, so
    the vblank reference is re-taken long before the 5 s disable could fire. The re-anchor mechanism
    you reproduced is real, but it cannot be what our idle regime is made of.
@@ -2474,5 +2477,121 @@ amount of work either way; what varies is how our own pipelining smears it.
 
 Parked here deliberately: the fix is compositor-side frame pacing, which is a design item, not a
 measurement. Data: `~/Projects/gnome-shell-rs-runs/2026-07-31/`.
+
+*— the gnome-shell-rs guest session.*
+
+## §40 — Journal survey (24 h of kov's live seat): 76% is §10's known class, and a NEW once-a-minute self-inflicted miss (2026-08-10, guest)
+
+Not an experiment — a read of one real day's journal on the daily-driver seat, plus the 40
+auto-dumps it left behind. Two sessions: `synoik[125279]` until 07:31, `synoik[2773]` after.
+**23 668 miss lines** (excluding the `auto-dumped` echoes) over 24 h.
+
+Sources: `sudo journalctl _UID=1000 --since "24 hours ago"`; `~/.local/state/synoik/frame-log.*.txt`.
+
+| missed | count | | queued LATE by | count |
+|---|---|---|---|---|
+| 1 vblank | 22 870 (96.6%) | | < 3 ms | 17 895 (75.6%) |
+| 2–6 | 752 | | 3–10 ms | 2 540 |
+| 7–16 | 45 | | > 10 ms | 965 |
+| 133 | 1 | | (queued *early*) | 294 |
+
+### A — 76%: §10.1's class, confirmed at scale on a real workload
+
+`missed 1 vblank, queued 0–3 ms LATE, 5–8 cycles since the last flip, aimed N−1 cycles after the
+last flip` — the frame targeted the very next vblank and lost it by a hair. This is exactly §10.1's
+documented shape (back-to-back flips miss ~1%, anything with a cycle of quiet in front misses
+26–47%, flat). Nothing new; it dominates by volume because it *is* the ordinary interactive regime.
+Worth recording only that the class holds its shape over a full unscripted day, not just the
+scripted workloads §10–§19 were built on.
+
+### B — NEW: once a minute, from full idle, a guaranteed miss
+
+Overnight (00:00–06:59) the rate is **exactly ~60 misses/hour**, timestamped at `:00` seconds of
+each minute, with **3 600 cycles since the last flip** (60 s at 60 Hz). The same shape returns
+whenever the desktop idles in the day (14:53–15:03, one per minute).
+
+- 636 events with ≥1 000 idle cycles in front; 476 in the 3 600–4 200 bucket.
+- Mean queue lateness **51.1 ms**, max 99.8 ms — against 1–2 ms for class A.
+- Typically 3–6 vblanks missed, not 1.
+
+**This is a changed idle regime, and it invalidates a premise of §10.1.** That section dismissed the
+KMS vblank re-anchor because "our idle is a clock/cursor cadence of roughly one flip per second …
+exactly one flip in 18 575 had a >5 s gap". The compositor now genuinely sleeps for a whole minute,
+i.e. well past `vblankoffdelay=5000`. The re-anchor mechanism is back in scope and should not be
+quoted as ruled out.
+
+#### Where the 50 ms goes
+
+Frame lines immediately preceding a miss, from the auto-dumps:
+
+| class | n | med took | med waiting | med gpu |
+|---|---|---|---|---|
+| idle-wake (≥100 cycles gap) | 351 | **46.96 ms** | **45.82 ms** | 10.71 ms |
+| short gap (<100 cycles) | 2 157 | 3.44 ms | 2.72 ms | 1.00 ms |
+
+Nearly the whole idle-wake frame is the frame **waiting on its own first submit's fence**: 278 of
+351 wait on `first offscreen` (median **42.47 ms**), 73 on `first scanout` (median 11.70 ms).
+
+The offscreen is one bake site:
+
+| bake site | n | p50 | p90 | max |
+|---|---|---|---|---|
+| **`ui/panel.rs:2074`** | 370 | **40.98 ms** | 46.48 ms | 66.11 ms |
+| `ui/dash.rs:1176` | 104 | 0.91 ms | 1.45 ms | 2.97 ms |
+| `ui/overview_search.rs:810` | 8 | 1.53 ms | — | — |
+| `ui/calendar.rs:696` | 6 | 2.35 ms | 3.28 ms | — |
+
+**Sampling caveat, stated before anyone quotes the table.** All 370 samples come from auto-dumps,
+which are miss-adjacent by construction, so warm bakes are under-represented. `p50 = 40.98 ms` is a
+p50 *of the dumped population*, not of all panel bakes — it is not "the panel bake costs 41 ms". The
+bimodality survives the bias, and so does the contrast against the other sites in the *same* dumps.
+
+That site's full distribution is bimodal: **min 0.85 ms, p10 3.21 ms, p50 40.98 ms**. The two
+fastest samples are frames tagged `animating panel` — warm, mid-activity. Same code, same size,
+same draw count: **~1 ms warm, ~41 ms as the first submit after idle.** So the 41 ms is not the
+bake's work; it is a cold first-submit round trip the bake happens to be standing in front of, and
+the frame blocks on it (`waiting 46.92ms (first offscreen 42.56ms)`).
+
+#### Why that bake is first in line — read from the code, not inferred
+
+`src/ui/widget/mod.rs:2046`, in its own comment: *"Every offscreen bake funnels through here, and
+each one is a render pass, a submit and a fence wait."* The bake **is** a separate submit the frame
+blocks on — the shape `docs/fork/frame-submit-discipline.md` says to keep off the frame path.
+
+And the panel bar bake is cached on `(scale, width_px)` and invalidated when the clock text changes
+(`src/ui/panel.rs:1550`), so it fires **once per minute and only then** — the same instant the
+compositor wakes from its minute-long sleep. The one bake the minute tick needs is therefore also
+the frame's first submit, and it absorbs the whole cold round trip.
+
+### C — the >10 ms tail (965 lines, 4%)
+
+582 are in active hours; 581 of those have a multi-cycle gap in front, so they are the same
+idle-wake class with a shorter nap. The 100–270 ms specimens cluster into bursts of a few per minute
+(12:08–12:40, 14:16) — episodic, matching §21.4.
+
+### The single outlier, and it is not ours
+
+```
+14:50:45  missed 133 vblank(s): presented 2216.82ms late, queued 0.88ms LATE,
+          137 cycles since the last flip, aimed 4 cycles after the last flip
+```
+
+Queued essentially on time and presented 2.2 s later. Nothing on our side was late; the flip did not
+come back for two seconds. Below the display path.
+
+### Next step, and the thing that is NOT yet measured
+
+The obvious move is to fold the panel bake into the frame's own submit — record it, don't
+submit-and-wait — per the discipline doc: two round trips become one.
+
+**That is only a large win if the cold cost is per-submit-wake rather than per-process-wake.** In
+these specimens the scanout submit *behind* the bake still costs ~4.4 ms, while an idle-wake frame
+with no offscreen at all pays ~11.70 ms on `first scanout` alone. Whether merging saves ~40 ms or
+merely moves it is exactly the untested question — one A/B, not an inference. Do not bank the saving
+until it is measured.
+
+Secondary: if a residue survives the merge, it is a cold ring / KMS vblank re-anchor after >5 s of
+quiet (now reachable again, per B above), which is upstream of us, and the question becomes whether
+a heartbeat is worth keeping.
 
 *— the gnome-shell-rs guest session.*
