@@ -249,6 +249,81 @@ must stay — it is no longer protecting our scanout, only client imports. Detai
 
 ---
 
+## 11. Surviving device loss — we die instead, and on venus we cannot even see it
+
+**Opened 2026-08-10 by a real crash on kov's seat.** The session suspended (s2idle) at 17:41:22 and
+resumed at 17:44:42; one second after resume the guest kernel began rejecting virtgpu traffic
+(`[drm:virtio_gpu_dequeue_ctrl_func] *ERROR* response 0x1200 (command 0x207)` —
+`RESP_ERR_UNSPEC` to `SUBMIT_3D`, later `0x1203 RESP_ERR_INVALID_RESOURCE_ID` on teardown commands:
+the host's resource table had lost every pre-suspend entry). Sixteen seconds later synoik took
+`SIGABRT` inside mesa, on the first `vkCreateImage` after resume — baking the lock-screen prompt text:
+
+```
+Synoik::render → render_inner → LockScreen::render_prompt → widget::bake_uncached_sized
+  → VulkanRenderer::create_buffer → ash create_image
+  → vn_CreateImage → vn_image_init → vn_ring_submit_command → vn_ring_wait_seqno → vn_relax → abort()
+```
+
+**The suspend half is not ours to fix** (the VMM must preserve or re-create the venus context across
+guest suspend), and it predates us: on 2026-07-20 the same resume killed `vkmark` while *gnome-shell*
+was still the seat compositor, and wedged gnome-shell badly enough that systemd had to abort it.
+What *is* ours is that a compositor should not be a casualty of a recoverable GPU event.
+
+### Why venus aborts, and why `VN_DEBUG=no_abort` is not the answer
+
+Read from the mesa checkout (`~/Projects/mesa`, `53a453b3ef7`), `src/virtio/vulkan/vn_common.c:245`.
+`vn_relax()` has three abort paths: the ring's `VK_RING_STATUS_FATAL_BIT_MESA` (**not** guarded by
+`no_abort`), an expired watchdog "alive" bit, and a plain iteration ceiling (~895 s for the ring-seqno
+profile). The stated rationale in the commit that added it (`bbbbf395594`, Feb 2022) is only "more
+friendly than printing the messages forever" — but the structural reason is stronger: **there is no
+legal way to report the failure.** `vn_ring_wait_seqno` (`vn_ring.c:182`) returns `void` and loops
+`do { … } while (true)`, and `vkCreateImage` may return only the OOM codes per spec — never
+`VK_ERROR_DEVICE_LOST`. Venus *does* report device loss where the spec permits it (`vn_sync.c`,
+`vn_query_pool.c` check `vn_relax_warn()` and return `DEVICE_LOST`); it aborts only where it can't.
+
+So `VN_DEBUG=no_abort` does **not** hand us a `VkResult` on this path — it removes the abort from a
+loop with no exit, i.e. it converts a crash into a permanent hang. For a daily driver that is worse.
+`VN_DEBUG` is undocumented besides: it appears in `vn_common.h`'s `enum vn_debug` and the option table
+in `vn_common.c`, and nowhere in `docs/envvars.rst`.
+
+Related: the warnings that precede an abort are invisible by default — `vn_log` logs at
+`MESA_LOG_DEBUG` and release mesa defaults to `MESA_LOG_INFO` (`src/util/log.h:49`). Setting
+`MESA_LOG_LEVEL=debug` on the seat is a cheap, standing win: the next occurrence will name *which*
+abort fired ("aborting on ring fatal error" / "on expired ring alive status" / plain "aborting").
+Worth doing before anything else here, since the 16-second death does not match the ~895 s ceiling
+and so was the host actively signalling death, not a timeout.
+
+### What closing this looks like
+
+Mutter is building the same capability — see
+<https://blogs.gnome.org/anonymoux47/2026/07/02/gpu-reset-recovery-in-mutter-a-progress-update/>
+(on the author's fork, not upstream as of 2026-07). The shape is worth copying:
+
+- A **five-state machine**: Normal → Reset In Progress (poll ~20 ms) → Reset Completed (or a 2 s
+  timeout) → Restoring → Normal, with a Failed arm that exits cleanly.
+- The rebuild runs **outside the frame dispatch loop**, then unrealizes and re-realizes the scene.
+- **Clients are not recoverable by the compositor** — they must re-render their own buffers, so even
+  a complete implementation means a visibly broken frame or two, not a seamless save.
+
+Their *detection* story does not transfer: it is GL/EGL, hinging on `EXT_robustness` /
+`EXT_create_context_robustness` with `EGL_LOSE_CONTEXT_ON_RESET`. For us `VK_ERROR_DEVICE_LOST` is
+core Vulkan — every submit and acquire already returns it, no extension, no polling. Our problem is
+narrower and lower: **on venus the process is killed before any `VkResult` reaches us**, so step 0 is
+making device loss observable at all. That means upstreaming a venus change (a bail-out from the
+seqno wait, and ring-fatal → `DEVICE_LOST` where the spec allows), or a watchdog of our own — not an
+env var.
+
+Their hardest bug will be ours too, and worse: the **glyph cache** — actors holding `PangoLayout`s
+bound to a dead renderer, needing an explicit forget/unrealize before recreation. Our equivalent is
+every baked texture and every cached element keyed by `Id`, spread across the widget layer rather
+than owned by one renderer object. A device loss must invalidate **every bake key**, not just the
+device handle. Expect that, not the state machine, to be the work.
+
+**Sequencing note:** this is insurance against GPU resets generally; it is *not* the fix for the
+suspend crash above, which stays host-side. Do not let it be scheduled as one.
+
+---
+
 ## Roadmap order (recommended)
 
 1. **Multi-planar / non-LINEAR import** (§1) — affects every machine, including the VM.
@@ -259,3 +334,7 @@ must stay — it is no longer protecting our scanout, only client imports. Detai
 
 Independent and slottable anytime: **HW cursor plane** (§8, once the Smithay patch lands) and
 **direct-scanout verification** (§9).
+
+**Device-loss survival** (§11) is sequenced by its own step 0: set `MESA_LOG_LEVEL=debug` on the seat
+now (free), and treat the recovery machine as gated on device loss becoming *observable* — a venus
+change, upstream or ours. Until then it is unimplementable, not merely deferred.

@@ -408,6 +408,13 @@ every machine including the VM**, is not multi-GPU but **multi-planar dmabuf imp
 zero-copy hardware video decode)**; multi-GPU is bounded, mostly-mechanical work whose real cost is
 driver validation on bare metal we don't have.
 
+**Surviving device loss is a gap, and on Venus a blocked one — `renderer-gaps.md` §11.** A GPU reset,
+or a venus context that dies across guest suspend, currently kills the compositor: mesa `abort()`s
+inside `vn_relax` because `vkCreateImage` has no legal way to return `VK_ERROR_DEVICE_LOST`. Mutter is
+growing recovery for the GL case and the state machine is worth copying, but our step 0 is lower —
+making device loss *observable* needs a venus change, not an env var. Do not schedule it as the fix
+for suspend/resume; that one is the VMM's.
+
 **HDR/wide-gamut/color-management stays deferred** — an industry-wide moving target
 (cosmic-comp's own Vulkan/HDR work is Epoch 2–3, 2026–27), and Vulkan alone ≠ HDR (color-mgmt
 is still WIP upstream). **Night Light is cheap and mostly reusable**: consume `gsd-color`'s
