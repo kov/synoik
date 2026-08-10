@@ -10,7 +10,7 @@ use proptest::prelude::*;
 use proptest_derive::Arbitrary;
 use smithay::output::{Mode, PhysicalProperties, Subpixel};
 use smithay::utils::Rectangle;
-use synoik_config::utils::{Flag, MergeWith as _};
+use synoik_config::utils::Flag;
 use synoik_config::workspace::WorkspaceName;
 use synoik_config::{
     CenterFocusedColumn, FloatOrInt, OutputName, Struts, TabIndicatorLength, TabIndicatorPosition,
