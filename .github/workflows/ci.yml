@@ -81,8 +81,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check (no default features)
-        run: cargo check --no-default-features
+      # A full build, not a `check`, because this combination has a downstream consumer: ghost's
+      # test suite provisions synoik by cloning a pinned rev and building it `--no-default-features`
+      # (no systemd, no xdp-gnome-screencast, no audio), which is what keeps the pipewire headers off
+      # a ghost developer's machine. `check` would not catch a link failure, and a link failure is
+      # exactly what a feature-gated native dependency produces. The other combinations below stay
+      # `check`: they exist to catch compile errors in gated code, and nothing links them.
+      - name: Build (no default features)
+        run: cargo build --no-default-features
 
       - name: Check (just systemd)
         run: cargo check --no-default-features --features systemd
