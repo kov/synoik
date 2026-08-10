@@ -183,6 +183,20 @@ The alternative — declaring every mapped window primary — was rejected as a 
 visibility, free to drift from the one tty and the capture paths use. The element pass costs nothing
 measurable: the workspace suite stayed at ~10 s.
 
+ghost re-measured against the fix: **12.09 s → 0.45 s cold, 0.34 s warm**, for the same 13 frames on
+the same venus adapter — at parity with headless weston (0.45 s), slightly better warm.
+
+**But the fix moved a headless client from 1 fps to *unpaced*, not to 60 Hz.**
+`send_frame_callbacks` runs once per redraw (`src/synoik.rs:11172`) and headless leaves the output
+`Idle` afterwards, so a self-pacing client cycles commit → redraw → callback as fast as the CPU
+allows, whatever mode the output advertises. That is why 0.34 s beats weston, and it is right for a
+test rig — but **headless synoik is not a frame-rate reference**: anything expressed in fps or
+frames-per-unit-time has your CPU as its denominator. Frames *presented* and frame *geometry* are
+unaffected. Neither the old behavior nor the new one was 60 Hz, so this is not a regression; real
+pacing would need a gate equivalent to the tty backend's `WaitingForVBlank`, and note that always
+arming `queue_next_frame` does **not** provide one — `redraw_queued_outputs` processes
+`WaitingForEstimatedVBlankAndQueued` immediately. Open, and owned here rather than left implicit.
+
 Two lessons worth more than the fix:
 
 - **The corpus was structurally unable to see this.** It drives renders by hand and never waits on a
