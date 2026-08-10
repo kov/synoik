@@ -418,10 +418,13 @@ Rules, and why each is the way it is:
 — a real `switch_workspace`, so it is the real animation. Abandoning the session animates back;
 committing keeps it. Two things make it safe to do for real:
 
-- **A dwell** (`WORKSPACE_PREVIEW_DELAY`, 150 ms, ours). The raise half is instant because it costs
+- **A dwell** (`WORKSPACE_PREVIEW_DELAY`, 300 ms, ours). The raise half is instant because it costs
   a draw order; a workspace slide is not, and tabbing across apps on three workspaces would start,
   interrupt and reverse one per keypress. Re-armed from scratch on every move, so holding Tab down
-  never settles anywhere — a dwell, not a rate limit.
+  never settles anywhere — a dwell, not a rate limit. It started at `POPUP_DELAY`'s 150 ms and was
+  raised on the seat: passing through is only free if a human can outrun the timer, and at 150 ms
+  nobody can. 500 bought that but made an intended stop feel hesitant; 300 is the seat-tested
+  middle.
 - **The `previous_workspace_id` bookmark is preserved.** A workspace you previewed and abandoned is
   not somewhere you "were": "switch to previous workspace" must not learn about workspaces a
   switcher merely passed through. On commit the bookmark is pointed at where the *session* started,

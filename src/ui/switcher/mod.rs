@@ -60,10 +60,13 @@ pub const FADE_OUT: Duration = Duration::from_millis(100);
 /// Ours, not GNOME's: GNOME previews nothing. The raise half of the preview is instant because it
 /// costs a draw order, but the workspace half is a whole animated slide — and tabbing across four
 /// apps spread over three workspaces would otherwise start, interrupt and reverse a slide per
-/// keypress, which reads as the screen convulsing rather than as a preview. Same value and same
-/// job as [`POPUP_DELAY`]: long enough that passing through costs nothing, short enough that
-/// stopping shows you where you are going.
-pub const WORKSPACE_PREVIEW_DELAY: Duration = Duration::from_millis(150);
+/// keypress, which reads as the screen convulsing rather than as a preview. Same job as
+/// [`POPUP_DELAY`] — long enough that passing through costs nothing, short enough that stopping
+/// shows you where you are going — but not the same value: at 150 ms nobody can tab past a
+/// workspace fast enough to avoid the slide, so passing through does not in fact cost nothing.
+/// Tried on the seat at 500, settled at 300 — enough to outrun while travelling, and 500 made a
+/// stop you meant feel like the switcher was thinking it over.
+pub const WORKSPACE_PREVIEW_DELAY: Duration = Duration::from_millis(300);
 /// `POPUP_SCROLL_TIME` (`:10`) — how long the list takes to scroll a newly selected
 /// item into view.
 pub const SCROLL_TIME: Duration = Duration::from_millis(100);
