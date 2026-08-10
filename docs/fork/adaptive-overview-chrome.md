@@ -11,8 +11,9 @@ the live canvas lands at ramp 0.8, which steps the dash one ladder rung and read
 shape: linear, not snapped — no mushiness observed. (C) Layer B: untouched, as planned.
 
 **Method note.** Judging this needs a canvas, and `--headless` hardcoded 1920x1080; it now takes
-`SYNOIK_HEADLESS_MODE=WxH`, so the harness reproduces any display exactly (mode + `synoik msg output
-… scale`) and the chrome can be eyeballed on the shape that is actually wrong.
+`--output WxH[@SCALE]`, so the harness reproduces any display exactly and the chrome can be
+eyeballed on the shape that is actually wrong. (Written when this was `SYNOIK_HEADLESS_MODE=WxH`
+plus a `synoik msg output … scale` call; the flag replaced both.)
 
 ## Decision
 

@@ -25,8 +25,8 @@ pub struct Cli {
     /// on a TTY as your non-main compositor instance, to avoid messing up the global environment.
     #[arg(long)]
     pub session: bool,
-    /// Run with a headless backend: no display or input devices, one virtual
-    /// output.
+    /// Run with a headless backend: no display or input devices, virtual
+    /// outputs only (see `--output`).
     ///
     /// The compositor is fully driveable over IPC (`synoik msg`), which is the
     /// point: it allows exercising the real compositor — spawning clients,
@@ -34,12 +34,70 @@ pub struct Cli {
     /// session or a free VT.
     #[arg(long)]
     pub headless: bool,
+    /// Virtual output for `--headless`, as `WIDTHxHEIGHT[@SCALE]` (e.g. `1600x1000@1.25`).
+    ///
+    /// Repeat the flag for more than one output; they are laid out left to right in the order
+    /// given. Defaults to a single 1920x1080. Omitting `@SCALE` leaves the scale to the usual
+    /// precedence (monitors.xml, then the DPI guess) rather than pinning it to 1.
+    ///
+    /// Chrome that adapts to the canvas has to be judged on a canvas, so this is how a headless
+    /// run reproduces the display it is standing in for — and two outputs at different scales is
+    /// the only way to test a window crossing a scale boundary.
+    #[arg(long = "output", value_name = "WxH[@SCALE]", requires = "headless")]
+    pub outputs: Vec<HeadlessOutput>,
     /// Command to run upon compositor startup.
     #[arg(last = true)]
     pub command: Vec<OsString>,
 
     #[command(subcommand)]
     pub subcommand: Option<Sub>,
+}
+
+/// A `--output WIDTHxHEIGHT[@SCALE]` virtual output.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeadlessOutput {
+    pub width: u16,
+    pub height: u16,
+    /// `None` leaves the scale to the usual precedence (monitors.xml, then the DPI guess).
+    pub scale: Option<f64>,
+}
+
+impl std::str::FromStr for HeadlessOutput {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (size, scale) = match s.split_once('@') {
+            Some((size, scale)) => {
+                let scale: f64 = scale
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("invalid scale in {s:?}, expected a number"))?;
+                if !(scale.is_finite() && scale > 0.) {
+                    return Err(format!(
+                        "invalid scale in {s:?}, expected a positive number"
+                    ));
+                }
+                (size, Some(scale))
+            }
+            None => (s, None),
+        };
+
+        let (w, h) = size
+            .split_once(['x', 'X'])
+            .ok_or_else(|| format!("invalid output {s:?}, expected WIDTHxHEIGHT[@SCALE]"))?;
+        let parse = |v: &str, what: &str| -> Result<u16, String> {
+            match v.trim().parse::<u16>() {
+                Ok(v) if v > 0 => Ok(v),
+                _ => Err(format!("invalid {what} in {s:?}, expected 1..=65535")),
+            }
+        };
+
+        Ok(Self {
+            width: parse(w, "width")?,
+            height: parse(h, "height")?,
+            scale,
+        })
+    }
 }
 
 #[derive(Subcommand)]
@@ -246,6 +304,58 @@ impl TryFrom<CompletionShell> for Shell {
             CompletionShell::PowerShell => Ok(Shell::PowerShell),
             CompletionShell::Zsh => Ok(Shell::Zsh),
             CompletionShell::Nushell => Err("Nushell should be handled separately"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr as _;
+
+    use super::*;
+
+    #[test]
+    fn headless_output_parses_size_and_scale() {
+        assert_eq!(
+            HeadlessOutput::from_str("1600x1000@1.25").unwrap(),
+            HeadlessOutput {
+                width: 1600,
+                height: 1000,
+                scale: Some(1.25),
+            }
+        );
+        // No scale leaves it to the usual precedence rather than pinning 1.0 — pinning would make
+        // the flag silently override monitors.xml for anyone who only wanted a size.
+        assert_eq!(
+            HeadlessOutput::from_str("800x600").unwrap(),
+            HeadlessOutput {
+                width: 800,
+                height: 600,
+                scale: None,
+            }
+        );
+    }
+
+    #[test]
+    fn headless_output_rejects_what_it_cannot_honor() {
+        // A zero dimension or a zero/negative scale would reach the compositor as a mode or scale
+        // no output can have; refuse at the boundary, where the message can name the argument.
+        for bad in [
+            "",
+            "1600",
+            "x600",
+            "1600x",
+            "0x600",
+            "1600x0",
+            "1600x1000@0",
+            "1600x1000@-1",
+            "1600x1000@x",
+            "99999x1000",
+        ] {
+            assert!(
+                HeadlessOutput::from_str(bad).is_err(),
+                "{bad:?} must not parse",
+            );
         }
     }
 }

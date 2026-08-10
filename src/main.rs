@@ -22,7 +22,7 @@ use clap_complete_nushell::Nushell;
 use sd_notify::NotifyState;
 use smithay::reexports::wayland_server::Display;
 use synoik::backend::BackendMode;
-use synoik::cli::{Cli, CompletionShell, Sub};
+use synoik::cli::{Cli, CompletionShell, HeadlessOutput, Sub};
 use synoik::ipc::client::handle_msg;
 use synoik::synoik::State;
 use synoik::utils::spawning::{
@@ -258,19 +258,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // shows window contents and one that shows a hole where the window is.
         let synoik = &mut state.synoik;
         state.backend.headless().add_dmabuf_global(synoik);
-        // `SYNOIK_HEADLESS_MODE=WxH` sizes the virtual output. The headless backend
-        // advertises exactly one (custom) mode, so `synoik msg output … mode` cannot reach
-        // any other shape — and chrome that adapts to the canvas has to be judged on a
+        // `--output WxH[@scale]`, repeatable, sizes the virtual outputs. The headless backend
+        // advertises exactly one (custom) mode per output, so `synoik msg output … mode` cannot
+        // reach any other shape — and chrome that adapts to the canvas has to be judged on a
         // canvas, at the mode+scale of the display being reproduced.
-        let size = env::var("SYNOIK_HEADLESS_MODE")
-            .ok()
-            .and_then(|s| {
-                let (w, h) = s.split_once(['x', 'X'])?;
-                Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
-            })
-            .unwrap_or((1920, 1080));
-        let synoik = &mut state.synoik;
-        state.backend.headless().add_output(synoik, 1, size);
+        let outputs = if cli.outputs.is_empty() {
+            vec![HeadlessOutput {
+                width: 1920,
+                height: 1080,
+                scale: None,
+            }]
+        } else {
+            cli.outputs.clone()
+        };
+        for (i, out) in outputs.iter().enumerate() {
+            let n = u8::try_from(i + 1).expect("at most 255 headless outputs");
+            let synoik = &mut state.synoik;
+            state
+                .backend
+                .headless()
+                .add_output(synoik, n, (out.width, out.height));
+            // Through the same path `synoik msg output … scale` takes, so a scale set at startup
+            // and one set at runtime cannot disagree — and neither can be undone by the
+            // monitors.xml store the reload consults.
+            if let Some(scale) = out.scale {
+                state.apply_transient_output_config(
+                    &format!("headless-{n}"),
+                    synoik_ipc::OutputAction::Scale {
+                        scale: synoik_ipc::ScaleToSet::Specific(scale),
+                    },
+                );
+            }
+        }
     }
 
     // Set WAYLAND_DISPLAY for children.
@@ -288,8 +307,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("IPC listening on: {}", socket_path.to_string_lossy());
     }
 
-    // Setup xwayland-satellite integration.
-    xwayland::satellite::setup(&mut state);
+    // Setup xwayland-satellite integration. Not headless: the X11 sockets live in the *shared*
+    // `/tmp/.X11-unix`, so concurrent headless instances (and the developer's own session) would
+    // be competing for display numbers, and the satellite is a child process a test rig would
+    // then have to reap. A headless run has no X11 clients to serve.
+    if !cli.headless {
+        xwayland::satellite::setup(&mut state);
+    }
     if let Some(satellite) = &state.synoik.satellite {
         let name = satellite.display_name();
         *CHILD_DISPLAY.write().unwrap() = Some(name.to_owned());

@@ -1400,7 +1400,8 @@ Approved as one batch; the first three landed in `66953ae5` + `d2e5bae9`.
   grid — still reserve the entry's height, because they would otherwise render underneath it.
 * **The strip gets double the band.** ✅ `MAX_THUMBNAIL_SCALE` 0.05 → 0.10, so a thumbnail
   (which keeps the output's aspect) covers four times the area. Judged live at 1024×665
-  (`SYNOIK_HEADLESS_MODE=2048x1330` + scale 2). **Superseded 2026-08-03 (§12.7):** the strip is the
+  (`--output 2048x1330@2`; `SYNOIK_HEADLESS_MODE` plus a scale call at the time).
+  **Superseded 2026-08-03 (§12.7):** the strip is the
   app-grid row, so its size is `small_workspace_height` and its band is the full view width,
   overlapping the floating pill rather than dodging it.
 * **Dragging a thumbnail reorders the workspaces.** ✅ macOS Mission Control's gesture, on top
