@@ -390,6 +390,11 @@ with each other and leaves the group raise as the thing Super-Tab does.
 
 The `group` flag on `OpenRequest` and the pinned initial selection it drove are gone with it.
 
+Side effect, intended: because the rewrite matches on `Items::Windows`, pressing Above_Tab while
+an *Alt-Tab* popup is up now advances that list too, where GNOME ignores it there. Both popups are
+window lists at that point and the key means "next window" in one of them, so making it mean
+nothing in the other is a distinction without a difference.
+
 ### 3. DIVERGENCE: every switcher previews what it would raise
 
 GNOME previews nothing outside the cycler. The cycler's raise — a draw-order skip in
@@ -427,6 +432,10 @@ tabbed across three workspaces is still owed back the one the session started on
 ends without reaching `finish_switcher` — a modal or the lock screen taking the grab — is handed
 back by the per-frame `sync_switcher_preview`, which owns both halves of the preview and is the
 single writer for them.
+
+The workspace restore resolves its origin **by `WorkspaceId`**, falling back to the recorded index
+only if that workspace is gone: `w`/`F4` closes windows without ending the session, so the strip
+can renumber under a live preview.
 
 Corpus: `super_tab_brings_the_whole_app_forward_not_just_its_focused_window`,
 `switch_group_walks_the_current_apps_windows_as_a_window_switcher`,

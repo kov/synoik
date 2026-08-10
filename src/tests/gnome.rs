@@ -19654,6 +19654,7 @@ fn switcher_apps(f: &mut Fixture) {
         Box::new(FakeCatalog::new(vec![
             AppEntry::fake("org.example.One.desktop", "One"),
             AppEntry::fake("org.example.Two.desktop", "Two"),
+            AppEntry::fake("org.example.Three.desktop", "Three"),
         ])),
         Box::new(crate::app_system::RecordingLauncher::default()),
     );
@@ -19665,6 +19666,21 @@ fn switcher_rest(f: &mut Fixture, by: Duration) {
     let now = clock.now_unadjusted();
     clock.set_unadjusted(now + by);
     f.synoik().advance_animations();
+}
+
+/// Rest long enough for the workspace preview to settle on the current selection.
+///
+/// Two beats, not one: the dwell is armed by the frame that *notices* the selection moved and
+/// fires on a later one, so a single advance can only ever arm it. A live session queues a frame
+/// on the keypress itself, which is what makes one beat's worth of latency invisible there.
+///
+/// The first beat is a whole [`POPUP_DELAY`](crate::ui::switcher::POPUP_DELAY) because a popup
+/// still inside that delay previews nothing at all, so a shorter beat would arm nothing and the
+/// second would find no dwell to fire.
+fn settle_workspace_preview(f: &mut Fixture) {
+    switcher_rest(f, crate::ui::switcher::POPUP_DELAY);
+    switcher_rest(f, crate::ui::switcher::WORKSPACE_PREVIEW_DELAY * 2);
+    f.synoik_complete_animations();
 }
 
 /// The active workspace's floating stack, topmost first.
@@ -19827,15 +19843,24 @@ fn the_switcher_previews_another_workspace_and_gives_it_back() {
 
     let client = f.add_client();
 
-    // "Two" lives one workspace down. Mapped *first*, because the app switcher's item order is
-    // pure MRU by focus timestamp and switching workspaces does not re-stamp the window it lands
-    // on — mapping "One" last is what makes it unambiguously the app we are in.
+    // One app per workspace, walking *down* as each one is mapped: the strip only grows a
+    // workspace once the one before it is occupied, so mapping first and moving second is the
+    // only order that reliably reaches three of them.
+    //
+    // It also puts the MRU order where this test needs it. The app switcher's item order is pure
+    // MRU by focus timestamp and switching workspaces does not re-stamp the window it lands on,
+    // so mapping "One" last is what makes it unambiguously the app we are in, with "Two" one
+    // workspace away and "Three" two.
+    map_window_for_app(&mut f, client, "org.example.Three");
+    let far = f.synoik().layout.focus().unwrap().id();
+
     f.synoik_state()
         .do_action(Action::FocusWorkspaceDown, false);
     map_window_for_app(&mut f, client, "org.example.Two");
     let there = f.synoik().layout.focus().unwrap().id();
 
-    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
     map_window_for_app(&mut f, client, "org.example.One");
     let here = f.synoik().layout.focus().unwrap().id();
     f.synoik_complete_animations();
@@ -19847,7 +19872,7 @@ fn the_switcher_previews_another_workspace_and_gives_it_back() {
             .unwrap()
             .active_workspace_idx()
     };
-    assert_eq!(ws(&mut f), 0, "sanity: we start where \"One\" is");
+    assert_eq!(ws(&mut f), 2, "sanity: we start where \"One\" is");
 
     // Leg 1: open on "Two" and pass straight through — too quick to have gone anywhere.
     f.key_press(KEY_LEFTMETA);
@@ -19856,13 +19881,12 @@ fn the_switcher_previews_another_workspace_and_gives_it_back() {
     switcher_rest(&mut f, crate::ui::switcher::POPUP_DELAY);
     assert_eq!(
         ws(&mut f),
-        0,
+        2,
         "the dwell has not elapsed, so nothing has moved yet"
     );
 
     // Rest on it, and the screen follows the selection.
-    switcher_rest(&mut f, crate::ui::switcher::WORKSPACE_PREVIEW_DELAY * 2);
-    f.synoik_complete_animations();
+    settle_workspace_preview(&mut f);
     assert_eq!(
         ws(&mut f),
         1,
@@ -19874,27 +19898,50 @@ fn the_switcher_previews_another_workspace_and_gives_it_back() {
     f.key_release(KEY_LEFTMETA);
     f.synoik_complete_animations();
     f.double_roundtrip(client);
-    assert_eq!(ws(&mut f), 0, "abandoning it brings us back");
+    assert_eq!(ws(&mut f), 2, "abandoning it brings us back");
     assert_eq!(
         f.synoik().layout.focus().unwrap().id(),
         here,
         "with the focus we had"
     );
 
-    // Leg 2: the same trip, committed this time — we stay.
+    // Leg 2: the same trip, but tabbing *on* to a third app two workspaces away, and committed
+    // this time. Two hops, because one is what makes the bookmark assertion below vacuous — with
+    // a single hop the workspace we came from and the workspace the session started on are the
+    // same one, and a preview that trampled the bookmark would pass anyway.
     f.key_press(KEY_LEFTMETA);
     f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
-    switcher_rest(&mut f, crate::ui::switcher::WORKSPACE_PREVIEW_DELAY * 2);
+    settle_workspace_preview(&mut f);
+    assert_eq!(ws(&mut f), 1, "the first stop");
+
+    f.synoik_state()
+        .do_action(Action::SwitchApplications { backward: false }, false);
+    settle_workspace_preview(&mut f);
+    assert_eq!(ws(&mut f), 0, "and on to the second");
+
     f.key_release(KEY_LEFTMETA);
     f.synoik_complete_animations();
     f.double_roundtrip(client);
 
-    assert_eq!(ws(&mut f), 1, "committing keeps the workspace we went to");
+    assert_eq!(ws(&mut f), 0, "committing keeps the workspace we ended on");
     assert_eq!(
         f.synoik().layout.focus().unwrap().id(),
-        there,
+        far,
         "and focuses the window we picked"
+    );
+    let _ = there;
+
+    // "The previous workspace" is where the *session* started, not the last stop the preview made
+    // on the way. Letting `activate_workspace` write the bookmark as the preview went would leave
+    // this on workspace 1, which is somewhere the user only ever saw out of the corner of an eye.
+    f.synoik_state()
+        .do_action(Action::FocusWorkspacePrevious, false);
+    f.synoik_complete_animations();
+    assert_eq!(
+        ws(&mut f),
+        2,
+        "the bookmark is the workspace the session started on, not a stop it passed through"
     );
 }
 

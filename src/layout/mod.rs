@@ -4233,7 +4233,16 @@ impl<W: LayoutElement> Layout<W> {
         let Some(mon) = self.monitor_for_output_mut(&origin.output) else {
             return;
         };
-        mon.switch_workspace(origin.idx);
+        // By id first: the strip can move under a preview — `w`/`F4` closes windows without
+        // ending the session, and emptying the workspace the switcher started on is enough to
+        // renumber it. The recorded index is only the fallback for a workspace that is gone
+        // outright, where landing next to where you were beats not moving at all.
+        let idx = mon
+            .workspaces
+            .iter()
+            .position(|ws| ws.id() == origin.id)
+            .unwrap_or(origin.idx);
+        mon.switch_workspace(idx);
         mon.previous_workspace_id = origin.previous;
     }
 
