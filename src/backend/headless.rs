@@ -53,9 +53,11 @@ use crate::utils::{get_monotonic_time, logical_output};
 /// The headless backend's optional renderer. Clients need one to draw (and for screencasting);
 /// the compositor logic itself is driveable over IPC with none.
 pub struct Headless {
-    // Reached through `with_vulkan_renderer`: `render` itself composites nothing (there is no
-    // scanout to composite for), but everything that captures the output as a side effect of the
-    // redraw — screencast, screencopy, screenshots — draws through this renderer.
+    // `render` composites nothing through it (there is no scanout to composite for), but it does
+    // run the element pass on it to learn what the output is presenting
+    // (`render_element_states`), and everything that captures the output as a side effect of the
+    // redraw — screencast, screencopy, screenshots — draws through it. Also reached directly via
+    // `with_vulkan_renderer`.
     #[cfg_attr(not(test), allow(dead_code))]
     renderer: Option<crate::render_helpers::vulkan::VulkanRenderer>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
