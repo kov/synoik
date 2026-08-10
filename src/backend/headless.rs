@@ -10,8 +10,12 @@
 //!
 //! Not a test-only fork of the compositor — it runs the same `Synoik` the tty backend does, which
 //! is what makes the conformance corpus worth anything. What it does not have is a scanout: there
-//! is no screen to composite for, so `render` only paces frame callbacks, and the capture paths
-//! (screencast, screencopy, screenshot) are what actually draw.
+//! is no screen to composite for, so `render` assembles the frame's elements but hands them to
+//! nothing, and the capture paths (screencast, screencopy, screenshot) are what actually draw.
+//!
+//! It assembles them anyway because the element pass is what decides *which surfaces this output is
+//! presenting* — see [`Headless::render_element_states`]. Skipping it does not save a redraw, it
+//! silently mis-answers that question, and frame callbacks are the thing that notices.
 //!
 //! Clients present through the GPU here, same as on a real seat: [`Headless::add_dmabuf_global`]
 //! advertises dmabuf off a plain render node — no DRM master, no seat, no VT.
@@ -26,6 +30,7 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::gbm::GbmDevice;
 #[cfg(feature = "xdp-gnome-screencast")]
 use smithay::backend::drm::DrmDeviceFd;
+use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::ImportDma as _;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
@@ -278,13 +283,57 @@ impl Headless {
         self.renderer.as_mut().map(f)
     }
 
+    /// Which surfaces this redraw is presenting, from the same element pass the tty backend runs.
+    ///
+    /// Headless has no scanout, but it still owes an answer to "is this surface being presented on
+    /// this output": [`Synoik::send_frame_callbacks`] filters on it, and a surface that answers
+    /// "no" is left to smithay's *overdue* path — one callback per `FRAME_CALLBACK_THROTTLE`
+    /// (995 ms), which paces a self-pacing client at 1 fps. This handed back an empty
+    /// [`RenderElementStates`] until 2026-08-10, so that was every headless client; pinned now by
+    /// `a_client_is_paced_by_the_redraw_not_the_overdue_fallback`.
+    ///
+    /// The answer comes from the real element pass on purpose. A cheaper "every mapped window is on
+    /// its output" shortcut would be a second notion of visibility, free to drift from the one the
+    /// tty backend and the capture paths use — and this is exactly the question the corpus exists
+    /// to answer the same way the real compositor does.
+    ///
+    /// `damage_output` computes coverage and occlusion without drawing; the damage it returns is
+    /// discarded, and the tracker is built per call so it can never go stale against an output that
+    /// changed mode or scale.
+    fn render_element_states(&mut self, synoik: &Synoik, output: &Output) -> RenderElementStates {
+        let Some(renderer) = &mut self.renderer else {
+            // No renderer means no dmabuf global and inert capture paths, so nothing is drawing
+            // that a frame callback could pace. Overdue is then the honest answer, not a fallback.
+            return RenderElementStates::default();
+        };
+
+        let ctx = crate::render_helpers::RenderCtx {
+            renderer,
+            target: crate::render_helpers::RenderTarget::Output,
+            xray: None,
+            appearance: Some(synoik.appearance()),
+        };
+        let elements = synoik.render_to_vec(ctx, output, true);
+
+        let mut damage_tracker = OutputDamageTracker::from_output(output);
+        match damage_tracker.damage_output(1, &elements) {
+            Ok((_damage, states)) => states,
+            Err(err) => {
+                warn!("error computing headless render element states: {err:?}");
+                RenderElementStates::default()
+            }
+        }
+    }
+
     pub fn render(
         &mut self,
         synoik: &mut Synoik,
         output: &Output,
         target_presentation_time: Duration,
     ) -> RenderResult {
-        let states = RenderElementStates::default();
+        let states = self.render_element_states(synoik, output);
+        synoik.update_primary_scanout_output(output, &states);
+
         let mut presentation_feedbacks = synoik.take_presentation_feedbacks(output, &states);
         presentation_feedbacks.presented::<_, smithay::utils::Monotonic>(
             get_monotonic_time(),

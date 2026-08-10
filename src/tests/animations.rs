@@ -195,6 +195,64 @@ fn egl_clientside_height_change_doesnt_animate() {
     ");
 }
 
+/// A client that paces itself off `wl_surface.frame` must get its callback from the redraw, not
+/// from the overdue fallback.
+///
+/// `send_frames_surface_tree` sends a callback when the surface is on the output's primary scanout
+/// output **or** the frame is overdue past `FRAME_CALLBACK_THROTTLE` (995 ms). Headless used to
+/// hand `update_primary_scanout_output` an empty `RenderElementStates`, so no surface was ever on
+/// any output and every headless client was paced at ~1 fps by the fallback alone — correct, and
+/// 60× too slow. Found from outside by ghost's rig, whose 13-frame swapchain test took 12.1 s
+/// headless against 0.45 s on weston; our own corpus could not see it, because it drives renders by
+/// hand and never waits on a callback.
+///
+/// It has to be *several* frames: `SurfaceFrameThrottlingState::update` returns true when nothing
+/// was ever sent (`unwrap_or(true)`), so the first callback arrives promptly even when the whole
+/// primary-scanout path is dead. The throttle only bites from the second frame on — which is why a
+/// one-frame version of this test passed against the bug.
+#[test]
+fn a_client_is_paced_by_the_redraw_not_the_overdue_fallback() {
+    const FRAMES: usize = 3;
+    // Well under `FRAMES * FRAME_CALLBACK_THROTTLE` (~3 s), and far above the ~16 ms a paced frame
+    // costs, so neither a slow machine nor a fast one changes the verdict.
+    const BUDGET: Duration = Duration::from_millis(600);
+
+    let mut f = set_up();
+    let id = f.add_client();
+    let surface = create_window(&mut f, id, 100, 100);
+    f.double_roundtrip(id);
+
+    let output = f.synoik_output(1);
+    let start = std::time::Instant::now();
+
+    for frame_no in 0..FRAMES {
+        // Draw a frame and ask to be told when to draw the next one, as a real client does.
+        let window = f.client(id).window(&surface);
+        let frame = window.request_frame_callback();
+        window.attach_new_buffer();
+        window.commit();
+        f.roundtrip(id);
+
+        f.synoik().queue_redraw(&output);
+
+        let paced = f.dispatch_until(BUDGET, |_| {
+            frame.done.load(std::sync::atomic::Ordering::Relaxed)
+        });
+        assert!(
+            paced,
+            "frame {frame_no} never got its callback within {BUDGET:?}: the redraw is not pacing \
+             the client, so it is left to the 995 ms overdue throttle"
+        );
+    }
+
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < BUDGET,
+        "{FRAMES} frames took {elapsed:?}, which is throttle-paced, not redraw-paced — a headless \
+         client is running at ~1 fps"
+    );
+}
+
 /// Headless has no VBlank, so nothing outside the backend ever asks for the *next* frame of an
 /// animation: a redraw leaves the output idle, and only fresh damage brings it back. Without the
 /// backend's own frame timer an animation therefore renders exactly one frame and sits there —

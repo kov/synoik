@@ -864,6 +864,18 @@ impl Window {
         self.surface.attach(Some(&buffer), 0, 0);
     }
 
+    /// `wl_surface.frame`: ask to be told when to draw the next frame.
+    ///
+    /// The returned flag flips once the callback fires. This is how a real client paces itself, and
+    /// the only way to see the compositor's pacing from the outside — a test that acks configures
+    /// and commits on its own schedule never notices that callbacks are not arriving.
+    #[must_use]
+    pub fn request_frame_callback(&self) -> Arc<SyncData> {
+        let data = Arc::new(SyncData::default());
+        self.surface.frame(&self.qh, data.clone());
+        data
+    }
+
     /// Attach a null buffer, which unmaps the surface on the next commit.
     pub fn attach_null_buffer(&self) {
         self.surface.attach(None, 0, 0);
