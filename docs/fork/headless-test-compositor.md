@@ -163,7 +163,38 @@ the same 65px ghost measures for itself, the first time that arithmetic has been
 anything but ghost. Not exercised by them: input injection, screenshot-to-file,
 `ext-background-effect-v1`.
 
-## 7. One trap for any rig
+## 7. What the outside consumer found that we could not
+
+ghost's ported suite immediately surfaced a bug the corpus had been blind to since headless existed:
+a self-pacing client ran at **~1 fps**. Their 13-frame swapchain test took 12.1 s headless against
+0.45 s on weston.
+
+The chain, because every link is a trap on its own:
+
+- smithay's `send_frames_surface_tree` sends a callback when the surface is
+  `on_primary_scanout_output` **or** `frame_overdue`;
+- `FRAME_CALLBACK_THROTTLE` is 995 ms (`src/synoik.rs:269`), which is the 0.9 s ghost measured;
+- `update_primary_scanout_output` was called from exactly one place in the tree, `src/backend/tty.rs`
+  — headless passed `RenderElementStates::default()`, an empty map, so **no headless surface was ever
+  on any output** and the overdue path was the only one that ever fired.
+
+Fixed in `65c0cfaa` by computing the states from the real element pass (`Headless::render_element_states`).
+The alternative — declaring every mapped window primary — was rejected as a second notion of
+visibility, free to drift from the one tty and the capture paths use. The element pass costs nothing
+measurable: the workspace suite stayed at ~10 s.
+
+Two lessons worth more than the fix:
+
+- **The corpus was structurally unable to see this.** It drives renders by hand and never waits on a
+  frame callback, so it never exercised the one path a real client depends on. `wl_surface.frame` is
+  now reachable from the test client (`Window::request_frame_callback`).
+- **A one-frame test passes against this bug.** `SurfaceFrameThrottlingState::update` returns true
+  when nothing was ever sent (`unwrap_or(true)`), so the *first* callback always arrives promptly;
+  the throttle only bites from the second frame on. The first version of the pinning test measured
+  exactly the one frame that worked. Any test of pacing must measure several frames — see
+  `a_client_is_paced_by_the_redraw_not_the_overdue_fallback`.
+
+## 8. One trap for any rig
 
 `reload_output_config` loads the developer's real `~/.config/monitors.xml` (`src/synoik.rs:3568`),
 which sits *above* the KDL-era output config in the precedence chain. A test rig that does not
