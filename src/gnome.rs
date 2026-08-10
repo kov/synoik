@@ -135,9 +135,12 @@ pub struct GnomeSettings {
     /// `"Adwaita"`.
     pub icon_theme: String,
 
-    /// `org.gnome.desktop.interface enable-animations`. We do not gate our own animations on it
-    /// yet; it is here because `org.gnome.Shell.Introspect` publishes it and the portal reads it
-    /// to decide whether to animate its dialogs (`introspect.js:184-192`).
+    /// `org.gnome.desktop.interface enable-animations`. False turns our animations off, via
+    /// [`State::apply_animation_clock`] — mutter honors this key, so a session that asked for no
+    /// animations gets none. It is also published over `org.gnome.Shell.Introspect`, which the
+    /// portal reads to decide whether to animate its dialogs (`introspect.js:184-192`).
+    ///
+    /// [`State::apply_animation_clock`]: crate::synoik::State::apply_animation_clock
     pub enable_animations: bool,
     /// `org.gnome.desktop.interface enable-hot-corners`: whether the top-left corner toggles the
     /// overview when the pointer pushes into it (`layout.js:436-443`). GNOME has exactly one hot

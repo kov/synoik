@@ -24425,3 +24425,59 @@ fn a_window_is_not_configured_smaller_than_it_asked_for() {
         CONTENT + HEADER,
     );
 }
+
+/// `org.gnome.desktop.interface enable-animations` turns our animations off, the way it turns
+/// mutter's off.
+///
+/// We read this key from the start — the introspect interface publishes it, and the portal animates
+/// its dialogs to match — but for a long time the shell itself kept animating regardless. A session
+/// that asked for no animations (an a11y profile, a VM image, a user who dislikes them) got them
+/// anyway, and disagreed with every GTK app in it.
+///
+/// It is also the deterministic mode a test rig needs: no transition to race, reached through the
+/// same key a user has rather than a test-only switch.
+#[test]
+fn enable_animations_off_stops_the_shell_animating() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+
+    assert!(
+        !f.synoik().clock.should_complete_instantly(),
+        "precondition: animations are on by default",
+    );
+
+    // Drive the real entry point — the one the gsettings watcher calls on a change.
+    f.synoik_state().synoik.gnome_settings.enable_animations = false;
+    f.synoik_state().refresh_animation_clock();
+    assert!(
+        f.synoik().clock.should_complete_instantly(),
+        "enable-animations=false must reach the animation clock",
+    );
+
+    // Observable, not just the flag: opening the overview leaves nothing running.
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.synoik().advance_animations();
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "the overview must still open — off means instant, not inert",
+    );
+    assert!(
+        !f.synoik().layout.are_animations_ongoing(Some(&output)),
+        "with animations off the transition must already be over",
+    );
+
+    // And back: turning the key on animates again, so this is a setting and not a one-way door.
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.settle_animations();
+    f.synoik_state().synoik.gnome_settings.enable_animations = true;
+    f.synoik_state().refresh_animation_clock();
+    assert!(!f.synoik().clock.should_complete_instantly());
+
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.synoik().advance_animations();
+    assert!(
+        f.synoik().layout.are_animations_ongoing(Some(&output)),
+        "with animations on the overview transition must actually run",
+    );
+}

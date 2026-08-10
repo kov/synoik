@@ -1564,6 +1564,9 @@ impl State {
             let (initial, rx, writer) = crate::gnome::load_and_watch_gsettings();
             state.synoik.gnome_settings = initial;
             state.synoik.refresh_keybinding_state();
+            // Before anything can animate: `enable-animations` decides whether the clock completes
+            // instantly, and the clock was built from the config alone (no settings existed yet).
+            state.refresh_animation_clock();
             // The libinput device settings and the key-repeat parameters (see
             // `crate::input::peripherals`). Devices come and go later, and each one is
             // configured as it appears through the same `apply_libinput_settings`.
@@ -1841,6 +1844,10 @@ impl State {
                             || state.synoik.gnome_settings.base_font_family
                                 != settings.base_font_family;
                         state.synoik.gnome_settings = settings;
+                        // `enable-animations` can flip mid-session (a11y, a user toggle), and an
+                        // animation already running is left to finish on the old clock rather than
+                        // snapping — same as flipping it in GNOME.
+                        state.refresh_animation_clock();
                         // The scroll bindings live in this model, and the pointer
                         // handlers gate on a set derived from it.
                         state.synoik.refresh_keybinding_state();
@@ -3280,6 +3287,35 @@ impl State {
         }
     }
 
+    /// Point the animation clock at the current settings: how fast animations run, and whether
+    /// they run at all.
+    ///
+    /// Two things can turn them off, and either one is enough. `animations.off` is ours (the
+    /// debug/config switch the tests reach for). `org.gnome.desktop.interface enable-animations`
+    /// is GNOME's, and honoring it is what mutter does — a session where the user, an a11y
+    /// profile or a VM image turned animations off must not animate. This used to be read and
+    /// ignored, which left the key advertised over `org.gnome.Shell.Introspect` (so the portal
+    /// animated to match it) while the shell itself kept animating.
+    ///
+    /// It doubles as the deterministic mode any test rig wants: with animations off there is no
+    /// transition to race, and it is reached through the same key a user has rather than through a
+    /// test-only switch. Pinning the *clock* is Fixture-internal and deliberately stays that way.
+    pub(crate) fn apply_animation_clock(&mut self, config: &Config) {
+        let rate = 1.0 / config.animations.slowdown.max(0.001);
+        let off = config.animations.off || !self.synoik.gnome_settings.enable_animations;
+
+        self.synoik.clock.set_rate(rate);
+        self.synoik.clock.set_complete_instantly(off);
+    }
+
+    /// As [`apply_animation_clock`](Self::apply_animation_clock), for the callers that just want
+    /// the current config re-applied (a gsettings change, startup).
+    pub(crate) fn refresh_animation_clock(&mut self) {
+        let config = self.synoik.config.clone();
+        let config = config.borrow();
+        self.apply_animation_clock(&config);
+    }
+
     /// Nothing in the session reaches this any more — there is no config file to reload — but
     /// it stays as the one place that knows how to apply a config, and the renderer tests use
     /// it to install a custom shader through the real path.
@@ -3307,11 +3343,7 @@ impl State {
             self.synoik.layout.ensure_named_workspace(ws_config);
         }
 
-        let rate = 1.0 / config.animations.slowdown.max(0.001);
-        self.synoik.clock.set_rate(rate);
-        self.synoik
-            .clock
-            .set_complete_instantly(config.animations.off);
+        self.apply_animation_clock(&config);
 
         *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
 
