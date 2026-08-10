@@ -45,6 +45,13 @@ pub struct Cli {
     /// the only way to test a window crossing a scale boundary.
     #[arg(long = "output", value_name = "WxH[@SCALE]", requires = "headless")]
     pub outputs: Vec<HeadlessOutput>,
+    /// Listen on this Wayland socket name instead of the first free `wayland-N`.
+    ///
+    /// Fails to start if the name is already taken, rather than quietly landing somewhere else.
+    /// The socket is created in `XDG_RUNTIME_DIR` as usual, so a test rig that sets both knows
+    /// exactly where to point its clients without scraping the log for the name we chose.
+    #[arg(long, value_name = "NAME")]
+    pub wayland_display: Option<String>,
     /// Command to run upon compositor startup.
     #[arg(last = true)]
     pub command: Vec<OsString>,

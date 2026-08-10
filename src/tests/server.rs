@@ -33,7 +33,7 @@ impl Server {
             event_loop.get_signal(),
             display,
             BackendMode::HeadlessTest,
-            false,
+            crate::synoik::WaylandSocket::None,
             false,
         )
         .unwrap();

@@ -1260,6 +1260,19 @@ pub struct OutputState {
     pub last_frame_anim_causes: AnimCauses,
 }
 
+/// Which Wayland socket, if any, the compositor should listen on.
+#[derive(Debug, Clone)]
+pub enum WaylandSocket {
+    /// Do not listen at all — the in-process test fixture, which speaks to its clients over a
+    /// socketpair and must not appear in `XDG_RUNTIME_DIR` for anything else to find.
+    None,
+    /// The first free `wayland-N`.
+    Auto,
+    /// Exactly this name, and fail if it is taken (`--wayland-display`). A rig that names its
+    /// socket knows where to point its clients without scraping the log for the name we picked.
+    Named(String),
+}
+
 #[derive(Debug, Default)]
 pub enum RedrawState {
     /// The compositor is idle.
@@ -1507,7 +1520,7 @@ impl State {
         stop_signal: LoopSignal,
         display: Display<State>,
         mode: BackendMode,
-        create_wayland_socket: bool,
+        wayland_socket: WaylandSocket,
         is_session_instance: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let _span = tracy_client::span!("State::new");
@@ -1534,7 +1547,7 @@ impl State {
             stop_signal,
             display,
             &backend,
-            create_wayland_socket,
+            wayland_socket,
             is_session_instance,
         );
         backend.init(&mut synoik);
@@ -6931,7 +6944,7 @@ impl Synoik {
         stop_signal: LoopSignal,
         display: Display<State>,
         backend: &Backend,
-        create_wayland_socket: bool,
+        wayland_socket: WaylandSocket,
         is_session_instance: bool,
     ) -> Self {
         let _span = tracy_client::span!("Synoik::new");
@@ -7160,20 +7173,39 @@ impl Synoik {
             )
             .unwrap();
 
-        let socket_name = create_wayland_socket.then(|| {
-            let socket_source = ListeningSocketSource::new_auto().unwrap();
-            let socket_name = socket_source.socket_name().to_os_string();
-            event_loop
-                .insert_source(socket_source, move |client, _, state| {
-                    state.synoik.insert_client(NewClient {
-                        client,
-                        restricted: false,
-                        credentials_unknown: false,
-                    });
-                })
-                .unwrap();
-            socket_name
-        });
+        let socket_name = match &wayland_socket {
+            WaylandSocket::None => None,
+            socket => {
+                let source = match socket {
+                    WaylandSocket::Auto => ListeningSocketSource::new_auto(),
+                    WaylandSocket::Named(name) => ListeningSocketSource::with_name(name),
+                    WaylandSocket::None => unreachable!(),
+                };
+                // Name the directory and the socket: a bare `BindError` says neither, and the two
+                // ways this fails are both about *where* — a name already taken by another
+                // instance, or an `XDG_RUNTIME_DIR` whose path plus the socket name overflows the
+                // 108-byte `sockaddr_un` limit. Guessing that from "invalid argument" costs an
+                // afternoon.
+                let source = source.unwrap_or_else(|err| {
+                    panic!(
+                        "cannot bind the Wayland socket ({socket:?}) in {}: {err}",
+                        std::env::var("XDG_RUNTIME_DIR")
+                            .unwrap_or_else(|_| "$XDG_RUNTIME_DIR (unset)".to_owned()),
+                    )
+                });
+                let socket_name = source.socket_name().to_os_string();
+                event_loop
+                    .insert_source(source, move |client, _, state| {
+                        state.synoik.insert_client(NewClient {
+                            client,
+                            restricted: false,
+                            credentials_unknown: false,
+                        });
+                    })
+                    .unwrap();
+                Some(socket_name)
+            }
+        };
 
         let ipc_server = match IpcServer::start(&event_loop, socket_name.as_deref()) {
             Ok(server) => Some(server),

@@ -94,7 +94,9 @@ that to be where the surprises are, not in the import itself.
   surface minus geometry" is currently only ever checked from inside the client.
 - **Ask 3 — `--wayland-display NAME`.** Least load-bearing of the set: the socket is auto-named and
   already logged (`src/main.rs:274`), and a private `XDG_RUNTIME_DIR` deterministically yields
-  `wayland-0`. Worth having, worth doing last.
+  `wayland-0`. Worth having, worth doing last. (It also surfaced a real hazard: the bind was an
+  `unwrap`, so a rig with a long `XDG_RUNTIME_DIR` — over the 108-byte `sockaddr_un` limit — got a
+  backtrace naming neither the directory nor the reason. It now names both.)
 
 ## 4. Determinism: the GNOME-shaped version
 
@@ -130,18 +132,25 @@ granularity turns out to be genuinely needed, it is added *to* that surface — 
 per-buffer commit counters, so the data is reachable — and never as a parallel counter beside it.
 Marginal value for synoik's own testing either way.
 
-## 6. Order
+## 6. Order — all landed 2026-08-10
 
-1. **Headless dmabuf global + import**, one commit, pinned by a corpus test that runs a real dmabuf
-   client and asserts non-blank pixels. Unblocks ghost entirely and closes our own content-assertion
-   blind spot.
-2. **`enable-animations` → animation clock**, with a conformance test. Independent of ghost.
-3. **`--output WxH@scale`, repeatable**, replacing `SYNOIK_HEADLESS_MODE`; gate xwayland-satellite
-   off in headless in the same pass.
-4. **`msg windows` state fields.**
-5. **`--wayland-display NAME`.**
+1. ✅ **Headless dmabuf global + import**, one commit, pinned by
+   `a_client_dmabuf_reaches_the_composited_frame`: a real GBM client buffer, filled on the GPU,
+   presented over `zwp_linux_dmabuf_v1` and counted in the composited readback (40000 green pixels
+   for a 200×200 window). Breaking the import fails it at `create_immed`.
+2. ✅ **`enable-animations` → animation clock**, pinned by
+   `enable_animations_off_stops_the_shell_animating`. Both switches now meet in
+   `State::apply_animation_clock`, so ours and GNOME's cannot drift apart.
+3. ✅ **`--output WxH[@SCALE]`, repeatable**, replacing `SYNOIK_HEADLESS_MODE`; the scale goes
+   through `apply_transient_output_config`, the same path `msg output … scale` takes.
+   xwayland-satellite no longer starts headless.
+4. ✅ **`msg windows` state fields** — maximized/fullscreen/activated/tiled edges from the last
+   acked configure, plus `surface_size` beside `window_size`, and all of them in the event-stream
+   change check so a consumer's copy cannot go stale.
+5. ✅ **`--wayland-display NAME`**, and a bind failure that names the runtime dir and the reason
+   (a too-long `XDG_RUNTIME_DIR` used to be a raw `BindError` unwrap backtrace).
 
-Steps 1–3 clear ghost's stated bar for replacing both mutter and weston.
+That clears ghost's stated bar for replacing both mutter and weston.
 
 ## 7. One trap for any rig
 

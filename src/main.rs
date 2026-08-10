@@ -24,7 +24,7 @@ use smithay::reexports::wayland_server::Display;
 use synoik::backend::BackendMode;
 use synoik::cli::{Cli, CompletionShell, HeadlessOutput, Sub};
 use synoik::ipc::client::handle_msg;
-use synoik::synoik::State;
+use synoik::synoik::{State, WaylandSocket};
 use synoik::utils::spawning::{
     spawn, spawn_sh, store_and_increase_nofile_rlimit, CHILD_DISPLAY, CHILD_ENV,
     REMOVE_ENV_RUST_BACKTRACE, REMOVE_ENV_RUST_LIB_BACKTRACE,
@@ -242,7 +242,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_loop.get_signal(),
         display,
         mode,
-        true,
+        match &cli.wayland_display {
+            Some(name) => WaylandSocket::Named(name.clone()),
+            None => WaylandSocket::Auto,
+        },
         cli.session,
     )
     .unwrap();
