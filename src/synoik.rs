@@ -1956,6 +1956,22 @@ impl State {
         self.synoik.clock.clear();
         self.synoik.pointer_inactivity_timer_got_reset = false;
         self.synoik.notified_activity_this_iteration = false;
+
+        // Close the loop-watch window. Last, because this callback is the last thing
+        // in a turn of the event loop, and the window it measures runs from here to
+        // the same point next turn — the poll plus every source callback dispatched
+        // in between. See `frame_log::LoopWatch`.
+        //
+        // The pending flag is sampled here rather than when a stall is reported: the
+        // question is whether the loop owed a frame *while* it was busy or blocked,
+        // and by the time the window closes the frame may already have gone out.
+        let redraw_pending = self.synoik.output_state.values().any(|state| {
+            matches!(
+                state.redraw_state,
+                RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
+            )
+        });
+        self.synoik.frame_log.loop_turn_end(redraw_pending);
     }
 
     // We monitor both libinput and logind: libinput is always there (including without DBus), but

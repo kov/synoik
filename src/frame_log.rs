@@ -63,6 +63,12 @@
 //!   handed it to KMS ([`FrameLog::queued`]) — because "late with 8ms of slack" and "late because
 //!   we handed it over late" are different bugs and the lateness alone cannot tell them apart.
 //!
+//! - **Main-loop stalls**, from the wall and CPU time of one turn of the event loop
+//!   ([`LoopWatch`]). The other two only ever measure a *frame*, so a stutter caused by anything
+//!   else on the compositor thread — a D-Bus callback, a burst of client messages, a blocking read
+//!   — reports every frame under budget and leaves no trace but a `cadence` bucket. "It stuttered
+//!   and the log is clean" is what this answers.
+//!
 //! Neither is much use without knowing what the frame was *doing*, so a logged
 //! frame carries its [`FrameContext`]: element count, whether the damage was
 //! forced full, how many widget bakes ran (an uncached bake is a full GPU
@@ -768,6 +774,111 @@ const AUTODUMP_MAX: u64 = 20;
 /// is not 1.
 const AUTODUMP_DEFAULT_CYCLES: u64 = 2;
 
+/// CPU time on the compositor thread, outside the frame path, that counts as a stall.
+///
+/// A quarter of a 60Hz budget. Anything at or above this is work that has to come out
+/// of the frame the loop owes next, and it is invisible to every other instrument
+/// here — the frame log times a frame from `begin` to `end`, so cost incurred in some
+/// other event source's callback simply is not in it.
+const STALL_CPU: Duration = Duration::from_millis(4);
+
+/// Wall time the compositor thread spent **not running** — no CPU accrued — with a
+/// redraw already queued.
+///
+/// This is the other stall class and the one nothing else can see. A handler that
+/// makes a synchronous D-Bus round trip, reads a cold file, or waits on a lock burns
+/// no CPU while it does so, so it looks exactly like an idle poll. What separates
+/// them is that a frame was already due: an idle loop with nothing pending is
+/// supposed to sit in poll, and an idle loop with a frame queued is not.
+///
+/// Two refresh intervals at 60Hz. One would fire on the ordinary wait for the vblank
+/// timer that schedules the redraw in the first place.
+const STALL_BLOCKED: Duration = Duration::from_millis(32);
+
+/// Shortest gap between two stall warnings. A pathological stretch stalls every
+/// iteration, and the warning is a formatted journal line on the very thread that is
+/// already behind.
+const STALL_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// This thread's CPU time, which advances only while the thread is actually running.
+///
+/// The whole loop watch rests on that: a window's wall time covers the poll *and*
+/// every event source's callback, and CPU time is what separates "we were blocked
+/// waiting for something" from "we were busy". No portable Rust API exposes it, hence
+/// the raw `clock_gettime`.
+/// Whether one turn of the event loop counts as a stall, and what to call it.
+///
+/// Split out of [`FrameLog::loop_turn_end`] so the thresholds can be pinned by tests:
+/// the live path reads two real clocks, and nothing about a wall-clock reading is
+/// reproducible. This is the whole decision — the caller only formats it.
+///
+/// `other_cpu` is CPU burned in the window that was not the frame; `blocked` is wall
+/// time in which the thread ran nothing at all.
+fn stall_verdict(
+    other_cpu: Duration,
+    blocked: Duration,
+    redraw_was_pending: bool,
+) -> Option<&'static str> {
+    let busy = other_cpu >= STALL_CPU;
+    // Blocked time is only a fault if a frame was owed. An idle loop with nothing
+    // pending is *supposed* to sit in poll, and reporting that would bury the real
+    // signal under one line per idle second.
+    let stuck = redraw_was_pending && blocked >= STALL_BLOCKED;
+
+    match (busy, stuck) {
+        (true, true) => Some("busy and blocked"),
+        (true, false) => Some("busy"),
+        (false, true) => Some("blocked with a frame due"),
+        (false, false) => None,
+    }
+}
+
+fn thread_cpu() -> Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // Safe: `ts` is a valid, correctly-sized output for a clock the kernel always
+    // provides. A failure leaves it zeroed, which reads as "no CPU accrued" — the
+    // conservative direction, since it can only *suppress* a CPU-stall report.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts);
+    }
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+/// Watches the compositor thread for time spent *outside* the frame path.
+///
+/// The gap this closes: every other instrument in this module measures a frame, from
+/// [`FrameLog::begin`] to [`FrameLog::end`]. A stutter caused by something else on the
+/// thread — a D-Bus callback, a burst of client messages, a blocking read — produces
+/// no slow frame at all. The frame log reports every frame under budget and the only
+/// surviving trace is a `cadence` bucket, which says a gap happened and nothing about
+/// why. That signature ("it stuttered but the log is clean") had no owner.
+///
+/// The window measured is *between* consecutive runs of the post-dispatch callback,
+/// which is exactly one turn of `calloop`'s loop: the poll, every source callback it
+/// dispatched, and the callback body itself. Redraw's own CPU is subtracted, because
+/// redraw runs inside a source callback and the frame log already reports it in far
+/// more detail.
+#[derive(Debug, Default)]
+struct LoopWatch {
+    /// Wall and thread-CPU at the end of the previous callback — the start of the
+    /// window being measured. `None` before the first one; that iteration is skipped
+    /// rather than reported as an enormous stall from process start.
+    last_end: Option<(Instant, Duration)>,
+    /// Whether a redraw was already queued when the previous callback ended. Sampled
+    /// *then*, not now: the question is whether the loop owed a frame during the
+    /// window, and by the end of it the redraw may have happened.
+    redraw_was_pending: bool,
+    /// Thread CPU spent inside frames during the window.
+    redraw_cpu: Duration,
+    /// When the last stall was warned about, for [`STALL_COOLDOWN`].
+    last_warned: Option<Instant>,
+    /// Total stalls seen this session, reported by the IPC perf request.
+    stalls: u64,
+}
+
 /// Largest presentation gap [`Stats::cadence`] counts on its own; anything longer
 /// lands in this bucket. Four cycles is 67ms at 60Hz — well past "a hitch".
 const CADENCE_MAX: usize = 4;
@@ -855,6 +966,9 @@ struct InFlight {
     /// can still find it. See [`FRAME_SEQ`].
     seq: u64,
     started: Instant,
+    /// This thread's CPU time when the frame started, so [`LoopWatch`] can subtract
+    /// the frame's own work from the loop iteration that contained it.
+    cpu_started: Duration,
     /// When the current phase began — every mark closes one span and opens the next.
     phase_started: Instant,
     /// The attributed-scope union at that same moment, so a span can report how much of itself the
@@ -1045,6 +1159,8 @@ pub struct FrameLog {
     last_autodump: Option<Instant>,
     /// How many automatic dumps this session has written, for [`AUTODUMP_MAX`].
     autodumps: u64,
+    /// Watches for time the compositor thread spent outside the frame path.
+    loop_watch: LoopWatch,
 }
 
 impl FrameLog {
@@ -1104,6 +1220,7 @@ impl FrameLog {
             last_summary: Instant::now(),
             last_autodump: None,
             autodumps: 0,
+            loop_watch: LoopWatch::default(),
         }
     }
 
@@ -1206,6 +1323,7 @@ impl FrameLog {
             output: output.to_owned(),
             seq,
             started: now,
+            cpu_started: thread_cpu(),
             phase_started: now,
             phase_attributed: synoik_vk::stats::attributed(),
             phase: None,
@@ -1261,6 +1379,11 @@ impl FrameLog {
         // Whatever renders next — a screenshot, a screencast, the next frame's own bakes before
         // its `begin` — is not this frame's. See `CURRENT_SEQ`.
         CURRENT_SEQ.store(0, Ordering::Relaxed);
+
+        // Charge this frame's CPU to the frame, so the loop watch does not report it
+        // as unexplained work outside the frame path. Accumulated rather than
+        // assigned: one loop iteration can redraw several outputs.
+        self.loop_watch.redraw_cpu += thread_cpu().saturating_sub(frame.cpu_started);
 
         let now = Instant::now();
         if let Some(last) = frame.phase.take() {
@@ -1762,6 +1885,84 @@ impl FrameLog {
         self.maybe_autodump(settings, missed, &line);
     }
 
+    /// Close out one turn of the event loop, reporting any time the compositor thread
+    /// spent outside the frame path.
+    ///
+    /// Call at the **end** of the post-dispatch callback, which is once per turn of
+    /// `calloop`'s loop. `redraw_pending` is whether any output has a redraw queued
+    /// *now* — it is stashed for the next window, because the question a stall asks
+    /// is whether a frame was owed while the thread was busy or blocked.
+    ///
+    /// See [`LoopWatch`] for why this exists at all: it is the one instrument here
+    /// that can see a stutter which produced no slow frame.
+    pub fn loop_turn_end(&mut self, redraw_pending: bool) {
+        if self.settings.is_none() {
+            return;
+        }
+
+        let now = Instant::now();
+        let cpu = thread_cpu();
+
+        if let Some((last_wall, last_cpu)) = self.loop_watch.last_end {
+            let wall = now.saturating_duration_since(last_wall);
+            let window_cpu = cpu.saturating_sub(last_cpu);
+            // Work that was not the frame. Redraw runs inside a source callback, so
+            // it lands in this window, and the frame log already reports it in far
+            // more detail than a stall line could.
+            let other_cpu = window_cpu.saturating_sub(self.loop_watch.redraw_cpu);
+            // Time the thread was not running at all: poll, or a handler blocked in a
+            // syscall. Only the second is a bug, and `redraw_was_pending` is what
+            // tells them apart.
+            let blocked = wall.saturating_sub(window_cpu);
+
+            if let Some(why) = stall_verdict(other_cpu, blocked, self.loop_watch.redraw_was_pending)
+            {
+                self.loop_watch.stalls += 1;
+                let line = format!(
+                    "main loop {why}: {} outside the frame path ({} of CPU, {} not running, \
+                     frame {} of CPU), turn took {}",
+                    ms(other_cpu + blocked),
+                    ms(other_cpu),
+                    ms(blocked),
+                    ms(self.loop_watch.redraw_cpu),
+                    ms(wall),
+                );
+
+                // Banked as well as warned, for the same reason miss lines are: an
+                // event missing from a dump reads as a session in which it never
+                // happened. This is the line that explains a clean frame log.
+                if let Some(cap) = self.settings.and_then(|s| s.ring) {
+                    while self.ring.len() >= cap {
+                        self.ring.pop_front();
+                    }
+                    self.ring.push_back(Entry::Line(line.clone()));
+                }
+
+                // Rate-limited because a pathological stretch stalls every turn, and
+                // formatting a journal line costs the very thread that is behind.
+                // The ring entry above is not rate-limited — it is nearly free, and
+                // thinning it would put holes in the record.
+                let quiet = self
+                    .loop_watch
+                    .last_warned
+                    .is_some_and(|last| now.duration_since(last) < STALL_COOLDOWN);
+                if !quiet {
+                    self.loop_watch.last_warned = Some(now);
+                    tracing::warn!("{line}");
+                }
+            }
+        }
+
+        self.loop_watch.last_end = Some((now, cpu));
+        self.loop_watch.redraw_was_pending = redraw_pending;
+        self.loop_watch.redraw_cpu = Duration::ZERO;
+    }
+
+    /// How many main-loop stalls this session has seen.
+    pub fn stalls(&self) -> u64 {
+        self.loop_watch.stalls
+    }
+
     /// Write the run-up to a bad miss to a file by itself, so a stutter nobody was
     /// ready for still leaves evidence.
     ///
@@ -2249,6 +2450,7 @@ mod tests {
             seq: 1,
             output: "out".to_owned(),
             started: now,
+            cpu_started: Duration::ZERO,
             phase_started: now,
             phase_attributed: Duration::ZERO,
             phase: None,
@@ -2483,6 +2685,7 @@ mod tests {
             last_summary: Instant::now(),
             last_autodump: None,
             autodumps: 0,
+            loop_watch: LoopWatch::default(),
         }
     }
 
@@ -2801,6 +3004,108 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The loop watch must separate a blocked thread from an idle one, and must not
+    /// charge the frame's own cost to the loop.
+    ///
+    /// Three failure modes, each of which would make the instrument worse than
+    /// nothing:
+    ///
+    /// 1. Reporting idle polls. A desktop sits in poll for seconds at a time; a stall line per idle
+    ///    second buries the one that matters.
+    /// 2. Reporting the frame. Redraw runs inside a source callback, so its CPU lands in the loop's
+    ///    window. Left in, every animating frame would be a "stall", and the number would say
+    ///    nothing the frame log does not say better.
+    /// 3. Missing the blocked case. A handler waiting on a D-Bus round trip burns no CPU, so a
+    ///    CPU-only test sees a healthy loop — and that is the class this exists to catch, since it
+    ///    produces no slow frame either.
+    #[test]
+    fn a_stall_is_work_or_a_block_but_never_an_idle_poll() {
+        let ms = Duration::from_millis;
+
+        assert_eq!(
+            stall_verdict(Duration::ZERO, ms(5000), false),
+            None,
+            "an idle poll with nothing pending is not a stall, however long"
+        );
+        assert_eq!(
+            stall_verdict(ms(1), ms(1), true),
+            None,
+            "a healthy turn with a frame queued is not a stall"
+        );
+
+        // The blocked case: no CPU at all, so anything measuring work would miss it.
+        assert_eq!(
+            stall_verdict(Duration::ZERO, STALL_BLOCKED, true),
+            Some("blocked with a frame due"),
+            "a handler blocked in a syscall with a frame due is the case that \
+             produces no slow frame, and must be caught"
+        );
+        assert_eq!(
+            stall_verdict(Duration::ZERO, STALL_BLOCKED, false),
+            None,
+            "the same block with no frame owed is just an idle poll"
+        );
+
+        // The busy case is reported whether or not a frame was pending: CPU burned
+        // outside the frame path comes out of the frame the loop owes next.
+        assert_eq!(
+            stall_verdict(STALL_CPU, Duration::ZERO, false),
+            Some("busy")
+        );
+        assert_eq!(
+            stall_verdict(STALL_CPU, STALL_BLOCKED, true),
+            Some("busy and blocked")
+        );
+
+        // The thresholds are bounds, not decoration: just under must stay quiet.
+        assert_eq!(
+            stall_verdict(STALL_CPU - ms(1), STALL_BLOCKED - ms(1), true),
+            None,
+            "just under both thresholds must not report"
+        );
+    }
+
+    /// A frame's own CPU is charged to the frame, not to the loop.
+    ///
+    /// Drives the real `begin`/`end` and `loop_turn_end` rather than the arithmetic:
+    /// the subtraction is only correct if `end` actually accumulates, and a test of
+    /// the formula would pass with the accumulation deleted.
+    #[test]
+    fn a_frames_cpu_does_not_read_as_a_loop_stall() {
+        let mut log = test_log();
+        log.settings = Some(Settings {
+            summary_every: None,
+            ..Settings::default()
+        });
+
+        // Open the window.
+        log.loop_turn_end(false);
+        assert_eq!(log.stalls(), 0);
+
+        // A frame that burns real CPU. Busy-spin rather than sleep: sleeping accrues
+        // wall time and no CPU, which is the *other* case entirely.
+        log.begin("out");
+        let spin_until = Instant::now() + Duration::from_millis(12);
+        while Instant::now() < spin_until {
+            std::hint::spin_loop();
+        }
+        log.end(Some(Duration::from_millis(16)));
+
+        assert!(
+            log.loop_watch.redraw_cpu >= Duration::from_millis(5),
+            "the frame must have been charged its own CPU, got {:?}",
+            log.loop_watch.redraw_cpu
+        );
+
+        log.loop_turn_end(false);
+        assert_eq!(
+            log.stalls(),
+            0,
+            "a turn whose only cost was the frame is not a loop stall — the frame \
+             log already reports it, in more detail than a stall line could"
+        );
     }
 
     /// A dump must contain everything the scorer needs to compute a miss rate.
@@ -3144,6 +3449,7 @@ mod tests {
             last_summary: Instant::now(),
             last_autodump: None,
             autodumps: 0,
+            loop_watch: LoopWatch::default(),
         };
         let dropped = |log: &FrameLog| log.stats.get("out").map_or(0, |s| s.dropped);
 
@@ -3191,6 +3497,7 @@ mod tests {
             last_summary: Instant::now(),
             last_autodump: None,
             autodumps: 0,
+            loop_watch: LoopWatch::default(),
         };
         for i in 0..5 {
             let target = Duration::from_secs(200) + Duration::from_secs(i);
@@ -3225,6 +3532,7 @@ mod tests {
             last_summary: Instant::now(),
             last_autodump: None,
             autodumps: 0,
+            loop_watch: LoopWatch::default(),
         };
 
         let base = Duration::from_secs(100);
@@ -3269,6 +3577,7 @@ mod tests {
             last_summary: Instant::now(),
             last_autodump: None,
             autodumps: 0,
+            loop_watch: LoopWatch::default(),
         };
 
         let base = Duration::from_secs(100);
@@ -3320,6 +3629,7 @@ mod tests {
             last_summary: Instant::now(),
             last_autodump: None,
             autodumps: 0,
+            loop_watch: LoopWatch::default(),
         };
         let headroom = |log: &FrameLog| {
             log.stats
