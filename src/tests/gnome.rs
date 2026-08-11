@@ -24214,6 +24214,10 @@ fn creating_a_session_schedules_a_write() {
 ///
 /// The endpoints are blind to this: before the pickup and after the settle
 /// the layout is identical either way. Sample across the settle.
+///
+/// The *dropped* window is exempt: since 2026-08-11 it eases from the box it was released
+/// at into its slot, which is `dropped_preview_flies_back_into_its_slot`. What must not
+/// move is everything else — a preview the drop did not displace.
 #[test]
 fn overview_drop_does_not_reflow_the_picker_while_the_window_settles() {
     let mut f = Fixture::new();
@@ -24259,10 +24263,133 @@ fn overview_drop_does_not_reflow_the_picker_while_the_window_settles() {
     let samples = f.sample_animation(Duration::from_millis(600), 12, |f| slots(f));
     for (i, sample) in samples.iter().enumerate() {
         assert_eq!(
-            sample, &before,
+            &sample[..2],
+            &before[..2],
             "the picker must hold its layout across the drop settle, sample {i}"
         );
     }
+    // ...and the dropped one lands back exactly where it started, so the grid the samples
+    // above were checked against is the one the drop actually settles into.
+    assert_eq!(samples.last().unwrap(), &before);
+}
+
+/// The previews already on the workspace you drop onto have to make room for the arrival,
+/// and they ease into their new slots rather than re-packing on one frame — gnome-shell
+/// eases each child from its current allocation whenever the layout changes
+/// (`_syncWindowPositions` / `animateAllocation`, `workspace.js:759-766`, `:389-399`).
+#[test]
+fn a_drop_eases_the_previews_it_displaces() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // A on desktop 1, B on desktop 2.
+    let (win_a, win_b) = setup_two_desktops_in_overview(&mut f, id);
+    f.settle_animations();
+    // Workspace-local: the workspace's own placement animates too, and a rect that folded
+    // it in would be two motions at once.
+    let b_before = f.synoik().layout.expose_slot_local(&win_b).unwrap();
+
+    // Drop A on B's thumbnail: B now shares its desktop and must move over.
+    let rect = f.synoik().layout.expose_target_rect(&win_a).unwrap();
+    let (tx, ty) = thumbnail_center(&mut f, 1);
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    pointer_motion_to(&mut f, tx, ty);
+    // No roundtrip before sampling: it advances the clock, and this ease is 200ms long.
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    let samples = f.sample_animation(Duration::from_millis(200), 4, |f| {
+        f.synoik().layout.expose_slot_local(&win_b).unwrap()
+    });
+    f.settle_animations();
+    let b_after = f.synoik().layout.expose_slot_local(&win_b).unwrap();
+    assert_ne!(
+        b_after, b_before,
+        "the arrival must have displaced B at all, or there is nothing to ease",
+    );
+
+    // It starts where it was and arrives where it is going, having been in between.
+    assert_eq!(samples[0], b_before, "B must not jump on the drop frame");
+    assert_eq!(samples[4], b_after);
+    for (i, sample) in samples[1..4].iter().enumerate() {
+        assert!(
+            *sample != b_before && *sample != b_after,
+            "sample {} sits on an endpoint — B snapped rather than eased: {samples:?}",
+            i + 1,
+        );
+    }
+}
+
+/// The dropped preview eases from the box it was released at into its picker slot, rather
+/// than appearing there.
+///
+/// **Divergence (approved 2026-08-11).** gnome-shell pops the added clone up from scale 0
+/// (`workspace.js:1235-1243`); it only eases previews that were *already* in the layout
+/// (`_syncWindowPositions`, `workspace.js:759-766`). We fly the dropped one too, which is
+/// the motion that makes a drop read as a move rather than a teleport.
+#[test]
+fn dropped_preview_flies_back_into_its_slot() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (1600, 1000), None);
+    let _b = map_window_sized(&mut f, id, (760, 600), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle_animations();
+
+    let slot = f.synoik().layout.expose_target_rect(&win_b).unwrap();
+    pointer_motion_to(
+        &mut f,
+        slot.loc.x + slot.size.w / 2.,
+        slot.loc.y + slot.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    // A short carry, well inside the workspace: a longer one lands on a neighbour, and
+    // then the slot it settles into is not the one it started from.
+    f.pointer_motion(-60., -40.);
+    // The tile is out of the workspace while the drag is in flight, so there is no slot
+    // to read here — the drop below is what puts it back.
+    assert_eq!(f.synoik().layout.expose_target_rect(&win_b), None);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    // It travels: neither stuck at the release box nor already home.
+    let samples = f.sample_animation(Duration::from_millis(200), 6, |f| {
+        f.synoik().layout.expose_target_rect(&win_b).unwrap()
+    });
+    let progress = |r: smithay::utils::Rectangle<f64, smithay::utils::Logical>| {
+        (r.loc.x - samples[0].loc.x) / (slot.loc.x - samples[0].loc.x)
+    };
+    for pair in samples.windows(2) {
+        assert!(
+            progress(pair[1]) >= progress(pair[0]) - 0.001,
+            "the preview must close on its slot monotonically, got {samples:?}",
+        );
+    }
+    assert!(
+        progress(samples[1]) > 0.,
+        "it must leave the release box, got {samples:?}",
+    );
+    assert!(
+        progress(samples[2]) < 1.,
+        "it must not be home a third of the way in, got {samples:?}",
+    );
+
+    f.settle_animations();
+    assert_eq!(
+        f.synoik().layout.expose_target_rect(&win_b),
+        Some(slot),
+        "and it must land on the slot the picker gives it",
+    );
 }
 
 /// Restore must not drift: a window that is saved, restored, saved again and

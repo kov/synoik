@@ -122,6 +122,10 @@ pub struct Workspace<W: LayoutElement> {
     /// (gnome-shell's frozen workspace layout), keyed by window.
     expose_frozen: Option<FrozenExposeSlots<W>>,
 
+    /// Previews easing from the slots they held to the ones the picker now gives them —
+    /// see [`Workspace::slide_expose_slots_from`].
+    expose_slides: ExposeSlides<W>,
+
     /// Per-window picker-overlay progress: 0 idle, 1 fully hovered. gnome-shell's
     /// `showOverlay`/`hideOverlay` ease the pointed-at preview up to
     /// `WINDOW_ACTIVE_SIZE_INC` bigger and back down again
@@ -174,6 +178,23 @@ type FrozenExposeSlots<W> = Vec<(<W as LayoutElement>::Id, Rectangle<f64, Logica
 
 /// Picker-overlay progress per window — see [`Workspace::expose_hover`].
 type ExposeHovers<W> = Vec<(<W as LayoutElement>::Id, Animation)>;
+
+/// One preview crossing from the slot it held to the one it has now — see
+/// [`Workspace::slide_expose_slots_from`].
+#[derive(Debug)]
+struct SlotSlide {
+    /// The slot it is coming from, in workspace coordinates.
+    from: Rectangle<f64, Logical>,
+    /// 0 = at `from`, 1 = at the slot the picker computes today.
+    anim: Animation,
+}
+
+type ExposeSlides<W> = Vec<(<W as LayoutElement>::Id, SlotSlide)>;
+
+/// gnome-shell eases a preview from its current allocation to a new one over
+/// `WINDOW_REPOSITIONING_DELAY`-free `Workspace._syncWindowPositions`: 200ms `EASE_OUT_QUAD`
+/// (`workspace.js:759-766`, `animateAllocation` at `:389-399`).
+const SLOT_SLIDE_MS: u32 = 200;
 
 /// How much bigger a hovered preview gets, in each direction
 /// (`WINDOW_ACTIVE_SIZE_INC`, `windowPreview.js:20`). GNOME multiplies it by the
@@ -414,6 +435,7 @@ impl<W: LayoutElement> Workspace<W> {
             name: config.map(|c| c.name.0),
             layout_config,
             expose_frozen: None,
+            expose_slides: Vec::new(),
             expose_hover: Vec::new(),
             id: WorkspaceId::next(),
         }
@@ -480,6 +502,7 @@ impl<W: LayoutElement> Workspace<W> {
             name: config.map(|c| c.name.0),
             layout_config,
             expose_frozen: None,
+            expose_slides: Vec::new(),
             expose_hover: Vec::new(),
             id: WorkspaceId::next(),
         }
@@ -514,12 +537,20 @@ impl<W: LayoutElement> Workspace<W> {
         self.floating.advance_animations();
         self.expose_hover
             .retain(|(_, anim)| !(anim.is_done() && anim.to() == 0.));
+        // A slot ease that has landed is over: the preview is at the slot the picker
+        // computes for it, which is what it would draw at anyway.
+        self.expose_slides
+            .retain(|(_, slide)| !slide.anim.is_done());
     }
 
     pub fn are_animations_ongoing(&self) -> bool {
         self.scrolling.are_animations_ongoing()
             || self.floating.are_animations_ongoing()
             || self.expose_hover.iter().any(|(_, anim)| !anim.is_done())
+            || self
+                .expose_slides
+                .iter()
+                .any(|(_, slide)| !slide.anim.is_done())
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
@@ -2096,8 +2127,101 @@ impl<W: LayoutElement> Workspace<W> {
         tiles
             .into_iter()
             .zip(slots)
-            .map(|((tile, rect, _), slot)| (tile, rect, slot))
+            .map(|((tile, rect, _), slot)| (tile, rect, self.slide_slot(tile, slot)))
             .collect()
+    }
+
+    /// A preview's slot on the way to the one just computed for it, if it is mid-ease.
+    ///
+    /// A **post-pass**, deliberately: the interpolated slot must never reach
+    /// [`expose::compute_slots`], which sorts previews into rows and columns by their
+    /// centres. An animating input re-sorts the grid every frame and the whole picker
+    /// shuffles — the reason the layout above is taken over settled rects in the first
+    /// place.
+    fn slide_slot(&self, tile: &Tile<W>, slot: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+        let Some((_, slide)) = self
+            .expose_slides
+            .iter()
+            .find(|(id, _)| id == tile.window().id())
+        else {
+            return slot;
+        };
+        let t = slide.anim.clamped_value().clamp(0., 1.);
+        let lerp = |a: f64, b: f64| a + (b - a) * t;
+        Rectangle::new(
+            Point::from((
+                lerp(slide.from.loc.x, slot.loc.x),
+                lerp(slide.from.loc.y, slot.loc.y),
+            )),
+            Size::from((
+                lerp(slide.from.size.w, slot.size.w),
+                lerp(slide.from.size.h, slot.size.h),
+            )),
+        )
+    }
+
+    /// The picker slots as drawn right now — the `from` of a slot ease. Taken *before*
+    /// whatever changes the layout, and handed straight back to
+    /// [`Self::slide_expose_slots_from`] after.
+    pub(super) fn expose_slots_now(&self) -> Vec<(W::Id, Rectangle<f64, Logical>)> {
+        self.expose_layout()
+            .into_iter()
+            .map(|(tile, _, slot)| (tile.window().id().clone(), slot))
+            .collect()
+    }
+
+    /// Eases every preview from where it was to where the picker now puts it — gnome-shell
+    /// easing each child from its current allocation on `layoutChanged`
+    /// (`workspace.js:759-766`).
+    ///
+    /// `from` is a snapshot from [`Self::expose_slots_now`]; a window missing from it is
+    /// one the layout has only just gained, and it comes in from `arriving` — the rect it
+    /// was actually let go at, which is not derivable here.
+    ///
+    /// Taking the `from` as a snapshot rather than diffing against a remembered layout is
+    /// what keeps this out of the render path: the caller knows when it changed the
+    /// layout, and nothing has to notice after the fact.
+    pub(super) fn slide_expose_slots_from(
+        &mut self,
+        from: Vec<(W::Id, Rectangle<f64, Logical>)>,
+        arriving: Option<(W::Id, Rectangle<f64, Logical>)>,
+    ) {
+        if self.options.animations.off {
+            return;
+        }
+        let config = synoik_config::Animation {
+            off: false,
+            kind: synoik_config::animations::Kind::Easing(
+                synoik_config::animations::EasingParams {
+                    duration_ms: SLOT_SLIDE_MS,
+                    curve: synoik_config::animations::Curve::EaseOutQuad,
+                },
+            ),
+        };
+
+        // Cleared first so the snapshot below is the picker's own answer, not one already
+        // being interpolated by a previous drop.
+        self.expose_slides.clear();
+        self.expose_slides = self
+            .expose_slots_now()
+            .into_iter()
+            .filter_map(|(id, now)| {
+                let was = from
+                    .iter()
+                    .chain(arriving.as_ref())
+                    .find(|(other, _)| *other == id)
+                    .map(|(_, rect)| *rect)?;
+                // A preview the change did not move has nothing to ease, and arming one
+                // anyway would keep the compositor drawing frames for 200ms of nothing.
+                (was != now).then(|| {
+                    let slide = SlotSlide {
+                        from: was,
+                        anim: Animation::new(self.clock.clone(), 0., 1., 0., config),
+                    };
+                    (id, slide)
+                })
+            })
+            .collect();
     }
 
     /// The area the picker lays its slots out in: the working area, **symmetrized about the
@@ -2181,6 +2305,9 @@ impl<W: LayoutElement> Workspace<W> {
     /// the preview above its neighbours for the whole exit animation.
     pub(super) fn clear_expose_hover(&mut self) {
         self.expose_hover.clear();
+        // Leaving the picker: an eased slot would keep `render_expose` restacking (and
+        // would be interpolating toward a layout nobody is looking at).
+        self.expose_slides.clear();
     }
 
     /// Every window with an overlay showing, and how far it has faded in. The

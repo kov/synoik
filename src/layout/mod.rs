@@ -775,6 +775,17 @@ impl<W: LayoutElement> InteractiveMoveData<W> {
         1. + (target - 1.) * progress
     }
 
+    /// The box the drag is drawing in, in view coordinates — where the preview visibly
+    /// *is*, shrink and all, which is the only honest place for it to fly to its slot
+    /// from.
+    fn tile_render_rect(&self, zoom: f64) -> Rectangle<f64, Logical> {
+        let size = self
+            .tile
+            .tile_size()
+            .upscale(zoom * self.expose_extra_scale(zoom));
+        Rectangle::new(self.tile_render_location(zoom), size)
+    }
+
     fn tile_render_location(&self, zoom: f64) -> Point<f64, Logical> {
         let scale = Scale::from(self.output.current_scale().fractional_scale());
         let window_size = self.tile.window_size();
@@ -4803,6 +4814,14 @@ impl<W: LayoutElement> Layout<W> {
             mon.dnd_scroll_gesture_end();
         }
 
+        // Where every preview is *right now*, taken while the layouts are still frozen —
+        // i.e. exactly what is on screen. The drop below re-packs them; these are the
+        // rects they ease out of.
+        let slots_before: Vec<_> = self
+            .workspaces()
+            .map(|(_, _, ws)| (ws.id(), ws.expose_slots_now()))
+            .collect();
+
         // The drop lets the picker layouts recompute (frozen at pickup).
         for ws in self.workspaces_mut() {
             ws.unfreeze_expose();
@@ -4900,6 +4919,8 @@ impl<W: LayoutElement> Layout<W> {
 
                 let win_id = move_.tile.window().id().clone();
                 let tile_render_loc = move_.tile_render_location(zoom);
+                // The box the preview was let go at, before `move_.tile` is handed over.
+                let released_rect = move_.tile_render_rect(zoom);
                 let ws_count_before = mon.workspaces.len();
 
                 let ws_idx = match insert_ws {
@@ -5041,6 +5062,38 @@ impl<W: LayoutElement> Layout<W> {
                 // create; hand it over to the real one, or ease it shut.
                 let created = mon.workspaces.len() != ws_count_before;
                 mon.settle_thumb_phantom(created);
+
+                // Every preview the drop moved eases from where it was to where the
+                // picker now puts it, the dropped one included — it flies from the box it
+                // was let go at rather than appearing in its slot. gnome-shell eases each
+                // child from its current allocation on a layout change
+                // (`workspace.js:759-766`); the arrival is ours, since gnome-shell pops
+                // the added clone up from scale 0 instead (`workspace.js:1235-1243`).
+                if keep_position {
+                    // In the target workspace's own coordinates: the picker's slots are
+                    // workspace-local, the release rect is in view coordinates.
+                    let arriving = mon
+                        .workspaces_with_render_geo()
+                        .find(|(ws, _)| ws.has_window(&win_id))
+                        .map(|(_, geo)| {
+                            Rectangle::new(
+                                (released_rect.loc - geo.loc).downscale(zoom),
+                                released_rect.size.downscale(zoom),
+                            )
+                        });
+                    for ws in mon.workspaces.iter_mut() {
+                        // A workspace the drop *created* has no entry: it had no previews
+                        // to come from, only the arriving one.
+                        let before = slots_before
+                            .iter()
+                            .find(|(id, _)| *id == ws.id())
+                            .map_or_else(Vec::new, |(_, slots)| slots.clone());
+                        let arriving = arriving
+                            .filter(|_| ws.has_window(&win_id))
+                            .map(|rect| (win_id.clone(), rect));
+                        ws.slide_expose_slots_from(before, arriving);
+                    }
+                }
 
                 // The insert above can shift the workspace index, so re-find the tile.
                 let (tile, tile_offset, ws_geo) = mon
@@ -5932,6 +5985,22 @@ impl<W: LayoutElement> Layout<W> {
 
     /// The overview picker slot of a window, in output coordinates — where
     /// the window's preview sits on screen in the GNOME overview.
+    /// The picker slot of `window` in its **workspace's own** coordinates.
+    ///
+    /// [`Self::expose_target_rect`] folds in where that workspace currently sits, which
+    /// animates on its own account (a switch, a row that re-laid). Anything measuring how
+    /// a *preview* moves wants this one, or it is reading two motions at once and cannot
+    /// tell which it caught.
+    pub fn expose_slot_local(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
+        self.monitors().find_map(|mon| {
+            mon.expose_progress()?;
+            let (ws, _) = mon
+                .workspaces_with_render_geo()
+                .find(|(ws, _)| ws.has_window(window))?;
+            ws.expose_slot(window)
+        })
+    }
+
     pub fn expose_target_rect(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
         self.monitors().find_map(|mon| {
             mon.expose_progress()?;
