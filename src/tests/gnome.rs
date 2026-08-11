@@ -25431,3 +25431,129 @@ fn a_maximize_moves_and_grows_together() {
         samples[4],
     );
 }
+
+/// Redraws the client at `size` and lets the compositor see it.
+fn redraw_window_at(f: &mut Fixture, id: ClientId, surface: &WlSurface, size: (u16, u16)) {
+    let w = f.client(id).window(surface);
+    w.attach_new_buffer();
+    w.set_size(size.0, size.1);
+    w.commit();
+    f.double_roundtrip(id);
+}
+
+/// The last configure the client got, as `(size, maximized)`.
+fn last_configure(f: &mut Fixture, id: ClientId, surface: &WlSurface) -> ((i32, i32), bool) {
+    let (_, configure) = f
+        .client(id)
+        .window(surface)
+        .configures_received
+        .last()
+        .unwrap();
+    (
+        configure.size,
+        configure.states.contains(&xdg_toplevel::State::Maximized),
+    )
+}
+
+#[test]
+fn a_lazy_ack_does_not_corrupt_the_restore_rect() {
+    let mut f = Fixture::with_config(Config::default());
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    // Maximize for real: the client answers and redraws at the work-area size.
+    f.synoik_state().do_action(Action::Maximize, false);
+    f.double_roundtrip(id);
+    redraw_window_at(&mut f, id, &surface, (1920, 1048));
+
+    // Unmaximize, and let the client ack it *at the old size* — GTK4 does exactly this, putting
+    // its CSD margins back on the commit after (see `448e2dc5`). For that one commit the window
+    // legitimately *is* work-area sized while its restore is still in flight.
+    f.synoik_state().do_action(Action::Unmaximize, false);
+    f.double_roundtrip(id);
+    f.client(id).window(&surface).ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    // Maximize again inside that window, then unmaximize once more. The rect to come back to is
+    // still the 800x600 the window had before any of this — not the size it was caught wearing.
+    f.synoik_state().do_action(Action::Maximize, false);
+    f.double_roundtrip(id);
+    f.synoik_state().do_action(Action::Unmaximize, false);
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        last_configure(&mut f, id, &surface),
+        ((800, 600), false),
+        "the second unmaximize must restore the pre-maximize size, not the work area",
+    );
+}
+
+#[test]
+fn a_restore_the_client_answered_is_the_clients_size_again() {
+    let mut f = Fixture::with_config(Config::default());
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    f.synoik_state().do_action(Action::Maximize, false);
+    f.double_roundtrip(id);
+    redraw_window_at(&mut f, id, &surface, (1920, 1048));
+
+    // This time the client answers the restore honestly, and then resizes itself smaller.
+    f.synoik_state().do_action(Action::Unmaximize, false);
+    f.double_roundtrip(id);
+    f.client(id).window(&surface).ack_last_and_commit();
+    redraw_window_at(&mut f, id, &surface, (800, 600));
+    redraw_window_at(&mut f, id, &surface, (640, 480));
+
+    f.synoik_state().do_action(Action::Maximize, false);
+    f.double_roundtrip(id);
+    f.synoik_state().do_action(Action::Unmaximize, false);
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        last_configure(&mut f, id, &surface),
+        ((640, 480), false),
+        "once the client has answered a restore, its own size is the rect to come back to",
+    );
+}
+
+#[test]
+fn a_window_resized_back_to_the_work_area_still_saves_its_own_rect() {
+    let mut f = Fixture::with_config(Config::default());
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+
+    f.synoik_state().do_action(Action::Maximize, false);
+    f.double_roundtrip(id);
+    redraw_window_at(&mut f, id, &surface, (1920, 1048));
+
+    f.synoik_state().do_action(Action::Unmaximize, false);
+    f.double_roundtrip(id);
+    f.client(id).window(&surface).ack_last_and_commit();
+    redraw_window_at(&mut f, id, &surface, (800, 600));
+
+    // The user then drags the floating window out to exactly the work-area size. That is the same
+    // size the restore was in flight *from*, so a stale in-flight marker would read as "the client
+    // still has not answered" and hand back the old 800x600.
+    redraw_window_at(&mut f, id, &surface, (1920, 1048));
+
+    f.synoik_state().do_action(Action::Maximize, false);
+    f.double_roundtrip(id);
+    f.synoik_state().do_action(Action::Unmaximize, false);
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        last_configure(&mut f, id, &surface),
+        ((1920, 1048), false),
+        "a floating window that happens to be work-area sized comes back to that size",
+    );
+}

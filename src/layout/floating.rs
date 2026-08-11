@@ -17,7 +17,7 @@ use synoik_ipc::{PositionChange, SizeChange, WindowLayout};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::scrolling::ColumnWidth;
-use super::tile::{Tile, TileRenderElement, TileUnmapSnapshot};
+use super::tile::{RestoreInFlight, Tile, TileRenderElement, TileUnmapSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, Options, RemovedTile, SizeFrac,
@@ -1363,8 +1363,14 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return;
         }
 
+        // A restore the client has not answered yet leaves the window at a size that is about to
+        // stop being true; keep the rect we asked it to come back to rather than snapshotting the
+        // size it is still catching up from. See `Tile::restore_in_flight`.
         let win = tile.window();
-        let size = win.expected_size().unwrap_or_else(|| win.size());
+        let size = match tile.restore_in_flight {
+            Some(flight) if win.size() == flight.from_size => flight.size,
+            _ => win.expected_size().unwrap_or_else(|| win.size()),
+        };
         tile.tiled_restore_size = Some(size);
         tile.tiled_restore_pos = Some(Data::logical_to_size_frac_in_working_area(
             area,
@@ -1395,7 +1401,14 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let max_size = win.max_size();
         let w = ensure_min_max_size_maybe_zero(size.w, min_size.w, max_size.w);
         let h = ensure_min_max_size_maybe_zero(size.h, min_size.h, max_size.h);
-        win.request_size_once(Size::from((w, h)), true);
+        let restore_size = Size::from((w, h));
+        win.request_size_once(restore_size, true);
+
+        let from_size = win.size();
+        tile.restore_in_flight = Some(RestoreInFlight {
+            from_size,
+            size: restore_size,
+        });
 
         let prev_pos = self.data[idx].logical_pos;
         if let Some(pos) = restore_pos {
@@ -1600,6 +1613,13 @@ impl<W: LayoutElement> FloatingSpace<W> {
     pub fn refresh(&mut self, is_active: bool, is_focused: bool) {
         let active = self.active_window_id.clone();
         for tile in &mut self.tiles {
+            // The client answered the restore — whatever size it chose is its own again.
+            if let Some(flight) = tile.restore_in_flight {
+                if tile.window().size() != flight.from_size {
+                    tile.restore_in_flight = None;
+                }
+            }
+
             let win = tile.window_mut();
 
             win.set_active_in_column(true);

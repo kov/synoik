@@ -95,6 +95,18 @@ pub struct Tile<W: LayoutElement> {
     /// The position to restore when untiling (mutter's `saved_rect`).
     pub(super) tiled_restore_pos: Option<Point<f64, SizeFrac>>,
 
+    /// The size a restore asked the client for, held until the client acts on it.
+    ///
+    /// mutter's wayland `save_rect` reads the geometry the *compositor asked for* — it walks
+    /// `pending_configurations` and only falls back to the window's own config
+    /// (`meta_window_wayland_save_rect`, `src/wayland/meta-window-wayland.c:1151`). We cannot
+    /// simply do the same: a GTK4 client answers an unmaximize by acking at its old size and
+    /// only shrinking a commit later (see `448e2dc5`), so our configure has left the pending set
+    /// while the window is still maximized-sized. Re-maximizing in that window would save the
+    /// work-area size as the rect to come back to, and the next unmaximize would "restore" the
+    /// window to the full screen. So we remember what we asked for instead.
+    pub(super) restore_in_flight: Option<RestoreInFlight>,
+
     /// Whether the window was maximized when it went fullscreen (mutter's `saved_maximize`).
     ///
     /// A window's `SizingMode` is a single value with fullscreen on top, so this is the only place
@@ -142,6 +154,15 @@ pub struct Tile<W: LayoutElement> {
 
     /// Configurable properties of the layout.
     pub(super) options: Rc<Options>,
+}
+
+/// A restore the client has not acted on yet; see [`Tile::restore_in_flight`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreInFlight {
+    /// The window's size when the restore was requested. The client has acted once it differs.
+    pub from_size: Size<i32, Logical>,
+    /// The size the restore asked for — the rect to keep as the one to come back to.
+    pub size: Size<i32, Logical>,
 }
 
 synoik_render_elements! {
@@ -290,6 +311,7 @@ impl<W: LayoutElement> Tile<W> {
             floating_pos: None,
             tiled_restore_size: None,
             tiled_restore_pos: None,
+            restore_in_flight: None,
             saved_maximize: false,
             floating_preset_width_idx: None,
             floating_preset_height_idx: None,
