@@ -24,6 +24,9 @@ export XDG_RUNTIME_DIR=$R PIPEWIRE_RUNTIME_DIR=$R XDG_CONFIG_HOME=$R/config
 export DBUS_SESSION_BUS_ADDRESS=unix:path=$R/bus
 export RUST_LOG=${RUST_LOG:-synoik=info,synoik::screencasting=trace}
 
+# NH_OUTPUT reproduces the display under test (`WxH[@SCALE]`, e.g. 3840x2160@1.25). A bug that
+# only shows at the seat's mode and scale cannot be chased on the default 1920x1080.
+
 # The screencast D-Bus interfaces are session-instance only unless this is set.
 export SYNOIK_DEBUG_DBUS_INTERFACES_IN_NON_SESSION_INSTANCES=1
 
@@ -42,7 +45,7 @@ sleep 1
 dbus-daemon --session --fork --address="unix:path=$R/bus" --print-pid=1 > "$R/dbus.pid" 2>/dev/null
 cat "$R/dbus.pid" >> "$R/pids" 2>/dev/null
 sleep 1
-"$SYNOIK" --headless > "$R/synoik.log" 2>&1 & echo $! >> "$R/pids"
+"$SYNOIK" --headless ${NH_OUTPUT:+--output "$NH_OUTPUT"} > "$R/synoik.log" 2>&1 & echo $! >> "$R/pids"
 sleep 5
 
 NS=$(ls "$R"/synoik.*.sock 2>/dev/null | head -1)
