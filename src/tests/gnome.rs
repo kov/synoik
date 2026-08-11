@@ -6484,8 +6484,9 @@ fn overview_dragging_a_thumbnail_reorders_the_workspaces() {
     pointer_motion_to(&mut f, t1x + 1., t0y);
 
     // Mid-drag the row parts: the dragged thumbnail follows the pointer, and the one it
-    // passed has closed up into the slot it left.
-    {
+    // passed heads for the slot the drag left — easing, having been overtaken rather than
+    // having jumped out of the way.
+    let (dest, start) = {
         let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         let strip = mon.unwrap().thumbnail_strip().unwrap();
         assert_eq!(
@@ -6493,12 +6494,27 @@ fn overview_dragging_a_thumbnail_reorders_the_workspaces() {
             t1x + 1.,
             "the dragged thumbnail must hang off the pointer"
         );
-        assert_eq!(
-            strip.thumbs[1].loc.x,
-            t0x - strip.thumbs[1].size.w / 2.,
-            "the passed thumbnail must close up into the slot the drag left"
-        );
-    }
+        let half = strip.thumbs[1].size.w / 2.;
+        (t0x - half, t1x - half)
+    };
+    let passed = |f: &mut Fixture| {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap().thumbnail_strip().unwrap().thumbs[1].loc.x
+    };
+    let crossing = passed(&mut f);
+    assert!(
+        (crossing - dest).abs() > 1.,
+        "the passed thumbnail must ease out of the way, not jump: {crossing} == {dest}",
+    );
+    assert!(
+        crossing <= start + 1. && crossing >= dest - 1.,
+        "and it must be heading the right way: {crossing} outside {dest}..={start}",
+    );
+    f.settle_animations();
+    assert!(
+        (passed(&mut f) - dest).abs() <= 1.,
+        "the passed thumbnail must arrive in the slot the drag left",
+    );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.synoik_complete_animations();
@@ -6518,6 +6534,126 @@ fn overview_dragging_a_thumbnail_reorders_the_workspaces() {
         f.synoik().layout.is_overview_open(),
         "reordering must not leave the overview"
     );
+}
+
+/// A dropped thumbnail flies from the box it was let go at into its slot, rather than
+/// appearing there — the same rule the dropped *window* preview follows.
+#[test]
+fn a_dropped_thumbnail_flies_into_its_slot() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (win_a, _win_b) = setup_two_desktops_in_overview(&mut f, id);
+    f.settle_animations();
+
+    let (t0x, t0y) = thumbnail_center(&mut f, 0);
+    let (t1x, _) = thumbnail_center(&mut f, 1);
+
+    // Carry the first thumbnail past the second, then let go a little short of the
+    // slot's own centre so the flight has somewhere to come from.
+    pointer_motion_to(&mut f, t0x, t0y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, t1x + 20., t0y);
+    f.settle_animations();
+
+    // Where the thumbnail it is carrying sits at the moment of release, and which index
+    // its workspace lands at.
+    let released = {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap().thumbnail_strip().unwrap().thumbs[0].loc.x
+    };
+    // No roundtrip before sampling: it advances the clock, and this ease is 200ms long.
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    // The carried workspace swapped with its neighbour, so it is the row's second slot now.
+    let carried = |f: &mut Fixture| {
+        let idx = f
+            .synoik()
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(&win_a))
+            .map(|(_, idx, _)| idx)
+            .expect("the carried workspace must still exist");
+        assert_eq!(idx, 1, "the drop must have swapped it past its neighbour");
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap().thumbnail_strip().unwrap().thumbs[idx].loc.x
+    };
+    let samples = f.sample_animation(Duration::from_millis(200), 4, carried);
+    assert!(
+        (samples[0] - released).abs() <= 1.,
+        "the drop must start from the box the thumbnail was let go at: {samples:?}",
+    );
+
+    f.settle_animations();
+    let home = carried(&mut f);
+    assert!(
+        (home - released).abs() > 1.,
+        "the slot must be somewhere other than the release point, or nothing is proven",
+    );
+    for (i, sample) in samples[1..4].iter().enumerate() {
+        assert!(
+            (sample - released).abs() > 1. && (sample - home).abs() > 1.,
+            "sample {} sits on an endpoint — the thumbnail snapped rather than flew: \
+             {samples:?} -> {home}",
+            i + 1,
+        );
+    }
+}
+
+/// The same, carried the other way — right to left, which is the direction that renumbers
+/// the row *behind* the carried workspace and so is the one a positional snapshot would
+/// skew (`Monitor::thumb_xs` maps by identity for exactly this).
+#[test]
+fn a_thumbnail_carried_leftwards_flies_into_its_slot() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let (_win_a, win_b) = setup_two_desktops_in_overview(&mut f, id);
+    f.settle_animations();
+
+    let (t0x, t0y) = thumbnail_center(&mut f, 0);
+    let (t1x, _) = thumbnail_center(&mut f, 1);
+
+    // B's thumbnail is the second one; carry it left past the first.
+    pointer_motion_to(&mut f, t1x, t0y);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, t0x - 20., t0y);
+    f.settle_animations();
+
+    let released = {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap().thumbnail_strip().unwrap().thumbs[1].loc.x
+    };
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+
+    let carried = |f: &mut Fixture| {
+        let idx = f
+            .synoik()
+            .layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(&win_b))
+            .map(|(_, idx, _)| idx)
+            .expect("the carried workspace must still exist");
+        assert_eq!(idx, 0, "the drop must have swapped it past its neighbour");
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap().thumbnail_strip().unwrap().thumbs[idx].loc.x
+    };
+    let samples = f.sample_animation(Duration::from_millis(200), 4, carried);
+    assert!(
+        (samples[0] - released).abs() <= 1.,
+        "the drop must start from the box the thumbnail was let go at: {samples:?}",
+    );
+
+    f.settle_animations();
+    let home = carried(&mut f);
+    for (i, sample) in samples[1..4].iter().enumerate() {
+        assert!(
+            (sample - released).abs() > 1. && (sample - home).abs() > 1.,
+            "sample {} sits on an endpoint — the thumbnail snapped rather than flew: \
+             {samples:?} -> {home}",
+            i + 1,
+        );
+    }
 }
 
 /// …and under the movement threshold the same press is still a plain click, which is what

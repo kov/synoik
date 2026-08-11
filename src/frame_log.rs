@@ -645,6 +645,8 @@ bitflags::bitflags! {
         const INTERACTIVE_MOVE = 1 << 26;
         /// The workspace row's phantom slot easing back shut after a drag left it.
         const THUMB_PHANTOM = 1 << 27;
+        /// The workspace row easing to where it belongs after a drop or a reorder.
+        const THUMB_ROW_SLIDE = 1 << 28;
     }
 }
 
@@ -685,6 +687,7 @@ impl AnimCauses {
             (AnimCauses::DND, "dnd"),
             (AnimCauses::INTERACTIVE_MOVE, "interactive-move"),
             (AnimCauses::THUMB_PHANTOM, "thumb-phantom"),
+            (AnimCauses::THUMB_ROW_SLIDE, "thumb-row-slide"),
         ];
         TABLE
             .iter()

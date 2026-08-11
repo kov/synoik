@@ -178,9 +178,8 @@ pub struct Monitor<W: LayoutElement> {
     /// The slot the row holds open for a workspace a drop would create — see
     /// [`PhantomSlot`].
     thumb_phantom: Option<PhantomSlot>,
-    /// The row recentring after a drop turned that slot into a workspace — see
-    /// [`OpenSlide`].
-    thumb_open_slide: Option<OpenSlide>,
+    /// The row easing to where it belongs after a drop or a reorder — see [`RowSlide`].
+    thumb_row_slide: Option<RowSlide>,
     /// The strip closing the gap left by a workspace you dismissed — see
     /// [`Self::close_workspace`].
     thumb_close_slide: Option<CloseSlide>,
@@ -317,23 +316,25 @@ struct CloseSlide {
     anim: Animation,
 }
 
-/// The row catching up with the workspace a drop just appended.
+/// The row catching up with a rearrangement, from where it was drawn to where it belongs.
 ///
-/// The slot the drag held open hangs off the *right end* of a row that never moved
-/// (`thumbnails::Phantom`), so the moment the workspace becomes real the row owes itself
-/// half a slot of recentring. That is this: the pre-drop positions are snapshotted by the
-/// caller — including the phantom's, which is where the new thumbnail starts — and the
-/// thumbnails ease from there to the row they belong in.
+/// Three things arm it, and they are the same event seen three ways — the row's contents
+/// changed under a gesture that had been holding them still:
 ///
-/// A snapshot rather than a re-lay (which is how [`CloseSlide`] does it) because by the
-/// time the drop is settled the old row cannot be reconstructed: the window that arrived
-/// may have changed which workspaces exist, not just how many.
+/// - a drop appended a workspace, so the slot that hung off the right end (`thumbnails::Phantom`)
+///   is real and the run owes itself half a slot of recentring;
+/// - a reorder drag crossed a neighbour, so that neighbour owes the slot it just gave up;
+/// - a reorder drag ended, so the thumbnail the pointer was carrying owes its slot.
+///
+/// A snapshot of drawn positions rather than a re-lay of the old row (which is how
+/// [`CloseSlide`] does it), because in none of those three can the old row be
+/// reconstructed afterwards: the workspaces themselves have moved.
 #[derive(Debug)]
-struct OpenSlide {
-    /// Where each thumbnail was drawn just before the drop, in workspace order, the
-    /// phantom's slot last.
+struct RowSlide {
+    /// Where each thumbnail was drawn when the row changed, indexed by its workspace's
+    /// index *after* the change.
     from: Vec<f64>,
-    /// 0 = that row, 1 = the row the new workspace belongs in.
+    /// 0 = that row, 1 = the row it is heading for.
     anim: Animation,
 }
 
@@ -349,7 +350,7 @@ struct OpenSlide {
 /// [`Monitor::phantom_target`]. Two reasons it has to be, and they are the same reason: a
 /// reveal read off the row it is itself moving is a feedback loop, and a row that shifts
 /// under the pointer changes which drop the pointer is asking for. The row is therefore
-/// held still for the whole drag and catches up afterwards, in one [`OpenSlide`].
+/// held still for the whole drag and catches up afterwards, in one [`RowSlide`].
 #[derive(Debug)]
 struct PhantomSlot {
     /// The workspace index the slot stands in for.
@@ -602,7 +603,7 @@ impl<W: LayoutElement> Monitor<W> {
             thumb_placeholder: FocusRing::new(thumbnail_placeholder_config()),
             thumb_drag: None,
             thumb_phantom: None,
-            thumb_open_slide: None,
+            thumb_row_slide: None,
             thumb_close_slide: None,
             insert_hint_render_loc: None,
             overview_open: false,
@@ -1485,8 +1486,8 @@ impl<W: LayoutElement> Monitor<W> {
         {
             causes |= AnimCauses::THUMB_PHANTOM;
         }
-        if self.thumb_open_slide.is_some() {
-            causes |= AnimCauses::THUMB_PHANTOM;
+        if self.thumb_row_slide.is_some() {
+            causes |= AnimCauses::THUMB_ROW_SLIDE;
         }
         if self.workspaces.iter().any(|ws| ws.are_animations_ongoing()) {
             causes |= AnimCauses::WINDOWS;
@@ -1515,7 +1516,7 @@ impl<W: LayoutElement> Monitor<W> {
                 .thumb_phantom
                 .as_ref()
                 .is_some_and(|slot| slot.closing.is_some())
-            || self.thumb_open_slide.is_some()
+            || self.thumb_row_slide.is_some()
             || self
                 .workspaces
                 .iter()
@@ -2110,11 +2111,11 @@ impl<W: LayoutElement> Monitor<W> {
             self.thumb_phantom = None;
         }
         if self
-            .thumb_open_slide
+            .thumb_row_slide
             .as_ref()
             .is_some_and(|s| s.anim.is_done())
         {
-            self.thumb_open_slide = None;
+            self.thumb_row_slide = None;
         }
     }
 
@@ -2272,7 +2273,8 @@ impl<W: LayoutElement> Monitor<W> {
     /// being dragged, the row parts around where it would land.
     pub fn thumbnail_strip(&self) -> Option<Strip> {
         let strip = self.lay_strip(self.thumb_phantom.as_ref().map(PhantomSlot::phantom))?;
-        Some(self.apply_thumb_drag(strip))
+        let strip = self.apply_thumb_drag(strip);
+        Some(self.apply_row_slide(strip))
     }
 
     /// The strip as laid out with neither the phantom slot nor a reorder drag applied.
@@ -2303,24 +2305,49 @@ impl<W: LayoutElement> Monitor<W> {
             thumbnails::strip_geometry(self.view_size, band, thumb_w, gap, n, insert, focus)
         };
         let strip = lay(self.workspaces.len(), self.workspace_render_idx());
-        let strip = self.apply_close_slide(strip, &lay);
-        Some(self.apply_open_slide(strip))
+        Some(self.apply_close_slide(strip, &lay))
     }
 
-    /// Eases the row from where it stood with a slot merely held open to where it stands
-    /// with that workspace real — see [`OpenSlide`].
-    fn apply_open_slide(&self, mut strip: Strip) -> Strip {
-        let Some(slide) = &self.thumb_open_slide else {
+    /// Eases the row from the positions it was drawn at when it last changed to the ones it
+    /// is heading for — see [`RowSlide`].
+    ///
+    /// Applied **after** the reorder drag, not before: while a thumbnail is being carried
+    /// its position is the pointer's and nothing may interpolate it, and the slots the
+    /// others are easing towards are the ones the drag just decided.
+    fn apply_row_slide(&self, mut strip: Strip) -> Strip {
+        let Some(slide) = &self.thumb_row_slide else {
             return strip;
         };
         if slide.from.len() != strip.thumbs.len() {
             return strip;
         }
+        let carried = self.thumb_drag.map(|drag| drag.from);
         let t = slide.anim.clamped_value().clamp(0., 1.);
-        for (rect, from) in zip(&mut strip.thumbs, &slide.from) {
+        for (i, (rect, from)) in zip(&mut strip.thumbs, &slide.from).enumerate() {
+            if carried == Some(i) {
+                continue;
+            }
             rect.loc.x = from + (rect.loc.x - from) * t;
         }
         strip
+    }
+
+    /// Arms [`RowSlide`] to ease from `from` — the positions the row was drawn at just
+    /// before whatever change is about to be, or has just been, made.
+    fn arm_row_slide(&mut self, from: Vec<f64>) {
+        if from.len() != self.workspaces.len() {
+            return;
+        }
+        self.thumb_row_slide = Some(RowSlide {
+            from,
+            anim: Animation::new(
+                self.clock.clone(),
+                0.,
+                1.,
+                0.,
+                strip_transition_config(&self.options),
+            ),
+        });
     }
 
     /// Eases the row from where it stood with a just-closed workspace still in it to where
@@ -2441,16 +2468,7 @@ impl<W: LayoutElement> Monitor<W> {
         // other way — an interior insert, a window arriving from elsewhere — is not what
         // was snapshotted, and easing to it from the wrong row is worse than not easing.
         if had_slot && was.len() == self.workspaces.len() {
-            self.thumb_open_slide = Some(OpenSlide {
-                from: was,
-                anim: Animation::new(
-                    self.clock.clone(),
-                    0.,
-                    1.,
-                    0.,
-                    strip_transition_config(&self.options),
-                ),
-            });
+            self.arm_row_slide(was);
         }
     }
 
@@ -2530,16 +2548,70 @@ impl<W: LayoutElement> Monitor<W> {
         true
     }
 
-    /// Follows the pointer.
+    /// Follows the pointer, and eases the row apart when the carried thumbnail crosses a
+    /// neighbour rather than letting the neighbour jump to its new slot.
     pub fn update_thumb_drag(&mut self, pos: Point<f64, Logical>) {
+        let Some(drag) = self.thumb_drag else {
+            return;
+        };
+        // Snapshotted before the move, because the crossing is decided by it.
+        let was = self.thumb_xs();
+
         if let Some(drag) = &mut self.thumb_drag {
             drag.pos = pos;
         }
+
+        let Some(strip) = self.thumbnail_strip_at_rest() else {
+            return;
+        };
+        let moved = ThumbDrag { pos, ..drag };
+        if thumb_drag_target(&strip, moved) != thumb_drag_target(&strip, drag) {
+            self.arm_row_slide_by_id(was);
+        }
+    }
+
+    /// Where each thumbnail is drawn right now, tagged with whose it is.
+    ///
+    /// By identity, not by index, because the callers snapshot *before* a move that can
+    /// renumber the row — and [`Self::move_workspace_to_idx`] does more than shuffle: it
+    /// appends an empty workspace when the moved one lands last, and reaps empties on the
+    /// way out. A positional snapshot would silently skew by one.
+    fn thumb_xs(&self) -> Vec<(WorkspaceId, f64)> {
+        let Some(strip) = self.thumbnail_strip() else {
+            return Vec::new();
+        };
+        zip(&self.workspaces, &strip.thumbs)
+            .map(|(ws, rect)| (ws.id(), rect.loc.x))
+            .collect()
+    }
+
+    /// Arms [`RowSlide`] from a [`Self::thumb_xs`] snapshot taken before the row was
+    /// renumbered. A workspace the snapshot does not know starts where it belongs, so it
+    /// simply appears rather than flying in from an address it never had.
+    fn arm_row_slide_by_id(&mut self, was: Vec<(WorkspaceId, f64)>) {
+        let Some(rest) = self.thumbnail_strip_at_rest() else {
+            return;
+        };
+        if rest.thumbs.len() != self.workspaces.len() {
+            return;
+        }
+        let from = zip(&self.workspaces, &rest.thumbs)
+            .map(|(ws, rect)| {
+                was.iter()
+                    .find(|(id, _)| *id == ws.id())
+                    .map_or(rect.loc.x, |(_, x)| *x)
+            })
+            .collect();
+        self.arm_row_slide(from);
     }
 
     /// Ends the drag, reordering the workspaces to where the thumbnail was
     /// dropped. Returns whether anything moved.
     pub fn finish_thumb_drag(&mut self) -> bool {
+        // Taken while the drag is still on, so the carried thumbnail's snapshot is the box
+        // it was let go at: it flies from there into its slot rather than appearing in it.
+        let was = self.thumb_xs();
+
         let Some(drag) = self.thumb_drag.take() else {
             return false;
         };
@@ -2548,16 +2620,22 @@ impl<W: LayoutElement> Monitor<W> {
         };
         let target = thumb_drag_target(&strip, drag);
         if target == drag.from {
+            // Nothing reordered, but the thumbnail is still out where the pointer left it.
+            self.arm_row_slide_by_id(was);
             return false;
         }
         self.move_workspace_to_idx(drag.from, target);
+        self.arm_row_slide_by_id(was);
         true
     }
 
     /// Drops the drag without reordering (the overview closing under it, a
     /// cancelled grab).
     pub fn cancel_thumb_drag(&mut self) {
-        self.thumb_drag = None;
+        let was = self.thumb_xs();
+        if self.thumb_drag.take().is_some() {
+            self.arm_row_slide_by_id(was);
+        }
     }
 
     /// Whether a reorder drag is under way.
@@ -3077,7 +3155,17 @@ impl<W: LayoutElement> Monitor<W> {
                 .render(rect.loc + slide, &mut push_ring);
         }
 
-        for (idx, (ws, slot)) in zip(&self.workspaces, &strip.thumbs).enumerate() {
+        // A carried thumbnail is drawn first — first pushed = topmost — so it passes over
+        // its neighbours whichever way it is going. Left in workspace order it would go
+        // under everything to its left, which is exactly half of any reorder.
+        let carried = self.thumb_drag.map(|drag| drag.from);
+        let n = self.workspaces.len().min(strip.thumbs.len());
+        let order = carried
+            .filter(|i| *i < n)
+            .into_iter()
+            .chain((0..n).filter(|i| carried != Some(*i)));
+        for idx in order {
+            let (ws, slot) = (&self.workspaces[idx], &strip.thumbs[idx]);
             let shrink = self.workspace_render_scale(idx);
             let thumb = thumbnail_drawn_rect(*slot, shrink, slide);
             let thumb_scale = strip.scale * shrink;
