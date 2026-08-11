@@ -2394,6 +2394,17 @@ impl<W: LayoutElement> Monitor<W> {
         let strip = self.thumbnail_strip_at_rest()?;
         let last = *strip.thumbs.last()?;
 
+        // A drag aimed into an interior gap means *that* gap, and the pill is what marks
+        // it. Opening the end slot as well — which proximity alone would do, since an
+        // interior gap near the end of the row is within a thumbnail's width of the
+        // trailing one — would have the row pointing at a workspace the drop is not
+        // going to create.
+        if let Some(thumbnails::DropTarget::NewAt(idx)) = strip.drop_target(pos) {
+            if idx < strip.thumbs.len() {
+                return None;
+            }
+        }
+
         // A drop on the trailing workspace fills it, and `clean_up_workspaces` appends a
         // fresh empty one after it — so the slot that opens is the one past the end.
         let ramp = last.size.w;
@@ -2965,23 +2976,6 @@ impl<W: LayoutElement> Monitor<W> {
                 .render(rect.loc + slide, &mut push_ring);
         }
 
-        // The workspace a drop would create, materializing in the slot the row has opened
-        // for it. Drawn before the real ones so it sits under them while it is still
-        // small enough to overlap.
-        if let Some((rect, phantom)) = strip.phantom {
-            self.render_phantom_thumb(
-                ctx.r(),
-                wallpaper,
-                Rectangle::new(rect.loc + slide, rect.size),
-                strip.scale,
-                phantom,
-                progress,
-                band,
-                glow_bounds_logical,
-                push,
-            );
-        }
-
         for (idx, (ws, slot)) in zip(&self.workspaces, &strip.thumbs).enumerate() {
             let shrink = self.workspace_render_scale(idx);
             let thumb = thumbnail_drawn_rect(*slot, shrink, slide);
@@ -3119,6 +3113,25 @@ impl<W: LayoutElement> Monitor<W> {
             } else {
                 ws.render_shadow(push_shadow);
             }
+        }
+
+        // The workspace a drop would create, materializing in the slot the row has opened
+        // for it. Pushed after the whole row — last pushed = bottommost — so that the
+        // shadow it casts while it eases shut passes under its neighbours rather than
+        // over them. Its own slot is exclusive, so nothing of it but that shadow reaches
+        // a real thumbnail.
+        if let Some((rect, phantom)) = strip.phantom {
+            self.render_phantom_thumb(
+                ctx.r(),
+                wallpaper,
+                Rectangle::new(rect.loc + slide, rect.size),
+                strip.scale,
+                phantom,
+                progress,
+                band,
+                glow_bounds_logical,
+                push,
+            );
         }
     }
 

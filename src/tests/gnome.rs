@@ -7010,6 +7010,68 @@ fn dragging_toward_the_last_workspace_opens_the_row_for_it() {
     );
 }
 
+/// A drag aimed into an *interior* gap gets the pill, not the trailing slot.
+///
+/// Proximity alone would open both: a gap near the end of the row is well within a
+/// thumbnail's width of the trailing one, and the phantom is armed on distance. But the
+/// drop is going to insert *there*, so the row would be pointing at a workspace that
+/// never arrives — and the pill, which is the thing that marks the real insert point,
+/// would be gone, because the two are alternatives in one slot.
+///
+/// Only the phantom's half is asserted here: the pill is armed off `insert_hint`, which
+/// the render path fills in, and `Fixture::refresh` deliberately does not draw.
+#[test]
+fn a_drag_into_an_interior_gap_keeps_the_pill() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (800, 600), None);
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.synoik_complete_animations();
+    let _b = map_window_sized(&mut f, id, (640, 480), None);
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+    tap(&mut f, KEY_LEFTMETA);
+    f.synoik_complete_animations();
+
+    // Two occupied workspaces and the trailing empty one.
+    let thumbs = {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap().thumbnail_strip().unwrap().thumbs.clone()
+    };
+    assert_eq!(thumbs.len(), 3);
+
+    // Pick the preview up, well away from the row.
+    let rect = f.synoik().layout.expose_target_rect(&win_b).unwrap();
+    let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    pointer_motion_to(&mut f, grab.0, grab.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    f.pointer_motion(0., 90.);
+
+    // Into the gap between the last two thumbnails — an interior insert, and close
+    // enough to the trailing thumbnail that distance alone would open the end slot.
+    let gap_x = (thumbs[1].loc.x + thumbs[1].size.w + thumbs[2].loc.x) / 2.;
+    pointer_motion_to(&mut f, gap_x, thumbs[2].loc.y + thumbs[2].size.h / 2.);
+
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+    let strip = mon.unwrap().thumbnail_strip().unwrap();
+    assert_eq!(
+        strip.drop_target(smithay::utils::Point::from((
+            gap_x,
+            thumbs[2].loc.y + thumbs[2].size.h / 2.,
+        ))),
+        Some(crate::layout::thumbnails::DropTarget::NewAt(2)),
+        "the fixture must actually be aiming at an interior gap",
+    );
+    assert_eq!(
+        strip.phantom, None,
+        "the end slot must not open for a drop that is not going there — and it shares \
+         its slot with the pill, so an open one would erase the mark as well",
+    );
+}
+
 /// While a preview drag is in flight, the source desktop's picker layout is
 /// frozen (gnome-shell's layout_frozen): the remaining previews hold their
 /// slots — the dragged window leaves a gap — until the drop.
