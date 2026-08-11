@@ -31,6 +31,45 @@ pub const WORKSPACE_CUT_SIZE: f64 = 10.;
 /// `.placeholder`).
 pub const PLACEHOLDER_WIDTH: f64 = 18.;
 
+/// A workspace that is not in the model yet, holding open the slot it would take.
+///
+/// gnome-shell's `collapse_fraction`, inverted so 1 reads as "there": the layout walk
+/// contributes `thumbnailWidth - round(thumbnailWidth * collapse_fraction)` for a
+/// thumbnail and `spacing - round(collapse_fraction * spacing)` for the gap before it
+/// (`workspaceThumbnail.js:1360,1428`), so a fully collapsed slot costs the row exactly
+/// nothing and a fully expanded one costs a whole workspace.
+///
+/// **Divergence (approved 2026-08-11).** gnome-shell only ever runs this *after* a drop —
+/// during the drag it shows a fixed-width `.placeholder` pill and nothing moves
+/// (`_dropPlaceholderPos`, `workspaceThumbnail.js:1352-1390`). Ours is driven by the drag
+/// itself, so the row opens as you approach and the drop lands on a row already in its
+/// final shape. See `docs/fork/dynamic-workspaces-divergence.md`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Phantom {
+    /// The workspace index it would be inserted at.
+    pub idx: usize,
+    /// How much row it takes: 0 = not there at all, 1 = a full workspace's worth.
+    /// gnome-shell's `collapse_fraction`, inverted.
+    pub reveal: f64,
+    /// How far the workspace itself has materialized in the slot the `reveal` opened:
+    /// gnome-shell's `slide_position`, inverted — scale `lerp(0.75, 1, emerge)` and
+    /// opacity `emerge` (`workspaceThumbnail.js:319-333`). Geometry ignores it; only the
+    /// drawing does, which is why the two are separate.
+    pub emerge: f64,
+}
+
+/// What the row is making room for while a drag is in flight. Alternatives, not partners:
+/// a gap you have to aim into gets the pill, and the workspace a drop would *append* gets
+/// the phantom.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Insert {
+    /// The fixed-width drop pill, before the thumbnail at this index (gnome-shell's
+    /// `_dropPlaceholderPos`, `workspaceThumbnail.js:1352-1390`).
+    Placeholder(usize),
+    /// A whole workspace's slot, opening.
+    Phantom(Phantom),
+}
+
 /// The close button's box on a thumbnail, logical px at ramp 1.
 ///
 /// **Divergence (approved 2026-08-03).** gnome-shell has no such button — it reaps empty
@@ -67,8 +106,10 @@ pub struct Strip {
     /// scrolled row puts some of these partly or wholly outside [`Self::band`];
     /// they are clipped to it when drawn and are not hit-testable beyond it.
     pub thumbs: Vec<Rectangle<f64, Logical>>,
-    /// The new-workspace drop placeholder, when a drag hovers a gap.
+    /// The new-workspace drop placeholder pill, when a drag hovers an interior gap.
     pub placeholder: Option<Rectangle<f64, Logical>>,
+    /// The slot held open for a workspace that does not exist yet, and how far open it is.
+    pub phantom: Option<(Rectangle<f64, Logical>, Phantom)>,
     /// The band the strip was allocated: the row's viewport, and the clip.
     pub band: Rectangle<f64, Logical>,
 }
@@ -84,15 +125,15 @@ pub struct Strip {
 /// dozen workspaces is a run of specks. Ours stay aspect-locked whatever
 /// the count, and the row scrolls instead.
 ///
-/// A `placeholder` index makes room for the new-workspace drop placeholder before that
-/// thumbnail (gnome-shell's drop placeholder), lengthening the run like an extra slot.
+/// An [`Insert`] lengthens the run like an extra slot, marking where a drop would put a
+/// new workspace.
 pub fn strip_geometry(
     view_size: Size<f64, Logical>,
     band: Rectangle<f64, Logical>,
     thumb_w: f64,
     gap: f64,
     n: usize,
-    placeholder: Option<usize>,
+    insert: Option<Insert>,
     focus: f64,
 ) -> Strip {
     // A thumbnail is the band's full height: the band is allocated exactly one workspace
@@ -105,14 +146,28 @@ pub fn strip_geometry(
     // where the focused thumbnail actually landed — the placeholder displaces it.
     let mut x = 0.;
     let mut placeholder_rect = None;
-    let mut place = |i: usize, x: &mut f64| {
-        if placeholder == Some(i) {
+    let mut phantom_rect = None;
+    let mut place = |i: usize, x: &mut f64| match insert {
+        Some(Insert::Placeholder(idx)) if idx == i => {
             placeholder_rect = Some(Rectangle::new(
                 Point::from((*x, y)),
                 Size::from((PLACEHOLDER_WIDTH, thumb.h)),
             ));
             *x += PLACEHOLDER_WIDTH + gap;
         }
+        Some(Insert::Phantom(ph)) if ph.idx == i => {
+            // gnome-shell rounds the *collapsing* portion and leaves the rest unrounded,
+            // so a slot mid-animation never jitters by a pixel while a settled row still
+            // totals exactly right (`workspaceThumbnail.js:1424-1428`).
+            let collapse = 1. - ph.reveal.clamp(0., 1.);
+            let w = thumb.w - (thumb.w * collapse).round();
+            phantom_rect = Some((
+                Rectangle::new(Point::from((*x, y)), Size::from((w, thumb.h))),
+                ph,
+            ));
+            *x += w + gap - (gap * collapse).round();
+        }
+        _ => (),
     };
     let mut thumbs = Vec::with_capacity(n);
     for i in 0..n {
@@ -139,6 +194,9 @@ pub fn strip_geometry(
     if let Some(rect) = &mut placeholder_rect {
         rect.loc.x += x0;
     }
+    if let Some((rect, _)) = &mut phantom_rect {
+        rect.loc.x += x0;
+    }
 
     Strip {
         // The exact scale the rounded thumbnail size implies, so contents
@@ -146,6 +204,7 @@ pub fn strip_geometry(
         scale: thumb.h / view_size.h,
         thumbs,
         placeholder: placeholder_rect,
+        phantom: phantom_rect,
         band,
     }
 }
@@ -157,7 +216,15 @@ impl Strip {
         let last = self.thumbs[self.thumbs.len() - 1];
         let mut x0 = first.loc.x;
         let mut x1 = last.loc.x + last.size.w;
-        if let Some(rect) = self.placeholder {
+        // A slot with no width in it is not part of the row — it sits one gap past the
+        // last thumbnail, and counting it would stretch the drop-target region there
+        // before the phantom had opened at all.
+        let phantom = self
+            .phantom
+            .iter()
+            .map(|(r, _)| r)
+            .filter(|r| r.size.w > 0.);
+        for rect in self.placeholder.iter().chain(phantom) {
             x0 = x0.min(rect.loc.x);
             x1 = x1.max(rect.loc.x + rect.size.w);
         }
@@ -243,7 +310,18 @@ mod tests {
     /// The row with the first workspace active, which is where every test that is
     /// not about scrolling wants to be.
     fn strip(n: usize, placeholder: Option<usize>) -> Strip {
-        strip_geometry(view(), band(), THUMB_W, GAP, n, placeholder, 0.)
+        let insert = placeholder.map(Insert::Placeholder);
+        strip_geometry(view(), band(), THUMB_W, GAP, n, insert, 0.)
+    }
+
+    /// The row with a phantom slot at `idx` open by `reveal`.
+    fn strip_phantom(n: usize, idx: usize, reveal: f64) -> Strip {
+        let insert = Some(Insert::Phantom(Phantom {
+            idx,
+            reveal,
+            emerge: 0.,
+        }));
+        strip_geometry(view(), band(), THUMB_W, GAP, n, insert, 0.)
     }
 
     /// Positions of a row of `n` at an arbitrary thumbnail width and gap — the sweep the
@@ -470,6 +548,81 @@ mod tests {
         // hover is stable.
         let center = Point::from((rect.loc.x + rect.size.w / 2., BAND_Y + 40.));
         assert_eq!(strip.drop_target(center), Some(DropTarget::NewAt(1)));
+    }
+
+    /// A fully revealed phantom costs the row exactly one workspace: the run is a whole
+    /// slot longer, and the drop that makes it real therefore moves nothing.
+    #[test]
+    fn a_full_phantom_holds_a_whole_workspace_open() {
+        let at_rest = strip(3, None);
+        let strip = strip_phantom(3, 1, 1.);
+
+        let (rect, _) = strip.phantom.expect("phantom rect must be laid out");
+        assert_eq!(rect.size, Size::from((THUMB_W, THUMB_H)));
+        // It sits between the first two thumbnails, with normal spacing.
+        assert_eq!(rect.loc.x, strip.thumbs[0].loc.x + THUMB_W + GAP);
+        assert_eq!(strip.thumbs[1].loc.x, rect.loc.x + THUMB_W + GAP);
+
+        // Exactly the row a real fourth workspace would produce, and the phantom stands
+        // where that workspace would.
+        let real = self::strip(4, None);
+        assert_eq!(strip.thumbs[0].loc.x, real.thumbs[0].loc.x);
+        assert_eq!(rect.loc.x, real.thumbs[1].loc.x);
+        assert_eq!(strip.thumbs[1].loc.x, real.thumbs[2].loc.x);
+        assert_eq!(strip.thumbs[2].loc.x, real.thumbs[3].loc.x);
+
+        // The run is longer by exactly one slot, and still centered — so it opens
+        // symmetrically rather than pushing the row off one edge.
+        let shift = at_rest.thumbs[0].loc.x - strip.thumbs[0].loc.x;
+        assert!((shift - (THUMB_W + GAP) / 2.).abs() <= 1.);
+
+        // A pointer over the phantom maps to the insertion point it stands for.
+        let center = Point::from((rect.loc.x + rect.size.w / 2., BAND_Y + 40.));
+        assert_eq!(strip.drop_target(center), Some(DropTarget::NewAt(1)));
+    }
+
+    /// A phantom at zero reveal costs nothing at all, so arming one is not itself a
+    /// visible event — the row only starts moving as the reveal does.
+    #[test]
+    fn a_zero_phantom_lays_the_row_out_unchanged() {
+        let at_rest = strip(3, None);
+        for idx in 0..4 {
+            let strip = strip_phantom(3, idx, 0.);
+            let (rect, _) = strip.phantom.unwrap();
+            assert_eq!(rect.size.w, 0.);
+            let xs: Vec<_> = strip.thumbs.iter().map(|r| r.loc.x).collect();
+            let base: Vec<_> = at_rest.thumbs.iter().map(|r| r.loc.x).collect();
+            assert_eq!(xs, base, "a zero phantom at {idx} moved the row");
+            // Including for the drop targets, which are taken against the bounds.
+            assert_eq!(
+                strip.bounds(),
+                at_rest.bounds(),
+                "a zero phantom at {idx} stretched the row's bounds",
+            );
+        }
+    }
+
+    /// The slot opens monotonically, and the row spreads with it — nothing overshoots or
+    /// doubles back partway through, which is what a jerky reveal would look like.
+    #[test]
+    fn the_phantom_opens_monotonically() {
+        let mut last_w = -1.;
+        let mut last_run = -1.;
+        for step in 0..=20 {
+            let reveal = step as f64 / 20.;
+            let strip = strip_phantom(3, 3, reveal);
+            let (rect, _) = strip.phantom.unwrap();
+            let run = strip.bounds().size.w;
+            assert!(
+                rect.size.w >= last_w && run >= last_run,
+                "reveal {reveal}: slot {} run {run} went backwards",
+                rect.size.w,
+            );
+            (last_w, last_run) = (rect.size.w, run);
+        }
+        // ...and the full reveal is a whole workspace wider than none.
+        let none = strip_phantom(3, 3, 0.).bounds().size.w;
+        assert!((last_run - none - (THUMB_W + GAP)).abs() <= 1.);
     }
 
     #[test]

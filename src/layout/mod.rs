@@ -4715,7 +4715,34 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        self.sync_thumb_phantom();
+
         true
+    }
+
+    /// Points every monitor's workspace row at the drag, so the row opens for the
+    /// workspace a drop would append (see `Monitor::update_thumb_phantom`).
+    ///
+    /// Driven from the drag and from [`Self::refresh`], **never** from
+    /// `update_render_elements`: state armed in the render path is a cycle late and
+    /// invisible to anything that does not draw, which is how the Activities highlight
+    /// went wrong (`d4e94d45`).
+    fn sync_thumb_phantom(&mut self) {
+        let drag = match &self.interactive_move {
+            Some(InteractiveMoveState::Moving(move_)) => {
+                Some((move_.output.clone(), move_.pointer_pos_within_output))
+            }
+            _ => None,
+        };
+        for mon in self.monitors_mut() {
+            // Only the output the drag is over holds a slot open; every other row eases
+            // shut, so dragging away from a monitor closes the row it had opened.
+            let pos = drag
+                .as_ref()
+                .filter(|(output, _)| *output == mon.output)
+                .map(|(_, pos)| *pos);
+            mon.update_thumb_phantom(pos);
+        }
     }
 
     pub fn interactive_move_end(&mut self, window: &W::Id) {
@@ -4873,6 +4900,7 @@ impl<W: LayoutElement> Layout<W> {
 
                 let win_id = move_.tile.window().id().clone();
                 let tile_render_loc = move_.tile_render_location(zoom);
+                let ws_count_before = mon.workspaces.len();
 
                 let ws_idx = match insert_ws {
                     InsertWorkspace::Existing(ws_id) => mon
@@ -5008,6 +5036,11 @@ impl<W: LayoutElement> Layout<W> {
                         }
                     }
                 }
+
+                // The row has been holding a slot open for the workspace this drop might
+                // create; hand it over to the real one, or ease it shut.
+                let created = mon.workspaces.len() != ws_count_before;
+                mon.settle_thumb_phantom(created);
 
                 // The insert above can shift the workspace index, so re-find the tile.
                 let (tile, tile_offset, ws_geo) = mon
@@ -5631,6 +5664,11 @@ impl<W: LayoutElement> Layout<W> {
         let _span = tracy_client::span!("Layout::refresh");
 
         self.is_active = is_active;
+
+        // A drag that ended by any route other than a drop — the window closed under it,
+        // the overview shut — leaves a slot open with nothing driving it. Reconciling
+        // here eases it back rather than leaving the row a workspace too wide.
+        self.sync_thumb_phantom();
 
         let mut ongoing_scrolling_dnd = self.dnd.is_some().then_some(true);
 

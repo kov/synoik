@@ -643,6 +643,8 @@ bitflags::bitflags! {
         const DND = 1 << 25;
         /// An interactive window move.
         const INTERACTIVE_MOVE = 1 << 26;
+        /// The workspace row's phantom slot easing back shut after a drag left it.
+        const THUMB_PHANTOM = 1 << 27;
     }
 }
 
@@ -682,6 +684,7 @@ impl AnimCauses {
             (AnimCauses::OVERVIEW, "overview"),
             (AnimCauses::DND, "dnd"),
             (AnimCauses::INTERACTIVE_MOVE, "interactive-move"),
+            (AnimCauses::THUMB_PHANTOM, "thumb-phantom"),
         ];
         TABLE
             .iter()

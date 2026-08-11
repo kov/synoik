@@ -175,6 +175,9 @@ pub struct Monitor<W: LayoutElement> {
     thumb_placeholder: FocusRing,
     /// A thumbnail being dragged along the strip to reorder the workspaces.
     thumb_drag: Option<ThumbDrag>,
+    /// The slot the row holds open for a workspace a drop would create — see
+    /// [`PhantomSlot`].
+    thumb_phantom: Option<PhantomSlot>,
     /// The strip closing the gap left by a workspace you dismissed — see
     /// [`Self::close_workspace`].
     thumb_close_slide: Option<CloseSlide>,
@@ -309,6 +312,47 @@ struct CloseSlide {
     active_was_below: bool,
     /// 0 = the row as it stood with the workspace still in it, 1 = closed up.
     anim: Animation,
+}
+
+/// The row holding a slot open for a workspace that does not exist yet.
+///
+/// While the drag is in flight the reveal is **recomputed from the pointer every frame**
+/// (see [`Monitor::phantom_for_drag`]) rather than animated: the user asked for the row to
+/// open as the window approaches, so the drag *is* the timeline. The animation only appears
+/// when the drag stops driving it — a drag that wanders off, or ends without making the
+/// workspace real, has to ease the slot shut rather than snap it.
+///
+/// The reveal is measured against the row **at rest**, never against the row as drawn. A
+/// reveal read off the row it is itself widening is a feedback loop: the run recenters as
+/// the slot opens (`thumbnails::strip_geometry`), which moves the thumbnail the distance is
+/// measured to, which changes the reveal. The same reason [`thumb_drag_target`] takes its
+/// answer at rest.
+#[derive(Debug)]
+struct PhantomSlot {
+    /// The workspace index the slot stands in for.
+    idx: usize,
+    /// The reveal the drag last asked for, 0..=1.
+    reveal: f64,
+    /// Set once the drag stops driving it: eases [`Self::reveal`] back to 0.
+    closing: Option<Animation>,
+}
+
+impl PhantomSlot {
+    /// The two stages gnome-shell runs in sequence — `collapse_fraction` to 0, then
+    /// `slide_position` to 0 (`workspaceThumbnail.js:1144-1181`) — laid end to end over
+    /// one driver, since ours is a continuous approach rather than two eases. The row
+    /// makes room over the first half and the workspace materializes over the second.
+    fn phantom(&self) -> thumbnails::Phantom {
+        let t = match &self.closing {
+            Some(anim) => anim.clamped_value().clamp(0., 1.),
+            None => self.reveal,
+        };
+        thumbnails::Phantom {
+            idx: self.idx,
+            reveal: (t * 2.).min(1.),
+            emerge: (t * 2. - 1.).max(0.),
+        }
+    }
 }
 
 /// The index an armed drag would drop at: how many of the *other* thumbnails the dragged
@@ -534,6 +578,7 @@ impl<W: LayoutElement> Monitor<W> {
             )),
             thumb_placeholder: FocusRing::new(thumbnail_placeholder_config()),
             thumb_drag: None,
+            thumb_phantom: None,
             thumb_close_slide: None,
             insert_hint_render_loc: None,
             overview_open: false,
@@ -1407,6 +1452,15 @@ impl<W: LayoutElement> Monitor<W> {
         if self.thumb_close_slide.is_some() {
             causes |= AnimCauses::THUMB_CLOSE_SLIDE;
         }
+        // Only the ease shut queues frames; a reveal the drag is driving gets its frames
+        // from the pointer motion that changes it.
+        if self
+            .thumb_phantom
+            .as_ref()
+            .is_some_and(|slot| slot.closing.is_some())
+        {
+            causes |= AnimCauses::THUMB_PHANTOM;
+        }
         if self.workspaces.iter().any(|ws| ws.are_animations_ongoing()) {
             causes |= AnimCauses::WINDOWS;
         }
@@ -1430,6 +1484,10 @@ impl<W: LayoutElement> Monitor<W> {
         self.workspace_switch.is_some()
             || self.app_grid_expand.is_some()
             || self.thumb_close_slide.is_some()
+            || self
+                .thumb_phantom
+                .as_ref()
+                .is_some_and(|slot| slot.closing.is_some())
             || self
                 .workspaces
                 .iter()
@@ -2014,6 +2072,15 @@ impl<W: LayoutElement> Monitor<W> {
         {
             self.thumb_close_slide = None;
         }
+        // A slot that finished easing shut is gone; one still being driven by a drag is
+        // not an animation and never retires here.
+        if self
+            .thumb_phantom
+            .as_ref()
+            .is_some_and(|slot| slot.closing.as_ref().is_some_and(Animation::is_done))
+        {
+            self.thumb_phantom = None;
+        }
     }
 
     /// The show-apps state fraction (0 = window picker, 1 = app grid), eased.
@@ -2169,23 +2236,27 @@ impl<W: LayoutElement> Monitor<W> {
     /// for the new-workspace drop placeholder there; while a *thumbnail* is
     /// being dragged, the row parts around where it would land.
     pub fn thumbnail_strip(&self) -> Option<Strip> {
-        let strip = self.thumbnail_strip_at_rest()?;
+        let strip = self.lay_strip(self.thumb_phantom.as_ref().map(PhantomSlot::phantom))?;
         Some(self.apply_thumb_drag(strip))
     }
 
-    /// The strip as laid out with no reorder drag applied. Every drag
-    /// computation works off this, so the row it re-lays does not feed back into
-    /// where the drag thinks the slots are.
+    /// The strip as laid out with neither the phantom slot nor a reorder drag applied.
+    /// Every drag computation works off this, so the row it re-lays does not feed back
+    /// into where the drag thinks the slots are.
     fn thumbnail_strip_at_rest(&self) -> Option<Strip> {
+        self.lay_strip(None)
+    }
+
+    fn lay_strip(&self, phantom: Option<thumbnails::Phantom>) -> Option<Strip> {
         if !self.thumbnails_visible() {
             return None;
         }
-        let placeholder = self.insert_hint.as_ref().and_then(|hint| {
-            if !hint.via_strip {
-                return None;
-            }
+        // The phantom wins where it is open: whichever gap it is holding needs no pill
+        // marking it, it *is* the mark.
+        let insert = phantom.map(thumbnails::Insert::Phantom).or_else(|| {
+            let hint = self.insert_hint.as_ref().filter(|hint| hint.via_strip)?;
             match hint.workspace {
-                InsertWorkspace::NewAt(idx) => Some(idx),
+                InsertWorkspace::NewAt(idx) => Some(thumbnails::Insert::Placeholder(idx)),
                 InsertWorkspace::Existing(_) => None,
             }
         });
@@ -2194,7 +2265,7 @@ impl<W: LayoutElement> Monitor<W> {
         let thumb_w = (self.view_size.w * zoom).round();
         let gap = self.workspace_gap(zoom, FitMode::All);
         let lay = |n: usize, focus: f64| {
-            thumbnails::strip_geometry(self.view_size, band, thumb_w, gap, n, placeholder, focus)
+            thumbnails::strip_geometry(self.view_size, band, thumb_w, gap, n, insert, focus)
         };
         let strip = lay(self.workspaces.len(), self.workspace_render_idx());
         Some(self.apply_close_slide(strip, &lay))
@@ -2256,6 +2327,78 @@ impl<W: LayoutElement> Monitor<W> {
         strip.thumbs[drag.from].loc.x = drag.pos.x - drag.grab_offset;
 
         strip
+    }
+
+    /// Opens the row for the workspace a drop at `pos` would **append**, by however close
+    /// the drag has come to earning it — the reveal reaches 1 when the pointer is on the
+    /// trailing workspace, which is exactly where a drop creates one, so the row is
+    /// already in its final shape by the time the button comes up.
+    ///
+    /// Only the trailing workspace arms this way. An interior gap is a target you have to
+    /// aim into, and a proximity ramp would have the row breathing open a gap under the
+    /// pointer wherever it went; those keep the fixed pill
+    /// (`thumbnails::PLACEHOLDER_WIDTH`).
+    ///
+    /// `None` while no drag is in flight, which is what eases the slot back shut.
+    pub fn update_thumb_phantom(&mut self, pos: Option<Point<f64, Logical>>) {
+        let target = pos.and_then(|pos| self.phantom_target(pos));
+
+        match (&mut self.thumb_phantom, target) {
+            (Some(slot), Some((idx, reveal))) if slot.idx == idx => {
+                slot.reveal = reveal;
+                slot.closing = None;
+            }
+            (_, Some((idx, reveal))) => {
+                self.thumb_phantom = Some(PhantomSlot {
+                    idx,
+                    reveal,
+                    closing: None,
+                });
+            }
+            (Some(slot), None) => {
+                if slot.closing.is_none() {
+                    // Ease shut from wherever the drag left it, and retire once closed
+                    // (`update_app_grid_expand`).
+                    slot.closing = Some(Animation::new(
+                        self.clock.clone(),
+                        slot.reveal,
+                        0.,
+                        0.,
+                        strip_transition_config(&self.options),
+                    ));
+                }
+            }
+            (None, None) => (),
+        }
+    }
+
+    /// Retires the phantom slot at the end of a drop.
+    ///
+    /// If the drop earned the workspace, the row is already laid out for it and the real
+    /// thumbnail lands exactly where the phantom stood — so the slot goes on the spot and
+    /// nothing moves, which is the whole point of opening it during the drag. If it did
+    /// not, the slot eases shut rather than snapping.
+    pub fn settle_thumb_phantom(&mut self, created: bool) {
+        if created {
+            self.thumb_phantom = None;
+        } else {
+            self.update_thumb_phantom(None);
+        }
+    }
+
+    /// Where the row would open, and by how much, for a drag at `pos`.
+    fn phantom_target(&self, pos: Point<f64, Logical>) -> Option<(usize, f64)> {
+        // At rest, always: the reveal must not be a function of the row it is widening,
+        // or opening the slot moves the thumbnail the distance is measured to and the two
+        // chase each other. See [`PhantomSlot`].
+        let strip = self.thumbnail_strip_at_rest()?;
+        let last = *strip.thumbs.last()?;
+
+        // A drop on the trailing workspace fills it, and `clean_up_workspaces` appends a
+        // fresh empty one after it — so the slot that opens is the one past the end.
+        let ramp = last.size.w;
+        let reveal = 1. - (distance_to(last, pos) / ramp).clamp(0., 1.);
+        (reveal > 0.).then_some((strip.thumbs.len(), reveal))
     }
 
     /// Picks up the thumbnail at `idx` for reordering (**divergence**, see
@@ -2822,6 +2965,23 @@ impl<W: LayoutElement> Monitor<W> {
                 .render(rect.loc + slide, &mut push_ring);
         }
 
+        // The workspace a drop would create, materializing in the slot the row has opened
+        // for it. Drawn before the real ones so it sits under them while it is still
+        // small enough to overlap.
+        if let Some((rect, phantom)) = strip.phantom {
+            self.render_phantom_thumb(
+                ctx.r(),
+                wallpaper,
+                Rectangle::new(rect.loc + slide, rect.size),
+                strip.scale,
+                phantom,
+                progress,
+                band,
+                glow_bounds_logical,
+                push,
+            );
+        }
+
         for (idx, (ws, slot)) in zip(&self.workspaces, &strip.thumbs).enumerate() {
             let shrink = self.workspace_render_scale(idx);
             let thumb = thumbnail_drawn_rect(*slot, shrink, slide);
@@ -2960,6 +3120,138 @@ impl<W: LayoutElement> Monitor<W> {
                 ws.render_shadow(push_shadow);
             }
         }
+    }
+
+    /// Draws the slot the row is holding open for a workspace that does not exist yet:
+    /// an empty desktop, materializing where a drop would put it.
+    ///
+    /// Only the chrome an empty workspace has — its wallpaper (or the backing colour) and
+    /// the shadow under it. There is deliberately no `Workspace` behind it: nothing may
+    /// put a workspace in the model for a drawing's sake, or every index in the layout is
+    /// a lie for as long as the drag lasts (the same rule [`CloseSlide`] is written to).
+    #[allow(clippy::too_many_arguments)]
+    fn render_phantom_thumb(
+        &self,
+        ctx: RenderCtx,
+        wallpaper: Option<&Wallpaper>,
+        slot: Rectangle<f64, Logical>,
+        strip_scale: f64,
+        phantom: thumbnails::Phantom,
+        progress: f64,
+        band: Rectangle<f64, Logical>,
+        glow_bounds_logical: Rectangle<f64, Logical>,
+        push: &mut dyn FnMut(MonitorRenderElement),
+    ) {
+        // Stage one is the row making room; there is nothing to draw in the slot until
+        // the workspace starts materializing in it.
+        let alpha = (phantom.emerge * progress).clamp(0., 1.) as f32;
+        if alpha <= 0. {
+            return;
+        }
+
+        // `slide_position`: scale from 0.75 up, about the slot's centre so the slot it
+        // grows into does not move (`workspaceThumbnail.js:319-333`).
+        let grow = 0.75 + 0.25 * phantom.emerge.clamp(0., 1.);
+        let thumb = Rectangle::new(
+            slot.loc
+                + Point::from((
+                    slot.size.w * (1. - grow) / 2.,
+                    slot.size.h * (1. - grow) / 2.,
+                )),
+            slot.size.upscale(grow),
+        );
+        let scale = self.scale.fractional_scale();
+        let thumb_scale = strip_scale * grow;
+        let thumb_loc_physical = thumb.loc.to_physical_precise_round(scale);
+
+        // The same band clip the real thumbnails get, in the same pre-transform
+        // (workspace) coordinates.
+        let x0 = ((band.loc.x - thumb.loc.x) / thumb_scale).max(0.);
+        let x1 = ((band.loc.x + band.size.w - thumb.loc.x) / thumb_scale).min(self.view_size.w);
+        if x1 <= x0 {
+            return;
+        }
+        let crop_bounds = Rectangle::new(
+            Point::from((x0, 0.)),
+            Size::from((x1 - x0, self.view_size.h)),
+        )
+        .to_physical_precise_round(scale);
+
+        let radius = self.workspace_background_radius();
+        let mut wallpapered = false;
+        if let Some(wallpaper) = wallpaper {
+            if let Some(elem) = wallpaper.render_at_alpha(
+                ctx.renderer,
+                Default::default(),
+                self.view_size,
+                radius,
+                Scale::from(scale * thumb_scale),
+                alpha,
+            ) {
+                if let Some(elem) = CropRenderElement::from_element(elem, scale, crop_bounds) {
+                    let elem = MonitorInnerRenderElement::CroppedRoundedTexture(elem);
+                    let elem =
+                        RescaleRenderElement::from_element(elem, Point::from((0, 0)), thumb_scale);
+                    let elem = RelocateRenderElement::from_element(
+                        elem,
+                        thumb_loc_physical,
+                        Relocate::Relative,
+                    );
+                    push(elem);
+                }
+                wallpapered = true;
+            }
+        }
+        if !wallpapered {
+            // The backing colour every workspace shares, so a session with no picture set
+            // still sees the slot fill in rather than stay a hole.
+            let Some(ws) = self.workspaces.last() else {
+                return;
+            };
+            if let Some(elem) =
+                CropRenderElement::from_element(ws.render_background(), scale, crop_bounds)
+            {
+                let elem = MonitorInnerRenderElement::CroppedSolidColor(elem);
+                let elem =
+                    RescaleRenderElement::from_element(elem, Point::from((0, 0)), thumb_scale);
+                let elem = RelocateRenderElement::from_element(
+                    elem,
+                    thumb_loc_physical,
+                    Relocate::Relative,
+                );
+                push(elem);
+            }
+        }
+
+        // The shadow an inactive workspace casts — a phantom is never the active one.
+        // Taken off an existing workspace because the config is per-monitor, not
+        // per-workspace; there is no shadow of its own to build for something that does
+        // not exist.
+        let Some(ws) = self.workspaces.last() else {
+            return;
+        };
+        let glow_crop = Rectangle::new(
+            Point::from((
+                (glow_bounds_logical.loc.x - thumb.loc.x) / thumb_scale,
+                (glow_bounds_logical.loc.y - thumb.loc.y) / thumb_scale,
+            )),
+            glow_bounds_logical.size.downscale(thumb_scale),
+        )
+        .to_physical_precise_round(scale);
+        ws.render_shadow(&mut |elem: ShadowRenderElement| {
+            let elem = elem.with_alpha(alpha);
+            if let Some(elem) = CropRenderElement::from_element(elem, scale, glow_crop) {
+                let elem = MonitorInnerRenderElement::CroppedShadow(elem);
+                let elem =
+                    RescaleRenderElement::from_element(elem, Point::from((0, 0)), thumb_scale);
+                let elem = RelocateRenderElement::from_element(
+                    elem,
+                    thumb_loc_physical,
+                    Relocate::Relative,
+                );
+                push(elem);
+            }
+        });
     }
 
     pub fn render_workspaces(
@@ -3629,6 +3921,35 @@ pub(super) fn scroll_to_follow(span: f64, run: f64, focus: f64) -> f64 {
 /// unclamped end would leave most of a screen width empty beside the last workspace.
 pub(super) fn center_on_focus(span: f64, focus: f64) -> f64 {
     span / 2. - focus
+}
+
+/// How far a point lies outside a rect, 0 if inside.
+fn distance_to(rect: Rectangle<f64, Logical>, pos: Point<f64, Logical>) -> f64 {
+    let dx = (rect.loc.x - pos.x)
+        .max(pos.x - (rect.loc.x + rect.size.w))
+        .max(0.);
+    let dy = (rect.loc.y - pos.y)
+        .max(pos.y - (rect.loc.y + rect.size.h))
+        .max(0.);
+    f64::sqrt(dx * dx + dy * dy)
+}
+
+/// A strip transition: gnome-shell's `SLIDE_ANIMATION_TIME`, 200ms `EASE_OUT_QUAD`
+/// (`workspaceThumbnail.js:21-22`, used by every `_updateStates` ease at `:1144-1181`) — a
+/// fixed duration, not the configurable overview open/close one. Only whether animations
+/// run at all is inherited from the config.
+///
+/// Note [`CloseSlide`] predates this and runs at 250ms, `SIDE_CONTROLS_ANIMATION_TIME`,
+/// which is the strip *show/hide* constant rather than the per-thumbnail one. Worth
+/// reconciling, but not while the two are being changed for different reasons.
+fn strip_transition_config(options: &Options) -> synoik_config::Animation {
+    synoik_config::Animation {
+        off: options.animations.overview_open_close.0.off,
+        kind: synoik_config::animations::Kind::Easing(synoik_config::animations::EasingParams {
+            duration_ms: 200,
+            curve: synoik_config::animations::Curve::EaseOutQuad,
+        }),
+    }
 }
 
 /// The strip's drop placeholder: a translucent pill marking where the new

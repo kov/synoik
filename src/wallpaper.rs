@@ -244,7 +244,21 @@ impl Wallpaper {
         corner_radius: f64,
         scale: Scale<f64>,
     ) -> Option<RoundedTextureRenderElement<VkTexture>> {
-        self.render_vulkan(renderer, origin, view_size, corner_radius, scale)
+        self.render_at_alpha(renderer, origin, view_size, corner_radius, scale, 1.)
+    }
+
+    /// The wallpaper drawn translucent — for a workspace that is fading in or out and so
+    /// is not fully there yet (the overview row's phantom slot).
+    pub fn render_at_alpha(
+        &self,
+        renderer: &mut VulkanRenderer,
+        origin: Point<f64, Logical>,
+        view_size: Size<f64, Logical>,
+        corner_radius: f64,
+        scale: Scale<f64>,
+        alpha: f32,
+    ) -> Option<RoundedTextureRenderElement<VkTexture>> {
+        self.render_vulkan(renderer, origin, view_size, corner_radius, scale, alpha)
     }
 
     /// The uploaded picture, uploading it if this is the first ask since it changed.
@@ -289,7 +303,7 @@ impl Wallpaper {
     ) -> Option<RoundedTextureRenderElement<VkTexture>> {
         // The upload (and its device-loss handling) is `render_vulkan`'s; go through it so a
         // blurred draw cannot diverge from a plain one about which texture is current.
-        self.render_vulkan(renderer, origin, view_size, 0., scale)?;
+        self.render_vulkan(renderer, origin, view_size, 0., scale, 1.)?;
         let buffer = self.ensure_texture(renderer)?;
         let texture = buffer.texture().clone();
 
@@ -347,6 +361,7 @@ impl Wallpaper {
         view_size: Size<f64, Logical>,
         corner_radius: f64,
         scale: Scale<f64>,
+        alpha: f32,
     ) -> Option<RoundedTextureRenderElement<VkTexture>> {
         let image = self.image.as_ref()?;
 
@@ -387,7 +402,7 @@ impl Wallpaper {
         let elem = TextureRenderElement::from_texture_buffer(
             buffer,
             origin,
-            1.,
+            alpha,
             Some(src),
             Some(view_size),
             Kind::Unspecified,

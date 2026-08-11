@@ -165,6 +165,36 @@ a close shifts everything after the gap and re-centers what is left.
 window preview's, whose alpha rides the picker's hover state. A per-workspace fade wants an
 animation per thumbnail; deferred until it actually reads badly on the seat.
 
+### The row opens for a new workspace *during* the drag (2026-08-11)
+
+gnome-shell moves nothing while you drag a window over the strip: it shows a fixed-width
+`.placeholder` pill at the insertion point (`_dropPlaceholderPos`, `workspaceThumbnail.js:1352-1390`),
+and only *after* the drop does the new thumbnail expand — `acceptDrop` puts it in
+`ThumbnailState.NEW` with `collapse_fraction = 1, slide_position = 1` (`:888-930`) and
+`_updateStates` runs two sequential 200ms `EASE_OUT_QUAD` eases, collapse then slide (`:1144-1181`).
+So the row snaps open under a drop that has already happened.
+
+Ours runs the same two stages, but the **drag** drives them instead of a timer: the reveal is a
+function of how close the pointer has come to the trailing workspace, the row makes room over the
+first half of the approach and the workspace materializes over the second, and by the time the
+pointer is on the trailing thumbnail — which is exactly where a drop appends a workspace — the row
+is already in its final shape. The drop then moves nothing at all. A drag that wanders off instead
+eases the slot shut over the same 200ms.
+
+Two things this is careful about:
+
+- **The reveal is measured against the row at rest**, never the row as drawn. Opening the slot
+  recenters the run, which moves the thumbnail the distance is measured to; reading the distance off
+  the drawn row would have the two chase each other. Same reason `thumb_drag_target` takes its
+  answer at rest.
+- **Only the trailing workspace arms by proximity.** An interior gap is a target you have to aim
+  into, and a distance ramp there would have the row breathing a gap open under the pointer wherever
+  it went; those keep the pill.
+
+The workspace is *not* in the model while the slot is open — `Monitor::render_phantom_thumb` draws
+an empty desktop's chrome and nothing else, for the same reason `CloseSlide` keeps a removed
+workspace out of it.
+
 ## Accepted losses
 
 **Empty workspaces do not survive their output going away.** `Monitor::into_workspaces` and

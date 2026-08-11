@@ -6909,6 +6909,107 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     );
 }
 
+/// The row and the phantom slot it is holding open, as drawn.
+fn strip_now(f: &mut Fixture) -> (Vec<f64>, Option<(f64, f64, f64)>) {
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+    let strip = mon
+        .expect("workspaces must be on a monitor")
+        .thumbnail_strip()
+        .expect("the thumbnails strip must be visible");
+    let xs = strip.thumbs.iter().map(|r| r.loc.x).collect();
+    let phantom = strip
+        .phantom
+        .map(|(rect, ph)| (rect.loc.x, rect.size.w, ph.reveal));
+    (xs, phantom)
+}
+
+/// Dragging a window towards the trailing workspace opens the row for the workspace the
+/// drop would append, in proportion to how close the drag has come.
+///
+/// **Divergence (approved 2026-08-11).** gnome-shell moves nothing during a drag — it
+/// shows a fixed-width `.placeholder` and only expands after the drop
+/// (`workspaceThumbnail.js:1352-1390`, `_updateStates` at `:1144-1181`). See
+/// `docs/fork/dynamic-workspaces-divergence.md`.
+#[test]
+fn dragging_toward_the_last_workspace_opens_the_row_for_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    let _a = map_window_sized(&mut f, id, (800, 600), None);
+    let win_a = f.synoik().layout.focus().unwrap().window.clone();
+    tap(&mut f, KEY_LEFTMETA);
+    f.synoik_complete_animations();
+
+    // One occupied workspace and the trailing empty one.
+    let (at_rest, phantom) = strip_now(&mut f);
+    assert_eq!(at_rest.len(), 2);
+    assert_eq!(phantom, None, "nothing is dragging yet");
+    let last = {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap().thumbnail_strip().unwrap().thumbs[1]
+    };
+
+    // Pick the preview up, well away from the row.
+    let rect = f.synoik().layout.expose_target_rect(&win_a).unwrap();
+    let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    pointer_motion_to(&mut f, grab.0, grab.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    // Two motions: the first begins the move, the second promotes it to `Moving`.
+    f.pointer_motion(0., 10.);
+    f.pointer_motion(0., 90.);
+
+    // Approach the trailing thumbnail. The slot opens monotonically, and the run grows
+    // with it.
+    let target = (last.loc.x + last.size.w / 2., last.loc.y + last.size.h / 2.);
+    // A sequence of positions closing on the thumbnail from below, each a step further in.
+    let mut widths = Vec::new();
+    for dy in [300., 220., 150., 90., 0.] {
+        pointer_motion_to(&mut f, target.0, target.1 + dy);
+        let (_, phantom) = strip_now(&mut f);
+        let (_, w, reveal) = phantom.expect("approaching must arm the slot");
+        widths.push((dy, w, reveal));
+    }
+    for pair in widths.windows(2) {
+        assert!(
+            pair[1].1 >= pair[0].1,
+            "the slot must not shrink as the drag closes in: {widths:?}",
+        );
+    }
+    assert!(
+        widths[0].1 > 0. && widths[0].1 < last.size.w,
+        "the slot must start partly open, not jump: got {widths:?}",
+    );
+    assert_eq!(
+        widths.last().unwrap().2,
+        1.,
+        "on the trailing thumbnail the slot must be all the way open, got {widths:?}",
+    );
+
+    // The row is now laid out for the workspace that does not exist yet — so the drop
+    // that creates it moves nothing.
+    let (before, phantom) = strip_now(&mut f);
+    let (phantom_x, phantom_w, _) = phantom.unwrap();
+    assert_ne!(before, at_rest, "the row must have made room");
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.double_roundtrip(id);
+
+    let (after, phantom) = strip_now(&mut f);
+    assert_eq!(phantom, None, "the drop retires the slot");
+    assert_eq!(after.len(), 3, "the drop must append a workspace");
+    assert_eq!(
+        after[..2],
+        before[..],
+        "the surviving thumbnails must not move: the row was already laid out for this",
+    );
+    assert_eq!(
+        (after[2], phantom_w),
+        (phantom_x, last.size.w),
+        "the real thumbnail must land exactly where the phantom stood",
+    );
+}
+
 /// While a preview drag is in flight, the source desktop's picker layout is
 /// frozen (gnome-shell's layout_frozen): the remaining previews hold their
 /// slots — the dragged window leaves a gap — until the drop.
