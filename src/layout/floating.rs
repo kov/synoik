@@ -1690,9 +1690,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
             return;
         }
 
+        // Held until the resize starts: the client has to commit the new size first, and a move
+        // that ran meanwhile would slide the window into place before it began to grow.
         let config = self.options.animations.window_resize.anim;
-        self.tiles[idx].animate_move_x_from_with_config(diff.x, config);
-        self.tiles[idx].animate_move_y_from_with_config(diff.y, config);
+        self.tiles[idx].hold_move_from(diff, config);
     }
 
     pub fn new_window_size(

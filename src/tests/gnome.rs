@@ -24749,3 +24749,69 @@ fn a_held_arm_does_not_animate_a_later_client_resize() {
         "a client-side resize must not inherit an animation from an older configure",
     );
 }
+
+/// A maximize moves and grows as one transition, not a slide followed by a grow.
+///
+/// The move can start the moment the user asks for it; the resize cannot, because it waits on the
+/// client committing the new size. Left to run on its own the move finished first, so a centered
+/// window slid into the corner at its old size and only then grew — measured on a real
+/// gnome-system-monitor as six frames of constant width before the first pixel of growth.
+#[test]
+fn a_maximize_moves_and_grows_together() {
+    let mut f = Fixture::with_config(Config::default());
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.synoik().layout.move_floating_window(
+        None,
+        synoik_ipc::PositionChange::SetFixed(400.),
+        synoik_ipc::PositionChange::SetFixed(200.),
+        false,
+    );
+    f.synoik_complete_animations();
+    assert_eq!(focused_window_pos(&mut f), (400., 232.));
+
+    f.synoik_state().do_action(Action::Maximize, false);
+    f.double_roundtrip(id);
+
+    // The window is not going to redraw for another commit. Its rendered position must not creep
+    // toward the corner in the meantime.
+    f.client(id).window(&surface).ack_last_and_commit();
+    f.double_roundtrip(id);
+    assert_eq!(
+        focused_window_pos(&mut f),
+        (400., 232.),
+        "the move must wait for the resize rather than run ahead of it",
+    );
+
+    // The commit that resizes starts both halves.
+    let w = f.client(id).window(&surface);
+    w.attach_new_buffer();
+    w.set_size(1920, 1048);
+    w.commit();
+    f.double_roundtrip(id);
+
+    let samples = f.sample_animation(Duration::from_millis(250), 4, |f| {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        let ws = mon.unwrap().active_workspace_ref();
+        let (tile, pos, _) = ws.tiles_with_render_positions().next().unwrap();
+        (pos.x, tile.animated_window_size().w)
+    });
+
+    // Both halves cover the same fraction of their travel at every sample: one transition.
+    for (i, (x, w)) in samples.iter().enumerate() {
+        let moved = (400. - x) / (400. - 0.);
+        let grown = (w - 800.) / (1920. - 800.);
+        assert!(
+            (moved - grown).abs() < 0.02,
+            "sample {i}: moved {moved:.3} of the way but grew {grown:.3} — the halves are not \
+             running as one transition",
+        );
+    }
+    assert!(
+        samples[0].0 > 399. && samples[4].0 < 1.,
+        "the move must actually run over the sampled window, got {:?} -> {:?}",
+        samples[0],
+        samples[4],
+    );
+}

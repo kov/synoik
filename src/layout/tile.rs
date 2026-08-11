@@ -190,6 +190,25 @@ struct ResizeAnimation {
 struct MoveAnimation {
     anim: Animation,
     from: f64,
+    /// Whether the move is waiting for the resize it belongs to.
+    ///
+    /// A sizing-mode change moves and resizes as one transition, but only the move can start when
+    /// the user asks for it: the resize waits on the client committing the new size, one or two
+    /// commits later. Running the move meanwhile is what made a maximize read as "slide into the
+    /// corner, *then* grow". While held the offset stays at `from` and the clock is not consulted;
+    /// [`Tile::release_held_move`] restarts it alongside the resize.
+    held: bool,
+}
+
+impl MoveAnimation {
+    /// How much of the move is left, 1 at the start and 0 at the end. A held move has not started.
+    fn progress(&self) -> f64 {
+        if self.held {
+            1.
+        } else {
+            self.anim.value()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -445,6 +464,13 @@ impl<W: LayoutElement> Tile<W> {
             }
         }
 
+        // The move half of a sizing-mode change waits for the resize half, so that the two run as
+        // one transition rather than a slide followed by a grow. Release it once the resize has
+        // started, or once nothing is coming that it could wait for.
+        if self.resize_animation.is_some() || !self.window.animate_pending() {
+            self.release_held_move();
+        }
+
         let round_max1 = |logical| round_logical_in_physical_max1(self.scale, logical);
 
         let rules = self.window.rules();
@@ -473,14 +499,22 @@ impl<W: LayoutElement> Tile<W> {
             }
         }
 
-        if let Some(move_) = &mut self.move_x_animation {
-            if move_.anim.is_done() {
-                self.move_x_animation = None;
+        for slot in [&mut self.move_x_animation, &mut self.move_y_animation] {
+            let Some(move_) = slot.as_mut() else {
+                continue;
+            };
+
+            // A held move waits for its resize, but not forever. If the client has not committed
+            // the new size by the time the move would itself have finished, run it: a window left
+            // parked away from where the layout has it is worse than a late move, and this is also
+            // what settles the hold when animations are asked to complete instantly.
+            if move_.held && move_.anim.is_done() {
+                move_.anim = move_.anim.restarted(1., 0., 0.);
+                move_.held = false;
             }
-        }
-        if let Some(move_) = &mut self.move_y_animation {
-            if move_.anim.is_done() {
-                self.move_y_animation = None;
+
+            if !move_.held && move_.anim.is_done() {
+                *slot = None;
             }
         }
 
@@ -608,10 +642,10 @@ impl<W: LayoutElement> Tile<W> {
         let mut offset = Point::from((0., 0.));
 
         if let Some(move_) = &self.move_x_animation {
-            offset.x += move_.from * move_.anim.value();
+            offset.x += move_.from * move_.progress();
         }
         if let Some(move_) = &self.move_y_animation {
-            offset.y += move_.from * move_.anim.value();
+            offset.y += move_.from * move_.progress();
         }
 
         offset += self.interactive_move_offset;
@@ -654,6 +688,7 @@ impl<W: LayoutElement> Tile<W> {
         self.move_x_animation = Some(MoveAnimation {
             anim,
             from: from + current_offset,
+            held: false,
         });
     }
 
@@ -673,6 +708,7 @@ impl<W: LayoutElement> Tile<W> {
         self.move_y_animation = Some(MoveAnimation {
             anim,
             from: from + current_offset,
+            held: false,
         });
     }
 
@@ -680,9 +716,41 @@ impl<W: LayoutElement> Tile<W> {
         if let Some(move_) = self.move_y_animation.as_mut() {
             // If the anim is almost done, there's little point trying to offset it; we can let
             // things jump. If it turns out like a bad idea, we could restart the anim instead.
-            let value = move_.anim.value();
+            let value = move_.progress();
             if value > 0.001 {
                 move_.from += offset / value;
+            }
+        }
+    }
+
+    /// Start a sizing-mode change's move, held until its resize starts.
+    ///
+    /// See [`MoveAnimation::held`]. The offset applies immediately — the tile's model position has
+    /// already changed, so the window must keep rendering where it was — but it does not decay
+    /// until [`Self::release_held_move`].
+    pub fn hold_move_from(&mut self, from: Point<f64, Logical>, config: synoik_config::Animation) {
+        let current_offset = self.render_offset();
+        for (slot, from) in [
+            (&mut self.move_x_animation, from.x + current_offset.x),
+            (&mut self.move_y_animation, from.y + current_offset.y),
+        ] {
+            *slot = Some(MoveAnimation {
+                anim: Animation::new(self.clock.clone(), 1., 0., 0., config),
+                from,
+                held: true,
+            });
+        }
+    }
+
+    /// Let a held move run, from wherever it was held.
+    pub fn release_held_move(&mut self) {
+        for move_ in [&mut self.move_x_animation, &mut self.move_y_animation]
+            .into_iter()
+            .flatten()
+        {
+            if move_.held {
+                move_.anim = move_.anim.restarted(1., 0., 0.);
+                move_.held = false;
             }
         }
     }

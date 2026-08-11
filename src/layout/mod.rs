@@ -375,6 +375,11 @@ pub trait LayoutElement {
     /// without redrawing at the new size yet.
     fn hold_animate_arm(&mut self) {}
 
+    /// Whether a configure is still waiting for the commit that animates it.
+    fn animate_pending(&self) -> bool {
+        false
+    }
+
     fn set_interactive_resize(&mut self, data: Option<InteractiveResizeData>);
     fn cancel_interactive_resize(&mut self);
     fn interactive_resize_data(&self) -> Option<InteractiveResizeData>;

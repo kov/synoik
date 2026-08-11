@@ -1554,6 +1554,10 @@ impl LayoutElement for Mapped {
         Mapped::hold_animate_arm(self);
     }
 
+    fn animate_pending(&self) -> bool {
+        self.animate_arm_held || !self.animate_serials.is_empty()
+    }
+
     fn set_interactive_resize(&mut self, data: Option<InteractiveResizeData>) {
         self.toplevel().with_pending_state(|state| {
             if data.is_some() {
