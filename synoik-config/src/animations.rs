@@ -227,12 +227,17 @@ pub struct WindowResizeAnim {
 impl Default for WindowResizeAnim {
     fn default() -> Self {
         Self {
+            // gnome-shell's size change: `WINDOW_ANIMATION_TIME` (250 ms) on
+            // `EASE_OUT_QUAD`, for the scale and the position together
+            // (`js/ui/windowManager.js` `_sizeChangedWindow`). niri's critically-damped
+            // spring put ~77% of the travel in the first 100 ms, which reads as a snap
+            // whenever the size delta is small — an un-maximize back to mutter's
+            // sqrt(0.8) clamp is only a 10% change.
             anim: Animation {
                 off: false,
-                kind: Kind::Spring(SpringParams {
-                    damping_ratio: 1.,
-                    stiffness: 800,
-                    epsilon: 0.0001,
+                kind: Kind::Easing(EasingParams {
+                    duration_ms: 250,
+                    curve: Curve::EaseOutQuad,
                 }),
             },
             custom_shader: None,

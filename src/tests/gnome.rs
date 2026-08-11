@@ -24551,3 +24551,108 @@ fn ipc_windows_report_maximized_and_tiled_state() {
         "a tiled window must report the edges it is tiled against",
     );
 }
+
+/// The un-maximize resize rides gnome-shell's size-change curve: `WINDOW_ANIMATION_TIME`
+/// (250 ms) on `EASE_OUT_QUAD` (`js/ui/windowManager.js` `_sizeChangedWindow`).
+///
+/// This is pinned on the case that exposed it — a window that auto-maximized at map, whose
+/// restore rect is mutter's sqrt(0.8) clamp of the work area and whose position does not move
+/// at all. There the resize is the *only* thing on screen, so a front-loaded curve (niri's
+/// critically-damped spring spent ~77% of the travel in the first 100 ms) reads as a snap.
+#[test]
+fn unmaximize_resizes_on_gnomes_size_change_curve() {
+    let mut f = Fixture::with_config(Config::default());
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // Big enough to trip the map-time auto-maximize (mutter's place.c 80% rule).
+    let surface = map_window_sized(&mut f, id, (1900, 1040), None);
+    assert_eq!(
+        focused_window_pos(&mut f),
+        (0., 32.),
+        "a work-area-sized window is placed at the work-area origin",
+    );
+
+    // Take the maximized size the auto-maximize configured.
+    let w = f.client(id).window(&surface);
+    w.attach_new_buffer();
+    w.set_size(1920, 1048);
+    w.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+
+    f.synoik_state().do_action(Action::Unmaximize, false);
+    f.double_roundtrip(id);
+    let w = f.client(id).window(&surface);
+    w.attach_new_buffer();
+    w.set_size(1717, 937);
+    w.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let from = 1048.;
+    let to = 937.;
+    let heights = f.sample_animation(Duration::from_millis(250), 4, |f| {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap()
+            .active_workspace_ref()
+            .tiles()
+            .next()
+            .unwrap()
+            .animated_window_size()
+            .h
+    });
+
+    // EASE_OUT_QUAD is 1 - (1 - t)², sampled at t = 0, ¼, ½, ¾, 1.
+    let expected: Vec<f64> = [0., 0.25, 0.5, 0.75, 1.]
+        .iter()
+        .map(|t: &f64| {
+            let p = 1. - (1. - t) * (1. - t);
+            (from + (to - from) * p).round()
+        })
+        .collect();
+    assert_eq!(
+        heights.iter().map(|h| h.round()).collect::<Vec<_>>(),
+        expected,
+        "the un-maximize must follow GNOME's 250 ms ease-out-quad, not niri's spring",
+    );
+}
+
+/// A sizing-mode transition always animates its move, however short.
+///
+/// Free moves have a 10 px dead zone so that rounding jitter does not animate, but a maximize is
+/// something the user asked for: a window that happens to sit a few pixels off the work-area
+/// origin must not lose half its transition to that threshold.
+#[test]
+fn a_short_maximize_move_still_animates() {
+    let mut f = Fixture::with_config(Config::default());
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = map_window_sized(&mut f, id, (800, 600), None);
+
+    f.synoik().layout.move_floating_window(
+        None,
+        synoik_ipc::PositionChange::SetFixed(4.),
+        synoik_ipc::PositionChange::SetFixed(3.),
+        false,
+    );
+    f.synoik_complete_animations();
+    assert_eq!(focused_window_pos(&mut f), (4., 35.));
+
+    // (4, 35) -> (0, 32) is 5 px, inside the free-move dead zone.
+    f.synoik_state().do_action(Action::Maximize, false);
+    f.double_roundtrip(id);
+
+    let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+    let offset = mon
+        .unwrap()
+        .active_workspace_ref()
+        .tiles()
+        .next()
+        .unwrap()
+        .render_offset();
+    assert!(
+        offset.x != 0. || offset.y != 0.,
+        "a maximize must animate its move even when it is shorter than the free-move threshold, \
+         got offset {offset:?}",
+    );
+}

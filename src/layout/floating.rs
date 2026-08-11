@@ -1237,7 +1237,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let prev_pos = self.data[idx].logical_pos;
         self.data[idx].set_logical_pos(Point::from((x, area.loc.y)));
         self.data[idx].set_anchor(Anchor::Free);
-        self.animate_move_from(idx, prev_pos);
+        self.animate_state_change_move_from(idx, prev_pos);
         self.interactive_resize_end(None);
     }
 
@@ -1337,7 +1337,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             let prev_pos = self.data[idx].logical_pos;
             self.tiles[idx].request_fullscreen(true, None);
             self.data[idx].set_anchor(Anchor::Output);
-            self.animate_move_from(idx, prev_pos);
+            self.animate_state_change_move_from(idx, prev_pos);
         } else if self.tiles[idx].saved_maximize {
             self.tiles[idx].saved_maximize = false;
             self.apply_maximized(idx);
@@ -1378,7 +1378,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let size = self.working_area.size;
         self.tiles[idx].request_maximized(size, true, None);
         self.data[idx].set_anchor(Anchor::WorkArea);
-        self.animate_move_from(idx, prev_pos);
+        self.animate_state_change_move_from(idx, prev_pos);
     }
 
     /// Returns the tile to normal sizing on its saved rect, from maximized, fullscreen or tiled.
@@ -1403,7 +1403,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             self.data[idx].set_logical_pos(pos);
         }
         self.data[idx].set_anchor(Anchor::Free);
-        self.animate_move_from(idx, prev_pos);
+        self.animate_state_change_move_from(idx, prev_pos);
 
         self.interactive_resize_end(None);
     }
@@ -1674,6 +1674,25 @@ impl<W: LayoutElement> FloatingSpace<W> {
         if diff.x * diff.x + diff.y * diff.y > ANIMATION_THRESHOLD_SQ {
             self.tiles[idx].animate_move_from(diff);
         }
+    }
+
+    /// The move half of a sizing-mode transition — maximize, un-maximize, tile, fullscreen.
+    ///
+    /// gnome-shell drives the scale and the position of a size change as one transition
+    /// (`js/ui/windowManager.js` `_sizeChangedWindow`), so this rides the *resize* curve rather
+    /// than the free-move one, and it has no dead zone: a transition the user asked for must not
+    /// half-disappear because the window happens to land within 10 px of where it started. That
+    /// case is not hypothetical — un-maximizing a window that auto-maximized at the work-area
+    /// origin returns it to exactly that origin, so the whole move is zero.
+    fn animate_state_change_move_from(&mut self, idx: usize, prev_pos: Point<f64, Logical>) {
+        let diff = prev_pos - self.data[idx].logical_pos;
+        if diff.x == 0. && diff.y == 0. {
+            return;
+        }
+
+        let config = self.options.animations.window_resize.anim;
+        self.tiles[idx].animate_move_x_from_with_config(diff.x, config);
+        self.tiles[idx].animate_move_y_from_with_config(diff.y, config);
     }
 
     pub fn new_window_size(
