@@ -24656,3 +24656,96 @@ fn a_short_maximize_move_still_animates() {
          got offset {offset:?}",
     );
 }
+
+/// A client may take a sizing-mode change on one commit and redraw at the new size on the next,
+/// and the animation belongs to the second one.
+///
+/// This is what made un-maximize snap while maximize animated: GTK4 answers a maximize in one
+/// commit, but on the way out it has to put its CSD shadow margins back, so the commit that acks
+/// the un-maximize still carries the maximized size. Spending the arm there left the resize that
+/// followed unarmed — measured on the seat as 8 snaps out of 8, against 8 clean animations in the
+/// other direction.
+#[test]
+fn a_resize_the_client_defers_to_its_next_commit_still_animates() {
+    let mut f = Fixture::with_config(Config::default());
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+
+    let resize_animation = |f: &mut Fixture| {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap()
+            .active_workspace_ref()
+            .tiles()
+            .next()
+            .unwrap()
+            .resize_animation()
+            .is_some()
+    };
+
+    f.synoik_state().do_action(Action::Maximize, false);
+    f.double_roundtrip(id);
+
+    // Ack the configure without redrawing: the window takes the maximized state at its old size.
+    f.client(id).window(&surface).ack_last_and_commit();
+    f.double_roundtrip(id);
+    assert!(
+        !resize_animation(&mut f),
+        "nothing has resized yet, so there is nothing to animate on the ack",
+    );
+
+    // The redraw at the configured size, one commit later.
+    let w = f.client(id).window(&surface);
+    w.attach_new_buffer();
+    w.set_size(1920, 1048);
+    w.commit();
+    f.double_roundtrip(id);
+    assert!(
+        resize_animation(&mut f),
+        "the commit that actually resizes must still be animated",
+    );
+}
+
+/// The held arm lasts exactly one commit, and only across a sizing-mode change.
+///
+/// Without both bounds it becomes a licence to animate whatever the client does next: a window
+/// that resizes itself — an EGL surface changing size, a client honouring nothing in particular —
+/// must not pick up an animation left lying around by an earlier configure.
+#[test]
+fn a_held_arm_does_not_animate_a_later_client_resize() {
+    let mut f = Fixture::with_config(Config::default());
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+
+    let resize_animation = |f: &mut Fixture| {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap()
+            .active_workspace_ref()
+            .tiles()
+            .next()
+            .unwrap()
+            .resize_animation()
+            .is_some()
+    };
+
+    f.synoik_state().do_action(Action::Maximize, false);
+    f.double_roundtrip(id);
+    f.client(id).window(&surface).ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    // One commit that does not resize spends the held arm...
+    f.client(id).window(&surface).commit();
+    f.double_roundtrip(id);
+
+    // ...so this resize, which the client chose on its own, is not animated.
+    let w = f.client(id).window(&surface);
+    w.attach_new_buffer();
+    w.set_size(1920, 1048);
+    w.commit();
+    f.double_roundtrip(id);
+    assert!(
+        !resize_animation(&mut f),
+        "a client-side resize must not inherit an animation from an older configure",
+    );
+}

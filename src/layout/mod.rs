@@ -371,6 +371,10 @@ pub trait LayoutElement {
 
     fn take_animation_snapshot(&mut self) -> Option<LayoutElementRenderSnapshot>;
 
+    /// Keep the animation armed for the next commit, because this one took a sizing-mode change
+    /// without redrawing at the new size yet.
+    fn hold_animate_arm(&mut self) {}
+
     fn set_interactive_resize(&mut self, data: Option<InteractiveResizeData>);
     fn cancel_interactive_resize(&mut self);
     fn interactive_resize_data(&self) -> Option<InteractiveResizeData>;

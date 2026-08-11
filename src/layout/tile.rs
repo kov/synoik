@@ -435,6 +435,13 @@ impl<W: LayoutElement> Tile<W> {
                 });
             } else {
                 self.resize_animation = None;
+
+                // Nothing to animate yet, but the window did take a new sizing mode on this
+                // commit — so this is the ack, and the resize is on the commit after it. Hold the
+                // arm for that one rather than spending it here on a window that has not moved.
+                if prev_sizing_mode != self.sizing_mode {
+                    self.window.hold_animate_arm();
+                }
             }
         }
 

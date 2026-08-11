@@ -122,6 +122,10 @@ pub struct Mapped {
     /// Serials of commits that should be animated.
     animate_serials: Vec<Serial>,
 
+    /// Whether the next commit should be animated because the last one took a sizing-mode change
+    /// without redrawing at the new size yet. See [`Mapped::hold_animate_arm`].
+    animate_arm_held: bool,
+
     /// Snapshot right before an animated commit, without popups.
     animation_snapshot: Option<LayoutElementRenderSnapshot>,
 
@@ -313,6 +317,7 @@ impl Mapped {
             blur_config: config.blur,
             animate_next_configure: false,
             animate_serials: Vec::new(),
+            animate_arm_held: false,
             animation_snapshot: None,
             request_size_once: None,
             transaction_for_next_configure: None,
@@ -442,7 +447,7 @@ impl Mapped {
     }
 
     pub fn should_animate_commit(&mut self, commit_serial: Serial) -> bool {
-        let mut should_animate = false;
+        let mut should_animate = std::mem::take(&mut self.animate_arm_held);
         self.animate_serials.retain_mut(|serial| {
             if commit_serial.is_no_older_than(serial) {
                 should_animate = true;
@@ -452,6 +457,22 @@ impl Mapped {
             }
         });
         should_animate
+    }
+
+    /// Keep the animation armed for one more commit.
+    ///
+    /// Taking a sizing-mode change and redrawing at the new size are two different things, and a
+    /// client may do them on two different commits. GTK4 does exactly that on the way out of
+    /// maximized, where it also has to put its CSD shadow margins back: the commit that acks the
+    /// un-maximize still carries the maximized size, and the resize lands on the commit after.
+    /// Spending the arm on the ack leaves that resize unarmed, which costs the whole animation —
+    /// the un-maximize then snaps while the maximize, which GTK usually answers in one commit,
+    /// animates.
+    ///
+    /// One commit, and only after a mode change actually took: the arm cannot outlive the
+    /// transition and go off on a later resize of the client's own.
+    pub fn hold_animate_arm(&mut self) {
+        self.animate_arm_held = true;
     }
 
     /// Store the animation snapshot. The window contents are not captured here — see
@@ -1527,6 +1548,10 @@ impl LayoutElement for Mapped {
 
     fn take_animation_snapshot(&mut self) -> Option<LayoutElementRenderSnapshot> {
         self.animation_snapshot.take()
+    }
+
+    fn hold_animate_arm(&mut self) {
+        Mapped::hold_animate_arm(self);
     }
 
     fn set_interactive_resize(&mut self, data: Option<InteractiveResizeData>) {
