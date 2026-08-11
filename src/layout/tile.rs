@@ -63,6 +63,10 @@ pub struct Tile<W: LayoutElement> {
     /// right away, to avoid black backdrop flicker before the window has had a chance to resize.
     sizing_mode: SizingMode,
 
+    /// The tiled edges the window has committed to, the other half of its sizing state. Tracked
+    /// for the same reason as `sizing_mode`: a change in either is a transition worth animating.
+    tiled_edges: [bool; 4],
+
     /// The black backdrop for fullscreen windows.
     fullscreen_backdrop: SolidColorBuffer,
 
@@ -271,6 +275,7 @@ impl<W: LayoutElement> Tile<W> {
         let focus_ring_config = focus_ring_config(&options, rules);
         let shadow_config = options.layout.shadow.merged_with(&rules.shadow);
         let sizing_mode = window.sizing_mode();
+        let tiled_edges = window.committed_tiled_edges();
 
         Self {
             window,
@@ -278,6 +283,7 @@ impl<W: LayoutElement> Tile<W> {
             focus_ring: FocusRing::new(focus_ring_config),
             shadow: Shadow::new(shadow_config),
             sizing_mode,
+            tiled_edges,
             fullscreen_backdrop: SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.]),
             restore_to_floating: false,
             floating_window_size: None,
@@ -346,6 +352,8 @@ impl<W: LayoutElement> Tile<W> {
     pub fn update_window(&mut self) {
         let prev_sizing_mode = self.sizing_mode;
         self.sizing_mode = self.window.sizing_mode();
+        let prev_tiled_edges = self.tiled_edges;
+        self.tiled_edges = self.window.committed_tiled_edges();
 
         if let Some(animate_from) = self.window.take_animation_snapshot() {
             let params = if let Some(resize) = self.resize_animation.take() {
@@ -458,7 +466,7 @@ impl<W: LayoutElement> Tile<W> {
                 // Nothing to animate yet, but the window did take a new sizing mode on this
                 // commit — so this is the ack, and the resize is on the commit after it. Hold the
                 // arm for that one rather than spending it here on a window that has not moved.
-                if prev_sizing_mode != self.sizing_mode {
+                if prev_sizing_mode != self.sizing_mode || prev_tiled_edges != self.tiled_edges {
                     self.window.hold_animate_arm();
                 }
             }

@@ -24756,6 +24756,93 @@ fn a_held_arm_does_not_animate_a_later_client_resize() {
 /// client committing the new size. Left to run on its own the move finished first, so a centered
 /// window slid into the corner at its old size and only then grew — measured on a real
 /// gnome-system-monitor as six frames of constant width before the first pixel of growth.
+/// An untile is a state change too, even though xdg-shell keeps the tiled edges out of the
+/// maximized/fullscreen state: it must hold its animate arm across the acking commit and park its
+/// move for the resize, exactly like an unmaximize.
+#[test]
+fn an_untile_moves_and_shrinks_together() {
+    let mut f = Fixture::with_config(Config::default());
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.synoik().layout.move_floating_window(
+        None,
+        synoik_ipc::PositionChange::SetFixed(400.),
+        synoik_ipc::PositionChange::SetFixed(200.),
+        false,
+    );
+    f.synoik_complete_animations();
+    let restored_pos = focused_window_pos(&mut f).0;
+
+    // Tile left, and let the client answer it.
+    f.synoik_state().do_action(Action::ToggleTiledLeft, false);
+    f.double_roundtrip(id);
+    let tiled_size = f
+        .client(id)
+        .window(&surface)
+        .configures_received
+        .last()
+        .unwrap()
+        .1
+        .size;
+    let w = f.client(id).window(&surface);
+    w.attach_new_buffer();
+    w.set_size(tiled_size.0 as u16, tiled_size.1 as u16);
+    w.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    let tiled_pos = focused_window_pos(&mut f).0;
+    assert!(
+        tiled_pos < restored_pos,
+        "tiling left must move the window left"
+    );
+
+    // Super+Down on a tiled window untiles it.
+    f.synoik_state().do_action(Action::Unmaximize, false);
+    f.double_roundtrip(id);
+
+    // The client acks without redrawing yet — GTK4's shape on the way out of a sized state. The
+    // window must not slide back at the tiled width in the meantime.
+    f.client(id).window(&surface).ack_last_and_commit();
+    f.double_roundtrip(id);
+    assert_eq!(
+        focused_window_pos(&mut f).0,
+        tiled_pos,
+        "the move must wait for the resize rather than run ahead of it",
+    );
+
+    // The commit that resizes starts both halves.
+    let w = f.client(id).window(&surface);
+    w.attach_new_buffer();
+    w.set_size(800, 600);
+    w.commit();
+    f.double_roundtrip(id);
+
+    let samples = f.sample_animation(Duration::from_millis(250), 4, |f| {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        let ws = mon.unwrap().active_workspace_ref();
+        let (tile, pos, _) = ws.tiles_with_render_positions().next().unwrap();
+        (pos.x, tile.animated_window_size().w)
+    });
+
+    let tiled_w = tiled_size.0 as f64;
+    for (i, (x, w)) in samples.iter().enumerate() {
+        let moved = (x - tiled_pos) / (restored_pos - tiled_pos);
+        let shrunk = (tiled_w - w) / (tiled_w - 800.);
+        assert!(
+            (moved - shrunk).abs() < 0.02,
+            "sample {i}: moved {moved:.3} of the way but shrunk {shrunk:.3} — the halves are not \
+             running as one transition",
+        );
+    }
+    assert!(
+        samples[0].1 > tiled_w - 1. && samples[4].1 < 801.,
+        "the resize must actually run over the sampled window, got {:?} -> {:?}",
+        samples[0],
+        samples[4],
+    );
+}
+
 #[test]
 fn a_maximize_moves_and_grows_together() {
     let mut f = Fixture::with_config(Config::default());

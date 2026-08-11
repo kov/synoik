@@ -380,6 +380,15 @@ pub trait LayoutElement {
         false
     }
 
+    /// The committed tiled edges, in the order left, right, top, bottom.
+    ///
+    /// Part of the window's sizing state alongside [`Self::sizing_mode`], but separate because
+    /// xdg-shell keeps the tiled edges as their own states: a half-tiled window is `Normal` with
+    /// two edges set, not a mode of its own.
+    fn committed_tiled_edges(&self) -> [bool; 4] {
+        [false; 4]
+    }
+
     fn set_interactive_resize(&mut self, data: Option<InteractiveResizeData>);
     fn cancel_interactive_resize(&mut self);
     fn interactive_resize_data(&self) -> Option<InteractiveResizeData>;

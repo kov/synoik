@@ -1558,6 +1558,19 @@ impl LayoutElement for Mapped {
         self.animate_arm_held || !self.animate_serials.is_empty()
     }
 
+    fn committed_tiled_edges(&self) -> [bool; 4] {
+        self.toplevel().with_committed_state(|state| {
+            state.map_or([false; 4], |state| {
+                [
+                    state.states.contains(xdg_toplevel::State::TiledLeft),
+                    state.states.contains(xdg_toplevel::State::TiledRight),
+                    state.states.contains(xdg_toplevel::State::TiledTop),
+                    state.states.contains(xdg_toplevel::State::TiledBottom),
+                ]
+            })
+        })
+    }
+
     fn set_interactive_resize(&mut self, data: Option<InteractiveResizeData>) {
         self.toplevel().with_pending_state(|state| {
             if data.is_some() {
