@@ -6600,6 +6600,78 @@ fn a_dropped_thumbnail_flies_into_its_slot() {
     }
 }
 
+/// The row gets out of the way at half overlap, in both directions.
+///
+/// Comparing the two centres — the obvious rule, and what this did first — costs a whole
+/// slot of travel, because the carried centre starts a whole slot from its neighbour's. By
+/// the time it fires the carried thumbnail is squarely on top of the neighbour and has been
+/// for a while, which reads as the row refusing to move. See `Monitor::thumb_drag_target`.
+#[test]
+fn the_row_parts_when_the_carried_thumbnail_is_half_over_a_neighbour() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = setup_two_desktops_in_overview(&mut f, id);
+    f.settle_animations();
+
+    let thumbs = |f: &mut Fixture| {
+        let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
+        mon.unwrap().thumbnail_strip().unwrap().thumbs.clone()
+    };
+    let rest = thumbs(&mut f);
+    let (w, gap) = (
+        rest[0].size.w,
+        rest[1].loc.x - rest[0].loc.x - rest[0].size.w,
+    );
+
+    // Where the *other* thumbnail is drawn tells us whether the row has parted: it only
+    // leaves its own slot once the drag has passed it.
+    // Settled, because the row now *eases* out of the way: read on the frame of the
+    // crossing it is still sitting at home, and every crossing would look like a refusal.
+    let parted = |f: &mut Fixture, other: usize, home: f64| {
+        f.settle_animations();
+        (thumbs(f)[other].loc.x - home).abs() > 1.
+    };
+
+    for (from, other, dir) in [(1usize, 0usize, -1.), (0, 1, 1.)] {
+        let (gx, gy) = thumbnail_center(&mut f, from);
+        let home = rest[other].loc.x;
+        pointer_motion_to(&mut f, gx, gy);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+
+        // Just short of half overlap: the carried box covers less than half of its
+        // neighbour, and the row has not moved. Half overlap is a half-width of travel
+        // plus the gap that was between them; a full slot, `w + gap`, would be the two
+        // centres meeting.
+        let half = w / 2. + gap;
+        pointer_motion_to(&mut f, gx + dir * (half - 4.), gy);
+        assert!(
+            !parted(&mut f, other, home),
+            "carrying {from} by {} must not part the row yet",
+            half - 4.,
+        );
+
+        // A few pixels further and it has.
+        pointer_motion_to(&mut f, gx + dir * (half + 4.), gy);
+        assert!(
+            parted(&mut f, other, home),
+            "carrying {from} by {} must part the row",
+            half + 4.,
+        );
+
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+        f.settle_animations();
+        // Put it back for the next direction.
+        let (bx, by) = thumbnail_center(&mut f, other);
+        pointer_motion_to(&mut f, bx, by);
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        pointer_motion_to(&mut f, bx - dir * (w + gap), by);
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+        f.settle_animations();
+        assert_eq!(thumbs(&mut f)[0].loc.x, rest[0].loc.x, "reset failed");
+    }
+}
+
 /// The same, carried the other way — right to left, which is the direction that renumbers
 /// the row *behind* the carried workspace and so is the one a positional snapshot would
 /// skew (`Monitor::thumb_xs` maps by identity for exactly this).

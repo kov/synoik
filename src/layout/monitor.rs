@@ -379,9 +379,18 @@ impl PhantomSlot {
     }
 }
 
-/// The index an armed drag would drop at: how many of the *other* thumbnails the dragged
-/// one's center has passed. Taken against the strip at rest, so the row parting out of the
-/// way underneath cannot feed back into the answer and make the target oscillate.
+/// The index an armed drag would drop at: how many of the *other* thumbnails the carried
+/// one still sits after. Taken against the strip at rest, so the row parting out of the way
+/// underneath cannot feed back into the answer and make the target oscillate.
+///
+/// A neighbour is passed once the carried thumbnail's **centre comes inside its box** — the
+/// two are the same width, so that is exactly half overlap, which is the moment they read
+/// as having crossed. Comparing the two centres instead (the obvious rule, and what this
+/// did first) needs a whole slot of travel, because the carried centre starts a whole slot
+/// away: by the time it fires the carried thumbnail is sitting squarely on top of the
+/// neighbour and has been for a while, which reads as the row refusing to get out of the
+/// way. Half a slot, and half overlap, is the same crossing seen from the rectangles rather
+/// than from their midpoints.
 fn thumb_drag_target(strip: &Strip, drag: ThumbDrag) -> usize {
     let width = strip.thumbs[drag.from].size.w;
     let center = drag.pos.x - drag.grab_offset + width / 2.;
@@ -390,7 +399,17 @@ fn thumb_drag_target(strip: &Strip, drag: ThumbDrag) -> usize {
         .iter()
         .enumerate()
         .filter(|(i, _)| *i != drag.from)
-        .take_while(|(_, rect)| rect.loc.x + rect.size.w / 2. < center)
+        .filter(|(i, rect)| {
+            if *i < drag.from {
+                // To the left, and still ahead of the carried one until its centre
+                // crosses this box's right edge.
+                center >= rect.loc.x + rect.size.w
+            } else {
+                // To the right, and behind the carried one until its centre crosses this
+                // box's left edge.
+                center > rect.loc.x
+            }
+        })
         .count()
 }
 
