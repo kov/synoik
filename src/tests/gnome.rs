@@ -6949,6 +6949,7 @@ fn dragging_toward_the_last_workspace_opens_the_row_for_it() {
         let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         mon.unwrap().thumbnail_strip().unwrap().thumbs[1]
     };
+    let gap = at_rest[1] - at_rest[0] - last.size.w;
 
     // Pick the preview up, well away from the row.
     let rect = f.synoik().layout.expose_target_rect(&win_a).unwrap();
@@ -6986,28 +6987,58 @@ fn dragging_toward_the_last_workspace_opens_the_row_for_it() {
         "on the trailing thumbnail the slot must be all the way open, got {widths:?}",
     );
 
-    // The row is now laid out for the workspace that does not exist yet — so the drop
-    // that creates it moves nothing.
+    // The slot grew off the right end and the row itself never budged — a still target
+    // to aim at for the whole drag.
     let (before, phantom) = strip_now(&mut f);
     let (phantom_x, phantom_w, _) = phantom.unwrap();
-    assert_ne!(before, at_rest, "the row must have made room");
+    assert_eq!(
+        before, at_rest,
+        "the row must hold still while the drag runs"
+    );
+    assert_eq!(
+        (phantom_x, phantom_w),
+        (last.loc.x + last.size.w + gap, last.size.w),
+        "the slot must stand one gap past the last thumbnail, a full workspace wide",
+    );
 
+    // No roundtrip before sampling: it advances the clock, and this ease is 200ms long.
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.double_roundtrip(id);
 
-    let (after, phantom) = strip_now(&mut f);
+    // The new thumbnail takes over the slot exactly as it stood, and *then* the row
+    // eases into its recentred shape.
+    let samples = f.sample_animation(Duration::from_millis(200), 4, |f| strip_now(f).0);
+    assert_eq!(
+        samples[0],
+        vec![before[0], before[1], phantom_x],
+        "the row must start the ease from where the drag left it, new thumbnail included",
+    );
+
+    f.settle_animations();
+    let (settled, phantom) = strip_now(&mut f);
     assert_eq!(phantom, None, "the drop retires the slot");
-    assert_eq!(after.len(), 3, "the drop must append a workspace");
-    assert_eq!(
-        after[..2],
-        before[..],
-        "the surviving thumbnails must not move: the row was already laid out for this",
+    assert_eq!(settled.len(), 3, "the drop must append a workspace");
+
+    // It lands centred, half a slot to the left of where it stood...
+    let shift = samples[0][0] - settled[0];
+    assert!(
+        (shift - (last.size.w + gap) / 2.).abs() <= 1.,
+        "the row must recentre by half a slot: {:?} -> {settled:?}",
+        samples[0],
     );
-    assert_eq!(
-        (after[2], phantom_w),
-        (phantom_x, last.size.w),
-        "the real thumbnail must land exactly where the phantom stood",
-    );
+    for pair in settled.windows(2) {
+        assert!(
+            (pair[1] - pair[0] - (last.size.w + gap)).abs() <= 1.,
+            "the settled row must be evenly spaced: {settled:?}",
+        );
+    }
+    // ...having travelled, rather than snapped, to get there.
+    for (i, sample) in samples[1..4].iter().enumerate() {
+        assert!(
+            *sample != samples[0] && *sample != settled,
+            "sample {} sits on an endpoint — the row snapped rather than eased: {samples:?}",
+            i + 1,
+        );
+    }
 }
 
 /// A drag aimed into an *interior* gap gets the pill, not the trailing slot.

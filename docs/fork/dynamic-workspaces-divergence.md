@@ -175,21 +175,28 @@ and only *after* the drop does the new thumbnail expand — `acceptDrop` puts it
 So the row snaps open under a drop that has already happened.
 
 Ours runs the same two stages, but the **drag** drives them instead of a timer: the reveal is a
-function of how close the pointer has come to the trailing workspace, the row makes room over the
-first half of the approach and the workspace materializes over the second, and by the time the
-pointer is on the trailing thumbnail — which is exactly where a drop appends a workspace — the row
-is already in its final shape. The drop then moves nothing at all. A drag that wanders off instead
+function of how close the pointer has come to the trailing workspace, the slot widens over the
+first half of the approach and the workspace materializes over the second. A drag that wanders off
 eases the slot shut over the same 200ms.
 
-Two things this is careful about:
+Three things this is careful about:
 
-- **The reveal is measured against the row at rest**, never the row as drawn. Opening the slot
-  recenters the run, which moves the thumbnail the distance is measured to; reading the distance off
-  the drawn row would have the two chase each other. Same reason `thumb_drag_target` takes its
-  answer at rest.
+- **The slot grows off the right end, and the row does not move.** It is placed after the run is
+  centered and takes no part in that centering (`thumbnails::strip_geometry`), so every real
+  thumbnail is exactly where it was when the drag began. The row owes itself half a slot of
+  recentring the moment the workspace is real, and pays it then, in one 200ms ease from the
+  snapshotted pre-drop positions (`Monitor::OpenSlide`).
+- **The row must be still for the whole drag**, and that is the reason for the above. A row that
+  recentered continuously was both a moving target to aim at and a feedback loop: the run shifts
+  under the pointer, which changes which drop the pointer is asking for, which changes the reveal.
+  At the gap before the trailing workspace that loop was visible as a shake. The reveal is
+  additionally measured against the row *at rest*, never the row as drawn — same rule
+  `thumb_drag_target` takes its answer by.
 - **Only the trailing workspace arms by proximity.** An interior gap is a target you have to aim
   into, and a distance ramp there would have the row breathing a gap open under the pointer wherever
-  it went; those keep the pill.
+  it went; those keep the pill. The ramp is measured to the trailing thumbnail and the slot
+  *together*, because both drops grow the row — which also means a drop can only ever land on a
+  slot that is already full width, so the real thumbnail takes it over with no jump.
 
 The workspace is *not* in the model while the slot is open — `Monitor::render_phantom_thumb` draws
 an empty desktop's chrome and nothing else, for the same reason `CloseSlide` keeps a removed

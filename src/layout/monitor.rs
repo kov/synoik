@@ -178,6 +178,9 @@ pub struct Monitor<W: LayoutElement> {
     /// The slot the row holds open for a workspace a drop would create — see
     /// [`PhantomSlot`].
     thumb_phantom: Option<PhantomSlot>,
+    /// The row recentring after a drop turned that slot into a workspace — see
+    /// [`OpenSlide`].
+    thumb_open_slide: Option<OpenSlide>,
     /// The strip closing the gap left by a workspace you dismissed — see
     /// [`Self::close_workspace`].
     thumb_close_slide: Option<CloseSlide>,
@@ -314,6 +317,26 @@ struct CloseSlide {
     anim: Animation,
 }
 
+/// The row catching up with the workspace a drop just appended.
+///
+/// The slot the drag held open hangs off the *right end* of a row that never moved
+/// (`thumbnails::Phantom`), so the moment the workspace becomes real the row owes itself
+/// half a slot of recentring. That is this: the pre-drop positions are snapshotted by the
+/// caller — including the phantom's, which is where the new thumbnail starts — and the
+/// thumbnails ease from there to the row they belong in.
+///
+/// A snapshot rather than a re-lay (which is how [`CloseSlide`] does it) because by the
+/// time the drop is settled the old row cannot be reconstructed: the window that arrived
+/// may have changed which workspaces exist, not just how many.
+#[derive(Debug)]
+struct OpenSlide {
+    /// Where each thumbnail was drawn just before the drop, in workspace order, the
+    /// phantom's slot last.
+    from: Vec<f64>,
+    /// 0 = that row, 1 = the row the new workspace belongs in.
+    anim: Animation,
+}
+
 /// The row holding a slot open for a workspace that does not exist yet.
 ///
 /// While the drag is in flight the reveal is **recomputed from the pointer every frame**
@@ -322,11 +345,11 @@ struct CloseSlide {
 /// when the drag stops driving it — a drag that wanders off, or ends without making the
 /// workspace real, has to ease the slot shut rather than snap it.
 ///
-/// The reveal is measured against the row **at rest**, never against the row as drawn. A
-/// reveal read off the row it is itself widening is a feedback loop: the run recenters as
-/// the slot opens (`thumbnails::strip_geometry`), which moves the thumbnail the distance is
-/// measured to, which changes the reveal. The same reason [`thumb_drag_target`] takes its
-/// answer at rest.
+/// The reveal is measured against the row **at rest**, never against the row as drawn — see
+/// [`Monitor::phantom_target`]. Two reasons it has to be, and they are the same reason: a
+/// reveal read off the row it is itself moving is a feedback loop, and a row that shifts
+/// under the pointer changes which drop the pointer is asking for. The row is therefore
+/// held still for the whole drag and catches up afterwards, in one [`OpenSlide`].
 #[derive(Debug)]
 struct PhantomSlot {
     /// The workspace index the slot stands in for.
@@ -579,6 +602,7 @@ impl<W: LayoutElement> Monitor<W> {
             thumb_placeholder: FocusRing::new(thumbnail_placeholder_config()),
             thumb_drag: None,
             thumb_phantom: None,
+            thumb_open_slide: None,
             thumb_close_slide: None,
             insert_hint_render_loc: None,
             overview_open: false,
@@ -1461,6 +1485,9 @@ impl<W: LayoutElement> Monitor<W> {
         {
             causes |= AnimCauses::THUMB_PHANTOM;
         }
+        if self.thumb_open_slide.is_some() {
+            causes |= AnimCauses::THUMB_PHANTOM;
+        }
         if self.workspaces.iter().any(|ws| ws.are_animations_ongoing()) {
             causes |= AnimCauses::WINDOWS;
         }
@@ -1488,6 +1515,7 @@ impl<W: LayoutElement> Monitor<W> {
                 .thumb_phantom
                 .as_ref()
                 .is_some_and(|slot| slot.closing.is_some())
+            || self.thumb_open_slide.is_some()
             || self
                 .workspaces
                 .iter()
@@ -2081,6 +2109,13 @@ impl<W: LayoutElement> Monitor<W> {
         {
             self.thumb_phantom = None;
         }
+        if self
+            .thumb_open_slide
+            .as_ref()
+            .is_some_and(|s| s.anim.is_done())
+        {
+            self.thumb_open_slide = None;
+        }
     }
 
     /// The show-apps state fraction (0 = window picker, 1 = app grid), eased.
@@ -2268,7 +2303,24 @@ impl<W: LayoutElement> Monitor<W> {
             thumbnails::strip_geometry(self.view_size, band, thumb_w, gap, n, insert, focus)
         };
         let strip = lay(self.workspaces.len(), self.workspace_render_idx());
-        Some(self.apply_close_slide(strip, &lay))
+        let strip = self.apply_close_slide(strip, &lay);
+        Some(self.apply_open_slide(strip))
+    }
+
+    /// Eases the row from where it stood with a slot merely held open to where it stands
+    /// with that workspace real — see [`OpenSlide`].
+    fn apply_open_slide(&self, mut strip: Strip) -> Strip {
+        let Some(slide) = &self.thumb_open_slide else {
+            return strip;
+        };
+        if slide.from.len() != strip.thumbs.len() {
+            return strip;
+        }
+        let t = slide.anim.clamped_value().clamp(0., 1.);
+        for (rect, from) in zip(&mut strip.thumbs, &slide.from) {
+            rect.loc.x = from + (rect.loc.x - from) * t;
+        }
+        strip
     }
 
     /// Eases the row from where it stood with a just-closed workspace still in it to where
@@ -2374,16 +2426,46 @@ impl<W: LayoutElement> Monitor<W> {
 
     /// Retires the phantom slot at the end of a drop.
     ///
-    /// If the drop earned the workspace, the row is already laid out for it and the real
-    /// thumbnail lands exactly where the phantom stood — so the slot goes on the spot and
-    /// nothing moves, which is the whole point of opening it during the drag. If it did
-    /// not, the slot eases shut rather than snapping.
-    pub fn settle_thumb_phantom(&mut self, created: bool) {
-        if created {
-            self.thumb_phantom = None;
-        } else {
+    /// If the drop earned the workspace, the new thumbnail takes over the slot exactly as
+    /// it stood — same place, same width, since a drop can only land there with the slot
+    /// fully open — and the row eases into its recentred shape from `was`, the positions
+    /// the caller snapshotted before the drop. If it did not earn one, the slot eases shut
+    /// and the row, which never moved, has nothing to do.
+    pub fn settle_thumb_phantom(&mut self, created: bool, was: Vec<f64>) {
+        if !created {
             self.update_thumb_phantom(None);
+            return;
         }
+        let had_slot = self.thumb_phantom.take().is_some();
+        // Only a drop into the slot owes the row a move. A drop that grew the row some
+        // other way — an interior insert, a window arriving from elsewhere — is not what
+        // was snapshotted, and easing to it from the wrong row is worse than not easing.
+        if had_slot && was.len() == self.workspaces.len() {
+            self.thumb_open_slide = Some(OpenSlide {
+                from: was,
+                anim: Animation::new(
+                    self.clock.clone(),
+                    0.,
+                    1.,
+                    0.,
+                    strip_transition_config(&self.options),
+                ),
+            });
+        }
+    }
+
+    /// The row as drawn right now, the phantom's slot appended — the snapshot
+    /// [`Self::settle_thumb_phantom`] eases away from.
+    pub fn thumb_positions_now(&self) -> Vec<f64> {
+        let Some(strip) = self.thumbnail_strip() else {
+            return Vec::new();
+        };
+        strip
+            .thumbs
+            .iter()
+            .map(|r| r.loc.x)
+            .chain(strip.phantom.map(|(r, _)| r.loc.x))
+            .collect()
     }
 
     /// Where the row would open, and by how much, for a drag at `pos`.
@@ -2406,10 +2488,29 @@ impl<W: LayoutElement> Monitor<W> {
         }
 
         // A drop on the trailing workspace fills it, and `clean_up_workspaces` appends a
-        // fresh empty one after it — so the slot that opens is the one past the end.
-        let ramp = last.size.w;
-        let reveal = 1. - (distance_to(last, pos) / ramp).clamp(0., 1.);
-        (reveal > 0.).then_some((strip.thumbs.len(), reveal))
+        // fresh empty one after it — so the slot that opens is the one past the end, and
+        // the trailing thumbnail and that slot are one target: both drops grow the row.
+        //
+        // The ramp is measured to that whole target, not to the thumbnail alone, so a
+        // pointer anywhere a drop would land finds the slot already all the way open —
+        // which is what lets the drop hand a full-width slot over to a full-width
+        // thumbnail with no jump in between.
+        let idx = strip.thumbs.len();
+        let slot = self.full_phantom_slot()?;
+        let target = last.merge(slot);
+        let reveal = 1. - (distance_to(target, pos) / last.size.w).clamp(0., 1.);
+        (reveal > 0.).then_some((idx, reveal))
+    }
+
+    /// The slot the row would hold open for an appended workspace, fully revealed — the
+    /// box the drag is aiming at, whatever the reveal happens to be right now.
+    fn full_phantom_slot(&self) -> Option<Rectangle<f64, Logical>> {
+        let phantom = thumbnails::Phantom {
+            idx: self.workspaces.len(),
+            reveal: 1.,
+            emerge: 0.,
+        };
+        Some(self.lay_strip(Some(phantom))?.phantom?.0)
     }
 
     /// Picks up the thumbnail at `idx` for reordering (**divergence**, see

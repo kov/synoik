@@ -4922,6 +4922,10 @@ impl<W: LayoutElement> Layout<W> {
                 // The box the preview was let go at, before `move_.tile` is handed over.
                 let released_rect = move_.tile_render_rect(zoom);
                 let ws_count_before = mon.workspaces.len();
+                // Where the row stands *before* the drop, the held-open slot included: the
+                // row has been still for the whole drag, so this is what it eases away
+                // from once the workspace is real (`Monitor::settle_thumb_phantom`).
+                let strip_before = mon.thumb_positions_now();
 
                 let ws_idx = match insert_ws {
                     InsertWorkspace::Existing(ws_id) => mon
@@ -5061,7 +5065,7 @@ impl<W: LayoutElement> Layout<W> {
                 // The row has been holding a slot open for the workspace this drop might
                 // create; hand it over to the real one, or ease it shut.
                 let created = mon.workspaces.len() != ws_count_before;
-                mon.settle_thumb_phantom(created);
+                mon.settle_thumb_phantom(created, strip_before);
 
                 // Every preview the drop moved eases from where it was to where the
                 // picker now puts it, the dropped one included — it flies from the box it
