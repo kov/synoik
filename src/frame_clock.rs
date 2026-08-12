@@ -123,7 +123,24 @@ impl FrameClock {
         self.last_presentation_time = Some(presentation_time);
     }
 
+    /// When to aim this frame's content at — the next vblank the frame can still reach, which is
+    /// also the time the caller freezes the animation clock at.
     pub fn next_presentation_time(&self) -> Duration {
+        self.next_target(true)
+    }
+
+    /// When the next vblank is due, whatever we can or cannot get done by then.
+    ///
+    /// This is a property of the *display*, so it is what the estimated-vblank fallback timer
+    /// waits on: that timer stands in for a page flip we never made, and pushing it out by what a
+    /// frame would have cost would slow the fallback cadence for a cost no frame is paying.
+    /// [`next_presentation_time`](Self::next_presentation_time) is the one that answers "aim at
+    /// what?" and is allowed to skip a vblank; this one is not.
+    pub fn next_vblank_estimate(&self) -> Duration {
+        self.next_target(false)
+    }
+
+    fn next_target(&self, advance_past_unreachable: bool) -> Duration {
         let mut now = get_monotonic_time();
 
         let Some(refresh_interval_ns) = self.refresh_interval_ns else {
@@ -165,7 +182,11 @@ impl FrameClock {
 
         let refresh_interval = Duration::from_nanos(refresh_interval_ns);
         let target = last_presentation_time + Duration::from_nanos(to_next_ns);
-        self.reachable(target, now, refresh_interval)
+        if advance_past_unreachable {
+            self.reachable(target, now, refresh_interval)
+        } else {
+            target
+        }
     }
 
     /// Advance `target` past any vblank this frame cannot reach, given what recent frames cost.
@@ -295,5 +316,28 @@ mod tests {
         let mut e = RenderTimeEstimate::default();
         e.record(Duration::from_secs(3), REFRESH);
         assert_eq!(e.get(), REFRESH * 3);
+    }
+
+    /// The fallback timer must not inherit the advance. It stands in for a vblank that happens
+    /// whether or not we had anything to put in it, so pacing it by what a frame *would* have
+    /// cost would slow the no-draw cadence — and with `unfinished_animations_remain`, that
+    /// cadence is what ticks the animation.
+    #[test]
+    fn the_vblank_estimate_ignores_what_a_frame_costs() {
+        let mut c = clock();
+        // Seed a last presentation so both paths do real arithmetic rather than returning `now`.
+        c.presented(get_monotonic_time());
+        let unloaded = c.next_vblank_estimate();
+
+        c.record_render_time(REFRESH * 2);
+        assert_eq!(
+            c.next_vblank_estimate(),
+            unloaded,
+            "a slow frame moved the display's own vblank estimate",
+        );
+        assert!(
+            c.next_presentation_time() > unloaded,
+            "…while the frame's target must have moved past the vblank it cannot reach",
+        );
     }
 }

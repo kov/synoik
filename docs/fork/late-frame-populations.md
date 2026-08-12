@@ -247,3 +247,14 @@ Everything here was read from a session running the *old* code. The two landed f
 guards but no live number yet: the next long seat run should show the once-a-minute 3–4 vblank
 misses gone from population 1, and should be read with the accounting caveat above in mind before
 comparing totals.
+
+One consequence of taking only half of mutter's arithmetic, to expect rather than rediscover.
+Mutter's target is self-fulfilling because it *delays dispatch* to `target − max_render_time`: the
+frame queues near the deadline and lands on the vblank it stamped. We advance the target without
+delaying the flip, so the stamp and the landing are decoupled in the other direction too — when the
+estimate overshoots (it is a slow-decaying max over a bimodal cost, so it will) and the frame turns
+out fast, KMS presents it at the *earlier* vblank and its animations were sampled one cycle ahead.
+It is the mirror of the bug being fixed, bounded at two cycles, and it decays by halves within a
+second or two of the slow frame that caused it. In a frame log it shows as headroom going
+*positive*. If it turns out visible on a seat, the fix is deadline-coupling — mutter's other half,
+deliberately not taken above, and the reasoning there is what would have to be revisited.

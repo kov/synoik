@@ -3146,8 +3146,10 @@ fn render_surface_with(
     // We're not expecting a vblank right after this.
     drop(surface.vblank_frame.take());
 
-    // Queue a timer to fire at the predicted vblank time.
-    queue_estimated_vblank_timer(synoik, output.clone(), target_presentation_time);
+    // Queue a timer to fire at the predicted vblank time. Deliberately not
+    // `target_presentation_time`: that one may have been advanced past a vblank the frame could
+    // not have reached, and this timer stands in for the vblank itself.
+    queue_estimated_vblank_timer(synoik, output.clone());
 
     rv
 }
@@ -3197,11 +3199,7 @@ fn compositor_frame_flags(
     flags
 }
 
-fn queue_estimated_vblank_timer(
-    synoik: &mut Synoik,
-    output: Output,
-    target_presentation_time: Duration,
-) {
+fn queue_estimated_vblank_timer(synoik: &mut Synoik, output: Output) {
     let output_state = synoik.output_state.get_mut(&output).unwrap();
     match mem::take(&mut output_state.redraw_state) {
         RedrawState::Idle => unreachable!(),
@@ -3215,7 +3213,10 @@ fn queue_estimated_vblank_timer(
     }
 
     let now = get_monotonic_time();
-    let mut duration = target_presentation_time.saturating_sub(now);
+    let mut duration = output_state
+        .frame_clock
+        .next_vblank_estimate()
+        .saturating_sub(now);
 
     // No use setting a zero timer, since we'll send frame callbacks anyway right after the call to
     // render(). This can happen for example with unknown presentation time from DRM.
