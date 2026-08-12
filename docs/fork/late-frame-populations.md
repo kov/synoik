@@ -53,10 +53,12 @@ Three facts make this diagnosable rather than mysterious:
 This is the [cold-cost class](./first-frame-costs.md): invisible to any steady-state instrument,
 because by construction it never happens twice in a row.
 
-**Fix:** the bar bake is a full-output-width texture holding three text labels — the clock, the
-recording `M:SS`, and the keyboard layout — so *any* of them changing re-rasterizes the entire bar.
-Each label becomes its own small texture, cached on its own content, exactly as the background, the
-pills and the workspace dots already are. The clock tick then re-bakes a clock-sized rect.
+**Fix (landed):** the bar bake was a full-output-width texture holding three text labels — the
+clock, the recording `M:SS`, and the keyboard layout — so *any* of them changing re-rasterized the
+entire bar. Each label is now its own small texture, cached on its own content, exactly as the
+background, the pills and the workspace dots already were. The clock tick re-bakes a clock-sized
+rect. `a_clock_tick_rebakes_only_the_clock` is the guard, counted on bakes rather than pixels
+because a needless re-bake renders identically to a cached one.
 
 Note the neighbour, which had the same shape and was worse: the screen-recording label is `M:SS`, so
 an active recording re-baked the full bar **every second**. Splitting one label and leaving the
@@ -118,10 +120,16 @@ and, on the dispatch-now path, flags the result `is_target_presentation_time = F
 "this is best-effort, not a promise". So the structural fix following mutter is **not** deadline
 dispatch. It is two things:
 
-1. **Pick an achievable target.** Advance the target vblank past any we cannot reach, so the frozen
-   clock matches the frame's real presentation.
-2. **Account honestly.** A best-effort target that slips is not the same event as a promised target
-   that slipped; conflating them inflates the miss count with unavoidable sporadic latency.
+1. **Pick an achievable target** *(landed)*. `FrameClock` now tracks what recent frames cost —
+   mutter's two-tier maximum, a short-term max that rises at once and a long-term max that decays
+   by halves once a second — and advances the target past vblanks that cost cannot reach, bounded
+   at two cycles of advance. The bound matters: aiming further out on one catastrophic frame would
+   jump every animation ahead of what renders, which reads worse than the miss it avoids.
+2. **Account honestly** *(open)*. A best-effort target that slips is not the same event as a
+   promised target that slipped; conflating them inflates the miss count with unavoidable sporadic
+   latency. Note this cuts the other way too — with (1) landed, a frame that aims one cycle out
+   and hits it is no longer counted late, so miss counts before and after this change are not
+   directly comparable.
 
 ## Population 3 — the process is not running
 
@@ -151,7 +159,9 @@ population 2 — they are additive, not the same thing.
 
 ### Keeping the compositor resident
 
-The answer is a systemd drop-in on the compositor unit — not a code change:
+The answer is a systemd drop-in on the compositor unit — not a code change. Applied on this seat,
+live, without a restart (`systemctl --user daemon-reload` re-applies cgroup properties to a running
+unit):
 
 ```ini
 # ~/.config/systemd/user/org.gnome.Shell@user.service.d/memory.conf
@@ -163,6 +173,33 @@ MemoryLow=512M
 unprotected cgroups first and only comes back for this one if it must. That is the right shape here
 — the compositor should be the last thing paged out, not a thing that cannot be paged out.
 
+**There is no `madvise` for this.** The obvious reach is a "don't swap this region" hint, and the
+kernel has no such advice — `madvise` tunes *reclaim order and readahead*, never residency.
+`MADV_WILLNEED` starts readahead on a range, so it can pull pages back, but nothing stops them
+leaving again the moment pressure returns; using it as protection is a treadmill. Residency is
+`mlock`'s job, and `mlock` is the thing with the hazards below.
+
+Two `madvise` uses would nonetheless be real, if we ever want them:
+
+- **`MADV_COLD` / `MADV_PAGEOUT` on what we know is cold** — the inverse move, and the one that
+  actually fits a compositor. Instead of protecting the hot set, volunteer the cold set (a
+  populated-once icon or texture staging cache, an overview bake nobody has opened in an hour) so
+  reclaim takes that and leaves the frame path alone. This needs a page-aligned region we own
+  end-to-end, which today means an arena, not a `HashMap` of `Vec`s.
+- **`MADV_FREE` on caches we can rebuild** — tells the kernel it may drop the pages *without*
+  swapping them, and we fault them back as zeroes and re-bake. Cheaper than a swap round trip for
+  anything reconstructible.
+
+Both share the same blocker, and it is worth stating plainly: `madvise` works on page ranges, and a
+general-purpose allocator interleaves our hot structures with our cold ones inside the same pages.
+"Protect the important data structures" is not expressible until those structures live in their own
+arena. That is a real project, not a flag.
+
+One thing the numbers above do *not* say, and worth keeping straight: `VmSwap` (153 MB) is anonymous
+memory only. The 12 365 major faults also include file-backed pages — the binary's own text, evicted
+from page cache and re-read from disk — and no amount of anon-swap tuning touches those. `mlock` on
+the text segment would; `MemoryLow` helps because it protects the cgroup's page cache too.
+
 Two stronger dials exist and are deliberately not used:
 
 - **`MemorySwapMax=0`** forbids swapping this cgroup outright. It converts memory pressure into an
@@ -172,7 +209,10 @@ Two stronger dials exist and are deliberately not used:
   `LimitMEMLOCK=infinity` (the unit's limit is 8 MB, far under a 130 MB RSS) or `CAP_IPC_LOCK`, and
   `MCL_FUTURE` makes *every future allocation* unswappable — which turns any leak into unkillable
   system-wide pressure. Given [the VMM exhaustion history](./frame-cost-investigation.md), that is a
-  trade this project should not take by default.
+  trade this project should not take by default. If it is ever wanted, `MCL_ONFAULT` alongside it
+  (or `mlock2(MLOCK_ONFAULT)` on a specific range) is the version to reach for: it locks pages as
+  they are actually faulted in rather than pre-faulting and pinning whole mappings, so the locked
+  set is the working set. The `RLIMIT_MEMLOCK` requirement does not go away.
 
 `MemoryLow` does not un-swap the 185 MB already out; the pages come back on demand, or on the next
 restart.
@@ -192,7 +232,18 @@ Two follow-ups, neither in the scope that produced this document:
 
 ## Backlog this leaves
 
-- **The 5.3 ms submit round trip** is now the only lever on population 2, which is 93% of all misses.
+- **The 5.3 ms submit round trip** is now the only lever on population 2, which is 93% of all
+  misses. Nothing above makes those frames arrive sooner — (1) only stops them lying about when
+  they will arrive.
 - The autodump cap and the missing dump IPC, above.
 - Honest miss accounting (population 2, item 2) — distinguishing a best-effort target from a
   promised one in the frame log's tallies.
+- An arena for reconstructible caches, without which the `madvise` options above cannot be
+  expressed at all.
+
+## What is not yet measured
+
+Everything here was read from a session running the *old* code. The two landed fixes have unit
+guards but no live number yet: the next long seat run should show the once-a-minute 3–4 vblank
+misses gone from population 1, and should be read with the accounting caveat above in mind before
+comparing totals.
