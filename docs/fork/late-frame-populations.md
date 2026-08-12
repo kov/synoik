@@ -98,6 +98,14 @@ Our split, for scale: only ~1 008 misses (13%) are 1–2-cycle, i.e. the continu
 deadline dispatch would apply at all. `RedrawState::WaitingForVBlank` already gives that case a full
 refresh interval of headroom.
 
+Deadline dispatch has since landed anyway (`5b7ad854`) — **not** as a fix for anything on this page.
+It cannot reduce a miss count: a frame started at the top of the cycle already had the whole
+interval. What it buys is latency in the continuous case, where the old behaviour finished the frame
+and then sat on it for ~14 ms while input and animation aged. It also closes the ahead-by-one caveat
+at the end of this document, by re-coupling the stamp to the landing. Everything else — the idle
+short-circuit above included — still dispatches immediately, which is the regression bound.
+`SYNOIK_NO_DEADLINE_DISPATCH=1` pins a seat back.
+
 ### What is a real bug here
 
 `Synoik::redraw` freezes the animation clock at a target it then systematically misses:
@@ -243,18 +251,23 @@ Two follow-ups, neither in the scope that produced this document:
 
 ## What is not yet measured
 
-Everything here was read from a session running the *old* code. The two landed fixes have unit
+Everything here was read from a session running the *old* code. The three landed fixes have unit
 guards but no live number yet: the next long seat run should show the once-a-minute 3–4 vblank
 misses gone from population 1, and should be read with the accounting caveat above in mind before
 comparing totals.
 
-One consequence of taking only half of mutter's arithmetic, to expect rather than rediscover.
-Mutter's target is self-fulfilling because it *delays dispatch* to `target − max_render_time`: the
-frame queues near the deadline and lands on the vblank it stamped. We advance the target without
-delaying the flip, so the stamp and the landing are decoupled in the other direction too — when the
-estimate overshoots (it is a slow-decaying max over a bimodal cost, so it will) and the frame turns
-out fast, KMS presents it at the *earlier* vblank and its animations were sampled one cycle ahead.
-It is the mirror of the bug being fixed, bounded at two cycles, and it decays by halves within a
-second or two of the slow frame that caused it. In a frame log it shows as headroom going
-*positive*. If it turns out visible on a seat, the fix is deadline-coupling — mutter's other half,
-deliberately not taken above, and the reasoning there is what would have to be revisited.
+The ahead-by-one caveat this section used to carry is now mostly closed, and it is worth recording
+what it *was*, because the shape recurs. Mutter's target is self-fulfilling because it delays
+dispatch to `target − max_render_time`: the frame queues near the deadline and lands on the vblank
+it stamped. Advancing the target *without* delaying the flip decouples the stamp from the landing in
+the other direction — when the estimate overshoots (a slow-decaying max over a bimodal cost, so it
+will) and the frame turns out fast, KMS presents it at the *earlier* vblank with animations sampled
+one cycle ahead. In a frame log that shows as headroom going *positive*. Deadline dispatch removes
+it in the continuous case by construction. It survives in the dispatch-now cases, which keep the
+advance and not the delay — bounded at two cycles, decaying by halves within a second or two of the
+slow frame that caused it.
+
+What to watch on the first seat run with deadline dispatch, since it is the change that spends
+margin: headroom p50 should tighten from about a full refresh interval toward estimate + 1 ms, the
+`aim` histogram should be unchanged or better, and the miss count must not regress. Client pacing
+shifts under it, so ghost's re-present watchdog is the canary for having got it wrong.
