@@ -2036,6 +2036,8 @@ impl FrameLog {
             autodumps: self.autodumps,
             dumps: self.dumps,
             stalls: self.loop_watch.stalls,
+            deadline_dispatch: crate::frame_clock::deadline_dispatch_enabled(),
+            deadline_margin_ms: crate::frame_clock::render_time_margin_now().as_secs_f64() * 1000.,
             outputs: self
                 .lifetime
                 .iter()

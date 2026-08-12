@@ -603,6 +603,14 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
             }
             println!("  Dumps written: {}", perf.dumps);
             println!("  Main-loop stalls: {}", perf.stalls);
+            if perf.deadline_dispatch {
+                println!(
+                    "  Dispatch: at the deadline, {}ms margin",
+                    perf.deadline_margin_ms
+                );
+            } else {
+                println!("  Dispatch: immediately");
+            }
 
             for out in &perf.outputs {
                 println!();

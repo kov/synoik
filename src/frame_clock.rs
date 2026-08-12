@@ -53,13 +53,13 @@ pub fn render_time_margin_now() -> Duration {
 /// `SYNOIK_DEADLINE_DISPATCH=1` starts a session with it on, and [`set_deadline_dispatch`] flips it
 /// at runtime.
 ///
-/// **Off by default because it measured worse.** On a seat under a continuous 60 fps client, at the
-/// 1 ms margin below, dropped frames ran 0.33% against a 0.03% baseline — reproduced three times,
-/// on two hosts. Widening the margin recovers most of that, but not demonstrably all of it, and it
-/// spends the very latency the feature exists for. What it buys — sampling input and animation
-/// closer to the photons — is real and *not* measurable with frame-perf, and it cannot lower a miss
-/// count by construction. Until there is an input-to-photon number to weigh against the drops, the
-/// safe default wins. `docs/fork/late-frame-populations.md` has the sweeps.
+/// **Off by default because it measured worse at the margin mutter uses.** On a seat under a
+/// continuous 60 fps client, at the 1 ms margin below, dropped frames ran 0.33% against a 0.042%
+/// baseline — reproduced three times, on two hosts. Widening the margin to 6–8 ms recovers it
+/// completely, but spends most of the latency the feature exists for, and what it buys — sampling
+/// input and animation closer to the photons — is real and *not* measurable with frame-perf. So
+/// turning this on is waiting on an input-to-photon number, not on another drop-rate sweep.
+/// `docs/fork/late-frame-populations.md` has both sweeps and the label-inversion trap in them.
 ///
 /// Runtime-switchable rather than read once, because measuring it needs an A/B *within* one
 /// session: comparing two logins compares two different sets of background work, and on the first

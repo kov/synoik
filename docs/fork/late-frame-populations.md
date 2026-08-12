@@ -123,36 +123,41 @@ by either setting.
 **The host was inflating the control, not the treatment.** Re-run after a VMM deploy quieted the
 host, as a margin sweep — eight 60 s blocks, every treatment block between two baselines:
 
-Two sweeps, sixteen blocks, ~58 000 frames, pooled:
+Two sweeps, sixteen blocks, ~58 000 frames. Arms below are the ones the **journal** confirms, not
+the ones the script labelled — see the trap at the end of this section:
 
 | margin | drops / frames | rate |
 | --- | --- | --- |
-| off (8 blocks) | 9 / 28 793 | **0.031%** |
+| off (8 blocks) | 12 / 28 795 | 0.042% |
 | 1 ms | 12 / 3 588 | **0.33%** |
 | 2 ms | 4 / 3 596 | 0.11% |
-| 4 ms | 5 / 7 195 | 0.07% |
-| 6 ms | 6 / 3 595 | 0.17% |
-| 8 ms | 5 / 7 195 | 0.07% |
+| 4 ms | 5 / 3 595 | 0.14% |
+| 6 ms | 1 / 3 599 | 0.028% |
+| 8 ms | 7 / 14 392 | 0.049% |
 
-**One point here is solid and the rest is noise.** 1 ms sits an order of magnitude above baseline
-and has now reproduced at 0.33% three times, on two hosts of very different quietness — that is the
-regression, and it is real. Everything at 2 ms and wider lands in a band the method cannot resolve:
-the first sweep read 12 → 4 → 5 → 0 and looked like a clean dose-response, the second read
-5 → 6 → 0 for 8/6/4 ms and put *six* drops in a baseline block, and the baseline floor itself moved
-between sweeps (0.007% → 0.056%). Pooled, held-with-a-wide-margin is 20/21 581 (0.093%) against
-9/28 793 (0.031%) — about 3x, on counts small enough that a Poisson test only just clears p≈0.02.
+It is a **dose-response that reaches parity**. 1 ms runs 8x the baseline and has reproduced at
+0.33% three times, on two hosts of very different quietness — that regression is real. 2 and 4 ms
+sit ~3x baseline on counts small enough to be worth little (p≈0.06 and p≈0.02). 6 and 8 ms are
+indistinguishable from not holding the frame at all, over 18 000 frames of held arm.
 
-So: do not quote a best margin from this. What the data supports is that 1 ms is too tight on this
-stack — plausibly because it stands in for mutter's vblank duration *and* a hardware deadline timer,
-where ours is an event-loop timer whose wakeup on this VM is itself worth milliseconds — and that
-2 ms and wider is *at worst* a small residual regression. Resolving 0.09% from 0.03% needs blocks
-measured in tens of minutes, not one.
+What the extra milliseconds pay for is everything mutter gets and we do not: the display's vblank
+duration, and a hardware deadline timer where ours is an event-loop timer whose wakeup on this VM is
+itself worth milliseconds. That is also why the number is so much larger than mutter's 1 ms.
 
-The cost of a wide margin is the latency the feature exists for. Releasing at
-`vblank − (estimate + 8 ms)` starts the frame ~5 ms after the previous presentation rather than
-immediately — a fraction of the freshness a 1–2 ms margin samples, though still ahead of dispatching
-now. Whether that residue is worth a code path cannot be settled with frame-perf, which has no
-input-to-photon number; that measurement is the actual prerequisite for turning this on.
+The cost is the latency the feature exists for. Releasing at `vblank − (estimate + 8 ms)` starts the
+frame ~5 ms after the previous presentation instead of immediately — a fraction of the freshness a
+1 ms margin samples, though still ahead of dispatching now. Whether that residue is worth a code
+path cannot be settled with frame-perf, which has no input-to-photon number. **That measurement is
+the prerequisite for turning this on**, not another drop-rate sweep.
+
+**The trap that nearly buried this.** The second sweep inherited a session the first had left
+*holding* frames, while its own state tracker assumed the shipped default — so every toggle landed
+backwards and all eight arms were inverted. Read naively it said the dose-response was noise (six
+drops in a "baseline" block that was really an 8 ms held block). The journal's
+`deadline dispatch is now …` lines were the only ground truth, and they are what the table above is
+built from. `msg frame-perf` now reports `Dispatch:` and the live margin for exactly this reason: a
+block that labels itself from what the script believes it set is one dropped toggle from inverting
+its own conclusion. **Take the arm from the sample, never from the script.**
 
 So the acceptance criterion at the bottom of this page — "the miss count must not regress" — is not
 met, and `SYNOIK_DEADLINE_DISPATCH=1` (or `debug-toggle-deadline-dispatch`) is now what turns it on

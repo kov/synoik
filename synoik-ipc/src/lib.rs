@@ -269,6 +269,16 @@ pub struct FramePerf {
     pub dumps: u64,
     /// Turns of the event loop that spent significant time outside the frame path.
     pub stalls: u64,
+    /// Whether continuous frames are being held until their dispatch deadline, and the slack the
+    /// deadline is computed with.
+    ///
+    /// Reported because these are runtime-switchable, and an A/B that labels its own blocks from
+    /// what it *believes* it set is one dropped toggle away from inverting its own result. That
+    /// happened: a sweep inherited a session already holding frames, and every arm came out
+    /// backwards. A sample that carries the live setting cannot lie about which arm it is.
+    pub deadline_dispatch: bool,
+    /// Deadline slack in milliseconds. Meaningless while `deadline_dispatch` is false.
+    pub deadline_margin_ms: f64,
     /// Per-output tallies.
     pub outputs: Vec<FramePerfOutput>,
 }
