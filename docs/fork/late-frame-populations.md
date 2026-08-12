@@ -1,0 +1,198 @@
+# Late frames come in three populations
+
+A session's `missed N vblank(s)` lines are not one phenomenon. Read from a 6-hour live seat run on
+2026-08-12 (pid 3079, 196 458 frames, 7 854 late presentations), they separate cleanly into three
+populations with three different causes, three different owners, and three different fixes. Sorting
+a late-frame report into these buckets *before* theorising is the point of this document — two of
+the three are not renderer bugs at all, and one of them is not even ours.
+
+The instruments: `synoik msg frame-perf` for the tallies, `SIGUSR1` for a ring dump
+(`src/utils/signals.rs`, non-terminating — it is the only way to get the ring out of a live session,
+see [the instrument gap](#the-instrument-gap) below), and the journal for the `main loop busy` lines.
+
+## How to tell them apart
+
+The miss line carries the discriminator. `N cycles since the last flip` says what the screen was
+doing, and `queued X ms LATE` says how badly we were beaten:
+
+| population | signature | share | cause | owner |
+|---|---|---|---|---|
+| **1. cold bake** | `3600 cycles`, 3–4 vblanks, `queued 30–50 ms LATE` | 236 events (1/min) | the full-bar panel bake, cold | ours, fixable |
+| **2. sporadic submit** | `3–10 cycles`, 1 vblank, `queued 0.3–4 ms LATE` | 7 242 of 7 778 | our submit round trip | ours, cost not scheduling |
+| **3. descheduled** | any, wide, correlated with `main loop busy` | 1 432 stalls | host memory pressure | environmental |
+
+## Population 1 — the minute clock tick re-bakes the whole panel bar
+
+Bake sites over the whole ring (65 536 entries, ~4 h):
+
+| site | bakes | total |
+|---|---|---|
+| `ui/panel.rs` bar chrome | 236 | **12 426 ms** |
+| `ui/switcher/ui.rs` | 4 | 8.9 ms |
+| `ui/panel.rs` (other) | 2 | 2.9 ms |
+
+Per bake: **min 0.9 ms, p50 60.7 ms, p90 91.8 ms, p99 311 ms, max 469 ms.** One per minute, forever,
+on an otherwise idle desktop, to change a clock digit. A representative idle-minute frame:
+
+```
+frame took 38.36ms — collect 34.50ms submit 3.74ms ... 30 draws covering 0.1x the output,
+waiting 37.54ms (first offscreen 33.94ms), 1 bakes in 34.08ms (ui/panel.rs bar chrome)
+missed 3 vblank(s): presented 53.70ms late, 3599 cycles since the last flip
+```
+
+Three facts make this diagnosable rather than mysterious:
+
+- **`min 0.9 ms` is the same bake, warm.** A p50 sixty times the minimum is not a slow bake, it is a
+  *cold* one. The once-a-minute cadence guarantees the path is cold at every single use.
+- **`0.1x the output` in 30 draws.** The work is trivial. The cost is the round trip, and the buffer
+  allocation, and whatever the driver had paged out.
+- **`collect 34.50ms` with `submit 3.74ms`.** The time is inside `collect`, i.e. inside the bake,
+  not in the frame's own submit. `widget::bake_uncached_sized` says so itself: "each one is a render
+  pass, a submit and a fence wait".
+
+This is the [cold-cost class](./first-frame-costs.md): invisible to any steady-state instrument,
+because by construction it never happens twice in a row.
+
+**Fix:** the bar bake is a full-output-width texture holding three text labels — the clock, the
+recording `M:SS`, and the keyboard layout — so *any* of them changing re-rasterizes the entire bar.
+Each label becomes its own small texture, cached on its own content, exactly as the background, the
+pills and the workspace dots already are. The clock tick then re-bakes a clock-sized rect.
+
+Note the neighbour, which had the same shape and was worse: the screen-recording label is `M:SS`, so
+an active recording re-baked the full bar **every second**. Splitting one label and leaving the
+others would have left a latent version of the same bug.
+
+## Population 2 — sporadic updates lose to our own submit cost
+
+7 242 of 7 778 misses are exactly one vblank, after a 3–10 cycle gap, `queued` only 0.3–4 ms late
+(mode 1–2 ms). The frames immediately preceding them:
+
+```
+n=5530   mean took 5.64ms — elements 0.03  collect 0.18  submit 5.29
+```
+
+**94% of it is `submit`.** Not our CPU work — the venus round trip. The median drawing frame is
+1–4 ms; the ones that miss average 5.6 ms. Damage arrives at a random phase in the refresh cycle,
+we render immediately, and whenever less than ~5.6 ms remained we land one vblank later.
+
+### What mutter does here, and what it does not
+
+It is tempting to call this a scheduling bug and reach for mutter's `max_render_time`. **That is
+wrong, and mutter's own source says so.** `clutter_frame_clock_estimate_max_update_time_us` and
+`calculate_next_update_time_us` (`clutter/clutter/clutter-frame-clock.c:857-1090`, 50.3) do compute
+a render-time estimate and dispatch at `next_presentation − max_update_time` — but only when the
+clock is in the *continuous* case. `should_update_now` (`:976-1023`) short-circuits all of it:
+
+> There was an idle period since the last presentation, so there seems be no constantly updating
+> actor. In this case it's best to start working on the next update ASAP, this results in lowest
+> average latency for sporadic user input.
+
+A 3–10 cycle gap **is** that idle period. Mutter dispatches immediately, exactly as we do, and
+accepts the same one-vblank landing. Waiting for a deadline would guarantee the later vblank *and*
+add latency. Our behaviour in this population already matches GNOME's; the only lever on it is the
+5.3 ms submit itself.
+
+Our split, for scale: only ~1 008 misses (13%) are 1–2-cycle, i.e. the continuous case where
+deadline dispatch would apply at all. `RedrawState::WaitingForVBlank` already gives that case a full
+refresh interval of headroom.
+
+### What is a real bug here
+
+`Synoik::redraw` freezes the animation clock at a target it then systematically misses:
+
+```rust
+let target_presentation_time = state.frame_clock.next_presentation_time();
+self.clock.set_unadjusted(target_presentation_time);
+```
+
+`FrameClock::next_presentation_time` returns the *next* vblank boundary unconditionally. In this
+population we cannot reach it, so every such frame samples its animations ~16.67 ms stale. Mutter
+does not have this problem: it pushes the target forward to one it can actually hit,
+
+```c
+while (next_presentation_time_us - min_update_time_estimate_us < now_us)
+  next_presentation_time_us += refresh_interval_us;
+```
+
+and, on the dispatch-now path, flags the result `is_target_presentation_time = FALSE` — an explicit
+"this is best-effort, not a promise". So the structural fix following mutter is **not** deadline
+dispatch. It is two things:
+
+1. **Pick an achievable target.** Advance the target vblank past any we cannot reach, so the frozen
+   clock matches the frame's real presentation.
+2. **Account honestly.** A best-effort target that slips is not the same event as a promised target
+   that slipped; conflating them inflates the miss count with unavoidable sporadic latency.
+
+## Population 3 — the process is not running
+
+1 432 `main loop busy` warnings, and the split inside them is the whole finding:
+
+```
+mean 112.47ms total — 7.81ms of CPU, 104.66ms not running (frame CPU 0.22ms)
+worst: 3150.38ms outside the frame path (10.58ms of CPU, 3139.80ms not running)
+```
+
+85% are not-running-majority; 93% of the aggregate stall time is wall-clock with no CPU behind it.
+`blocked = wall − thread CPU` (`frame_log.rs`, `loop_turn_end`), so it covers both deschedule and
+blocking syscalls — including major faults. The corroborating numbers, all from the same seat:
+
+- synoik held **153 MB swapped out against 129 MB resident**, with 12 365 major faults;
+- its cgroup: `memory.current` 204 MB, `memory.swap.current` 185 MB;
+- firefox and its content processes held ~1.5 GB of swap on an 8 GB VM;
+- the worst hour (4 178 misses, vs 200–1 300 in the others) is also the worst stall hour (532);
+- `ghost::render: forced a foreground re-present (watchdog: suspected stale frame)` fired 173 times
+   — a client independently noticing that presentation was late.
+
+`steal 0` in `/proc/stat` is not evidence against host contention; this hypervisor does not report
+steal. The swap and major-fault counters are the evidence.
+
+Only 27% of the missed-by-one seconds contain a stall, so this population does not explain
+population 2 — they are additive, not the same thing.
+
+### Keeping the compositor resident
+
+The answer is a systemd drop-in on the compositor unit — not a code change:
+
+```ini
+# ~/.config/systemd/user/org.gnome.Shell@user.service.d/memory.conf
+[Service]
+MemoryLow=512M
+```
+
+`MemoryLow` is reclaim *protection*, not a guarantee: under pressure the kernel reclaims from
+unprotected cgroups first and only comes back for this one if it must. That is the right shape here
+— the compositor should be the last thing paged out, not a thing that cannot be paged out.
+
+Two stronger dials exist and are deliberately not used:
+
+- **`MemorySwapMax=0`** forbids swapping this cgroup outright. It converts memory pressure into an
+  OOM kill of the compositor, which on this unit already carries `oom_score_adj=100`. A hard cliff
+  in place of a soft one.
+- **`mlockall(MCL_CURRENT|MCL_FUTURE)`** is the literal "unswappable". It needs
+  `LimitMEMLOCK=infinity` (the unit's limit is 8 MB, far under a 130 MB RSS) or `CAP_IPC_LOCK`, and
+  `MCL_FUTURE` makes *every future allocation* unswappable — which turns any leak into unkillable
+  system-wide pressure. Given [the VMM exhaustion history](./frame-cost-investigation.md), that is a
+  trade this project should not take by default.
+
+`MemoryLow` does not un-swap the 185 MB already out; the pages come back on demand, or on the next
+restart.
+
+## The instrument gap
+
+`AUTODUMP_MAX = 20` in `frame_log.rs` is a **lifetime** cap. In this session it was exhausted at
+08:06, hours before the worst window at 12:00 — the flight recorder went blind exactly when the
+session got interesting, and there is no IPC command to dump on demand. `kill -USR1` saved the run
+this time, but that requires knowing the signal exists.
+
+Two follow-ups, neither in the scope that produced this document:
+
+- make the cap a **rate** (per hour) rather than a lifetime total, so a long session stays
+  instrumented;
+- add a `msg frame-perf dump` so the ring can be taken without signalling the compositor.
+
+## Backlog this leaves
+
+- **The 5.3 ms submit round trip** is now the only lever on population 2, which is 93% of all misses.
+- The autodump cap and the missing dump IPC, above.
+- Honest miss accounting (population 2, item 2) — distinguishing a best-effort target from a
+  promised one in the frame log's tallies.
