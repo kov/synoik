@@ -885,6 +885,45 @@ struct LoopWatch {
     stalls: u64,
 }
 
+/// Upper edges, in microseconds, of the [`DispatchLateness`] buckets; the last bucket
+/// collects everything beyond the final edge.
+///
+/// Spaced to answer one question: is a released frame late by *scheduling* amounts
+/// (tens of microseconds — a timerfd wakeup) or by *milliseconds* (the loop was busy,
+/// or the vCPU was not running). The margin sweeps needed 6-8ms of slack to reach
+/// parity, and the difference between those two explanations is the difference between
+/// a 50-line timer source and a new event loop.
+const LATENESS_EDGES_US: [u64; 7] = [100, 250, 500, 1_000, 2_000, 4_000, 8_000];
+
+/// How late a deadline-dispatched frame actually started, against the moment it was
+/// armed for.
+///
+/// Measured on *every* held frame, not only the ones that then missed: "queued N ms
+/// LATE" prints on a miss, and a sample conditioned on missing is exactly the sample
+/// that cannot tell you how often release is punctual.
+#[derive(Debug, Default)]
+struct DispatchLateness {
+    /// Counts per bucket, edges from [`LATENESS_EDGES_US`], plus one overflow bucket.
+    buckets: [u64; LATENESS_EDGES_US.len() + 1],
+    count: u64,
+    total: Duration,
+    worst: Duration,
+}
+
+impl DispatchLateness {
+    fn record(&mut self, lateness: Duration) {
+        let us = lateness.as_micros() as u64;
+        let bucket = LATENESS_EDGES_US
+            .iter()
+            .position(|edge| us < *edge)
+            .unwrap_or(LATENESS_EDGES_US.len());
+        self.buckets[bucket] += 1;
+        self.count += 1;
+        self.total += lateness;
+        self.worst = self.worst.max(lateness);
+    }
+}
+
 /// Largest presentation gap [`Stats::cadence`] counts on its own; anything longer
 /// lands in this bucket. Four cycles is 67ms at 60Hz — well past "a hitch".
 const CADENCE_MAX: usize = 4;
@@ -1167,6 +1206,9 @@ pub struct FrameLog {
     autodumps: u64,
     /// Watches for time the compositor thread spent outside the frame path.
     loop_watch: LoopWatch,
+    /// How punctually deadline-dispatched frames were released. Empty unless deadline
+    /// dispatch is on, since nothing else has a scheduled start to be late against.
+    lateness: DispatchLateness,
     /// Per-output tallies since the session started, never reset.
     ///
     /// [`Stats`] is cleared on every summary, which makes it useless for the question
@@ -1267,6 +1309,7 @@ impl FrameLog {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lateness: DispatchLateness::default(),
             lifetime: HashMap::new(),
         }
     }
@@ -2027,6 +2070,17 @@ impl FrameLog {
     /// arm an instrument, and until now the only way to ask "has this session been
     /// stuttering" was to find every summary line in the journal since login and add
     /// them up. This answers it in one call, days later, from the running process.
+    /// Record how late a deadline-dispatched frame was released, against the moment the
+    /// deadline was armed for.
+    ///
+    /// This is the number that decides what the deadline margin is really paying for.
+    /// Release lateness in the tens of microseconds is a punctual timer, and a margin
+    /// wider than that is buying something else — loop occupancy, or a vCPU that was not
+    /// running. Milliseconds here would mean the wakeup itself is the cost.
+    pub fn record_dispatch_lateness(&mut self, lateness: Duration) {
+        self.lateness.record(lateness);
+    }
+
     pub fn perf_snapshot(&self) -> synoik_ipc::FramePerf {
         synoik_ipc::FramePerf {
             enabled: self.is_enabled(),
@@ -2036,6 +2090,15 @@ impl FrameLog {
             autodumps: self.autodumps,
             dumps: self.dumps,
             stalls: self.loop_watch.stalls,
+            held_frames: self.lateness.count,
+            lateness_mean_ms: if self.lateness.count == 0 {
+                0.
+            } else {
+                self.lateness.total.as_secs_f64() * 1000. / self.lateness.count as f64
+            },
+            lateness_worst_ms: self.lateness.worst.as_secs_f64() * 1000.,
+            lateness_buckets: self.lateness.buckets.to_vec(),
+            lateness_edges_us: LATENESS_EDGES_US.to_vec(),
             deadline_dispatch: crate::frame_clock::deadline_dispatch_enabled(),
             deadline_margin_ms: crate::frame_clock::render_time_margin_now().as_secs_f64() * 1000.,
             outputs: self
@@ -2449,6 +2512,25 @@ mod tests {
 
     use super::*;
 
+    /// A sample lands in the bucket for the first edge it is *under*, and the tail has
+    /// somewhere to go — an overflowing sample silently dropped would make a loop that
+    /// wakes up 20ms late look punctual.
+    #[test]
+    fn lateness_buckets_by_first_edge_above_it() {
+        let mut l = DispatchLateness::default();
+        l.record(Duration::from_micros(40)); // < 100
+        l.record(Duration::from_micros(100)); // the edge itself is not "under" it
+        l.record(Duration::from_micros(7_999)); // < 8000, the last edge
+        l.record(Duration::from_millis(20)); // overflow
+
+        assert_eq!(l.buckets[0], 1, "40us is under the first edge");
+        assert_eq!(l.buckets[1], 1, "100us is not under 100us");
+        assert_eq!(l.buckets[LATENESS_EDGES_US.len() - 1], 1);
+        assert_eq!(l.buckets[LATENESS_EDGES_US.len()], 1, "the tail is kept");
+        assert_eq!(l.count, 4);
+        assert_eq!(l.worst, Duration::from_millis(20));
+    }
+
     /// The env-var grammar, since it is the only interface this has.
     #[test]
     fn parses_the_documented_forms() {
@@ -2778,6 +2860,7 @@ mod tests {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lateness: DispatchLateness::default(),
             lifetime: HashMap::new(),
         }
     }
@@ -3549,6 +3632,7 @@ mod tests {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lateness: DispatchLateness::default(),
             lifetime: HashMap::new(),
         };
         let dropped = |log: &FrameLog| log.stats.get("out").map_or(0, |s| s.dropped);
@@ -3598,6 +3682,7 @@ mod tests {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lateness: DispatchLateness::default(),
             lifetime: HashMap::new(),
         };
         for i in 0..5 {
@@ -3634,6 +3719,7 @@ mod tests {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lateness: DispatchLateness::default(),
             lifetime: HashMap::new(),
         };
 
@@ -3680,6 +3766,7 @@ mod tests {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lateness: DispatchLateness::default(),
             lifetime: HashMap::new(),
         };
 
@@ -3733,6 +3820,7 @@ mod tests {
             last_autodump: None,
             autodumps: 0,
             loop_watch: LoopWatch::default(),
+            lateness: DispatchLateness::default(),
             lifetime: HashMap::new(),
         };
         let headroom = |log: &FrameLog| {

@@ -603,6 +603,28 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
             }
             println!("  Dumps written: {}", perf.dumps);
             println!("  Main-loop stalls: {}", perf.stalls);
+            if perf.held_frames > 0 {
+                println!(
+                    "  Release lateness: mean {:.2}ms, worst {:.2}ms over {} held frames",
+                    perf.lateness_mean_ms, perf.lateness_worst_ms, perf.held_frames
+                );
+                let mut parts = Vec::new();
+                for (i, count) in perf.lateness_buckets.iter().enumerate() {
+                    if *count == 0 {
+                        continue;
+                    }
+                    match perf.lateness_edges_us.get(i) {
+                        Some(edge) => parts.push(format!("<{}us x{count}", edge)),
+                        None => match perf.lateness_edges_us.last() {
+                            Some(last) => parts.push(format!(">={}us x{count}", last)),
+                            None => parts.push(format!("x{count}")),
+                        },
+                    }
+                }
+                if !parts.is_empty() {
+                    println!("    {}", parts.join("  "));
+                }
+            }
             if perf.deadline_dispatch {
                 println!(
                     "  Dispatch: at the deadline, {}ms margin",

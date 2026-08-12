@@ -11089,6 +11089,11 @@ impl Synoik {
         // Freeze the clock at the target time.
         self.clock.set_unadjusted(target_presentation_time);
 
+        if let Some(scheduled_at) = aim.scheduled_at {
+            self.frame_log
+                .record_dispatch_lateness(redraw_start.saturating_sub(scheduled_at));
+        }
+
         self.frame_log.begin(&output.name());
         self.frame_log.phase(Phase::Elements);
         self.update_render_elements(Some(output));

@@ -269,6 +269,21 @@ pub struct FramePerf {
     pub dumps: u64,
     /// Turns of the event loop that spent significant time outside the frame path.
     pub stalls: u64,
+    /// Deadline-dispatched frames released so far, i.e. the sample size behind the lateness
+    /// numbers below. Zero unless deadline dispatch has been on.
+    pub held_frames: u64,
+    /// Mean and worst release lateness — how long after its armed deadline a held frame
+    /// actually started — in milliseconds.
+    ///
+    /// This is what says whether a wide deadline margin is paying for timer imprecision or for
+    /// something the timer cannot fix, like a busy loop or a descheduled vCPU.
+    pub lateness_mean_ms: f64,
+    /// The worst single release, in milliseconds.
+    pub lateness_worst_ms: f64,
+    /// Release lateness bucketed by `lateness_edges_us`, with one extra overflow bucket.
+    pub lateness_buckets: Vec<u64>,
+    /// Upper edges, in microseconds, of `lateness_buckets`.
+    pub lateness_edges_us: Vec<u64>,
     /// Whether continuous frames are being held until their dispatch deadline, and the slack the
     /// deadline is computed with.
     ///
