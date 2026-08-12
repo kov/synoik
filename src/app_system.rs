@@ -419,10 +419,12 @@ impl AppSystem {
     /// reload, the way gnome-shell's `ShellAppCache` does. (GNOME also runs the
     /// enumeration itself off-thread; we do not, yet.)
     ///
-    /// Returns whether the enumeration actually differs from the one it replaces.
-    /// A ping is not proof of a change — glib's monitors fire for any write under a
-    /// watched directory, and one arrives shortly after startup on a catalog that is
-    /// already loaded — so the caller can skip re-deriving everything downstream.
+    /// Returns whether the enumeration actually differs from the one it replaces. Note that a ping
+    /// is not proof of a change — glib's monitors fire for any write under a watched directory, and
+    /// one arrives shortly after startup on a catalog that is already loaded. `reload_app_catalog`
+    /// used to gate its downstream on this; it no longer does (see its doc for why), so nothing but
+    /// the tests reads the return today. It is kept because "did this ping change anything" is the
+    /// question those tests exist to ask.
     pub fn refresh(&mut self) -> bool {
         let installed = self.catalog.enumerate();
         let changed = installed != self.installed;

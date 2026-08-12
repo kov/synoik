@@ -13562,10 +13562,19 @@ impl Synoik {
             });
         }
 
+        // Resolve the favorites *once*. `is_favorite` re-resolves every stored id through GIO on
+        // each call, so asking it per installed app is O(installed x favorites) desktop-file
+        // parses — 752 of them on a 94-app catalog, which is 25 of this function's 28 ms.
+        let favorites: HashSet<String> = self
+            .app_system
+            .favorites()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
         let mut entries: Vec<AppGridEntry> = self
             .app_system
             .installed()
-            .filter(|e| !self.app_system.is_favorite(&e.id) && !inside_folders.contains(&e.id))
+            .filter(|e| !favorites.contains(&e.id) && !inside_folders.contains(&e.id))
             .map(|e| AppGridEntry {
                 id: e.id.clone(),
                 name: e.name.clone(),
@@ -13664,17 +13673,23 @@ impl Synoik {
     }
 
     /// Re-read the app catalog and everything derived from it.
+    ///
+    /// Runs the downstream **unconditionally**, so a `touch` on any watched `.desktop` is a usable
+    /// "reload now" trigger even when the enumeration is unchanged. This used to early-return on an
+    /// identical enumeration, for a reason that has since stopped being true: dropping the icon
+    /// caches once blanked every dash and grid tile until the off-thread decodes landed, and
+    /// `AppIconCache::invalidate` now *demotes* buffers to `stale` and keeps serving the old pixels
+    /// until each replacement arrives (`render_helpers/icon.rs`), with the uploads dropped per icon
+    /// as it lands. `a_ping_on_an_unchanged_catalog_keeps_the_dash_icons` pins that.
+    ///
+    /// What is left is cost, and it is small: `perf_probe_what_does_an_app_catalog_reload_cost`
+    /// prices the downstream at ~1.2 ms on a 94-app catalog with the overview and app grid open,
+    /// against the ~7 ms `refresh()` enumeration that both the old and new shapes pay anyway. The
+    /// spurious glib ping that lands a few seconds into every session therefore costs ~1 ms, not a
+    /// visible flicker. Note that ~1.2 ms is *after* hoisting the favorites resolve out of
+    /// `sync_app_grid`'s per-app filter; before that, this function took 33 ms.
     pub(crate) fn reload_app_catalog(&mut self) {
-        if !self.app_system.refresh() {
-            // Same catalog: everything below is a no-op *except* the cache clearing,
-            // which is destructive. Icons are re-decoded off-thread, so dropping them
-            // blanks every dash and grid tile until the worker catches up — and the
-            // `queue_redraw_all()` at the end guarantees a frame is drawn in that gap.
-            // glib's monitors ping for any write under a watched directory and one
-            // lands a few seconds into every session, which is what made the dash
-            // flicker once, ~6s after startup, with nothing happening.
-            return;
-        }
+        self.app_system.refresh();
         // A newly installed app's icon (or a cached negative) may now resolve. The
         // cache keeps serving the old pixels until each replacement decode lands, and
         // the uploads are dropped per icon at that point — so nothing blanks here.
