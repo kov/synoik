@@ -1712,6 +1712,7 @@ impl Tty {
             RedrawState::WaitingForVBlank { redraw_needed } => redraw_needed,
             state @ (RedrawState::Idle
             | RedrawState::Queued
+            | RedrawState::ScheduledDispatch { .. }
             | RedrawState::WaitingForEstimatedVBlank(_)
             | RedrawState::WaitingForEstimatedVBlankAndQueued(_)) => {
                 // This is an error!() because it shouldn't happen, but on some systems it somehow
@@ -1821,6 +1822,7 @@ impl Tty {
         match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
             RedrawState::Idle => unreachable!(),
             RedrawState::Queued => unreachable!(),
+            RedrawState::ScheduledDispatch { .. } => unreachable!(),
             RedrawState::WaitingForVBlank { .. } => unreachable!(),
             RedrawState::WaitingForEstimatedVBlank(_) => (),
             // The timer fired just in front of a redraw.
@@ -3114,6 +3116,7 @@ fn render_surface_with(
                         match mem::replace(&mut output_state.redraw_state, new_state) {
                             RedrawState::Idle => unreachable!(),
                             RedrawState::Queued => (),
+                            RedrawState::ScheduledDispatch { .. } => unreachable!(),
                             RedrawState::WaitingForVBlank { .. } => unreachable!(),
                             RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
                             RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
@@ -3204,6 +3207,7 @@ fn queue_estimated_vblank_timer(synoik: &mut Synoik, output: Output) {
     match mem::take(&mut output_state.redraw_state) {
         RedrawState::Idle => unreachable!(),
         RedrawState::Queued => (),
+        RedrawState::ScheduledDispatch { .. } => unreachable!(),
         RedrawState::WaitingForVBlank { .. } => unreachable!(),
         RedrawState::WaitingForEstimatedVBlank(token)
         | RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {

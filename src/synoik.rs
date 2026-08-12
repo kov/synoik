@@ -136,7 +136,7 @@ use crate::dbus::freedesktop_login1::Login1ToSynoik;
 use crate::dbus::gnome_shell_introspect::{self, IntrospectToSynoik, SynoikToIntrospect};
 use crate::dbus::gnome_shell_screenshot::{ScreenshotToSynoik, SynoikToScreenshot};
 use crate::dbus::system_status::SystemStatusToSynoik;
-use crate::frame_clock::FrameClock;
+use crate::frame_clock::{Dispatch, FrameClock};
 use crate::frame_log::{AnimCauses, FrameContext, FrameLog, Phase};
 use crate::gnome::{AccelGrab, GnomeSettings, GnomeSettingsWriter};
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
@@ -1207,6 +1207,13 @@ pub struct OutputState {
     pub global: GlobalId,
     pub frame_clock: FrameClock,
     pub redraw_state: RedrawState,
+    /// Set by a fired dispatch deadline, taken by the redraw it was armed for.
+    ///
+    /// The aim belongs to the *decision*, not to the moment the redraw happens: recomputing the
+    /// target after waiting until `boundary − estimate` would land one microsecond past the point
+    /// where [`FrameClock::next_presentation_time`] gives up on that vblank, so every
+    /// deadline-dispatched frame would aim a cycle late.
+    pub pending_aim: Option<FrameAim>,
     pub on_demand_vrr_enabled: bool,
     // After the last redraw, some ongoing animations still remain.
     pub unfinished_animations_remain: bool,
@@ -1282,10 +1289,45 @@ pub enum RedrawState {
     Queued,
     /// We submitted a frame to the KMS and waiting for it to be presented.
     WaitingForVBlank { redraw_needed: bool },
+    /// A redraw is due, and deliberately held until its dispatch deadline (see
+    /// [`FrameClock::next_dispatch`]). The timer fires at `aim.target − estimated cost`.
+    ScheduledDispatch {
+        token: RegistrationToken,
+        aim: FrameAim,
+    },
     /// We did not submit anything to KMS and made a timer to fire at the estimated VBlank.
     WaitingForEstimatedVBlank(RegistrationToken),
     /// A redraw is queued on top of the above.
     WaitingForEstimatedVBlankAndQueued(RegistrationToken),
+}
+
+/// What a redraw is aiming at, decided before the redraw starts.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameAim {
+    /// The presentation time this frame's content is sampled for, and the vblank it is racing.
+    pub target: Duration,
+    /// When this frame was *supposed* to start, if it was deadline-dispatched.
+    ///
+    /// Everything from here to the redraw actually starting is charged to the frame's measured
+    /// cost, so a loop that gets descheduled — or merely spends a long turn on input and reconcile
+    /// between the timer firing and the drain — raises the render-time estimate and dispatches the
+    /// next frames earlier, instead of silently eating the margin and missing vblanks forever.
+    /// Mutter folds dispatch lateness in the same way
+    /// (`clutter/clutter/clutter-frame-clock.c:600-607`).
+    ///
+    /// The invariant is that the recorded cost spans `scheduled_at` to handed-to-KMS, because that
+    /// is exactly the span `at + estimate + constant == vblank` was solved for.
+    pub scheduled_at: Option<Duration>,
+}
+
+impl FrameAim {
+    /// Aim at `target` with nothing owed — a redraw that was not deadline-dispatched.
+    fn immediate(target: Duration) -> Self {
+        Self {
+            target,
+            scheduled_at: None,
+        }
+    }
 }
 
 pub struct PopupGrabState {
@@ -1444,10 +1486,12 @@ impl RedrawState {
                 RedrawState::WaitingForEstimatedVBlankAndQueued(token)
             }
 
-            // A redraw is already queued.
-            value @ (RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)) => {
-                value
-            }
+            // A redraw is already queued. `ScheduledDispatch` included: the damage that just
+            // arrived is covered by the frame that deadline is holding, and re-arming the timer
+            // on every commit would keep pushing the dispatch out.
+            value @ (RedrawState::Queued
+            | RedrawState::ScheduledDispatch { .. }
+            | RedrawState::WaitingForEstimatedVBlankAndQueued(_)) => value,
 
             // We're waiting for VBlank, request a redraw afterwards.
             RedrawState::WaitingForVBlank { .. } => RedrawState::WaitingForVBlank {
@@ -1988,7 +2032,9 @@ impl State {
         let redraw_pending = self.synoik.output_state.values().any(|state| {
             matches!(
                 state.redraw_state,
-                RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
+                RedrawState::Queued
+                    | RedrawState::ScheduledDispatch { .. }
+                    | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
             )
         });
         self.synoik.frame_log.loop_turn_end(redraw_pending);
@@ -7885,6 +7931,7 @@ impl Synoik {
         let state = OutputState {
             global,
             redraw_state: RedrawState::Idle,
+            pending_aim: None,
             on_demand_vrr_enabled: false,
             unfinished_animations_remain: false,
             frame_clock: FrameClock::new(refresh_interval, vrr),
@@ -7951,6 +7998,7 @@ impl Synoik {
             RedrawState::Idle => (),
             RedrawState::Queued => (),
             RedrawState::WaitingForVBlank { .. } => (),
+            RedrawState::ScheduledDispatch { token, .. } => self.event_loop.remove(token),
             RedrawState::WaitingForEstimatedVBlank(token) => self.event_loop.remove(token),
             RedrawState::WaitingForEstimatedVBlankAndQueued(token) => self.event_loop.remove(token),
         }
@@ -9087,10 +9135,83 @@ impl Synoik {
                 RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
             )
         }) {
-            trace!("redrawing output");
             let output = output.clone();
-            self.redraw(backend, &output);
+            let state = self.output_state.get_mut(&output).unwrap();
+
+            // A deadline that already fired brought its aim with it.
+            if let Some(aim) = state.pending_aim.take() {
+                trace!("redrawing output at its dispatch deadline");
+                self.redraw(backend, &output, aim);
+                continue;
+            }
+
+            // Only a plain `Queued` can be held: the estimated-vblank states are already holding a
+            // timer of their own, and they are the states where nothing was submitted anyway, so
+            // there is no vblank to be early for.
+            let dispatch = match state.redraw_state {
+                RedrawState::Queued => state.frame_clock.next_dispatch(),
+                _ => Dispatch::Now {
+                    target: state.frame_clock.next_presentation_time(),
+                },
+            };
+
+            match dispatch {
+                Dispatch::At { at, target } => {
+                    trace!("holding redraw until its dispatch deadline");
+                    self.schedule_dispatch(&output, at, target);
+                }
+                Dispatch::Now { target } => {
+                    trace!("redrawing output");
+                    self.redraw(backend, &output, FrameAim::immediate(target));
+                }
+            }
         }
+    }
+
+    /// Hold this output's redraw until `at`, then run it aimed at `target`.
+    ///
+    /// The timer only flips the state back to `Queued`; the redraw itself happens in the
+    /// end-of-turn drain, the same way [`Tty::on_estimated_vblank_timer`] hands an output back.
+    /// It is a no-op unless the output is still holding *this* deadline, so a token dropped
+    /// without being removed (the rogue-vblank error path in `Tty::on_vblank`) costs one wasted
+    /// wakeup and nothing else.
+    fn schedule_dispatch(&mut self, output: &Output, at: Duration, target: Duration) {
+        let now = get_monotonic_time();
+        let timer_output = output.clone();
+        let token = self
+            .event_loop
+            .insert_source(
+                Timer::from_duration(at.saturating_sub(now)),
+                move |_, _, data| {
+                    let synoik = &mut data.synoik;
+                    let Some(state) = synoik.output_state.get_mut(&timer_output) else {
+                        // The output went away while the deadline was pending.
+                        return TimeoutAction::Drop;
+                    };
+
+                    // Only *this* deadline may release the output: a token dropped without being
+                    // removed (the rogue-vblank error path in `Tty::on_vblank`) would otherwise
+                    // fire into whatever deadline was armed after it and release that one early.
+                    if let RedrawState::ScheduledDispatch { aim, .. } = state.redraw_state {
+                        if aim.scheduled_at == Some(at) {
+                            state.pending_aim = Some(aim);
+                            state.redraw_state = RedrawState::Queued;
+                        }
+                    }
+
+                    TimeoutAction::Drop
+                },
+            )
+            .unwrap();
+
+        let state = self.output_state.get_mut(output).unwrap();
+        state.redraw_state = RedrawState::ScheduledDispatch {
+            token,
+            aim: FrameAim {
+                target,
+                scheduled_at: Some(at),
+            },
+        };
     }
 
     /// Hotspot of the current cursor image for `output`, in physical pixels.
@@ -10951,7 +11072,7 @@ impl Synoik {
         }
     }
 
-    fn redraw(&mut self, backend: &mut Backend, output: &Output) {
+    fn redraw(&mut self, backend: &mut Backend, output: &Output, aim: FrameAim) {
         let _span = tracy_client::span!("Synoik::redraw");
 
         // Verify our invariant.
@@ -10962,7 +11083,7 @@ impl Synoik {
         ));
 
         let redraw_start = get_monotonic_time();
-        let target_presentation_time = state.frame_clock.next_presentation_time();
+        let target_presentation_time = aim.target;
         let refresh_interval = state.frame_clock.refresh_interval();
 
         // Freeze the clock at the target time.
@@ -11111,10 +11232,16 @@ impl Synoik {
         // callbacks and the screencast captures below run *after* the flip is queued, so they
         // are not part of the race against the vblank. Skipped frames drew nothing and would
         // pull the estimate down toward a cost no real frame has.
+        //
+        // Measured from the *deadline* when there was one, not from the start of this function:
+        // a redraw released by a timer still has to wait out the rest of the loop turn, and that
+        // wait comes out of the same budget. Charging it is what stops a loop that keeps missing
+        // its deadline from re-arming the same too-late deadline every frame.
         if res != RenderResult::Skipped {
+            let from = aim.scheduled_at.unwrap_or(redraw_start).min(redraw_start);
             state
                 .frame_clock
-                .record_render_time(get_monotonic_time().saturating_sub(redraw_start));
+                .record_render_time(get_monotonic_time().saturating_sub(from));
         }
 
         if res == RenderResult::Skipped {

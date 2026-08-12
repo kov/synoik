@@ -353,6 +353,7 @@ impl Headless {
                 synoik.event_loop.remove(token)
             }
             RedrawState::Idle
+            | RedrawState::ScheduledDispatch { .. }
             | RedrawState::WaitingForVBlank { .. }
             | RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
         }
@@ -453,7 +454,10 @@ fn on_frame_timer(synoik: &mut Synoik, output: &Output) {
             output_state.redraw_state = RedrawState::Queued;
             return;
         }
-        RedrawState::Idle | RedrawState::Queued | RedrawState::WaitingForVBlank { .. } => {
+        RedrawState::Idle
+        | RedrawState::Queued
+        | RedrawState::ScheduledDispatch { .. }
+        | RedrawState::WaitingForVBlank { .. } => {
             unreachable!()
         }
     }

@@ -3,9 +3,43 @@
 // From niri, copyright Ivan Molodetskikh and the niri contributors.
 
 use std::num::NonZeroU64;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::utils::get_monotonic_time;
+
+/// Slack added on top of the measured render time when picking a dispatch deadline — mutter's
+/// `clutter_max_render_time_constant_us` (`clutter/clutter/clutter-main.c:61`), same 1 ms.
+///
+/// Mutter also adds the display's vblank duration, which it gets from the DRM mode timings
+/// (`meta_calculate_drm_mode_vblank_duration_us`, `src/backends/native/meta-kms-crtc.c:891`). We do
+/// not plumb those through yet; the constant plus the dispatch-lateness feedback in
+/// [`FrameClock::record_render_time`]'s caller absorbs it, at the cost of a slightly later
+/// dispatch on the frames where it matters.
+const RENDER_TIME_CONSTANT: Duration = Duration::from_millis(1);
+
+/// `SYNOIK_NO_DEADLINE_DISPATCH=1` pins every frame back to dispatch-immediately.
+///
+/// Deadline dispatch trades safety margin for latency, and it is the whole session's frame pacing
+/// that is on the line — this is the switch that gets a seat back to the old behavior without a
+/// rebuild when something looks wrong.
+fn deadline_dispatch() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| !std::env::var_os("SYNOIK_NO_DEADLINE_DISPATCH").is_some_and(|v| v == "1"))
+}
+
+/// When to start building the next frame, and which presentation to aim it at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    /// Build it now.
+    Now { target: Duration },
+    /// Build it at `at`, aiming at `target` — mutter's deadline dispatch. The target is chosen
+    /// *here*, when the deadline is armed, and must be carried to the redraw rather than
+    /// recomputed when the timer fires: `at` is by construction the moment
+    /// [`FrameClock::next_presentation_time`] would flip to the vblank after this one.
+    At { at: Duration, target: Duration },
+}
 
 #[derive(Debug)]
 pub struct FrameClock {
@@ -67,6 +101,25 @@ impl RenderTimeEstimate {
     fn get(&self) -> Duration {
         self.longterm_max.max(self.shortterm_max)
     }
+}
+
+/// Where a moment sits in the display's refresh cadence.
+#[derive(Debug, Clone, Copy)]
+enum Cadence {
+    /// There is no cadence to pace against — no mode, nothing presented yet, or VRR with the
+    /// display already idle. Present as soon as we can; the payload is `now`, possibly nudged
+    /// forward past an early vblank.
+    Immediate(Duration),
+    Locked {
+        /// The next vblank at or after `now`.
+        boundary: Duration,
+        /// How far that boundary is from the last presentation — one refresh interval means the
+        /// display is running continuously, more means we have been idle.
+        since_last_presentation: Duration,
+        /// `now`, nudged forward past an early vblank.
+        now: Duration,
+        refresh_interval: Duration,
+    },
 }
 
 impl FrameClock {
@@ -140,14 +193,13 @@ impl FrameClock {
         self.next_target(false)
     }
 
-    fn next_target(&self, advance_past_unreachable: bool) -> Duration {
-        let mut now = get_monotonic_time();
-
+    /// Where in the display's cadence `now` sits, if there is a cadence to sit in.
+    fn cadence(&self, mut now: Duration) -> Cadence {
         let Some(refresh_interval_ns) = self.refresh_interval_ns else {
-            return now;
+            return Cadence::Immediate(now);
         };
         let Some(last_presentation_time) = self.last_presentation_time else {
-            return now;
+            return Cadence::Immediate(now);
         };
 
         let refresh_interval_ns = refresh_interval_ns.get();
@@ -177,15 +229,88 @@ impl FrameClock {
         // If VRR is enabled and more than one frame passed since last presentation, assume that we
         // can present immediately.
         if self.vrr && to_next_ns > refresh_interval_ns {
-            return now;
+            return Cadence::Immediate(now);
         }
 
-        let refresh_interval = Duration::from_nanos(refresh_interval_ns);
-        let target = last_presentation_time + Duration::from_nanos(to_next_ns);
-        if advance_past_unreachable {
-            self.reachable(target, now, refresh_interval)
-        } else {
-            target
+        Cadence::Locked {
+            boundary: last_presentation_time + Duration::from_nanos(to_next_ns),
+            since_last_presentation: Duration::from_nanos(to_next_ns),
+            now,
+            refresh_interval: Duration::from_nanos(refresh_interval_ns),
+        }
+    }
+
+    fn next_target(&self, advance_past_unreachable: bool) -> Duration {
+        match self.cadence(get_monotonic_time()) {
+            Cadence::Immediate(now) => now,
+            Cadence::Locked {
+                boundary,
+                now,
+                refresh_interval,
+                ..
+            } => {
+                if advance_past_unreachable {
+                    self.reachable(boundary, now, refresh_interval)
+                } else {
+                    boundary
+                }
+            }
+        }
+    }
+
+    /// When to start building the next frame, and what to aim it at.
+    ///
+    /// Mutter's deadline dispatch (`clutter_frame_clock_schedule_update`,
+    /// `clutter/clutter/clutter-frame-clock.c:1299-1383`): in the *continuous* case, hold the frame
+    /// until `vblank − max_render_time` instead of building it the moment the last one was
+    /// presented. Nothing about that reduces missed vblanks — a frame started right after a vblank
+    /// already has the whole interval — what it buys is **latency**: input and animation are
+    /// sampled a whole refresh interval closer to the photons. Building at the top of the cycle
+    /// then idling for 14 ms means every event in those 14 ms waits for the frame after next.
+    ///
+    /// Every other case dispatches immediately, exactly as before this existed:
+    ///
+    /// - no cadence yet (no mode, no presentation, VRR gone quiet) — nothing to aim at;
+    /// - an **idle period**, i.e. the next vblank is more than one interval out. Mutter
+    ///   short-circuits here too (`should_update_now`, `:894-923`): "lowest average latency for
+    ///   sporadic user input". This is the common case on a live seat, and the reason the miss
+    ///   population documented in `docs/fork/late-frame-populations.md` is untouched by this;
+    /// - no measured render time yet — the deadline would be a guess, and guessing low costs a
+    ///   vblank;
+    /// - the deadline has already passed, which is just "we are late, go".
+    pub fn next_dispatch(&self) -> Dispatch {
+        self.dispatch_from(get_monotonic_time())
+    }
+
+    fn dispatch_from(&self, now: Duration) -> Dispatch {
+        let (boundary, since_last_presentation, now, refresh_interval) = match self.cadence(now) {
+            Cadence::Immediate(now) => return Dispatch::Now { target: now },
+            Cadence::Locked {
+                boundary,
+                since_last_presentation,
+                now,
+                refresh_interval,
+            } => (boundary, since_last_presentation, now, refresh_interval),
+        };
+
+        let immediately = Dispatch::Now {
+            target: self.reachable(boundary, now, refresh_interval),
+        };
+
+        let idle = since_last_presentation > refresh_interval;
+        let estimate = self.render_time.get();
+        if idle || estimate.is_zero() || !deadline_dispatch() {
+            return immediately;
+        }
+
+        let at = boundary.saturating_sub(estimate + RENDER_TIME_CONSTANT);
+        if at <= now {
+            return immediately;
+        }
+
+        Dispatch::At {
+            at,
+            target: boundary,
         }
     }
 
@@ -316,6 +441,110 @@ mod tests {
         let mut e = RenderTimeEstimate::default();
         e.record(Duration::from_secs(3), REFRESH);
         assert_eq!(e.get(), REFRESH * 3);
+    }
+
+    /// Set up a clock that has presented at `last` and knows frames cost `cost`.
+    fn continuous(last: Duration, cost: Duration) -> FrameClock {
+        let mut c = clock();
+        c.presented(last);
+        c.record_render_time(cost);
+        c
+    }
+
+    /// The continuous case, which is the only one deadline dispatch touches: hold the frame until
+    /// the vblank minus what it costs, and aim it at that vblank.
+    #[test]
+    fn a_continuous_frame_is_held_until_its_deadline() {
+        let last = Duration::from_secs(10);
+        let c = continuous(last, Duration::from_millis(4));
+
+        // A moment after the presentation: the next vblank is one interval out.
+        let now = last + Duration::from_micros(200);
+        assert_eq!(
+            c.dispatch_from(now),
+            Dispatch::At {
+                at: last + REFRESH - Duration::from_millis(5),
+                target: last + REFRESH,
+            },
+            "4ms of frame plus the 1ms constant, held off the vblank it aims at",
+        );
+    }
+
+    /// The deadline must not be so late that the frame it releases cannot make the vblank — the
+    /// point where it lands is exactly the point where the target would otherwise move on.
+    #[test]
+    fn the_deadline_lands_where_the_target_would_slip() {
+        let last = Duration::from_secs(10);
+        let c = continuous(last, Duration::from_millis(4));
+
+        let Dispatch::At { at, target } = c.dispatch_from(last + Duration::from_micros(200)) else {
+            panic!("expected a held frame");
+        };
+        assert_eq!(
+            c.reachable(target, at, REFRESH),
+            target,
+            "the frame released at the deadline must still reach the vblank it was aimed at",
+        );
+    }
+
+    /// After an idle period, dispatch immediately — mutter's `should_update_now` short-circuit.
+    /// This is the dominant miss population on a live seat, and it is untouched by all of the
+    /// above by design.
+    #[test]
+    fn an_idle_period_dispatches_at_once() {
+        let last = Duration::from_secs(10);
+        let c = continuous(last, Duration::from_millis(4));
+
+        // Five cycles of nothing, then something to draw.
+        let now = last + REFRESH * 5 + Duration::from_millis(1);
+        assert_eq!(
+            c.dispatch_from(now),
+            Dispatch::Now {
+                target: last + REFRESH * 6
+            },
+        );
+    }
+
+    /// A clock that has measured nothing has no business guessing a deadline: guessing low costs
+    /// the vblank the deadline was supposed to protect.
+    #[test]
+    fn an_unmeasured_clock_dispatches_at_once() {
+        let last = Duration::from_secs(10);
+        let mut c = clock();
+        c.presented(last);
+        assert_eq!(
+            c.dispatch_from(last + Duration::from_micros(200)),
+            Dispatch::Now {
+                target: last + REFRESH
+            },
+        );
+    }
+
+    /// Being past the deadline already is just "we are late" — go now, and let `reachable` decide
+    /// which vblank is still in front of us.
+    #[test]
+    fn a_deadline_already_passed_dispatches_at_once() {
+        let last = Duration::from_secs(10);
+        let c = continuous(last, Duration::from_millis(14));
+
+        let now = last + Duration::from_millis(3);
+        assert_eq!(
+            c.dispatch_from(now),
+            Dispatch::Now {
+                target: last + REFRESH * 2
+            },
+            "a 14ms frame with 13.6ms left is late for this vblank and holds for none of it",
+        );
+    }
+
+    /// Nothing to pace against means nothing to hold for.
+    #[test]
+    fn a_clock_without_a_cadence_dispatches_at_once() {
+        let c = clock();
+        assert!(matches!(
+            c.dispatch_from(Duration::from_secs(10)),
+            Dispatch::Now { .. }
+        ));
     }
 
     /// The fallback timer must not inherit the advance. It stands in for a vblank that happens
