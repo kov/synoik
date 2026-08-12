@@ -947,12 +947,23 @@ pub enum Action {
     DebugToggleDamage {},
     /// Toggle holding each frame until its dispatch deadline.
     ///
-    /// On (the default, unless `SYNOIK_NO_DEADLINE_DISPATCH=1`) a continuously animating output
+    /// On (`SYNOIK_DEADLINE_DISPATCH=1` starts a session that way) a continuously animating output
     /// builds its frame at `vblank − recent cost`, so input and animation are sampled closer to
-    /// the photons; off, it builds immediately after the last presentation. Runtime-switchable
-    /// because the two are only comparable within one session — a re-login changes what else is
-    /// running, and that difference is larger than the effect.
+    /// the photons; off — the default, because it measured worse — it builds immediately after the
+    /// last presentation. Runtime-switchable because the two are only comparable within one
+    /// session: a re-login changes what else is running, and that difference is larger than the
+    /// effect.
     DebugToggleDeadlineDispatch {},
+    /// Set the slack added on top of the measured render time when picking a dispatch deadline.
+    ///
+    /// This is the dial the 0.33%-vs-0.09% dropped-frame result hangs on: 1 ms is mutter's
+    /// constant, but mutter also adds a vblank duration and arms a hardware timer, neither of
+    /// which we have. Settable at runtime so a sweep runs in one session, against one set of
+    /// background work.
+    DebugSetRenderTimeMargin {
+        /// Slack in milliseconds.
+        millis: f64,
+    },
     /// Move the focused window between the floating and the tiling layout.
     ToggleWindowFloating {
         /// Id of the window to move.

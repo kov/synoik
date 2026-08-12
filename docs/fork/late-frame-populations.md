@@ -104,7 +104,41 @@ interval. What it buys is latency in the continuous case, where the old behaviou
 and then sat on it for ~14 ms while input and animation aged. It also closes the ahead-by-one caveat
 at the end of this document, by re-coupling the stamp to the landing. Everything else — the idle
 short-circuit above included — still dispatches immediately, which is the regression bound.
-`SYNOIK_NO_DEADLINE_DISPATCH=1` pins a seat back.
+
+**It measured worse, and now ships off.** Two counterbalanced four-block A/Bs on the gsrs seat under
+a continuous 60 fps client (`vkcube`, FIFO), toggled inside one session so both arms share one set
+of background work, ~14 300 frames per arm:
+
+| round | pairs (held vs immediate), gaps ≥2 cycles |
+| --- | --- |
+| 1 (on first) | 2 vs 3 · 16 vs 5 |
+| 2 (off first) | 14 vs 1 · 16 vs 4 |
+
+48/14 353 held (**0.33%**) against 13/14 372 immediate (**0.09%**) — held is worse in three of the
+four adjacent pairs, and the exception is round 1's first block, where the render-time estimate was
+still empty and the arm was therefore behaving like the other one. The deepest misses in the whole
+run were in the *immediate* arm and are population 2 (`waiting 33.60ms (first scanout)`), untouched
+by either setting.
+
+**Treat the numbers as provisional.** This is a guest on a busy host, and host activity is outside
+every control the design has: interleaving and counterbalancing bound *drift* within the session,
+but not a burst that happens to land in one arm. Re-run on a quiet host before treating 0.33% as the
+number. The default is off in the meantime because that is the reversible direction on a daily
+driver, not because the case is closed.
+
+So the acceptance criterion at the bottom of this page — "the miss count must not regress" — is not
+met, and `SYNOIK_DEADLINE_DISPATCH=1` (or `debug-toggle-deadline-dispatch`) is now what turns it on
+rather than off. The code stays because the suspect is **calibration, not structure**: our 1 ms
+margin stands in for mutter's vblank duration *and* the hardware deadline timer it arms, neither of
+which exists here, so a release at `vblank − (estimate + 1 ms)` is simply too tight and the frame it
+releases slips a cycle. `debug-set-render-time-margin <ms>` sweeps it without a rebuild or a relogin;
+the open question is whether some wider margin keeps the latency win at parity on drops.
+
+Two things the runs cost, worth not re-learning: a **backgrounded VT renders at ~1 fps** and
+frame-perf keeps counting regardless, so a seat timing run is void unless `loginctl` says
+`Active=yes` (two full A/Bs were thrown away to this); and `Late presentations` is **not** comparable
+across the arms, because an immediate-dispatch frame carries a `reachable()`-advanced target and
+absorbs silently the same slip a held frame reports. Judge on the gap histogram.
 
 ### What is a real bug here
 

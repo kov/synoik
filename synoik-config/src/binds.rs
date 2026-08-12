@@ -130,6 +130,7 @@ pub enum Action {
     DebugToggleOpaqueRegions,
     DebugToggleDamage,
     DebugToggleDeadlineDispatch,
+    DebugSetRenderTimeMargin(f64),
     Spawn(Vec<String>),
     SpawnSh(String),
     DoScreenTransition(Option<u16>),
@@ -708,6 +709,9 @@ impl From<synoik_ipc::Action> for Action {
             synoik_ipc::Action::DebugToggleOpaqueRegions {} => Self::DebugToggleOpaqueRegions,
             synoik_ipc::Action::DebugToggleDamage {} => Self::DebugToggleDamage,
             synoik_ipc::Action::DebugToggleDeadlineDispatch {} => Self::DebugToggleDeadlineDispatch,
+            synoik_ipc::Action::DebugSetRenderTimeMargin { millis } => {
+                Self::DebugSetRenderTimeMargin(millis)
+            }
             synoik_ipc::Action::ToggleWindowFloating { id: None } => Self::ToggleWindowFloating,
             synoik_ipc::Action::ToggleWindowFloating { id: Some(id) } => {
                 Self::ToggleWindowFloatingById(id)

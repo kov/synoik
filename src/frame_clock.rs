@@ -3,7 +3,7 @@
 // From niri, copyright Ivan Molodetskikh and the niri contributors.
 
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -13,30 +13,64 @@ use crate::utils::get_monotonic_time;
 /// `clutter_max_render_time_constant_us` (`clutter/clutter/clutter-main.c:61`), same 1 ms.
 ///
 /// Mutter also adds the display's vblank duration, which it gets from the DRM mode timings
-/// (`meta_calculate_drm_mode_vblank_duration_us`, `src/backends/native/meta-kms-crtc.c:891`). We do
-/// not plumb those through yet; the constant plus the dispatch-lateness feedback in
-/// [`FrameClock::record_render_time`]'s caller absorbs it, at the cost of a slightly later
-/// dispatch on the frames where it matters.
-const RENDER_TIME_CONSTANT: Duration = Duration::from_millis(1);
+/// (`meta_calculate_drm_mode_vblank_duration_us`, `src/backends/native/meta-kms-crtc.c:891`), and
+/// arms a hardware deadline timer we do not have. Ours stands in for both, and 1 ms is measurably
+/// too thin on this stack (see the seat numbers in `docs/fork/late-frame-populations.md`) — which
+/// is why it is a dial rather than a constant: `SYNOIK_RENDER_TIME_MARGIN_MS` at startup,
+/// [`set_render_time_margin`] at runtime, so a calibration sweep costs no rebuild and no relogin.
+const RENDER_TIME_MARGIN_DEFAULT_US: u64 = 1000;
 
-/// Whether frames are held until their dispatch deadline. `SYNOIK_NO_DEADLINE_DISPATCH=1` starts a
-/// session with it off; [`set_deadline_dispatch`] flips it at runtime.
+static RENDER_TIME_MARGIN_US: AtomicU64 = AtomicU64::new(RENDER_TIME_MARGIN_DEFAULT_US);
+static RENDER_TIME_MARGIN_INIT: OnceLock<()> = OnceLock::new();
+
+fn render_time_margin() -> Duration {
+    RENDER_TIME_MARGIN_INIT.get_or_init(|| {
+        let us = std::env::var("SYNOIK_RENDER_TIME_MARGIN_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|ms| ms.is_finite() && *ms >= 0.)
+            .map(|ms| (ms * 1000.) as u64)
+            .unwrap_or(RENDER_TIME_MARGIN_DEFAULT_US);
+        RENDER_TIME_MARGIN_US.store(us, Ordering::Relaxed);
+    });
+    Duration::from_micros(RENDER_TIME_MARGIN_US.load(Ordering::Relaxed))
+}
+
+/// Set the deadline slack for the rest of the session; returns the new value.
+pub fn set_render_time_margin(margin: Duration) -> Duration {
+    // Through the same initialiser, or the env default would overwrite this on the next frame.
+    render_time_margin();
+    RENDER_TIME_MARGIN_US.store(margin.as_micros() as u64, Ordering::Relaxed);
+    margin
+}
+
+/// The deadline slack currently in force.
+pub fn render_time_margin_now() -> Duration {
+    render_time_margin()
+}
+
+/// Whether frames are held until their dispatch deadline. Off by default;
+/// `SYNOIK_DEADLINE_DISPATCH=1` starts a session with it on, and [`set_deadline_dispatch`] flips it
+/// at runtime.
 ///
-/// Deadline dispatch trades safety margin for latency, and it is the whole session's frame pacing
-/// that is on the line — this is the switch that gets a seat back to the old behavior without a
-/// rebuild when something looks wrong.
+/// **Off by default because it measured worse.** Two counterbalanced four-block A/Bs on a seat
+/// under a continuous 60 fps client (~14k frames per arm) put dropped frames at 0.33% held vs
+/// 0.09% dispatched immediately, consistent in three of four adjacent pairs. What it buys —
+/// sampling input and animation closer to the photons — is real but not measurable with frame-perf,
+/// and it cannot lower a miss count by construction. Until the margin above is calibrated for this
+/// stack, the safe default wins.
 ///
 /// Runtime-switchable rather than read once, because measuring it needs an A/B *within* one
 /// session: comparing two logins compares two different sets of background work, and on the first
 /// attempt that difference (a polkit dialog and a gnome-software refresh in one arm and not the
 /// other) was larger than the effect being measured.
-static DEADLINE_DISPATCH: AtomicBool = AtomicBool::new(true);
+static DEADLINE_DISPATCH: AtomicBool = AtomicBool::new(false);
 static DEADLINE_DISPATCH_INIT: OnceLock<()> = OnceLock::new();
 
 fn deadline_dispatch() -> bool {
     DEADLINE_DISPATCH_INIT.get_or_init(|| {
-        let off = std::env::var_os("SYNOIK_NO_DEADLINE_DISPATCH").is_some_and(|v| v == "1");
-        DEADLINE_DISPATCH.store(!off, Ordering::Relaxed);
+        let on = std::env::var_os("SYNOIK_DEADLINE_DISPATCH").is_some_and(|v| v == "1");
+        DEADLINE_DISPATCH.store(on, Ordering::Relaxed);
     });
     DEADLINE_DISPATCH.load(Ordering::Relaxed)
 }
@@ -309,6 +343,18 @@ impl FrameClock {
     }
 
     fn dispatch_from(&self, now: Duration) -> Dispatch {
+        self.dispatch_from_with(now, deadline_dispatch(), render_time_margin())
+    }
+
+    /// The decision itself, with the two session-global dials passed in. Tests drive *this*: the
+    /// dials are process-wide atomics, and a test that flipped one would be flipping it for every
+    /// other test running beside it.
+    fn dispatch_from_with(
+        &self,
+        now: Duration,
+        deadline_dispatch: bool,
+        margin: Duration,
+    ) -> Dispatch {
         let (boundary, since_last_presentation, now, refresh_interval) = match self.cadence(now) {
             Cadence::Immediate(now) => return Dispatch::Now { target: now },
             Cadence::Locked {
@@ -325,11 +371,11 @@ impl FrameClock {
 
         let idle = since_last_presentation > refresh_interval;
         let estimate = self.render_time.get();
-        if idle || estimate.is_zero() || !deadline_dispatch() {
+        if idle || estimate.is_zero() || !deadline_dispatch {
             return immediately;
         }
 
-        let at = boundary.saturating_sub(estimate + RENDER_TIME_CONSTANT);
+        let at = boundary.saturating_sub(estimate + margin);
         if at <= now {
             return immediately;
         }
@@ -469,6 +515,18 @@ mod tests {
         assert_eq!(e.get(), REFRESH * 3);
     }
 
+    impl FrameClock {
+        /// The dispatch decision with deadline dispatch forced on and the shipped margin, without
+        /// touching the process-wide dials the real path reads.
+        fn held(&self, now: Duration) -> Dispatch {
+            self.dispatch_from_with(
+                now,
+                true,
+                Duration::from_micros(RENDER_TIME_MARGIN_DEFAULT_US),
+            )
+        }
+    }
+
     /// Set up a clock that has presented at `last` and knows frames cost `cost`.
     fn continuous(last: Duration, cost: Duration) -> FrameClock {
         let mut c = clock();
@@ -487,7 +545,7 @@ mod tests {
         // A moment after the presentation: the next vblank is one interval out.
         let now = last + Duration::from_micros(200);
         assert_eq!(
-            c.dispatch_from(now),
+            c.held(now),
             Dispatch::At {
                 at: last + REFRESH - Duration::from_millis(5),
                 target: last + REFRESH,
@@ -503,7 +561,7 @@ mod tests {
         let last = Duration::from_secs(10);
         let c = continuous(last, Duration::from_millis(4));
 
-        let Dispatch::At { at, target } = c.dispatch_from(last + Duration::from_micros(200)) else {
+        let Dispatch::At { at, target } = c.held(last + Duration::from_micros(200)) else {
             panic!("expected a held frame");
         };
         assert_eq!(

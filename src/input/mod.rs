@@ -2581,6 +2581,14 @@ impl State {
                 warn!("deadline dispatch is now {}", if on { "on" } else { "off" });
                 self.synoik.queue_redraw_all();
             }
+            Action::DebugSetRenderTimeMargin(millis) => {
+                let millis = millis.clamp(0., 100.);
+                let margin = crate::frame_clock::set_render_time_margin(Duration::from_micros(
+                    (millis * 1000.) as u64,
+                ));
+                warn!("dispatch deadline margin is now {margin:?}");
+                self.synoik.queue_redraw_all();
+            }
             Action::DebugToggleDamage => {
                 self.synoik.debug_toggle_damage();
             }
