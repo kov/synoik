@@ -328,10 +328,25 @@ impl CompositorHandler for State {
                         // a crash, so a window landing on another desktop reads as "your app is
                         // back, over there" — the volume problem that rules this out for
                         // `session_restore` (a login restoring every app you had open, each one
-                        // shouting) does not apply to a single app. Not gated on the window having
-                        // wanted focus, unlike the launch arm below: restore deliberately seeds
-                        // `open_focused = false` for every reason but `launch`, so that test would
-                        // make this unreachable.
+                        // shouting) does not apply to a single app.
+                        //
+                        // *Every* off-desktop window of the recovering app is marked, not one of
+                        // them, and that is deliberate rather than a fan-out to be capped. The bit
+                        // is per window because app-level and window-level attention are heading
+                        // for separate affordances; until then the aggregation happens on the way
+                        // out, where focusing any window clears the whole app's set
+                        // (`Synoik::clear_urgency_of_focused_app`). Capping it here would drop
+                        // per-window state we would only have to reintroduce. Measured 2026-08-12:
+                        // three restored windows on an inactive workspace mark three windows and
+                        // still produce exactly one dash glow and one dock poke, since both of
+                        // those aggregate per app already.
+                        //
+                        // Not gated on the window having wanted focus, unlike the launch arm
+                        // below, which only marks a window whose focus request was denied. Restore
+                        // no longer seeds `open_focused` at all — see `RestoreOnMap::reason`, which
+                        // records why expressing activation policy through that rule was wrong —
+                        // so a `recover` window's `activate` comes from GNOME focus-stealing
+                        // prevention and cannot stand in for "this window wanted you".
                         if restore_reason == Some(Reason::Recover) && !lands_where_we_are {
                             wants_attention = true;
                         }
