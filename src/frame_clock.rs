@@ -53,12 +53,13 @@ pub fn render_time_margin_now() -> Duration {
 /// `SYNOIK_DEADLINE_DISPATCH=1` starts a session with it on, and [`set_deadline_dispatch`] flips it
 /// at runtime.
 ///
-/// **Off by default because it measured worse.** Two counterbalanced four-block A/Bs on a seat
-/// under a continuous 60 fps client (~14k frames per arm) put dropped frames at 0.33% held vs
-/// 0.09% dispatched immediately, consistent in three of four adjacent pairs. What it buys —
-/// sampling input and animation closer to the photons — is real but not measurable with frame-perf,
-/// and it cannot lower a miss count by construction. Until the margin above is calibrated for this
-/// stack, the safe default wins.
+/// **Off by default because it measured worse.** On a seat under a continuous 60 fps client, at the
+/// 1 ms margin below, dropped frames ran 0.33% against a 0.03% baseline — reproduced three times,
+/// on two hosts. Widening the margin recovers most of that, but not demonstrably all of it, and it
+/// spends the very latency the feature exists for. What it buys — sampling input and animation
+/// closer to the photons — is real and *not* measurable with frame-perf, and it cannot lower a miss
+/// count by construction. Until there is an input-to-photon number to weigh against the drops, the
+/// safe default wins. `docs/fork/late-frame-populations.md` has the sweeps.
 ///
 /// Runtime-switchable rather than read once, because measuring it needs an A/B *within* one
 /// session: comparing two logins compares two different sets of background work, and on the first

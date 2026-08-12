@@ -120,19 +120,46 @@ still empty and the arm was therefore behaving like the other one. The deepest m
 run were in the *immediate* arm and are population 2 (`waiting 33.60ms (first scanout)`), untouched
 by either setting.
 
-**Treat the numbers as provisional.** This is a guest on a busy host, and host activity is outside
-every control the design has: interleaving and counterbalancing bound *drift* within the session,
-but not a burst that happens to land in one arm. Re-run on a quiet host before treating 0.33% as the
-number. The default is off in the meantime because that is the reversible direction on a daily
-driver, not because the case is closed.
+**The host was inflating the control, not the treatment.** Re-run after a VMM deploy quieted the
+host, as a margin sweep — eight 60 s blocks, every treatment block between two baselines:
+
+Two sweeps, sixteen blocks, ~58 000 frames, pooled:
+
+| margin | drops / frames | rate |
+| --- | --- | --- |
+| off (8 blocks) | 9 / 28 793 | **0.031%** |
+| 1 ms | 12 / 3 588 | **0.33%** |
+| 2 ms | 4 / 3 596 | 0.11% |
+| 4 ms | 5 / 7 195 | 0.07% |
+| 6 ms | 6 / 3 595 | 0.17% |
+| 8 ms | 5 / 7 195 | 0.07% |
+
+**One point here is solid and the rest is noise.** 1 ms sits an order of magnitude above baseline
+and has now reproduced at 0.33% three times, on two hosts of very different quietness — that is the
+regression, and it is real. Everything at 2 ms and wider lands in a band the method cannot resolve:
+the first sweep read 12 → 4 → 5 → 0 and looked like a clean dose-response, the second read
+5 → 6 → 0 for 8/6/4 ms and put *six* drops in a baseline block, and the baseline floor itself moved
+between sweeps (0.007% → 0.056%). Pooled, held-with-a-wide-margin is 20/21 581 (0.093%) against
+9/28 793 (0.031%) — about 3x, on counts small enough that a Poisson test only just clears p≈0.02.
+
+So: do not quote a best margin from this. What the data supports is that 1 ms is too tight on this
+stack — plausibly because it stands in for mutter's vblank duration *and* a hardware deadline timer,
+where ours is an event-loop timer whose wakeup on this VM is itself worth milliseconds — and that
+2 ms and wider is *at worst* a small residual regression. Resolving 0.09% from 0.03% needs blocks
+measured in tens of minutes, not one.
+
+The cost of a wide margin is the latency the feature exists for. Releasing at
+`vblank − (estimate + 8 ms)` starts the frame ~5 ms after the previous presentation rather than
+immediately — a fraction of the freshness a 1–2 ms margin samples, though still ahead of dispatching
+now. Whether that residue is worth a code path cannot be settled with frame-perf, which has no
+input-to-photon number; that measurement is the actual prerequisite for turning this on.
 
 So the acceptance criterion at the bottom of this page — "the miss count must not regress" — is not
 met, and `SYNOIK_DEADLINE_DISPATCH=1` (or `debug-toggle-deadline-dispatch`) is now what turns it on
-rather than off. The code stays because the suspect is **calibration, not structure**: our 1 ms
-margin stands in for mutter's vblank duration *and* the hardware deadline timer it arms, neither of
-which exists here, so a release at `vblank − (estimate + 1 ms)` is simply too tight and the frame it
-releases slips a cycle. `debug-set-render-time-margin <ms>` sweeps it without a rebuild or a relogin;
-the open question is whether some wider margin keeps the latency win at parity on drops.
+rather than off. The code stays because the sweep above shows the cause is **calibration, not
+structure** — a release at `vblank − (estimate + 1 ms)` is too tight on this stack, and widening the
+margin buys the drops back in full. `debug-set-render-time-margin <ms>` re-runs the sweep without a
+rebuild or a relogin.
 
 Two things the runs cost, worth not re-learning: a **backgrounded VT renders at ~1 fps** and
 frame-perf keeps counting regardless, so a seat timing run is void unless `loginctl` says
