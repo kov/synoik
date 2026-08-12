@@ -10961,6 +10961,7 @@ impl Synoik {
             RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
         ));
 
+        let redraw_start = get_monotonic_time();
         let target_presentation_time = state.frame_clock.next_presentation_time();
         let refresh_interval = state.frame_clock.refresh_interval();
 
@@ -11104,6 +11105,17 @@ impl Synoik {
 
         let is_locked = self.is_locked();
         let state = self.output_state.get_mut(output).unwrap();
+
+        // What this frame cost, start of redraw to handed-to-KMS — the span the next frame's
+        // target has to fit into. Measured here rather than at the end of `redraw`: the frame
+        // callbacks and the screencast captures below run *after* the flip is queued, so they
+        // are not part of the race against the vblank. Skipped frames drew nothing and would
+        // pull the estimate down toward a cost no real frame has.
+        if res != RenderResult::Skipped {
+            state
+                .frame_clock
+                .record_render_time(get_monotonic_time().saturating_sub(redraw_start));
+        }
 
         if res == RenderResult::Skipped {
             // Update the redraw state on failed render.
