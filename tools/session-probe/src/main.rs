@@ -85,6 +85,14 @@ session-probe — drive xdg_session_management_v1 against a live compositor
     --hold SECS        exit after SECS instead of waiting for a signal
     --quit-on-configure  exit as soon as every window has mapped; useful for a
                        one-shot 'where did they land' check
+    --retitle-after-configure
+                       set_title in the gap between the initial configure and
+                       the first commit, the way an app that names a window
+                       after its own content does. That recompute used to wipe
+                       the seeds a restore had just written, so a restored
+                       window came back in the wrong place; without this flag
+                       the probe titles before its first commit and never
+                       reaches the seam.
     --quit-style S     how to tear down on the way out (default all-windows):
                          all-windows  destroy every toplevel, then the session
                          session-first destroy the session, then the toplevels
@@ -107,6 +115,7 @@ struct Opts {
     hold: Option<Duration>,
     quit_on_configure: bool,
     quit_style: QuitStyle,
+    retitle_after_configure: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -127,6 +136,7 @@ impl Default for Opts {
             hold: None,
             quit_on_configure: false,
             quit_style: QuitStyle::AllWindows,
+            retitle_after_configure: false,
         }
     }
 }
@@ -166,6 +176,7 @@ fn parse_args() -> Result<Opts, String> {
                 opts.hold = Some(Duration::from_secs(secs));
             }
             "--quit-on-configure" => opts.quit_on_configure = true,
+            "--retitle-after-configure" => opts.retitle_after_configure = true,
             "--quit-style" => {
                 opts.quit_style = match value()?.as_str() {
                     "all-windows" => QuitStyle::AllWindows,
@@ -363,6 +374,17 @@ fn main() {
             let w = &mut state.windows[i];
             if let Some(serial) = w.pending_ack.take() {
                 w.xdg_surface.ack_configure(serial);
+            }
+            // A client naming the window after its own content, in the gap between the initial
+            // configure and the first commit. This is the shape that broke session restore in
+            // `6e4fb6d9`: the compositor recomputes the window rules from scratch on `set_title`
+            // and used to assign over the seeds restore had just written, so the window came back
+            // the right size on the right desktop in the wrong place. Not a terminal-only habit --
+            // any app that titles itself from the session/tab it is about does this, and ghost
+            // does it unconditionally on every window open.
+            if state.opts.retitle_after_configure {
+                w.toplevel.set_title(format!("{} configured", w.name));
+                println!("retitled: name={} (post-configure, pre-attach)", w.name);
             }
             w.surface.attach(Some(&buffer), 0, 0);
             w.surface.damage_buffer(0, 0, cw, ch);
