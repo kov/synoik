@@ -74,6 +74,29 @@
 //! interleaved within the same seconds. Nothing the frame log records distinguishes them. Until
 //! that is explained, a single live number is not a workload measurement.
 //!
+//! # Sweep 8: the app-catalog reload (2026-08-12)
+//!
+//! Asked whether `reload_app_catalog` could stop early-returning on an unchanged enumeration, so
+//! that `touch`ing a `.desktop` becomes a "reload now" trigger. Measured on the real 94-app gio
+//! catalog with the overview and app grid open, `refresh()` timed separately because both shapes
+//! pay it:
+//!
+//! | | reload_app_catalog | of which sync_app_grid |
+//! |---|---|---|
+//! | early-return on unchanged (before) | 6.87 ms | — (skipped) |
+//! | unconditional (after) | **32.98 ms** | 27.80 ms |
+//! | unconditional, favorites hoisted | **8.14 ms** | 0.57 ms |
+//!
+//! `refresh()` is ~7 ms of that in every row, and the GPU side does not move at all: 0.37 ms warm,
+//! 0.30 ms with all 46 icons re-uploaded in a single frame. Icon uploads are not the cost anyone
+//! would have guessed they were.
+//!
+//! The 27.8 ms was **not** the reload's fault. `AppSystem::is_favorite` re-resolves every stored
+//! favorite through `DesktopAppInfo::new` on each call, and `sync_app_grid` called it once per
+//! installed app — 752 desktop-file parses per sync, paid on every *genuine* catalog change too.
+//! Resolving the favorites once ahead of the filter is the whole fix, and it is what makes the
+//! unconditional reload cost ~1.2 ms of downstream instead of ~26.
+//!
 //! Read GPU time, not wall clock, for any of this: [`render_once_gpu`] and [`best_gpu_of`] exist
 //! because the wall-clock figures in sweeps 1-6 fold in the host round trip, which on this stack is
 //! ~2.6 ms of mesa's userspace fence poll and has nothing to do with the frame.
@@ -914,4 +937,174 @@ where
         }
     }
     best
+}
+
+/// # Sweep 8: what does an app-catalog reload cost?
+///
+/// `reload_app_catalog` currently early-returns when the enumeration is byte-identical to the one
+/// it replaces, so a `touch` on a `.desktop` is not a usable "reload now" trigger. This prices the
+/// downstream that check skips, on the real installed catalog, with the overview open so the dash
+/// and the app grid — the only surfaces that pay — are on screen.
+///
+/// `refresh()` itself runs in **both** arms, so it is reported separately: the A/B delta is only
+/// the work below the check.
+#[test]
+#[ignore]
+fn perf_probe_what_does_an_app_catalog_reload_cost() {
+    const OUT: (u16, u16) = (2048, 1330);
+    const CALLS: usize = 20;
+    const REPEATS: usize = 9;
+
+    let Some(mut f) = build(OUT, 2) else { return };
+    let timed = f
+        .synoik_state()
+        .backend
+        .headless()
+        .with_vulkan_renderer(VulkanRenderer::enable_gpu_timing)
+        .unwrap_or(false);
+
+    // The real installed catalog: fake entries carry no icon names, so every decode and every
+    // upload this is trying to price would be missing. The channel end keeps the watcher's sender
+    // alive for the length of the test; nothing reads it here.
+    let (app_system, _app_db_rx) = crate::app_system::AppSystem::new_gio();
+    f.synoik().app_system = app_system;
+    let ids: Vec<String> = f
+        .synoik()
+        .app_system
+        .installed()
+        .filter(|e| e.should_show)
+        .map(|e| e.id.clone())
+        .collect();
+    let installed = ids.len();
+    f.synoik()
+        .app_system
+        .set_favorites(ids.iter().take(8).cloned().collect());
+
+    f.synoik().sync_dash_favorites();
+    f.synoik().sync_app_grid();
+    f.synoik_state().do_action(Action::OpenOverview, false);
+    // With only the dash on screen the sweep prices 8 favourites; the app grid is where the
+    // catalog's icons actually are, and it is the surface a reload has the most to redraw.
+    f.synoik().layout.open_app_grid();
+    f.settle_animations();
+    // Warm up with no worker wired, so `buffer()` decodes inline and the icons are actually on the
+    // GPU before anything is measured. Wiring the worker first would mean every frame here merely
+    // *enqueued* a decode nobody answers, and the sweep would price an empty dash.
+    let _ = best_of(&mut f, 3);
+    let warm_uploads = f.synoik().dash.icon_upload_count();
+    assert!(
+        warm_uploads > 0,
+        "no app icons reached the GPU, so this sweep would price an empty dash"
+    );
+
+    // Now wire the decode worker's channel, which is the production shape: the main thread pays the
+    // request, the worker pays the decode. The buffers warmed above stay cached until an
+    // invalidation demotes them, so this changes who does the work, not whether it is needed.
+    let icon_rx = f.synoik().app_icon_cache.wire_test_channel();
+
+    // `refresh()` alone — the enumeration both arms pay before the check is even reached.
+    let mut refreshes: Vec<Duration> = Vec::new();
+    for _ in 0..CALLS {
+        let started = Instant::now();
+        let _ = f.synoik().app_system.refresh();
+        refreshes.push(started.elapsed());
+    }
+
+    // The call under test. Which arm this is depends on the compiled source: with the check in
+    // place every one of these early-returns, with it removed every one runs the downstream.
+    let mut reloads: Vec<Duration> = Vec::new();
+    for _ in 0..CALLS {
+        let started = Instant::now();
+        f.synoik().reload_app_catalog();
+        reloads.push(started.elapsed());
+    }
+    let queued = icon_rx.try_iter().count();
+    let ms = |d: Duration| d.as_secs_f64() * 1000.;
+
+    // Attribute the downstream, so a verdict can name what is expensive rather than the call that
+    // contains it. Each step is timed on its own, in `reload_app_catalog`'s order.
+    let mut parts: Vec<(&str, Duration)> = Vec::new();
+    for _ in 0..CALLS {
+        let mut at = Instant::now();
+        let mut lap = |label: &'static str, parts: &mut Vec<(&'static str, Duration)>| {
+            let d = at.elapsed();
+            at = Instant::now();
+            match parts.iter_mut().find(|(l, _)| *l == label) {
+                Some((_, acc)) => *acc += d,
+                None => parts.push((label, d)),
+            }
+        };
+        f.synoik().app_icon_cache.clear();
+        lap("app_icon_cache.clear", &mut parts);
+        f.synoik().sync_overview_search();
+        lap("sync_overview_search", &mut parts);
+        f.synoik().sync_dash_favorites();
+        lap("sync_dash_favorites", &mut parts);
+        f.synoik().sync_app_grid();
+        lap("sync_app_grid", &mut parts);
+        f.synoik().prewarm_app_icons();
+        lap("prewarm_app_icons", &mut parts);
+        f.synoik().queue_redraw_all();
+        lap("queue_redraw_all", &mut parts);
+        let _ = icon_rx.try_iter().count();
+    }
+    for (label, total) in &parts {
+        println!(
+            "       {label:<22} {:6.3}ms/call",
+            ms(*total) / CALLS as f64
+        );
+    }
+
+    let stat = |v: &mut Vec<Duration>| {
+        v.sort();
+        (ms(v[0]), ms(v[v.len() / 2]), ms(v[v.len() - 1]))
+    };
+    let (r_min, r_med, r_max) = stat(&mut refreshes);
+    let (l_min, l_med, l_max) = stat(&mut reloads);
+
+    println!();
+    println!("  sweep 8: app-catalog reload, {installed} installed apps, overview open");
+    println!("     refresh() alone         min {r_min:6.3}ms  median {r_med:6.3}ms  max {r_max:6.3}ms  (both arms)");
+    println!("     reload_app_catalog()    min {l_min:6.3}ms  median {l_med:6.3}ms  max {l_max:6.3}ms  (x{CALLS})");
+    println!(
+        "     icon decodes queued     {queued} over {CALLS} calls, {warm_uploads} icons uploaded"
+    );
+
+    if !timed {
+        println!("     (no GPU timestamps: frame costs skipped)");
+        println!();
+        return;
+    }
+
+    let mut steady: Vec<Duration> = Vec::new();
+    for _ in 0..REPEATS {
+        if let Some((gpu, _, _)) = render_once_gpu(&mut f) {
+            steady.push(gpu);
+        }
+    }
+    // The worst case for the frame: every app icon re-uploaded at once. In production the drops are
+    // per-icon as each replacement decode lands, so the real cost is this spread over many frames —
+    // read it as a bound, not a value.
+    f.synoik().dash.clear_icon_uploads();
+    let cold = render_once_gpu(&mut f);
+    let after = f.synoik().dash.icon_upload_count();
+
+    steady.sort();
+    if steady.is_empty() {
+        println!("     every steady-state pair came back unusable");
+    } else {
+        println!(
+            "     frame gpu, warm         min {:6.3}ms  median {:6.3}ms",
+            ms(steady[0]),
+            ms(steady[steady.len() / 2]),
+        );
+    }
+    match cold {
+        Some((gpu, _, _)) => println!(
+            "     frame gpu, all {after:3} icons re-uploaded  {:6.3}ms  (worst case, one frame)",
+            ms(gpu),
+        ),
+        None => println!("     the re-upload frame's pair came back unusable"),
+    }
+    println!();
 }
