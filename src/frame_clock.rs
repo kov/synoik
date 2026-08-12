@@ -3,6 +3,7 @@
 // From niri, copyright Ivan Molodetskikh and the niri contributors.
 
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -18,15 +19,40 @@ use crate::utils::get_monotonic_time;
 /// dispatch on the frames where it matters.
 const RENDER_TIME_CONSTANT: Duration = Duration::from_millis(1);
 
-/// `SYNOIK_NO_DEADLINE_DISPATCH=1` pins every frame back to dispatch-immediately.
+/// Whether frames are held until their dispatch deadline. `SYNOIK_NO_DEADLINE_DISPATCH=1` starts a
+/// session with it off; [`set_deadline_dispatch`] flips it at runtime.
 ///
 /// Deadline dispatch trades safety margin for latency, and it is the whole session's frame pacing
 /// that is on the line — this is the switch that gets a seat back to the old behavior without a
 /// rebuild when something looks wrong.
+///
+/// Runtime-switchable rather than read once, because measuring it needs an A/B *within* one
+/// session: comparing two logins compares two different sets of background work, and on the first
+/// attempt that difference (a polkit dialog and a gnome-software refresh in one arm and not the
+/// other) was larger than the effect being measured.
+static DEADLINE_DISPATCH: AtomicBool = AtomicBool::new(true);
+static DEADLINE_DISPATCH_INIT: OnceLock<()> = OnceLock::new();
+
 fn deadline_dispatch() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| !std::env::var_os("SYNOIK_NO_DEADLINE_DISPATCH").is_some_and(|v| v == "1"))
+    DEADLINE_DISPATCH_INIT.get_or_init(|| {
+        let off = std::env::var_os("SYNOIK_NO_DEADLINE_DISPATCH").is_some_and(|v| v == "1");
+        DEADLINE_DISPATCH.store(!off, Ordering::Relaxed);
+    });
+    DEADLINE_DISPATCH.load(Ordering::Relaxed)
+}
+
+/// Whether frames are currently being held until their deadline.
+pub fn deadline_dispatch_enabled() -> bool {
+    deadline_dispatch()
+}
+
+/// Turn deadline dispatch on or off for the rest of the session; returns the new state.
+pub fn set_deadline_dispatch(enabled: bool) -> bool {
+    // Through the same initialiser, or the first call would be overwritten by the env default the
+    // next time a frame clock asks.
+    deadline_dispatch();
+    DEADLINE_DISPATCH.store(enabled, Ordering::Relaxed);
+    enabled
 }
 
 /// When to start building the next frame, and which presentation to aim it at.

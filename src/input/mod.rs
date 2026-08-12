@@ -2574,6 +2574,13 @@ impl State {
                 self.synoik.debug_draw_opaque_regions = !self.synoik.debug_draw_opaque_regions;
                 self.synoik.queue_redraw_all();
             }
+            Action::DebugToggleDeadlineDispatch => {
+                let on = crate::frame_clock::set_deadline_dispatch(
+                    !crate::frame_clock::deadline_dispatch_enabled(),
+                );
+                warn!("deadline dispatch is now {}", if on { "on" } else { "off" });
+                self.synoik.queue_redraw_all();
+            }
             Action::DebugToggleDamage => {
                 self.synoik.debug_toggle_damage();
             }

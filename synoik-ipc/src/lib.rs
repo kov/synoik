@@ -945,6 +945,14 @@ pub enum Action {
     DebugToggleOpaqueRegions {},
     /// Toggle visualization of output damage.
     DebugToggleDamage {},
+    /// Toggle holding each frame until its dispatch deadline.
+    ///
+    /// On (the default, unless `SYNOIK_NO_DEADLINE_DISPATCH=1`) a continuously animating output
+    /// builds its frame at `vblank − recent cost`, so input and animation are sampled closer to
+    /// the photons; off, it builds immediately after the last presentation. Runtime-switchable
+    /// because the two are only comparable within one session — a re-login changes what else is
+    /// running, and that difference is larger than the effect.
+    DebugToggleDeadlineDispatch {},
     /// Move the focused window between the floating and the tiling layout.
     ToggleWindowFloating {
         /// Id of the window to move.
