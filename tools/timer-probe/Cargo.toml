@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
+[package]
+name = "timer-probe"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+# Deliberately NOT a member of the synoik workspace, like the other probes: the dev loop is
+# `cargo test --workspace` and a diagnostic has no business slowing it down.
+# Build it on its own: `cargo build --manifest-path tools/timer-probe/Cargo.toml --release`.
+[workspace]
+
+[dependencies]
+calloop = "0.14.4"
+rustix = { version = "1.1.2", features = ["time", "thread"] }

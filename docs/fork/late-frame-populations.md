@@ -140,9 +140,36 @@ It is a **dose-response that reaches parity**. 1 ms runs 8x the baseline and has
 sit ~3x baseline on counts small enough to be worth little (p≈0.06 and p≈0.02). 6 and 8 ms are
 indistinguishable from not holding the frame at all, over 18 000 frames of held arm.
 
-What the extra milliseconds pay for is everything mutter gets and we do not: the display's vblank
-duration, and a hardware deadline timer where ours is an event-loop timer whose wakeup on this VM is
-itself worth milliseconds. That is also why the number is so much larger than mutter's 1 ms.
+**What the extra milliseconds pay for, measured.** Every held frame now records
+`redraw_start − the moment its deadline was armed for` (`c3bfae13`); `msg frame-perf` reports it as
+`Release lateness`. Under vkcube at a 2 ms margin, over 5 333 held frames:
+
+```
+Release lateness: mean 1.03ms, worst 2.80ms
+  <100us x239  <250us x665  <500us x884  <1000us x1224  <2000us x1411  <4000us x910
+```
+
+p50 is ~800 µs. So a 1 ms margin has *negative* effective slack more than half the time — that is
+the 8x drop rate, quantitatively — and the tail is what 6–8 ms is really buying.
+
+`tools/timer-probe` then asked where the lateness comes from, by requesting the same 60 Hz wakeups
+two ways in a process whose loop has nothing else to do:
+
+```
+clock_nanosleep: mean 1.378ms, worst 8.007ms
+calloop timer:   mean 0.920ms, worst 8.152ms
+```
+
+**The raw kernel sleep is worse than calloop.** This VM cannot wake a sleeping thread on time, and
+calloop rides slightly ahead of the syscall floor rather than adding to it. The compositor's 1.03 ms
+sits on that floor, so our own event-loop occupancy contributes ~nothing either. Neither a better
+timer source nor a bespoke event loop can move this number; it is the host.
+
+That reframes the whole result: **the margin is buying VM scheduling jitter, not a design flaw.**
+Mutter's 1 ms is probably right on hardware that wakes in tens of microseconds, and this fork's
+`deadline dispatch off by default` is a *this-machine* verdict, not a judgement on the technique.
+Before treating it as settled, re-run the sweep on bare metal — and re-run `timer-probe` there
+first, because if the floor is sub-100 µs there is nothing left to explain.
 
 The cost is the latency the feature exists for. Releasing at `vblank − (estimate + 8 ms)` starts the
 frame ~5 ms after the previous presentation instead of immediately — a fraction of the freshness a
