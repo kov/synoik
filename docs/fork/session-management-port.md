@@ -261,6 +261,58 @@ too-new `version` rejection, and the tombstone-vs-pending-save interaction.
 
 ---
 
+## Live verification (2026-08-12)
+
+Run end-to-end against the real protocol on two legs: `tools/session-probe` against an owned
+headless instance, and **ghost** against kov's seat with a human moving the windows. Recorded
+because "the tests pass" and "the desktop works" stayed different claims right up to the run — and
+because the honest answer to *what did this verify* is narrower than "restore works".
+
+**Verified live, previously corpus-only:**
+
+- The **reclaim path** — ghost restored under `win-92497-*` from a process that was no longer pid
+  92497, `/proc/92497` gone. The names come back from ghost's own `groups.toml`; nothing in the
+  compositor parses them. This is the arm where the whole feature either works or is a no-op that
+  looks fine, and it had never once been exercised.
+- **The store is a fixed point** across save → restore → save: byte-identical but for `last-used`.
+  A stronger property than "restore looked right", and the one to regress against.
+- `restored` rather than `created` for a remembered id; `restored` before the first configure;
+  `state: 2` handed back **at the initial configure** (`configure(3072, 1696, [4])`, not applied
+  after the fact); the pre-maximize rect stored alongside it, so unmaximize has a target.
+- **Unknown name degrades** with no `restored` event and normal placement, in the same run as two
+  known names that went to their saved desktops — the contrast is what makes it evidence.
+- `replaced`, via two ghost processes with separate `XDG_RUNTIME_DIR` and a shared `XDG_DATA_HOME`
+  (the only way a single-instance-locked app reaches it): loser destroyed its inert object 17µs
+  after the event, winner kept the id and its toplevels.
+
+**The seed-wipe fix (`6e4fb6d9`) is reachable only from a client that titles itself in the gap
+between the initial configure and the first commit.** Ghost does, unconditionally, on every window
+open — and on *restore* runs its OSC title lands in the seam too, so the seam is hit harder on
+exactly the runs carrying seeds. `session-probe` titled before its first commit and could not reach
+it at all; `--retitle-after-configure` (`1a9a81dd`) was added so the corpus side can.
+
+**Not covered by either leg, and not absorbable into the green:**
+
+- **Everything multi-output.** Both legs ran on one head, which makes
+  `output_for_saved_rect`'s largest-overlap choice a no-op and the "rect overlaps no connected
+  output → drop the seed" path unreachable. **A monitor unplugged between save and restore — the
+  case that path exists for — is untested.** It needs a multi-output seat; no amount of headless
+  work reaches it.
+- **Fractional scale.** kov's seat is 1.25 but nothing here isolated scale, so this says nothing
+  about geometry fidelity under scaling.
+- **A user-chosen position via interactive move.** `msg input` could not drive a Mod+LMB
+  `MoveGrab` (the held modifier is real — press/release toggles the overview — but no grab starts),
+  so every probe-side position was compositor-assigned. Ghost's leg had a human, which is the only
+  reason positions were user-chosen at all.
+
+**Method note, because it cost the most time.** A window that never moved proves nothing: a freshly
+placed window and a restored one are pixel-identical, so the first control run was vacuous and read
+as green. Every check here is paired with a negative control that produces a *different* answer from
+the same code path — a restored window at its saved rect next to an unregistered one at the slot
+placement picks. Without that pairing these are screenshots of a default.
+
+---
+
 ## Slices
 
 0. **Placement seam — DONE (`d2645598`).** `layout::placement` now owns the monitor/workspace
