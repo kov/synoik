@@ -575,17 +575,38 @@ fn indicator_logical_width(count: usize) -> f64 {
     2. * INDICATOR_H_PADDING + dots + gaps
 }
 
+/// Which of the bar's text labels a cached texture belongs to. Each is baked and cached
+/// on its own, so one changing does not re-rasterize the others — see [`BarCache::textures`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LabelSlot {
+    /// The centre clock, `PanelMenu.Button`-styled and bold.
+    Clock,
+    /// The screen-recording pill's `M:SS` elapsed label.
+    Recording,
+    /// The input-source indicator's short layout name ("us", "br").
+    Keyboard,
+}
+
+/// One baked bar label, with the text it was baked from (the cache hit test) and the physical-px
+/// offset from its anchor column to the texture's left edge — see [`draw_label_texture`].
+struct CachedLabel {
+    text: String,
+    buffer: TextureBuffer<VkTexture>,
+    lead_px: i32,
+}
+
 /// Cached bar textures, keyed so a content change misses. Tied to a renderer
 /// context: dropped wholesale when the renderer changes.
 struct BarCache {
     context: Option<ContextId<VkTexture>>,
-    /// Bar chrome keyed by (scale, physical width). Content changes (the clock label, the
-    /// recording timer, an input-source switch) invalidate it through [`Self::clear`],
-    /// which is why the key can stay structural.
+    /// The bar's text labels, one entry per [`LabelSlot`], keyed by (scale, slot) and holding
+    /// the text each was baked from. A label misses when *its own* text changes — which is the
+    /// whole point of the split: the clock ticks once a minute (once a *second* with seconds
+    /// shown), and it used to invalidate a bake the full width of the output.
     ///
     /// The workspace state used to be part of this key, because the dots were baked in
     /// here and the active index placed them. They are [`RoundedSolidRenderElement`]s now,
-    /// so nothing in this bake varies with the workspace at all. Neither is the background
+    /// so nothing in these bakes varies with the workspace at all. Neither is the background
     /// ([`bar_bg`]) — one cached bake serves the whole overview fade *and* the whole
     /// workspace switch.
     ///
@@ -595,7 +616,7 @@ struct BarCache {
     /// one arrive every frame, which forces a full redraw of every framebuffer effect on the
     /// output — see [`Self::bg`] and [`Self::dots`], kept for exactly this reason.
     /// `nothing_churns_its_element_id_per_frame` is the guard.
-    textures: HashMap<(NotNan<f64>, i32), TextureBuffer<VkTexture>>,
+    textures: HashMap<(NotNan<f64>, LabelSlot), CachedLabel>,
     /// The bar background. A buffer rather than a bare colour so its commit counter
     /// bumps when the colour or width changes — that is what tells damage tracking the
     /// background moved, now that it is no longer part of the chrome bake.
@@ -860,10 +881,11 @@ impl Panel {
             return false;
         }
         self.recording.as_mut().unwrap().label = label;
-        // Bars only: the label is drawn into the bar, but the composited status-icon
-        // uploads are keyed by name and tint and do not depend on it. This ticks once
-        // a second while recording, so re-uploading every icon here is pure waste.
-        self.cache.borrow_mut().clear();
+        // No cache invalidation: the label's bake is keyed on its own text
+        // ([`BarCache::textures`]), so this misses exactly one label-sized texture and leaves
+        // the clock, the keyboard label and every composited icon alone. It ticks once a
+        // second while recording — back when all three labels shared one output-width bake,
+        // this line re-rasterized the entire bar at that cadence.
         true
     }
 
@@ -911,9 +933,8 @@ impl Panel {
         let text = format_clock(now, self.clock_format);
         if text != self.clock_text {
             self.clock_text = text;
-            // Bars only — see `update_recording_label`. With seconds shown this fires
-            // every second, and the status icons have nothing to do with the time.
-            self.cache.borrow_mut().clear();
+            // No cache invalidation — see `update_recording_label`. With seconds shown this
+            // fires every second, and nothing but the clock's own texture depends on it.
             true
         } else {
             false
@@ -1409,8 +1430,6 @@ impl Panel {
         let icons = caches.icons;
         let scale = output.current_scale().fractional_scale();
         let width = output_size(output).w;
-        let width_px: i32 = to_physical_precise_round(scale, width);
-        let width_px = width_px.max(1);
         let Some(scale_key) = NotNan::new(scale).ok() else {
             return Vec::new();
         };
@@ -1530,7 +1549,7 @@ impl Panel {
             .zip(self.right_box_rect(ROLE_KEYBOARD, width))
             .map(|(label, kb)| (label.clone(), kb.loc.x + INDICATOR_H_PADDING));
 
-        // Nothing animated may enter this bake. Three things have been taken out of it,
+        // Nothing animated may enter these bakes. Three things have been taken out of them,
         // each because it moved every frame and a bake is a GPU round trip: the overview
         // fade is the bar *background*'s alpha, its own element below; the button-container
         // fills are the pills' alpha, their own elements too ([`pill_element`]); and the
@@ -1539,57 +1558,47 @@ impl Panel {
         // the Activities button and the bar re-baked on every frame of the fade; before the
         // third, every workspace switch did the same.
         //
-        // What is left — the clock label and the recording/keyboard labels — changes on
-        // content, not on a clock tick within an animation, so a single bake now serves
-        // every frame of both animations. `position` is deliberately not consulted here.
+        // The labels are the fourth, taken out for the *slower* version of the same reason.
+        // They used to share one bake the full width of the output, so a label changing
+        // re-rasterized the whole bar: 0.9 ms warm, but at a once-a-minute cadence the path is
+        // never warm, and a live seat measured p50 60.7 ms / p99 311 ms for it — three or four
+        // dropped vblanks every single minute, forever, to change a digit. Each label is its
+        // own label-sized texture now, keyed on its own text, so a clock tick re-bakes the
+        // clock. `position` is deliberately not consulted here.
         // `the_overview_animation_rebakes_nothing_per_frame` and
         // `the_workspace_switch_rebakes_nothing_per_frame` are the guards — both were written
-        // against this bake. They only see *bakes*, though: a cached texture rewrapped in a fresh
-        // buffer every frame bakes nothing and still churns the element identity, which is what
-        // `nothing_churns_its_element_id_per_frame` covers.
-        let bar_key = (scale_key, width_px);
-        #[allow(clippy::map_entry)]
-        if !cache.textures.contains_key(&bar_key) {
-            match draw_bar_texture(
-                renderer,
-                scale,
-                width_px,
-                &self.clock_text,
-                self.date_menu_rect(width).loc.x + clock_h_padding(),
-                recording_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
-                keyboard_label.as_ref().map(|(s, x)| (s.as_str(), *x)),
-            ) {
-                Ok(texture) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        // The chrome is transparent everywhere it does not draw, so it never
-                        // occludes. Nothing in the panel does any more: the background below it is
-                        // a translucent wash over a blurred backdrop, so the strip has no opaque
-                        // region at all and whatever is under the bar still has to be drawn.
-                        Vec::new(),
-                    );
-                    cache.textures.insert(bar_key, buffer);
-                }
+        // against the old single bake. They only see *bakes*, though: a cached texture rewrapped
+        // in a fresh buffer every frame bakes nothing and still churns the element identity,
+        // which is what `nothing_churns_its_element_id_per_frame` covers — hence the cache holds
+        // the `TextureBuffer`, not the texture.
+        //
+        // The recording label is why all three moved rather than just the clock: it is an `M:SS`
+        // elapsed timer, so an active recording re-baked the full bar *every second*. Splitting
+        // the clock alone would have left the same bug with a rarer trigger.
+        let labels = [(
+            LabelSlot::Clock,
+            self.clock_text.as_str(),
+            self.date_menu_rect(width).loc.x + clock_h_padding(),
+        )]
+        .into_iter()
+        .chain(
+            recording_label
+                .as_ref()
+                .map(|(s, x)| (LabelSlot::Recording, s.as_str(), *x)),
+        )
+        .chain(
+            keyboard_label
+                .as_ref()
+                .map(|(s, x)| (LabelSlot::Keyboard, s.as_str(), *x)),
+        );
+        for (slot, text, x) in labels {
+            match label_element(renderer, &mut cache, scale, scale_key, slot, text, x) {
+                Ok(element) => elements.push(element),
                 Err(err) => {
-                    tracing::error!("error drawing the panel bar: {err:#}");
+                    tracing::error!("error drawing the panel {slot:?} label: {err:#}");
                     return elements;
                 }
             }
-        }
-        if let Some(buffer) = cache.textures.get(&bar_key) {
-            elements.push(PanelElement::Texture(
-                TextureRenderElement::from_texture_buffer(
-                    buffer.clone(),
-                    Point::from((0., 0.)),
-                    1.,
-                    None,
-                    None,
-                    Kind::Unspecified,
-                ),
-            ));
         }
 
         // The workspace dots, over the pills and the background but under nothing they
@@ -2014,84 +2023,122 @@ fn pill_element(
     ))
 }
 
-fn draw_bar_texture(
+/// One bar label as a composited element, baked on miss and cached on its own text.
+///
+/// `x` is the label's padded left edge in logical coordinates — the same anchor the old
+/// full-width bake used as the run's origin — and the element is placed so the glyph ink
+/// lands on the exact physical column it did then.
+fn label_element(
+    renderer: &mut VulkanRenderer,
+    cache: &mut BarCache,
+    scale: f64,
+    scale_key: NotNan<f64>,
+    slot: LabelSlot,
+    text: &str,
+    x: f64,
+) -> anyhow::Result<PanelElement> {
+    let key = (scale_key, slot);
+    // The bake is keyed on the label's own text, so the clock ticking leaves the recording
+    // and keyboard labels alone — and vice versa. Comparing rather than keying by `String`
+    // keeps one entry per slot instead of one per distinct value ever shown: a clock keyed
+    // by its text would grow an entry a minute.
+    let hit = cache
+        .textures
+        .get(&key)
+        .is_some_and(|cached| cached.text == text);
+    if !hit {
+        let (texture, lead_px) = draw_label_texture(renderer, scale, text)?;
+        let buffer = TextureBuffer::from_texture(
+            renderer,
+            texture,
+            scale,
+            Transform::Normal,
+            // Transparent everywhere it does not draw, so it never occludes. Nothing in the
+            // panel does any more: the background below it is a translucent wash over a
+            // blurred backdrop, so the strip has no opaque region at all and whatever is
+            // under the bar still has to be drawn.
+            Vec::new(),
+        );
+        cache.textures.insert(
+            key,
+            CachedLabel {
+                text: text.to_owned(),
+                buffer,
+                lead_px,
+            },
+        );
+    }
+    let cached = cache.textures.get(&key).expect("just inserted");
+    // Place by the *physical* column the run used to be drawn at, converted back to logical:
+    // feeding the raw logical `x` through the element would round a second time, a hair away
+    // from where every other panel measurement (all of which are physical-rounded) puts it.
+    let loc = Point::<f64, Logical>::from((
+        f64::from(to_physical_precise_round::<i32>(scale, x) + cached.lead_px) / scale,
+        0.,
+    ));
+    Ok(PanelElement::Texture(
+        TextureRenderElement::from_texture_buffer(
+            cached.buffer.clone(),
+            loc,
+            1.,
+            None,
+            None,
+            Kind::Unspecified,
+        ),
+    ))
+}
+
+/// Bake one bar label into a label-sized texture. Returns it with the physical-px offset from
+/// the label's anchor column to the texture's left edge (`<= 0`, non-zero only for a glyph whose
+/// ink starts left of its origin), which [`label_element`] adds back when it places the element.
+fn draw_label_texture(
     renderer: &mut VulkanRenderer,
     scale: f64,
-    width_px: i32,
-    clock: &str,
-    clock_x: f64,
-    recording_label: Option<(&str, f64)>,
-    keyboard_label: Option<(&str, f64)>,
-) -> anyhow::Result<VkTexture> {
-    let _span = tracy_client::span!("panel::draw_bar_texture");
+    text: &str,
+) -> anyhow::Result<(VkTexture, i32)> {
+    let _span = tracy_client::span!("panel::draw_label_texture");
 
-    let width_px = width_px.max(1);
     let height_px: i32 = to_physical_precise_round(scale, panel_height());
     let height_px = height_px.max(1);
 
-    // Shape every run up front (needs `&mut renderer`, before the bake frame opens). `TextShaper`
-    // owns the pt → physical-px multiply; the clock draws bold, like GNOME's `panel_button`.
-    let bold = TextStyle::new(FONT_PT).bold();
-    let (clock_run, recording, keyboard) = {
+    // Shape up front (needs `&mut renderer`, before the bake frame opens). `TextShaper` owns the
+    // pt → physical-px multiply; bar labels draw bold, like GNOME's `panel_button`.
+    let run = {
         let mut shaper = TextShaper::new(renderer, scale);
-        let clock_run = shaper.shape(clock, bold)?;
-        // Bold, left-aligned at its button/pill padding, line-box-centered vertically like the
-        // clock.
-        let shape_label = |shaper: &mut TextShaper, label: &str, lx: f64| -> anyhow::Result<_> {
-            let run = shaper.shape(label, bold)?;
-            let origin = Point::<i32, Physical>::from((
-                to_physical_precise_round(scale, lx),
-                run.line_box_centered_y(height_px),
-            ));
-            Ok((run, origin))
-        };
-        let recording = recording_label
-            .map(|(label, lx)| shape_label(&mut shaper, label, lx))
-            .transpose()?;
-        let keyboard = keyboard_label
-            .map(|(label, lx)| shape_label(&mut shaper, label, lx))
-            .transpose()?;
-        (clock_run, recording, keyboard)
+        shaper.shape(text, TextStyle::new(FONT_PT).bold())?
     };
 
-    // The clock label sits at its button's own padding, like the recording/keyboard
-    // labels — `clock_x` is that padded left edge, and the button's width came from the
-    // same *advance* measurement (`clock_button_width`), not the ink. gnome-shell's
-    // WallClock uses tabular figures, so the advance width is constant as the seconds
-    // tick and the label never shifts; sizing on the ink (whose left edge/width wobble
-    // per digit) would make the whole run jitter left/right each second. Our Cantarell
-    // digits are tabular too, so an advance-derived origin is rock-steady.
-    // Vertical centers on the font line-box (ascent+descent about the baseline), as
-    // St/Pango do — reserving descent space so the caps sit a hair higher than ink
-    // centering would put them (GNOME's clock reads visually higher in the bar).
-    let c_origin = Point::<i32, Physical>::from((
-        to_physical_precise_round(scale, clock_x),
-        clock_run.line_box_centered_y(height_px),
-    ));
+    // A label sits at its button's own padding, and the button's width came from the *advance*
+    // measurement (`clock_button_width`), not the ink. gnome-shell's WallClock uses tabular
+    // figures, so the advance width is constant as the seconds tick and the label never shifts;
+    // sizing on the ink (whose left edge/width wobble per digit) would make the run jitter
+    // left/right each second. Our Cantarell digits are tabular too, so an advance-derived origin
+    // is rock-steady — which is why the *texture* may be ink-sized without the glyphs moving:
+    // the run keeps its ink offset from the anchor, the texture is just cropped to it.
+    let (ink_x, _, ink_w, _) = run.ink_bounds();
+    let lead_px = ink_x.min(0);
+    let width_px = (ink_x + ink_w - lead_px).max(1);
+    // Vertical centers on the font line-box (ascent+descent about the baseline), as St/Pango do —
+    // reserving descent space so the caps sit a hair higher than ink centering would put them
+    // (GNOME's clock reads visually higher in the bar). The band is the full panel height, as it
+    // was when every label shared one bar-tall texture, so nothing moves vertically either.
+    let origin = Point::<i32, Physical>::from((-lead_px, run.line_box_centered_y(height_px)));
 
     let size = Size::<i32, Physical>::from((width_px, height_px));
-
-    widget::bake_uncached_sized(renderer, size, |frame| {
+    let texture = widget::bake_uncached_sized(renderer, size, |frame| {
         let mut p = Painter::new(frame, scale, size);
 
         p.clear([0., 0., 0., 0.])?;
-        // The button containers are NOT here: they are their own elements, composited
-        // under this texture ([`pill_element`]). Their only animated property is alpha,
-        // and alpha is free at composite time — in here it made the whole bar
-        // uncacheable for the length of every hover and every overview open. Neither are
-        // the workspace dots ([`workspace_dots`]), for the stronger version of the same
-        // reason: their geometry animates, and geometry cannot ride an element's alpha.
-        p.text_px(&clock_run, c_origin, TEXT)?;
-        // The screen-recording pill's M:SS label, over its red container.
-        if let Some((run, origin)) = &recording {
-            p.text_px(run, *origin, TEXT)?;
-        }
-        // The keyboard input-source short label.
-        if let Some((run, origin)) = &keyboard {
-            p.text_px(run, *origin, TEXT)?;
-        }
+        // The button containers are NOT here: they are their own elements, composited under
+        // this texture ([`pill_element`]). Their only animated property is alpha, and alpha is
+        // free at composite time — in here it made the whole bar uncacheable for the length of
+        // every hover and every overview open. Neither are the workspace dots
+        // ([`workspace_dots`]), for the stronger version of the same reason: their geometry
+        // animates, and geometry cannot ride an element's alpha.
+        p.text_px(&run, origin, TEXT)?;
         Ok(())
-    })
+    })?;
+    Ok((texture, lead_px))
 }
 
 #[cfg(test)]
@@ -2975,6 +3022,7 @@ mod tests {
                 return;
             }
         };
+        use smithay::backend::renderer::Texture as _;
 
         let width_px = 400;
         let height_px = panel_height() as i32;
@@ -2993,42 +3041,45 @@ mod tests {
             "the open overview must light the Activities pill, or the assertion below \
              that the bake does not contain it proves nothing",
         );
-        // Where the right-anchored clock button puts its label on a 400px-wide bar.
-        let clock_w = synoik_vk::text::measure_line_width_weighted("12:34", font_px() as f32, true)
-            + clock_h_padding() * 2.;
-        let clock_x = width_px as f64 - clock_w + clock_h_padding();
-        let mut tex = draw_bar_texture(&mut vk, 1., width_px, "12:34", clock_x, None, None)
-            .expect("bar texture");
+        let (mut tex, lead_px) =
+            draw_label_texture(&mut vk, 1., "12:34").expect("clock label texture");
+        let size = tex.size();
+
+        // The texture is the *label*, not the bar. This is the invariant now: nothing that
+        // belongs to another element can be in here, because there is no room for it. A
+        // full-width bake is what made a clock tick cost a full-bar re-rasterization
+        // (p50 60.7 ms on a live seat, once a minute, forever).
+        assert!(
+            size.w < width_px / 2,
+            "the clock label must be label-sized, not bar-sized: {size:?} on a {width_px}px bar",
+        );
+        assert_eq!(size.h, height_px, "the label keeps the bar's full height");
+        assert_eq!(
+            lead_px, 0,
+            "tabular digits start at their origin; a non-zero lead would mean the ink hangs \
+             left of the anchor and `label_element` has to shift the element back",
+        );
 
         let fb = vk.bind(&mut tex).expect("bind for readback");
-        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((width_px, height_px)));
+        let region = Rectangle::<i32, BufferCoord>::from_size(size);
         let mapping = vk
             .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
             .expect("copy_framebuffer");
         let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
 
         let px_at = |x: i32, y: i32| -> [u8; 4] {
-            let i = ((y * width_px + x) * 4) as usize;
+            let i = ((y * size.w + x) * 4) as usize;
             [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
         };
 
-        // A pixel mid-bar (past the Activities button, before the right-anchored clock)
-        // is where the background would be. The chrome must not paint it at all.
-        let bg = px_at(width_px / 2, height_px / 2);
+        // The top-left corner is above the line box: background territory, and the label must
+        // not paint it. The bar background and the container pills are separate elements —
+        // their alpha animates, and an animated alpha in a bake costs a GPU round trip on every
+        // frame of the fade. See `pill_element`.
+        let corner = px_at(0, 0);
         assert_eq!(
-            bg[3], 0,
-            "the chrome bake must be transparent where the background element goes, got {bg:?}",
-        );
-
-        // …and the same for the container pills, for the same reason. The active
-        // Activities fill used to be painted right here (white at α0.28, sampled above
-        // the dot band and inside the inset pill); it is its own element now, because
-        // its alpha animates and an animated alpha in this bake costs a GPU round trip
-        // on every frame of the fade. See `pill_element`.
-        let pill = px_at(17, 6);
-        assert_eq!(
-            pill[3], 0,
-            "the chrome bake must be transparent where the container pill goes, got {pill:?}",
+            corner[3], 0,
+            "the label bake must be transparent where the background element goes, got {corner:?}",
         );
 
         // Bright glyph ink somewhere (the clock text).
@@ -3138,6 +3189,93 @@ mod tests {
             backgrounds[5].is_some_and(|a| a > first * 0.2 && a < first * 0.8),
             "mid-fade should be partly transparent, got {:?}",
             backgrounds[5]
+        );
+    }
+
+    /// **A clock tick re-bakes the clock, and nothing else.** The bar's three text labels used
+    /// to share one bake the full width of the output, so the minute tick re-rasterized the
+    /// whole bar. That is cheap warm (0.9 ms) and ruinous cold, which is what it always is at a
+    /// once-a-minute cadence: a live seat measured p50 60.7 ms, p99 311 ms, and three to four
+    /// dropped vblanks every minute on an idle desktop. See
+    /// `docs/fork/late-frame-populations.md`.
+    ///
+    /// Counted on bakes rather than pixels, like [`an_overview_fade_reuses_one_bar_bake`]: a
+    /// label re-baked needlessly renders identically to a cached one. Two ticks, because the
+    /// first has to pay for the clock and the assertion is that it pays for *only* the clock —
+    /// with a recording running, so there is a second label present to be spared.
+    #[test]
+    fn a_clock_tick_rebakes_only_the_clock() {
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping a_clock_tick_rebakes_only_the_clock: no Vulkan device ({e})");
+                return;
+            }
+        };
+        let mut panel = test_panel();
+        let output = Output::new(
+            "panel-test".to_owned(),
+            smithay::output::PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: smithay::output::Subpixel::Unknown,
+                make: "synoik".to_owned(),
+                model: "test".to_owned(),
+                serial_number: "0".to_owned(),
+            },
+        );
+        output.change_current_state(
+            Some(smithay::output::Mode {
+                size: Size::from((1920, 1080)),
+                refresh: 60_000,
+            }),
+            None,
+            None,
+            None,
+        );
+        let ws = WorkspaceState {
+            count: 3,
+            active: 1,
+        };
+        let icons = IconCache::new("Adwaita");
+        let images = crate::render_helpers::icon::ImageCache::new();
+        panel.set_keyboard_layout(Some("us".to_owned()));
+        panel.set_recording(Some(panel.clock.now_unadjusted()));
+        let render = |panel: &Panel, vk: &mut VulkanRenderer| {
+            let _ = panel.render(
+                vk,
+                &output,
+                ws,
+                1.,
+                0.,
+                DrawCaches {
+                    icons: &icons,
+                    images: &images,
+                },
+            );
+        };
+
+        // Warm every label.
+        render(&panel, &mut vk);
+        let warm = crate::frame_log::bakes();
+        render(&panel, &mut vk);
+        assert_eq!(
+            crate::frame_log::bakes(),
+            warm,
+            "a re-render with nothing changed must not bake at all",
+        );
+
+        // 12:00 → 12:01. Exactly one label's text changed.
+        assert!(
+            panel.update_clock_at(1_754_000_460),
+            "the clock text must actually change, or this test proves nothing",
+        );
+        let before = crate::frame_log::bakes();
+        render(&panel, &mut vk);
+        assert_eq!(
+            crate::frame_log::bakes(),
+            before + 1,
+            "a clock tick must re-bake the clock label alone — the recording and keyboard \
+             labels did not change",
         );
     }
 
@@ -3475,7 +3613,6 @@ mod tests {
             }
         };
         let scale = 2.0;
-        let width_px = to_physical_precise_round::<i32>(scale, 400.);
 
         // A red pill on the right with a label just inside its left padding.
         let pill = Rectangle::new(Point::from((300., 3.)), Size::from((90., 26.)));
@@ -3504,20 +3641,15 @@ mod tests {
         assert_eq!(corner[3], 0, "the pill must be rounded, got {corner:?}");
         drop(fb);
 
-        // The label, which stays in the chrome bake and draws over the pill.
-        let mut tex = draw_bar_texture(
-            &mut vk,
-            scale,
-            width_px,
-            "12:34",
-            // Park the clock at the far left; this test scans the 300–390 band for the
-            // recording label's ink, and the clock's would be indistinguishable there.
-            0.,
-            Some(("0:05", 306.)),
-            None,
-        )
-        .expect("bar texture");
+        // The M:SS label, its own texture, composited over the pill.
+        let (mut tex, _) = draw_label_texture(&mut vk, scale, "0:05").expect("label texture");
         let size = tex.size();
+        // It must fit inside the pill it draws over, or it is not a label texture.
+        assert!(
+            size.w < to_physical_precise_round::<i32>(scale, pill.size.w),
+            "the M:SS label must fit its pill: {size:?} in a {:?} pill",
+            pill.size,
+        );
 
         let fb = vk.bind(&mut tex).expect("bind for readback");
         let region = Rectangle::<i32, BufferCoord>::from_size(size);
@@ -3526,30 +3658,21 @@ mod tests {
             .expect("copy_framebuffer");
         let pixels = vk.map_texture(&mapping).expect("map_texture").to_vec();
 
-        // Readback is [R, G, B, A] per pixel. Scan the pill's physical column range.
-        let w = size.w as usize;
-        let x0 = to_physical_precise_round::<i32>(scale, 300.).max(0) as usize;
-        let x1 = (to_physical_precise_round::<i32>(scale, 390.) as usize).min(w);
+        // Readback is [R, G, B, A] per pixel.
         let mut ink = 0usize;
-        let mut bar_red = 0usize;
-        for y in 0..size.h as usize {
-            for x in x0..x1 {
-                let p = &pixels[(y * w + x) * 4..(y * w + x) * 4 + 4];
-                if p[0] > 150 && p[1] < 90 && p[2] < 90 && p[3] > 200 {
-                    bar_red += 1;
-                }
-                if p[0] > 200 && p[1] > 200 && p[2] > 200 {
-                    ink += 1;
-                }
+        let mut label_red = 0usize;
+        for p in pixels.chunks_exact(4) {
+            if p[0] > 150 && p[1] < 90 && p[2] < 90 && p[3] > 200 {
+                label_red += 1;
+            }
+            if p[0] > 200 && p[1] > 200 && p[2] > 200 {
+                ink += 1;
             }
         }
-        assert!(
-            ink > 5,
-            "expected white M:SS label ink where the pill goes, got {ink} px"
-        );
+        assert!(ink > 5, "expected white M:SS label ink, got {ink} px");
         assert_eq!(
-            bar_red, 0,
-            "the pill is its own element now; the chrome bake must not paint it",
+            label_red, 0,
+            "the pill is its own element now; the label bake must not paint it",
         );
     }
 
