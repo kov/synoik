@@ -266,16 +266,27 @@ fn the_effect_tracks_the_tile_through_a_resize() {
         );
     }
 
-    // The client answers with a bigger buffer and a matching region, in one commit — which is what
-    // a real client does (verified on the wire against ghost). The resize animation is still
+    // The client answers with a bigger buffer and a matching region, in **one** commit — which is
+    // what a real client does (verified on the wire against ghost). The resize animation is still
     // running, so the tile is between the two sizes here.
+    //
+    // It answers with the size it was actually configured with, rather than one of the test's
+    // choosing. A client that commits an arbitrary size drags the tile's target to that size, so
+    // the assertions below would be pinned to whatever number the test picked instead of to the
+    // maximized geometry — and the mid-flight window they need would exist only while the two
+    // happened to line up. `update_blur_region` carries the commit, so the buffer, the size, the
+    // ack and the region all land together the way they do on the wire.
     let window = f.client(id).window(&surface);
+    let (cw, ch) = window.configures_received.last().unwrap().1.size;
+    assert!(
+        cw > 400 && ch > 300,
+        "the maximize must have configured a bigger size than the window started at, got {cw}x{ch}",
+    );
     window.attach_solid_buffer(0, u32::MAX, 0, u32::MAX);
-    window.set_size(800, 600);
-    window.ack_last_and_commit();
-    f.double_roundtrip(id);
+    window.set_size(u16::try_from(cw).unwrap(), u16::try_from(ch).unwrap());
+    window.ack_last();
     f.client(id)
-        .update_blur_region(&effect, &surface, (0, 0, 800, 600));
+        .update_blur_region(&effect, &surface, (0, 0, cw, ch));
     f.double_roundtrip(id);
 
     // Step to a genuinely mid-flight instant: well inside the 250 ms window-resize easing
