@@ -26,8 +26,8 @@ use std::time::Duration;
 use anyhow::Context as _;
 
 /// Default output path for the keybind/pill trigger, matching GNOME's default exactly:
-/// `$XDG_VIDEOS_DIR/Screencasts/Screencast From <date> <time>.webm` (the same template
-/// gnome-shell's UI sends over D-Bus; `screenshot.js` builds `Screencasts/Screencast From %d %t`).
+/// `<Videos>/Screencasts/Screencast From <date> <time>.webm` (the same template gnome-shell's UI
+/// sends over D-Bus; `screenshot.js` builds `Screencasts/Screencast From %d %t`).
 /// Creates the directory.
 pub fn default_recording_path() -> anyhow::Result<PathBuf> {
     resolve_file_template("Screencasts/Screencast From %d %t", "webm")
@@ -38,7 +38,8 @@ pub fn default_recording_path() -> anyhow::Result<PathBuf> {
 /// - a trailing `.webm` is stripped (a compat shim; the real extension is appended here);
 /// - `%d` expands to the local date `YYYY-MM-DD`, `%t` to the local time `HH-MM-SS`, `%%` to `%`,
 ///   and any other `%x` escape is dropped (it is NOT strftime);
-/// - a relative result lands under `$XDG_VIDEOS_DIR` (else `$HOME`);
+/// - a relative result lands under the XDG **Videos** user directory (else `$HOME`) — see
+///   [`recordings_base`];
 /// - `extension` is appended and the parent directory is created.
 ///
 /// The default template gnome-shell's UI sends is `Screencasts/Screencast From %d %t`.
@@ -50,11 +51,8 @@ pub fn resolve_file_template(template: &str, extension: &str) -> anyhow::Result<
 
     let mut path = PathBuf::from(&stem);
     if path.is_relative() {
-        let base = std::env::var_os("XDG_VIDEOS_DIR")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-            .context("neither XDG_VIDEOS_DIR nor HOME is set")?;
-        path = base.join(path);
+        let dirs = directories::UserDirs::new().context("error retrieving the user directories")?;
+        path = recordings_base(dirs.video_dir(), dirs.home_dir()).join(path);
     }
 
     // Append the real extension (the template's stem never carries it).
@@ -68,6 +66,24 @@ pub fn resolve_file_template(template: &str, extension: &str) -> anyhow::Result<
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     Ok(path)
+}
+
+/// Where a relative screencast template lands: the XDG **Videos** user directory, else `$HOME` —
+/// `_getAbsolutePath` (`screencastService.js:585-594`), which is
+/// `g_get_user_special_dir(DIRECTORY_VIDEOS) || g_get_home_dir()`.
+///
+/// **Not the `XDG_VIDEOS_DIR` environment variable**, which is what this used to read. That
+/// variable is not part of the running session's contract: the user directories are declared in
+/// `~/.config/user-dirs.dirs`, which is what glib reads and what `directories::UserDirs` parses.
+/// The variable is unset in an ordinary session, so every recording fell through to `$HOME` and
+/// landed in `~/Screencasts` instead of `~/Videos/Screencasts`. Reading the file also gets the
+/// localized directory names right — a `pt_BR` session's videos live in `~/Vídeos`, and no amount
+/// of guessing English names finds them.
+///
+/// Pure, so the fallback is testable without touching the process environment (which in a parallel
+/// test binary is a flake generator).
+fn recordings_base(videos: Option<&std::path::Path>, home: &std::path::Path) -> PathBuf {
+    videos.unwrap_or(home).to_owned()
 }
 
 /// Expand the `%d`/`%t`/`%%` escapes of a screencast template. Pure, for testability; the caller
@@ -166,6 +182,24 @@ mod tests {
         // The parent directory is created.
         assert!(dir.is_dir());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A relative template lands in the *Videos* directory, and only falls back to `$HOME` when
+    /// there is no such directory at all.
+    ///
+    /// The fallback used to be the whole behaviour: the base came from `$XDG_VIDEOS_DIR`, which no
+    /// session sets, so recordings piled up in `~/Screencasts` instead of `~/Videos/Screencasts`.
+    #[test]
+    fn a_relative_recording_lands_in_the_videos_directory() {
+        let home = std::path::Path::new("/home/someone");
+        let videos = std::path::Path::new("/home/someone/Vídeos");
+
+        assert_eq!(recordings_base(Some(videos), home), videos);
+        assert_eq!(
+            recordings_base(None, home),
+            home,
+            "with no Videos directory declared, GNOME uses the home directory"
+        );
     }
 
     #[test]
