@@ -466,21 +466,37 @@ fn qs_indicator_icons(
     v
 }
 
-/// The x of the `i`-th quick-settings status icon, from the indicator rect's left edge. The single
-/// source of truth for the cluster's spacing: the render loop and the per-icon hit test must agree,
-/// or a scroll lands on a neighbour of the icon it looks like it is over.
-fn qs_icon_x(rect_x: f64, i: usize) -> f64 {
-    rect_x + INDICATOR_H_PADDING + QS_ICON_MARGIN + i as f64 * (QS_ICON + QS_ICON_GAP)
+/// The widths of `n` slots that are all plain `.system-status-icon`s — the shape every cluster
+/// had before the battery indicator, and still the shape of the app-indicator cluster.
+fn icon_widths(n: usize) -> Vec<f64> {
+    vec![QS_ICON; n]
 }
 
-/// Logical width of a right-box cluster of `n` `.system-status-icon`s (padding + icons + gaps).
+/// The x of the `i`-th slot in a right-box cluster, from the indicator rect's left edge, given
+/// every slot's width. The single source of truth for the cluster's spacing: the render loop and
+/// the per-slot hit test must agree, or a scroll lands on a neighbour of the icon it looks like it
+/// is over.
 ///
-/// The box's outer icons keep their facing margin too, so the cluster carries one
+/// Takes widths rather than an index-times-constant so the cluster can hold a slot that is not
+/// `QS_ICON` wide — the dynamic battery indicator is a wide self-painted element sitting among
+/// 16px icons (`docs/fork/battery-indicator-design.md`). Anything that walks the cluster must walk
+/// these widths, never `i * QS_ICON`. Every slot is still an icon today; this is the seam.
+fn qs_slot_x(widths: &[f64], rect_x: f64, i: usize) -> f64 {
+    rect_x
+        + INDICATOR_H_PADDING
+        + QS_ICON_MARGIN
+        + widths[..i].iter().map(|w| w + QS_ICON_GAP).sum::<f64>()
+}
+
+/// Logical width of a right-box cluster (padding + slots + gaps).
+///
+/// The box's outer slots keep their facing margin too, so the cluster carries one
 /// `QS_ICON_MARGIN` of breathing room at each end inside the button padding. Shared by the
 /// quick-settings cluster and the app indicators so both measure the same as
-/// [`qs_icon_x`] places.
-fn qs_cluster_width(n: f64) -> f64 {
-    2. * INDICATOR_H_PADDING + 2. * QS_ICON_MARGIN + n * QS_ICON + (n - 1.) * QS_ICON_GAP
+/// [`qs_slot_x`] places.
+fn qs_cluster_width(widths: &[f64]) -> f64 {
+    let gaps = (widths.len().max(1) - 1) as f64;
+    2. * INDICATOR_H_PADDING + 2. * QS_ICON_MARGIN + widths.iter().sum::<f64>() + gaps * QS_ICON_GAP
 }
 
 /// Logical width of the right-box quick-settings indicator. Depends on how many status
@@ -491,7 +507,18 @@ fn qs_indicator_width(
     audio: Option<AudioStatus>,
     mic: MicStatus,
 ) -> f64 {
-    qs_cluster_width(qs_indicator_icons(toggles, status, audio, mic).len() as f64)
+    qs_cluster_width(&qs_indicator_widths(toggles, status, audio, mic))
+}
+
+/// The width of each quick-settings cluster slot, in cluster order. Derived from the same
+/// [`qs_indicator_icons`] walk the render loop and the hit tests use, so the three cannot drift.
+fn qs_indicator_widths(
+    toggles: QuickToggles,
+    status: &SystemStatus,
+    audio: Option<AudioStatus>,
+    mic: MicStatus,
+) -> Vec<f64> {
+    icon_widths(qs_indicator_icons(toggles, status, audio, mic).len())
 }
 
 /// One app indicator as the panel draws it: an id to act on and the icon name to resolve.
@@ -1230,7 +1257,7 @@ impl Panel {
         if self.app_indicators.is_empty() {
             return 0.;
         }
-        qs_cluster_width(self.app_indicators.len() as f64)
+        qs_cluster_width(&icon_widths(self.app_indicators.len()))
     }
 
     /// The rect of the `i`-th app indicator, for hit-testing a click at one of several icons
@@ -1244,7 +1271,7 @@ impl Panel {
             return None;
         }
         let rect = self.app_indicators_rect(output_width)?;
-        let x = qs_icon_x(rect.loc.x, i) - QS_ICON_MARGIN;
+        let x = qs_slot_x(&icon_widths(self.app_indicators.len()), rect.loc.x, i) - QS_ICON_MARGIN;
         Some(Rectangle::new(
             Point::from((x, 0.)),
             Size::from((QS_ICON + 2. * QS_ICON_MARGIN, panel_height())),
@@ -1386,10 +1413,11 @@ impl Panel {
             .position(|(candidates, _)| candidates.first().is_some_and(|name| name == want))?;
 
         let rect = self.quick_settings_rect(output_width);
-        let x = qs_icon_x(rect.loc.x, index) - QS_ICON_MARGIN;
+        let widths = qs_indicator_widths(self.toggles, &self.system_status, self.audio, self.mic);
+        let x = qs_slot_x(&widths, rect.loc.x, index) - QS_ICON_MARGIN;
         Some(Rectangle::new(
             Point::from((x, 0.)),
-            Size::from((QS_ICON + 2. * QS_ICON_MARGIN, panel_height())),
+            Size::from((widths[index] + 2. * QS_ICON_MARGIN, panel_height())),
         ))
     }
 
@@ -1737,7 +1765,8 @@ impl Panel {
             // its natural size rather than stretched to the icon box.
             let logical = tb.logical_size();
             let location = Point::from((
-                qs_icon_x(rect.loc.x, i) + (QS_ICON - logical.w) / 2.,
+                qs_slot_x(&icon_widths(self.app_indicators.len()), rect.loc.x, i)
+                    + (QS_ICON - logical.w) / 2.,
                 (panel_height() - logical.h) / 2.,
             ));
             elements.push(PanelElement::Texture(
@@ -1762,34 +1791,38 @@ impl Panel {
         icons: &IconCache,
     ) {
         let rect = self.quick_settings_rect(output_width);
-        // The first icon carries the box's leading `.system-status-icon` left margin.
-        let mut x = qs_icon_x(rect.loc.x, 0);
-        for (candidates, color) in
+        // Slot positions come from the shared width walk, never from a running cursor: a slot
+        // whose icon fails to resolve must still consume its place, or every icon after it slides
+        // left of where the hit tests look for it.
+        let widths = qs_indicator_widths(self.toggles, &self.system_status, self.audio, self.mic);
+        for (i, (candidates, color)) in
             qs_indicator_icons(self.toggles, &self.system_status, self.audio, self.mic)
+                .into_iter()
+                .enumerate()
         {
             // The first candidate that resolves, in its tint.
             let Some(tb) = candidates
                 .iter()
                 .find_map(|name| icons.texture(renderer, name, QS_ICON, scale, color))
             else {
-                x += QS_ICON + QS_ICON_GAP;
                 continue;
             };
-            {
-                let logical = tb.logical_size();
-                let location = Point::from((x, (panel_height() - logical.h) / 2.));
-                elements.push(PanelElement::Texture(
-                    TextureRenderElement::from_texture_buffer(
-                        tb,
-                        location,
-                        1.,
-                        None,
-                        None,
-                        Kind::Unspecified,
-                    ),
-                ));
-            }
-            x += QS_ICON + QS_ICON_GAP;
+            let logical = tb.logical_size();
+            // The first icon carries the box's leading `.system-status-icon` left margin.
+            let location = Point::from((
+                qs_slot_x(&widths, rect.loc.x, i),
+                (panel_height() - logical.h) / 2.,
+            ));
+            elements.push(PanelElement::Texture(
+                TextureRenderElement::from_texture_buffer(
+                    tb,
+                    location,
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                ),
+            ));
         }
     }
 }
@@ -2197,7 +2230,9 @@ mod tests {
         );
 
         // The icon centres either side of it -- the neighbours -- are NOT in the box.
-        let centre = |i: usize| Point::from((qs_icon_x(cluster.loc.x, i) + QS_ICON / 2., 10.));
+        let widths = icon_widths(3);
+        let centre =
+            |i: usize| Point::from((qs_slot_x(&widths, cluster.loc.x, i) + widths[i] / 2., 10.));
         assert!(
             rect.contains(centre(1)),
             "the volume icon is the second of three"
@@ -2224,6 +2259,39 @@ mod tests {
         });
         let moved = panel.volume_indicator_rect(output_width).unwrap();
         assert_ne!(moved, rect, "a shorter cluster re-places the volume icon");
+    }
+
+    /// A cluster slot may be wider than `QS_ICON` — that is the whole point of walking widths
+    /// instead of `i * QS_ICON`, and what the dynamic battery indicator will need
+    /// (`docs/fork/battery-indicator-design.md`). Every slot is an icon today, so this pins the
+    /// geometry primitive directly: a wide slot must push its successors right by exactly its
+    /// excess, and the cluster must grow by the same amount.
+    #[test]
+    fn a_wide_cluster_slot_displaces_the_slots_after_it() {
+        let wide = QS_ICON + 13.5;
+        let uniform = icon_widths(3);
+        let mixed = vec![QS_ICON, wide, QS_ICON];
+
+        // Slots before the wide one do not move; slots after it shift by the excess.
+        assert_eq!(qs_slot_x(&mixed, 0., 0), qs_slot_x(&uniform, 0., 0));
+        assert_eq!(qs_slot_x(&mixed, 0., 1), qs_slot_x(&uniform, 0., 1));
+        assert_eq!(
+            qs_slot_x(&mixed, 0., 2),
+            qs_slot_x(&uniform, 0., 2) + (wide - QS_ICON),
+            "the slot after a wide one moves right by exactly its excess"
+        );
+
+        // The cluster grows by the excess, and by nothing else: the gaps are unchanged.
+        assert_eq!(
+            qs_cluster_width(&mixed),
+            qs_cluster_width(&uniform) + (wide - QS_ICON)
+        );
+
+        // A single-slot cluster carries no gap, and a wide lone slot is still measured.
+        assert_eq!(
+            qs_cluster_width(&[wide]) - qs_cluster_width(&icon_widths(1)),
+            wide - QS_ICON
+        );
     }
 
     fn indicator(id: &str, icon: Option<&str>) -> PanelIndicator {
