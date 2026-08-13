@@ -362,6 +362,12 @@ impl Headless {
 
         output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
 
+        // Headless presents inside the render call — there is no flip to come back from — so this
+        // is the same moment the TTY reaches on a vblank.
+        if mem::take(&mut output_state.shield_frame_queued) {
+            synoik.note_shield_frame_presented(output);
+        }
+
         queue_next_frame(synoik, output, target_presentation_time);
 
         RenderResult::Submitted

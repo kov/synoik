@@ -700,6 +700,16 @@ pub struct Synoik {
     /// fd is what tells logind to go ahead and suspend, so this field's *lifetime* is the
     /// mechanism, not a handle we happen to keep.
     pub sleep_inhibitor: Option<zbus::zvariant::OwnedFd>,
+    /// Outputs that still owe a *presented* frame of the settled curtain before the machine may
+    /// suspend. Non-empty only between `PrepareForSleep(true)` and the flip that puts the shield
+    /// on screen — see [`crate::screen_shield::ScreenShield::wants_sleep_inhibitor`].
+    ///
+    /// Held as the outputs themselves, and read through [`Self::shield_frame_owed`], which ignores
+    /// any that have gone away: an output unplugged mid-suspend owes nothing, and making the
+    /// removal path remember that would be a second place to get it wrong.
+    pub shield_frames_owed: HashSet<Output>,
+    /// The bound on the above (see [`Self::SHIELD_PRESENT_DEADLINE`]).
+    pub shield_present_deadline: Option<calloop::RegistrationToken>,
     /// What `GetActive` / `GetActiveTime` read, mirrored out of [`Self::screen_shield`] on every
     /// change so the bus task can answer without a round trip through the event loop.
     pub shield_snapshot:
@@ -1265,6 +1275,10 @@ pub struct OutputState {
     /// redraw loop derives `unfinished_animations_remain` from, kept so the frame
     /// log can name what a slow frame was doing.
     pub last_frame_anim_causes: AnimCauses,
+    /// The frame this output last handed to its backend shows the settled shield curtain, and its
+    /// presentation is what a pending suspend is waiting on. Taken by whichever moment the backend
+    /// calls "presented" — a vblank on the TTY, the render call itself headless.
+    pub shield_frame_queued: bool,
 }
 
 /// Which Wayland socket, if any, the compositor should listen on.
@@ -1921,7 +1935,7 @@ impl State {
                         // (`screenShield.js:110,113`). Without this, turning locking back on
                         // leaves the fd unheld until the next shield event — and the next suspend
                         // is the race the inhibitor exists to prevent.
-                        state.sync_sleep_inhibitor();
+                        state.synoik.sync_sleep_inhibitor();
                         // Every point size in the UI is a ratio against this
                         // (`crate::ui::base_font_pt`), so publishing it re-sizes all
                         // text at once — as `st_theme_context_set_font` does.
@@ -5103,17 +5117,41 @@ impl State {
             }
             Login1ToSynoik::SessionActive(active) => {
                 self.synoik.session_active = active;
-                self.sync_sleep_inhibitor();
+                self.synoik.sync_sleep_inhibitor();
             }
             // The last moment before the machine goes down — logind is holding the suspend on our
-            // delay inhibitor, and `apply_shield_effects` releases it once we have locked.
+            // delay inhibitor, and `apply_shield_effects` releases it once we have locked *and* the
+            // curtain has reached the screen.
             Login1ToSynoik::PrepareForSleep(about_to_suspend) => {
                 let now = crate::utils::get_monotonic_time();
+                // Armed before the lock, because that is when the question can still be asked: the
+                // curtain has to travel unless it is already down. Arming after would see the
+                // descent that `prepare_for_sleep` just started and never distinguish the two.
+                // `apply_shield_effects` ends in `sync_sleep_inhibitor`, which reads this.
+                if about_to_suspend {
+                    if !self.synoik.shield_curtain_landed() {
+                        self.synoik.arm_shield_present_wait();
+                    }
+                } else {
+                    // A suspend can be called off — another delay inhibitor may refuse it, and
+                    // logind then emits `false` without the machine ever going down. A wait left
+                    // armed there would hold the fd until its deadline for nothing.
+                    self.synoik.clear_shield_present_wait();
+                }
+
                 let effects =
                     self.synoik
                         .screen_shield
                         .prepare_for_sleep(about_to_suspend, now, false);
                 self.apply_shield_effects(effects);
+
+                // A shield that did not go down (`lock-enabled` off, or locked down) is never going
+                // to present the frame we just armed a wait for. The inhibitor is already released
+                // in that case — the settings it hangs on are the same ones — so this only saves a
+                // timer and the deadline warning it would log.
+                if about_to_suspend && !self.synoik.screen_shield.is_active() {
+                    self.synoik.clear_shield_present_wait();
+                }
             }
             Login1ToSynoik::BrightnessWriteDone { connector, outcome } => {
                 let Some(tty) = self.backend.tty_checked() else {
@@ -5915,7 +5953,7 @@ impl State {
 
         // Last, and unconditionally: the inhibitor is a function of the state we just moved to, and
         // the suspend path *depends* on it being dropped here — logind is waiting on that fd.
-        self.sync_sleep_inhibitor();
+        self.synoik.sync_sleep_inhibitor();
     }
 
     /// Bound how long a lock may wait on gdm before giving up and staying a screensaver.
@@ -6009,34 +6047,6 @@ impl State {
             .map_err(|err| warn!("error arming the idle lock timer: {err:?}"))
             .ok();
         self.synoik.lock_timer = token;
-    }
-
-    /// Hold or release logind's `delay` sleep inhibitor to match the shield's state
-    /// (`_syncInhibitor`, `screenShield.js:202-231`).
-    pub fn sync_sleep_inhibitor(&mut self) {
-        let want = self
-            .synoik
-            .screen_shield
-            .wants_sleep_inhibitor(self.synoik.session_active);
-        if want == self.synoik.sleep_inhibitor.is_some() {
-            return;
-        }
-
-        if !want {
-            // Dropping the fd is the "go ahead" logind is blocked on.
-            self.synoik.sleep_inhibitor = None;
-            return;
-        }
-
-        let Some(conn) = self
-            .synoik
-            .dbus
-            .as_ref()
-            .and_then(|d| d.conn_login1.as_ref())
-        else {
-            return;
-        };
-        self.synoik.sleep_inhibitor = crate::dbus::freedesktop_login1::take_sleep_inhibitor(conn);
     }
 
     /// gnome-session's presence changed (`_onStatusChanged`, `screenShield.js:242-272`).
@@ -7480,6 +7490,8 @@ impl Synoik {
             unlock_message_timer: None,
             session_active: true,
             sleep_inhibitor: None,
+            shield_frames_owed: HashSet::new(),
+            shield_present_deadline: None,
             shield_snapshot: Default::default(),
             screen_saver_emit: None,
             login1_tx: None,
@@ -7950,6 +7962,7 @@ impl Synoik {
             last_frame_elements: 0,
             last_frame_full_damage: false,
             last_frame_anim_causes: AnimCauses::empty(),
+            shield_frame_queued: false,
         };
         let rv = self.output_state.insert(output.clone(), state);
         assert!(rv.is_none(), "output was already tracked");
@@ -9777,6 +9790,101 @@ impl Synoik {
         }
     }
 
+    /// How long a suspend may be held waiting for the shield to reach the screen.
+    ///
+    /// The wait it bounds is a 250 ms slide plus one flip, so this is already several times the
+    /// honest cost; what it is really sized against is the case where the frame never comes at all
+    /// — a blanked output, a wedged GPU, a monitor unplugged mid-suspend. Without it those ride the
+    /// suspend all the way to logind's `InhibitDelayMaxSec` (5 s by default) and *then* suspend
+    /// anyway, so the only thing a longer bound buys is a longer lid-close.
+    const SHIELD_PRESENT_DEADLINE: Duration = Duration::from_secs(1);
+
+    /// Hold or release logind's `delay` sleep inhibitor to match the shield's state
+    /// (`_syncInhibitor`, `screenShield.js:202-231`).
+    ///
+    /// On [`Synoik`] rather than `State` because the release edge is now a *presentation*: the
+    /// backends reach it from a vblank, where there is no `State` to be had.
+    pub fn sync_sleep_inhibitor(&mut self) {
+        let want = self
+            .screen_shield
+            .wants_sleep_inhibitor(self.session_active, self.shield_frame_owed());
+        if want == self.sleep_inhibitor.is_some() {
+            return;
+        }
+
+        if !want {
+            // Dropping the fd is the "go ahead" logind is blocked on.
+            self.sleep_inhibitor = None;
+            return;
+        }
+
+        let Some(conn) = self.dbus.as_ref().and_then(|d| d.conn_login1.as_ref()) else {
+            return;
+        };
+        self.sleep_inhibitor = crate::dbus::freedesktop_login1::take_sleep_inhibitor(conn);
+    }
+
+    /// Whether a pending suspend is still waiting for the shield to reach a scanout buffer.
+    pub fn shield_frame_owed(&self) -> bool {
+        self.shield_frames_owed
+            .iter()
+            .any(|output| self.output_state.contains_key(output))
+    }
+
+    /// `PrepareForSleep(true)`: wait for the curtain to be *on screen* before releasing the
+    /// inhibitor, on every output that is currently drawing.
+    ///
+    /// Only called when the curtain still has to travel — a suspend arriving at an already-covered
+    /// screen owes no frame, and would otherwise wait for a flip that nothing is going to ask for.
+    pub fn arm_shield_present_wait(&mut self) {
+        self.shield_frames_owed = self.output_state.keys().cloned().collect();
+        if self.shield_frames_owed.is_empty() {
+            return;
+        }
+
+        if let Some(token) = self.shield_present_deadline.take() {
+            self.event_loop.remove(token);
+        }
+        let timer = calloop::timer::Timer::from_duration(Self::SHIELD_PRESENT_DEADLINE);
+        self.shield_present_deadline = self
+            .event_loop
+            .insert_source(timer, move |_, _, state| {
+                if !state.synoik.shield_frames_owed.is_empty() {
+                    warn!("the shield never reached the screen; letting the suspend go ahead");
+                    state.synoik.clear_shield_present_wait();
+                }
+                calloop::timer::TimeoutAction::Drop
+            })
+            .map_err(|err| warn!("error arming the shield presentation deadline: {err:?}"))
+            .ok();
+    }
+
+    /// Stop waiting, whatever the reason — the frame landed, the deadline passed, or the suspend
+    /// was called off. Releases the inhibitor if that was the last thing holding it.
+    pub fn clear_shield_present_wait(&mut self) {
+        self.shield_frames_owed.clear();
+        if let Some(token) = self.shield_present_deadline.take() {
+            self.event_loop.remove(token);
+        }
+        for state in self.output_state.values_mut() {
+            state.shield_frame_queued = false;
+        }
+        self.sync_sleep_inhibitor();
+    }
+
+    /// A frame carrying the settled curtain has been presented on `output`.
+    ///
+    /// Called from the backends' presentation edge — the point after which the buffer this names is
+    /// what a snapshot of the machine would contain.
+    pub fn note_shield_frame_presented(&mut self, output: &Output) {
+        if !self.shield_frames_owed.remove(output) {
+            return;
+        }
+        if self.shield_frames_owed.is_empty() {
+            self.clear_shield_present_wait();
+        }
+    }
+
     pub(crate) fn settle_lock_replies(&mut self) {
         if self.lock_replies.is_empty() {
             return;
@@ -11224,6 +11332,16 @@ impl Synoik {
             }
             state.last_frame_anim_causes = causes;
 
+            // Whether *this* frame is the one a pending suspend is waiting for, decided before it
+            // is handed over: `update_render_elements` above has already retired a finished slide,
+            // so the curtain state read here is the one the frame draws. Asking the same question
+            // again at presentation time would be an off-by-one — the curtain can land while a
+            // frame from mid-slide is still in flight, and that frame is the picture that would be
+            // left on screen.
+            let landed = self.shield_curtain_landed();
+            let state = self.output_state.get_mut(output).unwrap();
+            state.shield_frame_queued = landed;
+
             // Render. The backend marks its own sub-phases (collect / submit /
             // queue) as it goes.
             res = backend.render(self, output, target_presentation_time);
@@ -11231,6 +11349,12 @@ impl Synoik {
 
         let is_locked = self.is_locked();
         let state = self.output_state.get_mut(output).unwrap();
+
+        // Nothing went to the display, so nothing will come back to say it arrived — and leaving
+        // the mark set would let some *later* frame's vblank answer for this one.
+        if !matches!(res, RenderResult::Submitted) {
+            state.shield_frame_queued = false;
+        }
 
         // What this frame cost, start of redraw to handed-to-KMS — the span the next frame's
         // target has to fit into. Measured here rather than at the end of `redraw`: the frame

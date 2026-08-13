@@ -428,14 +428,26 @@ impl ScreenShield {
     ///
     /// `session_active` is logind's `Session.Active`: a session on an inactive VT must not hold up
     /// everyone else's suspend.
-    pub fn wants_sleep_inhibitor(&self, session_active: bool) -> bool {
+    ///
+    /// `curtain_frame_owed` is the suspend path's extra term: the shield's state has moved, but the
+    /// picture on the scanout buffer has not caught up. GNOME gets this for free from *when* it
+    /// flips `_isActive` — `activate(animate)` deliberately does **not** set it, leaving a comment
+    /// that there is "a 0.3 seconds window during which the lock screen is effectively visible and
+    /// the screen is locked, but the DBus interface reports the screensaver is off"
+    /// (`screenShield.js:601-612`); the flip happens in `_lockScreenShown`/`_onShortLightbox`
+    /// (`:490`, `:318`), i.e. at the *end* of the curtain ease, and `_setActive` is what calls
+    /// `_syncInhibitor` (`:156-164`). Our `active` goes up at `activate` time, so without this term
+    /// we release the fd mid-slide and the machine suspends with a half-drawn curtain on screen —
+    /// which is the image a VM snapshot keeps, and on a real machine the picture that greets a
+    /// resume before the first repaint.
+    pub fn wants_sleep_inhibitor(&self, session_active: bool, curtain_frame_owed: bool) -> bool {
         // `!self.active` is GNOME's condition (`:205-207`), plus the window its synchronous lock
         // does not have: a shield that is down but still waiting on its verifier has not finished
         // locking, and releasing the fd there lets the machine suspend mid-handshake. logind's
         // `InhibitDelayMaxSec` bounds how long that can hold anyone up.
         let lock_finished = self.active && self.awaiting_authenticator.is_none();
         session_active
-            && !lock_finished
+            && (!lock_finished || curtain_frame_owed)
             && self.settings.lock_enabled
             && !self.settings.disable_lock_screen
     }
@@ -823,7 +835,7 @@ mod tests {
         );
         assert!(shield.is_active(), "still covering the screen");
         assert!(
-            shield.wants_sleep_inhibitor(true),
+            shield.wants_sleep_inhibitor(true, false),
             "and the suspend still has to wait for us"
         );
 
@@ -946,17 +958,21 @@ mod tests {
     #[test]
     fn the_sleep_inhibitor_is_held_only_while_a_suspend_would_owe_a_lock() {
         let mut shield = ScreenShield::new(ShieldSettings::default());
-        assert!(shield.wants_sleep_inhibitor(true));
+        assert!(shield.wants_sleep_inhibitor(true, false));
 
         assert!(
-            !shield.wants_sleep_inhibitor(false),
+            !shield.wants_sleep_inhibitor(false, false),
             "an inactive VT must not hold up anyone else's suspend"
         );
 
         shield.activate(T0);
         assert!(
-            !shield.wants_sleep_inhibitor(true),
+            !shield.wants_sleep_inhibitor(true, false),
             "already covered; nothing left to do before sleeping"
+        );
+        assert!(
+            shield.wants_sleep_inhibitor(true, true),
+            "unless the curtain has not reached the screen yet"
         );
 
         shield.deactivate();
@@ -971,7 +987,7 @@ mod tests {
             },
         ] {
             shield.set_settings(settings);
-            assert!(!shield.wants_sleep_inhibitor(true));
+            assert!(!shield.wants_sleep_inhibitor(true, true));
         }
     }
 }

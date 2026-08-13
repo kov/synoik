@@ -1783,6 +1783,11 @@ impl Tty {
 
         output_state.frame_clock.presented(presentation_time);
 
+        // If that flip was the one a pending suspend is waiting for, the shield is now on the
+        // scanout buffer — which is the whole condition, since that buffer is what the machine
+        // goes to sleep holding.
+        let shield_frame_presented = mem::take(&mut output_state.shield_frame_queued);
+
         // Ends the `output_state` borrow so the frame log (which lives on `synoik`)
         // can be reached below.
         let unfinished_animations_remain = output_state.unfinished_animations_remain;
@@ -1791,6 +1796,10 @@ impl Tty {
             synoik
                 .frame_log
                 .presented(&output.name(), target, actual, refresh_interval);
+        }
+
+        if shield_frame_presented {
+            synoik.note_shield_frame_presented(&output);
         }
 
         if redraw_needed || unfinished_animations_remain {

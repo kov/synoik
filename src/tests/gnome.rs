@@ -11202,6 +11202,110 @@ fn suspending_covers_the_screen_immediately() {
     assert!(f.synoik().screen_shield.is_active());
 }
 
+/// The suspend waits for the curtain to be *on screen*, not merely decided.
+///
+/// GNOME gets this from *when* it flips `_isActive`: `activate(animate)` deliberately leaves it
+/// alone (`screenShield.js:601-612`) and the ease's completion sets it (`:479-490`, `:316-319`),
+/// so `_syncInhibitor` — which reads `_isActive` (`:156-164`, `:202-207`) — cannot release the fd
+/// mid-slide. Ours goes active up front, so the wait is explicit. It is also one step stronger:
+/// the release hangs on the frame being *presented*, because the buffer being scanned out is
+/// precisely what a suspended machine keeps (and what a VM snapshot captures).
+#[test]
+fn a_suspend_waits_for_the_curtain_to_reach_the_screen() {
+    use crate::dbus::freedesktop_login1::Login1ToSynoik;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    // No verifier to wait for, so the *other* term that holds the fd (the gdm handshake) answers
+    // itself at once and what is left is the curtain.
+    f.synoik_state().synoik.gdm_requests = None;
+
+    f.synoik_state()
+        .on_login1_msg(Login1ToSynoik::PrepareForSleep(true));
+    assert!(
+        f.synoik().shield_frame_owed(),
+        "the curtain has 250 ms of sliding to do"
+    );
+    let owed = f.synoik().shield_frame_owed();
+    assert!(
+        f.synoik().screen_shield.wants_sleep_inhibitor(true, owed),
+        "so logind is still held"
+    );
+
+    // A frame drawn mid-slide is not the one we are waiting for: releasing here is exactly the bug
+    // — the machine would go down holding a half-drawn curtain.
+    f.synoik_state().refresh_and_flush_clients();
+    assert!(f.synoik().shield_frame_owed());
+
+    // Real time, not the animation clock: the release is a presentation, so it has to come from
+    // the compositor's own loop rendering the frame after the slide lands.
+    let start = std::time::Instant::now();
+    assert!(
+        f.dispatch_until(Duration::from_millis(900), |state| {
+            !state.synoik.shield_frame_owed()
+        }),
+        "the curtain landed and the wait never ended"
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(900),
+        "released by the deadline rather than by a presented frame"
+    );
+
+    let owed = f.synoik().shield_frame_owed();
+    assert!(
+        !f.synoik().screen_shield.wants_sleep_inhibitor(true, owed),
+        "and now logind may go ahead"
+    );
+}
+
+/// Suspending at an already-covered screen owes nothing.
+///
+/// The wait is armed only when the curtain has to travel. Arming it unconditionally would hold
+/// every lid-close on a locked laptop for the full deadline, because nothing is going to damage
+/// the output and no flip is going to come.
+#[test]
+fn suspending_an_already_locked_screen_waits_for_nothing() {
+    use crate::dbus::freedesktop_login1::Login1ToSynoik;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::SetActive(true));
+    f.synoik().lock_screen.settle();
+    assert!(f.synoik().shield_curtain_landed());
+
+    f.synoik_state()
+        .on_login1_msg(Login1ToSynoik::PrepareForSleep(true));
+    assert!(
+        !f.synoik().shield_frame_owed(),
+        "the screen already shows what it will suspend holding"
+    );
+}
+
+/// A suspend that gets called off must not leave the wait armed.
+///
+/// logind emits `PrepareForSleep(false)` when *another* delay inhibitor refuses the suspend, with
+/// the machine never going down. A wait left behind there holds the fd until its deadline, and the
+/// next suspend is the one that pays for it.
+#[test]
+fn a_cancelled_suspend_ends_the_wait() {
+    use crate::dbus::freedesktop_login1::Login1ToSynoik;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.synoik_state()
+        .on_login1_msg(Login1ToSynoik::PrepareForSleep(true));
+    assert!(f.synoik().shield_frame_owed());
+
+    f.synoik_state()
+        .on_login1_msg(Login1ToSynoik::PrepareForSleep(false));
+    assert!(!f.synoik().shield_frame_owed());
+    assert!(f.synoik().shield_present_deadline.is_none());
+}
+
 /// `disable-lock-screen` makes `Lock` a no-op — the shield does not even go down.
 ///
 /// GNOME returns *before* `activate` (`screenShield.js:638-641`), so a locked-down session does
