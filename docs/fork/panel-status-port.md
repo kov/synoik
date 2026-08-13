@@ -189,8 +189,12 @@ system row, battery pill, volume slider, Network tile, and Dark Style / DND / Ni
   `Consumed`; rows are `Spawn`). Consumers so far: the **Network** tile (arrow → header + Network
   Settings row) and the **power button** (Q1 session submenu). This is the prerequisite for Q6/Q7/Q8's
   in-menu device/profile lists — each now just adds a `DetailOwner` arm (`header`/`rows`/`row_count`/
-  `anchor_row_bottom`) + the backend to enumerate/act. Deferred v1 polish: slide-down grow animation,
-  dim-the-rest, split-radius tile look.
+  `anchor_row_bottom`) + the backend to enumerate/act. **Grow animation + dim-the-rest landed**
+  (`66c307ed` split the card's bake out of the grid's so neither key carries the expansion,
+  `d7c7f8e5` the two `POPUP_ANIMATION_TIME/2` phases — height then card fade, ease-out-cubic —
+  and the `DIM_BRIGHTNESS = -0.4` wash over everything but the card). Divergence: a straight
+  switch from one open view to another eases the height old→new instead of animating both
+  concurrently (`_setOpenedSubMenu`). Still deferred: split-radius tile look.
 - **Shutdown submenu** in the system row (Q1) — ✅ done on the framework above.
 - **Hover highlighting** — ✅ `ac2d5b7b` + review `6b7d9e24` + notification fix `5642b2b9`. A
   `pointer_hover` route parallels `pointer_click`, and a hover change bumps the widget's texture

@@ -191,6 +191,11 @@ const SLIDER_TROUGH_BG: [f32; 4] = [1., 1., 1., 0.1];
 /// inset by `PAD` and self-rounded, so this arc never clips a tile or the pill.
 const MENU_RADIUS: f64 = 36.;
 
+/// How dark the rest of the menu goes while a detail view is open. gnome-shell eases the
+/// boxpointer's brightness to `DIM_BRIGHTNESS = -0.4` (`js/ui/quickSettings.js:18,852-867`),
+/// i.e. ×0.6 — which over an opaque surface is black at this alpha.
+const DIM_STRENGTH: f32 = 0.4;
+
 /// Inactive quick-toggle / pill / slider-trough fill — GNOME's `.button` normal
 /// `mix($fg_color, $bg_color, 9%)` ≈ `#48484c` (the quick-toggle extends `.button`,
 /// `_quick-settings.scss:5,15`). Shared [`widget::style::BUTTON_BG`], the raised control on the
@@ -1395,6 +1400,9 @@ pub struct QuickSettings {
     hovered: Option<QsHover>,
     /// The detail view's open/close animation state.
     expand: Expand,
+    /// The dim wash's own bake (the menu's rounded shape in black), kept apart from the chrome
+    /// cache because its only key is the menu size.
+    dim_cache: RefCell<widget::BakeCache>,
     /// Bumped on any toggle so the cached chrome texture is redrawn.
     revision: u64,
     cache: RefCell<TextureCache>,
@@ -1423,6 +1431,8 @@ struct Expand {
     height: Option<Animation>,
     /// The card's opacity, `0..1`.
     fade: Option<Animation>,
+    /// How dimmed the rest of the menu is, `0..1` of [`DIM_BRIGHTNESS`].
+    dim: Option<Animation>,
 }
 
 impl Expand {
@@ -1440,8 +1450,15 @@ impl Expand {
             .map_or(1., |a| a.clamped_value().clamp(0., 1.)) as f32
     }
 
+    /// How dark the wash over the rest of the menu is, `0..1`.
+    fn dim(&self) -> f32 {
+        self.dim
+            .as_ref()
+            .map_or(0., |a| a.clamped_value().clamp(0., 1.)) as f32
+    }
+
     fn ongoing(&self) -> bool {
-        [self.height.as_ref(), self.fade.as_ref()]
+        [self.height.as_ref(), self.fade.as_ref(), self.dim.as_ref()]
             .into_iter()
             .flatten()
             .any(|a| !a.is_done())
@@ -1459,6 +1476,7 @@ impl Expand {
         target: Option<DetailOwner>,
         clock: &Clock,
         params: synoik_config::Animation,
+        dim_params: synoik_config::Animation,
     ) -> bool {
         let Some(seen) = self.seen else {
             // First frame with this menu: adopt whatever is open, settled.
@@ -1471,6 +1489,17 @@ impl Expand {
         if seen != target {
             self.seen = Some(target);
             moved = true;
+            // The dim runs on its own clock, alongside both phases: gnome-shell eases the
+            // boxpointer's brightness over the full `POPUP_ANIMATION_TIME` from
+            // `open-state-changed`, not per phase (`_setDimmed`, `quickSettings.js:852-867`).
+            let dim_to = f64::from(u8::from(target.is_some()));
+            self.dim = Some(Animation::new(
+                clock.clone(),
+                f64::from(self.dim()),
+                dim_to,
+                0.,
+                dim_params,
+            ));
             match (seen, target) {
                 // Opening from nothing: grow the gap first, with the card still invisible.
                 (None, Some(_)) => {
@@ -1583,6 +1612,7 @@ impl QuickSettings {
             brightness,
             revision: 0,
             expand: Expand::default(),
+            dim_cache: RefCell::new(widget::BakeCache::new()),
             cache: RefCell::new(TextureCache {
                 context: None,
                 textures: HashMap::new(),
@@ -1673,8 +1703,14 @@ impl QuickSettings {
 
     /// Step the detail view's open/close animation. Driven by the popover once per frame, since
     /// that is where the clock and the animation config live. Returns whether it moved.
-    pub fn advance_expand(&mut self, clock: &Clock, params: synoik_config::Animation) -> bool {
-        self.expand.advance(self.expanded, clock, params)
+    pub fn advance_expand(
+        &mut self,
+        clock: &Clock,
+        params: synoik_config::Animation,
+        dim_params: synoik_config::Animation,
+    ) -> bool {
+        self.expand
+            .advance(self.expanded, clock, params, dim_params)
     }
 
     /// Whether the detail view is still growing, fading or collapsing.
@@ -2413,6 +2449,7 @@ impl QuickSettings {
 
         // The open detail view: its header icon and any per-row icons (the card background,
         // title, and row labels are chrome, drawn below).
+        let mut card_elements = Vec::new();
         if let (Some(owner), true) = (self.shown_detail(), self.expand.card_alpha() > 0.) {
             if let Some(card) = detail_rect(layout) {
                 let (cand, _title) = owner.header(self.network);
@@ -2431,7 +2468,7 @@ impl QuickSettings {
                     origin,
                     center,
                 ) {
-                    elements.push(el);
+                    card_elements.push(el);
                 }
                 for (k, row) in self.detail_rows(owner).into_iter().enumerate() {
                     let Some(rrect) = detail_row_rect(k, layout) else {
@@ -2450,7 +2487,7 @@ impl QuickSettings {
                         if let Some(el) = widget::icon_element(
                             renderer, icons, &row.icons, TILE_ICON, scale, FG_OFF, origin, center,
                         ) {
-                            elements.push(el);
+                            card_elements.push(el);
                         }
                     }
                     // The trailing check on the selected row (gnome-shell's `Ornament.CHECK`).
@@ -2469,7 +2506,7 @@ impl QuickSettings {
                             origin,
                             center,
                         ) {
-                            elements.push(el);
+                            card_elements.push(el);
                         }
                     }
                 }
@@ -2581,7 +2618,7 @@ impl QuickSettings {
                             Transform::Normal,
                             Vec::new(),
                         );
-                        elements.push(TextureRenderElement::from_texture_buffer(
+                        card_elements.push(TextureRenderElement::from_texture_buffer(
                             buffer,
                             origin + rect.loc,
                             self.expand.card_alpha(),
@@ -2612,7 +2649,54 @@ impl QuickSettings {
             Err(err) => tracing::error!("error drawing the quick-settings menu: {err:#}"),
         }
 
-        elements
+        // The dim over everything the open card is not: gnome-shell puts a
+        // `BrightnessContrastEffect` on the *boxpointer* and eases its brightness to
+        // `DIM_BRIGHTNESS` (`quickSettings.js:852-867`), while the card — a sibling of the
+        // boxpointer, not a child — stays bright.
+        //
+        // Brightness × 0.6 over an opaque surface is exactly black at alpha 0.4 composited over
+        // it, and `MENU_BG` is opaque, so this is a wash rather than an effect: same pixels, no
+        // offscreen pass. It takes the menu's own rounded shape so it lands on the plate and
+        // nowhere else.
+        if self.expand.dim() > 0. {
+            let size = self.logical_size();
+            let mut cache = self.dim_cache.borrow_mut();
+            match widget::bake_card_fill(
+                renderer,
+                &mut cache,
+                scale,
+                MENU_RADIUS as u64,
+                size,
+                MENU_RADIUS,
+                [0., 0., 0., 1.],
+            ) {
+                Ok(tex) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        tex,
+                        scale,
+                        Transform::Normal,
+                        Vec::new(),
+                    );
+                    elements.insert(
+                        0,
+                        TextureRenderElement::from_texture_buffer(
+                            buffer,
+                            origin,
+                            DIM_STRENGTH * self.expand.dim(),
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ),
+                    );
+                }
+                Err(err) => tracing::warn!("error baking the quick-settings dim: {err:?}"),
+            }
+        }
+
+        // FIRST = topmost: the card and its icons ride above the dim, everything else below it.
+        card_elements.extend(elements);
+        card_elements
     }
 
     /// Draw (or reuse) the chrome texture, caching per (scale, revision).
@@ -5022,13 +5106,13 @@ mod tests {
     #[test]
     fn a_detail_view_grows_its_gap_first_and_fades_its_card_second() {
         let mut clock = Clock::with_time(std::time::Duration::ZERO);
-        let params = synoik_config::Animations::default()
-            .quick_settings_detail_open_close
-            .0;
+        let anims = synoik_config::Animations::default();
+        let params = anims.quick_settings_detail_open_close.0;
+        let dim_params = anims.panel_popover_open_close.0;
         let mut qs = qs(NetworkStatus::Wired, None);
         let step = |qs: &mut QuickSettings, clock: &mut Clock, ms: u64| {
             clock.set_unadjusted(std::time::Duration::from_millis(ms));
-            qs.advance_expand(clock, params);
+            qs.advance_expand(clock, params, dim_params);
         };
 
         // Adopt the (collapsed) starting state, then open.
@@ -5038,8 +5122,11 @@ mod tests {
         ));
         step(&mut qs, &mut clock, 0);
 
-        // Halfway through phase 1: the gap is part-open and the card is not drawn at all.
+        // Halfway through phase 1: the gap is part-open and the card is not drawn at all. The
+        // dim runs alongside, on its own longer clock — it is not one of the two phases.
         step(&mut qs, &mut clock, 37);
+        let dim = qs.expand.dim();
+        assert!(dim > 0. && dim < 1., "the dim is easing in, got {dim}");
         let scale = qs.layout().block_scale;
         assert!(scale > 0. && scale < 1., "the gap is mid-grow, got {scale}");
         assert_eq!(qs.expand.card_alpha(), 0., "the card waits for the gap");
@@ -5066,6 +5153,7 @@ mod tests {
 
         step(&mut qs, &mut clock, 150);
         assert_eq!(qs.expand.card_alpha(), 1.);
+        assert_eq!(qs.expand.dim(), 1., "the rest of the menu is fully dimmed");
 
         // Closing: the card fades out *before* the gap collapses.
         qs.pointer_click(center(
@@ -5101,6 +5189,7 @@ mod tests {
         step(&mut qs, &mut clock, 300);
         step(&mut qs, &mut clock, 301);
         assert_eq!(qs.shown_detail(), None, "settled shut");
+        assert_eq!(qs.expand.dim(), 0., "and undimmed");
         assert!(!qs.are_animations_ongoing());
     }
 
