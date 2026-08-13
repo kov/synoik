@@ -4184,7 +4184,8 @@ impl State {
         // GNOME's own template and folder (`js/ui/screenshot.js:2056-2065`), which is what
         // `default_recording_path` already encodes — so the picker's recordings land beside the
         // keybind's rather than in a second place.
-        let path = match crate::recording::default_recording_path() {
+        let base = self.synoik.casting.recordings_base.clone();
+        let path = match crate::recording::default_recording_path(base.as_deref()) {
             Ok(path) => path,
             Err(err) => {
                 warn!("could not resolve the recording path: {err:?}");

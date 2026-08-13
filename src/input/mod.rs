@@ -2529,7 +2529,8 @@ impl State {
         if recording {
             self.stop_screen_recordings();
         } else if let Some(output) = self.synoik.layout.active_output().cloned() {
-            match crate::recording::default_recording_path() {
+            let base = self.synoik.casting.recordings_base.clone();
+            match crate::recording::default_recording_path(base.as_deref()) {
                 Ok(path) => {
                     // The keybind/pill records the whole active output at 30fps, cursor drawn.
                     if let Err(err) = self

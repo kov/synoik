@@ -29,8 +29,11 @@ use anyhow::Context as _;
 /// `<Videos>/Screencasts/Screencast From <date> <time>.webm` (the same template gnome-shell's UI
 /// sends over D-Bus; `screenshot.js` builds `Screencasts/Screencast From %d %t`).
 /// Creates the directory.
-pub fn default_recording_path() -> anyhow::Result<PathBuf> {
-    resolve_file_template("Screencasts/Screencast From %d %t", "webm")
+///
+/// `base` overrides where a relative template lands (see [`resolve_file_template`]); production
+/// passes `None`.
+pub fn default_recording_path(base: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
+    resolve_file_template("Screencasts/Screencast From %d %t", "webm", base)
 }
 
 /// Resolve a `org.gnome.Shell.Screencast` file template into an absolute path, matching
@@ -38,12 +41,17 @@ pub fn default_recording_path() -> anyhow::Result<PathBuf> {
 /// - a trailing `.webm` is stripped (a compat shim; the real extension is appended here);
 /// - `%d` expands to the local date `YYYY-MM-DD`, `%t` to the local time `HH-MM-SS`, `%%` to `%`,
 ///   and any other `%x` escape is dropped (it is NOT strftime);
-/// - a relative result lands under the XDG **Videos** user directory (else `$HOME`) — see
-///   [`recordings_base`];
+/// - a relative result lands under `base`, else the XDG **Videos** user directory (else `$HOME`) —
+///   see [`recordings_base`]. `base` exists so a test can drive the real capture path without
+///   writing into the developer's actual `~/Videos/Screencasts`, which it did, once per suite run;
 /// - `extension` is appended and the parent directory is created.
 ///
 /// The default template gnome-shell's UI sends is `Screencasts/Screencast From %d %t`.
-pub fn resolve_file_template(template: &str, extension: &str) -> anyhow::Result<PathBuf> {
+pub fn resolve_file_template(
+    template: &str,
+    extension: &str,
+    base: Option<&std::path::Path>,
+) -> anyhow::Result<PathBuf> {
     let template = template.strip_suffix(".webm").unwrap_or(template);
 
     let (date, time) = local_date_time().context("reading the local time for the template")?;
@@ -51,8 +59,15 @@ pub fn resolve_file_template(template: &str, extension: &str) -> anyhow::Result<
 
     let mut path = PathBuf::from(&stem);
     if path.is_relative() {
-        let dirs = directories::UserDirs::new().context("error retrieving the user directories")?;
-        path = recordings_base(dirs.video_dir(), dirs.home_dir()).join(path);
+        let base = match base {
+            Some(base) => base.to_owned(),
+            None => {
+                let dirs = directories::UserDirs::new()
+                    .context("error retrieving the user directories")?;
+                recordings_base(dirs.video_dir(), dirs.home_dir())
+            }
+        };
+        path = base.join(path);
     }
 
     // Append the real extension (the template's stem never carries it).
@@ -176,7 +191,7 @@ mod tests {
     fn resolve_appends_extension_and_keeps_absolute_paths() {
         let dir = std::env::temp_dir().join(format!("synoik-tmpl-{}", std::process::id()));
         let template = dir.join("rec %%").to_string_lossy().into_owned();
-        let path = resolve_file_template(&template, "webm").unwrap();
+        let path = resolve_file_template(&template, "webm", None).unwrap();
         // Absolute template is kept; `%%` collapses to `%`; the real extension is appended.
         assert_eq!(path, dir.join("rec %.webm"));
         // The parent directory is created.
@@ -206,7 +221,7 @@ mod tests {
     fn resolve_strips_a_trailing_dot_webm_from_the_template() {
         let dir = std::env::temp_dir().join(format!("synoik-tmpl2-{}", std::process::id()));
         let template = format!("{}.webm", dir.join("clip").to_string_lossy());
-        let path = resolve_file_template(&template, "webm").unwrap();
+        let path = resolve_file_template(&template, "webm", None).unwrap();
         assert_eq!(path, dir.join("clip.webm"));
         std::fs::remove_dir_all(&dir).ok();
     }

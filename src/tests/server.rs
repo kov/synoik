@@ -50,6 +50,13 @@ impl Server {
             state.synoik.gdm_requests = Some(to_gdm);
         }
 
+        // Recording paths reach the real filesystem: a test that drives the capture button in
+        // cast mode goes through `default_recording_path`, which resolves the XDG Videos
+        // directory. That left an empty recording in the developer's own `~/Videos/Screencasts`
+        // on every suite run. Point it somewhere disposable instead — per process, so parallel
+        // test binaries do not share it.
+        state.synoik.casting.recordings_base = Some(recordings_base());
+
         Self {
             event_loop,
             state,
@@ -63,4 +70,17 @@ impl Server {
             .unwrap();
         self.state.refresh_and_flush_clients();
     }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // Whatever a recording test wrote there is scratch; the path is this process's own.
+        std::fs::remove_dir_all(recordings_base()).ok();
+    }
+}
+
+/// The scratch directory recordings land in under test. Per process, so two test binaries running
+/// at once cannot delete each other's files on drop.
+fn recordings_base() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("synoik-test-recordings-{}", std::process::id()))
 }
