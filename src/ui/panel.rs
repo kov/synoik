@@ -421,6 +421,43 @@ fn battery_overlay_icon(overlay: system_status::BatteryOverlay) -> Option<&'stat
 /// is only `BODY_H - 2 * INSET` tall.
 const QS_BOLT: f64 = 12.;
 
+/// The mains plug's box. Deliberately taller than the battery body (13), so the plug breaks the
+/// body's outline top and bottom instead of sitting trapped inside it — at body height it was
+/// legible but cramped, and read as debris in the charge rather than as a plug.
+const QS_CORD: f64 = 18.;
+
+/// The plug's drop shadow: the same rim silhouette, a touch larger and nudged down, at low alpha.
+/// Lifts the glyph off the fill so the rim reads as its outline rather than as part of the shape.
+const CORD_SHADOW_SCALE: f64 = 1.14;
+const CORD_SHADOW_DY: f64 = 1.;
+const CORD_SHADOW: [f32; 4] = [0., 0., 0., 0.3];
+
+/// Push one themed glyph centred on `cx`, vertically centred in the bar and nudged down by `dy`.
+///
+/// Shared by the battery overlay's three layers (glyph, rim, shadow) so they cannot drift apart:
+/// each resolves at its own size and tint but lands on the same centre.
+#[allow(clippy::too_many_arguments)]
+fn push_centered_glyph(
+    renderer: &mut VulkanRenderer,
+    icons: &IconCache,
+    elements: &mut Vec<PanelElement>,
+    name: &str,
+    px: f64,
+    scale: f64,
+    color: [f32; 4],
+    cx: f64,
+    dy: f64,
+) {
+    let Some(tb) = icons.texture(renderer, name, px, scale, color) else {
+        return;
+    };
+    let logical = tb.logical_size();
+    let location = Point::from((cx - logical.w / 2., (panel_height() - logical.h) / 2. + dy));
+    elements.push(PanelElement::Texture(
+        TextureRenderElement::from_texture_buffer(tb, location, 1., None, None, Kind::Unspecified),
+    ));
+}
+
 /// The dark rim drawn behind the mains plug.
 ///
 /// A cord state's fill is white by design, so a white plug over it dissolved into the charge —
@@ -2051,43 +2088,36 @@ impl Panel {
         // The glyph sits over the body, so it is pushed first: elements are consumed in reverse.
         if let Some(name) = battery_overlay_icon(look.overlay) {
             let cord = look.overlay == system_status::BatteryOverlay::Cord;
-            // The rim goes behind the glyph, so it is pushed after it: elements are consumed in
-            // reverse. Same box, so the two land exactly concentric.
-            let glyph_box = |tb: &TextureBuffer<VkTexture>| {
-                let logical = tb.logical_size();
-                Point::from((
-                    x + (widget::Battery::BODY_W - logical.w) / 2.,
-                    (panel_height() - logical.h) / 2.,
-                ))
-            };
-            if let Some(tb) = icons.texture(renderer, name, QS_BOLT, scale, TEXT) {
-                let location = glyph_box(&tb);
-                elements.push(PanelElement::Texture(
-                    TextureRenderElement::from_texture_buffer(
-                        tb,
-                        location,
-                        1.,
-                        None,
-                        None,
-                        Kind::Unspecified,
-                    ),
-                ));
-            }
+            let px = if cord { QS_CORD } else { QS_BOLT };
+            // Centred on the *body*, not on the slot: the nub is not part of the battery's face.
+            let cx = x + widget::Battery::BODY_W / 2.;
+            // Pushed topmost-first, so the glyph goes down before the rim it sits on and the rim
+            // before the shadow under both. All three share a centre, so they stay concentric at
+            // any size.
+            push_centered_glyph(renderer, icons, elements, name, px, scale, TEXT, cx, 0.);
             if cord {
-                if let Some(tb) = icons.texture(renderer, CORD_HALO_ICON, QS_BOLT, scale, CORD_HALO)
-                {
-                    let location = glyph_box(&tb);
-                    elements.push(PanelElement::Texture(
-                        TextureRenderElement::from_texture_buffer(
-                            tb,
-                            location,
-                            1.,
-                            None,
-                            None,
-                            Kind::Unspecified,
-                        ),
-                    ));
-                }
+                push_centered_glyph(
+                    renderer,
+                    icons,
+                    elements,
+                    CORD_HALO_ICON,
+                    px,
+                    scale,
+                    CORD_HALO,
+                    cx,
+                    0.,
+                );
+                push_centered_glyph(
+                    renderer,
+                    icons,
+                    elements,
+                    CORD_HALO_ICON,
+                    px * CORD_SHADOW_SCALE,
+                    scale,
+                    CORD_SHADOW,
+                    cx,
+                    CORD_SHADOW_DY,
+                );
             }
         }
 
