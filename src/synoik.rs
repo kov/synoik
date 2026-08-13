@@ -9788,6 +9788,18 @@ impl Synoik {
                 );
             }
         }
+
+        // The same edge is what releases the sleep inhibitor, as it is in GNOME — `_setActive`
+        // ends in `_syncInhibitor` (`:156-164`), and `_isActive` is the condition (`:202-207`).
+        //
+        // Only in the *releasing* direction, and only while the fd is actually held: this runs
+        // from the render path, and taking the inhibitor is a blocking D-Bus round trip that has
+        // no business inside a frame. Nothing is lost — every edge that has to *take* it (a shield
+        // going away, a settings change, the VT coming back) arrives through
+        // `State::apply_shield_effects` or its own handler, which sync there.
+        if active && self.sleep_inhibitor.is_some() {
+            self.sync_sleep_inhibitor();
+        }
     }
 
     /// How long a suspend may be held waiting for the shield to reach the screen.
@@ -9807,7 +9819,7 @@ impl Synoik {
     pub fn sync_sleep_inhibitor(&mut self) {
         let want = self
             .screen_shield
-            .wants_sleep_inhibitor(self.session_active, self.shield_frame_owed());
+            .wants_sleep_inhibitor(self.session_active, self.curtain_frame_owed());
         if want == self.sleep_inhibitor.is_some() {
             return;
         }
@@ -9822,6 +9834,20 @@ impl Synoik {
             return;
         };
         self.sleep_inhibitor = crate::dbus::freedesktop_login1::take_sleep_inhibitor(conn);
+    }
+
+    /// Whether the screen still owes a picture of the shield, in either of the two senses that can
+    /// hold the inhibitor.
+    ///
+    /// The second half is the suspend's, and it is the stronger one. The first is GNOME's, and it
+    /// has to be there *whether or not a suspend has been announced*: the fd must already be held
+    /// when `PrepareForSleep` arrives, because taking it afterwards buys no delay at all. Lock the
+    /// screen and close the lid a tenth of a second later and the whole 250 ms slide is a window
+    /// where nothing is held — which is what `!this._isActive` covers for GNOME, `_isActive` being
+    /// flipped at the end of the ease (`screenShield.js:479-490`, `:316-319`).
+    pub fn curtain_frame_owed(&self) -> bool {
+        (self.screen_shield.is_active() && !self.shield_curtain_landed())
+            || self.shield_frame_owed()
     }
 
     /// Whether a pending suspend is still waiting for the shield to reach a scanout buffer.

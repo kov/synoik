@@ -11220,13 +11220,16 @@ fn a_suspend_waits_for_the_curtain_to_reach_the_screen() {
     // itself at once and what is left is the curtain.
     f.synoik_state().synoik.gdm_requests = None;
 
+    // Timed from the arming, because that is when the deadline that could *also* end this wait
+    // starts running: finishing inside it is what proves a presented frame did the releasing.
+    let armed = std::time::Instant::now();
     f.synoik_state()
         .on_login1_msg(Login1ToSynoik::PrepareForSleep(true));
     assert!(
         f.synoik().shield_frame_owed(),
         "the curtain has 250 ms of sliding to do"
     );
-    let owed = f.synoik().shield_frame_owed();
+    let owed = f.synoik().curtain_frame_owed();
     assert!(
         f.synoik().screen_shield.wants_sleep_inhibitor(true, owed),
         "so logind is still held"
@@ -11239,7 +11242,6 @@ fn a_suspend_waits_for_the_curtain_to_reach_the_screen() {
 
     // Real time, not the animation clock: the release is a presentation, so it has to come from
     // the compositor's own loop rendering the frame after the slide lands.
-    let start = std::time::Instant::now();
     assert!(
         f.dispatch_until(Duration::from_millis(900), |state| {
             !state.synoik.shield_frame_owed()
@@ -11247,15 +11249,58 @@ fn a_suspend_waits_for_the_curtain_to_reach_the_screen() {
         "the curtain landed and the wait never ended"
     );
     assert!(
-        start.elapsed() < Duration::from_millis(900),
+        armed.elapsed() < Duration::from_millis(900),
         "released by the deadline rather than by a presented frame"
     );
 
-    let owed = f.synoik().shield_frame_owed();
+    let owed = f.synoik().curtain_frame_owed();
     assert!(
         !f.synoik().screen_shield.wants_sleep_inhibitor(true, owed),
         "and now logind may go ahead"
     );
+}
+
+/// An ordinary lock holds the suspend too, for as long as its curtain is in the air.
+///
+/// The fd has to be in hand *before* `PrepareForSleep` arrives — taking it inside the handler buys
+/// no delay, because logind has already decided who it is waiting for. So the hold cannot be armed
+/// by the suspend: without this, locking the screen and closing the lid a tenth of a second later
+/// suspends mid-slide, which is the bug the presented-frame wait exists to prevent, arriving in
+/// the other order. GNOME covers it with `!this._isActive` (`screenShield.js:202-207`), `_isActive`
+/// being flipped at the end of the ease.
+#[test]
+fn a_lock_holds_the_suspend_until_its_own_curtain_lands() {
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    // The verifier answers itself at once, so the handshake is not what holds the fd here.
+    f.synoik_state().synoik.gdm_requests = None;
+
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    assert!(
+        f.synoik().curtain_frame_owed(),
+        "the lock has landed but the picture of it has not"
+    );
+    assert!(
+        !f.synoik().shield_frame_owed(),
+        "and no suspend was announced, so this is not the suspend's wait"
+    );
+    let owed = f.synoik().curtain_frame_owed();
+    assert!(
+        f.synoik().screen_shield.wants_sleep_inhibitor(true, owed),
+        "a suspend arriving now would find the fd held"
+    );
+
+    assert!(
+        f.dispatch_until(Duration::from_millis(900), |state| {
+            !state.synoik.curtain_frame_owed()
+        }),
+        "the curtain never landed"
+    );
+    let owed = f.synoik().curtain_frame_owed();
+    assert!(!f.synoik().screen_shield.wants_sleep_inhibitor(true, owed));
 }
 
 /// Suspending at an already-covered screen owes nothing.
