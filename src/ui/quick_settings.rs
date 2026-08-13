@@ -3086,6 +3086,7 @@ mod tests {
         BatteryStatus {
             icon_name: "battery-level-80-symbolic".to_string(),
             percentage,
+            ..Default::default()
         }
     }
 

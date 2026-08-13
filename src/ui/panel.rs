@@ -2206,6 +2206,7 @@ mod tests {
             battery: Some(BatteryStatus {
                 icon_name: "battery-level-90-symbolic".to_string(),
                 percentage: 90.,
+                ..Default::default()
             }),
             ..Default::default()
         });
@@ -2472,6 +2473,7 @@ mod tests {
             battery: Some(BatteryStatus {
                 icon_name: "battery-level-90-symbolic".to_string(),
                 percentage: 90.,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2633,6 +2635,7 @@ mod tests {
             Some(BatteryStatus {
                 icon_name: "battery-level-90-symbolic".to_string(),
                 percentage: 90.,
+                ..Default::default()
             })
         };
         let available = || {

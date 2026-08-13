@@ -293,13 +293,87 @@ pub enum NetworkStatus {
 }
 
 /// The battery state, from UPower's aggregate `DisplayDevice`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct BatteryStatus {
     /// UPower's own `IconName` — already the exact themed symbolic name
     /// (e.g. `battery-level-90-charging-symbolic`), charge state included.
     pub icon_name: String,
     /// 0..=100, for the derived fallback icon and future percentage labels.
     pub percentage: f64,
+    /// UPower's `State` ([`BatteryState`]).
+    pub state: BatteryState,
+    /// UPower's `WarningLevel` ([`BatteryWarning`]).
+    pub warning: BatteryWarning,
+}
+
+/// UPower's `State` enum (`UP_DEVICE_STATE_*`, `libupower-glib/up-types.h`).
+///
+/// **Charging is not the only on-AC state**, which is the trap: a machine that is plugged in but
+/// not currently drawing reports `PendingCharge`, and one sitting at 100% reports `FullyCharged`.
+/// Testing `state == Charging` alone paints a plugged-in laptop as discharging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BatteryState {
+    #[default]
+    Unknown,
+    Charging,
+    Discharging,
+    Empty,
+    FullyCharged,
+    PendingCharge,
+    PendingDischarge,
+}
+
+impl BatteryState {
+    /// Map UPower's wire value; anything unrecognised reads as `Unknown`.
+    pub fn from_upower(raw: u32) -> Self {
+        match raw {
+            1 => Self::Charging,
+            2 => Self::Discharging,
+            3 => Self::Empty,
+            4 => Self::FullyCharged,
+            5 => Self::PendingCharge,
+            6 => Self::PendingDischarge,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// On external power — charging, topped up, or plugged in and idle. The battery is not the
+    /// thing being spent, so a warning level (which UPower keeps reporting) must not colour it.
+    pub fn on_ac(self) -> bool {
+        matches!(
+            self,
+            Self::Charging | Self::FullyCharged | Self::PendingCharge
+        )
+    }
+}
+
+/// UPower's `WarningLevel` enum (`UP_DEVICE_LEVEL_*`, `libupower-glib/up-types.h`).
+///
+/// The thresholds behind these are UPower's policy and are configurable per device, so the shell
+/// reads the level and never re-derives it from a percentage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BatteryWarning {
+    /// `Unknown`, `None`, `Discharging`, and the above-normal levels (`Normal`/`High`/`Full`):
+    /// nothing to say.
+    #[default]
+    None,
+    Low,
+    Critical,
+    /// The level at which UPower's configured critical action (suspend/hibernate) fires.
+    Action,
+}
+
+impl BatteryWarning {
+    /// Map UPower's wire value. 0 Unknown, 1 None, 2 Discharging, 6 Normal, 7 High and 8 Full all
+    /// mean "no warning" for our purposes; only 3/4/5 carry one.
+    pub fn from_upower(raw: u32) -> Self {
+        match raw {
+            3 => Self::Low,
+            4 => Self::Critical,
+            5 => Self::Action,
+            _ => Self::None,
+        }
+    }
 }
 
 /// The symbolic-icon candidate list for a network state (first that resolves in
@@ -339,6 +413,55 @@ pub fn battery_icon(battery: &BatteryStatus) -> Vec<String> {
         battery.icon_name.clone(),
         derived_battery_icon(battery.percentage, charging),
     ]
+}
+
+/// How the dynamic battery indicator should read, derived from UPower's state and warning level
+/// (`docs/fork/battery-indicator-design.md`). Kept here, next to the state it reads, so it is a
+/// pure function the corpus can table-test without a renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatteryLook {
+    pub tint: BatteryTint,
+    /// Draw the charging bolt over the fill — only while current is actually flowing in.
+    pub bolt: bool,
+    /// Draw the critical "!" glyph. Deliberately redundant with [`BatteryTint::Critical`]: colour
+    /// alone is not an accessible channel, so the shape is what carries the state for a
+    /// colour-blind reader, and the red is the redundant half.
+    pub alert: bool,
+}
+
+/// The indicator's colour role. Resolved to pixels by the panel, which owns the palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BatteryTint {
+    /// Panel foreground white — discharging normally, or state unknown.
+    #[default]
+    Normal,
+    /// On external power.
+    Charging,
+    Low,
+    Critical,
+}
+
+/// The indicator's appearance for a battery state.
+///
+/// **State decides first, warning level second.** UPower keeps reporting a warning level while
+/// plugged in, so a machine charging from 3% must read as charging, not critical — and, the other
+/// way round, `Charging` is not the only on-AC state ([`BatteryState::on_ac`]).
+pub fn battery_look(battery: &BatteryStatus) -> BatteryLook {
+    let look = |tint, bolt, alert| BatteryLook { tint, bolt, alert };
+    match battery.state {
+        // On external power: green, and the bolt only while current is flowing in.
+        s if s.on_ac() => look(BatteryTint::Charging, s == BatteryState::Charging, false),
+        BatteryState::Empty => look(BatteryTint::Critical, false, true),
+        BatteryState::Unknown => look(BatteryTint::Normal, false, false),
+        // Discharging (or pending discharge): the warning level decides.
+        _ => match battery.warning {
+            BatteryWarning::None => look(BatteryTint::Normal, false, false),
+            BatteryWarning::Low => look(BatteryTint::Low, false, false),
+            BatteryWarning::Critical | BatteryWarning::Action => {
+                look(BatteryTint::Critical, false, true)
+            }
+        },
+    }
 }
 
 /// The `battery-level-{0,10,..,100}[-charging]-symbolic` name for a percentage.
@@ -558,11 +681,104 @@ mod tests {
         );
     }
 
+    /// Every `State` row, because charging is not the only on-AC state: this VM sits at
+    /// `PendingCharge` at 79%, and a naive `state == Charging` test paints a plugged-in machine
+    /// as plainly discharging.
+    #[test]
+    fn every_on_ac_state_reads_as_charging_and_only_charging_gets_the_bolt() {
+        let at = |state, warning| {
+            battery_look(&BatteryStatus {
+                state,
+                warning,
+                ..Default::default()
+            })
+        };
+
+        for state in [
+            BatteryState::Charging,
+            BatteryState::FullyCharged,
+            BatteryState::PendingCharge,
+        ] {
+            let look = at(state, BatteryWarning::None);
+            assert_eq!(look.tint, BatteryTint::Charging, "{state:?} is on AC");
+            assert!(!look.alert, "{state:?} must not alert");
+            assert_eq!(
+                look.bolt,
+                state == BatteryState::Charging,
+                "{state:?}: the bolt means current is flowing in, not merely plugged in"
+            );
+        }
+
+        // On AC the warning level is stale news: charging out of a critical charge reads green.
+        let charging_from_empty = at(BatteryState::Charging, BatteryWarning::Action);
+        assert_eq!(charging_from_empty.tint, BatteryTint::Charging);
+        assert!(!charging_from_empty.alert);
+    }
+
+    /// Discharging is where the warning level decides, and where the alert glyph lives.
+    #[test]
+    fn a_discharging_battery_takes_its_tint_from_the_warning_level() {
+        let at = |state, warning| {
+            battery_look(&BatteryStatus {
+                state,
+                warning,
+                ..Default::default()
+            })
+        };
+
+        for state in [BatteryState::Discharging, BatteryState::PendingDischarge] {
+            assert_eq!(
+                at(state, BatteryWarning::None).tint,
+                BatteryTint::Normal,
+                "{state:?} with no warning is plain"
+            );
+            assert_eq!(at(state, BatteryWarning::Low).tint, BatteryTint::Low);
+            assert!(
+                !at(state, BatteryWarning::Low).alert,
+                "low is a colour change only; the glyph is reserved for critical"
+            );
+
+            for warning in [BatteryWarning::Critical, BatteryWarning::Action] {
+                let look = at(state, warning);
+                assert_eq!(look.tint, BatteryTint::Critical);
+                assert!(
+                    look.alert,
+                    "{warning:?} needs a non-colour channel for colour-blind readers"
+                );
+            }
+        }
+
+        // Empty alerts regardless of what the warning level says; Unknown never does.
+        assert!(at(BatteryState::Empty, BatteryWarning::None).alert);
+        let unknown = at(BatteryState::Unknown, BatteryWarning::Critical);
+        assert_eq!(unknown.tint, BatteryTint::Normal);
+        assert!(!unknown.alert, "an unknown state must not cry wolf");
+    }
+
+    /// UPower's above-normal levels (6 Normal, 7 High, 8 Full) and 2 Discharging all mean "no
+    /// warning"; only 3/4/5 carry one. Mapping them by `raw >= 3` would make a full battery read
+    /// as an alarm.
+    #[test]
+    fn upower_warning_levels_above_action_are_not_warnings() {
+        assert_eq!(BatteryWarning::from_upower(0), BatteryWarning::None);
+        assert_eq!(BatteryWarning::from_upower(1), BatteryWarning::None);
+        assert_eq!(BatteryWarning::from_upower(2), BatteryWarning::None);
+        assert_eq!(BatteryWarning::from_upower(3), BatteryWarning::Low);
+        assert_eq!(BatteryWarning::from_upower(4), BatteryWarning::Critical);
+        assert_eq!(BatteryWarning::from_upower(5), BatteryWarning::Action);
+        for full in [6, 7, 8] {
+            assert_eq!(BatteryWarning::from_upower(full), BatteryWarning::None);
+        }
+        assert_eq!(BatteryState::from_upower(5), BatteryState::PendingCharge);
+        assert_eq!(BatteryState::from_upower(99), BatteryState::Unknown);
+    }
+
     #[test]
     fn battery_icon_prefers_upower_name_then_derives_a_fallback() {
         let b = BatteryStatus {
             icon_name: "battery-level-90-charging-symbolic".to_string(),
             percentage: 87.0,
+            ..Default::default()
         };
         let icons = battery_icon(&b);
         // UPower's exact name is tried first.
@@ -573,6 +789,7 @@ mod tests {
         let discharging = BatteryStatus {
             icon_name: "battery-level-20-symbolic".to_string(),
             percentage: 23.0,
+            ..Default::default()
         };
         assert_eq!(battery_icon(&discharging)[1], "battery-level-20-symbolic");
     }

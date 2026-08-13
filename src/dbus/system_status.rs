@@ -21,7 +21,8 @@ use zbus::names::InterfaceName;
 use zbus::{fdo, zvariant};
 
 use crate::system_status::{
-    BatteryStatus, BluetoothStatus, KnownProfile, NetworkStatus, PowerProfileStatus,
+    BatteryState, BatteryStatus, BatteryWarning, BluetoothStatus, KnownProfile, NetworkStatus,
+    PowerProfileStatus,
 };
 
 const POWER_PROFILES_BUS: &str = "org.freedesktop.UPower.PowerProfiles";
@@ -310,6 +311,8 @@ fn read_battery(props: &Props) -> Option<BatteryStatus> {
     Some(BatteryStatus {
         icon_name: get_str(props, "IconName").unwrap_or_default(),
         percentage: get_f64(props, "Percentage").unwrap_or(0.),
+        state: BatteryState::from_upower(get_u32(props, "State").unwrap_or(0)),
+        warning: BatteryWarning::from_upower(get_u32(props, "WarningLevel").unwrap_or(0)),
     })
 }
 
