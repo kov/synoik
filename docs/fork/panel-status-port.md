@@ -194,12 +194,19 @@ system row, battery pill, volume slider, Network tile, and Dark Style / DND / Ni
   `d7c7f8e5` the two `POPUP_ANIMATION_TIME/2` phases — height then card fade, ease-out-cubic —
   and the `DIM_BRIGHTNESS = -0.4` wash over everything but the card). **The constant is
   quickSettings' own `POPUP_ANIMATION_TIME = 400` (`js/ui/quickSettings.js:19`), which shadows
-  boxpointer's 150 of the same name** — so a phase is 200 ms and the dim spans 400; the first cut
-  took boxpointer's and read as a snap. Each phase is scaled by how far it has left to travel
-  (`duration * distance/targetHeight`, `duration * opacity/255`), so an interrupted transition
-  finishes at rate. Divergence: a straight switch from one open view to another eases the height
-  old→new instead of animating both concurrently (`_setOpenedSubMenu`). Still deferred:
-  split-radius tile look.
+  boxpointer's 150 of the same name** — the first cut took boxpointer's and read as a snap.
+  **Then the two phases themselves were replaced by a slide (approved divergence).** Ported
+  faithfully they read as two disjoint events, and the fade made the card's icons pop rather than
+  arrive — a symbolic glyph is invisible well before its alpha reaches 0. Instead the fully-drawn
+  card slides down out of its owner's row, clipped to the gap, over the whole 400 ms in one phase:
+  the gap's height is the card's exposed height, so the slide *drives* the growth. Its bottom edge
+  rides the gap's bottom throughout, so the top margin is the last thing to emerge. Card opacity is
+  never touched; rows are non-reactive until it settles. The transition is still scaled by how far
+  it has left to travel (`duration * distance/targetHeight`, `quickSettings.js:477`), so an
+  interrupted one finishes at rate. Clipping is `TextureRenderElement::clipped` (narrows `src`, one
+  quad — not `CropRenderElement`, which would change every caller's element type). Divergence: a
+  straight switch from one open view to another eases the height old→new instead of animating both
+  concurrently (`_setOpenedSubMenu`). Still deferred: split-radius tile look.
 - **Shutdown submenu** in the system row (Q1) — ✅ done on the framework above.
 - **Hover highlighting** — ✅ `ac2d5b7b` + review `6b7d9e24` + notification fix `5642b2b9`. A
   `pointer_hover` route parallels `pointer_click`, and a hover change bumps the widget's texture

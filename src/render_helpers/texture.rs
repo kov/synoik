@@ -168,6 +168,40 @@ impl<T: Texture> TextureRenderElement<T> {
         self.location = location;
     }
 
+    /// This element narrowed to `clip` (output-local logical), or `None` when it falls entirely
+    /// outside. The visible sub-rect is expressed as a narrower `src` over the same buffer, so a
+    /// clipped element still costs one quad — the alternative is `CropRenderElement`, which would
+    /// change the element type of every caller that builds a plain `Vec<TextureRenderElement>`.
+    ///
+    /// The `src` this narrows is in the *buffer's* logical space, which is only the same space as
+    /// `clip` when the element is drawn at its natural size; the ratio below is what carries a
+    /// scaled element across.
+    pub fn clipped(mut self, clip: Rectangle<f64, Logical>) -> Option<Self> {
+        let dst = Rectangle::new(self.location, self.logical_size());
+        let visible = dst.intersection(clip)?;
+        if visible == dst {
+            return Some(self);
+        }
+        let src = self
+            .src
+            .unwrap_or_else(|| Rectangle::from_size(self.buffer.logical_size()));
+        // Zero-sized in either axis: there is no ratio to map through, and nothing to draw.
+        if dst.size.w <= 0. || dst.size.h <= 0. {
+            return None;
+        }
+        let (rx, ry) = (src.size.w / dst.size.w, src.size.h / dst.size.h);
+        self.src = Some(Rectangle::new(
+            Point::from((
+                src.loc.x + (visible.loc.x - dst.loc.x) * rx,
+                src.loc.y + (visible.loc.y - dst.loc.y) * ry,
+            )),
+            Size::from((visible.size.w * rx, visible.size.h * ry)),
+        ));
+        self.size = Some(visible.size);
+        self.location = visible.loc;
+        Some(self)
+    }
+
     /// Override the element's logical size, scaling the texture to fit. Paired with
     /// `set_location`, this scales an already-built overlay element about a pivot (the
     /// panel popover's open/close scale). Only sound to use while the element is also

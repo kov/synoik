@@ -300,15 +300,18 @@ impl Default for ScreenshotUiOpenAnim {
     }
 }
 
-/// One phase of a quick-settings detail view opening or closing: gnome-shell runs the height
-/// and the content fade back to back, each `POPUP_ANIMATION_TIME / 2`
-/// (`js/ui/quickSettings.js:459-515`). Neither `ease()` call passes a mode, so both take
-/// Clutter's default ease-out-cubic (`clutter-actor.c:17063`).
+/// A quick-settings detail view sliding open or shut.
 ///
-/// **That is quickSettings' own `POPUP_ANIMATION_TIME = 400`** (`js/ui/quickSettings.js:19`),
+/// gnome-shell splits this in two — the container height, then the content fade, back to back at
+/// `POPUP_ANIMATION_TIME / 2` each (`js/ui/quickSettings.js:459-515`). We **diverge** and slide the
+/// drawn card out instead, in one phase over the whole time; see `ui::quick_settings::Expand` for
+/// why. The duration here is therefore the *whole* transition, matching the dim that runs beside
+/// it, not half of one.
+///
+/// **The time is quickSettings' own `POPUP_ANIMATION_TIME = 400`** (`js/ui/quickSettings.js:19`),
 /// which shadows the boxpointer constant of the same name — the file imports `PopupAnimation`
-/// from boxpointer but not its 150. So a phase is 200 ms, not 75; at 75 the growth does not
-/// register as growth at all.
+/// from boxpointer but not its 150. Neither `ease()` call passes a mode, so the curve is Clutter's
+/// default ease-out-cubic (`clutter-actor.c:17063`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuickSettingsDetailOpenCloseAnim(pub Animation);
 
@@ -317,7 +320,7 @@ impl Default for QuickSettingsDetailOpenCloseAnim {
         Self(Animation {
             off: false,
             kind: Kind::Easing(EasingParams {
-                duration_ms: 200,
+                duration_ms: 400,
                 curve: Curve::EaseOutCubic,
             }),
         })
@@ -325,8 +328,8 @@ impl Default for QuickSettingsDetailOpenCloseAnim {
 }
 
 /// The dim over the rest of the quick-settings menu while a detail view is open: the *whole*
-/// `POPUP_ANIMATION_TIME` (400 ms) on ease-out-quad, spanning both phases, and explicitly moded
-/// unlike them (`_setDimmed`, `js/ui/quickSettings.js:852-867`).
+/// `POPUP_ANIMATION_TIME` (400 ms) on ease-out-quad, and explicitly moded unlike the slide
+/// (`_setDimmed`, `js/ui/quickSettings.js:852-867`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuickSettingsDimAnim(pub Animation);
 
