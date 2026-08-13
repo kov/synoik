@@ -5137,6 +5137,14 @@ impl State {
                     // logind then emits `false` without the machine ever going down. A wait left
                     // armed there would hold the fd until its deadline for nothing.
                     self.synoik.clear_shield_present_wait();
+
+                    // Start the idle clock over (`prepare_for_sleep_cb`,
+                    // `meta-backend.c:1006-1023`, and the native backend's `resume`,
+                    // `meta-backend-native.c:1027-1028`). `CLOCK_MONOTONIC` does not tick across a
+                    // suspend, so without this the seat comes back holding whatever idle time it
+                    // went down with — and gnome-settings-daemon, reading `GetIdletime`, dims,
+                    // blanks or suspends again straight away instead of starting its countdown.
+                    self.synoik.reset_idletime(now);
                 }
 
                 let effects =
@@ -6512,9 +6520,7 @@ impl State {
                 self.synoik.reschedule_idle_monitor_timer();
             }
             IdleMonitorToSynoik::ResetIdletime => {
-                let fired = self.synoik.idle_monitor.on_activity(now);
-                self.synoik.emit_idle_watch_fired(&fired);
-                self.synoik.reschedule_idle_monitor_timer();
+                self.synoik.reset_idletime(now);
             }
             IdleMonitorToSynoik::SenderVanished(name) => {
                 self.synoik.idle_monitor.remove_watches_for_owner(&name);
@@ -15019,6 +15025,19 @@ impl Synoik {
             })
             .unwrap();
         self.switcher_timer = Some(token);
+    }
+
+    /// Start the idle clock over: stamp the activity time, fire the user-active watches, re-arm
+    /// the timed ones (`meta_idle_monitor_reset_idletime`, `meta-idle-monitor.c:454-490`).
+    ///
+    /// Not the same thing as [`notify_activity`](Self::notify_activity), which is what real input
+    /// does: this speaks for the *D-Bus* idle monitor alone, because its callers are not claiming
+    /// the user touched anything. mutter draws the same line — its resume path resets the core
+    /// monitor and nothing else (`meta-backend-native.c:1027-1028`).
+    pub fn reset_idletime(&mut self, now: Duration) {
+        let fired = self.idle_monitor.on_activity(now);
+        self.emit_idle_watch_fired(&fired);
+        self.reschedule_idle_monitor_timer();
     }
 
     /// Re-arm the single idle-watch timer to the earliest pending deadline (or cancel it if none).

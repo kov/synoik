@@ -11303,6 +11303,42 @@ fn a_lock_holds_the_suspend_until_its_own_curtain_lands() {
     assert!(!f.synoik().screen_shield.wants_sleep_inhibitor(true, owed));
 }
 
+/// Resuming starts the idle clock over.
+///
+/// `CLOCK_MONOTONIC` does not tick across a suspend, so the seat comes back holding exactly the
+/// idle time it went down with. gnome-settings-daemon reads that through `GetIdletime`, so without
+/// the reset a machine woken after a long sleep is instantly "idle for an hour" and dims, blanks
+/// or suspends again before the user has touched anything. mutter resets on the same signal
+/// (`meta-backend.c:1006-1023`).
+#[test]
+fn resuming_starts_the_idle_clock_over() {
+    use crate::dbus::freedesktop_login1::Login1ToSynoik;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Real elapsed time, because that is what the idle monitor measures — it is stamped from the
+    // monotonic clock by the handler under test, not from the animation clock.
+    std::thread::sleep(Duration::from_millis(60));
+    let idle_before = f
+        .synoik()
+        .idle_monitor
+        .idletime_ms(crate::utils::get_monotonic_time());
+    assert!(idle_before >= 50, "the seat has been idle since it started");
+
+    f.synoik_state()
+        .on_login1_msg(Login1ToSynoik::PrepareForSleep(false));
+
+    let idle_after = f
+        .synoik()
+        .idle_monitor
+        .idletime_ms(crate::utils::get_monotonic_time());
+    assert!(
+        idle_after < 50,
+        "the resume did not restart the count: {idle_after} ms"
+    );
+}
+
 /// Suspending at an already-covered screen owes nothing.
 ///
 /// The wait is armed only when the curtain has to travel. Arming it unconditionally would hold
