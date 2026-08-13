@@ -64,8 +64,22 @@ const PAD: f64 = 18.;
 /// `$base_font_size` (11pt), so 12em = `12 * pt_to_px(11)` ≈ 176px — wider than the old 150, which
 /// cramped two-line tiles (Power Mode) and made the whole menu narrower than gnome-shell's.
 fn tile_w() -> f64 {
-    12.0 * crate::ui::pt_to_px(11.0)
+    TILE_EM * crate::ui::pt_to_px(11.0)
 }
+
+/// **DIVERGENCE (deliberate).** gnome-shell's `.quick-toggle` is `min/max-width: 12em`
+/// (`_quick-settings.scss:17-18`). Ours is wider, because at 12em a menu-bearing tile has
+/// 12em − 94 ≈ 82px for its label once the icon inset (15), icon (16), gap (9), the padding the
+/// label keeps clear of the divider (9), the divider (1) and the arrow half (44) are taken — and
+/// "Power Mode" measures ~90. Upstream gets away with 12em because it *ellipsizes*; we clip, so
+/// too-narrow shows up as a chopped word rather than as "Power Mod…".
+///
+/// 13em fits it with a little room. This is the width the whole popover derives from
+/// ([`menu_w`]), so it widens the menu too.
+///
+/// The real fix is ellipsis: a long enough Wi-Fi name will still clip at any width we pick. When
+/// the toolkit grows it, this can go back to 12em.
+const TILE_EM: f64 = 13.0;
 /// `.quick-toggle` is `min-height: $scalable_icon_size * 3` = 48px (`_quick-settings.scss:19`) —
 /// sized off the icon so the button scales with it, as the rule's own comment says. Measured
 /// 48.0019 on a live 50.3 shell.
@@ -3145,6 +3159,58 @@ mod tests {
 
     use super::*;
     use crate::system_status::KnownProfile;
+
+    /// Every built-in tile label must fit the space its tile actually gives it.
+    ///
+    /// We *clip* labels where gnome-shell ellipsizes, so a tile that is too narrow does not
+    /// degrade gracefully — it chops a word mid-glyph. That is exactly what happened when the
+    /// label gained the padding it keeps clear of the menu divider: "Power Mode" went from
+    /// just-fitting to "Power Mod". Measuring the shaped runs is the only way to catch it, since
+    /// the widths depend on the font.
+    ///
+    /// This does not cover *dynamic* labels (a long Wi-Fi name will still clip at any width);
+    /// that wants ellipsis in the toolkit, not a wider tile.
+    #[test]
+    fn every_tile_label_fits_beside_its_menu_arrow() {
+        use crate::render_helpers::vulkan::VulkanRenderer;
+        use crate::ui::widget::{TextShaper, TextStyle};
+
+        let mut vk = match VulkanRenderer::new() {
+            Ok(vk) => vk,
+            Err(e) => {
+                eprintln!("skipping every_tile_label_fits_beside_its_menu_arrow: no device ({e})");
+                return;
+            }
+        };
+        let scale = 1.;
+        let mut shaper = TextShaper::new(&mut vk, scale);
+
+        let content = tile_w() - (TILE_ICON_INSET + TILE_ICON + TILE_ICON_GAP);
+        // A menu tile also loses the gap it keeps clear of the divider, the divider, and the
+        // arrow half. A plain one only loses its box's right padding.
+        let with_menu = content - (TILE_MENU_PAD + SEPARATOR_W + ARROW_W);
+        let plain = content - TILE_ICON_INSET;
+
+        for (label, has_menu) in [
+            ("Power Mode", true),
+            ("Wired", true),
+            ("Do Not Disturb", false),
+            ("Night Light", false),
+            ("Dark Style", false),
+            ("Airplane Mode", false),
+        ] {
+            let run = shaper
+                .shape(label, TextStyle::new(LABEL_PT).bold())
+                .expect("shaping a tile label");
+            let w = run.ink_bounds().2 as f64 / scale;
+            let available = if has_menu { with_menu } else { plain };
+            assert!(
+                w <= available,
+                "{label:?} needs {w:.1}px but its tile leaves {available:.1}px — widen TILE_EM, \
+                 or teach the toolkit to ellipsize"
+            );
+        }
+    }
 
     fn battery(percentage: f64) -> BatteryStatus {
         BatteryStatus {
