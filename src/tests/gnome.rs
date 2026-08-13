@@ -25443,6 +25443,9 @@ fn a_short_maximize_move_still_animates() {
 
     // (4, 35) -> (0, 32) is 5 px, inside the free-move dead zone.
     f.synoik_state().do_action(Action::Maximize, false);
+    // `render_offset` is exactly zero once the move settles, so the assertion below needs the
+    // animation still in flight — freeze, or the dispatch spends real time out of its budget.
+    f.freeze_clock();
     f.double_roundtrip(id);
 
     let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
@@ -25502,6 +25505,9 @@ fn a_resize_the_client_defers_to_its_next_commit_still_animates() {
     w.attach_new_buffer();
     w.set_size(1920, 1048);
     w.commit();
+    // The animation starts inside this dispatch and is dropped once it finishes, so real time
+    // spent here is time the 250 ms budget loses.
+    f.freeze_clock();
     f.double_roundtrip(id);
     assert!(
         resize_animation(&mut f),

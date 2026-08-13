@@ -4880,6 +4880,10 @@ fn vulkan_reaches_the_configured_custom_open_shader() {
     window.attach_shm_buffer(WIN as i32, WIN as i32, 0, 255, 0, 255);
     window.set_size(WIN, WIN);
     window.ack_last_and_commit();
+    // The 150 ms open animation starts inside this dispatch, and a dispatch clears the lazy clock;
+    // freeze so the frame rendered below is a fixed point on the curve rather than one chosen by
+    // how busy the machine was.
+    f.freeze_clock();
     f.double_roundtrip(id);
 
     let output = f.synoik_output(1);
