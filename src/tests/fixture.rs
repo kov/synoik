@@ -239,6 +239,30 @@ impl Fixture {
         synoik.advance_animations();
     }
 
+    /// Hold the animation clock still, so that only [`advance_clock`](Self::advance_clock) moves
+    /// it — the way to sample a mid-animation state across round trips.
+    ///
+    /// [`sample_animation`](Self::sample_animation) pins the clock per sample, which is enough when
+    /// nothing dispatches in between; a round trip runs the event loop, whose last act is to clear
+    /// the lazy clock, so the next read comes from the monotonic clock and the animation jumps
+    /// ahead by however long the round trip took in real time. That made every "assert something
+    /// mid-resize" test a race against the machine: under load
+    /// (two concurrent suites) the animation settled early and the precondition tripped.
+    pub fn freeze_clock(&mut self) {
+        self.synoik().clock.freeze();
+    }
+
+    /// Move the frozen clock forward by `by` and re-time every running animation.
+    ///
+    /// Only meaningful after [`freeze_clock`](Self::freeze_clock) — without it the next event-loop
+    /// iteration discards the pinned time.
+    pub fn advance_clock(&mut self, by: Duration) {
+        let synoik = self.synoik();
+        let now = synoik.clock.now_unadjusted();
+        synoik.clock.set_unadjusted(now + by);
+        synoik.advance_animations();
+    }
+
     /// Sample `f` at `n + 1` evenly spaced instants across the next `duration`,
     /// advancing animations at each pinned instant — the animated analogue of
     /// [`settle_animations`](Self::settle_animations), for asserting what a UI

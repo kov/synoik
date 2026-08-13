@@ -20,6 +20,10 @@ pub struct Clock {
 #[derive(Debug, Default)]
 struct LazyClock {
     time: Option<Duration>,
+    /// While set, [`clear`](Self::clear) does nothing, so the pinned time survives the end of an
+    /// event-loop iteration instead of being re-fetched from the monotonic clock. See
+    /// [`Clock::freeze`].
+    frozen: bool,
 }
 
 /// Clock that can adjust its rate.
@@ -61,6 +65,34 @@ impl Clock {
         self.inner.borrow_mut().inner.clear();
     }
 
+    /// Pin the clock at its current time until [`unfreeze`](Self::unfreeze), so that time advances
+    /// **only** through [`set_unadjusted`](Self::set_unadjusted).
+    ///
+    /// Normally the compositor clears the lazy time at the end of every event-loop iteration
+    /// (`Synoik::refresh`), so the next read comes from the monotonic clock and animations advance
+    /// by real elapsed wall time. That is right in a session and wrong in a test: a headless test
+    /// that round-trips a client mid-animation then advances by however long that round trip
+    /// happened to take, which on a loaded machine is enough to finish the animation and walk
+    /// straight past the frames under test. Freezing makes the sampled instant a property of the
+    /// test rather than of the machine.
+    ///
+    /// Intended for tests; nothing in a session freezes the clock.
+    pub fn freeze(&mut self) {
+        let mut clock = self.inner.borrow_mut();
+        // Materialize the current time first: freezing an unset lazy clock would otherwise pin it
+        // at whatever the *next* reader happened to fetch.
+        let now = clock.inner.now();
+        clock.inner.set(now);
+        clock.inner.frozen = true;
+    }
+
+    /// Let the clock follow the monotonic clock again. See [`freeze`](Self::freeze).
+    pub fn unfreeze(&mut self) {
+        let mut clock = self.inner.borrow_mut();
+        clock.inner.frozen = false;
+        clock.inner.clear();
+    }
+
     /// Gets the clock rate.
     pub fn rate(&self) -> f64 {
         self.inner.borrow().rate()
@@ -92,11 +124,16 @@ impl Eq for Clock {}
 
 impl LazyClock {
     pub fn with_time(time: Duration) -> Self {
-        Self { time: Some(time) }
+        Self {
+            time: Some(time),
+            frozen: false,
+        }
     }
 
     pub fn clear(&mut self) {
-        self.time = None;
+        if !self.frozen {
+            self.time = None;
+        }
     }
 
     pub fn set(&mut self, time: Duration) {

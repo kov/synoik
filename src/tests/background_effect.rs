@@ -10,6 +10,8 @@
 //! the double-buffered commit, our post-commit hook, and the lazily-recomputed rect cache. A bug
 //! anywhere along there means no blur at all, silently — the surface just renders as it always did.
 
+use std::time::Duration;
+
 use smithay::reexports::wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::Capability;
 use smithay::wayland::compositor::with_states;
 
@@ -245,6 +247,14 @@ fn the_effect_tracks_the_tile_through_a_resize() {
             .is_some_and(|r| rect_approx_eq(r, s.tile_geometry)));
     }
 
+    // Hold the clock from here on. Everything below round-trips a client between the resize and
+    // the samples, and each round trip runs the event loop, whose last act is to clear the lazy
+    // clock — so without this the animation advances by however long those round trips take in
+    // real time. That is a race against the machine: under load the 250 ms resize settled before
+    // the `mid` sample and the precondition below tripped. Frozen, the sampled instant is the
+    // `advance_clock` call and nothing else.
+    f.freeze_clock();
+
     // The compositor decides on a new size before the client can answer.
     f.synoik_state()
         .do_action(synoik_config::Action::Maximize, false);
@@ -267,6 +277,10 @@ fn the_effect_tracks_the_tile_through_a_resize() {
     f.client(id)
         .update_blur_region(&effect, &surface, (0, 0, 800, 600));
     f.double_roundtrip(id);
+
+    // Step to a genuinely mid-flight instant: well inside the 250 ms window-resize easing
+    // (`WindowResizeAnim`), so the tile has moved but has not arrived.
+    f.advance_clock(Duration::from_millis(100));
 
     let mid = sample_effect(&mut f);
     assert!(!mid.is_empty(), "the effect must still render mid-resize");
