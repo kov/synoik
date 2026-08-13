@@ -40,6 +40,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
+use crate::animation::{Animation, Clock};
 use crate::audio::{AudioStatus, MicStatus, SinkList, SourceList};
 use crate::end_session::SessionRequest;
 use crate::gnome::QuickToggles;
@@ -991,6 +992,11 @@ struct Layout {
     /// The number of grid tiles (4, or 5 with the airplane tile shown) — the grid's row count, and
     /// thus the menu height, depends on it.
     grid_len: usize,
+    /// The open card's height as a fraction of its settled one: 1 while it sits open, in `[0, 1)`
+    /// while it grows or shrinks. Only the *block* scales — the card's own contents are laid out
+    /// at full size, and stay invisible until the height has finished (gnome-shell fades
+    /// `this.box` in only once the container's height eases home).
+    block_scale: f64,
 }
 
 impl Layout {
@@ -1023,12 +1029,13 @@ impl Layout {
     /// The detail card's `(natural insert y, block height)` when a view is open. The block height
     /// is the card plus its top margin — exactly how far the rows below the owner shift down, and
     /// how much taller the menu grows.
+    ///
+    /// Scaled by [`block_scale`](Self::block_scale) while the view is growing or shrinking: it is
+    /// the container height gnome-shell eases (`QuickSettingsMenu.open`, `quickSettings.js:459`).
     fn detail_block(self) -> Option<(f64, f64)> {
         let owner = self.expanded?;
-        Some((
-            owner.anchor_row_bottom(self),
-            DETAIL_MARGIN + owner.detail_height(self.owner_device_count(owner)),
-        ))
+        let full = DETAIL_MARGIN + owner.detail_height(self.owner_device_count(owner));
+        Some((owner.anchor_row_bottom(self), full * self.block_scale))
     }
 
     /// The same layout with nothing expanded — the geometry the grid bake is drawn in, so its
@@ -1386,9 +1393,131 @@ pub struct QuickSettings {
     expanded: Option<DetailOwner>,
     /// The control the pointer is hovering, highlighted on render.
     hovered: Option<QsHover>,
+    /// The detail view's open/close animation state.
+    expand: Expand,
     /// Bumped on any toggle so the cached chrome texture is redrawn.
     revision: u64,
     cache: RefCell<TextureCache>,
+}
+
+/// The detail view's open/close animation — gnome-shell's `QuickSettingsMenu.open`/`close`
+/// (`js/ui/quickSettings.js:459-515`), which runs two `POPUP_ANIMATION_TIME / 2` phases back to
+/// back rather than one blended transition:
+///
+/// - **open**: the container's height eases to the card's, *then* the card's contents fade in. The
+///   card carries its own background (`.quick-toggle-menu` is the `%card`; the animating
+///   `.quick-toggle-menu-container` has none), so the first phase opens an empty gap and the whole
+///   card appears in the second.
+/// - **close**: the reverse — fade out, then collapse the gap.
+///
+/// The phases are sequenced in [`advance`](Self::advance) rather than with a completion callback,
+/// so a menu that is never advanced (every unit test) simply reads as settled.
+#[derive(Debug, Default)]
+struct Expand {
+    /// The owner [`advance`](Self::advance) last saw, so it can notice a change and arm the
+    /// animation. `None` before the first advance — a menu that is never advanced never animates.
+    seen: Option<Option<DetailOwner>>,
+    /// The card still on screen while it collapses, after `expanded` has already gone.
+    closing: Option<DetailOwner>,
+    /// The container height, `0..1` of the settled block.
+    height: Option<Animation>,
+    /// The card's opacity, `0..1`.
+    fade: Option<Animation>,
+}
+
+impl Expand {
+    /// The block-height fraction: 1 when settled (including when never advanced).
+    fn block_scale(&self) -> f64 {
+        self.height
+            .as_ref()
+            .map_or(1., |a| a.clamped_value().clamp(0., 1.))
+    }
+
+    /// The card's alpha: 1 when settled, 0 while the gap is still opening.
+    fn card_alpha(&self) -> f32 {
+        self.fade
+            .as_ref()
+            .map_or(1., |a| a.clamped_value().clamp(0., 1.)) as f32
+    }
+
+    fn ongoing(&self) -> bool {
+        [self.height.as_ref(), self.fade.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|a| !a.is_done())
+    }
+
+    /// Step the state machine towards `target`, arming the next phase as the current one lands.
+    /// Returns whether anything moved, so the caller can queue a redraw.
+    ///
+    /// Cross-switch (a second view opened while one is up) is a **divergence**: gnome-shell
+    /// animates the outgoing and incoming menus concurrently (`_setOpenedSubMenu`), we swap the
+    /// card and ease the height straight from the old block to the new. Two simultaneous block
+    /// shifts would have to live in `Layout::shift_below`, for a case that lasts 150 ms.
+    fn advance(
+        &mut self,
+        target: Option<DetailOwner>,
+        clock: &Clock,
+        params: synoik_config::Animation,
+    ) -> bool {
+        let Some(seen) = self.seen else {
+            // First frame with this menu: adopt whatever is open, settled.
+            self.seen = Some(target);
+            return false;
+        };
+        let mut moved = false;
+        let anim = |from: f64, to: f64| Animation::new(clock.clone(), from, to, 0., params);
+
+        if seen != target {
+            self.seen = Some(target);
+            moved = true;
+            match (seen, target) {
+                // Opening from nothing: grow the gap first, with the card still invisible.
+                (None, Some(_)) => {
+                    self.closing = None;
+                    self.height = Some(anim(0., 1.));
+                    self.fade = Some(anim(0., 0.));
+                }
+                // Closing: fade the card out first, over what is left of its opacity.
+                (Some(old), None) => {
+                    self.closing = Some(old);
+                    self.fade = Some(anim(f64::from(self.card_alpha()), 0.));
+                }
+                // Switching owners — see the divergence above.
+                (Some(_), Some(_)) => {
+                    self.closing = None;
+                    self.fade = Some(anim(f64::from(self.card_alpha()), 1.));
+                }
+                (None, None) => {}
+            }
+            return moved;
+        }
+
+        let height_done = self.height.as_ref().is_none_or(Animation::is_done);
+        let fade_done = self.fade.as_ref().is_none_or(Animation::is_done);
+        if target.is_some() {
+            // Phase 2 of an open: the gap is there, bring the card in.
+            if height_done && fade_done && self.card_alpha() < 1. {
+                self.fade = Some(anim(f64::from(self.card_alpha()), 1.));
+                moved = true;
+            }
+        } else if let Some(old) = self.closing {
+            if fade_done && height_done {
+                if self.block_scale() > 0. {
+                    // Phase 2 of a close: the card is gone, collapse the gap it left.
+                    self.height = Some(anim(self.block_scale(), 0.));
+                } else {
+                    // Settled shut: drop the card and the animations with it.
+                    let _ = old;
+                    self.closing = None;
+                    self.height = None;
+                    self.fade = None;
+                }
+                moved = true;
+            }
+        }
+        moved || self.ongoing()
+    }
 }
 
 /// A hoverable control in the quick-settings menu, for the hover highlight. A
@@ -1453,6 +1582,7 @@ impl QuickSettings {
             accent: widget::style::accent_rgba(accent),
             brightness,
             revision: 0,
+            expand: Expand::default(),
             cache: RefCell::new(TextureCache {
                 context: None,
                 textures: HashMap::new(),
@@ -1516,7 +1646,9 @@ impl QuickSettings {
     fn layout(&self) -> Layout {
         Layout {
             sliders: self.sliders(),
-            expanded: self.expanded,
+            // The card still on screen wins while it collapses, so the gap it leaves keeps its
+            // geometry until the animation has shut it.
+            expanded: self.expanded.or(self.expand.closing),
             sink_count: self.sink_list.sinks.len(),
             source_count: self.source_list.sources.len(),
             profile_count: self.power.available.len(),
@@ -1530,7 +1662,24 @@ impl QuickSettings {
                 _ => None,
             },
             grid_len: self.grid().len(),
+            block_scale: self.expand.block_scale(),
         }
+    }
+
+    /// The detail view actually on screen: the open one, or the one still fading/collapsing out.
+    fn shown_detail(&self) -> Option<DetailOwner> {
+        self.expanded.or(self.expand.closing)
+    }
+
+    /// Step the detail view's open/close animation. Driven by the popover once per frame, since
+    /// that is where the clock and the animation config live. Returns whether it moved.
+    pub fn advance_expand(&mut self, clock: &Clock, params: synoik_config::Animation) -> bool {
+        self.expand.advance(self.expanded, clock, params)
+    }
+
+    /// Whether the detail view is still growing, fading or collapsing.
+    pub fn are_animations_ongoing(&self) -> bool {
+        self.expand.ongoing()
     }
 
     /// An external content change (device list, profile, airplane, audio) can move or remove the
@@ -2264,7 +2413,7 @@ impl QuickSettings {
 
         // The open detail view: its header icon and any per-row icons (the card background,
         // title, and row labels are chrome, drawn below).
-        if let Some(owner) = self.expanded {
+        if let (Some(owner), true) = (self.shown_detail(), self.expand.card_alpha() > 0.) {
             if let Some(card) = detail_rect(layout) {
                 let (cand, _title) = owner.header(self.network);
                 // Centered on the icon pill (the pill itself is chrome, drawn in `draw`).
@@ -2423,7 +2572,7 @@ impl QuickSettings {
         // now drawn by the shared popover chrome behind this texture (`PanelPopover::render`).
         match self.textures(renderer, scale) {
             Ok((grid, card)) => {
-                if let Some(card) = card {
+                if let (Some(card), true) = (card, self.expand.card_alpha() > 0.) {
                     if let Some(rect) = detail_rect(layout) {
                         let buffer = TextureBuffer::from_texture(
                             renderer,
@@ -2435,7 +2584,7 @@ impl QuickSettings {
                         elements.push(TextureRenderElement::from_texture_buffer(
                             buffer,
                             origin + rect.loc,
-                            1.,
+                            self.expand.card_alpha(),
                             None,
                             None,
                             Kind::Unspecified,
@@ -2491,7 +2640,7 @@ impl QuickSettings {
         if !fresh {
             let grid = self.draw_grid(renderer, scale)?;
             let card = self
-                .expanded
+                .shown_detail()
                 .map(|owner| self.draw_card(renderer, scale, owner))
                 .transpose()?;
             cache
@@ -3353,6 +3502,7 @@ mod tests {
             show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
+            block_scale: 1.,
         }
     }
 
@@ -4674,6 +4824,7 @@ mod tests {
             show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
+            block_scale: 1.,
         };
         let expanded = Layout {
             sliders: Sliders {
@@ -4690,6 +4841,7 @@ mod tests {
             show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
+            block_scale: 1.,
         };
         assert!(
             menu_h(expanded) > menu_h(collapsed),
@@ -4788,6 +4940,7 @@ mod tests {
                     show_bluetooth: false,
                     drag: None,
                     grid_len: BASE_GRID.len(),
+                    block_scale: 1.,
                 };
                 assert!(
                     menu_h(l) < 600.,
@@ -4858,6 +5011,97 @@ mod tests {
                 assert!(size.w > 0 && size.h > 0, "non-empty at scale {scale}");
             }
         }
+    }
+
+    /// The detail view's two phases, sampled **mid**-transition: opening grows the gap with the
+    /// card still invisible, and only once the gap is there does the card fade in. Closing runs
+    /// the same two the other way round.
+    ///
+    /// Endpoints alone would pass with no animation at all, which is exactly the blindness that
+    /// makes an animated-geometry bug invisible — every assertion here is taken between them.
+    #[test]
+    fn a_detail_view_grows_its_gap_first_and_fades_its_card_second() {
+        let mut clock = Clock::with_time(std::time::Duration::ZERO);
+        let params = synoik_config::Animations::default()
+            .quick_settings_detail_open_close
+            .0;
+        let mut qs = qs(NetworkStatus::Wired, None);
+        let step = |qs: &mut QuickSettings, clock: &mut Clock, ms: u64| {
+            clock.set_unadjusted(std::time::Duration::from_millis(ms));
+            qs.advance_expand(clock, params);
+        };
+
+        // Adopt the (collapsed) starting state, then open.
+        step(&mut qs, &mut clock, 0);
+        qs.pointer_click(center(
+            tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap(),
+        ));
+        step(&mut qs, &mut clock, 0);
+
+        // Halfway through phase 1: the gap is part-open and the card is not drawn at all.
+        step(&mut qs, &mut clock, 37);
+        let scale = qs.layout().block_scale;
+        assert!(scale > 0. && scale < 1., "the gap is mid-grow, got {scale}");
+        assert_eq!(qs.expand.card_alpha(), 0., "the card waits for the gap");
+        let (_, block) = qs.layout().detail_block().expect("a block while growing");
+        assert!(
+            block < DETAIL_MARGIN + DetailOwner::Network.detail_height(0),
+            "the menu is still shorter than its settled height"
+        );
+
+        // Phase 1 lands: the gap is whole, and phase 2 arms.
+        step(&mut qs, &mut clock, 75);
+        assert_eq!(qs.layout().block_scale, 1.);
+        step(&mut qs, &mut clock, 112);
+        let alpha = qs.expand.card_alpha();
+        assert!(
+            alpha > 0. && alpha < 1.,
+            "the card is mid-fade, got {alpha}"
+        );
+        assert_eq!(
+            qs.layout().block_scale,
+            1.,
+            "the gap does not move while the card fades"
+        );
+
+        step(&mut qs, &mut clock, 150);
+        assert_eq!(qs.expand.card_alpha(), 1.);
+
+        // Closing: the card fades out *before* the gap collapses.
+        qs.pointer_click(center(
+            tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap(),
+        ));
+        assert_eq!(qs.expanded, None, "the click closed it");
+        step(&mut qs, &mut clock, 150);
+        step(&mut qs, &mut clock, 187);
+        let alpha = qs.expand.card_alpha();
+        assert!(
+            alpha > 0. && alpha < 1.,
+            "the card is mid-fade-out, got {alpha}"
+        );
+        assert_eq!(
+            qs.layout().block_scale,
+            1.,
+            "the gap is still full height while the card fades out"
+        );
+        assert_eq!(
+            qs.shown_detail(),
+            Some(DetailOwner::Network),
+            "the card is still on screen while it fades"
+        );
+
+        step(&mut qs, &mut clock, 225);
+        step(&mut qs, &mut clock, 262);
+        let scale = qs.layout().block_scale;
+        assert!(
+            scale > 0. && scale < 1.,
+            "the gap is mid-collapse, got {scale}"
+        );
+
+        step(&mut qs, &mut clock, 300);
+        step(&mut qs, &mut clock, 301);
+        assert_eq!(qs.shown_detail(), None, "settled shut");
+        assert!(!qs.are_animations_ongoing());
     }
 
     /// The collapsed grid bake tiles the expanded menu exactly: the two slices cover it end to
@@ -4949,6 +5193,7 @@ mod tests {
             show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
+            block_scale: 1.,
         };
         let expanded = Layout {
             sliders: Sliders {
@@ -4965,6 +5210,7 @@ mod tests {
             show_bluetooth: false,
             drag: None,
             grid_len: BASE_GRID.len(),
+            block_scale: 1.,
         };
         let block = DETAIL_MARGIN + DetailOwner::Power.detail_height(0);
         assert_eq!(

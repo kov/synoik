@@ -460,7 +460,19 @@ impl PanelPopover {
     }
 
     /// Settle the open/close animation: once a close fade finishes, drop the content.
+    ///
+    /// Also steps the quick-settings detail view's own grow/fade, which lives in the content but
+    /// needs the clock and animation config the popover holds.
     pub fn advance_animations(&mut self) {
+        let detail = self
+            .config
+            .borrow()
+            .animations
+            .quick_settings_detail_open_close
+            .0;
+        if let Some(PopoverContent::QuickSettings(qs)) = &mut self.content {
+            qs.advance_expand(&self.clock, detail);
+        }
         if self.closing && self.anim.as_ref().is_none_or(|a| a.is_done()) {
             self.open = false;
             self.closing = false;
@@ -470,9 +482,13 @@ impl PanelPopover {
         }
     }
 
-    /// Whether an open/close fade is still running (keeps the redraw loop ticking).
+    /// Whether an open/close fade — the popover's own, or the quick-settings detail view's —
+    /// is still running (keeps the redraw loop ticking).
     pub fn are_animations_ongoing(&self) -> bool {
-        self.anim.as_ref().is_some_and(|a| !a.is_done())
+        if self.anim.as_ref().is_some_and(|a| !a.is_done()) {
+            return true;
+        }
+        matches!(&self.content, Some(PopoverContent::QuickSettings(qs)) if qs.are_animations_ongoing())
     }
 
     /// The output the popover is anchored on, while open.

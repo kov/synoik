@@ -21,6 +21,7 @@ pub struct Animations {
     pub exit_confirmation_open_close: ExitConfirmationOpenCloseAnim,
     pub screenshot_ui_open: ScreenshotUiOpenAnim,
     pub panel_popover_open_close: PanelPopoverOpenCloseAnim,
+    pub quick_settings_detail_open_close: QuickSettingsDetailOpenCloseAnim,
     pub notification_open_close: NotificationOpenCloseAnim,
     pub overview_open_close: OverviewOpenCloseAnim,
 }
@@ -40,6 +41,7 @@ impl Default for Animations {
             exit_confirmation_open_close: Default::default(),
             screenshot_ui_open: Default::default(),
             panel_popover_open_close: Default::default(),
+            quick_settings_detail_open_close: Default::default(),
             notification_open_close: Default::default(),
             overview_open_close: Default::default(),
         }
@@ -61,6 +63,7 @@ pub struct AnimationsPart {
     pub exit_confirmation_open_close: Option<ExitConfirmationOpenCloseAnim>,
     pub screenshot_ui_open: Option<ScreenshotUiOpenAnim>,
     pub panel_popover_open_close: Option<PanelPopoverOpenCloseAnim>,
+    pub quick_settings_detail_open_close: Option<QuickSettingsDetailOpenCloseAnim>,
     pub notification_open_close: Option<NotificationOpenCloseAnim>,
     pub overview_open_close: Option<OverviewOpenCloseAnim>,
 }
@@ -88,6 +91,7 @@ impl MergeWith<AnimationsPart> for Animations {
             exit_confirmation_open_close,
             screenshot_ui_open,
             panel_popover_open_close,
+            quick_settings_detail_open_close,
             notification_open_close,
             overview_open_close,
         );
@@ -287,6 +291,25 @@ impl Default for ScreenshotUiOpenAnim {
             kind: Kind::Easing(EasingParams {
                 duration_ms: 200,
                 curve: Curve::EaseOutQuad,
+            }),
+        })
+    }
+}
+
+/// One phase of a quick-settings detail view opening or closing: gnome-shell runs the height
+/// and the content fade back to back, each `POPUP_ANIMATION_TIME / 2`
+/// (`js/ui/quickSettings.js:459-515`). Neither `ease()` call passes a mode, so both take
+/// Clutter's default ease-out-cubic (`clutter-actor.c:17063`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuickSettingsDetailOpenCloseAnim(pub Animation);
+
+impl Default for QuickSettingsDetailOpenCloseAnim {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: Kind::Easing(EasingParams {
+                duration_ms: 75,
+                curve: Curve::EaseOutCubic,
             }),
         })
     }
