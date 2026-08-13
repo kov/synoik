@@ -1759,8 +1759,18 @@ impl State {
             // (`js/ui/dateMenu.js:300-302,376-381,597-600`). Ours all funnel through
             // `Spawn`, so this one call covers them.
             PopoverAction::Spawn(command) => {
-                spawn(command, None);
+                // With a token, so a single-instance app that answers the second launch by
+                // presenting its existing window is actually allowed to raise it. Without one
+                // the window stays where it is and the click looks like it did nothing.
+                let (token, _) = self.synoik.activation_state.create_external_token(None);
+                spawn(command, Some(token.clone()));
                 self.synoik.layout.close_overview();
+            }
+            // `shell_app_activate`: raises the app's most recent window when it is already
+            // running, launches it when it is not.
+            PopoverAction::ActivateApp(id) => {
+                self.synoik.layout.close_overview();
+                self.activate_app(&id, false, "quick-settings");
             }
             // Straight to `org.gnome.SessionManager`, as gnome-shell does
             // (`systemActions.js:483-501`) — not the `gnome-session-quit` helper we used to

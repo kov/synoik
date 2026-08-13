@@ -1302,7 +1302,13 @@ impl SysButton {
     fn action(self) -> PopoverAction {
         let words: &[&str] = match self {
             SysButton::Screenshot => return PopoverAction::Screenshot,
-            SysButton::Settings => &["gnome-control-center"],
+            // Activate the app, do not spawn its command: gnome-shell's `SettingsItem` looks
+            // `org.gnome.Settings.desktop` up and calls `activate()`
+            // (`js/ui/status/system.js:133-154`), so an already-open Settings is *presented*
+            // rather than asked to start a second time.
+            SysButton::Settings => {
+                return PopoverAction::ActivateApp("org.gnome.Settings.desktop".to_owned());
+            }
             SysButton::Lock => &["loginctl", "lock-session"],
             SysButton::Power => {
                 unreachable!("the power button opens its submenu via detail_owner(), not action()")
@@ -3464,10 +3470,13 @@ mod tests {
         let shot = qs.pointer_click(center(sys_rect(SysButton::Screenshot, false)));
         assert!(matches!(shot, PopoverAction::Screenshot));
 
+        // Settings *activates the app*, it does not spawn a command — so an already-open
+        // Settings is presented rather than asked to start again
+        // (gnome-shell `js/ui/status/system.js:133-154`).
         let settings = qs.pointer_click(center(sys_rect(SysButton::Settings, false)));
         match settings {
-            PopoverAction::Spawn(cmd) => assert_eq!(cmd[0], "gnome-control-center"),
-            other => panic!("expected a spawn, got {other:?}"),
+            PopoverAction::ActivateApp(id) => assert_eq!(id, "org.gnome.Settings.desktop"),
+            other => panic!("expected an app activation, got {other:?}"),
         }
     }
 

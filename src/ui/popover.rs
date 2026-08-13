@@ -91,6 +91,11 @@ pub enum PopoverAction {
     /// The click was consumed but has no side effect (e.g. a calendar day, or a
     /// hit on empty menu space). The popover stays open.
     Consumed,
+    /// Activate an app by desktop id, presenting it if it is already running
+    /// (`shell_app_activate`). What gnome-shell's own quick-settings items do — its
+    /// `SettingsItem` looks `org.gnome.Settings.desktop` up and calls `activate()`
+    /// (`js/ui/status/system.js:133-154`), it does not spawn a command.
+    ActivateApp(String),
     /// Set `org.gnome.desktop.interface color-scheme` (Dark Style tile).
     SetDarkStyle(bool),
     /// Set the inverse of `org.gnome.desktop.notifications show-banners` (DND).
