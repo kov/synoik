@@ -1031,6 +1031,15 @@ impl Layout {
         ))
     }
 
+    /// The same layout with nothing expanded — the geometry the grid bake is drawn in, so its
+    /// texture stays valid whatever the detail view is doing.
+    fn collapsed(self) -> Self {
+        Layout {
+            expanded: None,
+            ..self
+        }
+    }
+
     /// The downward shift applied to an element whose natural (un-expanded) top is `natural_y`:
     /// the block height for anything at or below the owner's row bottom, else zero.
     fn shift_below(self, natural_y: f64) -> f64 {
@@ -1397,7 +1406,7 @@ enum QsHover {
 
 struct TextureCache {
     context: Option<ContextId<VkTexture>>,
-    textures: HashMap<NotNan<f64>, (u64, VkTexture)>,
+    textures: HashMap<NotNan<f64>, (u64, VkTexture, Option<VkTexture>)>,
 }
 
 impl QuickSettings {
@@ -2412,23 +2421,44 @@ impl QuickSettings {
         // The chrome (tile backgrounds + labels) on a transparent bg, beneath the icons. Reports
         // NO opaque region: the `.popup-menu-content` box fill (and its rounded opaque region) is
         // now drawn by the shared popover chrome behind this texture (`PanelPopover::render`).
-        match self.texture(renderer, scale) {
-            Ok(texture) => {
+        match self.textures(renderer, scale) {
+            Ok((grid, card)) => {
+                if let Some(card) = card {
+                    if let Some(rect) = detail_rect(layout) {
+                        let buffer = TextureBuffer::from_texture(
+                            renderer,
+                            card,
+                            scale,
+                            Transform::Normal,
+                            Vec::new(),
+                        );
+                        elements.push(TextureRenderElement::from_texture_buffer(
+                            buffer,
+                            origin + rect.loc,
+                            1.,
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ));
+                    }
+                }
                 let buffer = TextureBuffer::from_texture(
                     renderer,
-                    texture,
+                    grid,
                     scale,
                     Transform::Normal,
                     Vec::new(),
                 );
-                elements.push(TextureRenderElement::from_texture_buffer(
-                    buffer,
-                    origin,
-                    1.,
-                    None,
-                    None,
-                    Kind::Unspecified,
-                ));
+                for slice in grid_slices(layout, scale) {
+                    elements.push(TextureRenderElement::from_texture_buffer(
+                        buffer.clone(),
+                        origin + Point::from((0., slice.dst_y)),
+                        1.,
+                        Some(slice.src),
+                        Some(slice.src.size),
+                        Kind::Unspecified,
+                    ));
+                }
             }
             Err(err) => tracing::error!("error drawing the quick-settings menu: {err:#}"),
         }
@@ -2437,7 +2467,18 @@ impl QuickSettings {
     }
 
     /// Draw (or reuse) the chrome texture, caching per (scale, revision).
-    fn texture(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
+    /// The two chrome textures: the menu in its **collapsed** layout, and the open detail card
+    /// on its own. Cached together per (scale, revision).
+    ///
+    /// They are baked apart so neither one's key carries the expansion: the card grows the menu
+    /// and pushes the rows under its owner down, and baking that into one texture would mean a
+    /// full re-bake on every frame of the grow animation. Instead `render` composes them — the
+    /// collapsed bake is drawn as two slices with the block height between them.
+    fn textures(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+    ) -> anyhow::Result<(VkTexture, Option<VkTexture>)> {
         let scale_key = NotNan::new(scale).map_err(|_| anyhow::anyhow!("bad scale"))?;
         let mut cache = self.cache.borrow_mut();
         let context = renderer.context_id();
@@ -2446,23 +2487,243 @@ impl QuickSettings {
             cache.context = Some(context);
         }
         let fresh =
-            matches!(cache.textures.get(&scale_key), Some((rev, _)) if *rev == self.revision);
+            matches!(cache.textures.get(&scale_key), Some((rev, ..)) if *rev == self.revision);
         if !fresh {
-            let tex = self.draw(renderer, scale)?;
-            cache.textures.insert(scale_key, (self.revision, tex));
+            let grid = self.draw_grid(renderer, scale)?;
+            let card = self
+                .expanded
+                .map(|owner| self.draw_card(renderer, scale, owner))
+                .transpose()?;
+            cache
+                .textures
+                .insert(scale_key, (self.revision, grid, card));
         }
         Ok(cache
             .textures
             .get(&scale_key)
-            .map(|(_, t)| t.clone())
+            .map(|(_, g, c)| (g.clone(), c.clone()))
             .unwrap())
     }
 
-    fn draw(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
-        let _span = tracy_client::span!("quick_settings::draw");
+    /// Bake the open detail card on its own, in **card-local** coordinates (its top-left is the
+    /// texture's origin). Kept out of the grid bake so the growing menu never re-bakes: see
+    /// [`textures`](Self::textures).
+    fn draw_card(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+        owner: DetailOwner,
+    ) -> anyhow::Result<VkTexture> {
+        let _span = tracy_client::span!("quick_settings::draw_card");
 
         let layout = self.layout();
-        let size = self.logical_size();
+        let card_abs = detail_rect(layout)
+            .ok_or_else(|| anyhow::anyhow!("an expanded menu must have a card rect"))?;
+        let phys = Size::<i32, Physical>::from((
+            to_physical_precise_round::<i32>(scale, card_abs.size.w).max(1),
+            to_physical_precise_round::<i32>(scale, card_abs.size.h).max(1),
+        ));
+
+        // Shape every run up front (needs `&mut renderer`, before the bake frame opens).
+        let (title_run, row_runs) = {
+            let mut shaper = TextShaper::new(renderer, scale);
+            let (_, title) = owner.header(self.network);
+            let title_run = shaper.shape(&title, TextStyle::new(DETAIL_TITLE_PT).bold())?;
+            let row_w = detail_rect(self.layout()).map_or(0., |c| c.size.w) - 2. * DETAIL_PAD;
+            let rows = self.detail_rows(owner);
+            // The card is sized from the pure `row_shape`; assert the live rows match it
+            // (count + separator positions) so the geometry can't drift from what's drawn.
+            debug_assert_eq!(
+                rows.iter().map(DetailRow::spec).collect::<Vec<_>>(),
+                owner.row_shape(self.layout().owner_device_count(owner)),
+                "rows() must match row_shape() for correct card sizing"
+            );
+            let row_runs = rows
+                .into_iter()
+                .map(|r| -> anyhow::Result<DetailRowRun> {
+                    let r = match r {
+                        DetailRow::Item(row) => row,
+                        // A name label is an ordinary regular-weight menu item with
+                        // nothing else in it (`brightness.js:14-15`).
+                        DetailRow::Label(label) => ItemRow {
+                            label,
+                            icons: Vec::new(),
+                            action: PopoverAction::Consumed,
+                            separator_before: false,
+                            selected: false,
+                            trailing: None,
+                            placeholder: false,
+                        },
+                        // A slider row has no text at all; only its value is baked.
+                        DetailRow::Slider { value, .. } => {
+                            return Ok(DetailRowRun::Slider { value })
+                        }
+                    };
+                    // The placeholder is `.bt-menu-placeholder` = `%title_4` (13pt/700,
+                    // centered, wrapped inside 4em of side padding —
+                    // `_quick-settings.scss:227-232`, `bluetooth.js:291-294`); ordinary
+                    // rows are regular-weight single-line menu items.
+                    if r.placeholder {
+                        let wrap = placeholder_wrap_w(row_w);
+                        return Ok(DetailRowRun::Placeholder(shaper.paragraph(
+                            &[ParagraphSpan {
+                                text: &r.label,
+                                pt: DETAIL_PLACEHOLDER_PT,
+                                bold: true,
+                                mono: false,
+                            }],
+                            wrap,
+                            DETAIL_PLACEHOLDER_PT,
+                        )?));
+                    }
+                    let style = TextStyle::new(DETAIL_ROW_PT);
+                    Ok(DetailRowRun::Text(TextRun {
+                        label: shaper.shape(&r.label, style)?,
+                        trailing: r
+                            .trailing
+                            .map(|t| shaper.shape(&t, TextStyle::new(DETAIL_ROW_PT)))
+                            .transpose()?,
+                        has_icon: !r.icons.is_empty(),
+                    }))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (title_run, row_runs)
+        };
+
+        // Card-local: everything below is drawn relative to the card's own top-left.
+        let origin = card_abs.loc;
+        let card = Rectangle::new(Point::from((0., 0.)), card_abs.size);
+
+        widget::bake_uncached_sized(renderer, phys, |frame| {
+            let mut p = Painter::new(frame, scale, phys);
+            // The `%card` background is opaque and covers the whole texture; the rounded corners
+            // fall back to the popover chrome behind it.
+            p.clear(style::TRANSPARENT)?;
+            p.fill_rounded(card, DETAIL_RADIUS, CARD_BG)?;
+
+            // The `.header .icon` highlighted circular pill, behind the (separately
+            // composited) header icon glyph.
+            let pill_cx = card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_PILL / 2.;
+            let pill_cy = card.loc.y + DETAIL_PAD + DETAIL_HEADER_H / 2.;
+            let pill = Rectangle::new(
+                Point::from((
+                    pill_cx - DETAIL_HEADER_PILL / 2.,
+                    pill_cy - DETAIL_HEADER_PILL / 2.,
+                )),
+                Size::from((DETAIL_HEADER_PILL, DETAIL_HEADER_PILL)),
+            );
+            p.fill_rounded(pill, DETAIL_HEADER_PILL / 2., DETAIL_HEADER_PILL_BG)?;
+
+            let title_x = card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_PILL + DETAIL_HEADER_GAP;
+            let title_cy = card.loc.y + DETAIL_PAD + DETAIL_HEADER_H / 2.;
+            p.text_clipped(
+                &title_run,
+                Point::from((title_x, title_cy)),
+                Align::LEFT_MIDDLE,
+                FG_OFF,
+                card,
+            )?;
+
+            // The group-separator rules (`.popup-separator-menu-item`): one 1px rule per row
+            // that opens a new group (the shutdown menu's machine-power vs session split).
+            let sep_shape = owner.row_shape(layout.owner_device_count(owner));
+            for (k, row_run) in row_runs.iter().enumerate() {
+                // Card-local, like `card`: the row rects come out in menu coordinates.
+                let Some(mut rrect) = detail_row_rect(k, layout) else {
+                    continue;
+                };
+                rrect.loc -= origin;
+                // A card slider row: the shared slider body, inset like a `%menuitem`. No
+                // separator, no hover (`brightness.js:29` is a non-reactive item), no text.
+                let row_run = match row_run {
+                    DetailRowRun::Text(run) => run,
+                    // The bluetooth placeholder: a wrapped, centered block in its own taller
+                    // box (`.bt-menu-placeholder`), not a `%menuitem` line.
+                    DetailRowRun::Placeholder(block) => {
+                        let (_, _, bw, bh) = block.ink_bounds();
+                        let origin = Point::<f64, Physical>::from((
+                            (rrect.loc.x + rrect.size.w / 2.) * scale - f64::from(bw) / 2.,
+                            (rrect.loc.y + rrect.size.h / 2.) * scale - f64::from(bh) / 2.,
+                        ));
+                        p.paragraph(block, origin.to_i32_round(), FG_OFF)?;
+                        continue;
+                    }
+                    DetailRowRun::Slider { value } => {
+                        paint_slider(&mut p, detail_slider_track_rect(rrect), *value, self.accent)?;
+                        continue;
+                    }
+                };
+                let run = &row_run.label;
+                // The group-separator rule, centered in the extra gap above a group-opening
+                // row. The same `$borders_color` + crisp `Painter::hairline` as the calendar
+                // column separator — but this bakes onto the *opaque* card, where the clear
+                // would punch a translucent hole, so pre-blend the border over the card
+                // (`style::over`) to lay the identical line as an opaque color.
+                if k > 0 && sep_shape.get(k).is_some_and(|s| s.separator_before) {
+                    let line_cy = rrect.loc.y - (DETAIL_ROW_GAP + DETAIL_SEP_EXTRA) / 2.;
+                    // The separator is itself a `.popup-separator-menu-item`, so its rule is
+                    // inset by the `%menuitem` horizontal padding (`$base_padding*2`, our
+                    // `DETAIL_ROW_INSET`) on top of the card pad — i.e. its ends align with the
+                    // row labels, not the card edge (`_common.scss:135`, `_popovers.scss:113`).
+                    let inset = DETAIL_PAD + DETAIL_ROW_INSET;
+                    p.hairline(
+                        Rectangle::new(
+                            Point::from((card.loc.x + inset, line_cy)),
+                            Size::from((card.size.w - 2. * inset, 1.)),
+                        ),
+                        style::over(CARD_BG, style::BORDERS),
+                    )?;
+                }
+                // A hovered picker row: a faint rounded fill (it has no base
+                // bg) behind the label, matching GNOME's flat menu-item hover.
+                if self.hovered == Some(QsHover::DetailRow(k)) {
+                    p.fill_rounded(rrect, 8., style::HOVER_WASH)?;
+                }
+                let label_cy = rrect.loc.y + rrect.size.h / 2.;
+                // The bluetooth placeholder line: centered bold text, nothing else in the row
+                // (`.bt-menu-placeholder`, `_quick-settings.scss:227-232`).
+                let label_x = if row_run.has_icon {
+                    rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON + 8.
+                } else {
+                    rrect.loc.x + DETAIL_ROW_INSET
+                };
+                // The trailing sublabel (Connect/Disconnect, `.device-subtitle` = fg@50%,
+                // `_quick-settings.scss:234`), right-aligned where the check zone sits.
+                let mut trailing_w = TILE_ICON;
+                if let Some(trailing) = &row_run.trailing {
+                    trailing_w = f64::from(trailing.ink_bounds().2) / scale;
+                    p.text(
+                        trailing,
+                        Point::from((rrect.loc.x + rrect.size.w - DETAIL_ROW_INSET, label_cy)),
+                        Align::RIGHT_MIDDLE,
+                        DETAIL_SUBTITLE_FG,
+                    )?;
+                }
+                // Reserve the trailing zone (the check icon, or the sublabel's width) on every
+                // row so a long label (e.g. a verbose HDMI sink description or device alias)
+                // is clipped before it, not drawn under it.
+                let mut label_clip = rrect;
+                label_clip.size.w =
+                    (label_clip.size.w - (DETAIL_ROW_INSET + trailing_w + 8.)).max(0.);
+                p.text_clipped(
+                    run,
+                    Point::from((label_x, label_cy)),
+                    Align::LEFT_MIDDLE,
+                    FG_OFF,
+                    label_clip,
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Bake the menu **as if nothing were expanded**: tiles, sliders, the system row and the
+    /// pill, at the collapsed size. The detail card is [`draw_card`](Self::draw_card)'s job.
+    fn draw_grid(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
+        let _span = tracy_client::span!("quick_settings::draw_grid");
+
+        let layout = self.layout().collapsed();
+        let size = collapsed_size(layout);
         let w_px = to_physical_precise_round::<i32>(scale, size.w).max(1);
         let h_px = to_physical_precise_round::<i32>(scale, size.h).max(1);
         let phys = Size::<i32, Physical>::from((w_px, h_px));
@@ -2477,7 +2738,7 @@ impl QuickSettings {
             .iter()
             .map(|item| item.label(self.network))
             .collect();
-        let (label_runs, subtitle_runs, pill_run, detail_runs) = {
+        let (label_runs, subtitle_runs, pill_run) = {
             let mut shaper = TextShaper::new(renderer, scale);
             let label_runs: Vec<ShapedText> = labels
                 .iter()
@@ -2499,75 +2760,7 @@ impl QuickSettings {
                 .as_ref()
                 .map(|b| shaper.shape(&pill_label(b), pill_label_style()))
                 .transpose()?;
-            // The open detail view's header title (bold, `%title_3`) + its regular-weight rows.
-            let detail_runs = self
-                .expanded
-                .map(|owner| -> anyhow::Result<_> {
-                    let (_, title) = owner.header(self.network);
-                    let title_run = shaper.shape(&title, TextStyle::new(DETAIL_TITLE_PT).bold())?;
-                    let row_w =
-                        detail_rect(self.layout()).map_or(0., |c| c.size.w) - 2. * DETAIL_PAD;
-                    let rows = self.detail_rows(owner);
-                    // The card is sized from the pure `row_shape`; assert the live rows match it
-                    // (count + separator positions) so the geometry can't drift from what's drawn.
-                    debug_assert_eq!(
-                        rows.iter().map(DetailRow::spec).collect::<Vec<_>>(),
-                        owner.row_shape(self.layout().owner_device_count(owner)),
-                        "rows() must match row_shape() for correct card sizing"
-                    );
-                    let row_runs = rows
-                        .into_iter()
-                        .map(|r| -> anyhow::Result<DetailRowRun> {
-                            let r = match r {
-                                DetailRow::Item(row) => row,
-                                // A name label is an ordinary regular-weight menu item with
-                                // nothing else in it (`brightness.js:14-15`).
-                                DetailRow::Label(label) => ItemRow {
-                                    label,
-                                    icons: Vec::new(),
-                                    action: PopoverAction::Consumed,
-                                    separator_before: false,
-                                    selected: false,
-                                    trailing: None,
-                                    placeholder: false,
-                                },
-                                // A slider row has no text at all; only its value is baked.
-                                DetailRow::Slider { value, .. } => {
-                                    return Ok(DetailRowRun::Slider { value })
-                                }
-                            };
-                            // The placeholder is `.bt-menu-placeholder` = `%title_4` (13pt/700,
-                            // centered, wrapped inside 4em of side padding —
-                            // `_quick-settings.scss:227-232`, `bluetooth.js:291-294`); ordinary
-                            // rows are regular-weight single-line menu items.
-                            if r.placeholder {
-                                let wrap = placeholder_wrap_w(row_w);
-                                return Ok(DetailRowRun::Placeholder(shaper.paragraph(
-                                    &[ParagraphSpan {
-                                        text: &r.label,
-                                        pt: DETAIL_PLACEHOLDER_PT,
-                                        bold: true,
-                                        mono: false,
-                                    }],
-                                    wrap,
-                                    DETAIL_PLACEHOLDER_PT,
-                                )?));
-                            }
-                            let style = TextStyle::new(DETAIL_ROW_PT);
-                            Ok(DetailRowRun::Text(TextRun {
-                                label: shaper.shape(&r.label, style)?,
-                                trailing: r
-                                    .trailing
-                                    .map(|t| shaper.shape(&t, TextStyle::new(DETAIL_ROW_PT)))
-                                    .transpose()?,
-                                has_icon: !r.icons.is_empty(),
-                            }))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok((title_run, row_runs))
-                })
-                .transpose()?;
-            (label_runs, subtitle_runs, pill_run, detail_runs)
+            (label_runs, subtitle_runs, pill_run)
         };
 
         widget::bake_uncached_sized(renderer, phys, |frame| {
@@ -2741,133 +2934,6 @@ impl QuickSettings {
                 )?;
             }
 
-            // The open detail view: the `%card` background, its header title (the header icon
-            // composites on top in `render`), then the row labels. Row icons, if any, also
-            // composite on top.
-            if let (Some(card), Some((title_run, row_runs))) = (detail_rect(layout), &detail_runs) {
-                p.fill_rounded(card, DETAIL_RADIUS, CARD_BG)?;
-
-                // The `.header .icon` highlighted circular pill, behind the (separately
-                // composited) header icon glyph.
-                let pill_cx = card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_PILL / 2.;
-                let pill_cy = card.loc.y + DETAIL_PAD + DETAIL_HEADER_H / 2.;
-                let pill = Rectangle::new(
-                    Point::from((
-                        pill_cx - DETAIL_HEADER_PILL / 2.,
-                        pill_cy - DETAIL_HEADER_PILL / 2.,
-                    )),
-                    Size::from((DETAIL_HEADER_PILL, DETAIL_HEADER_PILL)),
-                );
-                p.fill_rounded(pill, DETAIL_HEADER_PILL / 2., DETAIL_HEADER_PILL_BG)?;
-
-                let title_x =
-                    card.loc.x + DETAIL_HEADER_INSET + DETAIL_HEADER_PILL + DETAIL_HEADER_GAP;
-                let title_cy = card.loc.y + DETAIL_PAD + DETAIL_HEADER_H / 2.;
-                p.text_clipped(
-                    title_run,
-                    Point::from((title_x, title_cy)),
-                    Align::LEFT_MIDDLE,
-                    FG_OFF,
-                    card,
-                )?;
-
-                // The group-separator rules (`.popup-separator-menu-item`): one 1px rule per row
-                // that opens a new group (the shutdown menu's machine-power vs session split).
-                let sep_shape = self
-                    .expanded
-                    .map(|o| o.row_shape(layout.owner_device_count(o)))
-                    .unwrap_or_default();
-                for (k, row_run) in row_runs.iter().enumerate() {
-                    let Some(rrect) = detail_row_rect(k, layout) else {
-                        continue;
-                    };
-                    // A card slider row: the shared slider body, inset like a `%menuitem`. No
-                    // separator, no hover (`brightness.js:29` is a non-reactive item), no text.
-                    let row_run = match row_run {
-                        DetailRowRun::Text(run) => run,
-                        // The bluetooth placeholder: a wrapped, centered block in its own taller
-                        // box (`.bt-menu-placeholder`), not a `%menuitem` line.
-                        DetailRowRun::Placeholder(block) => {
-                            let (_, _, bw, bh) = block.ink_bounds();
-                            let origin = Point::<f64, Physical>::from((
-                                (rrect.loc.x + rrect.size.w / 2.) * scale - f64::from(bw) / 2.,
-                                (rrect.loc.y + rrect.size.h / 2.) * scale - f64::from(bh) / 2.,
-                            ));
-                            p.paragraph(block, origin.to_i32_round(), FG_OFF)?;
-                            continue;
-                        }
-                        DetailRowRun::Slider { value } => {
-                            paint_slider(
-                                &mut p,
-                                detail_slider_track_rect(rrect),
-                                *value,
-                                self.accent,
-                            )?;
-                            continue;
-                        }
-                    };
-                    let run = &row_run.label;
-                    // The group-separator rule, centered in the extra gap above a group-opening
-                    // row. The same `$borders_color` + crisp `Painter::hairline` as the calendar
-                    // column separator — but this bakes onto the *opaque* card, where the clear
-                    // would punch a translucent hole, so pre-blend the border over the card
-                    // (`style::over`) to lay the identical line as an opaque color.
-                    if k > 0 && sep_shape.get(k).is_some_and(|s| s.separator_before) {
-                        let line_cy = rrect.loc.y - (DETAIL_ROW_GAP + DETAIL_SEP_EXTRA) / 2.;
-                        // The separator is itself a `.popup-separator-menu-item`, so its rule is
-                        // inset by the `%menuitem` horizontal padding (`$base_padding*2`, our
-                        // `DETAIL_ROW_INSET`) on top of the card pad — i.e. its ends align with the
-                        // row labels, not the card edge (`_common.scss:135`, `_popovers.scss:113`).
-                        let inset = DETAIL_PAD + DETAIL_ROW_INSET;
-                        p.hairline(
-                            Rectangle::new(
-                                Point::from((card.loc.x + inset, line_cy)),
-                                Size::from((card.size.w - 2. * inset, 1.)),
-                            ),
-                            style::over(CARD_BG, style::BORDERS),
-                        )?;
-                    }
-                    // A hovered picker row: a faint rounded fill (it has no base
-                    // bg) behind the label, matching GNOME's flat menu-item hover.
-                    if self.hovered == Some(QsHover::DetailRow(k)) {
-                        p.fill_rounded(rrect, 8., style::HOVER_WASH)?;
-                    }
-                    let label_cy = rrect.loc.y + rrect.size.h / 2.;
-                    // The bluetooth placeholder line: centered bold text, nothing else in the row
-                    // (`.bt-menu-placeholder`, `_quick-settings.scss:227-232`).
-                    let label_x = if row_run.has_icon {
-                        rrect.loc.x + DETAIL_ROW_INSET + TILE_ICON + 8.
-                    } else {
-                        rrect.loc.x + DETAIL_ROW_INSET
-                    };
-                    // The trailing sublabel (Connect/Disconnect, `.device-subtitle` = fg@50%,
-                    // `_quick-settings.scss:234`), right-aligned where the check zone sits.
-                    let mut trailing_w = TILE_ICON;
-                    if let Some(trailing) = &row_run.trailing {
-                        trailing_w = f64::from(trailing.ink_bounds().2) / scale;
-                        p.text(
-                            trailing,
-                            Point::from((rrect.loc.x + rrect.size.w - DETAIL_ROW_INSET, label_cy)),
-                            Align::RIGHT_MIDDLE,
-                            DETAIL_SUBTITLE_FG,
-                        )?;
-                    }
-                    // Reserve the trailing zone (the check icon, or the sublabel's width) on every
-                    // row so a long label (e.g. a verbose HDMI sink description or device alias)
-                    // is clipped before it, not drawn under it.
-                    let mut label_clip = rrect;
-                    label_clip.size.w =
-                        (label_clip.size.w - (DETAIL_ROW_INSET + trailing_w + 8.)).max(0.);
-                    p.text_clipped(
-                        run,
-                        Point::from((label_x, label_cy)),
-                        Align::LEFT_MIDDLE,
-                        FG_OFF,
-                        label_clip,
-                    )?;
-                }
-            }
-
             Ok(())
         })
     }
@@ -2897,6 +2963,62 @@ fn grid_bottom(layout: Layout) -> f64 {
 fn menu_h(layout: Layout) -> f64 {
     let base = grid_bottom(layout) + PAD;
     base + layout.detail_block().map(|(_, h)| h).unwrap_or(0.)
+}
+
+/// One horizontal slice of the collapsed grid bake, and where it lands in the expanded menu.
+#[derive(Debug, Clone, Copy)]
+struct GridSlice {
+    /// The source band inside the collapsed texture, in its own logical coordinates.
+    src: Rectangle<f64, Logical>,
+    /// The band's top edge in menu coordinates.
+    dst_y: f64,
+}
+
+/// How to lay the collapsed grid bake into the current (possibly expanded) menu: one slice when
+/// nothing is open, two when a detail card has pushed everything under its owner's row down.
+///
+/// The two slices come out of **one** rounded shift, never from rounding the top band's height
+/// and the bottom band's origin apart — splitting that arithmetic is what doubles the error at
+/// the far edge of a seam (the overview settle flash).
+fn grid_slices(layout: Layout, scale: f64) -> Vec<GridSlice> {
+    let full = collapsed_size(layout.collapsed());
+    let whole = Rectangle::new(Point::from((0., 0.)), full);
+    let Some((split_y, block_h)) = layout.detail_block() else {
+        return vec![GridSlice {
+            src: whole,
+            dst_y: 0.,
+        }];
+    };
+    // Snap the *cut* to a texel and derive both bands from that one value: a source band starting
+    // on a fractional texel is resampled, which reads as a soft line across the menu. Only the cut
+    // is snapped — the block height is the layout's, and rounding it here would slide the baked
+    // rows out from under the icons `render` composites on top at their own logical positions.
+    let split_y = (split_y * scale).round() / scale;
+    let top = Rectangle::new(whole.loc, Size::from((full.w, split_y)));
+    let bottom = Rectangle::new(
+        Point::from((0., split_y)),
+        Size::from((full.w, (full.h - split_y).max(0.))),
+    );
+    vec![
+        GridSlice {
+            src: top,
+            dst_y: 0.,
+        },
+        GridSlice {
+            src: bottom,
+            dst_y: split_y + block_h,
+        },
+    ]
+}
+
+/// The menu's logical size with nothing expanded — what [`draw_grid`](QuickSettings::draw_grid)
+/// bakes. Takes an already-collapsed layout.
+fn collapsed_size(layout: Layout) -> Size<f64, Logical> {
+    debug_assert!(
+        layout.expanded.is_none(),
+        "collapsed_size wants a collapsed layout"
+    );
+    Size::from((menu_w(), menu_h(layout)))
 }
 
 /// The natural (pre-shift) y of a slider's row top, from its vertical slot among the present
@@ -3560,7 +3682,7 @@ mod tests {
             crate::brightness::BrightnessView::default(),
             [0xff, 0x00, 0x00],
         );
-        let mut tex = qs.draw(&mut vk, 1.).expect("menu texture");
+        let mut tex = qs.draw_grid(&mut vk, 1.).expect("menu texture");
         let size = tex.size();
 
         let fb = vk.bind(&mut tex).expect("bind for readback");
@@ -4727,10 +4849,71 @@ mod tests {
         qs.pointer_click(center(sys_rect(SysButton::Power, false)));
         assert_eq!(qs.expanded, Some(DetailOwner::Power));
         for scale in [1.0, 2.0] {
-            let tex = qs.draw(&mut vk, scale).expect("shutdown submenu bakes");
-            let size = smithay::backend::renderer::Texture::size(&tex);
-            assert!(size.w > 0 && size.h > 0, "non-empty at scale {scale}");
+            for tex in [
+                qs.draw_grid(&mut vk, scale).expect("the grid bakes"),
+                qs.draw_card(&mut vk, scale, DetailOwner::Power)
+                    .expect("the shutdown submenu bakes"),
+            ] {
+                let size = smithay::backend::renderer::Texture::size(&tex);
+                assert!(size.w > 0 && size.h > 0, "non-empty at scale {scale}");
+            }
         }
+    }
+
+    /// The collapsed grid bake tiles the expanded menu exactly: the two slices cover it end to
+    /// end with the detail block between them, and nothing is drawn twice or skipped.
+    ///
+    /// This is the seam the grow animation slides open, so it is arithmetic worth pinning: a
+    /// bottom slice whose height came from its own rounding rather than from the split would
+    /// leave (or double) a row of pixels at the menu's foot.
+    #[test]
+    fn the_grid_slices_tile_the_menu_exactly() {
+        let mut qs = qs(NetworkStatus::Wired, None);
+
+        let collapsed = grid_slices(qs.layout(), 1.25);
+        assert_eq!(collapsed.len(), 1, "nothing expanded: one whole slice");
+        assert_eq!(collapsed[0].dst_y, 0.);
+        assert_eq!(collapsed[0].src.size, qs.logical_size());
+
+        qs.pointer_click(center(
+            tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap(),
+        ));
+        let layout = qs.layout();
+        let (split_y, block_h) = layout.detail_block().expect("expanded");
+        let slices = grid_slices(layout, 1.25);
+        assert_eq!(slices.len(), 2, "expanded: a slice each side of the block");
+
+        // Source: the two bands partition the collapsed bake, no gap and no overlap, cut on a
+        // whole texel of the 1.25-scaled bake.
+        let cut = slices[0].src.size.h;
+        assert!(
+            (cut - split_y).abs() <= 0.5 && (cut * 1.25).fract() == 0.,
+            "the cut is the split snapped to a texel: {cut} vs {split_y}"
+        );
+        assert_eq!(slices[0].src.loc.y, 0.);
+        assert_eq!(slices[1].src.loc.y, cut);
+        assert_eq!(
+            slices[0].src.size.h + slices[1].src.size.h,
+            collapsed_size(layout.collapsed()).h,
+            "the bands cover the whole collapsed bake"
+        );
+
+        // Destination: the gap between them is exactly the block, and the foot lands on the
+        // expanded menu's bottom edge.
+        assert_eq!(slices[1].dst_y - (slices[0].dst_y + cut), block_h);
+        assert!(
+            (slices[1].dst_y + slices[1].src.size.h - qs.logical_size().h).abs() <= 0.5,
+            "the bottom slice ends where the expanded menu does, up to the cut's snap"
+        );
+        // The card sits in the gap the slices leave.
+        let card = detail_rect(layout).expect("card");
+        assert!(
+            card.loc.y >= slices[0].dst_y + slices[0].src.size.h
+                && card.loc.y + card.size.h <= slices[1].dst_y,
+            "the card fits between the slices: card {card:?}, gap {}..{}",
+            slices[0].dst_y + slices[0].src.size.h,
+            slices[1].dst_y
+        );
     }
 
     /// At most one detail view is open: opening a second closes the first (across owners).
@@ -5364,8 +5547,12 @@ mod tests {
             }
         };
 
+        // The *card* texture, in card-local coordinates: since `891a…` the card bakes apart
+        // from the grid so the expansion never re-bakes the menu.
         let mut read_pixels = |qs: &QuickSettings| {
-            let mut tex = qs.draw(&mut vk, 1.).expect("menu texture");
+            let mut tex = qs
+                .draw_card(&mut vk, 1., DetailOwner::Bluetooth)
+                .expect("card texture");
             let size = tex.size();
             let fb = vk.bind(&mut tex).expect("bind for readback");
             let region = Rectangle::<i32, BufferCoord>::from_size(size);
@@ -5388,8 +5575,8 @@ mod tests {
         let (pixels, size) = read_pixels(&with_device);
 
         // The card surface is opaque (the `%card` bg) just inside its top-left arc.
-        let cx = (card.loc.x + DETAIL_RADIUS) as i32;
-        let cy = (card.loc.y + DETAIL_RADIUS) as i32;
+        let cx = DETAIL_RADIUS as i32;
+        let cy = DETAIL_RADIUS as i32;
         let k = ((cy * size.w + cx) * 4) as usize;
         assert!(
             pixels[k + 3] > 200,
@@ -5416,7 +5603,8 @@ mod tests {
             "the placeholder card is taller by one row-kind difference: grew {grew}, want {want}"
         );
 
-        let row = detail_row_rect(0, with_device.layout()).expect("row 0");
+        let mut row = detail_row_rect(0, with_device.layout()).expect("row 0");
+        row.loc -= card.loc;
         let mut differs = false;
         for y in (row.loc.y as i32)..((row.loc.y + row.size.h) as i32) {
             for x in (row.loc.x as i32)..((row.loc.x + row.size.w) as i32) {
