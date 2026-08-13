@@ -1436,11 +1436,13 @@ struct Expand {
 }
 
 impl Expand {
-    /// The block-height fraction: 1 when settled (including when never advanced).
+    /// The block-height fraction: 1 when settled (including when never advanced). It can exceed
+    /// 1 mid-switch, when the outgoing view's block is taller than the incoming one's and the gap
+    /// is easing *down* to it.
     fn block_scale(&self) -> f64 {
         self.height
             .as_ref()
-            .map_or(1., |a| a.clamped_value().clamp(0., 1.))
+            .map_or(1., |a| a.clamped_value().max(0.))
     }
 
     /// The card's alpha: 1 when settled, 0 while the gap is still opening.
@@ -1486,6 +1488,18 @@ impl Expand {
         };
         let mut moved = false;
         let anim = |from: f64, to: f64| Animation::new(clock.clone(), from, to, 0., params);
+        // gnome-shell scales a phase that starts partway by how far it has left to travel, so an
+        // interrupted transition finishes at the same *rate* rather than in the same time:
+        // `duration * (distance / targetHeight)` on the open height, `duration * (opacity / 255)`
+        // on the close fade (`quickSettings.js:477,501`). The phases it starts from a settled
+        // endpoint get the whole duration, which is what a factor of 1 gives here.
+        let anim_part = |from: f64, to: f64, factor: f64| {
+            let mut params = params;
+            if let synoik_config::animations::Kind::Easing(e) = &mut params.kind {
+                e.duration_ms = (f64::from(e.duration_ms) * factor.clamp(0., 1.)).round() as u32;
+            }
+            Animation::new(clock.clone(), from, to, 0., params)
+        };
 
         if seen != target {
             self.seen = Some(target);
@@ -1519,13 +1533,16 @@ impl Expand {
                         None => 0.,
                     };
                     self.closing = None;
-                    self.height = Some(anim(from, 1.));
-                    self.fade = Some(anim(0., 0.));
+                    self.height = Some(anim_part(from, 1., (1. - from).abs()));
+                    // Not an animation, just the card's starting opacity: zero duration, so it
+                    // never holds phase 2 back on a switch, where the height phase is shorter.
+                    self.fade = Some(anim_part(0., 0., 0.));
                 }
                 // Closing: fade the card out first, over what is left of its opacity.
                 (Some(old), None) => {
+                    let alpha = f64::from(self.card_alpha());
                     self.closing = Some(old);
-                    self.fade = Some(anim(f64::from(self.card_alpha()), 0.));
+                    self.fade = Some(anim_part(alpha, 0., alpha));
                 }
                 (None, None) => {}
             }
@@ -5121,7 +5138,7 @@ mod tests {
         let mut clock = Clock::with_time(std::time::Duration::ZERO);
         let anims = synoik_config::Animations::default();
         let params = anims.quick_settings_detail_open_close.0;
-        let dim_params = anims.panel_popover_open_close.0;
+        let dim_params = anims.quick_settings_dim.0;
         let mut qs = qs(NetworkStatus::Wired, None);
         let step = |qs: &mut QuickSettings, clock: &mut Clock, ms: u64| {
             clock.set_unadjusted(std::time::Duration::from_millis(ms));
@@ -5137,7 +5154,7 @@ mod tests {
 
         // Halfway through phase 1: the gap is part-open and the card is not drawn at all. The
         // dim runs alongside, on its own longer clock — it is not one of the two phases.
-        step(&mut qs, &mut clock, 37);
+        step(&mut qs, &mut clock, 100);
         let dim = qs.expand.dim();
         assert!(dim > 0. && dim < 1., "the dim is easing in, got {dim}");
         let scale = qs.layout().block_scale;
@@ -5150,9 +5167,9 @@ mod tests {
         );
 
         // Phase 1 lands: the gap is whole, and phase 2 arms.
-        step(&mut qs, &mut clock, 75);
+        step(&mut qs, &mut clock, 200);
         assert_eq!(qs.layout().block_scale, 1.);
-        step(&mut qs, &mut clock, 112);
+        step(&mut qs, &mut clock, 300);
         let alpha = qs.expand.card_alpha();
         assert!(
             alpha > 0. && alpha < 1.,
@@ -5164,7 +5181,7 @@ mod tests {
             "the gap does not move while the card fades"
         );
 
-        step(&mut qs, &mut clock, 150);
+        step(&mut qs, &mut clock, 400);
         assert_eq!(qs.expand.card_alpha(), 1.);
         assert_eq!(qs.expand.dim(), 1., "the rest of the menu is fully dimmed");
 
@@ -5173,8 +5190,8 @@ mod tests {
             tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap(),
         ));
         assert_eq!(qs.expanded, None, "the click closed it");
-        step(&mut qs, &mut clock, 150);
-        step(&mut qs, &mut clock, 187);
+        step(&mut qs, &mut clock, 400);
+        step(&mut qs, &mut clock, 500);
         let alpha = qs.expand.card_alpha();
         assert!(
             alpha > 0. && alpha < 1.,
@@ -5191,16 +5208,16 @@ mod tests {
             "the card is still on screen while it fades"
         );
 
-        step(&mut qs, &mut clock, 225);
-        step(&mut qs, &mut clock, 262);
+        step(&mut qs, &mut clock, 600);
+        step(&mut qs, &mut clock, 700);
         let scale = qs.layout().block_scale;
         assert!(
             scale > 0. && scale < 1.,
             "the gap is mid-collapse, got {scale}"
         );
 
-        step(&mut qs, &mut clock, 300);
-        step(&mut qs, &mut clock, 301);
+        step(&mut qs, &mut clock, 800);
+        step(&mut qs, &mut clock, 801);
         assert_eq!(qs.shown_detail(), None, "settled shut");
         assert_eq!(qs.expand.dim(), 0., "and undimmed");
         assert!(!qs.are_animations_ongoing());
@@ -5214,7 +5231,7 @@ mod tests {
         let mut clock = Clock::with_time(std::time::Duration::ZERO);
         let anims = synoik_config::Animations::default();
         let params = anims.quick_settings_detail_open_close.0;
-        let dim_params = anims.panel_popover_open_close.0;
+        let dim_params = anims.quick_settings_dim.0;
         let mut qs = qs(NetworkStatus::Wired, None);
         let step = |qs: &mut QuickSettings, clock: &mut Clock, ms: u64| {
             clock.set_unadjusted(std::time::Duration::from_millis(ms));
@@ -5230,7 +5247,7 @@ mod tests {
         // Open Network and let both phases land.
         step(&mut qs, &mut clock, 0);
         qs.pointer_click(net_arrow(&qs));
-        for ms in [0, 75, 150] {
+        for ms in [0, 200, 400] {
             step(&mut qs, &mut clock, ms);
         }
         assert_eq!(qs.expand.card_alpha(), 1.);
@@ -5240,7 +5257,7 @@ mod tests {
         // block measured against the new one — not from 0, and not snapped to the new height.
         qs.pointer_click(center(sys_rect(SysButton::Power, false)));
         assert_eq!(qs.expanded, Some(DetailOwner::Power));
-        step(&mut qs, &mut clock, 150);
+        step(&mut qs, &mut clock, 400);
         let power_h = block_of(DetailOwner::Power, &qs);
         assert!(
             (power_h - net_h).abs() > 1.,
@@ -5253,14 +5270,49 @@ mod tests {
             (block - net_h).abs() < 0.01,
             "the gap starts at the old block height, got {block} want {net_h}"
         );
-        step(&mut qs, &mut clock, 187);
+        step(&mut qs, &mut clock, 450);
         let (_, block) = qs.layout().detail_block().expect("a block while switching");
         let (lo, hi) = (net_h.min(power_h), net_h.max(power_h));
         assert!(
             block > lo && block < hi,
             "the gap is easing between the two blocks, got {block} in {lo}..{hi}"
         );
-        for ms in [225, 300] {
+        for ms in [500, 501, 800] {
+            step(&mut qs, &mut clock, ms);
+        }
+        assert_eq!(qs.expand.card_alpha(), 1.);
+
+        // And back, which is the same easing in the other direction: the gap has to be able to
+        // start *above* the incoming block and come down to it.
+        qs.pointer_click(net_arrow(&qs));
+        assert_eq!(qs.expanded, Some(DetailOwner::Network));
+        step(&mut qs, &mut clock, 800);
+        let (_, block) = qs
+            .layout()
+            .detail_block()
+            .expect("a block while switching back");
+        assert!(
+            (block - power_h).abs() < 0.01,
+            "the gap starts at the outgoing block, got {block} want {power_h}"
+        );
+        step(&mut qs, &mut clock, 850);
+        let (_, block) = qs
+            .layout()
+            .detail_block()
+            .expect("a block while switching back");
+        assert!(
+            block > lo && block < hi,
+            "the gap is easing back down between the two blocks, got {block} in {lo}..{hi}"
+        );
+        for ms in [1000, 1001, 1300] {
+            step(&mut qs, &mut clock, ms);
+        }
+        assert_eq!(qs.expand.card_alpha(), 1.);
+        assert_eq!(qs.layout().block_scale, 1.);
+
+        // Reopen Power so the close below runs from the same state it used to.
+        qs.pointer_click(center(sys_rect(SysButton::Power, false)));
+        for ms in [1300, 1500, 1501, 1800] {
             step(&mut qs, &mut clock, ms);
         }
         assert_eq!(qs.expand.card_alpha(), 1.);
@@ -5268,13 +5320,13 @@ mod tests {
         // Close, and reopen while the gap is still collapsing: it resumes from where it is.
         qs.pointer_click(center(sys_rect(SysButton::Power, false)));
         assert_eq!(qs.expanded, None);
-        for ms in [300, 375, 400] {
+        for ms in [1800, 2000, 2001, 2100] {
             step(&mut qs, &mut clock, ms);
         }
         let mid = qs.layout().block_scale;
         assert!(mid > 0. && mid < 1., "the gap is mid-collapse, got {mid}");
         qs.pointer_click(net_arrow(&qs));
-        step(&mut qs, &mut clock, 400);
+        step(&mut qs, &mut clock, 2100);
         let resumed = qs.layout().block_scale;
         assert!(
             (resumed - mid * power_h / net_h).abs() < 0.05,

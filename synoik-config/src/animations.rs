@@ -22,6 +22,7 @@ pub struct Animations {
     pub screenshot_ui_open: ScreenshotUiOpenAnim,
     pub panel_popover_open_close: PanelPopoverOpenCloseAnim,
     pub quick_settings_detail_open_close: QuickSettingsDetailOpenCloseAnim,
+    pub quick_settings_dim: QuickSettingsDimAnim,
     pub notification_open_close: NotificationOpenCloseAnim,
     pub overview_open_close: OverviewOpenCloseAnim,
 }
@@ -42,6 +43,7 @@ impl Default for Animations {
             screenshot_ui_open: Default::default(),
             panel_popover_open_close: Default::default(),
             quick_settings_detail_open_close: Default::default(),
+            quick_settings_dim: Default::default(),
             notification_open_close: Default::default(),
             overview_open_close: Default::default(),
         }
@@ -64,6 +66,7 @@ pub struct AnimationsPart {
     pub screenshot_ui_open: Option<ScreenshotUiOpenAnim>,
     pub panel_popover_open_close: Option<PanelPopoverOpenCloseAnim>,
     pub quick_settings_detail_open_close: Option<QuickSettingsDetailOpenCloseAnim>,
+    pub quick_settings_dim: Option<QuickSettingsDimAnim>,
     pub notification_open_close: Option<NotificationOpenCloseAnim>,
     pub overview_open_close: Option<OverviewOpenCloseAnim>,
 }
@@ -92,6 +95,7 @@ impl MergeWith<AnimationsPart> for Animations {
             screenshot_ui_open,
             panel_popover_open_close,
             quick_settings_detail_open_close,
+            quick_settings_dim,
             notification_open_close,
             overview_open_close,
         );
@@ -300,6 +304,11 @@ impl Default for ScreenshotUiOpenAnim {
 /// and the content fade back to back, each `POPUP_ANIMATION_TIME / 2`
 /// (`js/ui/quickSettings.js:459-515`). Neither `ease()` call passes a mode, so both take
 /// Clutter's default ease-out-cubic (`clutter-actor.c:17063`).
+///
+/// **That is quickSettings' own `POPUP_ANIMATION_TIME = 400`** (`js/ui/quickSettings.js:19`),
+/// which shadows the boxpointer constant of the same name — the file imports `PopupAnimation`
+/// from boxpointer but not its 150. So a phase is 200 ms, not 75; at 75 the growth does not
+/// register as growth at all.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuickSettingsDetailOpenCloseAnim(pub Animation);
 
@@ -308,8 +317,26 @@ impl Default for QuickSettingsDetailOpenCloseAnim {
         Self(Animation {
             off: false,
             kind: Kind::Easing(EasingParams {
-                duration_ms: 75,
+                duration_ms: 200,
                 curve: Curve::EaseOutCubic,
+            }),
+        })
+    }
+}
+
+/// The dim over the rest of the quick-settings menu while a detail view is open: the *whole*
+/// `POPUP_ANIMATION_TIME` (400 ms) on ease-out-quad, spanning both phases, and explicitly moded
+/// unlike them (`_setDimmed`, `js/ui/quickSettings.js:852-867`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuickSettingsDimAnim(pub Animation);
+
+impl Default for QuickSettingsDimAnim {
+    fn default() -> Self {
+        Self(Animation {
+            off: false,
+            kind: Kind::Easing(EasingParams {
+                duration_ms: 400,
+                curve: Curve::EaseOutQuad,
             }),
         })
     }

@@ -464,14 +464,17 @@ impl PanelPopover {
     /// Also steps the quick-settings detail view's own grow/fade, which lives in the content but
     /// needs the clock and animation config the popover holds.
     pub fn advance_animations(&mut self) {
-        let detail = self
-            .config
-            .borrow()
-            .animations
-            .quick_settings_detail_open_close
-            .0;
+        let (detail, dim) = {
+            let c = self.config.borrow();
+            (
+                c.animations.quick_settings_detail_open_close.0,
+                // The dim spans both phases on its own clock — quickSettings' *whole*
+                // `POPUP_ANIMATION_TIME`, which is not the boxpointer one the popover opens with.
+                c.animations.quick_settings_dim.0,
+            )
+        };
         if let Some(PopoverContent::QuickSettings(qs)) = &mut self.content {
-            qs.advance_expand(&self.clock, detail);
+            qs.advance_expand(&self.clock, detail, dim);
         }
         if self.closing && self.anim.as_ref().is_none_or(|a| a.is_done()) {
             self.open = false;

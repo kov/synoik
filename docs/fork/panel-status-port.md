@@ -192,9 +192,14 @@ system row, battery pill, volume slider, Network tile, and Dark Style / DND / Ni
   `anchor_row_bottom`) + the backend to enumerate/act. **Grow animation + dim-the-rest landed**
   (`66c307ed` split the card's bake out of the grid's so neither key carries the expansion,
   `d7c7f8e5` the two `POPUP_ANIMATION_TIME/2` phases — height then card fade, ease-out-cubic —
-  and the `DIM_BRIGHTNESS = -0.4` wash over everything but the card). Divergence: a straight
-  switch from one open view to another eases the height old→new instead of animating both
-  concurrently (`_setOpenedSubMenu`). Still deferred: split-radius tile look.
+  and the `DIM_BRIGHTNESS = -0.4` wash over everything but the card). **The constant is
+  quickSettings' own `POPUP_ANIMATION_TIME = 400` (`js/ui/quickSettings.js:19`), which shadows
+  boxpointer's 150 of the same name** — so a phase is 200 ms and the dim spans 400; the first cut
+  took boxpointer's and read as a snap. Each phase is scaled by how far it has left to travel
+  (`duration * distance/targetHeight`, `duration * opacity/255`), so an interrupted transition
+  finishes at rate. Divergence: a straight switch from one open view to another eases the height
+  old→new instead of animating both concurrently (`_setOpenedSubMenu`). Still deferred:
+  split-radius tile look.
 - **Shutdown submenu** in the system row (Q1) — ✅ done on the framework above.
 - **Hover highlighting** — ✅ `ac2d5b7b` + review `6b7d9e24` + notification fix `5642b2b9`. A
   `pointer_hover` route parallels `pointer_click`, and a hover change bumps the widget's texture
