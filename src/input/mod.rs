@@ -1665,7 +1665,7 @@ impl State {
     /// `pub(crate)` so the corpus can drive an action straight in: several of them are
     /// only reachable through a click that would really launch something.
     pub(crate) fn apply_popover_action(&mut self, action: crate::ui::popover::PopoverAction) {
-        use crate::ui::popover::PopoverAction;
+        use crate::ui::popover::{PopoverAction, SETTINGS_DESKTOP_ID};
 
         let set_toggle = |state: &mut Self, f: fn(&mut crate::gnome::QuickToggles, bool), v| {
             f(&mut state.synoik.gnome_settings.quick_toggles, v);
@@ -1771,6 +1771,19 @@ impl State {
             PopoverAction::ActivateApp(id) => {
                 self.synoik.layout.close_overview();
                 self.activate_app(&id, false, "quick-settings");
+            }
+            // Two halves, because neither one alone does the whole job (see
+            // `PopoverAction::LaunchSettingsPanel`): the `launch-panel` action picks the panel
+            // and starts Settings when it is stopped, and — since the raise it then attempts is
+            // refused by the activation gate — we present an already-running Settings ourselves.
+            // Only when it is `Running`: a stopped app would otherwise be started twice, once
+            // panel-less.
+            PopoverAction::LaunchSettingsPanel { panel, args } => {
+                self.synoik.launch_settings_panel(&panel, args);
+                self.synoik.layout.close_overview();
+                if self.synoik.app_system.app_state(SETTINGS_DESKTOP_ID) == AppState::Running {
+                    self.activate_app(SETTINGS_DESKTOP_ID, false, "quick-settings");
+                }
             }
             // Straight to `org.gnome.SessionManager`, as gnome-shell does
             // (`systemActions.js:483-501`) — not the `gnome-session-quit` helper we used to

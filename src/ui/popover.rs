@@ -83,6 +83,10 @@ use crate::ui::quick_settings::QuickSettings;
 use crate::ui::widget;
 use crate::utils::output_size;
 
+/// The Settings app's desktop id, which every quick-settings route into Settings resolves
+/// through (`js/ui/status/system.js:143`).
+pub const SETTINGS_DESKTOP_ID: &str = "org.gnome.Settings.desktop";
+
 /// The side effect a popover click asks the caller (the input handler) to apply.
 /// Keeps the content widgets pure — they never touch gsettings or spawn — while
 /// still driving real behavior.
@@ -96,6 +100,19 @@ pub enum PopoverAction {
     /// `SettingsItem` looks `org.gnome.Settings.desktop` up and calls `activate()`
     /// (`js/ui/status/system.js:133-154`), it does not spawn a command.
     ActivateApp(String),
+    /// Open Settings on a named panel — gnome-shell's `launchSettingsPanel`
+    /// (`js/ui/status/network.js:66-76`): the app's own `launch-panel` action, not a
+    /// `gnome-control-center <panel>` spawn.
+    ///
+    /// **Divergence (2026-08-13):** gnome-shell's plain settings rows use
+    /// `addSettingsAction(title, 'gnome-power-panel.desktop')` (`js/ui/popupMenu.js:709-721`),
+    /// i.e. launching a panel-specific desktop file and letting GTK's single-instance handoff
+    /// raise the running window. That handoff does not raise here: traced on the headless
+    /// harness, the primary GTK instance ignores the forwarded `XDG_ACTIVATION_TOKEN` and mints
+    /// its own with `set_serial(0, seat)`, which our activation gate refuses — as mutter's
+    /// `token_can_activate` would too (`src/wayland/meta-wayland-activation.c:288-312`). So we
+    /// take GNOME's *other* mechanism for the panel choice and do the raise ourselves.
+    LaunchSettingsPanel { panel: String, args: Vec<String> },
     /// Set `org.gnome.desktop.interface color-scheme` (Dark Style tile).
     SetDarkStyle(bool),
     /// Set the inverse of `org.gnome.desktop.notifications show-banners` (DND).
@@ -237,6 +254,12 @@ impl PopoverAction {
             self,
             PopoverAction::Screenshot
                 | PopoverAction::Spawn(_)
+                // Same as `Spawn`: gnome-shell's `SettingsItem` calls
+                // `Main.panel.closeQuickSettings()` before `activate()`
+                // (`js/ui/status/system.js:151-154`), and the raised window would otherwise
+                // come up under our modal grab.
+                | PopoverAction::ActivateApp(_)
+                | PopoverAction::LaunchSettingsPanel { .. }
                 | PopoverAction::SessionRequest(_)
                 | PopoverAction::ActivateNotification { .. }
                 | PopoverAction::InvokeNotificationAction { .. }

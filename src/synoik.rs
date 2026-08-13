@@ -14904,6 +14904,26 @@ impl Synoik {
         false
     }
 
+    /// Ask Settings to show `panel` — gnome-shell's `launchSettingsPanel`
+    /// (`js/ui/status/network.js:66-76`), which activates the app's own `launch-panel`
+    /// action rather than spawning `gnome-control-center <panel>`.
+    ///
+    /// This only *selects the panel* (and D-Bus-activates Settings if it is stopped). It does
+    /// **not** raise an already-open Settings, so the caller does the raise itself; see
+    /// [`Self::launch_settings_panel`]'s caller in `apply_popover_action`.
+    pub fn launch_settings_panel(&mut self, panel: &str, args: Vec<String>) {
+        use crate::notifications::GtkToNotifications;
+        let (token, _) = self.activation_state.create_external_token(None);
+        let token = token.as_str().to_owned();
+        if let Some(tx) = &self.gtk_notifications_emit {
+            let _ = tx.send_blocking(GtkToNotifications::LaunchSettingsPanel {
+                panel: panel.to_owned(),
+                args,
+                token,
+            });
+        }
+    }
+
     /// Pop and show the next queued banner if the surface is free (hidden, no
     /// popover open, GNOME mode, an output to show on).
     pub fn maybe_show_banner(&mut self) {

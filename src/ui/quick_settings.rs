@@ -50,7 +50,7 @@ use crate::system_status::{
     self, AirplaneStatus, BatteryStatus, BluetoothRfkill, BluetoothStatus, BtAdapterState,
     NetworkStatus, PowerProfileStatus,
 };
-use crate::ui::popover::PopoverAction;
+use crate::ui::popover::{PopoverAction, SETTINGS_DESKTOP_ID};
 use crate::ui::widget::{
     self, style, Align, Painter, ParagraphSpan, ShapedParagraph, ShapedText, TextShaper, TextStyle,
 };
@@ -561,11 +561,24 @@ fn session_row(label: &str, request: SessionRequest, separator_before: bool) -> 
     .into()
 }
 
-fn spawn_row(label: &str, cmd: &[&str], separator_before: bool) -> DetailRow {
+/// The action that opens Settings on `panel`, with no extra arguments — gnome-shell's
+/// `launchSettingsPanel(panel)` (`js/ui/status/network.js:66-76`).
+fn settings_panel(panel: &str) -> PopoverAction {
+    PopoverAction::LaunchSettingsPanel {
+        panel: panel.to_owned(),
+        args: Vec::new(),
+    }
+}
+
+/// A "<Thing> Settings" row: opens Settings on `panel`, gnome-shell's `addSettingsAction`
+/// entry point at the bottom of a detail view (`js/ui/status/volume.js:81-82`,
+/// `bluetooth.js:303-304`, `powerProfiles.js:79-80`). See
+/// [`PopoverAction::LaunchSettingsPanel`] for why it is that action and not a spawn.
+fn settings_row(label: &str, panel: &str, separator_before: bool) -> DetailRow {
     ItemRow {
         label: label.to_string(),
         icons: Vec::new(),
-        action: PopoverAction::Spawn(cmd.iter().map(|s| s.to_string()).collect()),
+        action: settings_panel(panel),
         separator_before,
         selected: false,
         trailing: None,
@@ -706,22 +719,14 @@ impl DetailOwner {
                         .into(),
                     );
                 }
-                rows.push(spawn_row(
-                    "Bluetooth Settings",
-                    &["gnome-control-center", "bluetooth"],
-                    true,
-                ));
+                rows.push(settings_row("Bluetooth Settings", "bluetooth", true));
                 rows
             }
             // v1 Network detail: a single entry point to the full settings (the in-menu
             // enable/disable toggle and the Wi-Fi connection list are Q6, needing NM writes).
             DetailOwner::Network => {
                 let _ = network;
-                vec![spawn_row(
-                    "Network Settings",
-                    &["gnome-control-center", "network"],
-                    false,
-                )]
+                vec![settings_row("Network Settings", "network", false)]
             }
             // gnome-shell's shutdown submenu, in its two groups: machine-power (Suspend / Restart /
             // Power Off) then, past a separator, the session group (Log Out). The `…` marks the
@@ -757,11 +762,7 @@ impl DetailOwner {
                         .into()
                     })
                     .collect();
-                rows.push(spawn_row(
-                    "Power Settings",
-                    &["gnome-control-center", "power"],
-                    true,
-                ));
+                rows.push(settings_row("Power Settings", "power", true));
                 rows
             }
             // gnome-shell's output device list: one row per **card port** (gvc UIDevice), labelled
@@ -787,11 +788,7 @@ impl DetailOwner {
                             .into()
                         })
                         .collect();
-                rows.push(spawn_row(
-                    "Sound Settings",
-                    &["gnome-control-center", "sound"],
-                    true,
-                ));
+                rows.push(settings_row("Sound Settings", "sound", true));
                 rows
             }
             // A (name label, slider) pair per monitor, and nothing else — gnome-shell's
@@ -828,11 +825,7 @@ impl DetailOwner {
                             .into()
                         })
                         .collect();
-                rows.push(spawn_row(
-                    "Sound Settings",
-                    &["gnome-control-center", "sound"],
-                    true,
-                ));
+                rows.push(settings_row("Sound Settings", "sound", true));
                 rows
             }
         }
@@ -1307,7 +1300,7 @@ impl SysButton {
             // (`js/ui/status/system.js:133-154`), so an already-open Settings is *presented*
             // rather than asked to start a second time.
             SysButton::Settings => {
-                return PopoverAction::ActivateApp("org.gnome.Settings.desktop".to_owned());
+                return PopoverAction::ActivateApp(SETTINGS_DESKTOP_ID.to_owned());
             }
             SysButton::Lock => &["loginctl", "lock-session"],
             SysButton::Power => {
@@ -1803,12 +1796,7 @@ impl QuickSettings {
                 return match item {
                     // Network body: open settings (the in-place enable/disable toggle is deferred);
                     // the arrow opens the detail view.
-                    GridTile::Network => PopoverAction::Spawn(
-                        ["gnome-control-center", "network"]
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                    ),
+                    GridTile::Network => settings_panel("network"),
                     GridTile::Toggle(tile) => {
                         let on = !tile.is_on(self.toggles);
                         self.set_tile(tile, on);
@@ -1848,12 +1836,7 @@ impl QuickSettings {
         // The battery pill opens power settings (gnome-shell's PowerToggle).
         if let Some(pill) = pill_rect(self.has_pill()) {
             if pill.contains(pos) {
-                return PopoverAction::Spawn(
-                    ["gnome-control-center", "power"]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect(),
-                );
+                return settings_panel("power");
             }
         }
         for button in SYS_BUTTONS {
@@ -3439,7 +3422,7 @@ mod tests {
         // The tile center falls in the toggle-body (left of the arrow-half), which opens settings.
         let action = qs.pointer_click(center(tile_rect(0, lay(false))));
         match action {
-            PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-control-center", "network"]),
+            PopoverAction::LaunchSettingsPanel { panel, .. } => assert_eq!(panel, "network"),
             other => panic!("expected network settings, got {other:?}"),
         }
         // Network is not a gsettings toggle: no local flip, so no chrome revision bump.
@@ -3475,7 +3458,7 @@ mod tests {
         // (gnome-shell `js/ui/status/system.js:133-154`).
         let settings = qs.pointer_click(center(sys_rect(SysButton::Settings, false)));
         match settings {
-            PopoverAction::ActivateApp(id) => assert_eq!(id, "org.gnome.Settings.desktop"),
+            PopoverAction::ActivateApp(id) => assert_eq!(id, SETTINGS_DESKTOP_ID),
             other => panic!("expected an app activation, got {other:?}"),
         }
     }
@@ -3506,7 +3489,7 @@ mod tests {
         let pill = pill_rect(true).expect("a battery must show the pill");
         let action = qs.pointer_click(center(pill));
         match action {
-            PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-control-center", "power"]),
+            PopoverAction::LaunchSettingsPanel { panel, .. } => assert_eq!(panel, "power"),
             other => panic!("expected power settings, got {other:?}"),
         }
         // Settings sits further right when the pill is present.
@@ -4636,7 +4619,7 @@ mod tests {
 
         let action = qs.pointer_click(center(row));
         match action {
-            PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-control-center", "network"]),
+            PopoverAction::LaunchSettingsPanel { panel, .. } => assert_eq!(panel, "network"),
             other => panic!("expected the network-settings spawn, got {other:?}"),
         }
     }
@@ -4941,7 +4924,7 @@ mod tests {
             other => panic!("expected SetOutputDevice, got {other:?}"),
         }
         match q.pointer_click(center(detail_row_rect(3, q.layout()).unwrap())) {
-            PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-control-center", "sound"]),
+            PopoverAction::LaunchSettingsPanel { panel, .. } => assert_eq!(panel, "sound"),
             other => panic!("expected the sound-settings spawn, got {other:?}"),
         }
     }
@@ -5216,7 +5199,7 @@ mod tests {
 
         // The settings row spawns control-center.
         match qs.pointer_click(center(detail_row_rect(3, qs.layout()).unwrap())) {
-            PopoverAction::Spawn(cmd) => assert_eq!(cmd, ["gnome-control-center", "bluetooth"]),
+            PopoverAction::LaunchSettingsPanel { panel, .. } => assert_eq!(panel, "bluetooth"),
             other => panic!("expected a spawn, got {other:?}"),
         }
     }

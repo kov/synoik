@@ -453,6 +453,24 @@ fn parameter_av(target: Option<zvariant::OwnedValue>) -> Vec<zvariant::Value<'st
     }
 }
 
+/// The Settings app, whose `launch-panel` action opens a named panel.
+pub const SETTINGS_APP_ID: &str = "org.gnome.Settings";
+
+/// The `launch-panel` target: `av` holding one `(sav)` of the panel name and its extra string
+/// arguments — the variant gnome-shell builds in `launchSettingsPanel`
+/// (`js/ui/status/network.js:67-68`).
+fn launch_panel_target(panel: &str, args: &[String]) -> Option<zvariant::OwnedValue> {
+    let args: Vec<zvariant::Value> = args
+        .iter()
+        .map(|a| zvariant::Value::from(a.as_str()))
+        .collect();
+    let inner = zvariant::Structure::from((
+        zvariant::Value::from(panel),
+        zvariant::Value::from(zvariant::Array::from(args)),
+    ));
+    zvariant::Value::from(inner).try_to_owned().ok()
+}
+
 /// `org.freedesktop.Application.ActivateAction` on the app's bus name, which
 /// D-Bus-activates it if stopped (gnome-shell's `this._app.activate_action`,
 /// `js/ui/notificationDaemon.js:510-517`). Failure is logged, not fatal (the
@@ -579,6 +597,16 @@ impl Start for GtkNotifications {
                             }
                             GtkToNotifications::Activate { app_id, token } => {
                                 activate_app(&emit_conn, &app_id, token).await;
+                            }
+                            GtkToNotifications::LaunchSettingsPanel { panel, args, token } => {
+                                activate_app_action(
+                                    &emit_conn,
+                                    SETTINGS_APP_ID,
+                                    "launch-panel",
+                                    launch_panel_target(&panel, &args),
+                                    token,
+                                )
+                                .await;
                             }
                         }
                     }

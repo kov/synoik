@@ -558,6 +558,20 @@ pub enum GtkToNotifications {
     /// `source.open()` = `this._app.activate()` (`js/ui/notificationDaemon.js:539`),
     /// i.e. `org.freedesktop.Application.Activate` (D-Bus-activating the app).
     Activate { app_id: String, token: String },
+    /// Open a Settings panel through the app's own `launch-panel` action, the way gnome-shell's
+    /// `launchSettingsPanel` does (`js/ui/status/network.js:66-76`).
+    ///
+    /// Not a spawn of `gnome-control-center <panel>`: that starts a second process which asks the
+    /// running instance to switch panel and raise, and the raise does not happen. Going straight
+    /// to `org.freedesktop.Application.ActivateAction` presents the instance that already exists.
+    ///
+    /// It rides this channel because that is where the connection with the app-action helper
+    /// lives — nothing about it is notification-specific.
+    LaunchSettingsPanel {
+        panel: String,
+        args: Vec<String>,
+        token: String,
+    },
 }
 
 /// The authoritative store behind all notification surfaces.
