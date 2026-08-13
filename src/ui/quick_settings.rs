@@ -1477,6 +1477,7 @@ impl Expand {
         clock: &Clock,
         params: synoik_config::Animation,
         dim_params: synoik_config::Animation,
+        block_of: impl Fn(DetailOwner) -> f64,
     ) -> bool {
         let Some(seen) = self.seen else {
             // First frame with this menu: adopt whatever is open, settled.
@@ -1501,21 +1502,30 @@ impl Expand {
                 dim_params,
             ));
             match (seen, target) {
-                // Opening from nothing: grow the gap first, with the card still invisible.
-                (None, Some(_)) => {
+                // Opening, whether from nothing or straight from another view (the cross-switch
+                // divergence above): the gap grows first, with the card invisible until it lands.
+                //
+                // It grows from whatever gap is on screen right now — the outgoing view's block
+                // on a switch, a half-collapsed one when a close is interrupted, zero otherwise.
+                // `height` is a fraction of the *target* block, so that gap has to be re-measured
+                // against the new one; and `block_scale()` reads 1 when settled, so it only means
+                // anything while an outgoing view is still there.
+                (_, Some(new)) => {
+                    let outgoing = seen.or(self.closing);
+                    let target_h = block_of(new);
+                    let from = match outgoing {
+                        Some(old) if target_h > 0. => block_of(old) * self.block_scale() / target_h,
+                        Some(_) => 1.,
+                        None => 0.,
+                    };
                     self.closing = None;
-                    self.height = Some(anim(0., 1.));
+                    self.height = Some(anim(from, 1.));
                     self.fade = Some(anim(0., 0.));
                 }
                 // Closing: fade the card out first, over what is left of its opacity.
                 (Some(old), None) => {
                     self.closing = Some(old);
                     self.fade = Some(anim(f64::from(self.card_alpha()), 0.));
-                }
-                // Switching owners — see the divergence above.
-                (Some(_), Some(_)) => {
-                    self.closing = None;
-                    self.fade = Some(anim(f64::from(self.card_alpha()), 1.));
                 }
                 (None, None) => {}
             }
@@ -1709,8 +1719,11 @@ impl QuickSettings {
         params: synoik_config::Animation,
         dim_params: synoik_config::Animation,
     ) -> bool {
+        let layout = self.layout();
         self.expand
-            .advance(self.expanded, clock, params, dim_params)
+            .advance(self.expanded, clock, params, dim_params, |owner| {
+                DETAIL_MARGIN + owner.detail_height(layout.owner_device_count(owner))
+            })
     }
 
     /// Whether the detail view is still growing, fading or collapsing.
@@ -5191,6 +5204,83 @@ mod tests {
         assert_eq!(qs.shown_detail(), None, "settled shut");
         assert_eq!(qs.expand.dim(), 0., "and undimmed");
         assert!(!qs.are_animations_ongoing());
+    }
+
+    /// The two transitions the endpoints cannot see: switching straight from one detail view to
+    /// another eases the gap between the two block heights (rather than snapping), and reopening
+    /// while the gap is still collapsing regrows it from where it got to.
+    #[test]
+    fn a_switch_eases_between_blocks_and_a_reopen_resumes_the_gap() {
+        let mut clock = Clock::with_time(std::time::Duration::ZERO);
+        let anims = synoik_config::Animations::default();
+        let params = anims.quick_settings_detail_open_close.0;
+        let dim_params = anims.panel_popover_open_close.0;
+        let mut qs = qs(NetworkStatus::Wired, None);
+        let step = |qs: &mut QuickSettings, clock: &mut Clock, ms: u64| {
+            clock.set_unadjusted(std::time::Duration::from_millis(ms));
+            qs.advance_expand(clock, params, dim_params);
+        };
+        let net_arrow = |qs: &QuickSettings| {
+            center(tile_arrow_rect(network_index(), GridTile::Network, qs.layout()).unwrap())
+        };
+        let block_of = |owner: DetailOwner, qs: &QuickSettings| {
+            DETAIL_MARGIN + owner.detail_height(qs.layout().owner_device_count(owner))
+        };
+
+        // Open Network and let both phases land.
+        step(&mut qs, &mut clock, 0);
+        qs.pointer_click(net_arrow(&qs));
+        for ms in [0, 75, 150] {
+            step(&mut qs, &mut clock, ms);
+        }
+        assert_eq!(qs.expand.card_alpha(), 1.);
+        let net_h = block_of(DetailOwner::Network, &qs);
+
+        // Switch straight to Power. The old card goes at once, and the gap starts from the old
+        // block measured against the new one — not from 0, and not snapped to the new height.
+        qs.pointer_click(center(sys_rect(SysButton::Power, false)));
+        assert_eq!(qs.expanded, Some(DetailOwner::Power));
+        step(&mut qs, &mut clock, 150);
+        let power_h = block_of(DetailOwner::Power, &qs);
+        assert!(
+            (power_h - net_h).abs() > 1.,
+            "the two blocks must differ for this to measure anything ({net_h} vs {power_h})"
+        );
+        assert_eq!(qs.shown_detail(), Some(DetailOwner::Power));
+        assert_eq!(qs.expand.card_alpha(), 0., "the new card waits for the gap");
+        let (_, block) = qs.layout().detail_block().expect("a block while switching");
+        assert!(
+            (block - net_h).abs() < 0.01,
+            "the gap starts at the old block height, got {block} want {net_h}"
+        );
+        step(&mut qs, &mut clock, 187);
+        let (_, block) = qs.layout().detail_block().expect("a block while switching");
+        let (lo, hi) = (net_h.min(power_h), net_h.max(power_h));
+        assert!(
+            block > lo && block < hi,
+            "the gap is easing between the two blocks, got {block} in {lo}..{hi}"
+        );
+        for ms in [225, 300] {
+            step(&mut qs, &mut clock, ms);
+        }
+        assert_eq!(qs.expand.card_alpha(), 1.);
+
+        // Close, and reopen while the gap is still collapsing: it resumes from where it is.
+        qs.pointer_click(center(sys_rect(SysButton::Power, false)));
+        assert_eq!(qs.expanded, None);
+        for ms in [300, 375, 400] {
+            step(&mut qs, &mut clock, ms);
+        }
+        let mid = qs.layout().block_scale;
+        assert!(mid > 0. && mid < 1., "the gap is mid-collapse, got {mid}");
+        qs.pointer_click(net_arrow(&qs));
+        step(&mut qs, &mut clock, 400);
+        let resumed = qs.layout().block_scale;
+        assert!(
+            (resumed - mid * power_h / net_h).abs() < 0.05,
+            "the regrow resumes from the collapsing gap, got {resumed} want ~{}",
+            mid * power_h / net_h
+        );
     }
 
     /// The collapsed grid bake tiles the expanded menu exactly: the two slices cover it end to
