@@ -376,6 +376,42 @@ impl BatteryWarning {
     }
 }
 
+impl BatteryState {
+    /// Parse the debug-override spelling of a UPower state. `auto` is not a state — it means
+    /// "hand the battery back to UPower" — so it is `None` here and handled by the caller.
+    pub fn parse_debug(s: &str) -> Option<Self> {
+        Some(match s {
+            "charging" => Self::Charging,
+            "discharging" => Self::Discharging,
+            "empty" => Self::Empty,
+            "fully-charged" => Self::FullyCharged,
+            "pending-charge" => Self::PendingCharge,
+            "pending-discharge" => Self::PendingDischarge,
+            "unknown" => Self::Unknown,
+            _ => return None,
+        })
+    }
+}
+
+impl BatteryWarning {
+    /// Parse the debug-override spelling of a UPower warning level.
+    pub fn parse_debug(s: &str) -> Option<Self> {
+        Some(match s {
+            "none" => Self::None,
+            "low" => Self::Low,
+            "critical" => Self::Critical,
+            "action" => Self::Action,
+            _ => return None,
+        })
+    }
+}
+
+/// The themed battery icon name a debug override should carry, so the icon view and the drawn
+/// indicator agree about what state is being faked.
+pub fn debug_icon_name(percentage: f64, state: BatteryState) -> String {
+    derived_battery_icon(percentage, state == BatteryState::Charging)
+}
+
 /// The symbolic-icon candidate list for a network state (first that resolves in
 /// the theme wins), or `None` when nothing should be drawn (`Unknown`).
 pub fn network_icon(status: NetworkStatus) -> Option<&'static [&'static str]> {

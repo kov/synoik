@@ -390,3 +390,31 @@ synoik msg event-stream      # live event feed
 
 `synoik msg` finds the instance via `$SYNOIK_SOCKET`; set it to the socket the
 instance printed if you have more than one running.
+
+## Faking hardware states: the `debug-*` actions
+
+**Reach for these before concluding a state cannot be validated.** A whole class of UI is gated on
+hardware or timing that a given machine simply will not produce — this VM reports its battery as
+`pending-charge` at ~79% forever, so four of the battery indicator's five readings are unreachable
+from real hardware here. `synoik msg action debug-*` fakes the *model input*, not the output, so
+what gets exercised is the entire path from the model to pixels rather than a preview mode.
+
+```sh
+synoik msg action debug-set-battery --percentage 14 --state discharging --warning low
+synoik msg action debug-set-battery --percentage 80 --state pending-charge   # plugged in, idle
+synoik msg action debug-set-battery --state auto                             # hand it back to UPower
+```
+
+Two properties worth copying when adding another one:
+
+- **Overlay, do not overwrite.** The battery override is applied where the status reaches the
+  panel, not written into the live snapshot, so the next real UPower update cannot silently
+  reinstate itself over the override — and clearing it restores the truth with no refetch.
+- **The same action drives the corpus.** `the_battery_indicator_reads_every_power_state`
+  (`src/tests/gnome.rs`) walks all five readings through `State::do_action`, which is only possible
+  because the fake goes in at the model. A debug hook that painted a preview would be
+  live-validation-only and would pin nothing.
+
+Existing ones: `debug-set-battery`, `debug-toggle-damage`, `debug-toggle-opaque-regions`,
+`debug-toggle-deadline-dispatch`, `debug-set-render-time-margin`, `toggle-debug-tint`
+(`synoik msg action --help` is the current list).

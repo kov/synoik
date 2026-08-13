@@ -603,6 +603,12 @@ pub struct Synoik {
     /// Live network + battery state for the panel status area (from the system-bus
     /// watcher); stays at its `Unknown`/absent default without the `dbus` feature.
     pub system_status: SystemStatus,
+    /// A battery forced by `debug-set-battery`, replacing UPower's until cleared.
+    ///
+    /// Overlaid where the status reaches the panel ([`Self::panel_system_status`]) rather than
+    /// written into `system_status`, so the live UPower snapshot underneath stays true and the
+    /// next real update does not silently reinstate itself over the override.
+    pub battery_override: Option<crate::system_status::BatteryStatus>,
     /// The authoritative last-selected (non-Balanced) power profile the Power Mode tile toggles
     /// back to (gnome-shell's `last-selected-power-profile`). Seeded from gsettings at
     /// startup, updated from each power-profile echo, and write-through-persisted — kept here
@@ -6300,7 +6306,7 @@ impl State {
         let mut redraw = self
             .synoik
             .panel
-            .set_system_status(self.synoik.system_status.clone());
+            .set_system_status(self.panel_system_status());
         // Keep an open quick-settings Power Mode tile in sync with live changes.
         redraw |= self
             .synoik
@@ -6315,6 +6321,16 @@ impl State {
         }
     }
 
+    /// The system status as the panel should see it: the live snapshot, with a
+    /// `debug-set-battery` override standing in for UPower's battery if one is set.
+    pub fn panel_system_status(&self) -> SystemStatus {
+        let mut status = self.synoik.system_status.clone();
+        if let Some(battery) = &self.synoik.battery_override {
+            status.battery = Some(battery.clone());
+        }
+        status
+    }
+
     /// Adopt a fresh rfkill snapshot from the gsd-rfkill watcher: the panel airplane icon, an open
     /// QS "Airplane Mode" toggle tile (which appears/vanishes with `show`), and the Bluetooth
     /// tile's availability gate + kill-switch state.
@@ -6324,7 +6340,7 @@ impl State {
         let mut redraw = self
             .synoik
             .panel
-            .set_system_status(self.synoik.system_status.clone());
+            .set_system_status(self.panel_system_status());
         redraw |= self.synoik.panel_popover.set_airplane(status.airplane);
         redraw |= self
             .synoik
@@ -7460,6 +7476,7 @@ impl Synoik {
             headphones: None,
             audio_backend: None,
             system_status: SystemStatus::default(),
+            battery_override: None,
             notifications: crate::notifications::NotificationStore::default(),
             notifications_emit: None,
             gtk_notifications_emit: None,

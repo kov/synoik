@@ -2581,6 +2581,37 @@ impl State {
                 warn!("deadline dispatch is now {}", if on { "on" } else { "off" });
                 self.synoik.queue_redraw_all();
             }
+            Action::DebugSetBattery(percentage, state, warning) => {
+                use crate::system_status::{BatteryState, BatteryStatus, BatteryWarning};
+                if state == "auto" {
+                    self.synoik.battery_override = None;
+                    warn!("battery override cleared; UPower owns the battery again");
+                } else {
+                    let Some(state) = BatteryState::parse_debug(&state) else {
+                        warn!("unknown battery state {state:?}; ignoring");
+                        return;
+                    };
+                    let Some(warning) = BatteryWarning::parse_debug(&warning) else {
+                        warn!("unknown battery warning level {warning:?}; ignoring");
+                        return;
+                    };
+                    let percentage = percentage.clamp(0., 100.);
+                    self.synoik.battery_override = Some(BatteryStatus {
+                        // The themed name is the icon path's input, which the dynamic indicator
+                        // does not use — but it stays consistent so a fallback never contradicts
+                        // the override.
+                        icon_name: crate::system_status::debug_icon_name(percentage, state),
+                        percentage,
+                        state,
+                        warning,
+                    });
+                    warn!("battery overridden: {percentage}% {state:?} {warning:?}");
+                }
+                let status = self.panel_system_status();
+                if self.synoik.panel.set_system_status(status) {
+                    self.synoik.queue_redraw_all();
+                }
+            }
             Action::DebugSetRenderTimeMargin(millis) => {
                 let millis = millis.clamp(0., 100.);
                 let margin = crate::frame_clock::set_render_time_margin(Duration::from_micros(

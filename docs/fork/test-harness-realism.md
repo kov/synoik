@@ -23,6 +23,22 @@ things a real session does. Two bugs found *outside* the suite pin the two halve
 Both are the same shape: the suite tests a compositor that runs a code path production never
 runs, and skips the one it does.
 
+## 1b. The cheap tier: fake the model input, not the hardware
+
+Before building a mock at the D-Bus or kernel level, check whether the state can be injected at
+**our own model** instead. `synoik msg action debug-set-battery` fakes a `BatteryStatus` where the
+UPower watcher would have delivered one; the panel, the corpus and the live session then all
+exercise the real path from the model onward.
+
+That is a fraction of the cost of mocking UPower, and it buys the two things that actually matter:
+every reading becomes reachable on hardware that will only ever report one of them, and the same
+injection drives a headless corpus test (`the_battery_indicator_reads_every_power_state`).
+
+It does not replace the tiers below — it cannot test our *reading* of UPower, only what we do with
+what we read, so the parse stays unit-tested against real enum values. But for anything downstream
+of a plain-data model, this is the first thing to reach for. See `RUNNING.md`
+("Faking hardware states") for the convention.
+
 ## 2. What this machine already has
 
 Probed 2026-08-01 on `7.1.5-limina16k`, aarch64:

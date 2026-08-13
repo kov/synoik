@@ -25845,3 +25845,84 @@ fn a_window_resized_back_to_the_work_area_still_saves_its_own_rect() {
         "a floating window that happens to be work-area sized comes back to that size",
     );
 }
+
+/// The dynamic battery indicator's five readings, driven through the real action a user (or a
+/// live-validation session) would send.
+///
+/// Real hardware volunteers about one of these per session — this VM sits in `PendingCharge`
+/// permanently — so without `debug-set-battery` four of the five could only ever be reasoned
+/// about. Two of them, the plugged-in-idle case and the critical case, were designed wrong the
+/// first time and only caught by looking.
+///
+/// The point of driving `do_action` rather than calling `battery_look` directly is that this
+/// covers the override plumbing too: the override has to survive the next UPower update, which is
+/// why it is overlaid where the status reaches the panel instead of written into the live
+/// snapshot.
+#[test]
+fn the_battery_indicator_reads_every_power_state() {
+    use crate::system_status::{BatteryOverlay, BatteryTint};
+
+    let mut f = Fixture::new();
+    let set = |f: &mut Fixture, pct: f64, state: &str, warning: &str| {
+        f.synoik_state().do_action(
+            Action::DebugSetBattery(pct, state.to_owned(), warning.to_owned()),
+            false,
+        );
+        f.synoik()
+            .panel
+            .battery_look()
+            .expect("an overridden battery")
+    };
+
+    // Discharging, healthy: no colour, no glyph. The resting state must be quiet.
+    let look = set(&mut f, 72., "discharging", "none");
+    assert_eq!(look.body, BatteryTint::Normal);
+    assert_eq!(look.fill, BatteryTint::Normal);
+    assert_eq!(look.overlay, BatteryOverlay::None);
+
+    // Charging: green in the charge only, with the bolt.
+    let look = set(&mut f, 45., "charging", "none");
+    assert_eq!(look.fill, BatteryTint::Charging);
+    assert_eq!(look.body, BatteryTint::Normal, "the housing stays neutral");
+    assert_eq!(look.overlay, BatteryOverlay::Bolt);
+
+    // Plugged in and held below full -- a charge limit stopping at 80%. A bolt here would claim a
+    // current that is not flowing, so it is a cord, and nothing is tinted.
+    let look = set(&mut f, 80., "pending-charge", "none");
+    assert_eq!(look.overlay, BatteryOverlay::Cord);
+    assert_eq!(look.fill, BatteryTint::Normal);
+
+    // Full on mains reads the same way, for the same reason.
+    assert_eq!(
+        set(&mut f, 100., "fully-charged", "none").overlay,
+        BatteryOverlay::Cord
+    );
+
+    // Low: the charge goes yellow, the housing does not, and there is still no glyph.
+    let look = set(&mut f, 14., "discharging", "low");
+    assert_eq!(look.fill, BatteryTint::Low);
+    assert_eq!(look.body, BatteryTint::Normal);
+    assert_eq!(look.overlay, BatteryOverlay::None);
+
+    // Critical: the whole indicator reddens AND gains a glyph. The glyph is the accessible
+    // channel -- colour alone is not one a colour-blind reader has -- so it is not optional.
+    let look = set(&mut f, 3., "discharging", "critical");
+    assert_eq!(look.fill, BatteryTint::Critical);
+    assert_eq!(look.body, BatteryTint::Critical);
+    assert_eq!(look.overlay, BatteryOverlay::Alert);
+
+    // Charging out of a critical charge is not critical: state outranks warning level.
+    let look = set(&mut f, 3., "charging", "action");
+    assert_eq!(look.fill, BatteryTint::Charging);
+    assert_eq!(look.overlay, BatteryOverlay::Bolt);
+
+    // And `auto` hands the battery back to UPower -- which, headless, means no battery at all.
+    f.synoik_state().do_action(
+        Action::DebugSetBattery(50., "auto".to_owned(), "none".to_owned()),
+        false,
+    );
+    assert!(
+        f.synoik().panel.battery_look().is_none(),
+        "clearing the override must not leave the faked battery behind"
+    );
+}

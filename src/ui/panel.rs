@@ -1329,6 +1329,15 @@ impl Panel {
     /// The quick-settings status indicator rect: the icon cluster plus a padding
     /// on each side, right-anchored on the output. Its width tracks how many
     /// status icons (toggles + live network/battery) are currently shown.
+    /// How the battery indicator currently reads, or `None` with no battery. The observable
+    /// state the corpus asserts against — the tint roles and overlay, not pixels.
+    pub fn battery_look(&self) -> Option<system_status::BatteryLook> {
+        self.system_status
+            .battery
+            .as_ref()
+            .map(system_status::battery_look)
+    }
+
     pub fn quick_settings_rect(&self, output_width: f64) -> Rectangle<f64, Logical> {
         // quickSettings anchors the right edge and is always present.
         self.right_box_rect(ROLE_QUICK_SETTINGS, output_width)

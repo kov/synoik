@@ -989,6 +989,26 @@ pub enum Action {
         /// Slack in milliseconds.
         millis: f64,
     },
+    /// Override the battery the panel shows, ignoring UPower until cleared.
+    ///
+    /// The dynamic battery indicator has five readings (charging, plugged-in-idle, normal, low,
+    /// critical) and real hardware volunteers about one of them per session, so there is otherwise
+    /// no way to see -- or test -- the other four. Drives the same model UPower feeds, so what is
+    /// exercised is the whole path from `BatteryStatus` to pixels, not a preview mode.
+    ///
+    /// `--state auto` hands the battery back to UPower.
+    DebugSetBattery {
+        /// Charge, 0..=100.
+        #[cfg_attr(feature = "clap", arg(long, default_value_t = 50.))]
+        percentage: f64,
+        /// UPower `State`: `auto`, `charging`, `discharging`, `empty`, `fully-charged`,
+        /// `pending-charge`, `pending-discharge`, `unknown`.
+        #[cfg_attr(feature = "clap", arg(long, default_value = "discharging"))]
+        state: String,
+        /// UPower `WarningLevel`: `none`, `low`, `critical`, `action`.
+        #[cfg_attr(feature = "clap", arg(long, default_value = "none"))]
+        warning: String,
+    },
     /// Move the focused window between the floating and the tiling layout.
     ToggleWindowFloating {
         /// Id of the window to move.
