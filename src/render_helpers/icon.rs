@@ -542,6 +542,7 @@ pub const EMBEDDED_ICON_NAMES: &[&str] = &[
     "screenshot-ui-show-pointer-symbolic",
     "battery-bolt-symbolic",
     "battery-cord-symbolic",
+    "battery-cord-halo-symbolic",
 ];
 
 fn embedded_icon(name: &str) -> Option<&'static [u8]> {
@@ -581,6 +582,9 @@ fn embedded_icon(name: &str) -> Option<&'static [u8]> {
         )),
         "battery-cord-symbolic" => Some(include_bytes!(
             "../../resources/icons/battery-cord-symbolic.svg"
+        )),
+        "battery-cord-halo-symbolic" => Some(include_bytes!(
+            "../../resources/icons/battery-cord-halo-symbolic.svg"
         )),
         // The screenshot UI's type buttons and its show-pointer toggle. `camera-photo-symbolic`
         // and `camera-web-symbolic`, which the shot/cast pair uses, come from the icon theme

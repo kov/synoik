@@ -421,6 +421,17 @@ fn battery_overlay_icon(overlay: system_status::BatteryOverlay) -> Option<&'stat
 /// is only `BODY_H - 2 * INSET` tall.
 const QS_BOLT: f64 = 12.;
 
+/// The dark rim drawn behind the mains plug.
+///
+/// A cord state's fill is white by design, so a white plug over it dissolved into the charge —
+/// measured on the seat, where `fully-charged` showed no plug at all. The rim is a dilated
+/// silhouette of the same shape drawn behind it, so the glyph reads over the fill and over the
+/// empty section both, at any charge.
+///
+/// The bolt needs none: a charging fill is green, which white already separates from.
+const CORD_HALO_ICON: &str = "battery-cord-halo-symbolic";
+const CORD_HALO: [f32; 4] = [0., 0., 0., 0.75];
+
 /// The critical glyph drawn in the battery body, and its size.
 const ALERT_GLYPH: &str = "!";
 const ALERT_PT: f64 = 8.;
@@ -2039,12 +2050,18 @@ impl Panel {
 
         // The glyph sits over the body, so it is pushed first: elements are consumed in reverse.
         if let Some(name) = battery_overlay_icon(look.overlay) {
-            if let Some(tb) = icons.texture(renderer, name, QS_BOLT, scale, TEXT) {
+            let cord = look.overlay == system_status::BatteryOverlay::Cord;
+            // The rim goes behind the glyph, so it is pushed after it: elements are consumed in
+            // reverse. Same box, so the two land exactly concentric.
+            let glyph_box = |tb: &TextureBuffer<VkTexture>| {
                 let logical = tb.logical_size();
-                let location = Point::from((
+                Point::from((
                     x + (widget::Battery::BODY_W - logical.w) / 2.,
                     (panel_height() - logical.h) / 2.,
-                ));
+                ))
+            };
+            if let Some(tb) = icons.texture(renderer, name, QS_BOLT, scale, TEXT) {
+                let location = glyph_box(&tb);
                 elements.push(PanelElement::Texture(
                     TextureRenderElement::from_texture_buffer(
                         tb,
@@ -2055,6 +2072,22 @@ impl Panel {
                         Kind::Unspecified,
                     ),
                 ));
+            }
+            if cord {
+                if let Some(tb) = icons.texture(renderer, CORD_HALO_ICON, QS_BOLT, scale, CORD_HALO)
+                {
+                    let location = glyph_box(&tb);
+                    elements.push(PanelElement::Texture(
+                        TextureRenderElement::from_texture_buffer(
+                            tb,
+                            location,
+                            1.,
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ),
+                    ));
+                }
             }
         }
 

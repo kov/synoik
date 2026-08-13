@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only
+     Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
+     OURS, not bundled. The dark rim drawn *behind* battery-cord-symbolic: the
+     same four shapes dilated by 0.9 units, so a uniform outline shows around
+     the plug. Without it the white plug dissolved into the white fill of a
+     charged battery — the fill of a cord state is white by design, so no single
+     glyph colour works inside the body at every charge.
+
+     A symbolic is one colour (coverage comes from alpha), which is why the
+     outline is a second file rather than a stroke on the first. Keep the shapes
+     in step with battery-cord-symbolic.svg: same x/y/w/h, grown by 0.9 on every
+     side, radii grown to match.
+
+     See docs/fork/battery-indicator-design.md. -->
+<svg height="16" width="16" xmlns="http://www.w3.org/2000/svg"><g style="fill:#bebebe;fill-opacity:1"><rect height="6.3" rx="1.8" width="3.8" x="4.1" y="0.6"/><rect height="6.3" rx="1.8" width="3.8" x="8.1" y="0.6"/><rect height="7.3" rx="2.5" width="9.8" x="3.1" y="4.6"/><rect height="5.3" rx="1.9" width="3.8" x="6.1" y="9.6"/></g></svg>
