@@ -2379,6 +2379,65 @@ impl ButtonStyle {
     }
 }
 
+/// The dynamic battery indicator: a rounded body with a fill bar that tracks the charge, a nub,
+/// and an optional critical glyph (`docs/fork/battery-indicator-design.md`).
+///
+/// A divergence we chose, not a GNOME port — 50.3 draws a 16px `battery-level-*-symbolic` glyph,
+/// which quantises a continuous quantity into ten pictures that differ by a few pixels of interior
+/// fill. A bar reads at a glance.
+///
+/// Carries no knowledge of UPower: the caller resolves state to a `tint` and the flags, so this
+/// stays a shape the toolkit can draw and a test can measure. The charging bolt is **not** here —
+/// it is `battery-bolt-symbolic` through the icon path, composited over the body by the caller,
+/// like every other glyph in the status cluster.
+#[derive(Debug, Clone, Copy)]
+pub struct Battery {
+    /// Charge, 0..=1. Clamped when drawn.
+    pub fill: f64,
+    /// Shell and fill colour — one colour, never a tinted shell over a plain bar.
+    pub tint: Rgba,
+    /// Draw the critical glyph over the body. Deliberately redundant with a red `tint`: colour
+    /// alone is not a channel a colour-blind reader has.
+    pub alert: bool,
+}
+
+impl Battery {
+    /// Body box. ~1.6x a `.system-status-icon`, which is what makes the bar legible at all.
+    pub const BODY_W: f64 = 26.;
+    pub const BODY_H: f64 = 13.;
+    /// Rounded rect, not a stadium: the mockup's corners are visibly tighter than `BODY_H / 2`.
+    pub const RADIUS: f64 = 4.5;
+    pub const STROKE: f64 = 1.5;
+    /// Fill inset from the body's *outer* edge, so a 1px gap shows inside the stroke.
+    pub const INSET: f64 = 2.5;
+    /// Concentric with [`Self::RADIUS`], so the fill's corners follow the shell's.
+    pub const FILL_RADIUS: f64 = Self::RADIUS - Self::INSET;
+    pub const NUB_W: f64 = 2.;
+    pub const NUB_H: f64 = 5.;
+    pub const NUB_GAP: f64 = 1.5;
+
+    /// The width a cluster slot must reserve — body, gap, nub. This is why the panel cluster walks
+    /// per-element widths instead of `i * QS_ICON`.
+    pub const WIDTH: f64 = Self::BODY_W + Self::NUB_GAP + Self::NUB_W;
+    /// The height the indicator occupies; the caller centres it in the bar.
+    pub const HEIGHT: f64 = Self::BODY_H;
+
+    /// The fill bar's width for a charge, inside the body. Floored at the fill *diameter*: a
+    /// rounded rect narrower than its own corner diameter cannot exist, so 1% must still be a
+    /// visible lozenge rather than a degenerate sliver.
+    pub fn fill_width(fill: f64) -> f64 {
+        let inner = Self::BODY_W - 2. * Self::INSET;
+        // `f64::clamp` *propagates* NaN rather than trapping it, so a non-finite percentage would
+        // otherwise sail through both clamps and reach the renderer as a NaN rect. Treat it as
+        // empty: the reading is wrong either way, but a lozenge is a shape and NaN is not.
+        if !fill.is_finite() {
+            return 2. * Self::FILL_RADIUS;
+        }
+        let want = inner * fill.clamp(0., 1.);
+        want.clamp(2. * Self::FILL_RADIUS, inner)
+    }
+}
+
 /// A clickable button: a rounded [`ButtonStyle`] fill with a centered bold-white
 /// label, the toolkit's standard hover wash, and an optional inset accent focus ring.
 /// The owner holds the logical `rect` (from its own layout) and the interaction flags;
@@ -3552,6 +3611,61 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     /// which is the direction the SCSS gives it (`:15-23`); the on state's hover is a
     /// 5% accent lighten we skip, since our switch has no hover state of its own yet
     /// (the whole row is the hover target).
+    /// The dynamic battery indicator ([`Battery`]), drawn at `origin` (its top-left) in a box
+    /// [`Battery::WIDTH`] x [`Battery::HEIGHT`].
+    ///
+    /// `alert` is the pre-shaped critical glyph; the caller shapes it in its bake's `prepare`
+    /// step, and passing `None` while `b.alert` is set simply omits it rather than failing.
+    ///
+    /// The shell is a real [`Self::stroke_rounded`], never a fill-then-inner-fill: that idiom
+    /// cannot round its corners and would put a hard edge where the mockup has a radius.
+    pub fn battery(
+        &mut self,
+        origin: Point<f64, Logical>,
+        b: &Battery,
+        alert: Option<&ShapedText>,
+    ) -> anyhow::Result<()> {
+        let body = Rectangle::new(origin, Size::from((Battery::BODY_W, Battery::BODY_H)));
+        self.stroke_rounded(body, Battery::RADIUS, Battery::STROKE, b.tint)?;
+
+        // The bar grows from the body's left edge, inset so a gap shows inside the stroke.
+        let fill = Rectangle::new(
+            origin + Point::from((Battery::INSET, Battery::INSET)),
+            Size::from((
+                Battery::fill_width(b.fill),
+                Battery::BODY_H - 2. * Battery::INSET,
+            )),
+        );
+        self.fill_rounded(fill, Battery::FILL_RADIUS, b.tint)?;
+
+        // The nub, centred on the body's right edge.
+        let nub = Rectangle::new(
+            origin
+                + Point::from((
+                    Battery::BODY_W + Battery::NUB_GAP,
+                    (Battery::BODY_H - Battery::NUB_H) / 2.,
+                )),
+            Size::from((Battery::NUB_W, Battery::NUB_H)),
+        );
+        self.fill_rounded(nub, Battery::NUB_W / 2., b.tint)?;
+
+        // The critical glyph, centred over the body. It reads against the fill beneath it, so it
+        // takes the panel foreground rather than the tint it would otherwise vanish into.
+        if b.alert {
+            if let Some(shaped) = alert {
+                let (x0, y0, x1, y1) = shaped.ink_bounds();
+                let cx = origin.x + Battery::BODY_W / 2.;
+                let cy = origin.y + Battery::BODY_H / 2.;
+                let origin_px = Point::<i32, Physical>::from((
+                    to_physical_precise_round::<i32>(self.scale, cx) - (x0 + x1) / 2,
+                    to_physical_precise_round::<i32>(self.scale, cy) - (y0 + y1) / 2,
+                ));
+                self.text_px(shaped, origin_px, style::TEXT)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn toggle_switch(
         &mut self,
         rect: Rectangle<f64, Logical>,
@@ -4072,6 +4186,46 @@ run it with --features reference-env, as the fedora CI job does"
 
     /// The bake-attribution chain: a bake must be recorded against the *widget's*
     /// line, not against whichever helper in this file it travelled through.
+    /// The fill bar is the whole point of the indicator, so its degenerate ends are pinned: a
+    /// rounded rect narrower than its own corner diameter cannot exist, and an empty battery must
+    /// still show *something* or the widget reads as broken rather than as flat.
+    #[test]
+    fn the_battery_fill_bar_never_collapses_below_its_own_corner_diameter() {
+        use super::Battery;
+
+        let inner = Battery::BODY_W - 2. * Battery::INSET;
+        let floor = 2. * Battery::FILL_RADIUS;
+
+        assert_eq!(
+            Battery::fill_width(1.),
+            inner,
+            "full fills the body exactly"
+        );
+        assert_eq!(Battery::fill_width(0.5), inner / 2., "half is half");
+        assert_eq!(
+            Battery::fill_width(0.),
+            floor,
+            "an empty battery still draws a lozenge, not a zero-width sliver"
+        );
+        assert_eq!(
+            Battery::fill_width(0.01),
+            floor,
+            "1% is below the corner diameter, so it clamps up to it"
+        );
+
+        // Out-of-range input is clamped, not trusted: UPower is not the only thing that can write
+        // a percentage, and a bar wider than its body would paint outside the shell.
+        assert_eq!(Battery::fill_width(1.5), inner);
+        assert_eq!(Battery::fill_width(-1.), floor);
+        assert_eq!(Battery::fill_width(f64::NAN), floor, "NaN must not escape");
+
+        // The slot the panel reserves has to hold the nub too, or the neighbour overlaps it.
+        assert_eq!(
+            Battery::WIDTH,
+            Battery::BODY_W + Battery::NUB_GAP + Battery::NUB_W
+        );
+    }
+
     ///
     /// This is the load-bearing half of `frame_log`'s bake reporting, and it
     /// degrades silently: drop `#[track_caller]` from one helper and every widget

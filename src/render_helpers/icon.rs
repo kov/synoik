@@ -519,6 +519,11 @@ fn icon_key(name: &str, logical_px: f64, scale: f64, color: [f32; 4]) -> Symboli
 /// `notification-collapse-symbolic` is our derived name for the expand chevron
 /// rotated 180° — gnome-shell rotates the button actor instead
 /// (`js/ui/messageList.js:635-638`); we bake the rotation into the SVG.
+///
+/// **One of these is ours, not gnome-shell's**: `battery-bolt-symbolic` is authored for synoik
+/// (GPL-3.0-only, unlike the bundled GPLv2+ rest) because no theme ships a standalone bolt — every
+/// charging glyph bakes one into a whole battery, and the dynamic battery indicator draws its own
+/// body. Keep new authored assets' provenance in the file header, as that one does.
 /// The names [`embedded_icon`] answers to, so a test can walk the table rather than trusting that
 /// each new arm was spelled the same in both places.
 pub const EMBEDDED_ICON_NAMES: &[&str] = &[
@@ -535,6 +540,7 @@ pub const EMBEDDED_ICON_NAMES: &[&str] = &[
     "screenshot-ui-display-symbolic",
     "screenshot-ui-window-symbolic",
     "screenshot-ui-show-pointer-symbolic",
+    "battery-bolt-symbolic",
 ];
 
 fn embedded_icon(name: &str) -> Option<&'static [u8]> {
@@ -567,6 +573,11 @@ fn embedded_icon(name: &str) -> Option<&'static [u8]> {
         // `object-select-symbolic` (`style::CHECK_ICONS`), which is Adwaita's and is what a *menu
         // ornament* uses — this one is gnome-shell's own, 14px, and is the check box's glyph.
         "check-symbolic" => Some(include_bytes!("../../resources/icons/check-symbolic.svg")),
+        // Ours, not bundled — see the file's own header and
+        // `docs/fork/battery-indicator-design.md`.
+        "battery-bolt-symbolic" => Some(include_bytes!(
+            "../../resources/icons/battery-bolt-symbolic.svg"
+        )),
         // The screenshot UI's type buttons and its show-pointer toggle. `camera-photo-symbolic`
         // and `camera-web-symbolic`, which the shot/cast pair uses, come from the icon theme
         // instead — those are Adwaita's, not gnome-shell's own.

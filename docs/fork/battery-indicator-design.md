@@ -194,7 +194,7 @@ Per the toolkit-first rule, this is a `widget::` type, not a one-off in
 have — `stroke_rounded` for the shell, `fill_rounded` for the bar and the nub,
 `text_px` for the "!" and the optional percentage.
 
-### The charging bolt is an open decision (2026-08-13)
+### The charging bolt — DECIDED (2026-08-13): C, an embedded SVG
 
 The bolt is the one part with no obvious home, and the first draft of this doc
 was too glib about it ("add `Painter::bolt`"). The renderer's whole primitive set
@@ -217,9 +217,22 @@ arbitrary-polygon verb. So there are three real options, not one:
   a whole battery (`battery-level-*-charging-symbolic`) — so this means adding one
   small asset of our own.
 
-**Leaning C**, on the grounds that the bolt is a glyph and we already have a
-glyph path; B is the answer only if we find we want bolts (or other small shapes)
-somewhere the icon path can't reach. Not decided — kov's call.
+**Decided: C.** It is not a deviation, it is the path we already have.
+`resources/icons/` already holds 13 symbolic SVGs compiled in with
+`include_bytes!`, resolved by `embedded_icon()` (`src/render_helpers/icon.rs:541`)
+against the `EMBEDDED_ICON_NAMES` table a test walks, rasterized by **resvg** —
+our own crate, no librsvg and no GObject — and tinted by `IconCache`. The bolt is
+entry 14 on machinery that is built, tested and in the daily driver.
+
+B would be justified if we wanted arbitrary shapes *generally*. We don't: we want
+a glyph, and glyphs have a home. Adding a polygon rasterizer to the renderer to
+draw one lightning bolt is the opposite of growing the toolkit for what the port
+needs — and it would owe a `SYNOIK_VK_VALIDATION=1` run for the privilege.
+
+**One genuinely new thing**, small but worth naming: all 13 current assets are
+*bundled* from gnome-shell's gresource (icons in no theme on disk), carrying
+upstream's GPLv2+. The bolt is the first icon we **author**, so it takes our
+GPL-3.0-only terms and its own provenance note rather than the inherited ones.
 
 Nothing else in the design needs a new verb: the shell is `stroke_rounded`, the
 bar and nub are `fill_rounded`, the "!" and the percentage are `text_px`.

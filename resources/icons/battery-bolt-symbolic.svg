@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only
+     Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
+     OURS, not bundled: unlike the other icons in this directory (which come from
+     gnome-shell's gresource under GPL-2.0-or-later), this one is authored for
+     synoik. Adwaita ships no standalone bolt — every charging glyph bakes the
+     bolt into a whole battery — and the dynamic battery indicator draws its own
+     body, so it needs the bolt alone to overlay on the fill.
+     See docs/fork/battery-indicator-design.md.
+
+     Square on purpose: the symbolic path rasterizes to px × px with
+     SvgFit::Stretch, and the fill colour is ignored — coverage comes from alpha
+     and the tint is painted through it. -->
+<svg height="16" width="16" xmlns="http://www.w3.org/2000/svg"><path style="fill:#bebebe;fill-opacity:1" d="M9.5 1.5 4 8.5h3.2L6.5 14.5 12 7.5H8.8Z"/></svg>
