@@ -11357,6 +11357,38 @@ fn any_key_that_raises_the_prompt_arms_the_reader() {
     );
 }
 
+/// The unlock entry has a caret from the moment the prompt is up, with nothing typed.
+///
+/// The model half of `vulkan_an_empty_focused_entry_draws_its_caret`: the view is never handed the
+/// password, so the caret it draws is the one *this* computes in masked coordinates. A field that
+/// shows neither bullets nor caret reads as dead, and the natural way to get there is to gate the
+/// caret on there being something to put it after.
+#[test]
+fn the_unlock_entry_shows_its_caret_before_anything_is_typed() {
+    use crate::dbus::gdm::VerifierEvent;
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    tap(&mut f, KEY_F10);
+
+    let d = &f.synoik().unlock_dialog;
+    assert!(d.entry().is_empty(), "nothing typed");
+    let mask = d.entry_mask().expect("a secret question masks its entry");
+    let (cursor, selection) = d.entry().masked_positions(mask, d.is_entry_live());
+    assert_eq!(cursor, Some(0), "the caret is at the start, and it exists");
+    assert_eq!(selection, None, "with nothing to select");
+}
+
 /// Resuming starts the idle clock over.
 ///
 /// `CLOCK_MONOTONIC` does not tick across a suspend, so the seat comes back holding exactly the

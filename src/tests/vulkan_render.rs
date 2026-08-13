@@ -14110,3 +14110,90 @@ fn a_client_dmabuf_reaches_the_composited_frame() {
          (a hole here means the buffer was accepted and then never sampled)",
     );
 }
+
+/// A focused entry with nothing typed still draws its caret.
+///
+/// An empty focused field is exactly where the caret is the only thing to see, and one showing
+/// neither text nor caret reads as dead — GNOME draws the hint label beside a `ClutterText` that
+/// still carries its cursor. Asserted on pixels rather than on `EntryContent::cursor` being
+/// `Some`, because the whole failure mode is that the model says caret and the bake draws none:
+/// the placeholder is what gets shaped when the text is empty, so the caret rides metrics
+/// recovered from a run it is not part of.
+#[test]
+fn vulkan_an_empty_focused_entry_draws_its_caret() {
+    use smithay::backend::renderer::element::Kind;
+
+    use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+    use crate::ui::widget;
+
+    let Some(mut f) = green_window_fixture() else {
+        return;
+    };
+
+    const W: f64 = 320.;
+    let h = widget::Entry::HEIGHT;
+    let size = widget::physical_size(1., Size::from((W, h)));
+
+    let state = f.synoik_state();
+    let shots = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| -> anyhow::Result<[Vec<u8>; 2]> {
+            let mut out = Vec::new();
+            // Identical in every respect but the caret, so any difference in the two composites
+            // is the caret and nothing else.
+            for (rev, cursor) in [(0u64, Some(0usize)), (1, None)] {
+                let mut cache = widget::BakeCache::default();
+                let texture = widget::Entry::bake(
+                    vk,
+                    &mut cache,
+                    1.,
+                    W,
+                    h,
+                    widget::EntryContent {
+                        text: "",
+                        placeholder: "Password:",
+                        cursor,
+                        selection: None,
+                        mask: None,
+                        preedit: None,
+                    },
+                    widget::EntryStyle::Lockscreen,
+                    cursor.is_some(),
+                    false,
+                    widget::style::TEXT,
+                    rev,
+                )?;
+                let buffer = TextureBuffer::from_texture(
+                    vk,
+                    texture,
+                    Scale::from(1.),
+                    Transform::Normal,
+                    Vec::new(),
+                );
+                let element = TextureRenderElement::from_texture_buffer(
+                    buffer,
+                    Point::from((0., 0.)),
+                    1.,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                );
+                out.push(composite_ui(vk, vec![element], size, Scale::from(1.)));
+            }
+            Ok([out.remove(0), out.remove(0)])
+        })
+        .expect("headless backend must hold a Vulkan renderer")
+        .expect("baking an entry must not error");
+
+    let [focused, unfocused] = shots;
+    let differing = focused
+        .chunks_exact(4)
+        .zip(unfocused.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        differing > 0,
+        "a focused empty entry composited identically to an unfocused one — no caret was drawn"
+    );
+}
