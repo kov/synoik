@@ -444,3 +444,45 @@ Corpus: `super_tab_brings_the_whole_app_forward_not_just_its_focused_window`,
 `switch_group_walks_the_current_apps_windows_as_a_window_switcher`,
 `a_switcher_shows_what_it_would_raise_and_puts_it_back_on_escape`,
 `the_switcher_previews_another_workspace_and_gives_it_back`.
+
+## Amendment 2026-08-13: GNOME's "window switching redux", and why our split already answers it
+
+The design team's *Shell Design Dreams* post (2026-08-11) proposes reworking the
+switcher (`window-switcher/window-switcher-redux.png`):
+
+- the last 4 windows exposed **individually** in the list, everything older
+  grouped by app behind an expander;
+- Alt/Super-tabbing once always goes to the last window regardless of app;
+- new visuals: the **real windows scale down in place**, no overlay list UI.
+
+Their stated diagnosis is a tension between two use cases — "get back to the
+window I was just in" and "reach any window by keyboard" — which they resolve
+*inside one list*, with a mode change partway down it.
+
+**We already resolved it, one key each.** `src/gnome.rs:1272` is a recorded
+divergence: `<Alt>Tab` → `switch-windows` (flat windows, MRU) and `<Super>Tab` →
+`switch-applications` (grouped by app). Upstream leaves `switch-windows` unbound
+and gives Alt+Tab to the app switcher, which is precisely why they have the
+problem. Two keys with one clear rule each beats one key whose semantics change
+halfway down the list, and ours needs no expander affordance.
+
+Disposition: **do not adopt the hybrid list.** If upstream ships it, record the
+divergence; this is not deferred work.
+
+**Do not adopt the scale-in-place visuals either.** The first constant in this
+doc is the whole feel: the popup does not appear for `POPUP_DELAY` after the
+keypress, so a quick Alt-Tab tap switches with no visible UI at all. Animating
+the entire desktop on every switch puts that at risk, and its cost scales with
+what is on screen rather than with the list length.
+
+**What we DO want from it: stacked window previews in the app switcher.** The app
+switcher shows a bare 96px app icon, which tells you nothing about *which* of
+that app's windows you would land on — a real gap, and the mockup's grouped
+entries answer it by showing the app's windows as a small stack. This is
+independent of the model change and of the visuals: `src/ui/window_preview.rs`
+already renders previews and `src/ui/switcher/window_list.rs` already knows each
+app's window list. Sizing the stack inside the 96px item, and deciding what
+happens past 3-4 windows, is the design work. Sequenced as its own slice; kov
+signed off 2026-08-13.
+
+Assessment context: `dreams-assessment.md` §7.

@@ -230,6 +230,58 @@ carved these out as separate work — none block R1 for daily use:
 - **Live-only checks:** the 1 s tick cadence, area-on-rotated-output, and the full D-Bus+PipeWire
   path (recorder → `is-recording` → pill → click → `Closed` → finalized `.webm`).
 
+## Design-dreams dispositions (2026-08-13)
+
+From the GNOME design team's *Shell Design Dreams* post (2026-08-11). Full
+assessment in `dreams-assessment.md`; the calls below are kov's.
+
+### REJECTED — notifications move into quick settings
+
+The post wants notifications (and the media card) to leave the calendar popover
+and join quick settings as a collapsible pair — QS expanded by default with one
+notification peeking below, or notifications expanded behind an "Expand
+Settings" button — leaving the popover with only date, events, world clocks and
+weather (`quick-toggles-notifications-collapsible-mpris.png`,
+`calendar-popover.png`).
+
+**We are not doing this, and it does not become owed work if GNOME ships it.**
+Record the divergence then; do not re-propose it.
+
+The stated problem is that the calendar popover is "an odd mix of things". The
+proposed fix makes quick settings the odd mix instead: a system row, sliders, six
+toggles, a media player, a notification list *and* a new expand/collapse mode, in
+a surface with less vertical room. That is the same heterogeneity relocated, plus
+modal state that did not exist before.
+
+The concrete regression: today you can see notifications **and** the
+clock/calendar at once, and DND sits one click away in the menu next door from
+the notifications it suppresses. The collapsible design makes those mutually
+exclusive.
+
+The *simplified calendar popover* on its own — adaptive, content-aware, reflowing
+by which of events/clocks/weather have content — is a nice piece of design, but it
+exists only as the consequence of the move, so it goes with it. If we ever want
+the adaptive layout independently, it is a separate proposal against C-series
+slices, not this one.
+
+### Live — the dynamic battery indicator
+
+`docs/fork/battery-indicator-design.md` (designed 2026-08-13). Replaces the 16px
+`battery-level-*-symbolic` glyph in the RIGHT-box cluster with a self-painted
+wide battery whose fill bar tracks the charge.
+
+**Its prerequisite is a panel change, not a battery change**, and it is the item
+to be careful with: `qs_icon_x()` (`src/ui/panel.rs:472`) is index arithmetic
+over fixed-width slots and its own comment declares it the single source of truth
+for both the render loop and the hit test. Any variable-width status element
+breaks the *indexing scheme*, not one call site — see the design doc's ordering.
+
+The mockup's OSD warning pills are deliberately **not** being built: `gsd-power`
+runs in our live session and already emits low-battery notifications, so the
+pills would warn twice from two processes.
+
+---
+
 ## Removed upstream in 50.1 — do NOT build
 - **App menu** (`AppMenuButton`) — gone; nothing sits left of activities.
 - **Calendar DND switch** — moved to the QS DND toggle (Q11), which we already have.

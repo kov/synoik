@@ -216,3 +216,36 @@ tests, and its wiki section). It is niri's way of doing workspaces, GNOME has no
 it complicated every invariant this change touches. Two of its tests — `add_and_remove_output`
 and `move_window_to_different_output` — were generic invariant checks that merely happened to set
 the flag; they were kept, flagless.
+
+## Amendment 2026-08-13 — GNOME's drag & drop workspace concept: IGNORED
+
+The design team's *Shell Design Dreams* post (2026-08-11) revives a GNOME-40-era
+concept (`window-dnd/window-dnd.png`): **remove the workspace minimap**, and when
+a window drag starts, scale the *real* workspaces down so they become large drop
+targets — one representation of a workspace instead of two. Plus drag-to-edge to
+half-tile, drag past the edge to create a workspace, and drag-and-hold at the
+edge to advance. Cleo Menezes Jr. has an extension prototyping it.
+
+**Disposition: ignore.** Not deferred pending upstream — if GNOME ships it, we
+record the divergence and move on.
+
+The reason is this document. Our overview is already answering the same question
+from a different direction, and the answers are load-bearing:
+
+- the strip is **always shown**, and it is the **same row** as the app grid
+  (§2, §2b) — so we do not have the two-representations problem their concept
+  exists to remove;
+- empty workspaces are closed **by hand**, macOS-style (§3), so a drag past the
+  end means something different in our model than in theirs;
+- the dash is a dock (`dock-divergence.md`), which changes what the bottom edge
+  of a drag means.
+
+Adopting their concept would mean unpicking all three. The core insight — that
+two representations of one workspace on screen at once is the actual problem — is
+correct, and we agree with it; we just already act on it.
+
+**Separable, if we ever want them:** the edge behaviours (half-tile on edge drag,
+drag-and-hold to advance) do not require the minimap to go away and could be
+judged on their own merits later.
+
+Assessment context: `dreams-assessment.md` §6.

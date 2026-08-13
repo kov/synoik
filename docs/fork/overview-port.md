@@ -1746,3 +1746,31 @@ file — `STRATEGY.md`):
 
 Both seat-shaped rather than seat-validated: verified on an owned headless session against a dark
 (`petals_dark`) and a light (`futurecity_light`) wallpaper.
+
+### 13b. Amendment 2026-08-13 — this settles GNOME's "transparent panel" dream
+
+The GNOME design team's *Shell Design Dreams* post (2026-08-11) lists a
+**Transparent Panel** as a long-wanted feature: detect that the wallpaper behind
+the bar is low-contrast and single-colour, and drop the panel background
+entirely. There is an unmerged implementation (gnome-shell!2961) that has needed
+"testing, polish, and review" for years.
+
+**We are not building it. §13 already delivers the thing it is chasing**, by a
+mechanism that is strictly better behaved: our bar is *never* opaque, so there is
+no detect to get wrong. The wash+blur degrades continuously instead of snapping
+between two states, and it keeps the white clock legible over any wallpaper —
+which is the job the contrast probe exists to do.
+
+What their design has that ours doesn't is the fully-transparent end of the
+range: a wallpaper flat and dark enough that even α0.4 is unnecessary. If we ever
+want that, it is a **tuning of the wash** (let the alpha fall toward zero over a
+flat dark strip), not a binary probe — and it would inherit the two problems that
+have kept !2961 unmerged:
+
+- the panel must go opaque under a maximised window, so the detect has to
+  negotiate with that, the overview transition, and the light/dark switch;
+- with no plate at all the foreground becomes a *second* derived signal — the
+  clock and status icons sit on raw wallpaper, so you must also flip their colour
+  or add a shadow, per wallpaper, per output.
+
+Disposition: **closed, satisfied.** Assessment context: `dreams-assessment.md` §2.
