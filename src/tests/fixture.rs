@@ -190,6 +190,19 @@ impl Fixture {
         stub
     }
 
+    /// Everything the shield has asked gdm for since the last call, in order.
+    ///
+    /// The verifier task is a real channel in the fixture (see `Server::new`), so this is what a
+    /// live gdm client would have received — the only way to see requests like `StartFingerprint`,
+    /// which change nothing observable inside the compositor.
+    pub fn gdm_requests(&mut self) -> Vec<crate::dbus::gdm::VerifierRequest> {
+        let mut out = Vec::new();
+        while let Ok(request) = self.state.server.gdm_requests.try_recv() {
+            out.push(request);
+        }
+        out
+    }
+
     pub fn synoik_output(&self, n: u8) -> Output {
         let synoik = &self.state.server.state.synoik;
         let idx = usize::from(n - 1);

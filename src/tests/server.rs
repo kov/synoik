@@ -19,7 +19,10 @@ pub struct Server {
     /// The receiving half of the shield's gdm request channel, kept alive for the fixture's
     /// lifetime. See [`Server::new`] — dropping it would close the channel and turn every lock
     /// into "nobody to ask".
-    _gdm_requests: async_channel::Receiver<crate::dbus::gdm::VerifierRequest>,
+    ///
+    /// Readable, because it is the only place a test can see what the shield actually asked gdm
+    /// for — `StartFingerprint` has no other observable effect in-process.
+    pub gdm_requests: async_channel::Receiver<crate::dbus::gdm::VerifierRequest>,
 }
 
 impl Server {
@@ -50,7 +53,7 @@ impl Server {
         Self {
             event_loop,
             state,
-            _gdm_requests: from_niri,
+            gdm_requests: from_niri,
         }
     }
 

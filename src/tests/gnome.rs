@@ -11303,6 +11303,60 @@ fn a_lock_holds_the_suspend_until_its_own_curtain_lands() {
     assert!(!f.synoik().screen_shield.wants_sleep_inhibitor(true, owed));
 }
 
+/// Raising the prompt arms the fingerprint reader — whatever key raised it.
+///
+/// The reader listens only while the prompt is up (`_showPrompt` → `_ensureAuthPrompt`,
+/// `unlockDialog.js:799-800`), so the request that starts `gdm-fingerprint` rides on the page
+/// change. It must not ride on what the key then did to the *entry*: a key that edits nothing —
+/// a modifier, a function key — still raised the prompt, and a user who then puts a finger on the
+/// sensor is entitled to have it listening. The failure is silent and total: the prompt looks
+/// right, the password works, and the reader is simply never started.
+#[test]
+fn any_key_that_raises_the_prompt_arms_the_reader() {
+    use crate::dbus::gdm::{VerifierEvent, VerifierRequest};
+    use crate::dbus::gnome_screen_saver::ScreenSaverToSynoik;
+    use crate::unlock_dialog::Page;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.synoik_state()
+        .on_screen_saver_msg(ScreenSaverToSynoik::Lock(None));
+    f.synoik_state().on_verifier_event(VerifierEvent::Ready(1));
+    f.synoik_state()
+        .on_verifier_event(VerifierEvent::AskQuestion {
+            question: "Password:".to_owned(),
+            secret: true,
+        });
+    f.gdm_requests();
+
+    // A function key: it raises the prompt and edits nothing, which is the case where the arming
+    // used to be dropped on the floor with the rest of the effects.
+    assert_eq!(f.synoik().unlock_dialog.page(), Page::Clock);
+    tap(&mut f, KEY_F10);
+    assert_eq!(
+        f.synoik().unlock_dialog.page(),
+        Page::Prompt,
+        "the key still raises the prompt"
+    );
+    assert!(
+        f.gdm_requests()
+            .iter()
+            .any(|r| matches!(r, VerifierRequest::StartFingerprint)),
+        "so the reader has to have been started"
+    );
+
+    // And it is not started again while the prompt stays up — gdm errors on a service that is
+    // already running, and the verifier task guards on that, but there is no reason to ask.
+    tap(&mut f, KEY_F10);
+    assert!(
+        !f.gdm_requests()
+            .iter()
+            .any(|r| matches!(r, VerifierRequest::StartFingerprint)),
+        "the prompt was already up"
+    );
+}
+
 /// Resuming starts the idle clock over.
 ///
 /// `CLOCK_MONOTONIC` does not tick across a suspend, so the seat comes back holding exactly the

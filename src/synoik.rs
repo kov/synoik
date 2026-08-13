@@ -5384,7 +5384,8 @@ impl State {
         // The entry gets first refusal on everything but the shield's own two keys, so the
         // password field has the same editing surface as every other entry in the shell.
         let theme = self.synoik.gnome_settings.key_theme;
-        let effects = match raw {
+        let was_clock = self.synoik.unlock_dialog.page() == crate::unlock_dialog::Page::Clock;
+        let mut effects = match raw {
             Some(Keysym::Escape) => self.synoik.unlock_dialog.cancel(),
             Some(Keysym::Return | Keysym::KP_Enter) => self.synoik.unlock_dialog.submit(now),
             _ => {
@@ -5400,6 +5401,17 @@ impl State {
                 }
             }
         };
+
+        // Raising the prompt is what arms the fingerprint reader, so that has to be read off the
+        // page actually moving — not carried by whichever branch happened to run. Two of them
+        // raise the prompt inside `entry_key` and then return `None`, discarding the effects that
+        // said so: a key that edits nothing, and a key arriving before gdm has asked its question.
+        // Both left a prompt on screen with a sensor that was never started, and nothing anywhere
+        // said so — the password still worked, so it read as a hardware problem.
+        if was_clock && self.synoik.unlock_dialog.page() == crate::unlock_dialog::Page::Prompt {
+            effects.start_fingerprint = true;
+        }
+
         self.apply_unlock_effects(effects);
     }
 
