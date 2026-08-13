@@ -31,6 +31,42 @@ The point of the change: charge is a *continuous* quantity currently quantised
 into ten glyphs that differ by a few pixels of interior fill. A fill bar reads at
 a glance; the ten-step glyph does not.
 
+## As built (2026-08-13) — read this before the sections below
+
+Everything below was written *before* the thing existed. The seat corrected it in four ways, and
+those corrections are the design now:
+
+1. **Colour lives in the charge, not the housing.** The housing takes the panel foreground like
+   every neighbouring glyph; only the fill is tinted. The first build tinted the whole indicator,
+   which made being on mains — permanent on a desktop — the brightest thing in the panel. Critical
+   is the single exception: it reddens everything.
+2. **"On AC" is two states, not one.** `Charging` (current flowing) gets the bolt and the green;
+   `PendingCharge` and `FullyCharged` get a **mains plug** and no tint at all. A laptop held at
+   ~80% by a charge limit sits in `PendingCharge` indefinitely, so a bolt there claims a current
+   that is not flowing.
+3. **Every overlay is a composited icon with a rim and a shadow**, sized to *cross* the body's
+   outline. A white glyph over a white fill is invisible — measured, not predicted: a plug over a
+   charged battery could not be seen at all. The rim (a dilated silhouette, a second asset) fixes
+   the contrast; the shadow makes the rim read as an outline rather than as part of the shape; the
+   size stops the glyph reading as debris trapped in the charge.
+4. **The critical glyph is an icon too**, not shaped text. That is what let it share the path
+   above, and it took the text shaping out of the bake entirely.
+
+Settled numbers, tuned by looking at rendered pixels at scale 1.25 (see `~/battery-states/`):
+body 26x13, radius 4.5, stroke 1.5, **inset 3** (2.5 welded the fill to the shell), nub 2.5x6 at
+**gap 0.5** (1.5 read as a detached tick), overlays **19** logical (**18** for the plug), shadow
+1.14x at +1px, rim black α0.75, shadow α0.3, green `$green_4` (`$green_3` shouted).
+
+Assets: `battery-{bolt,cord,alert}-symbolic.svg` and a `-halo-` rim for each, all ours
+(GPL-3.0-only), because no theme ships these alone — every themed battery bakes them into a whole
+battery, and we draw our own body. The bolt and alert rims are the same path **stroked in the fill
+colour**, since fill+stroke is a uniformly dilated silhouette; the plug's rim is hand-dilated rects
+from before that trick was found, and should switch if that shape is ever touched.
+
+**Validate with `debug-set-battery`**, not by waiting for hardware — and let the icon worker settle
+(~1.5s) before screenshotting, or a glyph that merely has not rasterized yet reads as a missing
+one. See `RUNNING.md`.
+
 ## Geometry
 
 Anchored to the existing panel metrics so it sits correctly among its neighbours:
