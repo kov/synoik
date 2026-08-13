@@ -402,25 +402,101 @@ fn mic_indicator_icon(mic: MicStatus) -> Option<(Vec<String>, [f32; 4])> {
     }
 }
 
+/// The charging bolt overlaid on the battery body — ours, not a theme icon
+/// (`resources/icons/battery-bolt-symbolic.svg`).
+const BOLT_ICON: &str = "battery-bolt-symbolic";
+
+/// The bolt's box. Smaller than a status icon: it sits *inside* the battery body, whose interior
+/// is only `BODY_H - 2 * INSET` tall.
+const QS_BOLT: f64 = 12.;
+
+/// The critical glyph drawn in the battery body, and its size.
+const ALERT_GLYPH: &str = "!";
+const ALERT_PT: f64 = 8.;
+
+/// The battery indicator's colour for a tint role.
+///
+/// Panel foreground indicators take the *lighter* palette step on our dark bar, the way
+/// `$privacy_indicator_color` does (`if($variant=='light', $orange_4, $orange_3)`,
+/// `_panel.scss:4`) — so palette step 3, not the `$warning_color`/`$error_color` *background*
+/// tokens, which are tuned to carry white text on top of them.
+fn battery_tint(tint: system_status::BatteryTint) -> [f32; 4] {
+    // `_palette.scss`: $green_3, $yellow_3, $red_3.
+    match tint {
+        system_status::BatteryTint::Normal => TEXT,
+        system_status::BatteryTint::Charging => rgb(0x33, 0xd1, 0x7a),
+        system_status::BatteryTint::Low => rgb(0xf6, 0xd3, 0x2d),
+        system_status::BatteryTint::Critical => rgb(0xe0, 0x1b, 0x24),
+    }
+}
+
+/// An opaque straight-alpha colour from 8-bit sRGB components.
+fn rgb(r: u8, g: u8, b: u8) -> [f32; 4] {
+    [
+        f32::from(r) / 255.,
+        f32::from(g) / 255.,
+        f32::from(b) / 255.,
+        1.,
+    ]
+}
+
+/// A revision of everything the battery bake draws, so the texture is rebuilt when — and only
+/// when — the picture changes.
+///
+/// The fill is quantised to whole physical-ish steps rather than keyed on the raw percentage: the
+/// bar is 21 logical px wide, so sub-half-percent changes cannot move it and would otherwise
+/// re-bake for nothing.
+fn battery_revision(look: &system_status::BatteryLook, fill: f64) -> u64 {
+    let steps = (widget::Battery::fill_width(fill) * 4.).round() as u64;
+    widget::Revision::new()
+        .of(look.tint as u8)
+        .of(look.bolt)
+        .of(look.alert)
+        .of(steps)
+        .done()
+}
+
+/// One slot in the quick-settings status cluster.
+///
+/// Almost every slot is a themed symbolic icon of [`QS_ICON`] width. The battery is not: it is a
+/// self-painted [`widget::Battery`] nearly twice as wide, which is the reason the cluster walks
+/// per-element widths ([`qs_slot_x`]) instead of `i * QS_ICON`.
+#[derive(Debug, Clone)]
+enum QsSlot {
+    /// Candidate icon names (first that resolves in the theme wins) and the tint to draw it in.
+    Icon(Vec<String>, [f32; 4]),
+    Battery(system_status::BatteryStatus),
+}
+
+impl QsSlot {
+    /// The width this slot occupies in the cluster.
+    fn width(&self) -> f64 {
+        match self {
+            QsSlot::Icon(..) => QS_ICON,
+            QsSlot::Battery(_) => widget::Battery::WIDTH,
+        }
+    }
+}
+
 /// The candidate icon-name lists for the quick-settings indicator, left-to-right:
 /// active toggle touches (DND / Night Light), then the live system cluster
 /// (network, then battery in the corner, like GNOME). Each entry is a candidate
 /// list; the first name that resolves in the theme is drawn. Falls back to the
 /// anchor icon so the cluster is never empty.
-fn qs_indicator_icons(
+fn qs_indicator_slots(
     toggles: QuickToggles,
     status: &SystemStatus,
     audio: Option<AudioStatus>,
     mic: MicStatus,
-) -> Vec<(Vec<String>, [f32; 4])> {
+) -> Vec<QsSlot> {
     let owned = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-    let mut v: Vec<(Vec<String>, [f32; 4])> = Vec::new();
+    let mut v: Vec<QsSlot> = Vec::new();
     if toggles.do_not_disturb {
-        v.push((owned(QS_DND_ICONS), TEXT));
+        v.push(QsSlot::Icon(owned(QS_DND_ICONS), TEXT));
     }
     if toggles.night_light {
-        v.push((owned(QS_NIGHT_ICONS), TEXT));
+        v.push(QsSlot::Icon(owned(QS_NIGHT_ICONS), TEXT));
     }
     // The network and airplane indicators are independent siblings in GNOME (`panel.js` adds
     // `_network` then `_rfkill`; `network.js` has no airplane input), so they can show together —
@@ -432,38 +508,61 @@ fn qs_indicator_icons(
     let airplane_on = status.airplane.show && status.airplane.active;
     if let Some(candidates) = system_status::network_icon(status.network) {
         if !(airplane_on && matches!(status.network, system_status::NetworkStatus::Offline)) {
-            v.push((owned(candidates), TEXT));
+            v.push(QsSlot::Icon(owned(candidates), TEXT));
         }
     }
     // Bluetooth: visible iff any connected device (`bluetooth.js:458-464`). GNOME's indicator
     // order puts bluetooth between network and rfkill (`panel.js:351-357`), so it slots here.
     if status.bluetooth.connected_count() > 0 {
-        v.push((owned(&["bluetooth-active-symbolic"]), TEXT));
+        v.push(QsSlot::Icon(owned(&["bluetooth-active-symbolic"]), TEXT));
     }
     if airplane_on {
-        v.push((owned(system_status::airplane_icon()), TEXT));
+        v.push(QsSlot::Icon(owned(system_status::airplane_icon()), TEXT));
     }
     if let Some(audio) = audio {
-        v.push((vec![crate::audio::volume_icon(&audio).to_string()], TEXT));
+        v.push(QsSlot::Icon(
+            vec![crate::audio::volume_icon(&audio).to_string()],
+            TEXT,
+        ));
     }
     // Power profile, shown only while active (not Balanced) — gnome-shell binds the rfkill-style
     // indicator's `visible` to the toggle's `checked` (`powerProfiles.js`). Sits just before the
     // battery (GNOME adds `_powerProfiles` right before `_system`, `panel.js`).
     if status.power.show && status.power.is_active() {
-        v.push((vec![status.power.icon().to_string()], TEXT));
+        v.push(QsSlot::Icon(vec![status.power.icon().to_string()], TEXT));
     }
     if let Some(battery) = &status.battery {
-        v.push((system_status::battery_icon(battery), TEXT));
+        v.push(QsSlot::Battery(battery.clone()));
     }
     // The mic privacy icon leads the cluster (GNOME inserts privacy indicators at the front,
     // `panel.js`), tinted orange while recording unmuted.
     if let Some(mic_icon) = mic_indicator_icon(mic) {
-        v.insert(0, mic_icon);
+        v.insert(0, QsSlot::Icon(mic_icon.0, mic_icon.1));
     }
     if v.is_empty() {
-        v.push((owned(QS_ANCHOR_ICONS), TEXT));
+        v.push(QsSlot::Icon(owned(QS_ANCHOR_ICONS), TEXT));
     }
     v
+}
+
+/// The cluster as themed icon names, one entry per slot, in cluster order.
+///
+/// A *slot identification* view, not a drawing one: the battery draws itself
+/// ([`widget::Battery`]) and contributes the symbolic name it would have had, so ordering tests
+/// and the volume slot lookup can index the cluster by icon name. Nothing renders from this.
+fn qs_indicator_icons(
+    toggles: QuickToggles,
+    status: &SystemStatus,
+    audio: Option<AudioStatus>,
+    mic: MicStatus,
+) -> Vec<(Vec<String>, [f32; 4])> {
+    qs_indicator_slots(toggles, status, audio, mic)
+        .into_iter()
+        .map(|slot| match slot {
+            QsSlot::Icon(candidates, color) => (candidates, color),
+            QsSlot::Battery(battery) => (system_status::battery_icon(&battery), TEXT),
+        })
+        .collect()
 }
 
 /// The widths of `n` slots that are all plain `.system-status-icon`s — the shape every cluster
@@ -511,14 +610,17 @@ fn qs_indicator_width(
 }
 
 /// The width of each quick-settings cluster slot, in cluster order. Derived from the same
-/// [`qs_indicator_icons`] walk the render loop and the hit tests use, so the three cannot drift.
+/// [`qs_indicator_slots`] walk the render loop and the hit tests use, so the three cannot drift.
 fn qs_indicator_widths(
     toggles: QuickToggles,
     status: &SystemStatus,
     audio: Option<AudioStatus>,
     mic: MicStatus,
 ) -> Vec<f64> {
-    icon_widths(qs_indicator_icons(toggles, status, audio, mic).len())
+    qs_indicator_slots(toggles, status, audio, mic)
+        .iter()
+        .map(QsSlot::width)
+        .collect()
 }
 
 /// One app indicator as the panel draws it: an id to act on and the icon name to resolve.
@@ -668,6 +770,20 @@ struct BarCache {
     ///
     /// Not dropped by `clear` — like [`Self::bg`], these hold no pixels, only identity.
     dots: Vec<RoundedSolidBuffer>,
+    /// The dynamic battery indicator's baked body, with the `(scale, revision)` it was baked at.
+    ///
+    /// A [`TextureBuffer`], not a bare texture, for the same reason [`Self::textures`] is: the
+    /// buffer carries the element `Id`, and rebuilding one per frame from an unchanged texture
+    /// churns that `Id` and forces a full redraw of every framebuffer effect on the output.
+    /// The battery is the worst possible offender for that — it is on screen at all times.
+    battery: Option<CachedBattery>,
+}
+
+/// The battery indicator's baked body and the key it is valid for.
+struct CachedBattery {
+    /// Scale plus a revision of everything the bake depends on — see [`battery_revision`].
+    key: (NotNan<f64>, u64),
+    buffer: TextureBuffer<VkTexture>,
 }
 
 impl BarCache {
@@ -678,6 +794,7 @@ impl BarCache {
             bg: SolidColorBuffer::default(),
             pills: widget::BakeCache::new(),
             dots: Vec::new(),
+            battery: None,
         }
     }
 
@@ -686,6 +803,8 @@ impl BarCache {
     /// bar re-bake, so a hover that redraws the bar never re-uploads an icon.
     fn clear(&mut self) {
         self.textures.clear();
+        // Holds a texture from the old renderer context, so it goes with them.
+        self.battery = None;
     }
 }
 
@@ -1476,7 +1595,7 @@ impl Panel {
         // The right-box status icons sit on top of the bar. Elements are pushed
         // first-topmost (the list is consumed in reverse). The workspace dots are now
         // drawn into the bar texture itself (rounded rects), not composited separately.
-        self.qs_indicator_elements(renderer, scale, width, &mut elements, icons);
+        self.qs_indicator_elements(renderer, scale, width, &mut elements, icons, &mut cache);
         self.app_indicator_elements(renderer, scale, width, &mut elements, caches);
 
         // The screen-recording indicator's stop glyph, composited on top of its red pill
@@ -1789,34 +1908,138 @@ impl Panel {
         output_width: f64,
         elements: &mut Vec<PanelElement>,
         icons: &IconCache,
+        cache: &mut BarCache,
     ) {
         let rect = self.quick_settings_rect(output_width);
+        let slots = qs_indicator_slots(self.toggles, &self.system_status, self.audio, self.mic);
         // Slot positions come from the shared width walk, never from a running cursor: a slot
         // whose icon fails to resolve must still consume its place, or every icon after it slides
         // left of where the hit tests look for it.
-        let widths = qs_indicator_widths(self.toggles, &self.system_status, self.audio, self.mic);
-        for (i, (candidates, color)) in
-            qs_indicator_icons(self.toggles, &self.system_status, self.audio, self.mic)
-                .into_iter()
-                .enumerate()
-        {
-            // The first candidate that resolves, in its tint.
-            let Some(tb) = candidates
-                .iter()
-                .find_map(|name| icons.texture(renderer, name, QS_ICON, scale, color))
-            else {
-                continue;
-            };
-            let logical = tb.logical_size();
+        let widths: Vec<f64> = slots.iter().map(QsSlot::width).collect();
+        for (i, slot) in slots.iter().enumerate() {
             // The first icon carries the box's leading `.system-status-icon` left margin.
-            let location = Point::from((
-                qs_slot_x(&widths, rect.loc.x, i),
-                (panel_height() - logical.h) / 2.,
-            ));
+            let x = qs_slot_x(&widths, rect.loc.x, i);
+            match slot {
+                QsSlot::Icon(candidates, color) => {
+                    // The first candidate that resolves, in its tint.
+                    let Some(tb) = candidates
+                        .iter()
+                        .find_map(|name| icons.texture(renderer, name, QS_ICON, scale, *color))
+                    else {
+                        continue;
+                    };
+                    let logical = tb.logical_size();
+                    let location = Point::from((x, (panel_height() - logical.h) / 2.));
+                    elements.push(PanelElement::Texture(
+                        TextureRenderElement::from_texture_buffer(
+                            tb,
+                            location,
+                            1.,
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ),
+                    ));
+                }
+                QsSlot::Battery(battery) => {
+                    self.battery_elements(renderer, scale, x, battery, elements, icons, cache);
+                }
+            }
+        }
+    }
+
+    /// The dynamic battery indicator at slot x: its baked body, plus the charging bolt composited
+    /// over it from the icon path like every other glyph in the cluster
+    /// (`docs/fork/battery-indicator-design.md`).
+    #[allow(clippy::too_many_arguments)]
+    fn battery_elements(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+        x: f64,
+        battery: &system_status::BatteryStatus,
+        elements: &mut Vec<PanelElement>,
+        icons: &IconCache,
+        cache: &mut BarCache,
+    ) {
+        let Ok(scale_key) = NotNan::new(scale) else {
+            return;
+        };
+        let look = system_status::battery_look(battery);
+        let fill = battery.percentage / 100.;
+        let key = (scale_key, battery_revision(&look, fill));
+        let y = (panel_height() - widget::Battery::HEIGHT) / 2.;
+
+        // Re-bake only when the drawn shape actually changes. The percentage moves a few times an
+        // hour, so this cache holds one entry that survives essentially the whole session.
+        if cache.battery.as_ref().map(|c| c.key) != Some(key) {
+            let w = widget::Battery {
+                fill,
+                tint: battery_tint(look.tint),
+                alert: look.alert,
+            };
+            let size = Size::from((widget::Battery::WIDTH, widget::Battery::HEIGHT));
+            // Shaped before the bake opens its frame: shaping needs the renderer, and the paint
+            // closure only has the frame.
+            let alert = w.alert.then(|| {
+                TextShaper::new(renderer, scale).shape(ALERT_GLYPH, TextStyle::new(ALERT_PT).bold())
+            });
+            let alert = match alert.transpose() {
+                Ok(alert) => alert,
+                Err(err) => {
+                    tracing::error!("error shaping the battery alert glyph: {err:#}");
+                    None
+                }
+            };
+            let baked = widget::bake_uncached(renderer, scale, size, |frame, phys| {
+                let mut p = Painter::new(frame, scale, phys);
+                p.clear(widget::style::TRANSPARENT)?;
+                p.battery(Point::from((0., 0.)), &w, alert.as_ref())
+            });
+            match baked {
+                Ok(texture) => {
+                    let buffer = TextureBuffer::from_texture(
+                        renderer,
+                        texture,
+                        scale,
+                        Transform::Normal,
+                        Vec::new(),
+                    );
+                    cache.battery = Some(CachedBattery { key, buffer });
+                }
+                Err(err) => {
+                    tracing::error!("error baking the battery indicator: {err:#}");
+                    return;
+                }
+            }
+        }
+
+        // The bolt sits over the body, so it is pushed first: elements are consumed in reverse.
+        if look.bolt {
+            if let Some(tb) = icons.texture(renderer, BOLT_ICON, QS_BOLT, scale, TEXT) {
+                let logical = tb.logical_size();
+                let location = Point::from((
+                    x + (widget::Battery::BODY_W - logical.w) / 2.,
+                    (panel_height() - logical.h) / 2.,
+                ));
+                elements.push(PanelElement::Texture(
+                    TextureRenderElement::from_texture_buffer(
+                        tb,
+                        location,
+                        1.,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ),
+                ));
+            }
+        }
+
+        if let Some(cached) = &cache.battery {
             elements.push(PanelElement::Texture(
                 TextureRenderElement::from_texture_buffer(
-                    tb,
-                    location,
+                    cached.buffer.clone(),
+                    Point::from((x, y)),
                     1.,
                     None,
                     None,
@@ -2292,6 +2515,70 @@ mod tests {
         assert_eq!(
             qs_cluster_width(&[wide]) - qs_cluster_width(&icon_widths(1)),
             wide - QS_ICON
+        );
+    }
+
+    /// The battery is the one cluster slot that is not `QS_ICON` wide, so the cluster must
+    /// reserve its real width and every hit test must survive it. This is the regression the
+    /// per-element-width walk exists to prevent: with fixed slots the battery drew over its
+    /// neighbour and a volume scroll landed on the wrong icon.
+    #[test]
+    fn the_battery_slot_reserves_its_own_width_and_shifts_nothing_onto_it() {
+        use crate::system_status::{BatteryStatus, NetworkStatus, SystemStatus};
+
+        let output_width = 1920.;
+        let mut panel = test_panel();
+        panel.set_system_status(SystemStatus {
+            network: NetworkStatus::Wired,
+            battery: Some(BatteryStatus {
+                icon_name: "battery-level-90-symbolic".to_string(),
+                percentage: 90.,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        panel.set_audio(Some(AudioStatus {
+            volume: 0.5,
+            muted: false,
+        }));
+
+        // Cluster order is network, volume, battery — and the battery slot is the wide one.
+        let widths =
+            qs_indicator_widths(panel.toggles, &panel.system_status, panel.audio, panel.mic);
+        assert_eq!(widths, vec![QS_ICON, QS_ICON, widget::Battery::WIDTH]);
+
+        // The cluster is wider than three icons by exactly the battery's excess.
+        let cluster = panel.quick_settings_rect(output_width);
+        assert_eq!(
+            cluster.size.w,
+            qs_cluster_width(&icon_widths(3)) + (widget::Battery::WIDTH - QS_ICON),
+            "the cluster must reserve the battery's real width"
+        );
+
+        // The volume box sits between them and touches neither neighbour's centre.
+        let volume = panel.volume_indicator_rect(output_width).unwrap();
+        let centre =
+            |i: usize| Point::from((qs_slot_x(&widths, cluster.loc.x, i) + widths[i] / 2., 10.));
+        assert!(volume.contains(centre(1)), "the volume icon is the second");
+        assert!(
+            !volume.contains(centre(0)),
+            "the network icon must not scroll volume"
+        );
+        assert!(
+            !volume.contains(centre(2)),
+            "the battery must not scroll volume"
+        );
+
+        // And the battery's whole slot clears the volume box, not merely its centre: a wide slot
+        // whose width was ignored would start inside its neighbour.
+        let battery_x = qs_slot_x(&widths, cluster.loc.x, 2);
+        assert!(
+            battery_x >= volume.loc.x + volume.size.w,
+            "the battery slot starts at or after the volume box ends"
+        );
+        assert!(
+            battery_x + widget::Battery::WIDTH <= cluster.loc.x + cluster.size.w,
+            "and ends inside the cluster"
         );
     }
 

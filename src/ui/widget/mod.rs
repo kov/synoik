@@ -3653,12 +3653,14 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         // takes the panel foreground rather than the tint it would otherwise vanish into.
         if b.alert {
             if let Some(shaped) = alert {
-                let (x0, y0, x1, y1) = shaped.ink_bounds();
+                // `ink_bounds` is (x, y, w, h) — the run's own ink offset, which the origin has to
+                // subtract out before centring, exactly as the content-sized bakes do.
+                let (ix, iy, iw, ih) = shaped.ink_bounds();
                 let cx = origin.x + Battery::BODY_W / 2.;
                 let cy = origin.y + Battery::BODY_H / 2.;
                 let origin_px = Point::<i32, Physical>::from((
-                    to_physical_precise_round::<i32>(self.scale, cx) - (x0 + x1) / 2,
-                    to_physical_precise_round::<i32>(self.scale, cy) - (y0 + y1) / 2,
+                    to_physical_precise_round::<i32>(self.scale, cx) - ix - iw / 2,
+                    to_physical_precise_round::<i32>(self.scale, cy) - iy - ih / 2,
                 ));
                 self.text_px(shaped, origin_px, style::TEXT)?;
             }
