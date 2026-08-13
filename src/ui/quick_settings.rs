@@ -133,6 +133,29 @@ const PILL_ICON_INSET: f64 = 15.;
 /// gnome-shell's to fit it without crowding the percentage.
 const PILL_ICON_SLOT: f64 = widget::Battery::WIDTH;
 
+/// The pill's percentage label, and its style — shared so the chrome bake and the element pass
+/// measure the same string and cannot disagree about where the contents start.
+fn pill_label(battery: &BatteryStatus) -> String {
+    format!("{}%", battery.percentage.round() as i64)
+}
+
+fn pill_label_style() -> TextStyle {
+    TextStyle::new(LABEL_PT).bold()
+}
+
+/// Where the pill's contents start, given the percentage label's measured width.
+///
+/// **Centred as a group, not left-anchored.** gnome-shell pins its contents to a fixed left inset
+/// inside a fixed-width pill, which is fine when the icon is 16px and the slack is small. Ours is
+/// nearly twice that, so the pill had to grow — and all of the growth landed to the right of the
+/// label, which read as lopsided. Centring spends the slack on both sides instead. It costs the
+/// battery a small horizontal shift when the label gains or loses a digit, which happens a handful
+/// of times in a battery's life.
+fn pill_content_x(pill: Rectangle<f64, Logical>, label_w: f64) -> f64 {
+    let group = PILL_ICON_SLOT + TILE_ICON_GAP + label_w;
+    pill.loc.x + ((pill.size.w - group) / 2.).max(PILL_ICON_INSET)
+}
+
 /// The volume slider row (gnome-shell's `.quick-slider`): a full-width row between the
 /// system row and the tile grid with a mute icon-button at the left and the slider
 /// track filling the rest. Height is the `.icon-button` disc; the track is a thin
@@ -175,6 +198,12 @@ const ARROW_ICONS: &[&str] = &["go-next-symbolic", "pan-end-symbolic"];
 /// The 1px divider between a menu tile's toggle-half and its arrow-half
 /// (`.quick-toggle-separator`); a faint line readable on both the off and accent backgrounds.
 const SEPARATOR_W: f64 = 1.;
+
+/// The gap a menu tile's label keeps clear of the separator. gnome-shell gives the toggle-half's
+/// box `padding-right: $scaled_padding * 1.5` when it has a menu
+/// (`_quick-settings.scss:56-58`; `$scaled_padding` is 6px, `_common.scss:57`) — we had no such
+/// padding, so the label ran flush into the divider and "Power Mode" nearly touched it.
+const TILE_MENU_PAD: f64 = 9.;
 const SEPARATOR_COLOR: [f32; 4] = [1., 1., 1., 0.22];
 
 /// The in-menu detail view (gnome-shell's `QuickToggleMenu`): a rounded card pinned directly
@@ -2310,8 +2339,14 @@ impl QuickSettings {
         if let (Some(battery), Some(pill)) = (&self.battery, pill_rect(self.has_pill())) {
             let look = system_status::battery_look(battery);
             if let Some(g) = widget::battery_overlay_glyph(look.overlay) {
+                // Measured the same way the bake measures it, so the glyph lands on the body it
+                // belongs to rather than on where a fixed inset would have put it.
+                let label_w = TextShaper::new(renderer, scale)
+                    .shape(&pill_label(battery), pill_label_style())
+                    .map(|run| run.ink_bounds().2 as f64 / scale)
+                    .unwrap_or_default();
                 let center = Point::from((
-                    pill.loc.x + PILL_ICON_INSET + widget::Battery::BODY_W / 2.,
+                    pill_content_x(pill, label_w) + widget::Battery::BODY_W / 2.,
                     pill.loc.y + pill.size.h / 2.,
                 ));
                 elements.extend(widget::battery_overlay_elements(
@@ -2459,7 +2494,7 @@ impl QuickSettings {
             let pill_run = self
                 .battery
                 .as_ref()
-                .map(|b| shaper.shape(&format!("{}%", b.percentage.round() as i64), label_style))
+                .map(|b| shaper.shape(&pill_label(b), pill_label_style()))
                 .transpose()?;
             // The open detail view's header title (bold, `%title_3`) + its regular-weight rows.
             let detail_runs = self
@@ -2574,8 +2609,20 @@ impl QuickSettings {
                 let center_y = rect.loc.y + rect.size.h / 2.;
                 let run = &label_runs[i];
                 // Clip the label to the toggle-body so a long name can't run under the arrow
-                // (gnome-shell ellipsizes; clipping is the minimal faithful bound).
-                let clip = tile_body_rect(i, item, layout);
+                // (gnome-shell ellipsizes; clipping is the minimal faithful bound), stopping
+                // `TILE_MENU_PAD` short of the separator on a menu tile — the body rect is the
+                // *hit* region and runs to the divider, which is not where text may go.
+                let clip = {
+                    let body = tile_body_rect(i, item, layout);
+                    if tile_arrow_rect(i, item, layout).is_some() {
+                        Rectangle::new(
+                            body.loc,
+                            Size::from((body.size.w - TILE_MENU_PAD, body.size.h)),
+                        )
+                    } else {
+                        body
+                    }
+                };
                 match &subtitle_runs[i] {
                     // Two-line tile (Power Mode): title above center, subtitle below.
                     Some(sub) => {
@@ -2616,6 +2663,7 @@ impl QuickSettings {
                 }
                 // The indicator's body is painted into this bake, like the slab under it; only
                 // its overlay glyph composites on top, the same split the panel uses.
+                let content_x = pill_content_x(pill, run.ink_bounds().2 as f64 / scale);
                 if let Some(battery) = &self.battery {
                     let look = system_status::battery_look(battery);
                     let w = widget::Battery {
@@ -2625,13 +2673,13 @@ impl QuickSettings {
                     };
                     p.battery(
                         Point::from((
-                            pill.loc.x + PILL_ICON_INSET,
+                            content_x,
                             pill.loc.y + (pill.size.h - widget::Battery::HEIGHT) / 2.,
                         )),
                         &w,
                     )?;
                 }
-                let label_x = pill.loc.x + PILL_ICON_INSET + PILL_ICON_SLOT + TILE_ICON_GAP;
+                let label_x = content_x + PILL_ICON_SLOT + TILE_ICON_GAP;
                 let label_cy = pill.loc.y + pill.size.h / 2.;
                 p.text(
                     run,
