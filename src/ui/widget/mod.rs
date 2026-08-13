@@ -2399,9 +2399,6 @@ pub struct Battery {
     /// The fill bar's colour — the channel that actually carries state, so colour appears *in*
     /// the charge rather than around it.
     pub fill_tint: Rgba,
-    /// Draw the critical glyph over the body. Deliberately redundant with a red tint: colour
-    /// alone is not a channel a colour-blind reader has.
-    pub alert: bool,
 }
 
 impl Battery {
@@ -3621,17 +3618,13 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
     /// The dynamic battery indicator ([`Battery`]), drawn at `origin` (its top-left) in a box
     /// [`Battery::WIDTH`] x [`Battery::HEIGHT`].
     ///
-    /// `alert` is the pre-shaped critical glyph; the caller shapes it in its bake's `prepare`
-    /// step, and passing `None` while `b.alert` is set simply omits it rather than failing.
+    /// Draws the housing, the charge and the nub, and nothing else: the charging bolt, the mains
+    /// plug and the critical glyph are all composited over this by the caller, through the icon
+    /// path, so each can carry the rim and shadow that let it survive a white fill.
     ///
     /// The shell is a real [`Self::stroke_rounded`], never a fill-then-inner-fill: that idiom
     /// cannot round its corners and would put a hard edge where the mockup has a radius.
-    pub fn battery(
-        &mut self,
-        origin: Point<f64, Logical>,
-        b: &Battery,
-        alert: Option<&ShapedText>,
-    ) -> anyhow::Result<()> {
+    pub fn battery(&mut self, origin: Point<f64, Logical>, b: &Battery) -> anyhow::Result<()> {
         let body = Rectangle::new(origin, Size::from((Battery::BODY_W, Battery::BODY_H)));
         self.stroke_rounded(body, Battery::RADIUS, Battery::STROKE, b.body_tint)?;
 
@@ -3655,23 +3648,6 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
             Size::from((Battery::NUB_W, Battery::NUB_H)),
         );
         self.fill_rounded(nub, Battery::NUB_W / 2., b.body_tint)?;
-
-        // The critical glyph, centred over the body. It reads against the fill beneath it, so it
-        // takes the panel foreground rather than the tint it would otherwise vanish into.
-        if b.alert {
-            if let Some(shaped) = alert {
-                // `ink_bounds` is (x, y, w, h) — the run's own ink offset, which the origin has to
-                // subtract out before centring, exactly as the content-sized bakes do.
-                let (ix, iy, iw, ih) = shaped.ink_bounds();
-                let cx = origin.x + Battery::BODY_W / 2.;
-                let cy = origin.y + Battery::BODY_H / 2.;
-                let origin_px = Point::<i32, Physical>::from((
-                    to_physical_precise_round::<i32>(self.scale, cx) - ix - iw / 2,
-                    to_physical_precise_round::<i32>(self.scale, cy) - iy - ih / 2,
-                ));
-                self.text_px(shaped, origin_px, style::TEXT)?;
-            }
-        }
         Ok(())
     }
 

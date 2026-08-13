@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only
+     Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
+     OURS, not bundled. The dark rim drawn behind battery-bolt-symbolic: the
+     same path, stroked in the fill colour so the union of fill and stroke is a
+     uniformly dilated silhouette. Keep the path identical to the glyph's — the
+     stroke width is the only difference.
+
+     See docs/fork/battery-indicator-design.md. -->
+<svg height="16" width="16" xmlns="http://www.w3.org/2000/svg"><path style="fill:#bebebe;fill-opacity:1;stroke:#bebebe;stroke-width:1.7;stroke-linejoin:round;stroke-opacity:1" d="M9.5 1.5 4 8.5h3.2L6.5 14.5 12 7.5H8.8Z"/></svg>

@@ -402,35 +402,62 @@ fn mic_indicator_icon(mic: MicStatus) -> Option<(Vec<String>, [f32; 4])> {
     }
 }
 
-/// The glyphs overlaid on the battery body — both ours, not theme icons
-/// (`resources/icons/battery-{bolt,cord}-symbolic.svg`).
-const BOLT_ICON: &str = "battery-bolt-symbolic";
-const CORD_ICON: &str = "battery-cord-symbolic";
+/// How an overlay glyph is drawn: the glyph itself, its dilated silhouette for the rim and
+/// shadow, and the box it occupies.
+struct OverlayGlyph {
+    icon: &'static str,
+    halo: &'static str,
+    /// Logical px. All three are taller than the body (13) on purpose, so the glyph breaks the
+    /// battery's outline instead of sitting trapped inside the charge.
+    px: f64,
+}
 
-/// The icon name for an overlay, if it is drawn as one. `Alert` is text, not an icon, and is
-/// baked into the body by [`widget::Painter::battery`].
-fn battery_overlay_icon(overlay: system_status::BatteryOverlay) -> Option<&'static str> {
+/// The glyph for an overlay, if it has one. All are ours, not theme icons
+/// (`resources/icons/battery-*-symbolic.svg`) — no theme ships these alone, because every themed
+/// battery bakes them into a whole battery and we draw our own body.
+fn battery_overlay_glyph(overlay: system_status::BatteryOverlay) -> Option<OverlayGlyph> {
+    let glyph = |icon, halo, px| Some(OverlayGlyph { icon, halo, px });
     match overlay {
-        system_status::BatteryOverlay::Bolt => Some(BOLT_ICON),
-        system_status::BatteryOverlay::Cord => Some(CORD_ICON),
-        system_status::BatteryOverlay::None | system_status::BatteryOverlay::Alert => None,
+        system_status::BatteryOverlay::Bolt => glyph(
+            "battery-bolt-symbolic",
+            "battery-bolt-halo-symbolic",
+            QS_OVERLAY,
+        ),
+        system_status::BatteryOverlay::Cord => glyph(
+            "battery-cord-symbolic",
+            "battery-cord-halo-symbolic",
+            QS_CORD,
+        ),
+        system_status::BatteryOverlay::Alert => glyph(
+            "battery-alert-symbolic",
+            "battery-alert-halo-symbolic",
+            QS_OVERLAY,
+        ),
+        system_status::BatteryOverlay::None => None,
     }
 }
 
-/// The bolt's box. Smaller than a status icon: it sits *inside* the battery body, whose interior
-/// is only `BODY_H - 2 * INSET` tall.
-const QS_BOLT: f64 = 12.;
+/// The bolt's and the alert glyph's box. Taller than the battery body (13), like the plug, so
+/// they cross its outline rather than sitting inside the charge.
+const QS_OVERLAY: f64 = 19.;
 
 /// The mains plug's box. Deliberately taller than the battery body (13), so the plug breaks the
 /// body's outline top and bottom instead of sitting trapped inside it — at body height it was
 /// legible but cramped, and read as debris in the charge rather than as a plug.
 const QS_CORD: f64 = 18.;
 
-/// The plug's drop shadow: the same rim silhouette, a touch larger and nudged down, at low alpha.
-/// Lifts the glyph off the fill so the rim reads as its outline rather than as part of the shape.
-const CORD_SHADOW_SCALE: f64 = 1.14;
-const CORD_SHADOW_DY: f64 = 1.;
-const CORD_SHADOW: [f32; 4] = [0., 0., 0., 0.3];
+/// Every battery overlay glyph is drawn in three layers: the white glyph, a dark rim, and a
+/// shadow. The rim is a dilated silhouette of the same shape (a second asset — a symbolic carries
+/// one colour, its alpha being the coverage, so an outline cannot be a stroke on the glyph
+/// itself); the shadow is that silhouette again, larger and nudged down.
+///
+/// The rim is what makes a white glyph survive a white fill — measured on the seat, where a plug
+/// over a charged battery was invisible. The shadow is what makes the rim read as an *outline*
+/// rather than as part of the shape.
+const GLYPH_SHADOW_SCALE: f64 = 1.14;
+const GLYPH_SHADOW_DY: f64 = 1.;
+const GLYPH_RIM: [f32; 4] = [0., 0., 0., 0.75];
+const GLYPH_SHADOW: [f32; 4] = [0., 0., 0., 0.3];
 
 /// Push one themed glyph centred on `cx`, vertically centred in the bar and nudged down by `dy`.
 ///
@@ -457,21 +484,6 @@ fn push_centered_glyph(
         TextureRenderElement::from_texture_buffer(tb, location, 1., None, None, Kind::Unspecified),
     ));
 }
-
-/// The dark rim drawn behind the mains plug.
-///
-/// A cord state's fill is white by design, so a white plug over it dissolved into the charge —
-/// measured on the seat, where `fully-charged` showed no plug at all. The rim is a dilated
-/// silhouette of the same shape drawn behind it, so the glyph reads over the fill and over the
-/// empty section both, at any charge.
-///
-/// The bolt needs none: a charging fill is green, which white already separates from.
-const CORD_HALO_ICON: &str = "battery-cord-halo-symbolic";
-const CORD_HALO: [f32; 4] = [0., 0., 0., 0.75];
-
-/// The critical glyph drawn in the battery body, and its size.
-const ALERT_GLYPH: &str = "!";
-const ALERT_PT: f64 = 8.;
 
 /// The battery indicator's colour for a tint role.
 ///
@@ -2047,25 +2059,12 @@ impl Panel {
                 fill,
                 body_tint: battery_tint(look.body),
                 fill_tint: battery_tint(look.fill),
-                alert: look.overlay == system_status::BatteryOverlay::Alert,
             };
             let size = Size::from((widget::Battery::WIDTH, widget::Battery::HEIGHT));
-            // Shaped before the bake opens its frame: shaping needs the renderer, and the paint
-            // closure only has the frame.
-            let alert = w.alert.then(|| {
-                TextShaper::new(renderer, scale).shape(ALERT_GLYPH, TextStyle::new(ALERT_PT).bold())
-            });
-            let alert = match alert.transpose() {
-                Ok(alert) => alert,
-                Err(err) => {
-                    tracing::error!("error shaping the battery alert glyph: {err:#}");
-                    None
-                }
-            };
             let baked = widget::bake_uncached(renderer, scale, size, |frame, phys| {
                 let mut p = Painter::new(frame, scale, phys);
                 p.clear(widget::style::TRANSPARENT)?;
-                p.battery(Point::from((0., 0.)), &w, alert.as_ref())
+                p.battery(Point::from((0., 0.)), &w)
             });
             match baked {
                 Ok(texture) => {
@@ -2086,39 +2085,26 @@ impl Panel {
         }
 
         // The glyph sits over the body, so it is pushed first: elements are consumed in reverse.
-        if let Some(name) = battery_overlay_icon(look.overlay) {
-            let cord = look.overlay == system_status::BatteryOverlay::Cord;
-            let px = if cord { QS_CORD } else { QS_BOLT };
+        if let Some(g) = battery_overlay_glyph(look.overlay) {
             // Centred on the *body*, not on the slot: the nub is not part of the battery's face.
             let cx = x + widget::Battery::BODY_W / 2.;
-            // Pushed topmost-first, so the glyph goes down before the rim it sits on and the rim
-            // before the shadow under both. All three share a centre, so they stay concentric at
-            // any size.
-            push_centered_glyph(renderer, icons, elements, name, px, scale, TEXT, cx, 0.);
-            if cord {
-                push_centered_glyph(
-                    renderer,
-                    icons,
-                    elements,
-                    CORD_HALO_ICON,
-                    px,
-                    scale,
-                    CORD_HALO,
-                    cx,
-                    0.,
-                );
-                push_centered_glyph(
-                    renderer,
-                    icons,
-                    elements,
-                    CORD_HALO_ICON,
-                    px * CORD_SHADOW_SCALE,
-                    scale,
-                    CORD_SHADOW,
-                    cx,
-                    CORD_SHADOW_DY,
-                );
-            }
+            // Topmost-first, so the glyph goes down before the rim it sits on and the rim before
+            // the shadow under both. All three share a centre, so they stay concentric.
+            push_centered_glyph(renderer, icons, elements, g.icon, g.px, scale, TEXT, cx, 0.);
+            push_centered_glyph(
+                renderer, icons, elements, g.halo, g.px, scale, GLYPH_RIM, cx, 0.,
+            );
+            push_centered_glyph(
+                renderer,
+                icons,
+                elements,
+                g.halo,
+                g.px * GLYPH_SHADOW_SCALE,
+                scale,
+                GLYPH_SHADOW,
+                cx,
+                GLYPH_SHADOW_DY,
+            );
         }
 
         if let Some(cached) = &cache.battery {

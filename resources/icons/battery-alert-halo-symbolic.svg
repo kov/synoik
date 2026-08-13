@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only
+     Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
+     OURS, not bundled. The dark rim behind battery-alert-symbolic: the same two
+     shapes, stroked in the fill colour so fill plus stroke is a uniformly
+     dilated silhouette. Keep the shapes identical to the glyph's.
+
+     See docs/fork/battery-indicator-design.md. -->
+<svg height="16" width="16" xmlns="http://www.w3.org/2000/svg"><g style="fill:#bebebe;fill-opacity:1;stroke:#bebebe;stroke-width:1.7;stroke-linejoin:round;stroke-opacity:1"><rect height="7.6" rx="1.1" width="2.2" x="6.9" y="2.4"/><circle cx="8" cy="12.4" r="1.35"/></g></svg>
