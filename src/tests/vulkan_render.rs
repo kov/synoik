@@ -14131,8 +14131,9 @@ fn vulkan_an_empty_focused_entry_draws_its_caret() {
     };
 
     const W: f64 = 320.;
+    const SCALE: f64 = 2.;
     let h = widget::Entry::HEIGHT;
-    let size = widget::physical_size(1., Size::from((W, h)));
+    let size = widget::physical_size(SCALE, Size::from((W, h)));
 
     let state = f.synoik_state();
     let shots = state
@@ -14147,7 +14148,7 @@ fn vulkan_an_empty_focused_entry_draws_its_caret() {
                 let texture = widget::Entry::bake(
                     vk,
                     &mut cache,
-                    1.,
+                    SCALE,
                     W,
                     h,
                     widget::EntryContent {
@@ -14159,7 +14160,9 @@ fn vulkan_an_empty_focused_entry_draws_its_caret() {
                         preedit: None,
                     },
                     widget::EntryStyle::Lockscreen,
-                    cursor.is_some(),
+                    // Focused in BOTH arms: vary only the caret, or the focus ring is what the
+                    // diff measures and the caret can be missing with the test still green.
+                    true,
                     false,
                     widget::style::TEXT,
                     rev,
@@ -14179,7 +14182,7 @@ fn vulkan_an_empty_focused_entry_draws_its_caret() {
                     None,
                     Kind::Unspecified,
                 );
-                out.push(composite_ui(vk, vec![element], size, Scale::from(1.)));
+                out.push(composite_ui(vk, vec![element], size, Scale::from(SCALE)));
             }
             Ok([out.remove(0), out.remove(0)])
         })
@@ -14192,8 +14195,13 @@ fn vulkan_an_empty_focused_entry_draws_its_caret() {
         .zip(unfocused.chunks_exact(4))
         .filter(|(a, b)| a != b)
         .count();
+    // A whole bar, not a sliver: the caret rides the run's *pen*, which sits left of the ink by
+    // the first glyph's side bearing, so a caret at offset 0 lands outside the text clip and is
+    // shaved down to nothing. Counting the rows it covers is what tells the two apart.
     assert!(
-        differing > 0,
-        "a focused empty entry composited identically to an unfocused one — no caret was drawn"
+        differing >= (size.h / 2) as usize,
+        "a focused empty entry drew {differing} px more than an unfocused one — \
+         expected a caret bar spanning most of a {}px-tall field",
+        size.h
     );
 }

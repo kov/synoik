@@ -1570,7 +1570,23 @@ impl Entry {
                 p.text_band(shaped, anchor, halign, 0., height, color, clip)?;
 
                 if let Some(at_byte) = cursor {
-                    p.caret(m.x_at(&display, at_byte), band, style::TEXT, Some(clip))?;
+                    // With nothing typed, the run that got shaped is the **placeholder**, and the
+                    // caret has no business riding its metrics: the pen sits left of that run's
+                    // ink by the first glyph's left side bearing, so the bar landed outside the
+                    // text clip and was shaved away to nothing. It is font-dependent, which is how
+                    // it survived every test — the caret was there under the harness's fallback
+                    // face and gone under Adwaita Sans on the seat.
+                    //
+                    // An empty entry's caret belongs where the first typed glyph's ink will start,
+                    // which is the text origin. Not folded into `x_at`: with text present and the
+                    // run scrolled, a caret at offset 0 is legitimately off the left edge and
+                    // clipping it away is right.
+                    let x = if empty {
+                        leading
+                    } else {
+                        m.x_at(&display, at_byte)
+                    };
+                    p.caret(x, band, style::TEXT, Some(clip))?;
                 }
                 Ok(())
             },
