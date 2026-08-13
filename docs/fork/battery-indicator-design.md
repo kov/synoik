@@ -194,11 +194,35 @@ Per the toolkit-first rule, this is a `widget::` type, not a one-off in
 have — `stroke_rounded` for the shell, `fill_rounded` for the bar and the nub,
 `text_px` for the "!" and the optional percentage.
 
-The one genuinely new verb is the **charging bolt**. It is a polygon, and
-`Painter::triangle` exists, so two triangles would work — but a bolt drawn as two
-triangles is exactly the fill-full-plus-inner class of fake that the rule warns
-about, and it can't be given a knockout outline later. Add `Painter::bolt` as a
-real verb.
+### The charging bolt is an open decision (2026-08-13)
+
+The bolt is the one part with no obvious home, and the first draft of this doc
+was too glib about it ("add `Painter::bolt`"). The renderer's whole primitive set
+is `render_rounded_rect`, `render_rounded_rect_faded`, `stroke_rounded_rect`,
+`render_triangle` and the glyph paths (`vulkan/frame.rs:615-853`) — there is no
+arbitrary-polygon verb. So there are three real options, not one:
+
+- **A. Two `Painter::triangle` calls.** No new machinery, but a bolt assembled
+  from two triangles is exactly the fill-full-plus-inner class of fake the
+  toolkit-first rule warns about: it can't take a knockout outline, and the joint
+  will show at some scale.
+- **B. A new renderer primitive** (an SDF or polygon verb) behind
+  `Painter::bolt`. Honest, reusable, and the only option that makes the bolt a
+  first-class shape — but it is renderer work, so it owes a
+  `SYNOIK_VK_VALIDATION=1` run.
+- **C. Ship a bolt asset and load it through the icon path.** `IconCache::texture`
+  already rasterizes and *tints* symbolic SVGs, which is how every other glyph in
+  this cluster is drawn, so the bolt would compose exactly like its neighbours for
+  free. Adwaita has no standalone bolt — every charging glyph bakes the bolt into
+  a whole battery (`battery-level-*-charging-symbolic`) — so this means adding one
+  small asset of our own.
+
+**Leaning C**, on the grounds that the bolt is a glyph and we already have a
+glyph path; B is the answer only if we find we want bolts (or other small shapes)
+somewhere the icon path can't reach. Not decided — kov's call.
+
+Nothing else in the design needs a new verb: the shell is `stroke_rounded`, the
+bar and nub are `fill_rounded`, the "!" and the percentage are `text_px`.
 
 Everything is painted, so there is no offscreen and **no rounded clipping** — this
 design does not reopen `clip_to_geometry` (`433d255f`).
