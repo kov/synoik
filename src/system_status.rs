@@ -420,22 +420,42 @@ pub fn battery_icon(battery: &BatteryStatus) -> Vec<String> {
 /// pure function the corpus can table-test without a renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatteryLook {
-    pub tint: BatteryTint,
-    /// Draw the charging bolt over the fill — only while current is actually flowing in.
-    pub bolt: bool,
-    /// Draw the critical "!" glyph. Deliberately redundant with [`BatteryTint::Critical`]: colour
-    /// alone is not an accessible channel, so the shape is what carries the state for a
-    /// colour-blind reader, and the red is the redundant half.
-    pub alert: bool,
+    /// The shell (housing) tint. Normally the panel foreground, like every neighbouring icon —
+    /// the housing is not what carries the reading. It only leaves white when the whole indicator
+    /// goes red, which the mockup reserves for critical.
+    pub body: BatteryTint,
+    /// The fill bar's tint. **This** is the channel that carries state: colour appears in the
+    /// charge, not around it.
+    pub fill: BatteryTint,
+    /// The glyph drawn over the body, if any.
+    pub overlay: BatteryOverlay,
+}
+
+/// What is drawn over the battery body.
+///
+/// `Bolt` and `Cord` are the two halves of "on external power", and telling them apart is the
+/// point: a laptop that stops charging at 80% to spare the cell sits in
+/// [`BatteryState::PendingCharge`] indefinitely, so a bolt there claims a current that is not
+/// flowing. Same for a battery that has reached 100%.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BatteryOverlay {
+    #[default]
+    None,
+    /// Charging: current is flowing in.
+    Bolt,
+    /// Plugged in and *not* charging — held below full, or already full.
+    Cord,
+    /// Critical. A shape, because colour alone is not a channel a colour-blind reader has.
+    Alert,
 }
 
 /// The indicator's colour role. Resolved to pixels by the panel, which owns the palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BatteryTint {
-    /// Panel foreground white — discharging normally, or state unknown.
+    /// Panel foreground — the same light grey the wifi and volume glyphs use.
     #[default]
     Normal,
-    /// On external power.
+    /// Actively charging.
     Charging,
     Low,
     Critical,
@@ -444,21 +464,38 @@ pub enum BatteryTint {
 /// The indicator's appearance for a battery state.
 ///
 /// **State decides first, warning level second.** UPower keeps reporting a warning level while
-/// plugged in, so a machine charging from 3% must read as charging, not critical — and, the other
-/// way round, `Charging` is not the only on-AC state ([`BatteryState::on_ac`]).
+/// plugged in, so a machine charging from 3% must read as charging, not critical — and
+/// [`BatteryState::Charging`] is not the only on-AC state.
+///
+/// Colour is spent narrowly and on purpose. Being on mains is the *least* eventful thing a desktop
+/// does, and it is permanent there, so it gets a glyph rather than a tint: only an actively
+/// flowing charge is green, and plugged-but-idle looks exactly like a healthy battery with a plug
+/// beside it. Yellow and red then mean what they say.
 pub fn battery_look(battery: &BatteryStatus) -> BatteryLook {
-    let look = |tint, bolt, alert| BatteryLook { tint, bolt, alert };
+    use BatteryOverlay as O;
+    use BatteryTint as T;
+    let look = |body, fill, overlay| BatteryLook {
+        body,
+        fill,
+        overlay,
+    };
     match battery.state {
-        // On external power: green, and the bolt only while current is flowing in.
-        s if s.on_ac() => look(BatteryTint::Charging, s == BatteryState::Charging, false),
-        BatteryState::Empty => look(BatteryTint::Critical, false, true),
-        BatteryState::Unknown => look(BatteryTint::Normal, false, false),
+        // Current flowing in: the charge itself is green, the housing stays panel foreground.
+        BatteryState::Charging => look(T::Normal, T::Charging, O::Bolt),
+        // On mains, not charging — held below full by a charge limit, or already full.
+        BatteryState::FullyCharged | BatteryState::PendingCharge => {
+            look(T::Normal, T::Normal, O::Cord)
+        }
+        BatteryState::Empty => look(T::Critical, T::Critical, O::Alert),
+        BatteryState::Unknown => look(T::Normal, T::Normal, O::None),
         // Discharging (or pending discharge): the warning level decides.
         _ => match battery.warning {
-            BatteryWarning::None => look(BatteryTint::Normal, false, false),
-            BatteryWarning::Low => look(BatteryTint::Low, false, false),
+            BatteryWarning::None => look(T::Normal, T::Normal, O::None),
+            // Low tints the charge only; the housing is still just a housing.
+            BatteryWarning::Low => look(T::Normal, T::Low, O::None),
+            // Critical is the one state that turns the *whole* indicator red.
             BatteryWarning::Critical | BatteryWarning::Action => {
-                look(BatteryTint::Critical, false, true)
+                look(T::Critical, T::Critical, O::Alert)
             }
         },
     }
@@ -681,11 +718,12 @@ mod tests {
         );
     }
 
-    /// Every `State` row, because charging is not the only on-AC state: this VM sits at
-    /// `PendingCharge` at 79%, and a naive `state == Charging` test paints a plugged-in machine
-    /// as plainly discharging.
+    /// The on-AC states, and the distinction that matters most on real hardware: a laptop held at
+    /// ~80% by a charge limit reports `PendingCharge` *indefinitely*, so a bolt there would claim
+    /// a current that is not flowing. It gets a cord instead, and no colour at all — being on
+    /// mains is the least eventful thing a machine does, and on a desktop it is permanent.
     #[test]
-    fn every_on_ac_state_reads_as_charging_and_only_charging_gets_the_bolt() {
+    fn plugged_in_but_not_charging_shows_a_cord_and_no_colour() {
         let at = |state, warning| {
             battery_look(&BatteryStatus {
                 state,
@@ -694,28 +732,40 @@ mod tests {
             })
         };
 
-        for state in [
-            BatteryState::Charging,
-            BatteryState::FullyCharged,
-            BatteryState::PendingCharge,
-        ] {
+        // Current actually flowing: green, in the charge only, with a bolt.
+        let charging = at(BatteryState::Charging, BatteryWarning::None);
+        assert_eq!(charging.fill, BatteryTint::Charging);
+        assert_eq!(
+            charging.body,
+            BatteryTint::Normal,
+            "the housing stays neutral"
+        );
+        assert_eq!(charging.overlay, BatteryOverlay::Bolt);
+
+        // Held below full, or already full: a cord, and nothing tinted.
+        for state in [BatteryState::PendingCharge, BatteryState::FullyCharged] {
             let look = at(state, BatteryWarning::None);
-            assert_eq!(look.tint, BatteryTint::Charging, "{state:?} is on AC");
-            assert!(!look.alert, "{state:?} must not alert");
             assert_eq!(
-                look.bolt,
-                state == BatteryState::Charging,
-                "{state:?}: the bolt means current is flowing in, not merely plugged in"
+                look.overlay,
+                BatteryOverlay::Cord,
+                "{state:?} is plugged in but not charging"
             );
+            assert_eq!(
+                look.fill,
+                BatteryTint::Normal,
+                "{state:?} must not read as charging"
+            );
+            assert_eq!(look.body, BatteryTint::Normal);
         }
 
-        // On AC the warning level is stale news: charging out of a critical charge reads green.
-        let charging_from_empty = at(BatteryState::Charging, BatteryWarning::Action);
-        assert_eq!(charging_from_empty.tint, BatteryTint::Charging);
-        assert!(!charging_from_empty.alert);
+        // On AC the warning level is stale news: charging out of a critical charge is not critical.
+        let from_empty = at(BatteryState::Charging, BatteryWarning::Action);
+        assert_eq!(from_empty.fill, BatteryTint::Charging);
+        assert_eq!(from_empty.overlay, BatteryOverlay::Bolt);
     }
 
-    /// Discharging is where the warning level decides, and where the alert glyph lives.
+    /// Discharging is where the warning level decides. Low tints the charge only; critical is the
+    /// one state that turns the whole indicator red, and the only one that earns a glyph.
     #[test]
     fn a_discharging_battery_takes_its_tint_from_the_warning_level() {
         let at = |state, warning| {
@@ -727,32 +777,55 @@ mod tests {
         };
 
         for state in [BatteryState::Discharging, BatteryState::PendingDischarge] {
+            let plain = at(state, BatteryWarning::None);
             assert_eq!(
-                at(state, BatteryWarning::None).tint,
+                plain.fill,
                 BatteryTint::Normal,
                 "{state:?} with no warning is plain"
             );
-            assert_eq!(at(state, BatteryWarning::Low).tint, BatteryTint::Low);
-            assert!(
-                !at(state, BatteryWarning::Low).alert,
+            assert_eq!(plain.overlay, BatteryOverlay::None);
+
+            let low = at(state, BatteryWarning::Low);
+            assert_eq!(low.fill, BatteryTint::Low);
+            assert_eq!(
+                low.body,
+                BatteryTint::Normal,
+                "low does not tint the housing"
+            );
+            assert_eq!(
+                low.overlay,
+                BatteryOverlay::None,
                 "low is a colour change only; the glyph is reserved for critical"
             );
 
             for warning in [BatteryWarning::Critical, BatteryWarning::Action] {
                 let look = at(state, warning);
-                assert_eq!(look.tint, BatteryTint::Critical);
-                assert!(
-                    look.alert,
+                assert_eq!(look.fill, BatteryTint::Critical);
+                assert_eq!(
+                    look.body,
+                    BatteryTint::Critical,
+                    "critical reddens the whole indicator"
+                );
+                assert_eq!(
+                    look.overlay,
+                    BatteryOverlay::Alert,
                     "{warning:?} needs a non-colour channel for colour-blind readers"
                 );
             }
         }
 
         // Empty alerts regardless of what the warning level says; Unknown never does.
-        assert!(at(BatteryState::Empty, BatteryWarning::None).alert);
+        assert_eq!(
+            at(BatteryState::Empty, BatteryWarning::None).overlay,
+            BatteryOverlay::Alert
+        );
         let unknown = at(BatteryState::Unknown, BatteryWarning::Critical);
-        assert_eq!(unknown.tint, BatteryTint::Normal);
-        assert!(!unknown.alert, "an unknown state must not cry wolf");
+        assert_eq!(unknown.fill, BatteryTint::Normal);
+        assert_eq!(
+            unknown.overlay,
+            BatteryOverlay::None,
+            "an unknown state must not cry wolf"
+        );
     }
 
     /// UPower's above-normal levels (6 Normal, 7 High, 8 Full) and 2 Discharging all mean "no

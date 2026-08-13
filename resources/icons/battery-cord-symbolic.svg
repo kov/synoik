@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only
+     Copyright (C) 2026 Gustavo Noronha Silva <gustavo@noronha.dev.br>
+
+     OURS, not bundled (see battery-bolt-symbolic.svg for why this directory is
+     no longer uniformly gnome-shell's). A mains plug, overlaid on the battery
+     body for "plugged in but not charging" — the state a Mac sits in once it
+     stops at ~80%, and the one a full battery sits in on AC. Adwaita expresses
+     this as battery-level-*-plugged-in-symbolic, whole batteries with the plug
+     baked in; we draw our own body, so we need the plug alone.
+
+     Deliberately chunky: it is drawn at ~12 logical px inside the battery, and
+     prongs thinner than this vanish. See docs/fork/battery-indicator-design.md. -->
+<svg height="16" width="16" xmlns="http://www.w3.org/2000/svg"><g style="fill:#bebebe;fill-opacity:1"><rect height="4.5" rx="0.9" width="2" x="5" y="1.5"/><rect height="4.5" rx="0.9" width="2" x="9" y="1.5"/><rect height="5.5" rx="1.6" width="8" x="4" y="5.5"/><rect height="3.5" rx="1" width="2" x="7" y="10.5"/></g></svg>

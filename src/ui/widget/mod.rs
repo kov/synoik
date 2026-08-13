@@ -2394,9 +2394,12 @@ impl ButtonStyle {
 pub struct Battery {
     /// Charge, 0..=1. Clamped when drawn.
     pub fill: f64,
-    /// Shell and fill colour — one colour, never a tinted shell over a plain bar.
-    pub tint: Rgba,
-    /// Draw the critical glyph over the body. Deliberately redundant with a red `tint`: colour
+    /// The shell (housing) colour. Normally the panel foreground, like the neighbouring glyphs.
+    pub body_tint: Rgba,
+    /// The fill bar's colour — the channel that actually carries state, so colour appears *in*
+    /// the charge rather than around it.
+    pub fill_tint: Rgba,
+    /// Draw the critical glyph over the body. Deliberately redundant with a red tint: colour
     /// alone is not a channel a colour-blind reader has.
     pub alert: bool,
 }
@@ -2408,13 +2411,17 @@ impl Battery {
     /// Rounded rect, not a stadium: the mockup's corners are visibly tighter than `BODY_H / 2`.
     pub const RADIUS: f64 = 4.5;
     pub const STROKE: f64 = 1.5;
-    /// Fill inset from the body's *outer* edge, so a 1px gap shows inside the stroke.
-    pub const INSET: f64 = 2.5;
+    /// Fill inset from the body's *outer* edge. Measured on the seat at scale 1.25: at 2.5 the
+    /// gap inside the stroke rounded to a single physical pixel and the fill read as one thick
+    /// green mass welded to the shell.
+    pub const INSET: f64 = 3.;
     /// Concentric with [`Self::RADIUS`], so the fill's corners follow the shell's.
     pub const FILL_RADIUS: f64 = Self::RADIUS - Self::INSET;
-    pub const NUB_W: f64 = 2.;
-    pub const NUB_H: f64 = 5.;
-    pub const NUB_GAP: f64 = 1.5;
+    pub const NUB_W: f64 = 2.5;
+    pub const NUB_H: f64 = 6.;
+    /// Nearly flush with the body. At 1.5 this was a whole empty physical pixel on the seat and
+    /// the nub read as a detached tick floating beside the battery rather than part of it.
+    pub const NUB_GAP: f64 = 0.5;
 
     /// The width a cluster slot must reserve — body, gap, nub. This is why the panel cluster walks
     /// per-element widths instead of `i * QS_ICON`.
@@ -3626,7 +3633,7 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
         alert: Option<&ShapedText>,
     ) -> anyhow::Result<()> {
         let body = Rectangle::new(origin, Size::from((Battery::BODY_W, Battery::BODY_H)));
-        self.stroke_rounded(body, Battery::RADIUS, Battery::STROKE, b.tint)?;
+        self.stroke_rounded(body, Battery::RADIUS, Battery::STROKE, b.body_tint)?;
 
         // The bar grows from the body's left edge, inset so a gap shows inside the stroke.
         let fill = Rectangle::new(
@@ -3636,7 +3643,7 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
                 Battery::BODY_H - 2. * Battery::INSET,
             )),
         );
-        self.fill_rounded(fill, Battery::FILL_RADIUS, b.tint)?;
+        self.fill_rounded(fill, Battery::FILL_RADIUS, b.fill_tint)?;
 
         // The nub, centred on the body's right edge.
         let nub = Rectangle::new(
@@ -3647,7 +3654,7 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
                 )),
             Size::from((Battery::NUB_W, Battery::NUB_H)),
         );
-        self.fill_rounded(nub, Battery::NUB_W / 2., b.tint)?;
+        self.fill_rounded(nub, Battery::NUB_W / 2., b.body_tint)?;
 
         // The critical glyph, centred over the body. It reads against the fill beneath it, so it
         // takes the panel foreground rather than the tint it would otherwise vanish into.

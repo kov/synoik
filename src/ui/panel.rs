@@ -402,9 +402,20 @@ fn mic_indicator_icon(mic: MicStatus) -> Option<(Vec<String>, [f32; 4])> {
     }
 }
 
-/// The charging bolt overlaid on the battery body — ours, not a theme icon
-/// (`resources/icons/battery-bolt-symbolic.svg`).
+/// The glyphs overlaid on the battery body — both ours, not theme icons
+/// (`resources/icons/battery-{bolt,cord}-symbolic.svg`).
 const BOLT_ICON: &str = "battery-bolt-symbolic";
+const CORD_ICON: &str = "battery-cord-symbolic";
+
+/// The icon name for an overlay, if it is drawn as one. `Alert` is text, not an icon, and is
+/// baked into the body by [`widget::Painter::battery`].
+fn battery_overlay_icon(overlay: system_status::BatteryOverlay) -> Option<&'static str> {
+    match overlay {
+        system_status::BatteryOverlay::Bolt => Some(BOLT_ICON),
+        system_status::BatteryOverlay::Cord => Some(CORD_ICON),
+        system_status::BatteryOverlay::None | system_status::BatteryOverlay::Alert => None,
+    }
+}
 
 /// The bolt's box. Smaller than a status icon: it sits *inside* the battery body, whose interior
 /// is only `BODY_H - 2 * INSET` tall.
@@ -424,7 +435,9 @@ fn battery_tint(tint: system_status::BatteryTint) -> [f32; 4] {
     // `_palette.scss`: $green_3, $yellow_3, $red_3.
     match tint {
         system_status::BatteryTint::Normal => TEXT,
-        system_status::BatteryTint::Charging => rgb(0x33, 0xd1, 0x7a),
+        // $green_4, not $green_3: a step down from the palette's brightest green, which next to
+        // four white glyphs on a dark bar shouted for a state that is merely "fine".
+        system_status::BatteryTint::Charging => rgb(0x2e, 0xc2, 0x7e),
         system_status::BatteryTint::Low => rgb(0xf6, 0xd3, 0x2d),
         system_status::BatteryTint::Critical => rgb(0xe0, 0x1b, 0x24),
     }
@@ -449,9 +462,9 @@ fn rgb(r: u8, g: u8, b: u8) -> [f32; 4] {
 fn battery_revision(look: &system_status::BatteryLook, fill: f64) -> u64 {
     let steps = (widget::Battery::fill_width(fill) * 4.).round() as u64;
     widget::Revision::new()
-        .of(look.tint as u8)
-        .of(look.bolt)
-        .of(look.alert)
+        .of(look.body as u8)
+        .of(look.fill as u8)
+        .of(look.overlay as u8)
         .of(steps)
         .done()
 }
@@ -1975,8 +1988,9 @@ impl Panel {
         if cache.battery.as_ref().map(|c| c.key) != Some(key) {
             let w = widget::Battery {
                 fill,
-                tint: battery_tint(look.tint),
-                alert: look.alert,
+                body_tint: battery_tint(look.body),
+                fill_tint: battery_tint(look.fill),
+                alert: look.overlay == system_status::BatteryOverlay::Alert,
             };
             let size = Size::from((widget::Battery::WIDTH, widget::Battery::HEIGHT));
             // Shaped before the bake opens its frame: shaping needs the renderer, and the paint
@@ -2014,9 +2028,9 @@ impl Panel {
             }
         }
 
-        // The bolt sits over the body, so it is pushed first: elements are consumed in reverse.
-        if look.bolt {
-            if let Some(tb) = icons.texture(renderer, BOLT_ICON, QS_BOLT, scale, TEXT) {
+        // The glyph sits over the body, so it is pushed first: elements are consumed in reverse.
+        if let Some(name) = battery_overlay_icon(look.overlay) {
+            if let Some(tb) = icons.texture(renderer, name, QS_BOLT, scale, TEXT) {
                 let logical = tb.logical_size();
                 let location = Point::from((
                     x + (widget::Battery::BODY_W - logical.w) / 2.,
