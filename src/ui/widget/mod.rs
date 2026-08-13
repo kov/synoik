@@ -86,6 +86,12 @@ pub mod style {
     pub const TRANSPARENT: Rgba = [0., 0., 0., 0.];
     /// Primary foreground (opaque white); glyph coverage modulates the alpha.
     pub const TEXT: Rgba = [1., 1., 1., 1.];
+
+    /// An opaque straight-alpha colour from 8-bit sRGB components, for palette values quoted as
+    /// hex in the GNOME sass.
+    pub const fn rgb8(r: u8, g: u8, b: u8) -> Rgba {
+        [r as f32 / 255., g as f32 / 255., b as f32 / 255., 1.]
+    }
     /// Dimmed foreground (secondary labels, e.g. a row's short code).
     pub const MUTED: Rgba = [0.6, 0.6, 0.6, 1.];
     /// The hover highlight wash over a row/tile (a subtle lighten). NOTE: the
@@ -2379,6 +2385,111 @@ impl ButtonStyle {
     }
 }
 
+/// The battery indicator's colour for a tint role.
+///
+/// Panel foreground indicators on our dark chrome take the *lighter* palette step, the way
+/// `$privacy_indicator_color` does (`if($variant=='light', $orange_4, $orange_3)`,
+/// `_panel.scss:4`) — palette step 3/4, not the `$warning_color`/`$error_color` *background*
+/// tokens, which are tuned to carry white text on top of them.
+pub fn battery_tint(tint: crate::system_status::BatteryTint) -> Rgba {
+    use crate::system_status::BatteryTint as T;
+    match tint {
+        T::Normal => style::TEXT,
+        // $green_4, not $green_3: the palette's brightest green shouted next to white glyphs.
+        T::Charging => style::rgb8(0x2e, 0xc2, 0x7e),
+        T::Low => style::rgb8(0xf6, 0xd3, 0x2d),
+        T::Critical => style::rgb8(0xe0, 0x1b, 0x24),
+    }
+}
+
+/// How a battery overlay glyph is drawn: the glyph, its dilated silhouette for the rim and
+/// shadow, its box, and the colour role it takes.
+pub struct OverlayGlyph {
+    pub icon: &'static str,
+    pub halo: &'static str,
+    /// Logical px. Taller than the body on purpose, so the glyph breaks the battery's outline
+    /// instead of sitting trapped inside the charge.
+    pub px: f64,
+    pub tint: crate::system_status::BatteryTint,
+}
+
+/// The glyph for a battery overlay, if it has one.
+///
+/// All are ours, not theme icons (`resources/icons/battery-*-symbolic.svg`) — no theme ships
+/// these alone, because every themed battery bakes them into a whole battery and we draw our own
+/// body.
+pub fn battery_overlay_glyph(
+    overlay: crate::system_status::BatteryOverlay,
+) -> Option<OverlayGlyph> {
+    use crate::system_status::{BatteryOverlay as O, BatteryTint as T};
+    let g = |icon, halo, px, tint| {
+        Some(OverlayGlyph {
+            icon,
+            halo,
+            px,
+            tint,
+        })
+    };
+    match overlay {
+        O::Bolt => g(
+            "battery-bolt-symbolic",
+            "battery-bolt-halo-symbolic",
+            Battery::OVERLAY,
+            T::Normal,
+        ),
+        O::Cord => g(
+            "battery-cord-symbolic",
+            "battery-cord-halo-symbolic",
+            Battery::CORD,
+            T::Normal,
+        ),
+        // Red, like the housing it sits in: the alert is part of the critical reading, not a
+        // neutral mark on top of it. Its rim is what keeps it legible against that red.
+        O::Alert => g(
+            "battery-alert-symbolic",
+            "battery-alert-halo-symbolic",
+            Battery::OVERLAY,
+            T::Critical,
+        ),
+        O::None => None,
+    }
+}
+
+/// The three layers of a battery overlay glyph — the glyph, a dark rim, and a shadow — centred on
+/// `center` (relative to `origin`), topmost first.
+///
+/// The rim is a dilated silhouette of the same shape drawn behind the glyph. It is a second asset
+/// because a symbolic carries one colour (its alpha is the coverage), so an outline cannot be a
+/// stroke on the glyph itself. Without it a white glyph over a white fill is invisible — measured
+/// on the seat, where a plug over a charged battery could not be seen at all. The shadow is what
+/// makes the rim read as an *outline* rather than as part of the shape.
+pub fn battery_overlay_elements(
+    renderer: &mut VulkanRenderer,
+    icons: &IconCache,
+    glyph: &OverlayGlyph,
+    scale: f64,
+    origin: Point<f64, Logical>,
+    center: Point<f64, Logical>,
+) -> Vec<TextureRenderElement<VkTexture>> {
+    let tint = battery_tint(glyph.tint);
+    let shadow_center = center + Point::from((0., Battery::GLYPH_SHADOW_DY));
+    [
+        (glyph.icon, glyph.px, tint, center),
+        (glyph.halo, glyph.px, Battery::GLYPH_RIM, center),
+        (
+            glyph.halo,
+            glyph.px * Battery::GLYPH_SHADOW_SCALE,
+            Battery::GLYPH_SHADOW,
+            shadow_center,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, px, color, c)| {
+        icon_element(renderer, icons, &[name], px, scale, color, origin, c)
+    })
+    .collect()
+}
+
 /// The dynamic battery indicator: a rounded body with a fill bar that tracks the charge, a nub,
 /// and an optional critical glyph (`docs/fork/battery-indicator-design.md`).
 ///
@@ -2425,6 +2536,16 @@ impl Battery {
     pub const WIDTH: f64 = Self::BODY_W + Self::NUB_GAP + Self::NUB_W;
     /// The height the indicator occupies; the caller centres it in the bar.
     pub const HEIGHT: f64 = Self::BODY_H;
+
+    /// The bolt's and the alert glyph's box, and the plug's (which is a shorter shape in its
+    /// viewBox, so it needs less). Both taller than the body, so they cross its outline.
+    pub const OVERLAY: f64 = 19.;
+    pub const CORD: f64 = 18.;
+    /// The overlay rim and its shadow — see [`battery_overlay_elements`].
+    pub const GLYPH_RIM: Rgba = [0., 0., 0., 0.75];
+    pub const GLYPH_SHADOW: Rgba = [0., 0., 0., 0.3];
+    pub const GLYPH_SHADOW_SCALE: f64 = 1.14;
+    pub const GLYPH_SHADOW_DY: f64 = 1.;
 
     /// The fill bar's width for a charge, inside the body. Floored at the fill *diameter*: a
     /// rounded rect narrower than its own corner diameter cannot exist, so 1% must still be a

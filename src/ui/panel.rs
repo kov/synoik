@@ -402,117 +402,6 @@ fn mic_indicator_icon(mic: MicStatus) -> Option<(Vec<String>, [f32; 4])> {
     }
 }
 
-/// How an overlay glyph is drawn: the glyph itself, its dilated silhouette for the rim and
-/// shadow, and the box it occupies.
-struct OverlayGlyph {
-    icon: &'static str,
-    halo: &'static str,
-    /// Logical px. All three are taller than the body (13) on purpose, so the glyph breaks the
-    /// battery's outline instead of sitting trapped inside the charge.
-    px: f64,
-}
-
-/// The glyph for an overlay, if it has one. All are ours, not theme icons
-/// (`resources/icons/battery-*-symbolic.svg`) — no theme ships these alone, because every themed
-/// battery bakes them into a whole battery and we draw our own body.
-fn battery_overlay_glyph(overlay: system_status::BatteryOverlay) -> Option<OverlayGlyph> {
-    let glyph = |icon, halo, px| Some(OverlayGlyph { icon, halo, px });
-    match overlay {
-        system_status::BatteryOverlay::Bolt => glyph(
-            "battery-bolt-symbolic",
-            "battery-bolt-halo-symbolic",
-            QS_OVERLAY,
-        ),
-        system_status::BatteryOverlay::Cord => glyph(
-            "battery-cord-symbolic",
-            "battery-cord-halo-symbolic",
-            QS_CORD,
-        ),
-        system_status::BatteryOverlay::Alert => glyph(
-            "battery-alert-symbolic",
-            "battery-alert-halo-symbolic",
-            QS_OVERLAY,
-        ),
-        system_status::BatteryOverlay::None => None,
-    }
-}
-
-/// The bolt's and the alert glyph's box. Taller than the battery body (13), like the plug, so
-/// they cross its outline rather than sitting inside the charge.
-const QS_OVERLAY: f64 = 19.;
-
-/// The mains plug's box. Deliberately taller than the battery body (13), so the plug breaks the
-/// body's outline top and bottom instead of sitting trapped inside it — at body height it was
-/// legible but cramped, and read as debris in the charge rather than as a plug.
-const QS_CORD: f64 = 18.;
-
-/// Every battery overlay glyph is drawn in three layers: the white glyph, a dark rim, and a
-/// shadow. The rim is a dilated silhouette of the same shape (a second asset — a symbolic carries
-/// one colour, its alpha being the coverage, so an outline cannot be a stroke on the glyph
-/// itself); the shadow is that silhouette again, larger and nudged down.
-///
-/// The rim is what makes a white glyph survive a white fill — measured on the seat, where a plug
-/// over a charged battery was invisible. The shadow is what makes the rim read as an *outline*
-/// rather than as part of the shape.
-const GLYPH_SHADOW_SCALE: f64 = 1.14;
-const GLYPH_SHADOW_DY: f64 = 1.;
-const GLYPH_RIM: [f32; 4] = [0., 0., 0., 0.75];
-const GLYPH_SHADOW: [f32; 4] = [0., 0., 0., 0.3];
-
-/// Push one themed glyph centred on `cx`, vertically centred in the bar and nudged down by `dy`.
-///
-/// Shared by the battery overlay's three layers (glyph, rim, shadow) so they cannot drift apart:
-/// each resolves at its own size and tint but lands on the same centre.
-#[allow(clippy::too_many_arguments)]
-fn push_centered_glyph(
-    renderer: &mut VulkanRenderer,
-    icons: &IconCache,
-    elements: &mut Vec<PanelElement>,
-    name: &str,
-    px: f64,
-    scale: f64,
-    color: [f32; 4],
-    cx: f64,
-    dy: f64,
-) {
-    let Some(tb) = icons.texture(renderer, name, px, scale, color) else {
-        return;
-    };
-    let logical = tb.logical_size();
-    let location = Point::from((cx - logical.w / 2., (panel_height() - logical.h) / 2. + dy));
-    elements.push(PanelElement::Texture(
-        TextureRenderElement::from_texture_buffer(tb, location, 1., None, None, Kind::Unspecified),
-    ));
-}
-
-/// The battery indicator's colour for a tint role.
-///
-/// Panel foreground indicators take the *lighter* palette step on our dark bar, the way
-/// `$privacy_indicator_color` does (`if($variant=='light', $orange_4, $orange_3)`,
-/// `_panel.scss:4`) — so palette step 3, not the `$warning_color`/`$error_color` *background*
-/// tokens, which are tuned to carry white text on top of them.
-fn battery_tint(tint: system_status::BatteryTint) -> [f32; 4] {
-    // `_palette.scss`: $green_3, $yellow_3, $red_3.
-    match tint {
-        system_status::BatteryTint::Normal => TEXT,
-        // $green_4, not $green_3: a step down from the palette's brightest green, which next to
-        // four white glyphs on a dark bar shouted for a state that is merely "fine".
-        system_status::BatteryTint::Charging => rgb(0x2e, 0xc2, 0x7e),
-        system_status::BatteryTint::Low => rgb(0xf6, 0xd3, 0x2d),
-        system_status::BatteryTint::Critical => rgb(0xe0, 0x1b, 0x24),
-    }
-}
-
-/// An opaque straight-alpha colour from 8-bit sRGB components.
-fn rgb(r: u8, g: u8, b: u8) -> [f32; 4] {
-    [
-        f32::from(r) / 255.,
-        f32::from(g) / 255.,
-        f32::from(b) / 255.,
-        1.,
-    ]
-}
-
 /// A revision of everything the battery bake draws, so the texture is rebuilt when — and only
 /// when — the picture changes.
 ///
@@ -2057,8 +1946,8 @@ impl Panel {
         if cache.battery.as_ref().map(|c| c.key) != Some(key) {
             let w = widget::Battery {
                 fill,
-                body_tint: battery_tint(look.body),
-                fill_tint: battery_tint(look.fill),
+                body_tint: widget::battery_tint(look.body),
+                fill_tint: widget::battery_tint(look.fill),
             };
             let size = Size::from((widget::Battery::WIDTH, widget::Battery::HEIGHT));
             let baked = widget::bake_uncached(renderer, scale, size, |frame, phys| {
@@ -2085,25 +1974,20 @@ impl Panel {
         }
 
         // The glyph sits over the body, so it is pushed first: elements are consumed in reverse.
-        if let Some(g) = battery_overlay_glyph(look.overlay) {
+        if let Some(g) = widget::battery_overlay_glyph(look.overlay) {
             // Centred on the *body*, not on the slot: the nub is not part of the battery's face.
-            let cx = x + widget::Battery::BODY_W / 2.;
-            // Topmost-first, so the glyph goes down before the rim it sits on and the rim before
-            // the shadow under both. All three share a centre, so they stay concentric.
-            push_centered_glyph(renderer, icons, elements, g.icon, g.px, scale, TEXT, cx, 0.);
-            push_centered_glyph(
-                renderer, icons, elements, g.halo, g.px, scale, GLYPH_RIM, cx, 0.,
-            );
-            push_centered_glyph(
-                renderer,
-                icons,
-                elements,
-                g.halo,
-                g.px * GLYPH_SHADOW_SCALE,
-                scale,
-                GLYPH_SHADOW,
-                cx,
-                GLYPH_SHADOW_DY,
+            let center = Point::from((x + widget::Battery::BODY_W / 2., panel_height() / 2.));
+            elements.extend(
+                widget::battery_overlay_elements(
+                    renderer,
+                    icons,
+                    &g,
+                    scale,
+                    Point::from((0., 0.)),
+                    center,
+                )
+                .into_iter()
+                .map(PanelElement::Texture),
             );
         }
 

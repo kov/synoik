@@ -122,11 +122,16 @@ const SYS_ADVANCE: f64 = SYS_HIT + SYS_GAP;
 /// The battery pill (gnome-shell's `PowerToggle`): a wide item at the far left of
 /// the system row showing the battery icon + percentage, only when a battery is
 /// present. Clicking it opens power settings.
-const PILL_W: f64 = 96.;
+const PILL_W: f64 = 110.;
 /// The pill is a `.quick-toggle` like any other, so its content rides the same box: 15px in from
 /// the left and 9px from icon to label (`_quick-settings.scss:26,35`) — measured 15/9 on a live
 /// 50.3 shell, where the pill's box reports `padding: 0 12 0 15`, `spacing: 9`.
 const PILL_ICON_INSET: f64 = 15.;
+
+/// The pill shows the same dynamic battery indicator as the panel, not a symbolic icon, so its
+/// icon slot is [`widget::Battery::WIDTH`] rather than [`SYS_ICON`] — and the pill is wider than
+/// gnome-shell's to fit it without crowding the percentage.
+const PILL_ICON_SLOT: f64 = widget::Battery::WIDTH;
 
 /// The volume slider row (gnome-shell's `.quick-slider`): a full-width row between the
 /// system row and the tile grid with a mute icon-button at the left and the slider
@@ -2300,24 +2305,18 @@ impl QuickSettings {
             }
         }
 
-        // The battery pill's icon, at its left (the percentage label is chrome).
+        // The battery pill's overlay glyph (bolt / plug / alert). The indicator's body is in the
+        // chrome bake; only the glyph, its rim and its shadow composite on top.
         if let (Some(battery), Some(pill)) = (&self.battery, pill_rect(self.has_pill())) {
-            let center = Point::from((
-                pill.loc.x + PILL_ICON_INSET + SYS_ICON / 2.,
-                pill.loc.y + pill.size.h / 2.,
-            ));
-            let candidates = system_status::battery_icon(battery);
-            if let Some(el) = widget::icon_element(
-                renderer,
-                icons,
-                &candidates,
-                SYS_ICON,
-                scale,
-                SYS_FG,
-                origin,
-                center,
-            ) {
-                elements.push(el);
+            let look = system_status::battery_look(battery);
+            if let Some(g) = widget::battery_overlay_glyph(look.overlay) {
+                let center = Point::from((
+                    pill.loc.x + PILL_ICON_INSET + widget::Battery::BODY_W / 2.,
+                    pill.loc.y + pill.size.h / 2.,
+                ));
+                elements.extend(widget::battery_overlay_elements(
+                    renderer, icons, &g, scale, origin, center,
+                ));
             }
         }
 
@@ -2615,7 +2614,24 @@ impl QuickSettings {
                 if self.hovered == Some(QsHover::Pill) {
                     p.fill_rounded(pill, pill.size.h / 2., style::HOVER_WASH)?;
                 }
-                let label_x = pill.loc.x + PILL_ICON_INSET + SYS_ICON + TILE_ICON_GAP;
+                // The indicator's body is painted into this bake, like the slab under it; only
+                // its overlay glyph composites on top, the same split the panel uses.
+                if let Some(battery) = &self.battery {
+                    let look = system_status::battery_look(battery);
+                    let w = widget::Battery {
+                        fill: battery.percentage / 100.,
+                        body_tint: widget::battery_tint(look.body),
+                        fill_tint: widget::battery_tint(look.fill),
+                    };
+                    p.battery(
+                        Point::from((
+                            pill.loc.x + PILL_ICON_INSET,
+                            pill.loc.y + (pill.size.h - widget::Battery::HEIGHT) / 2.,
+                        )),
+                        &w,
+                    )?;
+                }
+                let label_x = pill.loc.x + PILL_ICON_INSET + PILL_ICON_SLOT + TILE_ICON_GAP;
                 let label_cy = pill.loc.y + pill.size.h / 2.;
                 p.text(
                     run,
