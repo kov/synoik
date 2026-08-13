@@ -25387,6 +25387,9 @@ fn unmaximize_resizes_on_gnomes_size_change_curve() {
     w.attach_new_buffer();
     w.set_size(1717, 937);
     w.ack_last_and_commit();
+    // The heights below are exact rounded values off a 250 ms curve with no tolerance, and the
+    // animation starts inside this dispatch — see `a_maximize_moves_and_grows_together`.
+    f.freeze_clock();
     f.double_roundtrip(id);
 
     let from = 1048.;
@@ -25616,6 +25619,10 @@ fn an_untile_moves_and_shrinks_together() {
     w.attach_new_buffer();
     w.set_size(800, 600);
     w.commit();
+    // Frozen for the same reason as `a_maximize_moves_and_grows_together`: the animation starts
+    // inside this dispatch, which clears the lazy clock, so real time between here and the first
+    // sample would displace it.
+    f.freeze_clock();
     f.double_roundtrip(id);
 
     let samples = f.sample_animation(Duration::from_millis(250), 4, |f| {
@@ -25676,6 +25683,10 @@ fn a_maximize_moves_and_grows_together() {
     w.attach_new_buffer();
     w.set_size(1920, 1048);
     w.commit();
+    // The resize animation starts *inside* this dispatch, and a dispatch clears the lazy clock —
+    // so without freezing, the first sample below is displaced by however long the round trip took
+    // in real time. At 3.2 px/ms of travel, 0.3 ms of it breaks the `samples[0] > 399.` assertion.
+    f.freeze_clock();
     f.double_roundtrip(id);
 
     let samples = f.sample_animation(Duration::from_millis(250), 4, |f| {
