@@ -3575,6 +3575,11 @@ mod tests {
     /// This does not cover *dynamic* labels (a long Wi-Fi name will still clip at any width);
     /// that wants ellipsis in the toolkit, not a wider tile.
     #[test]
+    #[cfg_attr(
+        not(feature = "reference-env"),
+        ignore = "measures shaped text, so it needs the reference font stack; \
+run it with --features reference-env, as the fedora CI job does"
+    )]
     fn every_tile_label_fits_beside_its_menu_arrow() {
         use crate::render_helpers::vulkan::VulkanRenderer;
         use crate::ui::widget::{TextShaper, TextStyle};
