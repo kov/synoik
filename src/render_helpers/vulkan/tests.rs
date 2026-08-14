@@ -2833,11 +2833,17 @@ fn vulkan_dmabuf_import_cache_reuses_and_evicts() {
 /// submit/fence-wait, the Venus ring pressure this path exists to reduce). Prove the mechanism
 /// end-to-end: a miss queues nothing (its full import runs an internal barrier), a hit queues
 /// exactly one deferred acquire, `begin()` drains it, and the frame samples the *new* producer
-/// content written into the *same* shared dmabuf between commits. The `pending_*_len` assertions
-/// are the mechanism proof (a disabled drain fails them — mutation-checked); the green→red content
-/// check guards against gross sampling regressions (it does not, on this CPU-coherent LINEAR path,
-/// by itself prove the barrier's placement). Needs a Venus + GBM stack (real client dmabufs,
-/// CPU-writable LINEAR); skips on lavapipe / no GBM.
+/// content written into the *same* shared dmabuf between commits.
+///
+/// **The producer writes with the GPU**, through the ordinary `Bind<Dmabuf>` path, because that is
+/// what a client does: it renders into its buffer and commits it. This test used to have the
+/// producer `memcpy` into a CPU mapping of the buffer, which exercised a coherency path no client
+/// takes — and when that path regressed underneath us (host-side, 2026-08-14) the failure read as
+/// a compositor bug for as long as it took to notice the producer was not modelling a client. See
+/// `vmm-issue-dmabuf-cpu-write-coherency.md`, and `..._cpu_written_producer` below, which keeps
+/// the old shape as an ignored reproducer.
+///
+/// Needs a Venus + GBM stack (real client dmabufs); skips on lavapipe / no GBM.
 #[test]
 fn vulkan_dmabuf_import_cache_defers_reacquire_into_the_frame() {
     use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
@@ -2854,8 +2860,8 @@ fn vulkan_dmabuf_import_cache_defers_reacquire_into_the_frame() {
         }
     };
 
-    // Producer frame 1: a solid-green LINEAR client buffer.
-    let mut fb = match ForeignBuffer::allocate_filled(W as u32, H as u32, [[0, 255, 0, 255]; 4]) {
+    // The client's buffer. Allocated black; every write below goes through the GPU.
+    let fb = match ForeignBuffer::allocate_filled(W as u32, H as u32, [[0, 0, 0, 255]; 4]) {
         Ok(b) => b,
         Err(e) => {
             eprintln!(
@@ -2877,7 +2883,22 @@ fn vulkan_dmabuf_import_cache_defers_reacquire_into_the_frame() {
         fb.offset,
         fb.stride,
     ));
-    let dmabuf = builder.build().expect("build dmabuf");
+    let mut dmabuf = builder.build().expect("build dmabuf");
+
+    /// The producer: render `color` over the whole buffer, the way a client does — bind its dmabuf
+    /// as a render target, draw, and submit. `finish()` fence-waits, so the write is complete
+    /// before the compositor side imports it, exactly as a client's commit is.
+    fn produce(vk: &mut VulkanRenderer, dmabuf: &mut Dmabuf, color: [f32; 4]) {
+        let size = Size::<i32, Physical>::from((W, H));
+        let mut fb = vk.bind(dmabuf).expect("bind the client buffer as a target");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .clear(Color32F::from(color), &[Rectangle::from_size(size)])
+            .expect("clear the client buffer");
+        let _sync = frame.finish().expect("finish");
+    }
+
+    produce(&mut vk, &mut dmabuf, [0., 1., 0., 1.]);
 
     // Renders `tex` 1:1 into a W×H offscreen and reads back tight Abgr8888 (`[R,G,B,A]`). Each call
     // is one frame → one `VulkanFrame::begin`, which drains any queued deferred acquire.
@@ -2932,9 +2953,10 @@ fn vulkan_dmabuf_import_cache_defers_reacquire_into_the_frame() {
         "no deferred acquire outstanding after the miss frame",
     );
 
-    // Producer frame 2: rewrite the SAME dmabuf to solid red, then re-import — a cache HIT that
-    // queues exactly one deferred re-acquire (not run here).
-    fb.refill([[255, 0, 0, 255]; 4]).expect("refill red");
+    // Producer frame 2: the client redraws the SAME buffer solid red and commits it, then the
+    // compositor re-imports — a cache HIT that queues exactly one deferred re-acquire (not run
+    // here).
+    produce(&mut vk, &mut dmabuf, [1., 0., 0., 1.]);
     let t2 = vk
         .import_dmabuf_as_texture(&dmabuf)
         .expect("re-import (hit)");
@@ -2969,6 +2991,99 @@ fn vulkan_dmabuf_import_cache_defers_reacquire_into_the_frame() {
     eprintln!(
         "vulkan_dmabuf_import_cache_defers_reacquire_into_the_frame: frame1 center={c1:?} \
          frame2 center={c2:?}",
+    );
+}
+
+/// Reproducer for a **host-side** coherency regression, kept out of the suite. See
+/// `vmm-issue-dmabuf-cpu-write-coherency.md`.
+///
+/// The same shape as the test above, except the producer writes through a CPU mapping of the
+/// buffer instead of rendering into it. No Wayland client does that, so this is not a compositor
+/// behaviour worth gating on — but it is the smallest thing that shows the bug, and the bug is
+/// real: a `memcpy` into a mapped LINEAR GBM dmabuf, completed before the import, is not visible to
+/// a subsequent GPU sample of the same memory. Ignored rather than deleted so there is something
+/// to run when the host side changes: `cargo test --workspace -- --ignored dmabuf_cpu_written`.
+///
+/// History: passed 12/12 full-suite runs on 2026-08-14 and failed 4/5 after a VM reboot the same
+/// day, with identical guest code (verified by stashing) and identical mesa (26.1.5-9). The GPU
+/// producer above passes 5/5 across the same reboot, which is what localises this to the CPU-write
+/// path rather than to our acquire barrier.
+#[test]
+#[ignore = "reproduces a host-side coherency bug, not a compositor one"]
+fn vulkan_dmabuf_cpu_written_producer_is_visible_to_the_gpu() {
+    use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
+    use smithay::backend::allocator::Modifier;
+    use synoik_vk::dmabuf::ForeignBuffer;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("skipping vulkan_dmabuf_cpu_written_producer: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let mut fb = match ForeignBuffer::allocate_filled(W as u32, H as u32, [[0, 255, 0, 255]; 4]) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping vulkan_dmabuf_cpu_written_producer: GBM cannot allocate ({e})");
+            return;
+        }
+    };
+    let mut builder = Dmabuf::builder(
+        (W, H),
+        Fourcc::Argb8888,
+        Modifier::Linear,
+        DmabufFlags::empty(),
+    );
+    assert!(builder.add_plane(
+        fb.fd().try_clone_to_owned().expect("dup fd"),
+        0,
+        fb.offset,
+        fb.stride,
+    ));
+    let dmabuf = builder.build().expect("build dmabuf");
+
+    let sample = |vk: &mut VulkanRenderer, tex: VkTexture| -> [u8; 4] {
+        let size = Size::<i32, Physical>::from((W, H));
+        let buffer = TextureBuffer::from_texture(&*vk, tex, 1.0, Transform::Normal, Vec::new());
+        let element = TextureRenderElement::from_texture_buffer(
+            buffer,
+            Point::from((0.0, 0.0)),
+            1.0,
+            None,
+            None,
+            Kind::Unspecified,
+        );
+        let out = render_to_vec(
+            vk,
+            size,
+            Scale::from(1.0),
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            [element].into_iter(),
+        )
+        .expect("render client dmabuf");
+        px(&out, W / 2, H / 2)
+    };
+
+    let t1 = vk.import_dmabuf_as_texture(&dmabuf).expect("import (miss)");
+    let c1 = sample(&mut vk, t1);
+    assert!(
+        close_px(c1, [0, 255, 0, 255], 40),
+        "frame 1 green, got {c1:?}"
+    );
+
+    // The whole point: a CPU write completed *before* the re-import.
+    fb.refill([[255, 0, 0, 255]; 4]).expect("refill red");
+    let t2 = vk
+        .import_dmabuf_as_texture(&dmabuf)
+        .expect("re-import (hit)");
+    let c2 = sample(&mut vk, t2);
+    assert!(
+        close_px(c2, [255, 0, 0, 255], 40),
+        "a CPU write to the mapped dmabuf was not visible to the GPU sample: got {c2:?}, which is \
+         the buffer's previous contents. Host-side coherency bug — see \
+         vmm-issue-dmabuf-cpu-write-coherency.md",
     );
 }
 
