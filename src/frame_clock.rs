@@ -302,7 +302,17 @@ impl FrameClock {
     }
 
     fn next_target(&self, advance_past_unreachable: bool) -> Duration {
-        match self.cadence(get_monotonic_time()) {
+        self.next_target_from(get_monotonic_time(), advance_past_unreachable)
+    }
+
+    /// [`next_target`](Self::next_target) against an explicit `now`, so a test can ask twice and
+    /// get two answers about the same instant. Reading the real clock per call made
+    /// `the_vblank_estimate_ignores_what_a_frame_costs` compare two calls that could straddle a
+    /// vblank boundary, and it failed by exactly one refresh period whenever they did — rare on an
+    /// idle machine, reproducible under the load of `SYNOIK_VK_VALIDATION=1`. Same seam, and same
+    /// reason, as [`dispatch_from`](Self::dispatch_from).
+    fn next_target_from(&self, now: Duration, advance_past_unreachable: bool) -> Duration {
+        match self.cadence(now) {
             Cadence::Immediate(now) => now,
             Cadence::Locked {
                 boundary,
@@ -639,18 +649,22 @@ mod tests {
     #[test]
     fn the_vblank_estimate_ignores_what_a_frame_costs() {
         let mut c = clock();
-        // Seed a last presentation so both paths do real arithmetic rather than returning `now`.
-        c.presented(get_monotonic_time());
-        let unloaded = c.next_vblank_estimate();
+        // Seed a last presentation so both paths do real arithmetic rather than returning `now`,
+        // and pin `now` — every question below is about the *same* instant, and asking the real
+        // clock per call means two of them can land either side of a vblank.
+        let now = Duration::from_secs(1000);
+        c.presented(now);
+        let now = now + REFRESH / 2;
+        let unloaded = c.next_target_from(now, false);
 
         c.record_render_time(REFRESH * 2);
         assert_eq!(
-            c.next_vblank_estimate(),
+            c.next_target_from(now, false),
             unloaded,
             "a slow frame moved the display's own vblank estimate",
         );
         assert!(
-            c.next_presentation_time() > unloaded,
+            c.next_target_from(now, true) > unloaded,
             "…while the frame's target must have moved past the vblank it cannot reach",
         );
     }
