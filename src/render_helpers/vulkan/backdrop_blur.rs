@@ -84,6 +84,27 @@ impl BackdropBlur {
         self.size == size && self.blur.as_ref().map(|b| b.passes) == passes
     }
 
+    /// What [`Self::matches`] keys on, as a poolable identity — see
+    /// [`VulkanRenderer::recycle_backdrop_blur`](super::VulkanRenderer::recycle_backdrop_blur).
+    pub(crate) fn key(&self) -> ((u32, u32), Option<usize>) {
+        (self.size, self.blur.as_ref().map(|b| b.passes))
+    }
+
+    /// Roughly how much device memory this bundle holds, for the pool's budget. Approximate on
+    /// purpose: the capture and the output are exact, and the chain's levels are counted as one
+    /// more full-size image — a dual-Kawase's halving levels plus their ping-pong twins sum to
+    /// about 1.3× the base, so this rounds the estimate up rather than under-counting a cap whose
+    /// whole job is to bound retention.
+    pub(crate) fn bytes(&self) -> u64 {
+        let (w, h) = self.size;
+        let plane = u64::from(w) * u64::from(h) * 4;
+        if self.blur.is_some() {
+            plane * 3
+        } else {
+            plane
+        }
+    }
+
     /// The capture destination for [`VulkanFrame::capture_region`].
     ///
     /// [`VulkanFrame::capture_region`]: super::frame::VulkanFrame::capture_region

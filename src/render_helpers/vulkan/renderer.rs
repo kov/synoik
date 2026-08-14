@@ -220,6 +220,28 @@ pub struct VulkanRenderer {
     /// `vulkan_backdrop_blur_reuses_across_a_size_sweep`.
     #[cfg(test)]
     backdrop_blur_allocs: usize,
+    /// Evicted [`BackdropBlur`](super::BackdropBlur) bundles, keyed by the `(dims, passes)` their
+    /// [`matches`](super::BackdropBlur::matches) tests, newest last.
+    ///
+    /// `backdrop_blur::quantize`'s ladder already turns a per-frame rebuild into a handful per
+    /// animation. This is for what that handful costs on the seat: an overview round trip is a
+    /// *cyclic* sweep — the opening shrinks each effect's intermediate down through a set of rungs
+    /// and the closing grows it back through the very same ones, because the rungs are quantized
+    /// and so recur exactly. Without a pool every rung is built on the way down, destroyed, and
+    /// built again on the way up, forever. Measured on the seat 2026-08-14: ~17 rebuilds per
+    /// transition across 5 blurred elements — 51 GPU resource creations, whose host-side work
+    /// lands in the frame's single fence wait (creating is ~0.06 ms of *guest* time and ~10 ms
+    /// of waiting for it).
+    ///
+    /// Popping a bundle instead of building one is safe for the same reason keeping one across
+    /// frames is: a frame holds what it records ([`VulkanFrame::capture_backdrop`] pushes the
+    /// textures into `held` and the chain into `blur_chains`), and `capture_region` refills the
+    /// capture before anything samples it, so stale contents cannot be observed.
+    ///
+    /// Bounded by [`BACKDROP_BLUR_POOL_BYTES`], evicting oldest-first: retention is not what hurt
+    /// this VM, churn was — but a full-screen bundle is tens of megabytes, so an unbounded pool
+    /// would trade a host-time problem for a memory one.
+    backdrop_blur_pool: Vec<(BackdropBlurKey, super::BackdropBlur)>,
     /// Imported scanout dmabuf targets, keyed by buffer identity. `DrmCompositor` cycles a small
     /// fixed set of GBM buffers and re-binds one every frame; **importing** a dmabuf on Venus
     /// creates a host-side resource, so re-importing per frame churns those resources on the host
@@ -370,6 +392,21 @@ const MAX_PRESENT_BLIT_SHADOWS: usize = 8;
 /// screencopy, and the small cursor bitmap), so this is generous. See
 /// [`VulkanRenderer::readback_staging`].
 const MAX_READBACK_STAGING: usize = 4;
+
+/// What a pooled backdrop bundle is keyed by: the intermediate's `(width, height)` and the blur
+/// pass count (`None` = blur off), i.e. exactly what
+/// [`BackdropBlur::matches`](super::BackdropBlur::matches) tests.
+type BackdropBlurKey = ((u32, u32), Option<usize>);
+
+/// Budget for the evicted-backdrop-bundle pool, in bytes. See
+/// [`VulkanRenderer::backdrop_blur_pool`].
+///
+/// Sized for one overview round trip on a busy screen: five blurred effects sweeping ~4 rungs
+/// each, at the ~1100×630 intermediates a windowed effect actually asks for (~8 MB a bundle by
+/// [`BackdropBlur::bytes`](super::BackdropBlur::bytes)). A full-screen bundle is several times
+/// that, so this holds fewer of those — which is the right way round, since the biggest rungs are
+/// the ones a sweep passes through quickest.
+const BACKDROP_BLUR_POOL_BYTES: u64 = 192 * 1024 * 1024;
 
 /// Cap on cached glyph runs. Each pins its own R8 coverage atlas (a few tens of KB
 /// at panel/label sizes), and the live set is the strings actually on screen — every
@@ -595,6 +632,7 @@ impl VulkanRenderer {
             readback_staging_allocs: 0,
             #[cfg(test)]
             backdrop_blur_allocs: 0,
+            backdrop_blur_pool: Vec::new(),
             dmabuf_target_cache: HashMap::new(),
             dmabuf_import_cache: HashMap::new(),
             warned_modifiers: HashSet::new(),
@@ -3328,10 +3366,47 @@ impl VulkanRenderer {
         self.readback_staging_allocs
     }
 
+    /// Hand an evicted backdrop bundle to the pool instead of dropping it. See
+    /// [`Self::backdrop_blur_pool`].
+    pub(crate) fn recycle_backdrop_blur(&mut self, blur: super::BackdropBlur) {
+        self.backdrop_blur_pool.push((blur.key(), blur));
+
+        // Oldest-first, which for a sweep is also largest-first on the way down and smallest-first
+        // on the way up — either way the rungs a cyclic animation is about to want again are the
+        // recent ones. A size-aware policy would have to guess the direction; recency does not.
+        let mut total: u64 = self.backdrop_blur_pool.iter().map(|(_, b)| b.bytes()).sum();
+        let mut drained = 0;
+        while total > BACKDROP_BLUR_POOL_BYTES && drained < self.backdrop_blur_pool.len() {
+            total -= self.backdrop_blur_pool[drained].1.bytes();
+            drained += 1;
+        }
+        self.backdrop_blur_pool.drain(..drained);
+    }
+
+    /// Take a pooled bundle matching `dims`/`passes`, if one is held. Most-recent match first.
+    pub(crate) fn take_backdrop_blur(
+        &mut self,
+        dims: (u32, u32),
+        passes: Option<usize>,
+    ) -> Option<super::BackdropBlur> {
+        let want: BackdropBlurKey = (dims, passes);
+        let i = self
+            .backdrop_blur_pool
+            .iter()
+            .rposition(|(key, _)| *key == want)?;
+        Some(self.backdrop_blur_pool.remove(i).1)
+    }
+
     /// See [`Self::backdrop_blur_allocs`].
     #[cfg(test)]
     pub(super) fn backdrop_blur_allocs(&self) -> usize {
         self.backdrop_blur_allocs
+    }
+
+    /// How many bundles the pool is holding (test-only observability).
+    #[cfg(test)]
+    pub(super) fn backdrop_blur_pooled(&self) -> usize {
+        self.backdrop_blur_pool.len()
     }
 
     #[cfg(test)]

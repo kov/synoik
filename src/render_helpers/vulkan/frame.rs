@@ -1387,9 +1387,22 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         let dims = (size.w as u32, size.h as u32);
         let reuse = slot.as_ref().is_some_and(|b| b.matches(dims, passes));
         if !reuse {
-            #[cfg(test)]
-            self.renderer.note_backdrop_blur_alloc();
-            *slot = Some(BackdropBlur::new(self.renderer, size, passes)?);
+            // The rung we are leaving goes to the pool rather than to `vkDestroy*`. An animated
+            // geometry is almost always a *cyclic* sweep — the overview shrinks each intermediate
+            // down through a set of rungs and grows it back through the same ones — so the bundle
+            // being evicted here is, more often than not, one this same effect will ask for again
+            // within the second. See `VulkanRenderer::backdrop_blur_pool`.
+            if let Some(evicted) = slot.take() {
+                self.renderer.recycle_backdrop_blur(evicted);
+            }
+            *slot = match self.renderer.take_backdrop_blur(dims, passes) {
+                Some(pooled) => Some(pooled),
+                None => {
+                    #[cfg(test)]
+                    self.renderer.note_backdrop_blur_alloc();
+                    Some(BackdropBlur::new(self.renderer, size, passes)?)
+                }
+            };
         }
         let bb = slot.as_ref().expect("just populated");
         // The blur rides the capture's own command buffer, recorded in the gap between the two

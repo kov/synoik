@@ -3665,6 +3665,31 @@ fn vulkan_backdrop_blur_reuses_across_a_size_sweep() {
              the ladder should bound it to a handful",
         );
     }
+
+    // ...and having swept both ways once, every rung this geometry visits has been built. A
+    // repeat of the same cycle must now build *nothing*: the rungs are quantized, so a cyclic
+    // animation revisits the same sizes exactly, and an evicted bundle goes to the renderer's
+    // pool instead of to `vkDestroy*`.
+    //
+    // This is the seat case, not a synthetic one. An overview round trip sweeps every blurred
+    // effect down through a set of rungs and back up through the same ones; measured 2026-08-14,
+    // that was ~17 rebuilds and 51 GPU resource creations *per transition*, repeated for as long
+    // as the user keeps toggling. The ladder alone cannot fix it — a handful per sweep is
+    // exactly what it promises — so the fix has to be reuse across sweeps.
+    for cycle in 0..2 {
+        let before = vk.backdrop_blur_allocs();
+        for w in (LO..S).chain((LO..S).rev()) {
+            capture_at(&mut vk, &mut target, w);
+        }
+        assert_eq!(
+            vk.backdrop_blur_allocs() - before,
+            0,
+            "cycle {cycle} of an already-swept range rebuilt the backdrop cache; a cyclic \
+             animation must reuse the rungs it built on the way out, not rebuild them on the \
+             way back (pool holds {} bundles)",
+            vk.backdrop_blur_pooled(),
+        );
+    }
 }
 
 /// The renderer has exactly one render-pass format ([`NATIVE_FOURCC`]'s BGRA order), so an
