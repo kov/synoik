@@ -71,8 +71,10 @@ mod platform {
             .insert_source(
                 Signals::new(&[Signal::SIGUSR1]).unwrap(),
                 |_event, _, state| match state.synoik.frame_log.dump() {
-                    Ok((path, 0)) => {
-                        info!("frame-log ring is empty (is SYNOIK_FRAME_LOG=ring set?); {path:?}")
+                    // No path: nothing was written, and naming a file that does not exist
+                    // sends the reader looking for it.
+                    Ok((_, 0)) => {
+                        info!("frame-log ring is empty, nothing written (is SYNOIK_FRAME_LOG=ring set?)")
                     }
                     Ok((path, n)) => info!("dumped {n} frame-log entries to {}", path.display()),
                     Err(err) => warn!("error dumping the frame log: {err}"),

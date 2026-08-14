@@ -2552,6 +2552,14 @@ impl FrameLog {
     /// `scripts/correlate-frame-log.py` reads a dump directly.
     pub fn dump(&mut self) -> std::io::Result<(std::path::PathBuf, usize)> {
         let path = dump_path(self.dump_override.clone(), self.dumps);
+        if self.ring.is_empty() {
+            // No file at all, rather than an empty one. A 0-byte dump beside the others reads as
+            // "the window was captured and there was nothing in it" — which is the opposite of
+            // what it means, and indistinguishable at a glance from a session that rendered
+            // nothing. The caller says "the ring is empty" instead. Reachable whenever the
+            // recorder is off: the signal handler is installed regardless.
+            return Ok((path, 0));
+        }
         let entries = self.write_ring(&path, self.ring.len())?;
 
         self.ring.clear();
@@ -2571,6 +2579,10 @@ impl FrameLog {
     /// two triggers in a row would eat each other's evidence.
     fn dump_tail(&mut self, keep: usize) -> std::io::Result<(std::path::PathBuf, usize)> {
         let path = dump_path(self.dump_override.clone(), self.dumps);
+        // Same as [`dump`]: nothing banked, no file.
+        if self.ring.is_empty() {
+            return Ok((path, 0));
+        }
         let entries = self.write_ring(&path, keep)?;
         self.dumps += 1;
         Ok((path, entries))
@@ -3690,6 +3702,35 @@ mod tests {
             "a turn whose only cost was the frame is not a loop stall — the frame \
              log already reports it, in more detail than a stall line could"
         );
+    }
+
+    /// An empty ring writes no file at all.
+    ///
+    /// The signal handler is installed whether or not the recorder is on, so `SIGUSR1` with
+    /// `SYNOIK_FRAME_LOG` unset used to leave a 0-byte `frame-log.<pid>.0.txt` in the state dir.
+    /// Beside real dumps that reads as "the window was captured and there was nothing in it" —
+    /// the opposite of what it means, and indistinguishable from a session that rendered nothing.
+    #[test]
+    fn dumping_an_empty_ring_writes_no_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "synoik-empty-dump-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("dump.txt");
+
+        let mut log = test_log();
+        log.dump_override = Some(path.clone());
+
+        let (reported, entries) = log.dump().expect("an empty dump is not an error");
+        assert_eq!(entries, 0);
+        assert!(
+            !reported.exists(),
+            "an empty ring must leave no file behind, found {reported:?}",
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A dump must contain everything the scorer needs to compute a miss rate.
