@@ -252,8 +252,6 @@ pub const STARTUP_TIMEOUT: Duration = Duration::from_millis(15000);
 pub trait AppCatalog {
     /// Every installed app, unfiltered (`g_app_info_get_all`).
     fn enumerate(&self) -> Vec<AppEntry>;
-    /// A single app by desktop id, unfiltered (`g_desktop_app_info_new`).
-    fn lookup(&self, id: &str) -> Option<AppEntry>;
     /// Relevance-grouped search (`g_desktop_app_info_search`): outer vec is
     /// relevance tiers, inner vec is ids within a tier.
     fn search(&self, query: &str) -> Vec<Vec<String>>;
@@ -289,6 +287,18 @@ pub struct AppSystem {
     /// `StartupWMClass` → desktop id, rebuilt on every [`refresh`](Self::refresh)
     /// (`scan_startup_wm_class_to_id`, `shell-app-system.c:107`).
     startup_wm_class_to_id: HashMap<String, String>,
+    /// Desktop id → index into [`installed`](Self::installed), rebuilt on every
+    /// [`refresh`](Self::refresh). This is what makes [`lookup`](Self::lookup) a hash
+    /// probe instead of a disk read — `shell_app_cache_get_info` is documented as
+    /// exactly that, "a replacement for g_desktop_app_info_new() that will lookup the
+    /// information from the cache instead of (re)loading from disk"
+    /// (`shell-app-cache.c:344-370`), over the same `g_app_info_get_all()` list we
+    /// enumerate into `installed`.
+    ///
+    /// It matters because the *misses* are the expensive ones: resolving one window
+    /// walks the vendor-prefix ladder, so a handful of ids that do not exist used to
+    /// cost a `stat`/`access` path walk each, on the compositor thread, every refresh.
+    id_to_installed: HashMap<String, usize>,
     /// The raw window snapshot, kept so a catalog [`refresh`](Self::refresh) can
     /// re-resolve it (an app installed while its window is open then matches).
     windows: Vec<RunningWindow>,
@@ -322,6 +332,7 @@ impl AppSystem {
             installed: Vec::new(),
             stored: Vec::new(),
             startup_wm_class_to_id: HashMap::new(),
+            id_to_installed: HashMap::new(),
             windows: Vec::new(),
             running: Vec::new(),
             starting: HashMap::new(),
@@ -343,6 +354,7 @@ impl AppSystem {
             installed: Vec::new(),
             stored: Vec::new(),
             startup_wm_class_to_id: HashMap::new(),
+            id_to_installed: HashMap::new(),
             windows: Vec::new(),
             running: Vec::new(),
             starting: HashMap::new(),
@@ -398,6 +410,7 @@ impl AppSystem {
             installed: Vec::new(),
             stored: Vec::new(),
             startup_wm_class_to_id: HashMap::new(),
+            id_to_installed: HashMap::new(),
             windows: Vec::new(),
             running: Vec::new(),
             starting: HashMap::new(),
@@ -429,11 +442,25 @@ impl AppSystem {
         let installed = self.catalog.enumerate();
         let changed = installed != self.installed;
         self.installed = installed;
+        self.index_installed();
         self.scan_startup_wm_class_to_id();
         // Re-resolve the open windows: an app installed while its window was
         // already mapped now matches.
         self.recompute_running();
         changed
+    }
+
+    /// Rebuild the desktop-id index over [`installed`](Self::installed).
+    ///
+    /// First entry wins, because `shell_app_cache_get_info` walks its list and returns
+    /// the first id that matches (`shell-app-cache.c:361-367`) — the same "scan order
+    /// is part of the behavior" property [`scan_startup_wm_class_to_id`] relies on.
+    fn index_installed(&mut self) {
+        let mut index = HashMap::with_capacity(self.installed.len());
+        for (i, entry) in self.installed.iter().enumerate() {
+            index.entry(entry.id.clone()).or_insert(i);
+        }
+        self.id_to_installed = index;
     }
 
     /// Rebuild the `StartupWMClass` → id table (`scan_startup_wm_class_to_id`,
@@ -770,10 +797,18 @@ impl AppSystem {
         self.installed.iter().filter(|e| e.should_show)
     }
 
-    /// A single app by desktop id, resolved against the live catalog (unfiltered,
-    /// like `shell_app_system_lookup_app`).
+    /// A single app by desktop id, unfiltered — `shell_app_system_lookup_app`
+    /// (`shell-app-system.c:340-358`), which resolves through the app *cache*, never
+    /// off disk.
+    ///
+    /// So this answers from the last enumeration, not from the filesystem: an id that
+    /// is not in `g_app_info_get_all()` does not resolve here even if a `.desktop`
+    /// file for it exists (a `Hidden=true` entry, say). That is GNOME's answer too —
+    /// its cache is that same list — and it is what keeps a lookup off the compositor
+    /// thread's critical path. See [`id_to_installed`](Self::id_to_installed).
     pub fn lookup(&self, id: &str) -> Option<AppEntry> {
-        self.catalog.lookup(id)
+        let i = *self.id_to_installed.get(id)?;
+        self.installed.get(i).cloned()
     }
 
     /// An app by the id apps identify themselves with — a desktop file's basename **without**
@@ -1121,11 +1156,6 @@ impl AppCatalog for GioCatalog {
         gio::AppInfo::all().iter().filter_map(make_entry).collect()
     }
 
-    fn lookup(&self, id: &str) -> Option<AppEntry> {
-        let desktop = DesktopAppInfo::new(id)?;
-        make_entry(desktop.upcast_ref())
-    }
-
     fn search(&self, query: &str) -> Vec<Vec<String>> {
         DesktopAppInfo::search(query)
             .into_iter()
@@ -1346,9 +1376,6 @@ impl AppCatalog for EmptyCatalog {
     fn enumerate(&self) -> Vec<AppEntry> {
         Vec::new()
     }
-    fn lookup(&self, _id: &str) -> Option<AppEntry> {
-        None
-    }
     fn search(&self, _query: &str) -> Vec<Vec<String>> {
         Vec::new()
     }
@@ -1398,9 +1425,6 @@ impl FakeCatalog {
 impl AppCatalog for FakeCatalog {
     fn enumerate(&self) -> Vec<AppEntry> {
         self.apps.borrow().clone()
-    }
-    fn lookup(&self, id: &str) -> Option<AppEntry> {
-        self.apps.borrow().iter().find(|e| e.id == id).cloned()
     }
     fn search(&self, _query: &str) -> Vec<Vec<String>> {
         self.search_result.borrow().clone()
@@ -1730,12 +1754,24 @@ Actions=newwin;\n\n\
             // Icon extraction never panics on real catalog data.
             let _ = &entry.icon;
         }
-        let first = &all[0];
-        let looked_up = catalog
+        // Every enumerated app resolves by id — over *real* catalog data, which is
+        // where duplicate and oddly-shaped ids actually occur. `lookup` answers from
+        // the enumeration index, not from disk, so this is the round trip that used to
+        // be `catalog.lookup`.
+        let first = all[0].clone();
+        let system = AppSystem::with_parts(
+            Box::new(FakeCatalog::new(all.clone())),
+            Box::new(NullLauncher),
+        );
+        let looked_up = system
             .lookup(&first.id)
             .expect("lookup of an enumerated app");
         assert_eq!(looked_up.id, first.id);
         assert_eq!(looked_up.name, first.name);
+        assert!(
+            system.lookup("definitely-not-installed.desktop").is_none(),
+            "an id outside the enumeration must not resolve"
+        );
 
         // Searching an installed app's name finds it in *some* relevance group.
         // `all` is in hash order, so try a few entries and require one hit rather
