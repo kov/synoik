@@ -6259,3 +6259,68 @@ fn phase_deltas_accept_a_phase_that_took_no_time() {
         "the undefined high bits must be masked off, not compared",
     );
 }
+
+/// An opaque region is a claim about output pixels, so it must land inside the rect `geometry`
+/// reports — mapped through `src` into the element's destination, at the element's location.
+///
+/// The mapping used to scale the region by `texture_size / src.size` and ignore `location`
+/// entirely, which describes the texture at its own resolution sitting at the origin. That is
+/// correct only for an element drawn 1:1 at (0, 0), and every case here is a case that was wrong.
+///
+/// It is not only a fill-rate bug. Too *large* a region tells the damage tracker it may skip
+/// drawing something that is genuinely visible, which shows stale framebuffer; the live symptom
+/// that found it was the cheap direction, a full-screen wallpaper declaring ~0.98x of the output
+/// opaque and so failing to occlude the full-output backdrop beneath it.
+#[test]
+fn vulkan_texture_opaque_region_lands_where_the_element_is_drawn() {
+    let mut vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_texture_opaque_region_lands_where_the_element_is_drawn: \
+                 no Vulkan device ({e})"
+            );
+            return;
+        }
+    };
+
+    // A fully opaque 64x64 picture.
+    const N: i32 = 64;
+    let texels = vec![0xffu8; (N * N * 4) as usize];
+    let buffer = TextureBuffer::from_memory(
+        &mut vk,
+        &texels,
+        Fourcc::Abgr8888,
+        (N, N),
+        false,
+        1.0,
+        Transform::Normal,
+        vec![Rectangle::from_size(Size::<i32, BufferCoord>::from((N, N)))],
+    )
+    .expect("import texture");
+
+    // Drawn somewhere else, at a size that is not the texture's — the wallpaper's shape.
+    let location = Point::<f64, Logical>::from((10., 20.));
+    let size = Size::<f64, Logical>::from((200., 300.));
+    let elem = TextureRenderElement::from_texture_buffer(
+        buffer,
+        location,
+        1.0,
+        None,
+        Some(size),
+        Kind::Unspecified,
+    );
+
+    for scale in [1.0, 2.0] {
+        let scale = Scale::from(scale);
+        let geo = elem.geometry(scale);
+        let regions = elem.opaque_regions(scale).to_vec();
+        assert_eq!(
+            regions,
+            vec![geo],
+            "a fully opaque texture drawn at {location:?} sized {size:?} is opaque over exactly \
+             its geometry {geo:?} at scale {scale:?}, not over the texture's own {N}x{N} at the \
+             origin",
+        );
+    }
+}

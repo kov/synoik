@@ -307,8 +307,37 @@ impl<T: Texture> Element for TextureRenderElement<T> {
         if self.alpha < 1.0 {
             return OpaqueRegions::default();
         }
-        let texture_size = self.buffer.texture.size().to_f64();
         let src = self.src();
+        let geo = self.geometry(scale);
+
+        // An opaque region is a claim about *output* pixels, so it has to land in the same rect
+        // `geometry` reports: mapped through `src` into the element's destination, at the
+        // element's location. This used to scale the region by `texture_size / src.size` and
+        // drop `location` on the floor, which describes the texture sitting at the origin at its
+        // own resolution — right only when the element happens to be drawn 1:1 at (0, 0).
+        //
+        // The wallpaper is the case that found it: a picture whose resolution is not the output's,
+        // drawn full-screen, declared ~0.98x of the output opaque. That is enough to defeat
+        // `DrmCompositor`'s "completely hidden" cull for the full-output backdrop underneath it,
+        // so a full-damage frame shaded 1.9x the output to show 1.0x of pixels.
+        //
+        // Rounding is inward on purpose — location up, far edge down. An opaque region that is a
+        // pixel too *large* tells the damage tracker to skip drawing something that is genuinely
+        // visible, and the result is stale framebuffer content rather than a slow frame. Too small
+        // only costs fill rate. Round the direction whose failure is cheap.
+        let full_src_logical = Rectangle::from_size(src.size).to_logical(
+            self.buffer.scale,
+            self.buffer.transform,
+            &src.size,
+        );
+        if full_src_logical.size.w <= 0. || full_src_logical.size.h <= 0. {
+            return OpaqueRegions::default();
+        }
+        let logical_size = self.logical_size();
+        let ratio = Scale::from((
+            logical_size.w / full_src_logical.size.w,
+            logical_size.h / full_src_logical.size.h,
+        ));
 
         self.buffer
             .opaque_regions
@@ -317,11 +346,26 @@ impl<T: Texture> Element for TextureRenderElement<T> {
                 let mut region = region.to_f64().intersection(src)?;
 
                 region.loc -= src.loc;
-                region = region.upscale(texture_size / src.size);
-
                 let logical =
                     region.to_logical(self.buffer.scale, self.buffer.transform, &src.size);
-                Some(logical.to_physical_precise_down(scale))
+                let mut dst = logical.upscale(ratio);
+                dst.loc += self.location;
+
+                let p = dst.to_physical(scale);
+                let x0 = p.loc.x.ceil();
+                let y0 = p.loc.y.ceil();
+                let x1 = (p.loc.x + p.size.w).floor();
+                let y1 = (p.loc.y + p.size.h).floor();
+                if x1 <= x0 || y1 <= y0 {
+                    return None;
+                }
+                let rect = Rectangle::new(
+                    Point::<i32, Physical>::from((x0 as i32, y0 as i32)),
+                    Size::<i32, Physical>::from(((x1 - x0) as i32, (y1 - y0) as i32)),
+                );
+                // Never claim opacity outside the element itself: `geometry` rounds its own way,
+                // and a region poking past it is the over-claim this guards against.
+                rect.intersection(geo)
             })
             .collect()
     }
