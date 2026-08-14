@@ -1458,6 +1458,10 @@ impl VulkanRenderer {
                                 z: 1,
                             },
                         ]);
+                    synoik_vk::stats::blit(
+                        synoik_vk::stats::BlitSite::Other,
+                        u64::from(w) * u64::from(h),
+                    );
                     dev.cmd_blit_image(
                         cbuf,
                         image,

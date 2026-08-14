@@ -1294,6 +1294,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                         z: 1,
                     },
                 ]);
+            synoik_vk::stats::blit(
+                synoik_vk::stats::BlitSite::Capture,
+                u64::from(d_w) * u64::from(d_h),
+            );
             dev.cmd_blit_image(
                 cbuf,
                 src_image,
@@ -1836,6 +1840,13 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 std::slice::from_ref(&to_dst),
             );
 
+            synoik_vk::stats::blit(
+                synoik_vk::stats::BlitSite::Present,
+                rects
+                    .iter()
+                    .map(|r| u64::from(r.extent.width) * u64::from(r.extent.height))
+                    .sum(),
+            );
             dev.cmd_blit_image(
                 self.cbuf,
                 self.fb.buffer.image(),

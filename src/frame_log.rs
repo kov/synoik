@@ -1027,6 +1027,7 @@ struct InFlight {
     draws_at_start: u64,
     shaded_at_start: u64,
     shaded_by_site_at_start: [u64; synoik_vk::stats::DrawSite::ALL.len()],
+    blitted_by_site_at_start: [u64; synoik_vk::stats::BlitSite::ALL.len()],
     context: FrameContext,
 }
 
@@ -1099,6 +1100,12 @@ struct Totals {
     /// when something was allocated; these are for when nothing was. The first frame of an
     /// overview open is the open case: ~11ms of wait beyond its GPU time, with zero creates.
     host_calls: (u64, u64, u64),
+    /// Destination pixels blitted this frame, split by [`synoik_vk::stats::BlitSite`].
+    ///
+    /// Blits are **not draws**, so `shaded` cannot see them, yet they are recorded inside the GPU
+    /// timestamp bracket — which is how a frame reports GPU time its coverage cannot explain.
+    /// `perf_probe`'s sweep 7 named this blind spot and then had to guess at its size.
+    blitted_by_site: [u64; synoik_vk::stats::BlitSite::ALL.len()],
     draws: u64,
     /// Fragments shaded. The number that actually predicts a frame's cost: holding draws fixed
     /// and shrinking the damage rect collapses a frame to its bare submit overhead.
@@ -1595,6 +1602,7 @@ impl FrameLog {
             draws_at_start: synoik_vk::stats::draws(),
             shaded_at_start: synoik_vk::stats::shaded(),
             shaded_by_site_at_start: synoik_vk::stats::shaded_by_site(),
+            blitted_by_site_at_start: synoik_vk::stats::blitted_by_site(),
             context: FrameContext::default(),
         });
     }
@@ -1676,6 +1684,14 @@ impl FrameLog {
             uploaded: synoik_vk::stats::take_uploaded_bytes(),
             creates: synoik_vk::stats::take_creates(),
             host_calls: synoik_vk::stats::take_host_calls(),
+            blitted_by_site: {
+                let now = synoik_vk::stats::blitted_by_site();
+                let mut d = [0u64; synoik_vk::stats::BlitSite::ALL.len()];
+                for (i, slot) in d.iter_mut().enumerate() {
+                    *slot = now[i] - frame.blitted_by_site_at_start[i];
+                }
+                d
+            },
             create_sites: synoik_vk::stats::take_create_sites(),
             staging_write: synoik_vk::stats::take_staging_write(),
             draws: synoik_vk::stats::draws() - frame.draws_at_start,
@@ -1910,6 +1926,33 @@ impl FrameLog {
                 .collect();
             if !shares.is_empty() {
                 let _ = write!(line, " [{}]", shares.join(", "));
+            }
+        }
+        // Blits, beside the draws, because they are GPU work inside the same timestamp bracket
+        // that `covering` structurally cannot describe — a frame whose GPU time exceeds what its
+        // coverage explains is asking exactly this question.
+        if ctx.output_px > 0 {
+            let blitted: u64 = totals.blitted_by_site.iter().sum();
+            if blitted * 10 > ctx.output_px {
+                let shares: Vec<String> = synoik_vk::stats::BlitSite::ALL
+                    .iter()
+                    .filter(|site| totals.blitted_by_site[site.index()] * 10 > ctx.output_px)
+                    .map(|site| {
+                        format!(
+                            "{} {:.1}x",
+                            site.label(),
+                            totals.blitted_by_site[site.index()] as f64 / ctx.output_px as f64
+                        )
+                    })
+                    .collect();
+                let _ = write!(
+                    line,
+                    ", blitting {:.1}x the output",
+                    blitted as f64 / ctx.output_px as f64
+                );
+                if !shares.is_empty() {
+                    let _ = write!(line, " [{}]", shares.join(", "));
+                }
             }
         }
         // Submits before bakes and shaping: on a virtualized GPU the round-trip
@@ -2857,6 +2900,7 @@ mod tests {
             draws_at_start: 0,
             shaded_at_start: 0,
             shaded_by_site_at_start: [0; synoik_vk::stats::DrawSite::ALL.len()],
+            blitted_by_site_at_start: [0; synoik_vk::stats::BlitSite::ALL.len()],
             context: FrameContext::default(),
         }
     }
@@ -2867,6 +2911,41 @@ mod tests {
     /// chain rebuilt because its size animates, a swapchain image per frame, and an upload that
     /// forgot its cache — three different bugs. The seat's overview transition sat at exactly
     /// that number with nowhere to take it until the line named the constructor.
+    /// Blits are GPU work inside the frame's timestamp bracket that `covering` structurally cannot
+    /// describe — they are not draws. A frame whose GPU time exceeds what its coverage explains is
+    /// asking exactly this question, so the answer has to be on the same line.
+    #[test]
+    fn a_frame_says_how_much_it_blitted_beside_what_it_drew() {
+        use synoik_vk::stats::BlitSite;
+
+        let mut frame = empty_frame();
+        frame.context.output_px = 1000;
+        let mut blitted = [0u64; BlitSite::ALL.len()];
+        blitted[BlitSite::Present.index()] = 1000;
+        blitted[BlitSite::Capture.index()] = 500;
+        let totals = Totals {
+            submits: 1,
+            blitted_by_site: blitted,
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(17), &totals, None);
+        assert!(
+            line.contains("blitting 1.5x the output [present 1.0x, capture 0.5x]"),
+            "{line}"
+        );
+
+        // Under a tenth of the output is not a lever, and the line is already long.
+        let mut blitted = [0u64; BlitSite::ALL.len()];
+        blitted[BlitSite::Present.index()] = 50;
+        let totals = Totals {
+            submits: 1,
+            blitted_by_site: blitted,
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(17), &totals, None);
+        assert!(!line.contains("blitting"), "{line}");
+    }
+
     /// Host calls ride every submitting frame, because the number is read by comparing a slow
     /// frame with the steady one beside it — a field that appears only when it is large cannot be
     /// compared against its own absence.

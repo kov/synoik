@@ -866,6 +866,10 @@ impl BlurChain {
                     height: dst_h,
                     depth: 1,
                 });
+            crate::stats::blit(
+                crate::stats::BlitSite::Other,
+                u64::from(dst_w) * u64::from(dst_h),
+            );
             device.cmd_copy_image(
                 cbuf,
                 out.image,

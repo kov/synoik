@@ -61,6 +61,9 @@ thread_local! {
     static SHAPE_NANOS: Cell<u64> = const { Cell::new(0) };
     /// See [`host_calls`]. Counted, never timed: individually each is far below what a clock read
     /// here could resolve, and it is the *count* that crosses to the host.
+    /// See [`blit`]. Split by site for the same reason [`SHADED_BY_SITE`] is: a present blit and a
+    /// backdrop capture are different costs with different fixes.
+    static BLITTED_BY_SITE: Cell<[u64; BlitSite::ALL.len()]> = const { Cell::new([0; BlitSite::ALL.len()]) };
     static BARRIERS: Cell<u64> = const { Cell::new(0) };
     static DESCRIPTOR_WRITES: Cell<u64> = const { Cell::new(0) };
     static DESCRIPTOR_ALLOCS: Cell<u64> = const { Cell::new(0) };
@@ -683,6 +686,61 @@ pub fn draw(site: DrawSite, pixels: u64) {
         a[site.index()] += pixels;
         s.set(a);
     });
+}
+
+/// Where a blit's pixels went.
+///
+/// Blits are **not draws**, so nothing in `shaded` sees them, and they sit inside the frame's GPU
+/// timestamp bracket — which is how a frame can report GPU time that its coverage cannot explain.
+/// `perf_probe`'s sweep 7 flagged exactly this blind spot and then had to guess at it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlitSite {
+    /// The present blit out of the shadow into the scanout dmabuf. Full-damage with a channel
+    /// reorder, on every damaged frame, because this VM's primary plane advertises LINEAR only.
+    Present,
+    /// A backdrop capture: the scaled blit of an output sub-region into a blurred effect's capture
+    /// texture, once per blurred effect per frame.
+    Capture,
+    /// Anything else recorded on the frame path — readback staging, the blur chain's copy out.
+    Other,
+}
+
+impl BlitSite {
+    /// Every site, for iteration by the frame log.
+    pub const ALL: [BlitSite; 3] = [BlitSite::Present, BlitSite::Capture, BlitSite::Other];
+
+    /// How it appears in the frame line.
+    pub const fn label(self) -> &'static str {
+        match self {
+            BlitSite::Present => "present",
+            BlitSite::Capture => "capture",
+            BlitSite::Other => "other",
+        }
+    }
+
+    /// Position in [`ALL`](Self::ALL), for the per-site arrays.
+    pub const fn index(self) -> usize {
+        match self {
+            BlitSite::Present => 0,
+            BlitSite::Capture => 1,
+            BlitSite::Other => 2,
+        }
+    }
+}
+
+/// Record a blit of `pixels` destination pixels. See [`BlitSite`].
+pub fn blit(site: BlitSite, pixels: u64) {
+    BLITTED_BY_SITE.with(|s| {
+        let mut a = s.get();
+        a[site.index()] += pixels;
+        s.set(a);
+    });
+}
+
+/// Blitted destination pixels on this thread, split by site. The caller takes a delta across a
+/// frame, exactly as it does for [`shaded_by_site`].
+pub fn blitted_by_site() -> [u64; BlitSite::ALL.len()] {
+    BLITTED_BY_SITE.with(Cell::get)
 }
 
 /// Record a pipeline barrier, a descriptor-set write, and a descriptor-set allocation.
