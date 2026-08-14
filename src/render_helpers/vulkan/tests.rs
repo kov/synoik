@@ -3753,9 +3753,22 @@ fn vulkan_backdrop_blur_pool_prefers_many_small_bundles() {
         }
     };
 
-    let steps: Vec<f64> = (0..=20).map(|i| 0.35 + 0.65 * f64::from(i) / 20.).collect();
+    let base: Vec<f64> = (0..=20).map(|i| 0.35 + 0.65 * f64::from(i) / 20.).collect();
     let mut per_cycle = Vec::new();
-    for _ in 0..3 {
+    for cyc in 0..3 {
+        // The last cycle duplicates every fourth frame, which is what frame timing does on this
+        // stack — a contended host or a missed vblank re-renders the same geometry. A settle test
+        // that trusts a single repeat reads those as "at rest", flips the intermediate to full
+        // resolution and back, and pays two of the most expensive rebuilds there are *during* the
+        // animation. That scored 31 rebuilds here against 0, and it is why live rebuild counts
+        // tracked host contention when nothing about contention should change them.
+        let mut steps = Vec::new();
+        for (i, f) in base.iter().enumerate() {
+            steps.push(*f);
+            if cyc == 2 && i % 4 == 0 {
+                steps.push(*f);
+            }
+        }
         let before = vk.backdrop_blur_allocs();
         for f in steps.iter().chain(steps.iter().rev()) {
             capture_at(&mut vk, &mut target, *f);
@@ -3785,12 +3798,13 @@ fn vulkan_backdrop_blur_pool_prefers_many_small_bundles() {
     // proves nothing. This sweep is deterministic, so the count is the honest assertion.
     let steady = per_cycle[2];
     assert!(
-        steady <= 4,
-        "a warmed cycle rebuilt {steady} bundles. Two things keep this at zero and this catches \
-         the loss of either: capping the intermediate while the geometry moves (without it, 19), \
-         and evicting the *largest* pooled bundle rather than the oldest (without that, 34) — a \
-         bundle saves a fixed creation cost whatever its size, so a binding budget spent on big \
-         ones buys fewer hits.",
+        steady <= 8,
+        "a warmed cycle with duplicated frames rebuilt {steady} bundles. Three things keep this \
+         near zero and this catches the loss of any of them: capping the intermediate while the \
+         geometry moves (without it, 19); requiring several still frames before calling an effect \
+         settled, so a duplicated frame does not flip the resolution down and back (without it, \
+         31); and evicting the *largest* pooled bundle rather than the oldest, since a bundle \
+         saves a fixed creation cost whatever its size (without it, 34).",
     );
 }
 

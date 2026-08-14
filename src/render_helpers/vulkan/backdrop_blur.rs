@@ -44,6 +44,8 @@ pub(crate) struct BackdropBlur {
     blur: Option<BlurState>,
     /// See [`Self::last_need`].
     last_need: (i32, i32),
+    /// How many consecutive frames have asked for [`Self::last_need`]. See [`Self::still_for`].
+    still_for: u8,
 }
 
 impl BackdropBlur {
@@ -78,6 +80,7 @@ impl BackdropBlur {
             capture,
             blur,
             last_need: (0, 0),
+            still_for: 0,
         })
     }
 
@@ -99,10 +102,23 @@ impl BackdropBlur {
         self.last_need
     }
 
-    /// See [`Self::last_need`]. Set every frame, including on a bundle taken from the pool, whose
-    /// stored value belongs to whatever effect last used it.
-    pub(crate) fn set_last_need(&mut self, need: (i32, i32)) {
+    /// How many consecutive frames have now asked for the same intermediate size.
+    ///
+    /// A *single* repeat is not enough to call an effect settled: frame timing duplicates a frame
+    /// often enough on this stack (a contended host, a missed vblank), and treating that as "at
+    /// rest" flips the intermediate to full resolution and straight back — two rebuilds of the most
+    /// expensive kind, in the middle of the animation the cap exists to protect. Measured: a sweep
+    /// that repeats every fourth frame cost 31 rebuilds against 0 for the same sweep without
+    /// repeats, and it pushed the pool 273 MB past its budget.
+    pub(crate) fn still_for(&self) -> u8 {
+        self.still_for
+    }
+
+    /// See [`Self::last_need`] and [`Self::still_for`]. Set every frame, including on a bundle
+    /// taken from the pool, whose stored values belong to whatever effect last used it.
+    pub(crate) fn set_stillness(&mut self, need: (i32, i32), still_for: u8) {
         self.last_need = need;
+        self.still_for = still_for;
     }
 
     /// What [`Self::matches`] keys on, as a poolable identity — see

@@ -24,6 +24,21 @@ use super::fence::VkSubmitFence;
 use super::renderer::{transition_image, GpuTimerSlot, VulkanRenderer};
 use super::types::{GlyphRun, VkFramebuffer, VkTexture};
 
+/// How many consecutive frames must ask for the same intermediate size before an effect counts as
+/// settled and gets its full-resolution blur back.
+///
+/// Not one: frame timing duplicates a frame often enough here (a contended host, a missed vblank)
+/// that a single repeat is no evidence of rest, and acting on it flips the intermediate to full
+/// resolution and back — two of the most expensive rebuilds there are, in the middle of the
+/// animation `MOVING_INTERMEDIATE_CAP` exists to protect. Measured on the five-effect sweep: with a
+/// repeat every fourth frame, treating one repeat as rest cost 31 rebuilds against 0, and pushed
+/// the pool 273 MB past its budget. It also explained why live rebuild counts moved with host
+/// contention when nothing about contention should change how many bundles get built.
+///
+/// Three frames is ~50 ms at 60 Hz — long enough that a duplicate cannot reach it, short enough
+/// that the upgrade lands while the screen is still obviously at rest.
+const REST_AFTER_STILL_FRAMES: u8 = 3;
+
 /// Longest axis a blur intermediate may take **while its effect's geometry is moving**, in pixels.
 /// A resting effect is never capped. See [`VulkanFrame::capture_backdrop`].
 ///
@@ -1391,9 +1406,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // one, which is hard to see on something that is moving and easy to see on something that
         // is not. Resting effects keep today's full-resolution look exactly.
         let need = (size.w, size.h);
-        let moving = slot
-            .as_ref()
-            .is_some_and(|b| b.last_need() != (0, 0) && b.last_need() != need);
+        let still_for = match slot.as_ref().map(|b| (b.last_need(), b.still_for())) {
+            Some((last, n)) if last == need => n.saturating_add(1),
+            _ => 0,
+        };
+        let moving = still_for < REST_AFTER_STILL_FRAMES;
 
         let (size, offset) = match passes {
             Some(_) => {
@@ -1457,9 +1474,11 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 }
             };
         }
-        // Every frame, including on a bundle just taken from the pool, whose stored value belongs
+        // Every frame, including on a bundle just taken from the pool, whose stored values belong
         // to whichever effect used it last.
-        slot.as_mut().expect("just populated").set_last_need(need);
+        slot.as_mut()
+            .expect("just populated")
+            .set_stillness(need, still_for);
         let bb = slot.as_ref().expect("just populated");
         // The blur rides the capture's own command buffer, recorded in the gap between the two
         // render passes — no submit of its own, and no flush to make one visible to it.
