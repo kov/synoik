@@ -56,8 +56,9 @@ extern "C" fn fail_on_validation_errors() {
     if errors > 0 {
         eprintln!(
             "\nVULKAN VALIDATION FAILED: the layer reported {errors} error(s) — see the \
-             `VULKAN ERROR` lines above. Re-run with `--test-threads=1` to see which test caused \
-             them (parallel output interleaves, so nearby test names mean nothing)."
+             `VULKAN ERROR ... VALIDATION` lines above. Re-run with `--test-threads=1` to see \
+             which test caused them (parallel output interleaves, so nearby test names mean \
+             nothing)."
         );
         std::process::abort();
     }
@@ -76,7 +77,16 @@ unsafe extern "system" fn debug_callback(
     _user_data: *mut c_void,
 ) -> vk::Bool32 {
     let _ = std::panic::catch_unwind(|| {
-        if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        // Only *validation* errors are counted, never GENERAL ones. GENERAL is the loader's own
+        // channel, and it reports conditions that are not spec violations and not ours — most
+        // usefully `setup_loader_term_phys_devs: Failed to detect any valid GPUs in the current
+        // config`, which a machine under a parallel suite really does hit transiently. Every test
+        // here already skips itself when `VulkanRenderer::new` finds no device; counting the
+        // loader's complaint meant the *run* aborted instead, dumping a 13 MB core and reading
+        // exactly like a renderer bug. Seen once on 2026-08-14 and it cost an investigation.
+        // Everything is still printed below — this changes what fails a run, not what you can see.
+        let counts = types.contains(vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION);
+        if counts && severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
             VALIDATION_ERRORS.fetch_add(1, Ordering::Relaxed);
         }
 
