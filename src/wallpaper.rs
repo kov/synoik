@@ -35,7 +35,7 @@ use calloop::channel::Sender;
 use image::ImageReader;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{ContextId, Renderer as _};
+use smithay::backend::renderer::{ContextId, Renderer as _, Texture as _};
 use smithay::utils::{Buffer, Logical, Point, Rectangle, Scale, Size, Transform};
 use synoik_vk::gpu::Gpu;
 use synoik_vk::staging::HostStaging;
@@ -332,14 +332,25 @@ impl Wallpaper {
             backdrop.queue(renderer, &texture, texture_radius, brightness);
         }
 
-        // Same geometry as the unblurred element, sampling the blurred copy instead.
-        let blurred = TextureBuffer::from_texture(
-            renderer,
-            backdrop.output().clone(),
-            1.,
-            Transform::Normal,
-            Vec::new(),
-        );
+        // Same geometry as the unblurred element, sampling the blurred copy instead — including
+        // the opacity, which this used to drop on the floor.
+        //
+        // A blur of an opaque picture is opaque: the chain samples only that picture and the
+        // brightness multiply does not touch alpha. Declaring nothing meant the overview's
+        // full-screen blurred backdrop occluded nothing, so the full-output `SolidColor` backdrop
+        // underneath it (`Synoik::render_output`'s `push(backdrop)`) drew in full behind a layer
+        // hiding every pixel of it, on every overview frame.
+        //
+        // Keyed on the *source* being opaque rather than on the blur output's format, so a
+        // wallpaper with real transparency stays honest.
+        let output = backdrop.output().clone();
+        let opaque_regions = if self.image.as_ref().is_some_and(|image| image.opaque) {
+            vec![Rectangle::from_size(output.size())]
+        } else {
+            Vec::new()
+        };
+        let blurred =
+            TextureBuffer::from_texture(renderer, output, 1., Transform::Normal, opaque_regions);
         let elem = TextureRenderElement::from_texture_buffer(
             blurred,
             origin,
@@ -557,6 +568,61 @@ fn zoom_crop(picture: Size<f64, Logical>, view: Size<f64, Logical>) -> Rectangle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A blur of an opaque picture is opaque, and has to say so: the overview draws the blurred
+    /// wallpaper full-screen over the full-output `SolidColor` backdrop, and a layer that declares
+    /// no opaque region occludes nothing, so that backdrop is drawn in full behind something
+    /// hiding every pixel of it. Live, the blurred layer read `opaque=0.00x` against a
+    /// `SolidColor 1.00x` beneath it.
+    ///
+    /// Keyed on the source picture, so a wallpaper with real transparency keeps declaring nothing.
+    #[test]
+    fn a_blur_of_an_opaque_wallpaper_is_itself_opaque() {
+        use smithay::backend::renderer::element::Element as _;
+
+        let mut vk = match VulkanRenderer::new() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping a_blur_of_an_opaque_wallpaper_is_itself_opaque: no Vulkan device ({e})");
+                return;
+            }
+        };
+
+        const N: i32 = 64;
+        let view = Size::<f64, Logical>::from((N as f64, N as f64));
+        let scale = Scale::from(1.);
+
+        for opaque in [true, false] {
+            let wp = Wallpaper {
+                image: Some(Image {
+                    pixels: Pixels::Host(vec![0xffu8; (N * N * 4) as usize]),
+                    size: Size::from((N, N)),
+                    opaque,
+                }),
+                ..Default::default()
+            };
+
+            let Some(elem) = wp.render_blurred(&mut vk, Default::default(), view, scale, 4., 1.)
+            else {
+                panic!("the blurred wallpaper must build (opaque = {opaque})");
+            };
+
+            let geo = elem.geometry(scale);
+            let regions = elem.opaque_regions(scale).to_vec();
+            if opaque {
+                assert_eq!(
+                    regions,
+                    vec![geo],
+                    "a blur of an opaque picture covers its whole geometry {geo:?}",
+                );
+            } else {
+                assert!(
+                    regions.is_empty(),
+                    "a blur of a picture with transparency must claim nothing, got {regions:?}",
+                );
+            }
+        }
+    }
 
     /// A picture change decodes off-thread: the current wallpaper keeps showing
     /// until the new decode lands (no freeze/blank), and a stale result is ignored.
