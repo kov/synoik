@@ -1080,6 +1080,11 @@ struct Totals {
     /// cannot see. Added because the seat's worst frames had ~50ms that was neither a fence wait
     /// nor a bake.
     creates: (u64, Duration),
+    /// The same creations, split by constructor. Which resource is being made every frame is the
+    /// actionable half — a blur chain, an offscreen and a staging buffer are three different bugs
+    /// with three different fixes — and the bare count cannot say. See
+    /// [`synoik_vk::stats::take_create_sites`].
+    create_sites: Vec<synoik_vk::stats::CreateSite>,
     /// Wall time memcpying host bytes into mapped staging. Separate from `creates` because it is a
     /// different cost with a different fix — first-touch page faults on a freshly mapped buffer,
     /// scaling with payload (`docs/fork/venus-cost.md` §9.2; the mapping itself is cached and does
@@ -1503,6 +1508,7 @@ impl FrameLog {
             first_wait: synoik_vk::stats::take_first_wait(),
             uploaded: synoik_vk::stats::take_uploaded_bytes(),
             creates: synoik_vk::stats::take_creates(),
+            create_sites: synoik_vk::stats::take_create_sites(),
             staging_write: synoik_vk::stats::take_staging_write(),
             draws: synoik_vk::stats::draws() - frame.draws_at_start,
             shaded: synoik_vk::stats::shaded() - frame.shaded_at_start,
@@ -1768,6 +1774,16 @@ impl FrameLog {
                     totals.creates.0,
                     ms(totals.creates.1)
                 );
+                // Name them, capped exactly like the bake sites above and for the same reason.
+                if let Some((shown, rest)) = split_at_most(&totals.create_sites, CREATE_SITES_SHOWN)
+                {
+                    let names: Vec<String> = shown.iter().map(ToString::to_string).collect();
+                    let _ = write!(line, " ({}", names.join(", "));
+                    if rest > 0 {
+                        let _ = write!(line, ", +{rest} more");
+                    }
+                    let _ = write!(line, ")");
+                }
             }
         } else if !totals.retiring.is_zero() {
             // A frame can pay a wait for work it did not submit: retiring a previous
@@ -2419,6 +2435,10 @@ fn dump_dir_from(
 /// How many bake sites a frame line names before it starts counting the rest.
 const BAKE_SITES_SHOWN: usize = 3;
 
+/// The same, for creation sites. There are fewer distinct constructors than widgets, so three
+/// names covers a frame that is allocating for more than one reason.
+const CREATE_SITES_SHOWN: usize = 3;
+
 /// How long the display had been quiet in front of a missed flip, in whole refresh cycles.
 ///
 /// Its own function so a test can pin the wording without going through a page flip. The
@@ -2636,6 +2656,60 @@ mod tests {
             shaded_at_start: 0,
             context: FrameContext::default(),
         }
+    }
+
+    /// A creating frame names *what* it created, not just how much.
+    ///
+    /// The count alone is a dead end: 15 creations a frame is equally consistent with a blur
+    /// chain rebuilt because its size animates, a swapchain image per frame, and an upload that
+    /// forgot its cache — three different bugs. The seat's overview transition sat at exactly
+    /// that number with nowhere to take it until the line named the constructor.
+    #[test]
+    fn a_creating_frame_names_the_constructor() {
+        use synoik_vk::stats::CreateSite;
+
+        let frame = empty_frame();
+        let site = |file, line, creates, micros| CreateSite {
+            file,
+            line,
+            creates,
+            time: Duration::from_micros(micros),
+        };
+        let totals = Totals {
+            // The creation clause rides the submit breakdown, so the frame needs a submit.
+            submits: 1,
+            creates: (19, Duration::from_micros(4300)),
+            create_sites: vec![
+                site("synoik-vk/src/texture.rs", 496, 15, 3000),
+                site("synoik-vk/src/blur.rs", 224, 3, 1000),
+                site("synoik-vk/src/staging.rs", 211, 1, 300),
+            ],
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(17), &totals, None);
+        assert!(
+            line.contains(
+                "19 created in 4.30ms (texture.rs:496 ×15 3.00ms, blur.rs:224 ×3 1.00ms, \
+                 staging.rs:211 ×1 0.30ms)"
+            ),
+            "{line}"
+        );
+
+        // Capped like the bake sites, and the drop is stated rather than silent: a line that
+        // quietly showed three of five would read as a frame with three creators.
+        let totals = Totals {
+            submits: 1,
+            creates: (4, Duration::from_micros(400)),
+            create_sites: vec![
+                site("synoik-vk/src/texture.rs", 496, 1, 400),
+                site("synoik-vk/src/texture.rs", 590, 1, 300),
+                site("synoik-vk/src/blur.rs", 224, 1, 200),
+                site("synoik-vk/src/staging.rs", 211, 1, 100),
+            ],
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(17), &totals, None);
+        assert!(line.contains("+1 more)"), "{line}");
     }
 
     /// Enqueueing work and waiting for it are reported apart, and a wait is never

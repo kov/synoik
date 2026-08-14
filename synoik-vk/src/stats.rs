@@ -41,7 +41,9 @@
 //! [`set_enabled`] so an unlogged session does not pay an `Instant::now()` per
 //! submit.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::LocalKey;
 use std::time::{Duration, Instant};
@@ -201,6 +203,14 @@ impl GpuPhase {
     }
 }
 
+/// Where a creation came from: `(file, line)` of the constructor's call, from `#[track_caller]`.
+/// `Location` itself is not hashable, and the pair is what a reader wants anyway.
+type CreateKey = (&'static str, u32);
+
+/// What one creation site did: `(creations, nanoseconds)`. Nanoseconds stay zero unless timing
+/// is on — see [`creating`].
+type CreateTally = (u64, u64);
+
 /// One site's share of a frame. Times are gated on [`set_enabled`]; the count never is.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct SiteTotals {
@@ -232,6 +242,11 @@ thread_local! {
     /// Wall time inside GPU resource creation this frame, and how many creations. See [`creating`].
     static CREATE_NANOS: Cell<u64> = const { Cell::new(0) };
     static CREATES: Cell<u64> = const { Cell::new(0) };
+    /// The same creations, split by the constructor that made them — see [`take_create_sites`].
+    /// A `RefCell<HashMap>` rather than the `Cell` the other counters use because the key set is
+    /// open; a creation is rare enough per frame (tens, against thousands of draws) that the
+    /// borrow and the hash are not worth avoiding.
+    static CREATE_SITES: RefCell<HashMap<CreateKey, CreateTally>> = RefCell::new(HashMap::new());
     /// Wall time spent memcpying into mapped host-visible staging. See [`staging_write`].
     static STAGE_NANOS: Cell<u64> = const { Cell::new(0) };
     /// How many attributed scopes are open, and when the outermost one opened. See
@@ -400,25 +415,97 @@ pub fn uploaded(bytes: u64) {
 ///
 /// Counted even when timing is off, so the count stays meaningful on its own; the clock reads are
 /// gated like every other timer here.
+#[track_caller]
 pub fn creating() -> CreateTimer {
     add(&CREATES, 1);
+    let caller = std::panic::Location::caller();
+    let site = (caller.file(), caller.line());
+    // Count the site now, time it on drop: a creation that panics still happened.
+    CREATE_SITES.with(|s| s.borrow_mut().entry(site).or_default().0 += 1);
     let started = ENABLED.load(Ordering::Relaxed).then(Instant::now);
     if started.is_some() {
         enter_attributed();
     }
-    CreateTimer(started)
+    CreateTimer { started, site }
 }
 
-pub struct CreateTimer(Option<Instant>);
+pub struct CreateTimer {
+    started: Option<Instant>,
+    site: CreateKey,
+}
 
 impl Drop for CreateTimer {
     fn drop(&mut self) {
-        if let Some(started) = self.0 {
+        if let Some(started) = self.started {
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             add(&CREATE_NANOS, nanos);
+            CREATE_SITES.with(|s| s.borrow_mut().entry(self.site).or_default().1 += nanos);
             leave_attributed();
         }
     }
+}
+
+/// One constructor's creations over some window of time. See [`take_create_sites`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateSite {
+    /// Source file of the constructor, workspace-relative (`synoik-vk/src/texture.rs`).
+    pub file: &'static str,
+    pub line: u32,
+    /// How many resources it created.
+    pub creates: u64,
+    /// How long those creations took in total. Zero unless timing is on — the count is
+    /// always recorded, the timing is not.
+    pub time: Duration,
+}
+
+impl fmt::Display for CreateSite {
+    /// `texture.rs:496 ×15 0.21ms` — the crate-relative `src/` prefix is dropped, since
+    /// every site here has one.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let file = self
+            .file
+            .rsplit_once("src/")
+            .map_or(self.file, |(_, tail)| tail);
+        write!(f, "{file}:{} ×{}", self.line, self.creates)?;
+        if !self.time.is_zero() {
+            write!(f, " {:.2}ms", self.time.as_secs_f64() * 1000.)?;
+        }
+        Ok(())
+    }
+}
+
+/// Take and clear this thread's per-site creation tallies, most expensive first (ties broken
+/// by count, then location, so the order is stable for tests).
+///
+/// The bare count answers "is this frame allocating?"; this answers "allocating *what*". They
+/// are different questions with different fixes: a blur chain rebuilt per frame is a sizing
+/// bug, a scanout image per frame is a swapchain bug, and a staging buffer per frame is an
+/// upload that wants to be cached. Without the split, 15 creations a frame is a number with
+/// nowhere to go — which is exactly where an overview-transition stall sat until this existed.
+///
+/// Draining rather than accumulating, so a caller measures a window it defines — the frame log
+/// takes them per frame, a test per rendered frame of an animation. Mirrors
+/// `frame_log::take_bake_sites`, which does the same for the other round-trip class.
+pub fn take_create_sites() -> Vec<CreateSite> {
+    let mut sites: Vec<CreateSite> = CREATE_SITES.with(|s| {
+        s.borrow_mut()
+            .drain()
+            .map(|((file, line), (creates, nanos))| CreateSite {
+                file,
+                line,
+                creates,
+                time: Duration::from_nanos(nanos),
+            })
+            .collect()
+    });
+    sites.sort_by(|a, b| {
+        b.time
+            .cmp(&a.time)
+            .then(b.creates.cmp(&a.creates))
+            .then(a.file.cmp(b.file))
+            .then(a.line.cmp(&b.line))
+    });
+    sites
 }
 
 /// Times a host write into mapped `HOST_VISIBLE` staging memory.
@@ -687,6 +774,41 @@ mod tests {
         assert!(
             take_first_wait().is_none(),
             "a frame that only submitted, and never waited, reported a wait"
+        );
+        set_enabled(false);
+    }
+    /// A creation is attributed to the constructor that made it, and the tallies drain.
+    ///
+    /// The site is what makes the count actionable — allocating *something* every frame is a
+    /// symptom, allocating a colour target every frame is a bug with an address. `#[track_caller]`
+    /// is the whole mechanism, and it is one attribute away from silently collapsing every
+    /// creation onto this module's own line.
+    #[test]
+    fn a_creation_is_attributed_to_its_caller() {
+        set_enabled(true);
+        let _ = take_create_sites();
+
+        let here = std::panic::Location::caller().file();
+        for _ in 0..2 {
+            drop(creating());
+        }
+        let other_line = line!() + 1;
+        drop(creating());
+
+        let sites = take_create_sites();
+        assert!(
+            sites.iter().all(|s| s.file == here),
+            "creations were attributed somewhere other than the caller: {sites:?}"
+        );
+        // Two call sites, and the one called twice aggregates rather than appearing twice.
+        assert_eq!(sites.len(), 2, "{sites:?}");
+        let by_line = |line: u32| sites.iter().find(|s| s.line == line).map(|s| s.creates);
+        assert_eq!(by_line(other_line), Some(1), "{sites:?}");
+        assert_eq!(sites.iter().map(|s| s.creates).sum::<u64>(), 3, "{sites:?}");
+
+        assert!(
+            take_create_sites().is_empty(),
+            "taking the sites did not clear them, so the next frame inherits this one"
         );
         set_enabled(false);
     }
