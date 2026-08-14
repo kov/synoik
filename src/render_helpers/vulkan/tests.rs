@@ -3783,10 +3783,12 @@ fn vulkan_backdrop_blur_pool_prefers_many_small_bundles() {
     // proves nothing. This sweep is deterministic, so the count is the honest assertion.
     let steady = per_cycle[2];
     assert!(
-        steady <= 24,
-        "a warmed cycle rebuilt {steady} bundles; largest-first eviction scores 19 here and \
-         oldest-first 34. A bundle saves a fixed creation cost whatever its size, so under a \
-         binding budget the pool must drop its *largest* entries, not its oldest.",
+        steady <= 4,
+        "a warmed cycle rebuilt {steady} bundles. Two things keep this at zero and this catches \
+         the loss of either: capping the intermediate while the geometry moves (without it, 19), \
+         and evicting the *largest* pooled bundle rather than the oldest (without that, 34) — a \
+         bundle saves a fixed creation cost whatever its size, so a binding budget spent on big \
+         ones buys fewer hits.",
     );
 }
 

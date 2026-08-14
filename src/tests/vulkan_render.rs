@@ -5447,6 +5447,135 @@ fn vulkan_capture_region_splits_the_render_pass() {
     eprintln!("vulkan_capture_region_splits_the_render_pass: capture=red, target=green");
 }
 
+/// Capping the blur intermediate while the geometry moves must change the *resolution* of the
+/// blur and nothing else — in particular not its radius.
+///
+/// The cap exists to stop the rebuild churn (see `MOVING_INTERMEDIATE_CAP`), and it is only safe
+/// to trade because the on-screen radius is held constant across it: a dual-Kawase's radius in
+/// texels is proportional to the tap offset, and the on-screen radius is that times
+/// (screen / intermediate), so scaling the offset by the same factor the intermediate was capped
+/// by leaves the result where it was. Get that compensation wrong — compare against the capped
+/// size instead of the pre-cap need, say — and the blur is ~2x wider whenever anything animates,
+/// snapping back the instant it settles. That is very visible and no pixel test elsewhere sees it.
+///
+/// The backdrop is one hard vertical edge, because the blurred gradient across it *is* the radius.
+/// A high-frequency backdrop is the wrong probe here: three passes wash a checkerboard to
+/// near-uniform at either resolution, so a doubled radius hides in it (measured, 0.62 against a
+/// correct 0.60 — no separation at all).
+#[test]
+fn vulkan_moving_blur_cap_changes_resolution_not_radius() {
+    use smithay::backend::renderer::Offscreen;
+    use smithay::utils::user_data::UserDataMap;
+
+    use crate::render_helpers::background_effect::RenderParams;
+    use crate::render_helpers::blur::BlurOptions;
+    use crate::render_helpers::framebuffer_effect::FramebufferEffect;
+    use crate::render_helpers::vulkan::VulkanRenderer as Vk;
+
+    let mut vk = match Vk::new() {
+        Ok(vk) => vk,
+        Err(_) => return,
+    };
+    const S: i32 = 2048;
+    let size = Size::<i32, Physical>::from((S, S));
+
+    // `w` is the geometry to capture at; returns the composited readback.
+    let run = |vk: &mut Vk, needs: &[i32]| -> Vec<u8> {
+        let mut target = vk
+            .create_buffer(NATIVE_FOURCC, Size::from((S, S)))
+            .expect("target");
+        let cache = UserDataMap::new();
+        for (i, w) in needs.iter().enumerate() {
+            let effect = FramebufferEffect::new();
+            let element = effect.render(
+                None,
+                RenderParams {
+                    geometry: Rectangle::from_size(Size::from((f64::from(*w), f64::from(S)))),
+                    subregion: None,
+                    clip: None,
+                    scale: 1.0,
+                },
+                Some(BlurOptions {
+                    passes: 3,
+                    offset: 2.0,
+                }),
+                crate::render_helpers::blur::Finish::NONE,
+            );
+            let src = element.src();
+            let dst = element.geometry(Scale::from(1.0));
+            let mut fb = vk.bind(&mut target).expect("bind");
+            let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+            // One hard vertical edge. This is what exposes a *radius* change: the blurred
+            // gradient across it is the radius, directly. (A checkerboard is the wrong probe —
+            // three passes wash it to near-uniform at either resolution, so a doubled radius
+            // hides in the noise. Measured: it scored 0.62 mean against a correct 0.60.)
+            let half = Rectangle::new((0, 0).into(), (S / 2, S).into());
+            frame
+                .draw_solid(
+                    half,
+                    &[Rectangle::from_size((S / 2, S).into())],
+                    Color32F::from([0.9, 0.1, 0.1, 1.]),
+                )
+                .expect("solid");
+            let other = Rectangle::new((S / 2, 0).into(), (S / 2, S).into());
+            frame
+                .draw_solid(
+                    other,
+                    &[Rectangle::from_size((S / 2, S).into())],
+                    Color32F::from([0.1, 0.9, 0.1, 1.]),
+                )
+                .expect("solid");
+            RenderElement::<Vk>::capture_framebuffer(&element, &mut frame, src, dst, &cache)
+                .expect("cap");
+            RenderElement::<Vk>::draw(
+                &element,
+                &mut frame,
+                src,
+                dst,
+                &[Rectangle::from_size(size)],
+                &[],
+                Some(&cache),
+            )
+            .expect("draw");
+            let _ = frame.finish().expect("finish");
+            let _ = i;
+        }
+        let fb = vk.bind(&mut target).expect("rebind");
+        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((S, S)));
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy");
+        vk.map_texture(&mapping).expect("map").to_vec()
+    };
+
+    // Resting: the same need twice, so frame 2 sees last_need == need.
+    let resting = run(&mut vk, &[S, S]);
+    // Moving: a different need first, so frame 2 sees last_need != need and caps.
+    let moving = run(&mut vk, &[S - 37, S]);
+
+    let (mut sum, mut max) = (0u64, 0u32);
+    for (a, b) in resting.iter().zip(moving.iter()) {
+        let d = u32::from(a.abs_diff(*b));
+        sum += u64::from(d);
+        max = max.max(d);
+    }
+    let mean = sum as f64 / resting.len() as f64;
+    eprintln!(
+        "vulkan_moving_blur_cap_changes_resolution_not_radius: mean {mean:.2}/255, max {max}/255"
+    );
+    // Measured at 0.12 mean / 11 max with the compensation right, and 0.66 / 41 with it taken
+    // against the capped size instead — a 5x separation on the mean, which is what makes this an
+    // assertion and not a vibe. It also says how small the trade is: capping a 2048px
+    // intermediate to 921 moves a hard edge's blurred gradient by 0.05% on average.
+    assert!(
+        mean < 0.3 && max < 20,
+        "capping the intermediate while moving changed the blurred result by mean {mean:.2}/255, \
+         max {max}/255 — far more than a resample of it should. The tap-offset compensation in \
+         `capture_backdrop` must be measured against the pre-cap need, or the cap changes the \
+         blur radius and not just its resolution.",
+    );
+}
+
 /// End-to-end backdrop blur on the owned Vulkan renderer: draw a hard red|green vertical edge, then
 /// run a `FramebufferEffectElement` (blur enabled) over the whole frame — `capture_framebuffer`
 /// grabs the scene (mid-frame render-pass split), blurs it, and `draw` composites the result. A

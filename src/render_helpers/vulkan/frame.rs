@@ -24,6 +24,25 @@ use super::fence::VkSubmitFence;
 use super::renderer::{transition_image, GpuTimerSlot, VulkanRenderer};
 use super::types::{GlyphRun, VkFramebuffer, VkTexture};
 
+/// Longest axis a blur intermediate may take **while its effect's geometry is moving**, in pixels.
+/// A resting effect is never capped. See [`VulkanFrame::capture_backdrop`].
+///
+/// The intermediate is a resample, so its size is purely a resolution dial, and the on-screen blur
+/// radius is held constant across the cap by the tap-offset compensation next to it — what a cap
+/// costs is detail in the blurred image, which is what an animation hides best and a still frame
+/// shows worst.
+///
+/// What it buys is the end of the rebuild churn rather than a bigger pool to store it in: every
+/// ladder rung above the cap collapses into one, so the expensive top of a sweep stops crossing
+/// rungs. Measured on the three-big-windows overview shape: 19 rebuilds per cycle to 0, with the
+/// pool holding 41 MB where fitting the uncapped rungs would have taken ~480 MB.
+///
+/// 921 because it *is* a rung of `backdrop_blur::quantize`'s ladder: the cap is applied before
+/// quantization, so a value between rungs would be rounded straight back up and the constant would
+/// not mean what it says (960 silently behaved as 1151). It sits a little under half this seat's
+/// 2371 px output, which keeps the softening modest; the whole trade is this one number.
+const MOVING_INTERMEDIATE_CAP: i32 = 921;
+
 /// The clip a [`ClippedSurfaceRenderElement`](crate::render_helpers::clipped_surface) wants applied
 /// to the surface it is about to draw. Set on the frame (via [`VulkanFrame::set_clip_override`])
 /// before the inner `WaylandSurfaceRenderElement` draws, so [`VulkanFrame::render_texture_from_to`]
@@ -1366,8 +1385,34 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // known gap, not an oversight. Quantizing it is the wrong trade: the raw capture is a
         // resample of the framebuffer, so slack would upsample and then downsample it, and that
         // path exists precisely to leave the backdrop crisp.
+        // Is this effect's geometry *moving*? A need that differs from the previous frame's is an
+        // animation in progress. That is the only state in which the intermediate is capped below,
+        // and the reason is perceptual: a blur computed at a lower resolution is a wider, softer
+        // one, which is hard to see on something that is moving and easy to see on something that
+        // is not. Resting effects keep today's full-resolution look exactly.
+        let need = (size.w, size.h);
+        let moving = slot
+            .as_ref()
+            .is_some_and(|b| b.last_need() != (0, 0) && b.last_need() != need);
+
         let (size, offset) = match passes {
             Some(_) => {
+                // While moving, cap the intermediate's long axis, preserving aspect so the blur
+                // stays as isotropic as the ladder's own slack leaves it. This is what actually
+                // ends the rebuild churn rather than storing it: every rung above the cap collapses
+                // into one, so the expensive top of a sweep stops crossing rungs at all — measured
+                // on the three-big-windows shape as 19 rebuilds per cycle down to 0, with the pool
+                // holding 41 MB instead of 171 MB. Fitting those rungs in the pool instead would
+                // have taken ~480 MB.
+                let long = size.w.max(size.h);
+                let size = if moving && long > MOVING_INTERMEDIATE_CAP {
+                    Size::from((
+                        (size.w * MOVING_INTERMEDIATE_CAP / long).max(1),
+                        (size.h * MOVING_INTERMEDIATE_CAP / long).max(1),
+                    ))
+                } else {
+                    size
+                };
                 let quantized = Size::from((
                     backdrop_blur::quantize(size.w),
                     backdrop_blur::quantize(size.h),
@@ -1377,8 +1422,16 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 // back up by how much we overshot, or the blur would visibly thin at every rung
                 // crossing. One scalar, not one per axis: the two overshoots differ by at most
                 // 1.25:1, and that much anisotropy in a blur is not something you can see.
-                let ratio = (f64::from(quantized.w) / f64::from(size.w))
-                    * (f64::from(quantized.h) / f64::from(size.h));
+                //
+                // Measured against the *pre-cap* need, so the cap above changes resolution and
+                // nothing else. A dual-Kawase's radius in texels is proportional to `offset`, and
+                // the on-screen radius is that times (screen / intermediate) — so capping the
+                // intermediate by `k` and scaling `offset` by the same `k` leaves the on-screen
+                // radius exactly where it was. Comparing against the capped size instead would
+                // leave the blur `1/k` times wider while moving, and it would visibly snap back
+                // the moment the animation settled.
+                let ratio = (f64::from(quantized.w) / f64::from(need.0))
+                    * (f64::from(quantized.h) / f64::from(need.1));
                 (quantized, offset * ratio.sqrt() as f32)
             }
             None => (size, offset),
@@ -1404,6 +1457,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 }
             };
         }
+        // Every frame, including on a bundle just taken from the pool, whose stored value belongs
+        // to whichever effect used it last.
+        slot.as_mut().expect("just populated").set_last_need(need);
         let bb = slot.as_ref().expect("just populated");
         // The blur rides the capture's own command buffer, recorded in the gap between the two
         // render passes — no submit of its own, and no flush to make one visible to it.

@@ -42,6 +42,8 @@ pub(crate) struct BackdropBlur {
     /// [`VulkanFrame::capture_region`]: super::frame::VulkanFrame::capture_region
     capture: VkTexture,
     blur: Option<BlurState>,
+    /// See [`Self::last_need`].
+    last_need: (i32, i32),
 }
 
 impl BackdropBlur {
@@ -75,6 +77,7 @@ impl BackdropBlur {
             size: dims,
             capture,
             blur,
+            last_need: (0, 0),
         })
     }
 
@@ -82,6 +85,24 @@ impl BackdropBlur {
     /// can be reused instead of rebuilt). `size` is expected to be a [`quantize`]d one.
     pub(crate) fn matches(&self, size: (u32, u32), passes: Option<usize>) -> bool {
         self.size == size && self.blur.as_ref().map(|b| b.passes) == passes
+    }
+
+    /// The unquantized intermediate size this effect asked for on the previous frame, or `(0, 0)`
+    /// before it has been asked twice.
+    ///
+    /// This is how [`VulkanFrame::capture_backdrop`](super::frame::VulkanFrame::capture_backdrop)
+    /// knows whether the effect's geometry is *moving*: a need that differs from last frame's is an
+    /// animation in progress, and one that repeats is at rest. Kept here rather than plumbed in
+    /// from the compositor because the renderer already has it — the caller passes the size every
+    /// frame, and two consecutive values are the whole signal.
+    pub(crate) fn last_need(&self) -> (i32, i32) {
+        self.last_need
+    }
+
+    /// See [`Self::last_need`]. Set every frame, including on a bundle taken from the pool, whose
+    /// stored value belongs to whatever effect last used it.
+    pub(crate) fn set_last_need(&mut self, need: (i32, i32)) {
+        self.last_need = need;
     }
 
     /// What [`Self::matches`] keys on, as a poolable identity — see
