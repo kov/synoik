@@ -317,9 +317,15 @@ impl<T: Texture> Element for TextureRenderElement<T> {
         // own resolution — right only when the element happens to be drawn 1:1 at (0, 0).
         //
         // The wallpaper is the case that found it: a picture whose resolution is not the output's,
-        // drawn full-screen, declared ~0.98x of the output opaque. That is enough to defeat
-        // `DrmCompositor`'s "completely hidden" cull for the full-output backdrop underneath it,
-        // so a full-damage frame shaded 1.9x the output to show 1.0x of pixels.
+        // drawn full-screen, declared ~0.98x of the output opaque. That defeats `DrmCompositor`'s
+        // "completely hidden" cull for the full-output backdrop underneath it, which needs total
+        // coverage.
+        //
+        // Measured, that cull is worth ~nothing: frames cost 0.9x the output either side of this
+        // fix, because the damage tracker already subtracts the 98% and leaves the backdrop
+        // redrawing only the sliver. Keep the fix for the correctness half below, and do not cite
+        // it as a performance win — the 1.9x frames that prompted the hunt turned out to be every
+        // element drawn into two damage rects (42 draws against 21), nothing to do with this.
         //
         // Rounding is inward on purpose — location up, far edge down. An opaque region that is a
         // pixel too *large* tells the damage tracker to skip drawing something that is genuinely
