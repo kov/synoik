@@ -687,7 +687,10 @@ impl QuadPipeline {
                 as_bytes(quad),
             );
             gpu.device.cmd_draw(cbuf, 6, 1, 0, 0);
-            crate::stats::draw((quad.size[0] * quad.size[1]).max(0.) as u64);
+            crate::stats::draw(
+                crate::stats::DrawSite::Offscreen,
+                (quad.size[0] * quad.size[1]).max(0.) as u64,
+            );
         }
     }
 

@@ -54,6 +54,9 @@ thread_local! {
     static RETIRE_NANOS: Cell<u64> = const { Cell::new(0) };
     static DRAWS: Cell<u64> = const { Cell::new(0) };
     static SHADED: Cell<u64> = const { Cell::new(0) };
+    /// [`SHADED`] split by [`DrawSite`]. A plain array indexed by the site rather than a map:
+    /// this is incremented once per draw, on the frame path.
+    static SHADED_BY_SITE: Cell<[u64; DrawSite::ALL.len()]> = const { Cell::new([0; DrawSite::ALL.len()]) };
     static SHAPES: Cell<u64> = const { Cell::new(0) };
     static SHAPE_NANOS: Cell<u64> = const { Cell::new(0) };
 }
@@ -150,6 +153,55 @@ impl SubmitSite {
     /// frame log indexes its own GPU-time array with the same taxonomy — one
     /// vocabulary for where a submit came from, whether we are reporting the CPU's
     /// wait on it or the GPU time it actually cost.
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// What a draw was *for*, so a frame's overdraw multiple can be attributed.
+///
+/// "155 draws covering 6.7x the output" says a frame shades six and a half screens and gives no
+/// clue which half to attack — and the classes behave completely differently: the scene's draws are
+/// the compositor's own layering, a blur chain's are a fixed multiple of the effect's area chosen
+/// by its pass count, and glyphs are tiny and numerous. Splitting them is the difference between
+/// "the overview is expensive" and a lever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawSite {
+    /// One element of the scene: a surface, a texture, a solid, a shadow. The compositor's own
+    /// layering, and the only class where the count reflects what is on screen.
+    Scene,
+    /// One pass of a dual-Kawase chain, shading its whole destination level. A chain is `passes`
+    /// levels down and the same back up, so it costs a fixed multiple of its intermediate's area
+    /// however small that intermediate is on screen.
+    Blur,
+    /// One glyph quad.
+    Text,
+    /// A quad drawn into an offscreen by the low-level renderer: a widget bake, a preview, a
+    /// snapshot.
+    Offscreen,
+}
+
+impl DrawSite {
+    /// Every site, in the order they are reported. Keep this exhaustive — a site missing here is
+    /// simply invisible, which is the problem this type exists to fix.
+    pub const ALL: [DrawSite; 4] = [
+        DrawSite::Scene,
+        DrawSite::Blur,
+        DrawSite::Text,
+        DrawSite::Offscreen,
+    ];
+
+    /// How it appears in the frame line.
+    pub const fn label(self) -> &'static str {
+        match self {
+            DrawSite::Scene => "scene",
+            DrawSite::Blur => "blur",
+            DrawSite::Text => "text",
+            DrawSite::Offscreen => "offscreen",
+        }
+    }
+
+    /// Position in [`ALL`](Self::ALL), for the per-site arrays.
     pub const fn index(self) -> usize {
         self as usize
     }
@@ -618,9 +670,20 @@ pub fn take_shape_time() -> Duration {
 /// fixed and shrinking the damage rect collapses a frame's cost to the bare submit overhead — so
 /// what a frame costs is how many fragments it shades, not how many draws it issues. Reported as
 /// an overdraw multiple of the output area, because that is the form you can act on.
-pub fn draw(pixels: u64) {
+pub fn draw(site: DrawSite, pixels: u64) {
     add(&DRAWS, 1);
     add(&SHADED, pixels);
+    SHADED_BY_SITE.with(|s| {
+        let mut a = s.get();
+        a[site.index()] += pixels;
+        s.set(a);
+    });
+}
+
+/// Fragments shaded on this thread, split by [`DrawSite`]. The caller takes a delta across a frame,
+/// exactly as it does for [`shaded`].
+pub fn shaded_by_site() -> [u64; DrawSite::ALL.len()] {
+    SHADED_BY_SITE.with(Cell::get)
 }
 
 /// Fragments shaded on this thread. The caller takes a delta across a frame.
@@ -720,7 +783,7 @@ mod tests {
         std::thread::spawn(|| {
             let _submit = submit(SubmitSite::KmsFrame);
             let _shape = shape();
-            draw(1234);
+            draw(DrawSite::Scene, 1234);
         })
         .join()
         .unwrap();

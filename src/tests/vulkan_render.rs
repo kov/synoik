@@ -5576,6 +5576,112 @@ fn vulkan_moving_blur_cap_changes_resolution_not_radius() {
     );
 }
 
+/// A frame's overdraw multiple must say *what* it was spent on.
+///
+/// "155 draws covering 6.7x the output" names no lever: the scene's draws are the compositor's own
+/// layering, while a blur chain's are a fixed multiple of its intermediate's area chosen by the
+/// pass count — completely different things to attack, and a total hides which dominates. A blur
+/// pass shades its whole destination level and is counted like any other draw, so without the
+/// split it is invisible inside the coverage figure.
+///
+/// Pins that a blurred frame attributes real area to [`DrawSite::Blur`], and that a chain costs
+/// more than its own intermediate once (it walks down and back up), which is the property that
+/// makes it worth reporting apart.
+#[test]
+fn vulkan_a_blurs_shaded_area_is_attributed_to_the_blur() {
+    use smithay::backend::renderer::Offscreen;
+    use smithay::utils::user_data::UserDataMap;
+    use synoik_vk::stats::DrawSite;
+
+    use crate::render_helpers::background_effect::RenderParams;
+    use crate::render_helpers::blur::BlurOptions;
+    use crate::render_helpers::framebuffer_effect::FramebufferEffect;
+    use crate::render_helpers::vulkan::VulkanRenderer as Vk;
+
+    let mut vk = match Vk::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_a_blurs_shaded_area_is_attributed_to_the_blur: no Vulkan ({e})"
+            );
+            return;
+        }
+    };
+
+    const S: i32 = 512;
+    let size = Size::<i32, Physical>::from((S, S));
+    let mut target = vk
+        .create_buffer(NATIVE_FOURCC, Size::from((S, S)))
+        .expect("create target");
+
+    let effect = FramebufferEffect::new();
+    let element = effect.render(
+        None,
+        RenderParams {
+            geometry: Rectangle::from_size(Size::from((f64::from(S), f64::from(S)))),
+            subregion: None,
+            clip: None,
+            scale: 1.0,
+        },
+        Some(BlurOptions {
+            passes: 3,
+            offset: 2.0,
+        }),
+        crate::render_helpers::blur::Finish::NONE,
+    );
+    let cache = UserDataMap::new();
+    let src = element.src();
+    let dst = element.geometry(Scale::from(1.0));
+
+    let before = synoik_vk::stats::shaded_by_site();
+    {
+        let mut fb = vk.bind(&mut target).expect("bind");
+        let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+        frame
+            .draw_solid(
+                Rectangle::from_size((S, S).into()),
+                &[Rectangle::from_size((S, S).into())],
+                Color32F::from([0.5, 0.2, 0.8, 1.]),
+            )
+            .expect("draw solid");
+        RenderElement::<Vk>::capture_framebuffer(&element, &mut frame, src, dst, &cache)
+            .expect("capture_framebuffer");
+        RenderElement::<Vk>::draw(
+            &element,
+            &mut frame,
+            src,
+            dst,
+            &[Rectangle::from_size(size)],
+            &[],
+            Some(&cache),
+        )
+        .expect("draw");
+        let _ = frame.finish().expect("finish");
+    }
+    let after = synoik_vk::stats::shaded_by_site();
+
+    let delta = |site: DrawSite| after[site.index()] - before[site.index()];
+    let (blur, scene) = (delta(DrawSite::Blur), delta(DrawSite::Scene));
+    let output_px = u64::try_from(S * S).expect("positive");
+    eprintln!(
+        "vulkan_a_blurs_shaded_area_is_attributed_to_the_blur: blur {:.2}x, scene {:.2}x",
+        blur as f64 / output_px as f64,
+        scene as f64 / output_px as f64,
+    );
+
+    assert!(
+        blur > 0,
+        "a blurred frame attributed no shaded area to the blur — the chain's passes are counted \
+         as draws, so they belong to `DrawSite::Blur` and not to whatever site happens to be \
+         nearest in the code",
+    );
+    assert!(
+        scene > 0,
+        "the solid and the composite are scene draws; attributing none of them means the split \
+         has collapsed onto one site",
+    );
+}
+
 /// End-to-end backdrop blur on the owned Vulkan renderer: draw a hard red|green vertical edge, then
 /// run a `FramebufferEffectElement` (blur enabled) over the whole frame — `capture_framebuffer`
 /// grabs the scene (mid-frame render-pass split), blurs it, and `draw` composites the result. A

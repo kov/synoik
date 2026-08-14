@@ -1026,6 +1026,7 @@ struct InFlight {
     submits_at_start: u64,
     draws_at_start: u64,
     shaded_at_start: u64,
+    shaded_by_site_at_start: [u64; synoik_vk::stats::DrawSite::ALL.len()],
     context: FrameContext,
 }
 
@@ -1095,6 +1096,10 @@ struct Totals {
     /// Fragments shaded. The number that actually predicts a frame's cost: holding draws fixed
     /// and shrinking the damage rect collapses a frame to its bare submit overhead.
     shaded: u64,
+    /// [`Self::shaded`] split by what the draw was for. The total alone says a frame shades six
+    /// screens and gives no clue which one to attack; the classes are unrelated levers (see
+    /// [`synoik_vk::stats::DrawSite`]).
+    shaded_by_site: [u64; synoik_vk::stats::DrawSite::ALL.len()],
 }
 
 /// How many entries the ring holds by default: ~22 minutes at 50 fps. Sized off the
@@ -1428,6 +1433,7 @@ impl FrameLog {
             submits_at_start: synoik_vk::stats::submits(),
             draws_at_start: synoik_vk::stats::draws(),
             shaded_at_start: synoik_vk::stats::shaded(),
+            shaded_by_site_at_start: synoik_vk::stats::shaded_by_site(),
             context: FrameContext::default(),
         });
     }
@@ -1512,6 +1518,14 @@ impl FrameLog {
             staging_write: synoik_vk::stats::take_staging_write(),
             draws: synoik_vk::stats::draws() - frame.draws_at_start,
             shaded: synoik_vk::stats::shaded() - frame.shaded_at_start,
+            shaded_by_site: {
+                let now = synoik_vk::stats::shaded_by_site();
+                let mut d = [0u64; synoik_vk::stats::DrawSite::ALL.len()];
+                for (i, slot) in d.iter_mut().enumerate() {
+                    *slot = now[i] - frame.shaded_by_site_at_start[i];
+                }
+                d
+            },
         };
 
         // The budget: an explicit threshold if given, else the refresh interval.
@@ -1716,6 +1730,25 @@ impl FrameLog {
                 " covering {:.1}x the output",
                 totals.shaded as f64 / ctx.output_px as f64
             );
+            // Split by what the draws were *for*. A blur chain's share is a fixed multiple of its
+            // intermediate's area and moves only with the pass count or the intermediate size; the
+            // scene's is the compositor's own layering. Without this the coverage figure names no
+            // lever. Sites contributing under a tenth of the output are left out — the line is
+            // already long, and a 0.0x share is not a lever either.
+            let shares: Vec<String> = synoik_vk::stats::DrawSite::ALL
+                .iter()
+                .filter(|site| totals.shaded_by_site[site.index()] * 10 > ctx.output_px)
+                .map(|site| {
+                    format!(
+                        "{} {:.1}x",
+                        site.label(),
+                        totals.shaded_by_site[site.index()] as f64 / ctx.output_px as f64
+                    )
+                })
+                .collect();
+            if !shares.is_empty() {
+                let _ = write!(line, " [{}]", shares.join(", "));
+            }
         }
         // Submits before bakes and shaping: on a virtualized GPU the round-trip
         // count is usually the headline, and both of those are ways of spending it.
@@ -2654,6 +2687,7 @@ mod tests {
             submits_at_start: 0,
             draws_at_start: 0,
             shaded_at_start: 0,
+            shaded_by_site_at_start: [0; synoik_vk::stats::DrawSite::ALL.len()],
             context: FrameContext::default(),
         }
     }
