@@ -1259,8 +1259,10 @@ where
                 .filter_map(|r| r.intersection(output))
                 .map(|r| f64::from(r.size.w.max(0)) * f64::from(r.size.h.max(0)))
                 .sum();
+            let name = format!("{e:?}");
+            let kind = name.split(['(', ' ', '{']).next().unwrap_or("?");
             Some(format!(
-                "  scene element #{i} {:.2}x alpha={:.2} opaque={:.2}x {}x{}+{}+{} {:?}",
+                "  scene element #{i} {kind} {:.2}x alpha={:.2} opaque={:.2}x {}x{}+{}+{} {:?}",
                 area / px,
                 e.alpha(),
                 opaque / px,

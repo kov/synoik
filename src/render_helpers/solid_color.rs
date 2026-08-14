@@ -196,6 +196,64 @@ mod rescale_tests {
 
     use super::*;
 
+    /// `RelocateRenderElement` moves an element's `geometry` but forwards its `opaque_regions`
+    /// unmoved, and the two are in the same physical space — so a relocated opaque element claims
+    /// to be opaque where it no longer is.
+    ///
+    /// The correctness half is worse than the cost half. A relocation moves the claim *onto* pixels
+    /// the element does not cover, so the tracker can skip drawing something that is actually
+    /// visible — stale framebuffer, not a slow frame. We have no reproduction of either half yet;
+    /// this test pins the mechanism only.
+    ///
+    /// It is a live *suspect*, not a diagnosis. A full-damage desktop frame on kov's seat shades
+    /// 1.9x the output, because the scene's bottom element is a full-output opaque backdrop
+    /// (`Synoik::render_output`'s `push(backdrop)`) that `DrmCompositor` would skip if the
+    /// wallpaper above it declared full coverage — and it declares 0.98x. Whether *this* is why it
+    /// falls short is unestablished: the relocation would have to be non-zero, and a full-output
+    /// wallpaper's is likely zero. Do not cite this test as the cause of that until the element is
+    /// identified.
+    ///
+    /// Upstream, not ours: fixing it means relocating the regions in
+    /// `RelocateRenderElement::opaque_regions`, exactly as `geometry` already does. Pinned here so
+    /// that whenever we take a smithay bump, this fails and tells us the workaround can go.
+    #[test]
+    fn relocating_an_element_does_not_move_the_region_it_claims_is_opaque() {
+        use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
+
+        let logical = Rectangle::new(Point::from((0., 0.)), Size::from((100., 100.)));
+        let opaque = SolidColorRenderElement::new(
+            Id::new(),
+            logical,
+            CommitCounter::default(),
+            Color32F::from([0., 0., 0., 1.]),
+            Kind::Unspecified,
+        );
+        let scale = Scale::from(1.);
+        assert_eq!(
+            opaque.opaque_regions(scale).to_vec(),
+            vec![Rectangle::new(Point::from((0, 0)), Size::from((100, 100)))],
+            "an opaque solid color covers its whole geometry — the premise of the rest",
+        );
+
+        let moved = RelocateRenderElement::from_element(
+            opaque,
+            Point::<i32, smithay::utils::Physical>::from((40, 40)),
+            Relocate::Relative,
+        );
+
+        assert_eq!(
+            moved.geometry(scale).loc,
+            Point::from((40, 40)),
+            "geometry follows the relocation",
+        );
+        assert_eq!(
+            moved.opaque_regions(scale).to_vec(),
+            vec![Rectangle::new(Point::from((0, 0)), Size::from((100, 100)))],
+            "and the opaque region does not — it still claims the pre-move rectangle. When this \
+             fails, smithay has been fixed: drop the workaround this pins and delete the test.",
+        );
+    }
+
     #[test]
     fn a_rescaled_edge_lands_where_the_arithmetic_puts_it() {
         // A window-ish box, at the fractional scale the live session runs at.
