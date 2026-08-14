@@ -1084,8 +1084,9 @@ impl Panel {
     }
 
     /// Set which panel button the pointer is hovering (`None` when off any button).
-    /// Returns whether it changed, so the caller can queue a redraw; only the bar
-    /// chrome is invalidated (the status icons are unaffected by hover).
+    /// Returns whether it changed, so the caller can queue a redraw. Nothing is
+    /// invalidated: a hover only moves a container fill, which is its own element
+    /// ([`pill_element`]) — see [`Self::retarget_fills`].
     pub fn set_hovered_role(&mut self, role: Option<&'static str>) -> bool {
         if role == self.hovered {
             return false;
@@ -1126,11 +1127,18 @@ impl Panel {
 
     /// Recompute every button's target fill alpha after a state change and, for any
     /// that changed, start a fade from the current (animated) value to the new
-    /// target — gnome-shell's `panel_button` 150ms transition. Invalidates the bar
-    /// cache so the fade redraws.
+    /// target — gnome-shell's `panel_button` 150ms transition.
+    ///
+    /// Deliberately does **not** touch [`BarCache`]. The fills used to be painted into the
+    /// bar bake, so retargeting one had to invalidate it; they are their own elements now
+    /// ([`pill_element`], fed by [`Self::button_containers`]) and nothing the bake draws
+    /// varies with a fill. The stale invalidation was expensive in exactly the place it is
+    /// least affordable: `activities_checked` flips on every overview open *and* close, so
+    /// each transition threw away every label bake and the battery, and re-baked them —
+    /// 1.1–7.2ms of GPU round trips landing on a frame that is already animating.
+    /// `opening_the_overview_rebakes_no_panel_chrome` is the guard.
     fn retarget_fills(&mut self) {
         let config = self.config.borrow().animations.panel_popover_open_close.0;
-        let mut changed = false;
         for role in PILL_ROLES {
             let target = self.target_alpha(role);
             let fade = self.fills.get_mut(role).expect("every role has a fade");
@@ -1146,10 +1154,6 @@ impl Panel {
                 0.,
                 config,
             ));
-            changed = true;
-        }
-        if changed {
-            self.cache.borrow_mut().clear();
         }
     }
 

@@ -9917,6 +9917,69 @@ fn the_overview_animation_rebakes_nothing_per_frame() {
     );
 }
 
+/// The panel may not re-bake *at all* when the overview opens or closes.
+///
+/// The guard above only catches a site that bakes on more than one frame, and the bug this
+/// pins baked exactly once per transition — invisible to it, and still 1.1–7.2ms of GPU
+/// round trips landing on the first frame of an animation, twice per round trip.
+///
+/// The cause was a stale invalidation: opening the overview checks the Activities button,
+/// which retargets its container fill, and `retarget_fills` cleared the whole [`BarCache`]
+/// — every label bake plus the battery. That was right when the fills were painted into the
+/// bar bake and wrong once they became their own elements, since nothing the bake draws
+/// varies with a fill. Nothing about the panel's *content* changes when the overview opens,
+/// so the honest assertion is zero, not "not every frame".
+#[test]
+fn opening_the_overview_rebakes_no_panel_chrome() {
+    let Some(mut f) = window_fixture_settled(GREEN, true, Some("panel bake probe")) else {
+        return;
+    };
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+
+    // One full round trip first, unmeasured. The Activities pill's stadium is baked the first
+    // time the container is lit at all (`pill_texture`) — content appearing for the first time
+    // in the process, not a cache being dropped. Warming it keeps the assertion below at a
+    // literal zero instead of an allowlist that would hide the next real regression.
+    for _ in 0..2 {
+        f.synoik().layout.toggle_overview();
+        f.refresh();
+        f.synoik_complete_animations();
+        let _ = render_output_vulkan(&mut f, &output);
+    }
+
+    // Both directions: `activities_checked` flips on the close as well as the open.
+    for direction in ["opening", "closing"] {
+        let _ = render_output_vulkan(&mut f, &output);
+        let _ = crate::frame_log::take_bake_sites();
+
+        f.synoik().layout.toggle_overview();
+        // The Activities highlight is armed in `State::refresh`, not in the render — so a test
+        // that only toggles the layout never flips `activities_checked` and never reaches the
+        // invalidation this pins. (An earlier draft did exactly that and passed with the bug
+        // deliberately re-introduced.)
+        f.refresh();
+        let per_frame = bake_sites_per_frame(&mut f, &output, 6, Duration::from_millis(40));
+
+        let panel: Vec<String> = per_frame
+            .iter()
+            .flatten()
+            .filter(|site| site.file.ends_with("ui/panel.rs"))
+            .map(|site| format!("{}:{} ×{}", site.file, site.line, site.bakes))
+            .collect();
+        assert!(
+            panel.is_empty(),
+            "the panel baked while {direction} the overview: {panel:?}\n\
+             The overview changes the panel's alphas, never its content, so every one of \
+             these is a cache being dropped for nothing. Check what invalidates `BarCache` \
+             on an Activities-button state change.",
+        );
+
+        // Leave the animation settled so the next direction starts from rest.
+        f.synoik_complete_animations();
+        let _ = render_output_vulkan(&mut f, &output);
+    }
+}
+
 /// Nothing may re-bake on every frame of a workspace switch either.
 ///
 /// This one carried a known exception until 2026-07-26: the panel's workspace dots
