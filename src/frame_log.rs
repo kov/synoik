@@ -1092,6 +1092,13 @@ struct Totals {
     /// ~58 GB/s once warm) — and folding it in made a wallpaper frame read as 9.96ms of
     /// "creation".
     staging_write: Duration,
+    /// `(barriers, descriptor writes, descriptor allocations)` this frame recorded. Counted, not
+    /// timed: each is negligible on its own, and what costs is that venus forwards every one to
+    /// the host, so a frame issuing many pays inside its fence wait — where this log reads the
+    /// time as `waiting … first scanout` rather than as GPU execution. `creates` explains that gap
+    /// when something was allocated; these are for when nothing was. The first frame of an
+    /// overview open is the open case: ~11ms of wait beyond its GPU time, with zero creates.
+    host_calls: (u64, u64, u64),
     draws: u64,
     /// Fragments shaded. The number that actually predicts a frame's cost: holding draws fixed
     /// and shrinking the damage rect collapses a frame to its bare submit overhead.
@@ -1668,6 +1675,7 @@ impl FrameLog {
             first_wait: synoik_vk::stats::take_first_wait(),
             uploaded: synoik_vk::stats::take_uploaded_bytes(),
             creates: synoik_vk::stats::take_creates(),
+            host_calls: synoik_vk::stats::take_host_calls(),
             create_sites: synoik_vk::stats::take_create_sites(),
             staging_write: synoik_vk::stats::take_staging_write(),
             draws: synoik_vk::stats::draws() - frame.draws_at_start,
@@ -1971,6 +1979,13 @@ impl FrameLog {
                     }
                     let _ = write!(line, ")");
                 }
+            }
+            // Every frame, not only notable ones: this is a number you read by *comparing* a slow
+            // frame against the steady one next to it, and a field that appears only when it is
+            // large cannot be compared against its own absence.
+            let (barriers, writes, allocs) = totals.host_calls;
+            if barriers | writes | allocs > 0 {
+                let _ = write!(line, ", host {barriers}b/{writes}w/{allocs}a");
             }
         } else if !totals.retiring.is_zero() {
             // A frame can pay a wait for work it did not submit: retiring a previous
@@ -2852,6 +2867,29 @@ mod tests {
     /// chain rebuilt because its size animates, a swapchain image per frame, and an upload that
     /// forgot its cache — three different bugs. The seat's overview transition sat at exactly
     /// that number with nowhere to take it until the line named the constructor.
+    /// Host calls ride every submitting frame, because the number is read by comparing a slow
+    /// frame with the steady one beside it — a field that appears only when it is large cannot be
+    /// compared against its own absence.
+    #[test]
+    fn a_frame_says_how_many_calls_it_made_the_host_forward() {
+        let frame = empty_frame();
+        let totals = Totals {
+            submits: 1,
+            host_calls: (37, 12, 4),
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(17), &totals, None);
+        assert!(line.contains("host 37b/12w/4a"), "{line}");
+
+        // A frame that made none says nothing rather than printing zeros.
+        let totals = Totals {
+            submits: 1,
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(17), &totals, None);
+        assert!(!line.contains("host "), "{line}");
+    }
+
     #[test]
     fn a_creating_frame_names_the_constructor() {
         use synoik_vk::stats::CreateSite;

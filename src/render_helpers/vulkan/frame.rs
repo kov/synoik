@@ -1257,6 +1257,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(dest_image)
                 .subresource_range(range);
+            synoik_vk::stats::barriers(1);
             dev.cmd_pipeline_barrier(
                 cbuf,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -1313,6 +1314,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(dest_image)
                 .subresource_range(range);
+            synoik_vk::stats::barriers(1);
             dev.cmd_pipeline_barrier(
                 cbuf,
                 vk::PipelineStageFlags::TRANSFER,
@@ -1823,6 +1825,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(present.image())
                 .subresource_range(range);
+            synoik_vk::stats::barriers(1);
             dev.cmd_pipeline_barrier(
                 self.cbuf,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -1853,6 +1856,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(present.image())
                 .subresource_range(range);
+            synoik_vk::stats::barriers(1);
             dev.cmd_pipeline_barrier(
                 self.cbuf,
                 vk::PipelineStageFlags::TRANSFER,

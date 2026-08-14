@@ -59,6 +59,11 @@ thread_local! {
     static SHADED_BY_SITE: Cell<[u64; DrawSite::ALL.len()]> = const { Cell::new([0; DrawSite::ALL.len()]) };
     static SHAPES: Cell<u64> = const { Cell::new(0) };
     static SHAPE_NANOS: Cell<u64> = const { Cell::new(0) };
+    /// See [`host_calls`]. Counted, never timed: individually each is far below what a clock read
+    /// here could resolve, and it is the *count* that crosses to the host.
+    static BARRIERS: Cell<u64> = const { Cell::new(0) };
+    static DESCRIPTOR_WRITES: Cell<u64> = const { Cell::new(0) };
+    static DESCRIPTOR_ALLOCS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Whether timing is on. Process-wide, unlike the counters: it is configuration,
@@ -678,6 +683,37 @@ pub fn draw(site: DrawSite, pixels: u64) {
         a[site.index()] += pixels;
         s.set(a);
     });
+}
+
+/// Record a pipeline barrier, a descriptor-set write, and a descriptor-set allocation.
+///
+/// These are the per-frame calls that cost *host* time on a virtualized GPU without allocating
+/// anything: venus forwards each one, so a frame that issues many pays for them inside its fence
+/// wait, where the frame log reads the time as `waiting … first scanout` rather than as GPU
+/// execution. That gap is the thing they exist to explain — creates were the last mystery of this
+/// shape and [`CREATE_SITES`] is what named them, but a frame can sit in that gap with zero
+/// creates.
+pub fn barriers(n: u64) {
+    add(&BARRIERS, n);
+}
+
+/// See [`barriers`].
+pub fn descriptor_writes(n: u64) {
+    add(&DESCRIPTOR_WRITES, n);
+}
+
+/// See [`barriers`].
+pub fn descriptor_allocs(n: u64) {
+    add(&DESCRIPTOR_ALLOCS, n);
+}
+
+/// `(barriers, descriptor writes, descriptor allocations)` on this thread, reset to zero.
+pub fn take_host_calls() -> (u64, u64, u64) {
+    (
+        BARRIERS.with(|c| c.replace(0)),
+        DESCRIPTOR_WRITES.with(|c| c.replace(0)),
+        DESCRIPTOR_ALLOCS.with(|c| c.replace(0)),
+    )
 }
 
 /// Fragments shaded on this thread, split by [`DrawSite`]. The caller takes a delta across a frame,

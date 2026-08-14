@@ -1326,6 +1326,7 @@ mod tests {
         let alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(desc_pool)
             .set_layouts(std::slice::from_ref(&set_layout));
+        crate::stats::descriptor_allocs(1);
         let set = unsafe { gpu.device.allocate_descriptor_sets(&alloc) }?[0];
         let img = vk::DescriptorImageInfo::default()
             .sampler(atlas.texture.sampler)
@@ -1336,6 +1337,7 @@ mod tests {
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(std::slice::from_ref(&img));
+        crate::stats::descriptor_writes(1);
         unsafe { gpu.device.update_descriptor_sets(&[write], &[]) };
 
         let dims = [tw as f32, th as f32];

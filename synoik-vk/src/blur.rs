@@ -737,6 +737,7 @@ impl BlurChain {
                 .subresource_range(crate::render::COLOR_RANGE)
                 .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            crate::stats::barriers(1);
             device.cmd_pipeline_barrier(
                 cbuf,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
@@ -768,6 +769,7 @@ impl BlurChain {
             let host = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ);
+            crate::stats::barriers(1);
             device.cmd_pipeline_barrier(
                 cbuf,
                 vk::PipelineStageFlags::TRANSFER,
@@ -834,6 +836,7 @@ impl BlurChain {
                 .subresource_range(crate::render::COLOR_RANGE)
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            crate::stats::barriers(1);
             device.cmd_pipeline_barrier(
                 cbuf,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
@@ -882,6 +885,7 @@ impl BlurChain {
                 .subresource_range(crate::render::COLOR_RANGE)
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            crate::stats::barriers(1);
             device.cmd_pipeline_barrier(
                 cbuf,
                 vk::PipelineStageFlags::TRANSFER,
@@ -1066,6 +1070,7 @@ fn alloc_sampler_set(
     let alloc = vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(desc_pool)
         .set_layouts(std::slice::from_ref(&set_layout));
+    crate::stats::descriptor_allocs(1);
     let set = unsafe { device.allocate_descriptor_sets(&alloc) }.context("blur set")?[0];
     let img = vk::DescriptorImageInfo::default()
         .sampler(sampler)
@@ -1076,6 +1081,7 @@ fn alloc_sampler_set(
         .dst_binding(0)
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .image_info(std::slice::from_ref(&img));
+    crate::stats::descriptor_writes(1);
     unsafe { device.update_descriptor_sets(&[write], &[]) };
     Ok(set)
 }

@@ -469,6 +469,7 @@ impl RenderTarget {
             let host = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ);
+            crate::stats::barriers(1);
             device.cmd_pipeline_barrier(
                 cbuf,
                 vk::PipelineStageFlags::TRANSFER,

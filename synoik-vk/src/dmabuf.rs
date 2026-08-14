@@ -304,6 +304,7 @@ impl ImportedImage {
                 .dst_queue_family_index(dst_qf)
                 .image(image)
                 .subresource_range(COLOR_RANGE);
+            crate::stats::barriers(1);
             device.cmd_pipeline_barrier(
                 cbuf,
                 vk::PipelineStageFlags::TOP_OF_PIPE,

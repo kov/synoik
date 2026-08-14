@@ -326,6 +326,7 @@ fn render_text(gpu: &Arc<Gpu>) -> Result<Vec<u8>> {
     let alloc = vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(desc_pool)
         .set_layouts(std::slice::from_ref(&set_layout));
+    synoik_vk::stats::descriptor_allocs(1);
     let set = unsafe { gpu.device.allocate_descriptor_sets(&alloc) }.context("set")?[0];
     let img = vk::DescriptorImageInfo::default()
         .sampler(atlas.sampler)
@@ -336,6 +337,7 @@ fn render_text(gpu: &Arc<Gpu>) -> Result<Vec<u8>> {
         .dst_binding(0)
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .image_info(std::slice::from_ref(&img));
+    synoik_vk::stats::descriptor_writes(1);
     unsafe { gpu.device.update_descriptor_sets(&[write], &[]) };
 
     let dims = [TW as f32, TH as f32];
@@ -513,6 +515,7 @@ fn bind_sampled(
     let alloc = vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(desc_pool)
         .set_layouts(std::slice::from_ref(&set_layout));
+    synoik_vk::stats::descriptor_allocs(1);
     let set = unsafe { device.allocate_descriptor_sets(&alloc) }.context("alloc desc set")?[0];
 
     let img = vk::DescriptorImageInfo::default()
@@ -524,6 +527,7 @@ fn bind_sampled(
         .dst_binding(0)
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .image_info(std::slice::from_ref(&img));
+    synoik_vk::stats::descriptor_writes(1);
     unsafe { device.update_descriptor_sets(&[write], &[]) };
 
     Ok((desc_pool, set))

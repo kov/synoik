@@ -1095,6 +1095,7 @@ impl Texture {
                 .dst_queue_family_index(dst_qf)
                 .image(self.image)
                 .subresource_range(COLOR_RANGE);
+            crate::stats::barriers(1);
             device.cmd_pipeline_barrier(
                 cbuf,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -1951,6 +1952,7 @@ unsafe fn transition(
         .subresource_range(COLOR_RANGE)
         .src_access_mask(src_access)
         .dst_access_mask(dst_access);
+    crate::stats::barriers(1);
     device.cmd_pipeline_barrier(
         cbuf,
         src_stage,

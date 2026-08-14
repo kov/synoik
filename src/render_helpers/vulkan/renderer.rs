@@ -791,6 +791,7 @@ impl VulkanRenderer {
         // Free the pool if set allocation fails (e.g. host-OOM under Venus pressure) — a bare `?`
         // here would orphan it, and the batch path calls this once per icon.
         let set = match unsafe {
+            synoik_vk::stats::descriptor_allocs(1);
             dev.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(pool)
@@ -812,6 +813,7 @@ impl VulkanRenderer {
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&image_info);
+        synoik_vk::stats::descriptor_writes(1);
         unsafe { dev.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
         Ok((pool, set))
     }
@@ -1504,6 +1506,7 @@ impl VulkanRenderer {
                 let host = vk::MemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(vk::AccessFlags::HOST_READ);
+                synoik_vk::stats::barriers(1);
                 dev.cmd_pipeline_barrier(
                     cbuf,
                     vk::PipelineStageFlags::TRANSFER,
@@ -1777,6 +1780,7 @@ pub(super) unsafe fn transition_image(
         .subresource_range(COLOR_RANGE)
         .src_access_mask(src_access)
         .dst_access_mask(dst_access);
+    synoik_vk::stats::barriers(1);
     dev.cmd_pipeline_barrier(
         cbuf,
         src_stage,
