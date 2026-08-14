@@ -55,7 +55,7 @@ impl Server {
         // directory. That left an empty recording in the developer's own `~/Videos/Screencasts`
         // on every suite run. Point it somewhere disposable instead — per process, so parallel
         // test binaries do not share it.
-        state.synoik.casting.recordings_base = Some(recordings_base());
+        state.synoik.recordings_base = Some(recordings_base());
 
         Self {
             event_loop,

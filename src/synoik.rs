@@ -1128,6 +1128,18 @@ pub struct Synoik {
 
     #[cfg(feature = "xdp-gnome-screencast")]
     pub casting: Screencasting,
+
+    /// Where a relative recording template lands, overriding the XDG Videos directory. `None` in
+    /// production; the test fixture points it at a scratch directory, because these paths reach
+    /// the real filesystem and a test driving the real capture button would otherwise leave a
+    /// recording in the developer's own `~/Videos/Screencasts` on every suite run.
+    ///
+    /// Here rather than on [`Screencasting`], which is `xdp-gnome-screencast`-gated: this governs
+    /// the *native* recorder, which is not. It lived there until the no-default-features build
+    /// broke on reading it — and gating the reads instead would have been worse than the build
+    /// error, since ghost provisions synoik with that exact feature set and runs its suite against
+    /// it, which is the litter this field exists to prevent.
+    pub recordings_base: Option<std::path::PathBuf>,
 }
 
 /// A capture armed to fire once its delay has run out. See [`State::arm_delayed_capture`].
@@ -4184,7 +4196,7 @@ impl State {
         // GNOME's own template and folder (`js/ui/screenshot.js:2056-2065`), which is what
         // `default_recording_path` already encodes — so the picker's recordings land beside the
         // keybind's rather than in a second place.
-        let base = self.synoik.casting.recordings_base.clone();
+        let base = self.synoik.recordings_base.clone();
         let path = match crate::recording::default_recording_path(base.as_deref()) {
             Ok(path) => path,
             Err(err) => {
@@ -7672,6 +7684,8 @@ impl Synoik {
 
             #[cfg(feature = "xdp-gnome-screencast")]
             casting: screencasting,
+
+            recordings_base: None,
         };
 
         synoik.reset_pointer_inactivity_timer();

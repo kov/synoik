@@ -46,12 +46,6 @@ pub struct Screencasting {
     /// Dynamic-target casts waiting for their first target to start.
     pub pending_dynamic_casts: Vec<PendingCast>,
 
-    /// Where a relative recording template lands, overriding the XDG Videos directory. `None` in
-    /// production; the test fixture points it at a scratch directory, because these paths reach
-    /// the real filesystem and a test driving the real capture button would otherwise leave a
-    /// recording in the developer's own `~/Videos/Screencasts` on every suite run.
-    pub recordings_base: Option<std::path::PathBuf>,
-
     pub pw_to_niri: calloop::channel::Sender<PwToSynoik>,
 
     /// Screencast output for each mapped window.
@@ -135,7 +129,6 @@ impl Screencasting {
             casts: vec![],
             recordings: vec![],
             pending_dynamic_casts: vec![],
-            recordings_base: None,
             pw_to_niri,
             mapped_cast_output: HashMap::new(),
             dynamic_cast_id_for_portal: MappedId::next(),
@@ -1113,7 +1106,7 @@ impl Synoik {
             }
         };
 
-        let base = self.casting.recordings_base.clone();
+        let base = self.recordings_base.clone();
         let path = crate::recording::resolve_file_template(template, "webm", base.as_deref())
             .map_err(|err| format!("could not resolve the recording path: {err:#}"))?;
         self.start_native_recording(&output, path.clone(), framerate, draw_cursor, crop)
