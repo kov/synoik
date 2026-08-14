@@ -3692,6 +3692,104 @@ fn vulkan_backdrop_blur_reuses_across_a_size_sweep() {
     }
 }
 
+/// The pool's budget must buy as many *bundles* as it can, not as many bytes.
+///
+/// A pooled bundle saves one `BackdropBlur::new` — a fixed handful of host-side resource
+/// creations, ~1ms each on Venus whatever the extent — while costing its full extent in device
+/// memory. The two are unrelated, so under a byte budget the right thing to drop is the largest
+/// bundle, not the oldest.
+///
+/// This is the seat's shape, not a synthetic one: three big blurred windows sweeping through the
+/// overview and back. On it, the whole working set is ~480MB — far past anything worth holding on
+/// this machine — so the budget genuinely binds and the eviction policy is what decides how much
+/// of the churn survives.
+#[test]
+fn vulkan_backdrop_blur_pool_prefers_many_small_bundles() {
+    use smithay::utils::user_data::UserDataMap;
+
+    use crate::render_helpers::background_effect::RenderParams;
+    use crate::render_helpers::framebuffer_effect::FramebufferEffect;
+
+    let mut vk = match VulkanRenderer::new() {
+        Ok(vk) => vk,
+        Err(_) => return,
+    };
+    // The seat's shape: a 2371x1200 output with three big blurred windows.
+    const W: i32 = 2238;
+    const H: i32 = 1258;
+    let size = Size::<i32, Physical>::from((W, H));
+    let mut target = vk
+        .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((W, H)))
+        .expect("create target");
+    let caches: Vec<UserDataMap> = (0..3).map(|_| UserDataMap::new()).collect();
+
+    let capture_at = |vk: &mut VulkanRenderer, target: &mut VkTexture, frac: f64| {
+        for cache in &caches {
+            let effect = FramebufferEffect::new();
+            let element = effect.render(
+                None,
+                RenderParams {
+                    geometry: Rectangle::from_size(Size::from((W as f64 * frac, H as f64 * frac))),
+                    subregion: None,
+                    clip: None,
+                    scale: 1.0,
+                },
+                Some(BlurOptions {
+                    passes: 3,
+                    offset: 2.0,
+                }),
+                crate::render_helpers::blur::Finish::NONE,
+            );
+            let src = element.src();
+            let dst = element.geometry(Scale::from(1.0));
+            let mut fb = vk.bind(target).expect("bind");
+            let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+            RenderElement::<VulkanRenderer>::capture_framebuffer(
+                &element, &mut frame, src, dst, cache,
+            )
+            .expect("capture_framebuffer");
+            let _ = frame.finish().expect("finish");
+        }
+    };
+
+    let steps: Vec<f64> = (0..=20).map(|i| 0.35 + 0.65 * f64::from(i) / 20.).collect();
+    let mut per_cycle = Vec::new();
+    for _ in 0..3 {
+        let before = vk.backdrop_blur_allocs();
+        for f in steps.iter().chain(steps.iter().rev()) {
+            capture_at(&mut vk, &mut target, *f);
+        }
+        per_cycle.push(vk.backdrop_blur_allocs() - before);
+    }
+    eprintln!(
+        "vulkan_backdrop_blur_pool_prefers_many_small_bundles: {per_cycle:?} allocs per cycle, \
+         pool holds {} bundles ({} MB)",
+        vk.backdrop_blur_pooled(),
+        vk.backdrop_blur_pool_bytes() / (1024 * 1024),
+    );
+
+    // The invariant the policy exists to keep: never over budget.
+    assert!(
+        vk.backdrop_blur_pool_bytes() <= 192 * 1024 * 1024,
+        "the pool is holding {} bytes, past its budget",
+        vk.backdrop_blur_pool_bytes(),
+    );
+
+    // A steady cycle must be cheaper than the cold one, and by a wide margin — the point of the
+    // pool is that a cyclic sweep revisits rungs it has already built. Oldest-first eviction
+    // scored 34 here against a cold 53, which this would have caught; largest-first scores 19.
+    // An absolute bound, not a ratio against the cold cycle: the policy moves *both* numbers
+    // (oldest-first scores 53 then 34, largest-first 38 then 19), so a ratio passes either way and
+    // proves nothing. This sweep is deterministic, so the count is the honest assertion.
+    let steady = per_cycle[2];
+    assert!(
+        steady <= 24,
+        "a warmed cycle rebuilt {steady} bundles; largest-first eviction scores 19 here and \
+         oldest-first 34. A bundle saves a fixed creation cost whatever its size, so under a \
+         binding budget the pool must drop its *largest* entries, not its oldest.",
+    );
+}
+
 /// The renderer has exactly one render-pass format ([`NATIVE_FOURCC`]'s BGRA order), so an
 /// offscreen in the *other* byte order is not a legal framebuffer attachment and `create_buffer`
 /// must reject it — a mismatched attachment is undefined behavior, not a wrong picture.

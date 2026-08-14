@@ -3371,16 +3371,28 @@ impl VulkanRenderer {
     pub(crate) fn recycle_backdrop_blur(&mut self, blur: super::BackdropBlur) {
         self.backdrop_blur_pool.push((blur.key(), blur));
 
-        // Oldest-first, which for a sweep is also largest-first on the way down and smallest-first
-        // on the way up — either way the rungs a cyclic animation is about to want again are the
-        // recent ones. A size-aware policy would have to guess the direction; recency does not.
+        // Largest-first, because what a pooled bundle saves and what it costs are unrelated: the
+        // saving is one `BackdropBlur::new` — a fixed handful of host-side resource creations,
+        // ~1 ms each on Venus whatever their extent — while the cost is its full extent in device
+        // memory. So a budget spent on many small bundles buys strictly more than the same budget
+        // spent on a few big ones. Measured on the three-big-windows shape (see
+        // `vulkan_backdrop_blur_pool_prefers_many_small_bundles`): at the same 192 MB, evicting
+        // oldest-first left 34 rebuilds per cycle, largest-first leaves 19.
+        //
+        // It is emphatically *not* free: the largest rungs are the ones that keep missing, and
+        // fitting them all takes ~480 MB on that shape. Capping the intermediate's resolution
+        // would collapse those rungs instead of storing them, but that changes how a blurred
+        // surface looks, so it is a decision for a human and not a policy tweak.
         let mut total: u64 = self.backdrop_blur_pool.iter().map(|(_, b)| b.bytes()).sum();
-        let mut drained = 0;
-        while total > BACKDROP_BLUR_POOL_BYTES && drained < self.backdrop_blur_pool.len() {
-            total -= self.backdrop_blur_pool[drained].1.bytes();
-            drained += 1;
+        while total > BACKDROP_BLUR_POOL_BYTES {
+            let Some(i) = (0..self.backdrop_blur_pool.len())
+                .max_by_key(|&i| self.backdrop_blur_pool[i].1.bytes())
+            else {
+                break;
+            };
+            total -= self.backdrop_blur_pool[i].1.bytes();
+            self.backdrop_blur_pool.remove(i);
         }
-        self.backdrop_blur_pool.drain(..drained);
     }
 
     /// Take a pooled bundle matching `dims`/`passes`, if one is held. Most-recent match first.
@@ -3407,6 +3419,12 @@ impl VulkanRenderer {
     #[cfg(test)]
     pub(super) fn backdrop_blur_pooled(&self) -> usize {
         self.backdrop_blur_pool.len()
+    }
+
+    /// What the pool is holding, in bytes (test-only observability).
+    #[cfg(test)]
+    pub(super) fn backdrop_blur_pool_bytes(&self) -> u64 {
+        self.backdrop_blur_pool.iter().map(|(_, b)| b.bytes()).sum()
     }
 
     #[cfg(test)]
