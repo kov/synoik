@@ -62,11 +62,19 @@ impl BackdropBlur {
         let dims = capture.extent();
         let blur = match passes {
             Some(passes) => {
-                // The chain samples `capture` (its descriptor set is built here, bound to the
-                // capture's stable view) — capture_region refills the capture each frame, so a
-                // cached chain stays valid across frames.
-                let chain = SharedBlurChain::new(&renderer.gpu, capture.synoik_texture(), passes)?;
+                // The output is created *before* the chain because the chain is told to render its
+                // final upsample straight into it. That is what removes a full-size
+                // `vkCmdCopyImage` per blurred surface per frame — see
+                // `BlurChain::set_external_dst`. The chain samples `capture` (its descriptor set is
+                // built here, bound to the capture's stable view) — capture_region refills the
+                // capture each frame, so a cached chain stays valid across frames.
                 let output = renderer.create_buffer(NATIVE_FOURCC, size)?;
+                let chain = SharedBlurChain::new_into(
+                    &renderer.gpu,
+                    capture.synoik_texture(),
+                    passes,
+                    output.synoik_texture(),
+                )?;
                 Some(BlurState {
                     passes,
                     chain,

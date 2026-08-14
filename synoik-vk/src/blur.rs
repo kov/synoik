@@ -78,6 +78,18 @@ pub struct BlurChain {
     /// Descriptor set that samples the external source texture.
     source_set: vk::DescriptorSet,
     passes: usize,
+    /// Where the final upsample writes, when the caller gave the chain somewhere of its own.
+    ///
+    /// Without it the chain's result lands in `levels[0]` and the caller copies it out with
+    /// [`Self::copy_output_to`] — a full-size `vkCmdCopyImage` per blurred surface per frame,
+    /// invisible in the frame log's coverage figure because a copy is not a draw. With it the last
+    /// pass simply renders where the consumer is going to sample, and the copy does not happen.
+    ///
+    /// The render pass makes this safe rather than clever: `loadOp DONT_CARE` (the pass overwrites
+    /// every pixel), `initialLayout UNDEFINED` (no contents to preserve) and
+    /// `finalLayout SHADER_READ_ONLY_OPTIMAL` — which is exactly the state `copy_output_to` left
+    /// its destination in, so nothing downstream can tell the difference except by timing.
+    external_dst: Option<Level>,
 }
 
 /// The gaussian path's own pipelines, shaders and ping-pong targets.
@@ -372,11 +384,65 @@ impl BlurChain {
             levels: std::mem::take(&mut guard.levels),
             source_set,
             passes,
+            external_dst: None,
         })
     }
 
+    /// Point the final upsample at `dst` — an image the caller owns, the same size as level 0 and
+    /// created with `COLOR_ATTACHMENT` usage — instead of leaving the result in level 0 for the
+    /// caller to copy out.
+    ///
+    /// This is the difference between one full-size `vkCmdCopyImage` per blurred surface per frame
+    /// and none. The copy never showed up in the frame log's coverage figure (a copy is not a
+    /// draw), so it was pure invisible bandwidth: at a 2238x1258 intermediate it moves ~11 MB in
+    /// and ~11 MB out, per effect, every frame.
+    ///
+    /// Safe because the chain's render pass already describes exactly the contract the copy
+    /// provided: `loadOp DONT_CARE` and `initialLayout UNDEFINED` (the pass overwrites every
+    /// pixel of the destination, so there is nothing to preserve and no transition to make), and
+    /// `finalLayout SHADER_READ_ONLY_OPTIMAL` (where `copy_output_to` left it). The chain owns
+    /// only the framebuffer it creates here; the image, its view and its memory stay the
+    /// caller's, and [`Self::destroy`] respects that.
+    ///
+    /// `stop`-ping the upsample early ([`Self::record_to_level`]) ignores this: a caller that
+    /// wants a partial result wants it where partial results have always been.
+    pub fn set_external_dst(
+        &mut self,
+        gpu: &Gpu,
+        view: vk::ImageView,
+        w: u32,
+        h: u32,
+    ) -> Result<()> {
+        let fb_ci = vk::FramebufferCreateInfo::default()
+            .render_pass(self.render_pass)
+            .attachments(std::slice::from_ref(&view))
+            .width(w)
+            .height(h)
+            .layers(1);
+        let framebuffer = unsafe { gpu.device.create_framebuffer(&fb_ci, None) }
+            .context("blur external destination fb")?;
+        if let Some(old) = self.external_dst.replace(Level {
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+            view,
+            framebuffer,
+            set: vk::DescriptorSet::null(),
+            w,
+            h,
+        }) {
+            unsafe { gpu.device.destroy_framebuffer(old.framebuffer, None) };
+        }
+        Ok(())
+    }
+
+    /// Whether the final upsample writes the caller's own image (see [`Self::set_external_dst`]),
+    /// in which case there is nothing to copy out of level 0.
+    pub fn has_external_dst(&self) -> bool {
+        self.external_dst.is_some()
+    }
+
     /// Record the full down+up chain into `cbuf`. Afterwards level 0 holds the blurred output in
-    /// `SHADER_READ_ONLY_OPTIMAL`.
+    /// `SHADER_READ_ONLY_OPTIMAL` — or, with an external destination set, that image does.
     pub fn record(&self, gpu: &Gpu, cbuf: vk::CommandBuffer, offset: f32) {
         self.record_to_level(gpu, cbuf, offset, 0);
     }
@@ -405,7 +471,14 @@ impl BlurChain {
         // Upsample: L_passes → L_{passes-1}, …, L_{stop+1} → L_stop.
         for i in (stop + 1..=self.passes).rev() {
             let src = &self.levels[i];
-            let dst = &self.levels[i - 1];
+            // The last pass writes the caller's own image when it gave us one, so the result does
+            // not have to be copied out of level 0 afterwards. Only when the upsample really is
+            // running to completion: a caller that stops early wants the partial result where it
+            // has always been.
+            let dst = match (&self.external_dst, i) {
+                (Some(ext), 1) if stop == 0 => ext,
+                _ => &self.levels[i - 1],
+            };
             // half_pixel = half a source pixel.
             let half_pixel = [0.5 / src.w as f32, 0.5 / src.h as f32];
             self.pass(gpu, cbuf, self.up, dst, src.set, half_pixel, offset);
@@ -824,6 +897,11 @@ impl BlurChain {
     pub fn destroy(&self, gpu: &Gpu) {
         let d = &gpu.device;
         unsafe {
+            // The external destination is a framebuffer over somebody else's image: destroy the
+            // framebuffer, never the image, view or memory behind it.
+            if let Some(ext) = &self.external_dst {
+                d.destroy_framebuffer(ext.framebuffer, None);
+            }
             let scratch = self.gaussian.iter().flat_map(|g| g.scratch.iter());
             for level in self.levels.iter().chain(scratch) {
                 d.destroy_framebuffer(level.framebuffer, None);
@@ -1233,7 +1311,7 @@ mod tests {
         println!("empty submit (subtracted below): {:.3}ms", ms(empty));
         println!(
             "{:<12} {:>10} {:>10} {:>10} {:>10}",
-            "size", "px", "record+copy", "record", "record→L1"
+            "size", "px", "record+copy", "record→dst", "record→L1"
         );
 
         for &(w, h) in SIZES {
@@ -1252,10 +1330,16 @@ mod tests {
                 }),
                 empty,
             );
+            // The shipping path: the final upsample renders straight into `dst`, so there is no
+            // copy to pay for. This is the column `record+copy` is here to be compared against.
+            let mut direct = BlurChain::new(&gpu, &source, PASSES).expect("chain (direct)");
+            direct
+                .set_external_dst(&gpu, dst.view, w, h)
+                .expect("external dst");
             let no_copy = per_rep(
                 time_submit(&gpu, pool, |cbuf| {
                     for _ in 0..reps() {
-                        chain.record(&gpu, cbuf, OFFSET);
+                        direct.record(&gpu, cbuf, OFFSET);
                     }
                 }),
                 empty,
@@ -1278,6 +1362,7 @@ mod tests {
                 ms(to_l1),
             );
 
+            direct.destroy(&gpu);
             chain.destroy(&gpu);
             dst.destroy(&gpu);
             source.destroy(&gpu);

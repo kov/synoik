@@ -44,7 +44,20 @@ impl SharedBlurChain {
         source: &SynoikTexture,
         passes: usize,
     ) -> Result<Arc<Self>, VulkanError> {
-        Self::build(gpu, source, passes, false)
+        Self::build(gpu, source, passes, false, None)
+    }
+
+    /// As [`Self::new`], but the final upsample renders straight into `dst` instead of into level 0
+    /// — so [`Self::record_into`] has nothing to copy out afterwards. `dst` must be level-0 sized
+    /// and `COLOR_ATTACHMENT`-usable; see `BlurChain::set_external_dst` for why that is all it
+    /// takes.
+    pub(crate) fn new_into(
+        gpu: &Arc<Gpu>,
+        source: &SynoikTexture,
+        passes: usize,
+        dst: &SynoikTexture,
+    ) -> Result<Arc<Self>, VulkanError> {
+        Self::build(gpu, source, passes, false, Some(dst))
     }
 
     /// As [`Self::new`], plus the pipelines [`Self::record_gaussian_into`] needs.
@@ -53,7 +66,7 @@ impl SharedBlurChain {
         source: &SynoikTexture,
         passes: usize,
     ) -> Result<Arc<Self>, VulkanError> {
-        Self::build(gpu, source, passes, true)
+        Self::build(gpu, source, passes, true, None)
     }
 
     fn build(
@@ -61,12 +74,16 @@ impl SharedBlurChain {
         source: &SynoikTexture,
         passes: usize,
         gaussian: bool,
+        dst: Option<&SynoikTexture>,
     ) -> Result<Arc<Self>, VulkanError> {
-        let chain = if gaussian {
+        let mut chain = if gaussian {
             BlurChain::new_with_gaussian(gpu, source, passes)?
         } else {
             BlurChain::new(gpu, source, passes)?
         };
+        if let Some(dst) = dst {
+            chain.set_external_dst(gpu, dst.view, dst.width, dst.height)?;
+        }
         Ok(Arc::new(Self {
             gpu: gpu.clone(),
             chain,
@@ -105,8 +122,10 @@ impl SharedBlurChain {
         height: u32,
     ) {
         self.chain.record(&self.gpu, cbuf, offset);
-        self.chain
-            .copy_output_to(&self.gpu, cbuf, output, width, height);
+        if !self.chain.has_external_dst() {
+            self.chain
+                .copy_output_to(&self.gpu, cbuf, output, width, height);
+        }
     }
 }
 
