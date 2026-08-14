@@ -64,6 +64,8 @@ thread_local! {
     /// See [`blit`]. Split by site for the same reason [`SHADED_BY_SITE`] is: a present blit and a
     /// backdrop capture are different costs with different fixes.
     static BLITTED_BY_SITE: Cell<[u64; BlitSite::ALL.len()]> = const { Cell::new([0; BlitSite::ALL.len()]) };
+    /// See [`render_pass`].
+    static RENDER_PASSES: Cell<u64> = const { Cell::new(0) };
     static BARRIERS: Cell<u64> = const { Cell::new(0) };
     static DESCRIPTOR_WRITES: Cell<u64> = const { Cell::new(0) };
     static DESCRIPTOR_ALLOCS: Cell<u64> = const { Cell::new(0) };
@@ -741,6 +743,23 @@ pub fn blit(site: BlitSite, pixels: u64) {
 /// frame, exactly as it does for [`shaded_by_site`].
 pub fn blitted_by_site() -> [u64; BlitSite::ALL.len()] {
     BLITTED_BY_SITE.with(Cell::get)
+}
+
+/// Record the start of a render pass.
+///
+/// The host GPU here is tile-based, so a pass boundary is not free bookkeeping: it resolves tile
+/// memory out to the render target and, for a pass that loads, reads it back. At 4K that is tens
+/// of megabytes of traffic per boundary, spent without shading a fragment, blitting a pixel or
+/// allocating anything — invisible to every other counter on the frame line. The backdrop capture
+/// path opens a gap between passes by design (see `VulkanFrame::capture_region`), so the count is
+/// a function of how many effects capture, not of the scene.
+pub fn render_pass() {
+    add(&RENDER_PASSES, 1);
+}
+
+/// Render passes begun on this thread, reset to zero.
+pub fn take_render_passes() -> u64 {
+    RENDER_PASSES.with(|c| c.replace(0))
 }
 
 /// Record a pipeline barrier, a descriptor-set write, and a descriptor-set allocation.

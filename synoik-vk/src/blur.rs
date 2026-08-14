@@ -593,6 +593,7 @@ impl BlurChain {
                 extent,
             });
         unsafe {
+            crate::stats::render_pass();
             device.cmd_begin_render_pass(cbuf, &begin, vk::SubpassContents::INLINE);
             device.cmd_bind_pipeline(cbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
             let viewport = vk::Viewport {
@@ -675,6 +676,7 @@ impl BlurChain {
             extent,
         };
         unsafe {
+            crate::stats::render_pass();
             device.cmd_begin_render_pass(cbuf, &begin, vk::SubpassContents::INLINE);
             device.cmd_set_viewport(cbuf, 0, &[viewport]);
             device.cmd_set_scissor(cbuf, 0, &[scissor]);

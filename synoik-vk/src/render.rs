@@ -419,6 +419,7 @@ impl RenderTarget {
             })
             .clear_values(&clears);
         unsafe {
+            crate::stats::render_pass();
             gpu.device
                 .cmd_begin_render_pass(cbuf, &begin, vk::SubpassContents::INLINE);
         }

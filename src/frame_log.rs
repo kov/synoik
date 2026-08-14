@@ -1100,6 +1100,10 @@ struct Totals {
     /// when something was allocated; these are for when nothing was. The first frame of an
     /// overview open is the open case: ~11ms of wait beyond its GPU time, with zero creates.
     host_calls: (u64, u64, u64),
+    /// Render passes this frame began. On a tile-based host a pass boundary resolves and reloads
+    /// tile memory for the whole target — tens of megabytes at 4K, spent without shading a
+    /// fragment or blitting a pixel, so no other counter here can see it.
+    render_passes: u64,
     /// Destination pixels blitted this frame, split by [`synoik_vk::stats::BlitSite`].
     ///
     /// Blits are **not draws**, so `shaded` cannot see them, yet they are recorded inside the GPU
@@ -1684,6 +1688,7 @@ impl FrameLog {
             uploaded: synoik_vk::stats::take_uploaded_bytes(),
             creates: synoik_vk::stats::take_creates(),
             host_calls: synoik_vk::stats::take_host_calls(),
+            render_passes: synoik_vk::stats::take_render_passes(),
             blitted_by_site: {
                 let now = synoik_vk::stats::blitted_by_site();
                 let mut d = [0u64; synoik_vk::stats::BlitSite::ALL.len()];
@@ -2029,6 +2034,9 @@ impl FrameLog {
             let (barriers, writes, allocs) = totals.host_calls;
             if barriers | writes | allocs > 0 {
                 let _ = write!(line, ", host {barriers}b/{writes}w/{allocs}a");
+            }
+            if totals.render_passes > 0 {
+                let _ = write!(line, ", {} passes", totals.render_passes);
             }
         } else if !totals.retiring.is_zero() {
             // A frame can pay a wait for work it did not submit: retiring a previous
@@ -2911,6 +2919,21 @@ mod tests {
     /// chain rebuilt because its size animates, a swapchain image per frame, and an upload that
     /// forgot its cache — three different bugs. The seat's overview transition sat at exactly
     /// that number with nowhere to take it until the line named the constructor.
+    /// A pass boundary costs tile-memory traffic for the whole target and shades nothing, so it is
+    /// invisible to `covering`, `blitting` and `host` alike. Two frames with the same draws and the
+    /// same coverage can differ by it.
+    #[test]
+    fn a_frame_says_how_many_render_passes_it_opened() {
+        let frame = empty_frame();
+        let totals = Totals {
+            submits: 1,
+            render_passes: 9,
+            ..Totals::default()
+        };
+        let line = FrameLog::format_frame(&frame, Duration::from_millis(17), &totals, None);
+        assert!(line.contains("9 passes"), "{line}");
+    }
+
     /// Blits are GPU work inside the frame's timestamp bracket that `covering` structurally cannot
     /// describe — they are not draws. A frame whose GPU time exceeds what its coverage explains is
     /// asking exactly this question, so the answer has to be on the same line.

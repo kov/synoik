@@ -341,6 +341,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 max_depth: 1.0,
             };
             unsafe {
+                synoik_vk::stats::render_pass();
                 dev.cmd_begin_render_pass(cbuf, &pass_begin, vk::SubpassContents::INLINE);
                 dev.cmd_set_viewport(cbuf, 0, std::slice::from_ref(&viewport));
                 dev.cmd_set_scissor(cbuf, 0, std::slice::from_ref(&render_area));
@@ -1343,6 +1344,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 .render_pass(continuation)
                 .framebuffer(framebuffer)
                 .render_area(render_area);
+            synoik_vk::stats::render_pass();
             dev.cmd_begin_render_pass(cbuf, &pass_begin, vk::SubpassContents::INLINE);
             dev.cmd_set_viewport(cbuf, 0, std::slice::from_ref(&viewport));
             dev.cmd_set_scissor(cbuf, 0, std::slice::from_ref(&render_area));
