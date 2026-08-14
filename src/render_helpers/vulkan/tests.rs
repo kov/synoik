@@ -3699,10 +3699,11 @@ fn vulkan_backdrop_blur_reuses_across_a_size_sweep() {
 /// memory. The two are unrelated, so under a byte budget the right thing to drop is the largest
 /// bundle, not the oldest.
 ///
-/// This is the seat's shape, not a synthetic one: three big blurred windows sweeping through the
-/// overview and back. On it, the whole working set is ~480MB — far past anything worth holding on
-/// this machine — so the budget genuinely binds and the eviction policy is what decides how much
-/// of the churn survives.
+/// This is the seat's shape, not a synthetic one: five big blurred effects — three windows plus
+/// the panel and the dash — sweeping through the overview and back. Uncapped, its working set is
+/// ~480MB per three effects, far past anything worth holding, so the budget binds hard and the
+/// eviction policy decides how much churn survives. Capped, it settles at 215MB, which is what
+/// `BACKDROP_BLUR_POOL_BYTES` is sized from.
 #[test]
 fn vulkan_backdrop_blur_pool_prefers_many_small_bundles() {
     use smithay::utils::user_data::UserDataMap;
@@ -3714,14 +3715,14 @@ fn vulkan_backdrop_blur_pool_prefers_many_small_bundles() {
         Ok(vk) => vk,
         Err(_) => return,
     };
-    // The seat's shape: a 2371x1200 output with three big blurred windows.
+    // The seat's shape: a big output with five blurred effects animating at once.
     const W: i32 = 2238;
     const H: i32 = 1258;
     let size = Size::<i32, Physical>::from((W, H));
     let mut target = vk
         .create_buffer(NATIVE_FOURCC, Size::<i32, BufferCoord>::from((W, H)))
         .expect("create target");
-    let caches: Vec<UserDataMap> = (0..3).map(|_| UserDataMap::new()).collect();
+    let caches: Vec<UserDataMap> = (0..5).map(|_| UserDataMap::new()).collect();
 
     let capture_at = |vk: &mut VulkanRenderer, target: &mut VkTexture, frac: f64| {
         for cache in &caches {
@@ -3770,9 +3771,10 @@ fn vulkan_backdrop_blur_pool_prefers_many_small_bundles() {
 
     // The invariant the policy exists to keep: never over budget.
     assert!(
-        vk.backdrop_blur_pool_bytes() <= 192 * 1024 * 1024,
-        "the pool is holding {} bytes, past its budget",
+        vk.backdrop_blur_pool_bytes() <= VulkanRenderer::backdrop_blur_pool_budget(),
+        "the pool is holding {} bytes, past its {} budget",
         vk.backdrop_blur_pool_bytes(),
+        VulkanRenderer::backdrop_blur_pool_budget(),
     );
 
     // A steady cycle must be cheaper than the cold one, and by a wide margin — the point of the

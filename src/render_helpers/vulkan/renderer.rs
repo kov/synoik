@@ -401,12 +401,19 @@ type BackdropBlurKey = ((u32, u32), Option<usize>);
 /// Budget for the evicted-backdrop-bundle pool, in bytes. See
 /// [`VulkanRenderer::backdrop_blur_pool`].
 ///
-/// Sized for one overview round trip on a busy screen: five blurred effects sweeping ~4 rungs
-/// each, at the ~1100×630 intermediates a windowed effect actually asks for (~8 MB a bundle by
-/// [`BackdropBlur::bytes`](super::BackdropBlur::bytes)). A full-screen bundle is several times
-/// that, so this holds fewer of those — which is the right way round, since the biggest rungs are
-/// the ones a sweep passes through quickest.
-const BACKDROP_BLUR_POOL_BYTES: u64 = 192 * 1024 * 1024;
+/// With the moving-geometry cap in place (`MOVING_INTERMEDIATE_CAP`), the working set is no longer
+/// a sweep's worth of rungs — it is dominated by the *resting*, full-resolution bundle of each
+/// blurred effect, which is rebuilt whenever an animation settles and is by far the largest thing
+/// the pool is asked to hold. Those are also exactly what largest-first eviction throws out first,
+/// so a budget a little too small does not degrade gracefully: it misses on every settle, and each
+/// miss is a big `SharedBlurChain::new` (measured on the seat at ~1.6 ms a chain, ~9 ms a
+/// transition, landing on the frame an animation ends).
+///
+/// Sized from the seat's own shape — three big blurred windows plus the panel and the dash — which
+/// `vulkan_backdrop_blur_pool_prefers_many_small_bundles` reproduces at 215 MB held for zero steady
+/// rebuilds. This leaves headroom over that. The memory is host-backed on this stack (one 48 GiB
+/// heap) and retention was never what hurt here; churn was.
+const BACKDROP_BLUR_POOL_BYTES: u64 = 288 * 1024 * 1024;
 
 /// Cap on cached glyph runs. Each pins its own R8 coverage atlas (a few tens of KB
 /// at panel/label sizes), and the live set is the strings actually on screen — every
@@ -3419,6 +3426,12 @@ impl VulkanRenderer {
     #[cfg(test)]
     pub(super) fn backdrop_blur_pooled(&self) -> usize {
         self.backdrop_blur_pool.len()
+    }
+
+    /// The pool's byte budget, so a test asserting the invariant cannot drift from the constant.
+    #[cfg(test)]
+    pub(super) fn backdrop_blur_pool_budget() -> u64 {
+        BACKDROP_BLUR_POOL_BYTES
     }
 
     /// What the pool is holding, in bytes (test-only observability).
