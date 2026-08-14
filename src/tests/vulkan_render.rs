@@ -10274,6 +10274,77 @@ fn element_ids(f: &mut Fixture, output: &Output) -> Vec<String> {
         .expect("the fixture must have a Vulkan renderer")
 }
 
+/// An element's geometry is its shaded area — which is what makes the scene breakdown honest.
+///
+/// The frame line splits coverage into scene / blur / text, and once the answer is "the scene", the
+/// next question is which elements. `frame_log::scene_breakdown` answers it by summing element
+/// geometry, with no counter of its own — so the claim it rests on is that the sum equals what the
+/// renderer actually shaded. This asserts exactly that, on a real overview frame: the breakdown's
+/// total against the `DrawSite::Scene` counter for the same frame.
+///
+/// If they ever diverge the breakdown is lying about where a frame's fill rate goes, and it will
+/// lie plausibly — the numbers stay the right order of magnitude while pointing at the wrong
+/// element. Clipping is the likely way in: an element hanging off the edge of the output shades
+/// only the part inside it.
+#[test]
+fn the_scene_breakdown_totals_what_was_actually_shaded() {
+    let Some(mut f) = window_fixture_settled(GREEN, true, Some("scene breakdown")) else {
+        return;
+    };
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    f.synoik().layout.toggle_overview();
+    f.refresh();
+    f.synoik_complete_animations();
+    // One warm frame first: the breakdown describes a settled scene, and the first render of one
+    // uploads and bakes things that never draw again.
+    let _ = render_output_vulkan(&mut f, &output);
+
+    let before = synoik_vk::stats::shaded_by_site();
+    let _ = render_output_vulkan(&mut f, &output);
+    let after = synoik_vk::stats::shaded_by_site();
+    let shaded = after[synoik_vk::stats::DrawSite::Scene.index()]
+        - before[synoik_vk::stats::DrawSite::Scene.index()];
+
+    let out_px = u64::from(OUT_W) * u64::from(OUT_H);
+    let state = f.synoik_state();
+    let line = state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let synoik = &mut state.synoik;
+            synoik.update_render_elements(Some(&output));
+            let ctx = RenderCtx {
+                renderer: vk,
+                target: RenderTarget::Output,
+                xray: None,
+                appearance: Some(synoik.appearance()),
+            };
+            let els = synoik.render_to_vec(ctx, &output, false);
+            crate::frame_log::scene_breakdown(
+                &els,
+                1.0.into(),
+                Rectangle::from_size(Size::from((i32::from(OUT_W), i32::from(OUT_H)))),
+            )
+        })
+        .expect("the fixture must have a Vulkan renderer")
+        .expect("a non-empty output has a breakdown");
+    eprintln!("the_scene_breakdown_totals_what_was_actually_shaded: {line}");
+
+    let reported: f64 = line
+        .split_once(": ")
+        .and_then(|(_, rest)| rest.split_once('x'))
+        .and_then(|(n, _)| n.parse().ok())
+        .expect("the line starts with the total as a multiple of the output");
+    let measured = shaded as f64 / out_px as f64;
+    assert!(
+        (reported - measured).abs() < 0.05,
+        "the breakdown claims {reported:.2}x the output but the renderer shaded {measured:.2}x. \
+         The breakdown sums element geometry and owns no counter, so it is only true while those \
+         agree — a divergence means it is attributing a frame's fill rate to the wrong elements \
+         while still looking about right.",
+    );
+}
+
 /// Nor may one during the overview animation, where the cost is worst.
 ///
 /// The idle guard below cannot see this: the elements that churned were the ones that only *exist*

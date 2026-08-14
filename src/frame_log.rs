@@ -1173,6 +1173,94 @@ fn frame_cost(total: Duration, totals: &Totals) -> Duration {
     total + totals.gpu.saturating_sub(totals.retiring)
 }
 
+/// Log which *elements* a frame's `scene` overdraw went to, when `SYNOIK_SCENE_BREAKDOWN` is set.
+///
+/// The frame line splits coverage by [`DrawSite`](synoik_vk::stats::DrawSite) — scene vs blur vs
+/// text — which is enough to say *which class* to attack and no more. Once the answer is "the
+/// scene", the next question is which of the ninety-odd elements in an overview frame are paying
+/// for it, and that needs the element list, which only the render path has.
+///
+/// An element's geometry **is** its shaded area: measured headlessly on a settled overview frame,
+/// the sum of `geometry ∩ output` over every element came to 1.68x the output against a `scene`
+/// counter reading 1.68x. So this needs no new counter, just the arithmetic.
+///
+/// Off by default and one atomic load when off. On, it logs one frame in [`EVERY`]: the breakdown
+/// of a settled scene does not change, and a per-frame log of ninety elements would push
+/// everything else out of the journal.
+pub fn log_scene_breakdown<E>(
+    elements: &[E],
+    scale: smithay::utils::Scale<f64>,
+    output: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+) where
+    E: smithay::backend::renderer::element::Element + std::fmt::Debug,
+{
+    /// Log one frame in this many.
+    const EVERY: u64 = 240;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("SYNOIK_SCENE_BREAKDOWN").is_ok()) {
+        return;
+    }
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if !SEEN.fetch_add(1, Ordering::Relaxed).is_multiple_of(EVERY) {
+        return;
+    }
+    if let Some(line) = scene_breakdown(elements, scale, output) {
+        tracing::info!("{line}");
+    }
+}
+
+/// The line [`log_scene_breakdown`] logs, split out so it can be asserted on — the arithmetic is
+/// the whole point of it, and a `tracing` call proves nothing in a test.
+pub fn scene_breakdown<E>(
+    elements: &[E],
+    scale: smithay::utils::Scale<f64>,
+    output: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+) -> Option<String>
+where
+    E: smithay::backend::renderer::element::Element + std::fmt::Debug,
+{
+    let output_px = u64::from(output.size.w.max(0) as u32) * u64::from(output.size.h.max(0) as u32);
+    if output_px == 0 {
+        return None;
+    }
+
+    let mut by_kind: HashMap<String, (usize, f64)> = HashMap::new();
+    let mut total = 0.0;
+    for e in elements {
+        // Clipped to the output, because that is what gets shaded: an element hanging off the
+        // edge — every overview element does, mid-animation — pays only for the part inside. The
+        // unclipped sum reads high and stays plausible, which is the worst way for an instrument
+        // to be wrong; `the_scene_breakdown_totals_what_was_actually_shaded` is the guard.
+        let area = e.geometry(scale).intersection(output).map_or(0.0, |r| {
+            f64::from(r.size.w.max(0)) * f64::from(r.size.h.max(0))
+        });
+        total += area;
+        // The `Debug` prefix is the element enum's variant name — the granularity that answers
+        // "what is this" without adding a trait method to every element type.
+        let name = format!("{e:?}");
+        let kind = name.split(['(', ' ', '{']).next().unwrap_or("?").to_owned();
+        let entry = by_kind.entry(kind).or_insert((0, 0.0));
+        entry.0 += 1;
+        entry.1 += area;
+    }
+    let mut ranked: Vec<(String, (usize, f64))> = by_kind.into_iter().collect();
+    ranked.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
+    let px = output_px as f64;
+    let shares: Vec<String> = ranked
+        .iter()
+        .take(8)
+        .filter(|(_, (_, a))| a / px >= 0.01)
+        .map(|(kind, (n, a))| format!("{kind} {:.2}x n={n}", a / px))
+        .collect();
+    Some(format!(
+        "scene breakdown: {:.2}x the output over {} elements — {}",
+        total / px,
+        elements.len(),
+        shares.join(", "),
+    ))
+}
+
 /// See the [module docs](self).
 #[derive(Debug)]
 pub struct FrameLog {

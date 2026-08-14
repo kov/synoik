@@ -50,7 +50,7 @@ use smithay::reexports::gbm::Modifier;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols;
-use smithay::utils::{DeviceFd, Transform};
+use smithay::utils::{DeviceFd, Rectangle, Transform};
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::drm_lease::{
     DrmLease, DrmLeaseBuilder, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
@@ -3072,6 +3072,15 @@ fn render_surface_with(
         state.last_frame_elements = elements.len();
         state.last_frame_full_damage = force_full_damage;
     }
+    crate::frame_log::log_scene_breakdown(
+        &elements,
+        output.current_scale().fractional_scale().into(),
+        Rectangle::from_size(
+            output
+                .current_mode()
+                .map_or_else(Default::default, |m| m.size),
+        ),
+    );
 
     synoik.frame_log.phase(Phase::Submit);
     // This is the one frame whose completion has somewhere to go: `DrmCompositor` puts the sync
