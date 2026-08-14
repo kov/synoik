@@ -49,11 +49,11 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::overview_layout::ControlsLayout;
 use crate::ui::text_edit::{EditMods, EditOutcome, KeyTheme, TextEdit};
@@ -832,14 +832,7 @@ impl OverviewSearch {
                 .of(appearance.rev())
                 .done(),
         ) {
-            Ok(texture) => {
-                let buffer = TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    vec![],
-                );
+            Ok(buffer) => {
                 elements.push(TextureRenderElement::from_texture_buffer(
                     buffer,
                     layout.entry.pill.loc,
@@ -865,14 +858,7 @@ impl OverviewSearch {
                 let origin = card.loc;
                 let card_size = card.size;
                 let empty = self.results.is_empty();
-                let mut push_card_layer = |renderer: &VulkanRenderer, texture| {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        vec![],
-                    );
+                let mut push_card_layer = |buffer| {
                     elements.push(TextureRenderElement::from_texture_buffer(
                         buffer,
                         card.loc,
@@ -943,7 +929,7 @@ impl OverviewSearch {
                         Ok(())
                     },
                 ) {
-                    Ok(texture) => push_card_layer(renderer, texture),
+                    Ok(buffer) => push_card_layer(buffer),
                     Err(err) => tracing::error!("error baking the search labels: {err:#}"),
                 }
 
@@ -1036,7 +1022,7 @@ impl OverviewSearch {
                         Ok(())
                     },
                 ) {
-                    Ok(texture) => push_card_layer(renderer, texture),
+                    Ok(buffer) => push_card_layer(buffer),
                     Err(err) => tracing::error!("error baking the search card: {err:#}"),
                 }
             }

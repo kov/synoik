@@ -35,11 +35,11 @@ use std::collections::HashMap;
 
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::synoik_render_elements;
 use crate::ui::widget::{
@@ -257,14 +257,7 @@ impl PreviewChrome {
                 },
             );
             match disc {
-                Ok(texture) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        vec![],
-                    );
+                Ok(buffer) => {
                     elements.push(
                         TextureRenderElement::from_texture_buffer(
                             buffer,
@@ -346,23 +339,14 @@ impl PreviewChrome {
             },
         );
         match texture {
-            Ok(texture) => {
-                let buffer = TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    vec![],
-                );
-                Some(TextureRenderElement::from_texture_buffer(
-                    buffer,
-                    caption_origin(overlay.preview, size),
-                    overlay.alpha,
-                    None,
-                    None,
-                    Kind::Unspecified,
-                ))
-            }
+            Ok(buffer) => Some(TextureRenderElement::from_texture_buffer(
+                buffer,
+                caption_origin(overlay.preview, size),
+                overlay.alpha,
+                None,
+                None,
+                Kind::Unspecified,
+            )),
             Err(err) => {
                 tracing::error!("error baking a preview caption: {err:#}");
                 None

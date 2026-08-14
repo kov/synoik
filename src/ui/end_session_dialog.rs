@@ -27,15 +27,14 @@ use std::sync::Mutex;
 
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::Texture;
 use smithay::output::Output;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use synoik_config::Config;
 
 use crate::animation::{Animation, Clock};
 use crate::end_session::Presentation;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanFrame, VulkanRenderer};
 use crate::synoik_render_elements;
 use crate::ui::widget::{
@@ -519,20 +518,8 @@ impl EndSessionDialog {
             }
         };
 
-        if let Some(texture) = texture {
-            let tex_size = texture.size();
-            let buffer = TextureBuffer::from_texture(
-                renderer,
-                texture,
-                scale,
-                Transform::Normal,
-                Vec::new(),
-            );
-
-            let size = Size::<f64, Logical>::from((
-                f64::from(tex_size.w) / scale,
-                f64::from(tex_size.h) / scale,
-            ));
+        if let Some(buffer) = texture {
+            let size = buffer.logical_size();
             let location = (output_size.to_point() - size.to_point()).downscale(2.);
             let mut location = location.to_physical_precise_round(scale).to_logical(scale);
             location.x = f64::max(0., location.x);
@@ -856,7 +843,7 @@ mod tests {
                 for &(focused, checkbox) in variants {
                     let box_h = height(checkbox.is_some());
                     let mut cache = BakeCache::new();
-                    let mut tex = widget::bake(
+                    let tex = widget::bake(
                         &mut vk,
                         &mut cache,
                         1.,
@@ -868,6 +855,9 @@ mod tests {
                         },
                     )
                     .expect("dialog texture");
+                    use smithay::backend::renderer::Texture as _;
+
+                    let mut tex = tex.texture().clone();
                     let size = tex.size();
                     assert_eq!(
                         (size.w, size.h),

@@ -33,13 +33,13 @@ use std::cell::RefCell;
 use smithay::backend::renderer::element::Kind;
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::animation::{Animation, Clock, Curve};
 use crate::app_system::AppIconRef;
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::synoik_render_elements;
 use crate::ui::app_grid::{
@@ -1195,14 +1195,7 @@ impl FolderDialog {
                 Ok(())
             },
         ) {
-            Ok(texture) => {
-                let buffer = TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    vec![],
-                );
+            Ok(buffer) => {
                 content.push(TextureRenderElement::from_texture_buffer(
                     buffer,
                     l.name_entry.loc,
@@ -1275,14 +1268,7 @@ impl FolderDialog {
                 Ok(())
             },
         ) {
-            Ok(texture) => {
-                let buffer = TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    vec![],
-                );
+            Ok(buffer) => {
                 content.push(TextureRenderElement::from_texture_buffer(
                     buffer,
                     l.edit_button.loc,
@@ -1377,14 +1363,7 @@ impl FolderDialog {
                     Ok(())
                 },
             ) {
-                Ok(texture) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        vec![],
-                    );
+                Ok(buffer) => {
                     content.push(TextureRenderElement::from_texture_buffer(
                         buffer,
                         l.name_band.loc,
@@ -1423,14 +1402,7 @@ impl FolderDialog {
                 Ok(())
             },
         ) {
-            Ok(texture) => {
-                let buffer = TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    vec![],
-                );
+            Ok(buffer) => {
                 content.push(TextureRenderElement::from_texture_buffer(
                     buffer,
                     l.panel.loc,

@@ -24,7 +24,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::Texture as _;
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 use synoik_config::Config;
 
 use crate::animation::{Animation, Clock};
@@ -70,7 +70,7 @@ const POPOVER_SHADOW: widget::DropShadowSpec = widget::DropShadowSpec {
 /// `$outer_borders_color` (dark) = `lighten($bg_color #36363a, 5%)` = `#424247`.
 const POPOVER_BORDER: widget::Rgba = [0.260, 0.260, 0.279, 1.];
 
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::a11y_menu::A11yMenu;
 use crate::ui::app_menu::AppMenu;
@@ -1336,15 +1336,12 @@ impl PanelPopover {
                     // The fill is the popover's one opaque surface, so it carries the rounded
                     // opaque region (two bands excluding the transparent corners). The content
                     // textures above it are transparent-bg and report none.
-                    let opaque =
-                        widget::rounded_opaque_regions(tex.size(), (radius * scale).round() as i32);
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        tex,
-                        scale,
-                        Transform::Normal,
-                        opaque,
+                    let opaque = widget::rounded_opaque_regions(
+                        tex.texture().size(),
+                        (radius * scale).round() as i32,
                     );
+                    let mut buffer = tex;
+                    buffer.set_opaque_regions(opaque);
                     elements.push(TextureRenderElement::from_texture_buffer(
                         buffer,
                         origin,
@@ -1374,15 +1371,8 @@ impl PanelPopover {
                 radius,
                 POPOVER_SHADOW,
             ) {
-                Ok((tex, off)) => {
+                Ok((buffer, off)) => {
                     let loc = origin - off.to_f64().to_logical(scale);
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        tex,
-                        scale,
-                        Transform::Normal,
-                        Vec::new(),
-                    );
                     elements.push(TextureRenderElement::from_texture_buffer(
                         buffer,
                         loc,
@@ -1412,14 +1402,7 @@ impl PanelPopover {
                 radius,
                 POPOVER_BORDER,
             ) {
-                Ok(tex) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        tex,
-                        scale,
-                        Transform::Normal,
-                        Vec::new(),
-                    );
+                Ok(buffer) => {
                     elements.insert(
                         0,
                         TextureRenderElement::from_texture_buffer(

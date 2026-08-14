@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
-use smithay::utils::{Logical, Physical, Point, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Size};
 
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
@@ -139,7 +139,11 @@ impl Ripples {
     /// their bottom-right quadrant lands inside the buffer — the same "let the rect run past the
     /// bake buffer on the side that should stay square" idiom the rest of the toolkit uses for a
     /// per-corner `border-radius`.
-    fn texture(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
+    fn texture(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+    ) -> anyhow::Result<TextureBuffer<VkTexture>> {
         // The shadow's fringe reaches ~3σ past the spread box; pad so it doesn't clip.
         let pad = SHADOW_BLUR * 1.5 + SHADOW_SPREAD + 1.;
         let logical = Size::<f64, Logical>::from((BOX_SIZE + pad, BOX_SIZE + pad));
@@ -211,13 +215,10 @@ impl Ripples {
             // Dividing the buffer scale magnifies: a buffer tagged at a fraction of the output
             // scale covers correspondingly more logical area, pinned at its top-left — which is
             // the corner, and so is the pivot gnome-shell scales about.
-            let buffer = TextureBuffer::from_texture(
-                renderer,
-                texture.clone(),
-                scale * MAX_SCALE / wave_scale,
-                Transform::Normal,
-                Vec::new(),
-            );
+            // Set on a clone of the cached bake rather than built fresh: the magnification is a
+            // presentation property, and a new buffer would mint a new `Id` every frame.
+            let mut buffer = texture.clone();
+            buffer.set_texture_scale(scale * MAX_SCALE / wave_scale);
             push(TextureRenderElement::from_texture_buffer(
                 buffer,
                 local,

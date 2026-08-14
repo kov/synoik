@@ -2168,7 +2168,7 @@ fn pill_texture(
     scale: f64,
     size: Size<f64, Logical>,
     color: [f32; 4],
-) -> anyhow::Result<VkTexture> {
+) -> anyhow::Result<TextureBuffer<VkTexture>> {
     let opaque = [color[0], color[1], color[2], 1.];
     // `widget::bake` keys on (scale, physical size), so the colour has to ride in the
     // revision or two pills of the same shape in different colours would alias. Alpha is
@@ -2214,15 +2214,7 @@ fn pill_element(
     rect: Rectangle<f64, Logical>,
     color: [f32; 4],
 ) -> anyhow::Result<PanelElement> {
-    let texture = pill_texture(renderer, cache, scale, rect.size, color)?;
-    let buffer = TextureBuffer::from_texture(
-        renderer,
-        texture,
-        scale,
-        Transform::Normal,
-        // Translucent (and rounded), so it never occludes what is under it.
-        Vec::new(),
-    );
+    let buffer = pill_texture(renderer, cache, scale, rect.size, color)?;
     Ok(PanelElement::Texture(
         TextureRenderElement::from_texture_buffer(
             buffer,
@@ -3933,8 +3925,10 @@ mod tests {
 
         // The pill itself, baked at full alpha into its own texture.
         let mut cache = widget::BakeCache::new();
-        let mut pill_tex =
-            pill_texture(&mut vk, &mut cache, scale, pill.size, R1_BG).expect("pill texture");
+        let mut pill_tex = pill_texture(&mut vk, &mut cache, scale, pill.size, R1_BG)
+            .expect("pill texture")
+            .texture()
+            .clone();
         let pill_size = pill_tex.size();
         let fb = vk.bind(&mut pill_tex).expect("bind pill for readback");
         let mapping = vk

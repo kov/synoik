@@ -21,7 +21,7 @@ use smithay::backend::renderer::element::Kind;
 use smithay::utils::{Logical, Rectangle, Size};
 
 use crate::render_helpers::icon::IconCache;
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::synoik_render_elements;
 use crate::ui::widget::{self, style, BakeCache, Painter, Rgba};
@@ -112,14 +112,7 @@ impl ThumbnailChrome {
                     p.icon_button(&widget_button, accent)
                 },
             );
-            if let Ok(texture) = disc {
-                let buffer = TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    smithay::utils::Transform::Normal,
-                    Vec::new(),
-                );
+            if let Ok(buffer) = disc {
                 elements.push(
                     TextureRenderElement::from_texture_buffer(
                         buffer,

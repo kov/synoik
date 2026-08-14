@@ -2716,14 +2716,7 @@ impl QuickSettings {
                 MENU_RADIUS,
                 [0., 0., 0., 1.],
             ) {
-                Ok(tex) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        tex,
-                        scale,
-                        Transform::Normal,
-                        Vec::new(),
-                    );
+                Ok(buffer) => {
                     elements.insert(
                         0,
                         TextureRenderElement::from_texture_buffer(

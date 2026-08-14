@@ -104,6 +104,17 @@ impl<T: Texture> TextureBuffer<T> {
         self.scale = scale.into();
     }
 
+    /// Replace the opaque regions, keeping the buffer's `Id`.
+    ///
+    /// Presentation properties are set on the buffer, never by building a new one: a fresh buffer
+    /// carries a fresh `Id`, and an element that changes identity every frame throws away
+    /// everything keyed on it — a backdrop blur's whole chain included. A cached bake is handed
+    /// out as a clone (`widget::bake`), so this is how a caller says "same texture, and it is
+    /// opaque here".
+    pub fn set_opaque_regions(&mut self, regions: Vec<Rectangle<i32, Buffer>>) {
+        self.opaque_regions = regions;
+    }
+
     pub fn texture_transform(&self) -> Transform {
         self.transform
     }

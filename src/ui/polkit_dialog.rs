@@ -33,7 +33,7 @@ use std::time::Duration;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 
 use crate::image_source::ImageSource;
 use crate::polkit_dialog::{Focus, Message, PolkitDialog, TITLE};
@@ -374,9 +374,7 @@ impl PolkitDialogUi {
                 widget::Avatar::RING_COLOR,
             ) {
                 Ok(texture) => push(PolkitDialogRenderElement::Plain(plain(
-                    renderer,
                     texture,
-                    scale,
                     origin + l.avatar.loc,
                     clamped,
                 ))),
@@ -437,7 +435,7 @@ impl PolkitDialogUi {
                     let mut at = origin + l.entry.loc;
                     at.x += self.wiggle.offset(now);
                     push(PolkitDialogRenderElement::Plain(plain(
-                        renderer, texture, scale, at, clamped,
+                        texture, at, clamped,
                     )));
                 }
                 Err(err) => warn!("error drawing the polkit entry: {err:#}"),
@@ -447,7 +445,7 @@ impl PolkitDialogUi {
         // --- The card itself, under everything that sits on it. ---
         match card {
             Ok(texture) => push(PolkitDialogRenderElement::Texture(scaled(
-                renderer, texture, scale, origin, clamped, value, centre,
+                texture, origin, clamped, value, centre,
             ))),
             // This dialog holds a modal grab; a failed draw must not leave an invisible trap, so
             // the backdrop below is pushed either way.
@@ -473,14 +471,10 @@ fn dialog_avatar(dialog: &PolkitDialog) -> Option<ImageSource> {
 }
 
 fn plain(
-    renderer: &mut VulkanRenderer,
-    texture: VkTexture,
-    scale: f64,
+    buffer: TextureBuffer<VkTexture>,
     at: Point<f64, Logical>,
     alpha: f32,
 ) -> TextureRenderElement<VkTexture> {
-    let buffer =
-        TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
     TextureRenderElement::from_texture_buffer(buffer, at, alpha, None, None, Kind::Unspecified)
 }
 
@@ -488,15 +482,13 @@ fn plain(
 /// uses, so the two modal surfaces arrive the same way.
 #[allow(clippy::too_many_arguments)]
 fn scaled(
-    renderer: &mut VulkanRenderer,
-    texture: VkTexture,
-    scale: f64,
+    buffer: TextureBuffer<VkTexture>,
     at: Point<f64, Logical>,
     alpha: f32,
     value: f64,
     centre: Point<i32, Physical>,
 ) -> RescaleRenderElement<TextureRenderElement<VkTexture>> {
-    let elem = plain(renderer, texture, scale, at, alpha);
+    let elem = plain(buffer, at, alpha);
     RescaleRenderElement::from_element(elem, centre, value.max(0.) * 0.2 + 0.8)
 }
 
@@ -799,7 +791,7 @@ mod tests {
             let d = dialog(user, entry, message, caps);
             let l = layout(&d);
             let mut cache = BakeCache::new();
-            let mut tex = widget::bake(
+            let tex = widget::bake(
                 &mut vk,
                 &mut cache,
                 1.,
@@ -812,6 +804,7 @@ mod tests {
             )
             .expect("dialog texture");
 
+            let mut tex = tex.texture().clone();
             let size = tex.size();
             let fb = vk.bind(&mut tex).expect("bind");
             let region = Rectangle::<i32, BufferCoord>::from_size(size);

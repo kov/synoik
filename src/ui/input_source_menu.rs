@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 
 use smithay::backend::renderer::element::Kind;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 
 use crate::render_helpers::icon::IconCache;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -283,7 +283,11 @@ impl InputSourceMenu {
         Ok(())
     }
 
-    fn bg_texture(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
+    fn bg_texture(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+    ) -> anyhow::Result<TextureBuffer<VkTexture>> {
         widget::bake(
             renderer,
             &mut self.bg_cache.borrow_mut(),
@@ -328,14 +332,7 @@ impl InputSourceMenu {
         }
 
         match self.bg_texture(renderer, scale) {
-            Ok(texture) => {
-                let buffer = TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    Vec::new(),
-                );
+            Ok(buffer) => {
                 elements.push(TextureRenderElement::from_texture_buffer(
                     buffer,
                     origin,

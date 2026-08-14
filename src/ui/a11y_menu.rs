@@ -27,7 +27,7 @@
 use std::cell::RefCell;
 
 use smithay::backend::renderer::element::Kind;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 
 use crate::gnome::{A11ySettings, A11yToggle};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -293,7 +293,11 @@ impl A11yMenu {
         Ok(())
     }
 
-    fn bg_texture(&self, renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
+    fn bg_texture(
+        &self,
+        renderer: &mut VulkanRenderer,
+        scale: f64,
+    ) -> anyhow::Result<TextureBuffer<VkTexture>> {
         widget::bake(
             renderer,
             &mut self.bg_cache.borrow_mut(),
@@ -314,14 +318,7 @@ impl A11yMenu {
         origin: Point<f64, Logical>,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         match self.bg_texture(renderer, scale) {
-            Ok(texture) => {
-                let buffer = TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    Vec::new(),
-                );
+            Ok(buffer) => {
                 vec![TextureRenderElement::from_texture_buffer(
                     buffer,
                     origin,

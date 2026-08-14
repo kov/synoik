@@ -532,20 +532,20 @@ struct PanelCache {
     context: Option<ContextId<VkTexture>>,
     /// What [`texture`](Self::texture) was baked for; `None` before the first bake.
     state: Option<PanelState>,
-    texture: Option<VkTexture>,
+    texture: Option<TextureBuffer<VkTexture>>,
     /// Where every control sits inside `texture`, in panel-local logical px. Produced by the bake
     /// because it is content-sized (the captions need a shaper), and it is the *only* hit-test
     /// authority — a control cannot be drawn somewhere the pointer will not find it.
     layout: Option<PanelLayout>,
     /// The panel's drop shadow, baked into its own transparent texture and composited *behind* the
     /// panel.
-    shadow: Option<VkTexture>,
+    shadow: Option<TextureBuffer<VkTexture>>,
     /// The close button, which is a sibling of the panel rather than a child of it (it straddles a
     /// panel corner), so it is its own texture placed by [`close_rect`].
-    close: Option<VkTexture>,
+    close: Option<TextureBuffer<VkTexture>>,
     /// One selection corner handle. All four are identical, so this is baked once and drawn four
     /// times — it depends on the scale alone, never on [`PanelState`].
-    handle: Option<VkTexture>,
+    handle: Option<TextureBuffer<VkTexture>>,
 }
 
 impl PanelState {
@@ -2432,7 +2432,10 @@ impl OutputData {
         };
         let shadow = texture
             .as_ref()
-            .map(|t| Size::<i32, Physical>::from((t.width() as i32, t.height() as i32)))
+            .map(|t| {
+                let size = t.texture().size();
+                Size::<i32, Physical>::from((size.w, size.h))
+            })
             .and_then(|panel_size| {
                 generate_panel_shadow(renderer, scale, panel_size)
                     .map_err(|err| warn!("error rendering the screenshot panel's shadow: {err:?}"))
@@ -2515,7 +2518,7 @@ impl OutputData {
     /// the panel by that margin). Composited *behind* the panel. `None` until the shadow is baked.
     fn shadow_element(
         &self,
-        renderer: &mut VulkanRenderer,
+        _renderer: &mut VulkanRenderer,
         alpha: f32,
     ) -> Option<CapturedTextureRenderElement> {
         let scale = self.scale;
@@ -2527,8 +2530,7 @@ impl OutputData {
         let loc = (panel_location(self, panel_size) - Point::from((margin, margin)))
             .to_f64()
             .to_logical(scale);
-        let buffer =
-            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
+        let buffer = texture;
         Some(CapturedTextureRenderElement(
             TextureRenderElement::from_texture_buffer(
                 buffer,
@@ -2580,7 +2582,7 @@ impl OutputData {
         .map_err(|err| warn!("error rendering the screenshot tooltip: {err:?}"))
         .ok()?;
 
-        Some(self.texture_element(renderer, texture, Point::from((x, y)), alpha))
+        Some(self.texture_element(texture, Point::from((x, y)), alpha))
     }
 
     /// A control's on-screen rect in output-logical px. `None` before the panel has baked.
@@ -2685,46 +2687,43 @@ impl OutputData {
         })
         .map_err(|err| warn!("error rendering the window selector border: {err:?}"))
         .ok()?;
+        // Baked uncached, once per frame, so there is no cached buffer to hand out and the wrap
+        // belongs here. The picker draws no backdrop blur, so the fresh `Id` costs nothing beyond
+        // the re-bake this already pays.
+        let buffer =
+            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
 
-        Some(self.texture_element(renderer, texture, outer.loc, alpha))
+        Some(self.texture_element(buffer, outer.loc, alpha))
     }
 
     /// The panel element, or `None` if it hasn't been built (see [`Self::ensure_panel`]).
     fn panel_element(
         &self,
-        renderer: &mut VulkanRenderer,
+        _renderer: &mut VulkanRenderer,
         location: Point<f64, Logical>,
         alpha: f32,
     ) -> Option<CapturedTextureRenderElement> {
         let texture = self.panel.borrow().texture.clone()?;
-        Some(self.texture_element(renderer, texture, location, alpha))
+        Some(self.texture_element(texture, location, alpha))
     }
 
     /// The close-button element, straddling the panel's top corner.
     fn close_element(
         &self,
-        renderer: &mut VulkanRenderer,
+        _renderer: &mut VulkanRenderer,
         alpha: f32,
     ) -> Option<CapturedTextureRenderElement> {
         let texture = self.panel.borrow().close.clone()?;
         let loc = close_rect(self.panel_rect_logical()?).loc;
-        Some(self.texture_element(renderer, texture, loc, alpha))
+        Some(self.texture_element(texture, loc, alpha))
     }
 
     fn texture_element(
         &self,
-        renderer: &mut VulkanRenderer,
-        texture: VkTexture,
+        buffer: TextureBuffer<VkTexture>,
         location: Point<f64, Logical>,
         alpha: f32,
     ) -> CapturedTextureRenderElement {
-        let buffer = TextureBuffer::from_texture(
-            renderer,
-            texture,
-            self.scale,
-            Transform::Normal,
-            Vec::new(),
-        );
         CapturedTextureRenderElement(TextureRenderElement::from_texture_buffer(
             buffer,
             location,
@@ -2742,7 +2741,7 @@ impl OutputData {
     /// which is also why the hit test in [`area_target`] reaches outside the rectangle.
     fn push_handles(
         &self,
-        renderer: &mut VulkanRenderer,
+        _renderer: &mut VulkanRenderer,
         rect: Rectangle<i32, Physical>,
         alpha: f32,
         push: &mut dyn FnMut(ScreenshotUiRenderElement),
@@ -2761,7 +2760,7 @@ impl OutputData {
             let loc =
                 Point::<f64, Physical>::from((f64::from(cx) - offset, f64::from(cy) - offset))
                     .to_logical(self.scale);
-            let elem = self.texture_element(renderer, texture.clone(), loc, alpha);
+            let elem = self.texture_element(texture.clone(), loc, alpha);
             push(ScreenshotUiRenderElement::Screenshot(elem));
         }
     }
@@ -3344,16 +3343,25 @@ fn generate_close_button(
     renderer: &mut VulkanRenderer,
     scale: f64,
     hovered: bool,
-) -> anyhow::Result<VkTexture> {
+) -> anyhow::Result<TextureBuffer<VkTexture>> {
     let size = widget::physical_size(scale, Size::from((CLOSE_SIZE, CLOSE_SIZE)));
-    widget::bake_uncached_sized(renderer, size, |frame| {
+    let texture = widget::bake_uncached_sized(renderer, size, |frame| {
         let mut p = Painter::new(frame, scale, size);
         p.clear(style::TRANSPARENT)?;
         let bg = if hovered { CLOSE_BG_HOVER } else { CLOSE_BG };
         // `border-radius: $forced_circular_radius` — a full circle.
         p.fill_rounded_full(CLOSE_SIZE / 2., bg)?;
         Ok(())
-    })
+    })?;
+    // Wrapped once, here, rather than per frame at the call site: the buffer carries the element
+    // `Id`, and `PanelCache` holds this across frames precisely so the identity is stable.
+    Ok(TextureBuffer::from_texture(
+        renderer,
+        texture,
+        scale,
+        Transform::Normal,
+        Vec::new(),
+    ))
 }
 
 /// Draw the screenshot help panel straight into a `VkTexture`: a dark box with a grey border, the
@@ -3376,13 +3384,13 @@ fn generate_panel_shadow(
     renderer: &mut VulkanRenderer,
     scale: f64,
     panel_size: Size<i32, Physical>,
-) -> anyhow::Result<VkTexture> {
+) -> anyhow::Result<TextureBuffer<VkTexture>> {
     let (margin, offset_y) = shadow_pad(scale);
     let size = Size::<i32, Physical>::from((
         panel_size.w + margin * 2,
         panel_size.h + margin * 2 + offset_y,
     ));
-    widget::bake_uncached_sized(renderer, size, |frame| {
+    let texture = widget::bake_uncached_sized(renderer, size, |frame| {
         let mut p = Painter::new(frame, scale, size);
         p.clear([0., 0., 0., 0.])?;
         // The panel footprint sits at (margin, margin) in the buffer; `drop_shadow` shifts it down
@@ -3402,7 +3410,16 @@ fn generate_panel_shadow(
             SHADOW_COLOR,
         )?;
         Ok(())
-    })
+    })?;
+    // Wrapped once, here, rather than per frame at the call site: the buffer carries the element
+    // `Id`, and the cache holds this across frames precisely so the identity is stable.
+    Ok(TextureBuffer::from_texture(
+        renderer,
+        texture,
+        scale,
+        Transform::Normal,
+        Vec::new(),
+    ))
 }
 
 /// The handle texture's physical size, and the shadow margin inside it. The circle sits at
@@ -3417,11 +3434,14 @@ fn handle_pad(scale: f64) -> (i32, i32) {
 }
 
 /// Bake one `.screenshot-ui-area-selector-handle`: a white circle over its own drop shadow.
-fn generate_handle(renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<VkTexture> {
+fn generate_handle(
+    renderer: &mut VulkanRenderer,
+    scale: f64,
+) -> anyhow::Result<TextureBuffer<VkTexture>> {
     let (side, margin) = handle_pad(scale);
     let size = Size::<i32, Physical>::from((side + margin * 2, side + margin * 2));
 
-    widget::bake_uncached_sized(renderer, size, |frame| {
+    let texture = widget::bake_uncached_sized(renderer, size, |frame| {
         let mut p = Painter::new(frame, scale, size);
         p.clear(style::TRANSPARENT)?;
 
@@ -3445,7 +3465,16 @@ fn generate_handle(renderer: &mut VulkanRenderer, scale: f64) -> anyhow::Result<
         )?;
         p.fill_rounded(circle, HANDLE_PX / 2., [1., 1., 1., 1.])?;
         Ok(())
-    })
+    })?;
+    // Wrapped once, here, rather than per frame at the call site: the buffer carries the element
+    // `Id`, and `PanelCache` holds this across frames precisely so the identity is stable.
+    Ok(TextureBuffer::from_texture(
+        renderer,
+        texture,
+        scale,
+        Transform::Normal,
+        Vec::new(),
+    ))
 }
 
 /// Bake GNOME's control panel: the `%osd_panel` card, the three type buttons with their captions,
@@ -3460,7 +3489,7 @@ fn generate_panel(
     scale: f64,
     accent: Rgba,
     state: PanelState,
-) -> anyhow::Result<(VkTexture, PanelLayout)> {
+) -> anyhow::Result<(TextureBuffer<VkTexture>, PanelLayout)> {
     let _span = tracy_client::span!("screenshot_ui::generate_panel");
 
     let captions: Vec<ShapedText> = {
@@ -3610,7 +3639,11 @@ fn generate_panel(
         Ok(())
     })?;
 
-    Ok((texture, layout))
+    // Wrapped once, here, rather than per frame at the call site: the buffer carries the element
+    // `Id`, and the cache holds this across frames precisely so the identity is stable.
+    let buffer =
+        TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
+    Ok((buffer, layout))
 }
 
 // === Delayed-capture countdown =================================================================
@@ -3739,7 +3772,7 @@ struct CountdownCache {
     seconds: u64,
     scale: f64,
     context: Option<ContextId<VkTexture>>,
-    texture: Option<VkTexture>,
+    texture: Option<TextureBuffer<VkTexture>>,
 }
 
 impl Countdown {
@@ -3786,8 +3819,7 @@ impl Countdown {
             (size.h - COUNTDOWN_SIDE) / 2.,
         ));
 
-        let buffer =
-            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
+        let buffer = texture;
         Some(CapturedTextureRenderElement(
             TextureRenderElement::from_texture_buffer(
                 buffer,
@@ -3805,7 +3837,7 @@ fn generate_countdown(
     renderer: &mut VulkanRenderer,
     scale: f64,
     seconds: u64,
-) -> anyhow::Result<VkTexture> {
+) -> anyhow::Result<TextureBuffer<VkTexture>> {
     let label = {
         let mut shaper = TextShaper::new(renderer, scale);
         shaper.shape(&seconds.to_string(), TextStyle::new(COUNTDOWN_PT))?
@@ -3813,7 +3845,7 @@ fn generate_countdown(
 
     let logical = Size::from((COUNTDOWN_SIDE, COUNTDOWN_SIDE));
     let size = widget::physical_size(scale, logical);
-    widget::bake_uncached_sized(renderer, size, |frame| {
+    let texture = widget::bake_uncached_sized(renderer, size, |frame| {
         let mut p = Painter::new(frame, scale, size);
         p.clear(style::TRANSPARENT)?;
         p.fill_rounded_full(COUNTDOWN_RADIUS, style::OSD_BG)?;
@@ -3825,7 +3857,16 @@ fn generate_countdown(
             style::OSD_FG,
         )?;
         Ok(())
-    })
+    })?;
+    // Wrapped once, here, rather than per frame at the call site: the buffer carries the element
+    // `Id`, and the cache holds this across frames precisely so the identity is stable.
+    Ok(TextureBuffer::from_texture(
+        renderer,
+        texture,
+        scale,
+        Transform::Normal,
+        Vec::new(),
+    ))
 }
 
 #[cfg(test)]

@@ -15,10 +15,10 @@
 //! the menu is up. GNOME's own menus are built before they are shown; a remote menu cannot be.
 
 use smithay::backend::renderer::element::Kind;
-use smithay::utils::{Logical, Point, Size, Transform};
+use smithay::utils::{Logical, Point, Size};
 
 use crate::dbusmenu::{to_entries, MenuNode};
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::popover::PopoverAction;
 use crate::ui::widget::{Menu, MenuHit};
@@ -117,14 +117,7 @@ impl IndicatorMenu {
         origin: Point<f64, Logical>,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         match self.menu.bake(renderer, scale) {
-            Ok(texture) => {
-                let buffer = TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    vec![],
-                );
+            Ok(buffer) => {
                 vec![TextureRenderElement::from_texture_buffer(
                     buffer,
                     origin,

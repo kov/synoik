@@ -51,7 +51,7 @@ use std::cell::RefCell;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 use synoik_config::CornerRadius;
 
 use crate::animation::{Animation, Clock, Curve};
@@ -60,7 +60,7 @@ use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::blur::{BlurOptions, Finish};
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
 use crate::render_helpers::icon::{AppIconCache, IconCache};
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::synoik_render_elements;
 use crate::ui::theme_node::{allocate_1d, Align1, Edges, ThemeNode};
@@ -991,14 +991,7 @@ impl Dash {
                 },
             );
             match texture {
-                Ok(texture) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        vec![],
-                    );
+                Ok(buffer) => {
                     elements.push(DashElement::Texture(
                         TextureRenderElement::from_texture_buffer(
                             buffer,
@@ -1092,14 +1085,7 @@ impl Dash {
                 },
             );
             match texture {
-                Ok(texture) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        vec![],
-                    );
+                Ok(buffer) => {
                     elements.push(DashElement::Texture(
                         TextureRenderElement::from_texture_buffer(
                             buffer,
@@ -1214,15 +1200,8 @@ impl Dash {
             },
         );
         match texture {
-            Ok(texture) => {
+            Ok(buffer) => {
                 // Rounded + faded: no opaque hint.
-                let buffer = TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    vec![],
-                );
                 elements.push(DashElement::Texture(
                     TextureRenderElement::from_texture_buffer(
                         buffer,

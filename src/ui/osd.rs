@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use synoik_config::Config;
 
 use crate::animation::{Animation, Clock, Curve};
@@ -464,14 +464,10 @@ impl OsdWindow {
     }
 
     fn element(
-        renderer: &mut VulkanRenderer,
-        texture: VkTexture,
-        scale: f64,
+        buffer: TextureBuffer<VkTexture>,
         loc: Point<f64, Logical>,
         alpha: f32,
     ) -> TextureRenderElement<VkTexture> {
-        let buffer =
-            TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, Vec::new());
         TextureRenderElement::from_texture_buffer(buffer, loc, alpha, None, None, Kind::Unspecified)
     }
 
@@ -548,13 +544,7 @@ impl OsdWindow {
                 },
             );
             match baked {
-                Ok(texture) => elements.push(Self::element(
-                    renderer,
-                    texture,
-                    scale,
-                    origin + rect.loc,
-                    alpha,
-                )),
+                Ok(buffer) => elements.push(Self::element(buffer, origin + rect.loc, alpha)),
                 Err(err) => tracing::error!("error drawing the OSD level bar: {err:#}"),
             }
         }
@@ -568,7 +558,7 @@ impl OsdWindow {
             |renderer| self.shape_label(renderer, scale),
             |frame, phys, label| self.paint_chrome(frame, phys, scale, &layout, label),
         ) {
-            Ok(texture) => elements.push(Self::element(renderer, texture, scale, origin, alpha)),
+            Ok(buffer) => elements.push(Self::element(buffer, origin, alpha)),
             Err(err) => {
                 tracing::error!("error drawing the OSD: {err:#}");
                 // Without its background the icon and bar would float on the desktop.

@@ -35,10 +35,10 @@
 //! the ones that end up adjacent to nothing.
 
 use smithay::backend::renderer::element::Kind;
-use smithay::utils::{Logical, Point, Size, Transform};
+use smithay::utils::{Logical, Point, Size};
 
 use crate::app_system::{AppEntry, AppState, RunningWindow};
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::popover::PopoverAction;
 use crate::ui::widget::{Menu, MenuEntry, MenuHit, MenuItem};
@@ -246,14 +246,7 @@ impl AppMenu {
         origin: Point<f64, Logical>,
     ) -> Vec<TextureRenderElement<VkTexture>> {
         match self.menu.bake(renderer, scale) {
-            Ok(texture) => {
-                let buffer = TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    vec![],
-                );
+            Ok(buffer) => {
                 vec![TextureRenderElement::from_texture_buffer(
                     buffer,
                     origin,

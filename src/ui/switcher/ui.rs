@@ -15,14 +15,14 @@ use std::time::Duration;
 
 use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 use synoik_config::{Config, Modifiers};
 
 use crate::animation::{Animation, Clock, Curve};
 use crate::app_system::AppIconRef;
 use crate::render_helpers::inset_ring::InsetRing;
 use crate::render_helpers::solid_color::SolidColorRenderElement;
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::VkTexture;
 use crate::render_helpers::window_thumbnail::{self, WindowThumbnailRenderElement};
 use crate::render_helpers::RenderCtx;
@@ -1159,14 +1159,7 @@ impl SwitcherUi {
         );
 
         match baked {
-            Ok(texture) => {
-                let buffer = TextureBuffer::from_texture(
-                    ctx.renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    Vec::new(),
-                );
+            Ok(buffer) => {
                 Some(TextureRenderElement::from_texture_buffer(
                     buffer,
                     panel.loc,
@@ -1432,14 +1425,7 @@ impl SwitcherUi {
 
         let mut panel_element = None;
         match baked {
-            Ok(texture) => {
-                let buffer = TextureBuffer::from_texture(
-                    ctx.renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    Vec::new(),
-                );
+            Ok(buffer) => {
                 panel_element = Some(TextureRenderElement::from_texture_buffer(
                     buffer,
                     panel.loc,

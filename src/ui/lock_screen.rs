@@ -29,7 +29,7 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use smithay::backend::renderer::element::Kind;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::animation::Curve;
 use crate::image_source::ImageSource;
@@ -992,9 +992,9 @@ impl LockScreen {
             widget::style::TEXT,
             entry_rev,
         ) {
-            Ok(texture) => elements.push(
-                Self::element(renderer, texture, scale, origin + l.entry.loc, t, centre).into(),
-            ),
+            Ok(texture) => {
+                elements.push(Self::element(texture, scale, origin + l.entry.loc, t, centre).into())
+            }
             Err(err) => tracing::error!("error drawing the unlock entry: {err:#}"),
         }
 
@@ -1034,8 +1034,7 @@ impl LockScreen {
                     let mut faded = t;
                     faded.alpha *= caps_alpha;
                     elements.push(
-                        Self::element(renderer, texture, scale, origin + l.caps.loc, faded, centre)
-                            .into(),
+                        Self::element(texture, scale, origin + l.caps.loc, faded, centre).into(),
                     );
                 }
                 Err(err) => tracing::error!("error drawing the caps-lock warning: {err:#}"),
@@ -1118,10 +1117,8 @@ impl LockScreen {
                 AVATAR_PX / 2.,
                 widget::Avatar::RING_COLOR,
             ) {
-                Ok(texture) => elements.push(
-                    Self::element(renderer, texture, scale, origin + l.avatar.loc, t, centre)
-                        .into(),
-                ),
+                Ok(texture) => elements
+                    .push(Self::element(texture, scale, origin + l.avatar.loc, t, centre).into()),
                 Err(err) => tracing::error!("error drawing the avatar ring: {err:#}"),
             }
             elements.push(PromptElement::Rounded(el));
@@ -1185,9 +1182,7 @@ impl LockScreen {
             },
         );
         match baked {
-            Ok(texture) => {
-                elements.push(Self::element(renderer, texture, scale, origin, t, centre).into())
-            }
+            Ok(texture) => elements.push(Self::element(texture, scale, origin, t, centre).into()),
             Err(err) => tracing::error!("error drawing the unlock prompt: {err:#}"),
         }
 
@@ -1249,9 +1244,7 @@ impl LockScreen {
                 Ok(texture) => {
                     let mut at = l.message.loc;
                     at.x += self.wiggle_offset(now);
-                    elements.push(
-                        Self::element(renderer, texture, scale, origin + at, t, centre).into(),
-                    );
+                    elements.push(Self::element(texture, scale, origin + at, t, centre).into());
                 }
                 Err(err) => tracing::error!("error drawing the prompt message: {err:#}"),
             }
@@ -1335,9 +1328,7 @@ impl LockScreen {
                 Ok(())
             },
         ) {
-            Ok(texture) => {
-                elements.push(Self::element(renderer, texture, scale, rect.loc, t, centre).into())
-            }
+            Ok(texture) => elements.push(Self::element(texture, scale, rect.loc, t, centre).into()),
             Err(err) => tracing::error!("error drawing the switch-user button: {err:#}"),
         }
 
@@ -1345,20 +1336,17 @@ impl LockScreen {
     }
 
     fn element(
-        renderer: &mut VulkanRenderer,
-        texture: VkTexture,
+        texture: TextureBuffer<VkTexture>,
         scale: f64,
         loc: Point<f64, Logical>,
         t: PageTransform,
         centre: Point<f64, Logical>,
     ) -> TextureRenderElement<VkTexture> {
-        let buffer = TextureBuffer::from_texture(
-            renderer,
-            texture,
-            t.buffer_scale(scale),
-            Transform::Normal,
-            Vec::new(),
-        );
+        // The page zoom rides the *buffer scale* of the cached bake — set on the clone, so the
+        // element keeps its identity across the animation (see `TextureBuffer::set_opaque_regions`
+        // for why that matters).
+        let mut buffer = texture;
+        buffer.set_texture_scale(t.buffer_scale(scale));
         TextureRenderElement::from_texture_buffer(
             buffer,
             t.place(loc, centre),
@@ -1483,7 +1471,7 @@ impl LockScreen {
         // Scaled about the block's middle (`pivot_point(0.5, 0.5)`, `:604`).
         let centre = Point::from((monitor.loc.x + monitor.size.w / 2., loc.y + size.h / 2.));
 
-        vec![Self::element(renderer, texture, scale, loc, t, centre)]
+        vec![Self::element(texture, scale, loc, t, centre)]
     }
 }
 

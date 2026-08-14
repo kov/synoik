@@ -856,7 +856,9 @@ impl Menu {
         &self,
         renderer: &mut VulkanRenderer,
         scale: f64,
-    ) -> anyhow::Result<crate::render_helpers::vulkan::VkTexture> {
+    ) -> anyhow::Result<
+        crate::render_helpers::texture::TextureBuffer<crate::render_helpers::vulkan::VkTexture>,
+    > {
         super::bake(
             renderer,
             &mut self.bg_cache.borrow_mut(),

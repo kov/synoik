@@ -50,12 +50,12 @@ use std::time::Duration;
 
 use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Transform};
+use smithay::utils::{Logical, Point, Rectangle};
 use synoik_config::Config;
 
 use crate::animation::{Animation, Clock};
 use crate::render_helpers::icon::{AppIconCache, IconCache};
-use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+use crate::render_helpers::texture::TextureRenderElement;
 use crate::render_helpers::vulkan::{VkTexture, VulkanRenderer};
 use crate::ui::notification_card::{
     card_elements, layout, CardCache, CardContent, CardLayout, CardZone,
@@ -698,15 +698,8 @@ impl NotificationBanner {
                 RADIUS,
                 SHADOW,
             ) {
-                Ok((tex, off)) => {
+                Ok((buffer, off)) => {
                     let loc = origin - off.to_f64().to_logical(scale);
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        tex,
-                        scale,
-                        Transform::Normal,
-                        Vec::new(),
-                    );
                     elements.push(TextureRenderElement::from_texture_buffer(
                         buffer,
                         loc,

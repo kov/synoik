@@ -2877,14 +2877,7 @@ fn vulkan_menu_draws_an_expanded_submenus_children() {
     let ink_at = |vk: &mut VulkanRenderer, menu: &Menu, at: Point<f64, Logical>| -> usize {
         let size = menu.logical_size();
         let phys = crate::ui::widget::physical_size(scale, size);
-        let texture = menu.bake(vk, scale).expect("bake the menu");
-        let buffer = crate::render_helpers::texture::TextureBuffer::from_texture(
-            vk,
-            texture,
-            scale,
-            Transform::Normal,
-            vec![],
-        );
+        let buffer = menu.bake(vk, scale).expect("bake the menu");
         let elem = crate::render_helpers::texture::TextureRenderElement::from_texture_buffer(
             buffer,
             Point::from((0., 0.)),
@@ -9983,6 +9976,72 @@ fn element_ids(f: &mut Fixture, output: &Output) -> Vec<String> {
         .expect("the fixture must have a Vulkan renderer")
 }
 
+/// Nor may one during the overview animation, where the cost is worst.
+///
+/// The idle guard below cannot see this: the elements that churned were the ones that only *exist*
+/// while the overview is open (the previews' chrome, the dash), so an idle desktop never composited
+/// them. Each fresh `Id` is a fresh, empty `UserDataMap`, which is where a backdrop blur keeps its
+/// capture texture and its whole dual-Kawase chain — so the churn was measured on the seat as ~15
+/// GPU resource creations *per frame*, 5 blur chains and their 10 colour targets, for the length of
+/// every transition (frames of 20-27ms against a 16.67ms budget, worst 80ms).
+///
+/// An element that genuinely appears mid-animation is fine, and expected — the assertion is about
+/// an id **replacing** another for something that was already on screen, so it counts ids that
+/// appear exactly once across a run of frames in which the element list never changes size.
+#[test]
+fn nothing_churns_its_element_id_during_the_overview_animation() {
+    let Some(mut f) = window_fixture_settled(GREEN, true, Some("overview id churn probe")) else {
+        return;
+    };
+    let output = f.synoik().global_space.outputs().next().unwrap().clone();
+    let _ = element_ids(&mut f, &output);
+
+    f.synoik().layout.toggle_overview();
+
+    let mut per_frame = Vec::new();
+    let mut animated = 0usize;
+    for _ in 0..8 {
+        let mut clock = f.synoik().clock.clone();
+        let now = clock.now_unadjusted();
+        clock.set_unadjusted(now + Duration::from_millis(40));
+        f.synoik().advance_animations();
+        if f.synoik().layout.are_animations_ongoing(Some(&output)) {
+            animated += 1;
+        }
+        per_frame.push(element_ids(&mut f, &output));
+    }
+    // Anti-vacuity, like the bake guards': a run of static frames satisfies this perfectly.
+    assert!(
+        animated >= 2,
+        "only {animated} sampled frames had an animation running, so this proves nothing",
+    );
+
+    // Drop the frames while the element list is still growing — an element arriving is not churn.
+    let steady: Vec<&Vec<String>> = {
+        let last = per_frame.last().expect("sampled frames").len();
+        per_frame.iter().filter(|ids| ids.len() == last).collect()
+    };
+    assert!(steady.len() >= 3, "not enough steady frames to compare");
+
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for ids in &steady {
+        for id in ids.iter() {
+            *seen.entry(id.as_str()).or_default() += 1;
+        }
+    }
+    let churned = seen.values().filter(|&&n| n == 1).count();
+    assert_eq!(
+        churned,
+        0,
+        "{churned} element ids appeared on exactly one of {} steady overview frames: an `Id` must \
+         be cached alongside whatever it names. `widget::bake` hands back the cached \
+         `TextureBuffer` for this reason — wrapping its texture in a fresh buffer per frame bakes \
+         nothing and still churns the identity, which throws away every backdrop blur on the \
+         output.",
+        steady.len(),
+    );
+}
+
 /// On an idle desktop, no element may change its `Id` from one frame to the next.
 ///
 /// An element `Id` is an *identity*, not a handle: damage tracking uses it to recognise the same
@@ -14131,7 +14190,7 @@ fn a_client_dmabuf_reaches_the_composited_frame() {
 fn vulkan_an_empty_focused_entry_draws_its_caret() {
     use smithay::backend::renderer::element::Kind;
 
-    use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+    use crate::render_helpers::texture::TextureRenderElement;
     use crate::ui::widget;
 
     let Some(mut f) = green_window_fixture() else {
@@ -14175,13 +14234,9 @@ fn vulkan_an_empty_focused_entry_draws_its_caret() {
                     widget::style::TEXT,
                     rev,
                 )?;
-                let buffer = TextureBuffer::from_texture(
-                    vk,
-                    texture,
-                    Scale::from(1.),
-                    Transform::Normal,
-                    Vec::new(),
-                );
+                let mut buffer = texture;
+                // The bake carries its own scale; this composites the physical pixels 1:1.
+                buffer.set_texture_scale(Scale::from(1.));
                 let element = TextureRenderElement::from_texture_buffer(
                     buffer,
                     Point::from((0., 0.)),

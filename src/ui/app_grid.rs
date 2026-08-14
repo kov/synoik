@@ -87,7 +87,7 @@ use ordered_float::NotNan;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{ContextId, Renderer};
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::animation::{Animation, Clock, Curve};
 use crate::app_system::AppIconRef;
@@ -366,9 +366,7 @@ fn push_tile_ring(
             Ok(())
         },
     ) {
-        Ok(texture) => {
-            let buffer =
-                TextureBuffer::from_texture(renderer, texture, scale, Transform::Normal, vec![]);
+        Ok(buffer) => {
             elements.push(TextureRenderElement::from_texture_buffer(
                 buffer,
                 tile.loc,
@@ -2404,8 +2402,7 @@ impl AppGrid {
                 (tile.loc.x + (tile.size.w - label_w) / 2.).round(),
                 metrics.label_top(tile),
             ));
-            let buffer =
-                TextureBuffer::from_texture(renderer, bake, scale, Transform::Normal, vec![]);
+            let buffer = bake;
             if has_actor(k) {
                 actor_elements.push((k, elements.len()));
             }
@@ -2475,14 +2472,7 @@ impl AppGrid {
                 Ok(())
             },
         ) {
-            Ok(texture) => {
-                let buffer = TextureBuffer::from_texture(
-                    renderer,
-                    texture,
-                    scale,
-                    Transform::Normal,
-                    vec![],
-                );
+            Ok(buffer) => {
                 elements.push(TextureRenderElement::from_texture_buffer(
                     buffer,
                     block.loc,
@@ -2589,14 +2579,7 @@ impl AppGrid {
                     Ok(())
                 },
             ) {
-                Ok(texture) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        vec![],
-                    );
+                Ok(buffer) => {
                     if has_actor(k) {
                         actor_elements.push((k, elements.len()));
                     }
@@ -2665,14 +2648,7 @@ impl AppGrid {
                     Ok(())
                 },
             ) {
-                Ok(texture) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        vec![],
-                    );
+                Ok(buffer) => {
                     elements.push(TextureRenderElement::from_texture_buffer(
                         buffer,
                         block.loc,
@@ -2712,14 +2688,7 @@ impl AppGrid {
                     Ok(())
                 },
             ) {
-                Ok(texture) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        vec![],
-                    );
+                Ok(buffer) => {
                     actor_elements.push((k, elements.len()));
                     elements.push(TextureRenderElement::from_texture_buffer(
                         buffer,
@@ -2915,14 +2884,7 @@ impl AppGrid {
                         Ok(())
                     },
                 ) {
-                    Ok(texture) => {
-                        let buffer = TextureBuffer::from_texture(
-                            renderer,
-                            texture,
-                            scale,
-                            Transform::Normal,
-                            vec![],
-                        );
+                    Ok(buffer) => {
                         // Off its own outer edge at peek 0, in place at 1.
                         let slide = (1. - peek) * band.size.w * if prev { -1. } else { 1. };
                         elements.push(TextureRenderElement::from_texture_buffer(
@@ -3053,14 +3015,7 @@ impl AppGrid {
                         Ok(())
                     },
                 ) {
-                    Ok(texture) => {
-                        let buffer = TextureBuffer::from_texture(
-                            renderer,
-                            texture,
-                            scale,
-                            Transform::Normal,
-                            vec![],
-                        );
+                    Ok(buffer) => {
                         elements.push(TextureRenderElement::from_texture_buffer(
                             buffer,
                             origin,
@@ -3126,14 +3081,7 @@ impl AppGrid {
                     Ok(())
                 },
             ) {
-                Ok(texture) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        vec![],
-                    );
+                Ok(buffer) => {
                     elements.push(TextureRenderElement::from_texture_buffer(
                         buffer,
                         dots_box.loc,
@@ -3198,14 +3146,7 @@ impl AppGrid {
                     Ok(())
                 },
             ) {
-                Ok(texture) => {
-                    let buffer = TextureBuffer::from_texture(
-                        renderer,
-                        texture,
-                        scale,
-                        Transform::Normal,
-                        vec![],
-                    );
+                Ok(buffer) => {
                     elements.push(TextureRenderElement::from_texture_buffer(
                         buffer,
                         disc.loc,

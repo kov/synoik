@@ -1450,7 +1450,7 @@ impl Entry {
         // The system accent, for the styles whose focus ring is `focus_ring()`.
         accent: Rgba,
         revision: u64,
-    ) -> anyhow::Result<VkTexture> {
+    ) -> anyhow::Result<TextureBuffer<VkTexture>> {
         let size = Size::<f64, Logical>::from((width, height));
         let (shown, map) = content.display();
         let empty = shown.is_empty();
@@ -1664,6 +1664,10 @@ impl CaretMetrics {
     }
 }
 
+/// What a cached bake is keyed by: `(scale, physical_w, physical_h)`. The revision rides beside
+/// the value rather than in here, since a stale entry is replaced, never looked up.
+type BakeKey = (NotNan<f64>, i32, i32);
+
 /// A per-widget offscreen-texture cache for [`bake`], keyed by `(scale,
 /// physical_size, revision)`. One lives (behind a `RefCell`) on each baking
 /// widget; it clears itself when the renderer context changes.
@@ -1675,8 +1679,17 @@ pub struct BakeCache {
     /// under a key the widget has no reason to change. Without this the blank survives as long as
     /// the widget's content does. See `VulkanRenderer::text_epoch`.
     text_epoch: u64,
-    // key: (scale, physical_w, physical_h) -> (revision, texture)
-    textures: HashMap<(NotNan<f64>, i32, i32), (u64, VkTexture)>,
+    // key: (scale, physical_w, physical_h) -> (revision, buffer)
+    //
+    // The cached value is the [`TextureBuffer`], not the bare texture, and that is load-bearing:
+    // the buffer is what carries the element `Id`, so wrapping a cached texture in a fresh buffer
+    // each frame churns an *identity* even though not a pixel changed. Damage tracking then sees
+    // the old element leave and a stranger arrive every frame, which throws away everything keyed
+    // on that id — including each backdrop blur's whole dual-Kawase chain, rebuilt from render
+    // pass to pipelines. That cost ~15 GPU resource creations a frame for the length of every
+    // overview transition (`ui/window_preview.rs`, `ui/dash.rs`), which is why `bake` hands back
+    // the buffer rather than leaving the wrap to its callers.
+    textures: HashMap<BakeKey, (u64, TextureBuffer<VkTexture>)>,
 }
 
 impl BakeCache {
@@ -1809,7 +1822,7 @@ pub fn bake<P>(
     revision: u64,
     prepare: impl FnOnce(&mut VulkanRenderer) -> anyhow::Result<P>,
     paint: impl FnOnce(&mut VulkanFrame, Size<i32, Physical>, &P) -> anyhow::Result<()>,
-) -> anyhow::Result<VkTexture> {
+) -> anyhow::Result<TextureBuffer<VkTexture>> {
     let scale_key = NotNan::new(scale).context("non-finite scale")?;
     let phys = physical_size(scale, logical_size);
     let key = (scale_key, phys.w, phys.h);
@@ -1837,10 +1850,15 @@ pub fn bake<P>(
         let tex = bake_uncached(renderer, scale, logical_size, |frame, phys| {
             paint(frame, phys, &prepared)
         })?;
-        cache.textures.insert(key, (revision, tex));
+        // Widget bakes are transparent-cornered and composited by their caller, so there is no
+        // opaque region to declare; `Transform::Normal` because a bake is drawn the way it was
+        // painted.
+        let buffer = TextureBuffer::from_texture(renderer, tex, scale, Transform::Normal, vec![]);
+        cache.textures.insert(key, (revision, buffer));
     }
 
-    Ok(cache.textures.get(&key).map(|(_, t)| t.clone()).unwrap())
+    // A clone keeps the `Id`: that is the point of caching the buffer.
+    Ok(cache.textures.get(&key).map(|(_, b)| b.clone()).unwrap())
 }
 
 /// A GNOME `box-shadow` for a card, in logical px: gaussian `blur` radius (σ = blur/2), `offset`
@@ -1869,7 +1887,7 @@ pub fn bake_card_shadow(
     card_size: Size<f64, Logical>,
     radius: f64,
     spec: DropShadowSpec,
-) -> anyhow::Result<(VkTexture, Point<i32, Physical>)> {
+) -> anyhow::Result<(TextureBuffer<VkTexture>, Point<i32, Physical>)> {
     // Blur reach (~3σ) + a pixel of ceil headroom, plus the spread, is the pad on every side; the
     // downward offset only extends the bottom (top pad already covers a small upward offset).
     let reach = spec.blur * 1.5 + 1.;
@@ -1924,7 +1942,7 @@ pub fn bake_card_border(
     card_size: Size<f64, Logical>,
     radius: f64,
     color: Rgba,
-) -> anyhow::Result<VkTexture> {
+) -> anyhow::Result<TextureBuffer<VkTexture>> {
     bake(
         renderer,
         cache,
@@ -1956,7 +1974,7 @@ pub fn bake_card_fill(
     card_size: Size<f64, Logical>,
     radius: f64,
     color: Rgba,
-) -> anyhow::Result<VkTexture> {
+) -> anyhow::Result<TextureBuffer<VkTexture>> {
     bake(
         renderer,
         cache,
@@ -3915,7 +3933,7 @@ impl<'a, 'frame, 'buffer> Painter<'a, 'frame, 'buffer> {
 pub fn assert_scale_correct(
     vk: &mut VulkanRenderer,
     logical_size: Size<f64, Logical>,
-    mut bake_at: impl FnMut(&mut VulkanRenderer, f64) -> VkTexture,
+    mut bake_at: impl FnMut(&mut VulkanRenderer, f64) -> TextureBuffer<VkTexture>,
 ) {
     use smithay::backend::allocator::Fourcc;
     use smithay::backend::renderer::{ExportMem, Texture};
@@ -3926,7 +3944,8 @@ pub fn assert_scale_correct(
 
     for scale in [1.0, 1.5, 2.0] {
         let expected = physical_size(scale, logical_size);
-        let mut tex = bake_at(vk, scale);
+        // Readback binds the *texture*; the buffer is just the cached wrapper around it.
+        let mut tex = bake_at(vk, scale).texture().clone();
 
         let size = tex.size();
         assert_eq!(
