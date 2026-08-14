@@ -1197,10 +1197,14 @@ pub fn log_scene_breakdown<E>(
     /// Log one frame in this many.
     const EVERY: u64 = 240;
 
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var("SYNOIK_SCENE_BREAKDOWN").is_ok()) {
-        return;
-    }
+    static MODE: OnceLock<Option<bool>> = OnceLock::new();
+    let verbose = match MODE.get_or_init(|| match std::env::var("SYNOIK_SCENE_BREAKDOWN") {
+        Ok(v) => Some(v == "verbose"),
+        Err(_) => None,
+    }) {
+        Some(verbose) => *verbose,
+        None => return,
+    };
     static SEEN: AtomicU64 = AtomicU64::new(0);
     if !SEEN.fetch_add(1, Ordering::Relaxed).is_multiple_of(EVERY) {
         return;
@@ -1208,6 +1212,66 @@ pub fn log_scene_breakdown<E>(
     if let Some(line) = scene_breakdown(elements, scale, output) {
         tracing::info!("{line}");
     }
+    if verbose {
+        for line in scene_elements(elements, scale, output) {
+            tracing::info!("{line}");
+        }
+    }
+}
+
+/// One line per element, for when the per-kind [`scene_breakdown`] has named the expensive class
+/// and the question becomes *which* element that is and *why it is not culled*.
+///
+/// Both of those are answered by the same three numbers: an element covering the whole output that
+/// is fully opaque hides everything below it, and one that is not is a full-screen blend that
+/// nothing can remove — it can only be merged into its neighbour or not drawn. So each line carries
+/// the clipped area, the element's `alpha`, and how much of that area it declares opaque. Verbose
+/// only (`SYNOIK_SCENE_BREAKDOWN=verbose`): a settled overview frame is ninety-odd lines.
+fn scene_elements<E>(
+    elements: &[E],
+    scale: smithay::utils::Scale<f64>,
+    output: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+) -> Vec<String>
+where
+    E: smithay::backend::renderer::element::Element + std::fmt::Debug,
+{
+    let output_px = u64::from(output.size.w.max(0) as u32) * u64::from(output.size.h.max(0) as u32);
+    if output_px == 0 {
+        return Vec::new();
+    }
+    let px = output_px as f64;
+    elements
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            let g = e.geometry(scale);
+            let area = g.intersection(output).map_or(0.0, |r| {
+                f64::from(r.size.w.max(0)) * f64::from(r.size.h.max(0))
+            });
+            // Below a hundredth of the output an element cannot be the answer to "what is drawing
+            // 3.87x", and there are dozens of them.
+            if area / px < 0.01 {
+                return None;
+            }
+            let opaque: f64 = e
+                .opaque_regions(scale)
+                .iter()
+                .filter_map(|r| r.intersection(output))
+                .map(|r| f64::from(r.size.w.max(0)) * f64::from(r.size.h.max(0)))
+                .sum();
+            Some(format!(
+                "  scene element #{i} {:.2}x alpha={:.2} opaque={:.2}x {}x{}+{}+{} {:?}",
+                area / px,
+                e.alpha(),
+                opaque / px,
+                g.size.w,
+                g.size.h,
+                g.loc.x,
+                g.loc.y,
+                e.id(),
+            ))
+        })
+        .collect()
 }
 
 /// The line [`log_scene_breakdown`] logs, split out so it can be asserted on — the arithmetic is
