@@ -16634,6 +16634,62 @@ fn a_startup_sequence_that_never_maps_expires() {
 /// The matching *table* is pinned by unit tests in `app_system.rs`; what this
 /// pins is that a real window reaches it at all, and that the running set follows
 /// map/unmap without an explicit invalidation hook.
+/// A window whose `app_id` matches nothing still reaches the app switcher.
+///
+/// GNOME's `get_app_for_window` can never return NULL — its last resort is
+/// `_shell_app_new_for_window` (`shell-window-tracker.c:469-471`) — so a window is always
+/// switchable. Ours used to drop it, which is how a fullscreen Wesnoth (a flatpak whose `app_id`
+/// is the bare `wesnoth` while its entry is `org.wesnoth.Wesnoth.desktop`) stayed on screen,
+/// focused, and absent from the app switcher.
+///
+/// Driven through the real `sync_running_apps` seam and the real `app_items`, because the bug was
+/// never in the matching table: it was a window failing to reach the row at all.
+#[test]
+fn an_unmatched_window_still_reaches_the_app_switcher() {
+    use crate::app_system::{AppSystem, FakeCatalog, RecordingLauncher};
+    use crate::ui::switcher::app_switcher::app_items;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // Nothing installed at all, so no ladder rung can match.
+    f.synoik().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(Vec::new())),
+        Box::new(RecordingLauncher::default()),
+    );
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.set_app_id("wesnoth");
+    window.set_title("The Battle for Wesnoth - 1.19.24");
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let running = f.synoik().app_system.running().to_vec();
+    assert_eq!(running.len(), 1, "the window must not be lost");
+    assert!(
+        running[0].is_window_backed(),
+        "it resolves to nothing, so it is window-backed: {}",
+        running[0].id
+    );
+
+    // The row the user actually sees.
+    let tab_list: Vec<_> = running[0].windows.iter().map(|w| w.id).collect();
+    let items = app_items(&running, &tab_list);
+    assert_eq!(items.len(), 1, "the app switcher must offer it");
+    assert_eq!(
+        items[0].fallback_label, "The Battle for Wesnoth - 1.19.24",
+        "and label it with the window's own title, never the synthetic window:<n> id"
+    );
+}
+
 #[test]
 fn overview_mapped_window_marks_its_app_running() {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};

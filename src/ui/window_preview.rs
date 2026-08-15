@@ -144,10 +144,9 @@ pub struct PreviewOverlay {
     pub preview: Rectangle<f64, Logical>,
     pub alpha: f32,
     pub hovered: bool,
-    /// The window's app icon, resolved through the app model. `None` when the
-    /// window resolves to no installed app — GNOME always has one because it
-    /// synthesizes a window-backed `ShellApp`, which we do not
-    /// (`app_system::AppSystem::recompute_running`).
+    /// The window's app icon, resolved through the app model. `None` when the window resolves
+    /// to no installed app: it is a window-backed app
+    /// (`app_system::AppSystem::recompute_running`), which has an identity but no icon.
     pub icon: Option<AppIconRef>,
     /// `_getCaption` (`windowPreview.js:259-266`): the window title, falling back
     /// to the app name. Empty draws nothing.

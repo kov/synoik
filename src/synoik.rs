@@ -13883,8 +13883,17 @@ impl Synoik {
             if items.iter().any(|item| item.id == app.id) {
                 continue;
             }
-            // A running app that no longer resolves (uninstalled under us) is
-            // skipped rather than drawn iconless.
+            // NOT YET SHOWN IN THE DASH when it does not resolve, though GNOME shows one: a
+            // window-backed `ShellApp` is an ordinary `ShellApp` whose `info` is NULL, and the
+            // dash draws it with the `application-x-executable` fallback.
+            //
+            // Adding it here mints one fresh element `Id` mid-animation, which trips
+            // `nothing_churns_its_element_id_during_the_overview_animation` (measured: exactly one
+            // `External` id on 1 of 8 steady frames, and a warm-up frame does NOT clear it, so it
+            // is not a first-frame bake). Churning an `Id` throws away the output's backdrop blur,
+            // so this waits until that is understood rather than shipping a render regression for
+            // a cosmetic gain. The switcher and the running set already carry window-backed apps,
+            // which is what stops a window becoming unreachable.
             if let Some(entry) = self.app_system.lookup(&app.id) {
                 items.push(DashEntry {
                     urgent: self.app_system.has_urgent_window(&entry.id),
@@ -14125,9 +14134,10 @@ impl Synoik {
     /// plus `_getCaption` (`windowPreview.js:133-135,259-266`): the window's title,
     /// falling back to the app's name.
     ///
-    /// The icon is `None` when the window resolves to no installed app; gnome-shell
-    /// always has one because it synthesizes a window-backed `ShellApp`, a
-    /// divergence already recorded on `AppSystem::recompute_running`.
+    /// The icon is `None` when the window resolves to no installed app. Such a window is now a
+    /// window-backed app in the running set, but there is still no icon behind it — the dash
+    /// draws `AppIconRef::Fallback` for one; a preview draws none rather than stamping every
+    /// unresolvable window with `application-x-executable`.
     fn preview_app_chrome(
         &self,
         window: &smithay::desktop::Window,
@@ -14138,9 +14148,12 @@ impl Synoik {
         let (app_id, title) = crate::utils::with_toplevel_role(mapped.toplevel(), |role| {
             (role.app_id.clone(), role.title.clone())
         });
+        let sandbox = self
+            .app_system
+            .sandbox_id_cached(mapped.credentials().map(|c| c.pid));
         let entry = app_id
             .as_deref()
-            .and_then(|app_id| self.app_system.app_for_window(app_id));
+            .and_then(|app_id| self.app_system.app_for_window(app_id, sandbox));
         let caption = title
             .filter(|t| !t.is_empty())
             .or_else(|| entry.as_ref().map(|e| e.name.clone()))
@@ -14267,8 +14280,11 @@ impl Synoik {
 
         let focused_app = self.layout.focus().and_then(|focused| {
             let app_id = with_toplevel_role(focused.toplevel(), |role| role.app_id.clone())?;
+            let sandbox = self
+                .app_system
+                .sandbox_id_cached(focused.credentials().map(|c| c.pid));
             self.app_system
-                .app_for_window(&app_id)
+                .app_for_window(&app_id, sandbox)
                 .map(|entry| entry.id)
         });
         let Some(focused_app) = focused_app else {
@@ -14283,8 +14299,9 @@ impl Synoik {
             if !mapped.is_urgent() {
                 return;
             }
+            let sandbox = app_system.sandbox_id_cached(mapped.credentials().map(|c| c.pid));
             let same_app = with_toplevel_role(mapped.toplevel(), |role| role.app_id.clone())
-                .and_then(|id| app_system.app_for_window(&id))
+                .and_then(|id| app_system.app_for_window(&id, sandbox))
                 .is_some_and(|entry| entry.id == focused_app);
             if same_app {
                 mapped.set_urgent(false);
@@ -14314,6 +14331,7 @@ impl Synoik {
             windows.push(RunningWindow {
                 id: mapped.id(),
                 app_id,
+                pid: mapped.credentials().map(|c| c.pid),
                 title,
                 urgent: mapped.is_urgent(),
                 last_focus: mapped.get_focus_timestamp(),
@@ -15419,7 +15437,9 @@ impl Synoik {
                 let entry = self.app_system.lookup(&item.app_id);
                 crate::ui::switcher::ui::ItemArt {
                     icon: entry.as_ref().map(|e| e.icon.clone()),
-                    label: entry.map_or_else(|| item.app_id.clone(), |e| e.name),
+                    // A window-backed app has no entry, and its id is a synthetic `window:<n>`:
+                    // show what the window calls itself instead of that.
+                    label: entry.map_or_else(|| item.fallback_label.clone(), |e| e.name),
                     arrow: item.has_arrow(),
                     // The sub-list's captions, resolved now for the same reason the icons are:
                     // it is built half a second later, from the UI, with no way back here.
@@ -15447,9 +15467,12 @@ impl Synoik {
         title
             .filter(|t| !t.is_empty())
             .or_else(|| {
+                let sandbox = self
+                    .app_system
+                    .sandbox_id_cached(mapped.credentials().map(|c| c.pid));
                 app_id
                     .as_deref()
-                    .and_then(|id| self.app_system.app_for_window(id))
+                    .and_then(|id| self.app_system.app_for_window(id, sandbox))
                     .map(|e| e.name)
             })
             .unwrap_or_default()
@@ -15472,9 +15495,12 @@ impl Synoik {
                         (role.app_id.clone(), role.title.clone())
                     })
                 });
+                let sandbox = self
+                    .app_system
+                    .sandbox_id_cached(mapped.and_then(|(_, m)| m.credentials()).map(|c| c.pid));
                 let entry = app_id
                     .as_deref()
-                    .and_then(|id| self.app_system.app_for_window(id));
+                    .and_then(|id| self.app_system.app_for_window(id, sandbox));
 
                 crate::ui::switcher::ui::ItemArt {
                     icon: entry.as_ref().map(|e| e.icon.clone()),

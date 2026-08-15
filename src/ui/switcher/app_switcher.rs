@@ -44,6 +44,13 @@ pub const ICON_HOVER_TIMEOUT: std::time::Duration = std::time::Duration::from_mi
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppItem {
     pub app_id: String,
+    /// What to call this app when [`app_id`](Self::app_id) resolves to no desktop entry — a
+    /// **window-backed** app, whose id is a synthetic `window:<n>` that must never be shown.
+    ///
+    /// Carried on the item rather than recomputed at paint time so that the one rule in
+    /// [`RunningApp::fallback_label`] is the only one, and so the label cannot go stale between
+    /// building the row and drawing it.
+    pub fallback_label: String,
     /// This app's windows **in tab-list order**, not the app's own order.
     pub windows: Vec<MappedId>,
 }
@@ -75,6 +82,7 @@ pub fn app_items(running: &[RunningApp], tab_list: &[MappedId]) -> Vec<AppItem> 
 
             (!windows.is_empty()).then(|| AppItem {
                 app_id: app.id.clone(),
+                fallback_label: app.fallback_label().to_owned(),
                 windows,
             })
         })
@@ -160,6 +168,7 @@ mod tests {
             windows: windows
                 .iter()
                 .map(|&id| RunningWindow {
+                    pid: None,
                     id,
                     app_id: None,
                     title: None,

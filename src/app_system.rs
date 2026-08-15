@@ -166,6 +166,14 @@ pub struct RunningWindow {
     pub id: MappedId,
     /// The xdg-shell `app_id` — our only `WM_CLASS` analogue.
     pub app_id: Option<String>,
+    /// The client's pid, which is the only handle we have on its **sandbox**.
+    ///
+    /// mutter reads `/proc/<pid>/root/.flatpak-info` once at window construction and hangs the
+    /// result on the window (`meta_window_update_sandboxed_app_id`, `window.c:1043-1059`); we have
+    /// no such per-window slot, so the read is cached by pid in
+    /// [`sandbox_ids`](AppSystem::sandbox_ids) instead. `None` for a window whose client
+    /// credentials are unknown.
+    pub pid: Option<i32>,
     /// The toplevel title — an "Open Windows" row's label, falling back to the app
     /// name when empty (`_updateWindowsSection`, `appMenu.js:283`).
     pub title: Option<String>,
@@ -200,6 +208,31 @@ impl RunningApp {
     /// Whether any of the app's windows is demanding attention.
     pub fn is_urgent(&self) -> bool {
         self.windows.iter().any(|window| window.urgent)
+    }
+
+    /// Whether this app was synthesized from a window rather than resolved to a desktop entry —
+    /// see [`is_window_backed`]. Its [`id`](Self::id) will not look up.
+    pub fn is_window_backed(&self) -> bool {
+        is_window_backed(&self.id)
+    }
+
+    /// What to call this app when its id resolves to no entry.
+    ///
+    /// One place for the fallback so that every surface showing a window-backed app agrees, and
+    /// so that no consumer ever renders the raw `window:5`. GNOME reaches the same strings from
+    /// `shell_app_get_name`, which falls back to the window title for an info-less app
+    /// (`shell-app.c:186-197`).
+    ///
+    /// The title first, then the `app_id` it failed to resolve, and only then the bare id — an
+    /// unresolvable window is precisely the case where the title is all the user has.
+    pub fn fallback_label(&self) -> &str {
+        let first = self.windows.first();
+        let title = first
+            .and_then(|w| w.title.as_deref())
+            .filter(|t| !t.is_empty());
+        title
+            .or_else(|| first.and_then(|w| w.app_id.as_deref()))
+            .unwrap_or(&self.id)
     }
 
     /// How many windows resolved to this app — `shell_app_get_n_windows()`.
@@ -302,6 +335,16 @@ pub struct AppSystem {
     /// The raw window snapshot, kept so a catalog [`refresh`](Self::refresh) can
     /// re-resolve it (an app installed while its window is open then matches).
     windows: Vec<RunningWindow>,
+    /// pid → its sandboxed app id, cached because the answer comes from a **file read**.
+    ///
+    /// [`recompute_running`](Self::recompute_running) runs on every window change, so an
+    /// uncached read would put a `/proc` open on that path once per window per refresh.
+    /// Misses are cached as `None` too — otherwise every ordinary, unsandboxed window pays a
+    /// failed open forever, which is the common case.
+    ///
+    /// Keyed by pid rather than by window because that is what the answer depends on, and
+    /// because a pid's sandbox cannot change under us.
+    sandbox_ids: HashMap<i32, Option<String>>,
     /// `windows` resolved, grouped and ordered — `get_running()`'s answer.
     running: Vec<RunningApp>,
     /// Open startup sequences by desktop id — the `STARTING` half of
@@ -334,6 +377,7 @@ impl AppSystem {
             startup_wm_class_to_id: HashMap::new(),
             id_to_installed: HashMap::new(),
             windows: Vec::new(),
+            sandbox_ids: HashMap::new(),
             running: Vec::new(),
             starting: HashMap::new(),
             state_changed: false,
@@ -356,6 +400,7 @@ impl AppSystem {
             startup_wm_class_to_id: HashMap::new(),
             id_to_installed: HashMap::new(),
             windows: Vec::new(),
+            sandbox_ids: HashMap::new(),
             running: Vec::new(),
             starting: HashMap::new(),
             state_changed: false,
@@ -412,6 +457,7 @@ impl AppSystem {
             startup_wm_class_to_id: HashMap::new(),
             id_to_installed: HashMap::new(),
             windows: Vec::new(),
+            sandbox_ids: HashMap::new(),
             running: Vec::new(),
             starting: HashMap::new(),
             state_changed: false,
@@ -547,13 +593,62 @@ impl AppSystem {
     /// clients reach us through xwayland-satellite, which has already flattened the
     /// pair into one `app_id`.
     ///
-    /// Also unported: `check_app_id_prefix`'s sandbox scoping
-    /// (`meta_window_get_sandboxed_app_id`) — we have no sandbox id on the
-    /// toplevel, so a sandboxed app cannot currently be told from a host app
-    /// claiming its `WM_CLASS`.
-    pub fn app_for_window(&self, app_id: &str) -> Option<AppEntry> {
+    /// `sandbox_id` is the app id the client's *sandbox* claims — [`sandboxed_app_id`]. It does
+    /// two distinct jobs here, both of them GNOME's:
+    ///
+    /// 1. it **scopes** the `app_id` rungs, so a sandboxed window may only match a desktop entry
+    ///    whose id starts `<sandbox_id>.` (`check_app_id_prefix`, `shell-window-tracker.c:126-134`,
+    ///    applied to all four rungs at `:193-210`). That is what stops a host app claiming a
+    ///    sandboxed app's `WM_CLASS`;
+    /// 2. it is a **rung of its own** once those miss (`get_app_from_sandboxed_app_id`,
+    ///    `:279-288`), which is the only thing that resolves a flatpak whose `app_id` is unrelated
+    ///    to its desktop id — Wesnoth ships `org.wesnoth.Wesnoth.desktop`, declares no
+    ///    `StartupWMClass`, and sets `app_id` to the bare `wesnoth`.
+    ///
+    /// That rung is an **exact** lookup, not a heuristic one: `get_app_from_id` (`:226-244`) does
+    /// `lookup_app("<id>.desktop")` and nothing else — no canonicalization, no vendor prefixes.
+    /// GNOME's comment says why it can afford to be exact ("a corresponding .desktop file is
+    /// guaranteed to match", `:421-422`).
+    ///
+    /// Still unported, deliberately: the Snap half of the sandbox id
+    /// (`meta_window_update_snap_id`, `window.c:992-1039`), the GApplication-id rung (`:432-436`),
+    /// the pid map (`:438-440`) and startup-notification (`:442-462`). Each is a separate source
+    /// of identity, not a fallback this one needs.
+    pub fn app_for_window(&self, app_id: &str, sandbox_id: Option<&str>) -> Option<AppEntry> {
+        // `check_app_id_prefix` returns TRUE for an unsandboxed window, so an absent sandbox id
+        // must accept everything rather than reject everything.
+        let allowed = |entry: &AppEntry| match sandbox_id {
+            Some(sandbox) => entry.id.starts_with(&format!("{sandbox}.")),
+            None => true,
+        };
+
         self.lookup_startup_wmclass(app_id)
-            .or_else(|| self.lookup_desktop_wmclass(app_id))
+            .filter(&allowed)
+            .or_else(|| self.lookup_desktop_wmclass(app_id).filter(&allowed))
+            .or_else(|| self.lookup(&format!("{}.desktop", sandbox_id?)))
+    }
+
+    /// The sandboxed app id for a pid **from the cache only**, never reading.
+    ///
+    /// For the `&self` resolution sites, which must agree with the running set but cannot take
+    /// `&mut` to fill a cache. Warm by construction:
+    /// [`recompute_running`](Self::recompute_running) resolves every open window's pid on every
+    /// window change, so a window that exists has an entry here. A miss therefore means "not a
+    /// window we track", and answering `None` degrades to the pre-sandbox behavior rather than
+    /// to a wrong match.
+    pub fn sandbox_id_cached(&self, pid: Option<i32>) -> Option<&str> {
+        self.sandbox_ids.get(&pid?)?.as_deref()
+    }
+
+    /// The sandboxed app id for a pid, reading through the cache.
+    fn sandbox_id_for(&mut self, pid: Option<i32>) -> Option<String> {
+        let pid = pid?;
+        if let Some(cached) = self.sandbox_ids.get(&pid) {
+            return cached.clone();
+        }
+        let id = sandboxed_app_id(pid);
+        self.sandbox_ids.insert(pid, id.clone());
+        id
     }
 
     /// Replace the open-window snapshot (what the compositor's map/unmap/focus
@@ -577,26 +672,40 @@ impl AppSystem {
     /// "most recently used first". Ties break by id — GNOME's tie order is its
     /// hash-table iteration order, i.e. arbitrary; ours is merely deterministic.
     fn recompute_running(&mut self) {
+        // Resolved up front, in one pass, because reading a sandbox id needs `&mut self` for the
+        // cache while the loop below borrows `self.windows`. Cheap after the first refresh: every
+        // pid, sandboxed or not, is answered from the map.
+        let sandbox_ids: Vec<Option<String>> = self
+            .windows
+            .iter()
+            .map(|window| window.pid)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|pid| self.sandbox_id_for(pid))
+            .collect();
+
         let mut apps: Vec<RunningApp> = Vec::new();
-        for window in &self.windows {
-            // A window with no `app_id`, or one that resolves to nothing, is
-            // dropped. GNOME instead synthesizes a window-backed `ShellApp` and
-            // shows it in the dash; that needs an icon we cannot get from a
-            // toplevel, so it is deferred (`overview-port.md` S6).
-            let Some(entry) = window
+        for (window, sandbox_id) in self.windows.iter().zip(&sandbox_ids) {
+            // A window that resolves to nothing still gets an app: GNOME's last resort is
+            // `_shell_app_new_for_window` (`shell-window-tracker.c:469-471`), so
+            // `get_app_for_window` never returns NULL and no window can fall out of the running
+            // set. Losing one means it disappears from the app switcher and the dash while it is
+            // still on screen — which is exactly what a flatpak whose `app_id` does not match its
+            // desktop id used to do.
+            let id = window
                 .app_id
                 .as_deref()
-                .and_then(|id| self.app_for_window(id))
-            else {
-                continue;
-            };
-            match apps.iter_mut().find(|a| a.id == entry.id) {
+                .and_then(|app_id| self.app_for_window(app_id, sandbox_id.as_deref()))
+                .map(|entry| entry.id)
+                .unwrap_or_else(|| window_backed_id(window.id));
+
+            match apps.iter_mut().find(|a| a.id == id) {
                 Some(app) => {
                     app.windows.push(window.clone());
                     app.last_focus = app.last_focus.max(window.last_focus);
                 }
                 None => apps.push(RunningApp {
-                    id: entry.id,
+                    id,
                     windows: vec![window.clone()],
                     last_focus: window.last_focus,
                 }),
@@ -753,7 +862,9 @@ impl AppSystem {
             // Unresolvable ids still key the table (that is what `launch` inserts
             // when the catalog is a fake), so fall back to the raw string.
             let desktop_id = self
-                .app_for_window(app_id)
+                // A startup sequence is keyed by the id we launched, not by a window, so there
+                // is no client pid to ask about a sandbox here.
+                .app_for_window(app_id, None)
                 .map(|entry| entry.id)
                 .unwrap_or_else(|| app_id.to_owned());
             self.starting
@@ -1061,6 +1172,66 @@ fn resolve_launch(mode: LaunchMode, entry: &AppEntry) -> ResolvedLaunch {
             }
         }
     }
+}
+
+/// The synthetic id of a window-backed app — GNOME's `window:%d` over the window's stable
+/// sequence (`shell-app.c:884`), with [`MappedId`] standing in for that sequence.
+///
+/// It deliberately cannot collide with a desktop id, which always ends `.desktop`.
+pub fn window_backed_id(window: MappedId) -> String {
+    format!("window:{}", window.get())
+}
+
+/// Whether an id came from [`window_backed_id`] rather than from a desktop entry.
+///
+/// Consumers need this because such an id resolves to no [`AppEntry`]: there is no name, no icon
+/// and no actions behind it. GNOME expresses the same split as `app->info == NULL`
+/// (`shell_app_get_id`, `shell-app.c:172-177`).
+pub fn is_window_backed(id: &str) -> bool {
+    id.starts_with("window:")
+}
+
+/// The app id a **flatpak** sandbox claims for `pid`, or `None` for anything else.
+///
+/// mutter's `meta_window_update_flatpak_id` (`window.c:969-989`): read
+/// `/proc/<pid>/root/.flatpak-info` as a key file and take `[Application] name`. Going through
+/// `/proc/<pid>/root` is the point — it resolves inside the sandbox's own mount namespace, so
+/// the file is the *client's* `.flatpak-info` and cannot be spoofed by a host process putting one
+/// on its own filesystem. It reads fine unprivileged (verified against a running flatpak).
+///
+/// Not a `Result`: every failure here — no such pid, not sandboxed, unreadable, malformed — means
+/// the same thing to the caller, "no sandbox id", and an unsandboxed window is the common case
+/// rather than an error.
+///
+/// Parsed by hand rather than with a key-file crate: we need exactly one key, the section headers
+/// are the only structure that matters, and the file is written by flatpak itself.
+fn sandboxed_app_id(pid: i32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/root/.flatpak-info")).ok()?;
+    parse_flatpak_app_id(&text)
+}
+
+/// `[Application] name` out of a `.flatpak-info`, split from the read so it can be tested: a
+/// `/proc/<pid>/root` path cannot be fabricated for a made-up pid.
+fn parse_flatpak_app_id(text: &str) -> Option<String> {
+    let mut in_application = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            // The key is only meaningful inside [Application] — `name` also names the *runtime*
+            // under [Runtime]. A later section ends the block.
+            in_application = section == "Application";
+            continue;
+        }
+        if in_application {
+            if let Some(name) = line.strip_prefix("name=") {
+                let name = name.trim();
+                if !name.is_empty() {
+                    return Some(name.to_owned());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Whether `id` is `wm_class` with an optional `.desktop` suffix — the
@@ -2147,8 +2318,15 @@ Actions=newwin;\n\n\
     }
 
     fn win(app_id: &str, secs: Option<u64>) -> RunningWindow {
+        win_with_id(MappedId::next(), app_id, secs)
+    }
+
+    /// A window with a *chosen* id — for re-stating the same snapshot, which `win` cannot do
+    /// because it mints a fresh id on every call.
+    fn win_with_id(id: MappedId, app_id: &str, secs: Option<u64>) -> RunningWindow {
         RunningWindow {
-            id: MappedId::next(),
+            pid: None,
+            id,
             app_id: Some(app_id.to_owned()),
             title: None,
             urgent: false,
@@ -2166,7 +2344,7 @@ Actions=newwin;\n\n\
             AppEntry::fake_with_wm_class("org.gnu.emacs.desktop", "Emacs", "Emacs"),
         ]);
         assert_eq!(
-            system.app_for_window("Emacs").map(|e| e.id),
+            system.app_for_window("Emacs", None).map(|e| e.id),
             Some("org.gnu.emacs.desktop".to_owned())
         );
     }
@@ -2181,7 +2359,9 @@ Actions=newwin;\n\n\
             AppEntry::fake("org.example.foo.bar.desktop", "Lowercased Decoy"),
         ]);
         assert_eq!(
-            system.app_for_window("org.example.Foo.Bar").map(|e| e.id),
+            system
+                .app_for_window("org.example.Foo.Bar", None)
+                .map(|e| e.id),
             Some("org.example.Foo.Bar.desktop".to_owned()),
             "the verbatim id must win; canonicalizing first would pick the decoy"
         );
@@ -2194,7 +2374,7 @@ Actions=newwin;\n\n\
     fn desktop_basename_canonicalizes_case_and_spaces() {
         let system = system_with(vec![AppEntry::fake("fedora-eclipse.desktop", "Eclipse")]);
         assert_eq!(
-            system.app_for_window("Fedora Eclipse").map(|e| e.id),
+            system.app_for_window("Fedora Eclipse", None).map(|e| e.id),
             Some("fedora-eclipse.desktop".to_owned())
         );
     }
@@ -2205,10 +2385,10 @@ Actions=newwin;\n\n\
     fn vendor_prefixes_are_tried_for_a_bare_basename() {
         let system = system_with(vec![AppEntry::fake("gnome-terminal.desktop", "Terminal")]);
         assert_eq!(
-            system.app_for_window("terminal").map(|e| e.id),
+            system.app_for_window("terminal", None).map(|e| e.id),
             Some("gnome-terminal.desktop".to_owned())
         );
-        assert_eq!(system.app_for_window("nonesuch"), None);
+        assert_eq!(system.app_for_window("nonesuch", None), None);
     }
 
     /// When two entries claim the same `StartupWMClass`, the one whose id *is* the
@@ -2221,7 +2401,7 @@ Actions=newwin;\n\n\
             AppEntry::fake_with_wm_class("Navigator.desktop", "Navigator", "Navigator"),
         ]);
         assert_eq!(
-            system.app_for_window("Navigator").map(|e| e.id),
+            system.app_for_window("Navigator", None).map(|e| e.id),
             Some("Navigator.desktop".to_owned())
         );
     }
@@ -2239,7 +2419,7 @@ Actions=newwin;\n\n\
             AppEntry::fake_with_wm_class("shown.desktop", "Shown", "Steam"),
         ]);
         assert_eq!(
-            hidden_first.app_for_window("Steam").map(|e| e.id),
+            hidden_first.app_for_window("Steam", None).map(|e| e.id),
             Some("shown.desktop".to_owned()),
             "a shown entry must evict a hidden incumbent"
         );
@@ -2252,7 +2432,7 @@ Actions=newwin;\n\n\
             },
         ]);
         assert_eq!(
-            shown_first.app_for_window("Steam").map(|e| e.id),
+            shown_first.app_for_window("Steam", None).map(|e| e.id),
             Some("shown.desktop".to_owned()),
             "a hidden entry must not evict a shown incumbent"
         );
@@ -2297,36 +2477,221 @@ Actions=newwin;\n\n\
         assert_eq!(ids, ["c.desktop", "a.desktop", "b.desktop"]);
     }
 
-    /// A window that resolves to nothing is dropped rather than shown as a
-    /// window-backed app (recorded divergence from `_shell_app_new_for_window`).
+    /// A sandboxed app resolves through its **sandbox** id when its `app_id` resolves to nothing.
+    ///
+    /// The live case this was written for: Wesnoth ships `org.wesnoth.Wesnoth.desktop`, declares
+    /// no `StartupWMClass`, and sets `app_id` to the bare `wesnoth`. Both `app_id` rungs miss, so
+    /// without `get_app_from_sandboxed_app_id` (`shell-window-tracker.c:279-288`) the window
+    /// never becomes its app and drops out of the app switcher.
     #[test]
-    fn unmatched_windows_are_dropped() {
+    fn a_sandboxed_app_resolves_through_its_sandbox_id() {
+        let system = system_with(vec![
+            AppEntry::fake("org.wesnoth.Wesnoth.desktop", "Battle for Wesnoth"),
+            AppEntry::fake("a.desktop", "A"),
+        ]);
+
+        // Without the sandbox id, the bare app_id resolves to nothing.
+        assert_eq!(system.app_for_window("wesnoth", None), None);
+        assert_eq!(
+            system
+                .app_for_window("wesnoth", Some("org.wesnoth.Wesnoth"))
+                .map(|e| e.id),
+            Some("org.wesnoth.Wesnoth.desktop".to_owned())
+        );
+
+        // The rung is *exact* — `get_app_from_id` appends `.desktop` and does nothing else, no
+        // canonicalization and no vendor prefixes.
+        assert_eq!(system.app_for_window("wesnoth", Some("nonesuch")), None);
+    }
+
+    /// A sandboxed window may only match a desktop entry inside its own sandbox
+    /// (`check_app_id_prefix`, `shell-window-tracker.c:126-134`, applied to every `app_id` rung
+    /// at `:193-210`). That is what stops a host app claiming a sandboxed app's `WM_CLASS`.
+    #[test]
+    fn the_sandbox_id_scopes_which_entries_an_app_id_may_match() {
+        let system = system_with(vec![
+            AppEntry::fake("a.desktop", "A"),
+            AppEntry::fake("org.example.App.desktop", "App"),
+            AppEntry::fake("org.example.App.Editor.desktop", "Editor"),
+        ]);
+
+        // Unsandboxed: the prefix check is vacuous, exactly as it is for a NULL prefix.
+        assert_eq!(
+            system.app_for_window("a", None).map(|e| e.id),
+            Some("a.desktop".to_owned())
+        );
+        // Sandboxed as something else: `a.desktop` is outside the sandbox, so that match is
+        // refused. The window is then attributed to the sandbox's *own* app by the next rung —
+        // which is the point of the scoping. A sandboxed client claiming `WM_CLASS=a` must not
+        // become the host's A.
+        assert_eq!(
+            system
+                .app_for_window("a", Some("org.example.App"))
+                .map(|e| e.id),
+            Some("org.example.App.desktop".to_owned()),
+        );
+        // With no entry for the sandbox either, the refusal is all that is left — the host entry
+        // is still not borrowed.
+        assert_eq!(system.app_for_window("a", Some("org.nothing.Here")), None);
+        // Inside its own sandbox the same shape is allowed: the id starts `org.example.App.`.
+        assert_eq!(
+            system
+                .app_for_window("org.example.App.Editor", Some("org.example.App"))
+                .map(|e| e.id),
+            Some("org.example.App.Editor.desktop".to_owned())
+        );
+    }
+
+    /// The `.flatpak-info` parse: only `[Application] name`, and only that section.
+    #[test]
+    fn the_sandbox_id_is_the_application_name_from_flatpak_info() {
+        // Not a pid we can fabricate a `/proc` entry for, so the parse is exercised directly
+        // through the same helper the reader uses.
+        assert_eq!(
+            parse_flatpak_app_id(
+                "[Application]\nname=org.wesnoth.Wesnoth\nruntime=runtime/org.fedoraproject.Platform/aarch64/f44\n"
+            ),
+            Some("org.wesnoth.Wesnoth".to_owned())
+        );
+        // A `name` outside the [Application] section is a different key entirely — the runtime's.
+        assert_eq!(
+            parse_flatpak_app_id("[Runtime]\nname=org.fedoraproject.Platform\n"),
+            None
+        );
+        // A later section ends the block.
+        assert_eq!(
+            parse_flatpak_app_id("[Application]\n[Instance]\nname=nope\n"),
+            None
+        );
+        // Real files have leading sections and blank lines before the one we want.
+        assert_eq!(
+            parse_flatpak_app_id(
+                "[Context]\nshared=network\n\n[Application]\nname=org.gnome.Foo\n"
+            ),
+            Some("org.gnome.Foo".to_owned())
+        );
+        // Not flatpak at all.
+        assert_eq!(parse_flatpak_app_id(""), None);
+        assert_eq!(parse_flatpak_app_id("[Application]\nname=\n"), None);
+    }
+
+    /// A window that resolves to nothing still gets an app, synthesized from the window —
+    /// GNOME's `_shell_app_new_for_window` last resort (`shell-window-tracker.c:469-471`).
+    ///
+    /// The invariant is what matters: `get_app_for_window` never returns NULL, so no window can
+    /// fall out of the running set. Dropping one takes it out of the app switcher and the dash
+    /// while it is still on screen — which is what a flatpak whose `app_id` does not match its
+    /// desktop id used to do (Wesnoth: `app_id=wesnoth`, `org.wesnoth.Wesnoth.desktop`).
+    #[test]
+    fn unmatched_windows_become_window_backed_apps() {
         let mut system = system_with(vec![AppEntry::fake("a.desktop", "A")]);
+        let untitled = MappedId::next();
         system.set_windows(vec![
             win("a", Some(1)),
             win("nonesuch", Some(2)),
             RunningWindow {
-                id: MappedId::next(),
+                pid: None,
+                id: untitled,
                 app_id: None,
                 title: None,
                 urgent: false,
                 last_focus: Some(Duration::from_secs(3)),
             },
         ]);
-        let ids: Vec<&str> = system.running().iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, ["a.desktop"]);
+
+        let running = system.running();
+        assert_eq!(running.len(), 3, "no window may be lost");
+        assert_eq!(
+            running.iter().filter(|a| !a.is_window_backed()).count(),
+            1,
+            "only the resolvable window becomes a real app"
+        );
+        // The one with no `app_id` at all is window-backed under its own window's id.
+        assert!(
+            running
+                .iter()
+                .any(|a| a.id == window_backed_id(untitled) && a.is_window_backed()),
+            "a window with no app_id is still an app, keyed by the window"
+        );
+        // Two unresolvable windows are two apps, never merged: GNOME's grouping fallback is the
+        // X11 window group, which Wayland has no analogue for.
+        assert_eq!(
+            running.iter().filter(|a| a.is_window_backed()).count(),
+            2,
+            "window-backed apps are per window, not pooled"
+        );
+    }
+
+    /// A window-backed app is never shown as the raw `window:5`.
+    #[test]
+    fn a_window_backed_app_falls_back_to_the_title_then_the_app_id() {
+        let mut system = system_with(Vec::new());
+        let id = MappedId::next();
+        let window = RunningWindow {
+            pid: None,
+            id,
+            app_id: Some("nonesuch".to_owned()),
+            title: Some("Some Document".to_owned()),
+            urgent: false,
+            last_focus: None,
+        };
+
+        system.set_windows(vec![window.clone()]);
+        assert_eq!(system.running()[0].fallback_label(), "Some Document");
+
+        // No title: the `app_id` we could not resolve is still better than the synthetic id.
+        system.set_windows(vec![RunningWindow {
+            title: None,
+            ..window.clone()
+        }]);
+        assert_eq!(system.running()[0].fallback_label(), "nonesuch");
+
+        // An empty title must not win over the app_id either.
+        system.set_windows(vec![RunningWindow {
+            title: Some(String::new()),
+            ..window.clone()
+        }]);
+        assert_eq!(system.running()[0].fallback_label(), "nonesuch");
+
+        // Nothing at all: the id, rather than an empty label.
+        system.set_windows(vec![RunningWindow {
+            title: None,
+            app_id: None,
+            ..window
+        }]);
+        assert_eq!(system.running()[0].fallback_label(), window_backed_id(id));
     }
 
     /// `set_windows` reports only *resolved* changes — the dash redisplay trigger.
-    /// A window of an unknown app appearing changes nothing observable.
+    ///
+    /// An unresolvable window now counts as one: since it becomes a window-backed app it is a
+    /// new entry in the running set, and the dash has something to draw. Before window-backed
+    /// apps it was invisible, and this test asserted the opposite.
     #[test]
     fn set_windows_reports_resolved_changes_only() {
         let mut system = system_with(vec![AppEntry::fake("a.desktop", "A")]);
         let a = win("a", Some(1));
         assert!(system.set_windows(vec![a.clone()]));
         assert!(
-            !system.set_windows(vec![a.clone(), win("nonesuch", Some(2))]),
-            "an unresolvable window must not trigger a redisplay"
+            system.set_windows(vec![a.clone(), win("nonesuch", Some(2))]),
+            "an unresolvable window is a window-backed app, so it does change the running set"
+        );
+        // What must still *not* trigger one: re-stating the very same snapshot.
+        assert!(
+            !system.set_windows(vec![
+                a.clone(),
+                win_with_id(
+                    system
+                        .running()
+                        .iter()
+                        .find(|app| app.is_window_backed())
+                        .map(|app| app.windows[0].id)
+                        .expect("the unresolvable window is window-backed"),
+                    "nonesuch",
+                    Some(2),
+                )
+            ]),
+            "an unchanged snapshot must not trigger a redisplay"
         );
         let refocused = RunningWindow {
             urgent: false,
@@ -2346,7 +2711,8 @@ Actions=newwin;\n\n\
         let catalog = FakeCatalog::new(Vec::new());
         let mut system = AppSystem::with_parts(Box::new(catalog.clone()), Box::new(NullLauncher));
         system.set_windows(vec![win("a", Some(1))]);
-        assert!(system.running().is_empty());
+        // Window-backed until the app exists: not lost, just unresolved.
+        assert!(system.running()[0].is_window_backed());
 
         catalog
             .apps

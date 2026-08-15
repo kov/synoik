@@ -129,8 +129,8 @@ Still open, and **still true** (checked, not assumed):
 - `can_open_new_window` cannot reach its GtkApplication rung without
   `gtk_shell1.set_dbus_properties` — which is why System Monitor offers a "New Window" it does
   not have;
-- window-backed `ShellApp`s (a window whose `app_id` resolves to no desktop entry) are dropped
-  rather than synthesized;
+- window-backed `ShellApp`s are synthesized (`window:<n>`, as GNOME does), but carry no icon of
+  their own — the dash draws the `application-x-executable` fallback;
 - parental controls (`malcontent`) are not modelled, so that half of the app-grid filter is inert.
 
 The cheap recurring check: grep the tree for simplification notes ("for now", "we have no",

@@ -401,8 +401,10 @@ open/close & cross-fade **animation** → largely live-only ([[headless-animatio
   (`shell-app.c:839`) reduced to the running set — every app there has windows and we have no
   minimized state, so it is "most recently used first" off `Mapped::get_focus_timestamp`, ties by id
   (GNOME's tie order is hash-table order, i.e. arbitrary). The raw window snapshot is kept so a
-  catalog refresh re-resolves it. **Windows matching nothing are dropped**, where GNOME synthesizes a
-  window-backed `ShellApp` and dashes it — that needs an icon a toplevel cannot give us.
+  catalog refresh re-resolves it. Windows matching nothing become **window-backed apps** (`window:<n>`), as in GNOME's
+  `_shell_app_new_for_window` last resort, so no window can fall out of the running set; they are
+  dashed under the window's own title with the fallback icon. A sandboxed client additionally
+  resolves through its flatpak id (`/proc/<pid>/root/.flatpak-info`).
   `State::refresh` re-snapshots unconditionally and reports only resolved changes (the
   keyboard-layout-indicator pattern: one window walk, no invalidation bookkeeping, immune to a
   missed edge). Pins: 9 `app_system.rs` unit tests + a conformance test driving a real window's

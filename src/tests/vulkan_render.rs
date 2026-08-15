@@ -9675,6 +9675,7 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
     f.synoik()
         .app_system
         .set_windows(vec![crate::app_system::RunningWindow {
+            pid: None,
             id: crate::window::mapped::MappedId::next(),
             app_id: Some("run".to_owned()),
             title: None,
