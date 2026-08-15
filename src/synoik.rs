@@ -2121,6 +2121,12 @@ impl State {
         if self.synoik.sync_running_apps() {
             self.synoik.emit_introspect_changed();
             if self.synoik.sync_dash_favorites() {
+                // An app that just started is a *new* dash tile whose icon has never been
+                // decoded. Warm it off-thread here, exactly as the pin/unpin path does, instead
+                // of letting the first frame that draws the tile decode it inline: only the
+                // catalog-reload and settings paths warmed before, so a plain app launch — the
+                // most common way the dash gains a tile — was the one case that missed.
+                self.synoik.prewarm_app_icons();
                 self.synoik.queue_redraw_all();
             }
         }
@@ -13883,17 +13889,17 @@ impl Synoik {
             if items.iter().any(|item| item.id == app.id) {
                 continue;
             }
-            // NOT YET SHOWN IN THE DASH when it does not resolve, though GNOME shows one: a
-            // window-backed `ShellApp` is an ordinary `ShellApp` whose `info` is NULL, and the
-            // dash draws it with the `application-x-executable` fallback.
+            // NOT YET dashed when it resolves to nothing, though GNOME dashes such a
+            // window-backed app like any other (`application-x-executable` fallback).
             //
-            // Adding it here mints one fresh element `Id` mid-animation, which trips
-            // `nothing_churns_its_element_id_during_the_overview_animation` (measured: exactly one
-            // `External` id on 1 of 8 steady frames, and a warm-up frame does NOT clear it, so it
-            // is not a first-frame bake). Churning an `Id` throws away the output's backdrop blur,
-            // so this waits until that is understood rather than shipping a render regression for
-            // a cosmetic gain. The switcher and the running set already carry window-backed apps,
-            // which is what stops a window becoming unreachable.
+            // Adding a tile re-lays-out the row, so the tiles ALREADY in it re-bake, and one
+            // existing icon's element `Id` changes on the first frame after the change — measured:
+            // one `External` id, on frame 0 only, element list constant at 53. A churned `Id`
+            // costs the output's backdrop blur. It is a one-time cost, not per-frame, but the
+            // re-bake happens inside the frame path and a content sync alone does not pre-empt it
+            // (verified: `sync_dash_favorites` before the overview does NOT clear it; only an
+            // extra render does). Doing it properly means baking the dash off the frame path when
+            // its content changes, which is its own change.
             if let Some(entry) = self.app_system.lookup(&app.id) {
                 items.push(DashEntry {
                     urgent: self.app_system.has_urgent_window(&entry.id),
