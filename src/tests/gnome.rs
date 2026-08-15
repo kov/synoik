@@ -16690,6 +16690,53 @@ fn an_unmatched_window_still_reaches_the_app_switcher() {
     );
 }
 
+/// ...and it reaches the dash too, under the window's own name.
+///
+/// GNOME dashes a window-backed `ShellApp` like any other; its `info` is NULL, so it draws the
+/// `application-x-executable` fallback ([`AppIconRef::Fallback`] resolves to exactly that).
+/// Skipping it here would leave a running app with no way to reach it from the overview.
+#[test]
+fn an_unmatched_window_is_dashed_under_its_own_name() {
+    use crate::app_system::{AppIconRef, AppSystem, FakeCatalog, RecordingLauncher};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    f.synoik().app_system = AppSystem::with_parts(
+        Box::new(FakeCatalog::new(Vec::new())),
+        Box::new(RecordingLauncher::default()),
+    );
+
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.set_app_id("wesnoth");
+    window.set_title("The Battle for Wesnoth - 1.19.24");
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    f.synoik().sync_dash_favorites();
+
+    let items = f.synoik().dash.items().to_vec();
+    assert_eq!(items.len(), 1, "the running window must have a dash tile");
+    assert_eq!(
+        items[0].name, "The Battle for Wesnoth - 1.19.24",
+        "labelled with the window's title, never the synthetic window:<n> id"
+    );
+    assert_eq!(
+        items[0].icon,
+        AppIconRef::Fallback,
+        "no desktop entry means no icon of its own, so GNOME's generic one"
+    );
+    assert!(items[0].running, "and it draws its running dot");
+}
+
 #[test]
 fn overview_mapped_window_marks_its_app_running() {
     use crate::app_system::{AppEntry, AppSystem, FakeCatalog, RecordingLauncher};

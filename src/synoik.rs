@@ -13900,14 +13900,21 @@ impl Synoik {
             // (verified: `sync_dash_favorites` before the overview does NOT clear it; only an
             // extra render does). Doing it properly means baking the dash off the frame path when
             // its content changes, which is its own change.
-            if let Some(entry) = self.app_system.lookup(&app.id) {
-                items.push(DashEntry {
+            match self.app_system.lookup(&app.id) {
+                Some(entry) => items.push(DashEntry {
                     urgent: self.app_system.has_urgent_window(&entry.id),
                     id: entry.id,
                     name: entry.name,
                     icon: entry.icon,
                     running: true,
-                });
+                }),
+                None => items.push(DashEntry {
+                    urgent: self.app_system.has_urgent_window(&app.id),
+                    id: app.id.clone(),
+                    name: app.fallback_label().to_owned(),
+                    icon: crate::app_system::AppIconRef::Fallback,
+                    running: true,
+                }),
             }
         }
 
