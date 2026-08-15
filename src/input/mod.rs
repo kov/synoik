@@ -4540,6 +4540,11 @@ impl State {
 
         let role = if self.synoik.layout.is_gnome_mode() {
             self.synoik.output_under(pos).and_then(|(output, p)| {
+                // A panel hidden over a fullscreen window is out of the pick entirely, so it
+                // cannot be hovered either (`Synoik::panel_visible_on`).
+                if !self.synoik.panel_visible_on(output) {
+                    return None;
+                }
                 let ws = self.synoik.workspace_state_for(output);
                 let output_w = output_size(output).w;
                 self.synoik.panel.hit_test(p, output_w, ws)
@@ -7171,9 +7176,17 @@ impl State {
                 // A click on an app indicator, whichever button — the cluster is the one panel
                 // item that takes all three, so it is handled before the left-only block below.
                 // Which icon was hit is a second question: several share the item's slot.
+                let panel_takes_input = under
+                    .as_ref()
+                    .is_some_and(|(output, _)| self.synoik.panel_visible_on(output));
                 if let (Some(button), Some((output, pos))) = (button, under.clone()) {
                     let output_w = output_size(&output).w;
-                    if let Some((id, anchor)) = self.synoik.panel.app_indicator_hit(pos, output_w) {
+                    if let Some((id, anchor)) = self
+                        .synoik
+                        .panel
+                        .app_indicator_hit(pos, output_w)
+                        .filter(|_| panel_takes_input)
+                    {
                         let (id, anchor) = (id.to_owned(), anchor);
                         self.click_app_indicator(&id, output, anchor, button);
                         self.synoik.suppressed_buttons.insert(button_code);
@@ -7184,7 +7197,7 @@ impl State {
 
                 // A left-click on a panel button: the workspace indicator toggles the overview
                 // (the mouse counterpart of the Super-tap); the clock opens the calendar popover.
-                if button == Some(MouseButton::Left) {
+                if button == Some(MouseButton::Left) && panel_takes_input {
                     if let Some((output, pos)) = under {
                         let ws = self.synoik.workspace_state_for(&output);
                         let output_w = output_size(&output).w;
@@ -7700,6 +7713,9 @@ impl State {
                 .synoik
                 .output_under(location)
                 .map(|(output, pos)| {
+                    if !self.synoik.panel_visible_on(output) {
+                        return false;
+                    }
                     let ws = self.synoik.workspace_state_for(output);
                     let output_w = output_size(output).w;
                     self.synoik.panel.hit_test(pos, output_w, ws)

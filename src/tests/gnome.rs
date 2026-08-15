@@ -3040,6 +3040,70 @@ fn fullscreen_window_covers_the_top_layer() {
     );
 }
 
+/// The panel is hidden over a fullscreen window, and takes no input there.
+///
+/// GNOME registers `panelBox` with `trackFullscreen: true` (`js/ui/layout.js:285`) and
+/// `_updateActorVisibility` (`:983`) sets `visible = !(window_group.visible && inFullscreen)`.
+/// Clutter visibility gates the pick too, so the hidden panel must not answer a hover or a click
+/// — otherwise a 40px strip along the top of every fullscreen window silently eats them.
+///
+/// The window group is hidden in the overview, so the panel comes back there even with the
+/// fullscreen window still up.
+#[test]
+fn panel_hides_and_stops_taking_input_over_a_fullscreen_window() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik().global_space.outputs().next().cloned().unwrap();
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window_id = f.synoik().layout.focus().unwrap().window.clone();
+    assert!(
+        f.synoik().panel_visible_on(&output),
+        "the panel shows over an ordinary window"
+    );
+
+    f.synoik().layout.toggle_fullscreen(&window_id);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+
+    assert!(
+        !f.synoik().panel_visible_on(&output),
+        "a fullscreen window must hide the panel"
+    );
+
+    // Hovering the Activities button must not light it up...
+    f.pointer_motion(10., 10.);
+    f.refresh();
+    assert_eq!(
+        f.synoik().panel.hovered_role(),
+        None,
+        "a hidden panel must not take hover"
+    );
+
+    // ...and clicking it must not reach the panel. Activities would open the overview.
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.synoik_complete_animations();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "a click over a fullscreen window must not reach the hidden panel"
+    );
+
+    // The overview hides the window group, which brings the panel back (GNOME's
+    // `window_group.visible` conjunct) even though the window is still fullscreen.
+    f.synoik().layout.toggle_overview();
+    f.synoik_complete_animations();
+    assert!(
+        f.synoik().panel_visible_on(&output),
+        "the panel returns in the overview, fullscreen window or not"
+    );
+}
+
 /// `org.gnome.mutter center-new-windows`, GNOME's default since mutter 48:
 /// a new window opens in the middle of the work area. `find_first_fit` never
 /// runs, so nothing tries to avoid overlap — a window landing within

@@ -1083,6 +1083,12 @@ impl Panel {
         }
     }
 
+    /// Which panel button the pointer is hovering, if any.
+    #[must_use]
+    pub fn hovered_role(&self) -> Option<&'static str> {
+        self.hovered
+    }
+
     /// Set which panel button the pointer is hovering (`None` when off any button).
     /// Returns whether it changed, so the caller can queue a redraw. Nothing is
     /// invalidated: a hover only moves a container fill, which is its own element

@@ -8224,6 +8224,34 @@ impl Synoik {
         Some((output, pos_within_output))
     }
 
+    /// Whether the top panel shows on `output` — false over a fullscreen window.
+    ///
+    /// GNOME registers `panelBox` as chrome with `trackFullscreen: true`
+    /// (`js/ui/layout.js:285`), and `_updateActorVisibility` (`:983`) sets
+    /// `visible = !(global.window_group.visible && monitor.inFullscreen)`. The window group is
+    /// hidden while the overview is up, so the panel comes back there even over a fullscreen
+    /// window — which for us is just `is_overview_open`. (GNOME's other conjunct,
+    /// `sessionMode.hasWindows`, covers the lock screen; the panel render path already returns
+    /// before that.)
+    ///
+    /// `inFullscreen` is `render_above_top_layer`, the same predicate the hot corner uses for the
+    /// same reason (`js/ui/layout.js:1247`) — one source of truth so the two cannot drift.
+    ///
+    /// **This gates input as well as drawing.** In Clutter `visible = false` takes the actor out
+    /// of the pick, so a hidden panel cannot be hovered or clicked; a version of this that only
+    /// skipped rendering would leave an invisible 40px strip eating clicks along the top of every
+    /// fullscreen window.
+    pub fn panel_visible_on(&self, output: &Output) -> bool {
+        if self.layout.is_overview_open() {
+            return true;
+        }
+
+        !self
+            .layout
+            .monitor_for_output(output)
+            .is_some_and(|mon| mon.render_above_top_layer())
+    }
+
     /// The workspace snapshot for `output`'s monitor, driving that panel's dot indicator.
     pub fn workspace_state_for(&self, output: &Output) -> crate::ui::panel::WorkspaceState {
         let (count, active) = self
@@ -10588,29 +10616,34 @@ impl Synoik {
             for element in self.osd.render(ctx.renderer, &self.icon_cache, output) {
                 push(element.into());
             }
-            for element in self.panel.render(
-                ctx.renderer,
-                output,
-                ws,
-                ws_position,
-                overview_fade,
-                crate::render_helpers::icon::DrawCaches {
-                    icons: &self.icon_cache,
-                    images: &self.image_cache,
-                },
-            ) {
-                push(element.into());
-            }
-            // A panel popover (dateMenu calendar, quick settings, …) sits above the
-            // bar; the quick-settings menu composites several elements (chrome + icons).
-            for element in self.panel_popover.render(
-                ctx.renderer,
-                &self.icon_cache,
-                &self.app_icon_cache,
-                &self.image_cache,
-                output,
-            ) {
-                push(element.into());
+            // Hidden over a fullscreen window, and with it its popovers — see
+            // `panel_visible_on`. The OSD above is deliberately outside this: it is not
+            // `trackFullscreen` chrome and shows over fullscreen windows in GNOME too.
+            if self.panel_visible_on(output) {
+                for element in self.panel.render(
+                    ctx.renderer,
+                    output,
+                    ws,
+                    ws_position,
+                    overview_fade,
+                    crate::render_helpers::icon::DrawCaches {
+                        icons: &self.icon_cache,
+                        images: &self.image_cache,
+                    },
+                ) {
+                    push(element.into());
+                }
+                // A panel popover (dateMenu calendar, quick settings, …) sits above the
+                // bar; the quick-settings menu composites several elements (chrome + icons).
+                for element in self.panel_popover.render(
+                    ctx.renderer,
+                    &self.icon_cache,
+                    &self.app_icon_cache,
+                    &self.image_cache,
+                    output,
+                ) {
+                    push(element.into());
+                }
             }
             // The notification banner slides out from under the bar (pushed after
             // the panel = below it in z, like gnome-shell's tray behind the panel).
