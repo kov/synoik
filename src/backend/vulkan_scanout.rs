@@ -41,6 +41,7 @@ use smithay::backend::drm::exporter::{ExportBuffer, ExportFramebuffer};
 use smithay::backend::drm::{DrmDeviceFd, DrmNode, Framebuffer};
 use smithay::reexports::drm::buffer::{Handle as DrmBufferHandle, PlanarBuffer};
 use smithay::reexports::drm::control::{framebuffer, Device as ControlDevice, FbCmd2Flags};
+use smithay::reexports::drm::{Device as BasicDevice, DriverCapability};
 use smithay::utils::{Buffer as BufferCoords, Size};
 use synoik_vk::gpu::Gpu;
 use synoik_vk::texture::{ScanoutExport, Texture};
@@ -115,19 +116,32 @@ impl Allocator for VulkanScanoutAllocator {
         fourcc: Fourcc,
         modifiers: &[Modifier],
     ) -> Result<Self::Buffer, Self::Error> {
-        // `Modifier::Invalid` has no encoding in `VkImageDrmFormatModifierListCreateInfoEXT`, and
-        // it never reaches us any more: it only appeared when the KMS driver advertised no
-        // `IN_FORMATS` blob at all, which the guest kernel has done since 7.1.6. Drop it rather
-        // than substitute LINEAR — guessing a layout is how a buffer scans out as garbage.
-        let candidates: Vec<u64> = modifiers
+        // `Modifier::Invalid` has no encoding in `VkImageDrmFormatModifierListCreateInfoEXT`, so it
+        // is asked for as LINEAR. INVALID reaches us when the KMS plane publishes no `IN_FORMATS`
+        // blob and therefore advertises its fourccs implicitly — stock virtio-gpu, which on this
+        // stack is the only plane there is. That driver has no tiling, so its buffers are linear by
+        // construction; asking Vulkan for LINEAR names the layout the plane would have assumed
+        // anyway, which is the opposite of guessing. The buffer still reports whatever modifier the
+        // driver actually picked, below.
+        //
+        // On real hardware INVALID means "unknown, ask the allocator" and this substitution would
+        // be wrong; see `scanout_render_formats` in `backend::tty` for why this stack is different.
+        let mut candidates: Vec<u64> = modifiers
             .iter()
-            .filter(|m| **m != Modifier::Invalid)
-            .map(|m| u64::from(*m))
+            .map(|m| {
+                if *m == Modifier::Invalid {
+                    u64::from(Modifier::Linear)
+                } else {
+                    u64::from(*m)
+                }
+            })
             .collect();
+        // INVALID may collapse onto an already-offered LINEAR; Vulkan wants a set, not a list.
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|m| seen.insert(*m));
         if candidates.is_empty() {
             return Err(AllocateError(format!(
-                "no usable DRM modifier offered for a {fourcc:?} scanout buffer (asked with \
-                 {modifiers:?}); INVALID cannot be named to Vulkan"
+                "no DRM modifier offered for a {fourcc:?} scanout buffer"
             )));
         }
 
@@ -299,6 +313,7 @@ pub enum ExportError {
     Prime(std::io::Error),
     AddFramebuffer(std::io::Error),
     NoModifier,
+    UnnameableModifier(Modifier),
 }
 
 impl std::fmt::Display for ExportError {
@@ -315,6 +330,11 @@ impl std::fmt::Display for ExportError {
                 write!(f, "adding a framebuffer for a dmabuf failed: {err}")
             }
             Self::NoModifier => f.write_str("a dmabuf with modifier INVALID cannot be scanned out"),
+            Self::UnnameableModifier(modifier) => write!(
+                f,
+                "the KMS device does not support DRM_CAP_ADDFB2_MODIFIERS, so a buffer with \
+                 modifier {modifier:?} cannot be described to it"
+            ),
         }
     }
 }
@@ -323,7 +343,7 @@ impl std::error::Error for ExportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Export(err) | Self::Prime(err) | Self::AddFramebuffer(err) => Some(err),
-            Self::NoModifier => None,
+            Self::NoModifier | Self::UnnameableModifier(_) => None,
         }
     }
 }
@@ -350,6 +370,11 @@ impl ExportFramebuffer<VulkanScanoutBuffer> for PrimeFramebufferExporter {
                 if dmabuf.format().modifier == Modifier::Invalid {
                     return Ok(None);
                 }
+                // Likewise a client buffer whose layout this device has no way to be told about
+                // declines scanout rather than failing the frame.
+                if !device_names_modifiers(drm) && dmabuf.format().modifier != Modifier::Linear {
+                    return Ok(None);
+                }
                 dmabuf.clone()
             }
             ExportBuffer::Allocator(buffer) => buffer.export().map_err(ExportError::Export)?,
@@ -369,6 +394,18 @@ impl ExportFramebuffer<VulkanScanoutBuffer> for PrimeFramebufferExporter {
     }
 }
 
+/// Whether `drm` accepts `DRM_MODE_FB_MODIFIERS` on `AddFB2` at all.
+///
+/// A device without the capability rejects the flag outright, so a buffer's layout can only be
+/// implied there, never named. Stock virtio-gpu is such a device — it advertises no `IN_FORMATS`
+/// blob either, which is the same fact seen from the plane side.
+fn device_names_modifiers(drm: &DrmDeviceFd) -> bool {
+    matches!(
+        drm.get_driver_capability(DriverCapability::AddFB2Modifiers),
+        Ok(1)
+    )
+}
+
 /// PRIME-import every plane of `dmabuf` on `drm` and add a framebuffer for it.
 ///
 /// `use_opaque` substitutes the alpha-less twin of the fourcc (`Argb8888` → `Xrgb8888`), which is
@@ -383,6 +420,16 @@ fn framebuffer_from_dmabuf(
     // it is a coin flip between a picture and garbage.
     if dmabuf.format().modifier == Modifier::Invalid {
         return Err(ExportError::NoModifier);
+    }
+
+    // A device without `DRM_CAP_ADDFB2_MODIFIERS` rejects `AddFB2` with `DRM_MODE_FB_MODIFIERS`
+    // outright, so a modifier cannot be named to it at all — it assumes the driver's implicit
+    // layout. That is only the same buffer we have if the buffer is LINEAR, which on the one
+    // driver that lands here (stock virtio-gpu, no tiling) is what every buffer is. Anything else
+    // is refused rather than handed over unnamed, which is the garbage case below.
+    let name_modifier = device_names_modifiers(drm);
+    if !name_modifier && dmabuf.format().modifier != Modifier::Linear {
+        return Err(ExportError::UnnameableModifier(dmabuf.format().modifier));
     }
 
     let mut handles = [None; 4];
@@ -413,18 +460,24 @@ fn framebuffer_from_dmabuf(
     let planar = DmabufPlanes {
         size: (dmabuf.width(), dmabuf.height()),
         code,
-        modifier: dmabuf.format().modifier,
+        // `add_planar_framebuffer` *asserts* that the flag and this agree, so it is not enough to
+        // drop the flag.
+        modifier: name_modifier.then_some(dmabuf.format().modifier),
         handles,
         pitches,
         offsets,
     };
 
-    // No legacy `AddFB` fallback: it exists for drivers that reject `DRM_MODE_FB_MODIFIERS`, and
-    // this whole path is gated on a plane that advertises modifiers through `IN_FORMATS`. If this
-    // fails, the layout really is unacceptable to the display engine and silently retrying without
-    // naming it would be the garbage case above.
+    // Still no legacy `AddFB` fallback: this is `AddFB2` either way, only without naming a modifier
+    // on a device that has no way to hear one. If it fails, the layout really is unacceptable to
+    // the display engine and retrying differently would be the garbage case above.
+    let flags = if name_modifier {
+        FbCmd2Flags::MODIFIERS
+    } else {
+        FbCmd2Flags::empty()
+    };
     let fb = drm
-        .add_planar_framebuffer(&planar, FbCmd2Flags::MODIFIERS)
+        .add_planar_framebuffer(&planar, flags)
         .map_err(ExportError::AddFramebuffer)?;
 
     Ok(PrimeFramebuffer {
@@ -464,7 +517,8 @@ impl Drop for GemHandles<'_> {
 struct DmabufPlanes {
     size: (u32, u32),
     code: Fourcc,
-    modifier: Modifier,
+    /// `None` when the device cannot be told a modifier at all (no `DRM_CAP_ADDFB2_MODIFIERS`).
+    modifier: Option<Modifier>,
     handles: [Option<DrmBufferHandle>; 4],
     pitches: [u32; 4],
     offsets: [u32; 4],
@@ -480,7 +534,7 @@ impl PlanarBuffer for DmabufPlanes {
     }
 
     fn modifier(&self) -> Option<Modifier> {
-        Some(self.modifier)
+        self.modifier
     }
 
     fn pitches(&self) -> [u32; 4] {

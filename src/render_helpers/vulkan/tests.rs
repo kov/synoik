@@ -2717,6 +2717,61 @@ fn vulkan_renders_into_its_own_scanout_dmabuf() {
     );
 }
 
+/// A KMS plane that publishes no `IN_FORMATS` blob advertises its fourccs with the implicit
+/// `INVALID` modifier, and smithay's swapchain then asks the allocator for exactly that. `INVALID`
+/// has no encoding in `VkImageDrmFormatModifierListCreateInfoEXT`, so the allocator asks Vulkan for
+/// LINEAR instead — the layout such a plane assumes anyway. This is the single line stock
+/// virtio-gpu's display depends on; getting it wrong is a compositor that never starts.
+///
+/// The buffer must come back naming the modifier the *driver* chose, never `INVALID`: everything
+/// downstream (the dmabuf export, the renderer's re-import, `AddFB2`) reads the layout off it.
+#[test]
+fn vulkan_scanout_allocator_treats_invalid_as_linear() {
+    use smithay::backend::allocator::{Allocator, Buffer as _, Modifier};
+
+    use crate::backend::vulkan_scanout::VulkanScanoutAllocator;
+
+    let vk = match VulkanRenderer::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_scanout_allocator_treats_invalid_as_linear: no Vulkan device ({e})"
+            );
+            return;
+        }
+    };
+
+    let mut alloc = match VulkanScanoutAllocator::new(vk.gpu().clone(), None) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("skipping vulkan_scanout_allocator_treats_invalid_as_linear: {e:#}");
+            return;
+        }
+    };
+
+    let buffer = alloc
+        .create_buffer(W as u32, H as u32, NATIVE_FOURCC, &[Modifier::Invalid])
+        .expect("an INVALID-only modifier list must still allocate, as explicit LINEAR");
+
+    assert_eq!(buffer.format().code, NATIVE_FOURCC);
+    assert_eq!(
+        buffer.format().modifier,
+        Modifier::Linear,
+        "the buffer must name the layout it actually has, not the INVALID it was asked with",
+    );
+
+    // INVALID collapsing onto an offered LINEAR must not duplicate the candidate.
+    let both = alloc
+        .create_buffer(
+            W as u32,
+            H as u32,
+            NATIVE_FOURCC,
+            &[Modifier::Invalid, Modifier::Linear],
+        )
+        .expect("INVALID alongside LINEAR must allocate");
+    assert_eq!(both.format().modifier, Modifier::Linear);
+}
+
 // --- client dmabuf import cache: reuse the imported image across commits, evict freed buffers ----
 
 /// The client-dmabuf import cache (`import_dmabuf_as_texture`) keeps a client's imported

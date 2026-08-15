@@ -56,6 +56,31 @@ The framebuffer then comes from `PrimeFramebufferExporter`: `drmPrimeFDToHandle`
 `AddFB2` with `DRM_MODE_FB_MODIFIERS`, and the imported GEM handles closed as soon as the FB holds
 its own reference.
 
+### The implicit-modifier plane
+
+A **stock** virtio-gpu (no `DRM_CAP_ADDFB2_MODIFIERS`, no `IN_FORMATS` blob) advertises its plane
+formats with the implicit/`INVALID` modifier, so a plain intersection against a LINEAR-only renderer
+set is empty and `DrmCompositor::new` fails with *"No supported plane buffer format found"* — the
+fourcc matched, only the modifier did not. That is a compositor that never starts, which reads as a
+boot hang (gdm never takes the display, `plymouth-quit-wait` never completes).
+
+Three places cooperate to accept it, and none of them guesses a layout:
+
+- `scanout_render_formats` (`backend/tty.rs`) adds an `INVALID` twin per LINEAR entry, **for the
+  compositor negotiation only** — `owned_vulkan_dmabuf_formats`, which is also what clients see,
+  stays explicit.
+- `VulkanScanoutAllocator::create_buffer` asks Vulkan for LINEAR when offered `INVALID`
+  (`INVALID` has no encoding in `VkImageDrmFormatModifierListCreateInfoEXT`), and still reports back
+  whatever modifier the driver picked.
+- `framebuffer_from_dmabuf` drops the `DRM_MODE_FB_MODIFIERS` flag when the device has no
+  `DRM_CAP_ADDFB2_MODIFIERS` — still `AddFB2`, just without naming a modifier to a device that
+  cannot hear one. A non-LINEAR buffer is refused there rather than handed over unnamed.
+
+This is safe **because of what this plane is**: virtio-gpu has no tiling, so its buffers are linear
+by construction, and our scanout buffers are created by the host through venus, so the host already
+knows their exact layout. On real hardware `INVALID` means "unknown, ask the allocator" and refusing
+it stays correct.
+
 ### Why the exporter had to be rewritten too
 
 Smithay's `GbmFramebufferExporter` turns a buffer into a `framebuffer::Handle` by importing it
@@ -97,6 +122,10 @@ Verified present on this stack (2026-08-05, `vulkaninfo` + `drm_info /dev/dri/ca
 | `VK_EXT_external_memory_dma_buf`, `VK_KHR_external_memory_fd` | present |
 | `DRM_CAP_ADDFB2_MODIFIERS` | 1 |
 | primary + cursor plane `IN_FORMATS` | `DRM_FORMAT_MOD_LINEAR` for XRGB/ARGB/XBGR/ABGR8888 |
+
+Those last two rows were a **limina kernel patch**, not upstream: guest kernel 7.1.8 dropped it, so
+the cap is `0` and the primary plane advertises `XR24` alone with `INVALID`. See *The
+implicit-modifier plane* above — the compositor handles both shapes now, and must keep doing so.
 | host KosmicKrisp modifiers | LINEAR only |
 
 **LINEAR only** — do not negotiate other modifiers on this stack; the host advertises nothing else.

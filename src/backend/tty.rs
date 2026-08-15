@@ -23,7 +23,7 @@ use libc::dev_t;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::GbmDevice;
-use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::{Format, Fourcc};
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
 use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, NodeType, VrrSupport,
@@ -1453,7 +1453,7 @@ impl Tty {
         //
         // The GLES path used to filter CCS modifiers out of the EGL set here for bandwidth
         // reasons; LINEAR-only sidesteps that entirely.
-        let render_formats = owned_vulkan_dmabuf_formats();
+        let render_formats = scanout_render_formats(owned_vulkan_dmabuf_formats());
 
         // Create the compositor. `gbm` here is only the *cursor*-plane allocator (CPU-written
         // CURSOR buffers that KMS reads and Vulkan never touches), which is why it survives the
@@ -1472,9 +1472,9 @@ impl Tty {
             Some(device.gbm.clone()),
         );
 
-        // The GLES path's retry-with-invalid-modifier fallback does not apply: every format here
-        // names LINEAR explicitly, and INVALID is refused at allocation rather than papered over.
-        // Surface the error instead.
+        // No retry-with-a-different-set fallback: the INVALID case a fallback would exist for is
+        // already inside `scanout_render_formats`, and anything left is a genuine mismatch between
+        // what the renderer can produce and what the plane can display. Surface the error instead.
         let mut compositor =
             res.context("error creating DRM compositor for the Vulkan renderer")?;
 
@@ -2835,6 +2835,38 @@ fn owned_vulkan_dmabuf_formats() -> FormatSet {
     crate::render_helpers::vulkan::dmabuf_formats()
 }
 
+/// The renderer's formats, widened with an INVALID-modifier twin of every LINEAR entry, for the
+/// `DrmCompositor` scanout-format negotiation *only*.
+///
+/// A KMS plane that publishes no `IN_FORMATS` blob (no `DRM_CAP_ADDFB2_MODIFIERS`) advertises its
+/// fourccs with the implicit/INVALID modifier, so a plain intersection against a LINEAR-only
+/// renderer set is empty and the compositor fails to start with "No supported plane buffer format
+/// found" — the fourcc matched, only the modifier did not. Stock virtio-gpu is exactly that plane,
+/// and on this stack it is the *only* plane.
+///
+/// Accepting INVALID here is safe **because of what this plane is**, and must not be generalised:
+/// virtio-gpu has no tiling, so its buffers are linear by construction, and our scanout buffers are
+/// created by the host through venus, so the host already knows their exact layout — nothing
+/// downstream infers a layout from the modifier. On real hardware INVALID genuinely means "unknown,
+/// ask the allocator" and refusing it stays correct.
+///
+/// Allocation is unaffected: [`VulkanScanoutAllocator`] still names LINEAR to Vulkan when asked
+/// with INVALID (see its `create_buffer`), so nothing is ever guessed.
+///
+/// This deliberately does not widen [`owned_vulkan_dmabuf_formats`] itself: that set is also what
+/// we advertise to clients, and client-facing formats stay explicit.
+fn scanout_render_formats(formats: FormatSet) -> FormatSet {
+    let invalid_twins = formats
+        .iter()
+        .filter(|f| f.modifier == Modifier::Linear)
+        .map(|f| Format {
+            code: f.code,
+            modifier: Modifier::Invalid,
+        })
+        .collect::<Vec<_>>();
+    formats.into_iter().chain(invalid_twins).collect()
+}
+
 fn surface_dmabuf_feedback(
     compositor: &ScanoutDrmCompositor,
     primary_formats: FormatSet,
@@ -3921,7 +3953,8 @@ mod tests {
     use synoik_ipc::{HSyncPolarity, VSyncPolarity};
 
     use crate::backend::tty::{
-        calculate_drm_mode_from_modeline, calculate_mode_cvt, owned_vulkan_dmabuf_formats, Modifier,
+        calculate_drm_mode_from_modeline, calculate_mode_cvt, owned_vulkan_dmabuf_formats,
+        scanout_render_formats, Modifier,
     };
 
     #[test]
@@ -3929,6 +3962,34 @@ mod tests {
         for format in owned_vulkan_dmabuf_formats() {
             assert_ne!(format.modifier, Modifier::Invalid, "{format:?}");
         }
+    }
+
+    /// A plane with no `IN_FORMATS` blob advertises its fourccs with INVALID; without a twin per
+    /// LINEAR entry the scanout intersection is empty and the compositor never starts.
+    #[test]
+    fn scanout_formats_gain_an_invalid_twin_per_linear() {
+        let base = owned_vulkan_dmabuf_formats();
+        let widened = scanout_render_formats(base.clone());
+
+        // Nothing is lost.
+        for format in base.iter() {
+            assert!(widened.contains(format), "{format:?} dropped");
+        }
+
+        for format in base.iter() {
+            assert_eq!(format.modifier, Modifier::Linear, "{format:?}");
+            let implicit = crate::backend::tty::Format {
+                code: format.code,
+                modifier: Modifier::Invalid,
+            };
+            assert!(
+                widened.contains(&implicit),
+                "no implicit twin for {format:?}"
+            );
+        }
+
+        // And exactly one twin each, nothing invented.
+        assert_eq!(widened.iter().count(), base.iter().count() * 2);
     }
 
     #[test]
