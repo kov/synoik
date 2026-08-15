@@ -145,12 +145,10 @@ pub struct VulkanRenderer {
     defer_scanout: bool,
     /// The host-visible buffer every readback copies into, grown on demand and reused.
     ///
-    /// This used to be a fresh `VkBuffer` + `HOST_VISIBLE` allocation per call. On Venus
-    /// host-visible memory is a virtio-gpu blob, and shm screencopy reads back **every frame** —
-    /// per-frame mappable-blob churn, which costs real host time and host pool pressure.
-    /// (It used to *abort* the session; that was fixed at the VMM level in 2026-07, so this is
-    /// now a performance and resource argument, not a stability one — but it is still the
-    /// reason this is cached.) Grow-only, so a steady stream of same-size reads allocates once;
+    /// This used to be a fresh `VkBuffer` + `HOST_VISIBLE` allocation per call. On Venus every
+    /// allocation is a synchronous host round trip, and shm screencopy reads back **every frame**,
+    /// so the per-call allocation cost real host time for nothing. Grow-only, so a steady stream
+    /// of same-size reads allocates once;
     /// a larger read grows it and smaller ones then reuse the larger buffer.
     readback_staging_buffer: synoik_vk::texture::Staging,
     /// Count of readback host-buffer (re)allocations (test-only): the no-churn invariant is that
@@ -162,16 +160,15 @@ pub struct VulkanRenderer {
     upscale_filter: TextureFilter,
     debug_flags: DebugFlags,
     /// Reused shadows for the present-blit path, keyed by target size and kept across
-    /// frames so `bind` does not allocate a full-screen device image every frame (which exhausts
-    /// host memory on Venus under sustained rendering).
+    /// frames so `bind` does not allocate a full-screen device image every frame (on Venus every
+    /// allocation is a synchronous host round trip).
     ///
     /// Keyed by size rather than held in a single slot because **several differently-sized
     /// `Argb8888`/`Xrgb8888` targets are bound within one frame**: the scanout buffer of each
     /// output, a screencast buffer (window casts are sized to the window's bbox, and a rotated
     /// output's cast is transform-sized), and any screencopy region. A single slot would evict and
-    /// reallocate on every bind as those alternate — exactly the per-frame Venus blob churn these
-    /// caches exist to avoid (costly on the host; no longer an abort — see
-    /// `readback_staging_buffer`).
+    /// reallocate on every bind as those alternate — exactly the per-frame host allocation these
+    /// caches exist to avoid.
     ///
     /// Bounded by [`MAX_PRESENT_BLIT_SHADOWS`], evicting least-recently-used, so a stream of new
     /// sizes (an interactively resized window cast renegotiates its size as it grows) cannot grow
@@ -3249,10 +3246,8 @@ impl VulkanRenderer {
     /// and the renderer's cache the other, so dropping the frame does not free the image — it is
     /// reused next frame, and an eviction here cannot pull an image out from under a live frame.
     ///
-    /// This keeps `bind` from allocating a target-sized device image every frame — the memory
-    /// churn that exhausts host memory on Venus under sustained rendering (it used to abort the
-    /// session; that was fixed at the VMM level in 2026-07, see [`Self::readback_staging_buffer`]).
-    /// Safe because rendering is synchronous
+    /// This keeps `bind` from allocating a target-sized device image every frame, which on Venus
+    /// is a synchronous host round trip. Safe because rendering is synchronous
     /// (`finish` CPU-waits), so no shadow is read or written by two frames at once — including
     /// the shadow two *different* consumers of the same size share. See
     /// [`Self::present_blit_shadows`].
@@ -3286,7 +3281,7 @@ impl VulkanRenderer {
         }
 
         // Same reasoning as the present-blit shadows: evicting a size that is read back every frame
-        // would reallocate it every frame, which is the Venus blob churn this cache prevents. If
+        // would reallocate it every frame, which is the host allocation this cache prevents. If
         // this logs steadily, the cap is too low.
         if self.readback_staging.len() >= MAX_READBACK_STAGING {
             if let Some(&lru) = self

@@ -49,7 +49,7 @@ impl OffscreenRenderer for VulkanRenderer {
         // it — our keep-alive, not a foreign owner. Counting them is answering "not unique" about
         // ourselves, and the caller's answer to "not unique" is to throw the texture away and
         // allocate a new one: per frame, per blurred window, along with its blur chain. That is
-        // the virtio-gpu blob churn this path exists to avoid (host time and host pool pressure —
+        // the per-frame host allocation this path exists to avoid (host time and pool pressure —
         // `VulkanRenderer::readback_staging_buffer` for why it is no longer an abort), and it
         // re-queues the blur on the fresh chain each time — four full-output blurs in a frame that
         // needed one.

@@ -3685,7 +3685,7 @@ fn vulkan_alternating_present_blit_sizes_reuse_shadows() {
             vk.present_blit_shadow_allocs(),
             2,
             "frame {frame_no}: each bound size must allocate its shadow once and reuse it \
-             thereafter; a growing count is the per-frame blob churn these caches exist to avoid \
+             thereafter; a growing count is the per-frame host allocation these caches avoid \
              (host time and host pool pressure — see VulkanRenderer::readback_staging_buffer)",
         );
     }
@@ -4093,7 +4093,7 @@ fn vulkan_repeated_converting_readbacks_reuse_staging() {
         vk.readback_staging_allocs(),
         1,
         "a converting readback of one size must allocate its staging image once, not per call \
-         (per-frame blob churn — see VulkanRenderer::readback_staging_buffer)",
+         (per-frame host allocation — see VulkanRenderer::readback_staging_buffer)",
     );
 
     // The host-visible buffer the pixels land in is the *other* per-call allocation, and the more

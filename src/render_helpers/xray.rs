@@ -424,7 +424,7 @@ impl RenderElement<VulkanRenderer> for XrayElement {
         // failed to run) — nothing to draw. The clone is frame-scoped only (the frame
         // retains it until `finish`); the element never caches it, so the next prepare
         // keeps the offscreen texture uniquely referenced (else a per-frame recreate +
-        // blur-chain rebuild — Venus blob churn, costly on the host).
+        // blur-chain rebuild — a per-frame host allocation, costly on Venus).
         let Some(texture) = buffer.texture_vulkan(self.blur) else {
             return Ok(());
         };
