@@ -465,6 +465,17 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let is_open = state.overview.is_open;
             Response::OverviewState(Overview { is_open })
         }
+        Request::DebugFocusState => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let _ = tx.send_blocking(state.synoik.debug_focus_state());
+            });
+            let debug = rx
+                .recv()
+                .await
+                .map_err(|_| String::from("error getting debug focus state"))?;
+            Response::DebugFocusState(debug)
+        }
         Request::FramePerf => {
             let (tx, rx) = async_channel::bounded(1);
             ctx.event_loop.insert_idle(move |state| {

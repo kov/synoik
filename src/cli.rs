@@ -181,6 +181,8 @@ pub enum Msg {
     RequestError,
     /// Print the overview state.
     OverviewState,
+    /// Print the live overview, keyboard-focus and input-method state, for debugging.
+    DebugFocusState,
     /// List screencasts.
     Casts,
     /// Print this session's frame-timing tallies.

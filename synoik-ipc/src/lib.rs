@@ -123,6 +123,14 @@ pub enum Request {
     ReturnError,
     /// Request information about the overview.
     OverviewState,
+    /// Request the **live** overview / keyboard-focus / input-method state, for debugging.
+    ///
+    /// Unlike [`Request::OverviewState`], which answers from the event-stream mirror, this is
+    /// read on the compositor thread so it cannot disagree with what the render and input paths
+    /// actually see. It exists because a live wedge on 2026-08-15 (the overview reported open
+    /// while a fullscreen window still rendered above it, and the input method drove ibus at
+    /// 78 Hz) could only be diagnosed by inferring internal state from its side effects.
+    DebugFocusState,
     /// Request information about screencasts.
     Casts,
     /// Request the frame-timing tallies for this session.
@@ -240,6 +248,8 @@ pub enum Response {
     OutputConfigChanged(OutputConfigChanged),
     /// Information about the overview.
     OverviewState(Overview),
+    /// The live overview / keyboard-focus / input-method state.
+    DebugFocusState(DebugFocusState),
     /// Information about screencasts.
     Casts(Vec<Cast>),
     /// Frame-timing tallies for this session.
@@ -330,6 +340,46 @@ pub struct FramePerfOutput {
 pub struct Overview {
     /// Whether the overview is currently open.
     pub is_open: bool,
+}
+
+/// The live overview, keyboard-focus and input-method state — a debugging snapshot.
+///
+/// Every field here is one that a 2026-08-15 wedge had to be *inferred* from side effects: the
+/// overview's open flag disagreeing with its progress, keyboard focus being on neither a window
+/// nor the overview, and the input method's focus flapping. Read together they say which of
+/// those is true in one command.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct DebugFocusState {
+    /// `Layout::is_overview_open()` — the flag, which is what the IPC and the panel consult.
+    pub overview_open: bool,
+    /// The overview's animation progress, 0 closed to 1 open. **`None` while `overview_open` is
+    /// true is the desync**: it makes `render_above_top_layer()` true again, so a fullscreen
+    /// window draws over the overview.
+    pub overview_progress: Option<f64>,
+    /// Which kind of progress it is: `Open`, `Animation` or `Gesture`.
+    pub overview_progress_kind: Option<String>,
+    /// Whether the focused monitor is drawing a window above the top layer — the predicate that
+    /// hides the overview and the panel behind a fullscreen window.
+    pub render_above_top_layer: Option<bool>,
+    /// The compositor's keyboard focus, as its variant name. `Layout` with no surface means
+    /// nothing is focused *and* the overview does not hold focus either.
+    pub keyboard_focus: String,
+    /// Whether an input method is configured at all.
+    pub input_method: bool,
+    /// Which entry the engine is focused on: `None`, `Client`, or `Shell(<entry>)`.
+    pub im_focus: String,
+    /// Whether the worker has a live ibus connection.
+    pub im_connected: bool,
+    /// Whether the focused *client* has text input enabled — one input to `im_focus`, and the
+    /// thing that flapping makes the engine's focus flap.
+    pub im_client_enabled: bool,
+    /// How many keystrokes are held back awaiting a verdict.
+    pub im_pending_keys: usize,
+    /// Consecutive keys that expired unanswered.
+    pub im_unanswered: u32,
+    /// Whether that tripped passthrough — keys stop being held for a verdict.
+    pub im_unresponsive: bool,
 }
 
 /// Color picked from the screen.

@@ -54,6 +54,7 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
         Msg::EventStream => Request::EventStream,
         Msg::RequestError => Request::ReturnError,
         Msg::OverviewState => Request::OverviewState,
+        Msg::DebugFocusState => Request::DebugFocusState,
         Msg::Casts => Request::Casts,
         Msg::FramePerf => Request::FramePerf,
         Msg::Input { input } => Request::InjectInput {
@@ -541,6 +542,57 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                 println!("Overview is open.");
             } else {
                 println!("Overview is closed.");
+            }
+        }
+        Msg::DebugFocusState => {
+            let Response::DebugFocusState(d) = response else {
+                bail!("unexpected response: expected DebugFocusState, got {response:?}");
+            };
+
+            if json {
+                let d = serde_json::to_string(&d).context("error formatting response")?;
+                println!("{d}");
+                return Ok(());
+            }
+
+            let progress = match (d.overview_progress, &d.overview_progress_kind) {
+                (Some(v), Some(kind)) => format!("{v:.3} ({kind})"),
+                _ => String::from("none"),
+            };
+            println!("Overview:");
+            println!("  open:            {}", d.overview_open);
+            println!("  progress:        {progress}");
+            println!(
+                "  above top layer: {}",
+                match d.render_above_top_layer {
+                    Some(v) => v.to_string(),
+                    None => String::from("no active monitor"),
+                }
+            );
+            // The pairing, not either flag, is what a wedge looks like: the compositor believes
+            // the overview is up while every monitor is told to draw the fullscreen window over
+            // it, so the screen keeps showing a client that no longer has focus.
+            if d.overview_open && d.overview_progress.is_none() {
+                println!("  !! open with no progress — monitors will render above the top layer");
+            }
+            println!("Keyboard focus:    {}", d.keyboard_focus);
+            println!("Input method:");
+            if !d.input_method {
+                println!("  none configured");
+            } else {
+                println!("  focus:           {}", d.im_focus);
+                println!("  connected:       {}", d.im_connected);
+                println!("  client enabled:  {}", d.im_client_enabled);
+                println!("  pending keys:    {}", d.im_pending_keys);
+                println!(
+                    "  unanswered:      {}{}",
+                    d.im_unanswered,
+                    if d.im_unresponsive {
+                        " (passthrough)"
+                    } else {
+                        ""
+                    }
+                );
             }
         }
         Msg::Casts => {

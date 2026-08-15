@@ -5955,6 +5955,26 @@ impl<W: LayoutElement> Layout<W> {
         changed
     }
 
+    /// The overview's animation progress and which kind it is, for debugging.
+    ///
+    /// `None` while [`Layout::is_overview_open`] is true is a **desync**: the monitors are told
+    /// `set_overview_progress(None)`, so a fullscreen window renders above the top layer again
+    /// and draws over an overview the rest of the compositor believes is up.
+    pub fn overview_progress_debug(&self) -> Option<(f64, &'static str)> {
+        let progress = self.overview_progress.as_ref()?;
+        let kind = match progress {
+            OverviewProgress::Animation(_) => "Animation",
+            OverviewProgress::Gesture(_) => "Gesture",
+            OverviewProgress::Open => "Open",
+        };
+        Some((progress.value(), kind))
+    }
+
+    /// Whether the active monitor is drawing a window above the top layer.
+    pub fn active_monitor_renders_above_top_layer(&self) -> Option<bool> {
+        Some(self.active_monitor_ref()?.render_above_top_layer())
+    }
+
     /// Whether the overview is still animating open — see
     /// [`Monitor::is_overview_opening`]. Asked of the active monitor, the one the
     /// overlay key is about to act on.

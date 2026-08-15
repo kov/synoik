@@ -1542,6 +1542,39 @@ impl Default for SurfaceFrameThrottlingState {
 }
 
 impl KeyboardFocus {
+    /// The variant's name, plus whether it carries a surface, for debugging.
+    ///
+    /// `Layout(none)` is the interesting one: it is what focus falls back to when nothing can
+    /// take it, and it is indistinguishable from a focused window in every other readout.
+    pub fn debug_name(&self) -> String {
+        let name = match self {
+            KeyboardFocus::Layout { .. } => "Layout",
+            KeyboardFocus::LayerShell { .. } => "LayerShell",
+            KeyboardFocus::LockScreen { .. } => "LockScreen",
+            KeyboardFocus::ScreenshotUi => "ScreenshotUi",
+            KeyboardFocus::ExitConfirmDialog => "ExitConfirmDialog",
+            KeyboardFocus::RunDialog => "RunDialog",
+            KeyboardFocus::EndSessionDialog => "EndSessionDialog",
+            KeyboardFocus::PolkitDialog => "PolkitDialog",
+            KeyboardFocus::Popover => "Popover",
+            KeyboardFocus::Overview => "Overview",
+            KeyboardFocus::Switcher => "Switcher",
+        };
+        match self {
+            KeyboardFocus::Layout { .. }
+            | KeyboardFocus::LayerShell { .. }
+            | KeyboardFocus::LockScreen { .. } => {
+                let surface = if self.surface().is_some() {
+                    "surface"
+                } else {
+                    "none"
+                };
+                format!("{name}({surface})")
+            }
+            _ => name.to_owned(),
+        }
+    }
+
     pub fn surface(&self) -> Option<&WlSurface> {
         match self {
             KeyboardFocus::Layout { surface } => surface.as_ref(),
@@ -8215,6 +8248,35 @@ impl Synoik {
         backend.set_monitors_active(true);
 
         self.queue_redraw_all();
+    }
+
+    /// A snapshot of the overview, keyboard-focus and input-method state, for `synoik msg
+    /// debug-focus-state`.
+    ///
+    /// Every field here had to be inferred from side effects during a 2026-08-15 wedge, where
+    /// unfocusing a fullscreen client left the compositor presenting that client's last frame
+    /// forever. Reading them together is one command instead of an afternoon.
+    pub fn debug_focus_state(&self) -> synoik_ipc::DebugFocusState {
+        let progress = self.layout.overview_progress_debug();
+        let im = self.input_method.as_ref();
+        let (pending, unanswered) = im.map_or(
+            (0, 0),
+            crate::input_method::InputMethod::pending_and_unanswered,
+        );
+        synoik_ipc::DebugFocusState {
+            overview_open: self.layout.is_overview_open(),
+            overview_progress: progress.map(|(value, _)| value),
+            overview_progress_kind: progress.map(|(_, kind)| kind.to_owned()),
+            render_above_top_layer: self.layout.active_monitor_renders_above_top_layer(),
+            keyboard_focus: self.keyboard_focus.debug_name(),
+            input_method: im.is_some(),
+            im_focus: im.map_or_else(|| String::from("-"), |im| format!("{:?}", im.focus())),
+            im_connected: im.is_some_and(crate::input_method::InputMethod::is_connected),
+            im_client_enabled: im.is_some_and(crate::input_method::InputMethod::is_enabled),
+            im_pending_keys: pending,
+            im_unanswered: unanswered,
+            im_unresponsive: im.is_some_and(crate::input_method::InputMethod::is_unresponsive),
+        }
     }
 
     pub fn output_under(&self, pos: Point<f64, Logical>) -> Option<(&Output, Point<f64, Logical>)> {

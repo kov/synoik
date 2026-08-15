@@ -361,6 +361,18 @@ impl InputMethod {
         !self.pending.is_empty()
     }
 
+    /// Whether the worker has a live ibus connection. For debugging — the key path asks
+    /// [`InputMethod::wants_keys`], which already folds this in.
+    pub fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    /// How many keys are held back, and how many consecutive keys have expired unanswered.
+    /// For debugging only; see [`InputMethod::is_unresponsive`] for the behaviour they drive.
+    pub fn pending_and_unanswered(&self) -> (usize, u32) {
+        (self.pending.len(), self.unanswered)
+    }
+
     /// The preedit currently shown to the client, if any.
     pub fn preedit(&self) -> Option<&str> {
         self.preedit.as_deref()
