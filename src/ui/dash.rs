@@ -949,12 +949,15 @@ impl Dash {
         let alpha = progress as f32;
 
         let mut cache = self.cache.borrow_mut();
-        // Cached uploads belong to one renderer context; drop them if it changed.
+        // Cached uploads belong to one renderer context; drop them if it changed. Shared map,
+        // per-surface context field — `sync_icon_upload_context` is why that needs care.
         let context = renderer.context_id();
-        if cache.context.as_ref() != Some(&context) {
-            cache.icons.borrow_mut().clear();
-            cache.context = Some(context);
-        }
+        let DashCache {
+            context: seen,
+            icons,
+            ..
+        } = &mut *cache;
+        widget::sync_icon_upload_context(seen, icons, context);
 
         let mut elements = Vec::with_capacity(layout.tiles.len() + 2);
 

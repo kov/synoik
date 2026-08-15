@@ -53,9 +53,32 @@ pub type AppIconUploads = HashMap<(NotNan<f64>, AppIconRef, u16), TextureBuffer<
 /// grid and a search result is uploaded once. Ours were per surface, which meant typing a
 /// query re-uploaded, at the same size, icons the grid already had on the GPU.
 ///
-/// Each surface still keeps its own renderer-context check and clears this when *it* sees
-/// a new context; the first one through does the work and the rest find it already empty.
+/// Each surface still keeps its own renderer-context check, but it must clear this map only on a
+/// real *change* — see [`sync_icon_upload_context`], which is the only correct way to do it.
 pub type SharedAppIconUploads = std::rc::Rc<std::cell::RefCell<AppIconUploads>>;
+
+/// Invalidate the shared icon uploads when *this* surface's renderer context has changed.
+///
+/// The subtlety is that the map is **shared** while the context field is **per surface**. A
+/// surface that has never drawn holds `None`, and treating that as "changed" makes its first
+/// draw clear textures the *other* icon surfaces already uploaded — so their next frame
+/// re-uploads and hands out fresh element `Id`s for icons that did not change. A churned `Id`
+/// throws away the output's backdrop blur, and this fired once per surface, on the frame after
+/// each one first drew.
+///
+/// So: only a `Some(old) != new` invalidates. `None` means this surface holds no textures of its
+/// own yet, so it has nothing to invalidate; whichever surface *did* draw under the old context
+/// still clears the map when it next runs.
+pub fn sync_icon_upload_context(
+    seen: &mut Option<ContextId<VkTexture>>,
+    uploads: &SharedAppIconUploads,
+    context: ContextId<VkTexture>,
+) {
+    if seen.as_ref().is_some_and(|seen| *seen != context) {
+        uploads.borrow_mut().clear();
+    }
+    *seen = Some(context);
+}
 
 /// Drop the uploads of one icon at one logical size, across every output scale.
 ///

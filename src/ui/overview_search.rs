@@ -717,9 +717,9 @@ impl OverviewSearch {
 
         let mut cache = self.cache.borrow_mut();
         let context = renderer.context_id();
-        if cache.context.as_ref() != Some(&context) {
-            cache.icons.borrow_mut().clear();
-            cache.context = Some(context);
+        {
+            let cache = &mut *cache;
+            crate::ui::widget::sync_icon_upload_context(&mut cache.context, &cache.icons, context);
         }
 
         let mut elements = Vec::new();
