@@ -3207,12 +3207,11 @@ fn render_surface_with(
     rv
 }
 
-/// The `DrmCompositor` scanout flags derived from the debug config, shared by the GLES and Vulkan
-/// render paths so the two can't drift. Cursor-plane scanout is on by default (honoring
-/// `debug.disable_cursor_plane`); overlay-plane scanout stays behind `debug.enable_overlay_planes`
-/// (off by default — overlay planes cause performance issues on some systems). `allow_primary`
-/// gates primary-plane direct scanout: the GLES path passes `true`, the Vulkan path `false` for now
-/// (see the Vulkan branch in `Tty::render`).
+/// The `DrmCompositor` scanout flags derived from the debug config. Cursor-plane scanout is on by
+/// default (honoring `debug.disable_cursor_plane`); overlay-plane scanout stays behind
+/// `debug.enable_overlay_planes` (off by default — overlay planes cause performance issues on some
+/// systems). `allow_primary` gates primary-plane direct scanout; the one caller passes `true`, for
+/// the reasons spelled out at that call site in `Tty::render`.
 fn compositor_frame_flags(
     config: &Rc<RefCell<Config>>,
     synoik: &Synoik,

@@ -81,6 +81,30 @@ by construction, and our scanout buffers are created by the host through venus, 
 knows their exact layout. On real hardware `INVALID` means "unknown, ask the allocator" and refusing
 it stays correct.
 
+#### …and pass-through scanout on it
+
+The three above get the compositor *running*; a fourth thing is needed to let a **client** buffer
+reach the plane. `DrmCompositor` gates every promotion on
+
+```rust
+if !plane.formats.contains(&element_config.properties.format)   // compositor/mod.rs
+```
+
+which on an implicit plane compares a buffer that names LINEAR against a plane that names nothing,
+and refuses everything. That kills direct scan-out outright — for the **primary** plane too, so it
+is not something the caller can steer.
+
+It is also not reachable from here. The `planes: Option<Planes>` argument to `DrmCompositor::new`
+only feeds *overlay* and *cursor* assignment; `try_assign_primary_plane` reads
+`self.surface.plane_info()`, a `DrmSurface` field built at surface creation. So this one is fixed in
+the smithay fork (`drm/compositor: allow scanout on a plane with only implicit modifiers`): when
+**every** plane entry is `INVALID`, match on the fourcc alone. A plane that names some modifiers is
+still matched exactly.
+
+Colour safety is unchanged — the fourcc is still a requirement, and an element whose buffer is
+opaque gets `get_opaque` applied by `PrimeFramebufferExporter` before the comparison, so an
+`Argb8888` client still promotes onto an `XR24`-only plane while an RGBA-order one does not.
+
 ### Why the exporter had to be rewritten too
 
 Smithay's `GbmFramebufferExporter` turns a buffer into a `framebuffer::Handle` by importing it
