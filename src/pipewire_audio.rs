@@ -43,8 +43,8 @@ use pipewire::spa::sys::{
     SPA_PARAM_Props, SPA_PARAM_ROUTE_available, SPA_PARAM_ROUTE_description,
     SPA_PARAM_ROUTE_device, SPA_PARAM_ROUTE_devices, SPA_PARAM_ROUTE_direction,
     SPA_PARAM_ROUTE_index, SPA_PARAM_ROUTE_name, SPA_PARAM_ROUTE_priority,
-    SPA_PARAM_ROUTE_profiles, SPA_PARAM_ROUTE_save, SPA_PROP_channelVolumes, SPA_PROP_mute,
-    SPA_PROP_volume, SPA_TYPE_OBJECT_ParamProfile, SPA_TYPE_OBJECT_ParamRoute,
+    SPA_PARAM_ROUTE_profiles, SPA_PARAM_ROUTE_props, SPA_PARAM_ROUTE_save, SPA_PROP_channelVolumes,
+    SPA_PROP_mute, SPA_PROP_volume, SPA_TYPE_OBJECT_ParamProfile, SPA_TYPE_OBJECT_ParamRoute,
     SPA_TYPE_OBJECT_Props, SPA_DIRECTION_INPUT, SPA_DIRECTION_OUTPUT,
 };
 use pipewire::types::ObjectType;
@@ -309,6 +309,61 @@ impl Inner {
             self.cards_dirty = Some(cards);
         }
     }
+    /// Write volume/mute onto the **card route** that carries `node_id`, with `save: true`.
+    /// Returns whether it landed; `false` means the node has no route behind it and the caller
+    /// must fall back to writing the node's own `Props`.
+    ///
+    /// This is where a device's user-facing volume lives. Writing `Props` on the *node* instead
+    /// looks like it works — the level moves — but it is the wrong param in three ways:
+    /// WirePlumber persists routes (`~/.local/state/wireplumber/default-routes`) and not node
+    /// props, so the setting dies at logout; every other client (gnome-control-center, anything
+    /// on pipewire-pulse) reads the route, so it never sees ours; and WirePlumber's own
+    /// route-restore keeps writing the route underneath us, so the two desynchronise — a node
+    /// write of 0.02 left the route at 0.94 and pulse reporting 98%.
+    ///
+    /// This is not a Pulse-ism reached through the pulse proxy: it is what WirePlumber's
+    /// `mixer-api` does natively for any node that has a device (`wpctl set-volume` included).
+    /// A node without one (a virtual sink like `auto_null`, a loopback) genuinely takes node
+    /// props, which is the fallback.
+    fn set_route_props(
+        &self,
+        node_id: u32,
+        channel_volumes: Option<Vec<f32>>,
+        mute: Option<bool>,
+    ) -> bool {
+        let Some(props) = props_object(channel_volumes, mute) else {
+            return false;
+        };
+        // The join: node -> its card (`device.id`) and its SPA device index within that card
+        // (`card.profile.device`), which is what the active route's `device` field matches.
+        let Some(tracked) = self
+            .sinks
+            .get(&node_id)
+            .or_else(|| self.sources.get(&node_id))
+        else {
+            return false;
+        };
+        let (Some(card_id), Some(card_device)) = (tracked.device_id, tracked.card_profile_device)
+        else {
+            return false;
+        };
+        let Some(card) = self.cards.get(&card_id) else {
+            return false;
+        };
+        let Some(route) = card.active.iter().find(|r| r.device == Some(card_device)) else {
+            return false;
+        };
+
+        let Some(bytes) = route_props_pod(route.index, card_device, props) else {
+            warn!("failed to serialize audio Route props pod");
+            return false;
+        };
+        let Some(pod) = Pod::from_bytes(&bytes) else {
+            return false;
+        };
+        card.device.set_param(ParamType::Route, 0, pod);
+        true
+    }
 }
 
 /// Connect to PipeWire and start tracking the default sink. Returns `None`-worthy
@@ -415,8 +470,10 @@ impl AudioBackend for PwAudio {
         let mut inner = self.inner.borrow_mut();
         let bound = inner.bound.as_ref()?;
         let linear = volume_to_pw_linear(volume) as f32;
-        let vols = vec![linear; bound.channels.max(1)];
-        set_props(&bound.node, Some(vols), None);
+        let (id, vols) = (bound.id, vec![linear; bound.channels.max(1)]);
+        if !inner.set_route_props(id, Some(vols.clone()), None) {
+            set_props(&inner.bound.as_ref()?.node, Some(vols), None);
+        }
         let status = AudioStatus {
             volume,
             muted: inner.status.muted,
@@ -428,8 +485,10 @@ impl AudioBackend for PwAudio {
     /// Set the mute flag on the default sink.
     fn set_muted(&self, muted: bool) -> Option<AudioStatus> {
         let mut inner = self.inner.borrow_mut();
-        let bound = inner.bound.as_ref()?;
-        set_props(&bound.node, None, Some(muted));
+        let id = inner.bound.as_ref()?.id;
+        if !inner.set_route_props(id, None, Some(muted)) {
+            set_props(&inner.bound.as_ref()?.node, None, Some(muted));
+        }
         let status = AudioStatus {
             volume: inner.status.volume,
             muted,
@@ -452,8 +511,10 @@ impl AudioBackend for PwAudio {
         let mut inner = self.inner.borrow_mut();
         let bound = inner.bound_source.as_ref()?;
         let linear = volume_to_pw_linear(volume) as f32;
-        let vols = vec![linear; bound.channels.max(1)];
-        set_props(&bound.node, Some(vols), None);
+        let (id, vols) = (bound.id, vec![linear; bound.channels.max(1)]);
+        if !inner.set_route_props(id, Some(vols.clone()), None) {
+            set_props(&inner.bound_source.as_ref()?.node, Some(vols), None);
+        }
         inner.mic_volume = volume;
         inner.publish_mic();
         inner.mic_last
@@ -462,8 +523,10 @@ impl AudioBackend for PwAudio {
     /// Set the mute flag on the default **source**. Mirrors [`set_muted`].
     fn set_input_muted(&self, muted: bool) -> Option<MicStatus> {
         let mut inner = self.inner.borrow_mut();
-        let bound = inner.bound_source.as_ref()?;
-        set_props(&bound.node, None, Some(muted));
+        let id = inner.bound_source.as_ref()?.id;
+        if !inner.set_route_props(id, None, Some(muted)) {
+            set_props(&inner.bound_source.as_ref()?.node, None, Some(muted));
+        }
         inner.mic_muted = muted;
         inner.publish_mic();
         inner.mic_last
@@ -1223,6 +1286,70 @@ fn on_node_param(weak: &Weak<RefCell<Inner>>, pod: &Pod) {
 }
 
 /// Write a `Props` pod to `node` setting `channelVolumes` and/or `mute`.
+/// Serialize the `Route` param that carries volume/mute for a card device: the route to touch
+/// (`index` + `device`), the `props` payload, and `save: true` so the session manager persists it.
+///
+/// `save` is not optional decoration — without it WirePlumber applies the change but never writes
+/// `~/.local/state/wireplumber/default-routes`, and the setting dies at logout.
+fn route_props_pod(index: u32, device: u32, props: Value) -> Option<Vec<u8>> {
+    let object = Value::Object(Object {
+        type_: SPA_TYPE_OBJECT_ParamRoute,
+        id: pipewire::spa::sys::SPA_PARAM_Route,
+        properties: vec![
+            Property {
+                key: SPA_PARAM_ROUTE_index,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(index as i32),
+            },
+            Property {
+                key: SPA_PARAM_ROUTE_device,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(device as i32),
+            },
+            Property {
+                key: SPA_PARAM_ROUTE_props,
+                flags: PropertyFlags::empty(),
+                value: props,
+            },
+            Property {
+                key: SPA_PARAM_ROUTE_save,
+                flags: PropertyFlags::empty(),
+                value: Value::Bool(true),
+            },
+        ],
+    });
+    let mut bytes = Vec::new();
+    PodSerializer::serialize(Cursor::new(&mut bytes), &object).ok()?;
+    Some(bytes)
+}
+
+/// The `Props` object carried inside a `Route` param, or written straight to a node.
+fn props_object(channel_volumes: Option<Vec<f32>>, mute: Option<bool>) -> Option<Value> {
+    let mut properties = Vec::new();
+    if let Some(vols) = channel_volumes {
+        properties.push(Property {
+            key: SPA_PROP_channelVolumes,
+            flags: PropertyFlags::empty(),
+            value: Value::ValueArray(ValueArray::Float(vols)),
+        });
+    }
+    if let Some(mute) = mute {
+        properties.push(Property {
+            key: SPA_PROP_mute,
+            flags: PropertyFlags::empty(),
+            value: Value::Bool(mute),
+        });
+    }
+    if properties.is_empty() {
+        return None;
+    }
+    Some(Value::Object(Object {
+        type_: SPA_TYPE_OBJECT_Props,
+        id: SPA_PARAM_Props,
+        properties,
+    }))
+}
+
 fn set_props(node: &Node, channel_volumes: Option<Vec<f32>>, mute: Option<bool>) {
     let mut properties = Vec::new();
     if let Some(vols) = channel_volumes {
@@ -1423,6 +1550,61 @@ mod tests {
     ///
     /// The `available` value is the point. It is `unknown`, not `yes` — so a filter written as
     /// `== yes` would drop this card's only output from the picker. gvc's test is
+    /// Volume goes onto the card **route**, not the node's own `Props`.
+    ///
+    /// Writing node props looks like it works — the level moves — but WirePlumber persists routes
+    /// and not node props, every other client reads the route, and WirePlumber's route-restore
+    /// keeps rewriting the route underneath. Measured on the live seat: a node write of `0.02`
+    /// left the route at `0.943247` and pulse reporting 98% for a 2% request.
+    ///
+    /// So pin the three fields that make the write count: which route (`index` + `device`), the
+    /// `props` payload, and `save` — without `save` the change never reaches
+    /// `~/.local/state/wireplumber/default-routes` and dies at logout.
+    #[test]
+    fn route_props_pod_names_the_route_and_asks_to_be_saved() {
+        let props = props_object(Some(vec![0.25, 0.25]), Some(false)).expect("a props object");
+        let bytes = route_props_pod(0, 1, props).expect("serializes");
+        let pod = Pod::from_bytes(&bytes).expect("valid pod");
+
+        let (_, value) = PodDeserializer::deserialize_any_from(pod.as_bytes()).expect("parses");
+        let Value::Object(object) = value else {
+            panic!("expected an object pod");
+        };
+        assert_eq!(object.type_, SPA_TYPE_OBJECT_ParamRoute);
+
+        let find = |key| {
+            object
+                .properties
+                .iter()
+                .find(|p| p.key == key)
+                .map(|p| &p.value)
+        };
+        assert_eq!(find(SPA_PARAM_ROUTE_index), Some(&Value::Int(0)));
+        assert_eq!(find(SPA_PARAM_ROUTE_device), Some(&Value::Int(1)));
+        assert_eq!(
+            find(SPA_PARAM_ROUTE_save),
+            Some(&Value::Bool(true)),
+            "without `save` the volume never survives a logout",
+        );
+
+        let Some(Value::Object(props)) = find(SPA_PARAM_ROUTE_props) else {
+            panic!("the route must carry a nested Props object");
+        };
+        assert_eq!(props.type_, SPA_TYPE_OBJECT_Props);
+        let prop = |key| {
+            props
+                .properties
+                .iter()
+                .find(|p| p.key == key)
+                .map(|p| &p.value)
+        };
+        assert_eq!(
+            prop(SPA_PROP_channelVolumes),
+            Some(&Value::ValueArray(ValueArray::Float(vec![0.25, 0.25]))),
+        );
+        assert_eq!(prop(SPA_PROP_mute), Some(&Value::Bool(false)));
+    }
+
     /// `!= PA_PORT_AVAILABLE_NO` (`gvc-mixer-control.c:1973,1995`), which is what
     /// [`PortAvailability::is_offerable`] implements.
     #[test]
