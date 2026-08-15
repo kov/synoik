@@ -3657,6 +3657,91 @@ fn an_internal_input_method_receives_client_text_input_state() {
     );
 }
 
+/// An engine that stops answering must stop costing a second per keystroke.
+///
+/// Each held key waits `KEY_TIMEOUT` (1s) for a verdict before being delivered anyway. That is
+/// right for one slow key and catastrophic for an engine that has gone away: on a live session
+/// (2026-08-15, wesnoth's sustained key traffic wedging the ibus connection) it meant one second
+/// of latency on *every* keystroke for 18 minutes, plus 579 identical warnings.
+///
+/// So after `UNRESPONSIVE_AFTER` consecutive unanswered keys we stop holding them. We keep
+/// *asking*, which is what lets a single late verdict switch holding back on — pinned here,
+/// because a safety net that latches off forever would be its own bug.
+#[test]
+fn an_unresponsive_input_method_stops_holding_keys_and_recovers() {
+    use std::time::Instant;
+
+    use crate::input_method::{ImRequest, ImUpdate, KEY_TIMEOUT};
+
+    let (mut f, id, requests, _seen) = im_fixture();
+
+    // Three keys the engine never rules on. Each is held, then expires on its own timeout —
+    // which is what the user feels as a second of latency per keystroke.
+    for _ in 0..3 {
+        f.key_press(KEY_A);
+        f.double_roundtrip(id);
+        assert_eq!(
+            f.client(id).take_key_events(),
+            vec![],
+            "while the engine still looks healthy every key is held for a verdict"
+        );
+        f.synoik_state()
+            .expire_im_keys_at(Instant::now() + KEY_TIMEOUT);
+        f.double_roundtrip(id);
+        assert_eq!(
+            f.client(id).take_key_events(),
+            vec![(KEY_A, WlKeyState::Pressed)],
+            "an expired key is delivered rather than lost"
+        );
+    }
+    assert!(
+        f.synoik().input_method.as_ref().unwrap().is_unresponsive(),
+        "three unanswered keys in a row must trip the passthrough"
+    );
+
+    // The fourth key is not held at all: it reaches the client with no timeout in between.
+    while requests.try_recv().is_ok() {}
+    f.key_press(KEY_S);
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![(KEY_S, WlKeyState::Pressed)],
+        "past the strike count a key must reach the client at once, not a second late"
+    );
+    assert!(
+        !f.synoik().input_method.as_ref().unwrap().has_pending_keys(),
+        "and it must not be sitting in the queue either"
+    );
+
+    // But we keep *asking*. That is the only thing that can ever clear the flag.
+    let asked: Vec<ImRequest> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
+    let key_id = asked
+        .iter()
+        .find_map(|r| match r {
+            ImRequest::ProcessKey { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("the engine must still be offered keys while we pass them through");
+
+    // One late verdict — for a key we already delivered — and holding resumes.
+    f.synoik_state().on_im_update(ImUpdate::KeyResult {
+        id: key_id,
+        filtered: false,
+    });
+    assert!(
+        !f.synoik().input_method.as_ref().unwrap().is_unresponsive(),
+        "any verdict at all means the engine is back"
+    );
+
+    f.key_press(KEY_W);
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![],
+        "and the next key is held for the engine again"
+    );
+}
+
 /// The outbound half of the input method: what an engine produces reaches the client as
 /// preedit and commit strings.
 ///

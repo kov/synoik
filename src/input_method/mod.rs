@@ -52,7 +52,15 @@ use crate::synoik::State;
 /// machine's session bus is well under a millisecond, so this is three orders of magnitude of
 /// headroom and still bounds the damage at "input feels slow" rather than "the session is
 /// unusable". Deliberate divergence.
-const KEY_TIMEOUT: Duration = Duration::from_millis(1000);
+pub(crate) const KEY_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// How many consecutive keys may expire unanswered before we stop holding keys at all.
+///
+/// A wedged engine used to cost a full [`KEY_TIMEOUT`] on *every* keystroke, indefinitely, while
+/// emitting one identical warning per key — 579 of them across 18 minutes on a live session
+/// (2026-08-15) before anyone worked out it was the input method. Three strikes is enough to tell
+/// "the engine is thinking" from "the engine is gone".
+const UNRESPONSIVE_AFTER: u32 = 3;
 
 /// One of the compositor's own text entries — the surfaces that are *not* Wayland clients and so
 /// have no `zwp_text_input_v3` of their own.
@@ -283,6 +291,10 @@ pub struct InputMethod {
     /// press leaves a key stuck down in the client.
     pending: VecDeque<PendingKey>,
     next_key_id: u64,
+    /// Consecutive keys that expired without a verdict, and whether that has crossed
+    /// [`UNRESPONSIVE_AFTER`]. See [`InputMethod::is_unresponsive`].
+    unanswered: u32,
+    unresponsive: bool,
 }
 
 impl std::fmt::Debug for InputMethod {
@@ -302,6 +314,8 @@ impl InputMethod {
     pub fn new(to_worker: async_channel::Sender<ImRequest>) -> Self {
         Self {
             to_worker,
+            unanswered: 0,
+            unresponsive: false,
             client_enabled: false,
             client_content_type: (ibus::purpose::FREE_FORM, 0),
             focus: ImFocus::None,
@@ -329,6 +343,17 @@ impl InputMethod {
     /// live daemon with nothing focused must never see the user's typing.
     pub fn wants_keys(&self) -> bool {
         self.focus != ImFocus::None && self.connected
+    }
+
+    /// Whether the engine has stopped answering and keys are going straight through.
+    ///
+    /// Holding every keystroke for [`KEY_TIMEOUT`] behind an engine that will never reply is a
+    /// second of latency *per key*, which is worse for the user than losing the input method —
+    /// and it is indistinguishable from a wedged compositor. After [`UNRESPONSIVE_AFTER`]
+    /// consecutive unanswered keys we stop holding them. We keep *asking*, so a single late
+    /// verdict is enough to switch back (see `on_im_key_result`); recovery needs no reconnect.
+    pub fn is_unresponsive(&self) -> bool {
+        self.unresponsive
     }
 
     /// Whether any key is currently held back from the client.
@@ -583,8 +608,7 @@ impl State {
                 time,
                 mods_changed,
             },
-        );
-        true
+        )
     }
 
     /// Offer a keystroke bound for one of *our* entries to the engine.
@@ -632,14 +656,18 @@ impl State {
             keycode.raw().saturating_sub(8),
             state_mask,
             KeyDest::Shell(key),
-        );
-        true
+        )
     }
 
     /// Ask the engine about a key and hold it until the verdict comes back.
-    fn queue_im_key(&mut self, keysym: u32, keycode: u32, state: u32, dest: KeyDest) {
+    ///
+    /// Returns whether the key was actually held. While the engine is
+    /// [unresponsive](InputMethod::is_unresponsive) we still **ask** — that is what lets a single
+    /// late verdict switch holding back on — but we do not hold, so keys reach the client at once
+    /// instead of one second late, forever.
+    fn queue_im_key(&mut self, keysym: u32, keycode: u32, state: u32, dest: KeyDest) -> bool {
         let Some(im) = self.synoik.input_method.as_mut() else {
-            return;
+            return false;
         };
         let id = im.next_key_id;
         im.next_key_id += 1;
@@ -651,6 +679,10 @@ impl State {
             state,
         });
 
+        if im.unresponsive {
+            return false;
+        }
+
         let was_empty = im.pending.is_empty();
         im.pending.push_back(PendingKey {
             id,
@@ -661,6 +693,7 @@ impl State {
         if was_empty {
             self.arm_im_key_timeout(KEY_TIMEOUT);
         }
+        true
     }
 
     /// The engine answered. Deliver or drop the key it answered for.
@@ -668,6 +701,16 @@ impl State {
         let Some(im) = self.synoik.input_method.as_mut() else {
             return;
         };
+
+        // Any verdict at all means the engine is answering again — including one for a key we no
+        // longer hold, which is exactly what arrives while we are passing keys through. This is
+        // the whole recovery path; without it the strike count could only ever rise.
+        im.unanswered = 0;
+        if im.unresponsive {
+            im.unresponsive = false;
+            tracing::warn!("input method is answering again; holding keys for it once more");
+        }
+
         let Some(index) = im.pending.iter().position(|key| key.id == id) else {
             // Already flushed by a timeout or a focus change. The key has been delivered, so the
             // verdict is moot — dropping it here is the only correct move.
@@ -739,9 +782,23 @@ impl State {
 
     /// The engine took too long. Deliver what has actually expired and re-arm for the rest.
     fn on_im_key_timeout(&mut self) {
+        // The source returns `TimeoutAction::Drop`, so the token it left behind names nothing.
         self.synoik.im_key_timer = None;
+        self.expire_im_keys_at(std::time::Instant::now());
+    }
 
-        let now = std::time::Instant::now();
+    /// The body of [`Self::on_im_key_timeout`], against a caller-supplied clock.
+    ///
+    /// The seam exists for the corpus. A held key expires against **real** time on purpose (it
+    /// bounds an IPC stall, so it must fire with the frame clock idle), which leaves a test no way
+    /// to reach this path except by sleeping a real [`KEY_TIMEOUT`] per key — and the behaviour
+    /// worth pinning here takes three of them.
+    pub(crate) fn expire_im_keys_at(&mut self, now: std::time::Instant) {
+        // Remove rather than just forget: from the callback the source has already dropped itself
+        // and the token is gone, so this is a no-op — but reaching the seam any other way would
+        // otherwise leave a live timer armed behind us.
+        self.disarm_im_key_timeout();
+
         let mut expired = Vec::new();
         let mut next_deadline = None;
         if let Some(im) = self.synoik.input_method.as_mut() {
@@ -758,10 +815,33 @@ impl State {
         }
 
         if !expired.is_empty() {
-            tracing::warn!(
-                count = expired.len(),
-                "input method did not answer in {KEY_TIMEOUT:?}, delivering keys anyway"
-            );
+            let newly_unresponsive = if let Some(im) = self.synoik.input_method.as_mut() {
+                im.unanswered = im.unanswered.saturating_add(expired.len() as u32);
+                let crossed = !im.unresponsive && im.unanswered >= UNRESPONSIVE_AFTER;
+                if crossed {
+                    im.unresponsive = true;
+                }
+                crossed
+            } else {
+                false
+            };
+            // One line when it starts, one when it recovers — not one per keystroke forever.
+            if newly_unresponsive {
+                tracing::warn!(
+                    "input method has not answered {UNRESPONSIVE_AFTER} keys in a row; \
+                     passing keys straight through until it replies again"
+                );
+            } else if !self
+                .synoik
+                .input_method
+                .as_ref()
+                .is_some_and(|im| im.unresponsive)
+            {
+                tracing::warn!(
+                    count = expired.len(),
+                    "input method did not answer in {KEY_TIMEOUT:?}, delivering keys anyway"
+                );
+            }
         }
         for key in expired {
             self.forward_pending_key(key);

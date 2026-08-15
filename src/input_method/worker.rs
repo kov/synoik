@@ -136,23 +136,39 @@ async fn session(
 
     let mut caps = ibus::CAP_PREEDIT_TEXT | ibus::CAP_FOCUS;
 
-    loop {
-        let request = std::pin::pin!(requests.recv());
-        let event = std::pin::pin!(events.next());
-
-        match future::select(request, event).await {
-            future::Either::Left((Err(_), _)) => return Ok(()),
-            future::Either::Left((Ok(request), _)) => {
-                handle_request(&bus, &ctx, request, &mut caps, to_compositor).await?;
+    // Two pumps, concurrent on this one thread. They must not be folded back into a single
+    // `select` over both: awaiting a request there stops polling `events`, and zbus caps each
+    // incoming queue at 64 messages — "when the queue is full, no more messages can be received"
+    // (zbus `Connection` docs), **method replies included**. A left-biased `select` under
+    // sustained typing starves the signal streams, the queue fills, and the `ProcessKeyEvent`
+    // reply we are awaiting can never arrive. The connection wedges for good: no reply, and no
+    // disconnect either, so even restarting ibus-daemon does not recover it. That cost a live
+    // session 18 minutes of one-second-per-keystroke input on 2026-08-15.
+    //
+    // Requests stay **strictly sequential** inside their own pump — that is the key-ordering
+    // guarantee in the module note, and it is unaffected by draining signals concurrently.
+    let events_pump = async {
+        while let Some(event) = events.next().await {
+            if to_compositor.send(ImUpdate::Event(event)).is_err() {
+                return Ok(());
             }
-            future::Either::Right((Some(event), _)) => {
-                if to_compositor.send(ImUpdate::Event(event)).is_err() {
-                    return Ok(());
-                }
-            }
-            // Every signal stream ended at once, which only happens if the connection died.
-            future::Either::Right((None, _)) => anyhow::bail!("ibus signal streams ended"),
         }
+        // Every signal stream ended at once, which only happens if the connection died.
+        anyhow::bail!("ibus signal streams ended")
+    };
+
+    let requests_pump = async {
+        while let Ok(request) = requests.recv().await {
+            handle_request(&bus, &ctx, request, &mut caps, to_compositor).await?;
+        }
+        // The request channel closed: the compositor is going away.
+        Ok(())
+    };
+
+    let events_pump = std::pin::pin!(events_pump);
+    let requests_pump = std::pin::pin!(requests_pump);
+    match future::select(events_pump, requests_pump).await {
+        future::Either::Left((result, _)) | future::Either::Right((result, _)) => result,
     }
 }
 
@@ -216,7 +232,11 @@ async fn handle_request(
                 Err(err) => {
                     // Fail open: a key nobody could rule on belongs to the client. The compositor
                     // is holding it and will not release it until this answer arrives.
-                    tracing::debug!("process_key_event failed: {err}");
+                    //
+                    // `warn!`, not `debug!`: this is the one line that separates "the engine said
+                    // no" from "the engine never answered", and the sessions where that matters
+                    // run a release build, where `debug!` is the floor and `trace!` does not exist.
+                    tracing::warn!("process_key_event failed: {err}");
                     false
                 }
             };
