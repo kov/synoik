@@ -575,6 +575,11 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
             if d.overview_open && d.overview_progress.is_none() {
                 println!("  !! open with no progress — monitors will render above the top layer");
             }
+            for output in &d.outputs {
+                println!("Output {}:", output.name);
+                println!("  redraw state:    {}", output.redraw_state);
+                println!("  animating:       {}", output.unfinished_animations);
+            }
             println!("Keyboard focus:    {}", d.keyboard_focus);
             println!("Input method:");
             if !d.input_method {

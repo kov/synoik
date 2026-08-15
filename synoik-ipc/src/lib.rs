@@ -380,6 +380,21 @@ pub struct DebugFocusState {
     pub im_unanswered: u32,
     /// Whether that tripped passthrough — keys stop being held for a verdict.
     pub im_unresponsive: bool,
+    /// Per-output redraw state — the other way a screen freezes while the compositor is alive.
+    pub outputs: Vec<DebugOutputState>,
+}
+
+/// One output's redraw state — a debugging snapshot.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct DebugOutputState {
+    /// The output's connector name.
+    pub name: String,
+    /// Which `RedrawState` variant the output is in. A frozen screen sitting in
+    /// `WaitingForVBlank` means a page flip was accepted whose completion never came back.
+    pub redraw_state: String,
+    /// Whether animations still want frames after the last redraw.
+    pub unfinished_animations: bool,
 }
 
 /// Color picked from the screen.

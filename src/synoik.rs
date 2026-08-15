@@ -1333,6 +1333,32 @@ pub enum RedrawState {
     WaitingForEstimatedVBlankAndQueued(RegistrationToken),
 }
 
+impl RedrawState {
+    /// The variant's name, for `synoik msg debug-focus-state`.
+    ///
+    /// A frozen screen with a live event loop is one of these stuck: `WaitingForVBlank` means a
+    /// page flip was accepted and its completion never came back, while an estimated-vblank
+    /// variant means we are on a timer instead. They are indistinguishable from outside the
+    /// process and need opposite fixes, so name which one it is.
+    pub fn debug_name(&self) -> &'static str {
+        match self {
+            RedrawState::Idle => "Idle",
+            RedrawState::Queued => "Queued",
+            RedrawState::WaitingForVBlank {
+                redraw_needed: false,
+            } => "WaitingForVBlank",
+            RedrawState::WaitingForVBlank {
+                redraw_needed: true,
+            } => "WaitingForVBlank(redraw needed)",
+            RedrawState::ScheduledDispatch { .. } => "ScheduledDispatch",
+            RedrawState::WaitingForEstimatedVBlank(_) => "WaitingForEstimatedVBlank",
+            RedrawState::WaitingForEstimatedVBlankAndQueued(_) => {
+                "WaitingForEstimatedVBlankAndQueued"
+            }
+        }
+    }
+}
+
 /// What a redraw is aiming at, decided before the redraw starts.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameAim {
@@ -8276,6 +8302,15 @@ impl Synoik {
             im_pending_keys: pending,
             im_unanswered: unanswered,
             im_unresponsive: im.is_some_and(crate::input_method::InputMethod::is_unresponsive),
+            outputs: self
+                .output_state
+                .iter()
+                .map(|(output, state)| synoik_ipc::DebugOutputState {
+                    name: output.name(),
+                    redraw_state: state.redraw_state.debug_name().to_owned(),
+                    unfinished_animations: state.unfinished_animations_remain,
+                })
+                .collect(),
         }
     }
 
