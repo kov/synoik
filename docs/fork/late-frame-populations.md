@@ -318,6 +318,61 @@ Two stronger dials exist and are deliberately not used:
 `MemoryLow` does not un-swap the 185 MB already out; the pages come back on demand, or on the next
 restart.
 
+### If we ever do lock pages: what, and what not
+
+Deferred, not planned — this section exists so the question is answered from measurement rather
+than re-derived. The numbers below are from the live seat on 2026-08-15, 15h55m into a session,
+with the `MemoryLow` drop-in in place.
+
+**Start with the finding: almost none of the *buffers* qualify.** The instinct is to lock the hot
+render-path buffers, and one by one they fall away:
+
+- **Device-local Vulkan memory** is not guest-pageable. There is nothing to lock.
+- **Vulkan staging** (`StagingPool`, `HostStaging`) is the tempting target and the wrong one. On
+  Venus a `HOST_VISIBLE` buffer is a *host* blob, not guest anonymous memory — see the module
+  header on `synoik-vk/src/staging.rs`. The warm-vs-cold copy cost that pool exists to fight
+  (~7 GB/s cold against ~58 GB/s warm) is a host-side fault; guest residency does not reach it.
+- **Client shm buffers** are swappable, but they are client-owned tmpfs and the client picks the
+  size. Pinning them is an authorization we cannot give.
+- **Heap structures** — scene element vectors, damage regions, the frame-log ring, the UI model —
+  hit the same blocker stated above for `MADV_COLD`: a general-purpose allocator interleaves hot
+  and cold inside one page, so "lock the important structures" is not expressible without an arena.
+
+And there is a direct argument against locking broadly. The largest swapped mapping on the live
+compositor is 44 MB at `ffff18200000`, a glibc worker-thread malloc arena — cold, and *correctly*
+swapped, with more of the same in the 2 MB mappings around it. Indiscriminate locking pins that.
+
+**What is left is executable text and rodata**, which is also the part `MemoryLow` reaches least
+directly: the major faults counted above include file-backed pages, the binary's own text evicted
+from page cache and re-read from disk.
+
+So the shape, if it is ever wanted:
+
+- **`mlock2(MLOCK_ONFAULT)` walking `/proc/self/maps`**, over the `r-xp` and `r--p` mappings of
+  synoik plus the render-path libraries. `ONFAULT` is the point: the locked set becomes the working
+  set instead of pre-faulting whole mappings.
+- **Exclude libLLVM.** It is 141 MB on disk and it is the shader compiler — hot at pipeline
+  creation, cold forever after. Its 2.1 MB of swapped pages cost nothing. Total executable mapping
+  in the live process is 148 MB across 74 mappings and libLLVM is most of that, so this one
+  exclusion is the difference between a ~25 MB lock and a ~150 MB one.
+- synoik's own text is **24.6 MB mapped, 13.4 MB resident** (`VmExe`), and is the core target. Add
+  the venus ICD (`libvulkan_virtio.so`, 1.6 MB) and libc. Measure libgallium (40 MB) before locking
+  it rather than assuming: it is loaded, but how much of it sits on our per-frame path is a
+  question, not a given.
+- **`LimitMEMLOCK` to a finite cap** — 64–128M in the same `memory.conf`, never `infinity`. This is
+  the middle ground the `mlockall` rejection above skips past: that paragraph weighs
+  `MCL_FUTURE` under an unbounded limit and rightly refuses it, but a *bounded* lock over named
+  mappings has no leak-amplification story. `mlock` fails open past the cap; log and continue.
+- A trap for whoever writes the drop-in: `MemoryLow` applied live because it is a cgroup property,
+  so `daemon-reload` sufficed. **`LimitMEMLOCK` is an rlimit and needs a restart.** A reload alone
+  will look like the setting did not take.
+
+**Re-measure before spending any of this.** The session that produced this document showed 12 365
+major faults; the live seat under `MemoryLow` shows **1 710 over 15h55m**, with synoik's own text
+mapping at zero swapped pages. The soft dial already took roughly an order of magnitude out. Locking
+text is insurance against a recurrence, not a fix for a standing problem — the first step is to
+confirm major faults are still happening in a bad window, not to implement.
+
 ## The instrument gap
 
 `AUTODUMP_MAX = 20` in `frame_log.rs` is a **lifetime** cap. In this session it was exhausted at
