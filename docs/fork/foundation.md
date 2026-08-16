@@ -145,7 +145,7 @@ allocation.
 > fails on some other driver some other day. The guard asserts the **pass choice**
 > (`VulkanFrame::preserves_target`).
 
-### Two cross-driver faults, neither of them ours to fix
+### Two host-side faults, both now closed
 
 **1. Client buffer import — closed host-side.** A client's dmabufs are allocated by the client, so
 with GL on vrend they used to arrive as classic virgl resources that `vkGetMemoryFdPropertiesKHR`
@@ -160,70 +160,46 @@ GL-on-vrend with **zero** `error importing dmabuf into the Vulkan renderer` line
 `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu` + `GALLIUM_DRIVER=virgl`. It protects nothing of ours; a
 citation calling it load-bearing is stale.
 
-**2. The host stops applying `SET_SCANOUT_BLOB` for a released surface — open.** Written up for the
-VMM side in `limina-issue-scanout-blob-not-applied.md` (with attachments). The guest-side mechanism,
-established by elimination:
+**2. Scanout surfaces evicted from a bounded host store — fixed host-side.** The limina supervisor
+holds Mach-published scanout IOSurfaces in a bounded store that evicted **FIFO by insertion**. A
+compositor publishes its permanent scanout ring first and then churns client buffers forever, so the
+oldest-inserted surfaces are exactly the ones in continuous use — **ordered by age when the only
+thing that matters is use**. The scanouts are deliberately non-global (capability-scoped over a Mach
+port), so an evicted one could not be recovered by lookup and nothing re-published it: every later
+frame naming that id was skipped silently and permanently, while the worker kept consuming, applying
+and correctly ACKing every `SET_SCANOUT_BLOB`. The trigger was **publication volume**, not time —
+our own "time under client pass-through scan-out correlates" was volume in disguise.
 
-> A blob scanout resource can be knocked into a state where every `SET_SCANOUT_BLOB` naming it is
-> consumed and ACKed `RESP_OK_NODATA` but never applied; the display holds the last frame that was
-> applied, and nothing errors. Only a **genuinely new** resource restores that participant, and
-> creating new resources can knock *another* participant into the same state.
+**The guarantee we may now rely on: presenting a surface id keeps it resolvable, and a dropped id
+self-heals.** An id the guest is presenting is never evicted, and one dropped anyway is re-published
+on demand — one skipped frame instead of a freeze (833 permanently-skipped frames before, 0 after;
+with the pin disabled to force the fault, 3 evictions became 3 single-frame hitches). **So do not
+re-create swapchain buffers on a transition as a workaround**, which is what `698ae578` reverted and
+why: it worked by republishing, and it hid a host fault behind ~3.2 GB of 4K buffer churn per
+session on the one seat whose job is to surface such faults.
 
-**The fault is in the limina supervisor**, which is why no guest-side instrument could reach it. The
-supervisor keeps a **bounded** store of retained `IOSurfaceRef`s, capped at 32 and evicted **FIFO by
-insertion order**. A compositor publishes its permanent scanout ring *first*, at startup, and then
-churns transient client buffers for the rest of the session — so the oldest-inserted surfaces are
-exactly the ones in continuous use, and every new client buffer pushes them closer to the exit.
-**Eviction is ordered by age when the only thing that matters is use**, which makes our two scanout
-buffers the guaranteed first casualties. Once evicted, the frame-apply path falls back to a global
-`IOSurfaceLookup` that cannot succeed, because these surfaces are deliberately non-global
-(capability-scoped over a Mach port). Every later frame naming that id is dropped, silently and
-permanently — nothing re-publishes it.
-
-Everything the guest can see stays healthy, which is the whole difficulty: the worker ACKs every
-`SET_SCANOUT_BLOB` `RESP_OK_NODATA`, the resource→IOSurface mapping never goes stale, and the flip
-rate goes *up* at the freeze. We present harder, correctly, into surfaces the supervisor no longer
-holds.
-
-**The trigger is publication volume, not time.** One reproduction crossed the cap in seconds —
-launch a client, fullscreen it, open the overview — because that mints a burst of surfaces at once.
-Our own earlier reading, that time under client pass-through scan-out correlated, was volume wearing
-a disguise: longer stretches simply meant more buffers had been published. It also inverts the
-fullscreen-vs-resize discriminator we relied on: a resize healed not by replacing broken buffers but
-by **re-publishing**, which puts the id back in the store.
-
-**Our contribution to the pressure is two surfaces, and cannot be reduced.**
-`VkExportMemoryAllocateInfo` appears at exactly one site in `synoik-vk` — `Texture::allocate_scanout`
-— so the only images we export are the scanout ring. Offscreens, blur bundles and widget bakes are
-device-local and never become IOSurfaces. The redundant second `VkImage` under "Left on the table"
-is an *import* of a dmabuf that already exists, so removing it saves an image, a memory import and a
-query per swapchain buffer but should not remove a publication. **The churn is client buffers**,
-which is unbounded and not ours to promise to limit.
-
-A second, latent host-side hazard is on record and did **not** fire here: `note_released` drops the
-retained reference on the assumption that "the guest will not present it again". A guest that does
-present it again fails identically.
+**Our publication footprint, since any cap is a budget shared with clients.** `VkExportMemoryAllocateInfo`
+appears at exactly one site in `synoik-vk` (`Texture::allocate_scanout`), so the scanout ring is the
+only thing we export — up to `SLOT_CAP = 4` buffers, two bound in practice. Offscreens, blur bundles
+and widget bakes are device-local and never become IOSurfaces. We do allocate a *second* device
+memory per scanout buffer, importing the dmabuf we just exported (`import_dmabuf_target`, the
+redundancy under "Left on the table"); client buffers take one import each and no export. Removing
+the redundancy is worth a host resource per swapchain buffer if publication counts imports.
 
 > **The rule this bug earned: require an observation, not a fit.** Six mechanisms explained every
-> symptom here and were wrong — client-vs-compositor, resource longevity, "stops applying entirely",
-> surface-store capacity, a host-side stale-id cache, and a guest-side release. The one that survived
-> is the one an instrument printed, after a one-line log was added to the path that had none.
+> symptom and were wrong — client-vs-compositor, resource longevity, "stops applying entirely",
+> store capacity, a host-side stale-id cache, and a guest-side release. The one that survived is the
+> one an instrument printed, after a one-line log was added to a path that had none.
 >
-> Two corollaries worth more than the mechanism. **A ruling-out is only as good as the population it
-> counted**: "eviction is ruled out" was reached by counting 20 distinct ids in a log that covers only
-> scanout imports, while the store receives *every* published surface — 41 of them. Check that the
-> population you counted is the one you are bounding. And **an unlogged path is where the wrong answer
-> lives**: every theory that survived scrutiny for hours did so because the step that would have
-> falsified it printed nothing.
+> Two corollaries outlive it. **A ruling-out is only as good as the population it counted**: "eviction
+> is ruled out" came from counting 20 ids in a log covering only scanout imports, while the store
+> received every published surface — 41 of them. And **an unlogged path is where the wrong answer
+> lives**: every theory that survived hours did so because the step that would have falsified it
+> printed nothing.
 
-We are exonerated by measurement rather than argument: we render correct frames on time,
-`debug-dump-scanout` reads a perfect current image back out of the buffer we hand over, and
-tracepoints show the host ACKing every commit while the screen is frozen. **Both workarounds were
-deliberately reverted** (`698ae578`) — forcing a full redraw when the plane comes back never worked
-(`SYNOIK_VK_FULL_DAMAGE=1` does it every frame and still reproduced), and re-creating the swapchain
-buffers on the transition *did* work, which is exactly why it is out: it hides a host-side fault
-behind ~3.2 GB of 4K buffer churn per session, on the one seat whose job is to surface such faults.
-The instruments stayed.
+We were exonerated by measurement rather than argument, and the instruments that did it stayed:
+`debug-dump-scanout` reads the presented framebuffer back out through venus, and the per-frame
+presentation tally reports how each frame's elements reached the screen.
 
 ---
 
@@ -638,8 +614,9 @@ It is host-managed — not owned by any package, and `limina-agent.service` rewr
 so **the rename has to happen on their side.** Renaming it in the guest would leave two priority-90
 files with no owner the next time the agent deploys.
 
-Open questions, tracked in their own drafts: `limina-issue-scanout-blob-not-applied.md` (§2 item 2 —
-diagnosed host-side, fix pending — see §2).
+Open on their side, no action for us: publishes outnumber releases ~5:1 in a session, and whether
+that is benign or structural is unresolved. Our half of the arithmetic is in §2 — one export per
+scanout buffer, one import beside it, one import per client buffer, nothing else exportable.
 
 **Closed: the dmabuf CPU-write coherency issue.** Its draft is retired. Cause was
 control-queue work being unordered against venus ring work — virtio-gpu control commands run on
