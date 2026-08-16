@@ -1305,6 +1305,13 @@ pub struct OutputState {
     /// minimal damage — and we would repaint that damage onto a desktop image that is as stale as
     /// the stretch was long. See where this forces a full redraw in the tty backend.
     pub last_primary_was_client: bool,
+    /// Set on the frame that ends a pass-through scan-out stretch, consumed by the next one to
+    /// re-create the swapchain buffers.
+    ///
+    /// One-shot on purpose. Re-creating buffers *per frame* is how a debug flag once churned
+    /// ~3.9 GB/s of 4K buffers into the host, so this must fire on the transition and nowhere
+    /// else.
+    pub pending_buffer_reset: bool,
     /// Which animations were running when the last frame was built. The set the
     /// redraw loop derives `unfinished_animations_remain` from, kept so the frame
     /// log can name what a slow frame was doing.
@@ -8094,6 +8101,7 @@ impl Synoik {
             unfinished_animations_remain: false,
             last_frame_scanout: ScanoutTally::default(),
             last_primary_was_client: false,
+            pending_buffer_reset: false,
             frame_clock: FrameClock::new(refresh_interval, vrr),
             last_drm_sequence: None,
             vblank_throttle: VBlankThrottle::new(self.event_loop.clone(), name.connector.clone()),

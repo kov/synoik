@@ -1925,6 +1925,11 @@ impl Tty {
             .output_state
             .get(output)
             .is_some_and(|state| state.last_primary_was_client);
+        // Take the one-shot armed when the last stretch ended.
+        let reset_buffers = synoik
+            .output_state
+            .get_mut(output)
+            .is_some_and(|state| std::mem::take(&mut state.pending_buffer_reset));
         let force_full_damage = (!renders_direct && !single_scanout_surface)
             || resuming_from_scanout
             || full_damage_requested();
@@ -1970,6 +1975,7 @@ impl Tty {
                 // Decided above, per surface: the renderer preserves the target across frames
                 // (render-pass LOAD), so DrmCompositor's buffer-age damage is enough.
                 force_full_damage,
+                reset_buffers,
                 target_presentation_time,
             )
         }
@@ -3092,6 +3098,7 @@ fn render_surface_with(
     config: &Rc<RefCell<Config>>,
     flags: FrameFlags,
     force_full_damage: bool,
+    reset_buffers: bool,
     target_presentation_time: Duration,
 ) -> RenderResult {
     let mut rv = RenderResult::Skipped;
@@ -3137,6 +3144,18 @@ fn render_surface_with(
     // memory from 10 GB to 50 GB in a minute and got it OOM-killed by the host on 2026-08-06. Fixed
     // in our smithay fork; pinned by `tests::swapchain_ages`, which is where to look before
     // touching this.
+    // A pass-through scan-out stretch just ended. A full redraw is not enough to bring the
+    // desktop back: measured on a live black screen on 2026-08-15, we composited the whole
+    // overview into our own swapchain slots (124 elements, 180 draws covering 3.9x the output,
+    // GPU 2.8ms) and flipped between them at 60 Hz while the screen stayed black — and a VT
+    // switch, which re-creates the buffers, fixed it every time. So re-create them here rather
+    // than only clearing their damage history.
+    //
+    // Strictly one-shot. Doing this per frame is the 3.9 GB/s allocation storm that once got the
+    // VM OOM-killed by the host, so it is armed on the transition and cleared immediately.
+    if reset_buffers {
+        drm_compositor.reset_buffers();
+    }
     if force_full_damage {
         drm_compositor.reset_buffer_ages();
     }
@@ -3186,6 +3205,10 @@ fn render_surface_with(
             synoik.update_primary_scanout_output(output, &res.states);
             if let Some(state) = synoik.output_state.get_mut(output) {
                 state.last_frame_scanout = tally_scanout(&res.states);
+                // Arm on the transition only — see `pending_buffer_reset`.
+                if state.last_primary_was_client && !primary_was_client {
+                    state.pending_buffer_reset = true;
+                }
                 state.last_primary_was_client = primary_was_client;
             }
             if let Some(dmabuf_feedback) = surface.dmabuf_feedback.as_ref() {
