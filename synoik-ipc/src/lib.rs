@@ -395,6 +395,16 @@ pub struct DebugOutputState {
     pub redraw_state: String,
     /// Whether animations still want frames after the last redraw.
     pub unfinished_animations: bool,
+    /// Elements in the last frame.
+    pub elements: usize,
+    /// Of those, how many went to a plane directly (zero-copy scan-out).
+    pub zero_copy: usize,
+    /// Rendered because the buffer's format cannot be scanned out.
+    pub format_unsupported: usize,
+    /// Rendered because scan-out was attempted and **failed**.
+    pub scanout_failed: usize,
+    /// Rendered, never a scan-out candidate.
+    pub rendered: usize,
 }
 
 /// Color picked from the screen.

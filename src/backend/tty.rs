@@ -29,6 +29,7 @@ use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, NodeType, VrrSupport,
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::{DebugFlags, ImportDma};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
@@ -74,7 +75,7 @@ use crate::monitors_xml::{MonitorsConfig, SavedMode};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::vulkan::{matches_render_order, VulkanRenderer};
 use crate::render_helpers::{RenderCtx, RenderTarget};
-use crate::synoik::{RedrawState, State, Synoik};
+use crate::synoik::{RedrawState, ScanoutTally, State, Synoik};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
 const SUPPORTED_COLOR_FORMATS: [Fourcc; 8] = [
@@ -3019,6 +3020,29 @@ fn suspend() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Count how `states` presented this frame's elements: zero-copy scan-out, or rendered and why.
+///
+/// smithay records this per element, and it is the only authoritative source — "is direct scan-out
+/// engaging" cannot be read off the DRM debugfs framebuffer dump, whose `imported=` field reports
+/// `no` even for our own PRIME-imported scanout buffers.
+fn tally_scanout(states: &RenderElementStates) -> ScanoutTally {
+    use smithay::backend::renderer::element::{RenderElementPresentationState, RenderingReason};
+
+    let mut tally = ScanoutTally::default();
+    for state in states.states.values() {
+        match state.presentation_state {
+            RenderElementPresentationState::ZeroCopy => tally.zero_copy += 1,
+            RenderElementPresentationState::Skipped => tally.skipped += 1,
+            RenderElementPresentationState::Rendering { reason } => match reason {
+                Some(RenderingReason::FormatUnsupported) => tally.format_unsupported += 1,
+                Some(RenderingReason::ScanoutFailed) => tally.scanout_failed += 1,
+                None => tally.rendered += 1,
+            },
+        }
+    }
+    tally
+}
+
 /// Whether the session asked every scanout frame to be a full redraw, via
 /// `SYNOIK_VK_FULL_DAMAGE=1`. Read once — it must answer the same way for the whole process.
 ///
@@ -3141,6 +3165,9 @@ fn render_surface_with(
             }
 
             synoik.update_primary_scanout_output(output, &res.states);
+            if let Some(state) = synoik.output_state.get_mut(output) {
+                state.last_frame_scanout = tally_scanout(&res.states);
+            }
             if let Some(dmabuf_feedback) = surface.dmabuf_feedback.as_ref() {
                 synoik.send_dmabuf_feedbacks(output, dmabuf_feedback, &res.states);
             }

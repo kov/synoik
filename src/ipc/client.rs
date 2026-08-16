@@ -579,6 +579,15 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                 println!("Output {}:", output.name);
                 println!("  redraw state:    {}", output.redraw_state);
                 println!("  animating:       {}", output.unfinished_animations);
+                println!(
+                    "  last frame:      {} elements — {} zero-copy, {} rendered, \
+                     {} format-unsupported, {} SCAN-OUT FAILED",
+                    output.elements,
+                    output.zero_copy,
+                    output.rendered,
+                    output.format_unsupported,
+                    output.scanout_failed,
+                );
             }
             println!("Keyboard focus:    {}", d.keyboard_focus);
             println!("Input method:");

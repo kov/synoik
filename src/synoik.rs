@@ -1289,6 +1289,13 @@ pub struct OutputState {
     /// [`crate::frame_log`], which reports them alongside a slow frame.
     pub last_frame_elements: usize,
     pub last_frame_full_damage: bool,
+    /// How the last frame's elements were presented, from smithay's `RenderElementStates`.
+    ///
+    /// This is the **authoritative** answer to "did direct scan-out engage", and the reason it is
+    /// recorded rather than inferred: the DRM debugfs `imported=` field does not mean what it
+    /// looks like (our own PRIME-imported scanout buffers report `imported=no`), and reading
+    /// scan-out off it produced a confidently wrong answer on 2026-08-15.
+    pub last_frame_scanout: ScanoutTally,
     /// Which animations were running when the last frame was built. The set the
     /// redraw loop derives `unfinished_animations_remain` from, kept so the frame
     /// log can name what a slow frame was doing.
@@ -1357,6 +1364,21 @@ impl RedrawState {
             }
         }
     }
+}
+
+/// How one frame's elements were presented — zero-copy scan-out, or rendered and why.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScanoutTally {
+    /// Elements handed to a plane directly, no compositing.
+    pub zero_copy: usize,
+    /// Rendered because the buffer's format cannot be scanned out.
+    pub format_unsupported: usize,
+    /// Rendered because scan-out was *attempted and failed* — the interesting one.
+    pub scanout_failed: usize,
+    /// Rendered with no reason recorded (never a scan-out candidate).
+    pub rendered: usize,
+    /// Not visible this frame.
+    pub skipped: usize,
 }
 
 /// What a redraw is aiming at, decided before the redraw starts.
@@ -8061,6 +8083,7 @@ impl Synoik {
             pending_aim: None,
             on_demand_vrr_enabled: false,
             unfinished_animations_remain: false,
+            last_frame_scanout: ScanoutTally::default(),
             frame_clock: FrameClock::new(refresh_interval, vrr),
             last_drm_sequence: None,
             vblank_throttle: VBlankThrottle::new(self.event_loop.clone(), name.connector.clone()),
@@ -8309,6 +8332,11 @@ impl Synoik {
                     name: output.name(),
                     redraw_state: state.redraw_state.debug_name().to_owned(),
                     unfinished_animations: state.unfinished_animations_remain,
+                    elements: state.last_frame_elements,
+                    zero_copy: state.last_frame_scanout.zero_copy,
+                    format_unsupported: state.last_frame_scanout.format_unsupported,
+                    scanout_failed: state.last_frame_scanout.scanout_failed,
+                    rendered: state.last_frame_scanout.rendered,
                 })
                 .collect(),
         }
