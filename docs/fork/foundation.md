@@ -169,40 +169,52 @@ established by elimination:
 > applied, and nothing errors. Only a **genuinely new** resource restores that participant, and
 > creating new resources can knock *another* participant into the same state.
 
-**The fault is in the limina supervisor**, which is why no guest-side instrument could ever have
-seen it. The supervisor retains an `IOSurfaceRef` per guest surface id and drops it the moment the
-worker reports the guest released that resource, on the stated assumption that *"the guest will not
-present it again"*. **That premise is false for us**: we keep presenting the same scanout resources.
-Once the entry is gone the frame-apply path finds neither the map entry nor a global lookup — these
-surfaces are deliberately non-global, capability-scoped over a Mach port — so every later frame
-naming that id is skipped, silently and permanently.
+**The fault is in the limina supervisor**, which is why no guest-side instrument could reach it. The
+supervisor keeps a **bounded** store of retained `IOSurfaceRef`s, capped at 32 and evicted **FIFO by
+insertion order**. A compositor publishes its permanent scanout ring *first*, at startup, and then
+churns transient client buffers for the rest of the session — so the oldest-inserted surfaces are
+exactly the ones in continuous use, and every new client buffer pushes them closer to the exit.
+**Eviction is ordered by age when the only thing that matters is use**, which makes our two scanout
+buffers the guaranteed first casualties. Once evicted, the frame-apply path falls back to a global
+`IOSurfaceLookup` that cannot succeed, because these surfaces are deliberately non-global
+(capability-scoped over a Mach port). Every later frame naming that id is dropped, silently and
+permanently — nothing re-publishes it.
 
 Everything the guest can see stays healthy, which is the whole difficulty: the worker ACKs every
 `SET_SCANOUT_BLOB` `RESP_OK_NODATA`, the resource→IOSurface mapping never goes stale, and the flip
-rate goes *up* at the freeze. We present harder, correctly, into surfaces the supervisor has already
-released, while `surface N unresolved; skipping frame` accumulates in a host process we cannot see.
-It explains the two behaviours that defeated every guest-side theory: only a genuinely new resource
-heals, because only a new resource republishes a surface into the map; and creating resources knocks
-*another* participant out, because the release traffic is driven by our unref pattern.
+rate goes *up* at the freeze. We present harder, correctly, into surfaces the supervisor no longer
+holds.
 
-**Open on our side: what released those surfaces.** Nothing we can find. `Swapchain::reset_buffers`
-is the only thing that drops slots and our sole caller is session resume; the scanout `Dmabuf` is
-pinned in the slot's `UserDataMap` for the swapchain's lifetime; `dmabuf_target_cache` is weak-keyed
-with no size eviction, so allocation pressure cannot evict a scanout import; and
-`cleanup_texture_cache` — which `DrmCompositor` calls every frame during a client scan-out stretch —
-is not overridden by us, so it is a no-op. The host-side account infers rather than observes that a
-guest release removed the entries, and that path is unlogged; if nothing here can release them, the
-removal is likely elsewhere.
+**The trigger is publication volume, not time.** One reproduction crossed the cap in seconds —
+launch a client, fullscreen it, open the overview — because that mints a burst of surfaces at once.
+Our own earlier reading, that time under client pass-through scan-out correlated, was volume wearing
+a disguise: longer stretches simply meant more buffers had been published. It also inverts the
+fullscreen-vs-resize discriminator we relied on: a resize healed not by replacing broken buffers but
+by **re-publishing**, which puts the id back in the store.
 
-The one place a scanout resource carries a second, quieter guest-side reference is the redundant
-import under "Left on the table" — `import_dmabuf_target` builds a second `VkImage` around a buffer
-the allocator already owns. That is the reference whose destruction we would not notice. It is a
-place to look, not a mechanism: nothing shows it firing.
+**Our contribution to the pressure is two surfaces, and cannot be reduced.**
+`VkExportMemoryAllocateInfo` appears at exactly one site in `synoik-vk` — `Texture::allocate_scanout`
+— so the only images we export are the scanout ring. Offscreens, blur bundles and widget bakes are
+device-local and never become IOSurfaces. The redundant second `VkImage` under "Left on the table"
+is an *import* of a dmabuf that already exists, so removing it saves an image, a memory import and a
+query per swapchain buffer but should not remove a publication. **The churn is client buffers**,
+which is unbounded and not ours to promise to limit.
 
-> **The rule this bug earned: require an observation, not a fit.** Five mechanisms have explained
-> every symptom here and been wrong — client-vs-compositor, resource longevity, "stops applying
-> entirely", surface-store capacity, and a host-side stale-id cache. Fitting all the evidence has a
-> 0/5 record on this fault.
+A second, latent host-side hazard is on record and did **not** fire here: `note_released` drops the
+retained reference on the assumption that "the guest will not present it again". A guest that does
+present it again fails identically.
+
+> **The rule this bug earned: require an observation, not a fit.** Six mechanisms explained every
+> symptom here and were wrong — client-vs-compositor, resource longevity, "stops applying entirely",
+> surface-store capacity, a host-side stale-id cache, and a guest-side release. The one that survived
+> is the one an instrument printed, after a one-line log was added to the path that had none.
+>
+> Two corollaries worth more than the mechanism. **A ruling-out is only as good as the population it
+> counted**: "eviction is ruled out" was reached by counting 20 distinct ids in a log that covers only
+> scanout imports, while the store receives *every* published surface — 41 of them. Check that the
+> population you counted is the one you are bounding. And **an unlogged path is where the wrong answer
+> lives**: every theory that survived scrutiny for hours did so because the step that would have
+> falsified it printed nothing.
 
 We are exonerated by measurement rather than argument: we render correct frames on time,
 `debug-dump-scanout` reads a perfect current image back out of the buffer we hand over, and

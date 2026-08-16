@@ -93,7 +93,7 @@ why `record_pending_dmabuf_acquires` is `#[must_use]` with its batch going into 
 
 The trap is that dropping is only fatal when it is the **last** reference, so a cache one layer away
 decides whether you have a bug. Client dmabuf imports are cached weakly and swept on every lookup, so
-a client that reallocates buffers (anything resizing — our own open animation forces it every frame)
+a client that reallocates buffers — an interactive resize does it on every size it accepts —
 leaves the queue holding the sole reference. Queue a texture the cache still holds and nothing
 happens; queue one it has dropped and the compositor dies. It shipped, and the seat came down on a
 client that did nothing wrong.
