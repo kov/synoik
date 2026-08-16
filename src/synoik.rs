@@ -1296,6 +1296,15 @@ pub struct OutputState {
     /// looks like (our own PRIME-imported scanout buffers report `imported=no`), and reading
     /// scan-out off it produced a confidently wrong answer on 2026-08-15.
     pub last_frame_scanout: ScanoutTally,
+    /// Whether the last frame handed the **primary plane** to a client buffer instead of our
+    /// swapchain, i.e. we were in a pass-through scan-out stretch.
+    ///
+    /// While that is true we render nothing, so our swapchain slots are never cycled and keep
+    /// whatever desktop they held when the stretch began. `DrmCompositor`'s buffer age counts only
+    /// frames *it* composited, so on resume it reports a one-or-two-frame-old slot and hands us
+    /// minimal damage — and we would repaint that damage onto a desktop image that is as stale as
+    /// the stretch was long. See where this forces a full redraw in the tty backend.
+    pub last_primary_was_client: bool,
     /// Which animations were running when the last frame was built. The set the
     /// redraw loop derives `unfinished_animations_remain` from, kept so the frame
     /// log can name what a slow frame was doing.
@@ -8084,6 +8093,7 @@ impl Synoik {
             on_demand_vrr_enabled: false,
             unfinished_animations_remain: false,
             last_frame_scanout: ScanoutTally::default(),
+            last_primary_was_client: false,
             frame_clock: FrameClock::new(refresh_interval, vrr),
             last_drm_sequence: None,
             vblank_throttle: VBlankThrottle::new(self.event_loop.clone(), name.connector.clone()),
