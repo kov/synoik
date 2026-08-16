@@ -651,10 +651,21 @@ work together**: guest mesa flushes and waits on unmap of a `PIPE_BIND_SHARED` w
 and reverted after 10/10 still-stale runs. **Both halves are enhanced-tier only — the stock tier
 keeps the bug**, so this returns if we ever run against a guest without limina's mesa.
 
-**Also worth knowing about the shipped assert surface:** roughly 820 asserts in the KosmicKrisp build
-are live and reachable from guest usage, and one takes down the **whole VM**, not just our context —
-so a spec violation here can present as "the VM died" rather than as a validation error. Our
-validation layer is off by default, which is the realistic case. The VMM side is extending vkr's
-trust-boundary checks to the classes a compositor actually hits (degenerate rects, zero-size creates,
-format mismatches) and can offer a `-Db_ndebug=true` build for A/B on the dogfood seat. `virtual-display-identity.md` carries the display-identity
+**The shipped assert surface, and why its removal is not purely good news.** An earlier reading of
+this — repeated here for about an hour on 2026-08-16 — said ~820 KosmicKrisp asserts were live and
+reachable, so a spec violation of ours could take down the **whole VM**. That is **wrong**:
+`b_ndebug=true` ships on both the release and devenv builds, verified in the binary (zero `assert`
+symbol references, zero assertion-failure strings in `libvulkan_kosmickrisp.dylib`). A bad command
+will not abort the VM.
+
+It also will not abort anything else. **Compiling the asserts out removed the tripwire, not the
+hazard** — an unchecked bad command now runs on into undefined behaviour. So vkr's trust-boundary
+checks stop being defence in depth and become the only defence, and the failure mode they catch
+changes from a clean crash to **silent corruption**.
+
+That is the worse direction for us specifically, because our debugging posture assumes loud failure:
+`SYNOIK_VK_VALIDATION` is off by default, and the way undefined behaviour usually surfaces here is
+that something dies somewhere confusing. A corrupted frame is exactly the class we cannot see — a
+pixel comparison passes whenever the cache happens to hold the right image. Treat "the VM stopped
+dying" as a change in *symptom*, not in *risk*, and keep running validated runs after renderer work. `virtual-display-identity.md` carries the display-identity
 ask, deliberately written so it would help stock mutter too.
