@@ -14,14 +14,15 @@ Both reproduce **deterministically** (verified across repeated runs) and each wa
 adversarially checked to rule out reproducer-side confounds (see the per-issue "Confounds
 ruled out" notes).
 
-**A third, later finding lives next door:** timestamp queries are advertised in full and resolve
-to zero — see [`foundation.md`](../foundation.md), with its reproducer in
-[`repro-vk-timestamp-query/`](./repro-vk-timestamp-query). It is written up separately because it
-is a handoff for the VM-stack work rather than a dmabuf-import finding.
+**A third, later finding, now fixed:** timestamp queries were advertised in full and resolved to
+zero — two stacked bugs in the host Vulkan driver, fixed host-side 2026-07-26. Its reproducer,
+[`repro-vk-timestamp-query/`](./repro-vk-timestamp-query), **stays**: it is the discriminator, it is
+cheap, and it has reported three different answers on three builds. See
+[`foundation.md`](../foundation.md) §4.
 
 **For the performance picture rather than individual defects**, see
-[`foundation.md`](../foundation.md): what this stack prices per round trip, measured on a live
-compositor, and what would help most at the VMM level. These two findings appear there as §3.7.
+[`foundation.md`](../foundation.md) §5: what this stack prices per round trip, measured on a live
+compositor, and what would help most at the VMM level.
 
 ---
 

@@ -395,12 +395,15 @@ first-class constraint on this work.
   structurally can't cross virtio).
 - **(4) cut over at parity; delete GLES/pango/cairo.**
 
-**Performance ceiling of the owned renderer — see `docs/fork/foundation.md`,
-arrived at in `docs/fork/foundation.md`.** Every submit fence-waits; the scanout one
-costs 12-14ms of a 16.67ms frame and does not depend on anything we draw. The cheaper per-frame
-wins are done, so this is the only frame-cost item left.
+**Performance ceiling of the owned renderer — see `docs/fork/foundation.md` §3 and §5.** This is
+**closed**: it was one synchronous wait on the scanout submit costing 12–14 ms of a 16.67 ms frame,
+independent of anything we drew. Two changes took it out — the scanout submit now hands its fence to
+KMS, and `Argb8888`/`Xrgb8888` render straight into the scanout dmabuf with no shadow and no present
+blit (heavy-frame GPU p50 9.34 → 1.47 ms, aim-1 miss rate 11.92% → 0.00%). A frame is now one
+submit, and the only thing left waiting on the frame path is CPU readback. What remains is not GPU
+cost: frame pacing on top of async scanout, and the idle redraw loop.
 
-**Known gaps of the owned renderer vs GLES — see `docs/fork/foundation.md`.** Deleting GLES is
+**Known gaps of the owned renderer vs GLES — see `docs/fork/foundation.md` §6.** Deleting GLES is
 **not** a one-way door: single-device / LINEAR-only / single-plane are configurations of the Vulkan
 renderer, not its architecture, and Smithay's multi-GPU machinery is GLES-typed top to bottom, so
 keeping it would buy no head start on a Vulkan implementation. The gap that bites **first, and on
@@ -553,7 +556,7 @@ does not wait on the host: multi-planar sampling (per-plane `VkImage` +
 frame ever reaches a hardware plane; non-LINEAR modifier import depends on what Venus/KosmicKrisp can
 expose on a Metal host and may stay moot here. Sequence it *before* multi-GPU, and start the
 multi-planar half ahead of the VMM landing rather than discovering it afterwards. Related: overlay
-planes for video scanout are a VMM ask, not a prerequisite — see `foundation.md` §3.
+planes for video scanout are a VMM ask, not a prerequisite — see `foundation.md` §7.
 
 **Accessibility is its own milestone here, tracked in `docs/fork/a11y-port.md`** — chrome
 scale ends at the toggle menu (done); behind it sit high-contrast/text-scaling in our own
