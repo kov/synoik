@@ -3095,6 +3095,37 @@ impl<W: LayoutElement> Monitor<W> {
         ws.render_above_top_layer()
     }
 
+    /// How far the top panel is slid off the top edge of this monitor: 0 fully down, 1 fully
+    /// gone. A pure function of where the view *currently* is, so it needs no animation of
+    /// its own — it rides the workspace switch and the overview.
+    ///
+    /// **Divergence.** gnome-shell toggles `panelBox.visible` outright on `monitor.inFullscreen`
+    /// (`js/ui/layout.js:983`), which pops the panel in at the start of a switch and out again
+    /// when it settles. We slide it instead, interpolated between the workspaces the view sits
+    /// between, so entering a fullscreen workspace takes the panel up with the motion.
+    ///
+    /// The overview shows the panel over a fullscreen window (GNOME hides the window group
+    /// there, so `inFullscreen` goes false), hence the second factor: opening the overview
+    /// brings the panel back down, closing onto a fullscreen workspace takes it back up.
+    pub fn panel_hidden_fraction(&self) -> f64 {
+        // The whole overview leg, app grid included — the panel is down for all of it.
+        let overview = self.open_fraction().clamp(0., 1.);
+        if overview >= 1. {
+            return 0.;
+        }
+
+        let last = self.workspaces.len() - 1;
+        // A gesture can pull the position past either end; there is no workspace out there to
+        // interpolate towards, so the edge one holds.
+        let pos = self.workspace_scroll_position().clamp(0., last as f64);
+        let lo = pos.floor() as usize;
+        let hi = pos.ceil() as usize;
+        let hidden_at = |idx: usize| f64::from(self.workspaces[idx].render_above_top_layer());
+        let between = hidden_at(lo) + (hidden_at(hi) - hidden_at(lo)) * (pos - pos.floor());
+
+        between * (1. - overview)
+    }
+
     pub fn render_insert_hint_between_workspaces(
         &self,
         push: &mut dyn FnMut(MonitorRenderElement),

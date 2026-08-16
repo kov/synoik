@@ -8359,32 +8359,30 @@ impl Synoik {
         Some((output, pos_within_output))
     }
 
-    /// Whether the top panel shows on `output` — false over a fullscreen window.
-    ///
-    /// GNOME registers `panelBox` as chrome with `trackFullscreen: true`
-    /// (`js/ui/layout.js:285`), and `_updateActorVisibility` (`:983`) sets
-    /// `visible = !(global.window_group.visible && monitor.inFullscreen)`. The window group is
-    /// hidden while the overview is up, so the panel comes back there even over a fullscreen
-    /// window — which for us is just `is_overview_open`. (GNOME's other conjunct,
-    /// `sessionMode.hasWindows`, covers the lock screen; the panel render path already returns
-    /// before that.)
-    ///
-    /// `inFullscreen` is `render_above_top_layer`, the same predicate the hot corner uses for the
-    /// same reason (`js/ui/layout.js:1247`) — one source of truth so the two cannot drift.
-    ///
-    /// **This gates input as well as drawing.** In Clutter `visible = false` takes the actor out
-    /// of the pick, so a hidden panel cannot be hovered or clicked; a version of this that only
-    /// skipped rendering would leave an invisible 40px strip eating clicks along the top of every
-    /// fullscreen window.
-    pub fn panel_visible_on(&self, output: &Output) -> bool {
-        if self.layout.is_overview_open() {
-            return true;
-        }
-
-        !self
-            .layout
+    /// How far the top panel is slid off the top of `output`: 0 fully down, 1 fully gone over a
+    /// fullscreen window. See [`Monitor::panel_hidden_fraction`] for the shape and the GNOME
+    /// divergence (GNOME toggles `panelBox.visible` outright, `js/ui/layout.js:983`).
+    pub fn panel_hidden_fraction(&self, output: &Output) -> f64 {
+        self.layout
             .monitor_for_output(output)
-            .is_some_and(|mon| mon.render_above_top_layer())
+            .map_or(0., |mon| mon.panel_hidden_fraction())
+    }
+
+    /// Whether the top panel draws anything on `output` — false once it has slid all the way
+    /// off, so a fullscreen window is still the only thing on the output and keeps its scanout.
+    pub fn panel_visible_on(&self, output: &Output) -> bool {
+        self.panel_hidden_fraction(output) < 1.
+    }
+
+    /// Whether the top panel can be hovered or clicked on `output`.
+    ///
+    /// Only when it is fully down. In Clutter `visible = false` takes the actor out of the pick,
+    /// so GNOME's hidden panel cannot be hovered; a version that only skipped rendering would
+    /// leave an invisible 40px strip eating clicks along the top of every fullscreen window.
+    /// We need the stricter form because the panel now *slides*: input keeps testing against the
+    /// resting rectangle, so a panel caught halfway up must not answer for it.
+    pub fn panel_takes_input_on(&self, output: &Output) -> bool {
+        self.panel_hidden_fraction(output) <= 0.
     }
 
     /// The workspace snapshot for `output`'s monitor, driving that panel's dot indicator.
@@ -10161,6 +10159,17 @@ impl Synoik {
         if self.panel_popover.is_open() && (overview_just_opened || !self.layout.is_gnome_mode()) {
             self.panel_popover.close();
         }
+        // A menu whose bar is on its way out over a fullscreen window goes with it: the popover
+        // holds a modal keyboard grab (`KeyboardFocus::Popover`), and once the slide finishes
+        // nothing is drawn to dismiss.
+        if self.panel_popover.is_open()
+            && self
+                .panel_popover
+                .output()
+                .is_some_and(|output| self.panel_hidden_fraction(output) > 0.)
+        {
+            self.panel_popover.close();
+        }
 
         // Keep the panel button containers' active state in sync with the open popover
         // (the clock/quick-settings button stays lit while its menu is up).
@@ -10751,10 +10760,17 @@ impl Synoik {
             for element in self.osd.render(ctx.renderer, &self.icon_cache, output) {
                 push(element.into());
             }
-            // Hidden over a fullscreen window, and with it its popovers — see
-            // `panel_visible_on`. The OSD above is deliberately outside this: it is not
+            // Slid up off the top edge over a fullscreen window, and with it its popovers — see
+            // `panel_hidden_fraction`. The OSD above is deliberately outside this: it is not
             // `trackFullscreen` chrome and shows over fullscreen windows in GNOME too.
-            if self.panel_visible_on(output) {
+            let panel_hidden = self.panel_hidden_fraction(output);
+            if panel_hidden < 1. {
+                // One rounding, in physical pixels: rounding the logical offset and then
+                // converting would land the bar and its contents on different subpixels.
+                let scale = output.current_scale().fractional_scale();
+                let panel_slide: Point<i32, Physical> =
+                    Point::from((0., -(panel_hidden * crate::ui::panel::panel_height())))
+                        .to_physical_precise_round(scale);
                 for element in self.panel.render(
                     ctx.renderer,
                     output,
@@ -10766,10 +10782,18 @@ impl Synoik {
                         images: &self.image_cache,
                     },
                 ) {
-                    push(element.into());
+                    push(
+                        RelocateRenderElement::from_element(
+                            element,
+                            panel_slide,
+                            Relocate::Relative,
+                        )
+                        .into(),
+                    );
                 }
                 // A panel popover (dateMenu calendar, quick settings, …) sits above the
                 // bar; the quick-settings menu composites several elements (chrome + icons).
+                // It rides the same slide so a menu caught by a switch travels with its button.
                 for element in self.panel_popover.render(
                     ctx.renderer,
                     &self.icon_cache,
@@ -10777,7 +10801,14 @@ impl Synoik {
                     &self.image_cache,
                     output,
                 ) {
-                    push(element.into());
+                    push(
+                        RelocateRenderElement::from_element(
+                            element,
+                            panel_slide,
+                            Relocate::Relative,
+                        )
+                        .into(),
+                    );
                 }
             }
             // The notification banner slides out from under the bar (pushed after
@@ -15841,8 +15872,11 @@ synoik_render_elements! {
         // on GLES and the owned Vulkan renderer alike (the M1 escape hatch: `TextureRenderElement`
         // impls `RenderElement<R>` for any `R: Renderer<TextureId = T>`).
         UiTexture = TextureRenderElement<VkTexture>,
-        // The panel: baked chrome, plus its background as its own solid layer.
-        Panel = PanelElement,
+        // The panel: baked chrome, plus its background as its own solid layer. Relocated
+        // because it slides off the top edge over a fullscreen window; the offset is 0 at rest.
+        Panel = RelocateRenderElement<PanelElement>,
+        // A panel popover, relocated with the bar it hangs off.
+        RelocatedUiTexture = RelocateRenderElement<TextureRenderElement<VkTexture>>,
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<VulkanRenderer>>,
         // The wallpaper drawn straight onto an output rather than into a workspace — the lock

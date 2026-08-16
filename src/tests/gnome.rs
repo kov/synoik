@@ -3104,6 +3104,88 @@ fn panel_hides_and_stops_taking_input_over_a_fullscreen_window() {
     );
 }
 
+/// The panel *slides* off the top over a fullscreen window, riding the workspace switch and the
+/// overview rather than popping at either end of them.
+///
+/// **Divergence.** gnome-shell toggles `panelBox.visible` outright (`js/ui/layout.js:983`), so its
+/// panel is up for the whole switch and vanishes when the switch settles. Ours interpolates
+/// between the two workspaces the view sits between.
+///
+/// Sampled mid-flight on purpose: the endpoints agree with the binary behavior, so a test that
+/// only looks at them passes with no slide at all.
+#[test]
+fn panel_slides_away_with_the_switch_onto_a_fullscreen_workspace() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik().global_space.outputs().next().cloned().unwrap();
+    let id = f.add_client();
+
+    // A fullscreen window one workspace down, and the view left on the empty one above it.
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window_id = f.synoik().layout.focus().unwrap().window.clone();
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.synoik().layout.toggle_fullscreen(&window_id);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
+    f.synoik_complete_animations();
+
+    let hidden = |f: &mut Fixture| f.synoik().panel_hidden_fraction(&output);
+    assert_eq!(
+        hidden(&mut f),
+        0.,
+        "the panel is down on the empty workspace"
+    );
+
+    // Down onto the fullscreen workspace: the fraction must climb, not step.
+    f.freeze_clock();
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    let down = f.sample_animation(Duration::from_millis(400), 8, |f| {
+        (hidden(f), f.synoik().panel_takes_input_on(&output))
+    });
+    let fractions: Vec<f64> = down.iter().map(|(v, _)| *v).collect();
+    assert!(
+        fractions.windows(2).all(|w| w[1] >= w[0]),
+        "the slide must be monotonic: {fractions:?}"
+    );
+    assert!(
+        fractions.iter().any(|v| (0.05..0.95).contains(v)),
+        "the panel must be caught partway up, not stepped: {fractions:?}"
+    );
+    assert_eq!(
+        *fractions.last().unwrap(),
+        1.,
+        "the switch settles with the panel fully gone: {fractions:?}"
+    );
+    assert!(
+        down.iter().skip(1).all(|(_, input)| !input),
+        "a panel on its way up must not answer for its resting rectangle"
+    );
+
+    // Opening the overview on that workspace brings it back down the same way.
+    f.synoik().layout.toggle_overview();
+    let up = f.sample_animation(Duration::from_millis(400), 8, hidden);
+    assert!(
+        up.windows(2).all(|w| w[1] <= w[0]),
+        "the overview must bring the panel back down monotonically: {up:?}"
+    );
+    assert!(
+        up.iter().any(|v| (0.05..0.95).contains(v)),
+        "the panel must be caught partway down: {up:?}"
+    );
+    assert_eq!(
+        *up.last().unwrap(),
+        0.,
+        "the overview settles with the panel fully down: {up:?}"
+    );
+}
+
 /// `org.gnome.mutter center-new-windows`, GNOME's default since mutter 48:
 /// a new window opens in the middle of the work area. `find_first_fit` never
 /// runs, so nothing tries to avoid overlap — a window landing within

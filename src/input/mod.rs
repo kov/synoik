@@ -4547,8 +4547,8 @@ impl State {
         let role = if self.synoik.layout.is_gnome_mode() {
             self.synoik.output_under(pos).and_then(|(output, p)| {
                 // A panel hidden over a fullscreen window is out of the pick entirely, so it
-                // cannot be hovered either (`Synoik::panel_visible_on`).
-                if !self.synoik.panel_visible_on(output) {
+                // cannot be hovered either (`Synoik::panel_takes_input_on`).
+                if !self.synoik.panel_takes_input_on(output) {
                     return None;
                 }
                 let ws = self.synoik.workspace_state_for(output);
@@ -7184,7 +7184,7 @@ impl State {
                 // Which icon was hit is a second question: several share the item's slot.
                 let panel_takes_input = under
                     .as_ref()
-                    .is_some_and(|(output, _)| self.synoik.panel_visible_on(output));
+                    .is_some_and(|(output, _)| self.synoik.panel_takes_input_on(output));
                 if let (Some(button), Some((output, pos))) = (button, under.clone()) {
                     let output_w = output_size(&output).w;
                     if let Some((id, anchor)) = self
@@ -7719,7 +7719,7 @@ impl State {
                 .synoik
                 .output_under(location)
                 .map(|(output, pos)| {
-                    if !self.synoik.panel_visible_on(output) {
+                    if !self.synoik.panel_takes_input_on(output) {
                         return false;
                     }
                     let ws = self.synoik.workspace_state_for(output);
