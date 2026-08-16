@@ -7212,13 +7212,15 @@ fn overview_drag_of_edge_tiled_window_stays_tiled() {
     let win = f.synoik().layout.focus().unwrap().window.clone();
     let ws1_id = f.synoik().layout.active_workspace().unwrap().id();
 
-    // Tile left and ack the half-width configure.
+    // Tile left and ack the half-width configure. 1048, not 1080: the tiled height is the *work
+    // area*, which the top panel's strut has already shortened. Committing at full output height
+    // would leave the client a size the compositor never asked for.
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_LEFT);
     f.key_release(KEY_LEFTMETA);
     f.double_roundtrip(id);
     let window = f.client(id).window(&surface);
-    window.set_size(960, 1080);
+    window.set_size(960, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
     f.synoik_complete_animations();
@@ -7244,7 +7246,7 @@ fn overview_drag_of_edge_tiled_window_stays_tiled() {
     for configure in f.client(id).window(&surface).recent_configures() {
         assert_eq!(
             configure.size,
-            (960, 1080),
+            (960, 1048),
             "an overview drag must never resize the tiled window, got: {configure}"
         );
     }
@@ -25683,6 +25685,142 @@ fn ipc_windows_report_maximized_and_tiled_state() {
     assert!(
         w.tiled_edges.any(),
         "a tiled window must report the edges it is tiled against",
+    );
+}
+
+/// A mode or scale change re-fits the windows whose size the *compositor* owns: maximized,
+/// fullscreen and edge-tiled. Their geometry is a function of the working area, so when that area
+/// moves they have to be re-derived, or they overflow the new output or leave a gap.
+///
+/// mutter never stores such a rect. It re-runs the constraint system over every window in the
+/// workspace whenever a work area is invalidated (`workspace.c:829`), and the maximized size comes
+/// out of that run (`constraints.c:1326`).
+///
+/// A plain floating window is the control: nothing may size it, per
+/// `a_window_is_not_configured_smaller_than_it_asked_for`.
+#[test]
+fn a_mode_or_scale_change_refits_maximized_and_tiled_windows() {
+    // Read the geometry back off the IPC listing — the same surface a user or a script sees, so
+    // the test cannot pass against a private field the real consumers never read.
+    fn tile_geo(f: &mut Fixture, title: &str) -> ((f64, f64), (f64, f64)) {
+        f.synoik_state().ipc_refresh_layout();
+        let win = f
+            .synoik()
+            .ipc_server
+            .as_ref()
+            .unwrap()
+            .event_stream_state()
+            .windows
+            .windows
+            .values()
+            .find(|w| w.title.as_deref() == Some(title))
+            .unwrap_or_else(|| panic!("{title} must be in the IPC listing"))
+            .clone();
+        (
+            win.layout.tile_size,
+            win.layout.tile_pos_in_workspace_view.unwrap(),
+        )
+    }
+
+    let mut f = Fixture::with_config(Config::default());
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    // Titled so the IPC listing can tell them apart.
+    let map = |f: &mut Fixture, title: &str, size: (u16, u16)| {
+        let surface = map_window_sized(f, id, size, None);
+        f.client(id).window(&surface).set_title(title);
+        f.double_roundtrip(id);
+        surface
+    };
+    let maxed = map(&mut f, "maxed", (800, 600));
+    f.synoik_state().do_action(Action::Maximize, false);
+    let tiled = map(&mut f, "tiled", (800, 600));
+    f.synoik_state().do_action(Action::ToggleTiledLeft, false);
+
+    let floating = map(&mut f, "floating", (640, 480));
+    let all = [&maxed, &tiled, &floating];
+
+    // Honour the configure like a real client: take the size the compositor asked for and commit
+    // at it. A client that only acks would leave every tile at its mapped size, and the test would
+    // measure nothing.
+    let settle = |f: &mut Fixture| {
+        f.double_roundtrip(id);
+        for s in all {
+            let win = f.client(id).window(s);
+            let (w, h) = win.configures_received.last().unwrap().1.size;
+            if w > 0 && h > 0 {
+                win.set_size(w as u16, h as u16);
+            }
+            win.ack_last_and_commit();
+        }
+        f.double_roundtrip(id);
+        f.synoik_complete_animations();
+    };
+    settle(&mut f);
+
+    let before = f.synoik().layout.active_workspace().unwrap().working_area();
+    assert_eq!(
+        tile_geo(&mut f, "maxed").0,
+        (before.size.w, before.size.h),
+        "the maximized window starts out filling the work area"
+    );
+    let floating_before = tile_geo(&mut f, "floating");
+
+    // A narrower, shorter mode — the EDID change. Everything derived from the work area must
+    // follow it down; nothing may end up wider than the new output.
+    f.resize_output(1, Some((1280, 720)), None);
+    settle(&mut f);
+
+    let area = f.synoik().layout.active_workspace().unwrap().working_area();
+    assert_ne!(
+        (area.size.w, area.size.h),
+        (before.size.w, before.size.h),
+        "the mode change must move the work area, or this test proves nothing"
+    );
+
+    assert_eq!(
+        tile_geo(&mut f, "maxed").0,
+        (area.size.w, area.size.h),
+        "a maximized window must fill the *new* work area, not the old one"
+    );
+
+    assert_eq!(
+        tile_geo(&mut f, "tiled"),
+        (
+            ((area.size.w / 2.).round(), area.size.h),
+            (area.loc.x, area.loc.y)
+        ),
+        "an edge-tiled window must take half of the new work area, flush against its left edge"
+    );
+
+    assert_eq!(
+        tile_geo(&mut f, "floating").0,
+        floating_before.0,
+        "a plain floating window owns its own size; the compositor must not resize it"
+    );
+    // Its *position* does follow, proportionally — mutter remaps the unconstrained rect between
+    // the old and new monitor rects and keeps the size (`move_rect_between_rects`, window.c:4530).
+    assert_ne!(
+        tile_geo(&mut f, "floating").1,
+        floating_before.1,
+        "…but it is carried into the new area rather than left at stale coordinates"
+    );
+
+    // A scale change moves the work area in logical pixels too, and must re-fit the same way.
+    f.resize_output(1, None, Some(2.));
+    settle(&mut f);
+
+    let area = f.synoik().layout.active_workspace().unwrap().working_area();
+    assert_eq!(
+        tile_geo(&mut f, "maxed").0,
+        (area.size.w, area.size.h),
+        "a scale change must re-fit a maximized window too"
+    );
+    assert_eq!(
+        tile_geo(&mut f, "tiled").0,
+        ((area.size.w / 2.).round(), area.size.h),
+        "…and an edge-tiled one"
     );
 }
 

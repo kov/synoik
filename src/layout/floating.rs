@@ -306,6 +306,13 @@ impl<W: LayoutElement> FloatingSpace<W> {
         scale: f64,
         options: Rc<Options>,
     ) {
+        // A mode, scale or strut change moves the work area out from under the windows that were
+        // sized to it. Maximized, fullscreen and edge-tiled geometry is a *function* of that area,
+        // never a stored rect, so it has to be re-derived — mutter re-runs the whole constraint
+        // system over every window in the workspace whenever a work area is invalidated
+        // (`workspace.c:829`), which is where its maximized size comes from (`constraints.c:1326`).
+        let area_changed = self.view_size != view_size || self.working_area != working_area;
+
         for (tile, data) in zip(&mut self.tiles, &mut self.data) {
             tile.update_config(view_size, scale, options.clone());
             data.update(tile);
@@ -316,6 +323,41 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.working_area = working_area;
         self.scale = scale;
         self.options = options;
+
+        // After the loop above and the assignments: a refit reads the *new* area, and the
+        // fullscreen one reads it off `Tile::view_size`, which only `tile.update_config` refreshes.
+        if area_changed {
+            for idx in 0..self.tiles.len() {
+                self.refit_to_working_area(idx);
+            }
+        }
+    }
+
+    /// Re-derive one tile's geometry from the current work area, for a window whose size is owned
+    /// by a state rather than by the user: maximized, fullscreen or edge-tiled.
+    ///
+    /// Unanimated on purpose. This is not a state change the user asked for — the work area moved
+    /// underneath a state the window was already in — and mutter re-constrains such a window
+    /// instantly.
+    fn refit_to_working_area(&mut self, idx: usize) {
+        // Maximize and fullscreen only live in this space in GNOME mode; in niri's scrolling mode
+        // the scrolling layout owns them, and a tile here is plain floating. Edge tiling is ours
+        // in both (`Workspace::toggle_tiled` hands a scrolling window back to us to tile it).
+        let gnome_mode = self.options.layout.windowing_mode == WindowingMode::Floating;
+        match self.tiles[idx].window().pending_sizing_mode() {
+            SizingMode::Fullscreen if gnome_mode => {
+                self.tiles[idx].request_fullscreen(false, None);
+            }
+            SizingMode::Maximized if gnome_mode => {
+                let size = self.working_area.size;
+                self.tiles[idx].request_maximized(size, false, None);
+            }
+            _ => {
+                if let Some(side) = self.tiles[idx].window().edge_tiled_side() {
+                    self.place_edge_tiled(idx, side, false);
+                }
+            }
+        }
     }
 
     pub fn update_shaders(&mut self) {
@@ -505,6 +547,12 @@ impl<W: LayoutElement> FloatingSpace<W> {
         tile.update_config(self.view_size, self.scale, self.options.clone());
 
         let gnome_mode = self.options.layout.windowing_mode == WindowingMode::Floating;
+        // Edge tiling reads as `SizingMode::Normal`, so it would otherwise fall into the
+        // restore-the-floating-size arm below and quietly lose the tiling. Re-applied against this
+        // space once the tile is in place, like maximize and fullscreen — mutter carries
+        // side-by-side tiling across a monitor change too, re-constraining it against the new
+        // monitor (`window.c:4129-4135`).
+        let edge_tiled = tile.window().edge_tiled_side();
         match tile.window().pending_sizing_mode() {
             // GNOME mode: this space holds maximized and fullscreen windows itself. The state
             // survives, but is re-applied against *this* space — the tile may be arriving from a
@@ -514,6 +562,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
                 let size = self.working_area.size;
                 tile.request_maximized(size, true, None);
             }
+            // Handled after insertion, against this space's work area.
+            _ if edge_tiled.is_some() => {}
             // In niri's scrolling mode only the scrolling layout can size a window to the screen,
             // so a window arriving here leaves those states behind. Restore the previous floating
             // window size, and in case the tile is fullscreen, unfullscreen it.
@@ -579,6 +629,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let data = Data::new(self.working_area, &tile, pos);
         self.data.insert(idx, data);
         self.tiles.insert(idx, tile);
+
+        if let Some(side) = edge_tiled {
+            self.place_edge_tiled(idx, side, false);
+        }
 
         self.bring_up_descendants_of(idx);
     }
@@ -1203,8 +1257,6 @@ impl<W: LayoutElement> FloatingSpace<W> {
     /// 0.5 fraction): half the work area wide, full height, snapped to the
     /// side's edge.
     fn tile_to(&mut self, idx: usize, side: TileSide) {
-        let area = self.working_area;
-
         // First tile from floating: save the restore rect (mutter's `meta_window_save_rect`).
         // Re-tiling to the other side keeps it, and so does tiling a maximized or fullscreen
         // window, which already saved one on its way there (mutter clears the maximization and
@@ -1213,8 +1265,16 @@ impl<W: LayoutElement> FloatingSpace<W> {
             self.save_restore_rect(idx);
         }
 
+        self.tiles[idx].saved_maximize = false;
+        self.place_edge_tiled(idx, side, true);
+        self.interactive_resize_end(None);
+    }
+
+    /// Size and place an edge-tiled window against the *current* work area, the one piece of
+    /// [`Self::tile_to`] that has to run again whenever that area moves.
+    fn place_edge_tiled(&mut self, idx: usize, side: TileSide, animate: bool) {
+        let area = self.working_area;
         let tile = &mut self.tiles[idx];
-        tile.saved_maximize = false;
 
         let tile_width = (area.size.w / 2.).round();
         let win_width = tile.window_width_for_tile_width(tile_width);
@@ -1225,7 +1285,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let max_size = win.max_size();
         let win_width = ensure_min_max_size(win_width.round() as i32, min_size.w, max_size.w);
         let win_height = ensure_min_max_size(win_height.round() as i32, min_size.h, max_size.h);
-        win.request_size_once(Size::from((win_width, win_height)), true);
+        win.request_size_once(Size::from((win_width, win_height)), animate);
         win.set_edge_tiled(Some(side));
 
         // An edge-tiled window is positioned like a free-floating one, so drop any maximize or
@@ -1237,8 +1297,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
         let prev_pos = self.data[idx].logical_pos;
         self.data[idx].set_logical_pos(Point::from((x, area.loc.y)));
         self.data[idx].set_anchor(Anchor::Free);
-        self.animate_state_change_move_from(idx, prev_pos);
-        self.interactive_resize_end(None);
+        if animate {
+            self.animate_state_change_move_from(idx, prev_pos);
+        }
     }
 
     fn untile(&mut self, idx: usize) {

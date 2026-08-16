@@ -451,6 +451,29 @@ impl Fixture {
         state.backend.headless().add_output(synoik, n, size);
     }
 
+    /// Change an existing output's mode and/or fractional scale, the way an EDID/mode change or a
+    /// `ApplyMonitorsConfig` does, and run the resize through `Synoik::output_resized`.
+    ///
+    /// That last step is the point: it is what recomputes the working area and re-lays-out the
+    /// windows, so a test that only calls `change_current_state` measures nothing.
+    pub fn resize_output(&mut self, n: u8, size: Option<(u16, u16)>, scale: Option<f64>) {
+        let output = self.synoik_output(n);
+        let mode = size.map(|(w, h)| smithay::output::Mode {
+            size: smithay::utils::Size::from((i32::from(w), i32::from(h))),
+            refresh: 60_000,
+        });
+        output.change_current_state(
+            mode,
+            None,
+            scale.map(smithay::output::Scale::Fractional),
+            None,
+        );
+        if let Some(mode) = mode {
+            output.set_preferred(mode);
+        }
+        self.synoik().output_resized(&output);
+    }
+
     /// Unplug a headless output added by [`add_output`](Self::add_output), so a test
     /// can exercise the per-output teardown paths (OSD windows, banner retargeting).
     pub fn remove_output(&mut self, n: u8) {
