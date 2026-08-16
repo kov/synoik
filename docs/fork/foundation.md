@@ -526,6 +526,31 @@ because video is part of a good desktop, not because they will make the shell's 
 
 Answered 2026-08-16: **vkr imports classic virgl resources into venus** (§2, item 1 — closed).
 
+### To raise: rename `90-limina-zink.conf`
+
+`/etc/environment.d/90-limina-zink.conf` has not selected zink since 2026-08-15 — it sets
+`GALLIUM_DRIVER=virgl`, `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu`, `VK_DRIVER_FILES=…virtio_icd…`
+and `VN_DEBUG=mem_budget`. The name survived the value it was named after, and it cost real time on
+this side: two of our documents asserted the drop-in was load-bearing *because it selected zink*,
+and the name was the only evidence anyone re-checked.
+
+**Proposed: `90-limina-mesa.conf`.** The rule that avoids the recurrence is to **name the knob, not
+the value** — every variable in the file is mesa driver selection, which stays true whichever driver
+is selected next, whereas `zink` was a setting and settings move.
+
+Two smaller points for the same conversation:
+
+- **`VN_DEBUG=mem_budget` does not belong in a driver-selection file.** It is a tunable, on a
+  different change cadence from which ICD the guest loads, and today flipping it means editing the
+  file that decides whether GL works at all. Its own drop-in would be safer.
+- **Does the file still need the GL half?** Now that vkr imports virgl into venus, our reason for
+  caring which GL driver the session picked is gone. Whether anything *else* still needs it is
+  theirs to answer, but it is worth asking rather than inheriting.
+
+It is host-managed — not owned by any package, and `limina-agent.service` rewrote it on 2026-08-15 —
+so **the rename has to happen on their side.** Renaming it in the guest would leave two priority-90
+files with no owner the next time the agent deploys.
+
 Open questions, tracked in their own drafts: `limina-issue-scanout-blob-not-applied.md` (§2 item 2 —
 acknowledged on the limina side 2026-08-16, investigation to start), and
 `vmm-issue-dmabuf-cpu-write-coherency.md`. `virtual-display-identity.md` carries the display-identity
