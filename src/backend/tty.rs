@@ -1911,30 +1911,8 @@ impl Tty {
         // FIXME: a per-CRTC shadow would lift the second case to multi-output too. Unreachable on
         // any plane we have seen, so it stays a fallback rather than a project.
         let renders_direct = matches_render_order(surface.compositor.format());
-        // Third case: we were in a pass-through scan-out stretch. While a client buffer owns the
-        // primary plane we render nothing at all, so our swapchain slots are never cycled and
-        // still hold the desktop from before the stretch — which can be minutes old. But
-        // `DrmCompositor`'s buffer age counts only the frames *it* composited, so the moment we
-        // take the plane back it reports a one-or-two-frame-old slot and asks for a matching
-        // sliver of damage. Repainting only that onto a stale image is the desktop coming back
-        // decayed after a fullscreen game or video, worse the longer it ran, and it is invisible
-        // to a screenshot because that re-renders everything.
-        //
-        // Redraw whole until we have composited a frame again. This costs one full frame per
-        // stretch — the stretch itself renders nothing, so `reset_buffer_ages` while it lasts is
-        // just storing zeroes.
-        let resuming_from_scanout = synoik
-            .output_state
-            .get(output)
-            .is_some_and(|state| state.last_primary_was_client);
-        // Take the one-shot armed when the last stretch ended.
-        let reset_buffers = synoik
-            .output_state
-            .get_mut(output)
-            .is_some_and(|state| std::mem::take(&mut state.pending_buffer_reset));
-        let force_full_damage = (!renders_direct && !single_scanout_surface)
-            || resuming_from_scanout
-            || full_damage_requested();
+        let force_full_damage =
+            (!renders_direct && !single_scanout_surface) || full_damage_requested();
 
         if !device.drm.is_active() {
             // This branch hits any time we try to render while the user had switched to a
@@ -1977,7 +1955,6 @@ impl Tty {
                 // Decided above, per surface: the renderer preserves the target across frames
                 // (render-pass LOAD), so DrmCompositor's buffer-age damage is enough.
                 force_full_damage,
-                reset_buffers,
                 target_presentation_time,
             )
         }
@@ -3141,7 +3118,6 @@ fn render_surface_with(
     config: &Rc<RefCell<Config>>,
     flags: FrameFlags,
     force_full_damage: bool,
-    reset_buffers: bool,
     target_presentation_time: Duration,
 ) -> RenderResult {
     let mut rv = RenderResult::Skipped;
@@ -3187,18 +3163,6 @@ fn render_surface_with(
     // memory from 10 GB to 50 GB in a minute and got it OOM-killed by the host on 2026-08-06. Fixed
     // in our smithay fork; pinned by `tests::swapchain_ages`, which is where to look before
     // touching this.
-    // A pass-through scan-out stretch just ended. A full redraw is not enough to bring the
-    // desktop back: measured on a live black screen on 2026-08-15, we composited the whole
-    // overview into our own swapchain slots (124 elements, 180 draws covering 3.9x the output,
-    // GPU 2.8ms) and flipped between them at 60 Hz while the screen stayed black — and a VT
-    // switch, which re-creates the buffers, fixed it every time. So re-create them here rather
-    // than only clearing their damage history.
-    //
-    // Strictly one-shot. Doing this per frame is the 3.9 GB/s allocation storm that once got the
-    // VM OOM-killed by the host, so it is armed on the transition and cleared immediately.
-    if reset_buffers {
-        drm_compositor.reset_buffers();
-    }
     if force_full_damage {
         drm_compositor.reset_buffer_ages();
     }
@@ -3229,8 +3193,6 @@ fn render_surface_with(
     renderer.set_finish_may_defer(false);
     match rendered {
         Ok(res) => {
-            // Read before the `needs_sync` arm below moves `primary_element`.
-            let primary_was_client = matches!(res.primary_element, PrimaryPlaneElement::Element(_));
             let needs_sync = res.needs_sync()
                 || config
                     .borrow()
@@ -3263,11 +3225,6 @@ fn render_surface_with(
             synoik.update_primary_scanout_output(output, &res.states);
             if let Some(state) = synoik.output_state.get_mut(output) {
                 state.last_frame_scanout = tally_scanout(&res.states);
-                // Arm on the transition only — see `pending_buffer_reset`.
-                if state.last_primary_was_client && !primary_was_client {
-                    state.pending_buffer_reset = true;
-                }
-                state.last_primary_was_client = primary_was_client;
             }
             if let Some(dmabuf_feedback) = surface.dmabuf_feedback.as_ref() {
                 synoik.send_dmabuf_feedbacks(output, dmabuf_feedback, &res.states);

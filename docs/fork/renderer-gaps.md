@@ -324,6 +324,31 @@ suspend crash above, which stays host-side. Do not let it be scheduled as one.
 
 ---
 
+## 12. We commit a frame every vblank with nothing to draw — OPEN
+
+Measured 2026-08-15 on a live seat, with **no windows at all** and `animating: false`: a flat
+**360 `DRM_IOCTL_MODE_ATOMIC` commits in 6 seconds — 60/s — at 21 % CPU**, with the output sitting
+permanently in `RedrawState::WaitingForVBlank { redraw_needed: true }`. The same shape shows with
+one idle window: an empty workspace and two workspace-switch animations produced an unvarying
+6 commits per 100 ms, the animations causing no bump at all because the rate was already saturated.
+
+That is a **self-sustaining redraw loop**: every frame something re-requests a redraw, so
+`redraw_needed` is set again before the vblank that would have let us go idle. It is the shape of
+the old xray rebuild bug — an element re-stating itself each frame — and the compositor demonstrably
+*can* idle (a static fullscreen client sits at 0 % CPU with the plane unchanged for 25 samples), so
+the loop is being driven by something in the normal desktop scene.
+
+Why it matters beyond power: while the rate is pinned at 60/s, **animation cost is unmeasurable** —
+a workspace switch adds no visible commits, so the frame log cannot tell an animating frame from an
+idle one, and "is this animation actually rendering?" stopped being answerable during the
+2026-08-15 investigation precisely when we needed it.
+
+Finding it: the redraw requesters are the thing to instrument — log which call sets `redraw_needed`
+(or which element reports damage) once per second on an idle output. `SYNOIK_SCENE_BREAKDOWN=verbose`
+names per-element damage and is the cheapest first look.
+
+Not a regression from the scan-out work: it reproduces with no windows and no client on the plane.
+
 ## Roadmap order (recommended)
 
 1. **Multi-planar / non-LINEAR import** (§1) — affects every machine, including the VM.
