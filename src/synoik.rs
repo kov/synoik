@@ -8508,6 +8508,27 @@ impl Synoik {
             return;
         };
 
+        // A fullscreen window owns the bottom edge, exactly as it owns the corner
+        // (`push_hot_corner`) and the top strip (`panel_hidden_fraction`) — unless the overview
+        // is already up.
+        //
+        // No threshold can serve here, which is why this is a gate and not a bigger number:
+        // pressure is the motion the output clamp discarded, and edge-scrolling a game's map is
+        // *sustained* discarded motion. Any finite threshold is crossed by holding the pointer
+        // against the edge, so raising it only changes how many seconds of scrolling it takes.
+        //
+        // It also costs more than the interruption. The dock draws above the fullscreen window
+        // and outside the panel's hide gate, so a reveal here drops the window out of direct
+        // scanout — silently, at the worst moment.
+        let fullscreen = self
+            .layout
+            .monitor_for_output(&output)
+            .is_some_and(|mon| mon.render_above_top_layer());
+        if fullscreen && !self.layout.is_overview_open() {
+            self.dock.forget_pressure();
+            return;
+        }
+
         let discarded = unclamped - pos;
         if self
             .dock

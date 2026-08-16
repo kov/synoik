@@ -183,6 +183,15 @@ impl Dock {
         self.state = State::Hiding(self.slide(from, self.floor()));
     }
 
+    /// Drop any pressure accumulated on the bottom edge, and re-arm the barrier.
+    ///
+    /// For a caller that is refusing the edge for a reason the barrier cannot see — a fullscreen
+    /// window owning it. Without this the pressure would sit there and the dock would spring out
+    /// on the first motion after the window left fullscreen.
+    pub fn forget_pressure(&mut self) {
+        self.barrier.leave();
+    }
+
     /// Hide without animating — for the cases where the dock must simply not be there
     /// (the session locking, the output going away).
     pub fn dismiss(&mut self) {
@@ -524,6 +533,43 @@ mod tests {
             );
         }
         assert!(tripped, "sustained pushing must trip the dock's barrier");
+    }
+
+    /// [`Dock::forget_pressure`] empties the edge, so pressure a caller *refused* — the bottom
+    /// edge of a fullscreen window — cannot be banked and spent the moment it stops refusing.
+    ///
+    /// The pointer never leaves the edge here, which is the whole point: leaving re-arms the
+    /// barrier by itself, so a test that moves away would pass with no `forget_pressure` at all.
+    #[test]
+    fn refused_pressure_is_forgotten_rather_than_banked() {
+        let clock = Clock::with_time(Duration::ZERO);
+        let mut dock = Dock::new(clock);
+        let output = crate::utils::test_output(1920, 1080);
+
+        let at_edge = Point::from((960., 1079.));
+        let push = Point::from((0., 20.));
+        let shove = |dock: &mut Dock, at: u64| {
+            (0..6).any(|i| {
+                dock.push(
+                    &output,
+                    at_edge,
+                    push,
+                    push,
+                    Duration::from_millis(at + i * 8),
+                )
+            })
+        };
+
+        // Just under the trip: six capped pushes is 90 of the 100 needed.
+        assert!(!shove(&mut dock, 0), "the setup must not trip on its own");
+        dock.forget_pressure();
+
+        // The same again would trip a barrier that had kept the first round — all twelve pushes
+        // land inside the one-second window, so nothing was refunded by time.
+        assert!(
+            !shove(&mut dock, 48),
+            "forgotten pressure must not be spendable later"
+        );
     }
 
     /// The barrier is re-armed by the pointer *moving away*, whichever device moved it — not

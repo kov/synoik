@@ -353,6 +353,77 @@ fn the_dock_needs_pressure_on_the_bottom_edge() {
     );
 }
 
+/// A fullscreen window owns the bottom edge, the way it already owns the corner
+/// (`push_hot_corner`) and the top strip (`panel_hidden_fraction`).
+///
+/// The case is a game whose map scrolls when you push the pointer off the edge. Pressure *is*
+/// discarded motion, so that scroll is an unbroken pressure build: no threshold can tell it apart
+/// from a deliberate summon, which is why this is a gate and not a bigger number. A reveal here
+/// also drops the window out of direct scanout, since the dock draws above it.
+///
+/// The overview is the way back in, as it is for the panel and the corner.
+#[test]
+fn a_fullscreen_window_owns_the_bottom_edge() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik_output(1);
+    let id = f.add_client();
+
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    let window_id = f.synoik().layout.focus().unwrap().window.clone();
+
+    // Enough pressure to trip the edge twice over, to prove the gate and not a shortfall.
+    let shove = |f: &mut Fixture| {
+        pointer_motion_to(f, 960., 1079.);
+        for _ in 0..20 {
+            f.pointer_motion(0., 20.);
+        }
+        f.synoik_complete_animations();
+    };
+
+    shove(&mut f);
+    assert!(
+        f.synoik().dock.area(&output).is_some(),
+        "the control: windowed, the edge still summons the dock"
+    );
+
+    f.synoik().layout.toggle_fullscreen(&window_id);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.set_size(1920, 1080);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    // Let the dock the control raised slide away, so what follows measures a fresh reveal.
+    pointer_motion_to(&mut f, 960., 400.);
+    f.advance_clock(Duration::from_millis(600));
+    f.synoik_complete_animations();
+    assert!(f.synoik().dock.area(&output).is_none(), "the dock is away");
+
+    shove(&mut f);
+    assert!(
+        f.synoik().dock.area(&output).is_none(),
+        "pushing the bottom edge of a fullscreen window must not summon the dock"
+    );
+
+    // The edge comes back with the window. (That the refused pressure is *forgotten* rather than
+    // banked is `refused_pressure_is_forgotten_rather_than_banked`, where the pointer can be kept
+    // on the edge across the transition — leaving it re-arms the barrier by itself, so it cannot
+    // be shown from here.)
+    f.synoik().layout.toggle_fullscreen(&window_id);
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.set_size(800, 600);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    shove(&mut f);
+    assert!(
+        f.synoik().dock.area(&output).is_some(),
+        "leaving fullscreen must hand the bottom edge back"
+    );
+}
+
 /// The dock is the same dash the overview draws: it hit-tests, hovers and activates through the
 /// very same paths, just at a different place on screen.
 #[test]

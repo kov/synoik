@@ -22,6 +22,20 @@ The pressure is the motion the output clamp discarded — see `src/input/pressur
 is the honest stand-in for what mutter's blocking barriers report, and for the one case it cannot
 serve (absolute pointing devices, which build no pressure at all and so have no dock).
 
+**A fullscreen window owns the bottom edge**, as it already owns the corner (`push_hot_corner`) and
+the top strip (`Monitor::panel_hidden_fraction`) — unless the overview is up. Same predicate,
+`render_above_top_layer`, so the three cannot drift.
+
+This is a gate rather than a larger threshold, because no threshold can work here. Pressure *is*
+sustained inward motion, and a game whose map scrolls when you push the pointer off the edge
+generates exactly that, indefinitely. Any finite threshold is crossed by holding against the edge;
+raising it only buys seconds. The cost is worse than the interruption, too: the dock draws above
+the fullscreen window and outside the panel's hide gate, so a reveal drops the window out of direct
+scanout, silently, mid-game.
+
+Refused pressure is dropped rather than banked (`Dock::forget_pressure`), or the dock would spring
+out on the first motion after the window left fullscreen.
+
 ## Decisions
 
 | | | |
@@ -112,5 +126,9 @@ which is no signal at all.
 - `src/tests/gnome.rs` — `an_app_you_are_looking_at_does_not_demand_attention`.
 - `src/ui/dock.rs` — the state machine: pressure, the slide, the grace period, the drag hold.
 - `src/tests/gnome.rs` — `the_dock_needs_pressure_on_the_bottom_edge`,
+  `a_fullscreen_window_owns_the_bottom_edge`,
   `the_dock_hit_tests_the_same_dash_as_the_overview`, driving real synthetic input against the
   `Fixture`, as the conformance corpus does for GNOME behaviors.
+- `src/ui/dock.rs` — `refused_pressure_is_forgotten_rather_than_banked`, which needs the pointer
+  held *on* the edge across the refusal; leaving re-arms the barrier by itself, so the integration
+  test above cannot show it.
