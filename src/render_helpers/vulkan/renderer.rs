@@ -3681,15 +3681,43 @@ impl ExportMem for VulkanRenderer {
 
     fn copy_texture(
         &mut self,
-        _texture: &VkTexture,
-        _region: Rectangle<i32, BufferCoord>,
-        _format: Fourcc,
+        texture: &VkTexture,
+        region: Rectangle<i32, BufferCoord>,
+        format: Fourcc,
     ) -> Result<VkMapping, VulkanError> {
-        Err(VulkanError::Unsupported("copy_texture"))
+        // Same body as `copy_framebuffer` minus the present-blit indirection: there is no shadow
+        // behind a plain texture, the texture *is* the bytes.
+        //
+        // This exists to read back a **client's** buffer — specifically the one on the primary
+        // plane during pass-through scan-out, which `debug-dump-scanout` needs and which nothing
+        // else in the compositor ever reads. It is the only way to show that pixels a client
+        // produced were correct in memory while the display showed them wrong, and unlike our own
+        // buffers we cannot be suspected of having written them.
+        if import_format(format).is_none() {
+            return Err(VulkanError::UnsupportedFormat(format));
+        }
+
+        let w = region.size.w.max(0) as u32;
+        let h = region.size.h.max(0) as u32;
+        let source_order = texture.format().map(matches_render_order);
+        let want_order = matches_render_order(format);
+        let via = match source_order {
+            Some(order) if order != want_order => Some(self.readback_staging_for(w, h, format)?),
+            _ => None,
+        };
+
+        let data = self.download_region(texture, region.loc.x, region.loc.y, w, h, via.as_ref())?;
+        Ok(VkMapping {
+            data,
+            width: w,
+            height: h,
+            format,
+        })
     }
 
     fn can_read_texture(&mut self, _texture: &VkTexture) -> Result<bool, VulkanError> {
-        Ok(false)
+        // Every texture we hand out is readable now that `copy_texture` is implemented.
+        Ok(true)
     }
 
     fn map_texture<'a>(&mut self, texture_mapping: &'a VkMapping) -> Result<&'a [u8], VulkanError> {

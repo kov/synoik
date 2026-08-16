@@ -3022,14 +3022,64 @@ fn suspend() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write the **client's** scanned-out buffer to a PNG, when the plane is showing one directly.
+///
+/// This is the artifact that cannot be argued with. During pass-through scan-out we render
+/// nothing: the client writes those bytes, the host displays them, and synoik's only involvement
+/// is pointing the plane at the buffer. So if this comes back clean while the screen shows
+/// artifacts, correct pixels were sitting in a buffer the host displayed wrongly, in memory no
+/// code of ours ever touched.
+fn dump_client_scanout_png<E>(renderer: &mut VulkanRenderer, element: &E, output: &str)
+where
+    E: smithay::backend::renderer::element::RenderElement<VulkanRenderer>,
+{
+    use smithay::backend::renderer::element::UnderlyingStorage;
+    use smithay::backend::renderer::{ExportMem as _, ImportDma as _, Texture as _};
+
+    let Some(UnderlyingStorage::Wayland(buffer)) = element.underlying_storage(renderer) else {
+        warn!("debug-dump-scanout: the scanned-out element has no wayland buffer behind it");
+        return;
+    };
+    let dmabuf = match smithay::wayland::dmabuf::get_dmabuf(buffer) {
+        Ok(dmabuf) => dmabuf.clone(),
+        Err(err) => {
+            warn!("debug-dump-scanout: the scanned-out buffer is not a dmabuf: {err:?}");
+            return;
+        }
+    };
+    let texture = match renderer.import_dmabuf(&dmabuf, None) {
+        Ok(texture) => texture,
+        Err(err) => {
+            warn!("debug-dump-scanout: importing the client's scanout buffer failed: {err:?}");
+            return;
+        }
+    };
+    let size = texture.size();
+    let region = Rectangle::from_size(size);
+    // Ask for RGBA so the GPU reorders on the way out and the bytes need no CPU pass.
+    let mapping = match renderer.copy_texture(&texture, region, Fourcc::Abgr8888) {
+        Ok(mapping) => mapping,
+        Err(err) => {
+            warn!("debug-dump-scanout: reading the client's scanout buffer failed: {err:?}");
+            return;
+        }
+    };
+    let pixels = match renderer.map_texture(&mapping) {
+        Ok(pixels) => pixels.to_vec(),
+        Err(err) => {
+            warn!("debug-dump-scanout: mapping the client readback failed: {err:?}");
+            return;
+        }
+    };
+    write_scanout_png(size.w as u32, size.h as u32, pixels, output, "client");
+}
+
 /// Write the framebuffer we are scanning out to `~/.local/state/synoik/scanout-<output>-<n>.png`.
 ///
 /// The point of this is to be believed when a screenshot is not: `screenshot-screen` re-renders
 /// the scene into a fresh image, so it comes out clean even when the plane is showing black. This
 /// is the actual presented image, copied back off the GPU.
 fn dump_scanout_png(buffer: &VulkanScanoutBuffer, output: &str) {
-    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
     let (width, height, mut pixels) = match buffer.read_back() {
         Ok(read) => read,
         Err(err) => {
@@ -3038,11 +3088,25 @@ fn dump_scanout_png(buffer: &VulkanScanoutBuffer, output: &str) {
         }
     };
 
-    // The scanout format is Xrgb8888/Argb8888 — BGRA bytes in memory — and the alpha of an X
-    // format is undefined, so force it opaque rather than writing a PNG that may decode as
-    // fully transparent and be mistaken for the black we are chasing.
+    // Our scanout format is Xrgb8888/Argb8888 — BGRA bytes in memory — and this path reads them
+    // raw, so reorder here. (The client path asks the GPU for RGBA and needs no pass.)
     for px in pixels.chunks_exact_mut(4) {
         px.swap(0, 2);
+    }
+    write_scanout_png(width, height, pixels, output, "ours");
+}
+
+/// Write one readback to `~/.local/state/synoik/scanout-<output>-<who>-<n>.png`.
+///
+/// `who` says whose bytes these are — `ours` for a buffer we composited into, `client` for a
+/// client's own buffer taken straight off the plane — because the two answer different questions
+/// and confusing them would waste an entire reproduction.
+fn write_scanout_png(width: u32, height: u32, mut pixels: Vec<u8>, output: &str, who: &str) {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    // Alpha is undefined in an X format, and a PNG that decodes fully transparent looks exactly
+    // like the black screen we are chasing. Force it opaque so the image cannot lie about that.
+    for px in pixels.chunks_exact_mut(4) {
         px[3] = 0xff;
     }
 
@@ -3053,7 +3117,7 @@ fn dump_scanout_png(buffer: &VulkanScanoutBuffer, output: &str) {
         warn!("debug-dump-scanout: creating {}: {err:?}", dir.display());
         return;
     }
-    let path = dir.join(format!("scanout-{output}-{n}.png"));
+    let path = dir.join(format!("scanout-{output}-{who}-{n}.png"));
     match image::RgbaImage::from_raw(width, height, pixels) {
         Some(img) => match img.save(&path) {
             Ok(()) => warn!("debug-dump-scanout: wrote {}", path.display()),
@@ -3212,13 +3276,15 @@ fn render_surface_with(
             // blocking readback that costs a submit and a wait — debug-only, never per frame.
             if synoik.dump_scanout_next_frame {
                 synoik.dump_scanout_next_frame = false;
-                if let PrimaryPlaneElement::Swapchain(element) = &res.primary_element {
-                    dump_scanout_png(element.buffer(), &output.name());
-                } else {
-                    warn!(
-                        "debug-dump-scanout: the primary plane is a client buffer right now \
-                         (pass-through scan-out), so there is no framebuffer of ours to read back"
-                    );
+                match &res.primary_element {
+                    PrimaryPlaneElement::Swapchain(element) => {
+                        dump_scanout_png(element.buffer(), &output.name());
+                    }
+                    // The plane is showing a client's own buffer. Read *that* back — it is the
+                    // stronger artifact of the two, because we never write those bytes.
+                    PrimaryPlaneElement::Element(element) => {
+                        dump_client_scanout_png(renderer, *element, &output.name());
+                    }
                 }
             }
 
