@@ -12,11 +12,20 @@
 //! staged through [`crate::staging::HostStaging`] moves `VmRSS` by about 8 MB, and a leak of them
 //! would move it by about 8 MB each while costing the host 33 MB each.
 //!
-//! `VK_EXT_memory_budget` would have answered this from the driver, but venus does not expose it
-//! (checked 2026-08-07), so the only guest-side instrument is to count what we allocate ourselves.
-//! That is what this module is: every `vkAllocateMemory` this crate performs is recorded against
-//! the source location that asked for it, and every `vkFreeMemory` clears it. What survives is
-//! ours.
+//! `VK_EXT_memory_budget` answers a *different* question, and it is available after all. The note
+//! here used to say venus does not expose it (checked 2026-08-07); it is **gated on
+//! `VN_DEBUG=mem_budget`**, which the enhanced-tier environment now sets, and with that set
+//! `vulkaninfo` lists it (verified 2026-08-16 against a control extension, so the absence was the
+//! gate and not the driver). What it reports is the **host's** view: `heapBudget` carries the VMM's
+//! per-context GPU-memory cap, which is the one backpressure channel the venus transport does not
+//! throw away — over the cap the host kills the context rather than returning an error, because an
+//! async `vkAllocateMemory` has already returned `VK_SUCCESS`.
+//!
+//! So the two are complements, not substitutes, and this module is still the only thing that can
+//! attribute: every `vkAllocateMemory` this crate performs is recorded against the source location
+//! that asked for it, and every `vkFreeMemory` clears it. What survives is ours. Reading
+//! `heapBudget` alongside it — so we can see the cap approaching instead of discovering it as a
+//! dead context — is open work, tracked in `docs/fork/foundation.md` §6.
 //!
 //! Two different questions, and the census answers both because **live bytes alone cannot tell them
 //! apart**:

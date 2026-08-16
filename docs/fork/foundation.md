@@ -475,6 +475,14 @@ Slottable any time:
   worker would be a client we own. Images must be dmabuf-backed with modifiers to cross the boundary.
 - **An arena for reconstructible caches**, without which the `madvise` options in §3 cannot be
   expressed at all.
+- **Read `heapBudget` from `VK_EXT_memory_budget`.** The extension is available under
+  `VN_DEBUG=mem_budget` (which the enhanced-tier environment sets; verified 2026-08-16 — the earlier
+  "venus does not expose it" was the gate, not the driver). `heapBudget` carries the VMM's
+  per-context GPU-memory cap, and it is the **only** backpressure channel the venus transport does
+  not discard: over the cap the host kills our context rather than returning an error, because an
+  async `vkAllocateMemory` has already answered `VK_SUCCESS`. Today that arrives as an unexplained
+  death. `synoik_vk::devmem` complements it rather than replacing it — the census attributes *our*
+  allocations by site, `heapBudget` reports the *host's* total. Neither answers the other's question.
 
 ### Surviving device loss — gated on it being observable
 
