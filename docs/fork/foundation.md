@@ -170,22 +170,60 @@ established by elimination:
 > applied, and nothing errors. Only a **genuinely new** resource restores that participant, and
 > creating new resources can knock *another* participant into the same state.
 
-**A host-side lead, from the VMM side 2026-08-16 — a lead, not a diagnosis.** libkrun populates
-`RutabagaResource.iosurface_id` **exactly once, at resource create** (`virgl_renderer.rs`, "cached at
-create"), and nothing refreshes it; `virtio_gpu.rs::set_scanout_blob` resolves the surface from that
-cache on every flip and **returns `Ok(OkNoData)` unconditionally** regardless of what it finds. A
-stale cached id therefore presents whatever surface owns that id *now*, silently. That reproduces the
-signature point for point, including why only a genuinely new resource heals — a new resource is the
-only thing that mints a fresh cache entry — and IOSurface ids being kernel-recycled is a plausible
-mechanism for one participant's repair knocking out another. It does not yet explain the *trigger*.
+**DIAGNOSED 2026-08-16, host-side, and not where either of us was looking.** The fault is in the
+limina **supervisor**, not the worker — which is why no guest-side instrument could ever have seen
+it. The supervisor keeps a `SurfaceStore` mapping guest surface id → retained `IOSurfaceRef`, and
+drops its reference the moment the worker reports the guest released a resource, on the documented
+assumption that *"the guest will not present it again"*. **That premise is false for us**: we go on
+presenting the same scanout resources after the release. Once the entry is gone the frame-apply path
+finds neither the map entry nor a global lookup — these surfaces are deliberately non-global,
+capability-scoped over a Mach port — so every later frame naming that id is skipped, silently and
+permanently.
 
-The instrument was there all along and a log level hid it: the per-flip line
-`SET_SCANOUT_BLOB scanout={id} res={resource_id} -> IOSurface {iosurface_id}` logs at **`debug`**
-while the worker defaults to `warn`, so every normal boot discarded exactly the resource→IOSurface
-mapping needed. Next repro runs with that target at debug, cross-referenced against
-`[LIMINA-VKR-MTLTEX] import res <N> IOSurface id=<M>`.
+The worker was healthy throughout: `res=7 -> IOSurface 139` and `res=12 -> IOSurface 141` bound
+~2860 times each, stable across the whole session, zero `not IOSurface-backed` warnings, and the
+flip rate went *up* ~9× at the freeze. We were presenting harder, correctly, into correctly-resolved
+surfaces, while a `WARN … surface 139 unresolved; skipping frame` accumulated in a host process we
+cannot see — 161 → 168 → 1651 → 3013 per minute, i.e. ~42% of frames dropped when it read as "the
+animation is two frames" and every frame by the time it read as a freeze.
 
-We are exonerated by measurement, not by argument: the compositor renders correct frames on time,
+That accounts for every observation below, including the two that killed our earlier theories: only
+a genuinely new resource heals, because only a new resource publishes a new surface into the map;
+and creating resources knocks *another* participant out, because the release traffic that empties the
+map is driven by our unref pattern.
+
+**Left standing: what released those surfaces?** The host must not drop a surface the guest can
+still name — that fix is theirs — but the release was handed to us to explain, and a first pass says
+**we cannot find one**. Ruled out by reading, 2026-08-16:
+
+- `Swapchain::reset_buffers` is the only thing that drops slots, and our sole caller is **session
+  resume** (`backend/tty.rs`) — there was no VT switch or resume in the window.
+- The scanout `Dmabuf` is pinned in the slot's `UserDataMap` (`Slot::export` caches it there) for the
+  swapchain's lifetime, so it cannot lapse on its own.
+- `dmabuf_target_cache` is weak-keyed and swept only on lookup — **no size eviction**, so overview
+  allocation pressure cannot evict a scanout import.
+- `cleanup_texture_cache`, which `DrmCompositor` calls every frame during a client scan-out stretch,
+  is **not overridden by us** — smithay's default is a no-op.
+- This reproduction had no client pass-through at all: only `res=7` and `res=12` were ever bound, so
+  it was our own double-buffering throughout, and the scan-out-transition theories do not apply.
+
+The one place a scanout resource carries a *second, quieter* guest-side reference is the redundant
+import noted under "Left on the table" — `import_dmabuf_target` builds a second `VkImage` around a
+buffer the allocator already owns. That is the reference whose destruction we would not notice.
+
+This matters to the host-side diagnosis because its one inferred step is that a
+`SurfaceMsg::Released` removed the entries — flagged as inferred, not observed, with no logging on
+that path. If nothing here can release those buffers, the prior should shift toward the entries
+being removed by something *other* than a guest release.
+
+Two mechanisms were retracted getting here, and it is worth recording that the count is now five.
+The host-side `iosurface_id`-cached-at-create theory recorded here briefly on 2026-08-16 was the
+best-fitting one either side had produced, and it was **wrong**: the mapping never went stale. So
+was surface-store eviction (the store caps at 32 with FIFO eviction; only 20 distinct ids existed in
+the whole session). **On this bug, a mechanism that explains every observation has still been wrong
+five times out of five.** Require an observation, not a fit.
+
+We were exonerated by measurement, not by argument: the compositor renders correct frames on time,
 `debug-dump-scanout` reads back a perfect current image from the buffer we hand over, and the guest
 issues 60 Hz `SET_SCANOUT_BLOB` which virtio_gpu tracepoints show the host ACKing — while the screen
 is frozen. **Both workarounds were deliberately reverted** (`698ae578`): forcing a full redraw when
