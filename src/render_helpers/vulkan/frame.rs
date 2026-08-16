@@ -160,6 +160,42 @@ impl fmt::Debug for VulkanFrame<'_, '_> {
     }
 }
 
+/// Warn when a **scanout** frame is about to discard the target instead of loading it.
+///
+/// This is the silent half of the partial-damage contract. When it fires, the tty backend still
+/// redraws only `DrmCompositor`'s buffer-age damage, so everything outside that damage becomes
+/// undefined — on screen, the parts the scene has stopped repainting decay into stale content,
+/// while every screenshot (a full redraw) comes out clean and nothing is logged. That is precisely
+/// how `f3f2f076` hid for a week, and how a 2026-08-15 wedge presented: a compositor submitting a
+/// clean 60 Hz onto a frozen screen.
+///
+/// One discard per swapchain slot is expected and correct — a fresh image is `UNDEFINED` and the
+/// age-0 frame redraws it whole — so the first few are quiet. After that a discard means something
+/// left a scanout image in a layout the preserve test does not recognise, and the layout is the
+/// clue to which pass did it.
+fn note_scanout_discard(layout: vk::ImageLayout) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Enough for every slot of a swapchain to legitimately discard once on its first use.
+    const EXPECTED_COLD_DISCARDS: u64 = 8;
+    /// Warn at most once per this many afterwards: a decaying screen discards every frame, and a
+    /// per-frame warning would itself cost frames.
+    const WARN_EVERY: u64 = 300;
+
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= EXPECTED_COLD_DISCARDS {
+        return;
+    }
+    if (n - EXPECTED_COLD_DISCARDS - 1).is_multiple_of(WARN_EVERY) {
+        warn!(
+            total = n,
+            ?layout,
+            "scanout frame is DISCARDING its target rather than preserving it;              everything outside this frame's damage is now undefined. Expected layout is              TRANSFER_SRC_OPTIMAL. Set SYNOIK_VK_FULL_DAMAGE=1 to take the partial-damage              chain out of the picture"
+        );
+    }
+}
+
 impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
     /// Allocate + begin a command buffer, begin the render pass on `fb`'s GPU framebuffer, and set
     /// the (dynamic) viewport/scissor to the full target — leaving the frame ready to record draws.
@@ -220,6 +256,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         } else {
             fb.buffer.layout() == vk::ImageLayout::TRANSFER_SRC_OPTIMAL
         };
+        if !fb.offscreen && !preserve {
+            note_scanout_discard(fb.buffer.layout());
+        }
         let render_pass = if preserve {
             renderer.continuation_render_pass
         } else {
