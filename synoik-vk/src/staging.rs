@@ -8,7 +8,7 @@
 //!
 //! Both exist because of the same measurement. A copy into a mapping whose pages have never been
 //! touched runs at ~7 GB/s on this VM's Venus device against ~58 GB/s into the same buffer once
-//! warm (`docs/fork/venus-cost.md` §9.2), and on Venus a `HOST_VISIBLE` buffer is a host blob whose
+//! warm (`docs/fork/foundation.md` §5), and on Venus a `HOST_VISIBLE` buffer is a host blob whose
 //! creation and mapping are round trips. So the render thread's uploads share one warm buffer and
 //! rewind it per frame rather than each making its own — see [`StagingPool`], which also records
 //! what happened when they did not.
@@ -193,7 +193,7 @@ pub struct StagingChunk {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     /// Mapped for the chunk's whole life. On a virtualized driver `vkMapMemory` is where the host
-    /// creates the bo (`docs/fork/venus-cost.md` §9.2) — a round trip the per-upload staging paid
+    /// creates the bo (`docs/fork/foundation.md` §5) — a round trip the per-upload staging paid
     /// on every client commit.
     ptr: *mut u8,
     capacity: vk::DeviceSize,

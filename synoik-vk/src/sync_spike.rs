@@ -5,7 +5,7 @@
 //! Stage 3 de-risking spike: does host-GPU work completion actually propagate to a guest
 //! `sync_file` / `drm_syncobj` on this VM?
 //!
-//! `docs/fork/venus-explicit-sync-gap.md` establishes the *API surface*: only **binary `SYNC_FD`**
+//! `docs/fork/explicit-sync.md` establishes the *API surface*: only **binary `SYNC_FD`**
 //! external semaphores/fences export here (no `OPAQUE_FD`, no timeline export), and the kernel
 //! advertises `drm_syncobj` timeline caps. The portable explicit-sync path we intend to build
 //! (Wayland `linux-drm-syncobj-v1` + KMS `IN_FENCE`/`OUT_FENCE`) is: kernel timeline syncobj point
@@ -43,7 +43,7 @@
 //! Venus blocks on the CPU until completion, then hands back an already-signalled `detached-driver`
 //! stub. So host-GPU completion **does** propagate here, and **the KMS/Wayland explicit-sync design
 //! is buildable — but it must rest on VkFence export, not VkSemaphore export.** lavapipe emulates
-//! both, as expected. See `docs/fork/venus-explicit-sync-gap.md` §6 (now answered).
+//! both, as expected. See `docs/fork/explicit-sync.md` (now answered).
 //!
 //! This touches no live render/present path; it only extends the shared device with the two
 //! `SYNC_FD` extensions (see `gpu.rs`) that the real renderer will need anyway.

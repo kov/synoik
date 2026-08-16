@@ -563,7 +563,7 @@ impl Texture {
     /// the same driver the Vulkan device is, which for gbm is decided by a session-wide env var
     /// (`MESA_LOADER_DRIVER_OVERRIDE`) nobody here controls. Allocating on our own device removes
     /// the question: the memory is ours, and the dmabuf we hand KMS is a prime export of the very
-    /// blob venus rendered into. See `docs/fork/scanout-allocation.md`.
+    /// blob venus rendered into. See `docs/fork/foundation.md`.
     ///
     /// `modifiers` is the candidate list handed to `VkImageDrmFormatModifierListCreateInfoEXT`; the
     /// driver picks one and [`ScanoutExport::modifier`] reports which. Candidates the device does
@@ -773,7 +773,7 @@ impl Texture {
     ) -> Result<Self> {
         // Counted like any other create, and it is the *expensive* one: a dmabuf/DRM-modifier
         // `vkCreateImage` that misses venus's requirements cache costs 0.06-0.7 ms against 3 us
-        // for a plain image (`docs/fork/venus-cost.md` §9.1).
+        // for a plain image (`docs/fork/foundation.md` §5).
         let _timed = crate::stats::creating();
         let device = &gpu.device;
 
@@ -928,7 +928,7 @@ impl Texture {
     ) -> Result<Self> {
         // Counted like any other create, and it is the *expensive* one: a dmabuf/DRM-modifier
         // `vkCreateImage` that misses venus's requirements cache costs 0.06-0.7 ms against 3 us
-        // for a plain image (`docs/fork/venus-cost.md` §9.1).
+        // for a plain image (`docs/fork/foundation.md` §5).
         let _timed = crate::stats::creating();
         let device = &gpu.device;
 
@@ -1160,7 +1160,7 @@ impl Texture {
     /// [`stage_coverage_regions`](Self::stage_coverage_regions) for glyphs. It exists because the
     /// per-texture path costs a full submit *and a blocking fence wait* each, and a live seat frame
     /// was measured at `9 upload in 16.22ms` for 1.0 MiB of pixels — the bytes were 0.24ms of that.
-    /// Worse, each wait re-parks the host ring (`docs/fork/venus-cost.md` §9.4), so every upload
+    /// Worse, each wait re-parks the host ring (`docs/fork/foundation.md` §5), so every upload
     /// also taxes the *next* submit with a ~1ms wake.
     ///
     /// The returned texture is complete except for its contents — view and sampler are valid, and

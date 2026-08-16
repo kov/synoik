@@ -15,12 +15,12 @@ adversarially checked to rule out reproducer-side confounds (see the per-issue "
 ruled out" notes).
 
 **A third, later finding lives next door:** timestamp queries are advertised in full and resolve
-to zero — see [`../venus-timestamp-gap.md`](../venus-timestamp-gap.md), with its reproducer in
+to zero — see [`foundation.md`](../foundation.md), with its reproducer in
 [`repro-vk-timestamp-query/`](./repro-vk-timestamp-query). It is written up separately because it
 is a handoff for the VM-stack work rather than a dmabuf-import finding.
 
 **For the performance picture rather than individual defects**, see
-[`../venus-cost.md`](../venus-cost.md): what this stack prices per round trip, measured on a live
+[`foundation.md`](../foundation.md): what this stack prices per round trip, measured on a live
 compositor, and what would help most at the VMM level. These two findings appear there as §3.7.
 
 ---
@@ -280,12 +280,12 @@ helper, where the next reader of an import site will find it.
 
 **Why it was worth removing at all**, given it was harmless today: the fallback silently accepts a
 memory type the driver never blessed. It is harmless *here* only because this device exposes
-exactly **one** memory type (`docs/fork/venus-cost.md` §9.2), so whenever the query succeeds its
+exactly **one** memory type (`docs/fork/foundation.md` §5), so whenever the query succeeds its
 mask can only be `0b1` and the masking is a no-op — there is nothing for the fallback to get wrong.
 On a stack with several memory types — a different host driver, a real GPU passthrough — a query
 that failed for some unrelated reason would leave `trailing_zeros()` picking the lowest bit of an
 *unfiltered* mask, which need not be importable at all. It is a latent bug that this VM's single
-memory type is hiding, the same shape as the `renderer-gaps.md` entries.
+memory type is hiding, the same shape as the `foundation.md` entries.
 
 **Verified, not just compiled.** All three sites run in the suite with the query fatal: the client
 sampled-import and scanout-target tests (`vulkan_dmabuf_import_cache_*`,

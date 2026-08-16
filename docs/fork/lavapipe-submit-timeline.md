@@ -112,6 +112,6 @@ close this out quickly.
 
 - `docs/fork/frame-submit-discipline.md` — why the single-timeline invariant matters, and what
   breaks if a submit escapes it.
-- `docs/fork/venus-timestamp-gap.md` — the other "a counter reads wrong on this stack" handoff,
+- `docs/fork/foundation.md` — the other "a counter reads wrong on this stack" handoff,
   resolved host-side. Worth reading for the shape, not the cause; that one was reproducible on
   demand and this one is not.

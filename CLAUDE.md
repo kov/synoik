@@ -63,15 +63,16 @@ way" vs. a capability worth keeping, ask.
   fake-border smell: it can't round and duplicates behavior; use `Painter::stroke_rounded`. Shared
   controls become a `widget::` primitive so hover/focus/geometry stay consistent (see `widget::Button`,
   the inset-accent focus ring). Grow the toolkit as the port surfaces new interface, don't paint around it.
-- **Share the frame's submit — never add a `run_commands` to the frame path.** On this stack a
-  submit+fence-wait is a round trip whose cost is unrelated to its payload (a *barrier* on its own
-  submit measured 2.5–3.5 ms; 11 shm re-uploads cost 19.38 ms to move 0.33 ms of bytes). Work whose
-  only consumer is later GPU work gets **recorded** into a command buffer that is already being
-  submitted — submits are totally ordered on one timeline semaphore, so recorded is as good as
-  waited-for. Queue it for `VulkanFrame::begin`, or use `run_commands_deferred` when it truly can't
-  fold. The catch is the other side: anything sampling a queued resource *outside* a frame must
-  drain first (`flush_pending_texture_uploads`), so each such consumer is a stall you are adding.
-  Read `docs/fork/frame-submit-discipline.md` before touching this.
+- **Share the frame's submit — never add a `run_commands` to the frame path.** A submit is cheap
+  (~18 µs unwaited); the **fence wait** is the round trip, and each one idles the guest↔host ring so
+  the next submit pays a wake on top. Work whose only consumer is later GPU work gets **recorded**
+  into a command buffer that is already being submitted — submits are totally ordered on one timeline
+  semaphore, so recorded is as good as waited-for. Queue it for `VulkanFrame::begin`, or for the
+  mid-frame gap in `capture_region`; there is no third slot (`run_commands_deferred` is gone). The
+  catch is the other side: anything sampling a queued resource *outside* a frame must drain first
+  (`flush_pending_texture_uploads`), so each such consumer is a stall you are adding.
+  Read `docs/fork/frame-submit-discipline.md` before touching this, and `docs/fork/foundation.md`
+  for the renderer's status quo, settled costs and roadmap.
 - **A hazard you can describe, you can fix — do it now.** If you're about to write a comment saying
   something is a footgun, a flake generator, or "careful, this can X", that is the moment to fix it,
   not document it. Then check the neighbours for the same shape, because the pattern rarely has one

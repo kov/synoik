@@ -8,7 +8,7 @@ holds one Vulkan context and nothing else — no compositor, no seat, no KMS.
 |---|---|
 | [`probe-venus-costs`](./probe-venus-costs) | Is `vkCreateImage` priced by venus's requirements cache? Is the host-visible mapping cached or write-combined? What is actually inside a fence wait? |
 
-`probe-venus-costs` is the evidence behind [`../venus-cost.md`](../venus-cost.md) §9, which is where
+`probe-venus-costs` is the evidence behind [`foundation.md`](../foundation.md) §5, which is where
 its numbers are read. Run it with `cargo run --release -- [image|memory|fence|idle|all]`.
 
 Two cautions that apply to anything added here:

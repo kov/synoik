@@ -366,7 +366,7 @@ container.
 ### 9.6 The cost model — a bake is round trips, not drawing
 
 Measured on the seat, 2026-07-25 (`SYNOIK_FRAME_LOG`; see
-[`frame-cost-investigation.md`](./frame-cost-investigation.md)). `time_bake()` wraps all of
+[`foundation.md`](./foundation.md)). `time_bake()` wraps all of
 `bake_uncached_sized`, which contains **two synchronous GPU round trips**:
 
 1. `renderer.render(...)` → `VulkanFrame::begin` → `flush_glyph_uploads()` — a standalone submit
@@ -393,7 +393,7 @@ Consequences worth knowing before optimising anything here:
 - **The remaining fix is structural, not local** — eliminate or defer the two submits. The glyph
   copy can ride the frame's own command buffer the way `record_pending_dmabuf_acquires` already
   does (zero submits instead of one); the offscreen fence wait is slice 1 in
-  [`renderer-synchronous-submits.md`](./renderer-synchronous-submits.md). Note the bake runs during
+  [`foundation.md`](./foundation.md). Note the bake runs during
   element *collection*, so its wait sits at the **start** of building a frame — the same pipelining
   the scanout deferral bought back at the end.
 
@@ -403,7 +403,7 @@ a live seat the `offscreen` submit site's *wait* is now 0.00 ms (722 frames, 0.0
 against 7.67 s over a comparable synchronous session). The 2–3.5 ms was never "Venus submit
 overhead" in any GPU sense: a guest `vkWaitForFences` never enters the kernel, it is mesa's
 `vn_relax` userspace poll — 160 µs rungs, ~291 µs actually slept after guest timer slack, against a
-complete host round trip of 0.076 ms (`venus-cost.md` §11.2). So the cost was the *waiting*, not the
+complete host round trip of 0.076 ms (`foundation.md` §5). So the cost was the *waiting*, not the
 submitting, and not waiting removes it outright.
 
 What survives unchanged is the conclusion that matters here: **a cache hit is the whole game, and

@@ -296,7 +296,7 @@ pub struct VulkanRenderer {
     /// `import_memory` used to submit **and block** per texture. A live seat frame was measured at
     /// `9 upload in 16.22ms` moving 1.0 MiB — the bytes cost 0.24 ms of that, so the other 16 ms
     /// was nine round trips. Each blocking wait also idles the guest↔host ring past its 1 ms
-    /// timeout, so the *next* submit pays a ~1 ms wake on top (`docs/fork/venus-cost.md` §9.4):
+    /// timeout, so the *next* submit pays a ~1 ms wake on top (`docs/fork/foundation.md` §5):
     /// the waits were buying each other.
     ///
     /// Invariant, identical to the acquires': a [`super::VulkanFrame`] mutably borrows the
@@ -1346,7 +1346,7 @@ impl VulkanRenderer {
         // The import left the image `UNDEFINED`; queue its acquire onto the same list the cache-hit
         // path uses, so the barrier rides the next frame's command buffer instead of a submit and
         // fence-wait of its own. A live overview frame showed two of those standalone barriers
-        // costing ~3 ms each (`docs/fork/frame-cost-investigation.md`). No de-dupe check needed
+        // costing ~3 ms each (`docs/fork/foundation.md`). No de-dupe check needed
         // that the hit path needs: this image did not exist a moment ago, so it cannot be queued
         // already.
         self.pending_dmabuf_acquires.push(tex.clone());
@@ -1924,7 +1924,7 @@ impl GpuTimer {
 ///
 /// Freeing any of this while the GPU still reads it is a fault or silent corruption, not a panic
 /// — which is why the synchronous renderer never needed the type. See
-/// `docs/fork/renderer-synchronous-submits.md`.
+/// `docs/fork/foundation.md`.
 struct InFlightSubmit {
     /// The queue-timeline value this submit signals. The timeline is what proves completion here,
     /// rather than the fence: a `SYNC_FD` export resets the fence, so once KMS has taken it the
@@ -2030,7 +2030,7 @@ impl VulkanRenderer {
     /// Wait, bounded, for every scanout fence KMS is still holding to signal. For teardown:
     /// exiting with one unsignaled leaves the pending atomic commit parked on a fence whose
     /// venus context is about to die — if the host then fails to retire it, KMS wedges for
-    /// every later DRM master until reboot (`docs/fork/present-misses.md` §22). On a healthy
+    /// every later DRM master until reboot (`docs/fork/foundation.md` §3). On a healthy
     /// host these signal within milliseconds of the queue idling, so the normal cost is zero.
     pub(super) fn drain_exported_scanout_fences(&mut self) {
         use smithay::reexports::rustix::event::{poll, PollFd, PollFlags};
@@ -2069,7 +2069,7 @@ impl VulkanRenderer {
         if !fds.is_empty() {
             error!(
                 "{} scanout fence(s) never signaled within {:?}; a pending KMS commit may wedge \
-                 the next DRM master (docs/fork/present-misses.md §22)",
+                 the next DRM master (docs/fork/foundation.md §3)",
                 fds.len(),
                 SCANOUT_FENCE_DRAIN_TIMEOUT,
             );
@@ -2188,7 +2188,7 @@ impl VulkanRenderer {
     /// Stop [`Self::retire_completed`] from observing completions. Tests only, and the stand-in for
     /// a real property of the live seat: retirement is a *poll*, so an in-flight record survives
     /// every prepare that runs before the renderer happens to notice the queue timeline moved (on
-    /// this stack, with `VN_PERF=no_fence_feedback`, that is most of them). Anything whose
+    /// this stack, where completion is a host round trip, that is most of them). Anything whose
     /// correctness depends on an in-flight record having been freed is a race; pausing makes the
     /// unfavourable side of it deterministic.
     #[cfg(test)]
@@ -2548,7 +2548,7 @@ pub(super) fn phase_tick_deltas(
 ///
 /// Opt-in because the win it targets can only be confirmed on a real seat: headless there is no
 /// KMS plane to take the fence, so nothing here exercises the part that pays off. See
-/// `docs/fork/renderer-synchronous-submits.md`.
+/// `docs/fork/foundation.md`.
 /// A `poll` timeout of "answer now": the pruning path must never block a frame.
 const ZERO_TIMEOUT: smithay::reexports::rustix::time::Timespec =
     smithay::reexports::rustix::time::Timespec {

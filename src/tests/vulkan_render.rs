@@ -9793,7 +9793,7 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
 
 /// The xray blur costs no submit of its own, and the pixels still come out right.
 ///
-/// A blur's own round trip costs about as much as the blur (`docs/fork/venus-cost.md` §3.8, §12),
+/// A blur's own round trip costs about as much as the blur (`docs/fork/foundation.md` §5),
 /// so `EffectBlur::queue` does not make one: the chain is recorded into the next frame's command
 /// buffer, alongside the uploads and the dmabuf acquires. Two things have to hold for that to be
 /// safe, and neither is visible in a frame that merely looks correct:

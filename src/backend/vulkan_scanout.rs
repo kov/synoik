@@ -30,7 +30,7 @@
 //!   `DRM_MODE_FB_MODIFIERS` directly, which is all gbm was ever doing on our behalf.
 //!
 //! Both are gated at construction on the capabilities the path needs; see
-//! [`VulkanScanoutAllocator::new`] and `docs/fork/scanout-allocation.md`.
+//! [`VulkanScanoutAllocator::new`] and `docs/fork/foundation.md`.
 
 use std::sync::Arc;
 

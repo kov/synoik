@@ -15,7 +15,7 @@ use crate::utils::get_monotonic_time;
 /// Mutter also adds the display's vblank duration, which it gets from the DRM mode timings
 /// (`meta_calculate_drm_mode_vblank_duration_us`, `src/backends/native/meta-kms-crtc.c:891`), and
 /// arms a hardware deadline timer we do not have. Ours stands in for both, and 1 ms is measurably
-/// too thin on this stack (see the seat numbers in `docs/fork/late-frame-populations.md`) — which
+/// too thin on this stack (see the seat numbers in `docs/fork/foundation.md` §3) — which
 /// is why it is a dial rather than a constant: `SYNOIK_RENDER_TIME_MARGIN_MS` at startup,
 /// [`set_render_time_margin`] at runtime, so a calibration sweep costs no rebuild and no relogin.
 const RENDER_TIME_MARGIN_DEFAULT_US: u64 = 1000;
@@ -59,7 +59,7 @@ pub fn render_time_margin_now() -> Duration {
 /// completely, but spends most of the latency the feature exists for, and what it buys — sampling
 /// input and animation closer to the photons — is real and *not* measurable with frame-perf. So
 /// turning this on is waiting on an input-to-photon number, not on another drop-rate sweep.
-/// `docs/fork/late-frame-populations.md` has both sweeps and the label-inversion trap in them.
+/// `docs/fork/foundation.md` §3 has the margin sweep, and §4 the label-inversion trap.
 ///
 /// Runtime-switchable rather than read once, because measuring it needs an A/B *within* one
 /// session: comparing two logins compares two different sets of background work, and on the first
@@ -345,7 +345,7 @@ impl FrameClock {
     /// - an **idle period**, i.e. the next vblank is more than one interval out. Mutter
     ///   short-circuits here too (`should_update_now`, `:894-923`): "lowest average latency for
     ///   sporadic user input". This is the common case on a live seat, and the reason the miss
-    ///   population documented in `docs/fork/late-frame-populations.md` is untouched by this;
+    ///   population documented in `docs/fork/foundation.md` §3 is untouched by this;
     /// - no measured render time yet — the deadline would be a guess, and guessing low costs a
     ///   vblank;
     /// - the deadline has already passed, which is just "we are late, go".
@@ -412,7 +412,7 @@ impl FrameClock {
     /// "this results in lowest average latency for sporadic user input" — and that is the
     /// common case here: on a live seat 7 242 of 7 778 late presentations followed a 3-10 cycle
     /// gap. Waiting for a deadline would guarantee the later vblank *and* add latency. See
-    /// `docs/fork/late-frame-populations.md`.
+    /// `docs/fork/foundation.md` §3.
     fn reachable(&self, target: Duration, now: Duration, refresh_interval: Duration) -> Duration {
         // Bounded at two cycles of advance for the same reason mutter clamps its estimate: aiming
         // further out than that on one bad frame would jump every animation ahead of where it

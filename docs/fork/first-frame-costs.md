@@ -1,7 +1,7 @@
 # Cold costs: finding the work we only ever do once
 
 **Status:** plan, not built. Written 2026-07-27 out of the live session that produced
-[`present-misses.md`](./present-misses.md).
+[`foundation.md`](./foundation.md).
 
 ## Cold icon keys, and a prewarm that ran too early
 
@@ -68,7 +68,7 @@ From one 14-minute session (`niri[380336]`, 2026-07-27), the whole set of over-b
 
 None of these recurred in a second, larger burst of the same interactions later in the session
 (1655 frames, exactly one `collect` above 4 ms — and that one was a single 11.87 ms image
-allocation, a different problem that belongs to the host, see `present-misses.md` §7).
+allocation, a different problem that belongs to the host, see `foundation.md` §3).
 
 So: four known sites, one fixed, and no way to enumerate the rest.
 
@@ -188,4 +188,4 @@ So any harness for this must:
 Explicitly **not** in this plan: the bimodal image-allocation spikes (p50 0.10 ms, max 23.38 ms
 for a single `vkCreateImage`). Those are not first-execution costs — one hit an idle desktop
 twelve minutes into the session — and they are host-side. They live in
-[`present-misses.md`](./present-misses.md) §7.
+[`foundation.md`](./foundation.md) §7.

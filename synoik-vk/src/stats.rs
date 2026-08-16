@@ -9,7 +9,7 @@
 //! it. Together they are one full CPU↔GPU round trip. On a virtualized stack
 //! (Venus over virtio-gpu) the wait tracks GPU work closely, but a submit issued
 //! after the ring has been idle for a millisecond pays ~1 ms to wake the host ring
-//! thread — flat, whatever it carries (`docs/fork/venus-cost.md` §9.4). A blocking
+//! thread — flat, whatever it carries (`docs/fork/foundation.md` §5). A blocking
 //! wait puts the ring back to sleep, so *how many* round trips a frame makes is a
 //! more useful number than how much it drew.
 //!
@@ -17,7 +17,7 @@
 //! renderer is immediately retired by its own caller. The cost lives almost
 //! entirely in the retire — a scanout submit enqueues in microseconds and then
 //! parks for 12–14 ms — so a change that stops blocking on the fence and hands it
-//! to KMS instead (`docs/fork/renderer-synchronous-submits.md`) would collapse the
+//! to KMS instead (`docs/fork/foundation.md`) would collapse the
 //! submit time to nothing and read as a saving, when the wait had only moved. Two
 //! numbers make a removed wait tell itself apart from a moved one, and a retire
 //! deliberately carries no count: once waits are deferred, the retire that a frame
@@ -458,7 +458,7 @@ pub fn uploaded(bytes: u64) {
 /// submits. `vkAllocateMemory` and `vkCreateImageView` are asynchronous and cost microseconds, but
 /// `vkCreateImage` round-trips whenever venus misses its image-requirements cache — keyed on the
 /// whole `VkImageCreateInfo`, `extent` included — and a miss on the dmabuf/DRM-modifier shape runs
-/// 0.06–0.7 ms (`docs/fork/venus-cost.md` §9.1). So a frame that allocates can spend milliseconds
+/// 0.06–0.7 ms (`docs/fork/foundation.md` §5). So a frame that allocates can spend milliseconds
 /// somewhere the submit accounting cannot see. That is exactly the shape of the unattributed CPU on
 /// the seat's worst frames — collect time that is neither a fence wait nor a bake — and this is the
 /// counter that says whether it is this or something else.
@@ -575,7 +575,7 @@ pub fn take_create_sites() -> Vec<CreateSite> {
 /// Its own bucket rather than part of [`creating`] because it is a different cost with a different
 /// fix: not a round trip to the host but a straight memcpy into a mapping whose pages have never
 /// been touched, which on this VM runs at ~7 GB/s against ~58 GB/s once the same buffer is warm.
-/// The mapping is cached, not write-combined (`docs/fork/venus-cost.md` §9.2). It scales
+/// The mapping is cached, not write-combined (`docs/fork/foundation.md` §5). It scales
 /// with payload, so it is the number that describes a wallpaper (48 MiB ≈ 8 ms) and rounds to
 /// nothing for an icon. Read together with the uploaded-bytes counter.
 pub fn staging_write() -> StagingTimer {

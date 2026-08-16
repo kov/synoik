@@ -18,7 +18,7 @@
 //! available ([`synoik_vk::staging::HostStaging`]). Moving the decode off the main loop had left
 //! one multi-megabyte host write behind: the upload's own copy from the decoded `Vec` into a
 //! staging buffer, measured at 7–9 ms for a 4K picture — first-touch page faults on a freshly
-//! mapped buffer, no GPU work in it at all (`docs/fork/venus-cost.md` §9.2). Staging on the worker
+//! mapped buffer, no GPU work in it at all (`docs/fork/foundation.md` §5). Staging on the worker
 //! leaves the render thread with only the image creation and a copy queued for the next frame's
 //! command buffer — no submit of its own, which on a live frame was `first upload 18.62ms` for 48
 //! MiB. Without a device (headless tests, or before the renderer exists) it falls back to a plain

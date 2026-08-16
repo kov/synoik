@@ -1,5 +1,5 @@
 // LD_PRELOAD shim that times the DRM syncobj wait ioctl, to answer the one question
-// `venus-cost.md` §10.1 leaves open.
+// `foundation.md` §5 leaves open.
 //
 // The host side timed every hop it can see and found the complete host round trip is ~0.076 ms,
 // against 0.43-1.48 ms measured in the guest for the same waits — so ~90% of it is guest-side, on

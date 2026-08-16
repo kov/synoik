@@ -7,7 +7,7 @@ name = "probe-venus-costs"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "Measures the three costs disputed in docs/fork/venus-cost.md §8: image-requirements cache hit vs miss, host-visible mapping bandwidth (read and write), and the fixed cost of a submit + fence wait."
+description = "Measures the three costs disputed in docs/fork/foundation.md §5: image-requirements cache hit vs miss, host-visible mapping bandwidth (read and write), and the fixed cost of a submit + fence wait."
 
 [dependencies]
 ash = "0.38.0"

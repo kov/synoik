@@ -9,7 +9,7 @@ This answers one question: does a frame miss because of how *long* the GPU runs,
 or because of how *much* is recorded? Those point at different mechanisms — the
 first at anything proportional to GPU time, the second at anything proportional
 to command count, which is what a per-command host-side tax would be
-(docs/fork/present-misses.md §17.3, §18).
+(docs/fork/foundation.md §3).
 
 Method: each 10 s summary line closes a window. A window contributes its median
 per-frame gpu / draws / elements and its aim-1 miss rate. Spearman, because none

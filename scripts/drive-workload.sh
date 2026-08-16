@@ -9,7 +9,7 @@
 #
 # Why this exists: a human cannot reproduce a workload closely enough to measure
 # anything subtle. The continuation-frame miss rate on this stack varies by 100x
-# with what is on screen (docs/fork/present-misses.md §14), so an A/B driven by
+# with what is on screen (docs/fork/foundation.md §3), so an A/B driven by
 # hand measures the workload, not the variable under study — which is exactly how
 # §15 produced a 2x "effect" that §16 had to retract.
 #

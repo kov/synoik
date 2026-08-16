@@ -3146,7 +3146,7 @@ fn vulkan_dmabuf_cpu_written_producer_is_visible_to_the_gpu() {
 /// start its timer at the top of the function — above the cache lookup — so every cache **hit**
 /// reported a GPU resource creation, and the frame log's per-frame `created` number counted the
 /// work the cache exists to avoid. That is the one number telling us whether a frame allocates or
-/// reuses (`docs/fork/venus-cost.md` §9.1: a dmabuf/modifier `vkCreateImage` miss costs 0.06-0.7 ms
+/// reuses (`docs/fork/foundation.md` §5: a dmabuf/modifier `vkCreateImage` miss costs 0.06-0.7 ms
 /// against 3 us for a plain one), so a hit that reads as a create makes it useless in the exact
 /// case it was added for.
 ///
@@ -3212,7 +3212,7 @@ fn vulkan_dmabuf_import_cache_hit_is_not_counted_as_a_creation() {
 /// This is worth a test rather than a comment because the cost it removes is invisible in pixels.
 /// A live seat frame was logged at `9 upload in 16.22ms` while moving 1.0 MiB — the pixels were
 /// 0.24 ms of it, the rest was nine submits each parked on its own fence, and each of those waits
-/// re-idles the guest↔host ring so the *next* submit pays a wake too (`docs/fork/venus-cost.md`
+/// re-idles the guest↔host ring so the *next* submit pays a wake too (`docs/fork/foundation.md`
 /// §9.4). Revert the deferral and every assertion here still renders the right colour; only the
 /// counters move.
 ///
@@ -4971,7 +4971,7 @@ fn a_deferred_finish_returns_a_fence_and_still_orders_what_follows() {
 /// dma-fence the kernel waits on — while exiting with it unsignaled parks the pending atomic
 /// commit on a fence whose venus context is about to die. A host that fails to retire it then
 /// wedges KMS for every later DRM master until reboot: the 2026-07-29 logout wedge,
-/// `docs/fork/present-misses.md` §22. The renderer therefore keeps a dup of each exported FD
+/// `docs/fork/foundation.md` §3. The renderer therefore keeps a dup of each exported FD
 /// ([`super::fence::ExportedFenceRegistry`]) and [`VulkanRenderer::drain_exported_scanout_fences`]
 /// — run on drop, before the device goes — waits (bounded) until they are all signaled.
 ///

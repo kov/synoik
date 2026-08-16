@@ -267,7 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ) {
                     // A lost sample reads as 0 *and still reports available*, so a zero is
                     // indistinguishable from a real result except by being zero. Count it, never
-                    // average it in — see `venus-cost.md` §11.
+                    // average it in — see `foundation.md` §5.
                     Ok([a, b]) if a != 0 || b != 0 => deltas.push(b.wrapping_sub(a)),
                     Ok(_) => zeros += 1,
                     Err(e) => {

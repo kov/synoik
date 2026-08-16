@@ -9,7 +9,7 @@ The point of this script is the comparability gate. Two arms that ran the same
 keystrokes are not necessarily comparable: state drifts (a grid left open, a
 different workspace), and then the phases render different things. Frame-timing
 differences between phases rendering different content are meaningless, and this
-has already produced one retracted finding (docs/fork/present-misses.md §15/§16).
+has already produced one retracted finding (docs/fork/foundation.md §3).
 
 So a phase is scored only if the two arms agree on what was on screen, judged by
 the distribution of element counts and the number of bakes. Disagreement is

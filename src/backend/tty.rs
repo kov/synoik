@@ -3159,7 +3159,7 @@ fn tally_scanout(states: &RenderElementStates) -> ScanoutTally {
 /// into stale content everywhere the scene has stopped repainting, while every screenshot (a full
 /// redraw) comes out clean. Turning the chain off in one env var is what lets that be attributed on
 /// a live seat without a rebuild; it is also a usable stopgap, at the cost of a full redraw per
-/// frame. It earned its keep on 2026-08-05 — see `docs/fork/scanout-allocation.md`.
+/// frame. It earned its keep on 2026-08-05 — see `docs/fork/foundation.md`.
 fn full_damage_requested() -> bool {
     static REQUESTED: OnceLock<bool> = OnceLock::new();
     *REQUESTED.get_or_init(|| {

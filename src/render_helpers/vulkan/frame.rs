@@ -2072,7 +2072,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
 
             // Timed apart from the submit above: this park is where a scanout frame spends
             // 12–14 ms of its budget, and it is the one this renderer means to stop paying on
-            // the compositor thread. See `docs/fork/renderer-synchronous-submits.md`.
+            // the compositor thread. See `docs/fork/foundation.md`.
             {
                 let _timed = synoik_vk::stats::retire(self.submit_site());
                 dev.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;

@@ -1161,7 +1161,7 @@ mod tests {
 
     /// How many times each variant is recorded into a single command buffer. One
     /// submit for the lot, so the per-submit round trip (§9.3 of
-    /// `docs/fork/venus-cost.md`: ~1.2ms of guest-side polling, most of it
+    /// `docs/fork/foundation.md`: ~1.2ms of guest-side polling, most of it
     /// `clock_nanosleep`) is paid once and divided away instead of landing on
     /// every sample.
     ///
@@ -1183,7 +1183,7 @@ mod tests {
     const OFFSET: f32 = 3.0;
 
     /// Sizes to sweep. The last is roughly the 5.3x-output overview frame that
-    /// §3.8 of `docs/fork/venus-cost.md` measured at `1 blur in 13.63ms`.
+    /// §3.8 of `docs/fork/foundation.md` measured at `1 blur in 13.63ms`.
     const SIZES: &[(u32, u32)] = &[
         (1920, 1080),
         (2560, 1440),
@@ -1389,7 +1389,7 @@ mod tests {
     /// The compositor gives every blur its own fence-waited submission
     /// (`EffectBlur::run`, `BackdropBlur::run_blur`). That is a round trip, and
     /// on this stack a round trip is not free even when the work is: the wait
-    /// polls in ~291us steps (`venus-cost.md` §11.2), so a wait rounds up. This
+    /// polls in ~291us steps (`foundation.md` §5), so a wait rounds up. This
     /// prices the same total GPU work delivered both ways — N blurs in one
     /// submit, versus N blurs in N submits — which is exactly the choice between
     /// folding the blur into the frame's command buffer and leaving it standing

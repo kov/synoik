@@ -3513,7 +3513,7 @@ mod tests {
     /// whole bar. That is cheap warm (0.9 ms) and ruinous cold, which is what it always is at a
     /// once-a-minute cadence: a live seat measured p50 60.7 ms, p99 311 ms, and three to four
     /// dropped vblanks every minute on an idle desktop. See
-    /// `docs/fork/late-frame-populations.md`.
+    /// `docs/fork/foundation.md` §3.
     ///
     /// Counted on bakes rather than pixels, like [`an_overview_fade_reuses_one_bar_bake`]: a
     /// label re-baked needlessly renders identically to a cached one. Two ticks, because the

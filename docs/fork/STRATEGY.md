@@ -390,17 +390,17 @@ first-class constraint on this work.
   starts as a `SynoikRenderer` **trait redesign** (renderer-enum + niri-owned primitive API),
   not a second impl bolted beside the Gles hardwiring.
 - **(3) KMS scanout + explicit sync** — see the measured Venus explicit-sync constraints in
-  `docs/fork/venus-explicit-sync-gap.md` (bridge via kernel `drm_syncobj` timeline ⟷
+  `docs/fork/explicit-sync.md` (bridge via kernel `drm_syncobj` timeline ⟷
   `sync_file` ⟷ binary `SYNC_FD` VkSemaphore; `OPAQUE_FD`/Vulkan-timeline export is absent and
   structurally can't cross virtio).
 - **(4) cut over at parity; delete GLES/pango/cairo.**
 
-**Performance ceiling of the owned renderer — see `docs/fork/renderer-synchronous-submits.md`,
-arrived at in `docs/fork/frame-cost-investigation.md`.** Every submit fence-waits; the scanout one
+**Performance ceiling of the owned renderer — see `docs/fork/foundation.md`,
+arrived at in `docs/fork/foundation.md`.** Every submit fence-waits; the scanout one
 costs 12-14ms of a 16.67ms frame and does not depend on anything we draw. The cheaper per-frame
 wins are done, so this is the only frame-cost item left.
 
-**Known gaps of the owned renderer vs GLES — see `docs/fork/renderer-gaps.md`.** Deleting GLES is
+**Known gaps of the owned renderer vs GLES — see `docs/fork/foundation.md`.** Deleting GLES is
 **not** a one-way door: single-device / LINEAR-only / single-plane are configurations of the Vulkan
 renderer, not its architecture, and Smithay's multi-GPU machinery is GLES-typed top to bottom, so
 keeping it would buy no head start on a Vulkan implementation. The gap that bites **first, and on
@@ -408,7 +408,7 @@ every machine including the VM**, is not multi-GPU but **multi-planar dmabuf imp
 zero-copy hardware video decode)**; multi-GPU is bounded, mostly-mechanical work whose real cost is
 driver validation on bare metal we don't have.
 
-**Surviving device loss is a gap, and on Venus a blocked one — `renderer-gaps.md` §11.** A GPU reset,
+**Surviving device loss is a gap, and on Venus a blocked one — `foundation.md` §6.** A GPU reset,
 or a venus context that dies across guest suspend, currently kills the compositor: mesa `abort()`s
 inside `vn_relax` because `vkCreateImage` has no legal way to return `VK_ERROR_DEVICE_LOST`. Mutter is
 growing recovery for the GL case and the state machine is worth copying, but our step 0 is lower —
@@ -543,7 +543,7 @@ The milestone also covers the MPRIS model and the media card in the message list
 ScreenCast (PipeWire producer) → RemoteDesktop/InputCapture → Screenshot/portal backend →
 notifications/calendar clients → OSK → IBus candidate UI.
 
-**Hardware video is its own milestone here, tracked in `docs/fork/renderer-gaps.md` §1** — the
+**Hardware video is its own milestone here, tracked in `docs/fork/foundation.md` §6** — the
 Vulkan importer takes only single-plane LINEAR 8888 buffers, so a decoder-produced NV12/P010 dmabuf
 has to round-trip through a CPU conversion. This was parked as "the gap that matters first" while
 nothing on this machine could produce such a buffer; **the VMM side is now adding VA-API and Vulkan
@@ -553,7 +553,7 @@ does not wait on the host: multi-planar sampling (per-plane `VkImage` +
 frame ever reaches a hardware plane; non-LINEAR modifier import depends on what Venus/KosmicKrisp can
 expose on a Metal host and may stay moot here. Sequence it *before* multi-GPU, and start the
 multi-planar half ahead of the VMM landing rather than discovering it afterwards. Related: overlay
-planes for video scanout are a VMM ask, not a prerequisite — see `present-misses.md` §33.
+planes for video scanout are a VMM ask, not a prerequisite — see `foundation.md` §3.
 
 **Accessibility is its own milestone here, tracked in `docs/fork/a11y-port.md`** — chrome
 scale ends at the toggle menu (done); behind it sit high-contrast/text-scaling in our own

@@ -170,7 +170,7 @@ pub struct Gpu {
 /// Its whole job is to make GPU execution order equal submission order without
 /// blocking the CPU. Today every submit is followed by its own fence wait, so
 /// nothing can overlap and this changes nothing observable — but that wait is what
-/// we mean to stop paying (`docs/fork/renderer-synchronous-submits.md`), and the
+/// we mean to stop paying (`docs/fork/foundation.md`), and the
 /// moment a submit is left in flight, everything issued after it may execute
 /// alongside it. That is not a lifetime problem, which is the easy half: the
 /// present-blit shadow is one image shared by consecutive frames and the glyph
@@ -376,7 +376,7 @@ impl Gpu {
             c"VK_EXT_queue_family_foreign",
             // Explicit sync (Stage 3): export a submit's completion as a binary SYNC_FD, the only
             // usable Vulkan external-sync bridge on Venus/lavapipe (see
-            // docs/fork/venus-explicit-sync-gap.md). Both are enable-only — no feature struct —
+            // docs/fork/explicit-sync.md). Both are enable-only — no feature struct —
             // and their base extensions (external_semaphore/fence) are core in 1.1. See
             // sync_spike.
             c"VK_KHR_external_semaphore_fd",

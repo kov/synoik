@@ -39,8 +39,8 @@
 //! **The `gpu` option works on the dev VM as of 2026-07-26.** It used to produce
 //! nothing, for two independent reasons that looked identical from the log. The
 //! virtio-gpu/Venus stack advertised timestamp queries and resolved every one to
-//! zero — fixed host-side (`docs/fork/venus-timestamp-gap.md`, §13 of
-//! `docs/fork/venus-cost.md`), and this VMM now measures 100% usable pairs. And
+//! zero — fixed host-side in the host Vulkan driver (`docs/fork/foundation.md`
+//! §5), and this VMM now measures 100% usable pairs. And
 //! the flag was set too late for the renderer to see it (see [`gpu_timing`]), so
 //! the query pool was never allocated in the first place.
 //!
@@ -742,7 +742,7 @@ struct Settings {
     /// the ring rolls over, which is exactly the thing that fails for a one-off.
     ///
     /// **The threshold is at least 2 for a reason.** On this stack a *single* missed
-    /// cycle is routine — `docs/fork/present-misses.md` measures ~12% of presented
+    /// cycle is routine — `docs/fork/foundation.md` measures ~12% of presented
     /// frames landing one cycle late, unresolved and largely host-side. Triggering
     /// on that would dump continuously and tell you nothing. Two cycles (33ms at
     /// 60Hz) is past the point where a person sees a hitch rather than a statistic.
@@ -1089,7 +1089,7 @@ struct Totals {
     create_sites: Vec<synoik_vk::stats::CreateSite>,
     /// Wall time memcpying host bytes into mapped staging. Separate from `creates` because it is a
     /// different cost with a different fix — first-touch page faults on a freshly mapped buffer,
-    /// scaling with payload (`docs/fork/venus-cost.md` §9.2; the mapping itself is cached and does
+    /// scaling with payload (`docs/fork/foundation.md` §5; the mapping itself is cached and does
     /// ~58 GB/s once warm) — and folding it in made a wallpaper frame read as 9.96ms of
     /// "creation".
     staging_write: Duration,
@@ -2167,7 +2167,7 @@ impl FrameLog {
         // flips, back-to-back ones miss 1% of the time and *anything* with a cycle of quiet in
         // front of it misses 26-47%, flat from 2 cycles out to 5 seconds. Without this number a
         // miss line cannot tell the two apart, and the whole idle regime reads as one mystery.
-        // See `docs/fork/present-misses.md` §10.
+        // See `docs/fork/foundation.md` §3.
         let prev = self.last_presented.insert(output.to_owned(), actual);
         let since_last_flip = prev
             .and_then(|prev| actual.checked_sub(prev))
@@ -2189,7 +2189,7 @@ impl FrameLog {
         // so a miss cannot move this number. Same 1-based vocabulary as the direct gap on purpose —
         // 1 means "aimed at the cycle right after the last flip", so the two histograms line up row
         // for row and the difference between them is the thing under study. Idle cycles in front is
-        // this minus one. See `docs/fork/present-misses.md` §12.3/§13.2.
+        // this minus one. See `docs/fork/foundation.md` §3.
         let aimed_after = prev
             .and_then(|prev| target.checked_sub(prev))
             .map(|gap| (gap.as_secs_f64() / refresh.as_secs_f64()).round() as usize);
@@ -2709,7 +2709,7 @@ const CREATE_SITES_SHOWN: usize = 3;
 /// Its own function so a test can pin the wording without going through a page flip. The
 /// distinction it draws is the one the live data says matters: a flip that immediately follows
 /// another misses ~1% of the time on this stack, and one with even a single idle cycle in front of
-/// it misses 26–47% — flat from 2 cycles out to 5 seconds. See `docs/fork/present-misses.md` §10.
+/// it misses 26–47% — flat from 2 cycles out to 5 seconds. See `docs/fork/foundation.md` §3.
 fn cadence_clause(since_last_flip: Option<usize>) -> String {
     match since_last_flip {
         None => ", first flip".to_owned(),
@@ -2751,7 +2751,7 @@ fn histogram_clause(name: &str, buckets: &[u64; CADENCE_MAX + 1]) -> String {
 /// continuation frame under "2 cycles" no matter how busy the display was. The target is fixed at
 /// queue time, so it separates "this frame was launched into quiet" from "this frame missed". Same
 /// 1-based counting as the direct gap so the two read against each other; `n` here is `n - 1` idle
-/// cycles in front. See `docs/fork/present-misses.md` §12.3.
+/// cycles in front. See `docs/fork/foundation.md` §3.
 fn aim_clause(aimed_after: Option<usize>) -> String {
     match aimed_after {
         None => String::new(),
@@ -3056,7 +3056,7 @@ mod tests {
     /// dropped from the line just because this frame did not submit it.
     ///
     /// This is the property that lets the synchronous-submit work be measured at
-    /// all (`docs/fork/renderer-synchronous-submits.md`). With one number, handing
+    /// all (`docs/fork/foundation.md`). With one number, handing
     /// the scanout fence to KMS and deferring the same wait to the next frame look
     /// identical: both collapse "submits in 14ms" to nothing. Only a wait that
     /// leaves the line *and does not reappear on the next frame* is a real saving.
@@ -3481,7 +3481,7 @@ mod tests {
     /// `SYNOIK_FRAME_LOG=autodump` is a silent no-op — there is no ring to dump — and
     /// a session that never writes a file is indistinguishable from a session that
     /// never stuttered. And a default of 1 would fire on the ~12% of presentations
-    /// that land one cycle late on this stack (`docs/fork/present-misses.md`), i.e.
+    /// that land one cycle late on this stack (`docs/fork/foundation.md`), i.e.
     /// continuously, which is the same as not having a trigger.
     #[test]
     fn autodump_implies_ring_and_ignores_the_routine_miss() {
@@ -4012,7 +4012,7 @@ mod tests {
     /// ~18 500 live flips, a back-to-back flip misses 1% of the time and one with even a single
     /// idle cycle in front of it misses 26–47% — so the gap, not the lateness, is what sorts the
     /// two populations. The cadence figure is what the VM/VMM side asked for
-    /// (`docs/fork/present-misses.md` §9.3/§10), so pin the three shapes it can take.
+    /// (`docs/fork/foundation.md` §3), so pin the three shapes it can take.
     #[test]
     fn a_miss_line_says_how_long_the_display_had_been_quiet() {
         assert_eq!(cadence_clause(None), ", first flip");
