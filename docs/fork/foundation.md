@@ -145,23 +145,22 @@ allocation.
 > fails on some other driver some other day. The guard asserts the **pass choice**
 > (`VulkanFrame::preserves_target`).
 
-### Two open faults, neither of them ours to close
+### Two cross-driver faults, neither of them ours to fix
 
-**1. Client buffers are cross-driver by construction — CLOSED host-side 2026-08-16.** A client's
-dmabufs are allocated by the client, so with GL on vrend they used to arrive as classic virgl
-resources that `vkGetMemoryFdPropertiesKHR` refused; `Tty::import_dmabuf` correctly declined them,
-and Firefox and Epiphany then *hung* rather than falling back, so in practice it was a dead window.
-Mutter never hit this because its renderer is GL, the same driver that allocated the buffer — a
-Vulkan compositor is cross-driver by construction.
+**1. Client buffer import — closed host-side.** A client's dmabufs are allocated by the client, so
+with GL on vrend they used to arrive as classic virgl resources that `vkGetMemoryFdPropertiesKHR`
+refused; `Tty::import_dmabuf` correctly declined them, and Firefox and Epiphany then *hung* rather
+than falling back, so in practice it was a dead window. Mutter never hit this because its renderer
+is GL, the same driver that allocated the buffer — **a Vulkan compositor is cross-driver by
+construction**, and that is the durable part.
 
-**vkr now imports classic virgl resources into venus** (confirmed on the limina side, 2026-08-16),
-and the guest agrees: `/etc/environment.d/90-limina-zink.conf` has not selected zink since
-2026-08-15 — despite its name it sets `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu` +
-`GALLIUM_DRIVER=virgl` — and both dogfood seats have run GL-on-vrend since with **zero**
-`error importing dmabuf into the Vulkan renderer` lines. The drop-in no longer protects anything of
-ours; if you see it cited as load-bearing, that citation is stale.
+**vkr now imports classic virgl resources into venus**, and the guest agrees: both dogfood seats run
+GL-on-vrend with **zero** `error importing dmabuf into the Vulkan renderer` lines.
+`/etc/environment.d/90-limina-zink.conf` does not select zink either — despite its name it sets
+`MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu` + `GALLIUM_DRIVER=virgl`. It protects nothing of ours; a
+citation calling it load-bearing is stale.
 
-**2. The host stops applying `SET_SCANOUT_BLOB` for a knocked-out resource.** Written up for the
+**2. The host stops applying `SET_SCANOUT_BLOB` for a released surface — open.** Written up for the
 VMM side in `limina-issue-scanout-blob-not-applied.md` (with attachments). The guest-side mechanism,
 established by elimination:
 
@@ -170,67 +169,49 @@ established by elimination:
 > applied, and nothing errors. Only a **genuinely new** resource restores that participant, and
 > creating new resources can knock *another* participant into the same state.
 
-**DIAGNOSED 2026-08-16, host-side, and not where either of us was looking.** The fault is in the
-limina **supervisor**, not the worker — which is why no guest-side instrument could ever have seen
-it. The supervisor keeps a `SurfaceStore` mapping guest surface id → retained `IOSurfaceRef`, and
-drops its reference the moment the worker reports the guest released a resource, on the documented
-assumption that *"the guest will not present it again"*. **That premise is false for us**: we go on
-presenting the same scanout resources after the release. Once the entry is gone the frame-apply path
-finds neither the map entry nor a global lookup — these surfaces are deliberately non-global,
-capability-scoped over a Mach port — so every later frame naming that id is skipped, silently and
-permanently.
+**The fault is in the limina supervisor**, which is why no guest-side instrument could ever have
+seen it. The supervisor retains an `IOSurfaceRef` per guest surface id and drops it the moment the
+worker reports the guest released that resource, on the stated assumption that *"the guest will not
+present it again"*. **That premise is false for us**: we keep presenting the same scanout resources.
+Once the entry is gone the frame-apply path finds neither the map entry nor a global lookup — these
+surfaces are deliberately non-global, capability-scoped over a Mach port — so every later frame
+naming that id is skipped, silently and permanently.
 
-The worker was healthy throughout: `res=7 -> IOSurface 139` and `res=12 -> IOSurface 141` bound
-~2860 times each, stable across the whole session, zero `not IOSurface-backed` warnings, and the
-flip rate went *up* ~9× at the freeze. We were presenting harder, correctly, into correctly-resolved
-surfaces, while a `WARN … surface 139 unresolved; skipping frame` accumulated in a host process we
-cannot see — 161 → 168 → 1651 → 3013 per minute, i.e. ~42% of frames dropped when it read as "the
-animation is two frames" and every frame by the time it read as a freeze.
+Everything the guest can see stays healthy, which is the whole difficulty: the worker ACKs every
+`SET_SCANOUT_BLOB` `RESP_OK_NODATA`, the resource→IOSurface mapping never goes stale, and the flip
+rate goes *up* at the freeze. We present harder, correctly, into surfaces the supervisor has already
+released, while `surface N unresolved; skipping frame` accumulates in a host process we cannot see.
+It explains the two behaviours that defeated every guest-side theory: only a genuinely new resource
+heals, because only a new resource republishes a surface into the map; and creating resources knocks
+*another* participant out, because the release traffic is driven by our unref pattern.
 
-That accounts for every observation below, including the two that killed our earlier theories: only
-a genuinely new resource heals, because only a new resource publishes a new surface into the map;
-and creating resources knocks *another* participant out, because the release traffic that empties the
-map is driven by our unref pattern.
+**Open on our side: what released those surfaces.** Nothing we can find. `Swapchain::reset_buffers`
+is the only thing that drops slots and our sole caller is session resume; the scanout `Dmabuf` is
+pinned in the slot's `UserDataMap` for the swapchain's lifetime; `dmabuf_target_cache` is weak-keyed
+with no size eviction, so allocation pressure cannot evict a scanout import; and
+`cleanup_texture_cache` — which `DrmCompositor` calls every frame during a client scan-out stretch —
+is not overridden by us, so it is a no-op. The host-side account infers rather than observes that a
+guest release removed the entries, and that path is unlogged; if nothing here can release them, the
+removal is likely elsewhere.
 
-**Left standing: what released those surfaces?** The host must not drop a surface the guest can
-still name — that fix is theirs — but the release was handed to us to explain, and a first pass says
-**we cannot find one**. Ruled out by reading, 2026-08-16:
+The one place a scanout resource carries a second, quieter guest-side reference is the redundant
+import under "Left on the table" — `import_dmabuf_target` builds a second `VkImage` around a buffer
+the allocator already owns. That is the reference whose destruction we would not notice. It is a
+place to look, not a mechanism: nothing shows it firing.
 
-- `Swapchain::reset_buffers` is the only thing that drops slots, and our sole caller is **session
-  resume** (`backend/tty.rs`) — there was no VT switch or resume in the window.
-- The scanout `Dmabuf` is pinned in the slot's `UserDataMap` (`Slot::export` caches it there) for the
-  swapchain's lifetime, so it cannot lapse on its own.
-- `dmabuf_target_cache` is weak-keyed and swept only on lookup — **no size eviction**, so overview
-  allocation pressure cannot evict a scanout import.
-- `cleanup_texture_cache`, which `DrmCompositor` calls every frame during a client scan-out stretch,
-  is **not overridden by us** — smithay's default is a no-op.
-- This reproduction had no client pass-through at all: only `res=7` and `res=12` were ever bound, so
-  it was our own double-buffering throughout, and the scan-out-transition theories do not apply.
+> **The rule this bug earned: require an observation, not a fit.** Five mechanisms have explained
+> every symptom here and been wrong — client-vs-compositor, resource longevity, "stops applying
+> entirely", surface-store capacity, and a host-side stale-id cache. Fitting all the evidence has a
+> 0/5 record on this fault.
 
-The one place a scanout resource carries a *second, quieter* guest-side reference is the redundant
-import noted under "Left on the table" — `import_dmabuf_target` builds a second `VkImage` around a
-buffer the allocator already owns. That is the reference whose destruction we would not notice.
-
-This matters to the host-side diagnosis because its one inferred step is that a
-`SurfaceMsg::Released` removed the entries — flagged as inferred, not observed, with no logging on
-that path. If nothing here can release those buffers, the prior should shift toward the entries
-being removed by something *other* than a guest release.
-
-Two mechanisms were retracted getting here, and it is worth recording that the count is now five.
-The host-side `iosurface_id`-cached-at-create theory recorded here briefly on 2026-08-16 was the
-best-fitting one either side had produced, and it was **wrong**: the mapping never went stale. So
-was surface-store eviction (the store caps at 32 with FIFO eviction; only 20 distinct ids existed in
-the whole session). **On this bug, a mechanism that explains every observation has still been wrong
-five times out of five.** Require an observation, not a fit.
-
-We were exonerated by measurement, not by argument: the compositor renders correct frames on time,
-`debug-dump-scanout` reads back a perfect current image from the buffer we hand over, and the guest
-issues 60 Hz `SET_SCANOUT_BLOB` which virtio_gpu tracepoints show the host ACKing — while the screen
-is frozen. **Both workarounds were deliberately reverted** (`698ae578`): forcing a full redraw when
-the plane comes back never worked (`SYNOIK_VK_FULL_DAMAGE=1` forces one every frame and still
-reproduced), and re-creating the swapchain buffers on the transition *did* work but hides a fault we
-cannot see behind ~3.2 GB of 4K buffer churn per session, on the one seat whose job is to surface
-such faults. The instruments stayed.
+We are exonerated by measurement rather than argument: we render correct frames on time,
+`debug-dump-scanout` reads a perfect current image back out of the buffer we hand over, and
+tracepoints show the host ACKing every commit while the screen is frozen. **Both workarounds were
+deliberately reverted** (`698ae578`) — forcing a full redraw when the plane comes back never worked
+(`SYNOIK_VK_FULL_DAMAGE=1` does it every frame and still reproduced), and re-creating the swapchain
+buffers on the transition *did* work, which is exactly why it is out: it hides a host-side fault
+behind ~3.2 GB of 4K buffer churn per session, on the one seat whose job is to surface such faults.
+The instruments stayed.
 
 ---
 
@@ -250,10 +231,9 @@ remaining per-frame host cost lives.
 ### Async scanout — opt-in, and what it costs to read
 
 `SYNOIK_VK_ASYNC_SCANOUT=1` lets the KMS frame hand its fence to the atomic commit as `IN_FENCE_FD`
-instead of parking the compositor thread on it. **Neither dogfood seat runs it** (checked in
-`/proc/<pid>/environ` on both, 2026-08-16) — so every live number from either seat is the
-synchronous arm, whatever an older document says about a `92-async-scanout.conf`. Check the process,
-not a drop-in: both seats linger, which makes `environment.d` a dead drop. The tty backend brackets `render_frame` with
+instead of parking the compositor thread on it. **Neither dogfood seat runs it**, so every live
+number from either seat is the synchronous arm. Read the arm off `/proc/<pid>/environ`, never off a
+drop-in: both seats linger, which makes `environment.d` a dead drop that reads as "on". The tty backend brackets `render_frame` with
 `set_finish_may_defer`, cleared immediately after so the permission cannot leak to screencopy, a
 screencast or a widget bake — each of those hands its buffer straight to a consumer and must still
 be finished on return. Offscreen finishes defer on a weaker condition
@@ -394,6 +374,12 @@ Traps that have each cost a day:
 - **Measuring a cold cost twice in one process gives the warm number**, and the difference can be two
   orders of magnitude (408 ms → 11.8 ms for the same call). Measure the first occurrence in a fresh
   process, and separate I/O-bound cold costs from compute-bound ones.
+- **An instrument reads zero because it is off at least as often as because the event is absent.**
+  `tracing_on` defaults to `0`, so enabling a tracepoint event alone yields a convincing zero;
+  `vulkaninfo` exits silently when it cannot reach a display server, so clear `DISPLAY=` and
+  `WAYLAND_DISPLAY=` before believing an empty extension list; `strace` needs the right pid, not the
+  session leader. **Positive-control every zero** — drive the event you expect and confirm the
+  instrument counts it — before reporting the absence as a finding.
 - **A `lost` GPU-timestamp count is the regression signal.** The defect was a rate, not a switch (94%
   failure bare, 18% with the first workaround, 0% since the 2026-07-26 VMM). Nothing averages a zero
   in as if it were a fast pass. **Do not delete `venus-bugs/repro-vk-timestamp-query`** — it is the
@@ -415,8 +401,7 @@ Everything here was measured. Re-deriving any of it costs a day.
   and allocation, one host thread per ring (`vkr_ring_thread`). The per-thread TLS ring is a 16 KiB
   synchronous-command ring, not a submission lane. But the host side answers the other half:
   KosmicKrisp creates **one `MTLCommandQueue` per `VkQueue`** (`kk_queue.c:228`), so two queues do
-  get independent Metal queues and Metal schedules them concurrently (confirmed by the VMM side,
-  2026-08-16 — this corrects an earlier "untested" hedge here). **What serialises is command
+  get independent Metal queues and Metal schedules them concurrently. **What serialises is command
   encoding on the single ring thread, ~18 µs per submit — not execution.** A second `VkInstance` is
   therefore the shape that buys a lane. Our own strict serialization is **our** design: one queue,
   every submit chained on one timeline semaphore.
@@ -473,7 +458,7 @@ Everything here was measured. Re-deriving any of it costs a day.
    because this VM has one GPU; on any multi-GPU machine we would be telling clients to allocate for
    a device we are not rendering on. `Gpu::for_drm_node(node)` via `VK_EXT_physical_device_drm`, ~a
    day, and it is step 1 of item 7 anyway.
-3. ~~**The idle redraw loop.**~~ **CLOSED 2026-08-16 — did not reproduce on either seat.**
+3. ~~**The idle redraw loop.**~~ **CLOSED — did not reproduce on either seat.**
    On 2026-08-15 a live seat measured a flat 360 `DRM_IOCTL_MODE_ATOMIC` commits in 6 seconds — 60/s
    at 21% CPU — with the output reported permanently in
    `RedrawState::WaitingForVBlank { redraw_needed: true }`.
@@ -492,17 +477,11 @@ Everything here was measured. Re-deriving any of it costs a day.
    10 atomic commits, 20 gave exactly 20 `0x301` + 20 `0x104` — so these are measured zeros, not
    blind ones.
 
-   **What is not explained is why it changed**, and that is the honest residue: no commit between
-   the two measurements names this, so either something fixed it incidentally or the original
-   reading was confounded. Should it return, instrument the redraw *requesters* rather than the
-   commits, and note why it matters beyond power: while the rate is pinned at 60/s **animation cost
-   is unmeasurable**, because a workspace switch adds no visible commits and the frame log cannot
-   tell an animating frame from an idle one.
-
-   Two instrument traps this cost, both worth keeping: `tracing_on` defaults to `0`, so enabling a
-   tracepoint event alone yields a convincing zero; and `vulkaninfo` exits silently when it cannot
-   reach a display server, so `DISPLAY=` and `WAYLAND_DISPLAY=` must be cleared before believing an
-   empty extension list.
+   No commit explains the change, so treat the original reading as unexplained rather than fixed.
+   If it returns, instrument the redraw *requesters* rather than the commits — and note why it
+   matters beyond power: with the rate pinned at 60/s **animation cost is unmeasurable**, because a
+   workspace switch adds no visible commits and the frame log cannot tell an animating frame from an
+   idle one.
 4. **GPU-side capture readbacks, with colour conversion folded in.** `render_to_shm` and the
    PipeWire cursor bitmap read `Abgr8888` back and CPU-swizzle to BGRA because offscreens/readbacks
    are RGBA-order-only here; extend the `Bind<Dmabuf>` B8G8R8A8 + `vkCmdBlitImage` trick so both
@@ -547,8 +526,8 @@ Slottable any time:
 - **An arena for reconstructible caches**, without which the `madvise` options in §3 cannot be
   expressed at all.
 - **Read `heapBudget` from `VK_EXT_memory_budget`.** The extension is available under
-  `VN_DEBUG=mem_budget` (which the enhanced-tier environment sets; verified 2026-08-16 — the earlier
-  "venus does not expose it" was the gate, not the driver). `heapBudget` carries the VMM's
+  `VN_DEBUG=mem_budget`, which the enhanced-tier environment sets — check the gate before concluding
+  the driver lacks it. `heapBudget` carries the VMM's
   per-context GPU-memory cap, and it is the **only** backpressure channel the venus transport does
   not discard: over the cap the host kills our context rather than returning an error, because an
   async `vkAllocateMemory` has already answered `VK_SUCCESS`. Today that arrives as an unexplained
@@ -561,7 +540,7 @@ Slottable any time:
   query time, `heapUsage` being what our context holds and `heapBudget` the cap minus what every
   other context holds.
 
-### Surviving device loss — UNBLOCKED 2026-08-16, and now schedulable
+### Surviving device loss — unblocked, and now schedulable
 
 **The blocker is gone, and it was gone before we knew.** Guest mesa on the enhanced tier carries
 `patches/mesa-guest/0005-venus-surface-ring-loss-as-VK_ERROR_DEVICE_LOST-inst`: `vn_ring_wait_seqno`
@@ -590,41 +569,12 @@ a complete implementation means a visibly broken frame or two, not a seamless sa
 `MESA_LOG_DEBUG` and release mesa defaults to `MESA_LOG_INFO`, so without it an abort never names
 which path fired.
 
-<details>
-<summary>Why this was thought unimplementable, kept because the reasoning recurs</summary>
-
-We die instead. The session suspended, resumed, the guest kernel began rejecting virtgpu traffic
-(`RESP_ERR_UNSPEC` to `SUBMIT_3D`, then `RESP_ERR_INVALID_RESOURCE_ID`: the host's resource table had
-lost every pre-suspend entry), and 16 seconds later synoik took `SIGABRT` inside mesa on the first
-`vkCreateImage` after resume. **The suspend half is host-side** and predates us — the same resume
-killed vkmark while *gnome-shell* was still the seat compositor. What is ours is that a compositor
-should not be a casualty of a recoverable GPU event.
-
-`VN_DEBUG=no_abort` is **not** the answer, and the reason is structural rather than a policy choice.
-`vn_relax()` has three abort paths and the ring-fatal one is not guarded by the flag at all — but
-more importantly `vn_ring_wait_seqno` returns `void` and loops `do { … } while (true)`, and
-`vkCreateImage` may return only the OOM codes per spec, never `VK_ERROR_DEVICE_LOST`. Venus *does*
-report device loss where the spec permits it; it aborts only where it cannot. So `no_abort` removes
-the abort from a loop with no exit — it converts a crash into a permanent hang, which for a daily
-driver is worse.
-
-Mutter's recovery shape is worth copying (a five-state machine, rebuild outside the frame dispatch
-loop, and an explicit acceptance that **clients are not recoverable by the compositor** — even a
-complete implementation means a visibly broken frame or two). Their *detection* story does not
-transfer: it is GL/EGL robustness extensions, whereas `VK_ERROR_DEVICE_LOST` is core Vulkan and every
-submit already returns it. Our problem looked narrower and lower: on venus the process was killed
-before any `VkResult` reached us, so step 0 was making device loss observable.
-
-**That step was already done and we did not know**, which is the reusable lesson here. The mesa
-patch landed 2026-08-05 for the VMM side's own snapshot/restore work, and nobody connected it to our
-blocker — so "unimplementable" sat in this document for eleven days as a fact about a tree we do not
-own and had not re-read. When a blocker names *someone else's* code, its status is a question to
-ask, not a property to record.
-
-One diagnostic detail worth keeping: the 16-second death did not match `vn_relax`'s ~895 s iteration
-ceiling, so the host was actively signalling death rather than timing out.
-
-</details>
+**Why it read as unimplementable for eleven days**, since the shape recurs: the blocker was recorded
+here as a property of venus (the process dies before any `VkResult` reaches us) when it was really a
+question about a tree we do not own and had not re-read. **When a blocker names someone else's code,
+its status is a question to ask, not a fact to write down.** `VN_DEBUG=no_abort` is still not an
+answer, for the record — it removes the abort from a loop with no exit, converting a crash into a
+permanent hang.
 
 ---
 
@@ -635,7 +585,7 @@ ProMotion on the MacBook panels — no host hardware we own does 144), overlay p
 CALayer; we own both ends of the protocol extension), NV12/P010 on those planes with
 `COLOR_ENCODING`/`COLOR_RANGE`, and a cursor larger than 64×64.
 
-**Status 2026-08-16:** wave 4 closed; wave 1 parts 1–2 shipped. Next up are per-host-display,
+**Status (2026-08):** wave 4 closed; wave 1 parts 1–2 shipped. Next up are per-host-display,
 120 Hz/VRR, and overlay planes — so **overlay planes are not live yet**, and "when it lands" remains
 accurate for them, for NV12/P010-on-planes and for `COLOR_ENCODING`/`COLOR_RANGE`.
 
@@ -649,7 +599,7 @@ lever.** They help video and fullscreen surfaces; promoting the wallpaper is the
 (occluded most of the time, and blurred in the overview where it is most visible). We want them
 because video is part of a good desktop, not because they will make the shell's own drawing faster.
 
-Answered 2026-08-16: **vkr imports classic virgl resources into venus** (§2, item 1 — closed).
+Answered: **vkr imports classic virgl resources into venus** (§2, item 1 — closed).
 
 ### To raise: rename `90-limina-zink.conf`
 
@@ -677,10 +627,9 @@ so **the rename has to happen on their side.** Renaming it in the guest would le
 files with no owner the next time the agent deploys.
 
 Open questions, tracked in their own drafts: `limina-issue-scanout-blob-not-applied.md` (§2 item 2 —
-acknowledged on the limina side 2026-08-16, with a concrete host-side lead and a debug-logging repro
-run pending).
+diagnosed host-side, fix pending — see §2).
 
-**Closed 2026-08-16: the dmabuf CPU-write coherency issue.** Its draft is retired. Cause was
+**Closed: the dmabuf CPU-write coherency issue.** Its draft is retired. Cause was
 control-queue work being unordered against venus ring work — virtio-gpu control commands run on
 libkrun's gpu worker thread while venus runs on virglrenderer's `vkr_ring` thread, so a guest CPU
 write into a venus-shared dmabuf could be read one write behind. Fixed in two halves that **only
@@ -689,21 +638,15 @@ work together**: guest mesa flushes and waits on unmap of a `PIPE_BIND_SHARED` w
 and reverted after 10/10 still-stale runs. **Both halves are enhanced-tier only — the stock tier
 keeps the bug**, so this returns if we ever run against a guest without limina's mesa.
 
-**The shipped assert surface, and why its removal is not purely good news.** An earlier reading of
-this — repeated here for about an hour on 2026-08-16 — said ~820 KosmicKrisp asserts were live and
-reachable, so a spec violation of ours could take down the **whole VM**. That is **wrong**:
-`b_ndebug=true` ships on both the release and devenv builds, verified in the binary (zero `assert`
-symbol references, zero assertion-failure strings in `libvulkan_kosmickrisp.dylib`). A bad command
-will not abort the VM.
+**KosmicKrisp ships with asserts compiled out** (`b_ndebug=true` on both the release and devenv
+builds — zero `assert` symbol references and zero assertion-failure strings in
+`libvulkan_kosmickrisp.dylib`). So an invalid command from us will not abort the VM.
 
-It also will not abort anything else. **Compiling the asserts out removed the tripwire, not the
-hazard** — an unchecked bad command now runs on into undefined behaviour. So vkr's trust-boundary
-checks stop being defence in depth and become the only defence, and the failure mode they catch
-changes from a clean crash to **silent corruption**.
-
-That is the worse direction for us specifically, because our debugging posture assumes loud failure:
-`SYNOIK_VK_VALIDATION` is off by default, and the way undefined behaviour usually surfaces here is
-that something dies somewhere confusing. A corrupted frame is exactly the class we cannot see — a
-pixel comparison passes whenever the cache happens to hold the right image. Treat "the VM stopped
-dying" as a change in *symptom*, not in *risk*, and keep running validated runs after renderer work. `virtual-display-identity.md` carries the display-identity
+It will not abort anything, which is the point: **that removed the tripwire, not the hazard.** An
+unchecked bad command runs on into undefined behaviour, so vkr's trust-boundary checks are the only
+defence rather than defence in depth, and the failure mode changes from a clean crash to **silent
+corruption**. That is the direction we are least equipped for — `SYNOIK_VK_VALIDATION` is off by
+default, and a corrupted frame passes any pixel comparison whose cache happens to hold the right
+image. Treat "the VM stopped dying" as a change in *symptom*, not in *risk*, and keep running
+validated runs after renderer work. `virtual-display-identity.md` carries the display-identity
 ask, deliberately written so it would help stock mutter too.
