@@ -1100,6 +1100,9 @@ pub struct Synoik {
 
     pub debug_draw_opaque_regions: bool,
     pub debug_draw_damage: bool,
+    /// One-shot: dump the scanned-out framebuffer to a PNG after the next frame is rendered.
+    /// Set by `Action::DebugDumpScanout`, taken by the tty backend.
+    pub dump_scanout_next_frame: bool,
 
     /// Frame-timing instrumentation, off unless `SYNOIK_FRAME_LOG` says otherwise.
     /// See [`crate::frame_log`].
@@ -7771,6 +7774,7 @@ impl Synoik {
 
             debug_draw_opaque_regions: false,
             debug_draw_damage: false,
+            dump_scanout_next_frame: false,
 
             frame_log: FrameLog::from_env(),
 

@@ -67,7 +67,9 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
 use super::{IpcOutputMap, RenderResult};
 use crate::backend::backlight::{BacklightMonitor, Backlights};
-use crate::backend::vulkan_scanout::{PrimeFramebufferExporter, VulkanScanoutAllocator};
+use crate::backend::vulkan_scanout::{
+    PrimeFramebufferExporter, VulkanScanoutAllocator, VulkanScanoutBuffer,
+};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::frame_log::Phase;
@@ -3043,6 +3045,47 @@ fn suspend() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write the framebuffer we are scanning out to `~/.local/state/synoik/scanout-<output>-<n>.png`.
+///
+/// The point of this is to be believed when a screenshot is not: `screenshot-screen` re-renders
+/// the scene into a fresh image, so it comes out clean even when the plane is showing black. This
+/// is the actual presented image, copied back off the GPU.
+fn dump_scanout_png(buffer: &VulkanScanoutBuffer, output: &str) {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    let (width, height, mut pixels) = match buffer.read_back() {
+        Ok(read) => read,
+        Err(err) => {
+            warn!("debug-dump-scanout: reading the scanout image back failed: {err:?}");
+            return;
+        }
+    };
+
+    // The scanout format is Xrgb8888/Argb8888 — BGRA bytes in memory — and the alpha of an X
+    // format is undefined, so force it opaque rather than writing a PNG that may decode as
+    // fully transparent and be mistaken for the black we are chasing.
+    for px in pixels.chunks_exact_mut(4) {
+        px.swap(0, 2);
+        px[3] = 0xff;
+    }
+
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Same directory the frame-log dumps go to, so a wedge's evidence lands in one place.
+    let dir = std::path::PathBuf::from(crate::frame_log::dump_dir());
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        warn!("debug-dump-scanout: creating {}: {err:?}", dir.display());
+        return;
+    }
+    let path = dir.join(format!("scanout-{output}-{n}.png"));
+    match image::RgbaImage::from_raw(width, height, pixels) {
+        Some(img) => match img.save(&path) {
+            Ok(()) => warn!("debug-dump-scanout: wrote {}", path.display()),
+            Err(err) => warn!("debug-dump-scanout: writing {}: {err:?}", path.display()),
+        },
+        None => warn!("debug-dump-scanout: {width}x{height} does not match the bytes read back"),
+    }
+}
+
 /// Count how `states` presented this frame's elements: zero-copy scan-out, or rendered and why.
 ///
 /// smithay records this per element, and it is the only authoritative source — "is direct scan-out
@@ -3194,11 +3237,26 @@ fn render_surface_with(
                     .debug
                     .wait_for_frame_completion_before_queueing;
             if needs_sync {
-                if let PrimaryPlaneElement::Swapchain(element) = res.primary_element {
+                if let PrimaryPlaneElement::Swapchain(element) = &res.primary_element {
                     let _span = tracy_client::span!("wait for completion");
                     if let Err(err) = element.sync.wait() {
                         warn!("error waiting for frame completion: {err:?}");
                     }
+                }
+            }
+
+            // Take the `debug-dump-scanout` one-shot now: the frame is rendered and, on a
+            // successful submit, the scanout image is at rest in TRANSFER_SRC_OPTIMAL. This is a
+            // blocking readback that costs a submit and a wait — debug-only, never per frame.
+            if synoik.dump_scanout_next_frame {
+                synoik.dump_scanout_next_frame = false;
+                if let PrimaryPlaneElement::Swapchain(element) = &res.primary_element {
+                    dump_scanout_png(element.buffer(), &output.name());
+                } else {
+                    warn!(
+                        "debug-dump-scanout: the primary plane is a client buffer right now \
+                         (pass-through scan-out), so there is no framebuffer of ours to read back"
+                    );
                 }
             }
 

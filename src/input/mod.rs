@@ -2647,6 +2647,12 @@ impl State {
             Action::DebugToggleDamage => {
                 self.synoik.debug_toggle_damage();
             }
+            Action::DebugDumpScanout => {
+                // Armed here, taken by the tty backend once the next frame has been rendered —
+                // that is the only moment the scanout image is complete and at rest.
+                self.synoik.dump_scanout_next_frame = true;
+                self.synoik.queue_redraw_all();
+            }
             Action::Spawn(command) => {
                 let (token, _) = self.synoik.activation_state.create_external_token(None);
                 spawn(command, Some(token.clone()));

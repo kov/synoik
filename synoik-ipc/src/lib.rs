@@ -1045,6 +1045,13 @@ pub enum Action {
     DebugToggleOpaqueRegions {},
     /// Toggle visualization of output damage.
     DebugToggleDamage {},
+    /// Dump the framebuffer we are actually scanning out to a PNG, for debugging.
+    ///
+    /// Answers the one question a screenshot cannot: a screenshot re-renders the scene into a
+    /// *different* image, so it comes out clean whether or not the pixels on the plane are right.
+    /// This copies back the very image KMS is presenting. If it looks correct while the screen
+    /// does not, our writes landed and the display side stopped reading them.
+    DebugDumpScanout {},
     /// Toggle holding each frame until its dispatch deadline.
     ///
     /// On (`SYNOIK_DEADLINE_DISPATCH=1` starts a session that way) a continuously animating output

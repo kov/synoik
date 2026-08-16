@@ -129,6 +129,7 @@ pub enum Action {
     ToggleDebugTint,
     DebugToggleOpaqueRegions,
     DebugToggleDamage,
+    DebugDumpScanout,
     DebugToggleDeadlineDispatch,
     DebugSetRenderTimeMargin(f64),
     /// Percentage, UPower state spelling, UPower warning-level spelling.
@@ -710,6 +711,7 @@ impl From<synoik_ipc::Action> for Action {
             synoik_ipc::Action::ToggleDebugTint {} => Self::ToggleDebugTint,
             synoik_ipc::Action::DebugToggleOpaqueRegions {} => Self::DebugToggleOpaqueRegions,
             synoik_ipc::Action::DebugToggleDamage {} => Self::DebugToggleDamage,
+            synoik_ipc::Action::DebugDumpScanout {} => Self::DebugDumpScanout,
             synoik_ipc::Action::DebugToggleDeadlineDispatch {} => Self::DebugToggleDeadlineDispatch,
             synoik_ipc::Action::DebugSetRenderTimeMargin { millis } => {
                 Self::DebugSetRenderTimeMargin(millis)

@@ -2665,7 +2665,7 @@ fn dump_path(over: Option<std::path::PathBuf>, nth: u64) -> std::path::PathBuf {
 /// purpose is that it does not, so the runtime dir was the one place a measurement must
 /// not go: a reboot between taking a run and reading it destroyed it silently. State is
 /// the XDG category for exactly this — survives restarts, not precious enough to be data.
-fn dump_dir() -> std::ffi::OsString {
+pub(crate) fn dump_dir() -> std::ffi::OsString {
     let var = |k| std::env::var_os(k).filter(|s: &std::ffi::OsString| !s.is_empty());
     dump_dir_from(var("XDG_STATE_HOME"), var("HOME"), var("XDG_RUNTIME_DIR"))
 }

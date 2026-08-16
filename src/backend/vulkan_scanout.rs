@@ -193,6 +193,115 @@ struct ScanoutBuffer {
     node: Option<DrmNode>,
 }
 
+impl VulkanScanoutBuffer {
+    /// Copy this scanout image back out of the GPU, for `synoik msg action debug-dump-scanout`.
+    ///
+    /// This is the one measurement that separates the two ways a correct frame can fail to reach
+    /// glass. When the compositor is demonstrably compositing (elements drawn, plane cycling our
+    /// framebuffer ids, no errors) and the screen is nonetheless black or stale, either our writes
+    /// never became host-visible, or the host stopped reading a buffer that was correct all along.
+    /// Nothing else in the guest can tell those apart — a screenshot re-renders the scene into a
+    /// *different* image, so it comes out clean either way. Reading back the very image KMS is
+    /// scanning out answers it: correct pixels here means the host stopped reading.
+    ///
+    /// Returns `(width, height, bytes)` in the buffer's own channel order, 4 bytes per pixel.
+    ///
+    /// Debug-only, and deliberately a standalone submit-and-wait: the frame path must never grow a
+    /// `run_commands` (see `docs/fork/frame-submit-discipline.md`), and this stalls on purpose so
+    /// the bytes it reports are the ones that were on screen.
+    ///
+    /// Expects the image in its resting `TRANSFER_SRC_OPTIMAL` layout, which is what a completed
+    /// scanout frame leaves behind; call it between frames, not mid-render.
+    pub fn read_back(&self) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+        use anyhow::Context as _;
+
+        let inner = &self.0;
+        let gpu = &inner.gpu;
+        let device = &gpu.device;
+        let (width, height) = (inner.size.w as u32, inner.size.h as u32);
+        let size = u64::from(width) * u64::from(height) * 4;
+
+        let pool_ci = ash::vk::CommandPoolCreateInfo::default()
+            .queue_family_index(gpu.queue_family)
+            .flags(ash::vk::CommandPoolCreateFlags::TRANSIENT);
+        let pool = unsafe { device.create_command_pool(&pool_ci, None) }
+            .context("scanout readback command pool")?;
+
+        let buf_ci = ash::vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(ash::vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(ash::vk::SharingMode::EXCLUSIVE);
+        let buffer =
+            unsafe { device.create_buffer(&buf_ci, None) }.context("scanout readback buffer")?;
+        let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let index = gpu.find_memory_type(
+            req.memory_type_bits,
+            ash::vk::MemoryPropertyFlags::HOST_VISIBLE
+                | ash::vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let alloc = ash::vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(index);
+        let memory =
+            unsafe { device.allocate_memory(&alloc, None) }.context("scanout readback memory")?;
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }?;
+
+        let image = inner.texture.image;
+        let recorded = gpu.run_commands(
+            pool,
+            synoik_vk::stats::SubmitSite::Readback,
+            |cbuf| unsafe {
+                let region = ash::vk::BufferImageCopy::default()
+                    .image_subresource(ash::vk::ImageSubresourceLayers {
+                        aspect_mask: ash::vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(ash::vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    });
+                device.cmd_copy_image_to_buffer(
+                    cbuf,
+                    image,
+                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    buffer,
+                    &[region],
+                );
+                let host = ash::vk::MemoryBarrier::default()
+                    .src_access_mask(ash::vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(ash::vk::AccessFlags::HOST_READ);
+                device.cmd_pipeline_barrier(
+                    cbuf,
+                    ash::vk::PipelineStageFlags::TRANSFER,
+                    ash::vk::PipelineStageFlags::HOST,
+                    ash::vk::DependencyFlags::empty(),
+                    &[host],
+                    &[],
+                    &[],
+                );
+            },
+        );
+        unsafe { device.destroy_command_pool(pool, None) };
+        // Only now that the pool is back can the copy's result be trusted or its error reported.
+        recorded?;
+
+        let mut pixels = vec![0u8; size as usize];
+        unsafe {
+            let ptr = device
+                .map_memory(memory, 0, size, ash::vk::MemoryMapFlags::empty())
+                .context("map scanout readback")? as *const u8;
+            std::ptr::copy_nonoverlapping(ptr, pixels.as_mut_ptr(), size as usize);
+            device.unmap_memory(memory);
+            device.destroy_buffer(buffer, None);
+            device.free_memory(memory, None);
+        }
+        Ok((width, height, pixels))
+    }
+}
+
 impl std::fmt::Debug for ScanoutBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScanoutBuffer")
