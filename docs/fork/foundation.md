@@ -178,13 +178,15 @@ re-create swapchain buffers on a transition as a workaround**, which is what `69
 why: it worked by republishing, and it hid a host fault behind ~3.2 GB of 4K buffer churn per
 session on the one seat whose job is to surface such faults.
 
-**Our publication footprint, since any cap is a budget shared with clients.** `VkExportMemoryAllocateInfo`
-appears at exactly one site in `synoik-vk` (`Texture::allocate_scanout`), so the scanout ring is the
-only thing we export — up to `SLOT_CAP = 4` buffers, two bound in practice. Offscreens, blur bundles
-and widget bakes are device-local and never become IOSurfaces. We do allocate a *second* device
-memory per scanout buffer, importing the dmabuf we just exported (`import_dmabuf_target`, the
-redundancy under "Left on the table"); client buffers take one import each and no export. Removing
-the redundancy is worth a host resource per swapchain buffer if publication counts imports.
+**Our publication footprint is two surfaces, and the host's cap is not a reason to shrink it.**
+`VkExportMemoryAllocateInfo` appears at exactly one site in `synoik-vk` (`Texture::allocate_scanout`),
+so the scanout ring is the only thing we export — up to `SLOT_CAP = 4` buffers, two bound in
+practice. Offscreens, blur bundles and widget bakes are device-local and never become IOSurfaces.
+The host publishes a surface on **create, not on binding**, so the second device memory we allocate
+per scanout buffer — importing the dmabuf we just exported (`import_dmabuf_target`, the redundancy
+under "Left on the table") — costs the host nothing. Remove it for the guest-side saving of an
+image, a memory import and a `vkGetMemoryFdPropertiesKHR` per swapchain buffer, not for their cap.
+That cap is a memory bound on client transients, which churn and do release.
 
 > **The rule this bug earned: require an observation, not a fit.** Six mechanisms explained every
 > symptom and were wrong — client-vs-compositor, resource longevity, "stops applying entirely",
@@ -614,9 +616,7 @@ It is host-managed — not owned by any package, and `limina-agent.service` rewr
 so **the rename has to happen on their side.** Renaming it in the guest would leave two priority-90
 files with no owner the next time the agent deploys.
 
-Open on their side, no action for us: publishes outnumber releases ~5:1 in a session, and whether
-that is benign or structural is unresolved. Our half of the arithmetic is in §2 — one export per
-scanout buffer, one import beside it, one import per client buffer, nothing else exportable.
+Nothing open. §2's two faults are closed host-side.
 
 **Closed: the dmabuf CPU-write coherency issue.** Its draft is retired. Cause was
 control-queue work being unordered against venus ring work — virtio-gpu control commands run on
