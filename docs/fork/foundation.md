@@ -170,6 +170,21 @@ established by elimination:
 > applied, and nothing errors. Only a **genuinely new** resource restores that participant, and
 > creating new resources can knock *another* participant into the same state.
 
+**A host-side lead, from the VMM side 2026-08-16 — a lead, not a diagnosis.** libkrun populates
+`RutabagaResource.iosurface_id` **exactly once, at resource create** (`virgl_renderer.rs`, "cached at
+create"), and nothing refreshes it; `virtio_gpu.rs::set_scanout_blob` resolves the surface from that
+cache on every flip and **returns `Ok(OkNoData)` unconditionally** regardless of what it finds. A
+stale cached id therefore presents whatever surface owns that id *now*, silently. That reproduces the
+signature point for point, including why only a genuinely new resource heals — a new resource is the
+only thing that mints a fresh cache entry — and IOSurface ids being kernel-recycled is a plausible
+mechanism for one participant's repair knocking out another. It does not yet explain the *trigger*.
+
+The instrument was there all along and a log level hid it: the per-flip line
+`SET_SCANOUT_BLOB scanout={id} res={resource_id} -> IOSurface {iosurface_id}` logs at **`debug`**
+while the worker defaults to `warn`, so every normal boot discarded exactly the resource→IOSurface
+mapping needed. Next repro runs with that target at debug, cross-referenced against
+`[LIMINA-VKR-MTLTEX] import res <N> IOSurface id=<M>`.
+
 We are exonerated by measurement, not by argument: the compositor renders correct frames on time,
 `debug-dump-scanout` reads back a perfect current image from the buffer we hand over, and the guest
 issues 60 Hz `SET_SCANOUT_BLOB` which virtio_gpu tracepoints show the host ACKing — while the screen
@@ -357,16 +372,23 @@ Everything here was measured. Re-deriving any of it costs a day.
   syncobj wait ioctl signalled by a per-queue host CPU thread retiring FIFO: a host thread wake, a
   VMM retire, a guest interrupt, a guest wake. Any "cost of a submit" figure quoted anywhere is
   submit-**plus**-wait.
-- **A second VkQueue does not escape host serialization; a second VkInstance does.** One ring per
+- **A second VkQueue does not escape the *transport*; the GPU is not the constraint.** One ring per
   `VkInstance` (`vn_instance_init_ring`), `dev->primary_ring = instance->ring.ring` for every submit
   and allocation, one host thread per ring (`vkr_ring_thread`). The per-thread TLS ring is a 16 KiB
-  synchronous-command ring, not a submission lane. What that ring thread serializes is command
-  *encoding* (~18 µs/submit), which says nothing about whether two host queues would execute
-  concurrently — untested, not refuted. Our own strict serialization is **our** design: one queue,
+  synchronous-command ring, not a submission lane. But the host side answers the other half:
+  KosmicKrisp creates **one `MTLCommandQueue` per `VkQueue`** (`kk_queue.c:228`), so two queues do
+  get independent Metal queues and Metal schedules them concurrently (confirmed by the VMM side,
+  2026-08-16 — this corrects an earlier "untested" hedge here). **What serialises is command
+  encoding on the single ring thread, ~18 µs per submit — not execution.** A second `VkInstance` is
+  therefore the shape that buys a lane. Our own strict serialization is **our** design: one queue,
   every submit chained on one timeline semaphore.
-- **The ring parks between our frames.** Venus sets `idleTimeout` to 1 ms; the host ring thread
-  yields 16 times then sleeps. Blocking waits idle the ring past that timeout, so the *next* submit
-  pays a wake on top — the waits buy each other.
+- **The ring parks between our frames — and the timeout is ours to move.** The host ring thread
+  yields 16 times then sleeps, so blocking waits idle the ring past the timeout and the *next*
+  submit pays a wake on top; the waits buy each other. The 1 ms is **not a host constant**: it is
+  guest-supplied at ring creation (`vkr_transport.c` takes `info->idleTimeout`) from
+  `VN_RING_IDLE_TIMEOUT_NS` in guest mesa's `vn_ring.c` — a tree the VMM side owns and already
+  patches. So a mostly-idle second ring being cold exactly when needed is a negotiable trade-off,
+  not a constraint to design around.
 - **`VN_PERF=no_fence_feedback` cost us ~25–30% of the wall clock on real-work submits** and was
   dropped from the session env on **2026-07-25**. Any figure in git history dated before that is on
   the slow path. Fence feedback is gone from Mesa 26.2 entirely (`venus: deprecate fence feedback`),
@@ -413,25 +435,36 @@ Everything here was measured. Re-deriving any of it costs a day.
    because this VM has one GPU; on any multi-GPU machine we would be telling clients to allocate for
    a device we are not rendering on. `Gpu::for_drm_node(node)` via `VK_EXT_physical_device_drm`, ~a
    day, and it is step 1 of item 7 anyway.
-3. **The idle redraw loop — DID NOT REPRODUCE 2026-08-16; needs one more seat before closing.**
+3. ~~**The idle redraw loop.**~~ **CLOSED 2026-08-16 — did not reproduce on either seat.**
    On 2026-08-15 a live seat measured a flat 360 `DRM_IOCTL_MODE_ATOMIC` commits in 6 seconds — 60/s
-   at 21% CPU — with the output permanently in `RedrawState::WaitingForVBlank { redraw_needed: true }`,
-   with no windows at all and `animating: false`. That is the shape of the xray self-rebuild bug:
-   something re-requests a redraw before the vblank that would let us idle.
+   at 21% CPU — with the output reported permanently in
+   `RedrawState::WaitingForVBlank { redraw_needed: true }`.
 
-   Re-measured on gsrs (`bd7a845c`, `Active=yes`, fresh session) it is **gone**. Both arms:
-   windowless and with one idle `gnome-terminal`, `strace -e trace=ioctl` counted **0**
-   `DRM_IOCTL_MODE_ATOMIC` over 8 seconds, and `msg debug-focus-state` reports
-   `redraw state: Idle`. The instrument was checked against a positive control in the same session
-   — ten injected pointer motions produced exactly ten commits — so this is a measured zero, not a
-   blind one.
+   Re-measured the next day at `bd7a845c`, on both seats, all three configurations, every one
+   reading `redraw state: Idle` and `animating: false`:
 
-   What that does *not* settle: the original was a long-running seat, and this was a session two
-   minutes old. **Re-run it on kov's seat while its VT is foreground** before deleting the item; a
-   backgrounded VT renders at ~1 fps and cannot answer the question. Should it come back, instrument
-   the redraw *requesters*, and note the reason it matters beyond power: while the rate is pinned at
-   60/s, **animation cost is unmeasurable** — a workspace switch adds no visible commits, so the
-   frame log cannot tell an animating frame from an idle one.
+   | seat | state | window | commits |
+   |---|---|---|---|
+   | gsrs, fresh session | no windows | 8 s | **0** |
+   | gsrs, fresh session | one idle `gnome-terminal` | 8 s | **0** |
+   | kov, ~4 h uptime, real workload | many windows | 12 s | **0** |
+
+   A `virtio_gpu_cmd_queue` tracepoint agreed independently: **0 commands in 12 s** idle. Every
+   instrument was positive-controlled in the same session — 10 injected pointer motions gave exactly
+   10 atomic commits, 20 gave exactly 20 `0x301` + 20 `0x104` — so these are measured zeros, not
+   blind ones.
+
+   **What is not explained is why it changed**, and that is the honest residue: no commit between
+   the two measurements names this, so either something fixed it incidentally or the original
+   reading was confounded. Should it return, instrument the redraw *requesters* rather than the
+   commits, and note why it matters beyond power: while the rate is pinned at 60/s **animation cost
+   is unmeasurable**, because a workspace switch adds no visible commits and the frame log cannot
+   tell an animating frame from an idle one.
+
+   Two instrument traps this cost, both worth keeping: `tracing_on` defaults to `0`, so enabling a
+   tracepoint event alone yields a convincing zero; and `vulkaninfo` exits silently when it cannot
+   reach a display server, so `DISPLAY=` and `WAYLAND_DISPLAY=` must be cleared before believing an
+   empty extension list.
 4. **GPU-side capture readbacks, with colour conversion folded in.** `render_to_shm` and the
    PipeWire cursor bitmap read `Abgr8888` back and CPU-swizzle to BGRA because offscreens/readbacks
    are RGBA-order-only here; extend the `Bind<Dmabuf>` B8G8R8A8 + `vkCmdBlitImage` trick so both
@@ -483,8 +516,44 @@ Slottable any time:
   async `vkAllocateMemory` has already answered `VK_SUCCESS`. Today that arrives as an unexplained
   death. `synoik_vk::devmem` complements it rather than replacing it — the census attributes *our*
   allocations by site, `heapBudget` reports the *host's* total. Neither answers the other's question.
+  **Do not poll it per frame:** chaining `VkPhysicalDeviceMemoryBudgetPropertiesEXT` makes
+  `vn_GetPhysicalDeviceMemoryProperties2` a real synchronous `vn_call_` round trip — which is
+  exactly why it survives the transport, and exactly why it is not free. Per-N-frames or on an
+  allocation-rate trigger. Freshness is not a concern: the host computes it from its live ledger at
+  query time, `heapUsage` being what our context holds and `heapBudget` the cap minus what every
+  other context holds.
 
-### Surviving device loss — gated on it being observable
+### Surviving device loss — UNBLOCKED 2026-08-16, and now schedulable
+
+**The blocker is gone, and it was gone before we knew.** Guest mesa on the enhanced tier carries
+`patches/mesa-guest/0005-venus-surface-ring-loss-as-VK_ERROR_DEVICE_LOST-inst`: `vn_ring_wait_seqno`
+returns a status instead of looping forever, `vn_relax` returns `bool`, and ring loss surfaces as
+`VK_ERROR_DEVICE_LOST` from the entry points where the spec permits it — `vn_get_fence_status`,
+`vn_update_sync_result`, `vn_get_semaphore_counter_value`, `vn_query_feedback_wait_ready`,
+`vn_get_query_pool_feedback`, plus the ring wait-space and submit paths. Object creation like
+`vkCreateImage` is deliberately untouched, since the spec forbids `DEVICE_LOST` there.
+
+Verified on this seat in the shipped binary rather than from the version string: `vn_relax` carries
+a `DW_AT_type` resolving to `_Bool`, and `vn_ring_wait_seqno` is likewise non-`void` — upstream both
+return `void`, which in DWARF means no type attribute at all. `mesa-vulkan-drivers-26.1.6-1.limina.fc44`
+is the floor.
+
+So **recovery is ordinary work now**, not a research problem: detect `VK_ERROR_DEVICE_LOST` on
+submit/acquire, rebuild outside the frame dispatch loop, re-realize the scene. If an implementation
+still meets a `vn_relax` abort, that is a live bug in the mesa patch and the VMM side wants it.
+
+Expect the hardest part to be the **bake keys**, not the state machine. Mutter's equivalent is the
+glyph cache; ours is every baked texture and cached element keyed by `Id`, spread across the widget
+layer rather than owned by one renderer object. **A device loss must invalidate every bake key.**
+And clients are not recoverable by the compositor — they must re-render their own buffers — so even
+a complete implementation means a visibly broken frame or two, not a seamless save.
+
+`MESA_LOG_LEVEL=debug` on the seat stays worth having regardless: venus's warnings log at
+`MESA_LOG_DEBUG` and release mesa defaults to `MESA_LOG_INFO`, so without it an abort never names
+which path fired.
+
+<details>
+<summary>Why this was thought unimplementable, kept because the reasoning recurs</summary>
 
 We die instead. The session suspended, resumed, the guest kernel began rejecting virtgpu traffic
 (`RESP_ERR_UNSPEC` to `SUBMIT_3D`, then `RESP_ERR_INVALID_RESOURCE_ID`: the host's resource table had
@@ -505,18 +574,19 @@ Mutter's recovery shape is worth copying (a five-state machine, rebuild outside 
 loop, and an explicit acceptance that **clients are not recoverable by the compositor** — even a
 complete implementation means a visibly broken frame or two). Their *detection* story does not
 transfer: it is GL/EGL robustness extensions, whereas `VK_ERROR_DEVICE_LOST` is core Vulkan and every
-submit already returns it. **Our problem is narrower and lower: on venus the process is killed before
-any `VkResult` reaches us**, so step 0 is making device loss observable — a venus change, upstream or
-ours. Until then this is unimplementable, not merely deferred.
+submit already returns it. Our problem looked narrower and lower: on venus the process was killed
+before any `VkResult` reached us, so step 0 was making device loss observable.
 
-Two cheap things first: set `MESA_LOG_LEVEL=debug` on the seat (venus's warnings log at
-`MESA_LOG_DEBUG` and release mesa defaults to `MESA_LOG_INFO`, so they are invisible today — the next
-occurrence would name *which* abort fired), and note that the 16-second death does not match the
-~895 s iteration ceiling, so the host was actively signalling death rather than timing out.
+**That step was already done and we did not know**, which is the reusable lesson here. The mesa
+patch landed 2026-08-05 for the VMM side's own snapshot/restore work, and nobody connected it to our
+blocker — so "unimplementable" sat in this document for eleven days as a fact about a tree we do not
+own and had not re-read. When a blocker names *someone else's* code, its status is a question to
+ask, not a property to record.
 
-Expect the hardest part to be the **bake keys**, not the state machine. Mutter's equivalent is the
-glyph cache; ours is every baked texture and cached element keyed by `Id`, spread across the widget
-layer rather than owned by one renderer object. **A device loss must invalidate every bake key.**
+One diagnostic detail worth keeping: the 16-second death did not match `vn_relax`'s ~895 s iteration
+ceiling, so the host was actively signalling death rather than timing out.
+
+</details>
 
 ---
 
@@ -526,6 +596,15 @@ Booked as limina M15 "Virtual display pipeline v2": per-hardware-display native 
 ProMotion on the MacBook panels — no host hardware we own does 144), overlay planes (a plane is a
 CALayer; we own both ends of the protocol extension), NV12/P010 on those planes with
 `COLOR_ENCODING`/`COLOR_RANGE`, and a cursor larger than 64×64.
+
+**Status 2026-08-16:** wave 4 closed; wave 1 parts 1–2 shipped. Next up are per-host-display,
+120 Hz/VRR, and overlay planes — so **overlay planes are not live yet**, and "when it lands" remains
+accurate for them, for NV12/P010-on-planes and for `COLOR_ENCODING`/`COLOR_RANGE`.
+
+**Hardware video has no date, and no partial support to discover.** Measured on the host side:
+`VK_KHR_video_*` appears **nowhere** in KosmicKrisp or vkr, and `kk_physical_device.c` builds exactly
+**one** queue family (`GRAPHICS | COMPUTE | TRANSFER`). It is not on the M15 waves. This is why §6
+item 1 splits the work: the multi-planar sampling half is ours and does not wait.
 
 One expectation this fork set and should keep setting: **overlay planes are an adjunct, not the
 lever.** They help video and fullscreen surfaces; promoting the wallpaper is the weakest use of one
@@ -560,6 +639,22 @@ so **the rename has to happen on their side.** Renaming it in the guest would le
 files with no owner the next time the agent deploys.
 
 Open questions, tracked in their own drafts: `limina-issue-scanout-blob-not-applied.md` (§2 item 2 —
-acknowledged on the limina side 2026-08-16, investigation to start), and
-`vmm-issue-dmabuf-cpu-write-coherency.md`. `virtual-display-identity.md` carries the display-identity
+acknowledged on the limina side 2026-08-16, with a concrete host-side lead and a debug-logging repro
+run pending).
+
+**Closed 2026-08-16: the dmabuf CPU-write coherency issue.** Its draft is retired. Cause was
+control-queue work being unordered against venus ring work — virtio-gpu control commands run on
+libkrun's gpu worker thread while venus runs on virglrenderer's `vkr_ring` thread, so a guest CPU
+write into a venus-shared dmabuf could be read one write behind. Fixed in two halves that **only
+work together**: guest mesa flushes and waits on unmap of a `PIPE_BIND_SHARED` write map (restores
+*ordering*), and vrend `glFinish`es so the fence means *completion*. A barrier alone was tried first
+and reverted after 10/10 still-stale runs. **Both halves are enhanced-tier only — the stock tier
+keeps the bug**, so this returns if we ever run against a guest without limina's mesa.
+
+**Also worth knowing about the shipped assert surface:** roughly 820 asserts in the KosmicKrisp build
+are live and reachable from guest usage, and one takes down the **whole VM**, not just our context —
+so a spec violation here can present as "the VM died" rather than as a validation error. Our
+validation layer is off by default, which is the realistic case. The VMM side is extending vkr's
+trust-boundary checks to the classes a compositor actually hits (degenerate rects, zero-size creates,
+format mismatches) and can offer a `-Db_ndebug=true` build for A/B on the dogfood seat. `virtual-display-identity.md` carries the display-identity
 ask, deliberately written so it would help stock mutter too.
