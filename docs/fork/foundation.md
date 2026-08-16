@@ -147,13 +147,19 @@ allocation.
 
 ### Two open faults, neither of them ours to close
 
-**1. Client buffers are cross-driver by construction.** A client's dmabufs are allocated by the
-client. With GL on vrend they are classic virgl resources, `vkGetMemoryFdPropertiesKHR` refuses
-them, and `Tty::import_dmabuf` correctly declines the buffer — but Firefox and Epiphany both *hang*
-rather than falling back, so in practice it is a dead window. Mutter does not hit this because its
-renderer is GL, the same driver that allocated the buffer. **Until vkr importing virgl resources
-into venus is confirmed deployed, `/etc/environment.d/90-limina-zink.conf` stays.** It no longer
-protects our scanout; it keeps GL clients importable.
+**1. Client buffers are cross-driver by construction — CLOSED host-side 2026-08-16.** A client's
+dmabufs are allocated by the client, so with GL on vrend they used to arrive as classic virgl
+resources that `vkGetMemoryFdPropertiesKHR` refused; `Tty::import_dmabuf` correctly declined them,
+and Firefox and Epiphany then *hung* rather than falling back, so in practice it was a dead window.
+Mutter never hit this because its renderer is GL, the same driver that allocated the buffer — a
+Vulkan compositor is cross-driver by construction.
+
+**vkr now imports classic virgl resources into venus** (confirmed on the limina side, 2026-08-16),
+and the guest agrees: `/etc/environment.d/90-limina-zink.conf` has not selected zink since
+2026-08-15 — despite its name it sets `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu` +
+`GALLIUM_DRIVER=virgl` — and both dogfood seats have run GL-on-vrend since with **zero**
+`error importing dmabuf into the Vulkan renderer` lines. The drop-in no longer protects anything of
+ours; if you see it cited as load-bearing, that citation is stale.
 
 **2. The host stops applying `SET_SCANOUT_BLOB` for a knocked-out resource.** Written up for the
 VMM side in `limina-issue-scanout-blob-not-applied.md` (with attachments). The guest-side mechanism,
@@ -191,7 +197,10 @@ remaining per-frame host cost lives.
 ### Async scanout — opt-in, and what it costs to read
 
 `SYNOIK_VK_ASYNC_SCANOUT=1` lets the KMS frame hand its fence to the atomic commit as `IN_FENCE_FD`
-instead of parking the compositor thread on it. The tty backend brackets `render_frame` with
+instead of parking the compositor thread on it. **Neither dogfood seat runs it** (checked in
+`/proc/<pid>/environ` on both, 2026-08-16) — so every live number from either seat is the
+synchronous arm, whatever an older document says about a `92-async-scanout.conf`. Check the process,
+not a drop-in: both seats linger, which makes `environment.d` a dead drop. The tty backend brackets `render_frame` with
 `set_finish_may_defer`, cleared immediately after so the permission cannot leak to screencopy, a
 screencast or a widget bake — each of those hands its buffer straight to a consumer and must still
 be finished on return. Offscreen finishes defer on a weaker condition
@@ -404,16 +413,25 @@ Everything here was measured. Re-deriving any of it costs a day.
    because this VM has one GPU; on any multi-GPU machine we would be telling clients to allocate for
    a device we are not rendering on. `Gpu::for_drm_node(node)` via `VK_EXT_physical_device_drm`, ~a
    day, and it is step 1 of item 7 anyway.
-3. **The idle redraw loop.** With **no windows at all** and `animating: false`, a live seat measured
-   a flat 360 `DRM_IOCTL_MODE_ATOMIC` commits in 6 seconds — 60/s at 21% CPU — with the output
-   permanently in `RedrawState::WaitingForVBlank { redraw_needed: true }`. Something re-requests a
-   redraw every frame before the vblank that would let us idle; it is the shape of the xray
-   self-rebuild bug. The compositor demonstrably *can* idle (a static fullscreen client sits at 0%
-   with the plane unchanged for 25 samples), and this reproduces with no client on the plane, so it
-   is not the scan-out work. **It matters beyond power: while the rate is pinned at 60/s, animation
-   cost is unmeasurable** — a workspace switch adds no visible commits, so the frame log cannot tell
-   an animating frame from an idle one. Instrument the redraw *requesters*; `SYNOIK_SCENE_BREAKDOWN=verbose`
-   is the cheapest first look.
+3. **The idle redraw loop — DID NOT REPRODUCE 2026-08-16; needs one more seat before closing.**
+   On 2026-08-15 a live seat measured a flat 360 `DRM_IOCTL_MODE_ATOMIC` commits in 6 seconds — 60/s
+   at 21% CPU — with the output permanently in `RedrawState::WaitingForVBlank { redraw_needed: true }`,
+   with no windows at all and `animating: false`. That is the shape of the xray self-rebuild bug:
+   something re-requests a redraw before the vblank that would let us idle.
+
+   Re-measured on gsrs (`bd7a845c`, `Active=yes`, fresh session) it is **gone**. Both arms:
+   windowless and with one idle `gnome-terminal`, `strace -e trace=ioctl` counted **0**
+   `DRM_IOCTL_MODE_ATOMIC` over 8 seconds, and `msg debug-focus-state` reports
+   `redraw state: Idle`. The instrument was checked against a positive control in the same session
+   — ten injected pointer motions produced exactly ten commits — so this is a measured zero, not a
+   blind one.
+
+   What that does *not* settle: the original was a long-running seat, and this was a session two
+   minutes old. **Re-run it on kov's seat while its VT is foreground** before deleting the item; a
+   backgrounded VT renders at ~1 fps and cannot answer the question. Should it come back, instrument
+   the redraw *requesters*, and note the reason it matters beyond power: while the rate is pinned at
+   60/s, **animation cost is unmeasurable** — a workspace switch adds no visible commits, so the
+   frame log cannot tell an animating frame from an idle one.
 4. **GPU-side capture readbacks, with colour conversion folded in.** `render_to_shm` and the
    PipeWire cursor bitmap read `Abgr8888` back and CPU-swizzle to BGRA because offscreens/readbacks
    are RGBA-order-only here; extend the `Bind<Dmabuf>` B8G8R8A8 + `vkCmdBlitImage` trick so both
@@ -506,6 +524,9 @@ lever.** They help video and fullscreen surfaces; promoting the wallpaper is the
 (occluded most of the time, and blurred in the overview where it is most visible). We want them
 because video is part of a good desktop, not because they will make the shell's own drawing faster.
 
-Open questions, tracked in their own drafts: `limina-issue-scanout-blob-not-applied.md` (§2), and
+Answered 2026-08-16: **vkr imports classic virgl resources into venus** (§2, item 1 — closed).
+
+Open questions, tracked in their own drafts: `limina-issue-scanout-blob-not-applied.md` (§2 item 2 —
+acknowledged on the limina side 2026-08-16, investigation to start), and
 `vmm-issue-dmabuf-cpu-write-coherency.md`. `virtual-display-identity.md` carries the display-identity
 ask, deliberately written so it would help stock mutter too.
