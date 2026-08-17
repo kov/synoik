@@ -240,6 +240,7 @@ impl Headless {
         output.user_data().insert_if_missing(|| OutputName {
             connector,
             make: Some(make),
+            vendor: None,
             model: Some(model),
             serial: Some(serial),
         });
@@ -250,6 +251,7 @@ impl Headless {
             synoik_ipc::Output {
                 name: output.name(),
                 make: physical_properties.make,
+                vendor: None,
                 model: physical_properties.model,
                 serial: None,
                 physical_size: None,

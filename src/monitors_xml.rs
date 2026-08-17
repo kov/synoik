@@ -71,9 +71,8 @@ impl MonitorSetting {
     /// the serial/product we persist (from `synoik_ipc::Output`, EDID PNP id for vendor,
     /// connector-fallback serial) does not always match the representation the reader sees in
     /// `OutputName` (e.g. a headless output reports serial `1` but persists `headless-1`).
-    /// mutter keys on the full `<monitorspec>`, but its `<vendor>` is the PNP id (`RHT`) while
-    /// our `OutputName.make` is the decoded manufacturer, so vendor never compares equal and is
-    /// never consulted.
+    /// `<vendor>` is not consulted: it is one manufacturer code shared by every monitor of that
+    /// make, so it can never disambiguate two of them.
     fn corroborates(&self, name: &OutputName) -> bool {
         let eq = |saved: &Option<String>, have: &Option<String>| matches!((saved, have), (Some(a), Some(b)) if a == b);
         // Either field agreeing is enough to disambiguate; we don't require both, since a given
@@ -292,11 +291,11 @@ pub struct WriteLogicalMonitor {
 /// mutter keys a stored configuration on the *set* of `MetaMonitorSpec`s it covers
 /// (`MetaMonitorsConfigKey`, `meta-monitor-config-manager.c`; specs compared by
 /// `meta_monitor_spec_equals` over connector/vendor/product/serial). We leave `<vendor>` out and
-/// compare case-insensitively, because the same physical display is rendered differently by
-/// different writers: mutter's `<vendor>` is the raw EDID manufacturer code (`LMN`) while ours is
-/// the decoded make (`PNP(LMN)`), and mutter writes a fallback serial as `0x%08x` where we write
-/// it uppercase. Keying on those bytes would file two stanzas for one display; connector + product
-/// + serial is as discriminating in practice and survives a `monitors.xml` written by either.
+/// compare case-insensitively, so a stanza written by *some other* writer for this same display
+/// gets replaced rather than duplicated — our own builds before `28212e78` wrote the decoded make
+/// (`PNP(LMN)`) and an uppercase serial where mutter writes the raw code (`LMN`) and `0x%08x`.
+/// Vendor adds no discrimination anyway: it is one code per manufacturer, identical for every
+/// monitor they ship.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct SpecKey(String, String, String);
 
@@ -517,9 +516,9 @@ mod tests {
     fn name(connector: &str, model: Option<&str>, serial: Option<&str>) -> OutputName {
         OutputName {
             connector: connector.to_owned(),
-            make: None,
             model: model.map(str::to_owned),
             serial: serial.map(str::to_owned),
+            ..Default::default()
         }
     }
 

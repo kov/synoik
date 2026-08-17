@@ -739,6 +739,7 @@ fn print_output(output: Output) -> anyhow::Result<()> {
     let Output {
         name,
         make,
+        vendor: _,
         model,
         serial,
         physical_size,

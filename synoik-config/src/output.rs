@@ -97,10 +97,16 @@ impl Default for Output {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OutputName {
     pub connector: String,
+    /// Decoded manufacturer name, e.g. `Dell Inc.` — for display, and part of the niri-style
+    /// `"make model serial"` name a config entry can be written against.
     pub make: Option<String>,
+    /// Raw EDID manufacturer code, e.g. `DEL` — mutter's `<vendor>`, and what identifies the
+    /// monitor to `monitors.xml` and `Mutter/DisplayConfig`. Deliberately *not* part of name
+    /// matching: it is the display's identity, not a name a user would type.
+    pub vendor: Option<String>,
     pub model: Option<String>,
     pub serial: Option<String>,
 }
@@ -140,6 +146,7 @@ impl OutputName {
         Self {
             connector: output.name.clone(),
             make: (output.make != "Unknown").then(|| output.make.clone()),
+            vendor: output.vendor.clone(),
             model: (output.model != "Unknown").then(|| output.model.clone()),
             serial: output.serial.clone(),
         }
@@ -285,6 +292,7 @@ mod tests {
             make: make.map(|x| x.to_string()),
             model: model.map(|x| x.to_string()),
             serial: serial.map(|x| x.to_string()),
+            ..Default::default()
         }
     }
 

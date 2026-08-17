@@ -17858,9 +17858,7 @@ fn output_scale_is_derived_from_the_current_mode() {
     );
     output.user_data().insert_if_missing(|| OutputName {
         connector: "Virtual-1".to_owned(),
-        make: None,
-        model: None,
-        serial: None,
+        ..Default::default()
     });
 
     let set_mode = |size: (i32, i32)| {

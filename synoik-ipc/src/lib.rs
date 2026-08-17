@@ -1523,6 +1523,9 @@ pub struct Output {
     pub name: String,
     /// Textual description of the manufacturer.
     pub make: String,
+    /// Raw EDID manufacturer code (`DEL`), if known — the monitor's identity to a config store,
+    /// where the decoded `make` is for humans.
+    pub vendor: Option<String>,
     /// Textual description of the model.
     pub model: String,
     /// Serial of the output, if known.

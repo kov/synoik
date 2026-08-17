@@ -209,9 +209,7 @@ impl OutputDevice {
             let conn_name = format_connector_name(conn);
             return OutputName {
                 connector: conn_name,
-                make: None,
-                model: None,
-                serial: None,
+                ..Default::default()
             };
         }
 
@@ -220,9 +218,7 @@ impl OutputDevice {
             error!("crtc for connector {conn_name} missing from known");
             return OutputName {
                 connector: conn_name,
-                make: None,
-                model: None,
-                serial: None,
+                ..Default::default()
             };
         };
         info.name.clone()
@@ -1172,9 +1168,7 @@ impl Tty {
             );
             *name = OutputName {
                 connector,
-                make: None,
-                model: None,
-                serial: None,
+                ..Default::default()
             };
             return;
         }
@@ -2257,6 +2251,7 @@ impl Tty {
                 let ipc_output = synoik_ipc::Output {
                     name: connector_name,
                     make: output_name.make.unwrap_or_else(|| "Unknown".into()),
+                    vendor: output_name.vendor,
                     model: output_name.model.unwrap_or_else(|| "Unknown".into()),
                     serial: output_name.serial,
                     physical_size,
@@ -4164,12 +4159,58 @@ fn make_output_name(
     let info = get_edid_info(device, connector)
         .map_err(|err| warn!("error getting EDID info for {connector_name}: {err:?}"))
         .ok();
+    let spec = info.as_ref().and_then(monitor_spec_from_edid);
     OutputName {
         connector: connector_name,
+        // The *decoded* manufacturer ("Dell Inc."), which is what a display name wants; the raw
+        // code lives in `vendor` because that is what identifies the monitor to a store.
         make: info.as_ref().and_then(|info| info.make()),
-        model: info.as_ref().and_then(|info| info.model()),
-        serial: info.as_ref().and_then(|info| info.serial()),
+        vendor: spec.as_ref().and_then(|s| s.vendor.clone()),
+        model: spec.as_ref().map(|s| s.product.clone()),
+        serial: spec.as_ref().map(|s| s.serial.clone()),
     }
+}
+
+/// The `{vendor, product, serial}` a monitor is identified by, read mutter's way.
+struct MonitorSpec {
+    vendor: Option<String>,
+    product: String,
+    serial: String,
+}
+
+/// Derive a monitor's identity from its EDID exactly as mutter does
+/// (`set_output_details_from_edid`, meta-output.c:314): the vendor is the raw three-letter
+/// manufacturer code (`LMN`, *not* the decoded name), the product is the display-product-name
+/// descriptor falling back to `0x%04x` of the product code, and the serial is the
+/// display-product-serial descriptor falling back to `0x%08x` of the EDID serial number —
+/// lowercase.
+///
+/// This matters beyond aesthetics: these three strings are what `monitors.xml` keys on, so a
+/// display configured under mutter and one configured under us must render to the same bytes, or
+/// each compositor sees the other's stanzas as belonging to some other monitor.
+fn monitor_spec_from_edid(info: &libdisplay_info::info::Info) -> Option<MonitorSpec> {
+    use libdisplay_info::edid::DisplayDescriptorTag;
+
+    let edid = info.edid()?;
+    let vendor_product = edid.vendor_product();
+
+    let descriptor = |tag: DisplayDescriptorTag| {
+        edid.display_descriptors()
+            .iter()
+            .find(|d| d.tag() == tag)
+            .and_then(|d| d.string())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+    };
+
+    let vendor: String = vendor_product.manufacturer.iter().collect();
+    Some(MonitorSpec {
+        vendor: (!vendor.trim().is_empty()).then_some(vendor),
+        product: descriptor(DisplayDescriptorTag::ProductName)
+            .unwrap_or_else(|| format!("0x{:04x}", vendor_product.product)),
+        serial: descriptor(DisplayDescriptorTag::ProductSerial)
+            .unwrap_or_else(|| format!("0x{:08x}", vendor_product.serial.unwrap_or(0))),
+    })
 }
 
 /// Initializes the libinput plugin system.
@@ -4223,9 +4264,62 @@ mod tests {
     use synoik_ipc::{HSyncPolarity, VSyncPolarity};
 
     use crate::backend::tty::{
-        calculate_drm_mode_from_modeline, calculate_mode_cvt, owned_vulkan_dmabuf_formats,
-        scanout_render_formats, Modifier,
+        calculate_drm_mode_from_modeline, calculate_mode_cvt, monitor_spec_from_edid,
+        owned_vulkan_dmabuf_formats, scanout_render_formats, Modifier,
     };
+
+    /// A minimal but valid EDID 1.4 block for `DEL`, product `0x4321`, serial `0x12345678`, with an
+    /// optional display-product-name descriptor.
+    fn edid_blob(product_name: Option<&str>) -> Vec<u8> {
+        let mut e = vec![0u8; 128];
+        e[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        // "DEL" packed as three 5-bit letters, big-endian.
+        let id: u16 = (4 << 10) | (5 << 5) | 12;
+        e[8..10].copy_from_slice(&id.to_be_bytes());
+        e[10..12].copy_from_slice(&0x4321u16.to_le_bytes());
+        e[12..16].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        e[16] = 10; // manufacture week
+        e[17] = 35; // year 2025
+        e[18] = 1; // EDID 1.4
+        e[19] = 4;
+        e[20] = 0x80; // digital input
+        e[21] = 59; // 59 x 33 cm
+        e[22] = 33;
+        if let Some(name) = product_name {
+            let d = &mut e[54..72];
+            d[3] = 0xFC;
+            for (i, b) in name.bytes().take(13).enumerate() {
+                d[5 + i] = b;
+            }
+            if name.len() < 13 {
+                d[5 + name.len()] = b'\n';
+            }
+        }
+        let sum: u8 = e[..127].iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
+        e[127] = 0u8.wrapping_sub(sum);
+        e
+    }
+
+    /// The identity a store keys on is rendered exactly as mutter renders it: the raw manufacturer
+    /// code, the product-name descriptor, and lowercase hex fallbacks. A `monitors.xml` written by
+    /// either compositor has to describe this display with the same bytes.
+    #[test]
+    fn a_monitors_identity_is_rendered_mutters_way() {
+        let named = libdisplay_info::info::Info::parse_edid(&edid_blob(Some("DELL P2723QE")))
+            .expect("valid EDID");
+        let spec = monitor_spec_from_edid(&named).expect("spec from EDID");
+        assert_eq!(spec.vendor.as_deref(), Some("DEL"));
+        assert_eq!(spec.product, "DELL P2723QE");
+        assert_eq!(spec.serial, "0x12345678");
+
+        // No descriptors: mutter falls back to `0x%04x` of the product code and `0x%08x` of the
+        // serial number, lowercase — not the uppercase form libdisplay-info's own helpers produce.
+        let bare =
+            libdisplay_info::info::Info::parse_edid(&edid_blob(None)).expect("valid bare EDID");
+        let spec = monitor_spec_from_edid(&bare).expect("spec from bare EDID");
+        assert_eq!(spec.product, "0x4321");
+        assert_eq!(spec.serial, "0x12345678");
+    }
 
     #[test]
     fn client_formats_stay_explicit() {

@@ -796,9 +796,7 @@ impl Op {
                 );
                 output.user_data().insert_if_missing(|| OutputName {
                     connector: name,
-                    make: None,
-                    model: None,
-                    serial: None,
+                    ..Default::default()
                 });
                 layout.add_output(output.clone(), None);
             }
@@ -833,9 +831,7 @@ impl Op {
                 );
                 output.user_data().insert_if_missing(|| OutputName {
                     connector: name,
-                    make: None,
-                    model: None,
-                    serial: None,
+                    ..Default::default()
                 });
                 layout.add_output(output.clone(), layout_config.map(|x| *x));
             }

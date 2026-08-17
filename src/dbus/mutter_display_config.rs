@@ -131,13 +131,16 @@ impl DisplayConfig {
 
             let connector = c.clone();
             let model = output.model.clone();
-            let make = output.make.clone();
+            // mutter's monitorspec `vendor` is the raw EDID manufacturer code, not the decoded
+            // name (`set_output_details_from_edid`, meta-output.c:318): the decoded one is only
+            // ever shown, via the `display-name` property above.
+            let vendor = output.vendor.clone().unwrap_or_default();
 
             // Serial is used for session restore, so fall back to the connector name if it's
             // not available.
             let serial = output.serial.as_ref().unwrap_or(&connector).clone();
 
-            let names = (connector, make, model, serial);
+            let names = (connector, vendor, model, serial);
 
             if let Some(logical) = output.logical.as_ref() {
                 let transform = match logical.transform {
@@ -202,13 +205,13 @@ impl DisplayConfig {
                         "Connector '{connector}' not found",
                     )));
                 };
-                // Resolve the monitorspec + chosen mode dims for persistence. `<vendor>` should be
-                // the EDID PNP id, which we don't carry; the decoded make is a faithful-enough
-                // stand-in (our reader matches on connector + product/serial, not vendor).
+                // Resolve the monitorspec + chosen mode dims for persistence: `<vendor>` is the raw
+                // EDID manufacturer code, as mutter writes it, so a file written here and one
+                // written by mutter describe the same monitor with the same bytes.
                 let (mw, mh, mr) = parse_mode_id(&mode);
                 write_monitors.push(crate::monitors_xml::WriteMonitor {
                     connector: connector.clone(),
-                    vendor: output.make.clone(),
+                    vendor: output.vendor.clone().unwrap_or_default(),
                     product: output.model.clone(),
                     serial: output.serial.clone().unwrap_or_else(|| connector.clone()),
                     width: mw,

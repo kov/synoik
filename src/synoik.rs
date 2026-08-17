@@ -3879,9 +3879,7 @@ impl State {
             // Even if name is "make model serial", matching will work fine this way.
             temp = OutputName {
                 connector: name.to_owned(),
-                make: None,
-                model: None,
-                serial: None,
+                ..Default::default()
             };
             &temp
         };
