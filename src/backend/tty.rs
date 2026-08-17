@@ -1063,8 +1063,10 @@ impl Tty {
                         warn!("changed connector missing from known crtcs");
                     }
 
-                    // We don't actually need to do anything here; on_output_config_changed() will
-                    // take care of picking a new mode if needed.
+                    // Nothing to do per-event: on_output_config_changed() picks a new mode if
+                    // needed, and refresh_changed_identities() re-plugs the connector if the EDID
+                    // now describes a different display (which is checked for every connected
+                    // connector, since an in-place EDID swap need not change the mode list at all).
                 }
                 _ => (),
             }
@@ -1086,30 +1088,7 @@ impl Tty {
         }
 
         for (crtc, mut info) in added {
-            // Make/model/serial can match exactly between different physical monitors. This doesn't
-            // happen often, but our Layout does not support such duplicates and will panic.
-            //
-            // As a workaround, search for duplicates, and unname the new connectors if one is
-            // found. Connector names are always unique.
-            let name = &mut info.name;
-            let formatted = name.format_make_model_serial_or_connector();
-            for info in self.devices.values().flat_map(|d| d.known_crtcs.values()) {
-                if info.name.matches(&formatted) {
-                    let connector = mem::take(&mut name.connector);
-                    warn!(
-                        "new connector {connector} duplicates make/model/serial \
-                         of existing connector {}, unnaming",
-                        info.name.connector,
-                    );
-                    *name = OutputName {
-                        connector,
-                        make: None,
-                        model: None,
-                        serial: None,
-                    };
-                    break;
-                }
-            }
+            self.unname_if_duplicate(&mut info.name, None);
 
             // Insert it right away so next added connector will check against this one too.
             let device = self.devices.get_mut(&node).unwrap();
@@ -1156,12 +1135,130 @@ impl Tty {
             }
         }
 
+        // A connector that stayed connected can still be a different physical display now.
+        self.refresh_changed_identities(synoik, node);
+
         // This will connect any new connectors if needed, and apply other changes, such as
         // connecting back the internal laptop monitor once it becomes the only monitor left.
         //
         // It will also call refresh_ipc_outputs(), which will catch the disconnected connectors
         // above.
         self.on_output_config_changed(synoik);
+    }
+
+    /// Unnames `name` if another known CRTC already carries the same make/model/serial.
+    ///
+    /// Make/model/serial can match exactly between different physical monitors. This doesn't happen
+    /// often, but our Layout does not support such duplicates and will panic. As a workaround,
+    /// search for duplicates and unname the newcomer — connector names are always unique. `skip` is
+    /// the CRTC whose own entry must not count as a duplicate of itself (it still holds the name
+    /// we are replacing).
+    fn unname_if_duplicate(&self, name: &mut OutputName, skip: Option<(DrmNode, crtc::Handle)>) {
+        let formatted = name.format_make_model_serial_or_connector();
+        for (other_crtc, info) in self.devices.iter().flat_map(|(node, d)| {
+            d.known_crtcs
+                .iter()
+                .map(move |(crtc, info)| ((*node, *crtc), info))
+        }) {
+            if Some(other_crtc) == skip || !info.name.matches(&formatted) {
+                continue;
+            }
+
+            let connector = mem::take(&mut name.connector);
+            warn!(
+                "new connector {connector} duplicates make/model/serial \
+                 of existing connector {}, unnaming",
+                info.name.connector,
+            );
+            *name = OutputName {
+                connector,
+                make: None,
+                model: None,
+                serial: None,
+            };
+            return;
+        }
+    }
+
+    /// Re-reads the EDID of every connected connector and re-plugs the ones whose identity changed.
+    ///
+    /// mutter re-derives every output from its EDID on each hotplug
+    /// (`meta_monitor_manager_reload` → `ensure_configured`), and nothing weaker suffices here: a
+    /// virtual connector whose EDID is swapped in place never disconnects, and its mode list may
+    /// not change either, so neither a `Connected` nor a `Changed` scan event announces that
+    /// this is now a *different physical display*. The identity is what the `monitors.xml`
+    /// store keys on, so a stale one silently files the user's next save under the previous
+    /// monitor.
+    ///
+    /// A changed identity is handled as the re-plug it really is: tear the output down, take the
+    /// new name and a fresh [`OutputId`], and let `on_output_config_changed` build it back —
+    /// which runs the whole configuration chain (store → KDL → DPI guess) for the display that
+    /// is actually there. The live-applied config goes too, for the same reason
+    /// [`Self::forget_inapplicable_applied_config`] drops one whose mode is gone: it was a
+    /// judgement about the old display.
+    fn refresh_changed_identities(&mut self, synoik: &mut Synoik, node: DrmNode) {
+        let Some(device) = self.devices.get(&node) else {
+            return;
+        };
+
+        let mut fresh_names = vec![];
+        for (connector, crtc) in device.drm_scanner.crtcs() {
+            if connector.state() != connector::State::Connected {
+                continue;
+            }
+            if !device.known_crtcs.contains_key(&crtc) {
+                continue;
+            }
+            let connector_name = format_connector_name(connector);
+            fresh_names.push((
+                crtc,
+                make_output_name(&device.drm, connector.handle(), connector_name),
+            ));
+        }
+
+        let mut changed = vec![];
+        for (crtc, mut name) in fresh_names {
+            // Run the newcomer through the same duplicate check `Connected` does, so an identity
+            // that was unnamed for colliding with another monitor stays unnamed instead of reading
+            // as a change on every udev event.
+            self.unname_if_duplicate(&mut name, Some((node, crtc)));
+
+            let device = self.devices.get(&node).expect("device we just borrowed");
+            let known = &device.known_crtcs[&crtc].name;
+            let identity = |n: &OutputName| (n.make.clone(), n.model.clone(), n.serial.clone());
+            let nameless = |n: &OutputName| identity(n) == (None, None, None);
+            if nameless(&name) && !nameless(known) {
+                // A failed EDID read (or the duplicate-unnaming above) is an absence of
+                // information, not evidence of a different display: re-plugging on it would churn
+                // the output on every udev event.
+                continue;
+            }
+            if identity(known) != identity(&name) {
+                debug!(
+                    "connector {} is a different display now: \"{}\" was \"{}\"",
+                    name.connector,
+                    name.format_make_model_serial(),
+                    known.format_make_model_serial(),
+                );
+                changed.push((crtc, name));
+            }
+        }
+
+        for (crtc, name) in changed {
+            let old_name = self.devices[&node].known_crtcs[&crtc].name.clone();
+            self.forget_applied_config(synoik, &old_name, "the display it was applied to is gone");
+            self.connector_disconnected(synoik, node, crtc);
+
+            let device = self
+                .devices
+                .get_mut(&node)
+                .expect("device we just borrowed");
+            if let Some(info) = device.known_crtcs.get_mut(&crtc) {
+                info.name = name;
+                // A different display is a different output, not the same one renamed.
+                info.id = OutputId::next();
+            }
+        }
     }
 
     fn device_removed(&mut self, device_id: dev_t, synoik: &mut Synoik) {
@@ -2362,17 +2459,32 @@ impl Tty {
         }
 
         for name in stale {
-            debug!(
-                "output {:?}: dropping the applied display config, its mode is gone",
-                name.connector
-            );
-            synoik.applied_display_config.remove(&name.connector);
-            let mut config = self.config.borrow_mut();
-            if let Some(output) = config.outputs.find_mut(&name) {
-                output.mode = None;
-                output.scale = None;
-                output.transform = synoik_ipc::Transform::Normal;
-            }
+            self.forget_applied_config(synoik, &name, "its mode is gone");
+        }
+    }
+
+    /// Drops the live-applied config for one output: the override plus the fields the apply wrote
+    /// into the output config, so nothing of the old display is left for the configuration chain to
+    /// pick up. A no-op when there is no override, so a scale/mode the user wrote in their KDL
+    /// config by hand is never cleared.
+    fn forget_applied_config(&mut self, synoik: &mut Synoik, name: &OutputName, reason: &str) {
+        if synoik
+            .applied_display_config
+            .remove(&name.connector)
+            .is_none()
+        {
+            return;
+        }
+
+        debug!(
+            "output {:?}: dropping the applied display config, {reason}",
+            name.connector
+        );
+        let mut config = self.config.borrow_mut();
+        if let Some(output) = config.outputs.find_mut(name) {
+            output.mode = None;
+            output.scale = None;
+            output.transform = synoik_ipc::Transform::Normal;
         }
     }
 
