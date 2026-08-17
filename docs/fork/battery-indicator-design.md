@@ -55,7 +55,9 @@ those corrections are the design now:
 Settled numbers, tuned by looking at rendered pixels at scale 1.25 (see `~/battery-states/`):
 body 26x13, radius 4.5, stroke 1.5, **inset 3** (2.5 welded the fill to the shell), nub 2.5x6 at
 **gap 0.5** (1.5 read as a detached tick), overlays **19** logical (**18** for the plug), shadow
-1.14x at +1px, rim black α0.75, shadow α0.3, green `$green_4` (`$green_3` shouted).
+1.14x at +1px, rim `#444C44` — midway between black and the grey the neighbouring icons' dim parts
+read as (panel fg at Adwaita's 0.35 over the plate); black was the only hard outline in the cluster
+— shadow the same `#444C44` at α0.3, green `$green_4` (`$green_3` shouted).
 
 Assets: `battery-{bolt,cord,alert}-symbolic.svg` and a `-halo-` rim for each, all ours
 (GPL-3.0-only), because no theme ships these alone — every themed battery bakes them into a whole

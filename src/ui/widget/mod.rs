@@ -2496,14 +2496,16 @@ pub fn battery_overlay_glyph(
     }
 }
 
-/// The three layers of a battery overlay glyph — the glyph, a dark rim, and a shadow — centred on
+/// The three layers of a battery overlay glyph — the glyph, a grey rim, and a shadow — centred on
 /// `center` (relative to `origin`), topmost first.
 ///
 /// The rim is a dilated silhouette of the same shape drawn behind the glyph. It is a second asset
 /// because a symbolic carries one colour (its alpha is the coverage), so an outline cannot be a
 /// stroke on the glyph itself. Without it a white glyph over a white fill is invisible — measured
-/// on the seat, where a plug over a charged battery could not be seen at all. The shadow is what
-/// makes the rim read as an *outline* rather than as part of the shape.
+/// on the seat, where a plug over a charged battery could not be seen at all. The shadow is the
+/// rim's own colour at a low alpha, a hair larger and a pixel down: at panel size it is all but
+/// invisible, and it is at the *small* sizes that it earns its keep, thickening the plug's prongs
+/// enough to keep them apart.
 pub fn battery_overlay_elements(
     renderer: &mut VulkanRenderer,
     icons: &IconCache,
@@ -2583,8 +2585,24 @@ impl Battery {
     pub const OVERLAY: f64 = 19.;
     pub const CORD: f64 = 18.;
     /// The overlay rim and its shadow — see [`battery_overlay_elements`].
-    pub const GLYPH_RIM: Rgba = [0., 0., 0., 0.75];
-    pub const GLYPH_SHADOW: Rgba = [0., 0., 0., 0.3];
+    ///
+    /// Midway between black and the grey the *dim* parts of the neighbouring symbolic icons read
+    /// as (the unlit volume wave, the empty wifi arcs — panel foreground at Adwaita's 0.35 over
+    /// the plate, `#899989` on a green wallpaper): an edge that is deliberate without being the
+    /// only hard outline in the cluster, which is what black at 0.75 was.
+    ///
+    /// Opaque rather than a translucent white, because the rim also has to separate the glyph from
+    /// a *white* fill bar — white at any alpha composites to white there and the plug dissolves,
+    /// which is what put a dark rim here to begin with.
+    pub const GLYPH_RIM: Rgba = style::rgb8(0x44, 0x4c, 0x44);
+    /// The rim's colour again, low alpha — a black shadow under a grey rim reads as dirt in the
+    /// plug's prongs.
+    pub const GLYPH_SHADOW: Rgba = [
+        Self::GLYPH_RIM[0],
+        Self::GLYPH_RIM[1],
+        Self::GLYPH_RIM[2],
+        0.3,
+    ];
     pub const GLYPH_SHADOW_SCALE: f64 = 1.14;
     pub const GLYPH_SHADOW_DY: f64 = 1.;
 
