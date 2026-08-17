@@ -103,6 +103,12 @@ it was never chosen for.
   `tty::target_mode`) — otherwise a monitor that comes up at its preferred mode never matches its
   own entry. Both are mutter's rules; with a constant EDID the mode gate doubles as the only way to
   tell two displays apart.
+- **A stored scale is applied even when it is off the mode's ladder** — an accepted divergence.
+  mutter rejects one ("Scale %g not valid for resolution", meta-monitor-manager.c:2674) and falls
+  back to its computed default; we keep the user's saved value. The scales a mode *offers* are
+  mutter's (`utils::scale::supported_scales`), so nothing new lands off the ladder — only stanzas
+  written before that ladder existed, and silently moving a display the user had already set is the
+  worse outcome. Settings will not show such a scale as selected.
 - **A live-applied config dies with the display it was applied to** (`fd001ae6`): if the connector
   no longer offers the mode the apply named, the override and the fields it wrote are cleared and
   the chain re-runs. Mutter's `is_config_applicable`, applied to a hardware change it can't see.
