@@ -39,10 +39,33 @@ serve.
   We already expose this via smithay (`src/handlers/background_effect.rs`), so this is not new
   surface — it is the first time there is a *reference implementation* to conform to.
 - **[R] mutter's blur constants are fixed, not client- or config-driven**
-  (`src/compositor/meta-surface-actor.c`): radius `24.0` logical px, saturation `1.25`, noise
-  `0.015`. Ours (`src/render_helpers/background_effect.rs`) carries niri's optional
-  `noise`/`saturation` knobs. Per the fork tenet this is niri's way surviving where GNOME has one —
-  worth resolving.
+  (`src/compositor/meta-surface-actor.c`): radius `24.0`, saturation `1.25`, noise `0.015`. Ours
+  (`synoik-config` `Blur::default()` + `blur::client_finish`) carries niri's optional
+  `noise`/`saturation` knobs and adds two terms mutter has none of. Side by side:
+
+  | | mutter 51 | synoik default |
+  | --- | --- | --- |
+  | strength | gaussian **σ = 12 logical px**, × `view_scale` at paint | dual-Kawase `passes=3, offset=3` → **σ ≈ 19 physical px**, no scale factor |
+  | saturation | `1.25`, `mix(luma, color, s)`, Rec.601 luma | `1.5`, same `mix`, Rec.709 luma |
+  | noise | `0.015`, `(hash(gl_FragCoord) − 0.5) · noise` | `0.02`, identical formula |
+  | tint | none | 20%-alpha wash, white or near-black by color-scheme |
+  | contrast | none | `+0.06` about mid-grey |
+
+  `BACKGROUND_EFFECT_BLUR_RADIUS` is **2σ**, not σ: `clutter_blur_new` sets
+  `blur->sigma = radius / 2.0f` (`clutter/clutter/clutter-blur.c`). Our σ is a variance-matched
+  estimate from the tap kernels (down `0.5·d²`, up `1.33·d²`, `d = 0.5·2ⁱ·offset`), not a
+  measurement — pin it with `blur-probe` before treating it as exact.
+
+  The divergence that matters is **units, not magnitude**: mutter's radius is logical and gets
+  `× view_scale`, ours is fixed in physical pixels (`offset` reaches `record_blur` untouched; the
+  rescale at `frame.rs:1490` compensates the intermediate ladder, not output scale). So we are
+  ~1.6× *wider* than GNOME at 1× and narrower at 2×, and our blur changes strength when a window
+  moves between monitors of different scale. Theirs does not.
+
+  The tint and contrast are the larger *visible* divergence, and deliberate: `client_finish`
+  documents them as a legibility measure, since the protocol lets a client ask for blur without
+  saying anything about how it should look. GNOME 51 answers that question differently — it adds
+  nothing and lets the client own its own contrast.
 - **[R] sample-region rule**: mutter pads the blur region by `ceil(radius * 2)` on every side
   (`calculate_blur_sample_padding`) and keeps that padded region as a separate
   `background_blur_sample_region`, used both for damage and for the source read.
