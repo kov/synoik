@@ -393,7 +393,7 @@ const MAX_READBACK_STAGING: usize = 4;
 /// What a pooled backdrop bundle is keyed by: the intermediate's `(width, height)` and the blur
 /// pass count (`None` = blur off), i.e. exactly what
 /// [`BackdropBlur::matches`](super::BackdropBlur::matches) tests.
-type BackdropBlurKey = ((u32, u32), Option<usize>);
+type BackdropBlurKey = ((u32, u32), Option<crate::render_helpers::blur::BlurKind>);
 
 /// Budget for the evicted-backdrop-bundle pool, in bytes. See
 /// [`VulkanRenderer::backdrop_blur_pool`].
@@ -3405,13 +3405,17 @@ impl VulkanRenderer {
         }
     }
 
-    /// Take a pooled bundle matching `dims`/`passes`, if one is held. Most-recent match first.
+    /// Take a pooled bundle matching `dims`/`kind`, if one is held. Most-recent match first.
+    ///
+    /// The kind is in the key, not just the pass count: a Kawase bundle's chain renders into the
+    /// bundle's own output and a gaussian's does not, so handing one to the other's consumer would
+    /// blur into nothing.
     pub(crate) fn take_backdrop_blur(
         &mut self,
         dims: (u32, u32),
-        passes: Option<usize>,
+        kind: Option<crate::render_helpers::blur::BlurKind>,
     ) -> Option<super::BackdropBlur> {
-        let want: BackdropBlurKey = (dims, passes);
+        let want: BackdropBlurKey = (dims, kind);
         let i = self
             .backdrop_blur_pool
             .iter()

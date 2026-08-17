@@ -12,7 +12,7 @@ use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
 use synoik_config::CornerRadius;
 
 use crate::render_helpers::background_effect::RenderParams;
-use crate::render_helpers::blur::{BlurOptions, Finish};
+use crate::render_helpers::blur::{BlurRecipe, Finish};
 use crate::utils::region::TransformedRegion;
 
 #[derive(Debug)]
@@ -32,7 +32,7 @@ pub struct FramebufferEffectElement {
     /// intersects the damage with it, so the blur lands only inside it.
     subregion: Option<TransformedRegion>,
     scale: f32,
-    blur_options: Option<BlurOptions>,
+    blur: Option<BlurRecipe>,
     finish: Finish,
 }
 
@@ -60,7 +60,7 @@ impl FramebufferEffect {
         &self,
         ns: Option<usize>,
         params: RenderParams,
-        blur_options: Option<BlurOptions>,
+        blur: Option<BlurRecipe>,
         finish: Finish,
     ) -> FramebufferEffectElement {
         let (clip_geo, corner_radius) = params
@@ -80,7 +80,7 @@ impl FramebufferEffect {
             corner_radius,
             subregion: params.subregion,
             scale: params.scale as f32,
-            blur_options,
+            blur,
             finish,
         }
     }
@@ -216,9 +216,6 @@ mod vulkan_impl {
             // The target sub-region to grab (Normal: == clamped_dst).
             let src_region = transform.transform_rect_in(clamped_dst, &output_rect.size);
 
-            let passes = self.blur_options.map(|o| (o.passes as usize).clamp(1, 31));
-            let offset = self.blur_options.map_or(0.0, |o| o.offset) as f32;
-
             #[cfg(test)]
             crate::render_helpers::background_effect::trace::record_capture(
                 crate::render_helpers::background_effect::trace::CaptureSample {
@@ -230,7 +227,7 @@ mod vulkan_impl {
             let inner =
                 cache.get_or_insert::<RefCell<Option<BackdropBlur>>, _>(|| RefCell::new(None));
             let mut slot = inner.borrow_mut();
-            frame.capture_backdrop(&mut slot, src_region, size, passes, offset)
+            frame.capture_backdrop(&mut slot, src_region, size, self.blur)
         }
 
         fn draw(

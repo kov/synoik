@@ -12,7 +12,7 @@ use synoik_config::CornerRadius;
 use wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::handlers::background_effect::get_cached_blur_region;
-use crate::render_helpers::blur::{client_finish, BlurOptions};
+use crate::render_helpers::blur::{client_finish, BlurRecipe, GNOME_CLIENT_BLUR_RADIUS};
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
 use crate::render_helpers::xray::{XrayElement, XrayPos};
@@ -204,7 +204,21 @@ impl BackgroundEffect {
         // Use noise/saturation from options, falling back to blur defaults if blurred, and
         // to no effect if not blurred. `blur_config.off` was already folded into `options.blur`.
         let blur = self.options.blur;
-        let blur_options = blur.then_some(BlurOptions::from(self.blur_config));
+        // **GNOME's blur, not niri's.** A window or layer surface that ends up blurred here got
+        // there through `ext-background-effect-v1`, and as of 51 mutter implements that protocol
+        // itself — `BACKGROUND_EFFECT_BLUR_RADIUS` through `clutter_blur`'s separable gaussian
+        // (`src/compositor/meta-surface-actor.c`, `meta-background-effect.c`). So this path runs
+        // the gaussian at GNOME's radius rather than the dual-Kawase inherited from niri, and the
+        // config's `passes`/`offset` no longer reach it. They still drive the xray effect buffer
+        // below and the shell's own chrome, which answer to nobody upstream.
+        //
+        // The radius is logical and multiplied by the output scale here, exactly as mutter does at
+        // paint time (`create_blur_node` takes `radius * view_scale`) — that is what keeps the blur
+        // the same size on screen across monitors of different scale, which the physical-pixel
+        // Kawase offset never did.
+        let blur_recipe = blur.then_some(BlurRecipe::Gaussian {
+            radius: GNOME_CLIENT_BLUR_RADIUS * params.scale,
+        });
         let noise = if blur { self.blur_config.noise } else { 0. };
         let noise = self.options.noise.unwrap_or(noise) as f32;
         let saturation = if blur {
@@ -235,7 +249,7 @@ impl BackgroundEffect {
             // backdrop something a client's own text can sit on. Only here — the shell's chrome
             // paints its own `$system_*` fill over its blur and passes `Finish::NONE`.
             let finish = client_finish(self.options.appearance, noise, saturation);
-            let elem = self.nonxray.render(ns, params, blur_options, finish);
+            let elem = self.nonxray.render(ns, params, blur_recipe, finish);
             push(elem.into());
         }
     }

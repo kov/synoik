@@ -23,6 +23,7 @@ use super::error::VulkanError;
 use super::fence::VkSubmitFence;
 use super::renderer::{transition_image, GpuTimerSlot, VulkanRenderer};
 use super::types::{GlyphRun, VkFramebuffer, VkTexture};
+use crate::render_helpers::blur::BlurRecipe;
 
 /// How many consecutive frames must ask for the same intermediate size before an effect counts as
 /// settled and gets its full-resolution blur back.
@@ -1426,8 +1427,7 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         slot: &mut Option<BackdropBlur>,
         src_region: Rectangle<i32, Physical>,
         size: Size<i32, BufferCoord>,
-        passes: Option<usize>,
-        offset: f32,
+        recipe: Option<BlurRecipe>,
     ) -> Result<(), VulkanError> {
         // A near-fully-clipped effect (edge, or deep overview zoom) can round the intermediate size
         // to zero. `vkCreateImage` with a 0 extent is invalid usage, and a zero-region
@@ -1465,8 +1465,8 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         };
         let moving = still_for < REST_AFTER_STILL_FRAMES;
 
-        let (size, offset) = match passes {
-            Some(_) => {
+        let (size, recipe) = match recipe {
+            Some(recipe) => {
                 // While moving, cap the intermediate's long axis, preserving aspect so the blur
                 // stays as isotropic as the ladder's own slack leaves it. This is what actually
                 // ends the rebuild churn rather than storing it: every rung above the cap collapses
@@ -1502,13 +1502,17 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
                 // the moment the animation settled.
                 let ratio = (f64::from(quantized.w) / f64::from(need.0))
                     * (f64::from(quantized.h) / f64::from(need.1));
-                (quantized, offset * ratio.sqrt() as f32)
+                (quantized, Some(recipe.scaled(ratio.sqrt())))
             }
-            None => (size, offset),
+            None => (size, None),
         };
 
         let dims = (size.w as u32, size.h as u32);
-        let reuse = slot.as_ref().is_some_and(|b| b.matches(dims, passes));
+        // The gaussian's rung count depends on the intermediate it will run over, so the kind is
+        // only knowable once the ladder has picked `dims` — which is also exactly the point at
+        // which the recipe's length has been rescaled to that intermediate's texels.
+        let kind = recipe.map(|r| r.kind(dims.0, dims.1));
+        let reuse = slot.as_ref().is_some_and(|b| b.matches(dims, kind));
         if !reuse {
             // The rung we are leaving goes to the pool rather than to `vkDestroy*`. An animated
             // geometry is almost always a *cyclic* sweep — the overview shrinks each intermediate
@@ -1518,12 +1522,12 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
             if let Some(evicted) = slot.take() {
                 self.renderer.recycle_backdrop_blur(evicted);
             }
-            *slot = match self.renderer.take_backdrop_blur(dims, passes) {
+            *slot = match self.renderer.take_backdrop_blur(dims, kind) {
                 Some(pooled) => Some(pooled),
                 None => {
                     #[cfg(test)]
                     self.renderer.note_backdrop_blur_alloc();
-                    Some(BackdropBlur::new(self.renderer, size, passes)?)
+                    Some(BackdropBlur::new(self.renderer, size, kind)?)
                 }
             };
         }
@@ -1536,7 +1540,9 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // The blur rides the capture's own command buffer, recorded in the gap between the two
         // render passes — no submit of its own, and no flush to make one visible to it.
         self.capture_region(src_region, bb.capture(), |cbuf| {
-            bb.record_blur(cbuf, offset)
+            if let Some(recipe) = recipe {
+                bb.record_blur(cbuf, recipe);
+            }
         })?;
         // The chain's images and the output are read by a submit that has not happened yet (this
         // frame's), so they must outlive it exactly as a queued upload's destination does. The

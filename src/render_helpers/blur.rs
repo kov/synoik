@@ -30,6 +30,89 @@ impl From<synoik_config::Blur> for BlurOptions {
     }
 }
 
+/// GNOME's client-blur strength: `BACKGROUND_EFFECT_BLUR_RADIUS`
+/// (mutter 51 `src/compositor/meta-surface-actor.c`), in **logical** pixels.
+///
+/// It is `2σ`, not σ — `clutter_blur_new` opens with `blur->sigma = radius / 2.0f`
+/// (`clutter/clutter/clutter-blur.c`), which is the same convention
+/// [`BlurRecipe::Gaussian`] carries and the same one `BlurChain::record_gaussian` expects. mutter
+/// multiplies by the stage view's scale at paint time, so the on-screen blur is the same size
+/// whatever the output scale; the caller owes that multiply here too.
+pub const GNOME_CLIENT_BLUR_RADIUS: f64 = 24.0;
+
+/// Which blur to run over a captured backdrop.
+///
+/// Two algorithms, because they answer to two different owners. The shell's own chrome — the panel
+/// plate, the dash pill — keeps niri's dual-Kawase, tuned by hand against the surfaces it draws.
+/// Anything a *client* asked to blur through `ext-background-effect-v1` gets GNOME's separable
+/// gaussian at GNOME's radius, because as of 51 mutter implements that protocol itself and there is
+/// now one right answer to "what does a client that asked for blur get".
+///
+/// The two are not interchangeable at the cache level: the Kawase chain renders its final upsample
+/// straight into the bundle's output (`BlurChain::set_external_dst`) while the gaussian copies out
+/// of level 0, so a bundle built for one cannot serve the other. [`Self::kind`] is what keeps them
+/// apart in the cache key.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BlurRecipe {
+    /// niri's dual-Kawase: `passes` down/up levels, taps `offset` half-texels apart.
+    Kawase { passes: usize, offset: f64 },
+    /// GNOME's separable gaussian. `radius` is `2σ` **in the blurred texture's own pixels**, so a
+    /// caller whose intermediate is not at output resolution owes the conversion — the same debt
+    /// `GaussianBackdrop` documents.
+    Gaussian { radius: f64 },
+}
+
+/// A blur's cache identity: the algorithm plus how many pyramid rungs it needs. Two bundles with
+/// the same [`BlurKind`] and the same intermediate size are interchangeable; two with different
+/// kinds are not, whatever their size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlurKind {
+    Kawase { passes: usize },
+    Gaussian { passes: usize },
+}
+
+impl BlurRecipe {
+    /// The cache identity for running this recipe over a `width`×`height` intermediate.
+    ///
+    /// The gaussian's rung count is a function of the radius *and* the texture, because GNOME's
+    /// cascade keeps halving until the surviving σ is small enough to be cheap — so unlike the
+    /// Kawase's, it cannot be read off the recipe alone.
+    pub fn kind(&self, width: u32, height: u32) -> BlurKind {
+        match *self {
+            Self::Kawase { passes, .. } => BlurKind::Kawase {
+                passes: passes.clamp(1, 31),
+            },
+            Self::Gaussian { radius } => BlurKind::Gaussian {
+                // `.max(1)`: the horizontal pass needs a same-sized twin to land in, and only the
+                // shrinking levels have one. Mirrors `GaussianBackdrop::new`.
+                passes: synoik_vk::blur::downscale_levels(width, height, radius).max(1),
+            },
+        }
+    }
+
+    /// This recipe with its length scaled by `k` — what the intermediate-resolution ladder owes,
+    /// since both parameters are in the intermediate's texels and the intermediate is a *resample*
+    /// of the region rather than a copy of it.
+    pub fn scaled(self, k: f64) -> Self {
+        match self {
+            Self::Kawase { passes, offset } => Self::Kawase {
+                passes,
+                offset: offset * k,
+            },
+            Self::Gaussian { radius } => Self::Gaussian { radius: radius * k },
+        }
+    }
+}
+
+impl From<BlurOptions> for BlurRecipe {
+    fn from(options: BlurOptions) -> Self {
+        Self::Kawase {
+            passes: options.passes as usize,
+            offset: options.offset,
+        }
+    }
+}
+
 /// The postprocess **finish**: what the compositor does to a captured backdrop *after* the blur, to
 /// make it read as a material rather than a smeared photograph.
 ///

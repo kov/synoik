@@ -3775,10 +3775,13 @@ fn vulkan_backdrop_blur_reuses_across_a_size_sweep() {
                 clip: None,
                 scale: 1.0,
             },
-            Some(BlurOptions {
-                passes: 3,
-                offset: 2.0,
-            }),
+            Some(
+                BlurOptions {
+                    passes: 3,
+                    offset: 2.0,
+                }
+                .into(),
+            ),
             crate::render_helpers::blur::Finish::NONE,
         );
         let src = element.src();
@@ -3905,10 +3908,13 @@ fn vulkan_backdrop_blur_pool_prefers_many_small_bundles() {
                     clip: None,
                     scale: 1.0,
                 },
-                Some(BlurOptions {
-                    passes: 3,
-                    offset: 2.0,
-                }),
+                Some(
+                    BlurOptions {
+                        passes: 3,
+                        offset: 2.0,
+                    }
+                    .into(),
+                ),
                 crate::render_helpers::blur::Finish::NONE,
             );
             let src = element.src();

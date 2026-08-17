@@ -1237,7 +1237,7 @@ impl Dash {
                     clip: Some((layout.pill, CornerRadius::from(metrics.pill_radius as f32))),
                     scale,
                 },
-                Some(PILL_BLUR),
+                Some(PILL_BLUR.into()),
                 Finish::NONE,
             )));
         }

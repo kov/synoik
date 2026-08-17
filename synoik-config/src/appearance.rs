@@ -775,11 +775,19 @@ pub struct Blur {
 impl Default for Blur {
     fn default() -> Self {
         Self {
-            off: false,
+            // `passes`/`offset` are the dual-Kawase's, and now reach only the xray effect buffer
+            // and the shell's own chrome — a client-blurred surface runs GNOME's gaussian at
+            // GNOME's radius instead (`render_helpers::blur::GNOME_CLIENT_BLUR_RADIUS`).
             passes: 3,
             offset: 3.,
-            noise: 0.02,
-            saturation: 1.5,
+            off: false,
+            // `BACKGROUND_EFFECT_NOISE` / `BACKGROUND_EFFECT_SATURATION`, mutter 51
+            // `src/compositor/meta-surface-actor.c`. The noise is the same arithmetic on both
+            // sides — `(hash(gl_FragCoord) - 0.5) * noise` — so the constant transfers directly;
+            // the saturation is the same `mix(luma, color, s)` over a marginally different luma
+            // (we weigh Rec.709, clutter Rec.601).
+            noise: 0.015,
+            saturation: 1.25,
         }
     }
 }

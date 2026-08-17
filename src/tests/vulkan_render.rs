@@ -5036,7 +5036,7 @@ fn vulkan_framebuffer_effect_captures_and_blurs_through_the_render_loop() {
     let elem = fbe.render(
         None,
         params,
-        Some(blur),
+        Some(blur.into()),
         crate::render_helpers::blur::Finish::NONE,
     );
 
@@ -5106,7 +5106,7 @@ fn vulkan_a_blurred_frame_adds_no_submits() {
         fbe.render(
             None,
             params,
-            Some(blur),
+            Some(blur.into()),
             crate::render_helpers::blur::Finish::NONE,
         )
     };
@@ -5506,10 +5506,13 @@ fn vulkan_moving_blur_cap_changes_resolution_not_radius() {
                     clip: None,
                     scale: 1.0,
                 },
-                Some(BlurOptions {
-                    passes: 3,
-                    offset: 2.0,
-                }),
+                Some(
+                    BlurOptions {
+                        passes: 3,
+                        offset: 2.0,
+                    }
+                    .into(),
+                ),
                 crate::render_helpers::blur::Finish::NONE,
             );
             let src = element.src();
@@ -5634,10 +5637,13 @@ fn vulkan_a_blurs_shaded_area_is_attributed_to_the_blur() {
             clip: None,
             scale: 1.0,
         },
-        Some(BlurOptions {
-            passes: 3,
-            offset: 2.0,
-        }),
+        Some(
+            BlurOptions {
+                passes: 3,
+                offset: 2.0,
+            }
+            .into(),
+        ),
         crate::render_helpers::blur::Finish::NONE,
     );
     let cache = UserDataMap::new();
@@ -5735,10 +5741,13 @@ fn vulkan_backdrop_blur_softens_a_hard_edge() {
     let element = effect.render(
         None,
         params,
-        Some(BlurOptions {
-            passes: 3,
-            offset: 2.0,
-        }),
+        Some(
+            BlurOptions {
+                passes: 3,
+                offset: 2.0,
+            }
+            .into(),
+        ),
         crate::render_helpers::blur::Finish::NONE,
     );
     let _ = CornerRadius::default();
@@ -5868,10 +5877,13 @@ fn vulkan_backdrop_blur_radius_survives_a_rung_crossing() {
                 clip: None,
                 scale,
             },
-            Some(BlurOptions {
-                passes: 3,
-                offset: 3.0,
-            }),
+            Some(
+                BlurOptions {
+                    passes: 3,
+                    offset: 3.0,
+                }
+                .into(),
+            ),
             crate::render_helpers::blur::Finish::NONE,
         );
         let cache = UserDataMap::new();
@@ -5945,6 +5957,129 @@ fn vulkan_backdrop_blur_radius_survives_a_rung_crossing() {
     );
 }
 
+/// A surface a *client* asked to blur (`ext-background-effect-v1`) runs GNOME's separable gaussian
+/// at GNOME's radius, not the dual-Kawase the shell's own chrome uses — mutter 51 implements that
+/// protocol itself, with `BACKGROUND_EFFECT_BLUR_RADIUS` through `clutter_blur`
+/// (`src/compositor/meta-surface-actor.c`).
+///
+/// Two things could break silently and neither shows up as an error: the chain could be built
+/// without the gaussian pipelines (`record_gaussian` returns early and the "blur" is a copy), or
+/// the radius could stop reaching the shader through the intermediate-ladder rescale. Both leave a
+/// picture, just the wrong one. So measure the blended band across a hard red|green edge at two
+/// radii on the same destination and require it to *track the radius* — a fixed band would pass a
+/// "did it blur" check and fail this one.
+#[test]
+fn vulkan_client_blur_runs_gnomes_gaussian_at_gnomes_radius() {
+    use smithay::backend::renderer::Offscreen;
+    use smithay::utils::user_data::UserDataMap;
+
+    use crate::render_helpers::background_effect::RenderParams;
+    use crate::render_helpers::blur::{BlurRecipe, GNOME_CLIENT_BLUR_RADIUS};
+    use crate::render_helpers::framebuffer_effect::FramebufferEffect;
+    use crate::render_helpers::vulkan::VulkanRenderer as Vk;
+
+    let mut vk = match Vk::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!(
+                "skipping vulkan_client_blur_runs_gnomes_gaussian_at_gnomes_radius: no Vulkan ({e})"
+            );
+            return;
+        }
+    };
+
+    const S: i32 = 512;
+    let size = Size::<i32, Physical>::from((S, S));
+
+    let blend_width = |vk: &mut Vk, radius: f64| -> usize {
+        let mut target = vk
+            .create_buffer(NATIVE_FOURCC, Size::from((S, S)))
+            .expect("create target");
+        let effect = FramebufferEffect::new();
+        let element = effect.render(
+            None,
+            RenderParams {
+                geometry: Rectangle::from_size(Size::from((S as f64, S as f64))),
+                subregion: None,
+                clip: None,
+                scale: 1.0,
+            },
+            Some(BlurRecipe::Gaussian { radius }),
+            crate::render_helpers::blur::Finish::NONE,
+        );
+        let cache = UserDataMap::new();
+        let src = element.src();
+        let dst = element.geometry(Scale::from(1.0));
+        {
+            let mut fb = vk.bind(&mut target).expect("bind");
+            let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
+            frame
+                .draw_solid(
+                    Rectangle::new((0, 0).into(), (S / 2, S).into()),
+                    &[Rectangle::from_size((S / 2, S).into())],
+                    Color32F::from([1., 0., 0., 1.]),
+                )
+                .expect("draw red");
+            frame
+                .draw_solid(
+                    Rectangle::new((S / 2, 0).into(), (S / 2, S).into()),
+                    &[Rectangle::from_size((S / 2, S).into())],
+                    Color32F::from([0., 1., 0., 1.]),
+                )
+                .expect("draw green");
+            RenderElement::<Vk>::capture_framebuffer(&element, &mut frame, src, dst, &cache)
+                .expect("capture_framebuffer");
+            RenderElement::<Vk>::draw(
+                &element,
+                &mut frame,
+                src,
+                dst,
+                &[Rectangle::from_size(size)],
+                &[],
+                Some(&cache),
+            )
+            .expect("draw");
+            let _ = frame.finish().expect("finish");
+        }
+        let fb = vk.bind(&mut target).expect("rebind");
+        let region = Rectangle::<i32, BufferCoord>::from_size(Size::from((S, S)));
+        let mapping = vk
+            .copy_framebuffer(&fb, region, Fourcc::Abgr8888)
+            .expect("copy_framebuffer");
+        let pixels = vk.map_texture(&mapping).expect("map").to_vec();
+        let y = S / 2;
+        (0..S)
+            .filter(|&x| {
+                let p = px(&pixels, S, x, y);
+                p[0].min(p[1]) > 20
+            })
+            .count()
+    };
+
+    // GNOME's own radius at scale 1, and twice it — what the same surface would get on a 2x
+    // output, since the radius is logical and the caller multiplies by the output scale.
+    let narrow = blend_width(&mut vk, GNOME_CLIENT_BLUR_RADIUS);
+    let wide = blend_width(&mut vk, GNOME_CLIENT_BLUR_RADIUS * 2.);
+
+    eprintln!(
+        "vulkan_client_blur_runs_gnomes_gaussian_at_gnomes_radius: \
+         r={GNOME_CLIENT_BLUR_RADIUS} -> {narrow}px, r={} -> {wide}px",
+        GNOME_CLIENT_BLUR_RADIUS * 2.
+    );
+    assert!(
+        narrow > 8,
+        "no blended band at GNOME's own radius ({narrow}px) — the gaussian did not run"
+    );
+    // Doubling sigma doubles the band; allow a generous window, since what is being pinned is that
+    // the radius reaches the shader at all, not the exact falloff of the threshold.
+    let ratio = wide as f64 / narrow as f64;
+    assert!(
+        (1.5..=2.5).contains(&ratio),
+        "the band did not track the radius: {narrow}px at r={GNOME_CLIENT_BLUR_RADIUS} vs \
+         {wide}px at twice that (ratio {ratio:.2}) — the radius is not reaching the gaussian"
+    );
+}
+
 /// The client-blur **finish**: an appearance-aware tint composited over the blurred backdrop, which
 /// is what lets a client's own text sit on it (gap 5, `docs/fork/client-blur.md`). The protocol
 /// hands us a region and nothing else, so both the decision and the values are the compositor's.
@@ -5990,10 +6125,13 @@ fn vulkan_client_blur_finish_tints_by_appearance() {
                 clip: None,
                 scale: 1.0,
             },
-            Some(BlurOptions {
-                passes: 3,
-                offset: 2.0,
-            }),
+            Some(
+                BlurOptions {
+                    passes: 3,
+                    offset: 2.0,
+                }
+                .into(),
+            ),
             finish,
         );
         let cache = UserDataMap::new();
@@ -6109,10 +6247,13 @@ fn vulkan_backdrop_blur_honours_the_subregion() {
     let element = effect.render(
         None,
         params,
-        Some(BlurOptions {
-            passes: 3,
-            offset: 2.0,
-        }),
+        Some(
+            BlurOptions {
+                passes: 3,
+                offset: 2.0,
+            }
+            .into(),
+        ),
         crate::render_helpers::blur::Finish::NONE,
     );
     let cache = UserDataMap::new();
@@ -6668,7 +6809,7 @@ fn vulkan_backdrop_effect_roundtrips_under_rotation() {
                 let element = effect.render(
                     None,
                     params,
-                    blur,
+                    blur.map(Into::into),
                     crate::render_helpers::blur::Finish::NONE,
                 );
                 let cache = UserDataMap::new();

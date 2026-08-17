@@ -1791,7 +1791,7 @@ impl Panel {
                 clip: None,
                 scale,
             },
-            Some(BAR_BLUR),
+            Some(BAR_BLUR.into()),
             Finish::NONE,
         )));
 
