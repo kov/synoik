@@ -206,7 +206,11 @@ asking for a correct EDID makes every guest better.
   (`refresh_changed_identities` included) is not tested: doing that properly needs a VKMS device
   whose connectors and mode lists can be changed from configfs, which is the one piece of coverage
   still missing here. Until then it is verified live, by moving the VM's window between two host
-  displays and unplugging one.
+  displays and unplugging one. Measured 2026-08-17 on a two-display host (a 3840x2160 DELL P2723QE
+  and a 2048x1328 built-in panel, distinct identities): each display kept its own scale across
+  every move and across an unplug/replug, `monitors.xml` held one stanza per display, and one
+  sample caught the connector carrying the *new identity while still advertising the old mode list*
+  — which the compositor followed.
 
 ## 6. VMM-side response (2026-07-30, initial assessment)
 
