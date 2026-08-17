@@ -161,38 +161,32 @@ impl Default for Finish {
     }
 }
 
-/// The client-blur recipe for an appearance — the compositor's answer to a client that asked for
-/// blur and, per the protocol, said nothing else about how it should look.
+/// The client-blur recipe — the compositor's answer to a client that asked for blur and, per the
+/// protocol, said nothing else about how it should look.
 ///
-/// **Why a tint at all.** A blurred backdrop is whatever happened to be behind the window, at
-/// whatever brightness. The client then draws its own text over it in colours it chose for its own
-/// theme, and cannot know what it landed on. Without a wash pulling the backdrop toward the
-/// desktop's appearance, light-mode text over a dark backdrop (or the reverse) is simply
-/// unreadable, and no amount of blur fixes it — this is the whole of what KWin's merged contrast
-/// matrix and every macOS material are for.
+/// **GNOME's answer is "nothing extra".** mutter 51 runs the blur, a saturation boost and a grain,
+/// and stops there (`meta_background_effect_paint_blur_region`); the client's own translucent
+/// surface is composited over the result and owns its own contrast. So this is `saturation` and
+/// `noise` and no more.
 ///
-/// **Why the system appearance is the right signal**, weak as it is: it is the only one we have.
-/// `ext-background-effect-v1` carries a region and nothing else, so unlike macOS — where the app
-/// names a material and therefore its own light/dark intent — we cannot ask the client. A desktop
-/// set to light is overwhelmingly running light apps, so `color-scheme` is the best available
-/// proxy, and it is the same key the shell's own plate already follows.
+/// **What was here before, and why it might come back.** A blurred backdrop is whatever happened to
+/// be behind the window, at whatever brightness, and the client draws its text over it in colours
+/// chosen for its own theme without knowing what it landed on — the argument for a wash pulling the
+/// backdrop toward the desktop's appearance, which is what KWin's merged contrast matrix and every
+/// macOS material do. We shipped one: a 20%-alpha tint keyed on `color-scheme` (the only signal
+/// available, since the protocol carries a region and nothing else) plus a small contrast boost.
+/// That is a real divergence from upstream, deliberately taken, and dropping it is a decision to
+/// re-take by eye rather than a settled question. The `Finish` still carries `tint` and `contrast`,
+/// and `appearance` is still resolved into the effect's options, so re-arming it is one commit.
 ///
-/// The alphas are deliberately modest. A client asking for blur asked to be *seen through*; a wash
-/// heavy enough to guarantee legibility over any backdrop would override the translucency the
-/// client chose, which is the one thing it did get to decide.
+/// `appearance` is unused for the same reason it is still a parameter: what it selects is exactly
+/// what upstream declines to do, and the plumbing that keeps a colour-scheme flip repainting every
+/// blurred surface (`Options::appearance`) is what a restored tint would need.
 pub fn client_finish(appearance: Appearance, noise: f32, saturation: f32) -> Finish {
-    let tint = match appearance {
-        // Pull toward white so a light client's dark text keeps something to sit on.
-        Appearance::Light => [1.0, 1.0, 1.0, 0.20],
-        // Not pure black: GNOME's own dark surfaces are a desaturated near-black
-        // (`$system_bg_color` is `lighten(#222226, 5%)`), and a true black wash reads as a hole
-        // punched in the desktop rather than as a material.
-        Appearance::Dark => [0.09, 0.09, 0.106, 0.20],
-    };
+    let _ = appearance;
     Finish {
         noise,
         saturation,
-        tint,
-        contrast: 0.06,
+        ..Finish::NONE
     }
 }

@@ -6080,17 +6080,23 @@ fn vulkan_client_blur_runs_gnomes_gaussian_at_gnomes_radius() {
     );
 }
 
-/// The client-blur **finish**: an appearance-aware tint composited over the blurred backdrop, which
-/// is what lets a client's own text sit on it (gap 5, `docs/fork/client-blur.md`). The protocol
-/// hands us a region and nothing else, so both the decision and the values are the compositor's.
+/// The client-blur **finish** adds nothing beyond saturation and grain, whatever the desktop's
+/// appearance — mutter 51 runs the blur, the saturation and the noise and stops
+/// (`meta_background_effect_paint_blur_region`), leaving the client's own translucent surface to
+/// own its contrast.
 ///
-/// Three things at once, over a mid-grey backdrop so a wash either way is unambiguous: that the
-/// light recipe lightens, that the dark recipe darkens, and that `Finish::NONE` — what the shell's
-/// own chrome passes, because the panel and dash paint their own `$system_*` fill over the blur —
-/// leaves the backdrop exactly where it was. The last is the regression this feature can cause: a
-/// tint that leaked into the shared path would shift every chrome colour in the theme.
+/// Over a mid-grey backdrop, where a wash either way would be unambiguous: the light arm, the dark
+/// arm and `Finish::NONE` must all land on the same grey. This is the guard on a divergence we
+/// deliberately dropped (gap 5, `docs/fork/client-blur.md`) — it used to assert the opposite, that
+/// the light recipe lightened and the dark one darkened. If the tint is ever re-armed as a
+/// documented divergence, this test flips back with it; what it must never do is drift silently in
+/// either direction.
+///
+/// `Finish::NONE` is checked in the same breath because it is what the shell's own chrome passes —
+/// the panel and dash paint their own `$system_*` fill over the blur — so a tint leaking into the
+/// shared path would shift every chrome colour in the theme.
 #[test]
-fn vulkan_client_blur_finish_tints_by_appearance() {
+fn vulkan_client_blur_finish_adds_no_wash() {
     use smithay::backend::renderer::Offscreen;
     use smithay::utils::user_data::UserDataMap;
 
@@ -6103,7 +6109,7 @@ fn vulkan_client_blur_finish_tints_by_appearance() {
     let mut vk = match Vk::new() {
         Ok(vk) => vk,
         Err(e) => {
-            eprintln!("skipping vulkan_client_blur_finish_tints_by_appearance: no Vulkan ({e})");
+            eprintln!("skipping vulkan_client_blur_finish_adds_no_wash: no Vulkan ({e})");
             return;
         }
     };
@@ -6171,13 +6177,13 @@ fn vulkan_client_blur_finish_tints_by_appearance() {
     };
 
     // `client_finish`'s own noise/saturation arguments are held at identity so the only thing
-    // moving between the three arms is the tint and its contrast.
+    // that could move between the three arms is a wash — which is the whole point: none does.
     let plain = render_with(&mut vk, Finish::NONE);
     let light = render_with(&mut vk, client_finish(Appearance::Light, 0., 1.));
     let dark = render_with(&mut vk, client_finish(Appearance::Dark, 0., 1.));
 
     eprintln!(
-        "vulkan_client_blur_finish_tints_by_appearance: none={plain:?} light={light:?} dark={dark:?}"
+        "vulkan_client_blur_finish_adds_no_wash: none={plain:?} light={light:?} dark={dark:?}"
     );
 
     // A blurred flat grey is that same grey: the untinted arm is the reference point.
@@ -6186,14 +6192,17 @@ fn vulkan_client_blur_finish_tints_by_appearance() {
         "an untouched blur of flat mid-grey should come back mid-grey, got {plain:?} — \
          `Finish::NONE` is not the identity, which means the shell chrome moved too"
     );
+    // Both appearance arms must be indistinguishable from the untinted one. A margin of 2 is
+    // rounding through the intermediate, not a wash: the tint this replaced moved the same pixel by
+    // 25 levels.
     assert!(
-        light[0] > plain[0] + 10,
-        "the light recipe must lighten the backdrop so a light client's dark text has something \
-         to sit on: none={plain:?} light={light:?}"
+        light[0].abs_diff(plain[0]) <= 2,
+        "the light recipe must add no wash — GNOME's client blur is saturation and grain only: \
+         none={plain:?} light={light:?}"
     );
     assert!(
-        dark[0] + 10 < plain[0],
-        "the dark recipe must darken it: none={plain:?} dark={dark:?}"
+        dark[0].abs_diff(plain[0]) <= 2,
+        "the dark recipe must add no wash either: none={plain:?} dark={dark:?}"
     );
 }
 
