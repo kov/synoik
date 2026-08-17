@@ -349,9 +349,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Default-sink volume/mute for the panel indicator + QS slider, from PipeWire.
     // The connection's loop is driven on the compositor's calloop; skip in headless
-    // (IPC-only) runs. The watcher connects (and reconnects, across daemon restarts) on its own.
+    // (IPC-only) runs unless asked for, since a headless harness with its own PipeWire daemon is
+    // the only way to exercise this against a live daemon. The watcher connects — and reconnects,
+    // across daemon restarts — on its own.
     #[cfg(feature = "pipewire")]
-    if !cli.headless {
+    if !cli.headless || state.synoik.config.borrow().debug.audio_in_headless {
         let pw = synoik::pipewire_audio::start(&event_loop.handle());
         state.synoik.audio_backend = Some(Box::new(pw));
     }

@@ -29,6 +29,9 @@ pub struct Debug {
     pub honor_xdg_activation_with_invalid_serial: bool,
     pub deactivate_unfocused_windows: bool,
     pub skip_cursor_only_updates_during_vrr: bool,
+    /// Connect the PipeWire audio watcher in `--headless` runs, which normally skip it. The only
+    /// way to exercise the volume path against a live daemon without a seat.
+    pub audio_in_headless: bool,
 }
 
 impl Debug {
@@ -106,6 +109,7 @@ impl Debug {
             skip_cursor_only_updates_during_vrr: flag(
                 "SYNOIK_DEBUG_SKIP_CURSOR_ONLY_UPDATES_DURING_VRR",
             ),
+            audio_in_headless: flag("SYNOIK_DEBUG_AUDIO_IN_HEADLESS"),
         }
     }
 }
@@ -131,6 +135,7 @@ pub struct DebugPart {
     pub honor_xdg_activation_with_invalid_serial: Option<Flag>,
     pub deactivate_unfocused_windows: Option<Flag>,
     pub skip_cursor_only_updates_during_vrr: Option<Flag>,
+    pub audio_in_headless: Option<Flag>,
 }
 
 impl MergeWith<DebugPart> for Debug {
@@ -153,6 +158,7 @@ impl MergeWith<DebugPart> for Debug {
             honor_xdg_activation_with_invalid_serial,
             deactivate_unfocused_windows,
             skip_cursor_only_updates_during_vrr,
+            audio_in_headless,
         );
 
         merge_clone_opt!((self, part), preview_render, render_drm_device);

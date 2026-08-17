@@ -178,6 +178,9 @@ struct Inner {
     /// Set by the core `error` listener when the daemon connection dies; drained by the calloop
     /// source, which then tears down and schedules a reconnect.
     lost: bool,
+    /// Whether a reconnect is in flight, so the retry loop logs once per outage, not once a
+    /// second.
+    retrying: bool,
     /// Known `Audio/Sink` nodes by PipeWire global id.
     sinks: HashMap<u32, TrackedNode>,
     /// Known `Audio/Device` cards by global id, with their routes.
@@ -449,9 +452,20 @@ fn connect(
     inner: &Rc<RefCell<Inner>>,
 ) {
     match try_connect(loop_handle, conn_cell, inner) {
-        Ok(conn) => *conn_cell.borrow_mut() = Some(conn),
+        Ok(conn) => {
+            if inner.borrow().retrying {
+                info!("pipewire audio reconnected");
+            }
+            inner.borrow_mut().retrying = false;
+            *conn_cell.borrow_mut() = Some(conn);
+        }
         Err(err) => {
-            warn!("pipewire audio connection failed, retrying: {err:?}");
+            // Once per outage, not once per second: a daemon that stays down would otherwise
+            // bury the log line that says *why* under its own retries.
+            if !inner.borrow().retrying {
+                warn!("pipewire audio connection failed, retrying every second: {err:?}");
+            }
+            inner.borrow_mut().retrying = true;
             schedule_reconnect(loop_handle, conn_cell, inner);
         }
     }
@@ -513,6 +527,9 @@ fn try_connect(
                 let lost = inner.borrow().lost;
                 if lost {
                     inner.borrow_mut().reset_for_disconnect();
+                    // So the recovery logs even when the daemon is back before the first retry —
+                    // an `error` line with no resolution after it reads as a permanent failure.
+                    inner.borrow_mut().retrying = true;
                     if let Some(mut conn) = conn_cell.borrow_mut().take() {
                         // We are that source; returning `Remove` below unregisters it.
                         conn.token = None;
