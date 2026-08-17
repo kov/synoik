@@ -134,20 +134,39 @@ Two things the panel's shape now fixes in place, worth knowing before touching i
    at all, which is what stops the Window button lighting up and advertising a mode it refuses to
    enter.
 
+## The capture rect is derived from the type, never stored
+
+`Open::area` is always the rectangle the user dragged, in output-local physical coordinates. What a
+capture acts on is `capture_corners(type, area, output_size)`: the area in Selection mode, the whole
+output in Screen mode. Window mode has no rectangle at all — it crops the selected window's own
+frozen buffer — so the two callers that would care settle Window before asking.
+
+This is GNOME's split: `_areaSelector` keeps its own geometry while Screen mode draws
+`_screenSelectors`, a different widget (`js/ui/screenshot.js:1780-1800`). Four consequences worth
+keeping in mind when touching this:
+
+- `set_capture_type` is one field assignment plus a rebake. No mode has to move another's rectangle
+  out of the way, so there is no stash to keep in sync and no ordering between "set the type" and
+  "fix up the geometry".
+- `update_buffers` clamps the **area** back into bounds when an output shrinks, and derives the
+  chrome geometry separately. Writing a derived rect back into `area` is the aliasing this design
+  removes; don't reintroduce it.
+- `move_to_output` carries the area across proportionally in every mode, so it arrives in the new
+  output's coordinate space. Pinned by `moving_output_in_screen_mode_carries_the_area`, which uses
+  differently-sized outputs on purpose — on equal ones, carrying and not carrying agree.
+- `Closed::last_selection` is the area, so what a close remembers is what was dragged regardless of
+  what the picker was capturing at the time.
+
 ## Approved divergence: a fresh picker opens on Screen
 
 GNOME checks the area button as it builds the type row (`js/ui/screenshot.js:1305-1312`), so a
 first-ever picker will not capture anything until you drag a rectangle. Grabbing the whole output is
-the commoner errand, so ours opens on Screen with the output already selected; Selection is one
-click (or `s`) away and still remembers its rectangle across a close.
+the commoner errand, so ours opens on Screen; Selection is one click (or `s`) away and still holds
+its rectangle across a close. `ScreenshotUi::new` names that type, which is why `CaptureType` has no
+`Default` — nothing else needs to pick one. Pinned by `a_first_picker_opens_on_screen`.
 
-The subtlety is in `ScreenshotUi::open`: the type it *lands* on and the type the open path *starts*
-from are different answers, so `CaptureType` has no `Default`. `open` builds the `Open` state at
-`Selection` — the only type whose meaning is "`selection` is the dragged area" — and then calls
-`set_capture_type(remembered_type)`, which is what widens the selection for Screen and stashes the
-area in `saved_area`. Starting the state at `Screen` instead would make that call a no-op, and the
-picker would claim Screen while the selection was still the default centre-half rect: a "whole
-screen" capture of a quarter of the display. Pinned by `a_first_picker_opens_on_screen`.
+Restoring a remembered type is a plain assignment in `open`, with GNOME's one guard: `Window` with
+nothing left to pick falls back to `Selection` (`js/ui/screenshot.js:1662-1664`).
 
 ## Approved divergence: delayed capture
 

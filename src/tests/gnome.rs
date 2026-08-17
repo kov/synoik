@@ -21732,10 +21732,9 @@ fn pressing_outside_the_selection_still_starts_a_new_one() {
 
 /// A trip through Screen mode must not destroy the rectangle you dragged.
 ///
-/// Ours reuses `selection` for Screen mode — it widens it to the whole output so the capture path
-/// needs no special case — which quietly overwrote the area. Nothing can do that in GNOME:
-/// `_areaSelector` keeps its own geometry and Screen mode draws `_screenSelectors`, a different
-/// widget entirely (`js/ui/screenshot.js:1780-1800`).
+/// The area is stored and the capture rect derived from the type, so Screen mode has nothing to
+/// overwrite — the same separation GNOME gets from `_areaSelector` keeping its own geometry while
+/// Screen mode draws `_screenSelectors`, a different widget (`js/ui/screenshot.js:1780-1800`).
 #[test]
 fn the_area_selection_survives_a_trip_through_screen_mode() {
     use smithay::utils::{Point, Rectangle, Size};
@@ -21791,8 +21790,8 @@ fn a_first_picker_opens_on_screen() {
     assert_eq!(
         selection_of(&mut f),
         Rectangle::new(Point::from((0, 0)), Size::from((1920, 1080))),
-        "Screen at open must widen the selection, not merely claim the mode — a picker that says \
-         Screen while the selection is still the default centre rect captures a quarter of the \
+        "the capture rect at open must be the whole output, not merely the mode label — a picker \
+         that says Screen while the rect is still the default centre one captures a quarter of the \
          display"
     );
 
@@ -21804,6 +21803,60 @@ fn a_first_picker_opens_on_screen() {
     assert!(
         sel.size.w > 0 && sel.size.h > 0 && sel.size.w < 1920,
         "Selection must come back to a draggable rectangle, not the whole output: {sel:?}"
+    );
+}
+
+/// Moving to another output in Screen mode carries the area into its coordinate space.
+///
+/// The area is what a later switch to Selection hands back, so it has to travel with the capture
+/// and be rescaled on the way. Left behind in the old output's coordinates it lands out of bounds
+/// on a smaller monitor, and the bounds check then throws the user's rectangle away for a default
+/// one — the drag lost to a monitor change, with nothing to say so.
+///
+/// Deliberately sized 1920x1080 → 800x600: on equal outputs, carrying the area and leaving it
+/// behind produce the same numbers, and this would pass either way.
+#[test]
+fn moving_output_in_screen_mode_carries_the_area() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use crate::ui::screenshot_ui::CaptureType;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.add_output(2, (800, 600));
+    open_picker_headless_in_selection(&mut f);
+
+    // Down in the bottom-right, so the same numbers fall off the smaller output entirely.
+    drag_selection(&mut f, (1500, 900), (1899, 1019));
+    let one = f.synoik_output(1);
+    let two = f.synoik_output(2);
+    assert_eq!(f.synoik().screenshot_ui.selection_output(), Some(&one));
+
+    f.synoik()
+        .screenshot_ui
+        .set_capture_type(CaptureType::Screen);
+    f.synoik().screenshot_ui.move_to_output(two.clone());
+    assert_eq!(
+        f.synoik().screenshot_ui.selection_output(),
+        Some(&two),
+        "Screen mode must follow the move"
+    );
+    assert_eq!(
+        selection_of(&mut f).size,
+        Size::from((800, 600)),
+        "and still capture the whole of it"
+    );
+
+    // Switching back hands over the same rectangle, proportionally placed on the new output and
+    // clamped to fit — not the default it would be reset to if it had arrived out of bounds.
+    f.synoik()
+        .screenshot_ui
+        .set_capture_type(CaptureType::Selection);
+    let two_loc = f.synoik().global_space.output_geometry(&two).unwrap().loc;
+    assert_eq!(
+        selection_of(&mut f),
+        Rectangle::new(two_loc + Point::from((400, 480)), Size::from((400, 120))),
+        "the dragged rectangle must survive the move, rescaled onto the new output"
     );
 }
 

@@ -124,7 +124,14 @@ pub enum ScreenshotUi {
         config: Rc<RefCell<Config>>,
     },
     Open {
-        selection: (Output, Point<i32, Physical>, Point<i32, Physical>),
+        /// The output being captured, and the rectangle dragged out on it as two corner points.
+        ///
+        /// Always the *dragged* rectangle, whatever the capture type: what a capture acts on is
+        /// [`capture_corners`], derived from the type. Screen mode therefore cannot destroy the
+        /// area, and there is nothing to stash or hand back when the type changes — the same
+        /// separation GNOME gets from `_areaSelector` keeping its own geometry while Screen mode
+        /// draws `_screenSelectors`, a different widget (`js/ui/screenshot.js:1780-1800`).
+        area: (Output, Point<i32, Physical>, Point<i32, Physical>),
         output_data: HashMap<Output, OutputData>,
         button: Button,
         show_pointer: bool,
@@ -146,14 +153,6 @@ pub enum ScreenshotUi {
         hovered_window: Option<(Output, u64)>,
         /// What the pointer should look like where it currently is. See [`Self::cursor_icon`].
         cursor: CursorIcon,
-        /// The area rectangle put aside while another capture type borrows `selection`.
-        ///
-        /// Screen mode widens `selection` to the whole output so the capture path needs no special
-        /// case, which would otherwise *destroy* the rectangle the user dragged. In GNOME nothing
-        /// can: `_areaSelector` keeps its own geometry and Screen mode draws a different widget
-        /// entirely (`_screenSelectors`), so a trip through Screen and back leaves the area
-        /// exactly where it was.
-        saved_area: Option<(Point<i32, Physical>, Point<i32, Physical>)>,
         /// The pending or showing tooltip, if the pointer has settled on a control.
         tooltip: Option<TooltipState>,
         /// The control under the pointer, on the **selection output's** panel.
@@ -761,8 +760,8 @@ impl ScreenshotUi {
         let last_selection = last_selection
             .take()
             .and_then(|(weak, sel)| weak.upgrade().map(|output| (output, sel)));
-        let selection = match last_selection {
-            Some(selection) if screenshots.contains_key(&selection.0) => selection,
+        let area = match last_selection {
+            Some(area) if screenshots.contains_key(&area.0) => area,
             _ => {
                 let output = default_output;
                 let output_transform = output.current_transform();
@@ -778,10 +777,10 @@ impl ScreenshotUi {
             }
         };
 
-        let selection = (
-            selection.0,
-            selection.1.loc,
-            selection.1.loc + selection.1.size - Size::from((1, 1)),
+        let area = (
+            area.0,
+            area.1.loc,
+            area.1.loc + area.1.size - Size::from((1, 1)),
         );
 
         let output_data: HashMap<Output, OutputData> = screenshots
@@ -857,21 +856,28 @@ impl ScreenshotUi {
             Animation::new(clock.clone(), 0., 1., 0., c.animations.screenshot_ui_open.0)
         };
 
+        // GNOME's guard is at open, not at close: `_syncWindowButtonSensitivity` is followed by
+        // `if (!this._windowButton.reactive) this._selectionButton.checked = true`
+        // (`js/ui/screenshot.js:1662-1664`). A remembered Window mode with nothing left to pick
+        // would otherwise arm an insensitive button over an empty selector.
+        let no_windows = output_data.values().all(|d| d.windows.is_empty());
+        let capture_type = if remembered_type == CaptureType::Window && no_windows {
+            CaptureType::Selection
+        } else {
+            remembered_type
+        };
+
         *self = Self::Open {
-            selection,
+            area,
             output_data,
             button: Button::Up,
             show_pointer,
             delay: 0,
             mode: CaptureMode::default(),
-            // Not the remembered type: `selection` above is still the *area*, so the state has to
-            // start in the one type that means "selection is the area" and let
-            // `set_capture_type(remembered_type)` below do the widening and the stashing.
-            capture_type: CaptureType::Selection,
+            capture_type,
             selected_window,
             hovered_window: None,
             cursor: CursorIcon::Crosshair,
-            saved_area: None,
             tooltip: None,
             hover: None,
             open_anim,
@@ -882,19 +888,12 @@ impl ScreenshotUi {
 
         self.update_buffers();
 
-        // Applied after the state exists so the restore goes through the same door a click does:
-        // Screen has to widen the selection and put the area aside, and Window has to decline when
-        // there is nothing to pick. `set_capture_type` is a no-op for `Selection`, which is the
-        // common case, so the usual open still bakes once.
-        self.set_capture_type(remembered_type);
-
         true
     }
 
     pub fn close(&mut self) -> bool {
         let Self::Open {
-            selection,
-            saved_area,
+            area,
             show_pointer,
             capture_type,
             clock,
@@ -905,15 +904,9 @@ impl ScreenshotUi {
             return false;
         };
 
-        // Screen and Window mode borrow `selection`, so what the user dragged is in `saved_area`.
-        // Remembering `selection` regardless would hand the next open a whole-output rectangle and
-        // silently eat the area — in GNOME the area selector is a separate widget that Screen mode
-        // never touches at all.
-        let area = saved_area.unwrap_or((selection.1, selection.2));
-        let last_selection = Some((
-            selection.0.downgrade(),
-            rect_from_corner_points(area.0, area.1),
-        ));
+        // `area` is the dragged rectangle in every mode, so the next open gets it back whatever
+        // this one was capturing.
+        let last_selection = Some((area.0.downgrade(), rect_from_corner_points(area.1, area.2)));
 
         *self = Self::Closed {
             last_selection,
@@ -950,18 +943,12 @@ impl ScreenshotUi {
 
     /// Switch what the capture button will act on.
     ///
-    /// `Screen` takes the whole output as the selection, so the shade collapses and the ordinary
-    /// capture path needs no special case — the rect it crops is simply the full frame.
+    /// One assignment: what each type captures is derived from it ([`capture_corners`]), so no mode
+    /// has to move the area out of another's way. The rebake is for the chrome — `Screen` collapses
+    /// the shade and drops the handles.
     pub fn set_capture_type(&mut self, ty: CaptureType) {
         let window_enabled = self.window_enabled();
-        let Self::Open {
-            capture_type,
-            selection,
-            output_data,
-            saved_area,
-            ..
-        } = self
-        else {
+        let Self::Open { capture_type, .. } = self else {
             return;
         };
 
@@ -973,23 +960,7 @@ impl ScreenshotUi {
             return;
         }
 
-        // Leaving Selection puts the area aside; returning brings it back.
-        if *capture_type == CaptureType::Selection {
-            *saved_area = Some((selection.1, selection.2));
-        } else if ty == CaptureType::Selection {
-            if let Some((a, b)) = saved_area.take() {
-                selection.1 = a;
-                selection.2 = b;
-            }
-        }
         *capture_type = ty;
-
-        if ty == CaptureType::Screen {
-            let size = output_data[&selection.0].size;
-            selection.1 = Point::from((0, 0));
-            selection.2 = Point::from((size.w - 1, size.h - 1));
-        }
-
         self.update_buffers();
     }
 
@@ -1109,7 +1080,7 @@ impl ScreenshotUi {
     /// is free to move during the delay, and shooting where it *was* is not what was asked for.
     pub fn pending_target(&self) -> Option<(Output, PendingTarget)> {
         let Self::Open {
-            selection,
+            area,
             output_data,
             capture_type,
             ..
@@ -1123,13 +1094,12 @@ impl ScreenshotUi {
             return Some((output.clone(), PendingTarget::Window(id)));
         }
 
-        // Screen mode has already widened the selection to the whole output, so both modes are the
-        // same crop here.
-        let (output, a, b) = selection;
-        output_data.get(output)?;
+        let (output, a, b) = area;
+        let size = output_data.get(output)?.size;
+        let (a, b) = capture_corners(*capture_type, (*a, *b), size);
         Some((
             output.clone(),
-            PendingTarget::Area(rect_from_corner_points(*a, *b)),
+            PendingTarget::Area(rect_from_corner_points(a, b)),
         ))
     }
 
@@ -1155,7 +1125,7 @@ impl ScreenshotUi {
 
     pub fn set_space_down(&mut self, down: bool) {
         if let Self::Open {
-            selection,
+            area,
             button: Button::Down { grab, last_pos, .. },
             ..
         } = self
@@ -1165,7 +1135,7 @@ impl ScreenshotUi {
                 // turning that into a move mid-gesture would abandon it silently.
                 if matches!(grab, Grab::New) {
                     *grab = Grab::Move(MoveState {
-                        pointer_offset: last_pos.1 - selection.1,
+                        pointer_offset: last_pos.1 - area.1,
                         touch_slot: None,
                     });
                 }
@@ -1184,10 +1154,11 @@ impl ScreenshotUi {
 
     pub fn move_left(&mut self) {
         let Self::Open {
-            selection: (output, a, b),
+            area: (output, a, b),
             output_data,
-            // Screen mode's selection *is* the output; nudging or resizing it would silently
-            // make the panel lie about what the capture button will take.
+            // Only the area is nudgeable, and only Selection mode shows it. Screen and Window
+            // capture something else entirely, so a keypress here would move a rectangle the user
+            // cannot see and is not about to get.
             capture_type: CaptureType::Selection,
             ..
         } = self
@@ -1207,10 +1178,11 @@ impl ScreenshotUi {
 
     pub fn move_right(&mut self) {
         let Self::Open {
-            selection: (output, a, b),
+            area: (output, a, b),
             output_data,
-            // Screen mode's selection *is* the output; nudging or resizing it would silently
-            // make the panel lie about what the capture button will take.
+            // Only the area is nudgeable, and only Selection mode shows it. Screen and Window
+            // capture something else entirely, so a keypress here would move a rectangle the user
+            // cannot see and is not about to get.
             capture_type: CaptureType::Selection,
             ..
         } = self
@@ -1230,10 +1202,11 @@ impl ScreenshotUi {
 
     pub fn move_up(&mut self) {
         let Self::Open {
-            selection: (output, a, b),
+            area: (output, a, b),
             output_data,
-            // Screen mode's selection *is* the output; nudging or resizing it would silently
-            // make the panel lie about what the capture button will take.
+            // Only the area is nudgeable, and only Selection mode shows it. Screen and Window
+            // capture something else entirely, so a keypress here would move a rectangle the user
+            // cannot see and is not about to get.
             capture_type: CaptureType::Selection,
             ..
         } = self
@@ -1253,10 +1226,11 @@ impl ScreenshotUi {
 
     pub fn move_down(&mut self) {
         let Self::Open {
-            selection: (output, a, b),
+            area: (output, a, b),
             output_data,
-            // Screen mode's selection *is* the output; nudging or resizing it would silently
-            // make the panel lie about what the capture button will take.
+            // Only the area is nudgeable, and only Selection mode shows it. Screen and Window
+            // capture something else entirely, so a keypress here would move a rectangle the user
+            // cannot see and is not about to get.
             capture_type: CaptureType::Selection,
             ..
         } = self
@@ -1274,24 +1248,25 @@ impl ScreenshotUi {
         self.update_buffers();
     }
 
-    /// Moves the screenshot selection to a different output.
+    /// Moves the capture to a different output.
     ///
     /// This preserves the relative position while keeping logical size. It is (intentionally) very
     /// similar to how floating windows move across monitors, but with one difference: floating
-    /// windows can go partially outside the view, while the screenshot selection cannot. So, we
+    /// windows can go partially outside the view, while the screenshot area cannot. So, we
     /// clamp it to new output bounds, trying to preserve the size if possible.
+    ///
+    /// Screen mode needs no special case: it takes whichever output the area is on, so carrying the
+    /// area across is both the move and — once it is in the new output's coordinates — what
+    /// switching back to Selection hands the user.
     pub fn move_to_output(&mut self, new_output: Output) {
         let Self::Open {
-            selection,
-            output_data,
-            capture_type,
-            ..
+            area, output_data, ..
         } = self
         else {
             return;
         };
 
-        let (current_output, current_a, current_b) = selection;
+        let (current_output, current_a, current_b) = area;
 
         if current_output == &new_output {
             return;
@@ -1300,19 +1275,6 @@ impl ScreenshotUi {
         let Some(target_data) = output_data.get(&new_output) else {
             return;
         };
-
-        // Screen mode selects the whole output, so moving means taking all of the new one — not
-        // carrying a proportional rect across.
-        if *capture_type == CaptureType::Screen {
-            let size = target_data.size;
-            *selection = (
-                new_output,
-                Point::from((0, 0)),
-                Point::from((size.w - 1, size.h - 1)),
-            );
-            self.update_buffers();
-            return;
-        }
 
         let current_data = &output_data[current_output];
 
@@ -1348,7 +1310,7 @@ impl ScreenshotUi {
             Size::from((new_width, new_height)),
         );
 
-        *selection = (
+        *area = (
             new_output,
             new_rect.loc,
             new_rect.loc + new_rect.size - Size::from((1, 1)),
@@ -1359,10 +1321,11 @@ impl ScreenshotUi {
 
     pub fn set_width(&mut self, change: SizeChange) {
         let Self::Open {
-            selection: (output, a, b),
+            area: (output, a, b),
             output_data,
-            // Screen mode's selection *is* the output; nudging or resizing it would silently
-            // make the panel lie about what the capture button will take.
+            // Only the area is nudgeable, and only Selection mode shows it. Screen and Window
+            // capture something else entirely, so a keypress here would move a rectangle the user
+            // cannot see and is not about to get.
             capture_type: CaptureType::Selection,
             ..
         } = self
@@ -1400,10 +1363,11 @@ impl ScreenshotUi {
 
     pub fn set_height(&mut self, change: SizeChange) {
         let Self::Open {
-            selection: (output, a, b),
+            area: (output, a, b),
             output_data,
-            // Screen mode's selection *is* the output; nudging or resizing it would silently
-            // make the panel lie about what the capture button will take.
+            // Only the area is nudgeable, and only Selection mode shows it. Screen and Window
+            // capture something else entirely, so a keypress here would move a rectangle the user
+            // cannot see and is not about to get.
             capture_type: CaptureType::Selection,
             ..
         } = self
@@ -1479,16 +1443,17 @@ impl ScreenshotUi {
 
     fn update_buffers(&mut self) {
         let Self::Open {
-            selection,
+            area,
             output_data,
+            capture_type,
             ..
         } = self
         else {
             panic!("screenshot UI must be open to update buffers");
         };
 
-        let (selection_output, a, b) = selection;
-        let mut rect = rect_from_corner_points(*a, *b);
+        let capture_type = *capture_type;
+        let (area_output, a, b) = area;
 
         for (output, data) in output_data {
             let buffers = &mut data.buffers;
@@ -1496,16 +1461,24 @@ impl ScreenshotUi {
             let size = data.size;
             let scale = data.scale;
 
-            if output == selection_output {
-                // Check if the selection is still valid. If not, reset it back to default.
-                if !Rectangle::from_size(size).contains_rect(rect) {
-                    rect = Rectangle::new(
+            if output == area_output {
+                // An output that shrank can leave the *area* out of bounds; reset it to the default
+                // rectangle if so. Only the area is written back — the drawn rect is derived below,
+                // and storing Screen's whole-output rect here would be the aliasing this design
+                // exists to avoid.
+                if !Rectangle::from_size(size).contains_rect(rect_from_corner_points(*a, *b)) {
+                    let reset = Rectangle::new(
                         Point::from((size.w / 4, size.h / 4)),
                         Size::from((size.w / 2, size.h / 2)),
                     );
-                    *a = rect.loc;
-                    *b = rect.loc + rect.size - Size::from((1, 1));
+                    *a = reset.loc;
+                    *b = reset.loc + reset.size - Size::from((1, 1));
                 }
+
+                // The chrome frames what the capture will take, not what was dragged: in Screen
+                // mode the border goes round the whole output and the four shades collapse.
+                let (ca, cb) = capture_corners(capture_type, (*a, *b), size);
+                let rect = rect_from_corner_points(ca, cb);
 
                 let border = to_physical_precise_round(scale, SELECTION_BORDER);
 
@@ -1596,7 +1569,7 @@ impl ScreenshotUi {
         let _span = tracy_client::span!("ScreenshotUi::render_output");
 
         let Self::Open {
-            selection,
+            area,
             output_data,
             show_pointer,
             delay,
@@ -1623,7 +1596,7 @@ impl ScreenshotUi {
 
         // Hover only ever tracks the selection output (see the `hover` field), so a second output's
         // panel draws at rest.
-        let hover = if output == &selection.0 { *hover } else { None };
+        let hover = if output == &area.0 { *hover } else { None };
         let state = PanelState {
             capture_type: *capture_type,
             window_enabled: self.window_enabled(),
@@ -1650,7 +1623,7 @@ impl ScreenshotUi {
             // Earlier-pushed elements are composited on top (the screenshot goes last), so the
             // glyphs are pushed before the panel they sit on, and the shadow after it. The tooltip
             // goes first of all: GNOME parents it to the root so it draws over the panel.
-            if output == &selection.0 {
+            if output == &area.0 {
                 if let Some(tip) = tooltip {
                     // Nothing until the delay elapses; then it fades in.
                     if let Some(fade) = &tip.fade {
@@ -1688,11 +1661,11 @@ impl ScreenshotUi {
                 .map(|(_, id)| *id);
             output_data.push_window_selector(renderer, accent, progress, selected, hovered, push);
         } else {
-            // The four corner handles ride above the border, and only on the output that owns the
-            // selection — the others draw the shade alone. Screen mode has no handles: the
-            // selection is the whole output, and nothing about it is draggable.
-            if output == &selection.0 && *capture_type == CaptureType::Selection {
-                let rect = rect_from_corner_points(selection.1, selection.2);
+            // The four corner handles ride above the border, and only on the output being captured
+            // — the others draw the shade alone. Screen mode has no handles: it takes the whole
+            // output, and nothing about that is draggable.
+            if output == &area.0 && *capture_type == CaptureType::Selection {
+                let rect = rect_from_corner_points(area.1, area.2);
                 output_data.push_handles(renderer, rect, progress, push);
             }
 
@@ -1736,7 +1709,7 @@ impl ScreenshotUi {
         let _span = tracy_client::span!("ScreenshotUi::capture_from_neutral");
 
         let Self::Open {
-            selection,
+            area,
             output_data,
             show_pointer,
             capture_type,
@@ -1750,14 +1723,15 @@ impl ScreenshotUi {
             return self.capture_window_from_neutral();
         }
 
-        let data = &output_data[&selection.0];
+        let data = &output_data[&area.0];
         let OutputScreenshot {
             screen,
             pointer: screenshot_pointer,
             ..
         } = &data.screenshot[0];
 
-        let rect = rect_from_corner_points(selection.1, selection.2);
+        let (a, b) = capture_corners(*capture_type, (area.1, area.2), data.size);
+        let rect = rect_from_corner_points(a, b);
 
         // The pointer neutral carries its top-left in logical output coordinates; map it back to
         // the physical space the frozen screen (and the selection rect) live in.
@@ -1833,17 +1807,20 @@ impl ScreenshotUi {
     /// works in and is not it.
     pub fn selection_rect_global(&self) -> Option<Rectangle<i32, Logical>> {
         let Self::Open {
-            selection,
+            area,
             output_data,
+            capture_type,
             ..
         } = self
         else {
             return None;
         };
 
-        let (output, a, b) = selection;
-        let rect = rect_from_corner_points(*a, *b);
-        let scale = output_data.get(output)?.scale;
+        let (output, a, b) = area;
+        let data = output_data.get(output)?;
+        let (a, b) = capture_corners(*capture_type, (*a, *b), data.size);
+        let rect = rect_from_corner_points(a, b);
+        let scale = data.scale;
         let logical = rect.to_f64().to_logical(scale);
         let loc = output.current_location();
 
@@ -1858,7 +1835,7 @@ impl ScreenshotUi {
 
     pub fn selection_output(&self) -> Option<&Output> {
         if let Self::Open {
-            selection: (output, _, _),
+            area: (output, _, _),
             ..
         } = self
         {
@@ -1885,7 +1862,7 @@ impl ScreenshotUi {
         let hover_changed = self.update_hover(point);
 
         let Self::Open {
-            selection,
+            area,
             output_data,
             capture_type,
             cursor,
@@ -1909,30 +1886,30 @@ impl ScreenshotUi {
         let previous = last_pos.1;
         last_pos.1 = point;
 
-        // A press that landed on a control drags nothing, and Screen mode has no selection to drag.
+        // A press that landed on a control drags nothing, and only Selection mode draws a
+        // rectangle to drag.
         if on_control.is_some() || *capture_type != CaptureType::Selection {
             return hover_changed;
         }
 
-        let size = output_data[&selection.0].size;
+        let size = output_data[&area.0].size;
         match grab {
             Grab::New => {
-                selection.2 =
-                    Point::new(point.x.clamp(0, size.w - 1), point.y.clamp(0, size.h - 1));
+                area.2 = Point::new(point.x.clamp(0, size.w - 1), point.y.clamp(0, size.h - 1));
             }
             Grab::Move(state) => {
                 // The offset model *is* GNOME's rubberbanding (`:610-640`): it tracks the pointer's
                 // absolute position, so pushing into an edge clamps and coming back off it moves
                 // again immediately, which is what its overshoot bookkeeping buys with deltas.
-                let delta = point - (selection.1 + state.pointer_offset);
+                let delta = point - (area.1 + state.pointer_offset);
 
-                let desired = rect_from_corner_points(selection.1 + delta, selection.2 + delta);
+                let desired = rect_from_corner_points(area.1 + delta, area.2 + delta);
                 let bounds = Rectangle::from_size(size - desired.size);
                 let clamped_loc = desired.loc.constrain(bounds);
 
-                let delta = clamped_loc - rect_from_corner_points(selection.1, selection.2).loc;
-                selection.1 += delta;
-                selection.2 += delta;
+                let delta = clamped_loc - rect_from_corner_points(area.1, area.2).loc;
+                area.1 += delta;
+                area.2 += delta;
             }
             Grab::Resize { x, y } => {
                 // Only the grabbed axes move: a pure edge drag pins the other one (`:645-650`).
@@ -1945,9 +1922,9 @@ impl ScreenshotUi {
                 if y.is_none() {
                     delta.y = 0;
                 }
-                selection.2 = Point::new(
-                    (selection.2.x + delta.x).clamp(0, size.w - 1),
-                    (selection.2.y + delta.y).clamp(0, size.h - 1),
+                area.2 = Point::new(
+                    (area.2.x + delta.x).clamp(0, size.w - 1),
+                    (area.2.y + delta.y).clamp(0, size.h - 1),
                 );
             }
         }
@@ -1955,7 +1932,7 @@ impl ScreenshotUi {
         // After the drag, not before: `update_hover` ran at the top against the geometry this
         // motion was about to change, so a handle dragged past the far side would keep advertising
         // the corner it used to be for one motion longer.
-        *cursor = grab.cursor(selection.1, selection.2);
+        *cursor = grab.cursor(area.1, area.2);
 
         self.update_buffers();
         true
@@ -1966,7 +1943,7 @@ impl ScreenshotUi {
     fn update_hover(&mut self, point: Point<i32, Physical>) -> bool {
         let window_enabled = self.window_enabled();
         let Self::Open {
-            selection,
+            area,
             output_data,
             capture_type,
             hover,
@@ -1979,7 +1956,7 @@ impl ScreenshotUi {
             return false;
         };
 
-        let data = output_data.get(&selection.0);
+        let data = output_data.get(&area.0);
 
         // The crosshair belongs to the area selector, not to the whole picker: in GNOME it is set
         // on `_areaSelector` (`set_cursor_type`, `js/ui/screenshot.js:448`), so the panel's buttons
@@ -1993,7 +1970,7 @@ impl ScreenshotUi {
                 on_control: None,
                 grab,
                 ..
-            } if *capture_type == CaptureType::Selection => grab.cursor(selection.1, selection.2),
+            } if *capture_type == CaptureType::Selection => grab.cursor(area.1, area.2),
             _ if *capture_type != CaptureType::Selection
                 || data.is_some_and(|data| data.over_chrome(point)) =>
             {
@@ -2001,12 +1978,7 @@ impl ScreenshotUi {
             }
             // Free pointer over the selectable area: whatever a press here would grab.
             _ => data.map_or(CursorIcon::Crosshair, |data| {
-                area_target(
-                    rect_from_corner_points(selection.1, selection.2),
-                    point,
-                    data.scale,
-                )
-                .cursor()
+                area_target(rect_from_corner_points(area.1, area.2), point, data.scale).cursor()
             }),
         };
         let cursor_changed = *cursor != new_cursor;
@@ -2022,7 +1994,7 @@ impl ScreenshotUi {
         let new_window = (*capture_type == CaptureType::Window && new.is_none())
             .then(|| data.and_then(|data| data.window_at(point)))
             .flatten()
-            .map(|id| (selection.0.clone(), id));
+            .map(|id| (area.0.clone(), id));
 
         if *hover == new && *hovered_window == new_window && !cursor_changed {
             return false;
@@ -2072,7 +2044,7 @@ impl ScreenshotUi {
         move_existing: bool,
     ) -> Option<PointerDown> {
         let Self::Open {
-            selection,
+            area,
             output_data,
             capture_type,
             selected_window,
@@ -2095,7 +2067,7 @@ impl ScreenshotUi {
             {
                 if matches!(grab, Grab::New) {
                     *grab = Grab::Move(MoveState {
-                        pointer_offset: last_pos.1 - selection.1,
+                        pointer_offset: last_pos.1 - area.1,
                         touch_slot: Some(new_slot),
                     });
                 }
@@ -2107,7 +2079,7 @@ impl ScreenshotUi {
         }
 
         if move_existing {
-            if output != selection.0 || *capture_type != CaptureType::Selection {
+            if output != area.0 || *capture_type != CaptureType::Selection {
                 return None;
             }
 
@@ -2116,7 +2088,7 @@ impl ScreenshotUi {
                 on_control: None,
                 last_pos: (output, point),
                 grab: Grab::Move(MoveState {
-                    pointer_offset: point - selection.1,
+                    pointer_offset: point - area.1,
                     touch_slot: slot,
                 }),
             };
@@ -2155,8 +2127,8 @@ impl ScreenshotUi {
             return None;
         }
 
-        // In Screen mode the selection is the output; a press on the frozen screen must not start
-        // dragging a rectangle out of it.
+        // Outside Selection mode the frozen screen is not a surface you drag on: Screen captures
+        // all of it and Window picks from the selector, so a press must not start a rectangle.
         if *capture_type != CaptureType::Selection {
             *button = Button::Down {
                 touch_slot: slot,
@@ -2169,9 +2141,9 @@ impl ScreenshotUi {
 
         // What the press grabbed. Only a press on the *selection output's* own rectangle can grab
         // it — a second monitor has its own panel but not this selection.
-        let target = if output == selection.0 {
+        let target = if output == area.0 {
             area_target(
-                rect_from_corner_points(selection.1, selection.2),
+                rect_from_corner_points(area.1, area.2),
                 point,
                 output_data.scale,
             )
@@ -2187,12 +2159,12 @@ impl ScreenshotUi {
         let (grab, warp) = match target {
             AreaTarget::Outside => {
                 let point = clamp(point);
-                *selection = (output.clone(), point, point);
+                *area = (output.clone(), point, point);
                 (Grab::New, None)
             }
             AreaTarget::Move => (
                 Grab::Move(MoveState {
-                    pointer_offset: point - rect_from_corner_points(selection.1, selection.2).loc,
+                    pointer_offset: point - rect_from_corner_points(area.1, area.2).loc,
                     touch_slot: slot,
                 }),
                 None,
@@ -2201,21 +2173,21 @@ impl ScreenshotUi {
                 // `selection.1` becomes the stationary corner and `selection.2` the moving one, so
                 // the rest of the drag is "move `.2`" no matter which handle was taken
                 // (`js/ui/screenshot.js:524-537`).
-                let rect = rect_from_corner_points(selection.1, selection.2);
+                let rect = rect_from_corner_points(area.1, area.2);
                 let (left, top) = (rect.loc.x, rect.loc.y);
                 let (right, bottom) = (left + rect.size.w - 1, top + rect.size.h - 1);
 
                 let (stay_x, move_x) = match x {
                     Some(Side::Low) => (right, left),
                     Some(Side::High) => (left, right),
-                    None => (selection.1.x, selection.2.x),
+                    None => (area.1.x, area.2.x),
                 };
                 let (stay_y, move_y) = match y {
                     Some(Side::Low) => (bottom, top),
                     Some(Side::High) => (top, bottom),
-                    None => (selection.1.y, selection.2.y),
+                    None => (area.1.y, area.2.y),
                 };
-                *selection = (
+                *area = (
                     output.clone(),
                     Point::new(stay_x, stay_y),
                     Point::new(move_x, move_y),
@@ -2233,7 +2205,7 @@ impl ScreenshotUi {
 
         // GNOME sets the cursor inside `_onPress` (`js/ui/screenshot.js:465`, `:519`), and it has
         // to: taking hold of a handle is a cursor change with no motion behind it.
-        *cursor = grab.cursor(selection.1, selection.2);
+        *cursor = grab.cursor(area.1, area.2);
 
         *button = Button::Down {
             touch_slot: slot,
@@ -2250,7 +2222,7 @@ impl ScreenshotUi {
 
     pub fn pointer_up(&mut self, slot: Option<TouchSlot>) -> Option<PointerUp> {
         let Self::Open {
-            selection,
+            area,
             output_data,
             button,
             ..
@@ -2296,7 +2268,7 @@ impl ScreenshotUi {
 
         // Check if the resulting selection is zero-sized, and try to come up with a small
         // default rectangle.
-        let (output, a, b) = selection;
+        let (output, a, b) = area;
         let mut rect = rect_from_corner_points(*a, *b);
         if rect.size.is_empty() || rect.size == Size::from((1, 1)) {
             let data = &output_data[output];
@@ -2452,7 +2424,7 @@ impl OutputData {
             .map_err(|err| warn!("error rendering the screenshot close button: {err:?}"))
             .ok();
         let handle = generate_handle(renderer, scale)
-            .map_err(|err| warn!("error rendering a selection handle: {err:?}"))
+            .map_err(|err| warn!("error rendering a area handle: {err:?}"))
             .ok();
 
         *self.panel.borrow_mut() = PanelCache {
@@ -2923,6 +2895,30 @@ fn action(raw: Keysym, mods: ModifiersState) -> Option<Action> {
     }
 }
 
+/// The corner points a capture acts on: the dragged `area`, widened to the whole output in Screen
+/// mode.
+///
+/// Derived on every read rather than written into the area, so the rectangle the user dragged is
+/// never overwritten and changing the type is a one-field assignment.
+///
+/// Window mode has no rectangle on the output: it captures the selected window's own frozen buffer.
+/// The two callers that would take the wrong thing settle Window before asking
+/// ([`ScreenshotUi::pending_target`] and [`ScreenshotUi::capture_from_neutral`] both hand off to
+/// the window path); the area passes through for the rest, which keeps this total rather than
+/// fallible. `update_buffers` sizes chrome the selector draws over, and
+/// [`ScreenshotUi::selection_rect_global`] answers with the area — the rectangle a later switch to
+/// Selection would give you, and the only honest answer when the mode has no rect of its own.
+fn capture_corners(
+    ty: CaptureType,
+    area: (Point<i32, Physical>, Point<i32, Physical>),
+    size: Size<i32, Physical>,
+) -> (Point<i32, Physical>, Point<i32, Physical>) {
+    match ty {
+        CaptureType::Selection | CaptureType::Window => area,
+        CaptureType::Screen => (Point::from((0, 0)), Point::from((size.w - 1, size.h - 1))),
+    }
+}
+
 pub fn rect_from_corner_points(
     a: Point<i32, Physical>,
     b: Point<i32, Physical>,
@@ -3014,8 +3010,10 @@ pub(crate) fn crop_screenshot_neutral(
 
 /// What the capture button will act on — GNOME's three type buttons
 /// (`screenshot.js:1305-1348`).
-/// There is deliberately no `Default`: the type a fresh picker opens on and the neutral type the
-/// open path starts from before it restores are different answers, so both callers say which.
+///
+/// What each type captures is derived from it rather than stored — see [`capture_corners`] — so
+/// switching type never moves the dragged area out of another type's way. No `Default`: the one
+/// caller that needs a starting type is [`ScreenshotUi::new`], and it says which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureType {
     /// A dragged rectangle. GNOME's `Selection`, and the only mode niri's picker ever had.
