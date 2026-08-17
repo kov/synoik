@@ -25,9 +25,10 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use calloop::generic::Generic;
+use calloop::timer::{TimeoutAction, Timer};
 use calloop::{Interest, LoopHandle, Mode, PostAction, RegistrationToken};
 use pipewire::context::ContextRc;
-use pipewire::core::CoreRc;
+use pipewire::core::{CoreRc, Listener as CoreListener, PW_ID_CORE};
 use pipewire::device::{Device, DeviceInfoRef, DeviceListener};
 use pipewire::main_loop::MainLoopRc;
 use pipewire::metadata::{Metadata, MetadataListener};
@@ -56,16 +57,39 @@ use crate::audio::{
 };
 use crate::synoik::State;
 
+/// How long to wait before retrying a connection to the PipeWire daemon. It comes back within a
+/// second of a `systemctl --user restart pipewire`, and there is nothing to show meanwhile, so a
+/// flat retry beats any backoff: the sooner the sliders come back, the better.
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
 /// The live audio connection, owned by the compositor for the whole session.
+///
+/// The connection itself is a *replaceable* [`Conn`]: killing or restarting the PipeWire daemon
+/// kills the socket, and everything bound through it (the sinks, the cards, the `default` metadata)
+/// dies with it. We notice via the core `error` listener, publish the loss so the UI stops showing
+/// a slider that controls nothing, and retry every [`RECONNECT_DELAY`] until the daemon is back —
+/// so the `PwAudio` the compositor holds as its `AudioBackend` stays valid across daemon restarts.
 pub struct PwAudio {
-    // Kept alive; the loop is driven via the calloop source below.
-    main_loop: MainLoopRc,
+    loop_handle: LoopHandle<'static, State>,
+    conn: Rc<RefCell<Option<Conn>>>,
+    inner: Rc<RefCell<Inner>>,
+}
+
+/// One connection to the PipeWire daemon. Dropping it drops the whole object graph bound through
+/// it; [`Inner::reset_for_disconnect`] must run first, since the proxies it holds point into here.
+struct Conn {
+    // Kept alive; the loop is driven via the calloop source registered in `connect`.
+    _main_loop: MainLoopRc,
     _context: ContextRc,
     _core: CoreRc,
+    _core_listener: CoreListener,
     _registry: RegistryRc,
     _registry_listener: RegistryListener,
-    _loop_token: RegistrationToken,
-    inner: Rc<RefCell<Inner>>,
+    /// The calloop source driving `main_loop`, so a teardown that did *not* come from the source
+    /// itself can unregister it. The loss path clears this before dropping the `Conn`: that source
+    /// removes *itself* by returning [`PostAction::Remove`], and removing the same token twice is
+    /// not sound.
+    token: Option<RegistrationToken>,
 }
 
 /// A bound default-sink node and the listener keeping its param events flowing.
@@ -145,8 +169,15 @@ struct TrackedCard {
 struct Inner {
     /// Registry, so the metadata callback can bind a node when the default changes.
     registry: Option<RegistryRc>,
-    /// `default` metadata proxy + listener (bound once).
+    /// `default` metadata proxy + listener.
     metadata: Option<(Metadata, MetadataListener)>,
+    /// The global id behind `metadata`, so a session manager restart (WirePlumber owns this
+    /// object) unbinds the dead proxy and lets the replacement bind. Without it the
+    /// default-sink *read* stops updating and `set_default_sink` writes into a corpse.
+    metadata_id: Option<u32>,
+    /// Set by the core `error` listener when the daemon connection dies; drained by the calloop
+    /// source, which then tears down and schedules a reconnect.
+    lost: bool,
     /// Known `Audio/Sink` nodes by PipeWire global id.
     sinks: HashMap<u32, TrackedNode>,
     /// Known `Audio/Device` cards by global id, with their routes.
@@ -194,6 +225,36 @@ struct Inner {
 }
 
 impl Inner {
+    /// Forget the whole model and tell the compositor audio is gone.
+    ///
+    /// Called when the daemon connection dies, **before** the [`Conn`] is dropped: every proxy in
+    /// here (nodes, cards, the metadata) was bound through that core and must not outlive it.
+    /// Publishing the loss is the visible half — otherwise the QS slider and the panel indicator
+    /// freeze at their last values and keep offering control over a dead node.
+    fn reset_for_disconnect(&mut self) {
+        self.lost = false;
+        self.registry = None;
+        self.metadata = None;
+        self.metadata_id = None;
+        self.bound = None;
+        self.bound_source = None;
+        self.sinks.clear();
+        self.sources.clear();
+        self.cards.clear();
+        self.captures.clear();
+        // The defaults come back from the fresh `default` metadata; keeping the old names would
+        // make `on_metadata_property`'s no-change early-out swallow the rebind.
+        self.default_name = None;
+        self.default_source_name = None;
+        self.mic_muted = false;
+        self.mic_volume = 0.0;
+        self.publish(None);
+        self.publish_mic();
+        self.publish_sinks();
+        self.publish_sources();
+        self.publish_cards();
+    }
+
     /// Record a new status and flag it for the compositor to pick up.
     fn publish(&mut self, status: Option<AudioStatus>) {
         self.present = status.is_some();
@@ -366,9 +427,41 @@ impl Inner {
     }
 }
 
-/// Connect to PipeWire and start tracking the default sink. Returns `None`-worthy
-/// errors as `Err` so the caller can log and carry on without audio.
-pub fn start(loop_handle: &LoopHandle<'static, State>) -> anyhow::Result<PwAudio> {
+/// Start watching PipeWire for the default sink. Infallible: if the daemon isn't up (or goes away
+/// later), the returned backend is simply empty and keeps retrying every [`RECONNECT_DELAY`] — the
+/// compositor installs it once and never has to think about the connection again.
+pub fn start(loop_handle: &LoopHandle<'static, State>) -> PwAudio {
+    let audio = PwAudio {
+        loop_handle: loop_handle.clone(),
+        conn: Rc::new(RefCell::new(None)),
+        inner: Rc::new(RefCell::new(Inner::default())),
+    };
+    connect(&audio.loop_handle, &audio.conn, &audio.inner);
+    audio
+}
+
+/// Open a connection and register everything that hangs off it. On failure — daemon not running
+/// yet, socket refused — logs and schedules a retry, so this is the single entry point for both the
+/// first connect and every reconnect.
+fn connect(
+    loop_handle: &LoopHandle<'static, State>,
+    conn_cell: &Rc<RefCell<Option<Conn>>>,
+    inner: &Rc<RefCell<Inner>>,
+) {
+    match try_connect(loop_handle, conn_cell, inner) {
+        Ok(conn) => *conn_cell.borrow_mut() = Some(conn),
+        Err(err) => {
+            warn!("pipewire audio connection failed, retrying: {err:?}");
+            schedule_reconnect(loop_handle, conn_cell, inner);
+        }
+    }
+}
+
+fn try_connect(
+    loop_handle: &LoopHandle<'static, State>,
+    conn_cell: &Rc<RefCell<Option<Conn>>>,
+    inner: &Rc<RefCell<Inner>>,
+) -> anyhow::Result<Conn> {
     let main_loop = MainLoopRc::new(None).context("creating pipewire MainLoop")?;
     let context = ContextRc::new(&main_loop, None).context("creating pipewire Context")?;
     let core = context.connect_rc(None).context("connecting to pipewire")?;
@@ -376,11 +469,26 @@ pub fn start(loop_handle: &LoopHandle<'static, State>) -> anyhow::Result<PwAudio
         .get_registry_rc()
         .context("getting pipewire registry")?;
 
-    let inner = Rc::new(RefCell::new(Inner::default()));
     inner.borrow_mut().registry = Some(registry.clone());
 
+    // The daemon dying shows up here as an `EPIPE` on the core object itself. Only flag it; the
+    // teardown happens in the calloop source below, which is not inside a pipewire callback.
+    let core_listener = {
+        let weak = Rc::downgrade(inner);
+        core.add_listener_local()
+            .error(move |id, seq, res, message| {
+                warn!(id, seq, res, message, "pipewire audio error");
+                if id == PW_ID_CORE && res == -libc::EPIPE {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.borrow_mut().lost = true;
+                    }
+                }
+            })
+            .register()
+    };
+
     let registry_listener = {
-        let weak = Rc::downgrade(&inner);
+        let weak = Rc::downgrade(inner);
         let weak_rm = weak.clone();
         registry
             .add_listener_local()
@@ -394,56 +502,107 @@ pub fn start(loop_handle: &LoopHandle<'static, State>) -> anyhow::Result<PwAudio
     let loop_token = loop_handle
         .insert_source(source, {
             let inner = inner.clone();
+            let conn_cell = conn_cell.clone();
+            let loop_handle = loop_handle.clone();
             move |_, wrapper, state: &mut State| {
                 wrapper.0.loop_().iterate(Duration::ZERO);
-                // Drain all signals under one borrow, then release it before calling into State
-                // (which redraws) so nothing can re-enter a borrowed Inner.
-                let (dirty, mic_dirty, sink_list_dirty, source_list_dirty, cards_dirty) = {
-                    let mut inner = inner.borrow_mut();
-                    (
-                        inner.dirty.take(),
-                        inner.mic_dirty.take(),
-                        inner.sink_list_dirty.take(),
-                        inner.source_list_dirty.take(),
-                        inner.cards_dirty.take(),
-                    )
-                };
-                if let Some(status) = dirty {
-                    state.on_audio_status(status);
+
+                // The connection died mid-iterate. Publish the loss and drop everything bound
+                // through it *now*, not on the retry: a level-triggered source over a dead fd
+                // would spin, and the UI must stop offering control it no longer has.
+                let lost = inner.borrow().lost;
+                if lost {
+                    inner.borrow_mut().reset_for_disconnect();
+                    if let Some(mut conn) = conn_cell.borrow_mut().take() {
+                        // We are that source; returning `Remove` below unregisters it.
+                        conn.token = None;
+                    }
+                    schedule_reconnect(&loop_handle, &conn_cell, &inner);
                 }
-                if let Some(mic) = mic_dirty {
-                    state.on_mic_status(mic);
-                }
-                if let Some(list) = sink_list_dirty {
-                    state.on_sink_list(list);
-                }
-                if let Some(list) = source_list_dirty {
-                    state.on_source_list(list);
-                }
-                if let Some(cards) = cards_dirty {
-                    state.on_audio_cards(cards);
-                }
-                Ok(PostAction::Continue)
+
+                drain_into_state(&inner, state);
+                Ok(if lost {
+                    PostAction::Remove
+                } else {
+                    PostAction::Continue
+                })
             }
         })
         .map_err(|err| anyhow::anyhow!("inserting pipewire loop source: {err}"))?;
 
-    Ok(PwAudio {
-        main_loop,
+    // The daemon may already have been up for a while; pump once so the initial state lands without
+    // waiting for the first fd wakeup.
+    main_loop.loop_().iterate(Duration::ZERO);
+
+    Ok(Conn {
+        _main_loop: main_loop,
         _context: context,
         _core: core,
+        _core_listener: core_listener,
         _registry: registry,
         _registry_listener: registry_listener,
-        _loop_token: loop_token,
-        inner,
+        token: Some(loop_token),
     })
 }
 
-impl PwAudio {
-    /// Manually pump the loop once (used at startup so the initial state lands
-    /// without waiting for the first fd wakeup).
-    pub fn pump(&self) {
-        self.main_loop.loop_().iterate(Duration::ZERO);
+/// Retry the connection in [`RECONNECT_DELAY`]. Any `Conn` still in `conn_cell` (a caller that tore
+/// down without being the loop source itself) is dropped here, after its proxies are cleared.
+fn schedule_reconnect(
+    loop_handle: &LoopHandle<'static, State>,
+    conn_cell: &Rc<RefCell<Option<Conn>>>,
+    inner: &Rc<RefCell<Inner>>,
+) {
+    let handle = loop_handle.clone();
+    let conn_cell = conn_cell.clone();
+    let inner = inner.clone();
+    let res = loop_handle.insert_source(
+        Timer::from_duration(RECONNECT_DELAY),
+        move |_, _, state: &mut State| {
+            if let Some(conn) = conn_cell.borrow_mut().take() {
+                inner.borrow_mut().reset_for_disconnect();
+                if let Some(token) = conn.token {
+                    handle.remove(token);
+                }
+            }
+            connect(&handle, &conn_cell, &inner);
+            // A fresh connection replays the registry synchronously in `try_connect`'s pump, and
+            // the source that would drain it isn't in this loop iteration yet.
+            drain_into_state(&inner, state);
+            TimeoutAction::Drop
+        },
+    );
+    if let Err(err) = res {
+        warn!("cannot schedule a pipewire audio reconnect: {err}");
+    }
+}
+
+/// Hand every pending change to the compositor. Drains under one borrow and releases it before
+/// calling into `State` (which redraws), so nothing can re-enter a borrowed [`Inner`].
+fn drain_into_state(inner: &Rc<RefCell<Inner>>, state: &mut State) {
+    let (dirty, mic_dirty, sink_list_dirty, source_list_dirty, cards_dirty) = {
+        let mut inner = inner.borrow_mut();
+        (
+            inner.dirty.take(),
+            inner.mic_dirty.take(),
+            inner.sink_list_dirty.take(),
+            inner.source_list_dirty.take(),
+            inner.cards_dirty.take(),
+        )
+    };
+    if let Some(status) = dirty {
+        state.on_audio_status(status);
+    }
+    if let Some(mic) = mic_dirty {
+        state.on_mic_status(mic);
+    }
+    if let Some(list) = sink_list_dirty {
+        state.on_sink_list(list);
+    }
+    if let Some(list) = source_list_dirty {
+        state.on_source_list(list);
+    }
+    if let Some(cards) = cards_dirty {
+        state.on_audio_cards(cards);
     }
 }
 
@@ -699,12 +858,10 @@ fn on_global(
                 return;
             }
             let mut inner = inner_rc.borrow_mut();
-            // Bound once and never released: `on_global_remove` doesn't track the metadata global's
-            // id, so if the session manager (WirePlumber) restarts, this proxy goes stale — the
-            // default-sink read stops updating and `set_default_sink` writes into the dead proxy.
-            // Pre-existing (the volume read path already relied on this single bind); fine in
-            // practice (WirePlumber rarely restarts mid-session). TODO: track the id and rebind on
-            // removal to harden both the read and the picker's write.
+            // One `default` metadata at a time. The id is remembered so `on_global_remove` can drop
+            // the proxy when the session manager (WirePlumber) restarts and takes its metadata
+            // object with it — otherwise this bind is never released, the default-sink read stops
+            // updating, and `set_default_sink` writes into a corpse.
             if inner.metadata.is_some() {
                 return;
             }
@@ -726,6 +883,7 @@ fn on_global(
                     .register()
             };
             inner.metadata = Some((metadata, listener));
+            inner.metadata_id = Some(obj.id);
         }
         _ => {}
     }
@@ -984,6 +1142,18 @@ fn on_global_remove(weak: &Weak<RefCell<Inner>>, id: u32) {
     // A recording stream going away recomputes the indicator.
     if inner.captures.remove(&id).is_some() {
         inner.publish_mic();
+    }
+    // The `default` metadata belongs to the session manager, so it goes away on a WirePlumber
+    // restart and comes back as a *new* global. Drop the dead proxy so `on_global` binds the
+    // replacement, and forget the default names with it: `on_metadata_property` early-outs when the
+    // name is unchanged, so keeping them would swallow the rebind and leave the sliders inert.
+    if inner.metadata_id == Some(id) {
+        inner.metadata = None;
+        inner.metadata_id = None;
+        inner.default_name = None;
+        inner.default_source_name = None;
+        inner.publish_sinks();
+        inner.publish_sources();
     }
 }
 
