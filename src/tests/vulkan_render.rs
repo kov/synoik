@@ -759,33 +759,44 @@ fn vulkan_screenshot_ui_type_buttons_take_clicks_where_they_are_drawn() {
 
     assert_eq!(
         f.synoik().screenshot_ui.capture_type(),
-        CaptureType::Selection,
-        "the picker must open on Selection, the mode synoik's picker always had"
+        CaptureType::Screen,
+        "a fresh picker must open on Screen"
     );
 
-    // Screen is the middle button of the three, so its centre is the panel's horizontal centre at
-    // the type row's height — derived from the layout, not from a pixel guess.
+    // Centres derived from the layout, not from a pixel guess: Selection is the first of the three
+    // type buttons and Screen the middle one.
     let layout = f
         .synoik()
         .screenshot_ui
         .panel_layout(&output)
         .expect("the panel must publish its layout once baked");
-    let screen = layout.type_buttons[1];
-    let point = Point::<f64, Logical>::from((
-        screen.loc.x + screen.size.w / 2.,
-        screen.loc.y + screen.size.h / 2.,
-    ))
-    .to_physical(scale)
-    .to_i32_round::<i32>()
-        + rect.loc;
+    let centre = |b: Rectangle<f64, Logical>| {
+        Point::<f64, Logical>::from((b.loc.x + b.size.w / 2., b.loc.y + b.size.h / 2.))
+            .to_physical(scale)
+            .to_i32_round::<i32>()
+            + rect.loc
+    };
+    let selection = centre(layout.type_buttons[0]);
+    let screen = centre(layout.type_buttons[1]);
 
     let ui = &mut f.synoik_state().synoik.screenshot_ui;
-    ui.pointer_motion(point, None);
-    assert!(ui
-        .pointer_down(output.clone(), point, None, false)
-        .is_some());
-    assert_eq!(ui.pointer_up(None), Some(PointerUp::Redraw));
+    let click = |ui: &mut crate::ui::screenshot_ui::ScreenshotUi, point| {
+        ui.pointer_motion(point, None);
+        assert!(ui
+            .pointer_down(output.clone(), point, None, false)
+            .is_some());
+        assert_eq!(ui.pointer_up(None), Some(PointerUp::Redraw));
+    };
 
+    // Away from the mode it opened in first, so the switch back is a real transition either way.
+    click(ui, selection);
+    assert_eq!(
+        ui.capture_type(),
+        CaptureType::Selection,
+        "clicking the Selection button did not switch modes — the bake and the hit test disagree"
+    );
+
+    click(ui, screen);
     assert_eq!(
         ui.capture_type(),
         CaptureType::Screen,
@@ -14318,17 +14329,18 @@ fn vulkan_screenshot_ui_window_button_is_inert_without_windows() {
     );
 
     let ui = &mut f.synoik_state().synoik.screenshot_ui;
+    let opened_on = ui.capture_type();
     ui.set_capture_type(CaptureType::Window);
     assert_eq!(
         ui.capture_type(),
-        CaptureType::Selection,
+        opened_on,
         "Window mode must refuse to engage with nothing to select"
     );
 
     // ...and clicking it does nothing either.
     ui.pointer_down(output.clone(), point, None, false);
     ui.pointer_up(None);
-    assert_eq!(ui.capture_type(), CaptureType::Selection);
+    assert_eq!(ui.capture_type(), opened_on);
 }
 
 /// A tooltip waits out its delay before it draws, and follows the pointer between controls.

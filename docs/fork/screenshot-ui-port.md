@@ -134,6 +134,21 @@ Two things the panel's shape now fixes in place, worth knowing before touching i
    at all, which is what stops the Window button lighting up and advertising a mode it refuses to
    enter.
 
+## Approved divergence: a fresh picker opens on Screen
+
+GNOME checks the area button as it builds the type row (`js/ui/screenshot.js:1305-1312`), so a
+first-ever picker will not capture anything until you drag a rectangle. Grabbing the whole output is
+the commoner errand, so ours opens on Screen with the output already selected; Selection is one
+click (or `s`) away and still remembers its rectangle across a close.
+
+The subtlety is in `ScreenshotUi::open`: the type it *lands* on and the type the open path *starts*
+from are different answers, so `CaptureType` has no `Default`. `open` builds the `Open` state at
+`Selection` — the only type whose meaning is "`selection` is the dragged area" — and then calls
+`set_capture_type(remembered_type)`, which is what widens the selection for Screen and stashes the
+area in `saved_area`. Starting the state at `Screen` instead would make that call a no-op, and the
+picker would claim Screen while the selection was still the default centre-half rect: a "whole
+screen" capture of a quarter of the display. Pinned by `a_first_picker_opens_on_screen`.
+
 ## Approved divergence: delayed capture
 
 Requested 2026-08-03. GNOME's shell UI has no delay (gnome-screenshot had one; the shell dropped

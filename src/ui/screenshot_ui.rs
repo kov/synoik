@@ -719,7 +719,11 @@ impl ScreenshotUi {
             // GNOME's button is constructed unchecked (`screenshot.js:1417-1421`) and the cursor
             // actor starts hidden, so a first-ever picker shows no pointer.
             show_pointer: false,
-            capture_type: CaptureType::default(),
+            // Divergence: GNOME opens its first picker on Selection (`screenshot.js:1305-1312`
+            // checks the area button). We open on Screen — the whole output is the common capture,
+            // and a drag is one click away, while Selection makes every "just grab the screen"
+            // start with a full-output drag.
+            capture_type: CaptureType::Screen,
             clock,
             config,
         }
@@ -860,7 +864,10 @@ impl ScreenshotUi {
             show_pointer,
             delay: 0,
             mode: CaptureMode::default(),
-            capture_type: CaptureType::default(),
+            // Not the remembered type: `selection` above is still the *area*, so the state has to
+            // start in the one type that means "selection is the area" and let
+            // `set_capture_type(remembered_type)` below do the widening and the stashing.
+            capture_type: CaptureType::Selection,
             selected_window,
             hovered_window: None,
             cursor: CursorIcon::Crosshair,
@@ -3007,10 +3014,11 @@ pub(crate) fn crop_screenshot_neutral(
 
 /// What the capture button will act on — GNOME's three type buttons
 /// (`screenshot.js:1305-1348`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// There is deliberately no `Default`: the type a fresh picker opens on and the neutral type the
+/// open path starts from before it restores are different answers, so both callers say which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureType {
     /// A dragged rectangle. GNOME's `Selection`, and the only mode niri's picker ever had.
-    #[default]
     Selection,
     /// The whole output.
     Screen,

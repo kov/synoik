@@ -21565,6 +21565,20 @@ fn a_lock_mid_countdown_cancels_the_delayed_capture() {
     );
 }
 
+/// Open the picker and put it in Selection mode.
+///
+/// A fresh picker opens on Screen, which has no rectangle to drag, so every test *about* the area
+/// selector has to arm it first. Kept separate from [`open_picker_headless`] so the tests that pin
+/// which type a fresh picker lands on still see the untouched open.
+fn open_picker_headless_in_selection(f: &mut Fixture) {
+    use crate::ui::screenshot_ui::CaptureType;
+
+    open_picker_headless(f);
+    f.synoik()
+        .screenshot_ui
+        .set_capture_type(CaptureType::Selection);
+}
+
 /// Drive a press/drag/release on the area selector, in output-local physical coords.
 fn drag_selection(f: &mut Fixture, from: (i32, i32), to: (i32, i32)) {
     use smithay::utils::{Physical, Point};
@@ -21593,7 +21607,7 @@ fn dragging_a_handle_resizes_from_the_opposite_corner() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    open_picker_headless(&mut f);
+    open_picker_headless_in_selection(&mut f);
 
     // A known rectangle to grab: 400x400 at (400, 400).
     drag_selection(&mut f, (400, 400), (799, 799));
@@ -21629,7 +21643,7 @@ fn a_handle_dragged_past_the_far_side_flips() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    open_picker_headless(&mut f);
+    open_picker_headless_in_selection(&mut f);
     drag_selection(&mut f, (400, 400), (599, 599));
 
     let output = f.synoik_output(1);
@@ -21679,7 +21693,7 @@ fn dragging_inside_the_selection_moves_it() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    open_picker_headless(&mut f);
+    open_picker_headless_in_selection(&mut f);
     drag_selection(&mut f, (400, 400), (599, 599));
 
     drag_selection(&mut f, (500, 500), (700, 500));
@@ -21705,7 +21719,7 @@ fn pressing_outside_the_selection_still_starts_a_new_one() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    open_picker_headless(&mut f);
+    open_picker_headless_in_selection(&mut f);
     drag_selection(&mut f, (400, 400), (599, 599));
 
     // Well clear of the rectangle and its grab bands.
@@ -21730,7 +21744,7 @@ fn the_area_selection_survives_a_trip_through_screen_mode() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    open_picker_headless(&mut f);
+    open_picker_headless_in_selection(&mut f);
 
     drag_selection(&mut f, (300, 300), (699, 599));
     let area = Rectangle::new(Point::from((300, 300)), Size::from((400, 300)));
@@ -21757,6 +21771,42 @@ fn the_area_selection_survives_a_trip_through_screen_mode() {
     );
 }
 
+/// A first-ever picker opens on Screen, with the whole output already selected.
+///
+/// Divergence: GNOME checks the area button when it builds the row
+/// (`js/ui/screenshot.js:1305-1312`), so its first picker asks for a drag before it will capture
+/// anything. Grabbing the whole screen is the commoner errand and it should not cost a drag, so
+/// ours starts there and leaves Selection one click away.
+#[test]
+fn a_first_picker_opens_on_screen() {
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use crate::ui::screenshot_ui::CaptureType;
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    open_picker_headless(&mut f);
+
+    assert_eq!(f.synoik().screenshot_ui.capture_type(), CaptureType::Screen);
+    assert_eq!(
+        selection_of(&mut f),
+        Rectangle::new(Point::from((0, 0)), Size::from((1920, 1080))),
+        "Screen at open must widen the selection, not merely claim the mode — a picker that says \
+         Screen while the selection is still the default centre rect captures a quarter of the \
+         display"
+    );
+
+    // And the mode the fresh picker skipped is still one click away, with a rectangle in it.
+    f.synoik()
+        .screenshot_ui
+        .set_capture_type(CaptureType::Selection);
+    let sel = selection_of(&mut f);
+    assert!(
+        sel.size.w > 0 && sel.size.h > 0 && sel.size.w < 1920,
+        "Selection must come back to a draggable rectangle, not the whole output: {sel:?}"
+    );
+}
+
 /// The picker comes back the way you left it, for as long as the session lasts.
 ///
 /// gnome-shell's `ScreenshotUI` is a singleton built at startup that merely hides on close
@@ -21774,7 +21824,7 @@ fn the_picker_remembers_its_controls_across_opens() {
 
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
-    open_picker_headless(&mut f);
+    open_picker_headless_in_selection(&mut f);
 
     assert!(
         !f.synoik().screenshot_ui.show_pointer(),
@@ -21885,7 +21935,7 @@ fn the_crosshair_is_only_over_the_selectable_area() {
     let id = f.add_client();
     map_focused_window(&mut f, id);
 
-    open_picker_headless(&mut f);
+    open_picker_headless_in_selection(&mut f);
     let output = f.synoik_output(1);
     let scale = output.current_scale().fractional_scale();
     let panel = f.synoik().screenshot_ui.panel_rect(&output).unwrap();
@@ -22098,16 +22148,18 @@ fn single_keys_pick_the_capture_type_and_mode() {
     map_focused_window(&mut f, id);
 
     open_picker_headless(&mut f);
-    assert_eq!(
-        f.synoik().screenshot_ui.capture_type(),
-        CaptureType::Selection
-    );
+    assert_eq!(f.synoik().screenshot_ui.capture_type(), CaptureType::Screen);
 
     let tap = |f: &mut Fixture, code| {
         f.key_press(code);
         f.key_release(code);
     };
 
+    tap(&mut f, KEY_S);
+    assert_eq!(
+        f.synoik().screenshot_ui.capture_type(),
+        CaptureType::Selection
+    );
     tap(&mut f, KEY_C);
     assert_eq!(f.synoik().screenshot_ui.capture_type(), CaptureType::Screen);
     tap(&mut f, KEY_W);
