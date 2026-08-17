@@ -10584,7 +10584,17 @@ impl Synoik {
             // scale, and hence `render_blurred` doing its own conversion into the wallpaper
             // texture's resolution.
             let radius = crate::ui::lock_screen::BLUR_RADIUS * output_scale.x;
-            let brightness = crate::ui::lock_screen::BLUR_BRIGHTNESS as f32;
+            // GNOME's `BLUR_BRIGHTNESS` is a ceiling here, not a constant: a near-white wallpaper
+            // leaves 72pt white text below WCAG AA at *any* radius, so the picture gets measured
+            // and the multiply comes down when — and only when — it has to.
+            let brightness = self.wallpaper.legible_blur_brightness(
+                size,
+                output_scale,
+                radius,
+                crate::ui::lock_screen::text_band(Rectangle::from_size(size)),
+                crate::ui::lock_screen::BLUR_BRIGHTNESS,
+                crate::ui::lock_screen::BLUR_CONTRAST_TARGET,
+            ) as f32;
             let origin = Point::<f64, Logical>::from((0., slide));
             let blurred = self.wallpaper.render_blurred(
                 ctx.renderer,

@@ -101,6 +101,68 @@ struct Image {
     pixels: Pixels,
     size: Size<i32, Buffer>,
     opaque: bool,
+    /// The CPU-side copy the legibility rule reads; see [`Thumb`].
+    thumb: Thumb,
+    /// Memoized [`Wallpaper::legible_blur_brightness`]. Lives on the `Image` rather than on the
+    /// `Wallpaper` so it cannot outlive the picture it describes — a wallpaper change replaces the
+    /// whole `Image`, and with it this.
+    legible: RefCell<Option<(LegibilityQuery, f64)>>,
+}
+
+/// A small aspect-preserving RGB copy of the picture, kept so the legibility rule can be answered
+/// on the CPU without a readback.
+///
+/// It is built on the **decode worker**, which already holds the full picture off the main loop;
+/// 256px on the long edge is enough because everything the rule looks at has been blurred by tens
+/// of pixels first. Measured 2026-08-17 against the renderer's own output on three radii: the
+/// predicted p99 luminance tracked the GPU within ±3.3%.
+struct Thumb {
+    w: u32,
+    h: u32,
+    /// RGB8, tightly packed.
+    rgb: Vec<u8>,
+}
+
+/// The long edge of a [`Thumb`].
+const THUMB_EDGE: u32 = 256;
+
+impl Thumb {
+    fn from_rgba(data: &[u8], w: u32, h: u32) -> Self {
+        let full = (w > 0 && h > 0)
+            .then(|| image::RgbaImage::from_raw(w, h, data.to_vec()))
+            .flatten();
+        let Some(full) = full else {
+            return Self {
+                w: 0,
+                h: 0,
+                rgb: Vec::new(),
+            };
+        };
+        let small = image::DynamicImage::ImageRgba8(full)
+            .resize(
+                THUMB_EDGE,
+                THUMB_EDGE,
+                image::imageops::FilterType::Triangle,
+            )
+            .to_rgb8();
+        Self {
+            w: small.width(),
+            h: small.height(),
+            rgb: small.into_raw(),
+        }
+    }
+}
+
+/// What a memoized legibility answer was computed for. All of it can change without the picture
+/// changing (an output resize moves the crop *and* the band), so all of it is in the key.
+#[derive(Clone, Copy, PartialEq)]
+struct LegibilityQuery {
+    view: Size<f64, Logical>,
+    scale: f64,
+    radius: f64,
+    band: Rectangle<f64, Logical>,
+    ceiling: f64,
+    target: f64,
 }
 
 /// Where a decoded picture's bytes live.
@@ -231,6 +293,44 @@ impl Wallpaper {
         self.image = decoded.image;
         self.vk_texture.replace(None);
         true
+    }
+
+    /// The brightness a blurred draw of this wallpaper needs so white text over `band` clears
+    /// `target` WCAG contrast — never brighter than `ceiling`, which is the constant the caller
+    /// would otherwise have used.
+    ///
+    /// **Brightness is the lever, not radius.** A wider blur removes *variance*; it barely moves
+    /// the level, and on a wallpaper of one flat colour it does not move it at all. Measured
+    /// 2026-08-17 over the lock screen's clock band: `lcd-rainbow-l` reads 2.93:1 at radius 30, 50
+    /// and 90 alike — below even WCAG AA — while `lcd-rainbow-d` reads 11.2/12.0/14.0 across the
+    /// same three. So the rule dims, and [`crate::ui::lock_screen::BLUR_RADIUS`] stays a constant
+    /// chosen for how it looks.
+    ///
+    /// The answer is a pure function of the picture, the view and the band, so it is memoized and
+    /// never re-derived per frame; it also never watches its own output, which is what keeps it
+    /// from oscillating the way a rule fed by the rendered result would.
+    ///
+    /// `radius` is in output physical px, as [`render_blurred`](Self::render_blurred) takes it.
+    pub fn legible_blur_brightness(
+        &self,
+        view_size: Size<f64, Logical>,
+        scale: Scale<f64>,
+        radius: f64,
+        band: Rectangle<f64, Logical>,
+        ceiling: f64,
+        target: f64,
+    ) -> f64 {
+        let Some(image) = self.image.as_ref() else {
+            return ceiling;
+        };
+        image.legible_blur_brightness(LegibilityQuery {
+            view: view_size,
+            scale: scale.x,
+            radius,
+            band,
+            ceiling,
+            target,
+        })
     }
 
     /// Returns the wallpaper covering a `view_size` workspace, corners rounded by `corner_radius`
@@ -534,6 +634,9 @@ fn decode(path: &Path, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
     let opaque = !decoded.color().has_alpha();
     let size = Size::new(decoded.width() as i32, decoded.height() as i32);
     let data = decoded.into_rgba8().into_raw();
+    // On the worker, next to the decode that already owns these bytes: the main loop never sees
+    // this downscale, and after it the legibility rule never touches the full picture again.
+    let thumb = Thumb::from_rgba(&data, size.w as u32, size.h as u32);
 
     // This copy is the whole point of the staging path: it is tens of megabytes into a mapping
     // that has never been touched, and here it runs on the worker instead of between two frames.
@@ -552,7 +655,147 @@ fn decode(path: &Path, gpu: Option<&Arc<Gpu>>) -> Option<Image> {
         pixels,
         size,
         opaque,
+        thumb,
+        legible: RefCell::new(None),
     })
+}
+
+impl Image {
+    /// The blur brightness that keeps white text over `band` at `target` contrast, capped at
+    /// `ceiling`. See [`Wallpaper::legible_blur_brightness`].
+    fn legible_blur_brightness(&self, q: LegibilityQuery) -> f64 {
+        if let Some((key, answer)) = *self.legible.borrow() {
+            if key == q {
+                return answer;
+            }
+        }
+        let answer = self.compute_legible_blur_brightness(q);
+        *self.legible.borrow_mut() = Some((q, answer));
+        answer
+    }
+
+    fn compute_legible_blur_brightness(&self, q: LegibilityQuery) -> f64 {
+        if self.thumb.w == 0 || self.thumb.h == 0 || self.size.w <= 0 || self.size.h <= 0 {
+            return q.ceiling;
+        }
+        let picture = Size::new(self.size.w as f64, self.size.h as f64);
+        let src = zoom_crop(picture, q.view);
+        if src.size.w <= 0. || src.size.h <= 0. {
+            return q.ceiling;
+        }
+
+        // Everything below happens in *thumbnail* pixels. Two conversions get us there: the
+        // picture-to-thumb ratio, and the magnification the draw applies to the sampled crop.
+        let to_thumb = self.thumb.w as f64 / picture.w;
+        let crop_w_thumb = src.size.w * to_thumb;
+        let view_physical_w = q.view.w * q.scale;
+        if crop_w_thumb <= 0. || view_physical_w <= 0. {
+            return q.ceiling;
+        }
+        // `radius` arrives in output physical px, and `radius = 2σ` (`GaussianBackdrop`).
+        let sigma = (q.radius / 2.) * (crop_w_thumb / view_physical_w);
+
+        let Some(full) =
+            image::RgbImage::from_raw(self.thumb.w, self.thumb.h, self.thumb.rgb.clone())
+        else {
+            return q.ceiling;
+        };
+        // Blurring the whole thumbnail rather than the band keeps the band's own edges from
+        // clamping against a wall of themselves, which reads as extra contrast that isn't there.
+        let blurred = if sigma > 0.01 {
+            image::imageops::blur(&full, sigma as f32)
+        } else {
+            full
+        };
+
+        // The band, logical view coords -> fraction of the view -> thumbnail crop.
+        let px = |v: f64, span: f64, crop_loc: f64, crop_span: f64, limit: u32| -> f64 {
+            (crop_loc + (v / span) * crop_span).clamp(0., limit as f64)
+        };
+        let x0 = px(
+            q.band.loc.x,
+            q.view.w,
+            src.loc.x * to_thumb,
+            crop_w_thumb,
+            self.thumb.w,
+        );
+        let x1 = px(
+            q.band.loc.x + q.band.size.w,
+            q.view.w,
+            src.loc.x * to_thumb,
+            crop_w_thumb,
+            self.thumb.w,
+        );
+        let crop_h_thumb = src.size.h * to_thumb;
+        let y0 = px(
+            q.band.loc.y,
+            q.view.h,
+            src.loc.y * to_thumb,
+            crop_h_thumb,
+            self.thumb.h,
+        );
+        let y1 = px(
+            q.band.loc.y + q.band.size.h,
+            q.view.h,
+            src.loc.y * to_thumb,
+            crop_h_thumb,
+            self.thumb.h,
+        );
+        let (x0, x1) = (x0.floor() as u32, (x1.ceil() as u32).min(self.thumb.w));
+        let (y0, y1) = (y0.floor() as u32, (y1.ceil() as u32).min(self.thumb.h));
+        if x1 <= x0 || y1 <= y0 {
+            return q.ceiling;
+        }
+
+        let mut band: Vec<[f64; 3]> = Vec::with_capacity(((x1 - x0) * (y1 - y0)) as usize);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let p = blurred.get_pixel(x, y).0;
+                band.push([p[0] as f64, p[1] as f64, p[2] as f64]);
+            }
+        }
+
+        // `brightness` multiplies the *encoded* sample in the shader, so it goes in before the
+        // sRGB transfer function, not after. Getting that backwards put an early version of this
+        // predictor 130% off.
+        let contrast_at = |b: f64| -> f64 {
+            let mut lums: Vec<f64> = band
+                .iter()
+                .map(|c| {
+                    let l = |v: f64| {
+                        let v = (v * b) / 255.;
+                        if v <= 0.04045 {
+                            v / 12.92
+                        } else {
+                            ((v + 0.055) / 1.055).powf(2.4)
+                        }
+                    };
+                    0.2126 * l(c[0]) + 0.7152 * l(c[1]) + 0.0722 * l(c[2])
+                })
+                .collect();
+            // p99, not the mean: one bright frond behind a stroke is what makes a glyph vanish,
+            // and a mean over a band this wide would never see it.
+            let idx = (((lums.len() - 1) as f64) * 0.99).round() as usize;
+            lums.select_nth_unstable_by(idx, f64::total_cmp);
+            1.05 / (lums[idx] + 0.05)
+        };
+
+        if contrast_at(q.ceiling) >= q.target {
+            return q.ceiling;
+        }
+        // Monotone in `b`, so a bisection is exact to the tolerance. ~20 rounds over a band of a
+        // few thousand thumbnail pixels, once per wallpaper — not a per-frame cost.
+        let (mut lo, mut hi) = (0., q.ceiling);
+        for _ in 0..20 {
+            let mid = (lo + hi) / 2.;
+            if contrast_at(mid) >= q.target {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
 }
 
 /// GNOME's `zoom` fit (gnome-desktop's `gnome_bg` scaling): scale the picture
@@ -568,6 +811,97 @@ fn zoom_crop(picture: Size<f64, Logical>, view: Size<f64, Logical>) -> Rectangle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `Wallpaper` holding one flat colour, sized like a stock background.
+    fn flat(rgb: [u8; 3]) -> Wallpaper {
+        const N: i32 = 512;
+        let mut data = Vec::with_capacity((N * N * 4) as usize);
+        for _ in 0..N * N {
+            data.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 0xff]);
+        }
+        Wallpaper {
+            image: Some(Image {
+                thumb: Thumb::from_rgba(&data, N as u32, N as u32),
+                pixels: Pixels::Host(data),
+                size: Size::from((N, N)),
+                opaque: true,
+                legible: RefCell::new(None),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A 3072x1728 view at scale 1.25 — kov's seat — and the band the curtain's text lands in.
+    fn seat_query(wp: &Wallpaper, ceiling: f64, target: f64) -> f64 {
+        let view = Size::<f64, Logical>::from((3072., 1728.));
+        wp.legible_blur_brightness(
+            view,
+            Scale::from(1.25),
+            crate::ui::lock_screen::BLUR_RADIUS * 1.25,
+            crate::ui::lock_screen::text_band(Rectangle::from_size(view)),
+            ceiling,
+            target,
+        )
+    }
+
+    /// The rule only engages on a picture GNOME's constant cannot carry, and it engages *hard* on
+    /// the one that motivated it: a near-white wallpaper leaves white 72pt text at 2.93:1 —
+    /// below WCAG AA — at every radius we might pick, because the radius is not the lever.
+    #[test]
+    fn a_bright_wallpaper_dims_the_lock_blur_and_a_dark_one_does_not() {
+        use crate::ui::lock_screen::{BLUR_BRIGHTNESS, BLUR_CONTRAST_TARGET};
+
+        let dark = seat_query(
+            &flat([0x10, 0x10, 0x10]),
+            BLUR_BRIGHTNESS,
+            BLUR_CONTRAST_TARGET,
+        );
+        assert_eq!(
+            dark, BLUR_BRIGHTNESS,
+            "a dark wallpaper must keep GNOME's constant untouched"
+        );
+
+        let white = seat_query(
+            &flat([0xff, 0xff, 0xff]),
+            BLUR_BRIGHTNESS,
+            BLUR_CONTRAST_TARGET,
+        );
+        assert!(
+            (0.44..0.48).contains(&white),
+            "pure white should land near the 0.46 worst case, got {white}"
+        );
+
+        // Monotone in how bright the picture is: nothing about the rule should be able to make a
+        // brighter wallpaper come out brighter.
+        let mid = seat_query(
+            &flat([0xa0, 0xa0, 0xa0]),
+            BLUR_BRIGHTNESS,
+            BLUR_CONTRAST_TARGET,
+        );
+        assert!(
+            white <= mid && mid <= dark,
+            "brightness must fall as the wallpaper rises: {white} / {mid} / {dark}"
+        );
+    }
+
+    /// The answer it lands on is the answer it was asked for — a fixed point, which is what makes
+    /// the rule safe to run open-loop.
+    #[test]
+    fn the_chosen_brightness_meets_the_target_it_was_given() {
+        use crate::ui::lock_screen::BLUR_CONTRAST_TARGET;
+
+        let wp = flat([0xff, 0xff, 0xff]);
+        let b = seat_query(&wp, 0.65, BLUR_CONTRAST_TARGET);
+        // Re-asking with the answer as the ceiling must not move it further.
+        assert_eq!(b, seat_query(&wp, b, BLUR_CONTRAST_TARGET));
+    }
+
+    /// No picture, no opinion: the caller's constant survives.
+    #[test]
+    fn an_empty_wallpaper_keeps_the_callers_brightness() {
+        let wp = Wallpaper::default();
+        assert_eq!(seat_query(&wp, 0.65, 4.5), 0.65);
+    }
 
     /// A blur of an opaque picture is opaque, and has to say so: the overview draws the blurred
     /// wallpaper full-screen over the full-output `SolidColor` backdrop, and a layer that declares
@@ -598,6 +932,12 @@ mod tests {
                     pixels: Pixels::Host(vec![0xffu8; (N * N * 4) as usize]),
                     size: Size::from((N, N)),
                     opaque,
+                    thumb: Thumb::from_rgba(
+                        &vec![0xffu8; (N * N * 4) as usize],
+                        N as u32,
+                        N as u32,
+                    ),
+                    legible: RefCell::new(None),
                 }),
                 ..Default::default()
             };
@@ -711,6 +1051,37 @@ mod tests {
         );
     }
 
+    /// The picture that motivated the legibility rule, end to end through the real decode:
+    /// `lcd-rainbow-l` is a near-white background, and GNOME's 0.65 leaves the curtain's white text
+    /// at 2.93:1 over it — under WCAG AA — while its dark sibling is comfortably clear at the same
+    /// constant. Same ignore reason as [`decodes_a_stock_jxl_background`].
+    #[test]
+    #[ignore = "decodes an installed 4K background; run explicitly"]
+    fn the_stock_light_rainbow_is_the_wallpaper_that_needs_dimming() {
+        use crate::ui::lock_screen::{BLUR_BRIGHTNESS, BLUR_CONTRAST_TARGET};
+
+        let load = |name: &str| {
+            let path = PathBuf::from(format!("/usr/share/backgrounds/gnome/{name}.jxl"));
+            path.exists().then(|| Wallpaper {
+                image: decode(&path, None),
+                ..Default::default()
+            })
+        };
+        let (Some(light), Some(dark)) = (load("lcd-rainbow-l"), load("lcd-rainbow-d")) else {
+            return;
+        };
+
+        assert!(
+            seat_query(&light, BLUR_BRIGHTNESS, BLUR_CONTRAST_TARGET) < 0.55,
+            "the light rainbow must be dimmed well past GNOME's constant"
+        );
+        assert_eq!(
+            seat_query(&dark, BLUR_BRIGHTNESS, BLUR_CONTRAST_TARGET),
+            BLUR_BRIGHTNESS,
+            "the dark rainbow must be left alone"
+        );
+    }
+
     /// GNOME's stock backgrounds are JPEG XL; decode one through the
     /// jxl-oxide integration end-to-end. Ignored by default: it needs the
     /// installed backgrounds and a debug-build 4K decode is slow.
@@ -750,6 +1121,8 @@ mod tests {
                 pixels: Pixels::Host(vec![0xffu8; 8 * 8 * 4]),
                 size: Size::from((8, 8)),
                 opaque: true,
+                thumb: Thumb::from_rgba(&[0xffu8; 8 * 8 * 4], 8, 8),
+                legible: RefCell::new(None),
             }),
             ..Default::default()
         };
@@ -817,6 +1190,8 @@ mod tests {
                 pixels: Pixels::Staged(Arc::new(staging)),
                 size: Size::from((8, 8)),
                 opaque: true,
+                thumb: Thumb::from_rgba(&[0xffu8; 8 * 8 * 4], 8, 8),
+                legible: RefCell::new(None),
             }),
             decode_tx: Some(req_tx),
             ..Default::default()

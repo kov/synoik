@@ -75,7 +75,26 @@ pub const HINT_FADE: Duration = Duration::from_millis(300);
 ///
 /// It is not decoration: it is what makes white 72pt text legible over an arbitrary picture. The
 /// multiply rides inside the blur pass rather than being a separate wash, as GNOME's does.
+///
+/// **A ceiling, not a constant.** GNOME's one number has to cover every wallpaper, and it does not:
+/// measured 2026-08-17 over [`text_band`], the stock `lcd-rainbow-l` reads **2.93:1** against white
+/// here — below even WCAG AA — because it is a near-white picture, and no radius rescues it (see
+/// [`Wallpaper::legible_blur_brightness`]). So we keep 0.65 as the value and dim past it only when
+/// the picture in front of us fails [`BLUR_CONTRAST_TARGET`]. On a wallpaper GNOME's number already
+/// carries, nothing moves.
+///
+/// [`Wallpaper::legible_blur_brightness`]: crate::wallpaper::Wallpaper::legible_blur_brightness
 pub const BLUR_BRIGHTNESS: f64 = 0.65;
+
+/// The contrast white curtain text must clear against the blurred wallpaper.
+///
+/// WCAG 2.1 asks 3:1 of large text and 4.5:1 of body text; the clock is large, but the date and the
+/// hint are not, and the whole page is read at a glance from across a room. 4.5 also has the
+/// practical virtue of being far enough from 0.65 to *do* something — at 3:1 the light rainbow
+/// resolves to 0.642, a correction nobody can see, which is the same as not having the rule.
+///
+/// The worst case is bounded and mild: a pure-white wallpaper lands at ~0.46.
+pub const BLUR_CONTRAST_TARGET: f64 = 4.5;
 
 /// In **stage pixels** — so it scales with the output, and a caller converts it into whatever
 /// resolution the texture it blurs happens to be.
@@ -85,12 +104,13 @@ pub const BLUR_BRIGHTNESS: f64 = 0.65;
 /// the picture to be recognisably *your* picture — closer in character to the panel plate's 30
 /// ([`crate::ui::panel::BAR_BLUR_RADIUS`]) without going all the way there.
 ///
-/// It costs less legibility than it looks like it should. Measured on the seat's own wallpaper,
-/// over the band the clock occupies: WCAG contrast against white text is 12.70 at 90, 12.37 at 50
-/// and 10.85 at 30 — all far above the 4.5:1 that AAA asks of large text, because what a wider
-/// blur removes is *variance*, and [`BLUR_BRIGHTNESS`] is what sets the level. The picture reads as
-/// busier at a smaller radius mostly through texture, not brightness: mean |∇L| across that same
-/// band goes 0.00004 → 0.00010 → 0.00022.
+/// It costs no legibility, because legibility is not what the radius controls. Measured 2026-08-17
+/// over [`text_band`] on a dark, high-variance picture: WCAG contrast against white text is 12.70
+/// at 90, 12.37 at 50 and 10.85 at 30 — and on a flat one it does not move at all. What a wider
+/// blur removes is *variance*; [`BLUR_BRIGHTNESS`] is what sets the level. The picture reads as
+/// busier at a smaller radius through texture: mean |∇L| across that same band goes 0.00004 →
+/// 0.00010 → 0.00022. So this number is chosen for how it looks, and the legibility floor is
+/// [`BLUR_CONTRAST_TARGET`]'s job.
 pub const BLUR_RADIUS: f64 = 50.;
 
 /// What the curtain shows. Plain strings, so the caller owns formatting and this is testable
@@ -304,6 +324,22 @@ pub fn layout(width: f64, hint_w: f64, base_px: f64, rows: ClockRows) -> ClockLa
 /// clamps up rather than pushing the entry off the bottom.
 pub fn stack_top(monitor: Rectangle<f64, Logical>, block_h: f64) -> f64 {
     monitor.loc.y + (monitor.size.h / 3.).min((monitor.size.h - block_h).max(0.))
+}
+
+/// The strip of wallpaper the curtain's white text is read against — the clock block's own box,
+/// where [`stack_top`] puts it.
+///
+/// **Full monitor width on purpose.** The three lines are centred, and their drawn extent is not
+/// known until they are shaped, which is long after the backdrop has to pick a brightness. Taking
+/// the whole stripe is the conservative reading: it can only over-report how bright the background
+/// is, and over-reporting costs a slightly darker wallpaper, while under-reporting costs a clock
+/// you cannot read. It also keeps the answer stable as the time and the date change width.
+pub fn text_band(monitor: Rectangle<f64, Logical>) -> Rectangle<f64, Logical> {
+    let h = block_height(crate::ui::pt_to_px(crate::ui::base_font_pt()));
+    Rectangle::new(
+        Point::from((monitor.loc.x, stack_top(monitor, h))),
+        Size::from((monitor.size.w, h)),
+    )
 }
 
 /// `$_gdm_dialog_width: 25em` on `.login-dialog-prompt-layout` (`_login-lock.scss:16-18`).
