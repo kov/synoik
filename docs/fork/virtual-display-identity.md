@@ -1,23 +1,23 @@
-# Virtual display identity: what the VMM would have to tell us
+# Virtual display identity: what the VMM has to tell us
 
-*Written 2026-07-28, after three display-configuration bugs in a row that were all really one bug:
-this VM's two displays are indistinguishable to the guest except by the modes they advertise.*
+The compositor runs in a VM on an Apple laptop, with **one** virtual connector (`Virtual-1`) whose
+EDID describes whichever host display the VM's window currently sits on. Moving the window between
+the laptop panel and an external monitor rewrites that EDID in place. This document records what
+the guest can see, which parts of GNOME's display-configuration model that stresses, what the
+compositor does about it, and what the VMM has to present for the rest to work. The asks are
+deliberately written so they would help **stock mutter** too: each one is standard EDID/DRM
+behaviour, not a bespoke protocol for this fork.
 
-The compositor runs in a krun VM on an Apple laptop. Moving the VM's window between the laptop
-panel and an external monitor changes what the guest's single `Virtual-1` connector advertises —
-and nothing else. This document records exactly what the guest can see today, which parts of
-GNOME's display-configuration model that breaks, what we did to cope, what we tried and reverted,
-and what an ideal VMM would present instead. The last part is deliberately written so it would help
-**stock mutter** too: every ask below is a standard EDID/DRM behaviour, not a bespoke protocol for
-this fork.
+**The conclusion, up front:** per-display settings work exactly as well as the EDID's identity
+fields are honest and distinct. Where a VMM varies vendor/product/serial per host display, the
+compositor now remembers each display separately, re-reads the identity whenever the EDID changes,
+and needs nothing further. Where the EDID is a constant (§1), no amount of compositor-side
+cleverness substitutes (§3) — that is the VMM ask, ideally EDID passthrough (§4.2).
 
-**The conclusion, up front:** per-display settings cannot be made to work from the guest side. We
-took the compositor-side fixes that are mutter's own behaviour anyway, reverted the one that was a
-divergence, and the rest is a VMM ask — ideally EDID passthrough (§4.2).
+## 1. What a constant-identity EDID looks like
 
-## 1. What the guest sees today
-
-`/sys/class/drm/card0/card0-Virtual-1/edid`, 128 bytes, decoded:
+The krun images' EDID: `/sys/class/drm/card0/card0-Virtual-1/edid`, 128 bytes, decoded (a VMM that
+delivers §4.1/§4.2 varies the marked fields per host display instead):
 
 | Field | Value | Comment |
 | --- | --- | --- |
@@ -64,52 +64,63 @@ saved configuration at all.* This is the single highest-value fix on the list.
 `meta_monitor_has_aspect_as_size`; our port only checks for zero. Worth adding if a VMM ever
 reports 16:10 as "16 cm × 10 cm".)
 
-### 2.2 A saved configuration can only remember one display
+### 2.2 One connector carries two displays, so the store is asked to key on identity alone
 
 mutter keys a stored configuration on the set of `MetaMonitorSpec`s it covers — `{connector,
 vendor, product, serial}` (`meta-monitor-private.h:30-35`) — and replaces the entry with the
-matching key on save (`meta-monitor-config-store.c`, `g_hash_table_replace`). With one spec for
-both displays, saving settings for the external monitor **forgets** the laptop panel's, and vice
-versa. A real GNOME session on this VM would behave the same way.
+matching key on save (`meta-monitor-config-store.c`, `g_hash_table_replace`), writing every entry
+back out. Sharing one connector between two displays therefore costs nothing *as long as the
+identity fields differ*: two identities are two keys, two stanzas, two remembered configurations.
+With a constant EDID they are one key, and saving the external monitor's settings overwrites the
+laptop panel's. A real GNOME session on such a VM behaves the same way.
 
 ### 2.3 Nothing announces that the display changed
 
-The connector never disconnects; its mode list is simply different the next time it is read. So
-there is no hotplug moment at which a compositor would naturally re-run its configuration chain,
-and every piece of per-display state it holds (the applied scale, the current mode) silently
-carries over to a display it was never chosen for.
+The connector never disconnects, and its mode list may not even differ — so no DRM event says "this
+is a different panel now". A compositor that captures a connector's identity only when it goes
+connected keeps reporting the previous display's vendor/product/serial, and every piece of
+per-display state it holds (the applied scale, the current mode) silently carries over to a display
+it was never chosen for.
 
-## 3. What we do today to cope
+## 3. What the compositor does
 
-Three commits, all of them working around section 2:
+- **Every connected connector's EDID is re-read on every DRM device-changed event**, and an
+  identity that changed is handled as the re-plug it really is: the applied config is dropped, the
+  output is torn down, and `on_output_config_changed` rebuilds it through the whole configuration
+  chain (`Tty::refresh_changed_identities`). This is mutter's `meta_monitor_manager_reload` →
+  `ensure_configured`, and it is what makes an in-place EDID swap work without the VMM having to
+  fake a connector cycle. A failed EDID read yields *no* identity rather than a new one, so it
+  never counts as a change.
+- **A save merges into `monitors.xml` instead of replacing it** (`monitors_xml::merge`): the stanza
+  for this set of monitors is replaced, every other saved configuration is copied through as raw
+  source text, so configuring one display keeps the others' settings — and fields we don't model
+  (mutter's full-precision rates, anything a newer mutter adds) survive the round trip. Our key
+  leaves `<vendor>` out and folds case, because mutter writes the raw PNP code and a lowercase
+  `0x%08x` fallback serial where we write the decoded make and uppercase; keying on those bytes
+  would file a second stanza for the display the user is configuring.
+- **A saved scale is only applicable at the mode it was saved for** (`ce9325c1`), and the saved
+  **mode** is restored along with it (`fe61c6dd`, `MonitorsConfig::saved_modes_for` →
+  `tty::target_mode`) — otherwise a monitor that comes up at its preferred mode never matches its
+  own entry. Both are mutter's rules; with a constant EDID the mode gate doubles as the only way to
+  tell two displays apart.
+- **A live-applied config dies with the display it was applied to** (`fd001ae6`): if the connector
+  no longer offers the mode the apply named, the override and the fields it wrote are cleared and
+  the chain re-runs. Mutter's `is_config_applicable`, applied to a hardware change it can't see.
 
-- `ce9325c1` — a saved scale is only applicable **at the mode it was saved for**. This is mutter's
-  own rule (a stored config whose mode can't be assigned is rejected), and here it doubles as the
-  only way to tell the two displays apart.
-- `fe61c6dd` — restore the saved **mode** as well as the scale, since the gate above means a
-  monitor that comes up at its preferred mode never matches its own saved entry
-  (`MonitorsConfig::saved_modes_for` → `tty::target_mode`).
-- `fd001ae6` — a live-applied config dies with the display it was applied to: if the connector no
-  longer offers the mode the apply named, the override and the fields it wrote are cleared, and the
-  chain re-runs. Mutter's `is_config_applicable`, applied to a hardware change it can't see.
+None of this is a divergence from mutter.
 
-All three are mutter's own rules; none of them is a divergence.
+### Why identity cannot be replaced by the mode list
 
-### Tried and reverted: remembering both displays at once
+Keying the store on connector *and mode* instead of the monitorspec was tried (`10a4fd32`,
+reverted the same day). It works until two displays advertise a mode in common — the krun internal
+panel's preferred 2048x1330 is also advertised by the external monitor — and then the store cannot
+say which entry belongs to which, with a most-recently-saved tie-break that is wrong half the time.
+A store that silently applies another display's scale is worse than one that guesses from DPI.
 
-A fourth change (`10a4fd32`, reverted the same day) went further: **merge** saves into
-`monitors.xml` keyed on connector *and mode* instead of the monitorspec, so the laptop panel's
-settings and the external monitor's could coexist under one identity. It worked for the case it was
-written for, and it does not work in general — **the internal panel's preferred mode, 2048x1330, is
-also advertised by the external monitor**. Once two displays share a mode, a mode-keyed store
-cannot say which entry belongs to which, and the tie-break (most recently saved) is a guess that
-will be wrong half the time. Reverted rather than shipped: a store that silently applies another
-display's scale is worse than one that guesses from DPI.
-
-So there is no per-display memory here, and there cannot be one built on this EDID. The scale a
-display gets is the one saved for whatever mode it comes up in, else the DPI guess — and both are
-computed from a physical size that is a constant. **This is the piece that has to be fixed on the
-VMM side**; §4.1 and §4.2 are not conveniences, they are the whole feature.
+**Require an observation, not an inference: a display's identity has to come from the EDID.** With
+a constant EDID the scale a display gets is whatever was saved for the mode it comes up in, else the
+DPI guess — and that guess is computed from a physical size that is also a constant. §4.1 and §4.2
+are not conveniences, they are the whole feature.
 
 ## 4. The ideal world
 
@@ -144,11 +155,14 @@ remembered exactly as on bare metal, and `gnome-control-center`'s display list b
 For us it is the difference between having per-display settings and not having them at all —
 §3 explains why no amount of compositor-side cleverness substitutes.
 
-### 4.3 Announce the change as a hotplug
+### 4.3 Deliver a uevent whenever the EDID changes
 
 When the window moves to a display with a different identity or mode list, deliver a DRM hotplug
-uevent — ideally connector-disconnected then connector-connected, so the guest tears down and
-rebuilds its output rather than mutating one in place.
+uevent. **An in-place EDID swap on a connector that stays connected is enough** — we re-read every
+connected connector's EDID on each device-changed event (§3) — but *some* uevent is required, since
+a compositor has no other reason to look. A connector cycle (disconnected, then connected with the
+new EDID) also works and needs no wall-clock gap between the two on our side; it is simply more
+disruptive than the in-place swap.
 
 *Stock mutter:* `meta_monitor_manager_reload` → `ensure_configured` runs, which is the code path
 that consults the store and computes a default. That is exactly the moment a compositor is designed
@@ -181,11 +195,18 @@ asking for a correct EDID makes every guest better.
   or `edid-decode` if installed.
 - What we resolved it to: `synoik msg outputs` prints physical size, current mode, the advertised
   mode list and the scale in force.
+- Read back what the store holds: `~/.config/monitors.xml` should carry one `<configuration>` per
+  display that has ever been configured, and `GetCurrentState` (`gdbus call --session --dest
+  org.gnome.Mutter.DisplayConfig --object-path /org/gnome/Mutter/DisplayConfig --method
+  org.gnome.Mutter.DisplayConfig.GetCurrentState`) should report the identity of the display the
+  window is on right now.
 - The decisions that consume all this are pure functions with unit tests —
   `mode_is_available` / `applied_config_is_stale` / `choose_target_mode` in `src/backend/tty.rs`,
-  and `MonitorsConfig` in `src/monitors_xml.rs`. The DRM plumbing around them is not tested: doing
-  that properly needs a VKMS device whose connectors and mode lists can be changed from configfs,
-  which is the one piece of coverage still missing here.
+  and `MonitorsConfig` / `merge` in `src/monitors_xml.rs`. The DRM plumbing around them
+  (`refresh_changed_identities` included) is not tested: doing that properly needs a VKMS device
+  whose connectors and mode lists can be changed from configfs, which is the one piece of coverage
+  still missing here. Until then it is verified live, by moving the VM's window between two host
+  displays and unplugging one.
 
 ## 6. VMM-side response (2026-07-30, initial assessment)
 
