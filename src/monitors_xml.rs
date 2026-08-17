@@ -74,7 +74,9 @@ impl MonitorSetting {
     /// `<vendor>` is not consulted: it is one manufacturer code shared by every monitor of that
     /// make, so it can never disambiguate two of them.
     fn corroborates(&self, name: &OutputName) -> bool {
-        let eq = |saved: &Option<String>, have: &Option<String>| matches!((saved, have), (Some(a), Some(b)) if a == b);
+        // Case-insensitively, like the store key: a stanza written by mutter, or by one of our own
+        // builds before `f9142609`, spells the same serial in a different case.
+        let eq = |saved: &Option<String>, have: &Option<String>| matches!((saved, have), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b));
         // Either field agreeing is enough to disambiguate; we don't require both, since a given
         // monitors.xml may carry only one of them.
         eq(&self.product, &name.model) || eq(&self.serial, &name.serial)
