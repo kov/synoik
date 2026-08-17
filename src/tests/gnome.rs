@@ -17891,10 +17891,35 @@ fn output_scale_is_derived_from_the_current_mode() {
         AppliedDisplayConfig {
             scale: Some(1.),
             transform: None,
+            identity: None,
         },
     );
     let (applied, _) = f.synoik().derive_output_scale_transform(&output, None);
     assert_eq!(applied, 1.);
+
+    // ...but an override applied to a DIFFERENT display that shared this connector does not. On a
+    // VM whose one virtual connector mirrors whichever host display the window sits on, the scale
+    // set for the external panel was becoming the scale of the built-in on the next move, in both
+    // directions (measured on kov's seat, 2026-08-17: 1.25 applied to a 3840x2160 DELL followed
+    // the window onto a 2048x1328 panel that had 1.0 saved and 1.333 guessed).
+    f.synoik().applied_display_config.insert(
+        "Virtual-1".to_owned(),
+        AppliedDisplayConfig {
+            scale: Some(1.),
+            transform: None,
+            identity: Some("LMN DELL P2723QE 0x3704f790".to_owned()),
+        },
+    );
+    let (other_display, _) = f.synoik().derive_output_scale_transform(&output, None);
+    assert_eq!(
+        other_display, uhd,
+        "an override for another display must not apply here"
+    );
+    // And it is not merely ignored: the next reload clears it out, so nothing downstream can pick
+    // it up either.
+    let name = output.user_data().get::<OutputName>().unwrap().clone();
+    f.synoik().forget_applied_config_for_another_display(&name);
+    assert!(f.synoik().applied_display_config.is_empty());
 
     f.synoik().applied_display_config.remove("Virtual-1");
     set_mode((2048, 1330));

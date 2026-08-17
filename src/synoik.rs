@@ -1200,10 +1200,35 @@ impl PendingCapture {
 /// [`Synoik::applied_display_config`]). Only the fields the `monitors.xml` store also covers need
 /// overriding; mode/position/off flow through the regular output config and are never overridden
 /// by the store.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AppliedDisplayConfig {
     pub scale: Option<f64>,
     pub transform: Option<Transform>,
+    /// The identity of the display this was applied to, as `make model serial`.
+    ///
+    /// The override is keyed by connector, because that is all an `ApplyMonitorsConfig` names —
+    /// but a connector is not a display. On a VM whose one virtual connector mirrors whichever
+    /// host display the window sits on, a scale applied to the external panel would otherwise
+    /// become the scale of the built-in the moment the window moves, in either direction,
+    /// however the change arrives (a connector cycle, an in-place EDID swap, or a replug an
+    /// hour later).
+    ///
+    /// mutter has this for free: its current config is keyed on the whole monitor spec, so a
+    /// config naming a monitor that is not present is simply not applicable
+    /// (`meta_monitor_config_manager_get_current` + `is_config_applicable`). `None` means we could
+    /// not resolve an identity when the config was applied, and then it applies unconditionally —
+    /// the old behavior, and right for an output with no EDID to tell apart.
+    pub identity: Option<String>,
+}
+
+impl AppliedDisplayConfig {
+    /// Whether this override still describes the display now on that connector.
+    pub fn applies_to(&self, name: &OutputName) -> bool {
+        match &self.identity {
+            Some(identity) => identity.eq_ignore_ascii_case(&name.format_make_model_serial()),
+            None => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3768,6 +3793,16 @@ impl State {
     }
 
     pub fn reload_output_config(&mut self) {
+        let names: Vec<OutputName> = self
+            .synoik
+            .global_space
+            .outputs()
+            .map(|o| o.user_data().get::<OutputName>().unwrap().clone())
+            .collect();
+        for name in &names {
+            self.synoik.forget_applied_config_for_another_display(name);
+        }
+
         let mut resized_outputs = vec![];
         let mut recolored_outputs = vec![];
 
@@ -3908,6 +3943,7 @@ impl State {
             .output_by_name_match(name)
             .map(|o| o.user_data().get::<OutputName>().unwrap().connector.clone());
         if let Some(connector) = connector {
+            let identity = self.synoik.output_identity(&connector);
             match &action {
                 synoik_ipc::OutputAction::Scale { scale } => {
                     let entry = self
@@ -3915,6 +3951,7 @@ impl State {
                         .applied_display_config
                         .entry(connector)
                         .or_default();
+                    entry.identity = identity;
                     // Automatic clears the override: fall back to the store, KDL, then the guess.
                     entry.scale = match scale {
                         synoik_ipc::ScaleToSet::Automatic => None,
@@ -3922,11 +3959,13 @@ impl State {
                     };
                 }
                 synoik_ipc::OutputAction::Transform { transform } => {
-                    self.synoik
+                    let entry = self
+                        .synoik
                         .applied_display_config
                         .entry(connector)
-                        .or_default()
-                        .transform = Some(ipc_transform_to_smithay(*transform));
+                        .or_default();
+                    entry.identity = identity;
+                    entry.transform = Some(ipc_transform_to_smithay(*transform));
                 }
                 _ => (),
             }
@@ -4029,6 +4068,7 @@ impl State {
                     let applied = AppliedDisplayConfig {
                         scale: output.scale.map(|s| s.0),
                         transform: Some(ipc_transform_to_smithay(output.transform)),
+                        identity: self.synoik.output_identity(&name),
                     };
                     self.synoik
                         .applied_display_config
@@ -7992,13 +8032,62 @@ impl Synoik {
     /// Both the store lookup and the DPI guess read the output's *current mode*, so this must be
     /// re-run whenever the mode changes — see the mode-change branch in
     /// `Tty::on_output_config_changed`.
+    /// Drops the live-applied override on this output's connector when it was applied to a
+    /// *different* display, along with the fields that apply wrote into the output config — the
+    /// same clearing [`crate::backend::tty::Tty`] does when the hardware invalidates an override's
+    /// mode, for the same reason: leave nothing of the old display behind for the configuration
+    /// chain to pick up.
+    ///
+    /// Called for every output on reload, and for a freshly connected one before it derives
+    /// anything. An override for a connector with no output right now is left alone, so it survives
+    /// a plain unplug/replug of the same display — as mutter's current config does.
+    pub fn forget_applied_config_for_another_display(&mut self, name: &OutputName) {
+        let Some(applied) = self.applied_display_config.get(&name.connector) else {
+            return;
+        };
+        if applied.applies_to(name) {
+            return;
+        }
+
+        debug!(
+            "output {:?}: dropping the applied display config, it was applied to {:?}, not to {:?}",
+            name.connector,
+            applied.identity,
+            name.format_make_model_serial(),
+        );
+        self.applied_display_config.remove(&name.connector);
+        let mut config = self.config.borrow_mut();
+        if let Some(output) = config.outputs.find_mut(name) {
+            output.mode = None;
+            output.scale = None;
+            output.transform = synoik_ipc::Transform::Normal;
+        }
+    }
+
+    /// The `make model serial` of the display currently on `connector`, for recording with a
+    /// live-applied override. `None` when no output matches — the config is being applied to
+    /// something we cannot see, so it must not be pinned to an identity.
+    pub fn output_identity(&self, connector: &str) -> Option<String> {
+        self.global_space
+            .outputs()
+            .map(|o| o.user_data().get::<OutputName>().unwrap())
+            .find(|name| name.connector == connector)
+            .map(OutputName::format_make_model_serial)
+    }
+
     pub fn derive_output_scale_transform(
         &self,
         output: &Output,
         monitors_config: Option<&crate::monitors_xml::MonitorsConfig>,
     ) -> (f64, Transform) {
         let name = output.user_data().get::<OutputName>().unwrap();
-        let applied = self.applied_display_config.get(&name.connector);
+        // An override for a *different* display that happened to share this connector does not
+        // apply; `State::forget_stale_applied_configs` clears those out, this is the guard that
+        // makes it impossible to consume one in the window before it runs.
+        let applied = self
+            .applied_display_config
+            .get(&name.connector)
+            .filter(|a| a.applies_to(name));
         let config = self.config.borrow();
         let c = config.outputs.find(name);
         let saved = monitors_config.and_then(|m| m.setting_for(name, output.current_mode()));
@@ -8028,6 +8117,11 @@ impl Synoik {
     pub fn add_output(&mut self, output: Output, refresh_interval: Option<Duration>, vrr: bool) {
         let global = output.create_global::<State>(&self.display_handle);
 
+        let name = output.user_data().get::<OutputName>().unwrap().clone();
+
+        // A different display on a connector we hold an override for: that override, and the config
+        // fields the apply wrote, belong to the display that left.
+        self.forget_applied_config_for_another_display(&name);
         let name = output.user_data().get::<OutputName>().unwrap();
 
         // Same precedence as `reload_output_config` (see the rationale there): live-applied
