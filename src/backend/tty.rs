@@ -1197,6 +1197,14 @@ impl Tty {
     /// [`Self::forget_inapplicable_applied_config`] drops one whose mode is gone: it was a
     /// judgement about the old display.
     fn refresh_changed_identities(&mut self, synoik: &mut Synoik, node: DrmNode) {
+        // On an inactive VT we cannot rebuild what we tear down: `on_output_config_changed` bails
+        // early and only sets `update_output_config_on_resume`, so the output would stay gone —
+        // and its windows parked — until the seat comes back. Session resume re-runs
+        // `device_changed` for every device, which re-runs this, so deferring loses nothing.
+        if !self.session.is_active() {
+            return;
+        }
+
         let Some(device) = self.devices.get(&node) else {
             return;
         };
