@@ -77,9 +77,21 @@ pub const HINT_FADE: Duration = Duration::from_millis(300);
 /// multiply rides inside the blur pass rather than being a separate wash, as GNOME's does.
 pub const BLUR_BRIGHTNESS: f64 = 0.65;
 
-/// `BLUR_RADIUS = 90` (`:35`), in **stage pixels** — so it scales with the output, and a caller
-/// converts it into whatever resolution the texture it blurs happens to be.
-pub const BLUR_RADIUS: f64 = 90.;
+/// In **stage pixels** — so it scales with the output, and a caller converts it into whatever
+/// resolution the texture it blurs happens to be.
+///
+/// **Divergence (deliberate).** GNOME's `BLUR_RADIUS = 90` (`unlockDialog.js:35`) blurs the
+/// wallpaper to an abstract wash; we stop at 50, which still reads as defocused but keeps enough of
+/// the picture to be recognisably *your* picture — closer in character to the panel plate's 30
+/// ([`crate::ui::panel::BAR_BLUR_RADIUS`]) without going all the way there.
+///
+/// It costs less legibility than it looks like it should. Measured on the seat's own wallpaper,
+/// over the band the clock occupies: WCAG contrast against white text is 12.70 at 90, 12.37 at 50
+/// and 10.85 at 30 — all far above the 4.5:1 that AAA asks of large text, because what a wider
+/// blur removes is *variance*, and [`BLUR_BRIGHTNESS`] is what sets the level. The picture reads as
+/// busier at a smaller radius mostly through texture, not brightness: mean |∇L| across that same
+/// band goes 0.00004 → 0.00010 → 0.00022.
+pub const BLUR_RADIUS: f64 = 50.;
 
 /// What the curtain shows. Plain strings, so the caller owns formatting and this is testable
 /// without a wall clock.
