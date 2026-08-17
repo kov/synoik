@@ -766,8 +766,6 @@ impl From<ColorRgba> for Color {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Blur {
     pub off: bool,
-    pub passes: u8,
-    pub offset: f64,
     pub noise: f64,
     pub saturation: f64,
 }
@@ -775,11 +773,6 @@ pub struct Blur {
 impl Default for Blur {
     fn default() -> Self {
         Self {
-            // `passes`/`offset` are the dual-Kawase's, and now reach only the xray effect buffer
-            // and the shell's own chrome — a client-blurred surface runs GNOME's gaussian at
-            // GNOME's radius instead (`render_helpers::blur::GNOME_CLIENT_BLUR_RADIUS`).
-            passes: 3,
-            offset: 3.,
             off: false,
             // `BACKGROUND_EFFECT_NOISE` / `BACKGROUND_EFFECT_SATURATION`, mutter 51
             // `src/compositor/meta-surface-actor.c`. The noise is the same arithmetic on both
@@ -796,8 +789,6 @@ impl Default for Blur {
 pub struct BlurPart {
     pub off: bool,
     pub on: bool,
-    pub passes: Option<u8>,
-    pub offset: Option<FloatOrInt<0, 100>>,
     pub noise: Option<FloatOrInt<0, 1000>>,
     pub saturation: Option<FloatOrInt<0, 1000>>,
 }
@@ -809,8 +800,7 @@ impl MergeWith<BlurPart> for Blur {
             self.off = false;
         }
 
-        merge_clone!((self, part), passes);
-        merge!((self, part), offset, noise, saturation);
+        merge!((self, part), noise, saturation);
     }
 }
 

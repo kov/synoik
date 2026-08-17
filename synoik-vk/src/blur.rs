@@ -64,15 +64,11 @@ pub struct BlurChain {
     set_layout: vk::DescriptorSetLayout,
     desc_pool: vk::DescriptorPool,
     pipeline_layout: vk::PipelineLayout,
-    down: vk::Pipeline,
-    up: vk::Pipeline,
     /// GNOME's separable gaussian, and the plain resample its rungs use. `None` when the chain was
     /// built without it — the dual-Kawase path needs neither, and the scratch levels the gaussian
     /// ping-pongs through are not worth allocating for a chain that will never run it.
     gaussian: Option<Gaussian>,
     vert: vk::ShaderModule,
-    down_frag: vk::ShaderModule,
-    up_frag: vk::ShaderModule,
     /// Level 0 is full-size (the output); levels 1..=passes shrink.
     levels: Vec<Level>,
     /// Descriptor set that samples the external source texture.
@@ -107,8 +103,6 @@ struct Gaussian {
 }
 
 const FULLSCREEN_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fullscreen.vert.spv"));
-const DOWN_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blur_down.frag.spv"));
-const UP_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blur_up.frag.spv"));
 const SCALE_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blur_scale.frag.spv"));
 const GAUSSIAN_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blur_gaussian.frag.spv"));
 
@@ -150,11 +144,7 @@ struct NewGuard<'a> {
     set_layout: vk::DescriptorSetLayout,
     desc_pool: vk::DescriptorPool,
     pipeline_layout: vk::PipelineLayout,
-    down: vk::Pipeline,
-    up: vk::Pipeline,
     vert: vk::ShaderModule,
-    down_frag: vk::ShaderModule,
-    up_frag: vk::ShaderModule,
     scale: vk::Pipeline,
     gauss: vk::Pipeline,
     scale_frag: vk::ShaderModule,
@@ -173,11 +163,7 @@ impl<'a> NewGuard<'a> {
             set_layout: vk::DescriptorSetLayout::null(),
             desc_pool: vk::DescriptorPool::null(),
             pipeline_layout: vk::PipelineLayout::null(),
-            down: vk::Pipeline::null(),
-            up: vk::Pipeline::null(),
             vert: vk::ShaderModule::null(),
-            down_frag: vk::ShaderModule::null(),
-            up_frag: vk::ShaderModule::null(),
             scale: vk::Pipeline::null(),
             gauss: vk::Pipeline::null(),
             scale_frag: vk::ShaderModule::null(),
@@ -202,14 +188,10 @@ impl Drop for NewGuard<'_> {
                 crate::devmem::untrack(level.memory);
                 d.free_memory(level.memory, None);
             }
-            d.destroy_pipeline(self.down, None);
-            d.destroy_pipeline(self.up, None);
             d.destroy_pipeline(self.scale, None);
             d.destroy_pipeline(self.gauss, None);
             d.destroy_pipeline_layout(self.pipeline_layout, None);
             d.destroy_shader_module(self.vert, None);
-            d.destroy_shader_module(self.down_frag, None);
-            d.destroy_shader_module(self.up_frag, None);
             d.destroy_shader_module(self.scale_frag, None);
             d.destroy_shader_module(self.gauss_frag, None);
             d.destroy_descriptor_pool(self.desc_pool, None);
@@ -224,15 +206,10 @@ impl BlurChain {
     /// Build the chain to blur `source` (which stays owned by the caller). `passes` is clamped to
     /// at least 1; `source` must be full-size (matches level 0).
     pub fn new(gpu: &Gpu, source: &Texture, passes: usize) -> Result<Self> {
-        Self::build(gpu, source, passes, false)
+        Self::build(gpu, source, passes)
     }
 
-    /// As [`Self::new`], plus the pipelines and scratch levels [`Self::record_gaussian`] needs.
-    pub fn new_with_gaussian(gpu: &Gpu, source: &Texture, passes: usize) -> Result<Self> {
-        Self::build(gpu, source, passes, true)
-    }
-
-    fn build(gpu: &Gpu, source: &Texture, passes: usize, gaussian: bool) -> Result<Self> {
+    fn build(gpu: &Gpu, source: &Texture, passes: usize) -> Result<Self> {
         let _timed = crate::stats::creating();
         let device = &gpu.device;
         let passes = passes.max(1);
@@ -257,9 +234,9 @@ impl BlurChain {
 
         guard.set_layout = crate::render::sampler_set_layout(gpu)?;
 
-        // One descriptor set per level + one for the external source, doubled (less level 0) when
-        // the gaussian's scratch twins are along.
-        let count = (passes + 2 + if gaussian { passes } else { 0 }) as u32;
+        // One descriptor set per level (`passes + 1`), one for the external source, and one per
+        // scratch twin (`passes`, the shrinking levels only).
+        let count = (passes * 2 + 2) as u32;
         let sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(count)];
@@ -283,22 +260,6 @@ impl BlurChain {
             unsafe { device.create_pipeline_layout(&layout_ci, None) }.context("blur layout")?;
 
         guard.vert = load_module(device, FULLSCREEN_VERT)?;
-        guard.down_frag = load_module(device, DOWN_FRAG)?;
-        guard.up_frag = load_module(device, UP_FRAG)?;
-        guard.down = build_pipeline(
-            gpu,
-            guard.render_pass,
-            guard.pipeline_layout,
-            guard.vert,
-            guard.down_frag,
-        )?;
-        guard.up = build_pipeline(
-            gpu,
-            guard.render_pass,
-            guard.pipeline_layout,
-            guard.vert,
-            guard.up_frag,
-        )?;
 
         // Create the level pyramid.
         let (mut w, mut h) = (width, height);
@@ -317,7 +278,7 @@ impl BlurChain {
             h = (h / 2).max(1);
         }
 
-        if gaussian {
+        {
             guard.scale_frag = load_module(device, SCALE_FRAG)?;
             guard.gauss_frag = load_module(device, GAUSSIAN_FRAG)?;
             guard.scale = build_pipeline(
@@ -362,7 +323,7 @@ impl BlurChain {
         )?;
 
         guard.armed = false;
-        let gaussian = gaussian.then(|| Gaussian {
+        let gaussian = Some(Gaussian {
             scale: guard.scale,
             blur: guard.gauss,
             scale_frag: guard.scale_frag,
@@ -376,11 +337,7 @@ impl BlurChain {
             set_layout: guard.set_layout,
             desc_pool: guard.desc_pool,
             pipeline_layout: guard.pipeline_layout,
-            down: guard.down,
-            up: guard.up,
             vert: guard.vert,
-            down_frag: guard.down_frag,
-            up_frag: guard.up_frag,
             levels: std::mem::take(&mut guard.levels),
             source_set,
             passes,
@@ -388,9 +345,9 @@ impl BlurChain {
         })
     }
 
-    /// Point the final upsample at `dst` — an image the caller owns, the same size as level 0 and
-    /// created with `COLOR_ATTACHMENT` usage — instead of leaving the result in level 0 for the
-    /// caller to copy out.
+    /// Point the final upsample — either path's — at `dst`, an image the caller owns, the same size
+    /// as level 0 and created with `COLOR_ATTACHMENT` usage — instead of leaving the result in
+    /// level 0 for the caller to copy out.
     ///
     /// This is the difference between one full-size `vkCmdCopyImage` per blurred surface per frame
     /// and none. The copy never showed up in the frame log's coverage figure (a copy is not a
@@ -404,7 +361,6 @@ impl BlurChain {
     /// only the framebuffer it creates here; the image, its view and its memory stay the
     /// caller's, and [`Self::destroy`] respects that.
     ///
-    /// `stop`-ping the upsample early ([`Self::record_to_level`]) ignores this: a caller that
     /// wants a partial result wants it where partial results have always been.
     pub fn set_external_dst(
         &mut self,
@@ -441,50 +397,6 @@ impl BlurChain {
         self.external_dst.is_some()
     }
 
-    /// Record the full down+up chain into `cbuf`. Afterwards level 0 holds the blurred output in
-    /// `SHADER_READ_ONLY_OPTIMAL` — or, with an external destination set, that image does.
-    pub fn record(&self, gpu: &Gpu, cbuf: vk::CommandBuffer, offset: f32) {
-        self.record_to_level(gpu, cbuf, offset, 0);
-    }
-
-    /// As [`Self::record`], but stop the upsample once `stop` holds the result instead of carrying
-    /// it all the way to level 0.
-    ///
-    /// Level 0 is the only full-size level, so it alone costs more than the whole rest of the
-    /// pyramid; stopping at level 1 leaves a quarter-size result for the consumer's linear sampler
-    /// to finish. Exposed for the cost measurement in this module's tests, which is what decides
-    /// whether that trade is worth taking.
-    pub fn record_to_level(&self, gpu: &Gpu, cbuf: vk::CommandBuffer, offset: f32, stop: usize) {
-        // Downsample: source → L1, L1 → L2, …, L_{passes-1} → L_passes.
-        for i in 1..=self.passes {
-            let dst = &self.levels[i];
-            let src_set = if i == 1 {
-                self.source_set
-            } else {
-                self.levels[i - 1].set
-            };
-            // half_pixel = half a destination pixel.
-            let half_pixel = [0.5 / dst.w as f32, 0.5 / dst.h as f32];
-            self.pass(gpu, cbuf, self.down, dst, src_set, half_pixel, offset);
-        }
-
-        // Upsample: L_passes → L_{passes-1}, …, L_{stop+1} → L_stop.
-        for i in (stop + 1..=self.passes).rev() {
-            let src = &self.levels[i];
-            // The last pass writes the caller's own image when it gave us one, so the result does
-            // not have to be copied out of level 0 afterwards. Only when the upsample really is
-            // running to completion: a caller that stops early wants the partial result where it
-            // has always been.
-            let dst = match (&self.external_dst, i) {
-                (Some(ext), 1) if stop == 0 => ext,
-                _ => &self.levels[i - 1],
-            };
-            // half_pixel = half a source pixel.
-            let half_pixel = [0.5 / src.w as f32, 0.5 / src.h as f32];
-            self.pass(gpu, cbuf, self.up, dst, src.set, half_pixel, offset);
-        }
-    }
-
     /// Record GNOME's blur: `sigma = radius / 2`, evaluated separably on a downscaled copy
     /// (`ShellBlurEffect`, `shell-blur-effect.c:425-447`; `ClutterBlur`, `clutter-blur.c:339-370`).
     ///
@@ -495,8 +407,8 @@ impl BlurChain {
     /// `brightness` is `ShellBlurEffect`'s multiply, folded into the second direction rather than
     /// given a pass of its own.
     ///
-    /// Afterwards level 0 holds the result in `SHADER_READ_ONLY_OPTIMAL`, as with [`Self::record`].
-    /// Does nothing without the pipelines — build the chain with [`Self::new_with_gaussian`].
+    /// Afterwards level 0 holds the result in `SHADER_READ_ONLY_OPTIMAL` — or, with an external
+    /// destination set, that image does.
     pub fn record_gaussian(
         &self,
         gpu: &Gpu,
@@ -566,8 +478,12 @@ impl BlurChain {
         );
 
         // And back up to full size in one magnifying draw, which is what GNOME's compositing of the
-        // small texture over the actor's box amounts to.
-        self.pass_gaussian(gpu, cbuf, g.scale, full, self.levels[k].set, None);
+        // small texture over the actor's box amounts to — straight into the caller's own image when
+        // it gave us one, which is what makes the copy out of level 0 unnecessary. Level 0 is only
+        // ever this pass's target (the descent reads `source_set`), so there is nothing else that
+        // would go missing.
+        let out = self.external_dst.as_ref().unwrap_or(full);
+        self.pass_gaussian(gpu, cbuf, g.scale, out, self.levels[k].set, None);
     }
 
     /// One gaussian-path pass. `push` is `None` for the resample rungs, which read no constants.
@@ -631,73 +547,10 @@ impl BlurChain {
                 );
             }
             device.cmd_draw(cbuf, 3, 1, 0, 0);
-            device.cmd_end_render_pass(cbuf);
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn pass(
-        &self,
-        gpu: &Gpu,
-        cbuf: vk::CommandBuffer,
-        pipeline: vk::Pipeline,
-        dst: &Level,
-        src_set: vk::DescriptorSet,
-        half_pixel: [f32; 2],
-        offset: f32,
-    ) {
-        let device = &gpu.device;
-        let extent = vk::Extent2D {
-            width: dst.w,
-            height: dst.h,
-        };
-        let begin = vk::RenderPassBeginInfo::default()
-            .render_pass(self.render_pass)
-            .framebuffer(dst.framebuffer)
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent,
-            });
-        let push = BlurPush {
-            half_pixel,
-            offset,
-            _pad0: 0.0,
-        };
-        let viewport = vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: dst.w as f32,
-            height: dst.h as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        };
-        let scissor = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent,
-        };
-        unsafe {
-            crate::stats::render_pass();
-            device.cmd_begin_render_pass(cbuf, &begin, vk::SubpassContents::INLINE);
-            device.cmd_set_viewport(cbuf, 0, &[viewport]);
-            device.cmd_set_scissor(cbuf, 0, &[scissor]);
-            device.cmd_bind_pipeline(cbuf, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            device.cmd_bind_descriptor_sets(
-                cbuf,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
-                0,
-                &[src_set],
-                &[],
-            );
-            device.cmd_push_constants(
-                cbuf,
-                self.pipeline_layout,
-                vk::ShaderStageFlags::FRAGMENT,
-                0,
-                as_bytes(&push),
-            );
-            device.cmd_draw(cbuf, 3, 1, 0, 0);
-            // A blur pass shades its whole destination level.
+            // A blur pass shades its whole destination level. Counted here for the same reason the
+            // Kawase's passes were: these are draws, so they belong to `DrawSite::Blur` rather than
+            // to whichever site happens to be nearest in the code. Without it a frame full of blur
+            // reports none of it, which reads as a free blur rather than an unmeasured one.
             crate::stats::draw(
                 crate::stats::DrawSite::Blur,
                 u64::from(extent.width) * u64::from(extent.height),
@@ -926,12 +779,8 @@ impl BlurChain {
                 d.destroy_shader_module(g.scale_frag, None);
                 d.destroy_shader_module(g.blur_frag, None);
             }
-            d.destroy_pipeline(self.down, None);
-            d.destroy_pipeline(self.up, None);
             d.destroy_pipeline_layout(self.pipeline_layout, None);
             d.destroy_shader_module(self.vert, None);
-            d.destroy_shader_module(self.down_frag, None);
-            d.destroy_shader_module(self.up_frag, None);
             d.destroy_descriptor_pool(self.desc_pool, None);
             d.destroy_descriptor_set_layout(self.set_layout, None);
             d.destroy_sampler(self.sampler, None);
@@ -1179,8 +1028,13 @@ mod tests {
     }
 
     /// Passes the compositor actually configures (`synoik_config::Blur::default`).
-    const PASSES: usize = 3;
-    const OFFSET: f32 = 3.0;
+    /// `2σ`, the convention every radius in this crate carries.
+    const RADIUS: f64 = 30.0;
+
+    /// How many rungs GNOME's cascade wants for [`RADIUS`] over a `w`x`h` source.
+    fn levels(w: u32, h: u32) -> usize {
+        super::downscale_levels(w, h, RADIUS).max(1)
+    }
 
     /// Sizes to sweep. The last is roughly the 5.3x-output overview frame that
     /// §3.8 of `docs/fork/foundation.md` measured at `1 blur in 13.63ms`.
@@ -1247,7 +1101,8 @@ mod tests {
         let spread_of = |radius: f64, brightness: f32| -> (usize, u8, u8) {
             let source =
                 Texture::from_rgba(&gpu, pool, W, H, &src, vk::Filter::LINEAR).expect("source");
-            let chain = BlurChain::new_with_gaussian(&gpu, &source, PASSES).expect("chain");
+            let chain = BlurChain::new(&gpu, &source, super::downscale_levels(W, H, radius).max(1))
+                .expect("chain");
             gpu.run_commands(pool, crate::stats::SubmitSite::Blur, |cbuf| {
                 chain.record_gaussian(&gpu, cbuf, radius, brightness);
             })
@@ -1304,10 +1159,6 @@ mod tests {
     ///   0 into the caller's sampleable texture.
     /// - `record` drops that copy — what rendering the last upsample *directly* into the caller's
     ///   texture would cost.
-    /// - `record→L1` also stops the upsample one level short, leaving the result at quarter size
-    ///   for the consumer's sampler to finish. It skips the single most expensive pass in the chain
-    ///   (level 0 is the only full-size one) and would shrink the copy to a quarter if the copy
-    ///   stayed.
     #[test]
     #[ignore = "measures blur cost on the real device; run explicitly"]
     fn blur_cost_by_variant_and_size() {
@@ -1322,8 +1173,8 @@ mod tests {
         let empty = time_submit(&gpu, pool, |_| {});
         println!("empty submit (subtracted below): {:.3}ms", ms(empty));
         println!(
-            "{:<12} {:>10} {:>10} {:>10} {:>10}",
-            "size", "px", "record+copy", "record→dst", "record→L1"
+            "{:<12} {:>10} {:>10} {:>10}",
+            "size", "px", "record+copy", "record→dst"
         );
 
         for &(w, h) in SIZES {
@@ -1331,12 +1182,12 @@ mod tests {
             let source =
                 Texture::from_rgba(&gpu, pool, w, h, &src, vk::Filter::LINEAR).expect("source");
             let dst = Texture::new_color_target(&gpu, w, h, vk::Filter::LINEAR).expect("dst");
-            let chain = BlurChain::new(&gpu, &source, PASSES).expect("chain");
+            let chain = BlurChain::new(&gpu, &source, levels(w, h)).expect("chain");
 
             let full = per_rep(
                 time_submit(&gpu, pool, |cbuf| {
                     for _ in 0..reps() {
-                        chain.record(&gpu, cbuf, OFFSET);
+                        chain.record_gaussian(&gpu, cbuf, RADIUS, 1.0);
                         chain.copy_output_to(&gpu, cbuf, dst.image, w, h);
                     }
                 }),
@@ -1344,34 +1195,24 @@ mod tests {
             );
             // The shipping path: the final upsample renders straight into `dst`, so there is no
             // copy to pay for. This is the column `record+copy` is here to be compared against.
-            let mut direct = BlurChain::new(&gpu, &source, PASSES).expect("chain (direct)");
+            let mut direct = BlurChain::new(&gpu, &source, levels(w, h)).expect("chain (direct)");
             direct
                 .set_external_dst(&gpu, dst.view, w, h)
                 .expect("external dst");
             let no_copy = per_rep(
                 time_submit(&gpu, pool, |cbuf| {
                     for _ in 0..reps() {
-                        direct.record(&gpu, cbuf, OFFSET);
+                        direct.record_gaussian(&gpu, cbuf, RADIUS, 1.0);
                     }
                 }),
                 empty,
             );
-            let to_l1 = per_rep(
-                time_submit(&gpu, pool, |cbuf| {
-                    for _ in 0..reps() {
-                        chain.record_to_level(&gpu, cbuf, OFFSET, 1);
-                    }
-                }),
-                empty,
-            );
-
             println!(
-                "{:<12} {:>10.2} {:>9.3}ms {:>9.3}ms {:>9.3}ms",
+                "{:<12} {:>10.2} {:>9.3}ms {:>9.3}ms",
                 format!("{w}x{h}"),
                 (w as f64) * (h as f64) / 1e6,
                 ms(full),
                 ms(no_copy),
-                ms(to_l1),
             );
 
             direct.destroy(&gpu);
@@ -1416,10 +1257,10 @@ mod tests {
             let source =
                 Texture::from_rgba(&gpu, pool, w, h, &src, vk::Filter::LINEAR).expect("source");
             let dst = Texture::new_color_target(&gpu, w, h, vk::Filter::LINEAR).expect("dst");
-            let chain = BlurChain::new(&gpu, &source, PASSES).expect("chain");
+            let chain = BlurChain::new(&gpu, &source, levels(w, h)).expect("chain");
 
             let one = |cbuf| {
-                chain.record(&gpu, cbuf, OFFSET);
+                chain.record_gaussian(&gpu, cbuf, RADIUS, 1.0);
                 chain.copy_output_to(&gpu, cbuf, dst.image, w, h);
             };
             // All N in one command buffer: the round trip paid once.

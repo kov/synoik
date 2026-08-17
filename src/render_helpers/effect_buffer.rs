@@ -15,7 +15,6 @@ use smithay::backend::renderer::{
 };
 use smithay::utils::{Buffer, Logical, Physical, Scale, Size, Transform};
 
-use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::renderer::OffscreenRenderer as _;
 use crate::render_helpers::vulkan::{EffectBlur, VkTexture, VulkanRenderer};
 use crate::render_helpers::NATIVE_FOURCC;
@@ -30,8 +29,9 @@ pub struct EffectBuffer {
     size: Size<i32, Buffer>,
     /// Scale of the effect buffer.
     scale: Scale<f64>,
-    /// Options for blurring.
-    blur_options: BlurOptions,
+    /// The xray blur's radius (`2σ`) in **physical** pixels — the caller multiplies GNOME's
+    /// logical radius by the output scale. Zero until told otherwise.
+    blur_radius: f64,
 
     /// Elements to be rendered on demand.
     elements_vk: ElementsVk,
@@ -86,7 +86,7 @@ impl EffectBuffer {
             id: Id::new(),
             size: Size::default(),
             scale: Scale::from(1.),
-            blur_options: BlurOptions::default(),
+            blur_radius: 0.,
             elements_vk: ElementsVk::default(),
             offscreen_vk: None,
             commit_counter: CommitCounter::default(),
@@ -130,15 +130,15 @@ impl EffectBuffer {
         self.scale = scale;
     }
 
-    pub fn update_blur_options(&mut self, options: BlurOptions) {
-        if self.blur_options == options {
+    pub fn update_blur_radius(&mut self, radius: f64) {
+        if self.blur_radius == radius {
             return;
         }
 
-        self.blur_options = options;
+        self.blur_radius = radius;
 
         let mut had_blur = false;
-        // A pass-count change is picked up by `prepare_blur_vulkan` (it rebuilds the chain when
+        // A rung-count change is picked up by `prepare_blur_vulkan` (it rebuilds the chain when
         // `passes` differs), so invalidating is enough here.
         if let Some(offscreen) = &mut self.offscreen_vk {
             if let Some(blur) = &mut offscreen.blur {
@@ -326,14 +326,20 @@ impl EffectBuffer {
     }
 
     fn prepare_blur_vulkan(&mut self, renderer: &mut VulkanRenderer) -> anyhow::Result<()> {
-        let passes = (self.blur_options.passes as usize).clamp(1, 31);
-        let offset = self.blur_options.offset as f32;
+        let radius = self.blur_radius;
 
         let offscreen = self.offscreen_vk.as_mut().context("missing offscreen")?;
 
-        // Rebuild the chain when it is missing or the pass count changed. A texture recreation
+        // GNOME's cascade sizes the pyramid to the radius, so how many rungs this needs is a
+        // function of both. Rebuild when it is missing or that count changed. A texture recreation
         // already dropped it (offscreen_vk was set to None), so this only handles the same-texture
-        // pass-count change; the fresh chain binds the current texture view.
+        // change; the fresh chain binds the current texture view.
+        let passes = synoik_vk::blur::downscale_levels(
+            offscreen.texture.width(),
+            offscreen.texture.height(),
+            radius,
+        )
+        .max(1);
         let need_new = offscreen.blur.as_ref().is_none_or(|b| b.passes() != passes);
         if need_new {
             offscreen.blur = Some(EffectBlur::new(renderer, &offscreen.texture, passes)?);
@@ -344,7 +350,7 @@ impl EffectBuffer {
         let OffscreenVk { texture, blur, .. } = offscreen;
         let blur = blur.as_mut().expect("just populated");
         if !blur.is_valid() {
-            blur.queue(renderer, texture, offset);
+            blur.queue(renderer, texture, radius);
         }
 
         Ok(())

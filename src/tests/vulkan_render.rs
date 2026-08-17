@@ -5028,15 +5028,11 @@ fn vulkan_framebuffer_effect_captures_and_blurs_through_the_render_loop() {
         clip: None,
         scale: 1.0,
     };
-    // Blur on (`passes > 0`) so the effect is non-trivial; noise 0, saturation 1.
-    let blur = crate::render_helpers::blur::BlurOptions {
-        passes: 3,
-        offset: 5.0,
-    };
+    // Blur on so the effect is non-trivial; noise 0, saturation 1.
     let elem = fbe.render(
         None,
         params,
-        Some(blur.into()),
+        Some(62.0),
         crate::render_helpers::blur::Finish::NONE,
     );
 
@@ -5091,7 +5087,7 @@ fn vulkan_a_blurred_frame_adds_no_submits() {
             .map(|site| site.submits)
             .sum()
     };
-    let blurred_element = |passes: u8| {
+    let blurred_element = |radius: f64| {
         let fbe = crate::render_helpers::framebuffer_effect::FramebufferEffect::new();
         let params = crate::render_helpers::background_effect::RenderParams {
             geometry: Rectangle::from_size(Size::from((200., 200.))),
@@ -5099,14 +5095,10 @@ fn vulkan_a_blurred_frame_adds_no_submits() {
             clip: None,
             scale: 1.0,
         };
-        let blur = crate::render_helpers::blur::BlurOptions {
-            passes,
-            offset: 5.0,
-        };
         fbe.render(
             None,
             params,
-            Some(blur.into()),
+            Some(radius),
             crate::render_helpers::blur::Finish::NONE,
         )
     };
@@ -5119,7 +5111,7 @@ fn vulkan_a_blurred_frame_adds_no_submits() {
         Scale::from(1.0),
         Transform::Normal,
         Fourcc::Abgr8888,
-        std::iter::once(blurred_element(3)),
+        std::iter::once(blurred_element(24.0)),
     )
     .expect("warmup render");
 
@@ -5141,7 +5133,7 @@ fn vulkan_a_blurred_frame_adds_no_submits() {
         Scale::from(1.0),
         Transform::Normal,
         Fourcc::Abgr8888,
-        std::iter::once(blurred_element(3)),
+        std::iter::once(blurred_element(24.0)),
     )
     .expect("blurred render");
     let blurred = submits(());
@@ -5479,7 +5471,6 @@ fn vulkan_moving_blur_cap_changes_resolution_not_radius() {
     use smithay::utils::user_data::UserDataMap;
 
     use crate::render_helpers::background_effect::RenderParams;
-    use crate::render_helpers::blur::BlurOptions;
     use crate::render_helpers::framebuffer_effect::FramebufferEffect;
     use crate::render_helpers::vulkan::VulkanRenderer as Vk;
 
@@ -5506,13 +5497,7 @@ fn vulkan_moving_blur_cap_changes_resolution_not_radius() {
                     clip: None,
                     scale: 1.0,
                 },
-                Some(
-                    BlurOptions {
-                        passes: 3,
-                        offset: 2.0,
-                    }
-                    .into(),
-                ),
+                Some(24.8),
                 crate::render_helpers::blur::Finish::NONE,
             );
             let src = element.src();
@@ -5608,7 +5593,6 @@ fn vulkan_a_blurs_shaded_area_is_attributed_to_the_blur() {
     use synoik_vk::stats::DrawSite;
 
     use crate::render_helpers::background_effect::RenderParams;
-    use crate::render_helpers::blur::BlurOptions;
     use crate::render_helpers::framebuffer_effect::FramebufferEffect;
     use crate::render_helpers::vulkan::VulkanRenderer as Vk;
 
@@ -5637,13 +5621,7 @@ fn vulkan_a_blurs_shaded_area_is_attributed_to_the_blur() {
             clip: None,
             scale: 1.0,
         },
-        Some(
-            BlurOptions {
-                passes: 3,
-                offset: 2.0,
-            }
-            .into(),
-        ),
+        Some(24.8),
         crate::render_helpers::blur::Finish::NONE,
     );
     let cache = UserDataMap::new();
@@ -5712,7 +5690,6 @@ fn vulkan_backdrop_blur_softens_a_hard_edge() {
     use synoik_config::CornerRadius;
 
     use crate::render_helpers::background_effect::RenderParams;
-    use crate::render_helpers::blur::BlurOptions;
     use crate::render_helpers::framebuffer_effect::FramebufferEffect;
     use crate::render_helpers::vulkan::VulkanRenderer as Vk;
 
@@ -5741,13 +5718,7 @@ fn vulkan_backdrop_blur_softens_a_hard_edge() {
     let element = effect.render(
         None,
         params,
-        Some(
-            BlurOptions {
-                passes: 3,
-                offset: 2.0,
-            }
-            .into(),
-        ),
+        Some(24.8),
         crate::render_helpers::blur::Finish::NONE,
     );
     let _ = CornerRadius::default();
@@ -5845,7 +5816,6 @@ fn vulkan_backdrop_blur_radius_survives_a_rung_crossing() {
     use smithay::utils::user_data::UserDataMap;
 
     use crate::render_helpers::background_effect::RenderParams;
-    use crate::render_helpers::blur::BlurOptions;
     use crate::render_helpers::framebuffer_effect::FramebufferEffect;
     use crate::render_helpers::vulkan::VulkanRenderer as Vk;
 
@@ -5877,13 +5847,7 @@ fn vulkan_backdrop_blur_radius_survives_a_rung_crossing() {
                 clip: None,
                 scale,
             },
-            Some(
-                BlurOptions {
-                    passes: 3,
-                    offset: 3.0,
-                }
-                .into(),
-            ),
+            Some(37.2),
             crate::render_helpers::blur::Finish::NONE,
         );
         let cache = UserDataMap::new();
@@ -5974,7 +5938,7 @@ fn vulkan_client_blur_runs_gnomes_gaussian_at_gnomes_radius() {
     use smithay::utils::user_data::UserDataMap;
 
     use crate::render_helpers::background_effect::RenderParams;
-    use crate::render_helpers::blur::{BlurRecipe, GNOME_CLIENT_BLUR_RADIUS};
+    use crate::render_helpers::blur::GNOME_CLIENT_BLUR_RADIUS;
     use crate::render_helpers::framebuffer_effect::FramebufferEffect;
     use crate::render_helpers::vulkan::VulkanRenderer as Vk;
 
@@ -6004,7 +5968,7 @@ fn vulkan_client_blur_runs_gnomes_gaussian_at_gnomes_radius() {
                 clip: None,
                 scale: 1.0,
             },
-            Some(BlurRecipe::Gaussian { radius }),
+            Some(radius),
             crate::render_helpers::blur::Finish::NONE,
         );
         let cache = UserDataMap::new();
@@ -6101,7 +6065,7 @@ fn vulkan_client_blur_finish_adds_no_wash() {
     use smithay::utils::user_data::UserDataMap;
 
     use crate::render_helpers::background_effect::RenderParams;
-    use crate::render_helpers::blur::{client_finish, BlurOptions, Finish};
+    use crate::render_helpers::blur::{client_finish, Finish};
     use crate::render_helpers::framebuffer_effect::FramebufferEffect;
     use crate::render_helpers::vulkan::VulkanRenderer as Vk;
     use crate::ui::widget::style::Appearance;
@@ -6131,13 +6095,7 @@ fn vulkan_client_blur_finish_adds_no_wash() {
                 clip: None,
                 scale: 1.0,
             },
-            Some(
-                BlurOptions {
-                    passes: 3,
-                    offset: 2.0,
-                }
-                .into(),
-            ),
+            Some(24.8),
             finish,
         );
         let cache = UserDataMap::new();
@@ -6222,7 +6180,6 @@ fn vulkan_backdrop_blur_honours_the_subregion() {
     use smithay::utils::user_data::UserDataMap;
 
     use crate::render_helpers::background_effect::RenderParams;
-    use crate::render_helpers::blur::BlurOptions;
     use crate::render_helpers::framebuffer_effect::FramebufferEffect;
     use crate::render_helpers::vulkan::VulkanRenderer as Vk;
     use crate::utils::region::TransformedRegion;
@@ -6256,13 +6213,7 @@ fn vulkan_backdrop_blur_honours_the_subregion() {
     let element = effect.render(
         None,
         params,
-        Some(
-            BlurOptions {
-                passes: 3,
-                offset: 2.0,
-            }
-            .into(),
-        ),
+        Some(24.8),
         crate::render_helpers::blur::Finish::NONE,
     );
     let cache = UserDataMap::new();
@@ -6356,7 +6307,6 @@ fn vulkan_effect_buffer_renders_offscreen_and_blur() {
     use smithay::backend::renderer::{Offscreen, Texture as _};
     use synoik_vk::render::PostprocessPush;
 
-    use crate::render_helpers::blur::BlurOptions;
     use crate::render_helpers::effect_buffer::EffectBuffer;
     use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
     use crate::render_helpers::vulkan::VkTexture;
@@ -6518,10 +6468,7 @@ fn vulkan_effect_buffer_renders_offscreen_and_blur() {
     } // drop the offscreen clone before the next prepare so `is_unique_reference` holds
 
     // (c) blur on → the hard edge softens.
-    buffer.update_blur_options(BlurOptions {
-        passes: 3,
-        offset: 2.0,
-    });
+    buffer.update_blur_radius(24.0);
     assert!(
         buffer.prepare_vulkan(&mut vk, true),
         "prepare_vulkan (blur) failed"
@@ -6781,7 +6728,7 @@ fn vulkan_backdrop_effect_roundtrips_under_rotation() {
     let render_scene_opt = |vk: &mut Vk,
                             transform: Transform,
                             with_effect: bool,
-                            blur: Option<crate::render_helpers::blur::BlurOptions>,
+                            blur: Option<f64>,
                             subregion: Option<crate::utils::region::TransformedRegion>|
      -> Vec<u8> {
         let mut target = vk
@@ -6818,7 +6765,7 @@ fn vulkan_backdrop_effect_roundtrips_under_rotation() {
                 let element = effect.render(
                     None,
                     params,
-                    blur.map(Into::into),
+                    blur,
                     crate::render_helpers::blur::Finish::NONE,
                 );
                 let cache = UserDataMap::new();
@@ -6863,10 +6810,7 @@ fn vulkan_backdrop_effect_roundtrips_under_rotation() {
         render_scene_opt(vk, transform, with_effect, None, None)
     };
 
-    let blur_opts = crate::render_helpers::blur::BlurOptions {
-        passes: 3,
-        offset: 2.0,
-    };
+    let blur_opts = 24.0;
 
     // Count the quadrants that contain a blended (blurred-edge) pixel. The edge crosses all four
     // quadrants whatever the transform, so an unrestricted blur lights up 4; a blur restricted to
@@ -9975,7 +9919,6 @@ fn vulkan_dash_separator_and_running_dot_bake_over_the_pill() {
 fn vulkan_the_xray_blur_costs_no_submit_and_still_lands() {
     use smithay::backend::renderer::element::Kind;
 
-    use crate::render_helpers::blur::BlurOptions;
     use crate::render_helpers::effect_buffer::EffectBuffer;
     use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 
@@ -10032,10 +9975,7 @@ fn vulkan_the_xray_blur_costs_no_submit_and_still_lands() {
     const S: i32 = 64;
     let mut buffer = EffectBuffer::new();
     buffer.update_size(Size::<i32, Physical>::from((S, S)), scale);
-    buffer.update_blur_options(BlurOptions {
-        passes: 3,
-        offset: 2.0,
-    });
+    buffer.update_blur_radius(24.0);
     fill_edge(&mut buffer, S);
 
     let before = vk.in_flight_len();
@@ -10106,7 +10046,6 @@ fn vulkan_a_fresh_offscreen_costs_no_transition_submit() {
     use smithay::backend::renderer::element::Kind;
     use smithay::backend::renderer::Texture as _;
 
-    use crate::render_helpers::blur::BlurOptions;
     use crate::render_helpers::effect_buffer::EffectBuffer;
     use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
     use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -10128,10 +10067,7 @@ fn vulkan_a_fresh_offscreen_costs_no_transition_submit() {
 
     let scale = Scale::from(1.0);
     let mut buffer = EffectBuffer::new();
-    buffer.update_blur_options(BlurOptions {
-        passes: 3,
-        offset: 2.0,
-    });
+    buffer.update_blur_radius(24.0);
 
     // Redraw rounds, including the size changes that recreate the texture.
     for s in [64i32, 96, 96, 128] {

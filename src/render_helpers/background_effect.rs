@@ -12,7 +12,7 @@ use synoik_config::CornerRadius;
 use wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::handlers::background_effect::get_cached_blur_region;
-use crate::render_helpers::blur::{client_finish, BlurRecipe, GNOME_CLIENT_BLUR_RADIUS};
+use crate::render_helpers::blur::{client_finish, GNOME_CLIENT_BLUR_RADIUS};
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
 use crate::render_helpers::xray::{XrayElement, XrayPos};
@@ -216,9 +216,7 @@ impl BackgroundEffect {
         // paint time (`create_blur_node` takes `radius * view_scale`) — that is what keeps the blur
         // the same size on screen across monitors of different scale, which the physical-pixel
         // Kawase offset never did.
-        let blur_recipe = blur.then_some(BlurRecipe::Gaussian {
-            radius: GNOME_CLIENT_BLUR_RADIUS * params.scale,
-        });
+        let blur_radius = blur.then_some(GNOME_CLIENT_BLUR_RADIUS * params.scale);
         let noise = if blur { self.blur_config.noise } else { 0. };
         let noise = self.options.noise.unwrap_or(noise) as f32;
         let saturation = if blur {
@@ -249,7 +247,7 @@ impl BackgroundEffect {
             // backdrop something a client's own text can sit on. Only here — the shell's chrome
             // paints its own `$system_*` fill over its blur and passes `Finish::NONE`.
             let finish = client_finish(self.options.appearance, noise, saturation);
-            let elem = self.nonxray.render(ns, params, blur_recipe, finish);
+            let elem = self.nonxray.render(ns, params, blur_radius, finish);
             push(elem.into());
         }
     }

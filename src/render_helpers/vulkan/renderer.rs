@@ -42,7 +42,6 @@ use super::types::{
     import_format, matches_render_order, GlyphRun, VkFramebuffer, VkMapping, VkTexture,
     IMAGE_VK_FORMAT, NATIVE_FOURCC,
 };
-use crate::render_helpers::blur::BlurOptions;
 
 /// One host-memory buffer to import in a batch ([`VulkanRenderer::import_memory_batch`]): tight
 /// `w*h*4` bytes, its DRM `Fourcc`, the buffer size, and whether it is y-flipped.
@@ -340,24 +339,16 @@ pub struct VulkanRenderer {
 ///
 /// The xray effect buffer builds its blur while collecting elements, where no command buffer is
 /// open — so unlike the backdrop blur (which is invoked mid-frame and records straight into the
-/// gap `capture_region` opens) it has to be queued. See [`VulkanRenderer::queue_blur`].
+/// gap `capture_region` opens) it has to be queued. See [`VulkanRenderer::queue_gaussian_blur`].
 struct PendingBlur {
     chain: Arc<SharedBlurChain>,
     /// What the chain samples, and what it writes. Both held for the usual reason: the copy and
     /// the passes name these images, and the submit that runs them has not happened yet.
     source: VkTexture,
     output: VkTexture,
-    kind: PendingBlurKind,
-}
-
-/// Which blur a queued entry runs — the two kernels take different parameters and there is no
-/// meaningful conversion between them.
-#[derive(Debug, Clone, Copy)]
-enum PendingBlurKind {
-    /// niri's dual-Kawase, parameterised by its tap offset.
-    Kawase { offset: f32 },
-    /// GNOME's gaussian, parameterised by a radius in the source texture's pixels.
-    Gaussian { radius: f64, brightness: f32 },
+    /// `2σ` in the source texture's own pixels, and `ShellBlurEffect`'s dimming multiply.
+    radius: f64,
+    brightness: f32,
 }
 
 /// One staged texture upload waiting for a frame to record its copy, **with its destination held
@@ -393,7 +384,7 @@ const MAX_READBACK_STAGING: usize = 4;
 /// What a pooled backdrop bundle is keyed by: the intermediate's `(width, height)` and the blur
 /// pass count (`None` = blur off), i.e. exactly what
 /// [`BackdropBlur::matches`](super::BackdropBlur::matches) tests.
-type BackdropBlurKey = ((u32, u32), Option<crate::render_helpers::blur::BlurKind>);
+type BackdropBlurKey = ((u32, u32), Option<usize>);
 
 /// Budget for the evicted-backdrop-bundle pool, in bytes. See
 /// [`VulkanRenderer::backdrop_blur_pool`].
@@ -1702,13 +1693,14 @@ impl VulkanRenderer {
     ///
     /// Builds a transient blur chain per call (unoptimized — the render pass, pipelines and level
     /// pyramid are rebuilt each time); the eventual live `FramebufferEffectElement` consumer will
-    /// cache it. The chain records the down/up passes plus a copy of its output into `output`, then
-    /// this fence-waits and hands back `output` in `SHADER_READ_ONLY_OPTIMAL`.
+    /// cache it. The chain records the passes plus a copy of its output into `output`, then this
+    /// fence-waits and hands back `output` in `SHADER_READ_ONLY_OPTIMAL`. `radius` is `2σ` in
+    /// `source`'s own pixels.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn render_blur(
         &mut self,
         source: &VkTexture,
-        options: BlurOptions,
+        radius: f64,
     ) -> Result<VkTexture, VulkanError> {
         // The chain samples `source` on a submit of its own, ahead of any frame.
         self.flush_pending_texture_uploads()?;
@@ -1719,10 +1711,10 @@ impl VulkanRenderer {
 
         let gpu = self.gpu.clone();
         let pool = self.command_pool;
-        let passes = (options.passes as usize).clamp(1, 31);
+        let passes = synoik_vk::blur::downscale_levels(w, h, radius).max(1);
         let chain = BlurChain::new(&gpu, source.synoik_texture(), passes)?;
         let recorded = gpu.run_commands(pool, synoik_vk::stats::SubmitSite::Blur, |cbuf| {
-            chain.record(&gpu, cbuf, options.offset as f32);
+            chain.record_gaussian(&gpu, cbuf, radius, 1.0);
             chain.copy_output_to(&gpu, cbuf, output.image(), w, h);
         });
         // Free the transient chain regardless of whether recording/submission succeeded.
@@ -2976,38 +2968,12 @@ impl VulkanRenderer {
         queued
     }
 
-    /// Queue a blur of `source` into `output` for the next frame to record.
+    /// Queue GNOME's gaussian over `source` into `output`, for the next frame's command buffer.
     ///
     /// A blur already queued for the same `output` is **replaced**: the second one exists because
     /// the source was re-rendered, which makes the first one's result stale before it was ever
-    /// recorded. Same rule, and same reason, as [`Self::queue_texture_upload`].
-    pub(super) fn queue_blur(
-        &mut self,
-        chain: Arc<SharedBlurChain>,
-        source: VkTexture,
-        output: VkTexture,
-        offset: f32,
-    ) {
-        let image = output.image();
-        let entry = PendingBlur {
-            chain,
-            source,
-            output,
-            kind: PendingBlurKind::Kawase { offset },
-        };
-        match self
-            .pending_blurs
-            .iter_mut()
-            .find(|queued| queued.output.image() == image)
-        {
-            Some(superseded) => *superseded = entry,
-            None => self.pending_blurs.push(entry),
-        }
-    }
-
-    /// Queue GNOME's gaussian over `source` into `output`, for the next frame's command buffer.
-    ///
-    /// Same contract as [`Self::queue_blur`] — the radius is in `source`'s own pixels.
+    /// recorded. Same rule, and same reason, as [`Self::queue_texture_upload`]. The radius is `2σ`
+    /// in `source`'s own pixels.
     pub(super) fn queue_gaussian_blur(
         &mut self,
         chain: Arc<SharedBlurChain>,
@@ -3021,7 +2987,8 @@ impl VulkanRenderer {
             chain,
             source,
             output,
-            kind: PendingBlurKind::Gaussian { radius, brightness },
+            radius,
+            brightness,
         };
         match self
             .pending_blurs
@@ -3047,22 +3014,14 @@ impl VulkanRenderer {
         let mut textures = Vec::with_capacity(queued.len() * 2);
         for blur in queued {
             let (w, h) = blur.output.extent();
-            match blur.kind {
-                PendingBlurKind::Kawase { offset } => {
-                    blur.chain
-                        .record_into(cbuf, offset, blur.output.image(), w, h);
-                }
-                PendingBlurKind::Gaussian { radius, brightness } => {
-                    blur.chain.record_gaussian_into(
-                        cbuf,
-                        radius,
-                        brightness,
-                        blur.output.image(),
-                        w,
-                        h,
-                    );
-                }
-            }
+            blur.chain.record_gaussian_into(
+                cbuf,
+                blur.radius,
+                blur.brightness,
+                blur.output.image(),
+                w,
+                h,
+            );
             chains.push(blur.chain);
             textures.push(blur.source);
             textures.push(blur.output);
@@ -3092,22 +3051,14 @@ impl VulkanRenderer {
             |cbuf| {
                 for blur in &queued {
                     let (w, h) = blur.output.extent();
-                    match blur.kind {
-                        PendingBlurKind::Kawase { offset } => {
-                            blur.chain
-                                .record_into(cbuf, offset, blur.output.image(), w, h);
-                        }
-                        PendingBlurKind::Gaussian { radius, brightness } => {
-                            blur.chain.record_gaussian_into(
-                                cbuf,
-                                radius,
-                                brightness,
-                                blur.output.image(),
-                                w,
-                                h,
-                            );
-                        }
-                    }
+                    blur.chain.record_gaussian_into(
+                        cbuf,
+                        blur.radius,
+                        blur.brightness,
+                        blur.output.image(),
+                        w,
+                        h,
+                    );
                 }
             },
         )
@@ -3405,17 +3356,13 @@ impl VulkanRenderer {
         }
     }
 
-    /// Take a pooled bundle matching `dims`/`kind`, if one is held. Most-recent match first.
-    ///
-    /// The kind is in the key, not just the pass count: a Kawase bundle's chain renders into the
-    /// bundle's own output and a gaussian's does not, so handing one to the other's consumer would
-    /// blur into nothing.
+    /// Take a pooled bundle matching `dims`/`passes`, if one is held. Most-recent match first.
     pub(crate) fn take_backdrop_blur(
         &mut self,
         dims: (u32, u32),
-        kind: Option<crate::render_helpers::blur::BlurKind>,
+        passes: Option<usize>,
     ) -> Option<super::BackdropBlur> {
-        let want: BackdropBlurKey = (dims, kind);
+        let want: BackdropBlurKey = (dims, passes);
         let i = self
             .backdrop_blur_pool
             .iter()

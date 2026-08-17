@@ -28,7 +28,7 @@ use synoik_vk::texture::Texture as SynoikTexture;
 
 use super::error::VulkanError;
 
-/// A dual-Kawase blur chain that lives as long as its last holder — its owner (a `BackdropBlur` or
+/// A gaussian blur chain that lives as long as its last holder — its owner (a `BackdropBlur` or
 /// an `EffectBlur`) and every frame that has recorded it but not yet retired.
 pub(crate) struct SharedBlurChain {
     /// Keeps the device alive regardless of renderer/cache drop order, and is what `Drop` needs to
@@ -38,49 +38,36 @@ pub(crate) struct SharedBlurChain {
 }
 
 impl SharedBlurChain {
-    /// Build a chain sampling `source`, with `passes` down/up levels.
-    pub(crate) fn new(
-        gpu: &Arc<Gpu>,
-        source: &SynoikTexture,
-        passes: usize,
-    ) -> Result<Arc<Self>, VulkanError> {
-        Self::build(gpu, source, passes, false, None)
-    }
-
-    /// As [`Self::new`], but the final upsample renders straight into `dst` instead of into level 0
-    /// — so [`Self::record_into`] has nothing to copy out afterwards. `dst` must be level-0 sized
-    /// and `COLOR_ATTACHMENT`-usable; see `BlurChain::set_external_dst` for why that is all it
-    /// takes.
-    pub(crate) fn new_into(
-        gpu: &Arc<Gpu>,
-        source: &SynoikTexture,
-        passes: usize,
-        dst: &SynoikTexture,
-    ) -> Result<Arc<Self>, VulkanError> {
-        Self::build(gpu, source, passes, false, Some(dst))
-    }
-
-    /// As [`Self::new`], plus the pipelines [`Self::record_gaussian_into`] needs.
+    /// Build a chain sampling `source`, with `passes` halving rungs.
     pub(crate) fn new_gaussian(
         gpu: &Arc<Gpu>,
         source: &SynoikTexture,
         passes: usize,
     ) -> Result<Arc<Self>, VulkanError> {
-        Self::build(gpu, source, passes, true, None)
+        Self::build(gpu, source, passes, None)
+    }
+
+    /// As [`Self::new_gaussian`], but the magnifying upsample renders straight into `dst` — an
+    /// image the caller owns, level-0 sized and `COLOR_ATTACHMENT`-usable — so
+    /// [`Self::record_gaussian_into`] has nothing to copy afterwards. Worth it
+    /// only for a blur that re-runs every frame — a cached one (the lock screen's wallpaper, the
+    /// xray buffer) re-blurs so rarely that the copy is noise.
+    pub(crate) fn new_gaussian_into(
+        gpu: &Arc<Gpu>,
+        source: &SynoikTexture,
+        passes: usize,
+        dst: &SynoikTexture,
+    ) -> Result<Arc<Self>, VulkanError> {
+        Self::build(gpu, source, passes, Some(dst))
     }
 
     fn build(
         gpu: &Arc<Gpu>,
         source: &SynoikTexture,
         passes: usize,
-        gaussian: bool,
         dst: Option<&SynoikTexture>,
     ) -> Result<Arc<Self>, VulkanError> {
-        let mut chain = if gaussian {
-            BlurChain::new_with_gaussian(gpu, source, passes)?
-        } else {
-            BlurChain::new(gpu, source, passes)?
-        };
+        let mut chain = BlurChain::new(gpu, source, passes)?;
         if let Some(dst) = dst {
             chain.set_external_dst(gpu, dst.view, dst.width, dst.height)?;
         }
@@ -90,14 +77,13 @@ impl SharedBlurChain {
         }))
     }
 
-    /// Record the down/up passes and the copy into `output` — the whole blur, into a command
-    /// buffer the caller is already submitting. Must be outside a render pass (the chain begins
-    /// its own).
+    /// Record the whole blur — GNOME's separable gaussian at a `2σ` radius in the **source
+    /// texture's** pixels, plus the brightness multiply that goes with it — into a command buffer
+    /// the caller is already submitting. Must be outside a render pass (the chain begins its own).
+    /// The copy into `output` is skipped when the chain has an external destination.
     ///
     /// The caller must keep this `Arc` alive until that submit retires; see the module docs for
     /// what happens otherwise.
-    /// As [`Self::record_into`], but GNOME's separable gaussian: a radius in the **source
-    /// texture's** pixels, and the brightness multiply that goes with it.
     pub(crate) fn record_gaussian_into(
         &self,
         cbuf: vk::CommandBuffer,
@@ -109,19 +95,6 @@ impl SharedBlurChain {
     ) {
         self.chain
             .record_gaussian(&self.gpu, cbuf, radius, brightness);
-        self.chain
-            .copy_output_to(&self.gpu, cbuf, output, width, height);
-    }
-
-    pub(crate) fn record_into(
-        &self,
-        cbuf: vk::CommandBuffer,
-        offset: f32,
-        output: vk::Image,
-        width: u32,
-        height: u32,
-    ) {
-        self.chain.record(&self.gpu, cbuf, offset);
         if !self.chain.has_external_dst() {
             self.chain
                 .copy_output_to(&self.gpu, cbuf, output, width, height);

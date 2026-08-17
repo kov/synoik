@@ -27,7 +27,6 @@ use synoik_vk::render::{PostprocessPush, ResizePush};
 
 use super::custom::{pack_affine, CustomAnimPush, CustomResizePush, CustomShaderType};
 use super::{VkTexture, VulkanRenderer, NATIVE_FOURCC};
-use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::gradient_fade_texture::GradientFadeTextureRenderElement;
 use crate::render_helpers::offscreen::OffscreenBuffer;
@@ -1061,7 +1060,7 @@ fn vulkan_offscreen_snapshot() {
 
 // --- Dual-kawase blur: a hard edge becomes a smooth ramp ----------------------------------------
 
-/// The owned renderer's dual-kawase blur (`render_blur`, driving synoik-vk's `BlurChain`) softens a
+/// The owned renderer's gaussian (`render_blur`, driving synoik-vk's `BlurChain`) softens a
 /// hard black|white split into a monotonic mid-gray ramp localized around the boundary. Structural
 /// invariants (blur has no per-pixel oracle): the boundary column is intermediate gray, the profile
 /// is monotonic left→right, and columns deep in each half keep their extreme (not washed uniform).
@@ -1087,15 +1086,7 @@ fn vulkan_blur_smooths_edge() {
         .import_memory(&texels, Fourcc::Abgr8888, Size::from((W, H)), false)
         .expect("import source");
 
-    let mut blurred = vk
-        .render_blur(
-            &source,
-            BlurOptions {
-                passes: 3,
-                offset: 2.0,
-            },
-        )
-        .expect("render blur");
+    let mut blurred = vk.render_blur(&source, 24.0).expect("render blur");
 
     // Read the blurred output back (a sampleable offscreen).
     let fb = vk.bind(&mut blurred).expect("bind blurred");
@@ -3775,13 +3766,7 @@ fn vulkan_backdrop_blur_reuses_across_a_size_sweep() {
                 clip: None,
                 scale: 1.0,
             },
-            Some(
-                BlurOptions {
-                    passes: 3,
-                    offset: 2.0,
-                }
-                .into(),
-            ),
+            Some(24.8),
             crate::render_helpers::blur::Finish::NONE,
         );
         let src = element.src();
@@ -3908,13 +3893,7 @@ fn vulkan_backdrop_blur_pool_prefers_many_small_bundles() {
                     clip: None,
                     scale: 1.0,
                 },
-                Some(
-                    BlurOptions {
-                        passes: 3,
-                        offset: 2.0,
-                    }
-                    .into(),
-                ),
+                Some(24.8),
                 crate::render_helpers::blur::Finish::NONE,
             );
             let src = element.src();

@@ -166,7 +166,7 @@ use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
 use crate::protocols::session_management::{SessionManagerHandler as _, SessionManagerState};
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
-use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::blur::GNOME_CLIENT_BLUR_RADIUS;
 use crate::render_helpers::captured_texture::CapturedTextureRenderElement;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::icon::{AppIconCache, IconCache, ImageCache};
@@ -10249,16 +10249,18 @@ impl Synoik {
                     state.xray.workspaces.push((geo, bg_color));
                 }
                 state.xray.backdrop_color = state.backdrop_buffer.color();
-                let blur_options = BlurOptions::from(self.config.borrow().blur);
+                // The xray buffer is the cheap stand-in for a surface's real backdrop blur, so it
+                // runs at the same radius that backdrop would — GNOME's, scaled to this output.
+                let blur_radius = GNOME_CLIENT_BLUR_RADIUS * scale.x;
                 for buf in &state.xray.background {
                     let mut buffer = buf.borrow_mut();
                     buffer.update_size(size, scale);
-                    buffer.update_blur_options(blur_options);
+                    buffer.update_blur_radius(blur_radius);
                 }
                 for buf in &state.xray.backdrop {
                     let mut buffer = buf.borrow_mut();
                     buffer.update_size(size, scale);
-                    buffer.update_blur_options(blur_options);
+                    buffer.update_blur_radius(blur_radius);
                 }
 
                 let layer_map = layer_map_for_output(out);

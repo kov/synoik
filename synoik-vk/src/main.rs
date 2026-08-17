@@ -70,7 +70,7 @@ fn main() -> Result<()> {
     let path = artifact_path("blur.png");
     write_png(&path, SRC_W, SRC_H, &blur)?;
     eprintln!("synoik-vk: wrote {}", path.display());
-    eprintln!("synoik-vk: OK — dual-kawase blur verified");
+    eprintln!("synoik-vk: OK — gaussian blur verified");
 
     let text = render_text(&gpu)?;
     assert_text(&text)?;
@@ -216,8 +216,8 @@ const SRC_W: u32 = 192;
 const SRC_H: u32 = 128;
 const EDGE_RED: [u8; 4] = [230, 40, 40, 255];
 const EDGE_BLUE: [u8; 4] = [40, 60, 230, 255];
-const BLUR_PASSES: usize = 3;
-const BLUR_OFFSET: f32 = 3.0;
+/// `2σ`, the convention every radius in this crate carries.
+const BLUR_RADIUS: f64 = 24.0;
 
 /// Blur a hard vertical red|blue edge; output is level-0 sized (SRC_W x SRC_H).
 fn render_blur(gpu: &Gpu) -> Result<Vec<u8>> {
@@ -234,10 +234,11 @@ fn render_blur(gpu: &Gpu) -> Result<Vec<u8>> {
         }
     }
     let source = Texture::from_rgba(gpu, pool, SRC_W, SRC_H, &src, vk::Filter::LINEAR)?;
-    let chain = BlurChain::new(gpu, &source, BLUR_PASSES)?;
+    let passes = synoik_vk::blur::downscale_levels(SRC_W, SRC_H, BLUR_RADIUS).max(1);
+    let chain = BlurChain::new(gpu, &source, passes)?;
 
     gpu.run_commands(pool, synoik_vk::stats::SubmitSite::Blur, |cbuf| {
-        chain.record(gpu, cbuf, BLUR_OFFSET)
+        chain.record_gaussian(gpu, cbuf, BLUR_RADIUS, 1.0)
     })?;
     let (ow, oh) = chain.output_size();
     anyhow::ensure!(

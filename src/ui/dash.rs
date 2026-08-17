@@ -57,7 +57,7 @@ use synoik_config::CornerRadius;
 use crate::animation::{Animation, Clock, Curve};
 use crate::app_system::AppIconRef;
 use crate::render_helpers::background_effect::RenderParams;
-use crate::render_helpers::blur::{BlurOptions, Finish};
+use crate::render_helpers::blur::Finish;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
 use crate::render_helpers::icon::{AppIconCache, IconCache};
 use crate::render_helpers::texture::TextureRenderElement;
@@ -212,7 +212,9 @@ fn dash_bg(appearance: widget::style::Appearance) -> [f32; 4] {
 
 /// The dock pill's backdrop blur — the panel's, so the two read as the same material. See
 /// [`Dash::render`] for why the overview's dash does not get one.
-const PILL_BLUR: BlurOptions = crate::ui::panel::BAR_BLUR;
+/// The dash pill blurs its backdrop at the same radius as the panel plate — one surface
+/// effect, two places it shows up. See [`crate::ui::panel::BAR_BLUR_RADIUS`].
+const PILL_BLUR_RADIUS: f64 = crate::ui::panel::BAR_BLUR_RADIUS;
 
 /// The tile hover fill. GNOME's is `st-lighten($dash_background_color, 7%)` (flat + always-dark,
 /// `_drawing.scss:186-189,270-274`) — an *absolute* colour derived from an opaque pill, which over
@@ -1237,7 +1239,7 @@ impl Dash {
                     clip: Some((layout.pill, CornerRadius::from(metrics.pill_radius as f32))),
                     scale,
                 },
-                Some(PILL_BLUR.into()),
+                Some(PILL_BLUR_RADIUS * scale),
                 Finish::NONE,
             )));
         }

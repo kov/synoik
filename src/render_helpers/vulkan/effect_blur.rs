@@ -48,7 +48,7 @@ impl EffectBlur {
         source: &VkTexture,
         passes: usize,
     ) -> Result<Self, VulkanError> {
-        let chain = SharedBlurChain::new(&renderer.gpu, source.synoik_texture(), passes)?;
+        let chain = SharedBlurChain::new_gaussian(&renderer.gpu, source.synoik_texture(), passes)?;
         let output = renderer.create_buffer(NATIVE_FOURCC, source.size())?;
         Ok(Self {
             passes,
@@ -74,9 +74,9 @@ impl EffectBlur {
         &self.output
     }
 
-    /// Queue the dual-Kawase chain over `source`'s current contents into `output`, to be recorded
-    /// into the **next frame's** command buffer ([`VulkanRenderer::queue_blur`]) rather than
-    /// submitted here.
+    /// Queue the gaussian over `source`'s current contents into `output`, to be recorded into the
+    /// **next frame's** command buffer ([`VulkanRenderer::queue_gaussian_blur`]) rather than
+    /// submitted here. `radius` is `2σ` in `source`'s own pixels.
     ///
     /// This runs during element building, outside any frame, so there is no command buffer open to
     /// record into — the queue is how the work reaches one. It used to take a submit of its own,
@@ -91,12 +91,15 @@ impl EffectBlur {
     ///
     /// `source` is passed back in rather than stored because the queue has to hold it alive: the
     /// frame's command buffer samples it long after `prepare_blur_vulkan` returns.
-    pub(crate) fn queue(&mut self, renderer: &mut VulkanRenderer, source: &VkTexture, offset: f32) {
-        renderer.queue_blur(
+    pub(crate) fn queue(&mut self, renderer: &mut VulkanRenderer, source: &VkTexture, radius: f64) {
+        renderer.queue_gaussian_blur(
             self.chain.clone(),
             source.clone(),
             self.output.clone(),
-            offset,
+            radius,
+            // No dim: the xray buffer stands in for the real backdrop, and dimming it would make a
+            // surface look different depending on which of the two paths drew it.
+            1.0,
         );
         self.output
             .set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);

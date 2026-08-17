@@ -51,7 +51,7 @@ use crate::animation::{Animation, Clock};
 use crate::audio::{AudioStatus, MicStatus};
 use crate::gnome::{A11ySettings, ClockFormat, QuickToggles};
 use crate::render_helpers::background_effect::RenderParams;
-use crate::render_helpers::blur::{BlurOptions, Finish};
+use crate::render_helpers::blur::Finish;
 use crate::render_helpers::framebuffer_effect::{FramebufferEffect, FramebufferEffectElement};
 use crate::render_helpers::icon::{DrawCaches, IconCache, ImageFit};
 use crate::render_helpers::rounded_solid::{RoundedSolidBuffer, RoundedSolidRenderElement};
@@ -158,21 +158,26 @@ const MESSAGES_INDICATOR_GAP: f64 = 6.;
 /// (`_colors.scss:24` / `_palette.scss:46`), straight RGBA, but **translucent**.
 ///
 /// **Divergence (deliberate).** gnome-shell's panel is fully opaque; ours is a dark wash over a
-/// blurred capture of whatever is behind it ([`BAR_BLUR`]), the way the widely-used Blur my Shell
-/// extension does it. The alpha is what stands in for a brightness knob — the blur path has none —
-/// so it is chosen to land the backdrop near the 0.6 multiply that keeps the white panel foreground
-/// legible over an arbitrary wallpaper, the same job [`crate::ui::lock_screen::BLUR_BRIGHTNESS`]
-/// does behind the lock clock.
+/// blurred capture of whatever is behind it ([`BAR_BLUR_RADIUS`]), the way the widely-used Blur my
+/// Shell extension does it. The alpha is what stands in for a brightness knob — the blur path has
+/// none — so it is chosen to land the backdrop near the 0.6 multiply that keeps the white panel
+/// foreground legible over an arbitrary wallpaper, the same job
+/// [`crate::ui::lock_screen::BLUR_BRIGHTNESS`] does behind the lock clock.
 pub(crate) const BAR_BG: [f32; 4] = [0., 0., 0., 0.4];
 
-/// The panel's backdrop blur — a dual-Kawase pass over the mid-frame capture of the strip behind
-/// the bar. Fixed rather than config-driven: there is no config file (see
-/// `docs/fork/STRATEGY.md`), and these are the values the surface-level effect defaults to
-/// (`synoik_config::Blur::default`).
-pub(crate) const BAR_BLUR: BlurOptions = BlurOptions {
-    passes: 3,
-    offset: 3.,
-};
+/// The panel's backdrop blur radius, in **logical** pixels — the same separable gaussian every
+/// other blurred surface runs, at Blur my Shell's own documented default for this surface
+/// (`radius 30`, `docs/fork/blur-my-shell-inventory.md`), since the panel plate is that
+/// extension's divergence rather than anything gnome-shell ships.
+///
+/// It replaces a dual-Kawase at `passes 3 / offset 3`, which measured σ ≈ 19 *physical* px — very
+/// nearly this radius at a 1.25 output scale, and wrong at every other one. Fixed rather than
+/// config-driven: there is no config file (see `docs/fork/STRATEGY.md`).
+///
+/// BMS pairs it with `brightness 0.6`, which [`BAR_BG`]'s 0.4-alpha black wash already *is*
+/// (`0.4·0 + 0.6·x = 0.6x`). The wash stays where it is rather than moving into the blur pass,
+/// because it fades with the overview and a brightness baked into the blur would not.
+pub(crate) const BAR_BLUR_RADIUS: f64 = 30.;
 
 /// The bar background at `overview_fade`, where 0 is the normal desktop and 1 the
 /// fully-open overview. GNOME drops the panel to `background-color: transparent`
@@ -184,7 +189,7 @@ pub(crate) const BAR_BLUR: BlurOptions = BlurOptions {
 /// 250ms = the overview's own `ANIMATION_TIME` (`_panel.scss:10-18`), which is why
 /// riding the overview progress directly reproduces it. Only the *background* fades:
 /// the clock, dots and status icons stay fully opaque throughout. The blur under the wash
-/// ([`BAR_BLUR`]) does not fade — see the note where it is pushed.
+/// ([`BAR_BLUR_RADIUS`]) does not fade — see the note where it is pushed.
 fn bar_bg(overview_fade: f64) -> [f32; 4] {
     let [r, g, b, a] = BAR_BG;
     [r, g, b, a * (1. - overview_fade as f32)]
@@ -1791,7 +1796,7 @@ impl Panel {
                 clip: None,
                 scale,
             },
-            Some(BAR_BLUR.into()),
+            Some(BAR_BLUR_RADIUS * scale),
             Finish::NONE,
         )));
 

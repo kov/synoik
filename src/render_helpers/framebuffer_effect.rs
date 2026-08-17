@@ -12,7 +12,7 @@ use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
 use synoik_config::CornerRadius;
 
 use crate::render_helpers::background_effect::RenderParams;
-use crate::render_helpers::blur::{BlurRecipe, Finish};
+use crate::render_helpers::blur::Finish;
 use crate::utils::region::TransformedRegion;
 
 #[derive(Debug)]
@@ -32,7 +32,9 @@ pub struct FramebufferEffectElement {
     /// intersects the damage with it, so the blur lands only inside it.
     subregion: Option<TransformedRegion>,
     scale: f32,
-    blur: Option<BlurRecipe>,
+    /// The blur radius (`2σ`) in **physical** pixels — the caller has already multiplied
+    /// GNOME's logical radius by the output scale. `None` leaves the capture unblurred.
+    blur_radius: Option<f64>,
     finish: Finish,
 }
 
@@ -60,7 +62,7 @@ impl FramebufferEffect {
         &self,
         ns: Option<usize>,
         params: RenderParams,
-        blur: Option<BlurRecipe>,
+        blur_radius: Option<f64>,
         finish: Finish,
     ) -> FramebufferEffectElement {
         let (clip_geo, corner_radius) = params
@@ -80,7 +82,7 @@ impl FramebufferEffect {
             corner_radius,
             subregion: params.subregion,
             scale: params.scale as f32,
-            blur,
+            blur_radius,
             finish,
         }
     }
@@ -227,7 +229,7 @@ mod vulkan_impl {
             let inner =
                 cache.get_or_insert::<RefCell<Option<BackdropBlur>>, _>(|| RefCell::new(None));
             let mut slot = inner.borrow_mut();
-            frame.capture_backdrop(&mut slot, src_region, size, self.blur)
+            frame.capture_backdrop(&mut slot, src_region, size, self.blur_radius)
         }
 
         fn draw(

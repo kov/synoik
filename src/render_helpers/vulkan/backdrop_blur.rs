@@ -4,12 +4,12 @@
 
 //! Cached backdrop-blur state for the owned Vulkan renderer's `FramebufferEffectElement` path
 //! (niri's GNOME-style backdrop blur). Owns the mid-frame capture plus, when blur is enabled, the
-//! dual-Kawase [`SharedBlurChain`] and its blurred output. Held across frames in the effect
+//! gaussian [`SharedBlurChain`] and its blurred output. Held across frames in the effect
 //! element's `UserDataMap` so nothing is allocated per frame — on Venus a `VkTexture` is a
 //! virtio-gpu blob, and creating one per frame costs real host time and host pool pressure
 //! (`VulkanRenderer::readback_staging_buffer` has the history: this used to *abort* the session
 //! until the VMM-level fix in 2026-07, so it is now a cost argument, not a stability one). It is
-//! recreated only when the intermediate size or the blur pass-count changes.
+//! recreated only when the intermediate size or the pyramid's rung count changes.
 
 use std::sync::Arc;
 
@@ -21,16 +21,14 @@ use super::blur_chain::SharedBlurChain;
 use super::error::VulkanError;
 use super::renderer::VulkanRenderer;
 use super::types::{VkTexture, NATIVE_FOURCC};
-use crate::render_helpers::blur::{BlurKind, BlurRecipe};
 
-/// The blur resources, present only when blur is enabled (the recipe was `Some`).
+/// The blur resources, present only when blur is enabled (the radius was `Some`).
 struct BlurState {
-    kind: BlurKind,
+    passes: usize,
     /// Refcounted because a frame that has *recorded* the blur but not yet submitted it holds a
     /// reference too — see [`SharedBlurChain`].
     chain: Arc<SharedBlurChain>,
-    /// The blurred result. The Kawase chain renders its final upsample straight into this;
-    /// the gaussian copies it out of level 0 each frame.
+    /// The blurred result — the chain's magnifying upsample renders straight into it.
     output: VkTexture,
 }
 
@@ -51,49 +49,35 @@ pub(crate) struct BackdropBlur {
 }
 
 impl BackdropBlur {
-    /// (Re)create the capture (and, when `kind` is `Some`, the blur chain + output) sized to
-    /// `size`. `kind` is the element recipe's [`BlurRecipe::kind`] (`None` = blur off: the raw
-    /// capture is the composite source). The per-frame length — the Kawase's tap offset or the
-    /// gaussian's radius — is passed to [`Self::record_blur`], not stored.
+    /// (Re)create the capture (and, when `passes` is `Some`, the blur chain + output) sized to
+    /// `size`. `passes` is how many rungs GNOME's cascade wants for the radius over this
+    /// intermediate (`None` = blur off: the raw capture is the composite source). The per-frame
+    /// radius is passed to [`Self::record_blur`], not stored.
     pub(crate) fn new(
         renderer: &mut VulkanRenderer,
         size: Size<i32, BufferCoord>,
-        kind: Option<BlurKind>,
+        passes: Option<usize>,
     ) -> Result<Self, VulkanError> {
         let capture = renderer.create_buffer(NATIVE_FOURCC, size)?;
         let dims = capture.extent();
-        let blur = match kind {
-            Some(kind) => {
-                // The output is created *before* the chain because the Kawase chain is told to
-                // render its final upsample straight into it. That is what removes a full-size
+        let blur = match passes {
+            Some(passes) => {
+                // The output is created *before* the chain because the chain is told to render its
+                // final upsample straight into it. That is what removes a full-size
                 // `vkCmdCopyImage` per blurred surface per frame — see
                 // `BlurChain::set_external_dst`. The chain samples `capture` (its descriptor set is
                 // built here, bound to the capture's stable view) — capture_region refills the
                 // capture each frame, so a cached chain stays valid across frames.
                 //
-                // The gaussian path takes that copy back: `record_gaussian` ping-pongs through the
-                // working level's twin and leaves the result in level 0, so there is nothing to
-                // point at an external destination and `record_gaussian_into` copies out. It is a
-                // copy at the *quantized intermediate's* size, recorded into the frame's own
-                // command buffer — no submit, no fence, which is what
-                // `docs/fork/frame-submit-discipline.md` asks of work whose only consumer is later
-                // GPU work in the same frame.
                 let output = renderer.create_buffer(NATIVE_FOURCC, size)?;
-                let chain = match kind {
-                    BlurKind::Kawase { passes } => SharedBlurChain::new_into(
-                        &renderer.gpu,
-                        capture.synoik_texture(),
-                        passes,
-                        output.synoik_texture(),
-                    )?,
-                    BlurKind::Gaussian { passes } => SharedBlurChain::new_gaussian(
-                        &renderer.gpu,
-                        capture.synoik_texture(),
-                        passes,
-                    )?,
-                };
+                let chain = SharedBlurChain::new_gaussian_into(
+                    &renderer.gpu,
+                    capture.synoik_texture(),
+                    passes,
+                    output.synoik_texture(),
+                )?;
                 Some(BlurState {
-                    kind,
+                    passes,
                     chain,
                     output,
                 })
@@ -111,8 +95,8 @@ impl BackdropBlur {
 
     /// Whether this cache already matches the requested intermediate size + blur kind (and so can
     /// be reused instead of rebuilt). `size` is expected to be a [`quantize`]d one.
-    pub(crate) fn matches(&self, size: (u32, u32), kind: Option<BlurKind>) -> bool {
-        self.size == size && self.blur.as_ref().map(|b| b.kind) == kind
+    pub(crate) fn matches(&self, size: (u32, u32), passes: Option<usize>) -> bool {
+        self.size == size && self.blur.as_ref().map(|b| b.passes) == passes
     }
 
     /// The unquantized intermediate size this effect asked for on the previous frame, or `(0, 0)`
@@ -148,13 +132,13 @@ impl BackdropBlur {
 
     /// What [`Self::matches`] keys on, as a poolable identity — see
     /// [`VulkanRenderer::recycle_backdrop_blur`](super::VulkanRenderer::recycle_backdrop_blur).
-    pub(crate) fn key(&self) -> ((u32, u32), Option<BlurKind>) {
-        (self.size, self.blur.as_ref().map(|b| b.kind))
+    pub(crate) fn key(&self) -> ((u32, u32), Option<usize>) {
+        (self.size, self.blur.as_ref().map(|b| b.passes))
     }
 
     /// Roughly how much device memory this bundle holds, for the pool's budget. Approximate on
     /// purpose: the capture and the output are exact, and the chain's levels are counted as one
-    /// more full-size image — a dual-Kawase's halving levels plus their ping-pong twins sum to
+    /// more full-size image — the halving levels plus their ping-pong twins sum to
     /// about 1.3× the base, so this rounds the estimate up rather than under-counting a cap whose
     /// whole job is to bound retention.
     pub(crate) fn bytes(&self) -> u64 {
@@ -184,33 +168,17 @@ impl BackdropBlur {
     /// separate submission cannot see an un-submitted blit. Both are gone; the capture's `to_read`
     /// barrier, recorded just above this in the same command buffer, is what orders the chain
     /// after the blit.
-    /// `recipe` must be the same variant the bundle was built for — [`Self::matches`] is what
-    /// guarantees that, since the kind is part of the cache key.
-    pub(crate) fn record_blur(&self, cbuf: vk::CommandBuffer, recipe: BlurRecipe) {
+    /// `radius` is `2σ` in the intermediate's own texels.
+    pub(crate) fn record_blur(&self, cbuf: vk::CommandBuffer, radius: f64) {
         let Some(bs) = &self.blur else {
             return;
         };
         let (w, h) = self.size;
-        match (bs.kind, recipe) {
-            (BlurKind::Kawase { .. }, BlurRecipe::Kawase { offset, .. }) => {
-                bs.chain
-                    .record_into(cbuf, offset as f32, bs.output.image(), w, h);
-            }
-            (BlurKind::Gaussian { .. }, BlurRecipe::Gaussian { radius }) => {
-                // `brightness` is `ShellBlurEffect`'s dimming multiply, which the lock screen wants
-                // and a client-blurred surface does not: mutter's background effect runs the plain
-                // blur and leaves brightness alone.
-                bs.chain
-                    .record_gaussian_into(cbuf, radius, 1.0, bs.output.image(), w, h);
-            }
-            (kind, recipe) => {
-                debug_assert!(
-                    false,
-                    "backdrop bundle built for {kind:?} asked to run {recipe:?}"
-                );
-                return;
-            }
-        }
+        // `brightness` is `ShellBlurEffect`'s dimming multiply, which the lock wallpaper wants and
+        // a backdrop-blurred surface does not: the surfaces drawn through here paint their own
+        // wash over the blur (the panel plate) or none at all (a client's).
+        bs.chain
+            .record_gaussian_into(cbuf, radius, 1.0, bs.output.image(), w, h);
         // copy_output_to leaves `output` in SHADER_READ_ONLY (with a barrier); record the tracked
         // layout so a later readback/sample knows it. True as soon as it is recorded — the
         // postprocess draw that samples it is recorded after this, in this same command buffer.
@@ -246,7 +214,7 @@ const LADDER_DEN: i32 = 4;
 /// choice, and allocating a slightly larger one costs nothing but fill rate — no seam, no region,
 /// no change to the mapping. That is what lets the cache survive an animating geometry: without
 /// slack, `matches` keys on the exact size and a one-pixel move throws away the capture texture,
-/// the whole dual-Kawase chain (a level image plus its ping-pong twin per pass, each with a render
+/// the whole blur chain (a level image plus its ping-pong twin per pass, each with a render
 /// pass and descriptor sets) and the blurred output, then builds them all again. Measured at
 /// 1600×1000 with `passes: 3`: **5.79 ms per frame** of rebuild on top of a 0.92 ms steady-state
 /// capture-and-blur — a third of a 60 Hz frame, spent for as long as the geometry animates.
