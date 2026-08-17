@@ -15,6 +15,7 @@
 //! semantics follow `~/Projects/mutter/src/backends/meta-monitor-config-store.c`. Writing it back
 //! lives with the `Mutter/DisplayConfig` `ApplyMonitorsConfig` handler.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use smithay::utils::Transform;
@@ -286,12 +287,115 @@ pub struct WriteLogicalMonitor {
     pub monitors: Vec<WriteMonitor>,
 }
 
-/// Serialize `logical_monitors` to the v2 `monitors.xml` document mutter reads/writes. Format
-/// mirrors `meta_monitor_config_store_save` closely enough for both our reader and a real mutter to
-/// restore it: `<monitors version="2">` → one `<configuration>` (logical layout mode) → a
-/// `<logicalmonitor>` per entry. Scale is written bare (`2` not `2.0`) like mutter; `<transform>`
-/// is emitted only when non-normal.
+/// One monitor's identity as the store keys on it: connector + product + serial, case-folded.
+///
+/// mutter keys a stored configuration on the *set* of `MetaMonitorSpec`s it covers
+/// (`MetaMonitorsConfigKey`, `meta-monitor-config-manager.c`; specs compared by
+/// `meta_monitor_spec_equals` over connector/vendor/product/serial). We leave `<vendor>` out and
+/// compare case-insensitively, because the same physical display is rendered differently by
+/// different writers: mutter's `<vendor>` is the raw EDID manufacturer code (`LMN`) while ours is
+/// the decoded make (`PNP(LMN)`), and mutter writes a fallback serial as `0x%08x` where we write
+/// it uppercase. Keying on those bytes would file two stanzas for one display; connector + product
+/// + serial is as discriminating in practice and survives a `monitors.xml` written by either.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SpecKey(String, String, String);
+
+impl SpecKey {
+    fn new(connector: &str, product: &str, serial: &str) -> Self {
+        Self(
+            connector.to_lowercase(),
+            product.to_lowercase(),
+            serial.to_lowercase(),
+        )
+    }
+
+    /// The key of a `<configuration>` element: the set of its monitors' specs.
+    fn set_of(configuration: roxmltree::Node) -> BTreeSet<Self> {
+        let text = |parent: roxmltree::Node, tag: &str| {
+            parent
+                .children()
+                .find(|c| c.has_tag_name(tag))
+                .and_then(|c| c.text())
+                .map(str::trim)
+                .unwrap_or("")
+                .to_owned()
+        };
+        configuration
+            .children()
+            .filter(|c| c.has_tag_name("logicalmonitor"))
+            .flat_map(|lm| lm.children())
+            .filter(|c| c.has_tag_name("monitor"))
+            .filter_map(|m| m.children().find(|c| c.has_tag_name("monitorspec")))
+            .map(|spec| {
+                Self::new(
+                    &text(spec, "connector"),
+                    &text(spec, "product"),
+                    &text(spec, "serial"),
+                )
+            })
+            .collect()
+    }
+
+    /// The key of a configuration we are about to write.
+    fn set_of_written(logical_monitors: &[WriteLogicalMonitor]) -> BTreeSet<Self> {
+        logical_monitors
+            .iter()
+            .flat_map(|lm| &lm.monitors)
+            .map(|m| Self::new(&m.connector, &m.product, &m.serial))
+            .collect()
+    }
+}
+
+/// Merge one configuration into an existing `monitors.xml` document, mutter-style: the entry for
+/// *this* set of monitors is replaced, every other saved configuration is kept.
+///
+/// This is what makes per-display memory work. mutter's store is a hash table keyed on the
+/// monitor-spec set (`meta-monitor-config-store.c`, `g_hash_table_replace`) and
+/// `generate_config_xml` writes every entry, so configuring the laptop panel does not forget the
+/// dock monitor — even when both arrive on one connector with different EDIDs, as they do in a VM
+/// whose single virtual connector mirrors whichever host display the window sits on.
+///
+/// Configurations we keep are copied through as **raw source text**, not re-serialized: the reader
+/// models only what it applies (scale, transform, mode), and a lossy round-trip would quietly eat
+/// mutter's fields — full-precision rates, `<disabled>`, anything a newer mutter adds — on every
+/// save. An `existing` document we can't parse, or one that isn't version 2, is discarded: we don't
+/// understand its entries well enough to key them, so it cannot be merged into.
+pub fn merge(existing: Option<&str>, logical_monitors: &[WriteLogicalMonitor]) -> String {
+    let mut out = String::from("<monitors version=\"2\">\n");
+
+    if let Some(xml) = existing {
+        let new_key = SpecKey::set_of_written(logical_monitors);
+        if let Ok(doc) = roxmltree::Document::parse(xml) {
+            let root = doc.root_element();
+            if root.tag_name().name() == "monitors" && root.attribute("version") == Some("2") {
+                for conf in root.children().filter(|c| c.has_tag_name("configuration")) {
+                    if SpecKey::set_of(conf) == new_key {
+                        continue; // replaced by the configuration we're writing
+                    }
+                    out.push_str("  ");
+                    out.push_str(xml[conf.range()].trim_end());
+                    out.push('\n');
+                }
+            }
+        }
+    }
+
+    out.push_str(&serialize_configuration(logical_monitors));
+    out.push_str("</monitors>\n");
+    out
+}
+
+/// Serialize `logical_monitors` to a whole v2 `monitors.xml` document, discarding anything already
+/// stored. Prefer [`merge`] for a save; this is the from-scratch case (and the reader's fixture).
 pub fn serialize(logical_monitors: &[WriteLogicalMonitor]) -> String {
+    merge(None, logical_monitors)
+}
+
+/// Serialize one `<configuration>` element (indented two spaces, newline-terminated). Format
+/// mirrors `meta_monitor_config_store_save` closely enough for both our reader and a real mutter to
+/// restore it: `<configuration>` (logical layout mode) → a `<logicalmonitor>` per entry. Scale is
+/// written bare (`2` not `2.0`) like mutter; `<transform>` is emitted only when non-normal.
+fn serialize_configuration(logical_monitors: &[WriteLogicalMonitor]) -> String {
     fn esc(s: &str) -> String {
         s.replace('&', "&amp;")
             .replace('<', "&lt;")
@@ -306,7 +410,7 @@ pub fn serialize(logical_monitors: &[WriteLogicalMonitor]) -> String {
         }
     }
 
-    let mut out = String::from("<monitors version=\"2\">\n  <configuration>\n");
+    let mut out = String::from("  <configuration>\n");
     out.push_str("    <layoutmode>logical</layoutmode>\n");
     for lm in logical_monitors {
         out.push_str("    <logicalmonitor>\n");
@@ -342,19 +446,23 @@ pub fn serialize(logical_monitors: &[WriteLogicalMonitor]) -> String {
         }
         out.push_str("    </logicalmonitor>\n");
     }
-    out.push_str("  </configuration>\n</monitors>\n");
+    out.push_str("  </configuration>\n");
     out
 }
 
 /// Write `logical_monitors` to the `monitors.xml` path atomically (temp file + rename), creating
 /// the config dir if needed. Returns the path written.
+///
+/// The configuration is [`merge`]d into whatever is already stored, so saving settings for one
+/// display keeps the other displays' saved settings.
 pub fn write(logical_monitors: &[WriteLogicalMonitor]) -> std::io::Result<PathBuf> {
     let path = MonitorsConfig::path()
         .ok_or_else(|| std::io::Error::other("no config dir (HOME/XDG_CONFIG_HOME unset)"))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let xml = serialize(logical_monitors);
+    let existing = std::fs::read_to_string(&path).ok();
+    let xml = merge(existing.as_deref(), logical_monitors);
     let tmp = path.with_extension("xml.tmp");
     std::fs::write(&tmp, xml.as_bytes())?;
     std::fs::rename(&tmp, &path)?;
@@ -612,6 +720,204 @@ mod tests {
             .expect("round-tripped setting");
         assert_eq!(s.scale, 2.0);
         assert_eq!(s.transform, Transform::_90);
+    }
+
+    /// One saved display on `Virtual-1`, mutter's own formatting: raw PNP `<vendor>`, lowercase
+    /// fallback serial, full-precision rate, and a `<doublescan>` we don't model.
+    fn mutter_written(product: &str, serial: &str, w: i32, h: i32, scale: &str) -> String {
+        format!(
+            r#"<monitors version="2">
+  <configuration>
+    <layoutmode>logical</layoutmode>
+    <logicalmonitor>
+      <x>0</x>
+      <y>0</y>
+      <scale>{scale}</scale>
+      <primary>yes</primary>
+      <monitor>
+        <monitorspec>
+          <connector>Virtual-1</connector>
+          <vendor>LMN</vendor>
+          <product>{product}</product>
+          <serial>{serial}</serial>
+        </monitorspec>
+        <mode>
+          <width>{w}</width>
+          <height>{h}</height>
+          <rate>59.996398925781250</rate>
+          <doublescan>no</doublescan>
+        </mode>
+      </monitor>
+    </logicalmonitor>
+  </configuration>
+</monitors>
+"#
+        )
+    }
+
+    fn write_lm(product: &str, serial: &str, w: i32, h: i32, scale: f64) -> WriteLogicalMonitor {
+        WriteLogicalMonitor {
+            x: 0,
+            y: 0,
+            scale,
+            primary: true,
+            transform: 0,
+            monitors: vec![WriteMonitor {
+                connector: "Virtual-1".into(),
+                vendor: "PNP(LMN)".into(),
+                product: product.into(),
+                serial: serial.into(),
+                width: w,
+                height: h,
+                rate: 59.996,
+            }],
+        }
+    }
+
+    #[test]
+    fn saving_one_display_keeps_the_others() {
+        // The limina report's finding 2: with one virtual connector whose EDID mirrors whichever
+        // host display the VM's window sits on, saving a scale for the built-in panel used to
+        // *replace* the external panel's stanza, so nothing could be remembered per display.
+        let external = mutter_written("BenQ LCD", "0x6c42fae5", 2560, 1440, "1.25");
+        let merged = merge(
+            Some(&external),
+            &[write_lm("Built-in", "0x31d7dd41", 3024, 1964, 1.75)],
+        );
+
+        let cfg = MonitorsConfig::parse(&merged).unwrap();
+        assert_eq!(
+            cfg.setting_for(
+                &name("Virtual-1", Some("BenQ LCD"), Some("0x6c42fae5")),
+                mode(2560, 1440, 59.996)
+            )
+            .unwrap()
+            .scale,
+            1.25,
+            "the external panel's saved scale survives a save for the built-in: {merged}"
+        );
+        assert_eq!(
+            cfg.setting_for(
+                &name("Virtual-1", Some("Built-in"), Some("0x31d7dd41")),
+                mode(3024, 1964, 59.996)
+            )
+            .unwrap()
+            .scale,
+            1.75
+        );
+        // Kept configurations are copied through verbatim, so fields we don't model — mutter's
+        // full-precision rate, its `<doublescan>` — are not eaten by the round trip.
+        assert!(
+            merged.contains("<rate>59.996398925781250</rate>"),
+            "{merged}"
+        );
+        assert!(merged.contains("<doublescan>no</doublescan>"), "{merged}");
+    }
+
+    #[test]
+    fn re_saving_a_display_replaces_only_its_own_stanza() {
+        let external = mutter_written("BenQ LCD", "0x6c42fae5", 2560, 1440, "1.25");
+        let two = merge(
+            Some(&external),
+            &[write_lm("Built-in", "0x31d7dd41", 3024, 1964, 1.75)],
+        );
+        // Same display (identity and connector), new scale: one stanza replaced, one untouched.
+        let again = merge(
+            Some(&two),
+            &[write_lm("Built-in", "0x31d7dd41", 3024, 1964, 2.0)],
+        );
+        assert_eq!(again.matches("<configuration>").count(), 2, "{again}");
+
+        let cfg = MonitorsConfig::parse(&again).unwrap();
+        assert_eq!(
+            cfg.setting_for(
+                &name("Virtual-1", Some("Built-in"), Some("0x31d7dd41")),
+                mode(3024, 1964, 59.996)
+            )
+            .unwrap()
+            .scale,
+            2.0
+        );
+        assert_eq!(
+            cfg.setting_for(
+                &name("Virtual-1", Some("BenQ LCD"), Some("0x6c42fae5")),
+                mode(2560, 1440, 59.996)
+            )
+            .unwrap()
+            .scale,
+            1.25
+        );
+    }
+
+    #[test]
+    fn a_mutter_written_stanza_for_the_same_display_is_replaced_not_duplicated() {
+        // The store key deliberately ignores `<vendor>` and folds case: mutter writes `LMN` /
+        // `0x6c42fae5` where we write `PNP(LMN)` / uppercase, and keying on those bytes would file
+        // a second stanza for the one display the user is configuring.
+        let mutter = mutter_written("BenQ LCD", "0x6c42fae5", 2560, 1440, "1.25");
+        let ours = merge(
+            Some(&mutter),
+            &[write_lm("BenQ LCD", "0x6C42FAE5", 2560, 1440, 1.5)],
+        );
+        assert_eq!(ours.matches("<configuration>").count(), 1, "{ours}");
+        assert_eq!(
+            MonitorsConfig::parse(&ours)
+                .unwrap()
+                .setting_for(
+                    &name("Virtual-1", Some("BenQ LCD"), Some("0x6C42FAE5")),
+                    mode(2560, 1440, 59.996)
+                )
+                .unwrap()
+                .scale,
+            1.5
+        );
+    }
+
+    /// The whole path `ApplyMonitorsConfig(PERSISTENT)` takes: two saves for two displays leave two
+    /// stanzas on disk.
+    #[test]
+    fn write_merges_into_the_file_on_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "synoik-test-monitors-merge-{}-{:?}.xml",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_file(&path);
+        TEST_PATH.with(|p| *p.borrow_mut() = Some(path.clone()));
+
+        write(&[write_lm("BenQ LCD", "0x6C42FAE5", 2560, 1440, 1.25)]).unwrap();
+        write(&[write_lm("Built-in", "0x31D7DD41", 3024, 1964, 1.75)]).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+
+        TEST_PATH.with(|p| *p.borrow_mut() = None);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(on_disk.matches("<configuration>").count(), 2, "{on_disk}");
+        let cfg = MonitorsConfig::parse(&on_disk).unwrap();
+        for (product, serial, m, scale) in [
+            ("BenQ LCD", "0x6C42FAE5", mode(2560, 1440, 59.996), 1.25),
+            ("Built-in", "0x31D7DD41", mode(3024, 1964, 59.996), 1.75),
+        ] {
+            assert_eq!(
+                cfg.setting_for(&name("Virtual-1", Some(product), Some(serial)), m)
+                    .unwrap()
+                    .scale,
+                scale,
+                "{product}: {on_disk}"
+            );
+        }
+    }
+
+    #[test]
+    fn merging_into_an_unusable_document_replaces_it() {
+        let new = [write_lm("Built-in", "0x31d7dd41", 3024, 1964, 1.75)];
+        for existing in [
+            "not xml at all <<<",
+            &KOV_XML.replace(r#"version="2""#, r#"version="1""#),
+        ] {
+            let merged = merge(Some(existing), &new);
+            assert_eq!(merged, serialize(&new), "existing: {existing}");
+        }
     }
 
     #[test]
