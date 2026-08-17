@@ -4164,7 +4164,16 @@ fn make_output_name(
         connector: connector_name,
         // The *decoded* manufacturer ("Dell Inc."), which is what a display name wants; the raw
         // code lives in `vendor` because that is what identifies the monitor to a store.
-        make: info.as_ref().and_then(|info| info.make()),
+        //
+        // libdisplay-info renders a PNP id it has no name for as `PNP(LMN)`; mutter, whose lookup
+        // returns nothing for the same id, falls back to the bare code
+        // (`meta_monitor_make_display_name`, meta-monitor.c:301-307). Show what GNOME shows.
+        make: info.as_ref().and_then(|info| info.make()).map(|make| {
+            match make.strip_prefix("PNP(").and_then(|m| m.strip_suffix(')')) {
+                Some(code) => code.to_owned(),
+                None => make,
+            }
+        }),
         vendor: spec.as_ref().and_then(|s| s.vendor.clone()),
         model: spec.as_ref().map(|s| s.product.clone()),
         serial: spec.as_ref().map(|s| s.serial.clone()),
