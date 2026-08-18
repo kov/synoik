@@ -326,6 +326,10 @@ impl<'frame, 'buffer> VulkanFrame<'frame, 'buffer> {
         // `glyph_staging` does — and so must the images the copies were just recorded against,
         // which join the acquires in `held` for the same reason they are there.
         let (texture_staging, upload_targets) = renderer.record_pending_texture_uploads(cbuf);
+        // Every upload this frame has now claimed its staging, so this is the point where "unused
+        // for a frame" is decided. Ages the pool and hands back oversized chunks whose client has
+        // stopped committing; a client still streaming keeps its mapping, and its warmth.
+        renderer.age_staging_pool();
         acquired.extend(upload_targets);
 
         // Barriers for offscreens created but never rendered into, before anything that samples

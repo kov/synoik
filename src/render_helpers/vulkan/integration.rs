@@ -80,12 +80,35 @@ impl ImportMemWl for VulkanRenderer {
         surface: Option<&SurfaceData>,
         _damage: &[Rectangle<i32, BufferCoord>],
     ) -> Result<VkTexture, VulkanError> {
-        // Read the shm pool and repack the (possibly strided, offset) rows into a tight w*h*4
-        // buffer. We upload the whole buffer (`_damage` is ignored — damage-based partial
-        // upload is a bandwidth follow-up); the important win is the per-surface cache
-        // below, which reuses the VkImage + staging so an actively-updating client doesn't
-        // churn allocations every commit.
-        let prepared = with_buffer_contents(buffer, |ptr, len, data| {
+        // Read the shm pool, validate its geometry, and either refresh the cached image in place
+        // or import a new one. The rows are written **into** their destination — the staging
+        // mapping on the cache-hit path — rather than repacked into an intermediate `Vec` first:
+        // a HiDPI client shipping tens of MiB per commit paid for that `Vec` twice over, once to
+        // allocate and fill it and once to copy it in, both into never-touched pages, on the
+        // compositor thread, every frame. (`_damage` is still ignored — damage-based partial
+        // upload is a bandwidth follow-up. The per-surface cache below is the win that matters:
+        // it reuses the `VkImage` and its staging so an actively-updating client allocates
+        // nothing per commit.)
+        //
+        // Everything that touches the mapped pool happens inside `with_buffer_contents`, which is
+        // the only place smithay guarantees it is valid and SIGBUS-guarded.
+        let id = self.context_id();
+        let cached = surface.and_then(|surface| {
+            let cache = surface
+                .data_map
+                .get_or_insert_threadsafe(ShmTextureCache::default);
+            let cache = cache.0.lock().unwrap();
+            cache.get(&id).cloned()
+        });
+
+        enum Imported {
+            /// The cached image was refreshed in place; nothing more to do.
+            Reused(VkTexture),
+            /// No usable cache entry: the tight pixels, to import as a new image.
+            Fresh(Vec<u8>, Fourcc, Size<i32, BufferCoord>),
+        }
+
+        let imported = with_buffer_contents(buffer, |ptr, len, data| {
             let fourcc = match data.format {
                 wl_shm::Format::Argb8888 => Fourcc::Argb8888,
                 wl_shm::Format::Xrgb8888 => Fourcc::Xrgb8888,
@@ -97,28 +120,34 @@ impl ImportMemWl for VulkanRenderer {
                     )))
                 }
             };
+            let size = Size::<i32, BufferCoord>::from((data.width, data.height));
             // SAFETY: Smithay documents `ptr..ptr+len` as the valid, SIGBUS-guarded mapped pool
-            // region for the duration of this callback. We copy out immediately (client mutation of
-            // the shared memory makes a longer-lived borrow unsound), so the slice never escapes.
+            // region for the duration of this callback. The slice never escapes it: both arms
+            // below finish copying out before returning, because client mutation of the shared
+            // memory makes a longer-lived borrow unsound.
             let pool = unsafe { std::slice::from_raw_parts(ptr, len) };
-            let packed = repack_shm(pool, data.offset, data.stride, data.width, data.height)
+            let rows = ShmRows::new(pool, data.offset, data.stride, data.width, data.height)
                 .map_err(VulkanError::Other)?;
-            Ok((
-                packed,
-                fourcc,
-                Size::<i32, BufferCoord>::from((data.width, data.height)),
-            ))
+
+            // Reuse keys on `Fourcc`, not VkFormat: Argb/Xrgb8888 share `B8G8R8A8_UNORM` but
+            // differ in the view's alpha swizzle, so a same-size fourcc switch must re-import.
+            if let Some(tex) = cached {
+                if tex.size() == size && tex.format() == Some(fourcc) {
+                    self.reupload_shm_with(&tex, |dst| rows.write_into(dst))?;
+                    return Ok(Imported::Reused(tex));
+                }
+            }
+            Ok(Imported::Fresh(rows.to_packed(), fourcc, size))
         });
 
-        let (packed, fourcc, size) =
-            prepared.map_err(|e| VulkanError::Other(format!("shm buffer access: {e}")))??;
+        let imported =
+            imported.map_err(|e| VulkanError::Other(format!("shm buffer access: {e}")))??;
 
-        // smithay re-calls this on every new-buffer commit, and the old code allocated a fresh
-        // device image + a fresh HOST_VISIBLE staging buffer each time — a per-commit churn of the
-        // mappable-blob type that pressures the Venus host. Reuse the cached VkImage in place when
-        // the (size, fourcc) match, so an actively-updating shm client allocates nothing per frame.
-        // Reuse keys on `Fourcc`, not VkFormat: Argb/Xrgb8888 share `B8G8R8A8_UNORM` but differ in
-        // the view's alpha swizzle, so a same-size fourcc switch must re-import.
+        let (packed, fourcc, size) = match imported {
+            Imported::Reused(tex) => return Ok(tex),
+            Imported::Fresh(packed, fourcc, size) => (packed, fourcc, size),
+        };
+
         let Some(surface) = surface else {
             // No surface to hang the cache on (e.g. non-surface internal imports): keep the old
             // uncached behavior.
@@ -128,15 +157,6 @@ impl ImportMemWl for VulkanRenderer {
             .data_map
             .get_or_insert_threadsafe(ShmTextureCache::default);
         let mut cache = cache.0.lock().unwrap();
-        let id = self.context_id();
-        if let Some(existing) = cache.get(&id) {
-            if existing.size() == size && existing.format() == Some(fourcc) {
-                let tex = existing.clone();
-                drop(cache);
-                self.reupload_shm(&tex, &packed)?;
-                return Ok(tex);
-            }
-        }
         let tex = self.import_memory(&packed, fourcc, size, false)?;
         cache.insert(id, tex.clone());
         Ok(tex)
@@ -147,40 +167,86 @@ impl ImportMemWl for VulkanRenderer {
 /// `pool` into a tight `width*height*4` buffer. Every access is bounds-checked against `pool` with
 /// checked arithmetic — a malicious or buggy client controls these numbers. Pure and slice-based so
 /// the stride/offset/bounds logic is unit-testable without a live wl_shm buffer.
-fn repack_shm(
-    pool: &[u8],
-    offset: i32,
-    stride: i32,
-    width: i32,
-    height: i32,
-) -> Result<Vec<u8>, String> {
-    if width <= 0 || height <= 0 {
-        return Err(format!("shm buffer has non-positive size {width}x{height}"));
+/// A validated view of an shm pool's pixel rows: where each row starts and how many bytes it is.
+///
+/// Holds the geometry checks in one place so the two consumers — writing straight into a staging
+/// mapping, and building a tight `Vec` for a fresh import — cannot disagree about what is in
+/// bounds. Constructing one proves every row lies inside `pool`, so writing is infallible.
+struct ShmRows<'a> {
+    pool: &'a [u8],
+    offset: usize,
+    stride: usize,
+    row_bytes: usize,
+    height: usize,
+}
+
+impl<'a> ShmRows<'a> {
+    fn new(
+        pool: &'a [u8],
+        offset: i32,
+        stride: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<Self, String> {
+        if width <= 0 || height <= 0 {
+            return Err(format!("shm buffer has non-positive size {width}x{height}"));
+        }
+        if stride < width * 4 || offset < 0 {
+            return Err(format!(
+                "shm buffer geometry: stride {stride}, offset {offset}, width {width}"
+            ));
+        }
+        let (offset, stride) = (offset as usize, stride as usize);
+        let (row_bytes, height) = (width as usize * 4, height as usize);
+        // Check every row up front: the last one is the furthest into the pool, but the arithmetic
+        // that finds it can overflow, so walk them rather than reasoning about the maximum.
+        for row in 0..height {
+            let start = offset
+                .checked_add(row.checked_mul(stride).ok_or("shm geometry overflow")?)
+                .ok_or("shm geometry overflow")?;
+            let end = start
+                .checked_add(row_bytes)
+                .ok_or("shm geometry overflow")?;
+            if end > pool.len() {
+                return Err(format!(
+                    "shm row {row} spans {start}..{end}, past pool len {}",
+                    pool.len()
+                ));
+            }
+        }
+        Ok(Self {
+            pool,
+            offset,
+            stride,
+            row_bytes,
+            height,
+        })
     }
-    if stride < width * 4 || offset < 0 {
-        return Err(format!(
-            "shm buffer geometry: stride {stride}, offset {offset}, width {width}"
-        ));
+
+    /// Total bytes the tightly-packed pixels occupy.
+    fn packed_len(&self) -> usize {
+        self.row_bytes * self.height
     }
-    let (offset, stride) = (offset as usize, stride as usize);
-    let row_bytes = width as usize * 4;
-    let mut packed = vec![0u8; row_bytes * height as usize];
-    for row in 0..height as usize {
-        let start = offset
-            .checked_add(row.checked_mul(stride).ok_or("shm geometry overflow")?)
-            .ok_or("shm geometry overflow")?;
-        let end = start
-            .checked_add(row_bytes)
-            .ok_or("shm geometry overflow")?;
-        let src = pool.get(start..end).ok_or_else(|| {
-            format!(
-                "shm row {row} spans {start}..{end}, past pool len {}",
-                pool.len()
-            )
-        })?;
-        packed[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(src);
+
+    /// Write the rows tightly packed into `dst`, which must be [`Self::packed_len`] bytes.
+    ///
+    /// The whole point of the type: this is the *only* copy of the pixels on the re-upload path,
+    /// straight into the staging mapping.
+    fn write_into(&self, dst: &mut [u8]) {
+        debug_assert_eq!(dst.len(), self.packed_len());
+        for (row, out) in dst.chunks_exact_mut(self.row_bytes).enumerate() {
+            let start = self.offset + row * self.stride;
+            out.copy_from_slice(&self.pool[start..start + self.row_bytes]);
+        }
     }
-    Ok(packed)
+
+    /// The rows as a fresh tight buffer, for the import path — which allocates an image anyway, so
+    /// there is nothing yet to write into.
+    fn to_packed(&self) -> Vec<u8> {
+        let mut packed = vec![0u8; self.packed_len()];
+        self.write_into(&mut packed);
+        packed
+    }
 }
 
 impl ImportDma for VulkanRenderer {
@@ -203,7 +269,19 @@ impl ImportDmaWl for VulkanRenderer {}
 
 #[cfg(test)]
 mod tests {
-    use super::repack_shm;
+    use super::ShmRows;
+
+    /// `to_packed`, for the assertions below. The two producers share `write_into`, so exercising
+    /// either exercises the packing; this is simply the one that returns something to compare.
+    fn repack(
+        pool: &[u8],
+        offset: i32,
+        stride: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<Vec<u8>, String> {
+        ShmRows::new(pool, offset, stride, width, height).map(|rows| rows.to_packed())
+    }
 
     // A 2x2 image where each pixel byte is (10*row + col)*10 + channel, so mispacking is obvious.
     fn tight_2x2() -> Vec<u8> {
@@ -221,7 +299,7 @@ mod tests {
     #[test]
     fn repack_tight_is_verbatim() {
         let src = tight_2x2();
-        let out = repack_shm(&src, 0, 8, 2, 2).unwrap();
+        let out = repack(&src, 0, 8, 2, 2).unwrap();
         assert_eq!(out, src);
     }
 
@@ -234,7 +312,7 @@ mod tests {
             padded.extend_from_slice(&tight[row * 8..row * 8 + 8]);
             padded.extend_from_slice(&[0xEE; 4]); // padding that must be dropped
         }
-        let out = repack_shm(&padded, 0, 12, 2, 2).unwrap();
+        let out = repack(&padded, 0, 12, 2, 2).unwrap();
         assert_eq!(out, tight, "row padding must be stripped");
     }
 
@@ -243,18 +321,39 @@ mod tests {
         let tight = tight_2x2();
         let mut with_prefix = vec![0xAA; 5]; // leading bytes before the image
         with_prefix.extend_from_slice(&tight);
-        let out = repack_shm(&with_prefix, 5, 8, 2, 2).unwrap();
+        let out = repack(&with_prefix, 5, 8, 2, 2).unwrap();
         assert_eq!(out, tight);
     }
 
     #[test]
     fn repack_rejects_bad_geometry_and_bounds() {
         // stride < width*4
-        assert!(repack_shm(&[0; 64], 0, 4, 2, 2).is_err());
+        assert!(repack(&[0; 64], 0, 4, 2, 2).is_err());
         // negative offset / size
-        assert!(repack_shm(&[0; 64], -1, 8, 2, 2).is_err());
-        assert!(repack_shm(&[0; 64], 0, 8, 0, 2).is_err());
+        assert!(repack(&[0; 64], -1, 8, 2, 2).is_err());
+        assert!(repack(&[0; 64], 0, 8, 0, 2).is_err());
         // last row runs past the pool
-        assert!(repack_shm(&[0; 8], 0, 8, 2, 2).is_err());
+        assert!(repack(&[0; 8], 0, 8, 2, 2).is_err());
+    }
+
+    /// The re-upload path writes into a caller-owned destination rather than returning a `Vec`,
+    /// and that destination is a staging mapping holding whatever the *last* upload left. So a
+    /// byte `write_into` fails to write is not zero, it is a stale pixel — this pins that it
+    /// covers the whole extent, over a destination pre-filled with a value the source never has.
+    #[test]
+    fn write_into_covers_every_byte_of_a_dirty_destination() {
+        let tight = tight_2x2();
+        let mut padded = Vec::new();
+        for row in 0..2 {
+            padded.extend_from_slice(&tight[row * 8..row * 8 + 8]);
+            padded.extend_from_slice(&[0xEE; 4]);
+        }
+        let rows = ShmRows::new(&padded, 0, 12, 2, 2).unwrap();
+        let mut dst = vec![0xCD; rows.packed_len()];
+        rows.write_into(&mut dst);
+        assert_eq!(
+            dst, tight,
+            "every byte must be written, not just the changed ones"
+        );
     }
 }

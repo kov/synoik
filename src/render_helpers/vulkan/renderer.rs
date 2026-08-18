@@ -3180,6 +3180,13 @@ impl VulkanRenderer {
     /// test measuring "how many resources did this upload cost" wants it out of the window rather
     /// than folded into the first measurement. Touches no cache: it stages four bytes and drops
     /// them, leaving only the chunk behind.
+    /// Age the staging pool by a frame, retiring oversized chunks nothing is using — see
+    /// [`synoik_vk::staging::StagingPool::end_frame`]. Called from `VulkanFrame::begin`, once the
+    /// frame's uploads have taken what they need.
+    pub(super) fn age_staging_pool(&mut self) {
+        self.staging_pool.end_frame();
+    }
+
     #[cfg(test)]
     pub(crate) fn warm_staging_pool(&mut self) {
         let _ = self.staging_pool.stage(&self.gpu, &[0u8; 4]);
@@ -3484,18 +3491,20 @@ pub fn dmabuf_formats() -> FormatSet {
 }
 
 impl VulkanRenderer {
-    /// The shm-cache hit path: re-upload `data` (tightly-packed `w*h*4` bytes) into `tex`'s
-    /// existing image — no image allocation, and no submit of its own.
-    pub(super) fn reupload_shm(&mut self, tex: &VkTexture, data: &[u8]) -> Result<(), VulkanError> {
-        // The copy covers the image's full w*h extent, so short data would be an out-of-bounds
-        // staging read. The sole caller only reaches here on a size-matched cache hit with a 32bpp
-        // shm buffer; this pins that contract rather than guarding at runtime. (`reupload_32bpp`
-        // checks it again and errors, but a debug build should name the caller.)
-        debug_assert_eq!(
-            data.len(),
-            (tex.size().w as usize) * (tex.size().h as usize) * 4,
-            "reupload_shm data must be the texture's w*h*4 (32bpp) extent",
-        );
+    /// The shm-cache hit path: refresh `tex`'s existing image from `fill`, which writes the
+    /// tightly-packed `w*h*4` pixels straight into the staging mapping — no image allocation, no
+    /// intermediate buffer, and no submit of its own.
+    ///
+    /// `fill` writes rather than handing over a slice because the source is a client shm pool with
+    /// its own stride, valid only for the length of smithay's `with_buffer_contents` callback.
+    /// Repacking it into a `Vec` first and copying that in meant two passes over every pixel, both
+    /// into never-touched pages; a HiDPI client committing tens of MiB per frame spent more time in
+    /// the intermediate than in the upload it existed to feed.
+    pub(super) fn reupload_shm_with(
+        &mut self,
+        tex: &VkTexture,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<(), VulkanError> {
         // Queued, not submitted: the copy rides the next frame's command buffer alongside the
         // imports and the dmabuf acquires. A live seat frame showed `11 shm in 19.38ms` moving
         // 4.5 MiB — 0.33 ms of bytes behind eleven round trips — and forced the queued imports to
@@ -3505,7 +3514,9 @@ impl VulkanRenderer {
         // used to buy, and the queue gives it for free: a full-extent copy queued later replaces
         // the earlier one outright (`queue_texture_upload`), which is what "re-upload" means. A
         // client committing several times between two frames therefore uploads once.
-        let staged = tex.stage_reupload_shm(&mut self.staging_pool, data)?;
+        let staged = tex
+            .stage_reupload_shm_with(&mut self.staging_pool, fill)
+            .map_err(|e| VulkanError::Other(format!("staging shm re-upload: {e:#}")))?;
         self.queue_texture_upload(tex, staged);
         Ok(())
     }

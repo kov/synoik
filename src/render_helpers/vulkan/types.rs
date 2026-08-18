@@ -352,8 +352,9 @@ impl VkTexture {
         self.0.layout.store(layout.as_raw(), Ordering::Release);
     }
 
-    /// Stage a full frame of tightly-packed pixels for this texture's existing image — the shm
-    /// cache hit, refreshing a cached texture in place with no image allocation.
+    /// Stage a full frame of pixels for this texture's existing image — the shm cache hit,
+    /// refreshing a cached texture in place with no image allocation. `fill` writes the tight
+    /// `w*h*4` bytes directly into the staging mapping.
     ///
     /// **Stages only.** The returned [`StagedTexture`] carries the copy; the caller queues it so it
     /// rides a frame's command buffer
@@ -361,18 +362,18 @@ impl VkTexture {
     /// costing a submit and a fence wait per commit. The tracked layout is advanced to
     /// `SHADER_READ_ONLY_OPTIMAL` here, on the same recorded-is-as-good-as-submitted basis as
     /// everything else in that queue: the copy is ordered before any later sample.
-    pub(super) fn stage_reupload_shm(
+    pub(super) fn stage_reupload_shm_with(
         &self,
         pool: &mut synoik_vk::staging::StagingPool,
-        data: &[u8],
+        fill: impl FnOnce(&mut [u8]),
     ) -> anyhow::Result<synoik_vk::texture::StagedTexture> {
-        let staged = synoik_vk::texture::StagedTexture::reupload_32bpp(
+        let staged = synoik_vk::texture::StagedTexture::reupload_32bpp_with(
             &self.0.gpu,
             pool,
             self.image(),
             self.0.width,
             self.0.height,
-            data,
+            fill,
         )?;
         self.set_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         Ok(staged)

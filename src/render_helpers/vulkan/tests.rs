@@ -3338,7 +3338,7 @@ fn vulkan_shm_reupload_overwrites_in_place() {
         .expect("import red source");
 
     // Re-upload green into the SAME VkImage (the cache-reuse path), allocating no new image.
-    vk.reupload_shm(&tex, &solid_texels(GREEN))
+    vk.reupload_shm_with(&tex, |dst| dst.copy_from_slice(&solid_texels(GREEN)))
         .expect("reupload green");
 
     // Sample the re-uploaded texture 1:1 into an offscreen and read it back.
@@ -3424,9 +3424,9 @@ fn vulkan_repeated_shm_reuploads_supersede_in_the_queue() {
     );
 
     // Two more commits of the same surface, still with no frame in between.
-    vk.reupload_shm(&tex, &solid_texels(GREEN))
+    vk.reupload_shm_with(&tex, |dst| dst.copy_from_slice(&solid_texels(GREEN)))
         .expect("reupload green");
-    vk.reupload_shm(&tex, &solid_texels(BLUE))
+    vk.reupload_shm_with(&tex, |dst| dst.copy_from_slice(&solid_texels(BLUE)))
         .expect("reupload blue");
     assert_eq!(
         vk.pending_texture_uploads_len(),
@@ -3510,7 +3510,8 @@ fn vulkan_repeated_commits_do_not_grow_the_staging_pool() {
         .expect("offscreen");
     for round in 0..40u8 {
         // A client commit: new pixels into the image it already has.
-        vk.reupload_shm(&tex, &texels(round)).expect("reupload");
+        vk.reupload_shm_with(&tex, |dst| dst.copy_from_slice(&texels(round)))
+            .expect("reupload");
         // And the frame that records the copy, after which the staging is free again.
         let mut fb = vk.bind(&mut target).expect("bind");
         let mut frame = vk.render(&mut fb, size, Transform::Normal).expect("render");
