@@ -138,6 +138,10 @@ pub struct State {
     pub keyboard: Option<WlKeyboard>,
     /// `wl_keyboard.key` events received, as `(evdev code, state)`.
     pub key_events: Vec<(u32, wl_keyboard::KeyState)>,
+    /// `wl_keyboard.enter` / `.leave` received, in order. A client repaints on these — Firefox's
+    /// CSD chrome posts a whole-window `wl_shm` buffer on each — so *when* they arrive relative to
+    /// an animation is a cost, not just a notification.
+    pub focus_events: Vec<KeyboardFocus>,
 
     pub session_manager: Option<XdgSessionManagerV1>,
     /// Every `xdg_session_v1` / `xdg_toplevel_session_v1` event this client received, in order.
@@ -430,6 +434,7 @@ impl Client {
             screencopy: None,
             keyboard: None,
             key_events: Vec::new(),
+            focus_events: Vec::new(),
             session_manager: None,
             session_events: Vec::new(),
             windows: Vec::new(),
@@ -621,6 +626,11 @@ impl Client {
     /// `(evdev code, state)`.
     pub fn take_key_events(&mut self) -> Vec<(u32, wl_keyboard::KeyState)> {
         std::mem::take(&mut self.state.key_events)
+    }
+
+    /// Drain the `wl_keyboard.enter` / `.leave` events received so far, in order.
+    pub fn take_focus_events(&mut self) -> Vec<KeyboardFocus> {
+        std::mem::take(&mut self.state.focus_events)
     }
 
     pub fn output(&mut self, name: &str) -> WlOutput {
@@ -1670,6 +1680,13 @@ impl Dispatch<WlSeat, ()> for State {
     }
 }
 
+/// A `wl_keyboard` focus transition, as the client saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardFocus {
+    Enter,
+    Leave,
+}
+
 /// What the compositor sent a `zwp_text_input_v3`, flattened for assertions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TextInputEvent {
@@ -1810,8 +1827,12 @@ impl Dispatch<WlKeyboard, ()> for State {
     ) {
         match event {
             wl_keyboard::Event::Keymap { .. } => (),
-            wl_keyboard::Event::Enter { .. } => (),
-            wl_keyboard::Event::Leave { .. } => (),
+            wl_keyboard::Event::Enter { .. } => {
+                state.focus_events.push(KeyboardFocus::Enter);
+            }
+            wl_keyboard::Event::Leave { .. } => {
+                state.focus_events.push(KeyboardFocus::Leave);
+            }
             wl_keyboard::Event::Key {
                 key,
                 state: key_state,

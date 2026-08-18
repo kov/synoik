@@ -27,7 +27,7 @@ use synoik_config::{Action, Config};
 use wayland_client::protocol::wl_keyboard::KeyState as WlKeyState;
 use wayland_client::protocol::wl_surface::WlSurface;
 
-use super::client::{ClientId, SessionEvent, TextInputEvent as ClientEv};
+use super::client::{ClientId, KeyboardFocus, SessionEvent, TextInputEvent as ClientEv};
 use super::*;
 use crate::gnome::{
     Accel, AccelMods, AccelTrigger, FocusNewWindows, GnomeKeyAction, KeybindingAction,
@@ -26860,5 +26860,75 @@ fn the_battery_indicator_reads_every_power_state() {
     assert!(
         f.synoik().panel.battery_look().is_none(),
         "clearing the override must not leave the faked battery behind"
+    );
+}
+
+/// A workspace switch changes keyboard focus **at the start of the animation**, not at its end.
+///
+/// This is not incidental: mutter's `meta_workspace_activate_with_focus`
+/// (`src/core/workspace.c:557`) focuses synchronously right after
+/// `meta_compositor_switch_workspace`, so GNOME takes the focus change while the switch is in
+/// flight and so do we.
+///
+/// It has a cost, which is why it is pinned rather than left implicit. A client repaints on a focus
+/// change, and for a client whose toplevel is `wl_shm` — Firefox's CSD chrome is one — that repaint
+/// is a whole-window buffer we upload on the compositor thread. Landing it mid-animation puts a
+/// measured ~5-6 ms of a 16.67 ms budget on a frame that is already animating
+/// (`docs/fork/shm-upload-zero-copy.md`). Deferring focus to the end of the switch would move that
+/// cost onto a settled frame, and would be a **divergence from GNOME**: this test is what such a
+/// change has to flip, deliberately.
+#[test]
+fn a_workspace_switch_changes_focus_while_it_is_still_animating() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let output = f.synoik().global_space.outputs().next().cloned().unwrap();
+    let id = f.add_client();
+    f.client(id).get_keyboard();
+
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+    assert_eq!(
+        f.client(id).take_focus_events(),
+        vec![KeyboardFocus::Enter],
+        "the mapped window takes focus before the switch",
+    );
+
+    // Switch down to the empty workspace, and stop partway through the animation.
+    f.freeze_clock();
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.advance_clock(Duration::from_millis(50));
+    f.double_roundtrip(id);
+
+    assert!(
+        f.synoik()
+            .layout
+            .monitor_for_output(&output)
+            .is_some_and(|mon| mon.workspace_switch_in_progress()),
+        "precondition: the switch must still be animating when focus is sampled",
+    );
+    assert_eq!(
+        f.client(id).take_focus_events(),
+        vec![KeyboardFocus::Leave],
+        "focus leaves during the animation, as it does in mutter",
+    );
+
+    // The precondition above is only worth anything if it can read false — otherwise the sample
+    // above proves nothing about *when* the focus change landed.
+    f.settle_animations();
+    f.double_roundtrip(id);
+    assert!(
+        !f.synoik()
+            .layout
+            .monitor_for_output(&output)
+            .is_some_and(|mon| mon.workspace_switch_in_progress()),
+        "the switch must finish, or the mid-animation sample means nothing",
+    );
+    assert_eq!(
+        f.client(id).take_focus_events(),
+        vec![],
+        "settling adds no second focus change",
     );
 }
