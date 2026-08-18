@@ -242,6 +242,9 @@ pub enum ImRequest {
         keysym: u32,
         keycode: u32,
         state: u32,
+        /// When the compositor asked. A key the compositor has already given up on and delivered
+        /// is not worth asking about: see [`worker::coalesce`].
+        queued_at: std::time::Instant,
     },
 }
 
@@ -513,11 +516,53 @@ impl State {
         None
     }
 
+    /// Put the engine back in step after a request the queue had no room for.
+    ///
+    /// Everything the engine knows about us is state, so restating the current values is a
+    /// complete repair — there is no lost *event* to replay. Reached from [`Self::sync_im_focus`],
+    /// which runs on every refresh, so the first one after the queue drains does it.
+    fn resync_im_state(&mut self) {
+        let Some(im) = self.synoik.input_method.as_ref() else {
+            return;
+        };
+        if !(im.connected && im.desynced.get() && !im.to_worker.is_full()) {
+            return;
+        }
+        im.desynced.set(false);
+
+        // The engine first, in the same order a fresh connection does it (see `on_im_update`).
+        // A dropped `SetEngine` is the one piece of state the focus replay below cannot imply,
+        // and it is the piece that decides whether dead keys work at all.
+        self.sync_input_method_engine();
+
+        let Some(im) = self.synoik.input_method.as_ref() else {
+            return;
+        };
+        // Whichever way the focus went, which is why the unfocused case is stated too: a dropped
+        // `FocusOut` would otherwise leave the engine composing into a field that is gone.
+        match im.focus {
+            ImFocus::None => {
+                im.send(ImRequest::FocusOut);
+                im.send(ImRequest::ContentType {
+                    purpose: ibus::purpose::FREE_FORM,
+                    hints: 0,
+                });
+            }
+            _ => {
+                let (purpose, hints) = im.content_type;
+                im.send(ImRequest::FocusIn);
+                im.send(ImRequest::ContentType { purpose, hints });
+            }
+        }
+    }
+
     /// Move the engine's focus to whatever owns text right now.
     ///
     /// Call it after anything that can change that: keyboard focus, a dialog opening or closing,
     /// a client enabling or disabling its text input.
     pub fn sync_im_focus(&mut self) {
+        self.resync_im_state();
+
         let Some(im) = self.synoik.input_method.as_ref() else {
             return;
         };
@@ -527,27 +572,6 @@ impl State {
             None if im.client_enabled => ImFocus::Client,
             None => ImFocus::None,
         };
-
-        // A dropped request left the engine believing something we no longer believe. This runs
-        // on every refresh, so the first one after the queue drains puts it back in step —
-        // whichever way the focus went, which is why the unfocused case is stated too.
-        if im.connected && im.desynced.get() && !im.to_worker.is_full() {
-            im.desynced.set(false);
-            match im.focus {
-                ImFocus::None => {
-                    im.send(ImRequest::FocusOut);
-                    im.send(ImRequest::ContentType {
-                        purpose: ibus::purpose::FREE_FORM,
-                        hints: 0,
-                    });
-                }
-                _ => {
-                    let (purpose, hints) = im.content_type;
-                    im.send(ImRequest::FocusIn);
-                    im.send(ImRequest::ContentType { purpose, hints });
-                }
-            }
-        }
 
         if desired == im.focus {
             return;
@@ -732,11 +756,16 @@ impl State {
         let id = im.next_key_id;
         im.next_key_id += 1;
 
+        // One instant for both halves: the worker drops a request whose key the compositor has
+        // already expired, and it can only agree with `expire_im_keys_at` about which those are
+        // if they are timing the same moment.
+        let queued_at = std::time::Instant::now();
         im.send(ImRequest::ProcessKey {
             id,
             keysym,
             keycode,
             state,
+            queued_at,
         });
 
         if im.unresponsive {
@@ -747,7 +776,7 @@ impl State {
         im.pending.push_back(PendingKey {
             id,
             dest,
-            queued_at: std::time::Instant::now(),
+            queued_at,
         });
 
         if was_empty {

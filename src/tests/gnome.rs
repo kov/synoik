@@ -4181,8 +4181,17 @@ fn a_dropped_request_is_resynced_once_the_queue_drains() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    // Two slots: the enable below fills them, and everything after is dropped.
-    let (to_worker, requests) = async_channel::bounded(2);
+    // A configured input source, so there is an engine to re-select at all. Set before the model
+    // exists, so it costs none of the two slots below.
+    let sources = &mut f.synoik().gnome_settings.input_sources;
+    sources.present = true;
+    sources.sources = vec![("xkb".to_owned(), "us+intl".to_owned())];
+    sources.mru_sources = sources.sources.clone();
+
+    // A shallow queue, so the toggling below overruns it: each cycle is four requests and there
+    // are three of them. Deep enough that the repair itself — engine, focus, content type — fits
+    // once the worker has caught up, which is the thing under test.
+    let (to_worker, requests) = async_channel::bounded(8);
     f.synoik().input_method = Some(InputMethod::new(to_worker));
     f.synoik_state().on_im_update(ImUpdate::Connected(true));
 
@@ -4216,12 +4225,23 @@ fn a_dropped_request_is_resynced_once_the_queue_drains() {
     // The worker catches up.
     while requests.try_recv().is_ok() {}
 
-    // The next refresh owes the engine the truth: focused, with this client's content type.
+    // The next refresh owes the engine the truth: which engine, focused, with this client's
+    // content type.
     f.synoik_state().sync_im_focus();
     let queued: Vec<_> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
     assert!(
         queued.contains(&ImRequest::FocusIn),
         "a dropped request must be made good once the queue drains, got {queued:?}"
+    );
+    // The engine selection is the one piece of state the focus replay cannot imply: focusing in
+    // on the wrong engine is a session with no dead keys and nothing in the log about it.
+    let engine = queued
+        .iter()
+        .position(|r| matches!(r, ImRequest::SetEngine(_)));
+    let focus = queued.iter().position(|r| *r == ImRequest::FocusIn);
+    assert!(
+        engine.is_some_and(|engine| engine < focus.expect("asserted above")),
+        "the engine must be re-selected, before the focus: {queued:?}"
     );
     assert!(
         matches!(queued.last(), Some(ImRequest::ContentType { .. })),

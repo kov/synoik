@@ -8,10 +8,16 @@
 //! keystroke* (`inputMethod.js:344`), so doing it inline would put the frame loop behind an IPC
 //! call for every key.
 //!
-//! The loop is deliberately **sequential**: one request is awaited to completion before the next
-//! is taken. That is what makes key verdicts come back in the order the keys were typed, which
-//! mutter also relies on ("we rely on the IM implementation to notify back of key events in the
-//! exact same order they were given", `clutter-input-method.c:398-400`).
+//! Requests are issued **strictly in order**, one awaited to completion before the next is sent.
+//! That is what makes key verdicts come back in the order the keys were typed, which mutter also
+//! relies on ("we rely on the IM implementation to notify back of key events in the exact same
+//! order they were given", `clutter-input-method.c:398-400`).
+//!
+//! What is *not* guaranteed is that every queued request is issued. Whatever piled up while a call
+//! was in flight is collapsed by [`coalesce`] first, because the queue is a cache of intent rather
+//! than a log: only the latest value of each piece of state can still be acted on, and a keystroke
+//! the compositor has already given up on must not be acted on at all. Survivors keep their
+//! relative order, so the daemon sees a prefix-equivalent of what a daemon that kept up would have.
 
 use std::time::{Duration, Instant};
 
@@ -289,11 +295,22 @@ async fn session(
     };
 
     let requests_pump = async {
-        while let Ok(request) = requests.recv().await {
-            handle_request(&bus, &ctx, request, &mut caps, to_compositor).await?;
+        loop {
+            let Ok(first) = requests.recv().await else {
+                // The request channel closed: the compositor is going away.
+                return Ok(());
+            };
+            // Take whatever else piled up while the previous call was in flight. `try_recv` never
+            // waits, so a daemon that is keeping up sees batches of one and this costs nothing;
+            // only a daemon we are waiting on can produce a batch worth collapsing.
+            let mut batch = vec![first];
+            while let Ok(request) = requests.try_recv() {
+                batch.push(request);
+            }
+            for request in coalesce(batch, Instant::now()) {
+                handle_request(&bus, &ctx, request, &mut caps, to_compositor).await?;
+            }
         }
-        // The request channel closed: the compositor is going away.
-        Ok(())
     };
 
     let events_pump = std::pin::pin!(events_pump);
@@ -301,6 +318,76 @@ async fn session(
     match future::select(events_pump, requests_pump).await {
         future::Either::Left((result, _)) | future::Either::Right((result, _)) => result,
     }
+}
+
+/// The classes of request that are a *variable*, not an event: only the latest value of each can
+/// still be acted on, however many were queued.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateClass {
+    /// `FocusIn` and `FocusOut` are two values of one variable, not two independent commands.
+    Focus,
+    ContentType,
+    Engine,
+    Surrounding,
+    /// A command rather than a variable, but a repeated one is idempotent: dropping every `Reset`
+    /// but the last is safe, dropping the last is not — nothing else clears a composition.
+    Reset,
+}
+
+const STATE_CLASSES: usize = 5;
+
+fn state_class(request: &ImRequest) -> Option<StateClass> {
+    match request {
+        ImRequest::FocusIn | ImRequest::FocusOut => Some(StateClass::Focus),
+        ImRequest::ContentType { .. } => Some(StateClass::ContentType),
+        ImRequest::SetEngine(_) => Some(StateClass::Engine),
+        ImRequest::Surrounding { .. } => Some(StateClass::Surrounding),
+        ImRequest::Reset => Some(StateClass::Reset),
+        ImRequest::ProcessKey { .. } => None,
+    }
+}
+
+/// Collapse a batch of queued requests to what the daemon can still usefully act on.
+///
+/// Two rules, and neither ever reorders anything: **superseded state is deleted in place** (only
+/// the last request of each [`StateClass`] survives, at its original position), and **a keystroke
+/// nobody is waiting for is dropped**.
+///
+/// A key is not worth asking about once either of these holds:
+///
+/// * It was queued before the last focus transition in the batch. It belonged to the entry that
+///   lost the focus, and `sync_im_focus` already flushed it to that entry.
+/// * It is older than [`super::KEY_TIMEOUT`], so `expire_im_keys_at` has already delivered it.
+///
+/// Both are *hazards*, not merely waste: a verdict is ignored for a key we no longer hold, but the
+/// `commit` an engine emits alongside one is not, and it would land as a character the user never
+/// typed a second time. Dropped **silently** — synthesizing a `KeyResult` to keep the books
+/// straight would read as the engine answering, clearing `unanswered` and cancelling
+/// `is_unresponsive` on the strength of a reply that never came.
+fn coalesce(mut batch: Vec<ImRequest>, now: Instant) -> Vec<ImRequest> {
+    let mut last = [None; STATE_CLASSES];
+    for (index, request) in batch.iter().enumerate() {
+        if let Some(class) = state_class(request) {
+            last[class as usize] = Some(index);
+        }
+    }
+    let last_focus = last[StateClass::Focus as usize];
+
+    let mut next = 0;
+    batch.retain(|request| {
+        let index = next;
+        next += 1;
+        match request {
+            ImRequest::ProcessKey { queued_at, .. } => {
+                let outlived_its_focus = last_focus.is_some_and(|focus| index < focus);
+                let expired = now.saturating_duration_since(*queued_at) >= super::KEY_TIMEOUT;
+                !outlived_its_focus && !expired
+            }
+            // `state_class` is exhaustive over the rest, so the fallback is unreachable.
+            other => state_class(other).is_none_or(|class| last[class as usize] == Some(index)),
+        }
+    });
+    batch
 }
 
 async fn handle_request(
@@ -357,6 +444,8 @@ async fn handle_request(
             keysym,
             keycode,
             state,
+            // Staleness was already ruled on by `coalesce`; anything that reaches here is live.
+            queued_at: _,
         } => {
             let filtered = match ctx.process_key_event(keysym, keycode, state).await {
                 Ok(filtered) => filtered,
@@ -398,6 +487,115 @@ fn byte_to_char(text: &str, byte: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `ProcessKey` stamped `age` ago.
+    fn key(id: u64, age: Duration) -> ImRequest {
+        ImRequest::ProcessKey {
+            id,
+            keysym: 0x61,
+            keycode: 30,
+            state: 0,
+            queued_at: Instant::now() - age,
+        }
+    }
+
+    fn content(purpose: u32) -> ImRequest {
+        ImRequest::ContentType { purpose, hints: 0 }
+    }
+
+    #[test]
+    fn a_batch_of_one_is_left_alone() {
+        // The case that actually happens on a healthy session, and the one that must cost nothing.
+        let batch = vec![ImRequest::FocusIn];
+        assert_eq!(coalesce(batch, Instant::now()), vec![ImRequest::FocusIn]);
+    }
+
+    #[test]
+    fn a_focus_flip_flop_collapses_to_where_it_ended_up() {
+        // 90 minutes of a client toggling its text input is worth one focus request by the time
+        // anyone reads it. The engine cannot act on the intermediate states — they are gone.
+        let batch = vec![
+            ImRequest::FocusIn,
+            content(1),
+            ImRequest::FocusOut,
+            content(0),
+            ImRequest::FocusIn,
+            content(2),
+        ];
+        assert_eq!(
+            coalesce(batch, Instant::now()),
+            vec![ImRequest::FocusIn, content(2)]
+        );
+    }
+
+    #[test]
+    fn survivors_keep_the_order_they_were_queued_in() {
+        // Deleted in place, never regrouped: the daemon sees what a daemon that kept up would.
+        let batch = vec![
+            content(1),
+            ImRequest::SetEngine("xkb:us::eng".to_owned()),
+            ImRequest::FocusIn,
+            ImRequest::SetEngine("xkb:us:intl:eng".to_owned()),
+        ];
+        assert_eq!(
+            coalesce(batch, Instant::now()),
+            vec![
+                content(1),
+                ImRequest::FocusIn,
+                ImRequest::SetEngine("xkb:us:intl:eng".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_key_that_outlived_its_focus_is_not_offered_to_the_engine() {
+        // The key was flushed to the entry that lost the focus. Asking anyway invites a `commit`
+        // for it, which would type the character a second time — into whatever has the focus now.
+        let survivor = key(1, Duration::ZERO);
+        let batch = vec![
+            key(0, Duration::ZERO),
+            ImRequest::FocusOut,
+            ImRequest::FocusIn,
+            survivor.clone(),
+        ];
+        assert_eq!(
+            coalesce(batch, Instant::now()),
+            vec![ImRequest::FocusIn, survivor]
+        );
+    }
+
+    #[test]
+    fn a_key_the_compositor_already_gave_up_on_is_dropped() {
+        // Same hazard from the other direction: `expire_im_keys_at` delivered this one a second
+        // ago. A batch that is minutes old is entirely made of these.
+        let stale = key(0, super::super::KEY_TIMEOUT * 2);
+        let fresh = key(1, Duration::ZERO);
+        assert_eq!(
+            coalesce(vec![stale, fresh.clone()], Instant::now()),
+            vec![fresh]
+        );
+    }
+
+    #[test]
+    fn keys_are_never_collapsed_into_each_other() {
+        // Every keystroke is its own event: three fresh keys are three requests, in order.
+        let batch = vec![
+            key(0, Duration::ZERO),
+            key(1, Duration::ZERO),
+            key(2, Duration::ZERO),
+        ];
+        assert_eq!(coalesce(batch.clone(), Instant::now()), batch);
+    }
+
+    #[test]
+    fn the_last_reset_survives() {
+        // Repeated resets are idempotent, but losing the last one leaves a composition standing.
+        let batch = vec![ImRequest::Reset, ImRequest::FocusIn, ImRequest::Reset];
+        assert_eq!(
+            coalesce(batch, Instant::now()),
+            vec![ImRequest::FocusIn, ImRequest::Reset]
+        );
+    }
 
     #[test]
     fn byte_offsets_become_character_offsets() {
