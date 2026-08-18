@@ -239,6 +239,49 @@ impl Fixture {
         synoik.advance_animations();
     }
 
+    /// Run the compositor the way the live session runs it — one frame at a time — until nothing
+    /// is animating.
+    ///
+    /// The primitives around this one each do a *part* of a frame:
+    /// [`synoik_complete_animations`](Self::synoik_complete_animations) teleports the animation
+    /// clock to the end without a reconcile, [`refresh`](Self::refresh) reconciles without
+    /// advancing, [`dispatch`](Self::dispatch) pumps the loop without either. A test that needs a
+    /// transition to *finish the way it finishes in the session* had to hand-assemble the
+    /// sequence, and every test assembled it slightly differently — which is how a behaviour that
+    /// lands on the frame after an animation ends can be invisible to the corpus.
+    ///
+    /// This is that sequence, in the order the real loop runs it: advance the clock by one refresh
+    /// interval, pump the event loop, reconcile. It gives up after `max_frames` so a transition
+    /// that never settles fails the test instead of hanging it.
+    pub fn run_until_settled(&mut self, max_frames: usize) -> bool {
+        const FRAME: Duration = Duration::from_micros(16_667);
+
+        self.freeze_clock();
+        for _ in 0..max_frames {
+            self.advance_clock(FRAME);
+            self.dispatch();
+            self.refresh();
+            if !self.transitions_ongoing() {
+                // One more full frame: the live loop reconciles *after* the last animated frame,
+                // and that trailing pass is where anything deferred to the end of a transition
+                // actually lands.
+                self.advance_clock(FRAME);
+                self.dispatch();
+                self.refresh();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether any monitor still has a transition running.
+    pub fn transitions_ongoing(&mut self) -> bool {
+        self.synoik()
+            .layout
+            .monitors()
+            .any(|monitor| monitor.are_transitions_ongoing())
+    }
+
     /// Hold the animation clock still, so that only [`advance_clock`](Self::advance_clock) moves
     /// it — the way to sample a mid-animation state across round trips.
     ///

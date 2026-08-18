@@ -26922,9 +26922,12 @@ fn a_workspace_switch_holds_its_focus_change_until_it_settles() {
         "the repaint a focus change causes must not land on an animating frame",
     );
 
-    // ...and it arrives once the switch is over. The precondition above is only worth anything
-    // because this half shows `workspace_switch_in_progress` reading the other way.
-    f.settle_animations();
+    // ...and it arrives once the switch is over — driven by the real frame loop, not by pinning
+    // the clock past the end, so what is asserted is what the session does.
+    assert!(
+        f.run_until_settled(120),
+        "the switch must settle within two seconds of frames",
+    );
     f.double_roundtrip(id);
     assert!(
         !f.synoik()
