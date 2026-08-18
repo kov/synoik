@@ -355,6 +355,14 @@ impl Client {
         ti.commit();
     }
 
+    /// `disable` + `commit` — what a client does when its entry gives up focus. A client that
+    /// does this in its frame loop is what a queue behind an absent daemon has to survive.
+    pub fn disable_text_input(&mut self) {
+        let ti = self.state.text_input.clone().expect("text input");
+        ti.disable();
+        ti.commit();
+    }
+
     /// `set_surrounding_text` + `commit`.
     pub fn set_surrounding_text(&mut self, text: &str, cursor: i32, anchor: i32) {
         let ti = self.state.text_input.clone().expect("text input");

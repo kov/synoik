@@ -3916,6 +3916,9 @@ fn engine_output_reaches_the_client_as_preedit_then_commit() {
 
     let (to_worker, requests) = async_channel::unbounded();
     f.synoik().input_method = Some(InputMethod::new(to_worker));
+    // A daemon is there. Without this the model queues nothing at all, which is the whole point
+    // of the gate: requests made with no connection are replayed from state on the next one.
+    f.synoik_state().on_im_update(ImUpdate::Connected(true));
 
     let seen: Arc<Mutex<Vec<Ev>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
@@ -4091,6 +4094,139 @@ fn im_fixture() -> (
     // Drain the focus-in the setup itself produced, so a test sees only its own traffic.
     while requests.try_recv().is_ok() {}
     (f, id, requests, seen)
+}
+
+/// With no daemon behind it, the model must queue **nothing** — and pick the engine back up
+/// from its own state when one appears.
+///
+/// A live session ran 90 minutes with a killed `ibus-daemon` while a client toggled its text
+/// input, and the unbounded queue grew to 2.7 GB of stale focus flips that were then replayed,
+/// in order, at the daemon that came back — which spent an hour at 70% of a core acting on
+/// focus changes from an hour ago, while the user's actual keystrokes waited behind them.
+#[test]
+fn no_daemon_means_no_queue_and_a_replay_when_one_arrives() {
+    use std::sync::{Arc, Mutex};
+
+    use smithay::wayland::text_input::{TextInputEvent as Ev, TextInputSeat};
+
+    use crate::input_method::{ImRequest, ImUpdate, InputMethod};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let (to_worker, requests) = async_channel::unbounded();
+    f.synoik().input_method = Some(InputMethod::new(to_worker));
+
+    let seen: ImSink = Arc::new(Mutex::new(Vec::new()));
+    let sink: Arc<Mutex<Vec<Ev>>> = seen.clone();
+    f.synoik()
+        .seat
+        .text_input()
+        .set_internal_input_method(Some(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        })));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).create_text_input();
+    f.double_roundtrip(id);
+
+    // The flip-flop that filled the queue in the live session: enable, disable, enable.
+    for _ in 0..3 {
+        f.client(id).enable_text_input();
+        f.double_roundtrip(id);
+        pump_im(&mut f, &seen);
+        f.client(id).disable_text_input();
+        f.double_roundtrip(id);
+        pump_im(&mut f, &seen);
+    }
+    f.client(id).enable_text_input();
+    f.double_roundtrip(id);
+    pump_im(&mut f, &seen);
+
+    assert!(
+        requests.try_recv().is_err(),
+        "nothing may be queued for a worker with no daemon to send it to"
+    );
+
+    // The daemon arrives. What the engine needs is the state *now* — one focus-in for the entry
+    // that holds the text input — not the seven focus changes that got us here.
+    f.synoik_state().on_im_update(ImUpdate::Connected(true));
+    let queued: Vec<_> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
+    assert!(
+        queued.contains(&ImRequest::FocusIn),
+        "a reconnect must focus the engine on what holds the text input now, got {queued:?}"
+    );
+    assert_eq!(
+        queued.iter().filter(|r| **r == ImRequest::FocusIn).count(),
+        1,
+        "and exactly once, not once per focus change that happened while it was away: {queued:?}"
+    );
+    assert!(
+        !queued.contains(&ImRequest::FocusOut),
+        "nothing from before the connection may be replayed: {queued:?}"
+    );
+}
+
+/// A queue the worker is too far behind to accept drops requests rather than growing, and the
+/// next refresh puts the engine back in step with a focus and content type it can trust.
+#[test]
+fn a_dropped_request_is_resynced_once_the_queue_drains() {
+    use std::sync::{Arc, Mutex};
+
+    use smithay::wayland::text_input::{TextInputEvent as Ev, TextInputSeat};
+
+    use crate::input_method::{ImRequest, ImUpdate, InputMethod};
+
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    // Two slots: the enable below fills them, and everything after is dropped.
+    let (to_worker, requests) = async_channel::bounded(2);
+    f.synoik().input_method = Some(InputMethod::new(to_worker));
+    f.synoik_state().on_im_update(ImUpdate::Connected(true));
+
+    let seen: ImSink = Arc::new(Mutex::new(Vec::new()));
+    let sink: Arc<Mutex<Vec<Ev>>> = seen.clone();
+    f.synoik()
+        .seat
+        .text_input()
+        .set_internal_input_method(Some(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        })));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).create_text_input();
+    f.double_roundtrip(id);
+    f.client(id).enable_text_input();
+    f.double_roundtrip(id);
+    pump_im(&mut f, &seen);
+
+    // The client keeps toggling against a queue that has no room left.
+    for _ in 0..3 {
+        f.client(id).disable_text_input();
+        f.double_roundtrip(id);
+        pump_im(&mut f, &seen);
+        f.client(id).enable_text_input();
+        f.double_roundtrip(id);
+        pump_im(&mut f, &seen);
+    }
+
+    // The worker catches up.
+    while requests.try_recv().is_ok() {}
+
+    // The next refresh owes the engine the truth: focused, with this client's content type.
+    f.synoik_state().sync_im_focus();
+    let queued: Vec<_> = std::iter::from_fn(|| requests.try_recv().ok()).collect();
+    assert!(
+        queued.contains(&ImRequest::FocusIn),
+        "a dropped request must be made good once the queue drains, got {queued:?}"
+    );
+    assert!(
+        matches!(queued.last(), Some(ImRequest::ContentType { .. })),
+        "and the content type goes with it, or a password field stays free-form: {queued:?}"
+    );
 }
 
 /// A keystroke offered to the engine must not reach the client until the engine declines it.

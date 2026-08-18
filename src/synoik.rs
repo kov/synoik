@@ -1934,7 +1934,8 @@ impl State {
             {
                 use smithay::wayland::text_input::TextInputSeat as _;
 
-                let (to_worker, requests) = async_channel::unbounded();
+                let (to_worker, requests) =
+                    async_channel::bounded(crate::input_method::REQUEST_QUEUE);
                 let (updates_tx, updates_rx) = calloop::channel::channel();
                 crate::input_method::worker::spawn(requests, updates_tx, is_session_instance);
                 state.synoik.input_method = Some(crate::input_method::InputMethod::new(to_worker));

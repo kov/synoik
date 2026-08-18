@@ -32,6 +32,7 @@
 
 pub mod worker;
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -257,6 +258,16 @@ pub enum ImUpdate {
     KeyResult { id: u64, filtered: bool },
 }
 
+/// How many requests may wait for the worker.
+///
+/// Bounded on purpose. The queue is a *cache of intent*, not a log: a focus flip-flop that
+/// nobody drained is worth one focus request by the time it is read, and an unbounded queue
+/// turns a stalled or absent daemon into unbounded memory — a live session reached 2.7 GB of
+/// resident queue that way, and then replayed all of it at the daemon that came back. Deep
+/// enough that ordinary typing (one `ProcessKey` per key, plus a handful of state requests)
+/// never comes near it.
+pub const REQUEST_QUEUE: usize = 512;
+
 /// The compositor-side input method.
 pub struct InputMethod {
     to_worker: async_channel::Sender<ImRequest>,
@@ -295,6 +306,9 @@ pub struct InputMethod {
     /// [`UNRESPONSIVE_AFTER`]. See [`InputMethod::is_unresponsive`].
     unanswered: u32,
     unresponsive: bool,
+    /// A request the queue had no room for, so the engine's idea of the focus and content type
+    /// may no longer be ours. Cleared by the replay in [`State::sync_im_focus`].
+    desynced: Cell<bool>,
 }
 
 impl std::fmt::Debug for InputMethod {
@@ -324,6 +338,7 @@ impl InputMethod {
             content_type: (ibus::purpose::FREE_FORM, 0),
             pending: VecDeque::new(),
             next_key_id: 0,
+            desynced: Cell::new(false),
         }
     }
 
@@ -379,10 +394,21 @@ impl InputMethod {
     }
 
     fn send(&self, request: ImRequest) {
-        // A full or closed channel means the worker is gone or wedged. Losing a request is
-        // better than blocking the compositor thread on it; the next focus change resyncs.
-        if self.to_worker.try_send(request).is_err() {
-            tracing::debug!("input method worker is not accepting requests");
+        // Nobody is going to read this. The worker only drains the queue inside a live session,
+        // so queueing while disconnected buys nothing and *costs* unboundedly: a client that
+        // toggles its text input in its frame loop piles up a focus flip-flop for as long as the
+        // daemon is away, and every one of them is replayed at the daemon the moment it returns
+        // — long after the state that produced them is gone. Reconnecting replays the focus and
+        // content type from the current state instead (see `on_im_update`), which is the only
+        // thing the engine actually needs to know.
+        if !self.connected {
+            return;
+        }
+        // A full queue means the worker is behind — a wedged daemon, or one being flooded.
+        // Losing a request beats blocking the compositor thread on it; the replay in
+        // `sync_im_focus` puts the engine back in step once the queue drains.
+        if self.to_worker.try_send(request).is_err() && !self.desynced.replace(true) {
+            tracing::warn!("input method worker is behind; dropping requests until it drains");
         }
     }
 }
@@ -501,6 +527,28 @@ impl State {
             None if im.client_enabled => ImFocus::Client,
             None => ImFocus::None,
         };
+
+        // A dropped request left the engine believing something we no longer believe. This runs
+        // on every refresh, so the first one after the queue drains puts it back in step —
+        // whichever way the focus went, which is why the unfocused case is stated too.
+        if im.connected && im.desynced.get() && !im.to_worker.is_full() {
+            im.desynced.set(false);
+            match im.focus {
+                ImFocus::None => {
+                    im.send(ImRequest::FocusOut);
+                    im.send(ImRequest::ContentType {
+                        purpose: ibus::purpose::FREE_FORM,
+                        hints: 0,
+                    });
+                }
+                _ => {
+                    let (purpose, hints) = im.content_type;
+                    im.send(ImRequest::FocusIn);
+                    im.send(ImRequest::ContentType { purpose, hints });
+                }
+            }
+        }
+
         if desired == im.focus {
             return;
         }
@@ -889,11 +937,16 @@ impl State {
     pub fn on_im_update(&mut self, update: ImUpdate) {
         match update {
             ImUpdate::Connected(connected) => {
+                // Before anything is sent: `send` drops requests while disconnected, and the
+                // engine selection below is the first thing a new connection needs.
+                if let Some(im) = self.synoik.input_method.as_mut() {
+                    im.connected = connected;
+                }
                 if connected {
                     self.sync_input_method_engine();
                 }
                 if let Some(im) = self.synoik.input_method.as_mut() {
-                    im.connected = connected;
+                    im.desynced.set(false);
                     // A reconnect brings a *new* input context, which starts unfocused and knows
                     // nothing. Replay whatever holds the focus, or the engine stays deaf until
                     // the user moves to another entry.
