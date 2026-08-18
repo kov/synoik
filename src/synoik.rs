@@ -3281,6 +3281,49 @@ impl State {
             KeyboardFocus::Layout { surface: None }
         };
 
+        // A workspace switch holds its focus change until the animation finishes.
+        //
+        // **This is a deliberate divergence from GNOME.** mutter focuses synchronously at the start
+        // of the switch (`meta_workspace_activate_with_focus`, `src/core/workspace.c:557`). We
+        // defer, because a focus change makes clients repaint, and a client whose toplevel is
+        // `wl_shm` repaints its whole window — Firefox's CSD chrome is one, at ~5-6 ms of a
+        // 16.67 ms budget. Landing that on a frame that is already animating is the one moment it
+        // cannot be afforded; a settled frame absorbs it invisibly.
+        //
+        // Only window-to-window focus is held. A dialog, the lock screen or a layer surface taking
+        // focus is not the switch's doing and must not wait for it. Rapid switches coalesce for
+        // free: the animation is still in progress, so the focus that finally lands is the last
+        // one computed, never an intermediate workspace's.
+        //
+        // The cost is that keystrokes during the animation go to the window being switched away
+        // from, and `zwp_text_input` follows keyboard focus with them. See
+        // `docs/fork/workspace-switch-focus-divergence.md`.
+        let switching = self
+            .synoik
+            .layout
+            .active_output()
+            .and_then(|output| self.synoik.layout.monitor_for_output(output))
+            .is_some_and(|monitor| monitor.workspace_switch_in_progress());
+        // Both ends must be layout focus: a dialog, the lock screen or a layer surface taking
+        // focus is not the switch's doing. Switching *from* an empty workspace still holds — there
+        // is no surface to keep, but the destination's window must not be focused early either. A
+        // focused surface that has died is not worth holding: let the change through.
+        let holding = match &self.synoik.keyboard_focus {
+            KeyboardFocus::Layout {
+                surface: Some(surface),
+            } => surface.alive(),
+            KeyboardFocus::Layout { surface: None } => true,
+            _ => false,
+        } && matches!(focus, KeyboardFocus::Layout { .. });
+        // Hold by keeping the focus we already have, not by returning: the tail of this function
+        // runs whether or not focus moved, and an input method must not be left composing into an
+        // entry that has gone away.
+        let focus = if switching && holding {
+            self.synoik.keyboard_focus.clone()
+        } else {
+            focus
+        };
+
         let keyboard = self.synoik.seat.get_keyboard().unwrap();
         if self.synoik.keyboard_focus != focus {
             trace!(

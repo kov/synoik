@@ -21282,16 +21282,28 @@ fn the_switcher_previews_another_workspace_and_gives_it_back() {
     // MRU by focus timestamp and switching workspaces does not re-stamp the window it lands on,
     // so mapping "One" last is what makes it unambiguously the app we are in, with "Two" one
     // workspace away and "Three" two.
+    // Each switch is settled before the next window is mapped. A switch defers its focus change
+    // until it lands (`a_workspace_switch_holds_its_focus_change_until_it_settles`), and two
+    // switches inside one animation coalesce to the last one — so mapping through an unsettled
+    // switch would leave the middle window with no focus stamp at all, and the MRU order this
+    // test is built on would be a different order.
+    let settle = |f: &mut Fixture| {
+        f.settle_animations();
+        f.double_roundtrip(client);
+    };
+
     map_window_for_app(&mut f, client, "org.example.Three");
     let far = f.synoik().layout.focus().unwrap().id();
 
     f.synoik_state()
         .do_action(Action::FocusWorkspaceDown, false);
+    settle(&mut f);
     map_window_for_app(&mut f, client, "org.example.Two");
     let there = f.synoik().layout.focus().unwrap().id();
 
     f.synoik_state()
         .do_action(Action::FocusWorkspaceDown, false);
+    settle(&mut f);
     map_window_for_app(&mut f, client, "org.example.One");
     let here = f.synoik().layout.focus().unwrap().id();
     f.synoik_complete_animations();
@@ -21303,6 +21315,7 @@ fn the_switcher_previews_another_workspace_and_gives_it_back() {
             .unwrap()
             .active_workspace_idx()
     };
+    settle(&mut f);
     assert_eq!(ws(&mut f), 2, "sanity: we start where \"One\" is");
 
     // Leg 1: open on "Two" and pass straight through — too quick to have gone anywhere.
@@ -26863,22 +26876,16 @@ fn the_battery_indicator_reads_every_power_state() {
     );
 }
 
-/// A workspace switch changes keyboard focus **at the start of the animation**, not at its end.
+/// A workspace switch holds its focus change until the animation finishes.
 ///
-/// This is not incidental: mutter's `meta_workspace_activate_with_focus`
-/// (`src/core/workspace.c:557`) focuses synchronously right after
-/// `meta_compositor_switch_workspace`, so GNOME takes the focus change while the switch is in
-/// flight and so do we.
-///
-/// It has a cost, which is why it is pinned rather than left implicit. A client repaints on a focus
-/// change, and for a client whose toplevel is `wl_shm` — Firefox's CSD chrome is one — that repaint
-/// is a whole-window buffer we upload on the compositor thread. Landing it mid-animation puts a
-/// measured ~5-6 ms of a 16.67 ms budget on a frame that is already animating
-/// (`docs/fork/shm-upload-zero-copy.md`). Deferring focus to the end of the switch would move that
-/// cost onto a settled frame, and would be a **divergence from GNOME**: this test is what such a
-/// change has to flip, deliberately.
+/// **Deliberate divergence from GNOME.** mutter focuses synchronously at the start of the switch
+/// (`meta_workspace_activate_with_focus`, `src/core/workspace.c:557`). We defer, because a focus
+/// change makes clients repaint: a client whose toplevel is `wl_shm` repaints its *whole window*,
+/// and Firefox's CSD chrome is one, measured at ~5-6 ms of a 16.67 ms budget. Landing that on a
+/// frame that is already animating is the one moment it cannot be afforded. See
+/// `docs/fork/workspace-switch-focus-divergence.md`.
 #[test]
-fn a_workspace_switch_changes_focus_while_it_is_still_animating() {
+fn a_workspace_switch_holds_its_focus_change_until_it_settles() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
     let output = f.synoik().global_space.outputs().next().cloned().unwrap();
@@ -26911,12 +26918,12 @@ fn a_workspace_switch_changes_focus_while_it_is_still_animating() {
     );
     assert_eq!(
         f.client(id).take_focus_events(),
-        vec![KeyboardFocus::Leave],
-        "focus leaves during the animation, as it does in mutter",
+        vec![],
+        "the repaint a focus change causes must not land on an animating frame",
     );
 
-    // The precondition above is only worth anything if it can read false — otherwise the sample
-    // above proves nothing about *when* the focus change landed.
+    // ...and it arrives once the switch is over. The precondition above is only worth anything
+    // because this half shows `workspace_switch_in_progress` reading the other way.
     f.settle_animations();
     f.double_roundtrip(id);
     assert!(
@@ -26924,11 +26931,108 @@ fn a_workspace_switch_changes_focus_while_it_is_still_animating() {
             .layout
             .monitor_for_output(&output)
             .is_some_and(|mon| mon.workspace_switch_in_progress()),
-        "the switch must finish, or the mid-animation sample means nothing",
+        "the switch must finish, or the sample above means nothing",
     );
     assert_eq!(
         f.client(id).take_focus_events(),
+        vec![KeyboardFocus::Leave],
+        "focus is deferred, not dropped",
+    );
+}
+
+/// Switching again mid-animation must not focus the workspace being passed over.
+///
+/// This is where a deferral goes wrong: hold the change and apply it on a timer and the
+/// intermediate workspace gets a focus it never should have had — two repaints instead of none.
+/// Holding until the switch *settles* coalesces for free, because a second switch means the
+/// animation is still in progress.
+#[test]
+fn switching_twice_never_focuses_the_workspace_passed_over() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let passed_over = f.add_client();
+    let destination = f.add_client();
+
+    // A window on the workspace below, and another one below that.
+    f.client(passed_over).get_keyboard();
+    f.client(destination).get_keyboard();
+    let _a = map_window_sized(&mut f, passed_over, (800, 600), None);
+    f.double_roundtrip(passed_over);
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.synoik_complete_animations();
+    let _b = map_window_sized(&mut f, destination, (800, 600), None);
+    f.double_roundtrip(destination);
+    f.synoik_state()
+        .do_action(Action::MoveWindowToWorkspaceDown(true), false);
+    f.synoik_complete_animations();
+    f.synoik_state().do_action(
+        Action::FocusWorkspace(synoik_config::WorkspaceReference::Index(1)),
+        false,
+    );
+    f.synoik_complete_animations();
+    f.double_roundtrip(passed_over);
+    f.double_roundtrip(destination);
+    let _ = f.client(passed_over).take_focus_events();
+    let _ = f.client(destination).take_focus_events();
+
+    // Down, then down again before the first animation finishes.
+    f.freeze_clock();
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.advance_clock(Duration::from_millis(50));
+    // Dispatch mid-animation: without the hold this is where the workspace being passed over takes
+    // focus, so the test would be blind without it.
+    f.double_roundtrip(passed_over);
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.settle_animations();
+    f.double_roundtrip(passed_over);
+    f.double_roundtrip(destination);
+
+    assert_eq!(
+        f.client(passed_over).take_focus_events(),
         vec![],
-        "settling adds no second focus change",
+        "the workspace passed over must never take focus",
+    );
+    assert_eq!(
+        f.client(destination).take_focus_events(),
+        vec![KeyboardFocus::Enter],
+        "the workspace landed on takes focus, once",
+    );
+}
+
+/// The price of the divergence, pinned so it is a decision and not an accident: a key pressed while
+/// the switch animates goes to the window being switched *away from*, because that is still the
+/// keyboard focus. `zwp_text_input` follows keyboard focus, so typing is delayed by the animation.
+#[test]
+fn a_key_during_a_switch_goes_to_the_window_being_left() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    f.client(id).get_keyboard();
+
+    let _surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.double_roundtrip(id);
+    f.synoik_complete_animations();
+    f.double_roundtrip(id);
+    let _ = f.client(id).take_key_events();
+    let _ = f.client(id).take_focus_events();
+
+    f.freeze_clock();
+    f.synoik_state()
+        .do_action(Action::FocusWorkspaceDown, false);
+    f.advance_clock(Duration::from_millis(50));
+    // Dispatch first: without the hold, focus has left the window by now and the key would go
+    // nowhere. That is exactly the difference being pinned.
+    f.double_roundtrip(id);
+    f.key_press(KEY_Z);
+    f.key_release(KEY_Z);
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![(KEY_Z, WlKeyState::Pressed), (KEY_Z, WlKeyState::Released)],
+        "the window being left still has the keyboard until the switch settles",
     );
 }
