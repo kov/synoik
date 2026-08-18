@@ -651,6 +651,19 @@ bitflags::bitflags! {
 }
 
 impl AnimCauses {
+    /// Causes that are an ongoing **state** rather than a transition with an end.
+    ///
+    /// An animated cursor redraws for as long as it is on screen, and the lock screen keeps its
+    /// clock ticking for as long as it is up. Each is a perfectly good reason to draw another frame
+    /// — which is why they are in this set at all — but neither is ever going to *finish*, so
+    /// anything waiting for the compositor to come to rest must wait for the other causes only.
+    ///
+    /// `INTERACTIVE_MOVE` is deliberately **not** here even though a held drag does not end on its
+    /// own. The transitions a drag drives — a preview shrinking to its drag size, the dash
+    /// reordering under it — are reported under that same bit, so masking it would report a drag
+    /// as settled before its animation had run at all.
+    pub const ONGOING: Self = Self::CURSOR.union(Self::LOCK_SCREEN);
+
     /// Lowercase, hyphenated names of the set bits, for the log line. Allocates, so
     /// this is for formatting a frame that is already being written out — never on
     /// the banking path, which stores the raw bits.

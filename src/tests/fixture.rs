@@ -287,18 +287,37 @@ impl Fixture {
     /// transition never ends. This is the one to reach for: a test almost never wants to *tolerate*
     /// a transition that will not finish.
     pub fn settle(&mut self) {
-        assert!(
-            self.run_until_settled(600),
-            "transitions still running after 10s of frames",
-        );
+        if !self.run_until_settled(600) {
+            let outputs: Vec<_> = self.synoik().global_space.outputs().cloned().collect();
+            let causes: Vec<_> = outputs
+                .iter()
+                .map(|output| (output.name(), self.synoik().anim_causes(output)))
+                .filter(|(_, causes)| {
+                    !causes
+                        .difference(crate::frame_log::AnimCauses::ONGOING)
+                        .is_empty()
+                })
+                .collect();
+            panic!("still animating after 10s of frames: {causes:?}");
+        }
     }
 
-    /// Whether any monitor still has a transition running.
+    /// Whether anything is still animating, on any output — **the compositor's own answer**.
+    ///
+    /// `State::redraw` decides whether to queue another frame from `Synoik::anim_causes`, so the
+    /// harness asks the same question rather than keeping a second list. An earlier version asked
+    /// only whether a *monitor transition* was running, which is a much smaller set: it stopped two
+    /// frames into a switch and left timed overlays — an OSD, a banner — still up, so a settle that
+    /// looked faithful was not.
     pub fn transitions_ongoing(&mut self) -> bool {
-        self.synoik()
-            .layout
-            .monitors()
-            .any(|monitor| monitor.are_transitions_ongoing())
+        let outputs: Vec<_> = self.synoik().global_space.outputs().cloned().collect();
+        outputs.iter().any(|output| {
+            !self
+                .synoik()
+                .anim_causes(output)
+                .difference(crate::frame_log::AnimCauses::ONGOING)
+                .is_empty()
+        })
     }
 
     /// Hold the animation clock still, so that only [`advance_clock`](Self::advance_clock) moves

@@ -124,7 +124,7 @@ fn overview_opens_and_closes_via_action() {
     );
 
     f.synoik_state().do_action(Action::OpenOverview, false);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "OpenOverview must open the overview"
@@ -132,14 +132,14 @@ fn overview_opens_and_closes_via_action() {
 
     // Opening an already-open overview is a no-op, not a toggle.
     f.synoik_state().do_action(Action::OpenOverview, false);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "OpenOverview must be idempotent"
     );
 
     f.synoik_state().do_action(Action::CloseOverview, false);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "CloseOverview must close the overview"
@@ -155,11 +155,11 @@ fn toggle_overview_flips_state() {
     assert!(!f.synoik().layout.is_overview_open());
 
     f.synoik_state().do_action(Action::ToggleOverview, false);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(f.synoik().layout.is_overview_open(), "first toggle opens");
 
     f.synoik_state().do_action(Action::ToggleOverview, false);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "second toggle closes"
@@ -186,7 +186,7 @@ fn hot_corner_needs_pressure_to_open_the_overview() {
     // Arriving at the corner is not pushing into it: the motion that lands there is spent
     // travelling, and nothing is discarded.
     pointer_motion_to(&mut f, 0., 0.);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "merely touching the corner must not open the overview"
@@ -194,7 +194,7 @@ fn hot_corner_needs_pressure_to_open_the_overview() {
 
     // Nor is a nudge: 5 px per event, capped by nothing, is 25 px of the 100 px budget.
     push_into_corner(&mut f, 5, 5.);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "a nudge below the threshold must not open the overview"
@@ -203,7 +203,7 @@ fn hot_corner_needs_pressure_to_open_the_overview() {
     // Sustained pushing does. The per-event cap is 15 px (`layout.js:1401`), so this is
     // 5 more events at 15 px on top of the 25 already banked.
     push_into_corner(&mut f, 5, 20.);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "pushing past the threshold must open the overview"
@@ -220,14 +220,14 @@ fn hot_corner_latches_until_the_pointer_leaves() {
 
     pointer_motion_to(&mut f, 0., 0.);
     push_into_corner(&mut f, 10, 20.);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "the corner fires once"
     );
 
     push_into_corner(&mut f, 20, 20.);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "pushing on must not toggle the overview back shut"
@@ -237,7 +237,7 @@ fn hot_corner_latches_until_the_pointer_leaves() {
     pointer_motion_to(&mut f, 960., 540.);
     pointer_motion_to(&mut f, 0., 0.);
     push_into_corner(&mut f, 10, 20.);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "leaving re-arms the corner, so the next push toggles"
@@ -259,21 +259,21 @@ fn hot_corner_listens_along_both_edges() {
     for _ in 0..10 {
         f.pointer_motion(-20., 0.);
     }
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "the left edge within panel height of the corner is part of the hot corner"
     );
 
     f.synoik_state().do_action(Action::CloseOverview, false);
-    f.synoik_complete_animations();
+    f.settle();
 
     // Past the segment's end: the same push does nothing.
     pointer_motion_to(&mut f, 0., size + 100.);
     for _ in 0..10 {
         f.pointer_motion(-20., 0.);
     }
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "the left edge below the barrier must not trigger"
@@ -293,7 +293,7 @@ fn sliding_along_the_top_edge_builds_no_pressure() {
     for _ in 0..40 {
         f.pointer_motion(-10., -4.);
     }
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "travelling along the edge must not open the overview"
@@ -310,7 +310,7 @@ fn hot_corner_honors_enable_hot_corners() {
 
     pointer_motion_to(&mut f, 0., 0.);
     push_into_corner(&mut f, 20, 20.);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "a disabled hot corner must not open the overview"
@@ -327,7 +327,7 @@ fn the_dock_needs_pressure_on_the_bottom_edge() {
 
     // Arrive at the bottom edge without pushing into it.
     pointer_motion_to(&mut f, 960., 1079.);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().dock.area(&output).is_none(),
         "touching the bottom edge must not summon the dock"
@@ -337,7 +337,7 @@ fn the_dock_needs_pressure_on_the_bottom_edge() {
     for _ in 0..40 {
         f.pointer_motion(-20., 4.);
     }
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().dock.area(&output).is_none(),
         "sliding along the bottom edge must not summon the dock"
@@ -437,7 +437,7 @@ fn the_dock_hit_tests_the_same_dash_as_the_overview() {
     for _ in 0..10 {
         f.pointer_motion(0., 20.);
     }
-    f.synoik_complete_animations();
+    f.settle();
 
     let area = f.synoik().dock.area(&output).expect("the dock is out");
     assert!(
@@ -459,7 +459,7 @@ fn the_dock_hit_tests_the_same_dash_as_the_overview() {
 
     // And leaving the dock's area hides it again, after the grace period.
     pointer_motion_to(&mut f, 960., 300.);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().dash.hovered_for_test().is_none(),
         "leaving drops the hover"
@@ -483,7 +483,7 @@ fn the_dock_opens_an_icons_context_menu_and_keeps_it_up() {
     for _ in 0..10 {
         f.pointer_motion(0., 20.);
     }
-    f.synoik_complete_animations();
+    f.settle();
     assert!(f.synoik().dock_owns_dash(&output), "the dock is out");
 
     let area = f.synoik().dock.area(&output).expect("the dock is out");
@@ -514,7 +514,7 @@ fn the_dock_opens_an_icons_context_menu_and_keeps_it_up() {
     // too — `is_app_menu` stays true while a popover closes, so asserting on the frame after
     // the sync alone would not notice.
     f.synoik().advance_animations();
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().panel_popover.is_app_menu(),
         "the menu must survive the frame — there is no overview for it to outlive"
@@ -522,7 +522,7 @@ fn the_dock_opens_an_icons_context_menu_and_keeps_it_up() {
 
     // And the dock must not slide out from under it once the pointer moves up to the menu.
     pointer_motion_to(&mut f, 960., 300.);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().dock.area(&output).is_some(),
         "the dock is held open while one of its icons has a menu up"
@@ -561,7 +561,7 @@ fn the_dock_show_apps_button_opens_the_app_grid() {
     for _ in 0..10 {
         f.pointer_motion(0., 20.);
     }
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().dock_owns_dash(&output),
         "the dock is out with the overview shut"
@@ -578,7 +578,7 @@ fn the_dock_show_apps_button_opens_the_app_grid() {
     pointer_motion_to(&mut f, center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         f.synoik().layout.is_overview_open(),
@@ -607,7 +607,7 @@ fn super_tap_toggles_overview() {
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "a lone Super tap opens the overview"
@@ -615,7 +615,7 @@ fn super_tap_toggles_overview() {
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "a second Super tap closes it"
@@ -642,7 +642,7 @@ fn double_super_tap_opens_the_app_grid() {
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "a second tap during the open animation must not close the overview"
@@ -656,7 +656,7 @@ fn double_super_tap_opens_the_app_grid() {
     // shift is clamped at APP_GRID, so it never toggles the grid back down.
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "a tap after the animation settles closes the overview"
@@ -672,11 +672,11 @@ fn slow_second_super_tap_closes_the_overview() {
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "a second tap after the open animation closes the overview"
@@ -701,7 +701,7 @@ fn double_super_tap_opens_the_app_grid_without_animations() {
     f.key_release(KEY_LEFTMETA);
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_app_grid_open(),
         "two taps within 250 ms must reach the app grid with animations off"
@@ -711,7 +711,7 @@ fn double_super_tap_opens_the_app_grid_without_animations() {
     f.advance_input_time(300);
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "a tap more than 250 ms later closes the overview"
@@ -727,7 +727,7 @@ fn right_super_tap_toggles_overview_by_default() {
 
     f.key_press(KEY_RIGHTMETA);
     f.key_release(KEY_RIGHTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         f.synoik().layout.is_overview_open(),
@@ -750,7 +750,7 @@ fn super_plus_key_does_not_toggle_overview() {
     f.key_press(KEY_Z);
     f.key_release(KEY_Z);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         !f.synoik().layout.is_overview_open(),
@@ -773,7 +773,7 @@ fn super_then_click_does_not_toggle_overview() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         !f.synoik().layout.is_overview_open(),
@@ -819,7 +819,7 @@ fn overlay_key_firing_release_is_not_sent_to_the_client() {
     // A firing tap: the press is delivered, the release is swallowed.
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
     assert!(
         f.synoik().layout.is_overview_open(),
@@ -842,7 +842,7 @@ fn overlay_key_setting_can_disable() {
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         !f.synoik().layout.is_overview_open(),
@@ -862,7 +862,7 @@ fn super_tap_with_pointer_motion_still_toggles() {
     f.key_press(KEY_LEFTMETA);
     f.pointer_motion(5.0, 5.0);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         f.synoik().layout.is_overview_open(),
@@ -880,7 +880,7 @@ fn super_then_scroll_does_not_toggle_overview() {
     f.key_press(KEY_LEFTMETA);
     f.scroll_wheel();
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         !f.synoik().layout.is_overview_open(),
@@ -899,7 +899,7 @@ fn super_then_touch_does_not_toggle_overview() {
     f.touch_down(100.0, 100.0);
     f.touch_up();
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         !f.synoik().layout.is_overview_open(),
@@ -919,7 +919,7 @@ fn shift_held_super_tap_does_not_toggle_overview() {
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
     f.key_release(KEY_LEFTSHIFT);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         !f.synoik().layout.is_overview_open(),
@@ -945,7 +945,7 @@ fn shortcuts_inhibit_disables_overlay_key() {
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "the overlay key must be inert while the focused window inhibits shortcuts"
@@ -956,7 +956,7 @@ fn shortcuts_inhibit_disables_overlay_key() {
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "releasing the inhibitor must restore the overlay key"
@@ -1012,7 +1012,7 @@ fn numbered_workspace_switches_follow_the_settings() {
     f.key_press(KEY_2);
     f.key_release(KEY_2);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         f.synoik()
             .layout
@@ -1039,7 +1039,7 @@ fn numbered_workspace_switches_follow_the_settings() {
     f.key_press(KEY_2);
     f.key_release(KEY_2);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         f.synoik()
             .layout
@@ -1058,7 +1058,7 @@ fn numbered_workspace_switches_follow_the_settings() {
     f.key_press(KEY_1);
     f.key_release(KEY_1);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         f.synoik()
             .layout
@@ -1073,7 +1073,7 @@ fn numbered_workspace_switches_follow_the_settings() {
     f.key_press(KEY_HOME);
     f.key_release(KEY_HOME);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         f.synoik()
             .layout
@@ -1101,7 +1101,7 @@ fn ctrl_alt_arrows_switch_workspaces() {
     f.key_press(KEY_LEFTALT);
     f.key_press(KEY_DOWN);
     f.key_release(KEY_DOWN);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         f.synoik()
             .layout
@@ -1116,7 +1116,7 @@ fn ctrl_alt_arrows_switch_workspaces() {
     f.key_release(KEY_UP);
     f.key_release(KEY_LEFTALT);
     f.key_release(KEY_LEFTCTRL);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         f.synoik()
             .layout
@@ -1147,7 +1147,7 @@ fn super_shift_page_down_moves_window_to_next_workspace() {
     f.key_release(KEY_PAGEDOWN);
     f.key_release(KEY_LEFTSHIFT);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     let monitor = f.synoik().layout.active_monitor_ref().unwrap();
     assert_eq!(
@@ -1273,7 +1273,7 @@ fn a_wheel_notch_resolves_through_the_settings_model() {
 
     // Without the modifier it is an ordinary scroll, not a binding.
     f.scroll_wheel();
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         active(&mut f),
         0,
@@ -1283,7 +1283,7 @@ fn a_wheel_notch_resolves_through_the_settings_model() {
     f.key_press(KEY_LEFTMETA);
     f.scroll_wheel();
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         active(&mut f),
         1,
@@ -1318,7 +1318,7 @@ fn our_own_keybindings_resolve_too() {
     tap(&mut f, KEY_K);
     f.key_release(KEY_LEFTALT);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert_ne!(
         focused(&mut f),
         newest,
@@ -1330,7 +1330,7 @@ fn our_own_keybindings_resolve_too() {
     tap(&mut f, KEY_J);
     f.key_release(KEY_LEFTALT);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(focused(&mut f), newest, "<Super><Alt>j must come back down");
 
     // And rebinding one in the model takes effect, like any other key.
@@ -1349,7 +1349,7 @@ fn our_own_keybindings_resolve_too() {
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_Z);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert_ne!(
         focused(&mut f),
         newest,
@@ -1399,7 +1399,7 @@ fn a_grab_outranks_our_own_keybinding() {
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_Z);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(
         f.synoik().layout.focus().map(|m| m.id()),
@@ -1412,7 +1412,7 @@ fn a_grab_outranks_our_own_keybinding() {
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_Z);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert_ne!(
         f.synoik().layout.focus().map(|m| m.id()),
         newest,
@@ -1433,7 +1433,7 @@ fn super_number_activates_the_nth_favorite() {
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_2);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1, "exactly one favorite launched");
@@ -1470,7 +1470,7 @@ fn super_number_counts_the_favorites_the_dash_shows() {
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_2);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1, "exactly one favorite launched");
@@ -1501,7 +1501,7 @@ fn every_super_digit_activates_that_favorite() {
         f.key_press(KEY_LEFTMETA);
         tap(&mut f, *key);
         f.key_release(KEY_LEFTMETA);
-        f.synoik_complete_animations();
+        f.settle();
 
         let calls = recorder.calls.borrow();
         let n = i + 1;
@@ -1527,7 +1527,7 @@ fn super_ctrl_number_asks_for_a_new_window() {
     tap(&mut f, KEY_1);
     f.key_release(KEY_LEFTCTRL);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(
         recorder.calls.borrow().len(),
@@ -1606,7 +1606,7 @@ fn super_end_focuses_the_last_workspace() {
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_END);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         f.synoik()
             .layout
@@ -1635,7 +1635,7 @@ fn super_shift_right_moves_the_window_to_the_next_monitor() {
     tap(&mut f, KEY_RIGHT);
     f.key_release(KEY_LEFTSHIFT);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     let now = f.synoik().layout.active_output().unwrap().clone();
     assert_ne!(
@@ -1700,7 +1700,7 @@ fn super_a_toggles_the_app_grid() {
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_A);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_app_grid_open(),
         "from closed, <Super>a must open the overview at the app grid"
@@ -1709,7 +1709,7 @@ fn super_a_toggles_the_app_grid() {
     f.key_press(KEY_LEFTMETA);
     tap(&mut f, KEY_A);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_app_grid_open(),
         "pressing it again must fall back to the window picker"
@@ -1880,7 +1880,7 @@ fn gnome_keybindings_are_the_only_keybindings() {
     f.key_press(KEY_F4);
     f.key_release(KEY_F4);
     f.key_release(KEY_LEFTALT);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     assert!(
@@ -1913,7 +1913,7 @@ fn alt_tab_switches_to_previous_window() {
         "Alt+Tab must open the window switcher"
     );
     f.key_release(KEY_LEFTALT);
-    f.synoik_complete_animations();
+    f.settle();
     // Let the focus change go through a refresh cycle, like in a real event
     // loop iteration, so the MRU bookkeeping sees it.
     f.double_roundtrip(id);
@@ -1931,7 +1931,7 @@ fn alt_tab_switches_to_previous_window() {
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_TAB);
     f.key_release(KEY_LEFTALT);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         f.synoik().layout.focus().unwrap().id(),
         second_focused,
@@ -2224,7 +2224,7 @@ fn overlay_key_setting_rebinds() {
     // Left Super is no longer the overlay key.
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "left Super must be inert once the overlay key is Super_R"
@@ -2233,7 +2233,7 @@ fn overlay_key_setting_rebinds() {
     // Right Super now toggles the overview.
     f.key_press(KEY_RIGHTMETA);
     f.key_release(KEY_RIGHTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "a right Super tap must open the overview when it is the overlay key"
@@ -2261,7 +2261,7 @@ fn map_window_sized(
     window.set_size(size.0, size.1);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     surface
 }
@@ -2559,7 +2559,7 @@ fn the_monitor_choice_survives_the_pointer_moving_away() {
     window.attach_new_buffer();
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(
         focused_window_output(&mut f),
@@ -2705,7 +2705,7 @@ fn denied_focus_window_moves_off_the_focus_window() {
     window.set_size(900, 600);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     let synoik = f.synoik();
     assert_eq!(
@@ -2772,7 +2772,7 @@ fn stale_launch_denied_focus_and_marked_urgent() {
     window.set_size(100, 100);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     let synoik = f.synoik();
     assert_eq!(
@@ -2863,7 +2863,7 @@ fn super_left_tiles_and_toggles() {
     window.set_size(960, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     assert_pos_eq(
         focused_window_pos(&mut f),
         (0., 32.),
@@ -2885,7 +2885,7 @@ fn super_left_tiles_and_toggles() {
     window.set_size(800, 600);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     assert_pos_eq(
         focused_window_pos(&mut f),
         original_pos,
@@ -2950,7 +2950,7 @@ fn super_up_maximizes_super_down_restores() {
     window.set_size(800, 600);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     assert_pos_eq(
         focused_window_pos(&mut f),
         original_pos,
@@ -2969,7 +2969,7 @@ fn maximize_focused(f: &mut Fixture, id: ClientId, surface: &WlSurface, size: (u
     window.set_size(size.0, size.1);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 }
 
 /// A GNOME workspace is a stack, not a strip: two maximized windows sit on top of each other at
@@ -3019,7 +3019,7 @@ fn maximized_windows_stack_instead_of_sitting_side_by_side() {
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_TAB);
     f.key_release(KEY_LEFTALT);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
     assert_eq!(f.synoik().layout.focus().unwrap().id(), second_id);
 
@@ -3099,7 +3099,7 @@ fn fullscreen_window_covers_the_top_layer() {
     window.set_size(1920, 1080);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         f.synoik()
@@ -3140,7 +3140,7 @@ fn panel_hides_and_stops_taking_input_over_a_fullscreen_window() {
     window.set_size(1920, 1080);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         !f.synoik().panel_visible_on(&output),
@@ -3159,7 +3159,7 @@ fn panel_hides_and_stops_taking_input_over_a_fullscreen_window() {
     // ...and clicking it must not reach the panel. Activities would open the overview.
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "a click over a fullscreen window must not reach the hidden panel"
@@ -3168,7 +3168,7 @@ fn panel_hides_and_stops_taking_input_over_a_fullscreen_window() {
     // The overview hides the window group, which brings the panel back (GNOME's
     // `window_group.visible` conjunct) even though the window is still fullscreen.
     f.synoik().layout.toggle_overview();
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().panel_visible_on(&output),
         "the panel returns in the overview, fullscreen window or not"
@@ -3485,7 +3485,7 @@ fn active_maximized_window_covers_floating() {
     window.set_size(1920, 1080);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     // The maximized window is active: it must cover the floating window,
     // map order notwithstanding.
@@ -3501,7 +3501,7 @@ fn active_maximized_window_covers_floating() {
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_TAB);
     f.key_release(KEY_LEFTALT);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
     assert_eq!(f.synoik().layout.focus().unwrap().id(), second_id);
     assert_eq!(
@@ -3526,7 +3526,7 @@ fn super_drag_to(f: &mut Fixture, id: ClientId, grab_offset: (f64, f64), drop_po
     f.pointer_motion(drop_pos.0 - grab.0, drop_pos.1 - grab.1 - 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 }
 
@@ -3556,7 +3556,7 @@ fn drag_to_left_edge_tiles() {
     window.set_size(960, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     assert_pos_eq(
         focused_window_pos(&mut f),
         (0., 32.),
@@ -3579,7 +3579,7 @@ fn drag_to_left_edge_tiles() {
     window.set_size(800, 600);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     assert_pos_eq(
         focused_window_pos(&mut f),
         original_pos,
@@ -3628,7 +3628,7 @@ fn drag_to_top_edge_maximizes() {
     window.set_size(800, 600);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     assert_pos_eq(
         focused_window_pos(&mut f),
         original_pos,
@@ -3684,7 +3684,7 @@ fn dragging_maximized_window_shakes_loose_after_threshold() {
     window.set_size(1920, 1080);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     let _ = f.client(id).window(&surface).recent_configures();
 
     // Grab it and drag: sideways and a little down — still maximized.
@@ -3713,7 +3713,7 @@ fn dragging_maximized_window_shakes_loose_after_threshold() {
     f.pointer_motion(0., 400.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
     let synoik = f.synoik();
     let focused = synoik.layout.focus().unwrap().window.clone();
@@ -4575,7 +4575,7 @@ fn the_overview_search_composes_through_the_engine() {
     let (mut f, id, requests, _seen) = im_fixture();
     use_us_intl(&mut f);
     f.synoik_state().do_action(Action::ToggleOverview, false);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
     while requests.try_recv().is_ok() {}
 
@@ -4663,7 +4663,7 @@ fn the_lock_screen_password_entry_is_announced_as_a_password() {
         "exactly the press is offered; releases keep their original path"
     );
     f.synoik_state().update_keyboard_focus();
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
     assert_eq!(f.synoik().unlock_dialog.page(), Page::Prompt);
 
@@ -4794,7 +4794,7 @@ fn a_modal_entry_takes_the_engine_from_the_client_underneath() {
     while requests.try_recv().is_ok() {}
 
     f.synoik_state().do_action(Action::ShowRunDialog, false);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     assert_eq!(
@@ -4813,7 +4813,7 @@ fn a_modal_entry_takes_the_engine_from_the_client_underneath() {
     // Closing it gives the engine back to the client.
     f.synoik().run_dialog.close();
     f.synoik_state().update_keyboard_focus();
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
     assert_eq!(
         f.synoik().input_method.as_ref().unwrap().focus(),
@@ -4867,7 +4867,7 @@ fn a_binding_claims_its_key_before_the_engine_sees_it() {
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     assert!(
@@ -4991,7 +4991,7 @@ fn overview_spreads_windows_into_picker_slots() {
 
     // A lone Super tap opens the picker.
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(f.synoik().layout.is_overview_open());
 
     // Every window has a picker slot, and slots don't overlap.
@@ -5018,7 +5018,7 @@ fn overview_spreads_windows_into_picker_slots() {
     );
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     assert!(
@@ -5119,7 +5119,7 @@ fn overview_grid_transition_moves_the_row_monotonically() {
     let _w = map_window_sized(&mut f, id, (800, 600), None);
 
     tap(&mut f, KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
     let picker = workspace_geo(&mut f);
 
     // Into the app grid.
@@ -5131,7 +5131,7 @@ fn overview_grid_transition_moves_the_row_monotonically() {
         "the transition starts where the picker was",
     );
     assert_row_travels_monotonically(&samples, "picker -> app grid");
-    f.settle_animations();
+    f.settle();
     let grid = workspace_geo(&mut f);
     assert_geo_eq(
         samples.last().unwrap(),
@@ -5144,7 +5144,7 @@ fn overview_grid_transition_moves_the_row_monotonically() {
     let samples = f.sample_workspace_geo(1, Duration::from_millis(400), 32);
     assert_geo_eq(&samples[0], &grid, "the way back starts where the grid was");
     assert_row_travels_monotonically(&samples, "app grid -> picker");
-    f.settle_animations();
+    f.settle();
     assert_geo_eq(
         samples.last().unwrap(),
         &workspace_geo(&mut f),
@@ -5169,9 +5169,9 @@ fn overview_close_from_the_app_grid_lands_on_the_desktop() {
     let desktop = workspace_geo(&mut f);
 
     tap(&mut f, KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
     f.synoik().layout.toggle_app_grid();
-    f.settle_animations();
+    f.settle();
 
     f.synoik_state().do_action(Action::CloseOverview, false);
     let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 48);
@@ -5184,7 +5184,7 @@ fn overview_close_from_the_app_grid_lands_on_the_desktop() {
 
     // ...and the snap that used to follow is gone: settling changes nothing.
     let last = samples.last().unwrap().clone();
-    f.settle_animations();
+    f.settle();
     assert_geo_eq(
         &workspace_geo(&mut f),
         &last,
@@ -5274,7 +5274,7 @@ fn overview_picker_slots_clear_both_workspace_edges_evenly() {
     let win = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
 
     let output = f.synoik_output(1);
     let slot = f.synoik().layout.expose_target_rect(&win).unwrap();
@@ -5344,7 +5344,7 @@ fn overview_picker_slots_stay_out_of_a_bottom_strut() {
     let win = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
 
     let output = f.synoik_output(1);
     let slot = f.synoik().layout.expose_target_rect(&win).unwrap();
@@ -5405,12 +5405,12 @@ fn overview_preview_icon_scales_out_into_the_app_grid() {
     assert_eq!(icon_scale(&mut f), 0., "no icon with the overview closed");
 
     tap(&mut f, KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
     assert_eq!(icon_scale(&mut f), 1., "full size in the window picker");
     assert_eq!(previews(&mut f), 1);
 
     f.synoik().layout.toggle_app_grid();
-    f.settle_animations();
+    f.settle();
     assert_eq!(
         icon_scale(&mut f),
         0.,
@@ -5514,7 +5514,7 @@ fn overview_preview_close_button_closes_the_window() {
     let win = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
 
     // Un-hovered there is no button: clicking where it would be — the half of its
     // box that overhangs the preview's corner, clear of the preview itself —
@@ -5535,13 +5535,13 @@ fn overview_preview_close_button_closes_the_window() {
     if !f.synoik().layout.is_overview_open() {
         tap(&mut f, KEY_LEFTMETA);
     }
-    f.settle_animations();
+    f.settle();
 
     // Hover the preview, then click the button on its top-right corner. The
     // preview has grown by then, so take the button from the drawn rect.
     let inside = slot.loc + slot.size.downscale(2.).to_point();
     pointer_motion_to(&mut f, inside.x, inside.y);
-    f.settle_animations();
+    f.settle();
 
     let drawn = f.synoik().layout.expose_drawn_rect(&win).unwrap();
     let button = close_rect(drawn);
@@ -5575,7 +5575,7 @@ fn overview_workspace_fills_its_allocated_picker_box() {
     let win = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     // The small workspace row is always reserved (divergence, see
     // `docs/fork/dynamic-workspaces-divergence.md`), and it is one app-grid workspace
@@ -5641,7 +5641,7 @@ fn overview_workspace_shadow_shares_the_background_radius() {
     );
 
     tap(&mut f, KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
 
     // 30 pre-zoom units divided by the zoom, so it lands at 30 on screen.
     let zoom = {
@@ -5752,12 +5752,12 @@ fn overview_workspace_offset_interpolates_out_of_the_desktop() {
         "mid-open the row must be travelling toward the picker box, got y={mid} (box {box_y})"
     );
 
-    f.settle_animations();
+    f.settle();
     assert_eq!(row_y(&mut f), box_y);
 
     // And all the way back down on close.
     tap(&mut f, KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
     assert_eq!(row_y(&mut f), 0.);
 }
 
@@ -5775,7 +5775,7 @@ fn overview_entry_floats_over_an_app_grid_sized_workspace_row() {
         f.add_output(1, size);
         let id = f.add_client();
         let (_a, _b) = setup_two_desktops_in_overview_on(&mut f, id, size);
-        f.settle_animations();
+        f.settle();
 
         let controls = overview_controls(&mut f);
         let pill = f.synoik().overview_search.entry_pill(controls.into());
@@ -5846,7 +5846,7 @@ fn the_workspace_row_is_the_same_in_both_overview_states() {
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let (_a, _b) = setup_two_desktops_in_overview(&mut f, id);
-    f.settle_animations();
+    f.settle();
 
     let row = |f: &mut Fixture| {
         let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
@@ -5860,7 +5860,7 @@ fn the_workspace_row_is_the_same_in_both_overview_states() {
     assert!(picker.len() >= 3, "three workspaces must be laid out");
 
     f.synoik().layout.toggle_app_grid();
-    f.settle_animations();
+    f.settle();
     assert!(f.synoik().layout.is_app_grid_open(), "app grid must open");
 
     assert_eq!(
@@ -5873,7 +5873,7 @@ fn the_workspace_row_is_the_same_in_both_overview_states() {
     // place, so nothing is left to reconcile with the row that is already there.
     let controls = overview_controls(&mut f);
     f.synoik().layout.toggle_app_grid();
-    f.settle_animations();
+    f.settle();
     assert_eq!(
         overview_controls(&mut f).workspaces,
         controls.workspaces,
@@ -5895,7 +5895,7 @@ fn overview_thumbnail_strip_scrolls_instead_of_shrinking() {
     setup_n_desktops(&mut f, id, 12);
 
     f.synoik_state().do_action(Action::OpenOverview, false);
-    f.settle_animations();
+    f.settle();
 
     let controls = overview_controls(&mut f);
     let pill = f.synoik().overview_search.entry_pill(controls.into());
@@ -5960,7 +5960,7 @@ fn overview_thumbnail_strip_scrolls_instead_of_shrinking() {
 
         f.synoik_state()
             .do_action(Action::FocusWorkspaceDown, false);
-        f.settle_animations();
+        f.settle();
     }
 }
 
@@ -5972,7 +5972,7 @@ fn overview_thumbnail_strip_fills_its_allocated_band() {
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let (_a, _b) = setup_two_desktops_in_overview(&mut f, id);
-    f.settle_animations();
+    f.settle();
 
     let band = overview_controls(&mut f).workspace_row;
     // 32 + 40, the search puck's midline (the entry floats and takes no row), and one
@@ -6011,7 +6011,7 @@ fn overview_picker_box_does_not_move_with_the_workspace_count() {
     let _w2 = map_window_sized(&mut f, id, (640, 480), None);
 
     tap(&mut f, KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
 
     // One populated desktop plus the trailing empty: the band is already there.
     let one = overview_controls(&mut f).workspaces;
@@ -6030,13 +6030,13 @@ fn overview_picker_box_does_not_move_with_the_workspace_count() {
     let mid = overview_controls(&mut f).workspaces;
     assert_eq!((mid.loc.y, mid.size.h), (254., 693.));
 
-    f.settle_animations();
+    f.settle();
     let two = overview_controls(&mut f).workspaces;
     assert_eq!((two.loc.y, two.size.h), (254., 693.));
 
     // …and back. The emptied desktop is not reaped, so this is now three workspaces.
     f.synoik().layout.move_to_workspace_up(true);
-    f.settle_animations();
+    f.settle();
     let back = overview_controls(&mut f).workspaces;
     assert_eq!((back.loc.y, back.size.h), (254., 693.));
 
@@ -6062,7 +6062,7 @@ fn overview_click_neighbor_switches_and_stays() {
     let ws1_id = f.synoik().layout.active_workspace().unwrap().id();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     // The trailing empty workspace peeks at the right edge of the row:
     // the active workspace spans 161..1760 and the neighbor, drawn a touch
@@ -6071,7 +6071,7 @@ fn overview_click_neighbor_switches_and_stays() {
     f.pointer_motion(1850., 540.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         f.synoik().layout.is_overview_open(),
@@ -6088,7 +6088,7 @@ fn overview_click_neighbor_switches_and_stays() {
     f.pointer_motion(-940., 0.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         !f.synoik().layout.is_overview_open(),
@@ -6115,7 +6115,7 @@ fn overview_drag_within_workspace_keeps_desktop_position() {
     let original_pos = focused_window_pos(&mut f);
 
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     // Drag the preview towards the workspace's top-left corner and drop it.
     let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
@@ -6124,7 +6124,7 @@ fn overview_drag_within_workspace_keeps_desktop_position() {
     f.pointer_motion(0., 10.);
     f.pointer_motion(-400., -300.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     assert!(
@@ -6133,7 +6133,7 @@ fn overview_drag_within_workspace_keeps_desktop_position() {
     );
 
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert_pos_eq(
         focused_window_pos(&mut f),
         original_pos,
@@ -6213,7 +6213,7 @@ fn overview_drag_to_neighbor_keeps_position() {
     let ws1_id = f.synoik().layout.active_workspace().unwrap().id();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     // Drag the preview onto the trailing workspace peeking at the right
     // screen edge (visible from 1752 on; see the neighbor click test).
@@ -6224,7 +6224,7 @@ fn overview_drag_to_neighbor_keeps_position() {
     f.pointer_motion(0., 10.);
     f.pointer_motion(1800. - grab.0, 540. - grab.1 - 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     assert!(
@@ -6284,7 +6284,7 @@ fn the_workspace_row_fits_all_of_the_workspaces() {
     {
         f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
     }
-    f.settle_animations();
+    f.settle();
 
     use smithay::utils::{Logical, Rectangle};
 
@@ -6328,7 +6328,7 @@ fn the_workspace_row_fits_all_of_the_workspaces() {
     // index puts it — and the same before and after the app grid opens.
     let before = row(&mut f);
     f.synoik().layout.toggle_app_grid();
-    f.settle_animations();
+    f.settle();
     assert!(f.synoik().layout.is_app_grid_open(), "app grid must open");
     let grid = row(&mut f);
     assert_eq!(
@@ -6364,7 +6364,7 @@ fn setup_n_desktops(f: &mut Fixture, id: ClientId, n: usize) {
         f.synoik_state()
             .do_action(Action::FocusWorkspaceDown, false);
     }
-    f.synoik_complete_animations();
+    f.settle();
 }
 
 /// With enough workspaces the fitted row no longer fits, and every workspace past the edge
@@ -6388,9 +6388,9 @@ fn app_grid_scrolls_an_overflowing_workspace_row_into_view() {
     setup_n_desktops(&mut f, id, 8);
 
     f.synoik_state().do_action(Action::OpenOverview, false);
-    f.settle_animations();
+    f.settle();
     f.synoik().layout.toggle_app_grid();
-    f.settle_animations();
+    f.settle();
     assert!(f.synoik().layout.is_app_grid_open(), "app grid must open");
 
     let row = |f: &mut Fixture| -> Vec<Rectangle<f64, Logical>> {
@@ -6426,7 +6426,7 @@ fn app_grid_scrolls_an_overflowing_workspace_row_into_view() {
     {
         f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
     }
-    f.settle_animations();
+    f.settle();
 
     let mut visited = 0;
     loop {
@@ -6455,7 +6455,7 @@ fn app_grid_scrolls_an_overflowing_workspace_row_into_view() {
         }
         f.synoik_state()
             .do_action(Action::FocusWorkspaceDown, false);
-        f.settle_animations();
+        f.settle();
         let moved = f
             .synoik()
             .layout
@@ -6497,7 +6497,7 @@ fn overview_shrinks_the_inactive_workspaces() {
     {
         f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
     }
-    f.settle_animations();
+    f.settle();
 
     use crate::layout::monitor::WORKSPACE_INACTIVE_SCALE;
 
@@ -6541,7 +6541,7 @@ fn overview_shrinks_the_inactive_workspaces() {
 
     // Closed: the row is the live desktop, so nothing is scaled.
     f.synoik_state().do_action(Action::CloseOverview, false);
-    f.settle_animations();
+    f.settle();
     assert_eq!(
         scales(&mut f),
         vec![1., 1., 1.],
@@ -6573,7 +6573,7 @@ fn setup_two_desktops_in_overview_on(
     let win_b = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     // Drag B's preview onto the trailing workspace peeking at the right.
     let rect = f.synoik().layout.expose_target_rect(&win_b).unwrap();
@@ -6583,7 +6583,7 @@ fn setup_two_desktops_in_overview_on(
     f.pointer_motion(0., 10.);
     f.pointer_motion(drop_x - grab.0, drop_y - grab.1 - 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     (win_a, win_b)
@@ -6664,7 +6664,7 @@ fn dismissable_desktop_fixture(
 ) {
     setup_n_desktops(f, id, 2);
     f.synoik_state().do_action(Action::OpenOverview, false);
-    f.settle_animations();
+    f.settle();
 
     let win = {
         let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
@@ -6680,7 +6680,7 @@ fn dismissable_desktop_fixture(
     f.synoik()
         .layout
         .remove_window(&win, crate::utils::transaction::Transaction::new());
-    f.settle_animations();
+    f.settle();
 
     let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     let mon = mon.unwrap();
@@ -6733,7 +6733,7 @@ fn thumbnail_close_button_only_on_dismissable_desktops() {
         String::from("kept"),
         Some(synoik_config::WorkspaceReference::Id(empty_id.get())),
     );
-    f.settle_animations();
+    f.settle();
     assert!(
         thumbnail_close_rect(&mut f, 0).is_none(),
         "a named empty desktop is not dismissable"
@@ -6758,7 +6758,7 @@ fn thumbnail_close_button_dismisses_the_desktop() {
     );
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.settle_animations();
+    f.settle();
 
     let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     let mon = mon.unwrap();
@@ -6827,7 +6827,7 @@ fn dismissing_a_desktop_slides_the_strip_closed() {
 
     setup_n_desktops(&mut f, id, 3);
     f.synoik_state().do_action(Action::OpenOverview, false);
-    f.settle_animations();
+    f.settle();
 
     // Empty desktop 1 and focus desktop 0: [window, empty, window, trailing empty].
     let win = {
@@ -6847,7 +6847,7 @@ fn dismissing_a_desktop_slides_the_strip_closed() {
     for _ in 0..3 {
         f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
     }
-    f.settle_animations();
+    f.settle();
     let survivor = {
         let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
         let mon = mon.unwrap();
@@ -6885,7 +6885,7 @@ fn dismissing_a_desktop_slides_the_strip_closed() {
         synoik.advance_animations();
     }
     let mid = survivor_x(&mut f);
-    f.settle_animations();
+    f.settle();
     let end = survivor_x(&mut f);
 
     assert!(start != end, "the strip must actually have a gap to close");
@@ -6916,7 +6916,7 @@ fn the_workspace_row_closes_and_reorders_in_the_app_grid_too() {
     let id = f.add_client();
     let (win_a, win_b) = setup_two_desktops_in_overview(&mut f, id);
     f.synoik().layout.toggle_app_grid();
-    f.settle_animations();
+    f.settle();
     assert!(f.synoik().layout.is_app_grid_open(), "app grid must open");
 
     let ws_idx_of = |f: &mut Fixture, win: &smithay::desktop::Window| {
@@ -6939,7 +6939,7 @@ fn the_workspace_row_closes_and_reorders_in_the_app_grid_too() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, t1x + 1., t0y);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     assert!(
@@ -6960,7 +6960,7 @@ fn the_workspace_row_closes_and_reorders_in_the_app_grid_too() {
         .layout
         .remove_window(&win_b, crate::utils::transaction::Transaction::new());
     let _ = win;
-    f.settle_animations();
+    f.settle();
 
     let before = f.synoik().layout.workspaces().count();
     let rect = thumbnail_close_rect(&mut f, empty_idx)
@@ -6972,7 +6972,7 @@ fn the_workspace_row_closes_and_reorders_in_the_app_grid_too() {
     );
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.settle_animations();
+    f.settle();
 
     assert_eq!(
         f.synoik().layout.workspaces().count(),
@@ -7010,7 +7010,7 @@ fn thumbnail_close_press_beats_the_reorder_grab() {
         );
     }
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.settle_animations();
+    f.settle();
 
     let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
     assert_eq!(mon.unwrap().workspace_count(), 2);
@@ -7026,7 +7026,7 @@ fn overview_dragging_a_thumbnail_reorders_the_workspaces() {
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let (win_a, win_b) = setup_two_desktops_in_overview(&mut f, id);
-    f.settle_animations();
+    f.settle();
 
     let ws_idx_of = |f: &mut Fixture, win: &smithay::desktop::Window| {
         f.synoik()
@@ -7077,14 +7077,14 @@ fn overview_dragging_a_thumbnail_reorders_the_workspaces() {
         crossing <= start + 1. && crossing >= dest - 1.,
         "and it must be heading the right way: {crossing} outside {dest}..={start}",
     );
-    f.settle_animations();
+    f.settle();
     assert!(
         (passed(&mut f) - dest).abs() <= 1.,
         "the passed thumbnail must arrive in the slot the drag left",
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     assert_eq!(
@@ -7179,7 +7179,7 @@ fn the_row_parts_when_the_carried_thumbnail_is_half_over_a_neighbour() {
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let _ = setup_two_desktops_in_overview(&mut f, id);
-    f.settle_animations();
+    f.settle();
 
     let thumbs = |f: &mut Fixture| {
         let (mon, _, _) = f.synoik().layout.workspaces().next().unwrap();
@@ -7196,7 +7196,7 @@ fn the_row_parts_when_the_carried_thumbnail_is_half_over_a_neighbour() {
     // Settled, because the row now *eases* out of the way: read on the frame of the
     // crossing it is still sitting at home, and every crossing would look like a refusal.
     let parted = |f: &mut Fixture, other: usize, home: f64| {
-        f.settle_animations();
+        f.settle();
         (thumbs(f)[other].loc.x - home).abs() > 1.
     };
 
@@ -7227,14 +7227,14 @@ fn the_row_parts_when_the_carried_thumbnail_is_half_over_a_neighbour() {
         );
 
         f.pointer_button(BTN_LEFT, ButtonState::Released);
-        f.settle_animations();
+        f.settle();
         // Put it back for the next direction.
         let (bx, by) = thumbnail_center(&mut f, other);
         pointer_motion_to(&mut f, bx, by);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
         pointer_motion_to(&mut f, bx - dir * (w + gap), by);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
-        f.settle_animations();
+        f.settle();
         assert_eq!(thumbs(&mut f)[0].loc.x, rest[0].loc.x, "reset failed");
     }
 }
@@ -7303,7 +7303,7 @@ fn overview_a_short_thumbnail_press_still_activates_the_workspace() {
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let (win_a, win_b) = setup_two_desktops_in_overview(&mut f, id);
-    f.settle_animations();
+    f.settle();
 
     let active = |f: &mut Fixture| f.synoik().layout.active_workspace().unwrap().id();
     let ws_of = |f: &mut Fixture, win: &smithay::desktop::Window| {
@@ -7324,7 +7324,7 @@ fn overview_a_short_thumbnail_press_still_activates_the_workspace() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_motion(3., 0.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(
         active(&mut f),
@@ -7364,21 +7364,21 @@ fn thumbnail_strip_is_shown_at_every_workspace_count() {
 
     // A bare session: MIN_NUM_WORKSPACES empties, and the strip already showing.
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(count(&mut f), 2, "a fresh monitor shows two desktops");
     assert!(visible(&mut f), "an empty session must show the strip");
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     let _a = map_window_sized(&mut f, id, (800, 600), None);
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         visible(&mut f),
         "one populated desktop must show the strip too"
     );
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     let (_a, _b) = setup_two_desktops_in_overview(&mut f, id);
     assert!(visible(&mut f), "…and so must two");
@@ -7401,7 +7401,7 @@ fn thumbnail_click_switches_workspace_and_stays() {
     pointer_motion_to(&mut f, x, y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         f.synoik().layout.is_overview_open(),
@@ -7417,7 +7417,7 @@ fn thumbnail_click_switches_workspace_and_stays() {
     pointer_motion_to(&mut f, x, y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "clicking the active thumbnail must leave the overview"
@@ -7447,7 +7447,7 @@ fn thumbnail_drop_moves_window_keeping_position() {
     f.pointer_motion(0., 10.);
     pointer_motion_to(&mut f, tx, ty);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     assert!(
@@ -7515,7 +7515,7 @@ fn thumbnail_gap_drop_inserts_workspace() {
     }
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     assert_eq!(
@@ -7559,10 +7559,10 @@ fn overview_drag_of_edge_tiled_window_stays_tiled() {
     window.set_size(960, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     let _ = f.client(id).window(&surface).recent_configures();
 
     // Drag the preview onto the trailing workspace's peeking edge. The real
@@ -7576,7 +7576,7 @@ fn overview_drag_of_edge_tiled_window_stays_tiled() {
     f.double_roundtrip(id);
     pointer_motion_to(&mut f, 1800., 540.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     for configure in f.client(id).window(&surface).recent_configures() {
@@ -7629,10 +7629,10 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     window.set_size(1920, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     let _ = f.client(id).window(&surface).recent_configures();
 
     // A 20px drag is well under the 48px shake threshold, yet the preview
@@ -7653,7 +7653,7 @@ fn overview_drag_of_maximized_window_picks_up_and_stays_maximized() {
     // Drop it on the neighbor workspace peeking at the right edge.
     f.pointer_motion(1800. - grab.0, 540. - grab.1 - 20.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     for configure in f.client(id).window(&surface).recent_configures() {
@@ -7837,11 +7837,11 @@ fn a_drag_into_an_interior_gap_keeps_the_pill() {
     let _a = map_window_sized(&mut f, id, (800, 600), None);
     f.synoik_state()
         .do_action(Action::MoveWindowToWorkspaceDown(true), false);
-    f.synoik_complete_animations();
+    f.settle();
     let _b = map_window_sized(&mut f, id, (640, 480), None);
     let win_b = f.synoik().layout.focus().unwrap().window.clone();
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     // Two occupied workspaces and the trailing empty one.
     let thumbs = {
@@ -7895,7 +7895,7 @@ fn overview_drag_freezes_the_other_previews() {
     let win_b = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     let slot_a = f.synoik().layout.expose_target_rect(&win_a).unwrap();
 
@@ -7919,7 +7919,7 @@ fn overview_drag_freezes_the_other_previews() {
     // Drop B on the trailing workspace: A, now alone, re-layouts.
     pointer_motion_to(&mut f, 1800., 540.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_ne!(
         f.synoik().layout.expose_target_rect(&win_a),
@@ -7951,7 +7951,7 @@ fn overview_drag_does_not_reflow_the_picker_on_pickup() {
     let win_c = f.synoik().layout.focus().unwrap().window.clone();
 
     tap(&mut f, KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     let slot_a = f.synoik().layout.expose_target_rect(&win_a).unwrap();
     let slot_b = f.synoik().layout.expose_target_rect(&win_b).unwrap();
@@ -7997,11 +7997,11 @@ fn overview_drag_edge_scroll_snaps_one_desktop_at_a_time() {
     let (win_a, _win_b) = setup_two_desktops_in_overview(&mut f, id);
     {
         tap(&mut f, KEY_LEFTMETA);
-        f.synoik_complete_animations();
+        f.settle();
         let _c = map_window_sized(&mut f, id, (500, 400), None);
         let win_c = f.synoik().layout.focus().unwrap().window.clone();
         tap(&mut f, KEY_LEFTMETA);
-        f.synoik_complete_animations();
+        f.settle();
         let rect = f.synoik().layout.expose_target_rect(&win_c).unwrap();
         let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
         pointer_motion_to(&mut f, grab.0, grab.1);
@@ -8010,7 +8010,7 @@ fn overview_drag_edge_scroll_snaps_one_desktop_at_a_time() {
         let (tx, ty) = thumbnail_center(&mut f, 2);
         pointer_motion_to(&mut f, tx, ty);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
-        f.synoik_complete_animations();
+        f.settle();
         f.double_roundtrip(id);
     }
     assert!(f.synoik().layout.is_overview_open());
@@ -8072,7 +8072,7 @@ fn overview_drag_edge_scroll_snaps_one_desktop_at_a_time() {
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "the edge snaps must not leave the overview"
@@ -8104,7 +8104,7 @@ fn panel_reserves_top_strut() {
     window.set_size(1920, 1048);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     assert_pos_eq(
         focused_window_pos(&mut f),
         (0., 32.),
@@ -8195,7 +8195,7 @@ fn panel_activities_click_toggles_overview() {
     f.pointer_motion(10., 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         f.synoik().layout.is_overview_open(),
@@ -8210,7 +8210,7 @@ fn panel_activities_click_toggles_overview() {
     // A second click toggles it back.
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "clicking Activities again must close the overview"
@@ -8245,7 +8245,7 @@ fn panel_scroll_over_indicator_switches_workspace() {
     // Park the pointer over the indicator (top-left of the panel) and scroll down.
     pointer_motion_to(&mut f, 10., 10.);
     f.scroll_wheel();
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         f.synoik()
             .layout
@@ -8259,7 +8259,7 @@ fn panel_scroll_over_indicator_switches_workspace() {
     // A scroll far from the indicator (mid-screen) must NOT switch workspaces.
     pointer_motion_to(&mut f, 960., 540.);
     f.scroll_wheel();
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         f.synoik()
             .layout
@@ -8297,7 +8297,7 @@ fn panel_date_menu_click_opens_and_dismisses_calendar() {
     // so settle the animation before asserting it's gone.
     f.key_press(KEY_ESC);
     f.key_release(KEY_ESC);
-    f.settle_animations();
+    f.settle();
     assert!(
         !f.synoik().panel_popover.is_open(),
         "Escape must close the popover"
@@ -8309,7 +8309,7 @@ fn panel_date_menu_click_opens_and_dismisses_calendar() {
     pointer_motion_to(&mut f, 10., 700.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.settle_animations();
+    f.settle();
     assert!(
         !f.synoik().panel_popover.is_open(),
         "a click outside the popover must dismiss it"
@@ -8385,7 +8385,7 @@ fn panel_clock_sits_right_of_the_status_indicators() {
 
     f.key_press(KEY_ESC);
     f.key_release(KEY_ESC);
-    f.settle_animations();
+    f.settle();
 
     // The centre of the panel — GNOME's clock — is now bare bar.
     click(&mut f, 960.);
@@ -8430,7 +8430,7 @@ fn panel_popover_stays_open_in_overview() {
     // once closed the popover on the very next reconcile after it opened).
     f.refresh();
     f.refresh();
-    f.settle_animations();
+    f.settle();
     assert!(
         f.synoik().panel_popover.is_open(),
         "a popover opened in the overview must stay open across cycles"
@@ -8489,7 +8489,7 @@ fn overview_open_dismisses_open_panel_popover() {
 
     f.synoik_state().do_action(Action::ToggleOverview, false);
     f.refresh();
-    f.settle_animations();
+    f.settle();
     assert!(
         !f.synoik().panel_popover.is_open(),
         "opening the overview must dismiss an already-open popover"
@@ -8544,7 +8544,7 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
     // Escape closes it (animated fade-out; settle before asserting it's gone).
     f.key_press(KEY_ESC);
     f.key_release(KEY_ESC);
-    f.settle_animations();
+    f.settle();
     assert!(
         !f.synoik().panel_popover.is_open(),
         "Escape must close the quick-settings popover"
@@ -8556,7 +8556,7 @@ fn panel_quick_settings_click_opens_toggles_and_dismisses() {
     pointer_motion_to(&mut f, 960., 700.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.settle_animations();
+    f.settle();
     assert!(
         !f.synoik().panel_popover.is_open(),
         "a click outside the quick-settings popover must dismiss it"
@@ -10073,7 +10073,7 @@ fn quick_settings_system_rows_call_gnome_session_directly() {
 
     let open_overview = |f: &mut Fixture| {
         f.synoik_state().do_action(Action::OpenOverview, false);
-        f.synoik_complete_animations();
+        f.settle();
         assert!(f.synoik().layout.is_overview_open());
     };
 
@@ -10081,7 +10081,7 @@ fn quick_settings_system_rows_call_gnome_session_directly() {
     open_overview(&mut f);
     f.synoik_state()
         .apply_popover_action(PopoverAction::SessionRequest(SessionRequest::Logout));
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "the Log Out row must hide the overview first"
@@ -10096,7 +10096,7 @@ fn quick_settings_system_rows_call_gnome_session_directly() {
         open_overview(&mut f);
         f.synoik_state()
             .apply_popover_action(PopoverAction::SessionRequest(request));
-        f.synoik_complete_animations();
+        f.settle();
         assert!(
             f.synoik().layout.is_overview_open(),
             "{request:?} must leave the overview alone, as gnome-shell does"
@@ -10124,7 +10124,7 @@ fn overview_closes_when_a_panel_button_launches_an_app() {
 
     let open_overview = |f: &mut Fixture| {
         f.synoik_state().do_action(Action::OpenOverview, false);
-        f.synoik_complete_animations();
+        f.settle();
         assert!(f.synoik().layout.is_overview_open());
     };
 
@@ -10133,7 +10133,7 @@ fn overview_closes_when_a_panel_button_launches_an_app() {
     open_overview(&mut f);
     f.synoik_state()
         .apply_popover_action(PopoverAction::Spawn(Vec::new()));
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "a panel/quick-settings button that starts an app must leave the overview"
@@ -10144,7 +10144,7 @@ fn overview_closes_when_a_panel_button_launches_an_app() {
     open_overview(&mut f);
     f.synoik_state()
         .apply_popover_action(PopoverAction::SetDarkStyle(true));
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "a quick-settings toggle must not close the overview"
@@ -10157,7 +10157,7 @@ fn overview_closes_when_a_panel_button_launches_an_app() {
             id,
             key: "reply".to_owned(),
         });
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "the fdo path only emits ActionInvoked, so the overview stays up"
@@ -10235,7 +10235,7 @@ fn a_resize_grab_keeps_its_cursor_under_a_banner() {
     // Park the pointer somewhere harmless and put a banner up.
     pointer_motion_to(&mut f, 600., 600.);
     banner_notify(&mut f, banner_req("app", ":1.1"));
-    f.settle_animations();
+    f.settle();
     assert!(f.synoik().notification_banner.is_visible());
 
     // Start a real interactive resize on the bottom-right corner, the way the button handler does.
@@ -10351,10 +10351,10 @@ fn notification_banner_policy_low_dnd_critical() {
     critical.urgency = crate::notifications::Urgency::Critical;
     let cid = banner_notify(&mut f, critical);
     assert!(f.synoik().notification_banner.is_visible());
-    f.settle_animations();
+    f.settle();
     // No deadline: still up long past the normal timeout.
     tick(&mut f, 60_000);
-    f.settle_animations();
+    f.settle();
     assert_eq!(f.synoik().notification_banner.content_id(), Some(cid));
 }
 
@@ -10439,7 +10439,7 @@ fn notification_banner_close_click_dismisses() {
     f.synoik().notifications_emit = Some(tx);
 
     let id = banner_notify(&mut f, banner_req("app", ":1.1"));
-    f.settle_animations();
+    f.settle();
 
     // Banner geometry: 34em wide in the top-right corner, y = panel(32) + margin(4);
     // the close circle (28px) sits PAD + its 3px margin from the right edge, centered
@@ -10480,7 +10480,7 @@ fn notification_banner_action_click_emits_and_dismisses() {
     let mut req = banner_req("app", ":1.1");
     req.actions = vec![("ok".to_owned(), "OK".to_owned())];
     let id = banner_notify(&mut f, req);
-    f.settle_animations();
+    f.settle();
     assert!(!f.synoik().notification_banner.is_expanded());
 
     // Hovering the shown banner expands it, revealing the action row.
@@ -10528,7 +10528,7 @@ fn notification_banner_blocked_by_open_popover() {
     f.pointer_motion(1., 1.);
 
     banner_notify(&mut f, banner_req("app", ":1.1"));
-    f.settle_animations();
+    f.settle();
     assert!(f.synoik().notification_banner.is_visible());
 
     // Open the calendar via a clock click (panel y < banner y: no overlap).
@@ -10537,8 +10537,8 @@ fn notification_banner_blocked_by_open_popover() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
     assert!(f.synoik().panel_popover.is_open());
-    f.settle_animations();
-    f.settle_animations();
+    f.settle();
+    f.settle();
     assert!(
         !f.synoik().notification_banner.is_visible(),
         "banners are blocked while a popover is open"
@@ -10551,8 +10551,8 @@ fn notification_banner_blocked_by_open_popover() {
     // Closing the popover drains the queue.
     f.key_press(KEY_ESC);
     f.key_release(KEY_ESC);
-    f.settle_animations();
-    f.settle_animations();
+    f.settle();
+    f.settle();
     assert_eq!(f.synoik().notification_banner.content_id(), Some(queued));
 }
 
@@ -10566,18 +10566,18 @@ fn notification_banner_idle_gates_expiry() {
     // No activity while the pinned clock runs 5 s ahead: the user is idle.
     tick(&mut f, 5000);
     let id = banner_notify(&mut f, banner_req("app", ":1.1"));
-    f.settle_animations();
+    f.settle();
     assert_eq!(f.synoik().notification_banner.content_id(), Some(id));
 
     // Long past the normal timeout, still up: waiting for the user.
     tick(&mut f, 30_000);
-    f.settle_animations();
+    f.settle();
     assert!(f.synoik().notification_banner.is_visible());
 
     // First activity arms the 2 s deadline.
     f.pointer_motion(1., 1.);
     tick(&mut f, 2500);
-    f.settle_animations();
+    f.settle();
     assert!(!f.synoik().notification_banner.is_visible());
     assert!(f.synoik().notifications.find(id).is_some());
 }
@@ -10710,7 +10710,7 @@ fn calendar_message_list_acks_on_open_once() {
 
     banner_notify(&mut f, banner_req("app-a", ":1.1"));
     banner_notify(&mut f, banner_req("app-b", ":1.2"));
-    f.settle_animations();
+    f.settle();
     // The first banner showed (acked); the second sits queued, unseen.
     assert_eq!(f.synoik().notifications.unseen_count(), 1);
     assert!(!f.synoik().notifications.banner_queue.is_empty());
@@ -10747,8 +10747,8 @@ fn calendar_message_list_acks_on_open_once() {
     // soon as the popover unblocks the tray.
     f.key_press(KEY_ESC);
     f.key_release(KEY_ESC);
-    f.settle_animations();
-    f.settle_animations();
+    f.settle();
+    f.settle();
     assert!(!f.synoik().panel_popover.is_open());
     assert_eq!(
         f.synoik().notification_banner.content_id(),
@@ -10873,7 +10873,7 @@ fn closing_popover_restores_keyboard_focus_before_the_fade_ends() {
     );
 
     // And it stays there once the fade settles — the restore is not undone by the settle.
-    f.settle_animations();
+    f.settle();
     f.refresh();
     assert!(!f.synoik().panel_popover.is_open());
     assert_eq!(focused_surface(&mut f), window_surface);
@@ -10908,7 +10908,7 @@ fn messages_indicator_reflects_unseen_and_dnd() {
     );
     f.key_press(KEY_ESC);
     f.key_release(KEY_ESC);
-    f.settle_animations();
+    f.settle();
 
     // Under DND, an unseen notification does NOT light the dot — GNOME gates the
     // indicator on `show-banners` (`js/ui/dateMenu.js:796-797`).
@@ -10945,7 +10945,7 @@ fn calendar_message_list_click_close_body_and_clear() {
     let did = banner_notify(&mut f, with_default);
     tick(&mut f, 1000);
     let pid = banner_notify(&mut f, banner_req("app-c", ":1.3"));
-    f.settle_animations();
+    f.settle();
 
     open_calendar(&mut f);
     let output = f.synoik_output(1);
@@ -11010,7 +11010,7 @@ fn calendar_message_list_click_close_body_and_clear() {
         _ => panic!("expected an ActionInvoked emission"),
     }
     let _ = emitted.recv_blocking().unwrap(); // its Closed
-    f.settle_animations();
+    f.settle();
     assert!(
         !f.synoik().panel_popover.is_open(),
         "activating a notification closes the calendar"
@@ -11036,7 +11036,7 @@ fn calendar_message_list_click_close_body_and_clear() {
         f.synoik().notifications.find(rid).is_some(),
         "a resident notification survives activation"
     );
-    f.settle_animations();
+    f.settle();
     assert!(!f.synoik().panel_popover.is_open());
 
     // Clear: everything (resident included) closes; the placeholder is up.
@@ -11085,7 +11085,7 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
         ("no".to_owned(), "No".to_owned()),
     ];
     let id = banner_notify(&mut f, req);
-    f.settle_animations();
+    f.settle();
 
     open_calendar(&mut f);
     let output = f.synoik_output(1);
@@ -11219,7 +11219,7 @@ fn calendar_message_list_caret_expands_and_actions_invoke() {
         }
         _ => panic!("expected a Closed emission"),
     }
-    f.settle_animations();
+    f.settle();
     assert!(
         !f.synoik().panel_popover.is_open(),
         "invoking an action closes the calendar"
@@ -11242,7 +11242,7 @@ fn calendar_message_list_groups_and_group_close() {
     // Two notifications from the SAME app + sender → one source → one group.
     let id1 = banner_notify(&mut f, banner_req("chat", ":1.5"));
     let id2 = banner_notify(&mut f, banner_req("chat", ":1.5"));
-    f.settle_animations();
+    f.settle();
 
     open_calendar(&mut f);
     let output = f.synoik_output(1);
@@ -11347,7 +11347,7 @@ fn notification_banner_hover_expand_and_under_pointer_guard() {
     let x = 1920. - 100.;
     pointer_motion_to(&mut f, x, 80.);
     banner_notify(&mut f, banner_req("app", ":1.1"));
-    f.settle_animations();
+    f.settle();
     assert!(!f.synoik().notification_banner.is_expanded());
     assert!(
         banner_rect(&mut f, 1).contains(smithay::utils::Point::from((x, 80.))),
@@ -11386,7 +11386,7 @@ fn notification_banner_hover_during_slide_expands_when_shown() {
     );
     assert!(!f.synoik().notification_banner.is_expanded());
 
-    f.settle_animations();
+    f.settle();
     assert!(
         f.synoik().notification_banner.is_expanded(),
         "the settled pointer expands the banner at the Showing→Shown transition"
@@ -11409,7 +11409,7 @@ fn notification_banner_critical_auto_expands() {
         f.synoik().notification_banner.is_expanded(),
         "critical expands at show, before any hover"
     );
-    f.settle_animations();
+    f.settle();
 
     // The action row is present in the hit-test (short body: one line, so the
     // row sits right below the 48px body block).
@@ -11437,7 +11437,7 @@ fn notification_banner_buttons_light_under_the_pointer() {
     req.urgency = crate::notifications::Urgency::Critical; // auto-expands: the action row is up
     req.actions = vec![("ok".to_owned(), "OK".to_owned())];
     banner_notify(&mut f, req);
-    f.settle_animations();
+    f.settle();
     let banner = banner_rect(&mut f, 1);
     assert_eq!(f.synoik().notification_banner.hovered_zone(), None);
 
@@ -11484,7 +11484,7 @@ fn notification_banner_hangs_off_the_right_corner() {
     f.pointer_motion(1., 1.);
 
     banner_notify(&mut f, banner_req("app", ":1.1"));
-    f.settle_animations();
+    f.settle();
     let banner = banner_rect(&mut f, 1);
     assert!(
         banner.loc.x > 1920. / 2.,
@@ -11492,7 +11492,7 @@ fn notification_banner_hangs_off_the_right_corner() {
     );
 
     open_calendar(&mut f);
-    f.settle_animations();
+    f.settle();
     let popover_x = popover_origin(&mut f).x;
     let popover_w = f.synoik().panel_popover.content_size().unwrap().w;
     assert_eq!(
@@ -12092,7 +12092,7 @@ fn input_raises_the_shield_instead_of_reaching_the_desktop() {
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         !f.synoik().screen_shield.is_active(),
@@ -12110,7 +12110,7 @@ fn input_raises_the_shield_instead_of_reaching_the_desktop() {
     // A second tap now behaves normally — the shield is not swallowing input forever.
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "with the shield up, Super works again"
@@ -12136,7 +12136,7 @@ fn a_click_raises_the_shield_and_neither_edge_reaches_the_desktop() {
 
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         !f.synoik().screen_shield.is_active(),
@@ -12568,7 +12568,7 @@ fn a_locked_shield_swallows_keys_instead_of_raising() {
 
     f.key_press(KEY_LEFTMETA);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         f.synoik().screen_shield.is_active(),
@@ -12742,7 +12742,7 @@ fn a_dash_click_launches_focuses_or_opens_a_new_window_by_state() {
     let older = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.Files");
     let newer = f.synoik().layout.focus().unwrap().id();
-    f.synoik_complete_animations();
+    f.settle();
 
     let click = |f: &mut Fixture, i: usize| {
         f.synoik_state().do_action(Action::OpenOverview, false);
@@ -12767,13 +12767,13 @@ fn a_dash_click_launches_focuses_or_opens_a_new_window_by_state() {
     f.synoik_state().focus_window(&older_window);
     f.synoik_state().update_keyboard_focus();
     f.double_roundtrip(client);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(f.synoik().layout.focus().unwrap().id(), older);
     let _ = newer;
 
     // RUNNING, no modifier: focus its most recent window, and *do not launch*.
     click(&mut f, 0);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         recorder.calls.borrow().is_empty(),
         "a running app must not be relaunched — that is what opens the spurious startup sequence"
@@ -12871,7 +12871,7 @@ fn a_single_window_app_cannot_be_asked_for_a_new_window() {
     ] {
         map_window_for_app(&mut f, client, app);
     }
-    f.synoik_complete_animations();
+    f.settle();
 
     let can = |f: &mut Fixture, id: &str| f.synoik().app_system.can_open_new_window(id);
     assert!(
@@ -12902,7 +12902,7 @@ fn overview_dash_favorite_click_launches_and_closes() {
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1, "exactly one favorite launched");
@@ -12926,7 +12926,7 @@ fn overview_dash_favorite_launches_on_release_not_press() {
 
     pointer_motion_to(&mut f, center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         recorder.calls.borrow().is_empty(),
         "the press alone must not launch"
@@ -12937,7 +12937,7 @@ fn overview_dash_favorite_launches_on_release_not_press() {
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         recorder.calls.borrow().len(),
         1,
@@ -12959,7 +12959,7 @@ fn overview_dash_release_off_the_icon_does_not_launch() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, other.x, other.y);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         recorder.calls.borrow().is_empty(),
@@ -12998,7 +12998,7 @@ fn favorites_and_grid_fixture(
     f.synoik_state().do_action(Action::OpenOverview, false);
     f.synoik().layout.toggle_app_grid();
     assert!(f.synoik().layout.is_app_grid_open(), "app grid must open");
-    f.settle_animations();
+    f.settle();
 
     (f, recorder)
 }
@@ -13049,7 +13049,7 @@ fn overview_dragging_a_grid_icon_onto_the_dash_pins_it_at_that_slot() {
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(f.synoik().dash.drop_slot(), None, "the drop closes the gap");
     assert_eq!(
@@ -13134,7 +13134,7 @@ fn overview_dropping_a_favorite_next_to_itself_changes_nothing() {
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         dash_favorites(&mut f),
         before,
@@ -13279,7 +13279,7 @@ fn overview_right_clicking_an_icon_opens_its_context_menu() {
     // popover stays `is_open` while it fades out, and a press during that window is a
     // dismissal (it lands on the still-grabbing menu), not a new menu.
     f.synoik().panel_popover.close();
-    f.settle_animations();
+    f.settle();
     let grid_area = overview_controls(&mut f).app_display;
     let unpinned = f
         .synoik()
@@ -13354,7 +13354,7 @@ fn overview_the_context_menu_of_a_running_app_lists_its_windows_and_offers_quit(
     assert_eq!(f.synoik().app_system.running()[0].n_windows(), 2);
 
     f.synoik_state().do_action(Action::OpenOverview, false);
-    f.settle_animations();
+    f.settle();
 
     let first = dash_tile_center(&mut f, 0);
     pointer_motion_to(&mut f, first.x, first.y);
@@ -13451,7 +13451,7 @@ fn overview_the_context_menu_raises_the_window_row_you_pick() {
     assert_eq!(f.synoik().layout.focus().unwrap().window, windows[1]);
 
     f.synoik_state().do_action(Action::OpenOverview, false);
-    f.settle_animations();
+    f.settle();
     let first = dash_tile_center(&mut f, 0);
     pointer_motion_to(&mut f, first.x, first.y);
     f.pointer_button(BTN_RIGHT, ButtonState::Pressed);
@@ -13470,7 +13470,7 @@ fn overview_the_context_menu_raises_the_window_row_you_pick() {
     pointer_motion_to(&mut f, at.x, at.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.settle_animations();
+    f.settle();
 
     assert_eq!(
         f.synoik().layout.focus().unwrap().window,
@@ -13532,7 +13532,7 @@ fn overview_the_context_menu_pins_and_unpins() {
     pointer_motion_to(&mut f, at.x, at.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(
         dash_favorites(&mut f),
@@ -13593,7 +13593,7 @@ fn overview_an_empty_dash_reserves_a_drop_target_while_dragging() {
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(
         dash_favorites(&mut f),
@@ -13644,7 +13644,7 @@ fn overview_dropping_a_favorite_on_the_show_apps_button_unpins_it() {
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(
         dash_favorites(&mut f),
@@ -13692,7 +13692,7 @@ fn overview_dropping_a_grid_app_on_the_show_apps_button_does_nothing() {
     );
 
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         dash_favorites(&mut f),
         before,
@@ -13710,7 +13710,7 @@ fn overview_dragging_a_dash_icon_to_a_workspace_launches_it_there() {
     use crate::app_system::ResolvedLaunch;
 
     let (mut f, recorder) = dash_fixture(&["a.desktop"]);
-    f.settle_animations();
+    f.settle();
     let center = dash_tile_center(&mut f, 0);
 
     // Pick the icon up and drag it onto the workspace above the dash.
@@ -13729,7 +13729,7 @@ fn overview_dragging_a_dash_icon_to_a_workspace_launches_it_there() {
     let ws = f.synoik().layout.active_workspace().unwrap().id();
     pointer_motion_to(&mut f, 960., 400.);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(f.synoik().app_drag.is_none(), "the drop ends the drag");
     let calls = recorder.calls.borrow();
@@ -13775,10 +13775,10 @@ fn overview_launch_on_workspace_places_the_first_window() {
     let first_win = f.synoik().layout.focus().unwrap().window.clone();
     f.synoik_state()
         .do_action(Action::FocusWorkspaceDown, false);
-    f.synoik_complete_animations();
+    f.settle();
     let target = f.synoik().layout.active_workspace().unwrap().id();
     f.synoik_state().do_action(Action::FocusWorkspaceUp, false);
-    f.synoik_complete_animations();
+    f.settle();
     assert_ne!(
         f.synoik().layout.active_workspace().unwrap().id(),
         target,
@@ -13799,7 +13799,7 @@ fn overview_launch_on_workspace_places_the_first_window() {
     window.set_size(400, 300);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     let win = f
         .synoik()
@@ -13836,7 +13836,7 @@ fn overview_launch_on_workspace_places_the_first_window() {
 #[test]
 fn overview_dropping_an_icon_on_the_dash_launches_nothing() {
     let (mut f, recorder) = dash_fixture(&["a.desktop", "b.desktop"]);
-    f.settle_animations();
+    f.settle();
     let from = dash_tile_center(&mut f, 0);
     let onto = dash_tile_center(&mut f, 1);
 
@@ -13844,7 +13844,7 @@ fn overview_dropping_an_icon_on_the_dash_launches_nothing() {
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     pointer_motion_to(&mut f, onto.x, onto.y);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         recorder.calls.borrow().is_empty(),
@@ -13863,7 +13863,7 @@ fn overview_dash_favorite_middle_click_launches() {
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_MIDDLE, ButtonState::Pressed);
     f.pointer_button(BTN_MIDDLE, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(recorder.calls.borrow().len(), 1, "middle-click launches");
     assert!(!f.synoik().layout.is_overview_open());
@@ -13913,7 +13913,7 @@ fn overview_show_apps_toggles_the_app_grid() {
     let click = |f: &mut Fixture| {
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
-        f.synoik_complete_animations();
+        f.settle();
     };
 
     // Click show-apps → the app grid opens (no launch, overview stays open).
@@ -13941,7 +13941,7 @@ fn overview_show_apps_toggles_the_app_grid() {
     // it every iteration.)
     f.synoik_state().update_keyboard_focus();
     tap(&mut f, KEY_ESC);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_app_grid_open(),
         "Escape returns to the window picker"
@@ -13961,11 +13961,11 @@ fn overview_show_apps_toggles_the_app_grid() {
     assert!(f.synoik().layout.is_app_grid_open());
 
     f.synoik_state().do_action(Action::CloseOverview, false);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(!f.synoik().layout.is_overview_open());
 
     f.synoik_state().do_action(Action::OpenOverview, false);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_app_grid_open(),
         "reopening the overview starts in the window picker, not the app grid"
@@ -14001,7 +14001,7 @@ fn app_grid_fixture(
     f.synoik_state().do_action(Action::OpenOverview, false);
     assert!(f.synoik().layout.is_overview_open(), "overview must open");
     f.synoik().layout.toggle_app_grid();
-    f.synoik_complete_animations();
+    f.settle();
     assert!(f.synoik().layout.is_app_grid_open(), "app grid must open");
 
     (f, recorder)
@@ -14218,7 +14218,7 @@ fn overview_dropping_a_grid_icon_on_a_preview_band_changes_its_page() {
     // Out to the right band. It only becomes a target once the previews have slid in.
     let right = area.loc.x + area.size.w - 20.;
     pointer_motion_to(&mut f, right, start.y);
-    f.settle_animations();
+    f.settle();
     pointer_motion_to(&mut f, right - 1., start.y);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
 
@@ -14250,7 +14250,7 @@ fn overview_app_grid_click_launches_and_closes() {
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1, "exactly one app launched");
@@ -14335,7 +14335,7 @@ fn overview_app_grid_folds_a_folders_apps_out_of_the_top_level() {
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         recorder.calls.borrow().is_empty(),
@@ -14383,7 +14383,7 @@ fn overview_folder_dialog_renames_the_folder() {
     pointer_motion_to(&mut f, center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(f.synoik().folder_dialog.folder_id(), Some("Utilities"));
 
     // The edit button opens the entry, with the name selected whole.
@@ -14455,7 +14455,7 @@ fn overview_dragging_an_app_out_of_a_folder_removes_it() {
         pointer_motion_to(f, center.x, center.y);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
-        f.synoik_complete_animations();
+        f.settle();
     };
     let panel = crate::ui::folder_dialog::layout(view).panel;
     let outside: Point<f64, smithay::utils::Logical> =
@@ -14686,7 +14686,7 @@ fn overview_chrome_ramps_down_on_a_small_canvas() {
         f.add_output(1, size);
         let output = f.synoik_output(1);
         f.synoik_state().do_action(Action::OpenOverview, false);
-        f.synoik_complete_animations();
+        f.settle();
 
         let controls = f
             .synoik()
@@ -15005,7 +15005,7 @@ fn overview_dragging_a_member_onto_a_folder_page_band_moves_it_there() {
     pointer_motion_to(&mut f, center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         f.synoik().folder_dialog.page_count(view),
         2,
@@ -15033,7 +15033,7 @@ fn overview_dragging_a_member_onto_a_folder_page_band_moves_it_there() {
     // (`hint_at` reads the peek). `synoik_complete_animations` will not do: it flips the
     // clock's complete-instantly flag back off, so the peek reads 0 again the moment it
     // returns — the animation clock has to really move.
-    f.settle_animations();
+    f.settle();
     assert_eq!(
         f.synoik().folder_dialog.current_page(),
         0,
@@ -15088,7 +15088,7 @@ fn overview_dropping_a_member_on_the_folder_name_row_takes_it_out() {
     pointer_motion_to(&mut f, center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     let l = crate::ui::folder_dialog::layout(view);
     let name = Point::from((
@@ -15152,7 +15152,7 @@ fn overview_a_drag_inside_the_folder_leaves_the_grid_behind_alone() {
     pointer_motion_to(&mut f, center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     // Pick a member up and cross the drag threshold *inside* the panel.
     let from = f
@@ -15330,7 +15330,7 @@ fn overview_folder_dialog_opens_launches_and_pops_down() {
         pointer_motion_to(f, center.x, center.y);
         f.pointer_button(BTN_LEFT, ButtonState::Pressed);
         f.pointer_button(BTN_LEFT, ButtonState::Released);
-        f.synoik_complete_animations();
+        f.settle();
     };
 
     open_it(&mut f);
@@ -15351,7 +15351,7 @@ fn overview_folder_dialog_opens_launches_and_pops_down() {
     pointer_motion_to(&mut f, outside.x, outside.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().folder_dialog.is_open(),
         "a click outside pops down"
@@ -15392,7 +15392,7 @@ fn overview_folder_dialog_opens_launches_and_pops_down() {
     pointer_motion_to(&mut f, member.x, member.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1, "exactly one app launched");
@@ -15503,7 +15503,7 @@ fn overview_folder_dialog_navigates_with_the_keyboard() {
     tap(&mut f, KEY_RIGHT);
     assert_eq!(f.synoik().app_grid.focused(), Some(1));
     tap(&mut f, KEY_ENTER);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         f.synoik().folder_dialog.folder_id(),
         Some("Utilities"),
@@ -15524,7 +15524,7 @@ fn overview_folder_dialog_navigates_with_the_keyboard() {
     );
     // Enter launches the focused member and takes the overview with it.
     tap(&mut f, KEY_ENTER);
-    f.synoik_complete_animations();
+    f.settle();
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1, "exactly one app launched");
     assert_eq!(calls[0].0.id, "z.desktop", "the focused member launched");
@@ -15716,7 +15716,7 @@ fn overview_app_grid_paginates_and_navigates() {
     // A fresh overview open resets to page 0.
     f.synoik().app_grid.set_page(1, area);
     f.synoik_state().do_action(Action::CloseOverview, false);
-    f.synoik_complete_animations();
+    f.settle();
     f.synoik().refresh_overview_search_state(); // falling edge
     f.synoik_state().do_action(Action::OpenOverview, false);
     f.synoik().refresh_overview_search_state(); // rising edge → reset
@@ -15812,7 +15812,7 @@ fn overview_dash_ignored_when_overview_closed() {
     let center = dash_tile_center(&mut f, 0);
 
     f.synoik_state().do_action(Action::CloseOverview, false);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(!f.synoik().layout.is_overview_open());
 
     f.pointer_motion(center.x, center.y);
@@ -16354,7 +16354,7 @@ fn overview_search_enter_launches_selected_and_closes() {
 
     tap(&mut f, KEY_A);
     tap(&mut f, KEY_ENTER);
-    f.synoik_complete_animations();
+    f.settle();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1);
@@ -16431,7 +16431,7 @@ fn overview_search_click_result_launches() {
     f.pointer_motion(center.x, center.y);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     let calls = recorder.calls.borrow();
     assert_eq!(calls.len(), 1);
@@ -16480,7 +16480,7 @@ fn overview_search_escape_clears_then_closes() {
     );
 
     tap(&mut f, KEY_ESC);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
         "a second Escape (inactive) closes the overview via the hardcoded bind"
@@ -16533,7 +16533,7 @@ fn overview_search_makes_the_picker_inert() {
 
     f.synoik_state().do_action(Action::OpenOverview, false);
     f.synoik_state().update_keyboard_focus();
-    f.settle_animations();
+    f.settle();
 
     let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
     let center = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
@@ -16563,14 +16563,14 @@ fn overview_search_makes_the_picker_inert() {
     }
     let mid = f.synoik().overview_search_fade();
     assert!(mid > 0. && mid < 1., "the search fade must ease, got {mid}");
-    f.settle_animations();
+    f.settle();
     assert_eq!(f.synoik().overview_search_fade(), 1.);
 
     // A click out on the covered picker (the pointer has not moved) is consumed by
     // the results strip.
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         f.synoik().layout.is_overview_open(),
         "clicking the covered picker must not leave the overview"
@@ -16582,7 +16582,7 @@ fn overview_search_makes_the_picker_inert() {
 
     // Clearing brings the picker back — and its reactivity with it.
     tap(&mut f, KEY_ESC);
-    f.settle_animations();
+    f.settle();
     assert!(!f.synoik().overview_search.is_active());
     assert_eq!(f.synoik().overview_search_fade(), 0.);
     assert!(
@@ -16608,7 +16608,7 @@ fn overview_search_makes_the_thumbnail_strip_inert() {
     f.synoik().app_system =
         AppSystem::with_parts(Box::new(catalog), Box::new(RecordingLauncher::default()));
     f.synoik_state().update_keyboard_focus();
-    f.settle_animations();
+    f.settle();
 
     let (tx, ty) = thumbnail_center(&mut f, 0);
     let active = f.synoik().layout.active_workspace().unwrap().id();
@@ -16626,7 +16626,7 @@ fn overview_search_makes_the_thumbnail_strip_inert() {
 
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(
         f.synoik().layout.active_workspace().unwrap().id(),
@@ -16652,7 +16652,7 @@ fn overview_search_idle_entry_body_consumes_clicks() {
     f.pointer_motion(center.0, center.1);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         f.synoik().layout.is_overview_open(),
@@ -16738,7 +16738,7 @@ fn overview_search_closing_the_overview_drops_the_search() {
         "the search does not outlive the overview"
     );
 
-    f.synoik_complete_animations();
+    f.settle();
     f.synoik().advance_animations();
     assert_eq!(
         f.synoik().overview_search_fade(),
@@ -16758,7 +16758,7 @@ fn overview_search_resets_on_reopen() {
     // Prime the edge detector for the open state, then close and re-open.
     f.synoik().refresh_overview_search_state();
     f.synoik_state().do_action(Action::CloseOverview, false);
-    f.synoik_complete_animations();
+    f.settle();
     f.synoik().refresh_overview_search_state(); // falling edge
     f.synoik_state().do_action(Action::OpenOverview, false);
     f.synoik().refresh_overview_search_state(); // rising edge → clear
@@ -17500,9 +17500,9 @@ fn overview_grid_transitions_are_monotonic_with_the_active_workspace_in_the_midd
     let _first = map_window_sized(&mut f, id, (800, 600), None);
     f.synoik_state()
         .do_action(Action::FocusWorkspaceDown, false);
-    f.settle_animations();
+    f.settle();
     let _second = map_window_sized(&mut f, id, (800, 600), None);
-    f.settle_animations();
+    f.settle();
 
     let desktop = workspace_geo(&mut f);
     assert!(
@@ -17511,13 +17511,13 @@ fn overview_grid_transitions_are_monotonic_with_the_active_workspace_in_the_midd
     );
 
     tap(&mut f, KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
 
     f.synoik().layout.toggle_app_grid();
     let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 32);
     assert_row_travels_monotonically(&samples, "picker -> app grid (middle active)");
 
-    f.settle_animations();
+    f.settle();
     let grid = workspace_geo(&mut f);
 
     // ...and back down the same leg, which is the direction that used to swing
@@ -17525,7 +17525,7 @@ fn overview_grid_transitions_are_monotonic_with_the_active_workspace_in_the_midd
     f.synoik().layout.toggle_app_grid();
     let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 32);
     assert_row_travels_monotonically(&samples, "app grid -> picker (middle active)");
-    f.settle_animations();
+    f.settle();
     let picker = workspace_geo(&mut f);
     assert_geo_eq(
         &picker,
@@ -17535,7 +17535,7 @@ fn overview_grid_transitions_are_monotonic_with_the_active_workspace_in_the_midd
     );
 
     f.synoik().layout.toggle_app_grid();
-    f.settle_animations();
+    f.settle();
     f.synoik_state().do_action(Action::CloseOverview, false);
     let samples = f.sample_workspace_geo(1, Duration::from_millis(600), 32);
     assert_row_travels_monotonically(&samples, "app grid -> desktop (middle active)");
@@ -17646,9 +17646,9 @@ fn overview_close_from_the_app_grid_never_folds_the_row() {
     let _w = map_window_sized(&mut f, id, (800, 600), None);
 
     tap(&mut f, KEY_LEFTMETA);
-    f.settle_animations();
+    f.settle();
     f.synoik().layout.toggle_app_grid();
-    f.settle_animations();
+    f.settle();
     let grid = workspace_geo(&mut f);
 
     f.synoik_state().do_action(Action::CloseOverview, false);
@@ -17756,7 +17756,7 @@ fn overview_app_icon_prewarm_uses_the_size_the_grid_will_render() {
         f.synoik().sync_app_grid();
         f.synoik_state().do_action(Action::OpenOverview, false);
         f.synoik().layout.toggle_app_grid();
-        f.synoik_complete_animations();
+        f.settle();
 
         let area = overview_controls(&mut f).app_display;
         let rendered = f.synoik().app_grid.metrics_for(area).icon_px;
@@ -18046,7 +18046,7 @@ fn overview_app_grid_tab_walks_the_icons_in_order() {
         .expect("the folder tile");
     f.synoik().app_grid.set_focused(Some(folder));
     tap(&mut f, KEY_ENTER);
-    f.synoik_complete_animations();
+    f.settle();
     assert!(f.synoik().folder_dialog.is_open());
 
     tap(&mut f, KEY_TAB);
@@ -18209,7 +18209,7 @@ fn app_grid_makes_the_shrunken_workspaces_inert() {
 
     f.synoik_state().do_action(Action::ToggleOverview, false);
     f.synoik_state().update_keyboard_focus();
-    f.settle_animations();
+    f.settle();
 
     // In the picker, hovering a preview is live: it hovers, and a click would activate it.
     let rect = f.synoik().layout.expose_target_rect(&win).unwrap();
@@ -18221,7 +18221,7 @@ fn app_grid_makes_the_shrunken_workspaces_inert() {
     );
     // The overlay fades in, so it is only on screen once its animation has run — and settling has
     // to come after the last input roundtrip (the headless animation-clock trap).
-    f.settle_animations();
+    f.settle();
     let hovered = |f: &mut Fixture| {
         let out = f.synoik_output(1);
         f.synoik()
@@ -18236,7 +18236,7 @@ fn app_grid_makes_the_shrunken_workspaces_inert() {
     assert_eq!(hovered(&mut f), 1, "the hovered preview shows its overlay");
 
     f.synoik().layout.toggle_app_grid();
-    f.settle_animations();
+    f.settle();
 
     // Sample where the preview *now* is. The picker no longer travels into the app-grid
     // row — it fades away in place (divergence, 2026-08-03) — so this is very nearly where
@@ -18259,7 +18259,7 @@ fn app_grid_makes_the_shrunken_workspaces_inert() {
 
     // …and it comes back when the app grid closes.
     f.synoik().layout.toggle_app_grid();
-    f.settle_animations();
+    f.settle();
     pointer_motion_to(&mut f, center.x, center.y);
     let out = f.synoik_output(1);
     assert!(
@@ -18327,7 +18327,7 @@ fn a11y_menu_row_toggles_the_setting_and_closes() {
         "the clicked switch must flip before the menu finishes closing"
     );
 
-    f.settle_animations();
+    f.settle();
     assert!(
         !f.synoik().panel_popover.is_open(),
         "a switch row closes the menu (popupMenu.js:539-550)"
@@ -19339,7 +19339,7 @@ fn media_cards_sit_above_the_notification_groups() {
     f.synoik_state()
         .on_mpris_msg(mpris_update(bus, mpris_state("Rhythmbox", None)));
     let nid = banner_notify(&mut f, banner_req("app-a", ":1.1"));
-    f.settle_animations();
+    f.settle();
 
     open_calendar(&mut f);
     let dm = f.synoik().panel_popover.date_menu().unwrap();
@@ -19449,7 +19449,7 @@ fn media_card_controls_drive_the_player() {
         Some(SynoikToMpris::Raise(bus.to_owned()))
     );
     // `close()` starts the fade; the popover is open until it finishes.
-    f.settle_animations();
+    f.settle();
     assert!(
         !f.synoik().panel_popover.is_open(),
         "raising the player closes the calendar"
@@ -19465,7 +19465,7 @@ fn media_card_controls_drive_the_player() {
         rx.try_recv().ok(),
         Some(SynoikToMpris::Raise(bus.to_owned()))
     );
-    f.settle_animations();
+    f.settle();
     assert!(!f.synoik().panel_popover.is_open());
 }
 
@@ -19524,7 +19524,7 @@ fn only_the_volume_icon_consumes_a_panel_scroll() {
     // PipeWire connection, which a headless fixture has none of -- see the OSD test below.)
     pointer_motion_to(&mut f, centre_x, 10.);
     f.scroll_wheel();
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         active(&mut f),
         0,
@@ -19534,7 +19534,7 @@ fn only_the_volume_icon_consumes_a_panel_scroll() {
     // Just outside it -- still on the panel, still on the status cluster -- the bind fires.
     pointer_motion_to(&mut f, volume.loc.x + volume.size.w + 4., 10.);
     f.scroll_wheel();
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         active(&mut f),
         1,
@@ -19545,7 +19545,7 @@ fn only_the_volume_icon_consumes_a_panel_scroll() {
     // into fractional steps (`volume.js:452-458`), where ours used to ignore anything but a wheel.
     pointer_motion_to(&mut f, centre_x, 10.);
     f.scroll_finger(0., 120.);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         active(&mut f),
         1,
@@ -19556,7 +19556,7 @@ fn only_the_volume_icon_consumes_a_panel_scroll() {
     // fire it and the assertion above is not vacuous.
     pointer_motion_to(&mut f, volume.loc.x + volume.size.w + 4., 10.);
     f.scroll_finger(0., 120.);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(active(&mut f), 0, "off the icon, the touchpad bind runs");
 }
 
@@ -19631,7 +19631,7 @@ fn a_panel_volume_change_shows_the_osd_everywhere() {
     // The QS slider path is silent: it goes through `apply_popover_action`, which never asks for
     // an OSD.
     f.synoik().osd.hide_all();
-    f.settle_animations();
+    f.settle();
     f.synoik_state()
         .apply_popover_action(crate::ui::popover::PopoverAction::SetVolume(0.8));
     assert!(
@@ -19661,7 +19661,7 @@ fn a_scroll_over_the_volume_icon_steps_the_backend_and_shows_the_osd() {
 
     // One notch down: a write of exactly one slider step, and an OSD saying so.
     f.scroll_wheel();
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         audio.writes(),
         vec![AudioWrite::Volume(0.5 - crate::audio::SCROLL_STEP)],
@@ -19688,11 +19688,11 @@ fn a_scroll_over_the_volume_icon_steps_the_backend_and_shows_the_osd() {
             crate::audio::MAX_VOLUME,
         ));
     f.synoik().osd.hide_all();
-    f.settle_animations();
+    f.settle();
     audio.clear_writes();
 
     f.scroll_wheel_up();
-    f.synoik_complete_animations();
+    f.settle();
     assert!(
         !f.synoik().osd.is_visible(),
         "scrolling up at the ceiling must not keep re-arming the OSD"
@@ -19704,18 +19704,18 @@ fn a_scroll_over_the_volume_icon_steps_the_backend_and_shows_the_osd() {
     pointer_motion_to(&mut f, centre_x, 10.);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
     f.pointer_button(BTN_LEFT, ButtonState::Released);
-    f.settle_animations();
+    f.settle();
     assert_eq!(
         f.synoik().panel_popover.open_role(),
         Some(crate::ui::panel::ROLE_QUICK_SETTINGS),
         "the volume icon is part of the quick-settings button"
     );
     f.synoik().osd.hide_all();
-    f.settle_animations();
+    f.settle();
     audio.clear_writes();
 
     f.scroll_wheel();
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         audio.writes(),
         vec![],
@@ -19886,7 +19886,7 @@ fn a_port_change_to_headphones_shows_the_osd_but_the_first_answer_is_silent() {
 
     // Re-publishing the same port is not a change: no second OSD.
     f.synoik().osd.hide_all();
-    f.settle_animations();
+    f.settle();
     f.synoik_state()
         .on_audio_cards(cards("analog-output-headphones"));
     assert!(
@@ -19902,7 +19902,7 @@ fn a_port_change_to_headphones_shows_the_osd_but_the_first_answer_is_silent() {
     // A bluetooth headset arriving as the new default: no card, but a form factor. GNOME does not
     // reset `_hasHeadphones` across a stream swap, so this is a change and shows the OSD.
     f.synoik().osd.hide_all();
-    f.settle_animations();
+    f.settle();
     f.synoik_state().on_sink_list(crate::audio::SinkList {
         sinks: vec![SinkInfo {
             name: "bluez".to_owned(),
@@ -20045,7 +20045,7 @@ fn super_tab_opens_the_app_switcher_on_the_previous_app() {
     let client = f.add_client();
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.Two");
-    f.synoik_complete_animations();
+    f.settle();
 
     f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
@@ -20084,7 +20084,7 @@ fn a_quick_super_tab_switches_without_showing_the_popup() {
     map_window_for_app(&mut f, client, "org.example.One");
     let first = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.Two");
-    f.synoik_complete_animations();
+    f.settle();
 
     // Hold Super for real, so the popup gets a modifier to commit on: driving the action with
     // nothing held makes it a *no-modifier* switcher, which commits on a timeout instead and
@@ -20148,7 +20148,7 @@ fn super_tab_pops_up_an_apps_windows_and_commits_to_the_one_it_picks() {
     map_window_for_app(&mut f, client, "org.example.One");
     let b = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.Two");
-    f.synoik_complete_animations();
+    f.settle();
 
     // Rest on "One" (item 1) and let the popup timer run out.
     let open_on_one = |f: &mut Fixture| {
@@ -20182,7 +20182,7 @@ fn super_tab_pops_up_an_apps_windows_and_commits_to_the_one_it_picks() {
 
     // So the release still activates the app's most recent window.
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(client);
     assert_eq!(
         f.synoik().layout.focus().unwrap().id(),
@@ -20212,7 +20212,7 @@ fn super_tab_pops_up_an_apps_windows_and_commits_to_the_one_it_picks() {
     );
 
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(client);
     assert_eq!(
         f.synoik().layout.focus().unwrap().id(),
@@ -20244,7 +20244,7 @@ fn the_window_sublist_closes_on_up_and_on_moving_to_another_app() {
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.Two");
-    f.synoik_complete_animations();
+    f.settle();
 
     f.key_press(KEY_LEFTMETA);
     f.synoik_state()
@@ -20317,7 +20317,7 @@ fn switch_group_walks_the_current_apps_windows_as_a_window_switcher() {
     let b = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.One");
     let c = f.synoik().layout.focus().unwrap().id();
-    f.synoik_complete_animations();
+    f.settle();
 
     // Super + the key above Tab, held.
     f.key_press(KEY_LEFTMETA);
@@ -20352,7 +20352,7 @@ fn switch_group_walks_the_current_apps_windows_as_a_window_switcher() {
 
     // And releasing commits to the window it had picked.
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(client);
     let focused = f.synoik().layout.focus().unwrap().id();
     assert_eq!(focused, a, "committed to the picked window");
@@ -20391,7 +20391,7 @@ fn alt_escape_cycles_windows_in_place_with_no_popup() {
     let a = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.B");
     let b = f.synoik().layout.focus().unwrap().id();
-    f.synoik_complete_animations();
+    f.settle();
 
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_ESC);
@@ -20425,7 +20425,7 @@ fn alt_escape_cycles_windows_in_place_with_no_popup() {
 
     // Releasing the modifier commits, like any other switcher.
     f.key_release(KEY_LEFTALT);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(client);
     assert_eq!(f.synoik().layout.focus().unwrap().id(), b);
     assert!(
@@ -20451,7 +20451,7 @@ fn closing_a_window_under_a_cycler_does_not_take_the_compositor_with_it() {
     let a = f.synoik().layout.focus().unwrap().id();
     let b_surface = map_window_for_app(&mut f, client, "org.example.B");
     let b = f.synoik().layout.focus().unwrap().id();
-    f.synoik_complete_animations();
+    f.settle();
 
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_ESC);
@@ -20475,7 +20475,7 @@ fn closing_a_window_under_a_cycler_does_not_take_the_compositor_with_it() {
     assert_eq!(f.synoik().switcher.cycler_window(), Some(a));
 
     f.key_release(KEY_LEFTALT);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(f.synoik().layout.focus().unwrap().id(), a);
 }
 
@@ -20505,7 +20505,7 @@ fn alt_f6_cycles_only_the_focused_apps_windows() {
     let a = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.One");
     let b = f.synoik().layout.focus().unwrap().id();
-    f.synoik_complete_animations();
+    f.settle();
 
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_F6);
@@ -20524,7 +20524,7 @@ fn alt_f6_cycles_only_the_focused_apps_windows() {
     }
 
     f.key_release(KEY_LEFTALT);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(client);
     assert_eq!(f.synoik().layout.focus().unwrap().id(), b);
 }
@@ -20556,7 +20556,7 @@ fn a_key_the_cycler_does_not_match_falls_through_and_abandons_it() {
     map_window_for_app(&mut f, client, "org.example.A");
     map_window_for_app(&mut f, client, "org.example.A");
     let before = f.synoik().layout.focus().unwrap().id();
-    f.synoik_complete_animations();
+    f.settle();
 
     f.key_press(KEY_LEFTALT);
     tap(&mut f, KEY_F6);
@@ -20572,7 +20572,7 @@ fn a_key_the_cycler_does_not_match_falls_through_and_abandons_it() {
     assert!(f.synoik().cycler_highlight.is_none());
 
     f.key_release(KEY_LEFTALT);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(client);
     assert_eq!(
         f.synoik().layout.focus().unwrap().id(),
@@ -20610,7 +20610,7 @@ fn descending_into_an_open_sublist_moves_the_highlight_without_rebuilding_it() {
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.Two");
-    f.synoik_complete_animations();
+    f.settle();
 
     let mut clock = f.synoik().clock.clone();
     let rest = |f: &mut Fixture, clock: &mut crate::animation::Clock, by: Duration| {
@@ -20682,7 +20682,7 @@ fn the_window_sublist_fades_in() {
     let client = f.add_client();
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.One");
-    f.synoik_complete_animations();
+    f.settle();
 
     f.key_press(KEY_LEFTMETA);
     f.synoik_state()
@@ -20742,7 +20742,7 @@ fn the_switchers_close_and_quit_keys_act_without_ending_the_session() {
     let one_a = map_window_for_app(&mut f, client, "org.example.One");
     let one_b = map_window_for_app(&mut f, client, "org.example.One");
     let two = map_window_for_app(&mut f, client, "org.example.Two");
-    f.synoik_complete_animations();
+    f.settle();
 
     // How many of "One"'s windows have been asked to close, and whether "Two" ever was.
     let asked = |f: &mut Fixture| {
@@ -20859,7 +20859,7 @@ fn an_open_switcher_suppresses_underlying_pointer_focus() {
     );
 
     f.key_release(KEY_LEFTALT);
-    f.synoik_complete_animations();
+    f.settle();
 
     // ...and it comes back when the session ends.
     pointer_motion_to(&mut f, over_window.x, over_window.y);
@@ -20906,7 +20906,7 @@ fn the_switchers_arrows_walk_it_escape_abandons_it_and_return_takes_it() {
     tap(&mut f, KEY_ESC);
     assert!(!f.synoik().switcher.is_open(), "Escape destroys the popup");
     f.key_release(KEY_LEFTALT);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
     assert_eq!(
         f.synoik().layout.focus().unwrap().id(),
@@ -20922,7 +20922,7 @@ fn the_switchers_arrows_walk_it_escape_abandons_it_and_return_takes_it() {
     tap(&mut f, KEY_ENTER);
     assert!(!f.synoik().switcher.is_open(), "Return finishes the popup");
     f.key_release(KEY_LEFTALT);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
     assert_ne!(
         f.synoik().layout.focus().unwrap().id(),
@@ -20960,7 +20960,7 @@ fn alt_tab_titles_the_selection_across_the_panel_and_super_tab_labels_each_item(
     let client = f.add_client();
     map_window_for_app(&mut f, client, "org.example.One");
     map_window_for_app(&mut f, client, "org.example.One");
-    f.synoik_complete_animations();
+    f.settle();
 
     const KEY_LEFTALT: u32 = 56;
     const KEY_LEFTMETA: u32 = 125;
@@ -21045,7 +21045,7 @@ fn alt_tab_stays_on_this_workspace_and_super_tab_does_not() {
     f.synoik_state()
         .do_action(Action::FocusWorkspaceDown, false);
     map_window_for_app(&mut f, client, "org.example.Two");
-    f.synoik_complete_animations();
+    f.settle();
 
     // Sanity: the two really are on different workspaces, so the assertions below can differ.
     assert_eq!(
@@ -21111,7 +21111,7 @@ fn switcher_rest(f: &mut Fixture, by: Duration) {
 fn settle_workspace_preview(f: &mut Fixture) {
     switcher_rest(f, crate::ui::switcher::POPUP_DELAY);
     switcher_rest(f, crate::ui::switcher::WORKSPACE_PREVIEW_DELAY * 2);
-    f.synoik_complete_animations();
+    f.settle();
 }
 
 /// The active workspace's floating stack, topmost first.
@@ -21147,7 +21147,7 @@ fn super_tab_brings_the_whole_app_forward_not_just_its_focused_window() {
     let b = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.Two");
     let c = f.synoik().layout.focus().unwrap().id();
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(
         stack_order(&mut f),
@@ -21160,7 +21160,7 @@ fn super_tab_brings_the_whole_app_forward_not_just_its_focused_window() {
     f.synoik_state()
         .do_action(Action::SwitchApplications { backward: false }, false);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(client);
 
     assert_eq!(
@@ -21194,7 +21194,7 @@ fn a_switcher_shows_what_it_would_raise_and_puts_it_back_on_escape() {
     let b = f.synoik().layout.focus().unwrap().id();
     map_window_for_app(&mut f, client, "org.example.Two");
     let c = f.synoik().layout.focus().unwrap().id();
-    f.synoik_complete_animations();
+    f.settle();
 
     // `preview_raised` speaks the layout's window handles, so translate back to the ids the rest
     // of the test names windows by.
@@ -21244,7 +21244,7 @@ fn a_switcher_shows_what_it_would_raise_and_puts_it_back_on_escape() {
     // Escape abandons it.
     tap(&mut f, KEY_ESC);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(client);
 
     assert!(previewed(&mut f).is_empty(), "the preview is dropped");
@@ -21288,7 +21288,7 @@ fn the_switcher_previews_another_workspace_and_gives_it_back() {
     // switch would leave the middle window with no focus stamp at all, and the MRU order this
     // test is built on would be a different order.
     let settle = |f: &mut Fixture| {
-        f.settle_animations();
+        f.settle();
         f.double_roundtrip(client);
     };
 
@@ -21306,7 +21306,7 @@ fn the_switcher_previews_another_workspace_and_gives_it_back() {
     settle(&mut f);
     map_window_for_app(&mut f, client, "org.example.One");
     let here = f.synoik().layout.focus().unwrap().id();
-    f.synoik_complete_animations();
+    f.settle();
 
     let ws = |f: &mut Fixture| {
         f.synoik()
@@ -21340,7 +21340,7 @@ fn the_switcher_previews_another_workspace_and_gives_it_back() {
     // Escape: we are owed the workspace we started on.
     tap(&mut f, KEY_ESC);
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(client);
     assert_eq!(ws(&mut f), 2, "abandoning it brings us back");
     assert_eq!(
@@ -21365,7 +21365,7 @@ fn the_switcher_previews_another_workspace_and_gives_it_back() {
     assert_eq!(ws(&mut f), 0, "and on to the second");
 
     f.key_release(KEY_LEFTMETA);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(client);
 
     assert_eq!(ws(&mut f), 0, "committing keeps the workspace we ended on");
@@ -21381,7 +21381,7 @@ fn the_switcher_previews_another_workspace_and_gives_it_back() {
     // this on workspace 1, which is somewhere the user only ever saw out of the corner of an eye.
     f.synoik_state()
         .do_action(Action::FocusWorkspacePrevious, false);
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         ws(&mut f),
         2,
@@ -23054,7 +23054,7 @@ fn activating_a_row_sends_the_clients_node_id() {
     );
 
     // And the menu goes away, as activating any menu row does.
-    f.settle_animations();
+    f.settle();
     assert!(!f.synoik().panel_popover.is_open());
     f.synoik_state().reconcile_indicator_menu();
     assert_eq!(rx.try_recv().ok(), Some(Req::CloseMenu));
@@ -23267,7 +23267,7 @@ fn scrolling_an_indicator_forwards_to_the_client() {
             if delta > 0),
         "the notch reaches the client as a vertical scroll"
     );
-    f.synoik_complete_animations();
+    f.settle();
     assert_eq!(
         f.synoik()
             .layout
@@ -23323,7 +23323,7 @@ fn a_window_opened_from_an_indicator_lands_under_its_icon() {
     window.set_size(400, 300);
     window.ack_last_and_commit();
     f.double_roundtrip(client);
-    f.synoik_complete_animations();
+    f.settle();
 
     let synoik = f.synoik();
     let (_, _, ws) = synoik
@@ -23374,7 +23374,7 @@ fn a_window_without_our_token_is_not_moved() {
     // anything looser than the token.
     click_first_indicator(&mut f, BTN_LEFT);
     let _win = map_window_sized(&mut f, client, (400, 300), None);
-    f.synoik_complete_animations();
+    f.settle();
 
     let synoik = f.synoik();
     let (_, _, ws) = synoik
@@ -23703,7 +23703,7 @@ fn destroying_a_session_saves_its_still_mapped_toplevels() {
     // Somewhere unmistakable, and somewhere that is not where a fresh window lands.
     f.synoik_state()
         .do_action(Action::MoveWindowToWorkspaceDown(true), false);
-    f.synoik_complete_animations();
+    f.settle();
 
     session.destroy();
     f.double_roundtrip(id);
@@ -23739,7 +23739,7 @@ fn a_toplevel_outliving_its_session_still_saves() {
     // `second` has focus; move it one desktop down so the two differ.
     f.synoik_state()
         .do_action(Action::MoveWindowToWorkspaceDown(true), false);
-    f.synoik_complete_animations();
+    f.settle();
 
     // Tear down in the order that loses state: one toplevel, then the session, then the rest.
     f.client(id).window(&first).attach_null_buffer();
@@ -24308,7 +24308,7 @@ fn a_windows_geometry_survives_a_restart() {
     let win = f.synoik().layout.focus().unwrap().window.clone();
     f.synoik_state()
         .do_action(Action::MoveWindowToWorkspaceDown(true), false);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(first);
     let saved = f.synoik().layout.session_snapshot(&win).unwrap();
     let saved_rect = saved.floating_rect.expect("a floated window has a rect");
@@ -24328,7 +24328,7 @@ fn a_windows_geometry_survives_a_restart() {
     f.roundtrip(second);
     let (surface, _handle) = restore_window(&mut f, second, &session, "main");
     let size = map_at_configured_size(&mut f, second, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(
         size,
@@ -24402,7 +24402,7 @@ fn a_restored_window_lands_at_its_saved_position() {
 
     let (surface, _handle) = restore_window(&mut f, id, &session, "main");
     map_at_configured_size(&mut f, id, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     let win = f.synoik().layout.focus().unwrap().window.clone();
     let global = {
@@ -24535,7 +24535,7 @@ fn a_restored_window_returns_to_its_workspace_under_every_reason() {
 
         let (surface, _handle) = restore_window(&mut f, id, &session, "main");
         map_at_configured_size(&mut f, id, &surface);
-        f.synoik_complete_animations();
+        f.settle();
 
         // Not via `focus()`: two of the three reasons deliberately do not take focus.
         let win = f
@@ -24670,7 +24670,7 @@ fn a_restored_window_is_not_auto_maximized() {
 
     let (surface, _handle) = restore_window(&mut f, id, &session, "main");
     map_at_configured_size(&mut f, id, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     let win = f.synoik().layout.focus().unwrap().window.clone();
     let snapshot = f.synoik().layout.session_snapshot(&win).unwrap();
@@ -24719,7 +24719,7 @@ fn a_saved_workspace_index_past_the_end_grows_the_strip() {
 
     let (surface, _handle) = restore_window(&mut f, id, &session, "main");
     map_at_configured_size(&mut f, id, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     let win = session_window(&mut f, "main");
     assert_eq!(
@@ -24770,7 +24770,7 @@ fn restoring_windows_out_of_order_still_lands_each_on_its_own_workspace() {
         for name in order {
             let (surface, _handle) = restore_window(&mut f, id, &session, name);
             map_at_configured_size(&mut f, id, &surface);
-            f.synoik_complete_animations();
+            f.settle();
             let win = session_window(&mut f, name);
             let idx = f
                 .synoik()
@@ -24812,7 +24812,7 @@ fn a_window_moved_to_the_third_desktop_comes_back_to_the_third_desktop() {
         for _ in 0..2 {
             f.synoik_state()
                 .do_action(Action::MoveWindowToWorkspaceDown(true), false);
-            f.synoik_complete_animations();
+            f.settle();
         }
 
         for surface in [&a, &b] {
@@ -24864,7 +24864,7 @@ fn a_window_moved_to_the_third_desktop_comes_back_to_the_third_desktop() {
         for name in order {
             let (surface, _handle) = restore_window(&mut f, id, &session, name);
             map_at_configured_size(&mut f, id, &surface);
-            f.synoik_complete_animations();
+            f.settle();
             let win = session_window(&mut f, name);
             let synoik = f.synoik();
             landed.push((
@@ -24935,7 +24935,7 @@ fn a_window_demanding_attention_marks_its_app_urgent_in_the_dash() {
     f.client(id).window(&surface).commit();
     f.roundtrip(id);
     map_at_configured_size(&mut f, id, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         f.synoik()
@@ -25024,7 +25024,7 @@ fn a_window_with_a_seeded_workspace_still_finishes_its_apps_startup() {
     f.client(id).window(&surface).commit();
     f.roundtrip(id);
     map_at_configured_size(&mut f, id, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert!(
         f.synoik()
@@ -25090,7 +25090,7 @@ fn a_recover_demands_attention_from_another_desktop_but_a_restore_does_not() {
         f.client(id).window(&surface).commit();
         f.roundtrip(id);
         map_at_configured_size(&mut f, id, &surface);
-        f.synoik_complete_animations();
+        f.settle();
 
         let urgent = f
             .synoik()
@@ -25143,7 +25143,7 @@ fn an_app_you_are_looking_at_does_not_demand_attention() {
     window.set_size(300, 200);
     window.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     // Window two of the same app, restored onto the second desktop — the arm that marks urgent.
     let (session, session_id) = new_session(&mut f, id);
@@ -25176,7 +25176,7 @@ fn an_app_you_are_looking_at_does_not_demand_attention() {
     f.client(id).window(&surface).commit();
     f.roundtrip(id);
     map_at_configured_size(&mut f, id, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     // The snapshot is where the invariant runs, and it must reach the dash cleared.
     f.synoik().sync_running_apps();
@@ -25266,7 +25266,7 @@ fn a_window_mapping_on_another_workspace_does_not_take_you_there() {
 
     let (surface, _handle) = restore_window(&mut f, id, &session, "main");
     map_at_configured_size(&mut f, id, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(
         active_idx(&mut f),
@@ -25315,7 +25315,7 @@ fn restoring_several_windows_leaves_the_active_workspace_alone() {
     for name in ["w0", "w1", "w2"] {
         let (surface, _handle) = restore_window(&mut f, id, &session, name);
         map_at_configured_size(&mut f, id, &surface);
-        f.synoik_complete_animations();
+        f.settle();
     }
 
     assert_eq!(
@@ -25366,7 +25366,7 @@ fn a_login_restore_does_not_steal_focus_from_what_you_are_using() {
     for name in ["a", "b"] {
         let (surface, _handle) = restore_window(&mut f, restoring, &session2, name);
         map_at_configured_size(&mut f, restoring, &surface);
-        f.synoik_complete_animations();
+        f.settle();
     }
 
     let focused = f.synoik().layout.focus().map(|focus| focus.window.clone());
@@ -25415,7 +25415,7 @@ fn an_activation_token_takes_you_to_the_windows_workspace() {
         });
     }
     map_at_configured_size(&mut f, id, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     assert_eq!(
         active_idx(&mut f),
@@ -25449,7 +25449,7 @@ fn a_nonsense_saved_workspace_index_does_not_inflate_the_strip() {
 
     let (surface, _handle) = restore_window(&mut f, id, &session, "main");
     map_at_configured_size(&mut f, id, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     // A literal, not `MAX_NUM_WORKSPACES`: the property is "the strip stays small whatever the
     // file says", and an assertion phrased in terms of the constant it is guarding moves with it
@@ -25491,7 +25491,7 @@ fn restoring_onto_a_monitor_that_is_gone_still_maps() {
 
     let (surface, _handle) = restore_window(&mut f, id, &session, "main");
     map_at_configured_size(&mut f, id, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     let win = f
         .synoik()
@@ -25538,12 +25538,12 @@ fn unmaximizing_a_restored_window_returns_it_to_the_saved_rect() {
 
     let (surface, _handle) = restore_window(&mut f, id, &session, "main");
     map_at_configured_size(&mut f, id, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     f.synoik_state().do_action(Action::Unmaximize, false);
     f.double_roundtrip(id);
     map_at_configured_size(&mut f, id, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     let win = f.synoik().layout.focus().unwrap().window.clone();
     let snapshot = f.synoik().layout.session_snapshot(&win).unwrap();
@@ -25814,7 +25814,7 @@ fn restoring_the_same_window_repeatedly_does_not_drift() {
         w.set_size(first_size.0, first_size.1);
         w.ack_last_and_commit();
         f.double_roundtrip(first);
-        f.synoik_complete_animations();
+        f.settle();
 
         let win = f.synoik().layout.focus().unwrap().window.clone();
         let first_rect = f
@@ -25840,7 +25840,7 @@ fn restoring_the_same_window_repeatedly_does_not_drift() {
             f.roundtrip(next);
             let (surface, _handle) = restore_window(&mut f, next, &session, "main");
             let size = map_at_configured_size(&mut f, next, &surface);
-            f.synoik_complete_animations();
+            f.settle();
 
             assert_eq!(
                 size,
@@ -25914,7 +25914,7 @@ fn a_title_change_between_configure_and_map_keeps_the_restored_position() {
     w.set_size(400, 300);
     w.ack_last_and_commit();
     f.double_roundtrip(first);
-    f.synoik_complete_animations();
+    f.settle();
 
     // Somewhere the placement cascade would never put it, so that coming back
     // centred is distinguishable from coming back restored.
@@ -25926,7 +25926,7 @@ fn a_title_change_between_configure_and_map_keeps_the_restored_position() {
         },
         false,
     );
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(first);
 
     let win = f.synoik().layout.focus().unwrap().window.clone();
@@ -25959,7 +25959,7 @@ fn a_title_change_between_configure_and_map_keeps_the_restored_position() {
         .set_title("gustavo@host: ~");
     f.roundtrip(second);
     map_at_configured_size(&mut f, second, &surface);
-    f.synoik_complete_animations();
+    f.settle();
 
     let win = f.synoik().layout.focus().unwrap().window.clone();
     let got = f
@@ -26017,7 +26017,7 @@ fn a_window_is_not_configured_smaller_than_it_asked_for() {
     w.set_window_geometry(0, -HEADER, 400, CONTENT + HEADER);
     w.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     let configured = f
         .client(id)
@@ -26082,7 +26082,7 @@ fn enable_animations_off_stops_the_shell_animating() {
 
     // And back: turning the key on animates again, so this is a setting and not a one-way door.
     f.synoik_state().do_action(Action::ToggleOverview, false);
-    f.settle_animations();
+    f.settle();
     f.synoik_state().synoik.gnome_settings.enable_animations = true;
     f.synoik_state().refresh_animation_clock();
     assert!(!f.synoik().clock.should_complete_instantly());
@@ -26232,7 +26232,7 @@ fn a_mode_or_scale_change_refits_maximized_and_tiled_windows() {
             win.ack_last_and_commit();
         }
         f.double_roundtrip(id);
-        f.synoik_complete_animations();
+        f.settle();
     };
     settle(&mut f);
 
@@ -26698,7 +26698,7 @@ fn a_lazy_ack_does_not_corrupt_the_restore_rect() {
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let surface = map_window_sized(&mut f, id, (800, 600), None);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     // Maximize for real: the client answers and redraws at the work-area size.
@@ -26734,7 +26734,7 @@ fn a_restore_the_client_answered_is_the_clients_size_again() {
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let surface = map_window_sized(&mut f, id, (800, 600), None);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     f.synoik_state().do_action(Action::Maximize, false);
@@ -26766,7 +26766,7 @@ fn a_window_resized_back_to_the_work_area_still_saves_its_own_rect() {
     f.add_output(1, (1920, 1080));
     let id = f.add_client();
     let surface = map_window_sized(&mut f, id, (800, 600), None);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     f.synoik_state().do_action(Action::Maximize, false);
