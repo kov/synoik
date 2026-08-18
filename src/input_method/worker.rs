@@ -13,7 +13,7 @@
 //! mutter also relies on ("we rely on the IM implementation to notify back of key events in the
 //! exact same order they were given", `clutter-input-method.c:398-400`).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::future;
 use futures_util::stream::{self, LocalBoxStream, StreamExt};
@@ -29,13 +29,30 @@ use crate::dbus::ibus::{self, ImEvent, PreeditMode};
 const RETRY_START: Duration = Duration::from_millis(500);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 
+/// The systemd user unit that owns `ibus-daemon` in a GNOME session.
+///
+/// gnome-shell asks whether this unit exists and only spawns the daemon itself when it does not
+/// (`ibusManager.js:83-102`) — the unit is the supported path, and a daemon started under it
+/// outlives us instead of dying in the compositor's cgroup.
+const IBUS_UNIT: &str = "org.freedesktop.IBus.session.GNOME.service";
+
+/// The floor between two attempts to revive the daemon. A daemon that keeps dying must not be
+/// fought: one start per interval, no matter how fast the redial loop spins.
+const REVIVE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Start the worker. Returns immediately; the thread lives as long as the request channel does.
+///
+/// `revive_daemon` belongs to the **session instance** only: reviving `ibus-daemon` is a
+/// session-wide side effect, and a nested or headless instance must never reach out and start
+/// daemons on the developer's real seat.
 pub fn spawn(
     requests: async_channel::Receiver<ImRequest>,
     to_compositor: calloop::channel::Sender<ImUpdate>,
+    revive_daemon: bool,
 ) {
     let builder = std::thread::Builder::new().name("input method".to_owned());
-    if let Err(err) = builder.spawn(move || async_io::block_on(run(requests, to_compositor))) {
+    let run = move || async_io::block_on(run(requests, to_compositor, revive_daemon));
+    if let Err(err) = builder.spawn(run) {
         tracing::warn!("could not start the input method thread: {err:?}");
     }
 }
@@ -43,8 +60,10 @@ pub fn spawn(
 async fn run(
     requests: async_channel::Receiver<ImRequest>,
     to_compositor: calloop::channel::Sender<ImUpdate>,
+    revive_daemon: bool,
 ) {
     let mut backoff = RETRY_START;
+    let mut last_revive: Option<Instant> = None;
     loop {
         match session(&requests, &to_compositor).await {
             // The request channel closed: the compositor is going away.
@@ -57,9 +76,80 @@ async fn run(
             }
         }
 
+        // No daemon means no dead keys and no Compose *for every client on the seat*: we
+        // advertise `zwp_text_input_v3` unconditionally, which is what makes GTK drop its own
+        // compose table (see the note atop `crate::dbus::ibus`). So an absent daemon is not
+        // something to wait out — it is something to fix. Killing a wedged `ibus-daemon` is the
+        // standing workaround for it eating a core, and `Restart=on-abnormal` in the unit does
+        // not cover a clean SIGTERM, so a killed daemon stays dead until something asks for it.
+        let stale = last_revive.is_none_or(|at| at.elapsed() >= REVIVE_INTERVAL);
+        if revive_daemon && stale {
+            last_revive = Some(Instant::now());
+            if revive().await {
+                // The daemon is coming up now; redial promptly rather than sitting out the
+                // slow heartbeat this loop has settled into.
+                backoff = RETRY_START;
+            }
+        }
+
         async_io::Timer::after(backoff).await;
         backoff = (backoff * 2).min(RETRY_MAX);
     }
+}
+
+/// Bring `ibus-daemon` back, the way gnome-shell would. `true` if something was actually started.
+///
+/// Unit first, spawn second — the same order and the same argv as `ibusManager.js:111-122`. The
+/// unit is `Type=dbus`, so systemd returning from `StartUnit` does not mean the daemon has taken
+/// its name yet; the redial loop is what waits for that.
+async fn revive() -> bool {
+    match start_unit().await {
+        Ok(()) => {
+            tracing::info!("started {IBUS_UNIT} to bring the input method back");
+            return true;
+        }
+        // Every distro that ships the unit is served above. Anything else — no unit, no systemd,
+        // no session bus — falls through to gnome-shell's own spawn.
+        Err(err) => tracing::debug!("could not start {IBUS_UNIT}: {err:?}"),
+    }
+
+    // `--panel disable`, exactly as gnome-shell spawns it (`ibusManager.js:112`): the panel is
+    // the candidate popup and the shell draws that itself.
+    match std::process::Command::new("ibus-daemon")
+        .args(["--panel", "disable"])
+        .spawn()
+    {
+        Ok(mut child) => {
+            tracing::info!("spawned ibus-daemon to bring the input method back");
+            // Reaped off-thread: a child left unwaited is a zombie for the life of the session,
+            // and this thread is busy being an event loop.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(err) => {
+            tracing::warn!("could not start an input method daemon: {err}");
+            false
+        }
+    }
+}
+
+/// `StartUnit` on the systemd *user* manager. Fails when the unit is not installed, which is the
+/// case gnome-shell's spawn path exists for.
+async fn start_unit() -> anyhow::Result<()> {
+    let conn = zbus::Connection::session().await?;
+    let manager = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+    )
+    .await?;
+    // "replace" is systemd's ordinary queueing mode, and what `systemctl start` uses.
+    let _job: zbus::zvariant::OwnedObjectPath =
+        manager.call("StartUnit", &(IBUS_UNIT, "replace")).await?;
+    Ok(())
 }
 
 /// One connection's lifetime. `Ok(())` means a clean shutdown; any error is a reason to redial.
