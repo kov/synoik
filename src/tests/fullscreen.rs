@@ -202,7 +202,7 @@ fn unfullscreen_before_fullscreen_ack_doesnt_prevent_view_offset_save_restore() 
     window2.set_size(configure.size.0 as u16, configure.size.1 as u16);
     window2.ack_last_and_commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     // The view position is now at the fullscreen-sized window2.
     assert_snapshot!(f.synoik().layout.active_workspace().unwrap().scrolling().view_pos(), @"116");
@@ -216,7 +216,7 @@ fn unfullscreen_before_fullscreen_ack_doesnt_prevent_view_offset_save_restore() 
     window2.set_size(200, 200);
     window2.ack_last_and_commit();
     f.roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
 
     // The view position should restore to the first window.
     assert_snapshot!(f.synoik().layout.active_workspace().unwrap().scrolling().view_pos(), @"-16");

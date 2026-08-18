@@ -196,7 +196,7 @@ fn build_scene(out: (u16, u16), windows: usize, scene: Scene) -> Option<Fixture>
         f.synoik().wallpaper.update(&settings, gpu.as_ref());
     }
 
-    f.synoik_complete_animations();
+    f.settle();
     Some(f)
 }
 
@@ -461,7 +461,7 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
     for out in [(3840u16, 2160u16), (1920, 1080), (960, 540)] {
         if let Some(mut f) = build(out, 4) {
             f.synoik_state().do_action(Action::OpenOverview, false);
-            f.settle_animations();
+            f.settle();
             best_of(&mut f, 2);
             let s = best_of(&mut f, 5);
             row(&format!("  {}x{}", out.0, out.1), out, s);
@@ -474,7 +474,7 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
     for n in [1usize, 4, 8, 12] {
         if let Some(mut f) = build(out, n) {
             f.synoik_state().do_action(Action::OpenOverview, false);
-            f.settle_animations();
+            f.settle();
             best_of(&mut f, 2);
             let s = best_of(&mut f, 5);
             row(&format!("  {n} windows"), out, s);
@@ -514,7 +514,7 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
     ] {
         if let Some(mut f) = build_scene(out, 4, scene) {
             f.synoik_state().do_action(Action::OpenOverview, false);
-            f.settle_animations();
+            f.settle();
             best_of(&mut f, 2);
             let s = best_of(&mut f, 5);
             row(label, out, s);
@@ -539,7 +539,7 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
             if let Some(mut f) = build_scene(out, n, blur) {
                 if open {
                     f.synoik_state().do_action(Action::OpenOverview, false);
-                    f.settle_animations();
+                    f.settle();
                 }
                 best_of(&mut f, 2);
                 let s = best_of(&mut f, 5);
@@ -557,7 +557,7 @@ fn perf_probe_what_does_the_overview_frame_scale_with() {
     for fourcc in [Fourcc::Abgr8888, Fourcc::Argb8888] {
         if let Some(mut f) = build(out, 4) {
             f.synoik_state().do_action(Action::OpenOverview, false);
-            f.settle_animations();
+            f.settle();
             best_of(&mut f, 2);
             match best_of_dmabuf(&mut f, out, fourcc, 5) {
                 Some(s) => row(&format!("  dmabuf {fourcc:?}"), out, s),
@@ -742,7 +742,7 @@ fn perf_probe_what_does_a_draw_call_cost() {
             break;
         }
         f.synoik_state().do_action(Action::OpenOverview, false);
-        f.settle_animations();
+        f.settle();
         let mut samples: Vec<(Duration, u64, u64)> = Vec::new();
         for _ in 0..REPEATS {
             if let Some(s) = render_once_gpu(&mut f) {
@@ -986,7 +986,7 @@ fn perf_probe_what_does_an_app_catalog_reload_cost() {
     // With only the dash on screen the sweep prices 8 favourites; the app grid is where the
     // catalog's icons actually are, and it is the surface a reload has the most to redraw.
     f.synoik().layout.open_app_grid();
-    f.settle_animations();
+    f.settle();
     // Warm up with no worker wired, so `buffer()` decodes inline and the icons are actually on the
     // GPU before anything is measured. Wiring the worker first would mean every frame here merely
     // *enqueued* a decode nobody answers, and the sweep would price an empty dash.

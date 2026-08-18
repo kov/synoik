@@ -256,7 +256,12 @@ impl Fixture {
     pub fn run_until_settled(&mut self, max_frames: usize) -> bool {
         const FRAME: Duration = Duration::from_micros(16_667);
 
+        // Freezing is how the frames get a size that is a property of the test rather than of the
+        // machine, but it must not outlive the call: a caller that never froze goes on to expect a
+        // clock that follows real time, and calloop-timer behaviour would silently never fire.
+        let was_frozen = self.synoik().clock.is_frozen();
         self.freeze_clock();
+        let mut settled = false;
         for _ in 0..max_frames {
             self.advance_clock(FRAME);
             self.dispatch();
@@ -268,10 +273,24 @@ impl Fixture {
                 self.advance_clock(FRAME);
                 self.dispatch();
                 self.refresh();
-                return true;
+                settled = true;
+                break;
             }
         }
-        false
+        if !was_frozen {
+            self.synoik().clock.unfreeze();
+        }
+        settled
+    }
+
+    /// [`run_until_settled`](Self::run_until_settled) with a generous cap, failing the test if the
+    /// transition never ends. This is the one to reach for: a test almost never wants to *tolerate*
+    /// a transition that will not finish.
+    pub fn settle(&mut self) {
+        assert!(
+            self.run_until_settled(600),
+            "transitions still running after 10s of frames",
+        );
     }
 
     /// Whether any monitor still has a transition running.

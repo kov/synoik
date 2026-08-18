@@ -236,7 +236,7 @@ fn the_effect_tracks_the_tile_through_a_resize() {
 
     let effect = f.client(id).set_blur_region(&surface, (0, 0, 400, 300));
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     // Settled: the effect covers the tile exactly.
@@ -406,7 +406,7 @@ fn a_resize_damages_the_ground_the_effect_vacated() {
 
     let effect = f.client(id).set_blur_region(&surface, (0, 0, 600, 500));
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     let output = f.synoik_output(1);
@@ -430,7 +430,7 @@ fn a_resize_damages_the_ground_the_effect_vacated() {
     f.client(id)
         .update_blur_region(&effect, &surface, (0, 0, 300, 250));
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     let (damage, after) = sample_with_damage(&mut f, &mut tracker);
@@ -508,7 +508,7 @@ fn the_capture_grabs_the_rect_the_effect_is_drawn_at() {
 
     let effect = f.client(id).set_blur_region(&surface, (0, 0, 400, 300));
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     let output = f.synoik_output(1);
@@ -646,7 +646,7 @@ fn moving_the_effect_recaptures_even_with_a_static_backdrop() {
 
     f.client(id).set_blur_region(&surface, (0, 0, 400, 300));
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     let output = f.synoik_output(1);
@@ -686,7 +686,7 @@ fn moving_the_effect_recaptures_even_with_a_static_backdrop() {
     f.synoik_state()
         .do_action(synoik_config::Action::CenterWindow, false);
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     let (captures, after) = render_frame(&mut f, &mut tracker);
@@ -768,7 +768,7 @@ fn a_subsurface_blur_region_blurs_that_subsurface() {
     // A synchronized subsurface only takes effect when the parent commits.
     f.client(id).window(&parent).commit();
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     // Half one: the protocol seam works. Walk the compositor's surface tree for the window and
@@ -891,7 +891,7 @@ fn a_color_scheme_flip_redraws_a_blurred_surface() {
 
     f.client(id).set_blur_region(&surface, (0, 0, 400, 300));
     f.double_roundtrip(id);
-    f.synoik_complete_animations();
+    f.settle();
     f.double_roundtrip(id);
 
     let output = f.synoik_output(1);

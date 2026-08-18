@@ -86,6 +86,13 @@ impl Clock {
         clock.inner.frozen = true;
     }
 
+    /// Whether the clock is frozen. A helper that freezes temporarily reads this first so it can
+    /// leave the clock as it found it — a test that froze deliberately must not be un-frozen by a
+    /// helper it called in the middle.
+    pub fn is_frozen(&self) -> bool {
+        self.inner.borrow().inner.frozen
+    }
+
     /// Let the clock follow the monotonic clock again. See [`freeze`](Self::freeze).
     pub fn unfreeze(&mut self) {
         let mut clock = self.inner.borrow_mut();
