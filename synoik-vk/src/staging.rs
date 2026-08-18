@@ -171,10 +171,31 @@ impl Drop for HostStaging {
 /// cover the ordinary case — a handful of shm surfaces at panel/menu sizes — in one allocation.
 const MIN_CHUNK: vk::DeviceSize = 4 << 20;
 
-/// Uploads larger than this get a chunk of their own, which dies with them instead of joining the
-/// pool. Grow-only is the right shape for a per-frame arena and the wrong one for a 48 MiB
-/// wallpaper: pooling that would pin the peak for the life of the session.
+/// Above this an upload gets a chunk sized to itself rather than sharing the ordinary arena, and
+/// that chunk is retired once it goes unused for [`OVERSIZED_IDLE_FRAMES`].
+///
+/// It used to mean something stronger — such a chunk was created, used once and freed, never
+/// joining the pool — on the reasoning that grow-only is the wrong shape for a 48 MiB wallpaper,
+/// which would pin the peak for the life of the session. True for a wallpaper, and wrong for the
+/// case that turned up in practice: a HiDPI **shm** client re-uploading tens of MiB on *every*
+/// commit re-created its chunk every frame. That is the same per-commit mappable-blob churn this
+/// whole type exists to stop (see [`StagingPool`], and `texture.rs`'s note on the session it
+/// killed), and it cost twice over — the create/allocate/map round trips, and then a memcpy into
+/// pages the host had never touched, which this VM serves at ~5 GB/s against ~56 GB/s warm.
+///
+/// So size decides the chunk's *shape*, and idleness decides its *lifetime*. A streaming client
+/// keeps its chunk warm; a wallpaper's is handed back a second later.
 const MAX_POOLED_CHUNK: vk::DeviceSize = 16 << 20;
+
+/// How long an oversized chunk survives without being used, in frames. At 60 Hz this is about a
+/// second — long enough that a client which merely paused between commits keeps its warm mapping,
+/// short enough that a one-off upload's peak is not still held when the next one arrives.
+const OVERSIZED_IDLE_FRAMES: u32 = 60;
+
+/// Oversized chunk capacities are rounded up to a multiple of this, so a client whose buffer grows
+/// by a few rows — a window being resized — reuses its chunk instead of allocating a new one and
+/// leaving the old to idle out.
+const OVERSIZED_GRANULARITY: vk::DeviceSize = 4 << 20;
 
 /// How many chunks the pool keeps. It only needs more than one while an earlier frame's submit is
 /// still reading the previous chunk, so this is already generous; past it, free chunks are dropped
@@ -267,17 +288,27 @@ impl StagingChunk {
         &self.gpu.device
     }
 
-    /// Copy `data` in at `offset`.
+    /// Hand `fill` the mapped bytes at `offset..offset + len` to write in place.
+    ///
+    /// This exists so a producer whose pixels are not already a contiguous slice — an shm pool with
+    /// a stride, rows to be repacked — writes them **once**, straight into the mapping, instead of
+    /// building a `Vec` first and copying that in. On a client shipping tens of MiB per commit the
+    /// intermediate was the larger half of the cost: a fresh allocation and a full copy into
+    /// never-touched pages, on the compositor thread, per frame.
     ///
     /// # Safety
-    /// `offset + data.len()` must be within `capacity`, and no GPU read of that range may be in
-    /// flight. [`StagingPool::stage`] is the only caller and establishes both: it bump-allocates
-    /// the range and only rewinds a chunk nothing else references.
-    unsafe fn write_at(&self, offset: vk::DeviceSize, data: &[u8]) {
+    /// `offset + len` must be within `capacity` and no GPU read of that range may be in flight —
+    /// [`StagingPool::stage_with`] is the only caller and establishes both, bump-allocating the
+    /// range and only rewinding a chunk nothing else references. Additionally, `fill` must write
+    /// **every** byte of the slice and must not read from it. The mapping is device memory whose
+    /// contents are whatever the last upload left (or nothing at all, for a fresh chunk), so a
+    /// byte `fill` skips is uploaded as garbage rather than as zero.
+    unsafe fn fill_at(&self, offset: vk::DeviceSize, len: usize, fill: impl FnOnce(&mut [u8])) {
         let _timed = crate::stats::staging_write();
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(offset as usize), data.len());
-        }
+        // SAFETY: the caller guarantees the range is inside the mapping and unread by the GPU; the
+        // mapping outlives the borrow, which does not escape `fill`.
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.ptr.add(offset as usize), len) };
+        fill(dst);
     }
 }
 
@@ -311,12 +342,21 @@ impl Drop for StagingChunk {
 /// are — which is exactly what rewinding a whole chunk needs.
 pub struct StagingPool {
     /// Every chunk the pool owns. Small: one in the steady state, more only while an in-flight
-    /// submit still holds the previous one.
-    chunks: Vec<Arc<StagingChunk>>,
+    /// submit still holds the previous one, or while a client streams buffers too big to share.
+    chunks: Vec<PooledChunk>,
     /// Index into `chunks` of the chunk being filled, and how much of it is spoken for.
     current: Option<usize>,
     used: vk::DeviceSize,
     align: vk::DeviceSize,
+}
+
+/// A chunk and how long it has gone unused, which is what [`StagingPool::end_frame`] retires
+/// oversized chunks on.
+struct PooledChunk {
+    chunk: Arc<StagingChunk>,
+    /// Frames since this chunk last served an upload. Ordinary chunks ignore it — they are small,
+    /// and keeping one costs less than deciding not to.
+    idle_frames: u32,
 }
 
 impl StagingPool {
@@ -337,40 +377,70 @@ impl StagingPool {
         gpu: &Arc<Gpu>,
         data: &[u8],
     ) -> Result<(Arc<StagingChunk>, vk::DeviceSize)> {
-        let len = data.len() as vk::DeviceSize;
-        assert!(len > 0, "staging an empty upload");
+        self.stage_with(gpu, data.len() as vk::DeviceSize, |dst| {
+            dst.copy_from_slice(data)
+        })
+    }
 
-        // Too big to pool: a dedicated chunk, owned entirely by its upload and freed with it.
-        if len > MAX_POOLED_CHUNK {
-            let chunk = Arc::new(StagingChunk::new(gpu, len)?);
-            unsafe { chunk.write_at(0, data) };
-            return Ok((chunk, 0));
-        }
+    /// Reserve `len` bytes and let `fill` write them straight into the mapping.
+    ///
+    /// The general form of [`Self::stage`], for a producer whose bytes are not already contiguous:
+    /// an shm pool with a stride repacks its rows directly here rather than into a `Vec` that is
+    /// then copied in. `fill` must write every byte and must not read them — see
+    /// [`StagingChunk::fill_at`].
+    pub fn stage_with(
+        &mut self,
+        gpu: &Arc<Gpu>,
+        len: vk::DeviceSize,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<(Arc<StagingChunk>, vk::DeviceSize)> {
+        assert!(len > 0, "staging an empty upload");
 
         // Rewind: the chunk we were filling is free the moment nothing else references it — no
         // queued upload, no in-flight record — so the GPU cannot be reading it either. This is the
         // steady state, and it is why one chunk serves a whole session.
         if let Some(index) = self.current {
-            if Arc::strong_count(&self.chunks[index]) == 1 {
+            if Arc::strong_count(&self.chunks[index].chunk) == 1 {
                 self.used = 0;
             }
         }
 
+        // An upload too big to share sits alone in a chunk sized to it, so it never partly fills
+        // one the next upload then has to grow past. It still joins the pool: a client that ships
+        // one of these per commit needs its mapping *kept*, and `end_frame` is what hands it back
+        // when the client stops.
+        let oversized = len > MAX_POOLED_CHUNK;
+        let fits = |chunk: &PooledChunk, used: vk::DeviceSize| {
+            if oversized {
+                chunk.chunk.capacity() >= len
+            } else {
+                used + len <= chunk.chunk.capacity()
+            }
+        };
+
         let index = match self.current {
-            Some(index) if self.used + len <= self.chunks[index].capacity() => index,
-            // The current chunk is full (or there isn't one) while an earlier frame still holds
-            // it: take a free chunk that fits, or make one.
+            Some(index) if !oversized && fits(&self.chunks[index], self.used) => index,
+            // The current chunk is full (or there isn't one, or this upload wants one to itself)
+            // while an earlier frame still holds it: take a free chunk that fits, or make one.
             _ => {
                 let free = self
                     .chunks
                     .iter()
-                    .position(|chunk| Arc::strong_count(chunk) == 1 && chunk.capacity() >= len);
+                    .position(|chunk| Arc::strong_count(&chunk.chunk) == 1 && fits(chunk, 0));
                 let index = match free {
                     Some(index) => index,
                     None => {
                         self.sweep();
-                        let chunk = StagingChunk::new(gpu, len.max(MIN_CHUNK))?;
-                        self.chunks.push(Arc::new(chunk));
+                        let capacity = if oversized {
+                            len.next_multiple_of(OVERSIZED_GRANULARITY)
+                        } else {
+                            len.max(MIN_CHUNK)
+                        };
+                        let chunk = StagingChunk::new(gpu, capacity)?;
+                        self.chunks.push(PooledChunk {
+                            chunk: Arc::new(chunk),
+                            idle_frames: 0,
+                        });
                         self.chunks.len() - 1
                     }
                 };
@@ -381,13 +451,45 @@ impl StagingPool {
         };
 
         let offset = self.used;
-        unsafe { self.chunks[index].write_at(offset, data) };
+        let entry = &mut self.chunks[index];
+        entry.idle_frames = 0;
+        // SAFETY: `offset + len` is within capacity — either bump-allocated inside the current
+        // chunk or offset 0 of one sized to fit — and the chunk is either freshly created or one
+        // nothing else references, so no GPU read of the range is in flight.
+        unsafe { entry.chunk.fill_at(offset, len as usize, fill) };
         // Bump past this upload, aligned for the next `bufferOffset`. Saturating at the capacity
         // keeps the arithmetic honest when the last upload ends flush with the end of the chunk.
         self.used = (offset + len)
             .next_multiple_of(self.align)
-            .min(self.chunks[index].capacity());
-        Ok((self.chunks[index].clone(), offset))
+            .min(entry.chunk.capacity());
+        Ok((entry.chunk.clone(), offset))
+    }
+
+    /// Age the pool by one frame, retiring oversized chunks nothing has wanted for
+    /// [`OVERSIZED_IDLE_FRAMES`].
+    ///
+    /// Called once per frame from the render path. Without it an oversized chunk would be pinned
+    /// for the session — the very thing that made these dedicated-and-freed in the first place —
+    /// and with it a client that streams them keeps its mapping warm for as long as it is
+    /// streaming, which is the whole point.
+    pub fn end_frame(&mut self) {
+        let mut retired = false;
+        for entry in &mut self.chunks {
+            entry.idle_frames = entry.idle_frames.saturating_add(1);
+        }
+        let current = self
+            .current
+            .map(|index| Arc::as_ptr(&self.chunks[index].chunk));
+        self.chunks.retain(|entry| {
+            let keep = entry.chunk.capacity() <= MAX_POOLED_CHUNK
+                || entry.idle_frames <= OVERSIZED_IDLE_FRAMES
+                || Arc::strong_count(&entry.chunk) > 1;
+            retired |= !keep;
+            keep
+        });
+        if retired {
+            self.reindex(current);
+        }
     }
 
     /// Drop free chunks once the pool has grown past [`MAX_POOLED_CHUNKS`], before adding another.
@@ -397,14 +499,23 @@ impl StagingPool {
         if self.chunks.len() < MAX_POOLED_CHUNKS {
             return;
         }
-        let current = self.current.map(|index| Arc::as_ptr(&self.chunks[index]));
-        self.chunks
-            .retain(|chunk| Arc::strong_count(chunk) > 1 || Some(Arc::as_ptr(chunk)) == current);
-        // The indices just moved.
+        let current = self
+            .current
+            .map(|index| Arc::as_ptr(&self.chunks[index].chunk));
+        self.chunks.retain(|entry| {
+            Arc::strong_count(&entry.chunk) > 1 || Some(Arc::as_ptr(&entry.chunk)) == current
+        });
+        self.reindex(current);
+    }
+
+    /// Re-find `current` after a retain moved the indices, and forget the fill offset if the chunk
+    /// it referred to is gone — a stale `used` against a different chunk would hand out an offset
+    /// into the middle of someone else's bytes.
+    fn reindex(&mut self, current: Option<*const StagingChunk>) {
         self.current = current.and_then(|ptr| {
             self.chunks
                 .iter()
-                .position(|chunk| Arc::as_ptr(chunk) == ptr)
+                .position(|entry| Arc::as_ptr(&entry.chunk) == ptr)
         });
         if self.current.is_none() {
             self.used = 0;
@@ -487,15 +598,22 @@ mod tests {
         assert_eq!(pool.chunk_count(), 1);
     }
 
-    /// An upload too big to pool gets a chunk of its own, and that chunk leaves with it.
+    /// An upload too big to share gets a chunk of its own, and keeps it while it is still being
+    /// used — a streaming client's mapping must stay warm.
     ///
-    /// Grow-only is right for a per-frame arena and wrong for a wallpaper: pooling a 48 MiB upload
-    /// would pin its peak for the life of the session, for a buffer nothing that size will use
-    /// again.
+    /// This replaces a rule that said the opposite: such a chunk used to be created, used once and
+    /// freed, so that a 48 MiB wallpaper could not pin its peak for the session. That was right
+    /// about the wallpaper and wrong about a HiDPI shm client, which re-uploads tens of MiB on
+    /// *every* commit and so re-created its chunk every frame — the per-commit mappable-blob churn
+    /// [`a_pool_rewinds_instead_of_allocating`] exists to forbid, plus a memcpy into cold pages at
+    /// a tenth of the warm rate. Lifetime is now decided by idleness instead; see
+    /// [`a_pool_retires_an_oversized_chunk_that_goes_idle`] for the wallpaper half.
     #[test]
-    fn a_pool_does_not_keep_oversized_chunks() {
+    fn a_pool_keeps_an_oversized_chunk_a_client_keeps_using() {
         let Ok(gpu) = Gpu::new() else {
-            eprintln!("skipping a_pool_does_not_keep_oversized_chunks: no Vulkan device");
+            eprintln!(
+                "skipping a_pool_keeps_an_oversized_chunk_a_client_keeps_using: no Vulkan device"
+            );
             return;
         };
         let gpu = Arc::new(gpu);
@@ -504,16 +622,98 @@ mod tests {
         let huge = vec![0u8; (MAX_POOLED_CHUNK + 4096) as usize];
         let (chunk, offset) = pool.stage(&gpu, &huge).expect("stage");
         assert_eq!(offset, 0);
-        assert_eq!(
-            chunk.capacity(),
-            huge.len() as vk::DeviceSize,
-            "sized to the upload"
+        assert!(
+            chunk.capacity() >= huge.len() as vk::DeviceSize,
+            "sized to the upload",
         );
-        assert_eq!(pool.chunk_count(), 0, "the pool must not retain it");
+        assert_eq!(pool.chunk_count(), 1, "the pool must retain it");
+        let first = chunk.buffer();
         drop(chunk);
 
-        // And an ordinary upload afterwards still gets a pooled chunk.
+        // A client committing every frame must land in the same buffer every time — that is what
+        // keeps the mapping warm, and what stops the per-commit blob churn.
+        for frame in 0..8 {
+            pool.end_frame();
+            let (chunk, offset) = pool.stage(&gpu, &huge).expect("stage");
+            assert_eq!(offset, 0);
+            assert_eq!(chunk.buffer(), first, "frame {frame} allocated a new chunk");
+            assert_eq!(pool.chunk_count(), 1, "frame {frame} grew the pool");
+        }
+    }
+
+    /// ...and gives it back once nothing wants it, so a one-off upload does not pin its peak.
+    #[test]
+    fn a_pool_retires_an_oversized_chunk_that_goes_idle() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!(
+                "skipping a_pool_retires_an_oversized_chunk_that_goes_idle: no Vulkan device"
+            );
+            return;
+        };
+        let gpu = Arc::new(gpu);
+        let mut pool = StagingPool::new(&gpu);
+
+        let huge = vec![0u8; (MAX_POOLED_CHUNK + 4096) as usize];
+        let (chunk, _) = pool.stage(&gpu, &huge).expect("stage");
+        assert_eq!(pool.chunk_count(), 1);
+
+        // While the upload is still in flight the chunk is not the pool's to drop, however idle.
+        for _ in 0..=OVERSIZED_IDLE_FRAMES + 1 {
+            pool.end_frame();
+        }
+        assert_eq!(
+            pool.chunk_count(),
+            1,
+            "a chunk an in-flight upload still reads must survive its idle window",
+        );
+
+        drop(chunk);
+        for _ in 0..=OVERSIZED_IDLE_FRAMES {
+            pool.end_frame();
+        }
+        assert_eq!(
+            pool.chunk_count(),
+            0,
+            "an idle oversized chunk must be retired"
+        );
+
+        // An ordinary upload afterwards still gets a pooled chunk, and keeps it: only oversized
+        // chunks are worth retiring.
         let (_chunk, _) = pool.stage(&gpu, &[0u8; 4096]).expect("stage");
         assert_eq!(pool.chunk_count(), 1);
+        for _ in 0..=OVERSIZED_IDLE_FRAMES * 2 {
+            pool.end_frame();
+        }
+        assert_eq!(
+            pool.chunk_count(),
+            1,
+            "an ordinary chunk is never retired on idleness"
+        );
+    }
+
+    /// `stage_with` writes through to the same bytes `stage` would have, and does it in place.
+    ///
+    /// The shm path's whole reason for existing: the pixels reach the mapping without a `Vec` in
+    /// between. If the fill were handed a scratch buffer that was then copied, this would still
+    /// pass — so it also pins that a *partial* fill leaves the rest of the range alone, which is
+    /// what makes "the callback must write every byte" a real contract rather than a wish.
+    #[test]
+    fn stage_with_fills_the_mapping_in_place() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("skipping stage_with_fills_the_mapping_in_place: no Vulkan device");
+            return;
+        };
+        let gpu = Arc::new(gpu);
+        let mut pool = StagingPool::new(&gpu);
+
+        let (chunk, offset) = pool
+            .stage_with(&gpu, 8, |dst| {
+                assert_eq!(dst.len(), 8, "the fill sees exactly what it reserved");
+                dst.copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            })
+            .expect("stage_with");
+        // SAFETY: the mapping is live for the chunk's life and this range was just written.
+        let written = unsafe { std::slice::from_raw_parts(chunk.ptr.add(offset as usize), 8) };
+        assert_eq!(written, &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
 }

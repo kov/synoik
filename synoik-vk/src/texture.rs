@@ -320,8 +320,27 @@ impl StagedTexture {
             "re-upload data is {} bytes for {width}x{height}, need {size}",
             data.len(),
         );
+        Self::reupload_32bpp_with(gpu, pool, image, width, height, |dst| {
+            dst.copy_from_slice(data)
+        })
+    }
+
+    /// [`Self::reupload_32bpp`] for a producer whose pixels are not one contiguous slice.
+    ///
+    /// `fill` is handed the `width*height*4` staging bytes to write in place — an shm pool with a
+    /// stride repacks its rows straight in, rather than into a `Vec` that is then copied. It must
+    /// write every byte and must not read them; see [`crate::staging::StagingPool::stage_with`].
+    pub fn reupload_32bpp_with(
+        gpu: &Arc<Gpu>,
+        pool: &mut StagingPool,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<Self> {
+        let size = (width as vk::DeviceSize) * (height as vk::DeviceSize) * 4;
         crate::stats::uploaded(size);
-        let (chunk, offset) = pool.stage(gpu, data)?;
+        let (chunk, offset) = pool.stage_with(gpu, size, fill)?;
         Ok(StagedTexture {
             source: StagedSource::Pool(chunk, offset),
             image,
