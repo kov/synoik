@@ -691,12 +691,15 @@ mod tests {
         );
     }
 
-    /// `stage_with` writes through to the same bytes `stage` would have, and does it in place.
+    /// `stage_with`'s callback writes **into the mapping itself**, not into a scratch buffer that
+    /// is then copied in.
     ///
-    /// The shm path's whole reason for existing: the pixels reach the mapping without a `Vec` in
-    /// between. If the fill were handed a scratch buffer that was then copied, this would still
-    /// pass — so it also pins that a *partial* fill leaves the rest of the range alone, which is
-    /// what makes "the callback must write every byte" a real contract rather than a wish.
+    /// The distinction is the whole point of the API — one pass over the pixels instead of two —
+    /// and it is also what makes "the callback must write every byte" a safety contract rather
+    /// than a style note: the bytes a fill skips are whatever the *last* upload left there. So
+    /// this stages twice into the same rewound chunk, writes only half the second time, and reads
+    /// back the first upload's bytes underneath. A scratch-buffer implementation would hand back
+    /// zeroes (or fresh garbage) there and fail.
     #[test]
     fn stage_with_fills_the_mapping_in_place() {
         let Ok(gpu) = Gpu::new() else {
@@ -712,8 +715,21 @@ mod tests {
                 dst.copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
             })
             .expect("stage_with");
-        // SAFETY: the mapping is live for the chunk's life and this range was just written.
+        assert_eq!(offset, 0);
+        // Dropping it frees the range for the rewind, exactly as a retired submit does.
+        drop(chunk);
+
+        let (chunk, offset) = pool
+            .stage_with(&gpu, 8, |dst| dst[..4].copy_from_slice(&[9, 9, 9, 9]))
+            .expect("stage_with");
+        assert_eq!(offset, 0, "the pool must have rewound onto the same bytes");
+        // SAFETY: the mapping is live for the chunk's life and this range was just staged.
         let written = unsafe { std::slice::from_raw_parts(chunk.ptr.add(offset as usize), 8) };
-        assert_eq!(written, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            written,
+            &[9, 9, 9, 9, 5, 6, 7, 8],
+            "the unwritten half must still hold the previous upload — the fill's destination is \
+             the mapping, and a byte it skips is a stale pixel rather than a zero",
+        );
     }
 }
