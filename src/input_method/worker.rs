@@ -104,13 +104,17 @@ async fn run(
 /// its name yet; the redial loop is what waits for that.
 async fn revive() -> bool {
     match start_unit().await {
-        Ok(()) => {
+        UnitStart::Started => {
             tracing::info!("started {IBUS_UNIT} to bring the input method back");
             return true;
         }
-        // Every distro that ships the unit is served above. Anything else — no unit, no systemd,
-        // no session bus — falls through to gnome-shell's own spawn.
-        Err(err) => tracing::debug!("could not start {IBUS_UNIT}: {err:?}"),
+        // The unit exists and systemd said no — masked, or past its start limit. Both are an
+        // administrator's or systemd's decision about this seat's input method, and spawning the
+        // daemon behind them would override it. gnome-shell has the same rule from the other
+        // side: where the unit exists it *never* spawns the daemon itself.
+        UnitStart::Refused => return false,
+        // No unit, no systemd, no session bus: the distro gnome-shell's own spawn exists for.
+        UnitStart::NotInstalled => {}
     }
 
     // `--panel disable`, exactly as gnome-shell spawns it (`ibusManager.js:112`): the panel is
@@ -129,27 +133,64 @@ async fn revive() -> bool {
             true
         }
         Err(err) => {
-            tracing::warn!("could not start an input method daemon: {err}");
+            // A seat with no ibus installed at all is a perfectly ordinary configuration, and
+            // this loop runs forever: say it once at `warn`, then stop shouting about it.
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::debug!("could not start an input method daemon: {err}");
+            } else {
+                tracing::warn!("could not start an input method daemon: {err}");
+            }
             false
         }
     }
 }
 
-/// `StartUnit` on the systemd *user* manager. Fails when the unit is not installed, which is the
-/// case gnome-shell's spawn path exists for.
-async fn start_unit() -> anyhow::Result<()> {
-    let conn = zbus::Connection::session().await?;
-    let manager = zbus::Proxy::new(
-        &conn,
-        "org.freedesktop.systemd1",
-        "/org/freedesktop/systemd1",
-        "org.freedesktop.systemd1.Manager",
-    )
-    .await?;
-    // "replace" is systemd's ordinary queueing mode, and what `systemctl start` uses.
-    let _job: zbus::zvariant::OwnedObjectPath =
-        manager.call("StartUnit", &(IBUS_UNIT, "replace")).await?;
-    Ok(())
+/// What `StartUnit` said, reduced to the three answers that lead anywhere different.
+enum UnitStart {
+    /// systemd took the job.
+    Started,
+    /// There is no such unit here, or no systemd to ask.
+    NotInstalled,
+    /// The unit exists and systemd declined to start it.
+    Refused,
+}
+
+/// `StartUnit` on the systemd *user* manager.
+async fn start_unit() -> UnitStart {
+    let call = async {
+        let conn = zbus::Connection::session().await?;
+        let manager = zbus::Proxy::new(
+            &conn,
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+        )
+        .await?;
+        // "replace" is systemd's ordinary queueing mode, and what `systemctl start` uses.
+        let job: zbus::zvariant::OwnedObjectPath =
+            manager.call("StartUnit", &(IBUS_UNIT, "replace")).await?;
+        Ok::<_, zbus::Error>(job)
+    };
+
+    let err = match call.await {
+        Ok(_job) => return UnitStart::Started,
+        Err(err) => err,
+    };
+    tracing::debug!("could not start {IBUS_UNIT}: {err:?}");
+
+    match &err {
+        // A distro that does not ship the unit, and a session where systemd is not on the bus
+        // at all: both are "ask someone else", which is the spawn.
+        zbus::Error::MethodError(name, _, _) => match name.as_str() {
+            "org.freedesktop.systemd1.NoSuchUnit" | "org.freedesktop.DBus.Error.ServiceUnknown" => {
+                UnitStart::NotInstalled
+            }
+            _ => UnitStart::Refused,
+        },
+        // No session bus to ask.
+        _ => UnitStart::NotInstalled,
+    }
 }
 
 /// One connection's lifetime. `Ok(())` means a clean shutdown; any error is a reason to redial.
