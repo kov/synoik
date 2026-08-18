@@ -333,6 +333,10 @@ pub struct VulkanRenderer {
     /// [`synoik_vk::staging::StagingPool`] — the per-upload version ran the Venus host out of
     /// blobs two minutes into a live session.
     staging_pool: synoik_vk::staging::StagingPool,
+    /// When the staging pool was last aged. The pool retires an idle oversized chunk on a wall
+    /// clock, and this is the clock — it lives here because the pool takes a duration, so its
+    /// behaviour stays a pure function of what it is handed.
+    staging_pool_aged: Option<std::time::Instant>,
 }
 
 /// A blur waiting for a frame to record it, with everything it names held alive.
@@ -638,6 +642,7 @@ impl VulkanRenderer {
             pending_blurs: Vec::new(),
             pending_sampleable: Vec::new(),
             staging_pool,
+            staging_pool_aged: None,
         })
     }
 
@@ -3184,7 +3189,12 @@ impl VulkanRenderer {
     /// [`synoik_vk::staging::StagingPool::end_frame`]. Called from `VulkanFrame::begin`, once the
     /// frame's uploads have taken what they need.
     pub(super) fn age_staging_pool(&mut self) {
-        self.staging_pool.end_frame();
+        let now = std::time::Instant::now();
+        let elapsed = self
+            .staging_pool_aged
+            .map_or(std::time::Duration::ZERO, |last| now - last);
+        self.staging_pool_aged = Some(now);
+        self.staging_pool.end_frame(elapsed);
     }
 
     #[cfg(test)]

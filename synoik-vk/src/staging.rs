@@ -32,6 +32,7 @@
 //! [`HostStaging::belongs_to`] before uploading from it.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ash::vk;
@@ -172,7 +173,7 @@ impl Drop for HostStaging {
 const MIN_CHUNK: vk::DeviceSize = 4 << 20;
 
 /// Above this an upload gets a chunk sized to itself rather than sharing the ordinary arena, and
-/// that chunk is retired once it goes unused for [`OVERSIZED_IDLE_FRAMES`].
+/// that chunk is retired once it goes unused for [`OVERSIZED_IDLE`].
 ///
 /// It used to mean something stronger — such a chunk was created, used once and freed, never
 /// joining the pool — on the reasoning that grow-only is the wrong shape for a 48 MiB wallpaper,
@@ -187,10 +188,18 @@ const MIN_CHUNK: vk::DeviceSize = 4 << 20;
 /// keeps its chunk warm; a wallpaper's is handed back a second later.
 const MAX_POOLED_CHUNK: vk::DeviceSize = 16 << 20;
 
-/// How long an oversized chunk survives without being used, in frames. At 60 Hz this is about a
-/// second — long enough that a client which merely paused between commits keeps its warm mapping,
-/// short enough that a one-off upload's peak is not still held when the next one arrives.
-const OVERSIZED_IDLE_FRAMES: u32 = 60;
+/// How long an oversized chunk survives without being used.
+///
+/// **Wall clock, not frames.** Counting frames made a chunk's lifetime depend on how much
+/// *unrelated* drawing happened in between: a client repainting on focus changes ~85 frames apart
+/// lost its chunk on an otherwise-quiet session, and kept it on a busy one only because small
+/// uploads landed in the same chunk and reset the count. A busy session aged it faster, which is
+/// backwards — what decides whether the mapping is still wanted is how long ago its client last
+/// committed, and that is a duration.
+///
+/// Two seconds spans the cadence that matters (a repaint per focus change) without holding a
+/// one-off wallpaper's peak until the next one arrives.
+const OVERSIZED_IDLE: Duration = Duration::from_secs(2);
 
 /// Oversized chunk capacities are rounded up to a multiple of this, so a client whose buffer grows
 /// by a few rows — a window being resized — reuses its chunk instead of allocating a new one and
@@ -348,15 +357,19 @@ pub struct StagingPool {
     current: Option<usize>,
     used: vk::DeviceSize,
     align: vk::DeviceSize,
+    /// How many chunks the pool has ever allocated. Monotonic, so it distinguishes a chunk that
+    /// was *kept* from one that was retired and replaced — Vulkan recycles buffer handles, so
+    /// the handle cannot tell those apart.
+    allocations: u64,
 }
 
 /// A chunk and how long it has gone unused, which is what [`StagingPool::end_frame`] retires
 /// oversized chunks on.
 struct PooledChunk {
     chunk: Arc<StagingChunk>,
-    /// Frames since this chunk last served an upload. Ordinary chunks ignore it — they are small,
-    /// and keeping one costs less than deciding not to.
-    idle_frames: u32,
+    /// How long since this chunk last served an upload. Ordinary chunks ignore it — they are
+    /// small, and keeping one costs less than deciding not to.
+    idle: Duration,
 }
 
 impl StagingPool {
@@ -366,6 +379,7 @@ impl StagingPool {
             current: None,
             used: 0,
             align: gpu.buffer_copy_offset_alignment,
+            allocations: 0,
         }
     }
 
@@ -437,9 +451,10 @@ impl StagingPool {
                             len.max(MIN_CHUNK)
                         };
                         let chunk = StagingChunk::new(gpu, capacity)?;
+                        self.allocations += 1;
                         self.chunks.push(PooledChunk {
                             chunk: Arc::new(chunk),
-                            idle_frames: 0,
+                            idle: Duration::ZERO,
                         });
                         self.chunks.len() - 1
                     }
@@ -452,7 +467,7 @@ impl StagingPool {
 
         let offset = self.used;
         let entry = &mut self.chunks[index];
-        entry.idle_frames = 0;
+        entry.idle = Duration::ZERO;
         // SAFETY: `offset + len` is within capacity — either bump-allocated inside the current
         // chunk or offset 0 of one sized to fit — and the chunk is either freshly created or one
         // nothing else references, so no GPU read of the range is in flight.
@@ -465,24 +480,24 @@ impl StagingPool {
         Ok((entry.chunk.clone(), offset))
     }
 
-    /// Age the pool by one frame, retiring oversized chunks nothing has wanted for
-    /// [`OVERSIZED_IDLE_FRAMES`].
+    /// Age the pool by `elapsed`, retiring oversized chunks nothing has wanted for
+    /// [`OVERSIZED_IDLE`].
     ///
-    /// Called once per frame from the render path. Without it an oversized chunk would be pinned
-    /// for the session — the very thing that made these dedicated-and-freed in the first place —
-    /// and with it a client that streams them keeps its mapping warm for as long as it is
-    /// streaming, which is the whole point.
-    pub fn end_frame(&mut self) {
+    /// Called once per frame from the render path, which owns the clock — the pool takes the
+    /// duration so its behaviour is a pure function of it. Without this an oversized chunk would be
+    /// pinned for the session — the very thing that made these dedicated-and-freed in the first
+    /// place — and with it a client keeps its mapping warm for as long as it keeps committing.
+    pub fn end_frame(&mut self, elapsed: Duration) {
         let mut retired = false;
         for entry in &mut self.chunks {
-            entry.idle_frames = entry.idle_frames.saturating_add(1);
+            entry.idle = entry.idle.saturating_add(elapsed);
         }
         let current = self
             .current
             .map(|index| Arc::as_ptr(&self.chunks[index].chunk));
         self.chunks.retain(|entry| {
             let keep = entry.chunk.capacity() <= MAX_POOLED_CHUNK
-                || entry.idle_frames <= OVERSIZED_IDLE_FRAMES
+                || entry.idle <= OVERSIZED_IDLE
                 || Arc::strong_count(&entry.chunk) > 1;
             retired |= !keep;
             keep
@@ -525,6 +540,11 @@ impl StagingPool {
     /// Chunks currently owned by the pool. For the tests that pin "N uploads, one allocation".
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    /// How many chunks this pool has allocated over its life. Reuse is this staying put.
+    pub fn allocations(&self) -> u64 {
+        self.allocations
     }
 }
 
@@ -633,12 +653,45 @@ mod tests {
         // A client committing every frame must land in the same buffer every time — that is what
         // keeps the mapping warm, and what stops the per-commit blob churn.
         for frame in 0..8 {
-            pool.end_frame();
+            pool.end_frame(Duration::from_micros(16_667));
             let (chunk, offset) = pool.stage(&gpu, &huge).expect("stage");
             assert_eq!(offset, 0);
             assert_eq!(chunk.buffer(), first, "frame {frame} allocated a new chunk");
             assert_eq!(pool.chunk_count(), 1, "frame {frame} grew the pool");
         }
+    }
+
+    /// A client that repaints on *focus changes* rather than every frame still finds its mapping.
+    /// The gap between two of its uploads is however many frames the session drew in between — a
+    /// switch animation plus a second of idle — and that number says nothing about whether the
+    /// chunk is still wanted.
+    #[test]
+    fn a_pool_keeps_an_oversized_chunk_across_the_gap_between_repaints() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!(
+                "skipping a_pool_keeps_an_oversized_chunk_across_the_gap_between_repaints: no Vulkan device"
+            );
+            return;
+        };
+        let gpu = Arc::new(gpu);
+        let mut pool = StagingPool::new(&gpu);
+
+        let huge = vec![0u8; (MAX_POOLED_CHUNK + 4096) as usize];
+        let (chunk, _) = pool.stage(&gpu, &huge).expect("stage");
+        drop(chunk);
+        assert_eq!(pool.allocations(), 1);
+
+        // Measured on the seat 2026-08-18: ~85 frames between two repaints of a Firefox chrome
+        // surface, driving a workspace switch every 1.6s. The frame count is the point — it must
+        // not be what decides, so the test spends it as ordinary vsync intervals.
+        for _ in 0..85 {
+            pool.end_frame(Duration::from_micros(16_667));
+        }
+
+        let (chunk, _) = pool.stage(&gpu, &huge).expect("stage");
+        drop(chunk);
+        assert_eq!(pool.allocations(), 1, "the repaint allocated a new chunk");
+        assert_eq!(pool.chunk_count(), 1, "the repaint grew the pool");
     }
 
     /// ...and gives it back once nothing wants it, so a one-off upload does not pin its peak.
@@ -658,9 +711,7 @@ mod tests {
         assert_eq!(pool.chunk_count(), 1);
 
         // While the upload is still in flight the chunk is not the pool's to drop, however idle.
-        for _ in 0..=OVERSIZED_IDLE_FRAMES + 1 {
-            pool.end_frame();
-        }
+        pool.end_frame(OVERSIZED_IDLE * 2);
         assert_eq!(
             pool.chunk_count(),
             1,
@@ -668,9 +719,7 @@ mod tests {
         );
 
         drop(chunk);
-        for _ in 0..=OVERSIZED_IDLE_FRAMES {
-            pool.end_frame();
-        }
+        pool.end_frame(OVERSIZED_IDLE + Duration::from_millis(1));
         assert_eq!(
             pool.chunk_count(),
             0,
@@ -681,9 +730,7 @@ mod tests {
         // chunks are worth retiring.
         let (_chunk, _) = pool.stage(&gpu, &[0u8; 4096]).expect("stage");
         assert_eq!(pool.chunk_count(), 1);
-        for _ in 0..=OVERSIZED_IDLE_FRAMES * 2 {
-            pool.end_frame();
-        }
+        pool.end_frame(OVERSIZED_IDLE * 4);
         assert_eq!(
             pool.chunk_count(),
             1,
