@@ -2270,6 +2270,10 @@ impl State {
 
         // Needs to be called after updating the keyboard focus.
         self.synoik.refresh_a11y();
+
+        // Last: everything above can change what the input method owes the focused client, and
+        // the whole point of deferring is that they are answered together.
+        self.flush_im_done();
     }
 
     /// Push the active keyboard-layout short label into the panel's `keyboard` indicator (GNOME's

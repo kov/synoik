@@ -291,8 +291,18 @@ pub struct InputMethod {
     /// Whether the worker has a live daemon. While false the key path behaves exactly as it does
     /// with no input method at all, rather than queueing keys nobody will answer for.
     connected: bool,
-    /// The preedit we last showed, so focus changes and resets can clear it.
+    /// The preedit the client should be showing, as a **byte** offset cursor beside it.
+    ///
+    /// Buffered rather than sent: it goes out at [`State::flush_im_done`] time, so a burst of
+    /// engine events between two dispatches costs one `preedit_string`, not one each.
     preedit: Option<String>,
+    preedit_cursor: u32,
+    /// Whether the preedit changed since it was last sent. Mirrors mutter's `preedit.changed`:
+    /// together with "is there a string" it is what decides whether `preedit_string` is worth
+    /// sending at all (`clutter_input_focus_send_done`, `meta-wayland-text-input.c:194`).
+    preedit_changed: bool,
+    /// A `done` the client is owed. See [`State::flush_im_done`].
+    done_pending: bool,
     /// The content type last sent, as `(purpose, hints)`, so a reconnect can replay it. A new
     /// input context defaults to free-form, and letting a **password** field silently become
     /// free-form after a daemon restart is the one mistake here that matters.
@@ -338,6 +348,9 @@ impl InputMethod {
             focus: ImFocus::None,
             connected: false,
             preedit: None,
+            preedit_cursor: 0,
+            preedit_changed: false,
+            done_pending: false,
             content_type: (ibus::purpose::FREE_FORM, 0),
             pending: VecDeque::new(),
             next_key_id: 0,
@@ -1104,6 +1117,9 @@ impl State {
             .as_ref()
             .is_some_and(|im| im.preedit.is_some());
 
+        // Finished text goes out at once — only the `done` that seals it is deferred. mutter
+        // splits it the same way (`meta_wayland_text_input_focus_commit_text` sends both, then
+        // calls `..._defer_done`).
         self.synoik
             .seat
             .text_input()
@@ -1113,10 +1129,13 @@ impl State {
                 }
                 ti.commit_string(Some(text.to_owned()));
             });
-        self.synoik.seat.text_input().done(false);
 
         if let Some(im) = self.synoik.input_method.as_mut() {
+            // Sent explicitly just now, so the buffer owes the client nothing.
             im.preedit = None;
+            im.preedit_cursor = 0;
+            im.preedit_changed = false;
+            im.done_pending = true;
         }
     }
 
@@ -1181,19 +1200,11 @@ impl State {
             return;
         }
 
-        let payload = text.clone();
-        self.synoik
-            .seat
-            .text_input()
-            .with_active_text_input(|ti, _surface| {
-                // Both cursor ends are the same offset: gnome-shell never renders a preedit
-                // selection (`inputMethod.js:169`, `const anchor = pos`).
-                ti.preedit_string(payload.clone(), cursor as i32, cursor as i32);
-            });
-        self.synoik.seat.text_input().done(false);
-
         if let Some(im) = self.synoik.input_method.as_mut() {
             im.preedit = text;
+            im.preedit_cursor = cursor;
+            im.preedit_changed = true;
+            im.done_pending = true;
         }
     }
 
@@ -1242,7 +1253,51 @@ impl State {
             .with_active_text_input(|ti, _surface| {
                 ti.delete_surrounding_text(before_length, after_length);
             });
-        self.synoik.seat.text_input().done(false);
+        if let Some(im) = self.synoik.input_method.as_mut() {
+            im.done_pending = true;
+        }
+    }
+
+    /// Send the client the `done` it is owed, with any buffered preedit ahead of it.
+    ///
+    /// **One `done` per event-loop iteration, however many engine events arrived.** This is the
+    /// port of mutter's `meta_wayland_text_input_focus_defer_done`
+    /// (`meta-wayland-text-input.c:245-262`), which posts a `g_idle_add_full` at
+    /// `CLUTTER_PRIORITY_EVENTS + 1` for exactly this reason — its comment: "IM operations come as
+    /// individual ClutterEvents. We want to run .done after them all." Our `refresh()` runs after
+    /// every dispatch, so it is the same slot.
+    ///
+    /// Coalescing here is not a nicety. Sending a `done` per engine event turns a client that
+    /// toggles its text input into a **feedback loop**: each `done` reaches the toolkit as a text
+    /// editing event, the client reacts by toggling again, and the pair resonate as fast as the
+    /// CPU allows. Measured 2026-08-18 on a live session: wesnoth at 3,500 disable/enable cycles a
+    /// second, 35k text-input messages in one second, `ibus-daemon` pinned at 100% of a core.
+    /// The client's toggle is the client's bug; the resonance was ours.
+    pub(crate) fn flush_im_done(&mut self) {
+        let Some(im) = self.synoik.input_method.as_mut() else {
+            return;
+        };
+        if !im.done_pending {
+            return;
+        }
+        im.done_pending = false;
+
+        // Nothing to say about a preedit that is absent and unchanged — the same guard mutter
+        // applies at `meta-wayland-text-input.c:194`.
+        let preedit = (im.preedit.is_some() || im.preedit_changed).then(|| {
+            im.preedit_changed = false;
+            (im.preedit.clone(), im.preedit_cursor)
+        });
+
+        let text_input = self.synoik.seat.text_input();
+        if let Some((text, cursor)) = preedit {
+            text_input.with_active_text_input(|ti, _surface| {
+                // Both cursor ends are the same offset: gnome-shell never renders a preedit
+                // selection (`inputMethod.js:169`, `const anchor = pos`).
+                ti.preedit_string(text.clone(), cursor as i32, cursor as i32);
+            });
+        }
+        text_input.done(false);
     }
 }
 

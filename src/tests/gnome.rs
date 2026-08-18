@@ -4249,6 +4249,115 @@ fn a_dropped_request_is_resynced_once_the_queue_drains() {
     );
 }
 
+/// A burst of engine output costs the client one `done`, not one per event.
+///
+/// This is the resonance guard. A client that toggles its text input in reaction to `done` — SDL
+/// does, so wesnoth does — turns a `done`-per-event compositor into a feedback loop that runs at
+/// CPU speed: measured 2026-08-18 at 3,500 disable/enable cycles a second with `ibus-daemon` at
+/// 100% of a core. mutter coalesces to one `done` per main-loop iteration
+/// (`meta_wayland_text_input_focus_defer_done`) and never resonates.
+#[test]
+fn a_burst_of_engine_output_costs_the_client_one_done() {
+    use crate::dbus::ibus::{ImEvent, PreeditMode};
+    use crate::input_method::ImUpdate;
+
+    let (mut f, id, _requests, _seen) = im_fixture();
+
+    // Five engine events with no dispatch between them, which is exactly what arriving over one
+    // wakeup of the worker channel looks like.
+    for (n, text) in ["h", "he\u{301}", "hel", "hell", "hello"]
+        .iter()
+        .enumerate()
+    {
+        f.synoik_state()
+            .on_im_update(ImUpdate::Event(ImEvent::Preedit {
+                text: Some((*text).to_owned()),
+                cursor: n as u32 + 1,
+                visible: true,
+                mode: PreeditMode::Clear,
+            }));
+    }
+    f.double_roundtrip(id);
+
+    let events = f.client(id).text_input_events();
+    let dones = events
+        .iter()
+        .filter(|e| matches!(e, ClientEv::Done(_)))
+        .count();
+    let preedits: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, ClientEv::PreeditString { .. }))
+        .collect();
+
+    assert_eq!(
+        dones, 1,
+        "one done per iteration, not one per event: {events:?}"
+    );
+    assert_eq!(
+        preedits.len(),
+        1,
+        "and the intermediate compositions are never on the wire: {events:?}"
+    );
+    // The one that survives is the newest — a preedit is state, so the older ones are worth
+    // nothing by the time anyone can read them.
+    assert_eq!(
+        preedits[0],
+        &ClientEv::PreeditString {
+            text: Some("hello".to_owned()),
+            cursor_begin: 5,
+            cursor_end: 5,
+        },
+        "the surviving preedit must be the latest: {events:?}"
+    );
+}
+
+/// And a `done` is still owed once per iteration, so nothing is swallowed.
+#[test]
+fn a_deferred_done_still_arrives_on_the_next_dispatch() {
+    use crate::dbus::ibus::{ImEvent, PreeditMode};
+    use crate::input_method::ImUpdate;
+
+    let (mut f, id, _requests, _seen) = im_fixture();
+
+    for text in ["a", "b"] {
+        f.synoik_state()
+            .on_im_update(ImUpdate::Event(ImEvent::Preedit {
+                text: Some(text.to_owned()),
+                cursor: 1,
+                visible: true,
+                mode: PreeditMode::Clear,
+            }));
+        f.double_roundtrip(id);
+        let events = f.client(id).text_input_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ClientEv::Done(_)))
+                .count(),
+            1,
+            "each dispatch owes its own done: {events:?}"
+        );
+    }
+
+    // A commit seals the composition, and that too is one done rather than two.
+    f.synoik_state()
+        .on_im_update(ImUpdate::Event(ImEvent::Commit("c".to_owned())));
+    f.double_roundtrip(id);
+    let events = f.client(id).text_input_events();
+    assert!(
+        events.contains(&ClientEv::CommitString(Some("c".to_owned()))),
+        "finished text goes out at once: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, ClientEv::Done(_)))
+            .count(),
+        1,
+        "one done seals it: {events:?}"
+    );
+}
+
 /// A keystroke offered to the engine must not reach the client until the engine declines it.
 ///
 /// This is the whole point of the round trip: if the key were delivered eagerly, a composed
