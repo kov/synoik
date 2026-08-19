@@ -3360,6 +3360,26 @@ fn render_surface_with(
         ),
     );
 
+    // Which element dropped an instance, when `SYNOIK_DEBUG_INSTANCES` asks. It is checked here,
+    // over the list as composed, because the tracker's under-report is decided by what the frame
+    // *contains* — the rects that go missing are never asked for, so no damage log can show them.
+    if crate::frame_log::instance_watch_enabled() {
+        let now = crate::frame_log::instances_of(
+            &elements,
+            output.current_scale().fractional_scale().into(),
+        );
+        let name = output.name();
+        if let Some(state) = synoik.output_state.get_mut(output) {
+            if let Some(before) = state.last_frame_instances.replace(now) {
+                let after = state
+                    .last_frame_instances
+                    .as_ref()
+                    .expect("the frame's instances were just stored");
+                crate::frame_log::log_instance_shrinks(&name, &before, after);
+            }
+        }
+    }
+
     synoik.frame_log.phase(Phase::Submit);
     // This is the one frame whose completion has somewhere to go: `DrmCompositor` puts the sync
     // point on the primary plane and the atomic commit takes it as `IN_FENCE_FD`, so the renderer

@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 use insta::assert_snapshot;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::ButtonState;
-use smithay::backend::renderer::element::Element as _;
 use smithay::backend::renderer::Color32F;
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
@@ -2057,8 +2056,9 @@ fn no_element_drops_an_instance_while_another_stays_put() {
     let scale = Scale::from(out.current_scale().fractional_scale());
     summon_peek(&mut f);
 
-    // Every instance of every Id in the frame, by geometry.
-    let snapshot = |f: &mut Fixture| -> HashMap<String, Vec<Rectangle<i32, Physical>>> {
+    // Every instance of every Id in the frame, exactly as the log on a seat records them
+    // (`SYNOIK_DEBUG_INSTANCES`), through the same rule — so this pins what that reports.
+    let snapshot = |f: &mut Fixture| -> HashMap<String, Vec<crate::frame_log::Instance>> {
         let state = f.synoik_state();
         state.synoik.update_render_elements(Some(&out));
         state
@@ -2071,14 +2071,7 @@ fn no_element_drops_an_instance_while_another_stays_put() {
                     xray: None,
                     appearance: Some(state.synoik.appearance()),
                 };
-                let mut by_id: HashMap<String, Vec<_>> = HashMap::new();
-                for elem in state.synoik.render_to_vec(ctx, &out, true) {
-                    by_id
-                        .entry(format!("{:?}", elem.id()))
-                        .or_default()
-                        .push(elem.geometry(scale));
-                }
-                by_id
+                crate::frame_log::instances_of(&state.synoik.render_to_vec(ctx, &out, true), scale)
             })
             .expect("the probe fixture has a renderer")
     };
@@ -2089,23 +2082,7 @@ fn no_element_drops_an_instance_while_another_stays_put() {
         for _ in 0..frames {
             f.run_frames_for(Duration::from_millis(16));
             let now = snapshot(f);
-            for (id, was) in &previous {
-                let Some(is) = now.get(id) else {
-                    // The Id left the frame entirely; `elements_gone` damages all of it.
-                    continue;
-                };
-                if is.len() >= was.len() {
-                    continue;
-                }
-                if was.iter().any(|geo| is.contains(geo)) {
-                    let gone: Vec<_> = was.iter().filter(|geo| !is.contains(geo)).collect();
-                    offenders.push(format!(
-                        "{id}: {} instances down to {}, vacating {gone:?}",
-                        was.len(),
-                        is.len()
-                    ));
-                }
-            }
+            offenders.extend(crate::frame_log::instance_shrinks(&previous, &now));
             previous = now;
         }
     };

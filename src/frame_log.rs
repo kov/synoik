@@ -1279,6 +1279,113 @@ fn frame_damage_line(
     )
 }
 
+/// Whether the session asked to be told when an element drops one of its instances, via
+/// `SYNOIK_DEBUG_INSTANCES=1`.
+///
+/// Read once. Off by default: on, it keeps a per-output map of every element's instances and
+/// diffs it each frame.
+pub fn instance_watch_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SYNOIK_DEBUG_INSTANCES").is_some())
+}
+
+/// One instance of one element, as far as the damage tracker's `instance_matches` cares.
+///
+/// The z-index here is the element's position in the frame's list, where the tracker's is its
+/// position among the elements it actually *renders* — it skips ones hidden behind opaque
+/// regions. The two agree except where something became fully occluded, and disagreeing makes
+/// this report a shrink the tracker would have handled, never miss one it would not: a z-index
+/// that moved makes the survivor mismatch, which is the branch that damages everything.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Instance {
+    pub geometry: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
+    pub alpha: f32,
+    pub z_index: usize,
+}
+
+/// Every element of `elements` by id, ready to be diffed against the next frame's.
+pub fn instances_of<E>(
+    elements: &[E],
+    scale: smithay::utils::Scale<f64>,
+) -> std::collections::HashMap<String, Vec<Instance>>
+where
+    E: smithay::backend::renderer::element::Element,
+{
+    let mut by_id: std::collections::HashMap<String, Vec<Instance>> =
+        std::collections::HashMap::new();
+    for (z_index, elem) in elements.iter().enumerate() {
+        by_id
+            .entry(format!("{:?}", elem.id()))
+            .or_default()
+            .push(Instance {
+                geometry: elem.geometry(scale),
+                alpha: elem.alpha(),
+                z_index,
+            });
+    }
+    by_id
+}
+
+/// Report every element that dropped an instance while a sibling stayed put — the one way the
+/// damage tracker under-reports.
+///
+/// It allows an id to appear many times in a frame and decides per instance, matching each against
+/// *any* remembered one. An instance that moves matches none, takes the branch that damages its new
+/// geometry and every remembered instance, and so heals the rect it left. An instance that simply
+/// goes away heals nothing: the survivor matches, so the cheap branch runs, and `elements_gone`
+/// only fires for an id that left the frame altogether. The rect the departed instance covered is
+/// then asked for by nobody, in that frame or any after it — it sits in whichever screen buffer
+/// missed the repaint and resurfaces every time that buffer comes round. Pinned by
+/// `tests::damage_instances`.
+///
+/// We rely on multiple instances by design: one cached texture draws a window in the workspace and
+/// again in every thumbnail showing it. So the answer is not to stop sharing ids, and this says
+/// which element to look at when a stale rectangle appears.
+pub fn log_instance_shrinks(
+    output: &str,
+    before: &std::collections::HashMap<String, Vec<Instance>>,
+    after: &std::collections::HashMap<String, Vec<Instance>>,
+) {
+    for line in instance_shrinks(before, after) {
+        tracing::info!("instances {output} {line}");
+    }
+}
+
+/// The offenders themselves, one line each, so the same rule serves the log and the corpus.
+pub fn instance_shrinks(
+    before: &std::collections::HashMap<String, Vec<Instance>>,
+    after: &std::collections::HashMap<String, Vec<Instance>>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (id, was) in before {
+        let Some(is) = after.get(id) else {
+            // The id left the frame entirely, which `elements_gone` damages in full.
+            continue;
+        };
+        if is.len() >= was.len() || !was.iter().any(|i| is.contains(i)) {
+            continue;
+        }
+        let vacated = was
+            .iter()
+            .filter(|i| !is.contains(i))
+            .map(|i| {
+                format!(
+                    "{}x{}+{}+{}",
+                    i.geometry.size.w, i.geometry.size.h, i.geometry.loc.x, i.geometry.loc.y
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        lines.push(format!(
+            "{id} {} -> {} vacated=[{vacated}]",
+            was.len(),
+            is.len()
+        ));
+    }
+    lines.sort();
+    lines
+}
+
 /// Log which *elements* a frame's `scene` overdraw went to, when `SYNOIK_SCENE_BREAKDOWN` is set.
 ///
 /// The frame line splits coverage by [`DrawSite`](synoik_vk::stats::DrawSite) — scene vs blur vs
@@ -2881,6 +2988,52 @@ fn ms_us(us: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use smithay::utils::{Point, Rectangle, Size};
+
+    use super::Instance;
+
+    fn at(x: i32, y: i32) -> Instance {
+        Instance {
+            geometry: Rectangle::new(Point::from((x, y)), Size::from((100, 100))),
+            alpha: 1.,
+            z_index: 0,
+        }
+    }
+
+    /// The rule the seat's log and the corpus both run on, in all four of its cases — including
+    /// the ones it must stay quiet for, because a report that fires on a healthy frame is a report
+    /// nobody reads, and this one exists to be read once, during a reproduction.
+    #[test]
+    fn only_a_departure_past_a_sibling_that_stayed_is_reported() {
+        let id = String::from("thumbnail");
+        let one = |v: Vec<Instance>| HashMap::from([(id.clone(), v)]);
+
+        // A departure past a sibling that stayed: the tracker heals nothing.
+        let shrinks =
+            super::instance_shrinks(&one(vec![at(0, 0), at(400, 0)]), &one(vec![at(0, 0)]));
+        assert_eq!(shrinks, ["thumbnail 2 -> 1 vacated=[100x100+400+0]"]);
+
+        // A move: the arriving instance matches nothing, so it damages every remembered one.
+        assert!(super::instance_shrinks(
+            &one(vec![at(0, 0), at(400, 0)]),
+            &one(vec![at(0, 0), at(430, 0)])
+        )
+        .is_empty());
+
+        // A departure where the survivor also moved: same branch, same healing.
+        assert!(
+            super::instance_shrinks(&one(vec![at(0, 0), at(400, 0)]), &one(vec![at(30, 0)]))
+                .is_empty()
+        );
+
+        // The id gone altogether, which `elements_gone` damages in full.
+        assert!(
+            super::instance_shrinks(&one(vec![at(0, 0), at(400, 0)]), &HashMap::new()).is_empty()
+        );
+    }
+
     /// The damage log is read by eye out of a journal, so its shape is part of it: an empty age
     /// says `none` rather than an empty bracket that reads as a truncated line, and a long list
     /// says how much it dropped.

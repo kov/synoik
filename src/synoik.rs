@@ -1348,6 +1348,8 @@ pub struct OutputState {
     /// into its history on every call, so asking the same one for two ages would make the second
     /// answer for a frame that never happened. One per age, fed the same frames.
     pub damage_log_trackers: Option<Box<[OutputDamageTracker; 2]>>,
+    /// Last frame's element instances by id, for the `SYNOIK_DEBUG_INSTANCES` log.
+    pub last_frame_instances: Option<HashMap<String, Vec<crate::frame_log::Instance>>>,
     /// How many render elements the last frame carried, and whether it had to
     /// redraw the whole output. Recorded by the render path for
     /// [`crate::frame_log`], which reports them alongside a slow frame.
@@ -8304,6 +8306,7 @@ impl Synoik {
                     OutputDamageTracker::from_output(&output),
                 ])
             }),
+            last_frame_instances: None,
             last_frame_elements: 0,
             last_frame_full_damage: false,
             last_frame_anim_causes: AnimCauses::empty(),

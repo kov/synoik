@@ -336,6 +336,7 @@ drop-in: `LimitMEMLOCK` is an rlimit and needs a **restart**, unlike `MemoryLow`
 | `SYNOIK_SCENE_BREAKDOWN=verbose` | per-element damage and opacity — the cheapest first look at a redraw question |
 | `SYNOIK_VK_FULL_DAMAGE=1` | turns the whole partial-damage chain off: separates "we drew the wrong thing" from "what we drew did not survive" |
 | `SYNOIK_DEBUG_DAMAGE=1` | one line per frame per output: what the screen was told to repaint, for a one-frame-old buffer and a two-frame-old one, and whether the frame went to a swapchain buffer or straight to a plane |
+| `SYNOIK_DEBUG_INSTANCES=1` | names the element whenever one drops an instance while a sibling stays put — the damage tracker's only under-report |
 | `debug-dump-scanout` | reads back the framebuffer we actually present (and the client's buffer when it owns the plane) |
 | `tools/timer-probe`, `tools/blur-probe` | isolate the VM's wakeup floor and blur cost from the compositor |
 
@@ -346,6 +347,17 @@ about the buffers. Only two things see the buffers: what is on the glass, and a 
 which draws incrementally through its own tracker and so inherits the same miss. A trace that a
 running screencast records and a one-shot capture cannot is therefore a damage question, not a
 scene question — that is what `SYNOIK_DEBUG_DAMAGE` is for.
+
+**A stale rectangle nothing ever asks for is an instance that departed.** The tracker lets one
+`Id` appear many times in a frame and we lean on it — one cached texture draws a window in the
+workspace and again in every thumbnail showing it. It decides per instance against *any* remembered
+one, so an instance that moves damages its new geometry plus every remembered instance and heals
+what it left. An instance that simply goes away while a sibling stays unchanged heals nothing: the
+survivor takes the cheap branch, and `elements_gone` only fires for an `Id` absent altogether. That
+rect is then asked for by nobody, ever, and lives in whichever screen buffer missed the repaint —
+surfacing every time that buffer comes round, which reads as a region flickering between two states
+at frame rate. Pinned by `tests::damage_instances`; the fix is ~5 lines in the smithay fork (damage
+every remembered instance when the count shrinks) and ships only with the fork.
 
 **Turn validation on FIRST when the compositor misbehaves around the renderer** — before profiling,
 bisecting or theorising. Undefined behavior surfaces as whatever the driver felt like doing: a wedge
