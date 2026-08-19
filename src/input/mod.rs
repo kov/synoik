@@ -972,7 +972,12 @@ impl State {
                     // the strip away and goes no further. Only a release *before* the threshold
                     // reaches the tap below.
                     this.synoik.overlay_key_armed = None;
-                    return FilterResult::Intercept(None);
+                    // **Forwarded, where the tap intercepts.** The tap gets away with swallowing
+                    // its release because firing moves focus to the overview, and a keyboard
+                    // leave releases every key client-side. A peek moves focus nowhere — the
+                    // client keeps it throughout — so an intercepted release leaves the app
+                    // holding Super forever, on every peek. It saw the press; it sees the release.
+                    return FilterResult::Forward;
                 } else if this.synoik.overlay_key_armed.take() == Some(key_code) {
                     // A second tap that comes quickly enough shifts a state *up* —
                     // window picker → app grid — instead of toggling the overview
@@ -4950,7 +4955,15 @@ impl State {
         // Motion into the screen edge builds pressure against a hot corner: the clamp above threw
         // away exactly the push mutter's barrier would have reported. Skipped while a spatial grab
         // warps the pointer across the screen, where the discarded motion is a wrap, not a push.
-        let hot_corner_triggered: Option<Point<f64, Logical>> = if warped {
+        // A peek puts the thumbnail strip along the top edge, whose left end is the hot corner:
+        // a pointer travelling to the leftmost thumbnail would trip it and throw the user into
+        // the overview they were deliberately not opening (`docs/fork/workspace-peek.md`). The
+        // pressure is refused outright rather than merely ignored, or it would sit there and fire
+        // the moment the peek ended.
+        if self.synoik.peek_up {
+            self.synoik.hot_corner_barrier.leave();
+        }
+        let hot_corner_triggered: Option<Point<f64, Logical>> = if warped || self.synoik.peek_up {
             None
         } else {
             self.synoik.push_hot_corner(

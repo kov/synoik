@@ -665,13 +665,16 @@ fn holding_super_peeks_the_workspace_strip() {
         0.,
         "the desktop's own corners must stay square under a peek"
     );
+    // Index 1, deliberately: the shrink is a function of distance from the active workspace, so
+    // at index 0 both accessors return 1 whatever ramp they were handed and the assertion could
+    // not come out the other way.
     assert_eq!(
-        mon.workspace_render_scale(0),
+        mon.workspace_render_scale(1),
         1.,
         "the live desktop must not shrink under a peek"
     );
     assert!(
-        mon.strip_render_scale(0) <= 1.,
+        mon.strip_render_scale(1) < 1.,
         "but the strip's own thumbnails still take their inactive shrink"
     );
 }
@@ -730,6 +733,52 @@ fn a_click_does_not_cancel_the_peek() {
     assert!(
         f.synoik().layout.is_peeking(),
         "pointer activity cancels the tap, never the hold"
+    );
+}
+
+/// The peek's wire contract, which is **not** the tap's, and the measurement that decided it.
+///
+/// Both swallow the overlay key's release. The tap gets away with it because firing moves focus to
+/// the overview, and a keyboard leave releases every key client-side — the reason is written into
+/// `overlay_key_firing_release_is_not_sent_to_the_client`. **A peek moves focus nowhere**: the
+/// client keeps it throughout, and swallowing the release left the client's `mods_depressed` at 64
+/// — Super held down forever, on every single peek. So the peek forwards its release instead.
+#[test]
+fn a_swallowed_peek_release_still_clears_the_client_modifier() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.client(id).get_keyboard();
+    f.roundtrip(id);
+    let _ = f.client(id).take_key_events();
+    let _ = f.client(id).take_mods_events();
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+    assert!(f.synoik().layout.is_peeking(), "precondition: peeking");
+
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    f.double_roundtrip(id);
+
+    assert_eq!(
+        f.client(id).take_key_events(),
+        vec![
+            (KEY_LEFTMETA, WlKeyState::Pressed),
+            (KEY_LEFTMETA, WlKeyState::Released),
+        ],
+        "the peek forwards its release where the tap swallows it"
+    );
+    assert_eq!(
+        f.client(id).take_mods_events().last().copied(),
+        Some(0),
+        "and the client is told Super came up, or it holds it forever"
+    );
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "forwarding must not let the release reach the overlay-key tap"
     );
 }
 

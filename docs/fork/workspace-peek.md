@@ -23,6 +23,7 @@ holds:
 | release **before** 300 ms | the overview toggles, exactly as now |
 | release **after** 300 ms | the strip dismisses; the overview does **not** open |
 | any other key while held | the strip dismisses (if up) and the chord fires |
+| an action fires, by any route | the strip dismisses — see below |
 | **while the overview is open** | the overlay key behaves exactly as it does today, hold or not — no peek, and a release still closes the overview |
 
 A client holding a keyboard-shortcuts inhibit prevents the peek from arming, for the same reason and
@@ -142,6 +143,19 @@ So the peek timer is cancelled only by a chord and by the key's own release, whi
 cancelling the tap alone. The consequence is deliberate: any Super+drag held past 300 ms brings the
 strip down mid-drag, which is exactly when the drop target becomes useful.
 
+**An action stands the peek down, however it arrived.** A chord's own key press already does it,
+but taking it at `do_action` as well covers the actions no key press produced — IPC, a pointer
+binding — and, more to the point, stops a peek that fired under a modifier-held UI from swallowing
+the release that UI is waiting for. The alt-tab switcher is exactly that: Super is held for the
+whole popup, so the threshold passes under it as a matter of course, and a peek eating its release
+loses the window the user picked.
+
+**The peek forwards its release; the tap swallows its own.** The tap gets away with swallowing
+because firing moves focus to the overview, and a keyboard leave releases every key client-side
+(`overlay_key_firing_release_is_not_sent_to_the_client`). A peek moves focus nowhere — the client
+keeps it throughout — and an intercepted release left the focused client's `mods_depressed` at 64:
+Super held down forever, on every peek. The client saw the press, so it sees the release.
+
 Also to implement deliberately: arming is idempotent, so a virtual-keyboard client's key repeat
 cannot stack timers; the peek release is checked *before* the `overlay_key_armed` tap path, so a
 release past the threshold never reaches `ToggleOverview`; and it does not touch
@@ -206,6 +220,8 @@ the hold rather than sleeping:
 - release past the threshold → the strip is gone, the overview did not open
 - release before the threshold → the overview opens (existing behavior, pinned against regression)
 - a chord while held → the strip is gone and the chord's action fired
+- Super+Tab held past the threshold → the release commits the switcher, not the peek
+- the release of a peek → the focused client sees it, and its modifier state clears
 - hold while the overview is open → no peek, and the release closes the overview as today
 - hold with a shortcuts-inhibiting client focused → no peek
 - click a thumbnail → the active workspace changed, the strip is still up

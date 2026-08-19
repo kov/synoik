@@ -138,6 +138,10 @@ pub struct State {
     pub keyboard: Option<WlKeyboard>,
     /// `wl_keyboard.key` events received, as `(evdev code, state)`.
     pub key_events: Vec<(u32, wl_keyboard::KeyState)>,
+    /// Every `wl_keyboard.modifiers` the client saw, as `mods_depressed`. A key the compositor
+    /// swallows still has to leave the client's modifier state correct, and the key events alone
+    /// cannot show that.
+    pub mods_events: Vec<u32>,
     /// `wl_keyboard.enter` / `.leave` received, in order. A client repaints on these — Firefox's
     /// CSD chrome posts a whole-window `wl_shm` buffer on each — so *when* they arrive relative to
     /// an animation is a cost, not just a notification.
@@ -434,6 +438,7 @@ impl Client {
             screencopy: None,
             keyboard: None,
             key_events: Vec::new(),
+            mods_events: Vec::new(),
             focus_events: Vec::new(),
             session_manager: None,
             session_events: Vec::new(),
@@ -626,6 +631,11 @@ impl Client {
     /// `(evdev code, state)`.
     pub fn take_key_events(&mut self) -> Vec<(u32, wl_keyboard::KeyState)> {
         std::mem::take(&mut self.state.key_events)
+    }
+
+    /// The `mods_depressed` masks from every `wl_keyboard.modifiers` since the last take.
+    pub fn take_mods_events(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.state.mods_events)
     }
 
     /// Drain the `wl_keyboard.enter` / `.leave` events received so far, in order.
@@ -1842,7 +1852,9 @@ impl Dispatch<WlKeyboard, ()> for State {
                     .key_events
                     .push((key, key_state.into_result().unwrap()));
             }
-            wl_keyboard::Event::Modifiers { .. } => (),
+            wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
+                state.mods_events.push(mods_depressed);
+            }
             wl_keyboard::Event::RepeatInfo { .. } => (),
             _ => unreachable!(),
         }
