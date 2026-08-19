@@ -9,10 +9,11 @@ this document is the specification.
 
 ## The gesture
 
-Holding the overlay key (`org.gnome.mutter overlay-key`, default `Super_L`) past **300 ms** slides
-the workspace thumbnail strip down from the top of the work area, semi-transparent, over the live
-desktop. Nothing else changes: no window spread, no dash, no search entry, no dimming. Releasing the
-key slides it back up.
+Holding the overlay key (`org.gnome.mutter overlay-key`, default `Super_L`) past **300 ms** brings
+out the overview's two pieces of furniture over the live desktop: the workspace thumbnail strip
+slides down from the top of the work area, semi-transparent, and the dock slides up from the bottom.
+Nothing else changes — no window spread, no search entry, no dimming, and the windows do not move.
+Releasing the key puts both away.
 
 The hold and the tap partition the overlay key, so nothing that works today changes unless the user
 holds:
@@ -27,8 +28,9 @@ holds:
 A client holding a keyboard-shortcuts inhibit prevents the peek from arming, for the same reason and
 at the same point it prevents the overview tap from arming (`src/input/mod.rs:944`).
 
-The strip comes down on every output at once, as the overview's does. It is a pointer affordance:
-touch has no Super, and no touch path arms it.
+The strip comes down on every output at once, as the overview's does. The dock is single-output by
+construction (`Dock::show` takes the output whose edge was pushed); a peek shows it on the active
+one. It is a pointer affordance: touch has no Super, and no touch path arms it.
 
 ## What the strip does while it is down
 
@@ -41,6 +43,18 @@ touch has no Super, and no touch path arms it.
   feedback lives in the interactive-move render path, lerping the carried window's render scale by
   the pointer's proximity to the band; it is the one piece of this with no existing home.
 - **drop into a gap** — open a new workspace there, as on the overview strip.
+- **drag a dock icon onto a thumbnail** — launch that app on that workspace. This is why the peek
+  brings the dock out and not only the strip: the dock is hidden until the pointer *pushes* into the
+  bottom edge (`src/ui/dock.rs`), and that gesture is unreachable while the other hand holds Super
+  and the pointer is travelling to the top of the screen. With no dock there is nothing to drag, and
+  the strip's app-drag drop target (`Layout::drop_workspace_at`, `src/layout/mod.rs:5934`, reached
+  through `insert_position`'s strip branch) would be dead code on the desktop.
+
+The peek takes a **hold** on the dock while it is up, the same one an icon drag and an open context
+menu already take (`Dock::set_hold`). Releasing the key releases the hold, which re-arms the dock's
+ordinary hide deadline — so a dock the pointer is resting on stays, and one it is not slides away
+after the usual grace period. No new dock state, and the drag hold means carrying an icon to the
+strip keeps the dock out even if the key comes up mid-drag.
 
 ## The shape of the change
 
@@ -182,13 +196,6 @@ If the key comes up while a `ThumbGrab` or a strip-targeted move is in flight, d
 the button release that ends the grab, then slides up. This is not a latch — the strip is never
 *usable* after the key is up; it is only not torn down while a grab holds its geometry.
 
-## Open — needs a call
-
-- **Dock icon dragged onto the strip.** `drop_workspace_at` (`src/layout/mod.rs:5934`) routes through
-  `insert_position`'s strip branch, so with the dash-as-dock on the live desktop a dock drag while
-  peeked acquires the strip as a launch target for free. Coherent (it launches on that workspace) but
-  nobody asked for it. Allow, or refuse strip drops from app drags?
-
 ## Conformance corpus
 
 In `src/tests/gnome.rs`, driving real input against the `Fixture`. Peek state is observable through
@@ -207,6 +214,9 @@ the hold rather than sleeping:
   and the active workspace did not change
 - drag a thumbnail → the workspaces reordered
 - drag a window into a gap → a workspace was created there
+- hold past the threshold → the dock is out on the active output
+- release → the dock's hide deadline is re-armed, and it goes
+- drag a dock icon onto a thumbnail → the app launched on that workspace
 - Super held past the threshold *while already dragging a window* → the strip comes down
 - release the key mid-drag → the strip stays until the button releases, then goes
 - the top-left hot corner while peeked → the overview did not open
@@ -218,5 +228,5 @@ corners nor a shrink (the split accessors).
 
 ## Reverting
 
-The peek is a visibility source, a band, and the ten items above. The interactions it exposes are the
+The peek is a visibility source, a band, a dock hold, and the ten items above. The interactions it exposes are the
 strip's own, and no overview behavior is rewritten to make room for it.
