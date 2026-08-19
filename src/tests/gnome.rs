@@ -18,10 +18,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use insta::assert_snapshot;
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::ButtonState;
+use smithay::backend::renderer::Color32F;
 use smithay::input::keyboard::Keysym;
+use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel;
 use smithay::utils::user_data::UserDataMap;
+use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::xdg_activation::XdgActivationTokenData;
 use synoik_config::{Action, Config};
 use wayland_client::protocol::wl_keyboard::KeyState as WlKeyState;
@@ -38,6 +42,7 @@ use crate::protocols::raw::xdg_session_management::v1::client::xdg_session_v1::X
 use crate::protocols::raw::xdg_session_management::v1::client::xdg_toplevel_session_v1::XdgToplevelSessionV1;
 use crate::session_state::{ToplevelRecord, WindowState};
 use crate::status_notifier::ItemProps;
+use crate::synoik::OutputRenderElements;
 use crate::ui::osd::OsdLevel;
 use crate::utils::get_monotonic_time;
 
@@ -1474,6 +1479,335 @@ fn dropping_a_window_on_a_peeked_thumbnail_does_not_switch_to_it() {
         active_before,
         "sending a window away must not send the user after it"
     );
+}
+
+/// A render target that persists across frames, the way a real output's does.
+struct WarmTarget {
+    tracker: smithay::backend::renderer::damage::OutputDamageTracker,
+    texture: Option<crate::render_helpers::vulkan::VkTexture>,
+}
+
+impl WarmTarget {
+    fn new(out: &Output) -> Self {
+        WarmTarget {
+            tracker: smithay::backend::renderer::damage::OutputDamageTracker::from_output(out),
+            texture: None,
+        }
+    }
+}
+
+/// Composite `elements` into `target` through its damage tracker — repainting only what the
+/// tracker calls damaged, exactly as the backend does — and, when `read` is set, hand back the
+/// whole target's pixels.
+///
+/// Reading is opt-in because the readback is not free of consequence: the copy leaves the texture
+/// in a layout the next incremental pass does not load from, and the tiles that pass touches come
+/// back as garbage. Frames that only need to advance the tracker must not copy, and a frame that
+/// does copy has to be healed (see [`probe_frame`]) before the next incremental one.
+fn draw_into(
+    renderer: &mut crate::render_helpers::vulkan::VulkanRenderer,
+    target: &mut WarmTarget,
+    size: Size<i32, Physical>,
+    elements: &[OutputRenderElements],
+    read: bool,
+) -> Option<Vec<u8>> {
+    use smithay::backend::renderer::{ExportMem as _, Offscreen as _};
+
+    let texture = match &mut target.texture {
+        Some(tex) => tex,
+        none => none.insert(
+            renderer
+                .create_buffer(
+                    crate::render_helpers::NATIVE_FOURCC,
+                    size.to_logical(1).to_buffer(1, Transform::Normal),
+                )
+                .expect("create the probe's render target"),
+        ),
+    };
+
+    let mut fb = renderer
+        .bind_preserving(texture)
+        .expect("bind the probe's render target");
+    target
+        .tracker
+        .render_output(renderer, &mut fb, 1, elements, Color32F::BLACK)
+        .expect("composite the scene");
+    if !read {
+        return None;
+    }
+    let mapping = renderer
+        .copy_framebuffer(
+            &fb,
+            Rectangle::from_size(size.to_logical(1).to_buffer(1, Transform::Normal)),
+            Fourcc::Abgr8888,
+        )
+        .expect("copy the probe's framebuffer");
+    Some(
+        renderer
+            .map_texture(&mapping)
+            .expect("map the probe's readback")
+            .to_vec(),
+    )
+}
+
+/// One frame of the real scene, composited twice: once into a target that has been accumulating
+/// frames (so the damage tracker decides what gets repainted), and — when `cold` is given — once
+/// into a fresh one, which is repainted whole.
+///
+/// The two must agree. Where they do not, the tracker failed to report damage for something that
+/// changed, and the warm target is showing pixels that are no longer in the scene.
+fn probe_frame(
+    f: &mut Fixture,
+    out: &Output,
+    warm: &mut WarmTarget,
+    cold: Option<&mut WarmTarget>,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let size: Size<i32, Physical> = out.current_mode().unwrap().size;
+    let state = f.synoik_state();
+    state.synoik.update_render_elements(Some(out));
+    state
+        .backend
+        .headless()
+        .with_vulkan_renderer(|vk| {
+            let ctx = crate::render_helpers::RenderCtx {
+                renderer: vk,
+                target: crate::render_helpers::RenderTarget::Output,
+                xray: None,
+                appearance: Some(state.synoik.appearance()),
+            };
+            let elements = state.synoik.render_to_vec(ctx, out, true);
+            assert!(
+                !elements.is_empty(),
+                "precondition: the probe must see a real element list"
+            );
+            let read = cold.is_some();
+            let warm_px = draw_into(vk, warm, size, &elements, read);
+            let cold_px = cold.map(|cold| {
+                // The strip lives in a cached texture. Rendering the same element list again
+                // would composite that same cache, staleness and all — so drop it and build the
+                // scene from scratch, which is what a full re-render (our own screencast
+                // recorder) does.
+                state.synoik.reset_thumbnails_offscreen();
+                let ctx = crate::render_helpers::RenderCtx {
+                    renderer: vk,
+                    target: crate::render_helpers::RenderTarget::Output,
+                    xray: None,
+                    appearance: Some(state.synoik.appearance()),
+                };
+                let fresh = state.synoik.render_to_vec(ctx, out, true);
+                draw_into(vk, cold, size, &fresh, true).expect("the cold target was read")
+            });
+            if read {
+                // Heal the warm target: a full repaint through a fresh tracker puts every tile
+                // back, including the ones the readback left undefined, so the next incremental
+                // frame measures its own delta and nothing else.
+                warm.tracker =
+                    smithay::backend::renderer::damage::OutputDamageTracker::from_output(out);
+                draw_into(vk, warm, size, &elements, false);
+            }
+            (warm_px, cold_px)
+        })
+        .expect("the probe fixture has a renderer")
+}
+
+/// Pixels the incrementally-repainted frame got wrong, as a bounding box in physical coordinates.
+fn stale_bounds(
+    warm: &[u8],
+    cold: &[u8],
+    size: Size<i32, Physical>,
+    roi: Rectangle<i32, Physical>,
+) -> Option<Rectangle<i32, Physical>> {
+    let mut bounds: Option<(i32, i32, i32, i32)> = None;
+    let mut differing = 0u64;
+    for y in roi.loc.y.max(0)..(roi.loc.y + roi.size.h).min(size.h) {
+        for x in roi.loc.x.max(0)..(roi.loc.x + roi.size.w).min(size.w) {
+            let i = ((y * size.w + x) * 4) as usize;
+            if warm[i..i + 4] != cold[i..i + 4] {
+                differing += 1;
+                bounds = Some(match bounds {
+                    None => (x, y, x, y),
+                    Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+                });
+            }
+        }
+    }
+    bounds.map(|(x0, y0, x1, y1)| {
+        eprintln!("{differing} pixels of the band differ; a map of where, 32x16 per cell:");
+        let (ry0, ry1) = (roi.loc.y.max(0), (roi.loc.y + roi.size.h).min(size.h));
+        for gy in (ry0..ry1).step_by(16) {
+            let mut row = String::new();
+            for gx in (0..size.w).step_by(32) {
+                let mut n = 0;
+                for y in gy..(gy + 16).min(ry1) {
+                    for x in gx..(gx + 32).min(size.w) {
+                        let i = ((y * size.w + x) * 4) as usize;
+                        if warm[i..i + 4] != cold[i..i + 4] {
+                            n += 1;
+                        }
+                    }
+                }
+                row.push(if n == 0 {
+                    '.'
+                } else if n < 40 {
+                    '+'
+                } else {
+                    '#'
+                });
+            }
+            eprintln!("  y={gy:4} {row}");
+        }
+        Rectangle::new(
+            Point::from((x0, y0)),
+            Size::from((x1 - x0 + 1, y1 - y0 + 1)),
+        )
+    })
+}
+
+/// A peeked thumbnail draws each workspace in miniature, so moving a window between workspaces
+/// changes what the strip is showing — the miniature has to leave one thumbnail and appear in
+/// another, and the pixels it covered have to be repainted.
+///
+/// Pinned as a warm-versus-cold composite because damage is not observable any other way: a scene
+/// drawn from scratch is right by construction, and only the incrementally-repainted frame can
+/// carry pixels the scene no longer has. The comparison is confined to the strip's band: a
+/// framebuffer effect (the dock's blur, a window's) legitimately samples a half-drawn frame, so a
+/// whole-output diff reports differences that are not stale pixels.
+#[test]
+fn moving_a_window_between_workspaces_repaints_the_strip() {
+    if let Err(e) = crate::render_helpers::vulkan::VulkanRenderer::new() {
+        eprintln!(
+            "skipping moving_a_window_between_workspaces_repaints_the_strip: no Vulkan ({e})"
+        );
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    // Paint the windows: a miniature the same colour as the thumbnail it sits in is a miniature
+    // no pixel comparison can see leave.
+    let surface = map_window_sized(&mut f, id, (800, 600), None);
+    f.client(id)
+        .window(&surface)
+        .attach_solid_buffer(0, u32::MAX, 0, u32::MAX);
+    f.client(id).window(&surface).commit();
+    let other = map_window_sized(&mut f, id, (640, 480), None);
+    f.client(id)
+        .window(&other)
+        .attach_solid_buffer(u32::MAX, 0, 0, u32::MAX);
+    f.client(id).window(&other).commit();
+    f.double_roundtrip(id);
+    f.settle();
+
+    // Send the second window to a workspace of its own, so the strip has more than one populated
+    // thumbnail to move a window between.
+    let win_b = f.synoik().layout.focus().unwrap().window.clone();
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+    let rect = f.synoik().layout.expose_target_rect(&win_b).unwrap();
+    let grab = (rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.);
+    pointer_motion_to(&mut f, grab.0, grab.1);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.pointer_motion(0., 10.);
+    pointer_motion_to(&mut f, 1900., 540.);
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+    f.double_roundtrip(id);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let size: Size<i32, Physical> = out.current_mode().unwrap().size;
+    let target_idx = {
+        let active = f.synoik().layout.active_workspace().unwrap().id();
+        f.synoik()
+            .layout
+            .workspaces()
+            .position(|(_, _, ws)| ws.id() != active)
+            .expect("a workspace other than the active one")
+    };
+
+    summon_peek(&mut f);
+
+    // The strip's band, plus room for the shadows that reach past it.
+    let band = {
+        let mon = f.synoik().layout.monitor_for_output(&out).unwrap();
+        let band = mon.thumbnail_strip().expect("the strip is up").band;
+        let scale = out.current_scale().fractional_scale();
+        let band = Rectangle::new(
+            band.loc - Point::from((0., 60.)),
+            band.size + Size::from((0., 120.)),
+        );
+        band.to_physical_precise_round(scale)
+    };
+
+    // Accumulate a few frames so the warm target is carrying real history: the first frame of any
+    // tracker is full damage, which would repaint the strip no matter what the tracker knows.
+    let mut warm = WarmTarget::new(&out);
+    for _ in 0..4 {
+        probe_frame(&mut f, &out, &mut warm, None);
+        f.run_frames_for(Duration::from_millis(16));
+    }
+
+    // Control: with nothing happening, warm and cold must already agree. A difference here would
+    // be the instrument, not the scene.
+    {
+        let mut cold = WarmTarget::new(&out);
+        let (w, c) = probe_frame(&mut f, &out, &mut warm, Some(&mut cold));
+        assert_eq!(
+            stale_bounds(&w.unwrap(), &c.unwrap(), size, band),
+            None,
+            "an idle frame must composite the same warm and cold"
+        );
+    }
+
+    let check = |f: &mut Fixture, warm: &mut WarmTarget, stage: &str| {
+        let mut cold = WarmTarget::new(&out);
+        let (warm_px, cold_px) = probe_frame(f, &out, warm, Some(&mut cold));
+        let stale = stale_bounds(&warm_px.unwrap(), &cold_px.unwrap(), size, band);
+        assert_eq!(
+            stale, None,
+            "{stage}: the strip kept pixels the scene no longer draws"
+        );
+    };
+
+    // Pick the window up: its miniature leaves the thumbnail of the workspace it was on.
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let rect = f.synoik().layout.window_render_rect(&win, &out).unwrap();
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, 960., 900.);
+    check(&mut f, &mut warm, "picking the window up");
+
+    // Carry it onto another workspace's thumbnail, then let go. The window lands on a workspace
+    // that is not the active one, so nothing switches and no full-output repaint follows.
+    let (tx, ty) = thumbnail_center(&mut f, target_idx);
+    pointer_motion_to(&mut f, tx, ty);
+    check(&mut f, &mut warm, "carrying it over the thumbnail");
+
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    check(&mut f, &mut warm, "the drop");
+    for _ in 0..40 {
+        f.run_frames_for(Duration::from_millis(16));
+        check(&mut f, &mut warm, "after the drop");
+    }
+
+    // And let the strip go: the slide out is the last thing that can leave a trace behind.
+    f.key_release(KEY_LEFTSHIFT);
+    f.key_release(KEY_LEFTMETA);
+    for _ in 0..30 {
+        f.run_frames_for(Duration::from_millis(16));
+        check(&mut f, &mut warm, "the strip leaving");
+    }
 }
 
 /// Releasing the overlay key mid-drag must not yank the strip out from under the grab: the drag is

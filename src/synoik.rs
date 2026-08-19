@@ -10645,6 +10645,18 @@ impl Synoik {
         }
     }
 
+    /// Throw away the thumbnail strip's offscreen texture, so the next render composites the
+    /// strip from scratch.
+    ///
+    /// The strip is composited into one cached, damage-tracked texture; content that goes stale
+    /// inside it survives a full re-render of the output, which is why it shows up in a
+    /// screencast. A test that wants the strip as the scene actually describes it has to drop the
+    /// cache first.
+    #[cfg(test)]
+    pub(crate) fn reset_thumbnails_offscreen(&mut self) {
+        self.thumbnails_offscreen = OffscreenBuffer::default();
+    }
+
     pub fn render_to_vec(
         &self,
         ctx: RenderCtx,
