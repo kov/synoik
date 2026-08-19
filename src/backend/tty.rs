@@ -3403,6 +3403,37 @@ fn render_surface_with(
                 }
             }
 
+            // What the screen was told to repaint, when `SYNOIK_DEBUG_DAMAGE` asks. Taken from the
+            // frame result rather than from a tracker of our own, so it is the composed frame's
+            // damage — planes included — and not a shadow of it.
+            if let Some(trackers) = synoik
+                .output_state
+                .get_mut(output)
+                .and_then(|state| state.damage_log_trackers.as_mut())
+            {
+                let [first, second] = &mut **trackers;
+                let a = res
+                    .damage_from_age(first, 1, [])
+                    .ok()
+                    .and_then(|(damage, _)| damage.cloned())
+                    .unwrap_or_default();
+                let b = res
+                    .damage_from_age(second, 2, [])
+                    .ok()
+                    .and_then(|(damage, _)| damage.cloned())
+                    .unwrap_or_default();
+                let plane = match &res.primary_element {
+                    PrimaryPlaneElement::Swapchain(_) => "swapchain",
+                    PrimaryPlaneElement::Element(_) => "direct-scanout",
+                };
+                crate::frame_log::log_frame_damage(
+                    &output.name(),
+                    plane,
+                    elements.len(),
+                    [(1, &a), (2, &b)],
+                );
+            }
+
             synoik.update_primary_scanout_output(output, &res.states);
             if let Some(state) = synoik.output_state.get_mut(output) {
                 state.last_frame_scanout = tally_scanout(&res.states);

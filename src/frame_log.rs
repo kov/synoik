@@ -1207,6 +1207,78 @@ fn frame_cost(total: Duration, totals: &Totals) -> Duration {
     total + totals.gpu.saturating_sub(totals.retiring)
 }
 
+/// Whether the `SYNOIK_DEBUG_DAMAGE` per-frame damage log is on.
+///
+/// The damage a **screen** is repainted with is not observable any other way. It lives inside
+/// `DrmCompositor`, and every capture path re-renders the scene instead of reading the buffers, so
+/// a screenshot of a stale screen comes back clean — which says the scene is right, and nothing at
+/// all about what was repainted. This is the only view of the actual ask.
+///
+/// Read once. Off by default: on, it logs a line per frame per output.
+pub fn damage_log_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SYNOIK_DEBUG_DAMAGE").is_some())
+}
+
+/// One line per frame: what the screen was told to repaint, and into what.
+///
+/// `age` names the buffer the rects answer for — 1 is "since the previous frame", which is what a
+/// single-buffered screen would need, and 2 is what a double-buffered one needs, because the
+/// buffer it hands back last held the frame two ago. A region that changed and appears in neither
+/// is a region the screen keeps showing stale.
+///
+/// `plane` says whether the frame was composited into a swapchain buffer or handed to the scanout
+/// plane as a client's own buffer: a region that stops being on a plane has to be repainted by
+/// whoever takes it over, and that is a different failure from a missing rect.
+pub fn log_frame_damage(
+    output: &str,
+    plane: &str,
+    elements: usize,
+    ages: [(
+        usize,
+        &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
+    ); 2],
+) {
+    tracing::info!("{}", frame_damage_line(output, plane, elements, ages));
+}
+
+/// The log line itself, so its shape is pinned without a subscriber.
+fn frame_damage_line(
+    output: &str,
+    plane: &str,
+    elements: usize,
+    ages: [(
+        usize,
+        &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
+    ); 2],
+) -> String {
+    /// Past this many rects the tail says how many there were rather than printing them.
+    const SHOW: usize = 12;
+
+    let rects = |damage: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>]| {
+        if damage.is_empty() {
+            return String::from("none");
+        }
+        let mut out = damage
+            .iter()
+            .take(SHOW)
+            .map(|r| format!("{}x{}+{}+{}", r.size.w, r.size.h, r.loc.x, r.loc.y))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if damage.len() > SHOW {
+            let _ = write!(out, " (+{} more)", damage.len() - SHOW);
+        }
+        out
+    };
+
+    let [(age_a, damage_a), (age_b, damage_b)] = ages;
+    format!(
+        "damage {output} plane={plane} elements={elements} age{age_a}=[{}] age{age_b}=[{}]",
+        rects(damage_a),
+        rects(damage_b),
+    )
+}
+
 /// Log which *elements* a frame's `scene` overdraw went to, when `SYNOIK_SCENE_BREAKDOWN` is set.
 ///
 /// The frame line splits coverage by [`DrawSite`](synoik_vk::stats::DrawSite) — scene vs blur vs
@@ -2809,6 +2881,29 @@ fn ms_us(us: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The damage log is read by eye out of a journal, so its shape is part of it: an empty age
+    /// says `none` rather than an empty bracket that reads as a truncated line, and a long list
+    /// says how much it dropped.
+    #[test]
+    fn the_damage_line_says_what_it_left_out() {
+        use smithay::utils::{Physical, Point, Rectangle, Size};
+
+        let rect =
+            |x, y, w, h| Rectangle::<i32, Physical>::new(Point::from((x, y)), Size::from((w, h)));
+        let one = [rect(0, 32, 1920, 1)];
+        assert_eq!(
+            frame_damage_line("DP-1", "swapchain", 37, [(1, &one), (2, &[])]),
+            "damage DP-1 plane=swapchain elements=37 age1=[1920x1+0+32] age2=[none]"
+        );
+
+        let many: Vec<_> = (0..15).map(|i| rect(i, 0, 10, 10)).collect();
+        let line = frame_damage_line("DP-1", "direct-scanout", 1, [(1, &many), (2, &[])]);
+        assert!(
+            line.contains("(+3 more)"),
+            "a long list must say how many it dropped: {line}"
+        );
+    }
+
     use synoik_vk::stats::SubmitSite;
 
     use super::*;

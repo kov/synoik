@@ -335,8 +335,17 @@ drop-in: `LimitMEMLOCK` is an rlimit and needs a **restart**, unlike `MemoryLow`
 | `SIGUSR1` | non-terminating ring dump; the only way to get the ring out of a live session |
 | `SYNOIK_SCENE_BREAKDOWN=verbose` | per-element damage and opacity — the cheapest first look at a redraw question |
 | `SYNOIK_VK_FULL_DAMAGE=1` | turns the whole partial-damage chain off: separates "we drew the wrong thing" from "what we drew did not survive" |
+| `SYNOIK_DEBUG_DAMAGE=1` | one line per frame per output: what the screen was told to repaint, for a one-frame-old buffer and a two-frame-old one, and whether the frame went to a swapchain buffer or straight to a plane |
 | `debug-dump-scanout` | reads back the framebuffer we actually present (and the client's buffer when it owns the plane) |
 | `tools/timer-probe`, `tools/blur-probe` | isolate the VM's wakeup floor and blur cost from the compositor |
+
+**A capture cannot tell you what a screen was repainted with.** Every capture path re-renders the
+scene — a screenshot, a one-shot screencopy (`grim`), `render_for_screencopy_without_damage` — so a
+screen showing stale pixels photographs clean, which proves the scene is right and says nothing
+about the buffers. Only two things see the buffers: what is on the glass, and a *continuous* cast,
+which draws incrementally through its own tracker and so inherits the same miss. A trace that a
+running screencast records and a one-shot capture cannot is therefore a damage question, not a
+scene question — that is what `SYNOIK_DEBUG_DAMAGE` is for.
 
 **Turn validation on FIRST when the compositor misbehaves around the renderer** — before profiling,
 bisecting or theorising. Undefined behavior surfaces as whatever the driver felt like doing: a wedge

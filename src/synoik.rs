@@ -1342,6 +1342,12 @@ pub struct OutputState {
     pub screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
     pub debug_damage_tracker: OutputDamageTracker,
+    /// Trackers for the `SYNOIK_DEBUG_DAMAGE` log — one per age it reports.
+    ///
+    /// A tracker answers for exactly one buffer: `damage_output`/`damage_from_age` folds the frame
+    /// into its history on every call, so asking the same one for two ages would make the second
+    /// answer for a frame that never happened. One per age, fed the same frames.
+    pub damage_log_trackers: Option<Box<[OutputDamageTracker; 2]>>,
     /// How many render elements the last frame carried, and whether it had to
     /// redraw the whole output. Recorded by the render path for
     /// [`crate::frame_log`], which reports them alongside a slow frame.
@@ -8292,6 +8298,12 @@ impl Synoik {
             shield_backstop_buffer: SolidColorBuffer::new(size, [0., 0., 0., 1.]),
             screen_transition: None,
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
+            damage_log_trackers: crate::frame_log::damage_log_enabled().then(|| {
+                Box::new([
+                    OutputDamageTracker::from_output(&output),
+                    OutputDamageTracker::from_output(&output),
+                ])
+            }),
             last_frame_elements: 0,
             last_frame_full_damage: false,
             last_frame_anim_causes: AnimCauses::empty(),
@@ -12887,6 +12899,12 @@ impl Synoik {
         if self.debug_draw_damage {
             for (output, state) in &mut self.output_state {
                 state.debug_damage_tracker = OutputDamageTracker::from_output(output);
+                if let Some(trackers) = state.damage_log_trackers.as_mut() {
+                    **trackers = [
+                        OutputDamageTracker::from_output(output),
+                        OutputDamageTracker::from_output(output),
+                    ];
+                }
             }
         }
 
