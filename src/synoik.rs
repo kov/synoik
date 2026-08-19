@@ -859,30 +859,31 @@ pub struct Synoik {
     /// read when animations are off, where the double-tap escalation into the
     /// app grid falls back to a time comparison.
     pub overlay_key_last_fired: Option<Duration>,
-    /// The workspace peek's own arm: the keycode of the overlay key currently held down, from
-    /// the press until its release (`docs/fork/workspace-peek.md`).
+    /// The bare overlay key currently held down — its keycode, and the compositor-clock instant
+    /// it went down — from the press until its release (`docs/fork/workspace-peek.md`).
+    ///
+    /// Two things read it. Shift pressed while it is set summons the workspace peek, and the
+    /// same key's release puts the peek away. Its release *also* consults the elapsed time: a
+    /// hold longer than [`OVERLAY_KEY_TAP_LIMIT`](crate::input::OVERLAY_KEY_TAP_LIMIT) is not a
+    /// tap and toggles nothing.
     ///
     /// **Deliberately not [`Self::overlay_key_armed`]**, which any pointer button, scroll or
     /// touch clears — the tap must die on pointer activity because mutter will not let
     /// Super+click open the overview. The peek has the opposite relationship to the pointer: it
     /// *is* a pointer affordance, and the first click of any peek interaction would disarm it.
     /// So this one is cleared only by the key's own release and by a chord.
-    pub peek_key_held: Option<Keycode>,
-    /// Whether the hold fired and the strip is up. Separate from [`Self::peek_key_held`] because
-    /// the key can come up while a grab still holds the strip's geometry.
+    ///
+    /// Keycode and instant live in **one** field on purpose: two cleared in the same places is a
+    /// desync waiting for a path that clears only one, and a stale instant reads every later tap
+    /// as a long hold — which would make the overview unreachable by tap.
+    pub overlay_key_hold: Option<(Keycode, Duration)>,
+    /// Whether the peek fired and the strip is up. Separate from [`Self::overlay_key_hold`]
+    /// because the key can come up while a grab still holds the strip's geometry.
     pub peek_up: bool,
-    /// When the hold is due to fire, on the compositor clock. The transition itself happens in
-    /// `advance_animations`, like the dock's hide: the calloop timer below only guarantees the
-    /// loop wakes to notice, so a headless test can drive the hold by advancing the clock rather
-    /// than by sleeping.
-    pub peek_arm_at: Option<Duration>,
     /// The key came up while a grab still held the strip's geometry, so the dismissal is waiting
     /// for that grab to end (`docs/fork/workspace-peek.md`). Not a latch: the peek is no longer
     /// *usable*, it is only not torn down under something aiming at it.
     pub peek_dismiss_pending: bool,
-    /// The loop wake-up for [`Self::peek_arm_at`], and the deadline it was scheduled for.
-    pub peek_timer: Option<RegistrationToken>,
-    pub peek_timer_at: Option<Duration>,
     /// Button codes of the mouse buttons to suppress.
     pub suppressed_buttons: HashSet<u32>,
     /// Which of the overview's widgets a pointer press landed on, with the button
@@ -2236,8 +2237,10 @@ impl State {
         // release, so nothing else would ever put the strip away. Level-triggered rather than
         // hooked into each of the paths that can raise the shield, none of which could then
         // forget (`docs/fork/workspace-peek.md`).
-        if self.synoik.peek_up && (self.synoik.is_locked() || self.synoik.screen_shield.is_active())
-        {
+        // The hold is cleared as well as the strip, and unconditionally: with no timer behind it
+        // a hold whose release the shield swallowed would sit there forever, and a stale one reads
+        // every later tap as a long hold — which is the overview becoming unreachable by tap.
+        if self.synoik.is_locked() || self.synoik.screen_shield.is_active() {
             self.synoik.end_peek();
         }
 
@@ -7766,12 +7769,9 @@ impl Synoik {
             suppressed_keys: HashSet::new(),
             overlay_key_armed: None,
             overlay_key_last_fired: None,
-            peek_key_held: None,
+            overlay_key_hold: None,
             peek_up: false,
-            peek_arm_at: None,
             peek_dismiss_pending: false,
-            peek_timer: None,
-            peek_timer_at: None,
             suppressed_buttons: HashSet::new(),
             overview_pressed: None,
             app_grid_pan: None,
@@ -10305,7 +10305,6 @@ impl Synoik {
             .set_peeked(self.peek_up && !self.peek_is_over_fullscreen());
         // The hold's deadline, checked here rather than in its timer callback so the clock alone
         // decides when the strip comes down.
-        self.advance_peek();
         self.dock.advance_animations();
         if self.dock.next_wakeup() != self.dock_timer_at {
             self.reschedule_dock_timer();
@@ -15555,25 +15554,40 @@ impl Synoik {
 
     /// Wake the loop at the dock's auto-hide deadline: a dock resting on screen produces no
     /// frames of its own for the grace period to expire on.
-    /// Arm the workspace peek's hold on an overlay-key press (`docs/fork/workspace-peek.md`).
+    /// Record a bare overlay-key press: Shift may now summon the peek, and the release will be
+    /// measured against the tap limit (`docs/fork/workspace-peek.md`).
     ///
-    /// Idempotent, and it has to be: a virtual-keyboard client can repeat a press, and pushing the
-    /// deadline forward on each repeat would mean the strip never came down.
-    pub fn arm_peek(&mut self, key_code: Keycode) {
-        if self.peek_key_held == Some(key_code) {
+    /// Idempotent, and it has to be — for two reasons now. A virtual-keyboard client can repeat a
+    /// press, and refreshing the instant on each repeat would make an arbitrarily long hold read
+    /// as a fresh tap, which is exactly the accident the limit exists to kill.
+    pub fn hold_overlay_key(&mut self, key_code: Keycode) {
+        if self
+            .overlay_key_hold
+            .is_some_and(|(held, _)| held == key_code)
+        {
             return;
         }
         self.end_peek();
-        self.peek_key_held = Some(key_code);
-        self.peek_arm_at = Some(self.clock.now_unadjusted() + crate::input::PEEK_HOLD_THRESHOLD);
-        self.reschedule_peek_timer();
+        self.overlay_key_hold = Some((key_code, self.clock.now_unadjusted()));
     }
 
-    /// The hold landed: the strip comes down over the live desktop and the dock comes out.
-    fn start_peek(&mut self) {
-        self.peek_arm_at = None;
-        self.reschedule_peek_timer();
+    /// How long the overlay key has been down, if it is.
+    pub fn overlay_key_held_for(&self) -> Option<Duration> {
+        let (_, since) = self.overlay_key_hold?;
+        Some(self.clock.now_unadjusted().saturating_sub(since))
+    }
 
+    /// Shift went down while the overlay key was held: the strip comes down over the live desktop
+    /// and the dock comes out. Does nothing if no overlay key is held.
+    pub fn trigger_peek(&mut self) {
+        if self.overlay_key_hold.is_none() || self.peek_up {
+            return;
+        }
+        self.start_peek();
+    }
+
+    /// The peek fires: the strip comes down over the live desktop and the dock comes out.
+    fn start_peek(&mut self) {
         self.layout.set_peek(true);
         // The layout is the authority — it refuses a peek while the overview is open, where the
         // strip is already on screen in its own band.
@@ -15603,12 +15617,14 @@ impl Synoik {
             .is_some_and(|mon| mon.render_above_top_layer())
     }
 
-    /// Disarm the hold and put the strip away. Returns whether it had come down — which is what
-    /// tells a release past the threshold apart from a tap.
+    /// Let go of the overlay key and put the strip away. Returns whether the strip had come
+    /// down — which is what tells a peek's release apart from a tap's.
+    ///
+    /// Clears the hold as well as the peek, so it is also what a chord, an action, or a teardown
+    /// calls to say "that Super is spent". Nothing fires on a deadline any more, so a hold left
+    /// behind is not self-healing: every path that can swallow the key's release must reach here.
     pub fn end_peek(&mut self) -> bool {
-        self.peek_key_held = None;
-        self.peek_arm_at = None;
-        self.reschedule_peek_timer();
+        self.overlay_key_hold = None;
 
         if !self.peek_up {
             return false;
@@ -15631,43 +15647,6 @@ impl Synoik {
         self.peek_dismiss_pending = false;
         self.layout.set_peek(false);
         self.queue_redraw_all();
-    }
-
-    /// Bring the peek down once the hold's deadline passes. Driven from the frame rather than
-    /// from the timer callback, so the clock is the only thing that decides.
-    fn advance_peek(&mut self) {
-        if self
-            .peek_arm_at
-            .is_some_and(|at| self.clock.now_unadjusted() >= at)
-        {
-            self.start_peek();
-        }
-    }
-
-    pub fn reschedule_peek_timer(&mut self) {
-        if self.peek_timer_at == self.peek_arm_at {
-            return;
-        }
-        if let Some(token) = self.peek_timer.take() {
-            self.event_loop.remove(token);
-        }
-        self.peek_timer_at = self.peek_arm_at;
-        let Some(deadline) = self.peek_arm_at else {
-            return;
-        };
-        let now = self.clock.now_unadjusted();
-        let timer = Timer::from_duration(deadline.saturating_sub(now));
-        let token = self
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                state.synoik.peek_timer = None;
-                state.synoik.peek_timer_at = None;
-                // The frame's advance_animations is what actually fires the peek.
-                state.synoik.queue_redraw_all();
-                TimeoutAction::Drop
-            })
-            .unwrap();
-        self.peek_timer = Some(token);
     }
 
     pub fn reschedule_dock_timer(&mut self) {

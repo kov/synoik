@@ -113,20 +113,16 @@ const DRAG_THRESHOLD: f64 = 8.;
 /// the same constant gnome-shell compares to (`overviewControls.js:433`).
 const OVERLAY_KEY_SHIFT_WINDOW: Duration = Duration::from_millis(250);
 
-/// How long the overlay key must be held before the workspace peek brings the thumbnail strip
-/// down over the live desktop (`docs/fork/workspace-peek.md`).
+/// How long the overlay key may be held and still count as a tap. Past this its release toggles
+/// nothing (`docs/fork/workspace-peek.md`).
 ///
-/// There is no reference constant: gnome-shell spends the overlay key on the tap alone and does
-/// nothing with a hold. Long enough that a chord on the way to Super+Tab does not flash the strip,
-/// short enough that a deliberate hold does not feel ignored.
+/// **Divergence.** mutter fires the overlay key on release however long it was down, so resting a
+/// thumb on Super and letting go throws the overview at you. Nothing is *asking* for the overview
+/// at the end of a long hold: a tap is a tap.
 ///
-/// Not the same job as the switcher's
-/// [`WORKSPACE_PREVIEW_DELAY`](crate::ui::switcher::WORKSPACE_PREVIEW_DELAY), which happens to
-/// share a value at 300 ms: that one times a pause *inside* a gesture already underway, where the
-/// key is down either way and the delay only decides whether the view follows. This one is the
-/// gesture's entry, competing with every chord that starts with Super — so it is the longer of the
-/// two, and tuned on the seat.
-pub const PEEK_HOLD_THRESHOLD: Duration = Duration::from_millis(500);
+/// Not a trigger — the peek is summoned by Shift, not by waiting — so nothing needs to happen when
+/// this elapses and no timer is armed for it. It is read once, at the release.
+pub const OVERLAY_KEY_TAP_LIMIT: Duration = Duration::from_millis(500);
 
 /// Touchpad pixels per scroll step — mutter's `DISCRETE_SCROLL_STEP`
 /// (`src/backends/native/meta-seat-impl.c:62,1139`), which is the factor it divides libinput's
@@ -954,10 +950,10 @@ impl State {
                 // check ignores Super itself, which is right for the Super_L/Super_R
                 // settings but approximate for other keys.
                 //
-                // Holding it instead brings the workspace peek down — a divergence with no
-                // reference, `docs/fork/workspace-peek.md`. It rides the same press, but not the
-                // same arm: `overlay_key_armed` dies on the first pointer button, which is the
-                // first thing any peek interaction does.
+                // Pressing Shift while it is held brings the workspace peek down — a divergence
+                // with no reference, `docs/fork/workspace-peek.md`. It rides the same press, but
+                // not the same arm: `overlay_key_armed` dies on the first pointer button, which is
+                // the first thing any peek interaction does.
                 if pressed {
                     let is_overlay_key = raw
                         .is_some_and(|raw| this.synoik.gnome_settings.overlay_keys.contains(&raw))
@@ -967,23 +963,47 @@ impl State {
                         && !mods.alt
                         && !mods.iso_level3_shift
                         && !mods.iso_level5_shift;
+                    // Shift is the peek's trigger, and the only key that does not end a held
+                    // overlay key's business: it summons the strip instead. It still clears the
+                    // tap like any other key, and it is still forwarded — a modifier the client
+                    // does not see is a modifier it thinks is up.
+                    let is_peek_trigger = !is_overlay_key
+                        && raw.is_some_and(|raw| matches!(raw, Keysym::Shift_L | Keysym::Shift_R));
+
                     this.synoik.overlay_key_armed = is_overlay_key.then_some(key_code);
                     if is_overlay_key {
-                        this.synoik.arm_peek(key_code);
+                        this.synoik.hold_overlay_key(key_code);
+                    } else if is_peek_trigger {
+                        // Does nothing unless an overlay key is actually held — Shift on its own,
+                        // and Shift pressed *before* Super (which never arms, since arming
+                        // requires no other modifier), summon nothing.
+                        this.synoik.trigger_peek();
                     } else {
                         // Another key: the chord takes over, and the strip goes with the tap.
                         this.synoik.end_peek();
                     }
-                } else if this.synoik.peek_key_held == Some(key_code) && this.synoik.end_peek() {
-                    // The hold had already fired, so this release belongs to the peek: it puts
-                    // the strip away and goes no further. Only a release *before* the threshold
-                    // reaches the tap below.
+                } else if this
+                    .synoik
+                    .overlay_key_hold
+                    .is_some_and(|(held, _)| held == key_code)
+                    && {
+                        // This release belongs to the held overlay key. Two things can claim it:
+                        // a peek that is up, and a hold too long to be a tap. Either way it goes
+                        // no further — only a short, peekless release reaches the tap below.
+                        let too_long = this
+                            .synoik
+                            .overlay_key_held_for()
+                            .is_some_and(|held| held >= OVERLAY_KEY_TAP_LIMIT);
+                        let was_peeking = this.synoik.end_peek();
+                        was_peeking || too_long
+                    }
+                {
                     this.synoik.overlay_key_armed = None;
                     // **Forwarded, where the tap intercepts.** The tap gets away with swallowing
-                    // its release because firing moves focus to the overview, and a keyboard
-                    // leave releases every key client-side. A peek moves focus nowhere — the
-                    // client keeps it throughout — so an intercepted release leaves the app
-                    // holding Super forever, on every peek. It saw the press; it sees the release.
+                    // its release because firing moves focus to the overview, and a keyboard leave
+                    // releases every key client-side. Neither of these moves focus anywhere — the
+                    // client keeps it throughout — so an intercepted release would leave the app
+                    // holding Super forever. It saw the press; it sees the release.
                     return FilterResult::Forward;
                 } else if this.synoik.overlay_key_armed.take() == Some(key_code) {
                     // A second tap that comes quickly enough shifts a state *up* —

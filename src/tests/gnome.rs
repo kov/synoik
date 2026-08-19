@@ -82,8 +82,12 @@ const KEY_LEFTMETA: u32 = 125;
 
 /// Long enough that the workspace peek's hold has fired *and* the strip has finished sliding in,
 /// so a test that means "held" neither races the threshold nor measures a half-arrived strip.
-const HELD_PAST_THRESHOLD: Duration =
-    Duration::from_millis(crate::input::PEEK_HOLD_THRESHOLD.as_millis() as u64 + 400);
+/// Longer than the strip's slide-in, so a test reading its geometry sees it landed.
+const PEEK_SETTLE: Duration = Duration::from_millis(400);
+/// Past [`OVERLAY_KEY_TAP_LIMIT`](crate::input::OVERLAY_KEY_TAP_LIMIT), so the release that
+/// follows is not a tap.
+const HELD_PAST_TAP_LIMIT: Duration =
+    Duration::from_millis(crate::input::OVERLAY_KEY_TAP_LIMIT.as_millis() as u64 + 100);
 const KEY_RIGHTMETA: u32 = 126;
 pub(super) const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -634,7 +638,7 @@ fn super_tap_toggles_overview() {
 /// The tap and the hold partition the key, so this pins both halves at once: the overview must
 /// stay closed, and the desktop behind the strip must not move — a peek is not a small overview.
 #[test]
-fn holding_super_peeks_the_workspace_strip() {
+fn shift_under_a_held_super_peeks_the_workspace_strip() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
@@ -642,8 +646,7 @@ fn holding_super_peeks_the_workspace_strip() {
     let _surface = map_focused_window(&mut f, id);
     f.settle();
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
 
     assert!(f.synoik().layout.is_peeking(), "holding Super must peek");
     assert!(
@@ -682,12 +685,11 @@ fn holding_super_peeks_the_workspace_strip() {
 /// Releasing a *held* overlay key puts the strip away and goes no further: the release is the
 /// peek's, so it never reaches the tap that would toggle the overview.
 #[test]
-fn releasing_a_held_super_dismisses_the_peek_without_the_overview() {
+fn releasing_the_held_super_dismisses_the_peek_without_the_overview() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
     f.key_release(KEY_LEFTMETA);
     f.settle();
 
@@ -728,7 +730,8 @@ fn a_click_does_not_cancel_the_peek() {
 
     f.key_press(KEY_LEFTMETA);
     f.pointer_button(BTN_LEFT, ButtonState::Pressed);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    f.key_press(KEY_LEFTSHIFT);
+    f.run_frames_for(PEEK_SETTLE);
 
     assert!(
         f.synoik().layout.is_peeking(),
@@ -755,9 +758,10 @@ fn a_swallowed_peek_release_still_clears_the_client_modifier() {
     let _ = f.client(id).take_key_events();
     let _ = f.client(id).take_mods_events();
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
     assert!(f.synoik().layout.is_peeking(), "precondition: peeking");
+    f.key_release(KEY_LEFTSHIFT);
+    f.settle();
 
     f.key_release(KEY_LEFTMETA);
     f.settle();
@@ -767,9 +771,12 @@ fn a_swallowed_peek_release_still_clears_the_client_modifier() {
         f.client(id).take_key_events(),
         vec![
             (KEY_LEFTMETA, WlKeyState::Pressed),
+            (KEY_LEFTSHIFT, WlKeyState::Pressed),
+            (KEY_LEFTSHIFT, WlKeyState::Released),
             (KEY_LEFTMETA, WlKeyState::Released),
         ],
-        "the peek forwards its release where the tap swallows it"
+        "the peek forwards its release where the tap swallows it, and the trigger is a \
+         modifier the client must see either way"
     );
     assert_eq!(
         f.client(id).take_mods_events().last().copied(),
@@ -784,10 +791,9 @@ fn a_swallowed_peek_release_still_clears_the_client_modifier() {
 
 /// A peek must never swallow a release something else is waiting for.
 ///
-/// The alt-tab switcher holds Super down for its whole popup, so the hold threshold passes under
-/// it as a matter of course. A peek that came down there and then ate the release would lose the
-/// window the user had picked — the switcher commits on exactly that release. So an action, by
-/// whatever route it arrives, stands the peek down.
+/// The alt-tab switcher rides the same held Super the peek does, and a peek that ate the release
+/// would lose the window the user had picked — the switcher commits on exactly that release. So
+/// an action, by whatever route it arrives, stands the peek down.
 #[test]
 fn a_peek_does_not_swallow_the_switchers_release() {
     let mut f = Fixture::new();
@@ -799,11 +805,12 @@ fn a_peek_does_not_swallow_the_switchers_release() {
     let _second = map_focused_window(&mut f, client);
     f.settle();
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
     assert!(f.synoik().layout.is_peeking(), "precondition: peeking");
 
-    // The live gesture: Super is already held, and Tab arrives late.
+    // The live gesture: Super is still held, Shift has been let go, and Tab arrives late.
+    // (Shift first, or this would be Super+Shift+Tab — a different binding.)
+    f.key_release(KEY_LEFTSHIFT);
     f.key_press(KEY_TAB);
     assert!(
         !f.synoik().layout.is_peeking(),
@@ -834,8 +841,7 @@ fn a_chord_dismisses_the_peek() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
     assert!(f.synoik().layout.is_peeking(), "precondition: peeking");
 
     f.key_press(KEY_A);
@@ -847,10 +853,11 @@ fn a_chord_dismisses_the_peek() {
     );
 }
 
-/// Holding the overlay key while the overview is open does nothing: the strip is already on
-/// screen in its own band, and the key keeps the behavior it has always had.
+/// Super+Shift while the overview is open summons nothing: the strip is already on screen in its
+/// own band. The Shift kills the tap on the way, exactly as it did before the peek existed — the
+/// overview is left where it was, and the next bare tap closes it.
 #[test]
-fn holding_super_in_the_overview_does_not_peek() {
+fn the_peek_trigger_in_the_overview_does_nothing() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
@@ -862,18 +869,115 @@ fn holding_super_in_the_overview_does_not_peek() {
         "precondition: the overview is open"
     );
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
     assert!(
         !f.synoik().layout.is_peeking(),
         "the overview outranks the peek"
     );
 
+    f.key_release(KEY_LEFTSHIFT);
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "the Shift spent the tap, as any key pressed under Super always has"
+    );
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "and a bare tap still closes it"
+    );
+}
+
+/// A hold longer than [`OVERLAY_KEY_TAP_LIMIT`](crate::input::OVERLAY_KEY_TAP_LIMIT) is not a tap.
+///
+/// **Divergence.** mutter fires the overlay key on release however long it was down, so a thumb
+/// resting on Super throws the overview at you on the way off. Nothing is asking for the overview
+/// at the end of a long hold, and the same goes for closing it.
+#[test]
+fn a_long_super_hold_is_not_a_tap() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_TAP_LIMIT);
     f.key_release(KEY_LEFTMETA);
     f.settle();
     assert!(
         !f.synoik().layout.is_overview_open(),
-        "and the key still closes the overview on release, threshold or not"
+        "a long hold must not open the overview"
+    );
+
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "precondition for the other direction: a tap still opens it"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_TAP_LIMIT);
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "and must not close it either — a long hold is not a tap, anywhere"
+    );
+}
+
+/// The peek outlives the Shift that summoned it: the *hold* is what keeps it up.
+#[test]
+fn releasing_shift_keeps_the_peek_up() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    summon_peek(&mut f);
+    assert!(f.synoik().layout.is_peeking(), "precondition: peeking");
+
+    f.key_release(KEY_LEFTSHIFT);
+    f.run_frames_for(PEEK_SETTLE);
+    assert!(
+        f.synoik().layout.is_peeking(),
+        "Shift is the trigger, not the hold"
+    );
+
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    assert!(
+        !f.synoik().layout.is_peeking(),
+        "the overlay key is the hold, and it just came up"
+    );
+}
+
+/// An overlay key pressed *under* Shift is not a peek hold, and a later Shift cannot revive it.
+///
+/// Arming requires no other modifier down, which is mutter's rule for the tap and which the peek
+/// inherits by riding the same press. So the order is part of the gesture: Super first, then
+/// Shift. Pinned with the Shift released and pressed again, since only a Shift *press* summons —
+/// without the second press nothing could summon anyway and the test would pass on its own.
+#[test]
+fn an_overlay_key_pressed_under_shift_is_not_a_peek_hold() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTSHIFT);
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTSHIFT);
+    f.key_press(KEY_LEFTSHIFT);
+    f.run_frames_for(PEEK_SETTLE);
+    assert!(
+        !f.synoik().layout.is_peeking(),
+        "Super pressed under Shift never became a hold, so Shift has nothing to summon"
+    );
+
+    f.key_release(KEY_LEFTSHIFT);
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "and it was never a tap either"
     );
 }
 
@@ -891,8 +995,7 @@ fn the_peek_does_not_engage_over_a_fullscreen_window() {
     let window_id = f.synoik().layout.focus().unwrap().window.clone();
 
     // The control: windowed, the hold brings out both halves.
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
     assert!(
         f.synoik()
             .layout
@@ -931,8 +1034,7 @@ fn the_peek_does_not_engage_over_a_fullscreen_window() {
         "precondition: the dock is away"
     );
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
     assert!(
         !f.synoik()
             .layout
@@ -951,11 +1053,12 @@ fn the_peek_does_not_engage_over_a_fullscreen_window() {
         "and the peek does not engage at all"
     );
 
+    f.key_release(KEY_LEFTSHIFT);
     f.key_release(KEY_LEFTMETA);
     f.settle();
     assert!(
-        f.synoik().layout.is_overview_open(),
-        "the overlay key keeps its pre-peek meaning here: the release opens the overview"
+        !f.synoik().layout.is_overview_open(),
+        "and the keys keep the meaning they had before the peek existed: Shift spent the tap"
     );
 }
 
@@ -968,8 +1071,7 @@ fn the_resize_chord_dismisses_the_peek() {
     let _ = map_window_sized(&mut f, id, (800, 600), None);
     f.settle();
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
     assert!(
         f.synoik().layout.is_peeking(),
         "precondition: the strip is down"
@@ -999,8 +1101,7 @@ fn locking_dismisses_the_peek() {
     let mut f = Fixture::new();
     f.add_output(1, (1920, 1080));
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
     assert!(f.synoik().layout.is_peeking(), "precondition: peeking");
 
     f.synoik_state().on_screen_saver_msg(
@@ -1030,8 +1131,7 @@ fn clicking_a_peeked_thumbnail_switches_workspace() {
     );
     let active_before = f.synoik().layout.active_workspace().unwrap().id();
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
 
     let target = f
         .synoik()
@@ -1079,8 +1179,7 @@ fn the_peeked_strip_takes_the_pointer_from_the_window_under_it() {
     let _w = map_window_sized(&mut f, id, (1920, 1080), None);
     f.settle();
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
 
     let (x, y) = thumbnail_center(&mut f, 0);
     let pos = smithay::utils::Point::from((x, y));
@@ -1116,8 +1215,7 @@ fn clicking_the_active_peeked_thumbnail_does_nothing() {
     tap(&mut f, KEY_LEFTMETA);
     f.settle();
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
     let active_before = f.synoik().layout.active_workspace().unwrap().id();
     let active_idx = f
         .synoik()
@@ -1168,8 +1266,7 @@ fn dragging_a_peeked_thumbnail_reorders_the_workspaces() {
         "precondition"
     );
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
 
     let (t0x, t0y) = thumbnail_center(&mut f, 0);
     let (t1x, _) = thumbnail_center(&mut f, 1);
@@ -1203,8 +1300,7 @@ fn carrying_a_window_toward_the_peeked_strip_shrinks_it() {
     tap(&mut f, KEY_LEFTMETA);
     f.settle();
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
 
     // Grab the focused window low on the screen and read its drawn size there.
     let win = f.synoik().layout.focus().unwrap().window.clone();
@@ -1268,8 +1364,7 @@ fn releasing_super_mid_drag_keeps_the_strip_until_the_drop() {
     tap(&mut f, KEY_LEFTMETA);
     f.settle();
 
-    f.key_press(KEY_LEFTMETA);
-    f.run_frames_for(HELD_PAST_THRESHOLD);
+    summon_peek(&mut f);
 
     let (t0x, t0y) = thumbnail_center(&mut f, 0);
     let (t1x, _) = thumbnail_center(&mut f, 1);
@@ -7262,6 +7357,16 @@ fn setup_two_desktops_in_overview_on(
     f.double_roundtrip(id);
 
     (win_a, win_b)
+}
+
+/// Summon the workspace peek: hold the overlay key, press Shift, and let the strip land.
+///
+/// The trigger is instant but the slide is not, and `run_frames_for` deliberately leaves the
+/// clock frozen — a test that reads geometry without waiting sees a strip at progress ~0.
+fn summon_peek(f: &mut Fixture) {
+    f.key_press(KEY_LEFTMETA);
+    f.key_press(KEY_LEFTSHIFT);
+    f.run_frames_for(PEEK_SETTLE);
 }
 
 /// Absolute pointer motion: `Fixture::pointer_motion` takes deltas.

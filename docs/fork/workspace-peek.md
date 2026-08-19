@@ -3,36 +3,63 @@
 # Workspace peek — the thumbnail strip on the live desktop
 
 **Divergence, deliberate.** gnome-shell reaches the workspace thumbnail strip only through the
-overview. This makes the same strip available on the plain desktop, on a *hold* of the overlay key,
-and gives an interactive window move a drop target while it is down. There is no reference to port;
-this document is the specification.
+overview. This makes the same strip available on the plain desktop, on **Super+Shift**, and gives an
+interactive window move a drop target while it is down. There is no reference to port; this document
+is the specification.
 
 ## The gesture
 
-Holding the overlay key (`org.gnome.mutter overlay-key`, default `Super_L`) past
-**`PEEK_HOLD_THRESHOLD`** (500 ms, tuned on the seat) brings out the overview's two pieces of
-furniture over the live desktop: the workspace thumbnail strip
+**Hold the overlay key (`org.gnome.mutter overlay-key`, default `Super_L`) and press Shift.** Out
+come the overview's two pieces of furniture over the live desktop: the workspace thumbnail strip
 slides down from the top of the work area, semi-transparent, and the dock slides up from the bottom.
 Nothing else changes — no window spread, no search entry, no dimming, and the windows do not move.
-Releasing the key puts both away.
+**The overlay key is the hold**: releasing it puts both away, whatever Shift is doing. Shift is only
+the trigger, and letting go of it changes nothing.
 
-The hold and the tap partition the overlay key, so nothing that works today changes unless the user
-holds:
+The trigger is a *key*, not a *duration*. A hold cannot be one, because Super held down already
+means something: it is the modifier half of Super+drag, of Super+click, and of every Super chord.
+An affordance that fires on the passage of time fires in the middle of all of them — dragging a
+window to the top edge to maximize it takes longer than any threshold worth having.
 
 | what happens | result |
 | --- | --- |
-| release **before** the threshold | the overview toggles, exactly as now |
-| release **after** the threshold | the strip dismisses; the overview does **not** open |
+| Shift, with the overlay key held | the strip comes down |
+| release the overlay key | the strip dismisses; the overview does **not** open |
+| release Shift, keep holding | nothing — the strip stays |
 | any other key while held | the strip dismisses (if up) and the chord fires |
 | an action fires, by any route | the strip dismisses — see below |
-| **while the overview is open** | the overlay key behaves exactly as it does today, hold or not — no peek, and a release still closes the overview |
+| Super+MMB (the resize chord) | the strip dismisses and the resize begins |
+| **while the overview is open** | nothing comes down; the strip is already on screen in its own band |
+| **over a fullscreen window** | nothing comes down — see §8 |
 
-A client holding a keyboard-shortcuts inhibit prevents the peek from arming, for the same reason and
-at the same point it prevents the overview tap from arming (`src/input/mod.rs:944`).
+Shift spends the overlay key's tap on the way in, exactly as any key pressed under Super always
+has, so the release that ends a peek was never going to open the overview anyway. The peek claims it
+regardless, because it must **forward** that release where the tap swallows it (§4).
+
+The order is part of the gesture: Super, *then* Shift. An overlay key pressed while any other
+modifier is already down never arms — mutter's rule for the tap, which the peek inherits by riding
+the same press. A client holding a keyboard-shortcuts inhibit prevents arming for the same reason
+and at the same point.
 
 The strip comes down on every output at once, as the overview's does. The dock is single-output by
 construction (`Dock::show` takes the output whose edge was pushed); a peek shows it on the active
 one. It is a pointer affordance: touch has no Super, and no touch path arms it.
+
+## The overlay key's tap has a ceiling
+
+Independent of the peek, and shipped with it: **a hold longer than `OVERLAY_KEY_TAP_LIMIT` (500 ms)
+is not a tap.** Its release toggles the overview neither open nor shut.
+
+**Divergence.** mutter fires the overlay key on release however long it was down, so a thumb resting
+on Super throws the overview at you on the way off — an accident that happens often enough to be
+worth a rule. Nothing is asking for the overview at the end of a long hold.
+
+Nothing *happens* when the limit elapses, so nothing schedules a wake-up for it: it is read once, at
+the release, against the instant recorded when the key went down. That instant and the keycode live
+in one field (`Synoik::overlay_key_hold`) — two would be a desync waiting for a path that clears only
+one, and a stale instant reads every later tap as a long hold, which is the overview becoming
+unreachable by tap. With no timer behind it a stale hold does not self-heal, so every path that can
+swallow the key's release must reach `end_peek` (the lock/shield teardown does, unconditionally).
 
 ## What the strip does while it is down
 
@@ -132,24 +159,23 @@ That flag is cleared by **any pointer button, scroll, or touch** (`event_cancels
 `src/input/mod.rs:9745`, applied at `:488`) and overwritten by any other key press (`:950`). The
 first click of any peek interaction disarms it, so it cannot be the record that Super is down.
 
-The peek gets **its own state**, holding the keycode that armed it, and is dismissed on that
-keycode's release — which the keyboard path sees whatever the pointer did in between.
+The peek gets **its own state** — `Synoik::overlay_key_hold`, the keycode that armed it and when —
+and is dismissed on that keycode's release, which the keyboard path sees whatever the pointer did in
+between.
 
 **Pointer activity does not cancel the peek.** It cancels the *tap*, and must: mutter will not let
 Super+click open the overview. The peek has the opposite relationship to the pointer — it is a
-pointer affordance, and pointer activity is evidence the user wants it. Cancelling on button press
-would break the headline gesture outright: grabbing a window within the threshold of pressing Super is how
-anyone will actually perform "carry it to the strip", and it would mean the strip never comes down.
-So the peek timer is cancelled only by a chord and by the key's own release, while `:488` keeps
-cancelling the tap alone. The consequence is deliberate: any Super+drag held past the threshold brings the
-strip down mid-drag, which is exactly when the drop target becomes useful.
+pointer affordance, and pointer activity is evidence the user wants it. Reaching for Shift after
+grabbing a window is how anyone will actually perform "carry it to the strip", and a peek that died
+on the button press could never be summoned mid-drag. So the hold is cleared only by a chord and by
+the key's own release, while `:488` keeps cancelling the tap alone. Summoning the strip mid-drag is
+deliberate: that is exactly when the drop target becomes useful.
 
 **An action stands the peek down, however it arrived.** A chord's own key press already does it,
 but taking it at `do_action` as well covers the actions no key press produced — IPC, a pointer
 binding — and, more to the point, stops a peek that fired under a modifier-held UI from swallowing
-the release that UI is waiting for. The alt-tab switcher is exactly that: Super is held for the
-whole popup, so the threshold passes under it as a matter of course, and a peek eating its release
-loses the window the user picked.
+the release that UI is waiting for. The alt-tab switcher is exactly that: it rides the same held
+Super, and a peek eating its release loses the window the user picked.
 
 **The peek forwards its release; the tap swallows its own.** The tap gets away with swallowing
 because firing moves focus to the overview, and a keyboard leave releases every key client-side
@@ -157,10 +183,10 @@ because firing moves focus to the overview, and a keyboard leave releases every 
 keeps it throughout — and an intercepted release left the focused client's `mods_depressed` at 64:
 Super held down forever, on every peek. The client saw the press, so it sees the release.
 
-Also to implement deliberately: arming is idempotent, so a virtual-keyboard client's key repeat
-cannot stack timers; the peek release is checked *before* the `overlay_key_armed` tap path, so a
-release past the threshold never reaches `ToggleOverview`; and it does not touch
-`overlay_key_last_fired`, which belongs to the app-grid escalation (`:960-975`).
+Also deliberate: arming is idempotent, so a virtual-keyboard client's key repeat cannot refresh the
+hold's instant and make an arbitrarily long hold read as a fresh tap; the release is checked *before*
+the `overlay_key_armed` tap path, so a claimed release never reaches `ToggleOverview`; and it does
+not touch `overlay_key_last_fired`, which belongs to the app-grid escalation.
 
 ### 5. Clicking a thumbnail would open the overview
 
@@ -208,8 +234,8 @@ When `render_above_top_layer()` is true the render takes a branch that never cal
 `render_thumbnails`, has no close-button chrome and no alpha group.
 
 **A fullscreen window is left alone: the peek does not engage over one.** `Layout::set_peek`
-refuses there as it does in the overview, so the overlay key keeps exactly the meaning it had before
-the peek existed — hold as long as you like, the release opens the overview. That is deliberately a
+refuses there as it does in the overview, so Super+Shift keeps exactly the meaning it had before the
+peek existed, which is none. That is deliberately a
 question the seat can answer rather than a design: whether the strip is *wanted* over fullscreen is
 unknown, and an affordance that is half-there teaches nothing. Half-there is the specific risk,
 because only the strip is missing from that render branch: the dock would come out on its own, which
@@ -263,17 +289,21 @@ While the fullscreen branch draws no strip (§8), it takes no pointer there eith
 ## Conformance corpus
 
 In `src/tests/gnome.rs`, driving real input against the `Fixture`. Peek state is observable through
-the inspectable model, and the threshold is measured on the compositor clock, so the harness drives
+the inspectable model, and the tap limit is measured on the compositor clock, so the harness drives
 the hold rather than sleeping:
 
-- hold past the threshold → the strip is visible, the overview is closed, no window has moved
-- release past the threshold → the strip is gone, the overview did not open
-- release before the threshold → the overview opens (existing behavior, pinned against regression)
+- Shift under a held overlay key → the strip is visible, the overview is closed, no window has moved
+- release the overlay key → the strip is gone, the overview did not open
+- release Shift and keep holding → the strip stays; the overlay key is the hold
+- an overlay key pressed *under* Shift → never a hold, and a later Shift summons nothing
+- a bare tap → the overview opens (existing behavior, pinned against regression)
+- a bare hold past the tap limit → the overview neither opens nor closes
 - a chord while held → the strip is gone and the chord's action fired
-- Super+Tab held past the threshold → the release commits the switcher, not the peek
+- Super+Tab out of a peek → the release commits the switcher, not the peek
 - the release of a peek → the focused client sees it, and its modifier state clears
-- hold while the overview is open → no peek, and the release closes the overview as today
-- hold with a shortcuts-inhibiting client focused → no peek
+- the trigger while the overview is open → no peek; the Shift spends the tap, and a later bare
+  tap still closes the overview
+- the trigger with a shortcuts-inhibiting client focused → no peek
 - click a thumbnail → the active workspace changed, the strip is still up
 - click the active thumbnail → nothing changed, the overview did not open
 - drag a window to a thumbnail → the window is on that workspace, keeps its geometry, is not tiled,
@@ -283,14 +313,13 @@ the hold rather than sleeping:
 - carry a window toward the strip → it shrinks, and grows again on the way back down
 - release the key mid-drag → the strip stays until the button releases, then goes
 - drag a window into a gap → a workspace was created there
-- hold past the threshold → the dock is out on the active output
+- the trigger → the dock is out on the active output
 - release → the dock's hide deadline is re-armed, and it goes
 - drag a dock icon onto a thumbnail → the app launched on that workspace
-- Super held past the threshold *while already dragging a window* → the strip comes down
+- the trigger *while already dragging a window* → the strip comes down
 - the top-left hot corner while peeked → the overview did not open
 - Super+MMB while peeked → the strip is gone, and the release that follows opens nothing
-- hold over a fullscreen window → no peek, no strip, no dash, and the release opens the overview
-  as a tap would
+- the trigger over a fullscreen window → no peek, no strip, no dash
 - the pointer over a peeked thumbnail → the window under it holds neither surface nor activation,
   and takes both back when the peek goes
 - lock while peeked → the strip is gone
