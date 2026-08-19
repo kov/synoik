@@ -1689,6 +1689,10 @@ fn moving_a_window_between_workspaces_repaints_the_strip() {
         .add_renderer()
         .expect("build the Vulkan renderer");
     f.add_output(1, (1920, 1080));
+    // A patterned picture, not a flat colour: a thumbnail that draws its background at the wrong
+    // place, or samples the wrong part of it, looks exactly like a correct one when every pixel of
+    // the picture is the same.
+    f.synoik().wallpaper = crate::wallpaper::checker(1920, 1080, 60);
     let id = f.add_client();
     // Paint the windows: a miniature the same colour as the thumbnail it sits in is a miniature
     // no pixel comparison can see leave.
@@ -1835,6 +1839,10 @@ fn filing_windows_away_one_after_another_repaints_the_strip() {
         .expect("build the Vulkan renderer");
     f.add_output(1, (3840, 2160));
     f.resize_output(1, None, Some(1.25));
+    // A patterned picture, not a flat colour: a thumbnail that draws its background at the wrong
+    // place or samples the wrong part of it looks exactly like a correct one when every pixel of
+    // the picture is the same.
+    f.synoik().wallpaper = crate::wallpaper::checker(3840, 2160, 120);
     f.settle();
 
     let id = f.add_client();

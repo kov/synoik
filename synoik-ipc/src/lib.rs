@@ -382,6 +382,20 @@ pub struct DebugFocusState {
     pub im_unresponsive: bool,
     /// Per-output redraw state — the other way a screen freezes while the compositor is alive.
     pub outputs: Vec<DebugOutputState>,
+    /// Whether the workspace peek's strip is down over the live desktop.
+    pub peek_up: bool,
+    /// Whether the overlay key is being held — the peek's hold, and what a Shift press toggles
+    /// against. A hold with no peek is the state a long Super press leaves behind.
+    pub overlay_key_held: bool,
+    /// Whether the peek's trigger key is down. It gates the toggle on the key's *edge*, so a
+    /// trigger stuck down would make further presses do nothing.
+    pub peek_trigger_held: bool,
+    /// How far the thumbnail strip has come down, 0 to 1. `None` is a strip that is not drawing —
+    /// including a peek that is up but refusing to draw over a fullscreen window.
+    pub strip_progress: Option<f64>,
+    /// Each thumbnail's rect in the strip, in logical coordinates — what a capture has to be
+    /// measured against to say whether a thumbnail drew what it should have.
+    pub strip_thumbs: Vec<(f64, f64, f64, f64)>,
 }
 
 /// One output's redraw state — a debugging snapshot.

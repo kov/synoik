@@ -8520,6 +8520,27 @@ impl Synoik {
             im_pending_keys: pending,
             im_unanswered: unanswered,
             im_unresponsive: im.is_some_and(crate::input_method::InputMethod::is_unresponsive),
+            peek_up: self.peek_up,
+            overlay_key_held: self.overlay_key_hold.is_some(),
+            peek_trigger_held: self.peek_trigger_held.is_some(),
+            strip_progress: self
+                .layout
+                .active_output()
+                .and_then(|output| self.layout.monitor_for_output(output))
+                .and_then(|mon| mon.strip_progress()),
+            strip_thumbs: self
+                .layout
+                .active_output()
+                .and_then(|output| self.layout.monitor_for_output(output))
+                .and_then(|mon| mon.thumbnail_strip())
+                .map(|strip| {
+                    strip
+                        .thumbs
+                        .iter()
+                        .map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h))
+                        .collect()
+                })
+                .unwrap_or_default(),
             outputs: self
                 .output_state
                 .iter()

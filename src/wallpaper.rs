@@ -808,28 +808,60 @@ fn zoom_crop(picture: Size<f64, Logical>, view: Size<f64, Logical>) -> Rectangle
     Rectangle::new(loc, src_size)
 }
 
+/// A `Wallpaper` holding one flat colour, sized like a stock background.
+///
+/// A picture is what makes a thumbnail's background *visible*: without one a workspace falls back
+/// to a solid fill, and a draw that goes missing lands on a colour close enough to hide it.
+#[cfg(test)]
+pub(crate) fn flat(rgb: [u8; 3]) -> Wallpaper {
+    const N: i32 = 512;
+    let mut data = Vec::with_capacity((N * N * 4) as usize);
+    for _ in 0..N * N {
+        data.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 0xff]);
+    }
+    Wallpaper {
+        image: Some(Image {
+            thumb: Thumb::from_rgba(&data, N as u32, N as u32),
+            pixels: Pixels::Host(data),
+            size: Size::from((N, N)),
+            opaque: true,
+            legible: RefCell::new(None),
+        }),
+        ..Default::default()
+    }
+}
+
+/// A `Wallpaper` holding a checkerboard, so a draw that samples the wrong part of the picture —
+/// or does not cover what it was given — shows up as pattern, not as one flat colour.
+#[cfg(test)]
+pub(crate) fn checker(w: i32, h: i32, cell: i32) -> Wallpaper {
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let dark = ((x / cell) + (y / cell)) % 2 == 0;
+            let ramp = ((x * 255) / w) as u8;
+            if dark {
+                data.extend_from_slice(&[0xff, ramp, 0x00, 0xff]);
+            } else {
+                data.extend_from_slice(&[ramp, 0xff, 0x00, 0xff]);
+            }
+        }
+    }
+    Wallpaper {
+        image: Some(Image {
+            thumb: Thumb::from_rgba(&data, w as u32, h as u32),
+            pixels: Pixels::Host(data),
+            size: Size::from((w, h)),
+            opaque: true,
+            legible: RefCell::new(None),
+        }),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A `Wallpaper` holding one flat colour, sized like a stock background.
-    fn flat(rgb: [u8; 3]) -> Wallpaper {
-        const N: i32 = 512;
-        let mut data = Vec::with_capacity((N * N * 4) as usize);
-        for _ in 0..N * N {
-            data.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 0xff]);
-        }
-        Wallpaper {
-            image: Some(Image {
-                thumb: Thumb::from_rgba(&data, N as u32, N as u32),
-                pixels: Pixels::Host(data),
-                size: Size::from((N, N)),
-                opaque: true,
-                legible: RefCell::new(None),
-            }),
-            ..Default::default()
-        }
-    }
 
     /// A 3072x1728 view at scale 1.25 — kov's seat — and the band the curtain's text lands in.
     fn seat_query(wp: &Wallpaper, ceiling: f64, target: f64) -> f64 {

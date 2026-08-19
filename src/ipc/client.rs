@@ -589,6 +589,26 @@ pub fn handle_msg(mut msg: Msg, json: bool) -> anyhow::Result<()> {
                     output.scanout_failed,
                 );
             }
+            println!("Workspace peek:");
+            println!("  strip up:        {}", d.peek_up);
+            println!(
+                "  overlay key:     {}",
+                if d.overlay_key_held { "held" } else { "up" }
+            );
+            println!(
+                "  trigger:         {}",
+                if d.peek_trigger_held { "down" } else { "up" }
+            );
+            println!(
+                "  strip progress:  {}",
+                match d.strip_progress {
+                    Some(v) => format!("{v:.3}"),
+                    None => String::from("not drawing"),
+                }
+            );
+            for (n, (x, y, w, h)) in d.strip_thumbs.iter().enumerate() {
+                println!("  thumb {n}:         {x:.1},{y:.1} {w:.1}x{h:.1}");
+            }
             println!("Keyboard focus:    {}", d.keyboard_focus);
             println!("Input method:");
             if !d.input_method {
