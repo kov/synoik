@@ -14,7 +14,7 @@ use synoik_vk::render::{
     as_bytes, BorderPush, ClippedTexturePush, PostprocessPush, QuadPush, ResizePush, ShadowPush,
     TextPush, IDENTITY_PROJ,
 };
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::backdrop_blur::{self, BackdropBlur};
 use super::blur_chain::SharedBlurChain;
@@ -185,6 +185,16 @@ fn note_scanout_discard(layout: vk::ImageLayout) {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= EXPECTED_COLD_DISCARDS {
+        // Say so anyway, quietly. The budget exists because a slot's first discard is correct, but
+        // it is a *lifetime* budget: a swapchain of three slots spends three and leaves five for a
+        // pathological discard to hide in later. Then a journal with no discard line reads as "the
+        // preserve path held", which is a conclusion the counter had not earned. These lines are a
+        // handful at startup and make the silence afterwards mean something.
+        debug!(
+            seen = n,
+            ?layout,
+            "scanout frame discarded its target (cold)"
+        );
         return;
     }
     if (n - EXPECTED_COLD_DISCARDS - 1).is_multiple_of(WARN_EVERY) {
