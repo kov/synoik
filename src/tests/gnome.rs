@@ -1016,6 +1016,39 @@ fn releasing_shift_keeps_the_peek_up() {
     );
 }
 
+/// A diagnostic must not dismiss the thing it was called to look at.
+///
+/// Every other action stands the peek down, because an action means the overlay key is being used
+/// as a modifier rather than held. The debug actions are not that: they observe a state the
+/// compositor is already in, and the peek is one of the states worth observing.
+/// `debug-dump-scanout` read back a screen the strip had just been taken off, which is the
+/// instrument destroying its own subject — found while trying to capture the strip's own rendering
+/// artifact.
+#[test]
+fn a_debug_action_leaves_the_peek_standing() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    summon_peek(&mut f);
+    assert!(f.synoik().layout.is_peeking(), "precondition: peeking");
+
+    f.synoik_state()
+        .do_action(Action::DebugToggleOpaqueRegions, false);
+    f.run_frames_for(PEEK_SETTLE);
+    assert!(
+        f.synoik().layout.is_peeking(),
+        "a debug action asked about the compositor; it did not change it"
+    );
+
+    // A user-facing action still does stand it down, which is the rule the exemption carves out of.
+    f.synoik_state().do_action(Action::ToggleOverview, false);
+    f.settle();
+    assert!(
+        !f.synoik().layout.is_peeking(),
+        "an ordinary action means the overlay key is being used as a modifier"
+    );
+}
+
 /// An overlay key pressed *under* Shift is not a peek hold, and a later Shift cannot revive it.
 ///
 /// Arming requires no other modifier down, which is mutter's rule for the tap and which the peek

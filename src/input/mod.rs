@@ -2625,7 +2625,16 @@ impl State {
         // fired under a modifier-held UI from swallowing the release that UI is waiting for. The
         // alt-tab switcher is exactly that: Super is held for the whole popup, and a peek eating
         // its release loses the window the user picked.
-        self.synoik.end_peek();
+        //
+        // The debug actions are exempt, because every one of them exists to observe a state the
+        // compositor is already in, and a peek is one of the states worth observing. Dismissing it
+        // first makes `debug-dump-scanout` answer about a screen that no longer has the strip on
+        // it -- the instrument destroying its own subject. (`screenshot-screen` has the same shape
+        // and is *not* exempt: it is a user-facing action whose result the user is about to look
+        // at, and GNOME's own screenshot dismisses the shell UI too.)
+        if !is_debug_action(&action) {
+            self.synoik.end_peek();
+        }
 
         if let Some(touch) = self.synoik.seat.get_touch() {
             touch.cancel(self);
@@ -9973,6 +9982,21 @@ fn should_reset_pointer_inactivity_timer<I: InputBackend>(event: &InputEvent<I>)
             | InputEvent::TabletToolButton { .. }
             | InputEvent::TabletToolProximity { .. }
             | InputEvent::TabletToolTip { .. }
+    )
+}
+
+/// Actions that only *look at* the compositor, or flip a diagnostic switch -- never a state the
+/// user asked to change. They must leave transient UI standing, or they answer about a compositor
+/// that stopped being the one in question the moment they were called.
+fn is_debug_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::DebugToggleOpaqueRegions
+            | Action::DebugToggleDamage
+            | Action::DebugDumpScanout
+            | Action::DebugToggleDeadlineDispatch
+            | Action::DebugSetRenderTimeMargin(_)
+            | Action::DebugSetBattery(..)
     )
 }
 
