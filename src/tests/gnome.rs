@@ -946,6 +946,49 @@ fn clicking_a_peeked_thumbnail_switches_workspace() {
     );
 }
 
+/// The peeked strip takes the pointer. The window it covers is still a live, ordinary window —
+/// which is exactly why it kept pointer focus through the strip and went on painting its own
+/// cursor there, so a window edge under a thumbnail showed a resize cursor.
+///
+/// Varies one thing: the same point, once with the peek up and once without.
+#[test]
+fn the_peeked_strip_takes_the_pointer_from_the_window_under_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = setup_two_desktops_in_overview(&mut f, id);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    // A window big enough to lie under the band the strip comes down into.
+    let _w = map_window_sized(&mut f, id, (1920, 1080), None);
+    f.settle();
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+
+    let (x, y) = thumbnail_center(&mut f, 0);
+    let pos = smithay::utils::Point::from((x, y));
+    let under = f.synoik().contents_under(pos);
+    assert!(
+        under.window.is_none() && under.surface.is_none(),
+        "the strip covers the window there, so nothing under it may hold the pointer"
+    );
+    assert!(
+        f.synoik().window_under(pos).is_none(),
+        "and no window is there to activate"
+    );
+
+    // The control: the very same point with the peek gone is an ordinary window hit.
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    let under = f.synoik().contents_under(pos);
+    assert!(
+        under.window.is_some() && under.surface.is_some(),
+        "with the strip gone the window under the pointer takes it back"
+    );
+}
+
 /// Clicking the *active* thumbnail does nothing. In the overview that press is the gesture that
 /// leaves it, landing on the workspace clicked; a peek has no overview to leave, and opening one
 /// would be the opposite of what holding rather than tapping asked for.

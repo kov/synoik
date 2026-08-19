@@ -8908,6 +8908,32 @@ impl Synoik {
         false
     }
 
+    /// Whether shell chrome drawn over the *live* desktop covers this point: a peeked
+    /// thumbnail strip, or the dock's dash.
+    ///
+    /// Both sit above the windows and take the pointer with them, so the window underneath must
+    /// not keep pointer focus — it would go on driving the cursor image through our chrome, which
+    /// is how a window edge under the strip kept showing a resize cursor. Same reason as the
+    /// notification banner and the overview's own dash, which each state it separately just
+    /// above; this is the pair that appears with the overview shut.
+    ///
+    /// Note that losing focus is not by itself enough to fix the cursor: nothing resets the image
+    /// on a focus change, so the motion path also forces the arrow (`update_panel_hover`).
+    pub fn is_desktop_chrome_under(
+        &self,
+        output: &Output,
+        pos_within_output: Point<f64, Logical>,
+    ) -> bool {
+        if self.layout.peek_takes_pointer(output, pos_within_output) {
+            return true;
+        }
+
+        self.dock_owns_dash(output)
+            && self
+                .dash_area(output)
+                .is_some_and(|area| area.contains(pos_within_output))
+    }
+
     /// Returns the workspace under the position to be activated.
     ///
     /// The return value is an output and a workspace index on it.
@@ -8933,6 +8959,10 @@ impl Synoik {
         }
 
         if self.is_layout_obscured_under(output, pos_within_output) {
+            return None;
+        }
+
+        if self.is_desktop_chrome_under(output, pos_within_output) {
             return None;
         }
 
@@ -9073,6 +9103,10 @@ impl Synoik {
         }
 
         if self.is_layout_obscured_under(output, pos_within_output) {
+            return None;
+        }
+
+        if self.is_desktop_chrome_under(output, pos_within_output) {
             return None;
         }
 
@@ -9252,6 +9286,15 @@ impl Synoik {
                 .map(mapped_hit_data)
         };
 
+        // Chrome the shell draws over the live desktop — a peeked thumbnail strip, the dock's
+        // dash — takes the pointer where it covers. It resolves to nothing rather than to a
+        // window, and it *stops* the chain: the background and bottom layers behind it are
+        // covered too. Its own clicks and hover are handled in the input path.
+        let desktop_chrome = || {
+            self.is_desktop_chrome_under(output, pos_within_output)
+                .then_some((None, (None, None)))
+        };
+
         let mon = self.layout.monitor_for_output(output).unwrap();
 
         let mut under =
@@ -9264,6 +9307,7 @@ impl Synoik {
         if mon.render_above_top_layer() {
             under = under
                 .or_else(interactive_moved_window_under)
+                .or_else(desktop_chrome)
                 .or_else(window_under)
                 .or_else(|| layer_popup_under(Layer::Top))
                 .or_else(|| layer_toplevel_under(Layer::Top))
@@ -9284,7 +9328,7 @@ impl Synoik {
                     .or_else(|| layer_popup_under(Layer::Background));
             }
 
-            under = under.or_else(window_under);
+            under = under.or_else(desktop_chrome).or_else(window_under);
 
             if !is_overview_open {
                 under = under

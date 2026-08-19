@@ -210,6 +210,31 @@ If the key comes up while a `ThumbGrab` or a strip-targeted move is in flight, d
 the button release that ends the grab, then slides up. This is not a latch — the strip is never
 *usable* after the key is up; it is only not torn down while a grab holds its geometry.
 
+### 11. The strip is chrome over a live desktop, so it must take the pointer
+
+Everywhere else the strip appears, what it covers is inert: the overview's windows are drawn as
+previews and hit as `HitType::Activate`, never `Input`. A peek is the one place the strip lies over
+ordinary interactive windows, and nothing in the hit test knew about it — so the window underneath
+kept pointer focus and went on driving the cursor image through the strip, which is a window edge
+showing a resize cursor over a thumbnail.
+
+**Rule: where the peek draws, the peek owns the pointer.** `Synoik::is_desktop_chrome_under`
+suppresses the window under it in `contents_under`, `window_under` and `workspace_under`, and
+`resize_edges_under` finds no edge there. The region is the *row* (`Strip::bounds` ∩ the band),
+not the full-width band — the same rectangle that accepts a drop, so what swallows the pointer and
+what can be aimed at agree. A band with two thumbnails in it is mostly empty air with the desktop
+showing through, and a screen-wide dead zone with nothing drawn in it is worse than the leak.
+
+Losing focus does not reset the cursor image — nothing does — so the motion path also forces the
+arrow, as the notification banner already did. That runs on motion, so a strip descending under a
+stationary pointer leaves the stale cursor until the pointer next moves.
+
+The **dock** is the same defect on the other screen edge, and the peek brings it out: the dash
+suppression in `contents_under` was gated on the overview, so the dock's dash did not take the
+pointer from the window under it. It does now, peek or not.
+
+While the fullscreen branch draws no strip (§8), it takes no pointer there either.
+
 ## Conformance corpus
 
 In `src/tests/gnome.rs`, driving real input against the `Fixture`. Peek state is observable through
@@ -238,6 +263,8 @@ the hold rather than sleeping:
 - drag a dock icon onto a thumbnail → the app launched on that workspace
 - Super held past the threshold *while already dragging a window* → the strip comes down
 - the top-left hot corner while peeked → the overview did not open
+- the pointer over a peeked thumbnail → the window under it holds neither surface nor activation,
+  and takes both back when the peek goes
 - lock while peeked → the strip is gone
 
 Plus render tests for two things state assertions cannot see: that peek thumbnails show their

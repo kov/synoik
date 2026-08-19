@@ -4789,6 +4789,23 @@ impl State {
             }
         }
 
+        // Chrome over the live desktop — a peeked thumbnail strip, the dock's dash — suppresses
+        // the window beneath it in `contents_under`, but losing focus does not by itself reset the
+        // cursor image: whatever the client last set is still on screen. Force the arrow, or a
+        // window edge under the strip keeps showing its resize cursor. Not while a grab owns the
+        // cursor: see `grabbed` above.
+        if !grabbed {
+            let chrome = self
+                .synoik
+                .output_under(pos)
+                .is_some_and(|(output, p)| self.synoik.is_desktop_chrome_under(output, p));
+            if chrome {
+                self.synoik
+                    .cursor_manager
+                    .set_cursor_image(CursorImageStatus::default_named());
+            }
+        }
+
         // A panel popover grabs input modally: no window under it receives pointer focus
         // (see `contents_under`), so the app can't set the cursor image while we're open.
         // Force the default arrow so a stale client cursor (e.g. a terminal's I-beam that was

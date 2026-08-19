@@ -2630,6 +2630,17 @@ impl<W: LayoutElement> Layout<W> {
         mon.window_under(pos_within_output)
     }
 
+    /// Whether a peeked thumbnail strip covers this point — see
+    /// [`Monitor::peek_takes_pointer`].
+    pub fn peek_takes_pointer(
+        &self,
+        output: &Output,
+        pos_within_output: Point<f64, Logical>,
+    ) -> bool {
+        self.monitor_for_output(output)
+            .is_some_and(|mon| mon.peek_takes_pointer(pos_within_output))
+    }
+
     pub fn resize_edges_under(
         &self,
         output: &Output,

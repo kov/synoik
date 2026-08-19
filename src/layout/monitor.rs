@@ -3105,8 +3105,41 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    /// Whether a peeked thumbnail strip covers this point, and so owns the pointer there.
+    ///
+    /// The peek is the one place the strip is drawn over a *live* desktop, so it is the one place
+    /// something under the strip is still an ordinary interactive window. It is not: the strip is
+    /// chrome the user is actively holding open, and everything it covers is behind it.
+    ///
+    /// The region is the row, not the band. A band with two workspaces in it is mostly empty air
+    /// showing the desktop through, and a dead zone the width of the screen with nothing drawn in
+    /// it is worse than the leak. This is the same region [`Strip::drop_target`] accepts, so what
+    /// swallows the pointer and what accepts a drop are the same rectangle.
+    pub fn peek_takes_pointer(&self, pos_within_output: Point<f64, Logical>) -> bool {
+        if !self.strip_is_peek() {
+            return false;
+        }
+        // Over a fullscreen window the strip is not drawn at all — that render branch has no
+        // thumbnails group yet (`docs/fork/workspace-peek.md` §8). Taking the pointer where
+        // nothing is painted would be an invisible dead zone; drop this when the branch grows
+        // the strip.
+        if self.render_above_top_layer() {
+            return false;
+        }
+        let Some(strip) = self.thumbnail_strip() else {
+            return false;
+        };
+        strip.band.contains(pos_within_output) && strip.bounds().contains(pos_within_output)
+    }
+
     pub fn resize_edges_under(&self, pos_within_output: Point<f64, Logical>) -> Option<ResizeEdge> {
         if self.overview_progress.is_some() {
+            return None;
+        }
+
+        // Under a peeked strip there is no window edge to grab: Mod+MMB there would otherwise
+        // start resizing whatever the strip is covering.
+        if self.peek_takes_pointer(pos_within_output) {
             return None;
         }
 
