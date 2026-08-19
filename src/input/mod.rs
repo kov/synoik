@@ -113,6 +113,14 @@ const DRAG_THRESHOLD: f64 = 8.;
 /// the same constant gnome-shell compares to (`overviewControls.js:433`).
 const OVERLAY_KEY_SHIFT_WINDOW: Duration = Duration::from_millis(250);
 
+/// How long the overlay key must be held before the workspace peek brings the thumbnail strip
+/// down over the live desktop (`docs/fork/workspace-peek.md`).
+///
+/// There is no reference constant: gnome-shell spends the overlay key on the tap alone and does
+/// nothing with a hold. Long enough that a chord on the way to Super+Tab does not flash the strip,
+/// short enough that a deliberate hold does not feel ignored.
+pub const PEEK_HOLD_THRESHOLD: Duration = Duration::from_millis(300);
+
 /// Touchpad pixels per scroll step — mutter's `DISCRETE_SCROLL_STEP`
 /// (`src/backends/native/meta-seat-impl.c:62,1139`), which is the factor it divides libinput's
 /// pixel deltas by before handing Clutter a `dy`. GNOME's scroll consumers then read that `dy` as
@@ -938,6 +946,11 @@ impl State {
                 // which tracks the GSettings store live. The "no other modifiers"
                 // check ignores Super itself, which is right for the Super_L/Super_R
                 // settings but approximate for other keys.
+                //
+                // Holding it instead brings the workspace peek down — a divergence with no
+                // reference, `docs/fork/workspace-peek.md`. It rides the same press, but not the
+                // same arm: `overlay_key_armed` dies on the first pointer button, which is the
+                // first thing any peek interaction does.
                 if pressed {
                     let is_overlay_key = raw
                         .is_some_and(|raw| this.synoik.gnome_settings.overlay_keys.contains(&raw))
@@ -948,6 +961,18 @@ impl State {
                         && !mods.iso_level3_shift
                         && !mods.iso_level5_shift;
                     this.synoik.overlay_key_armed = is_overlay_key.then_some(key_code);
+                    if is_overlay_key {
+                        this.synoik.arm_peek(key_code);
+                    } else {
+                        // Another key: the chord takes over, and the strip goes with the tap.
+                        this.synoik.end_peek();
+                    }
+                } else if this.synoik.peek_key_held == Some(key_code) && this.synoik.end_peek() {
+                    // The hold had already fired, so this release belongs to the peek: it puts
+                    // the strip away and goes no further. Only a release *before* the threshold
+                    // reaches the tap below.
+                    this.synoik.overlay_key_armed = None;
+                    return FilterResult::Intercept(None);
                 } else if this.synoik.overlay_key_armed.take() == Some(key_code) {
                     // A second tap that comes quickly enough shifts a state *up* —
                     // window picker → app grid — instead of toggling the overview
@@ -2551,6 +2576,15 @@ impl State {
             return;
         }
 
+        // An action means the overlay key is being *used* — as a modifier, or not at all — so the
+        // workspace peek stands down and the action proceeds (`docs/fork/workspace-peek.md`). The
+        // chord's own key press already does this; taking it here as well covers the actions no
+        // key press produced (IPC, a pointer binding) and, more to the point, stops a peek that
+        // fired under a modifier-held UI from swallowing the release that UI is waiting for. The
+        // alt-tab switcher is exactly that: Super is held for the whole popup, and a peek eating
+        // its release loses the window the user picked.
+        self.synoik.end_peek();
+
         if let Some(touch) = self.synoik.seat.get_touch() {
             touch.cancel(self);
         }
@@ -2569,11 +2603,14 @@ impl State {
                 self.backend.change_vt(vt);
                 // Changing VT may not deliver the key releases, so clear the state.
                 self.synoik.suppressed_keys.clear();
+                // Including the overlay key's, which would leave the strip down for good.
+                self.synoik.end_peek();
             }
             Action::Suspend => {
                 self.backend.suspend();
                 // Suspend may not deliver the key releases, so clear the state.
                 self.synoik.suppressed_keys.clear();
+                self.synoik.end_peek();
             }
             Action::PowerOffMonitors => {
                 self.synoik.deactivate_monitors(&mut self.backend);

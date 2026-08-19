@@ -79,6 +79,11 @@ const KEY_J: u32 = 36;
 const KEY_K: u32 = 37;
 const KEY_V: u32 = 47;
 const KEY_LEFTMETA: u32 = 125;
+
+/// Comfortably past the workspace peek's hold threshold, so a test that means "held" does not
+/// depend on where the frame boundaries happen to land.
+const HELD_PAST_THRESHOLD: Duration =
+    Duration::from_millis(crate::input::PEEK_HOLD_THRESHOLD.as_millis() as u64 + 100);
 const KEY_RIGHTMETA: u32 = 126;
 pub(super) const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
@@ -619,6 +624,229 @@ fn super_tap_toggles_overview() {
     assert!(
         !f.synoik().layout.is_overview_open(),
         "a second Super tap closes it"
+    );
+}
+
+/// **Workspace peek** (`docs/fork/workspace-peek.md`), a divergence with no gnome-shell
+/// reference: *holding* the overlay key past its threshold brings the workspace thumbnail strip
+/// down over the live desktop, rather than opening the overview.
+///
+/// The tap and the hold partition the key, so this pins both halves at once: the overview must
+/// stay closed, and the desktop behind the strip must not move — a peek is not a small overview.
+#[test]
+fn holding_super_peeks_the_workspace_strip() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let _surface = map_focused_window(&mut f, id);
+    f.settle();
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+
+    assert!(f.synoik().layout.is_peeking(), "holding Super must peek");
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "a peek must not open the overview"
+    );
+
+    let mon = f.synoik().layout.monitors().next().unwrap();
+    assert!(
+        mon.thumbnails_visible(),
+        "the peek must put the thumbnail strip on screen"
+    );
+
+    // The desktop behind the strip, pinned against the two accessors the strip shares with it.
+    // Both used to ride the overview's progress alone; a peek that drove them would round the
+    // real wallpaper's corners and shrink the live desktop, which is an overview, not a peek.
+    assert_eq!(
+        mon.workspace_background_radius(),
+        0.,
+        "the desktop's own corners must stay square under a peek"
+    );
+    assert_eq!(
+        mon.workspace_render_scale(0),
+        1.,
+        "the live desktop must not shrink under a peek"
+    );
+    assert!(
+        mon.strip_render_scale(0) <= 1.,
+        "but the strip's own thumbnails still take their inactive shrink"
+    );
+}
+
+/// Releasing a *held* overlay key puts the strip away and goes no further: the release is the
+/// peek's, so it never reaches the tap that would toggle the overview.
+#[test]
+fn releasing_a_held_super_dismisses_the_peek_without_the_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+
+    assert!(!f.synoik().layout.is_peeking(), "the release puts it away");
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "a release past the threshold must not open the overview"
+    );
+}
+
+/// The other half of the partition, pinned against regression: a release *before* the threshold is
+/// still the plain overlay-key tap.
+#[test]
+fn a_short_super_tap_still_opens_the_overview() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "a tap must still open the overview"
+    );
+    assert!(!f.synoik().layout.is_peeking(), "and must not peek");
+}
+
+/// **A click must not cancel the peek.** This is the one place the peek deliberately parts company
+/// with the tap: mutter clears its overlay-key arm on any pointer button, and reusing that rule
+/// here would break the gesture the peek exists for — grabbing a window to carry it to the strip
+/// is a button press within the threshold, and the strip would never arrive.
+#[test]
+fn a_click_does_not_cancel_the_peek() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    f.pointer_motion(960., 540.);
+
+    f.key_press(KEY_LEFTMETA);
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+
+    assert!(
+        f.synoik().layout.is_peeking(),
+        "pointer activity cancels the tap, never the hold"
+    );
+}
+
+/// A peek must never swallow a release something else is waiting for.
+///
+/// The alt-tab switcher holds Super down for its whole popup, so the hold threshold passes under
+/// it as a matter of course. A peek that came down there and then ate the release would lose the
+/// window the user had picked — the switcher commits on exactly that release. So an action, by
+/// whatever route it arrives, stands the peek down.
+#[test]
+fn a_peek_does_not_swallow_the_switchers_release() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    let client = f.add_client();
+    let _first = map_focused_window(&mut f, client);
+    let first = f.synoik().layout.focus().unwrap().id();
+    let _second = map_focused_window(&mut f, client);
+    f.settle();
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+    assert!(f.synoik().layout.is_peeking(), "precondition: peeking");
+
+    // The live gesture: Super is already held, and Tab arrives late.
+    f.key_press(KEY_TAB);
+    assert!(
+        !f.synoik().layout.is_peeking(),
+        "the chord stands the peek down"
+    );
+    assert!(
+        f.synoik().switcher.is_open(),
+        "precondition: Super+Tab opened the switcher"
+    );
+    f.key_release(KEY_TAB);
+
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    assert_eq!(
+        f.synoik().layout.focus().unwrap().id(),
+        first,
+        "the release must commit the switcher, not merely dismiss a peek"
+    );
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "and it must not fall through to the overlay-key tap either"
+    );
+}
+
+/// A chord takes over from the peek: the strip goes away and the binding fires.
+#[test]
+fn a_chord_dismisses_the_peek() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+    assert!(f.synoik().layout.is_peeking(), "precondition: peeking");
+
+    f.key_press(KEY_A);
+    f.settle();
+
+    assert!(
+        !f.synoik().layout.is_peeking(),
+        "a chord dismisses the peek"
+    );
+}
+
+/// Holding the overlay key while the overview is open does nothing: the strip is already on
+/// screen in its own band, and the key keeps the behavior it has always had.
+#[test]
+fn holding_super_in_the_overview_does_not_peek() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    assert!(
+        f.synoik().layout.is_overview_open(),
+        "precondition: the overview is open"
+    );
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+    assert!(
+        !f.synoik().layout.is_peeking(),
+        "the overview outranks the peek"
+    );
+
+    f.key_release(KEY_LEFTMETA);
+    f.settle();
+    assert!(
+        !f.synoik().layout.is_overview_open(),
+        "and the key still closes the overview on release, threshold or not"
+    );
+}
+
+/// A peek cannot outlive the session locking: the shield swallows the overlay key's release, so
+/// nothing else would ever put the strip away.
+#[test]
+fn locking_dismisses_the_peek() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+
+    f.key_press(KEY_LEFTMETA);
+    f.run_frames_for(HELD_PAST_THRESHOLD);
+    assert!(f.synoik().layout.is_peeking(), "precondition: peeking");
+
+    f.synoik_state().on_screen_saver_msg(
+        crate::dbus::gnome_screen_saver::ScreenSaverToSynoik::Lock(None),
+    );
+    f.settle();
+
+    assert!(
+        !f.synoik().layout.is_peeking(),
+        "the lock must put the strip away"
     );
 }
 

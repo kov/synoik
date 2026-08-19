@@ -108,6 +108,22 @@ const MIN_WORKSPACE_BACKGROUND_CORNER_RADIUS: f64 = 8.;
 /// **Adaptive chrome, rule 1 — ramped.**
 const SHADOW_GLOW_MARGIN: f64 = 48.;
 
+/// How far the workspace peek's band sits below the top of the work area
+/// (`docs/fork/workspace-peek.md`). The strip is a transient thing resting *on* the desktop, and
+/// one flush against the panel reads as part of it.
+///
+/// **Adaptive chrome, rule 1 — ramped**: a fixed logical constant, so it multiplies by
+/// `overview_layout::chrome_ramp`.
+const PEEK_BAND_PADDING: f64 = 12.;
+
+/// How opaque the strip is while a peek holds it there.
+///
+/// The overview draws its row over a backdrop it owns; a peek draws over the user's own windows,
+/// and the point of the gesture is that they are still there. Translucent enough to read as
+/// resting on the desktop rather than replacing it, opaque enough that a thumbnail still reads as
+/// its workspace.
+pub const PEEK_STRIP_ALPHA: f32 = 0.88;
+
 /// A crop rect that crops nothing. `CropRenderElement` has no "no bounds" mode, so callers that
 /// only want the wrapper for its type pass this; the element still has to survive the intersection,
 /// hence half of `i32::MAX` on each side rather than the full range (which would overflow).
@@ -187,6 +203,10 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
     overview_progress: Option<OverviewProgress>,
+    /// How far the workspace peek has slid the strip onto the live desktop, 0 when it is not
+    /// there (`docs/fork/workspace-peek.md`). Pushed in from the parent layout, which owns the
+    /// animation, exactly as [`Self::overview_progress`] is.
+    peek_progress: f64,
     /// gnome-shell's `ControlsState` show-apps fraction (0 = window picker, 1 = app
     /// grid): eased when the show-apps state flips, shrinking the picker box and
     /// sliding the app grid up (`overviewControls.js` state adjustment). The target.
@@ -627,6 +647,7 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
+            peek_progress: 0.,
             app_grid_shown: false,
             app_grid_expand: None,
             workspace_switch: None,
@@ -990,7 +1011,7 @@ impl<W: LayoutElement> Monitor<W> {
             .filter(|(idx, _)| self.workspace_is_closable(*idx))
             .map(|(idx, (ws, slot))| {
                 let thumb =
-                    thumbnail_drawn_rect(*slot, self.workspace_render_scale(idx), Point::default());
+                    thumbnail_drawn_rect(*slot, self.strip_render_scale(idx), Point::default());
                 (ws.id(), thumbnails::close_rect(thumb, ramp))
             })
             .collect()
@@ -1620,7 +1641,12 @@ impl<W: LayoutElement> Monitor<W> {
         });
 
         let background_radius = self.workspace_background_radius();
-        for (ws, _) in self.workspaces_with_render_geo_mut(true) {
+        // The cull drops every workspace whose geometry misses the output — with the overview
+        // closed, that is all of them but the active one. A peek puts *all* of them on screen as
+        // thumbnails, so their elements have to be updated or the strip draws them stale. Bounded
+        // to the peek: the desktop keeps the cull, and the overview's spread makes it moot.
+        let cull = !self.strip_is_peek();
+        for (ws, _) in self.workspaces_with_render_geo_mut(cull) {
             ws.update_render_elements(is_active, background_radius);
         }
 
@@ -2020,6 +2046,46 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     /// This monitor's [`workspace_render_scale`] for one workspace.
+    /// The strip's own version of [`Self::workspace_background_radius`].
+    ///
+    /// The desktop one rides `expose_progress` because it also bakes the corners of the *live*
+    /// workspace (`update_render_elements`) — feed it the peek and the real desktop grows rounded
+    /// corners behind the strip. This one rides [`Self::strip_progress`], and takes the zoom the
+    /// overview would be at if it were open, so a thumbnail's corner is the same curve whether the
+    /// overview or a peek put it on screen.
+    fn strip_background_radius(&self) -> f64 {
+        let Some(progress) = self.strip_progress() else {
+            return 0.;
+        };
+        let zoom = if self.strip_is_peek() {
+            self.zoom_at(Some(1.))
+        } else {
+            self.overview_zoom()
+        };
+        let preview_h = self.view_size.h * zoom;
+        let radius = (WORKSPACE_BACKGROUND_CORNER_RADIUS * preview_h / REFERENCE_PREVIEW_H).clamp(
+            MIN_WORKSPACE_BACKGROUND_CORNER_RADIUS,
+            WORKSPACE_BACKGROUND_CORNER_RADIUS,
+        );
+        radius * progress / zoom
+    }
+
+    /// The strip's own version of [`Self::workspace_render_scale`]: how far a thumbnail shrinks
+    /// for not being the active one.
+    ///
+    /// Split for the same reason as the radius. [`Self::workspace_inactive_ramp`] feeds
+    /// `workspaces_render_geo`, which is the geometry of the **real desktop** — driving it from
+    /// the peek would shrink the live desktop mid-switch, overview-style, which is precisely what
+    /// a peek must not do.
+    pub fn strip_render_scale(&self, idx: usize) -> f64 {
+        let ramp = if self.workspaces_horizontal() {
+            self.strip_progress().unwrap_or(0.)
+        } else {
+            0.
+        };
+        workspace_render_scale(self.workspace_scroll_position(), idx, ramp)
+    }
+
     pub fn workspace_render_scale(&self, idx: usize) -> f64 {
         workspace_render_scale(
             self.workspace_scroll_position(),
@@ -2283,7 +2349,46 @@ impl<W: LayoutElement> Monitor<W> {
     /// appears and disappears under you is not one you can aim at. See
     /// `docs/fork/dynamic-workspaces-divergence.md`.
     pub fn thumbnails_visible(&self) -> bool {
-        self.expose_progress().is_some()
+        self.strip_progress().is_some()
+    }
+
+    /// How far the thumbnail strip is on screen, and why — the overview exposing it, or the
+    /// workspace peek bringing it down over the live desktop (`docs/fork/workspace-peek.md`).
+    ///
+    /// **Read this, not [`Self::expose_progress`], for anything that shapes the strip.** The two
+    /// differ in exactly the way that matters: `expose_progress` also drives the window spread and
+    /// the desktop's own geometry, which the peek must leave alone.
+    pub fn strip_progress(&self) -> Option<f64> {
+        if let Some(progress) = self.expose_progress() {
+            return Some(progress);
+        }
+        if self.options.layout.windowing_mode != WindowingMode::Floating {
+            return None;
+        }
+        (self.peek_progress > 0.).then_some(self.peek_progress)
+    }
+
+    /// Whether the strip on screen is the peek's rather than the overview's — which is what
+    /// picks its band, since the overview's row is allocated among the overview's chrome and the
+    /// peek's is not.
+    pub fn strip_is_peek(&self) -> bool {
+        self.expose_progress().is_none() && self.peek_progress > 0.
+    }
+
+    /// The peek's band: full width, pinned at the top of the work area, a thumbnail's height.
+    ///
+    /// The overview's row sits at the floating search entry's midline, well down the canvas —
+    /// that band is a position among the overview's other chrome, and there is no other chrome
+    /// here. The height is the overview row's, computed from the same `start_y`, so a thumbnail
+    /// is the same size in both and the strip does not resize if the overview opens over a peek.
+    fn peek_band(&self) -> Rectangle<f64, Logical> {
+        let start_y = self.working_area.loc.y;
+        let h = overview_layout::small_workspace_height(self.view_size, start_y);
+        let pad = PEEK_BAND_PADDING * overview_layout::chrome_ramp(self.view_size);
+        Rectangle::new(
+            Point::from((0., start_y + pad)),
+            Size::from((self.view_size.w, h)),
+        )
     }
 
     /// The thumbnails strip, laid out in the band [`Self::controls_layout`]
@@ -2316,7 +2421,11 @@ impl<W: LayoutElement> Monitor<W> {
                 InsertWorkspace::Existing(_) => None,
             }
         });
-        let band = self.controls_layout().workspace_row;
+        let band = if self.strip_is_peek() {
+            self.peek_band()
+        } else {
+            self.controls_layout().workspace_row
+        };
         let zoom = band.size.h / self.view_size.h;
         let thumb_w = (self.view_size.w * zoom).round();
         let gap = self.workspace_gap(zoom, FitMode::All);
@@ -2682,6 +2791,10 @@ impl<W: LayoutElement> Monitor<W> {
         let strip = self.thumbnail_strip()?;
         let idx = strip.thumb_under(pos_within_output)?;
         Some(&self.workspaces[idx])
+    }
+
+    pub(super) fn set_peek_progress(&mut self, progress: f64) {
+        self.peek_progress = progress;
     }
 
     pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
@@ -3162,7 +3275,7 @@ impl<W: LayoutElement> Monitor<W> {
         let Some(strip) = self.thumbnail_strip() else {
             return;
         };
-        let Some(progress) = self.expose_progress() else {
+        let Some(progress) = self.strip_progress() else {
             return;
         };
         let _span = tracy_client::span!("Monitor::render_thumbnails");
@@ -3216,7 +3329,7 @@ impl<W: LayoutElement> Monitor<W> {
             .chain((0..n).filter(|i| carried != Some(*i)));
         for idx in order {
             let (ws, slot) = (&self.workspaces[idx], &strip.thumbs[idx]);
-            let shrink = self.workspace_render_scale(idx);
+            let shrink = self.strip_render_scale(idx);
             let thumb = thumbnail_drawn_rect(*slot, shrink, slide);
             let thumb_scale = strip.scale * shrink;
             let thumb_loc_physical = thumb.loc.to_physical_precise_round(scale);
@@ -3275,7 +3388,7 @@ impl<W: LayoutElement> Monitor<W> {
                 // miniature is the picker scaled, corners included, and the shadow under
                 // it is baked on the very same radius (a square-cornered shadow around a
                 // rounded background shows through each corner as a pointy tab).
-                let radius = self.workspace_background_radius();
+                let radius = self.strip_background_radius();
                 if let Some(elem) = wallpaper.render(
                     ctx.renderer,
                     Default::default(),
@@ -3429,7 +3542,7 @@ impl<W: LayoutElement> Monitor<W> {
         )
         .to_physical_precise_round(scale);
 
-        let radius = self.workspace_background_radius();
+        let radius = self.strip_background_radius();
         let mut wallpapered = false;
         if let Some(wallpaper) = wallpaper {
             if let Some(elem) = wallpaper.render_at_alpha(

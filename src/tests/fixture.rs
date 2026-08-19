@@ -344,6 +344,32 @@ impl Fixture {
         synoik.advance_animations();
     }
 
+    /// Run the compositor for `duration` of its own time, one frame at a time, the way
+    /// [`run_until_settled`](Self::run_until_settled) does — for a gesture that is *held* rather
+    /// than one that finishes.
+    ///
+    /// A hold cannot be driven by settling: nothing is animating while a key is merely down, so
+    /// `settle` returns after a frame or two and the threshold never passes. Nor by teleporting
+    /// the clock: the deadline has to be crossed by frames, since the frame is what notices it.
+    ///
+    /// Leaves the clock frozen only if it found it frozen, for the reason in `run_until_settled`.
+    pub fn run_frames_for(&mut self, duration: Duration) {
+        const FRAME: Duration = Duration::from_micros(16_667);
+
+        let was_frozen = self.synoik().clock.is_frozen();
+        self.freeze_clock();
+        let mut elapsed = Duration::ZERO;
+        while elapsed < duration {
+            self.advance_clock(FRAME);
+            self.dispatch();
+            self.refresh();
+            elapsed += FRAME;
+        }
+        if !was_frozen {
+            self.synoik().clock.unfreeze();
+        }
+    }
+
     /// Sample `f` at `n + 1` evenly spaced instants across the next `duration`,
     /// advancing animations at each pinned instant — the animated analogue of
     /// [`settle_animations`](Self::settle_animations), for asserting what a UI

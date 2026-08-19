@@ -432,6 +432,13 @@ pub struct Layout<W: LayoutElement> {
     app_grid_open: bool,
     /// The overview zoom progress.
     overview_progress: Option<OverviewProgress>,
+    /// Whether the workspace peek is up: the thumbnail strip on the *live* desktop while the
+    /// overlay key is held (`docs/fork/workspace-peek.md`). Like [`Self::overview_open`] this is
+    /// the state input goes by; [`Self::peek_progress`] is the slide.
+    peek_open: bool,
+    /// The peek's slide, 1 fully out. Retired to `None` once it has finished going away, so a
+    /// closed peek costs nothing to check.
+    peek_progress: Option<Animation>,
     /// `org.gnome.mutter edge-tiling`: whether dragging a window to a screen
     /// edge tiles/maximizes it (GNOME windowing mode only). Pushed in from the
     /// GSettings model.
@@ -901,6 +908,8 @@ impl<W: LayoutElement> Layout<W> {
             clock,
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
+            peek_open: false,
+            peek_progress: None,
             app_grid_open: false,
             overview_progress: None,
             gnome_edge_tiling: true,
@@ -928,6 +937,8 @@ impl<W: LayoutElement> Layout<W> {
             clock,
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
+            peek_open: false,
+            peek_progress: None,
             app_grid_open: false,
             overview_progress: None,
             gnome_edge_tiling: true,
@@ -1024,6 +1035,7 @@ impl<W: LayoutElement> Layout<W> {
                 );
                 monitor.overview_open = self.overview_open;
                 monitor.set_overview_progress(self.overview_progress.as_ref());
+                monitor.set_peek_progress(self.peek_value());
                 monitors.push(monitor);
 
                 MonitorSet::Normal {
@@ -1045,6 +1057,7 @@ impl<W: LayoutElement> Layout<W> {
                 );
                 monitor.overview_open = self.overview_open;
                 monitor.set_overview_progress(self.overview_progress.as_ref());
+                monitor.set_peek_progress(self.peek_value());
 
                 MonitorSet::Normal {
                     monitors: vec![monitor],
@@ -3048,10 +3061,21 @@ impl<W: LayoutElement> Layout<W> {
             }
         }
 
+        if self
+            .peek_progress
+            .as_ref()
+            .is_some_and(|anim| anim.is_done())
+            && !self.peek_open
+        {
+            self.peek_progress = None;
+        }
+        let peek = self.peek_value();
+
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
                     mon.set_overview_progress(self.overview_progress.as_ref());
+                    mon.set_peek_progress(peek);
                     if overview_hidden {
                         mon.reset_app_grid();
                     }
@@ -3105,6 +3129,14 @@ impl<W: LayoutElement> Layout<W> {
             causes |= AnimCauses::OVERVIEW;
         }
 
+        if self
+            .peek_progress
+            .as_ref()
+            .is_some_and(|anim| !anim.is_done())
+        {
+            causes |= AnimCauses::WORKSPACE_PEEK;
+        }
+
         for mon in self.monitors() {
             if output.is_some_and(|output| mon.output != *output) {
                 continue;
@@ -3143,6 +3175,7 @@ impl<W: LayoutElement> Layout<W> {
 
         self.update_insert_hint(output);
 
+        let peek = self.peek_value();
         let MonitorSet::Normal {
             monitors,
             active_monitor_idx,
@@ -3161,6 +3194,7 @@ impl<W: LayoutElement> Layout<W> {
                     && idx == *active_monitor_idx
                     && !matches!(self.interactive_move, Some(InteractiveMoveState::Moving(_)));
                 mon.set_overview_progress(self.overview_progress.as_ref());
+                mon.set_peek_progress(peek);
                 mon.update_render_elements(is_active);
             }
         }
@@ -3228,7 +3262,7 @@ impl<W: LayoutElement> Layout<W> {
                     let pos_within_workspace =
                         (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
                     let position = if move_.is_floating {
-                        let target = edge_tiling
+                        let target = (edge_tiling && !via_strip)
                             .then(|| ws.edge_tile_target(pos_within_workspace))
                             .flatten();
                         target.map_or(InsertPosition::Floating, InsertPosition::EdgeTile)
@@ -4841,16 +4875,33 @@ impl<W: LayoutElement> Layout<W> {
             );
         }
 
+        // Whether the drop landed on the thumbnail strip. A strip drop names a workspace and
+        // nothing else: the pointer is over a *miniature*, so its position within that workspace
+        // is meaningless, and everything derived from it below has to be suppressed.
+        //
+        // **Keyed off the drop, not off the overview.** In the overview the two were the same
+        // thing, so `overview_open` stood in for it. A workspace peek is the first context with
+        // strip drops and the desktop's own drag semantics live at once
+        // (`docs/fork/workspace-peek.md`): without this, dropping a window on a thumbnail near
+        // the top of the screen feeds thumbnail-local coordinates to `edge_tile_target` and
+        // maximizes the window instead of moving it.
+        let via_strip = self
+            .monitors()
+            .find(|mon| mon.output == move_.output)
+            .and_then(|mon| mon.thumbnail_strip())
+            .is_some_and(|strip| strip.drop_target(move_.pointer_pos_within_output).is_some());
+
         // Dragging in the overview shouldn't switch the workspace and so on.
         let allow_to_activate_workspace = !self.overview_open;
         // Dropping on a screen edge tiles/maximizes (mutter edge tiling), but
-        // not from within the overview.
-        let edge_tiling = self.gnome_edge_tiling && !self.overview_open;
+        // not from within the overview, and never onto the strip.
+        let edge_tiling = self.gnome_edge_tiling && !self.overview_open && !via_strip;
         // A GNOME overview drag is gnome-shell's WindowPreview drag: the
         // preview's location isn't the window's, so dropping moves the window
-        // between workspaces but never repositions it on its desktop.
-        let keep_position =
-            self.overview_open && self.options.layout.windowing_mode == WindowingMode::Floating;
+        // between workspaces but never repositions it on its desktop. A strip drop is the same
+        // shape wherever it happens: the thumbnail says *which* workspace, never where in it.
+        let keep_position = (self.overview_open || via_strip)
+            && self.options.layout.windowing_mode == WindowingMode::Floating;
 
         match &mut self.monitor_set {
             MonitorSet::Normal {
@@ -5374,6 +5425,57 @@ impl<W: LayoutElement> Layout<W> {
                 mon.cancel_thumb_drag();
             }
             mon.set_overview_progress(self.overview_progress.as_ref());
+        }
+    }
+
+    /// Whether the workspace peek is up — what input goes by, as `overview_open` is for the
+    /// overview. True the moment the hold fires, not when the slide lands.
+    pub fn is_peeking(&self) -> bool {
+        self.peek_open
+    }
+
+    /// How far the peek has slid out, 0 when it is not there at all.
+    fn peek_value(&self) -> f64 {
+        self.peek_progress
+            .as_ref()
+            .map_or(0., |anim| anim.clamped_value())
+    }
+
+    /// Bring the peek up or put it away.
+    ///
+    /// The overview outranks it: while the overview is open the strip is already on screen in
+    /// its own band, and a peek would be a second claim on the same row.
+    pub fn set_peek(&mut self, open: bool) {
+        let open = open && !self.overview_open;
+        if self.peek_open == open {
+            return;
+        }
+        self.peek_open = open;
+
+        if !open {
+            // The strip is on its way out, so a reorder drag on it has nothing left to drop
+            // onto — the same reasoning as closing the overview.
+            for mon in self.monitors_mut() {
+                mon.cancel_thumb_drag();
+            }
+        }
+
+        let from = self.peek_value();
+        let to = if open { 1. } else { 0. };
+        self.peek_progress = Some(Animation::new(
+            self.clock.clone(),
+            from,
+            to,
+            0.,
+            peek_transition_config(&self.options),
+        ));
+        self.set_monitors_peek_progress();
+    }
+
+    fn set_monitors_peek_progress(&mut self) {
+        let value = self.peek_value();
+        for mon in self.monitors_mut() {
+            mon.set_peek_progress(value);
         }
     }
 
@@ -6050,6 +6152,21 @@ impl<W: LayoutElement> Default for MonitorSet<W> {
 /// Interpolates the workspace zoom from 1 (overview closed) to `zoom` (fully
 /// zoomed out) along the overview progress. What `zoom` itself is depends on
 /// the mode — see [`Monitor::zoom_at`].
+/// The peek's slide in and out (`docs/fork/workspace-peek.md`).
+///
+/// The strip's own transition, not the overview's: the peek is the row arriving, and it reads as
+/// the same movement whether a hold brought it or a drop re-laid it. It obeys the overview's
+/// animations-off switch, since that is the switch that turns off the thing it is part of.
+fn peek_transition_config(options: &Options) -> synoik_config::Animation {
+    synoik_config::Animation {
+        off: options.animations.overview_open_close.0.off,
+        kind: synoik_config::animations::Kind::Easing(synoik_config::animations::EasingParams {
+            duration_ms: 200,
+            curve: synoik_config::animations::Curve::EaseOutQuad,
+        }),
+    }
+}
+
 fn compute_overview_zoom(zoom: f64, overview_progress: Option<f64>) -> f64 {
     if let Some(p) = overview_progress {
         (1. - p * (1. - zoom)).max(0.0001)

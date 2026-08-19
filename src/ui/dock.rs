@@ -60,6 +60,8 @@ pub struct Dock {
     leave_at: Option<Duration>,
     /// Held open regardless of the pointer while an icon is being dragged out of it.
     dragging: bool,
+    /// Held open the same way while a workspace peek is up — see [`Dock::set_peeked`].
+    peeked: bool,
     /// Whether an app is demanding attention, which gives the dock a *resting* position above
     /// the edge instead of fully hidden. Not a hold: the dock still slides freely between the
     /// poke and fully out, the poke is just where "away" now means.
@@ -80,6 +82,7 @@ impl Dock {
             hovered: false,
             leave_at: None,
             dragging: false,
+            peeked: false,
             poking: false,
             menu_open: false,
             barrier: Barrier::new(THRESHOLD, TIMEOUT),
@@ -200,6 +203,7 @@ impl Dock {
         self.hovered = false;
         self.leave_at = None;
         self.dragging = false;
+        self.peeked = false;
         self.poking = false;
         self.menu_open = false;
         self.barrier.leave();
@@ -381,9 +385,21 @@ impl Dock {
         self.held_changed(was);
     }
 
+    /// A workspace peek is up: hold the dock out alongside the thumbnail strip
+    /// (`docs/fork/workspace-peek.md`). The peek shows both pieces of the overview's furniture,
+    /// and the dock is what a drag onto a thumbnail starts from.
+    ///
+    /// Re-stated every frame from the peek's own state like [`Self::set_dragging`], and
+    /// idempotent for the same reason.
+    pub fn set_peeked(&mut self, peeked: bool) {
+        let was = self.held();
+        self.peeked = peeked;
+        self.held_changed(was);
+    }
+
     /// Whether something other than the pointer is keeping the dock out.
     fn held(&self) -> bool {
-        self.dragging || self.menu_open
+        self.dragging || self.menu_open || self.peeked
     }
 
     /// Re-arm (or cancel) the hide deadline when the last hold is released or the first taken.

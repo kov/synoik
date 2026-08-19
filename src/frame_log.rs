@@ -647,6 +647,8 @@ bitflags::bitflags! {
         const THUMB_PHANTOM = 1 << 27;
         /// The workspace row easing to where it belongs after a drop or a reorder.
         const THUMB_ROW_SLIDE = 1 << 28;
+        /// The workspace peek sliding the thumbnail strip onto the live desktop.
+        const WORKSPACE_PEEK = 1 << 29;
     }
 }
 
@@ -697,6 +699,7 @@ impl AnimCauses {
             (AnimCauses::CURSOR, "cursor"),
             (AnimCauses::LAYER_SURFACE, "layer-surface"),
             (AnimCauses::OVERVIEW, "overview"),
+            (AnimCauses::WORKSPACE_PEEK, "workspace-peek"),
             (AnimCauses::DND, "dnd"),
             (AnimCauses::INTERACTIVE_MOVE, "interactive-move"),
             (AnimCauses::THUMB_PHANTOM, "thumb-phantom"),
