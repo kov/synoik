@@ -4956,8 +4956,11 @@ impl<W: LayoutElement> Layout<W> {
             .and_then(|mon| mon.thumbnail_strip())
             .is_some_and(|strip| strip.drop_target(move_.pointer_pos_within_output).is_some());
 
-        // Dragging in the overview shouldn't switch the workspace and so on.
-        let allow_to_activate_workspace = !self.overview_open;
+        // Dragging in the overview shouldn't switch the workspace and so on — and neither should
+        // a drop on the thumbnail strip, wherever the strip is. Sending a window to another
+        // workspace is filing it away; going there too turns one gesture into two, and the second
+        // one was not asked for.
+        let allow_to_activate_workspace = !self.overview_open && !via_strip;
         // Dropping on a screen edge tiles/maximizes (mutter edge tiling), but
         // not from within the overview, and never onto the strip.
         let edge_tiling = self.gnome_edge_tiling && !self.overview_open && !via_strip;

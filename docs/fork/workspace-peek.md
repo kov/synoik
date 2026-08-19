@@ -75,9 +75,11 @@ swallow the key's release must reach `end_peek` (the lock/shield teardown does, 
 - **click a thumbnail** — switch to that workspace. The strip stays up and scrolls to follow the new
   active workspace. Clicking the *active* thumbnail does nothing.
 - **drag a thumbnail** — reorder the workspaces.
-- **drag a window onto a thumbnail** — move it to that workspace. This is the existing interactive
-  move; what is new is that the strip is a drop target for it outside the overview, and that as the
-  pointer climbs toward the band the dragged window scales down toward thumbnail size. That
+- **drag a window onto a thumbnail** — move it to that workspace, and **stay where you are**:
+  sending a window away is filing it, and following it turns one gesture into two. This is the
+  existing interactive move; what is new is that the strip is a drop target for it outside the
+  overview, and that as the pointer climbs toward the band the dragged window scales down toward
+  thumbnail size. That
   feedback lives in the interactive-move render path, lerping the carried window's render scale by
   the pointer's proximity to the band; it is the one piece of this with no existing home.
 - **drop into a gap** — open a new workspace there, as on the overview strip.
@@ -317,7 +319,7 @@ the hold rather than sleeping:
 - click a thumbnail → the active workspace changed, the strip is still up
 - click the active thumbnail → nothing changed, the overview did not open
 - drag a window to a thumbnail → the window is on that workspace, keeps its geometry, is not tiled,
-  and the active workspace did not change
+  and the active workspace did not change (the drop names a workspace; it does not go there)
 - drag a thumbnail → the workspaces reordered
 - click the active thumbnail → nothing changed and the overview did not open
 - carry a window toward the strip → it shrinks, and grows again on the way back down

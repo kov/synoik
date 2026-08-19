@@ -1412,6 +1412,70 @@ fn carrying_a_window_toward_the_peeked_strip_shrinks_it() {
     f.settle();
 }
 
+/// Dropping a window on a thumbnail files it away; it does not take the user with it.
+///
+/// The drop names a workspace, and going there too turns one gesture into two — the second not
+/// asked for. Keyed off the drop rather than off the overview, which stood in for it while the
+/// strip only ever appeared there.
+#[test]
+fn dropping_a_window_on_a_peeked_thumbnail_does_not_switch_to_it() {
+    let mut f = Fixture::new();
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    let _ = setup_two_desktops_in_overview(&mut f, id);
+    tap(&mut f, KEY_LEFTMETA);
+    f.settle();
+
+    let active_before = f.synoik().layout.active_workspace().unwrap().id();
+    let target_idx = f
+        .synoik()
+        .layout
+        .workspaces()
+        .position(|(_, _, ws)| ws.id() != active_before)
+        .expect("a workspace other than the active one");
+    let target = f
+        .synoik()
+        .layout
+        .workspaces()
+        .nth(target_idx)
+        .map(|(_, _, ws)| ws.id())
+        .unwrap();
+
+    summon_peek(&mut f);
+
+    let win = f.synoik().layout.focus().unwrap().window.clone();
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let rect = f.synoik().layout.window_render_rect(&win, &out).unwrap();
+    pointer_motion_to(
+        &mut f,
+        rect.loc.x + rect.size.w / 2.,
+        rect.loc.y + rect.size.h / 2.,
+    );
+    f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+    pointer_motion_to(&mut f, 960., 900.);
+    f.run_frames_for(Duration::from_millis(50));
+    let (tx, ty) = thumbnail_center(&mut f, target_idx);
+    pointer_motion_to(&mut f, tx, ty);
+    f.run_frames_for(Duration::from_millis(50));
+    f.pointer_button(BTN_LEFT, ButtonState::Released);
+    f.settle();
+
+    let landed = f
+        .synoik()
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.windows().any(|w| w.window == win))
+        .map(|(_, _, ws)| ws.id())
+        .expect("the window must be on some workspace");
+    assert_eq!(landed, target, "precondition: the drop moved the window");
+
+    assert_eq!(
+        f.synoik().layout.active_workspace().unwrap().id(),
+        active_before,
+        "sending a window away must not send the user after it"
+    );
+}
+
 /// Releasing the overlay key mid-drag must not yank the strip out from under the grab: the drag is
 /// still aiming at it. Not a latch — the strip is no longer *usable*, it is only not torn down
 /// while something holds its geometry.
