@@ -1811,6 +1811,126 @@ fn moving_a_window_between_workspaces_repaints_the_strip() {
     }
 }
 
+/// The same check as [`moving_a_window_between_workspaces_repaints_the_strip`], over the seat's
+/// own scene: a 3840×2160 output at scale 1.25, three floating windows the size kov's Text Editor
+/// and Terminal windows are, filed away one after another.
+///
+/// One window moved is not the case that shows the artifact. Each drop creates the workspace it
+/// lands on, so the row grows a thumbnail and every thumbnail after it moves — the second and
+/// third windows are carried into a strip that is re-laying out under them.
+#[test]
+fn filing_windows_away_one_after_another_repaints_the_strip() {
+    if let Err(e) = crate::render_helpers::vulkan::VulkanRenderer::new() {
+        eprintln!(
+            "skipping filing_windows_away_one_after_another_repaints_the_strip: no Vulkan ({e})"
+        );
+        return;
+    }
+
+    let mut f = Fixture::new();
+    f.synoik_state()
+        .backend
+        .headless()
+        .add_renderer()
+        .expect("build the Vulkan renderer");
+    f.add_output(1, (3840, 2160));
+    f.resize_output(1, None, Some(1.25));
+    f.settle();
+
+    let id = f.add_client();
+    let sizes = [(896, 650), (896, 650), (1172, 1069)];
+    let colors = [
+        (0, u32::MAX, 0, u32::MAX),
+        (u32::MAX, 0, 0, u32::MAX),
+        (0, 0, u32::MAX, u32::MAX),
+    ];
+    for (size, color) in sizes.into_iter().zip(colors) {
+        let surface = map_window_sized(&mut f, id, size, None);
+        let window = f.client(id).window(&surface);
+        window.attach_solid_buffer(color.0, color.1, color.2, color.3);
+        window.commit();
+        f.double_roundtrip(id);
+        f.settle();
+    }
+
+    let out = f.synoik().global_space.outputs().next().unwrap().clone();
+    let size: Size<i32, Physical> = out.current_mode().unwrap().size;
+
+    summon_peek(&mut f);
+
+    let band = {
+        let mon = f.synoik().layout.monitor_for_output(&out).unwrap();
+        let band = mon.thumbnail_strip().expect("the strip is up").band;
+        let scale = out.current_scale().fractional_scale();
+        Rectangle::new(
+            band.loc - Point::from((0., 60.)),
+            band.size + Size::from((0., 120.)),
+        )
+        .to_physical_precise_round(scale)
+    };
+
+    let mut warm = WarmTarget::new(&out);
+    for _ in 0..4 {
+        probe_frame(&mut f, &out, &mut warm, None);
+        f.run_frames_for(Duration::from_millis(16));
+    }
+
+    let check = |f: &mut Fixture, warm: &mut WarmTarget, stage: &str| {
+        let mut cold = WarmTarget::new(&out);
+        let (warm_px, cold_px) = probe_frame(f, &out, warm, Some(&mut cold));
+        let stale = stale_bounds(&warm_px.unwrap(), &cold_px.unwrap(), size, band);
+        assert_eq!(
+            stale, None,
+            "{stage}: the strip kept pixels the scene no longer draws"
+        );
+    };
+
+    check(&mut f, &mut warm, "the settled strip");
+
+    for n in 0..3 {
+        // Take whichever window is on top: floating windows overlap, and a press lands on the
+        // topmost one whatever rect it was aimed at.
+        let win = f
+            .synoik()
+            .layout
+            .focus()
+            .expect("a window is focused")
+            .window
+            .clone();
+        // The last thumbnail is the workspace that does not exist yet: filing a window there is
+        // what grows the row.
+        let last = f.synoik().layout.workspaces().count() - 1;
+        let rect = f
+            .synoik()
+            .layout
+            .window_render_rect(&win, &out)
+            .expect("the focused window is on screen");
+        pointer_motion_to(
+            &mut f,
+            rect.loc.x + rect.size.w / 2.,
+            rect.loc.y + rect.size.h / 2.,
+        );
+        f.pointer_button(BTN_LEFT, ButtonState::Pressed);
+        pointer_motion_to(&mut f, 1536., 1400.);
+        check(&mut f, &mut warm, &format!("window {n}: picked up"));
+
+        let (tx, ty) = thumbnail_center(&mut f, last);
+        pointer_motion_to(&mut f, tx, ty);
+        check(
+            &mut f,
+            &mut warm,
+            &format!("window {n}: over the thumbnail"),
+        );
+
+        f.pointer_button(BTN_LEFT, ButtonState::Released);
+        check(&mut f, &mut warm, &format!("window {n}: dropped"));
+        for _ in 0..30 {
+            f.run_frames_for(Duration::from_millis(16));
+            check(&mut f, &mut warm, &format!("window {n}: after the drop"));
+        }
+    }
+}
+
 /// Releasing the overlay key mid-drag must not yank the strip out from under the grab: the drag is
 /// still aiming at it. Not a latch — the strip is no longer *usable*, it is only not torn down
 /// while something holds its geometry.
